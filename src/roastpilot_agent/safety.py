@@ -2,13 +2,17 @@
 
 Safety policy is deterministic code, not prompt text. Every roaster write
 passes through this layer; verdicts are typed and never string-compared in
-core logic. The full rule set (max temperatures, pre-T0 overrun, stale
-telemetry, bounds, rate limits, drop eligibility, e-stop) lands in E3.
+core logic. E3-S1 implements the temperature and pre-T0 overrun rules;
+telemetry validity (E3-S2), command validation (E3-S3), e-stop plumbing
+(E3-S4), and phase/source validity (E3-S5, D16) follow.
 """
 
 from enum import Enum
 
 from pydantic import BaseModel, Field
+
+from roastpilot_agent.config import SafetyLimits
+from roastpilot_agent.models import RoastPhase
 
 
 class SafetyVerdict(Enum):
@@ -31,25 +35,93 @@ class SafetyVerdict(Enum):
 class SafetyEvaluation(BaseModel):
     """Typed safety handshake attached to every roaster write.
 
-    ``adjusted_heat``/``adjusted_fan`` are nullable per the plan §5 schema:
-    REJECT, RECOVERY, FAULT, and EMERGENCY_STOP verdicts carry no adjusted
-    command, and a fabricated 0 would be indistinguishable from a genuine
-    clamp-to-zero in the persisted decision trace.
+    ``rule`` names the rule that fired (or ``all_clear``), matching the
+    plan §5 ``safety_evaluations.rule`` column. ``adjusted_heat``/
+    ``adjusted_fan`` are nullable per the schema: most non-ALLOW/CLAMP
+    verdicts carry no adjusted command — the pre-T0 overrun rule is the
+    documented exception (heat 0 %, safe fan, RECOVERY/FAULT verdict).
     """
 
+    rule: str = Field(min_length=1)
     verdict: SafetyVerdict
     adjusted_heat: int | None = Field(default=None, ge=0, le=100)
     adjusted_fan: int | None = Field(default=None, ge=0, le=100)
-    reason: str
+    reason: str = Field(min_length=1)
 
 
 class SafetyPolicy:
-    """Evaluates every command before it reaches the roaster.
+    """Evaluates telemetry and commands before anything reaches the roaster.
 
-    The rule set is implemented in E3; no code path may deliver advisor
-    output to the MCP client without a :class:`SafetyEvaluation`.
+    Deterministic and side-effect free: rules read the configured
+    :class:`SafetyLimits` and the inputs only. The controller owns acting
+    on verdicts; no code path may deliver advisor output to the MCP client
+    without a :class:`SafetyEvaluation`.
     """
 
+    def __init__(self, limits: SafetyLimits) -> None:
+        self._limits = limits
+
+    def evaluate_telemetry(
+        self,
+        *,
+        phase: RoastPhase,
+        bean_temp_c: float,
+        env_temp_c: float,
+        t0_confirmed: bool,
+    ) -> SafetyEvaluation:
+        """Apply the temperature rule set to a telemetry reading (E3-S1).
+
+        Severity order: hard ceilings first (bean, then environment —
+        breaching either is an emergency stop), then the pre-T0 overrun
+        rule, which applies only while ``preheating`` with no confirmed T0
+        (orchestration plan § Safety Policy): heat is forced to 0 %, fan to
+        the configured safe value, and the verdict is RECOVERY or FAULT per
+        ``pre_t0_overrun_severity``. Limits are strict: a reading exactly
+        at a ceiling does not trip it.
+        """
+        limits = self._limits
+        if bean_temp_c > limits.max_bean_temp_c:
+            return SafetyEvaluation(
+                rule="max_bean_temp",
+                verdict=SafetyVerdict.EMERGENCY_STOP,
+                reason=(
+                    f"bean temperature {bean_temp_c:.1f} °C exceeds the hard ceiling "
+                    f"{limits.max_bean_temp_c:.1f} °C"
+                ),
+            )
+        if env_temp_c > limits.max_env_temp_c:
+            return SafetyEvaluation(
+                rule="max_env_temp",
+                verdict=SafetyVerdict.EMERGENCY_STOP,
+                reason=(
+                    f"environment temperature {env_temp_c:.1f} °C exceeds the hard ceiling "
+                    f"{limits.max_env_temp_c:.1f} °C"
+                ),
+            )
+        if (
+            phase is RoastPhase.PREHEATING
+            and not t0_confirmed
+            and bean_temp_c > limits.pre_t0_max_bean_temp_c
+        ):
+            severe = limits.pre_t0_overrun_severity == "fault"
+            return SafetyEvaluation(
+                rule="pre_t0_overrun",
+                verdict=SafetyVerdict.FAULT if severe else SafetyVerdict.RECOVERY,
+                adjusted_heat=0,
+                adjusted_fan=limits.overrun_safe_fan_percent,
+                reason=(
+                    f"bean temperature {bean_temp_c:.1f} °C exceeds the pre-T0 charge bound "
+                    f"{limits.pre_t0_max_bean_temp_c:.1f} °C with no confirmed T0: heat 0 %, "
+                    f"fan {limits.overrun_safe_fan_percent} %, "
+                    f"{'fault' if severe else 'operator recovery'} required"
+                ),
+            )
+        return SafetyEvaluation(
+            rule="all_clear",
+            verdict=SafetyVerdict.ALLOW,
+            reason="telemetry within configured limits",
+        )
+
     def evaluate_command(self, requested_heat: int, requested_fan: int) -> SafetyEvaluation:
-        """Validate, clamp, or reject a heat/fan command (E3)."""
-        raise NotImplementedError("E3: safety rule set")
+        """Validate, clamp, or reject a heat/fan command (E3-S3)."""
+        raise NotImplementedError("E3-S3: command validation rules")

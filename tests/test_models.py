@@ -85,6 +85,7 @@ def test_event_sources_match_plan() -> None:
 def test_safety_evaluation_json_round_trip() -> None:
     """SafetyEvaluation survives a JSON round trip with the verdict typed."""
     evaluation = SafetyEvaluation(
+        rule="max_bean_temp",
         verdict=SafetyVerdict.CLAMP,
         adjusted_heat=80,
         adjusted_fan=60,
@@ -97,7 +98,9 @@ def test_safety_evaluation_json_round_trip() -> None:
 
 def test_safety_evaluation_round_trip_without_adjusted_command() -> None:
     """Nullable adjusted values (D15) survive the round trip as None."""
-    evaluation = SafetyEvaluation(verdict=SafetyVerdict.RECOVERY, reason="restart with active run")
+    evaluation = SafetyEvaluation(
+        rule="restart_recovery", verdict=SafetyVerdict.RECOVERY, reason="restart with active run"
+    )
     restored = SafetyEvaluation.model_validate_json(evaluation.model_dump_json())
     assert restored == evaluation
     assert restored.adjusted_heat is None
