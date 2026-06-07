@@ -641,6 +641,7 @@ class RoastController:
         self._run_started_monotonic = self._clock()
         self._current_heat = 0
         self._current_fan = 0
+        self._last_command_monotonic = None  # new run: rate-limit baseline resets
         try:
             await self._executor.start_session()
         except Exception:
@@ -716,7 +717,11 @@ class RoastController:
         self._events.emit(RoastEventKind.RECOVERY_ACKNOWLEDGED, {"resumed_to": target.value})
 
     def operator_acknowledge_fault(self) -> None:
-        """Operator acknowledgement ends a faulted run (plan §3)."""
+        """Operator acknowledgement ends a faulted run (plan §3).
+
+        Also the reset path from ``complete`` → ``idle`` for the next run
+        (the transition table permits both sources).
+        """
         self.transition_to(RoastPhase.IDLE)  # legal only from faulted/complete
         self._events.emit(RoastEventKind.RECOVERY_ACKNOWLEDGED, {"acknowledged": "fault"})
 
@@ -784,6 +789,9 @@ class RoastController:
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "stop_cooling"})
             return
+        self._events.emit(
+            RoastEventKind.COMMAND_EXECUTED, {"command": "stop_cooling", "source": "operator"}
+        )
         self.transition_to(RoastPhase.COMPLETE)
         self._events.emit(RoastEventKind.RUN_COMPLETED, {})
 

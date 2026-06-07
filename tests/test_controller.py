@@ -889,3 +889,128 @@ async def test_operator_early_abort_drop_from_roasting() -> None:
     await harness.controller.operator_drop_beans()
     assert harness.controller.phase is RoastPhase.COOLING
     assert "drop_beans" in harness.executor.commands
+
+
+# --- E4-S4: review fixes + coverage for failure branches ---
+
+
+class FailingCommandExecutor(RecordingExecutor):
+    """Fails the named commands; records everything else."""
+
+    def __init__(self, failing: set[str], log: list[str] | None = None) -> None:
+        super().__init__(log)
+        self._failing = failing
+
+    async def mark_first_crack(self) -> None:
+        if "mark_first_crack" in self._failing:
+            raise RuntimeError("write failed")
+        await super().mark_first_crack()
+
+    async def drop_beans(self) -> None:
+        if "drop_beans" in self._failing:
+            raise RuntimeError("write failed")
+        await super().drop_beans()
+
+    async def stop_cooling(self) -> None:
+        if "stop_cooling" in self._failing:
+            raise RuntimeError("write failed")
+        await super().stop_cooling()
+
+    async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+        if "set_targets" in self._failing:
+            raise RuntimeError("write failed")
+        await super().set_targets(heat_percent=heat_percent, fan_percent=fan_percent)
+
+
+def harness_in(phase_steps: int, executor: RecordingExecutor | None = None) -> Harness:
+    harness = make_harness(readings=[reading()], executor=executor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:phase_steps]:
+        harness.controller.transition_to(step)
+    harness.events.events.clear()
+    return harness
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_returns_to_idle() -> None:
+    harness = make_harness(readings=[reading()])
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    harness.controller.operator_acknowledge_fault()
+    assert harness.controller.phase is RoastPhase.IDLE
+    assert RoastEventKind.RECOVERY_ACKNOWLEDGED in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_also_resets_completed_run() -> None:
+    """Review finding 4: complete → idle uses the same reset path."""
+    harness = harness_in(6)  # …→ COMPLETE
+    harness.controller.operator_acknowledge_fault()
+    assert harness.controller.phase is RoastPhase.IDLE
+
+
+@pytest.mark.asyncio
+async def test_failed_operator_writes_surface_and_hold_phase() -> None:
+    """A failed MCP write emits COMMAND_FAILED and never moves the phase."""
+    fc = harness_in(3, FailingCommandExecutor({"mark_first_crack"}))
+    await fc.controller.operator_mark_first_crack()
+    assert fc.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert RoastEventKind.COMMAND_FAILED in fc.events.kinds()
+
+    drop = harness_in(4, FailingCommandExecutor({"drop_beans"}))
+    await drop.controller.operator_drop_beans()
+    assert drop.controller.phase is RoastPhase.DEVELOPMENT
+    assert RoastEventKind.COMMAND_FAILED in drop.events.kinds()
+
+    cool = harness_in(5, FailingCommandExecutor({"stop_cooling"}))
+    await cool.controller.operator_stop_cooling()
+    assert cool.controller.phase is RoastPhase.COOLING
+    assert RoastEventKind.COMMAND_FAILED in cool.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_failed_advisor_drop_write_holds_phase() -> None:
+    advisor = ScriptedAdvisor([decision(drop=True)])
+    harness = make_harness(
+        readings=[reading()],
+        advisor=advisor,
+        executor=FailingCommandExecutor({"drop_beans"}),
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:
+        harness.controller.transition_to(step)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_targets_surface_but_run_continues() -> None:
+    harness = make_harness(readings=[reading()], executor=FailingCommandExecutor({"set_targets"}))
+    await harness.controller.start_run(PROFILE)
+    assert harness.controller.phase is RoastPhase.PREHEATING  # run proceeds
+    assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_back_to_back_runs_are_not_rate_limited() -> None:
+    """Review finding 1: a new run resets the rate-limit baseline, so the
+    initial profile targets are never silently rejected."""
+    harness = make_harness(readings=[reading()])
+    await harness.controller.start_run(PROFILE)
+    assert harness.executor.targets == [(70, 40)]
+    # Finish the run instantly (no clock advance) and start the next.
+    for step in NORMAL_PATH[2:6]:
+        harness.controller.transition_to(step)
+    harness.controller.operator_acknowledge_fault()  # complete → idle
+    await harness.controller.start_run(PROFILE)
+    assert harness.executor.targets == [(70, 40), (70, 40)]  # second write happened
+
+
+@pytest.mark.asyncio
+async def test_stop_cooling_matrix_rejected_outside_cooling() -> None:
+    harness = harness_in(4)  # DEVELOPMENT — the D16 canonical invalid
+    await harness.controller.operator_stop_cooling()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.sink.evaluations[-1].rule == "command_phase_validity"
+    assert harness.executor.commands == []
