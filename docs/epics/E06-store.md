@@ -15,15 +15,17 @@ recovery reads the restart flow depends on.
 
 ## Stories
 
-### E6-S1 — Schema v1 and initialization
+### E6-S1 — Schema v1 and initialization ([#46](https://github.com/syamaner/roastpilot-agent/issues/46))
 
 Acceptance criteria:
 
-- [ ] All nine tables from plan §5 (roast_runs, roast_events,
-  telemetry_snapshots, safety_evaluations, advisor_decisions, command_log,
-  operator_actions, sync_jobs, reference_roasts) plus the specified indexes.
-- [ ] WAL + `synchronous=FULL` PRAGMAs set and asserted in tests.
-- [ ] Schema-version/migration mechanism with a test.
+- [x] All nine tables from plan §5 verbatim plus the six specified
+  indexes; exact table set pinned by test; foreign keys enforced.
+- [x] WAL + `synchronous=FULL` PRAGMAs set and asserted in tests
+  (synchronous == 2).
+- [x] Append-only `PRAGMA user_version` migration mechanism — an appended
+  migration applies on re-open, bumps the version, and leaves v1 content
+  untouched (tested); re-initialization idempotent.
 
 ### E6-S2 — Write paths
 
@@ -46,8 +48,8 @@ Acceptance criteria:
 
 | Story | Title | Status |
 |-------|-------|--------|
-| E6-S1 | Schema v1 and initialization | not started |
+| E6-S1 | Schema v1 and initialization | done |
 | E6-S2 | Write paths | not started |
 | E6-S3 | Recovery reads and immutability | not started |
 
-Epic status: **not started** — depends on E2.
+Epic status: **in progress** (E6-S1 done).
