@@ -99,6 +99,24 @@ class RoastEventSource(Enum):
     SAFETY = "safety"
 
 
+class RoastTelemetry(BaseModel):
+    """Minimal controller-facing telemetry reading (E4).
+
+    E5's typed MCP mirrors construct this from ``RoastSessionState``; the
+    controller's tick pipeline consumes it. Derived metrics (RoR) are
+    passed through from MCP, never recomputed (plan §2).
+    """
+
+    bean_temp_c: float
+    env_temp_c: float
+    age_seconds: float = 0.0
+    bean_ror_c_per_min: float | None = None
+    env_ror_c_per_min: float | None = None
+    t0_detected: bool = False
+    first_crack_detected: bool = False
+    cooling_on: bool = False
+
+
 class RoastProfile(BaseModel):
     """Minimal static roast profile (decision D7).
 

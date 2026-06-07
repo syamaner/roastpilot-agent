@@ -30,15 +30,24 @@ Acceptance criteria:
   unchanged after rejection), self-transitions rejected, `* → faulted`
   and `* → operator_recovery_required` from every phase.
 
-### E4-S2 — Tick loop and scheduler
+### E4-S2 — Tick loop and scheduler ([#28](https://github.com/syamaner/roastpilot-agent/issues/28))
 
 Acceptance criteria:
 
-- [ ] Monotonic fixed-rate scheduler (no drift accumulation) with
-  jitter measurement; tested with a fake clock.
-- [ ] Tick order enforced: read state → persist → safety → transitions →
-  (advisory?) → validate → execute → persist → emit events.
-- [ ] Slow/failed advisor call never blocks safety handling or polling.
+- [x] Monotonic fixed-rate `TickScheduler` (no drift accumulation —
+  scheduled times advance by exactly the interval) with per-tick jitter
+  measurement; slow ticks recover onto the original schedule; tested
+  with an injected fake clock + sleep.
+- [x] Tick order enforced and pinned by a cross-collaborator order log:
+  read state → persist snapshot → safety (MCP health → validity → temps)
+  → persist evaluation → act/transition → advisory (if due) → validate →
+  execute approved → emit. Fail-closed verdicts (FAULT/RECOVERY/E-STOP)
+  end the tick before any advisory or command.
+- [x] Slow/failed advisor never blocks: timeout-bounded via
+  `advisory_timeout_seconds`; timeout/crash become REJECT + hold-current-
+  targets evaluations; protocol collaborators (StateReader,
+  CommandExecutor, SnapshotSink, EventEmitter) keep the controller free
+  of FastAPI/MCP imports.
 
 ### E4-S3 — Preheating branch: T0 debounce and add-beans guidance
 
@@ -49,6 +58,11 @@ Acceptance criteria:
 - [ ] T0 debounce: counter increments on MCP-reported T0, resets when absent,
   transition after `t0_debounce_ticks` (default 3). Tests reflect that
   flapping originates from read faults, not MCP state (plan §2 note).
+- [ ] The debounced T0 state **replaces** E4-S2's interim
+  `t0_confirmed = phase is not PREHEATING` proxy in the tick's safety
+  evaluation — otherwise the T0 handover window (observed-but-not-yet-
+  committed) is judged against the pre-T0 charge bound and can trip a
+  spurious overrun (safety-reviewer carry-forward, E4-S2 PR).
 
 ### E4-S4 — Fake-MCP harness and restart recovery
 
@@ -89,8 +103,8 @@ Acceptance criteria:
 | Story | Title | Status |
 |-------|-------|--------|
 | E4-S1 | Transition table | done |
-| E4-S2 | Tick loop and scheduler | not started |
+| E4-S2 | Tick loop and scheduler | done |
 | E4-S3 | T0 debounce and add-beans guidance | not started |
 | E4-S4 | Fake-MCP harness and restart recovery | not started |
 
-Epic status: **in progress** (E4-S1 done).
+Epic status: **in progress** (E4-S1, E4-S2 done).
