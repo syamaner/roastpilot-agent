@@ -347,3 +347,55 @@ class OperatorRatingRequest(BaseModel):
 
     stars: Literal[1, 2, 3, 4, 5]
     notes: str | None = None
+
+
+# --- E7-S2: operator action queue (component plan §6) ---
+
+
+class OperatorAction(Enum):
+    """The operator actions the API accepts (plan §6 enum).
+
+    Plain ``Enum`` (D15): the SPA sends these wire forms, but a string
+    comparison against a member in core logic is a pyright strict error.
+
+    "Recovery-only" in plan §6 means *manual fallback*, not a single phase, and
+    the two are not symmetric (see ``safety.COMMAND_PHASE_MATRIX``):
+    ``mark_beans_added`` is the manual-T0 fallback accepted only in
+    ``preheating`` (NOT in ``operator_recovery_required``), while
+    ``start_cooling`` is accepted in ``cooling`` or ``operator_recovery_required``.
+    ``pause_advisory`` / ``resume_advisory`` / ``acknowledge_recovery`` are
+    control actions with no direct MCP write."""
+
+    MARK_BEANS_ADDED = "mark_beans_added"
+    MARK_FIRST_CRACK = "mark_first_crack"
+    PAUSE_ADVISORY = "pause_advisory"
+    RESUME_ADVISORY = "resume_advisory"
+    DROP_BEANS = "drop_beans"
+    START_COOLING = "start_cooling"
+    STOP_COOLING = "stop_cooling"
+    EMERGENCY_STOP = "emergency_stop"
+    ACKNOWLEDGE_RECOVERY = "acknowledge_recovery"
+
+
+class OperatorActionRequest(BaseModel):
+    """``POST /api/roasts/{id}/operator-actions`` body (plan §6:
+    ``{action, payload?}``)."""
+
+    action: OperatorAction
+    payload: dict[str, Any] | None = None
+
+
+class OperatorActionResult(BaseModel):
+    """The outcome of submitting an operator action (plan §6).
+
+    ``result`` mirrors the persisted ``operator_actions.result`` vocabulary.
+    In E7 the queue resolves ``accepted`` (phase-valid, queued for the
+    controller) or ``rejected`` (declined by safety policy, with the reason);
+    ``failed`` is reserved for an execution failure once the controller drains
+    the queue and writes MCP (E9 vertical slice). ``queued`` is true only when
+    the action was placed on the controller queue."""
+
+    action: OperatorAction
+    result: Literal["accepted", "rejected", "failed"]
+    reason: str
+    queued: bool

@@ -50,7 +50,7 @@ Acceptance criteria:
 | Story | Title | Status |
 |-------|-------|--------|
 | E7-S1 | REST routes | done |
-| E7-S2 | Operator action queue | not started |
+| E7-S2 | Operator action queue | done |
 | E7-S3 | SSE stream | not started |
 
 Epic status: **in progress** — depends on E4 ✅, E6 ✅.
@@ -65,3 +65,25 @@ Epic status: **in progress** — depends on E4 ✅, E6 ✅.
   read projections in `store.py`. The persisted run starts in `starting`; the
   live controller tick loop + MCP child that *drive* it are wired by the E9
   vertical slice (`RoastService` is the seam). No safety/controller changes.
+- **E7-S2 (#68):** Operator action queue. `OperatorAction` enum (plan §6, 9
+  actions incl. recovery-only `mark_beans_added`/`start_cooling`) + request/
+  result models in `models.py`. `POST /api/roasts/{id}/operator-actions`:
+  action → phase-validity pre-check via the existing
+  `SafetyPolicy.evaluate_command_phase` → `operator_actions` row → controller
+  queue (`asyncio.Queue` on `RoastService`). Accepted actions are enqueued;
+  rejected (wrong phase) are recorded with the policy reason and not queued;
+  `emergency_stop` is accepted from every phase. The queue performs **no MCP
+  write** and does not reimplement safety. Passed an adversarial
+  safety-reviewer pass. No `safety.py`/`controller.py` changes.
+  - **For E9:** the controller drains `operator_queue` each tick and runs the
+    **full** safety policy (rate limits, bounds, drop eligibility, phase)
+    before any MCP write — the queue's phase pre-check verdict is advisory
+    (last-persisted phase), not authoritative. E9 also adds the controller
+    handlers for the actions without one today: `mark_beans_added`,
+    `start_cooling`, `pause_advisory`, `resume_advisory` (the queue accepts
+    and records all 9; execution of these four is wired in E9).
+  - **For E9:** `operator_queue` is unbounded (`asyncio.Queue()`); with no
+    controller drain in E7 it cannot grow. When E9 wires the drain, bound it
+    (or dedup at drain) so a spammy operator cannot grow it without limit. A
+    terminal-run guard (409/410 on actions to a COMPLETE/FAULTED run) is also
+    a reasonable E9 addition — today the phase matrix rejects the harmful ones.
