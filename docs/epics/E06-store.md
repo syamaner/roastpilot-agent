@@ -42,13 +42,21 @@ Acceptance criteria:
   record_operator_action (nullable run_id). All enum values stored as
   lowercase wire forms passing the v1 CHECKs.
 
-### E6-S3 — Recovery reads and immutability
+### E6-S3 — Recovery reads and immutability ([#48](https://github.com/syamaner/roastpilot-agent/issues/48))
 
 Acceptance criteria:
 
-- [ ] Restart recovery reads: last persisted run state + phase recoverable.
-- [ ] Restart-during-preheat / development / cooling scenarios tested.
-- [ ] Completed runs immutable (rating/notes/sync fields excepted) — tested.
+- [x] `read_latest_run` → typed `PersistedRun` (phase, outcome, frozen
+  profile); `complete_run` finalizes outcome/manifest;
+  `set_operator_rating` exercises the exception path.
+- [x] Restart-during-preheat / development / cooling all tested with a
+  fresh store instance (process-death simulation), plus an E4/E6 seam
+  test: the persisted phase drives `recover_from_restart` into
+  `operator_recovery_required` with zero writes.
+- [x] Completed runs immutable — enforced by schema-v2 **triggers**, not
+  application discipline: phase/outcome updates and deletes abort;
+  operator rating/notes and cloud sync fields stay mutable; active runs
+  unaffected. (The BEGIN guard learned to allow trigger bodies.)
 
 ## Status
 
@@ -56,6 +64,6 @@ Acceptance criteria:
 |-------|-------|--------|
 | E6-S1 | Schema v1 and initialization | done |
 | E6-S2 | Write paths | done |
-| E6-S3 | Recovery reads and immutability | not started |
+| E6-S3 | Recovery reads and immutability | done |
 
-Epic status: **in progress** (E6-S1, E6-S2 done; E6-S3 remains).
+Epic status: **done** — all three stories complete; E7 (API) is now unblocked (E4 ✅ + E6 ✅); E8 (advisor) is the remaining leaf.
