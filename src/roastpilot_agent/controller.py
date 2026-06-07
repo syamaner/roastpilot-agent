@@ -20,6 +20,7 @@ from typing import Literal, Protocol
 from roastpilot_agent.advisor import AdvisorContext, RoastAdvisor
 from roastpilot_agent.config import ControllerConfig
 from roastpilot_agent.models import (
+    RoastCommand,
     RoastEventKind,
     RoastPhase,
     RoastProfile,
@@ -266,7 +267,11 @@ class RoastController:
         evaluation = self._evaluate_safety(telemetry, read_failed=read_failed)
         await self._snapshots.persist_evaluation(evaluation)
         if await self._act_on_safety(evaluation):
-            return  # fail-closed action taken: no advisory, no commands
+            # Fail-closed action taken: no advisory, no commands — and a
+            # stale advisory request must not survive into a later tick
+            # (it would otherwise fire in faulted/recovery).
+            self._advisory_requested = False
+            return
         if self._advisory_requested:
             await self._run_advisory(telemetry)
 
@@ -320,7 +325,17 @@ class RoastController:
         if verdict is SafetyVerdict.ALLOW:
             return False
         if verdict is SafetyVerdict.EMERGENCY_STOP:
-            await self._executor.emergency_stop(reason=evaluation.reason)
+            try:
+                await self._executor.emergency_stop(reason=evaluation.reason)
+            except Exception:
+                # A raising e-stop must not crash the tick loop or leave
+                # the phase pre-fault: fault anyway and surface the failed
+                # command. Timeout-bounding the call itself is E5's
+                # criterion; retry/fallback hardening is E4-S4's.
+                self._events.emit(
+                    RoastEventKind.COMMAND_FAILED,
+                    {"command": "emergency_stop", "reason": evaluation.reason},
+                )
             if self._phase is not RoastPhase.FAULTED:
                 self.transition_to(RoastPhase.FAULTED)
             self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
@@ -346,6 +361,20 @@ class RoastController:
         """
         self._advisory_requested = False
         if self._advisor is None or telemetry is None or self._profile is None:
+            return
+        # Command×phase matrix gate (E3-S5/D16) before the advisor is even
+        # consulted: set_targets writes heat, so SET_HEAT's row (the
+        # stricter of heat/fan) decides whether advice could be applied at
+        # all in this phase.
+        phase_validity = self._safety.evaluate_command_phase(
+            command=RoastCommand.SET_HEAT, phase=self._phase
+        )
+        if phase_validity.verdict is not SafetyVerdict.ALLOW:
+            await self._snapshots.persist_evaluation(phase_validity)
+            self._events.emit(
+                RoastEventKind.ADVISORY,
+                {"evaluation": phase_validity.model_dump(mode="json")},
+            )
             return
         context = self._build_advisor_context(telemetry)
         try:

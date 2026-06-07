@@ -17,6 +17,19 @@ from roastpilot_agent.safety import SafetyEvaluation
 from roastpilot_agent.store import RoastStore
 
 
+class FakeClock:
+    """Deterministic monotonic clock for scheduler/controller tests."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
 class FakeMCPClient:
     """Test double for RoasterMCPClient.
 

@@ -25,6 +25,7 @@ from roastpilot_agent.models import RoastEventKind, RoastProfile, RoastTelemetry
 from roastpilot_agent.safety import SafetyLimits, SafetyPolicy, SafetyVerdict
 from tests.conftest import (
     EventSink,
+    FakeClock,
     RecordingExecutor,
     RecordingSnapshotSink,
     ScriptedAdvisor,
@@ -32,17 +33,6 @@ from tests.conftest import (
 )
 
 # --- harness ---
-
-
-class FakeClock:
-    def __init__(self) -> None:
-        self.now = 0.0
-
-    def __call__(self) -> float:
-        return self.now
-
-    def advance(self, seconds: float) -> None:
-        self.now += seconds
 
 
 @dataclass
@@ -73,11 +63,12 @@ def make_harness(
     advisor: RoastAdvisor | None = None,
     config: ControllerConfig | None = None,
     limits: SafetyLimits | None = None,
+    executor: RecordingExecutor | None = None,
 ) -> Harness:
     log: list[str] = []
     clock = FakeClock()
     reader = ScriptedStateReader(readings, log)
-    executor = RecordingExecutor(log)
+    executor = executor if executor is not None else RecordingExecutor(log)
     sink = RecordingSnapshotSink(log)
     events = EventSink(log)
     controller = RoastController(
@@ -357,7 +348,7 @@ async def test_slow_advisor_never_blocks_the_tick() -> None:
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
 
-    config = ControllerConfig(advisory_timeout_seconds=0.01)
+    config = ControllerConfig(advisory_timeout_seconds=0.05)
     harness = harness_in_development(readings=[reading()], advisor=NeverAdvisor(), config=config)
     harness.controller.request_advisory()
     await asyncio.wait_for(harness.controller.tick(), timeout=1.0)
@@ -446,3 +437,62 @@ async def test_advisory_skipped_without_profile_or_telemetry() -> None:
     harness.controller.request_advisory()
     await harness.controller.tick()  # idle, no profile, no telemetry: no crash
     assert harness.executor.targets == []
+
+
+# --- E4-S2: claude-review regression fixes ---
+
+
+@pytest.mark.asyncio
+async def test_stale_advisory_request_does_not_survive_a_fault() -> None:
+    """Review finding 1: an advisory requested before a fail-closed tick
+    must not fire on a later tick (it would run in FAULTED phase)."""
+    advisor = ScriptedAdvisor([decision()])
+    harness = harness_in_development(
+        readings=[reading(bean=231.0), reading()],  # hot tick, then normal
+        advisor=advisor,
+    )
+    harness.controller.request_advisory()
+    await harness.controller.tick()  # e-stop + FAULTED; advisory must be dropped
+    assert harness.controller.phase is RoastPhase.FAULTED
+    await harness.controller.tick()  # normal reading, but faulted phase
+    assert "advisor" not in harness.log
+    assert harness.executor.targets == []
+
+
+@pytest.mark.asyncio
+async def test_advisory_gated_by_command_phase_matrix() -> None:
+    """Review finding 2: the advisory path consults the E3-S5 matrix —
+    SET_HEAT is invalid in cooling, so advice is rejected before the
+    advisor is even called."""
+    advisor = ScriptedAdvisor([decision()])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    harness.controller.transition_to(RoastPhase.COOLING)
+    harness.log.clear()
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert "advisor" not in harness.log
+    assert harness.executor.targets == []
+    assert harness.sink.evaluations[-1].rule == "command_phase_validity"
+    assert harness.sink.evaluations[-1].verdict is SafetyVerdict.REJECT
+
+
+@pytest.mark.asyncio
+async def test_failed_emergency_stop_still_faults() -> None:
+    """Review finding 4: a raising e-stop command must not crash the tick
+    loop or leave the phase pre-fault."""
+
+    class FailingEstopExecutor(RecordingExecutor):
+        async def emergency_stop(self, *, reason: str) -> None:
+            raise RuntimeError("serial port dead")
+
+    log: list[str] = []
+    harness = make_harness(readings=[reading(bean=231.0)], executor=FailingEstopExecutor(log))
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:
+        harness.controller.transition_to(step)
+    harness.events.events.clear()
+    await harness.controller.tick()  # must not raise
+    assert harness.controller.phase is RoastPhase.FAULTED
+    kinds = harness.events.kinds()
+    assert RoastEventKind.COMMAND_FAILED in kinds
+    assert RoastEventKind.FAULT in kinds
