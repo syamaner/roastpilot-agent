@@ -91,6 +91,22 @@ completing the current development window."
 (A request-shape replay returned the same decision with confidence 0.85 and
 an equivalent rationale — stable across runs at temperature 0.)
 
+**With thinking disabled (the fix — at the production budget):** after turning
+reasoning off in the LM Studio model-load config (the only place it could be
+disabled; see Finding 1), the same model at the default 10 s budget:
+
+- 3/3 iterations succeed, latency **~2.2 s mean (1.72 – 2.93 s)** — well
+  inside budget
+- clean `final_result` tool call, same sane decision, stable across
+  iterations: `heat=60% fan=60% should_drop=false confidence=0.85`,
+  rationale "Bean is in development phase, 7.8 °C below target drop temp. ROR
+  is healthy (10.97 °C/min). Maintain current heat/fan settings…"
+
+This closes the loop: with reasoning off, the convenience local setup
+delivers usable, sane, structured advice inside the tick-aligned advisory
+window. Latency — not the harness, the advisor, or advice quality — was the
+only gate.
+
 ### Is the advice sane for this roast moment?
 
 Yes. Bean is 189 °C, 8 °C below the 197 °C drop target, climbing at
@@ -121,10 +137,16 @@ This is a credible first real-advice data point.
      (ignored).
 
    The advisor's fixed `v0` system prompt therefore cannot turn thinking off,
-   which is the anticipated real finding. To use this model for live advice,
-   disable thinking at the **LM Studio model-load config** (or choose a
-   non-reasoning model / a faster-reasoning one). This is an operator/model
-   choice, not an advisor-code change.
+   which is the anticipated real finding. Root cause is confirmed in the
+   Qwen chat template: it gates on `enable_thinking`, but **LM Studio's
+   OpenAI-compatible endpoint does not forward `chat_template_kwargs`** to the
+   template, so the request-level switch never reaches it.
+
+   **Resolution (verified):** disabling reasoning in the **LM Studio
+   model-load config** drops latency from ~21 s to **~2.2 s** at the default
+   10 s budget, with the same sane structured advice (see "With thinking
+   disabled" above). This is an operator/model choice, not an advisor-code
+   change. Alternatively, choose a genuinely non-reasoning instruct model.
 
 2. **Structured output works out of the box — no code change needed.**
    PydanticAI's default tool-calling structured-output mode works against LM
@@ -144,10 +166,28 @@ This is a credible first real-advice data point.
   `ROASTPILOT_ADVISOR__PROVIDER` / `MODEL_SLUG` (and base_url/api_key_env)
   to compare candidates against the same grounded context — no code change
   (D18).
-- **Reasoning models need their thinking disabled (or a much larger budget)
-  to fit the 10 s tick-aligned advisory window.** Latency, not advice
-  quality, is the gating factor for this candidate. Capture latency and
-  reasoning-token cost alongside advice quality when comparing.
-- A cloud non-reasoning model (or Qwen with thinking off) is the apples-to-
-  apples comparison point; record each candidate's latency at the production
-  budget.
+- **Reasoning models need their thinking disabled to fit the 10 s
+  tick-aligned advisory window.** Latency, not advice quality, is the gating
+  factor. With reasoning off, Qwen 3.6 35B-A3B comes in at ~2.2 s with the
+  same sane advice. Capture latency and reasoning-token cost alongside advice
+  quality when comparing.
+- Candidate latencies at the production budget so far:
+
+  | Model | Reasoning | Latency | Fits 10 s? | Advice |
+  |---|---|---|---|---|
+  | Qwen 3.6 35B-A3B | on (default) | ~21.5 s | ✗ | hold 60/60, no drop — sane |
+  | Gemma 4 e4b | on (default) | ~13.8 s | ✗ | hold 60/60, no drop — sane |
+  | Qwen 3.6 35B-A3B | **off** | **~2.2 s** | ✓ | hold 60/60, no drop — sane |
+
+  Provenance: all rows used the **same harness and the same grounded
+  `AdvisorContext`** (this document's source row), against the local LM
+  Studio. The two reasoning-on rows are single characterisation runs (Qwen
+  via the headroom run above; Gemma 4 e4b — also LM Studio, swapped only by
+  `MODEL_SLUG` — a single run that likewise overran the budget). The
+  reasoning-off Qwen row is the 3-iteration run above (~2.2 s mean). Treat
+  the single-run latencies as indicative; re-measure with N≥3 when E8-S4
+  formally compares candidates.
+
+  (Both LM Studio models reason by default; turning it off is what makes them
+  viable. A cloud non-reasoning model is the apples-to-apples comparison
+  point — record each candidate's latency at the production budget.)
