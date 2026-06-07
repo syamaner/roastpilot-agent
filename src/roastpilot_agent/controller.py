@@ -15,6 +15,7 @@ fan (``operator_recovery_required``).
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from enum import Enum
 from typing import Literal, Protocol
 
 from roastpilot_agent.advisor import (
@@ -32,11 +33,18 @@ from roastpilot_agent.models import (
     RoastProfile,
     RoastTelemetry,
 )
-from roastpilot_agent.safety import SafetyEvaluation, SafetyPolicy, SafetyVerdict
+from roastpilot_agent.safety import (
+    COMMAND_PHASE_MATRIX,
+    SafetyEvaluation,
+    SafetyPolicy,
+    SafetyVerdict,
+)
 
 __all__ = [
     "TRANSITION_TABLE",
     "UNIVERSAL_TARGETS",
+    "AdvisoryCallPolicy",
+    "AdvisoryTrigger",
     "CommandExecutor",
     "EventEmitter",
     "InvalidTransitionError",
@@ -216,6 +224,117 @@ class TickScheduler:
             await self._sleep(max(0.0, scheduled - self._clock()))
 
 
+class AdvisoryTrigger(Enum):
+    """Why the advisor was consulted on a given tick (D15: plain ``Enum``).
+
+    Recorded on the ADVISORY event so the decision trace shows *why* advice
+    was requested — talk material per the E9/E12 demo-asset plan, and the
+    discriminator the call-frequency tests assert against.
+    """
+
+    MANUAL = "manual"
+    PHASE_CHANGE = "phase_change"
+    BEAN_TEMP_DELTA = "bean_temp_delta"
+    ROR_DELTA = "ror_delta"
+    MIN_INTERVAL = "min_interval"
+
+
+# Advice is only worth requesting in phases where its output (a heat/fan
+# target) could legally execute — the SET_HEAT row of the command×phase
+# matrix is the single source of truth, so this never drifts from safety.
+_ADVICE_PHASES: frozenset[RoastPhase] = COMMAND_PHASE_MATRIX[RoastCommand.SET_HEAT]
+
+
+class AdvisoryCallPolicy:
+    """Decides when the advisor is consulted (orchestration plan § Advisory
+    Call Frequency).
+
+    Change-based, never every tick: an automatic call fires only on a
+    meaningful change since the last call — a phase transition, a bean-temp
+    move of ``advisory_min_temp_delta_c``, a RoR move of
+    ``advisory_min_ror_delta_c_per_min``, or the
+    ``advisory_min_interval_seconds`` heartbeat (the plan emphasises this
+    during development; applied across all active-roast phases here). A
+    manual operator request bypasses every gate, including phase scoping, so
+    the operator always gets a response (the command×phase matrix then
+    decides whether that advice can apply).
+
+    Pure and deterministic: :meth:`evaluate` only reads state, and the
+    controller calls :meth:`note_call` after an actual consult to advance
+    the baselines. Unit-testable in isolation by feeding scripted
+    ``(phase, telemetry, now)`` sequences.
+    """
+
+    def __init__(self, config: ControllerConfig) -> None:
+        self._config = config
+        self._last_call_monotonic: float | None = None
+        self._last_bean_temp_c: float | None = None
+        self._last_bean_ror_c_per_min: float | None = None
+        self._last_phase: RoastPhase | None = None
+
+    def evaluate(
+        self,
+        *,
+        phase: RoastPhase,
+        telemetry: RoastTelemetry | None,
+        now: float,
+        manual_request: bool,
+    ) -> AdvisoryTrigger | None:
+        """Return the trigger to consult the advisor this tick, or ``None``.
+
+        Manual wins unconditionally. Otherwise automatic triggers apply only
+        in advice-applicable phases, evaluated most-meaningful first: a phase
+        change (including the first consult in an advice phase), then the
+        bean-temp and RoR deltas, then the minimum-interval heartbeat.
+        """
+        if manual_request:
+            return AdvisoryTrigger.MANUAL
+        if phase not in _ADVICE_PHASES:
+            return None
+        # First consult in an advice phase, or any phase transition since the
+        # last call: ``_last_phase`` starts None, so the first eligible tick
+        # establishes the baseline.
+        if phase is not self._last_phase:
+            return AdvisoryTrigger.PHASE_CHANGE
+        if self._last_call_monotonic is None:
+            return AdvisoryTrigger.PHASE_CHANGE
+        if (
+            telemetry is not None
+            and self._last_bean_temp_c is not None
+            and abs(telemetry.bean_temp_c - self._last_bean_temp_c)
+            >= self._config.advisory_min_temp_delta_c
+        ):
+            return AdvisoryTrigger.BEAN_TEMP_DELTA
+        if (
+            telemetry is not None
+            and telemetry.bean_ror_c_per_min is not None
+            and self._last_bean_ror_c_per_min is not None
+            and abs(telemetry.bean_ror_c_per_min - self._last_bean_ror_c_per_min)
+            >= self._config.advisory_min_ror_delta_c_per_min
+        ):
+            return AdvisoryTrigger.ROR_DELTA
+        if now - self._last_call_monotonic >= self._config.advisory_min_interval_seconds:
+            return AdvisoryTrigger.MIN_INTERVAL
+        return None
+
+    def note_call(
+        self,
+        *,
+        phase: RoastPhase,
+        telemetry: RoastTelemetry | None,
+        now: float,
+    ) -> None:
+        """Record that the advisor was consulted: advance the baselines the
+        next :meth:`evaluate` measures change against. Telemetry-derived
+        baselines update only when telemetry is present, so a manual consult
+        with no reading does not blank the delta baselines."""
+        self._last_call_monotonic = now
+        self._last_phase = phase
+        if telemetry is not None:
+            self._last_bean_temp_c = telemetry.bean_temp_c
+            self._last_bean_ror_c_per_min = telemetry.bean_ror_c_per_min
+
+
 class RoastController:
     """Code-owned deterministic state machine and tick pipeline.
 
@@ -252,6 +371,7 @@ class RoastController:
         self._run_started_monotonic: float | None = None
         self._consecutive_read_failures = 0
         self._advisory_requested = False
+        self._advisory_policy = AdvisoryCallPolicy(config)
         self._current_heat = 0
         self._current_fan = 0
         self._last_command_monotonic: float | None = None
@@ -302,8 +422,13 @@ class RoastController:
     # --- E4-S2: tick pipeline ---
 
     def request_advisory(self) -> None:
-        """Operator/manual advisory trigger (the change-based call-frequency
-        policy lands in E8-S3 and will also set this)."""
+        """Operator/manual advisory trigger.
+
+        Sets the manual flag the next tick honours unconditionally — it
+        bypasses the change-based :class:`AdvisoryCallPolicy` gates,
+        including phase scoping, so an explicit operator request always
+        reaches :meth:`_run_advisory` (where the command×phase matrix has
+        the final say on whether the resulting advice can apply)."""
         self._advisory_requested = True
 
     async def tick(self) -> None:
@@ -320,8 +445,26 @@ class RoastController:
             return
         await self._apply_phase_rules(telemetry)
         self._check_operator_timeout()
-        if self._advisory_requested:
-            await self._run_advisory(telemetry)
+        await self._maybe_run_advisory(telemetry)
+
+    async def _maybe_run_advisory(self, telemetry: RoastTelemetry | None) -> None:
+        """Consult the call-frequency policy and run the advisory step when it
+        fires. No advisor wired ⇒ nothing to consult; the manual flag is
+        cleared either way so it never survives into a later tick."""
+        manual_request = self._advisory_requested
+        self._advisory_requested = False
+        if self._advisor is None:
+            return
+        trigger = self._advisory_policy.evaluate(
+            phase=self._phase,
+            telemetry=telemetry,
+            now=self._clock(),
+            manual_request=manual_request,
+        )
+        if trigger is None:
+            return
+        await self._run_advisory(telemetry, trigger)
+        self._advisory_policy.note_call(phase=self._phase, telemetry=telemetry, now=self._clock())
 
     def _check_operator_timeout(self) -> None:
         """D16: alert (once) when a true operator-required state has waited
@@ -529,13 +672,16 @@ class RoastController:
         self._current_heat = evaluation.adjusted_heat
         self._current_fan = evaluation.adjusted_fan
 
-    async def _run_advisory(self, telemetry: RoastTelemetry | None) -> None:
+    async def _run_advisory(
+        self, telemetry: RoastTelemetry | None, trigger: AdvisoryTrigger
+    ) -> None:
         """Advisory step: timeout-bounded, never blocks the tick.
 
-        Failure of any kind becomes a REJECT evaluation with the
-        deterministic hold-current-targets fallback (E3-S3).
+        ``trigger`` is why the call-frequency policy fired; it rides along on
+        every ADVISORY event for the decision trace. Failure of any kind
+        becomes a REJECT evaluation with the deterministic
+        hold-current-targets fallback (E3-S3).
         """
-        self._advisory_requested = False
         if self._advisor is None or telemetry is None or self._profile is None:
             return
         # Command×phase matrix gate (E3-S5/D16) before the advisor is even
@@ -549,7 +695,7 @@ class RoastController:
             await self._snapshots.persist_evaluation(phase_validity)
             self._events.emit(
                 RoastEventKind.ADVISORY,
-                {"evaluation": phase_validity.model_dump(mode="json")},
+                {"trigger": trigger.value, "evaluation": phase_validity.model_dump(mode="json")},
             )
             return
         context = self._build_advisor_context(telemetry)
@@ -559,16 +705,16 @@ class RoastController:
                 timeout=self._config.advisory_timeout_seconds,
             )
         except TimeoutError:
-            await self._record_advisor_failure("timeout")
+            await self._record_advisor_failure("timeout", trigger)
             return
         except AdvisorMalformedOutputError:
-            await self._record_advisor_failure("malformed")
+            await self._record_advisor_failure("malformed", trigger)
             return
         except AdvisorUnsafeOutputError:
-            await self._record_advisor_failure("unsafe")
+            await self._record_advisor_failure("unsafe", trigger)
             return
         except Exception:
-            await self._record_advisor_failure("provider_error")
+            await self._record_advisor_failure("provider_error", trigger)
             return
         evaluation = self._safety.evaluate_command(
             requested_heat=decision.target_heat,
@@ -579,6 +725,7 @@ class RoastController:
         self._events.emit(
             RoastEventKind.ADVISORY,
             {
+                "trigger": trigger.value,
                 "decision": decision.model_dump(mode="json"),
                 "evaluation": evaluation.model_dump(mode="json"),
             },
@@ -618,7 +765,9 @@ class RoastController:
                 self.transition_to(RoastPhase.COOLING)
 
     async def _record_advisor_failure(
-        self, status: Literal["timeout", "malformed", "unsafe", "provider_error"]
+        self,
+        status: Literal["timeout", "malformed", "unsafe", "provider_error"],
+        trigger: AdvisoryTrigger,
     ) -> None:
         evaluation = self._safety.evaluate_advisor_failure(
             status=status,
@@ -627,7 +776,8 @@ class RoastController:
         )
         await self._snapshots.persist_evaluation(evaluation)
         self._events.emit(
-            RoastEventKind.ADVISORY, {"evaluation": evaluation.model_dump(mode="json")}
+            RoastEventKind.ADVISORY,
+            {"trigger": trigger.value, "evaluation": evaluation.model_dump(mode="json")},
         )
 
     def load_profile(self, profile: RoastProfile) -> None:

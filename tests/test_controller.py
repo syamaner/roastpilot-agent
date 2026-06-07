@@ -8,6 +8,7 @@ extend this suite.
 
 import asyncio
 from dataclasses import dataclass, field
+from typing import cast
 
 import pytest
 
@@ -16,6 +17,8 @@ from roastpilot_agent.config import ControllerConfig
 from roastpilot_agent.controller import (
     TRANSITION_TABLE,
     UNIVERSAL_TARGETS,
+    AdvisoryCallPolicy,
+    AdvisoryTrigger,
     InvalidTransitionError,
     RoastController,
     RoastPhase,
@@ -489,6 +492,215 @@ async def test_failed_emergency_stop_still_faults() -> None:
     assert RoastEventKind.FAULT in kinds
 
 
+# --- E8-S3: change-based call-frequency policy ---
+
+
+def _policy() -> AdvisoryCallPolicy:
+    """A policy with the default ControllerConfig thresholds (temp 1.0 °C,
+    RoR 2.0 °C/min, interval 15 s)."""
+    return AdvisoryCallPolicy(ControllerConfig())
+
+
+def test_policy_first_consult_in_advice_phase_is_phase_change() -> None:
+    policy = _policy()
+    trigger = policy.evaluate(
+        phase=RoastPhase.PREHEATING, telemetry=reading(), now=0.0, manual_request=False
+    )
+    assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
+def test_policy_phase_transition_triggers() -> None:
+    policy = _policy()
+    policy.note_call(phase=RoastPhase.PREHEATING, telemetry=reading(), now=0.0)
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(),
+        now=1.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
+def test_policy_bean_temp_delta_triggers_at_threshold_not_below() -> None:
+    policy = _policy()
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=200.0), now=0.0)
+    # +0.5 °C, well inside the interval: no trigger.
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.DEVELOPMENT,
+            telemetry=reading(bean=200.5),
+            now=1.0,
+            manual_request=False,
+        )
+        is None
+    )
+    # +1.0 °C reaches the threshold.
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.DEVELOPMENT,
+            telemetry=reading(bean=201.0),
+            now=1.0,
+            manual_request=False,
+        )
+        is AdvisoryTrigger.BEAN_TEMP_DELTA
+    )
+
+
+def test_policy_ror_delta_triggers_at_threshold() -> None:
+    policy = _policy()
+    policy.note_call(
+        phase=RoastPhase.DEVELOPMENT,
+        telemetry=reading(bean=200.0, bean_ror_c_per_min=5.0),
+        now=0.0,
+    )
+    # Same bean temp, RoR jumps +2.0 °C/min: RoR is the live trigger.
+    trigger = policy.evaluate(
+        phase=RoastPhase.DEVELOPMENT,
+        telemetry=reading(bean=200.0, bean_ror_c_per_min=7.0),
+        now=1.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.ROR_DELTA
+
+
+def test_policy_min_interval_heartbeat() -> None:
+    policy = _policy()
+    flat = reading(bean=200.0, bean_ror_c_per_min=5.0)
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=0.0)
+    # Flat telemetry just shy of the interval: silent (no per-tick spam).
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=14.9, manual_request=False
+        )
+        is None
+    )
+    # At the interval the heartbeat fires.
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=15.0, manual_request=False
+        )
+        is AdvisoryTrigger.MIN_INTERVAL
+    )
+
+
+def test_policy_does_not_fire_every_tick_on_flat_telemetry() -> None:
+    """The whole point: a stable roast between heartbeats is silent."""
+    policy = _policy()
+    flat = reading(bean=200.0, bean_ror_c_per_min=5.0)
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=0.0)
+    fired = [
+        policy.evaluate(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=t, manual_request=False)
+        for t in (1.0, 2.0, 3.0, 10.0, 14.0)
+    ]
+    assert fired == [None, None, None, None, None]
+
+
+def test_policy_manual_bypasses_phase_scoping_and_interval() -> None:
+    policy = _policy()
+    # Cooling is not an advice phase and no telemetry — manual still wins.
+    trigger = policy.evaluate(
+        phase=RoastPhase.COOLING, telemetry=None, now=0.0, manual_request=True
+    )
+    assert trigger is AdvisoryTrigger.MANUAL
+
+
+def test_policy_manual_takes_precedence_over_automatic_trigger() -> None:
+    policy = _policy()
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=200.0), now=0.0)
+    # A big delta would fire BEAN_TEMP_DELTA, but manual is reported instead.
+    trigger = policy.evaluate(
+        phase=RoastPhase.DEVELOPMENT,
+        telemetry=reading(bean=250.0),
+        now=1.0,
+        manual_request=True,
+    )
+    assert trigger is AdvisoryTrigger.MANUAL
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [RoastPhase.IDLE, RoastPhase.COOLING, RoastPhase.COMPLETE, RoastPhase.FAULTED],
+)
+def test_policy_no_automatic_call_outside_advice_phases(phase: RoastPhase) -> None:
+    policy = _policy()
+    trigger = policy.evaluate(
+        phase=phase, telemetry=reading(bean=999.0), now=999.0, manual_request=False
+    )
+    assert trigger is None
+
+
+def test_policy_baseline_advances_on_each_call() -> None:
+    """Deltas measure from the last call, not the start: after a call at
+    201 °C, a further +0.5 °C is below threshold again."""
+    policy = _policy()
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=200.0), now=0.0)
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.DEVELOPMENT,
+            telemetry=reading(bean=201.0),
+            now=1.0,
+            manual_request=False,
+        )
+        is AdvisoryTrigger.BEAN_TEMP_DELTA
+    )
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=201.0), now=1.0)
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.DEVELOPMENT,
+            telemetry=reading(bean=201.5),
+            now=2.0,
+            manual_request=False,
+        )
+        is None
+    )
+
+
+def test_policy_manual_consult_with_no_telemetry_keeps_delta_baseline() -> None:
+    """A manual consult mid-roast with a dropped reading must not blank the
+    temp baseline — the next real delta still measures from the prior call."""
+    policy = _policy()
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=200.0), now=0.0)
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=None, now=1.0)
+    trigger = policy.evaluate(
+        phase=RoastPhase.DEVELOPMENT,
+        telemetry=reading(bean=201.0),
+        now=2.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.BEAN_TEMP_DELTA
+
+
+@pytest.mark.asyncio
+async def test_automatic_advisory_fires_without_manual_request() -> None:
+    """Integration: entering development consults the advisor automatically
+    (no request_advisory), applies the advice, and tags the ADVISORY event
+    with the phase-change trigger."""
+    advisor = FakeAdvisor([decision(heat=60, fan=50)])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    await harness.controller.tick()
+    assert advisor.contexts  # advisor was consulted with no manual trigger
+    assert harness.executor.targets == [(60, 50)]
+    advisory_events = [
+        cast(dict[str, object], p) for k, p in harness.events.events if k is RoastEventKind.ADVISORY
+    ]
+    assert advisory_events
+    assert advisory_events[-1]["trigger"] == AdvisoryTrigger.PHASE_CHANGE.value
+
+
+@pytest.mark.asyncio
+async def test_no_automatic_advisory_in_cooling() -> None:
+    """The automatic policy is silent outside advice phases — cooling gets no
+    advisory call or rejection-spam (manual would still be answered)."""
+    advisor = FakeAdvisor([], default_decision=decision())
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    harness.controller.transition_to(RoastPhase.COOLING)
+    harness.log.clear()
+    harness.events.events.clear()
+    await harness.controller.tick()
+    assert "advisor" not in harness.log
+    assert RoastEventKind.ADVISORY not in harness.events.kinds()
+
+
 # --- E4-S3: T0 debounce and add-beans guidance ---
 
 
@@ -820,9 +1032,17 @@ async def test_advisor_drop_now_executes() -> None:
 
 @pytest.mark.asyncio
 async def test_full_mock_roast_with_fake_mcp() -> None:
-    """E4-S4 capstone: a complete scripted roast through the FakeMCPClient —
-    start → preheat → debounced T0 → MCP first crack → advisor drop →
-    operator stop-cooling → complete."""
+    """E4-S4 capstone (updated E8-S3): a complete scripted roast through the
+    FakeMCPClient — start → preheat → debounced T0 → MCP first crack →
+    advisor drop → operator stop-cooling → complete.
+
+    The advisor advises ``drop=True`` throughout, but the change-based
+    call-frequency policy consults it automatically (no manual trigger), and
+    drop-eligibility honours the recommendation only once development begins
+    — so the drop fires on entering development, and every earlier
+    ``drop=True`` in preheating/pre-FC is safely rejected. This is the
+    architecture invariant in motion: the advisor keeps advising, the
+    controller decides when it is safe to obey."""
     warm = reading(bean=120.0, env=140.0)
     charge = reading(bean=178.0, env=185.0)
     t0 = reading(bean=95.0, t0_detected=True)  # charge drop, T0 reported
@@ -832,7 +1052,9 @@ async def test_full_mock_roast_with_fake_mcp() -> None:
     mcp = FakeMCPClient([warm, charge, t0, t0, t0, fc, dev], log)
     events = EventSink(log)
     sink = RecordingSnapshotSink(log)
-    advisor = FakeAdvisor([decision(heat=40, fan=60, drop=True)], log=log)
+    # Constant advice via default_decision: consulted automatically on every
+    # meaningful change, drop honoured only in development.
+    advisor = FakeAdvisor([], default_decision=decision(heat=40, fan=60, drop=True), log=log)
     clock = FakeClock()
     controller = RoastController(
         config=ControllerConfig(),
@@ -854,21 +1076,22 @@ async def test_full_mock_roast_with_fake_mcp() -> None:
         await controller.tick()
         clock.advance(2.5)
     assert controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-    await controller.tick()  # FC frame
+    # The FC frame enters development and, in the same tick, the automatic
+    # advisory consult drops the beans (drop now eligible) → cooling.
+    await controller.tick()
     clock.advance(2.5)
-    assert controller.phase is RoastPhase.DEVELOPMENT
-    controller.request_advisory()
-    await controller.tick()  # advisory: clamp-free targets + drop
     assert controller.phase is RoastPhase.COOLING
     await controller.operator_stop_cooling()
     assert controller.phase is RoastPhase.COMPLETE
-    assert mcp.commands() == [
-        "start_session",
-        "set_targets",  # profile initials
-        "set_targets",  # advisor targets
-        "drop_beans",
-        "stop_cooling",
-    ]
+    commands = mcp.commands()
+    # Lifecycle bookends and the one drop, in order — set_targets recurs as
+    # advisory maintains targets across the roast, so assert the invariants,
+    # not an exact count.
+    assert commands[0] == "start_session"
+    assert commands[-1] == "stop_cooling"
+    assert commands.count("drop_beans") == 1
+    assert commands.index("drop_beans") < commands.index("stop_cooling")
+    assert commands.count("set_targets") >= 2  # profile initials + advisory
     kinds = events.kinds()
     for expected in (
         RoastEventKind.RUN_STARTED,
