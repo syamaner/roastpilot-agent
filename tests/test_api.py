@@ -843,6 +843,7 @@ def test_sse_event_types_are_event_kinds_plus_transport() -> None:
         "safety_alert",
         "fault",
         "recovery_required",
+        "recovery_acknowledged",
         "logs_exported",
         "run_completed",
         "heartbeat",
@@ -916,6 +917,7 @@ async def test_sse_endpoint_streams_typed_controller_event(
     await _make_run(store, "run-sse", RoastPhase.PREHEATING)
     response = await stream_events("run-sse", cast(Request, _FakeRequest()), service)
     assert response.media_type == "text/event-stream"
+    assert response.headers["cache-control"] == "no-cache"
     assert service.events.subscriber_count == 1
 
     service.events.emit(RoastEventKind.PHASE_CHANGED, {"phase": "preheating"})

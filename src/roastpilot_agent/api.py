@@ -572,7 +572,18 @@ async def stream_events(
         finally:
             service.events.unsubscribe(queue)
 
-    return StreamingResponse(frames(), media_type="text/event-stream")
+    return StreamingResponse(
+        frames(),
+        media_type="text/event-stream",
+        # Keep proxies and browsers from buffering or caching the live stream:
+        # without no-cache an edge/browser cache may serve a stale body, and
+        # X-Accel-Buffering: no disables Nginx response buffering.
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def create_app(service: RoastService | None = None) -> FastAPI:

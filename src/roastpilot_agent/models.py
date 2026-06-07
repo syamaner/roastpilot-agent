@@ -470,7 +470,7 @@ class SseEvent(BaseModel):
     optional monotonic sequence the broadcaster stamps for ordering/dedup."""
 
     event: SseEventType
-    data: dict[str, Any] = Field(default_factory=dict[str, Any])
+    data: dict[str, Any] = Field(default_factory=dict)
     id: int | None = None
 
     def render(self) -> str:
