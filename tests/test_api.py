@@ -918,6 +918,8 @@ async def test_sse_endpoint_streams_typed_controller_event(
     response = await stream_events("run-sse", cast(Request, _FakeRequest()), service)
     assert response.media_type == "text/event-stream"
     assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["connection"] == "keep-alive"
+    assert response.headers["x-accel-buffering"] == "no"
     assert service.events.subscriber_count == 1
 
     service.events.emit(RoastEventKind.PHASE_CHANGED, {"phase": "preheating"})
