@@ -722,8 +722,12 @@ class RoastController:
         Also the reset path from ``complete`` → ``idle`` for the next run
         (the transition table permits both sources).
         """
+        prior = self._phase
         self.transition_to(RoastPhase.IDLE)  # legal only from faulted/complete
-        self._events.emit(RoastEventKind.RECOVERY_ACKNOWLEDGED, {"acknowledged": "fault"})
+        # Payload carries the actual prior phase so consumers (E7/E9) can
+        # distinguish fault acknowledgement from a normal-completion reset
+        # without inspecting event history (review observation, E4-S4 PR).
+        self._events.emit(RoastEventKind.RECOVERY_ACKNOWLEDGED, {"acknowledged": prior.value})
 
     async def operator_mark_first_crack(self) -> None:
         """Operator FC override: matrix- and source-validated, then relayed

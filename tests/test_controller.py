@@ -942,7 +942,8 @@ async def test_acknowledge_fault_returns_to_idle() -> None:
     harness.controller.transition_to(RoastPhase.FAULTED)
     harness.controller.operator_acknowledge_fault()
     assert harness.controller.phase is RoastPhase.IDLE
-    assert RoastEventKind.RECOVERY_ACKNOWLEDGED in harness.events.kinds()
+    acked = [p for k, p in harness.events.events if k is RoastEventKind.RECOVERY_ACKNOWLEDGED]
+    assert acked == [{"acknowledged": "faulted"}]
 
 
 @pytest.mark.asyncio
@@ -951,6 +952,8 @@ async def test_acknowledge_also_resets_completed_run() -> None:
     harness = harness_in(6)  # …→ COMPLETE
     harness.controller.operator_acknowledge_fault()
     assert harness.controller.phase is RoastPhase.IDLE
+    acked = [p for k, p in harness.events.events if k is RoastEventKind.RECOVERY_ACKNOWLEDGED]
+    assert acked == [{"acknowledged": "complete"}]  # truthful payload, not "fault"
 
 
 @pytest.mark.asyncio
