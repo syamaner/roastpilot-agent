@@ -38,3 +38,11 @@ completed-run immutability, typed write paths with per-tick commits,
 recovery reads proven across the E4/E6 seam) — 357 tests. Next: E8
 (advisor — resolves plan §11 item 1, the OpenRouter model slug), then
 E7 (API, now unblocked), then E9 — the D17 vertical-slice criterion.
+
+E8 issues are minted (#53–#55, #57; epic tracking #56). E8-S4 is the
+advisor bake-off — the §11.1 resolution path agreed at the 7 Jun 2026
+product review; the operator judges advice quality and the output is a
+comparison document in `docs/` plus the winning slug as config default.
+When E8 closes: mint E7 issues per the closing rule, and note that the
+E10 UI kickoff brief will be waiting in the plan repo by then — surface
+it once E7 issues exist.
