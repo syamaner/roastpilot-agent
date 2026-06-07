@@ -476,3 +476,119 @@ async def test_real_child_process_round_trip() -> None:
     finally:
         await process.stop()
     assert not process.running
+
+
+# --- E5-S2 follow-up: lifecycle coverage via injected session factory ---
+
+
+class FakeInitializableSession(FakeSession):
+    def __init__(
+        self,
+        result: object,
+        *,
+        init_hangs: bool = False,
+        init_error: Exception | None = None,
+    ) -> None:
+        super().__init__(result)
+        self._init_hangs = init_hangs
+        self._init_error = init_error
+        self.initialized = False
+
+    async def initialize(self) -> object:
+        if self._init_hangs:
+            await asyncio.Event().wait()
+        if self._init_error is not None:
+            raise self._init_error
+        self.initialized = True
+        return None
+
+
+class FactoryProbe:
+    """Session factory recording spawn params and context teardown."""
+
+    def __init__(self, session: FakeInitializableSession) -> None:
+        self.session = session
+        self.params: object | None = None
+        self.exited = False
+
+    def __call__(self, params: object) -> "FactoryProbe._Context":
+        self.params = params
+        return FactoryProbe._Context(self)
+
+    class _Context:
+        def __init__(self, probe: "FactoryProbe") -> None:
+            self._probe = probe
+
+        async def __aenter__(self) -> FakeInitializableSession:
+            return self._probe.session
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            self._probe.exited = True
+
+
+def info_result() -> FakeResult:
+    from typing import cast
+
+    return FakeResult(structuredContent=dict(cast("dict[str, object]", CANNED["get_server_info"])))
+
+
+@pytest.mark.asyncio
+async def test_start_initializes_health_checks_and_stops_cleanly() -> None:
+    session = FakeInitializableSession(info_result())
+    probe = FactoryProbe(session)
+    process = MCPServerProcess(session_factory=probe)
+    await process.start()
+    assert process.running
+    assert session.initialized
+    assert session.calls == [("get_server_info", {})]  # health check
+    params = probe.params
+    assert getattr(params, "command", None) == "coffee-roaster-mcp"
+    await process.stop()
+    assert not process.running
+    assert probe.exited  # child torn down cleanly
+
+
+@pytest.mark.asyncio
+async def test_start_unwinds_on_initialize_timeout() -> None:
+    session = FakeInitializableSession(info_result(), init_hangs=True)
+    probe = FactoryProbe(session)
+    process = MCPServerProcess(MCPConfig(startup_timeout_seconds=0.05), session_factory=probe)
+    with pytest.raises(MCPConnectionError):
+        await asyncio.wait_for(process.start(), timeout=1.0)
+    assert not process.running
+    assert probe.exited  # the wedged child is not left dangling
+
+
+@pytest.mark.asyncio
+async def test_start_unwinds_on_failed_health_check() -> None:
+    session = FakeInitializableSession(RuntimeError("server broken"))
+    probe = FactoryProbe(session)
+    process = MCPServerProcess(session_factory=probe)
+    with pytest.raises(MCPConnectionError):
+        await process.start()
+    assert not process.running
+    assert probe.exited
+
+
+@pytest.mark.asyncio
+async def test_start_with_injected_session_is_a_noop() -> None:
+    process = MCPServerProcess(session=FakeSession(info_result()))
+    await process.start()  # already attached: nothing to spawn
+    assert process.running
+
+
+@pytest.mark.asyncio
+async def test_stop_without_start_is_safe() -> None:
+    process = MCPServerProcess()
+    await process.stop()
+    assert not process.running
+
+
+@pytest.mark.asyncio
+async def test_malformed_text_result_is_typed_failure() -> None:
+    """Review finding (E5-S2 PR): a JSONDecodeError from a malformed text
+    block must surface as MCPConnectionError, not escape raw."""
+    result = FakeResult(content=[FakeTextBlock("not valid json")])
+    process = MCPServerProcess(session=FakeSession(result))
+    with pytest.raises(MCPConnectionError):
+        await process.call_tool("get_roast_state", {})
