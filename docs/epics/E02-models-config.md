@@ -29,14 +29,16 @@ Acceptance criteria:
   error (plain `Enum`, pinned by tests).
 - [x] Round-trip serialization tests for every enum (`tests/test_models.py`).
 
-### E2-S2 — RoastProfile (D7)
+### E2-S2 — RoastProfile (D7) ([#4](https://github.com/syamaner/roastpilot-agent/issues/4))
 
 Acceptance criteria:
 
-- [ ] Minimal static profile: name, bean origin/varietal/weight, charge
+- [x] Minimal static profile: name, bean origin/varietal/weight, charge
   guidance range (default 170–200 °C), initial heat/fan, target drop temp,
   target development %. No curve targets.
-- [ ] Validation tests: bounds, defaults, rejected nonsense values.
+- [x] Validation tests: bounds, defaults, rejected nonsense values
+  (whitespace-only strings, zero/negative weight, out-of-range percents,
+  inverted/empty guidance band), plus JSON round trip.
 
 ### E2-S3 — Configuration surface
 
@@ -55,7 +57,7 @@ Acceptance criteria:
 | Story | Title | Status |
 |-------|-------|--------|
 | E2-S1 | Shared enums and event vocabulary | done |
-| E2-S2 | RoastProfile (D7) | not started |
+| E2-S2 | RoastProfile (D7) | done |
 | E2-S3 | Configuration surface | not started |
 
 Epic status: **in progress** (E2-S1 done; kickoff order: E2 then E3).
