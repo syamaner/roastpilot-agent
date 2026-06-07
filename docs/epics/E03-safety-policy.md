@@ -58,15 +58,19 @@ Acceptance criteria:
   recommendation ⇒ deterministic fallback holds current targets (adjusted
   values echo the heat/fan in effect).
 
-### E3-S4 — Emergency stop and verdict plumbing
+### E3-S4 — Emergency stop and verdict plumbing ([#9](https://github.com/syamaner/roastpilot-agent/issues/9))
 
 Acceptance criteria:
 
-- [ ] `emergency_stop` reachable from every phase; never gated on advisor,
-  UI, or cloud state.
-- [ ] Every evaluation produces a persisted-ready `SafetyEvaluation` (rule
-  name, verdict, input/adjusted values, reason).
-- [ ] safety-reviewer sub-agent run recorded on the closing PR.
+- [x] `emergency_stop` reachable from every phase (all nine parametrized);
+  never gated on advisor, UI, or cloud state — structurally enforced (the
+  signature takes only phase + operator reason, pinned by a test).
+- [x] Every evaluation produces a persisted-ready `SafetyEvaluation` (rule
+  name, verdict, input/adjusted values, reason) — `input_heat`/`input_fan`
+  added (deliberately unbounded: requests recorded verbatim, only adjusted
+  values are bounded); cross-method persistence test covers all seven rule
+  methods.
+- [x] safety-reviewer sub-agent run recorded on the closing PR.
 
 ### E3-S5 — Phase and source validity rules (D16)
 
@@ -89,7 +93,7 @@ Acceptance criteria:
 | E3-S1 | Temperature and overrun rules | done |
 | E3-S2 | Telemetry validity rules | done |
 | E3-S3 | Command validation rules | done |
-| E3-S4 | Emergency stop and verdict plumbing | not started |
+| E3-S4 | Emergency stop and verdict plumbing | done |
 | E3-S5 | Phase and source validity rules (D16) | not started |
 
-Epic status: **in progress** (E3-S1, E3-S2, E3-S3 done).
+Epic status: **in progress** (E3-S1 through E3-S4 done; E3-S5 remains).

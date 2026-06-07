@@ -36,15 +36,19 @@ class SafetyVerdict(Enum):
 class SafetyEvaluation(BaseModel):
     """Typed safety handshake attached to every roaster write.
 
-    ``rule`` names the rule that fired (or ``all_clear``), matching the
-    plan §5 ``safety_evaluations.rule`` column. ``adjusted_heat``/
-    ``adjusted_fan`` are nullable per the schema: most non-ALLOW/CLAMP
-    verdicts carry no adjusted command — the pre-T0 overrun rule is the
-    documented exception (heat 0 %, safe fan, RECOVERY/FAULT verdict).
+    Persisted-ready per the plan §5 ``safety_evaluations`` row: ``rule``
+    names the rule that fired (or ``all_clear``), ``input_heat``/
+    ``input_fan`` record what was *requested* (deliberately unbounded — an
+    out-of-range request must be recordable exactly as made), and
+    ``adjusted_heat``/``adjusted_fan`` what may be *executed* (bounded,
+    nullable: most non-ALLOW/CLAMP verdicts carry no adjusted command —
+    the fail-closed rules are the documented exception).
     """
 
     rule: str = Field(min_length=1)
     verdict: SafetyVerdict
+    input_heat: int | None = None
+    input_fan: int | None = None
     adjusted_heat: int | None = Field(default=None, ge=0, le=100)
     adjusted_fan: int | None = Field(default=None, ge=0, le=100)
     reason: str = Field(min_length=1)
@@ -246,6 +250,8 @@ class SafetyPolicy:
             return SafetyEvaluation(
                 rule="command_rate_limited",
                 verdict=SafetyVerdict.REJECT,
+                input_heat=requested_heat,
+                input_fan=requested_fan,
                 reason=(
                     f"command issued {seconds_since_last_command:.1f} s after the previous one "
                     f"(minimum {limits.min_seconds_between_commands:.1f} s): rejected — the "
@@ -258,6 +264,8 @@ class SafetyPolicy:
             return SafetyEvaluation(
                 rule="command_bounds",
                 verdict=SafetyVerdict.CLAMP,
+                input_heat=requested_heat,
+                input_fan=requested_fan,
                 adjusted_heat=clamped_heat,
                 adjusted_fan=clamped_fan,
                 reason=(
@@ -268,6 +276,8 @@ class SafetyPolicy:
         return SafetyEvaluation(
             rule="all_clear",
             verdict=SafetyVerdict.ALLOW,
+            input_heat=requested_heat,
+            input_fan=requested_fan,
             adjusted_heat=requested_heat,
             adjusted_fan=requested_fan,
             reason="command within bounds and rate limit",
@@ -322,4 +332,26 @@ class SafetyPolicy:
                 f"advisor outcome '{status}': recommendation rejected, deterministic fallback "
                 f"holds current targets (heat {current_heat} %, fan {current_fan} %)"
             ),
+        )
+
+    def evaluate_emergency_stop(
+        self,
+        *,
+        phase: RoastPhase,
+        operator_reason: str | None = None,
+    ) -> SafetyEvaluation:
+        """Emergency stop is always permitted, from every phase (E3-S4).
+
+        Deliberately the only rule with no condition: the signature takes
+        the phase (for the trace) and an optional operator reason — never
+        advisor, UI, or cloud state — and the verdict is unconditionally
+        EMERGENCY_STOP. No adjusted heat/fan values: the single MCP
+        ``emergency_stop`` command owns the hardware shutdown, not a
+        heat/fan write.
+        """
+        detail = f": {operator_reason}" if operator_reason else ""
+        return SafetyEvaluation(
+            rule="emergency_stop",
+            verdict=SafetyVerdict.EMERGENCY_STOP,
+            reason=f"emergency stop requested in phase {phase.value}{detail}",
         )

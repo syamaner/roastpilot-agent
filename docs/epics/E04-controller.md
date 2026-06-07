@@ -60,6 +60,10 @@ Acceptance criteria:
   hardware-off (heat 0, safe fan) via the controller's own path — the
   E3-S2 telemetry-validity rule is deliberately silent in those phases
   (safety-reviewer carry-forward, E3-S2 PR).
+- [ ] A failed MCP `emergency_stop` call lands in fail-closed handling
+  (FAULT + heat-0/safe-fan write attempts), never silent continuation —
+  the e-stop evaluation deliberately carries no adjusted values
+  (safety-reviewer carry-forward, E3-S4 PR).
 
 ## Status
 
