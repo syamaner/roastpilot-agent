@@ -2,7 +2,7 @@
 
 ## Active Epic
 
-- Epic file: `docs/epics/E02-models-config.md`
+- Epic file: `docs/epics/E03-safety-policy.md`
 - Project: RoastPilot (GitHub user project, owner `syamaner`)
 - Repository: `syamaner/roastpilot-agent`
 - Package: `roastpilot-agent`
@@ -18,12 +18,14 @@
   completes a story updates the epic file's status table in the same PR.
 - Plans live in `~/git/roastpilot-plan` and are the source of truth; record
   resolved open items in component plan §11.
-- Epic order: E1 ✅ → **E2 → E3** (dependency-free, test-heavy) → E4–E8 →
+- Epic order: E1 ✅ → E2 ✅ → **E3** (safety policy) → E4–E8 →
   E9 (vertical slice) → E10 (SPA) → E11 (packaging) → E12 (validation/demo).
 
 ## Active Context
 
-E1 (scaffold) is complete: package layout, four quality gates green in CI,
-typed module stubs, AGENTS.md + sub-agents, epic specs E01–E12. Next up is
-E2 (models & config), then E3 (safety policy) — the heart of the system and
-of the September talk.
+E1 (scaffold) and E2 (models & config) are complete: typed vocabulary
+(enums per D15/D16, RoastProfile per D7) and the full configuration surface
+(timing, advisor per D5, conservative SafetyLimits pending E12 hardware
+validation) are merged with tests. Next up is E3 (safety policy) — the
+heart of the system and of the September talk. Stories #6–#9 and #15
+(D16) are ready with acceptance criteria.

@@ -40,17 +40,22 @@ Acceptance criteria:
   (whitespace-only strings, zero/negative weight, out-of-range percents,
   inverted/empty guidance band), plus JSON round trip.
 
-### E2-S3 — Configuration surface
+### E2-S3 — Configuration surface ([#5](https://github.com/syamaner/roastpilot-agent/issues/5))
 
 Acceptance criteria:
 
-- [ ] `ControllerConfig` with documented timing defaults (1.0 s tick, 3-tick
-  T0 debounce, advisory thresholds, 5 s telemetry interval, 3 s staleness).
-- [ ] `AdvisorConfig` per D5 (OpenRouter base URL, api_key_env, model_slug,
-  timeout, temperature, prompt_version).
-- [ ] `SafetyLimits` with the full limit set E3 needs (max bean/env temp,
-  pre-T0 bound 200 °C, rate limits, bounds) — values justified in docstrings.
-- [ ] `AppConfig` loads from env (`ROASTPILOT_*`) with tests.
+- [x] `ControllerConfig` with documented timing defaults (1.0 s tick, 3-tick
+  T0 debounce, advisory thresholds, 5 s telemetry interval, 3 s staleness) —
+  all validated positive.
+- [x] `AdvisorConfig` per D5 (OpenRouter base URL, api_key_env, model_slug,
+  timeout, temperature, prompt_version); model slug stays empty until E8
+  (plan §11.1).
+- [x] `SafetyLimits` with the full limit set E3 needs: max bean (230 °C) /
+  env (240 °C) temps, pre-T0 bound 200 °C, overrun safe-fan + severity
+  (recovery|fault), command rate limit (2.0 s) — conservative software
+  ceilings justified in docstrings, flagged for E12-S1 hardware validation.
+- [x] `AppConfig` loads from env (`ROASTPILOT_*`, `__` nesting) with tests
+  (defaults, nested overrides, invalid-value rejection).
 
 ## Status
 
@@ -58,6 +63,7 @@ Acceptance criteria:
 |-------|-------|--------|
 | E2-S1 | Shared enums and event vocabulary | done |
 | E2-S2 | RoastProfile (D7) | done |
-| E2-S3 | Configuration surface | not started |
+| E2-S3 | Configuration surface | done |
 
-Epic status: **in progress** (E2-S1 done; kickoff order: E2 then E3).
+Epic status: **done** — all three stories complete; next epic is E3
+(safety policy) per the kickoff order.
