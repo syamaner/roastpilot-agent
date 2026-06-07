@@ -18,10 +18,16 @@ probability trace, full-workflow screen capture.
 
 The **first supervised hardware session is targeted for June** (D17 pulls
 hardware risk forward; it is also criterion 3 of the July
-harness-complete definition). That session should resolve the
-`drop_beans` cooling-behavior open item (component plan §11 item 2) —
-record the resolution in plan §11 when it happens. Demo assets must be
-recorded by **end of August** (D17), leaving September for slides.
+harness-complete definition). Demo assets must be recorded by **end of
+August** (D17), leaving September for slides.
+
+**Update 7 Jun 2026**: the `drop_beans` cooling question (plan §11 item 2)
+was resolved early by coffee-roaster-mcp's own E7-S6 live Hottop roast —
+drop+cooling is atomic (0.37 ms, `cooling_on: true` in the drop payload);
+recorded in plan §11. Live audio FC also confirmed working on hardware
+(confidence 0.907). The June agent session therefore carries one fewer
+unknown; D17 criterion 3 (one supervised roast **through the agent
+harness**) still stands.
 
 ## Stories
 
@@ -31,9 +37,11 @@ Acceptance criteria:
 
 - [ ] Supervised Hottop runs with explicit validation notes per AGENTS.md
   hardware rules (heat, fan, drop, cooling, e-stop behavior).
-- [ ] `drop_beans` cooling behavior on real hardware verified; controller's
-  fallback (`start_cooling` after configured window) confirmed or removed;
-  resolution recorded in plan §11 (closes open item 2).
+- [ ] Controller's post-drop `start_cooling` fallback validated on real
+  hardware — the cooling-behavior atomicity itself was confirmed 7 Jun
+  via coffee-roaster-mcp E7-S6 and recorded in plan §11 (open item 2
+  closed); the fallback is retained as defense-in-depth, so the remaining
+  E12-S1 work is confirming it never double-fires.
 - [ ] Unsafe/uncertain behavior fails closed and is documented.
 
 ### E12-S2 — Demo trace recording
