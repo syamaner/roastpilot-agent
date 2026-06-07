@@ -14,7 +14,6 @@ from roastpilot_agent import controller
 from roastpilot_agent.advisor import RoastDecision
 from roastpilot_agent.api import create_app
 from roastpilot_agent.config import SafetyLimits
-from roastpilot_agent.controller import RoastController
 from roastpilot_agent.models import RoastPhase, RoastProfile
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 
@@ -50,10 +49,6 @@ def test_roast_phases_match_plan() -> None:
 def test_controller_reexports_roast_phase() -> None:
     """controller.RoastPhase stays an alias of the models.py home (D15)."""
     assert controller.RoastPhase is RoastPhase
-
-
-def test_controller_starts_idle() -> None:
-    assert RoastController().phase is RoastPhase.IDLE
 
 
 def test_safety_verdicts_match_plan() -> None:

@@ -32,6 +32,9 @@ Acceptance criteria:
 - [ ] Spawn coffee-roaster-mcp as stdio child; health check; clean shutdown.
 - [ ] Crash/restart of the child surfaces as a typed failure the controller
   maps to recovery — never silent reconnect-and-continue.
+- [ ] Every MCP call is timeout-bounded — a hung read or write (including
+  `emergency_stop`) must raise rather than stall the tick; only the
+  advisor call is bounded today (safety-reviewer carry-forward, E4-S2 PR).
 
 ### E5-S3 — Contract fixtures
 
