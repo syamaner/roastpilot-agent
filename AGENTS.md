@@ -165,7 +165,7 @@ After completing a story:
    policy below), then squash-merge, delete the branch, and flip the story's
    project item to Done.
 
-### PR merge policy
+### PR Merge Policy
 
 Watching a PR, addressing its feedback, and squash-merging it is
 pre-authorized — no need to ask before merging your own story PR once it is
