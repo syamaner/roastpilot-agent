@@ -51,6 +51,11 @@ Acceptance criteria:
 - [ ] `FakeMCPClient` scripted full-roast scenarios in conftest.
 - [ ] Restart with possibly-active run lands in `operator_recovery_required`;
   heat/fan never auto-resumed; e-stop available.
+- [ ] Operator-timeout policy (D16) applies only in true operator-required
+  states — manual confirmation, manual hold, recovery — and never in normal
+  phases. UI disconnect during normal phases changes nothing: backend
+  safety continues without the UI (API-side disconnect behavior is E7-S3;
+  this story owns the controller-side policy).
 
 ## Status
 

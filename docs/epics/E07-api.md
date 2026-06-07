@@ -41,7 +41,9 @@ Acceptance criteria:
 - [ ] All plan §6 event types, typed JSON payloads, telemetry every tick,
   15 s heartbeat.
 - [ ] Disconnect handling tested; UI disconnect does not trigger cooling or
-  block backend safety.
+  block backend safety. (The controller-side rule — operator timeout only
+  in true operator-required states, never in normal phases — is owned by
+  E4-S4 per D16; this story covers the API/SSE side only.)
 
 ## Status
 
