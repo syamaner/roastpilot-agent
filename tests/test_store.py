@@ -124,11 +124,9 @@ async def test_migration_mechanism_applies_new_versions(
 
 @pytest.mark.asyncio
 async def test_foreign_keys_are_enforced(tmp_store: RoastStore) -> None:
-    import aiosqlite
-
     await tmp_store.initialize()
     try:
-        with pytest.raises(aiosqlite.IntegrityError):
+        with pytest.raises(aiosqlite_module.IntegrityError):
             await tmp_store.connection.execute(
                 "INSERT INTO roast_events (run_id, kind, source, recorded_at_utc)"
                 " VALUES ('missing-run', 'fault', 'controller', '2026-06-07T00:00:00Z')"
@@ -183,8 +181,6 @@ async def test_enum_check_constraints_reject_invalid_values(
     """Review finding (E6-S1 PR): the documented text-enum columns are
     CHECK-enforced, so an E6-S2 write-path bug cannot silently store an
     invalid verdict/status/source."""
-    import aiosqlite
-
     await tmp_store.initialize()
     try:
         await tmp_store.connection.execute(
@@ -192,15 +188,19 @@ async def test_enum_check_constraints_reject_invalid_values(
             " started_at_utc, created_at_utc, updated_at_utc)"
             " VALUES ('run-1', 'idle', '{}', '{}', 't', 't', 't')"
         )
-        with pytest.raises(aiosqlite.IntegrityError):
+        with pytest.raises(aiosqlite_module.IntegrityError):
             await tmp_store.connection.execute(
                 "INSERT INTO safety_evaluations"
                 " (run_id, tick, rule, verdict, reason, recorded_at_utc)"
                 " VALUES ('run-1', 1, 'r', 'ALLOW', 'wrong case', 't')"
             )
-        with pytest.raises(aiosqlite.IntegrityError):
+        with pytest.raises(aiosqlite_module.IntegrityError):
             await tmp_store.connection.execute(
                 "UPDATE roast_runs SET cloud_sync_status = 'uploading' WHERE id = 'run-1'"
+            )
+        with pytest.raises(aiosqlite_module.IntegrityError):
+            await tmp_store.connection.execute(
+                "UPDATE roast_runs SET agent_phase = 'warming_up' WHERE id = 'run-1'"
             )
     finally:
         await tmp_store.close()
@@ -217,3 +217,19 @@ async def test_initialize_twice_on_same_instance_is_a_noop(
         assert tmp_store.connection is first
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_migration_embedding_transaction_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_apply_migrations owns BEGIN/COMMIT — an embedded transaction in a
+    migration script is a programming error, caught loudly."""
+    store = RoastStore(db_path=tmp_path / "guard.sqlite3")
+    await store.initialize()
+    await store.close()
+    bad = "BEGIN; CREATE TABLE nope (id INTEGER); COMMIT;"
+    monkeypatch.setattr(store_module, "MIGRATIONS", (*MIGRATIONS, bad))
+    broken = RoastStore(db_path=store.db_path)
+    with pytest.raises(ValueError, match="embeds its own transaction"):
+        await broken.initialize()

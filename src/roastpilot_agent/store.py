@@ -14,7 +14,10 @@ SCHEMA_V1 = """
 CREATE TABLE roast_runs (
   id TEXT PRIMARY KEY,                      -- uuid4
   mcp_session_id TEXT,
-  agent_phase TEXT NOT NULL,                -- last persisted agent phase
+  agent_phase TEXT NOT NULL CHECK (agent_phase IN (
+    'idle', 'starting', 'preheating', 'roasting_pre_first_crack',
+    'development', 'cooling', 'complete', 'faulted',
+    'operator_recovery_required')),         -- models.RoastPhase.value
   profile_json TEXT NOT NULL,               -- frozen RoastProfile
   config_json TEXT NOT NULL,                -- frozen ControllerConfig + SafetyLimits
   started_at_utc TEXT NOT NULL,
@@ -55,7 +58,10 @@ CREATE TABLE telemetry_snapshots (
   tick INTEGER NOT NULL,
   recorded_at_utc TEXT NOT NULL,
   elapsed_seconds REAL,
-  agent_phase TEXT NOT NULL,
+  agent_phase TEXT NOT NULL CHECK (agent_phase IN (
+    'idle', 'starting', 'preheating', 'roasting_pre_first_crack',
+    'development', 'cooling', 'complete', 'faulted',
+    'operator_recovery_required')),
   mcp_phase TEXT,
   bean_temp_c REAL, env_temp_c REAL,
   bean_ror_c_per_min REAL, env_ror_c_per_min REAL,
@@ -179,7 +185,13 @@ class RoastStore:
             return
         connection = await aiosqlite.connect(self._db_path)
         try:
-            await connection.execute("PRAGMA journal_mode=WAL")
+            async with connection.execute("PRAGMA journal_mode=WAL") as cursor:
+                mode_row = await cursor.fetchone()
+            if mode_row is None or str(mode_row[0]).lower() != "wal":
+                raise RuntimeError(
+                    f"could not activate WAL journal mode (got {mode_row}): "
+                    f"the durability bias requires it"
+                )
             await connection.execute("PRAGMA synchronous=FULL")
             await connection.execute("PRAGMA foreign_keys=ON")
             await self._apply_migrations(connection)
@@ -194,9 +206,15 @@ class RoastStore:
     async def _apply_migrations(self, connection: aiosqlite.Connection) -> None:
         async with connection.execute("PRAGMA user_version") as cursor:
             row = await cursor.fetchone()
-        version = int(row[0]) if row is not None else 0
+        assert row is not None  # PRAGMA user_version always returns one row
+        version = int(row[0])
         for number, script in enumerate(MIGRATIONS, start=1):
             if version < number:
+                if "BEGIN" in script.upper():
+                    raise ValueError(
+                        f"migration {number} embeds its own transaction — "
+                        f"_apply_migrations owns BEGIN/COMMIT"
+                    )
                 # One explicit transaction per migration: SQLite DDL and
                 # PRAGMA user_version are both transactional, so a crash
                 # or failure anywhere rolls back to the previous version
@@ -211,7 +229,8 @@ class RoastStore:
         """The applied schema version (PRAGMA user_version)."""
         async with self.connection.execute("PRAGMA user_version") as cursor:
             row = await cursor.fetchone()
-        return int(row[0]) if row is not None else 0
+        assert row is not None  # PRAGMA user_version always returns one row
+        return int(row[0])
 
     async def close(self) -> None:
         """Close the connection (safe to call when never initialized)."""
