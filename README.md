@@ -18,7 +18,7 @@ A local Python service that drives a roast through
   fan control.
 - **Hard safety policy** — deterministic code, not prompt text. Every
   command is validated before it reaches the roaster; verdicts are typed:
-  `ALLOW / CLAMP / REJECT / FAULT / EMERGENCY_STOP`.
+  `ALLOW / CLAMP / REJECT / RECOVERY / FAULT / EMERGENCY_STOP`.
 - **Advisory-only LLM** — returns a typed recommendation
   (heat/fan targets, drop suggestion, rationale). It never calls tools,
   never owns the loop, and its output is validated, clamped, or rejected by
@@ -30,6 +30,34 @@ A local Python service that drives a roast through
 First-crack detection comes from an audio model
 ([dataset, model, and live demo on Hugging Face](https://huggingface.co/syamaner/coffee-first-crack-detection))
 running inside the MCP server on a Raspberry Pi 5.
+
+## Development setup
+
+Requires Python 3.11+.
+
+```bash
+git clone https://github.com/syamaner/roastpilot-agent.git
+cd roastpilot-agent
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e . --group dev
+```
+
+Quality gates (all must pass; CI runs the same four):
+
+```bash
+python -m ruff check .
+python -m ruff format --check .
+python -m pyright
+python -m pytest
+```
+
+All tests run hardware-free — no roaster, microphone, or model download
+needed. Project conventions and architecture invariants live in
+[AGENTS.md](AGENTS.md); epic specs and current status live under
+[docs/epics/](docs/epics/) with the active-epic pointer in
+[docs/state/registry.md](docs/state/registry.md).
 
 ## Related repositories
 

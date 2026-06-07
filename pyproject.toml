@@ -1,0 +1,96 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "roastpilot-agent"
+dynamic = ["version"]
+description = "RoastPilot Agent: deterministic agent harness for autonomous coffee roasting — the controller owns the loop, the LLM advises."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+  { name = "Sertan Yamaner" }
+]
+maintainers = [
+  { name = "Sertan Yamaner" }
+]
+keywords = [
+  "agent",
+  "autonomous-roasting",
+  "coffee",
+  "coffee-roasting",
+  "mcp",
+  "model-context-protocol",
+  "pydantic-ai",
+  "roastpilot"
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Natural Language :: English",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: System :: Hardware",
+  "Typing :: Typed"
+]
+dependencies = [
+  "aiosqlite>=0.22,<1",
+  "fastapi>=0.136,<1",
+  "httpx>=0.28,<1",
+  "mcp>=1.0.0,<2",
+  "pydantic>=2.10,<3",
+  "pydantic-ai>=1.0,<2",
+  "pydantic-settings>=2.7,<3",
+  "uvicorn>=0.34,<1"
+]
+
+[project.urls]
+Homepage = "https://github.com/syamaner/roastpilot-agent"
+Documentation = "https://github.com/syamaner/roastpilot-agent#readme"
+Repository = "https://github.com/syamaner/roastpilot-agent"
+Issues = "https://github.com/syamaner/roastpilot-agent/issues"
+"MCP Server" = "https://github.com/syamaner/coffee-roaster-mcp"
+"First-Crack Model" = "https://huggingface.co/syamaner/coffee-first-crack-detection"
+
+[project.scripts]
+roastpilot-agent = "roastpilot_agent.cli:main"
+
+[dependency-groups]
+dev = [
+  "pyright>=1.1",
+  "pytest>=8.0",
+  "pytest-asyncio>=1.0",
+  "ruff>=0.8"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/roastpilot_agent"]
+
+[tool.hatch.version]
+path = "src/roastpilot_agent/__init__.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+pythonpath = ["src"]
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pyright]
+pythonVersion = "3.11"
+typeCheckingMode = "strict"
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
