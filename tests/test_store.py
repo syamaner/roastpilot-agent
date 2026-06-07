@@ -233,3 +233,278 @@ async def test_migration_embedding_transaction_is_rejected(
     broken = RoastStore(db_path=store.db_path)
     with pytest.raises(ValueError, match="embeds its own transaction"):
         await broken.initialize()
+
+
+# --- E6-S2: write paths ---
+
+
+from roastpilot_agent.advisor import AdvisorContext, RoastDecision  # noqa: E402
+from roastpilot_agent.config import AppConfig  # noqa: E402
+from roastpilot_agent.models import (  # noqa: E402
+    RoastCommand,
+    RoastEventKind,
+    RoastEventSource,
+    RoastPhase,
+    RoastProfile,
+    RoastTelemetry,
+)
+from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict  # noqa: E402
+
+PROFILE = RoastProfile(
+    name="store-test",
+    bean_origin="Ethiopia",
+    bean_weight_grams=250.0,
+    initial_heat_percent=70,
+    initial_fan_percent=40,
+    target_drop_temp_c=205.0,
+    target_development_percent=20.0,
+)
+
+
+async def seeded_store(store: RoastStore, run_id: str = "run-1") -> RoastStore:
+    await store.initialize()
+    await store.create_run(
+        run_id=run_id,
+        profile=PROFILE,
+        config=AppConfig(),
+        agent_phase=RoastPhase.STARTING,
+    )
+    return store
+
+
+async def fetch_one(store: RoastStore, sql: str) -> tuple[object, ...]:
+    async with store.connection.execute(sql) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    return tuple(row)
+
+
+@pytest.mark.asyncio
+async def test_create_run_freezes_profile_and_config(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        row = await fetch_one(
+            tmp_store, "SELECT agent_phase, profile_json, config_json FROM roast_runs"
+        )
+        assert row[0] == "starting"
+        assert '"name":"store-test"' in str(row[1])
+        assert "tick_interval_seconds" in str(row[2])
+        assert "pre_t0_max_bean_temp_c" in str(row[2])
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_typed_writers_round_trip_enum_values(tmp_store: RoastStore) -> None:
+    """Every writer stores the lowercase wire values the CHECKs enforce."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.T0_DETECTED,
+            source=RoastEventSource.MCP,
+            monotonic_seconds=120.5,
+            payload={"bean_temp_c": 156.0},
+        )
+        evaluation_id = await tmp_store.record_safety_evaluation(
+            run_id="run-1",
+            tick=7,
+            evaluation=SafetyEvaluation(
+                rule="command_bounds",
+                verdict=SafetyVerdict.CLAMP,
+                input_heat=120,
+                input_fan=40,
+                adjusted_heat=100,
+                adjusted_fan=40,
+                reason="clamped",
+            ),
+        )
+        await tmp_store.record_command(
+            run_id="run-1",
+            tick=7,
+            tool=RoastCommand.SET_HEAT,
+            source="advisor",
+            status="ok",
+            args={"heat_level_percent": 100},
+            safety_evaluation_id=evaluation_id,
+        )
+        await tmp_store.record_operator_action(action="emergency_stop", result="accepted")
+
+        event = await fetch_one(tmp_store, "SELECT kind, source, payload_json FROM roast_events")
+        assert event[0] == "t0_detected" and event[1] == "mcp"
+        safety = await fetch_one(
+            tmp_store,
+            "SELECT verdict, input_heat, adjusted_heat FROM safety_evaluations",
+        )
+        assert safety == ("clamp", 120, 100)
+        command = await fetch_one(
+            tmp_store,
+            "SELECT tool, source, status, safety_evaluation_id FROM command_log",
+        )
+        assert command == ("set_heat", "advisor", "ok", evaluation_id)
+        action = await fetch_one(tmp_store, "SELECT run_id, action, result FROM operator_actions")
+        assert action == (None, "emergency_stop", "accepted")
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_advisor_decision_stores_hash_never_raw_context(
+    tmp_store: RoastStore,
+) -> None:
+    await seeded_store(tmp_store)
+    try:
+        context = AdvisorContext(
+            phase=RoastPhase.DEVELOPMENT,
+            roast_elapsed_seconds=500.0,
+            development_elapsed_seconds=30.0,
+            current_bean_temp_c=197.25,
+            current_env_temp_c=215.0,
+            bean_ror_c_per_min=8.0,
+            env_ror_c_per_min=6.0,
+            target_drop_temp_c=205.0,
+            profile_name="store-test",
+        )
+        decision = RoastDecision(
+            target_heat=45, target_fan=60, should_drop=False, confidence=0.8, rationale="hold"
+        )
+        await tmp_store.record_advisor_decision(
+            run_id="run-1",
+            tick=9,
+            provider="openrouter",
+            model="test-model",
+            prompt_version="v0",
+            context=context,
+            latency_ms=420,
+            decision=decision,
+            status="ok",
+        )
+        row = await fetch_one(
+            tmp_store, "SELECT context_hash, decision_json, status FROM advisor_decisions"
+        )
+        context_hash = str(row[0])
+        assert len(context_hash) == 64 and all(c in "0123456789abcdef" for c in context_hash)
+        assert "197.25" not in context_hash  # the hash, never the payload
+        assert row[1] is not None and '"target_heat":45' in str(row[1])
+        assert row[2] == "ok"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_telemetry_rows_are_interval_throttled(tmp_store: RoastStore) -> None:
+    """Plan §5: persist every tick, insert rows every
+    telemetry_log_interval_seconds (5 s default). First row always writes."""
+    await seeded_store(tmp_store)
+    try:
+        reading = RoastTelemetry(bean_temp_c=150.0, env_temp_c=170.0)
+        outcomes: list[bool] = []
+        for tick, elapsed in [(1, 0.0), (3, 2.0), (6, 5.0), (8, 7.0), (11, 10.0)]:
+            outcomes.append(
+                await tmp_store.record_telemetry(
+                    run_id="run-1",
+                    tick=tick,
+                    agent_phase=RoastPhase.PREHEATING,
+                    elapsed_seconds=elapsed,
+                    interval_seconds=5.0,
+                    telemetry=reading,
+                )
+            )
+        assert outcomes == [True, False, True, False, True]
+        row = await fetch_one(tmp_store, "SELECT COUNT(*) FROM telemetry_snapshots")
+        assert row[0] == 3
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_writes_commit_per_tick(tmp_store: RoastStore) -> None:
+    """Another connection sees every write immediately — proof that each
+    writer commits (power loss never costs a committed tick)."""
+    import aiosqlite as sqlite_check
+
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_event(
+            run_id="run-1", kind=RoastEventKind.RUN_STARTED, source=RoastEventSource.CONTROLLER
+        )
+        other = await sqlite_check.connect(tmp_store.db_path)
+        try:
+            async with other.execute("SELECT COUNT(*) FROM roast_events") as cursor:
+                row = await cursor.fetchone()
+            assert row is not None and row[0] == 1
+        finally:
+            await other.close()
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_update_run_phase_touches_updated_at(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        before = await fetch_one(tmp_store, "SELECT created_at_utc, updated_at_utc FROM roast_runs")
+        await asyncio_sleep_tiny()
+        await tmp_store.update_run_phase("run-1", RoastPhase.PREHEATING)
+        row = await fetch_one(
+            tmp_store, "SELECT agent_phase, created_at_utc, updated_at_utc FROM roast_runs"
+        )
+        assert row[0] == "preheating"
+        assert row[1] == before[0]  # created_at untouched
+        assert row[2] != before[1]  # updated_at actually advanced
+    finally:
+        await tmp_store.close()
+
+
+async def asyncio_sleep_tiny() -> None:
+    import asyncio
+
+    await asyncio.sleep(0.002)  # isoformat carries microseconds; ensure a delta
+
+
+@pytest.mark.asyncio
+async def test_update_run_phase_on_unknown_run_raises(tmp_store: RoastStore) -> None:
+    """Review finding (E6-S2 PR): a silent no-op would corrupt the
+    restart-recovery breadcrumb."""
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no roast_run"):
+            await tmp_store.update_run_phase("ghost-run", RoastPhase.PREHEATING)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_advisor_failure_persists_null_decision(tmp_store: RoastStore) -> None:
+    """Review finding (E6-S2 PR): the timeout path — the one that fires
+    when the LLM is unreachable — stores SQL NULL, not a JSON null."""
+    await seeded_store(tmp_store)
+    try:
+        context = AdvisorContext(
+            phase=RoastPhase.DEVELOPMENT,
+            roast_elapsed_seconds=500.0,
+            development_elapsed_seconds=None,
+            current_bean_temp_c=197.0,
+            current_env_temp_c=215.0,
+            bean_ror_c_per_min=None,
+            env_ror_c_per_min=None,
+            target_drop_temp_c=205.0,
+            profile_name="store-test",
+        )
+        await tmp_store.record_advisor_decision(
+            run_id="run-1",
+            tick=12,
+            provider="openrouter",
+            model="test-model",
+            prompt_version="v0",
+            context=context,
+            latency_ms=None,
+            decision=None,
+            status="timeout",
+        )
+        row = await fetch_one(
+            tmp_store, "SELECT decision_json, status, latency_ms FROM advisor_decisions"
+        )
+        assert row == (None, "timeout", None)
+    finally:
+        await tmp_store.close()

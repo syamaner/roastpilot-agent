@@ -27,14 +27,20 @@ Acceptance criteria:
   migration applies on re-open, bumps the version, and leaves v1 content
   untouched (tested); re-initialization idempotent.
 
-### E6-S2 — Write paths
+### E6-S2 — Write paths ([#47](https://github.com/syamaner/roastpilot-agent/issues/47))
 
 Acceptance criteria:
 
-- [ ] Per-tick commit during active roasts; telemetry rows every
-  `telemetry_log_interval_seconds`; no forced WAL checkpoint per tick.
-- [ ] Typed write APIs for events, safety evaluations, advisor decisions
-  (context hash, not raw payload), command log, operator actions.
+- [x] Every writer commits immediately (a second connection sees each
+  write — tested); telemetry rows throttled to
+  `telemetry_log_interval_seconds` with the cadence proven (5s interval,
+  3 of 5 ticks written); no WAL checkpoint is ever forced.
+- [x] Typed write APIs: create_run/update_run_phase (frozen profile +
+  config JSON), record_event, record_telemetry, record_safety_evaluation
+  (returns the row id for trace linking), record_advisor_decision
+  (sha256 context hash, never the raw payload — tested), record_command,
+  record_operator_action (nullable run_id). All enum values stored as
+  lowercase wire forms passing the v1 CHECKs.
 
 ### E6-S3 — Recovery reads and immutability
 
@@ -49,7 +55,7 @@ Acceptance criteria:
 | Story | Title | Status |
 |-------|-------|--------|
 | E6-S1 | Schema v1 and initialization | done |
-| E6-S2 | Write paths | not started |
+| E6-S2 | Write paths | done |
 | E6-S3 | Recovery reads and immutability | not started |
 
-Epic status: **in progress** (E6-S1 done).
+Epic status: **in progress** (E6-S1, E6-S2 done; E6-S3 remains).
