@@ -72,7 +72,7 @@ def _ror(rows: list[dict[str, Any]], index: int, field: str) -> float | None:
     """Estimate °C/min for ``field`` at ``rows[index]`` over the prior ~60 s."""
     now = rows[index]
     now_t = float(now["monotonic_seconds"])
-    for past in reversed(rows[: index + 1]):
+    for past in reversed(rows[:index]):  # rows strictly before now
         dt = now_t - float(past["monotonic_seconds"])
         if dt >= _ROR_WINDOW_SECONDS:
             return round((float(now[field]) - float(past[field])) / dt * 60.0, 3)
@@ -168,11 +168,14 @@ async def run(iterations: int, fixture: Path, row_offset_seconds: float) -> int:
         print(f"\n--- iteration {i}/{iterations} ---")
         started = time.perf_counter()
         try:
-            # Mirror the controller: the advisory call is bounded by the
-            # configured timeout (controller.tick wraps it in wait_for). A
-            # model that runs long — e.g. a reasoning model emitting a long
-            # <think> block — surfaces here as TimeoutError, not as silently
-            # slow advice.
+            # Bound the call like the controller does (it wraps the advisory
+            # call in wait_for). This uses AdvisorConfig.timeout_seconds
+            # (ROASTPILOT_ADVISOR__TIMEOUT_SECONDS) — a separate knob from the
+            # controller's ControllerConfig.advisory_timeout_seconds, but the
+            # same 10 s default, so it reproduces the production budget while
+            # letting a characterisation run extend it without touching the
+            # controller's live budget. A reasoning model that runs long
+            # surfaces here as TimeoutError, not as silently slow advice.
             decision = await asyncio.wait_for(
                 advisor.get_recommendation(context), timeout=config.timeout_seconds
             )
@@ -217,6 +220,8 @@ def main() -> int:
         help="target the development row this many seconds after first crack",
     )
     args = parser.parse_args()
+    if not args.fixture.exists():
+        parser.error(f"fixture not found: {args.fixture}")
     return asyncio.run(run(args.iterations, args.fixture, args.offset_seconds))
 
 

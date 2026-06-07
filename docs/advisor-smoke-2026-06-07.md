@@ -15,7 +15,7 @@ no-network guardrail stays; CI keeps using `FakeAdvisor`).
 | api_key_env | `LMSTUDIO_API_KEY` (`lm-studio`) |
 | prompt_version | `v0` |
 | temperature | `0.0` |
-| timeout_seconds | `10.0` (controller budget) |
+| timeout_seconds | `10.0` (`AdvisorConfig.timeout_seconds`; same default as the controller's `ControllerConfig.advisory_timeout_seconds`) |
 
 Command:
 
@@ -62,14 +62,16 @@ prior ~60 s; target = the roast's actual achieved drop temp):
 
 ## Result
 
-**At the production budget (`timeout_seconds=10`): TimeoutError.** The
-advisory call does not return within 10 s, so in a live roast the controller
-would REJECT it and hold current targets — correct fail-safe behavior, but
-no advice delivered. Root cause is thinking mode (below), not the network or
-the model's competence.
+**At the production budget (`AdvisorConfig.timeout_seconds=10`, the harness
+default): TimeoutError.** The advisory call does not return within 10 s, so
+in a live roast the controller — which applies its own
+`ControllerConfig.advisory_timeout_seconds` (also 10 s) — would REJECT it and
+hold current targets, correct fail-safe behavior but no advice delivered.
+Root cause is thinking mode (below), not the network or the model's
+competence.
 
-**With headroom (`timeout_seconds=180`, characterization only — exceeds the
-controller budget):**
+**With headroom (`ROASTPILOT_ADVISOR__TIMEOUT_SECONDS=180`, characterization
+only — extends the harness budget, not the controller's live budget):**
 
 - latency **21.55 s**
 - raw model output: a clean `final_result` tool call (no JSON parse issues),
