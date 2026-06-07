@@ -74,6 +74,10 @@ class SafetyLimits(BaseModel):
       runs at ~1 Hz (orchestration plan § Hardware Characteristics); writes
       more frequent than this cannot have an observable effect and only
       churn the serial protocol.
+    - ``max_consecutive_mcp_failures`` 3: at the 1.0 s tick this tolerates a
+      ~3 s blind window before faulting — the same scale as the T0 debounce,
+      long enough to ride out a transient stdio hiccup, short enough that a
+      hot machine is never uncontrolled for long.
     """
 
     max_bean_temp_c: float = Field(default=230.0, gt=0)
@@ -82,6 +86,7 @@ class SafetyLimits(BaseModel):
     overrun_safe_fan_percent: int = Field(default=100, ge=0, le=100)
     pre_t0_overrun_severity: Literal["recovery", "fault"] = "recovery"
     min_seconds_between_commands: float = Field(default=2.0, gt=0)
+    max_consecutive_mcp_failures: int = Field(default=3, ge=1)
 
 
 class AppConfig(BaseSettings):

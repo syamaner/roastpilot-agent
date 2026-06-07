@@ -33,6 +33,21 @@ class RoastPhase(Enum):
     OPERATOR_RECOVERY_REQUIRED = "operator_recovery_required"
 
 
+ACTIVE_ROAST_PHASES: frozenset[RoastPhase] = frozenset(
+    {
+        RoastPhase.PREHEATING,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        RoastPhase.DEVELOPMENT,
+        RoastPhase.COOLING,
+    }
+)
+"""Phases during which the machine may be hot with beans in play and
+telemetry must be trustworthy. ``starting`` is excluded (the MCP session is
+still being created — no telemetry exists yet); ``idle``/``complete``/
+``faulted``/``operator_recovery_required`` are excluded (no active control).
+"""
+
+
 class RoastEventKind(Enum):
     """Agent-level event kinds (component plan §5 ``roast_events.kind``).
 
