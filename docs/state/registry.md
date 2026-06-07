@@ -2,7 +2,7 @@
 
 ## Active Epic
 
-- Epic file: `docs/epics/E08-advisor.md`
+- Epic file: `docs/epics/E07-api.md`
 - Project: RoastPilot (GitHub user project, owner `syamaner`)
 - Repository: `syamaner/roastpilot-agent`
 - Package: `roastpilot-agent`
@@ -35,14 +35,18 @@
 E1–E6 are complete: safety policy, deterministic controller, typed MCP
 client, and SQLite persistence (schema v2 with trigger-enforced
 completed-run immutability, typed write paths with per-tick commits,
-recovery reads proven across the E4/E6 seam) — 357 tests. Next: E8
-(advisor — resolves plan §11 item 1, the OpenRouter model slug), then
-E7 (API, now unblocked), then E9 — the D17 vertical-slice criterion.
+recovery reads proven across the E4/E6 seam). E8-S1–S3 are complete (the
+advisor layer behind RoastAdvisor); E8-S4 (the advisor bake-off, #57) is
+the human-operator §11.1 resolution path and stays open — it does not
+block E7.
 
-E8 issues are minted (#53–#55, #57; epic tracking #56). E8-S4 is the
-advisor bake-off — the §11.1 resolution path agreed at the 7 Jun 2026
-product review; the operator judges advice quality and the output is a
-comparison document in `docs/` plus the winning slug as config default.
-When E8 closes: mint E7 issues per the closing rule, and note that the
-E10 UI kickoff brief will be waiting in the plan repo by then — surface
-it once E7 issues exist.
+**Active: E7 (API + SSE).** Issues minted #67–#69 (epic tracking #70).
+E7 is unblocked (depends on E4 ✅, E6 ✅; no E8 dependency). The full
+REST + SSE surface the SPA renders from — one backend authority, the SPA
+never calls MCP. The typed SSE event set is E7's most important output:
+E9 (vertical slice) and E10 (SPA) both render from it. E7 establishes the
+API + SSE contract and the operator action queue; E9 wires the live
+controller tick loop + MCP child to drive it.
+
+When E7 closes: E9 and E10 run in parallel next (vertical slice + SPA) —
+the E10 UI kickoff brief is waiting in the plan repo.

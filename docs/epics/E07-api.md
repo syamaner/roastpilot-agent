@@ -49,8 +49,19 @@ Acceptance criteria:
 
 | Story | Title | Status |
 |-------|-------|--------|
-| E7-S1 | REST routes | not started |
+| E7-S1 | REST routes | done |
 | E7-S2 | Operator action queue | not started |
 | E7-S3 | SSE stream | not started |
 
-Epic status: **not started** — depends on E4, E6.
+Epic status: **in progress** — depends on E4 ✅, E6 ✅.
+
+## Notes
+
+- **E7-S1 (#67):** REST surface + typed response models (`models.py`):
+  `GET /api/health` (liveness + MCP child status + active run id),
+  `POST /api/roasts` (409 if active), history list, run detail, telemetry
+  (`?downsample=` stride), timeline (decision trace), log manifest + artifact
+  downloads, operator rating. Backed by a new `RoastService` in `api.py` and
+  read projections in `store.py`. The persisted run starts in `starting`; the
+  live controller tick loop + MCP child that *drive* it are wired by the E9
+  vertical slice (`RoastService` is the seam). No safety/controller changes.
