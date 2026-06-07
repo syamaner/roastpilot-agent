@@ -13,7 +13,12 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from roastpilot_agent.config import SafetyLimits
-from roastpilot_agent.models import ACTIVE_ROAST_PHASES, RoastPhase
+from roastpilot_agent.models import (
+    ACTIVE_ROAST_PHASES,
+    RoastCommand,
+    RoastEventSource,
+    RoastPhase,
+)
 
 
 class SafetyVerdict(Enum):
@@ -52,6 +57,64 @@ class SafetyEvaluation(BaseModel):
     adjusted_heat: int | None = Field(default=None, ge=0, le=100)
     adjusted_fan: int | None = Field(default=None, ge=0, le=100)
     reason: str = Field(min_length=1)
+
+
+COMMAND_PHASE_MATRIX: dict[RoastCommand, frozenset[RoastPhase]] = {
+    # A session may only be started while idle (the API returns 409 on an
+    # active run) or during the starting handshake itself.
+    RoastCommand.START_ROAST_SESSION: frozenset({RoastPhase.IDLE, RoastPhase.STARTING}),
+    # Heat only while actively roasting — never during cooling (the D16
+    # canonical invalid example), never without a session.
+    RoastCommand.SET_HEAT: frozenset(
+        {RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT}
+    ),
+    # Fan additionally allowed during cooling: moving air is never dangerous
+    # and aids cooling.
+    RoastCommand.SET_FAN: frozenset(
+        {
+            RoastPhase.PREHEATING,
+            RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            RoastPhase.DEVELOPMENT,
+            RoastPhase.COOLING,
+        }
+    ),
+    # Manual-T0 fallback during preheating (plan §3) — "recovery-only" in
+    # the plan means a fallback for failed auto-detection, not the
+    # operator_recovery_required phase.
+    RoastCommand.MARK_BEANS_ADDED: frozenset({RoastPhase.PREHEATING}),
+    # Operator FC override only makes sense before development begins.
+    RoastCommand.MARK_FIRST_CRACK: frozenset({RoastPhase.ROASTING_PRE_FIRST_CRACK}),
+    # Drop with beans in the drum: the normal development drop, or an early
+    # operator abort during roasting. Never while preheating (no beans yet).
+    RoastCommand.DROP_BEANS: frozenset(
+        {RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT}
+    ),
+    # start_cooling is recovery-only (plan §6) plus the controller's
+    # post-drop fallback when cooling_on is not observed (plan §3).
+    RoastCommand.START_COOLING: frozenset(
+        {RoastPhase.COOLING, RoastPhase.OPERATOR_RECOVERY_REQUIRED}
+    ),
+    # The D16 canonical invalid example: stop_cooling during development.
+    RoastCommand.STOP_COOLING: frozenset({RoastPhase.COOLING}),
+    # Export is a file write, not roaster control: valid whenever a session
+    # exists (faulted runs export for diagnosis).
+    RoastCommand.EXPORT_ROAST_LOG: frozenset(
+        {
+            RoastPhase.PREHEATING,
+            RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            RoastPhase.DEVELOPMENT,
+            RoastPhase.COOLING,
+            RoastPhase.COMPLETE,
+            RoastPhase.FAULTED,
+            RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+        }
+    ),
+    # E-stop from every phase — mirrors evaluate_emergency_stop (E3-S4);
+    # a test pins this row to the full phase set.
+    RoastCommand.EMERGENCY_STOP: frozenset(RoastPhase),
+}
+"""Command×phase validity matrix (E3-S5, D16): which agent phases each MCP
+write command may execute in. Exhaustively tested per cell."""
 
 
 class SafetyPolicy:
@@ -354,4 +417,65 @@ class SafetyPolicy:
             rule="emergency_stop",
             verdict=SafetyVerdict.EMERGENCY_STOP,
             reason=f"emergency stop requested in phase {phase.value}{detail}",
+        )
+
+    def evaluate_command_phase(
+        self,
+        *,
+        command: RoastCommand,
+        phase: RoastPhase,
+    ) -> SafetyEvaluation:
+        """Command×phase validity matrix (E3-S5, D16).
+
+        Every MCP write command is checked against the current agent phase;
+        an invalid combination (e.g. ``set_heat`` during ``cooling``,
+        ``stop_cooling`` during ``development``) is REJECTed. The matrix is
+        :data:`COMMAND_PHASE_MATRIX`; rationale per row lives on the
+        constant. This rule gates *where* a command may run — bounds, rate
+        limits, and drop eligibility still apply on top.
+        """
+        allowed = COMMAND_PHASE_MATRIX[command]
+        if phase in allowed:
+            return SafetyEvaluation(
+                rule="command_phase_validity",
+                verdict=SafetyVerdict.ALLOW,
+                reason=f"{command.value} is valid in phase {phase.value}",
+            )
+        return SafetyEvaluation(
+            rule="command_phase_validity",
+            verdict=SafetyVerdict.REJECT,
+            reason=(
+                f"{command.value} is not valid in phase {phase.value} (allowed: "
+                f"{', '.join(sorted(p.value for p in allowed))})"
+            ),
+        )
+
+    def evaluate_event_source(
+        self,
+        *,
+        transition: Literal["t0", "first_crack"],
+        source: RoastEventSource,
+    ) -> SafetyEvaluation:
+        """FC/T0 source validity (E3-S5, D16).
+
+        First-crack and T0 state transitions are accepted only from MCP
+        detection status or explicit operator action (component plan §3
+        entry triggers). Anything else — advisor, controller, safety —
+        is REJECTed and the attempt is recorded in the trace: the advisor
+        must never be able to start the roast clock or the development
+        timer, directly or indirectly.
+        """
+        if source in (RoastEventSource.MCP, RoastEventSource.OPERATOR):
+            return SafetyEvaluation(
+                rule="event_source_validity",
+                verdict=SafetyVerdict.ALLOW,
+                reason=f"{transition} transition from source '{source.value}': accepted",
+            )
+        return SafetyEvaluation(
+            rule="event_source_validity",
+            verdict=SafetyVerdict.REJECT,
+            reason=(
+                f"{transition} transition from source '{source.value}': rejected — only MCP "
+                f"detection or explicit operator action may drive T0/first-crack transitions"
+            ),
         )

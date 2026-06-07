@@ -9,8 +9,18 @@ validity (E3-S5, D16) extend this suite.
 import pytest
 
 from roastpilot_agent.config import SafetyLimits
-from roastpilot_agent.models import ACTIVE_ROAST_PHASES, RoastPhase
-from roastpilot_agent.safety import SafetyEvaluation, SafetyPolicy, SafetyVerdict
+from roastpilot_agent.models import (
+    ACTIVE_ROAST_PHASES,
+    RoastCommand,
+    RoastEventSource,
+    RoastPhase,
+)
+from roastpilot_agent.safety import (
+    COMMAND_PHASE_MATRIX,
+    SafetyEvaluation,
+    SafetyPolicy,
+    SafetyVerdict,
+)
 
 
 @pytest.fixture
@@ -496,3 +506,107 @@ def test_every_rule_method_is_persisted_ready(policy: SafetyPolicy) -> None:
         assert evaluation.rule
         assert evaluation.reason
         assert isinstance(evaluation.verdict, SafetyVerdict)
+
+
+# --- E3-S5: command×phase matrix and FC/T0 source validity (D16) ---
+
+
+def test_matrix_covers_every_command() -> None:
+    """Every MCP write command has a row — no command escapes the matrix."""
+    assert set(COMMAND_PHASE_MATRIX) == set(RoastCommand)
+
+
+@pytest.mark.parametrize("command", list(RoastCommand))
+@pytest.mark.parametrize("phase", list(RoastPhase))
+def test_command_phase_matrix_exhaustive(
+    policy: SafetyPolicy, command: RoastCommand, phase: RoastPhase
+) -> None:
+    """All commands × all phases: the verdict matches the matrix cell and
+    is always one of ALLOW/REJECT with rule command_phase_validity."""
+    evaluation = policy.evaluate_command_phase(command=command, phase=phase)
+    assert evaluation.rule == "command_phase_validity"
+    expected = (
+        SafetyVerdict.ALLOW if phase in COMMAND_PHASE_MATRIX[command] else SafetyVerdict.REJECT
+    )
+    assert evaluation.verdict is expected
+
+
+def test_d16_canonical_invalid_combinations(policy: SafetyPolicy) -> None:
+    """The two invalid examples named by D16."""
+    heat_during_cooling = policy.evaluate_command_phase(
+        command=RoastCommand.SET_HEAT, phase=RoastPhase.COOLING
+    )
+    assert heat_during_cooling.verdict is SafetyVerdict.REJECT
+
+    stop_cooling_during_development = policy.evaluate_command_phase(
+        command=RoastCommand.STOP_COOLING, phase=RoastPhase.DEVELOPMENT
+    )
+    assert stop_cooling_during_development.verdict is SafetyVerdict.REJECT
+
+
+def test_emergency_stop_matrix_row_is_every_phase() -> None:
+    """The matrix must never contradict the E3-S4 e-stop invariant."""
+    assert COMMAND_PHASE_MATRIX[RoastCommand.EMERGENCY_STOP] == frozenset(RoastPhase)
+
+
+def test_set_heat_never_valid_without_active_control() -> None:
+    """Heat is rejected in every phase outside preheating/roasting/development
+    — including cooling, faulted, and recovery (no-auto-resume support)."""
+    for phase in (
+        RoastPhase.IDLE,
+        RoastPhase.STARTING,
+        RoastPhase.COOLING,
+        RoastPhase.COMPLETE,
+        RoastPhase.FAULTED,
+        RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+    ):
+        evaluation = policy_for_matrix().evaluate_command_phase(
+            command=RoastCommand.SET_HEAT, phase=phase
+        )
+        assert evaluation.verdict is SafetyVerdict.REJECT
+
+
+def policy_for_matrix() -> SafetyPolicy:
+    return SafetyPolicy(SafetyLimits())
+
+
+@pytest.mark.parametrize("transition", ["t0", "first_crack"])
+@pytest.mark.parametrize("source", list(RoastEventSource))
+def test_event_source_validity(
+    policy: SafetyPolicy, transition: str, source: RoastEventSource
+) -> None:
+    """FC/T0 transitions: MCP detection and operator action only."""
+    evaluation = policy.evaluate_event_source(
+        transition=transition,  # pyright: ignore[reportArgumentType]
+        source=source,
+    )
+    assert evaluation.rule == "event_source_validity"
+    if source in (RoastEventSource.MCP, RoastEventSource.OPERATOR):
+        assert evaluation.verdict is SafetyVerdict.ALLOW
+    else:
+        assert evaluation.verdict is SafetyVerdict.REJECT
+
+
+def test_advisor_can_never_drive_t0_or_fc(policy: SafetyPolicy) -> None:
+    """The talk's core invariant, stated directly."""
+    for transition in ("t0", "first_crack"):
+        evaluation = policy.evaluate_event_source(
+            transition=transition,  # pyright: ignore[reportArgumentType]
+            source=RoastEventSource.ADVISOR,
+        )
+        assert evaluation.verdict is SafetyVerdict.REJECT
+        assert "operator" in evaluation.reason
+
+
+def test_e3_s5_evaluations_are_persisted_ready(policy: SafetyPolicy) -> None:
+    evaluations = [
+        policy.evaluate_command_phase(command=RoastCommand.SET_HEAT, phase=RoastPhase.COOLING),
+        policy.evaluate_command_phase(
+            command=RoastCommand.DROP_BEANS, phase=RoastPhase.DEVELOPMENT
+        ),
+        policy.evaluate_event_source(transition="t0", source=RoastEventSource.MCP),
+        policy.evaluate_event_source(transition="first_crack", source=RoastEventSource.SAFETY),
+    ]
+    for evaluation in evaluations:
+        assert evaluation.rule
+        assert evaluation.reason
