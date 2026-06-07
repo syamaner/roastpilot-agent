@@ -36,27 +36,27 @@ Acceptance criteria:
 
 Acceptance criteria:
 
-- [ ] One `PydanticAIAdvisor` consuming a PydanticAI `Model` built by a
+- [x] One `PydanticAIAdvisor` consuming a PydanticAI `Model` built by a
   `build_model(config)` factory — **not** one advisor class per provider.
   The factory maps `AdvisorConfig.provider` → a `Model`: native
   `openai` / `anthropic` / `google` via PydanticAI's provider classes;
   `ollama` / `openai_compatible` via an OpenAI-compatible model at
   `provider_base_url` (OpenRouter by default, or a LAN Ollama URL).
-- [ ] Structured output, prompt versioning, context-hash logging (not raw
+- [x] Structured output, prompt versioning, context-hash logging (not raw
   payloads), and the typed-error mapping
   (`AdvisorError` / `AdvisorMalformedOutputError` /
   `AdvisorUnsafeOutputError`) live once in `PydanticAIAdvisor` —
   provider-independent. Only `Model` construction varies per provider.
-- [ ] The API key is read at build time from the env var named by
+- [x] The API key is read at build time from the env var named by
   `api_key_env` and handed to the provider — never stored in config or DB.
-- [ ] Native providers are optional dependency extras
+- [x] Native providers are optional dependency extras
   (`anthropic`, `google`); a minimal install (`openai_compatible` /
   `ollama` / `openai`) stays lean. Each provider value documents the extra
   it needs.
-- [ ] Each provider path is exercised behind a recorded-response double
+- [x] Each provider path is exercised behind a recorded-response double
   (plan §8) — no live calls in CI. The factory's provider→`Model` mapping
   is unit-tested for every enum value.
-- [ ] Ships a working provisional default (`openai_compatible` + the
+- [x] Ships a working provisional default (`openai_compatible` + the
   OpenRouter base URL). The settled default provider/`model_slug` and the
   plan §11 item 1 closure belong to E8-S4 (the bake-off).
 
@@ -99,7 +99,7 @@ Acceptance criteria:
 | Story | Title | Status |
 |-------|-------|--------|
 | E8-S1 | FakeAdvisor and failure fixtures | done |
-| E8-S2 | PydanticAI OpenRouter implementation | not started |
+| E8-S2 | PydanticAI provider-agnostic implementation | done |
 | E8-S3 | Call-frequency policy | done |
 | E8-S4 | Advisor bake-off | not started |
 

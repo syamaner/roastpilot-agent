@@ -16,14 +16,27 @@ rejected recommendation with the deterministic hold-current-targets
 fallback (``SafetyPolicy.evaluate_advisor_failure``).
 """
 
+import hashlib
+import logging
+import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
+from pydantic_ai import (
+    Agent,
+    ModelAPIError,
+    ModelSettings,
+    UnexpectedModelBehavior,
+)
+from pydantic_ai.models import Model
 
+from roastpilot_agent.config import AdvisorConfig
 from roastpilot_agent.models import RoastPhase
+
+_log = logging.getLogger(__name__)
 
 
 class AdvisorError(Exception):
@@ -158,14 +171,150 @@ class FakeAdvisor(RoastAdvisor):
         return step
 
 
-class PydanticAIAdvisor(RoastAdvisor):
-    """OpenRouter-backed PydanticAI advisor (decision D5).
+class _RawRoastDecision(BaseModel):
+    """Permissive structured-output shape for the model (E8-S2/D18).
 
-    Strict Pydantic output models, versioned prompts, context hashes (not
-    raw payloads) in logs; timeout/malformed/unsafe output is treated as a
-    rejected recommendation. Implementation lands in E8-S2.
+    Deliberately unconstrained: the provider only has to return the right
+    *shape* (a shape failure surfaces as malformed). The strict
+    ``RoastDecision`` (with its 0–100 / 0–1 bounds) is validated separately
+    so an out-of-range value surfaces as *unsafe*, not malformed — keeping
+    the two failure modes distinct as the controller expects.
     """
 
+    target_heat: int
+    target_fan: int
+    should_drop: bool
+    confidence: float
+    rationale: str
+
+
+# Versioned prompts (component plan §4: keep prompts versioned). The active
+# version is ``AdvisorConfig.prompt_version``; a context hash, never the raw
+# context, is logged per call.
+_PROMPTS: dict[str, str] = {
+    "v0": (
+        "You are an advisory assistant for a coffee roaster. You never control "
+        "hardware: you return a single recommendation and a deterministic safety "
+        "policy decides whether to apply it.\n"
+        "Given the current roast context (JSON), return target_heat and target_fan "
+        "as integer percentages 0-100, should_drop as a boolean, confidence in "
+        "0.0-1.0, and a short rationale. All temperatures are Celsius. Prefer small, "
+        "conservative adjustments; recommend should_drop=true only when development "
+        "is genuinely complete."
+    ),
+}
+
+
+def instructions_for(prompt_version: str) -> str:
+    """Return the versioned advisor instructions, or raise on an unknown version."""
+    try:
+        return _PROMPTS[prompt_version]
+    except KeyError:
+        raise ValueError(f"unknown advisor prompt_version: {prompt_version!r}") from None
+
+
+class AdvisorDependencyError(AdvisorError):
+    """A configured provider needs an optional dependency extra that is absent."""
+
+
+def build_model(config: AdvisorConfig) -> Model:
+    """Build the PydanticAI ``Model`` for ``config.provider`` (D18).
+
+    One factory, one advisor — only model construction varies per provider.
+    Native ``openai`` / ``anthropic`` / ``google`` go direct via PydanticAI's
+    provider classes; ``ollama`` / ``openai_compatible`` use an
+    OpenAI-compatible model pointed at ``config.provider_base_url``
+    (OpenRouter by default, or a LAN Ollama URL). The API key is read here
+    from the env var named by ``config.api_key_env`` and handed to the
+    provider — never stored. Provider SDK imports are lazy so a lean install
+    only needs the extra for the provider it actually uses; a missing extra
+    raises :class:`AdvisorDependencyError` with the install hint.
+    """
+    api_key = os.environ.get(config.api_key_env)
+    provider = config.provider
+    try:
+        if provider == "openai":
+            from pydantic_ai.models.openai import OpenAIChatModel
+            from pydantic_ai.providers.openai import OpenAIProvider
+
+            return OpenAIChatModel(config.model_slug, provider=OpenAIProvider(api_key=api_key))
+        if provider == "anthropic":
+            from pydantic_ai.models.anthropic import AnthropicModel
+            from pydantic_ai.providers.anthropic import AnthropicProvider
+
+            return AnthropicModel(config.model_slug, provider=AnthropicProvider(api_key=api_key))
+        if provider == "google":
+            from pydantic_ai.models.google import GoogleModel
+            from pydantic_ai.providers.google import GoogleProvider
+
+            return GoogleModel(config.model_slug, provider=GoogleProvider(api_key=api_key))
+        if provider in ("ollama", "openai_compatible"):
+            from pydantic_ai.models.openai import OpenAIChatModel
+            from pydantic_ai.providers.openai import OpenAIProvider
+
+            # The OpenAI client requires a non-empty key even for a keyless
+            # local Ollama endpoint; fall back to a placeholder so a LAN
+            # Ollama with no auth still constructs.
+            return OpenAIChatModel(
+                config.model_slug,
+                provider=OpenAIProvider(
+                    base_url=config.provider_base_url, api_key=api_key or "not-required"
+                ),
+            )
+    except ImportError as exc:  # pragma: no cover — needs the extra uninstalled
+        raise AdvisorDependencyError(
+            f"advisor provider {provider!r} needs an optional dependency: "
+            f"pip install 'roastpilot-agent[{provider}]'"
+        ) from exc
+    # Unreachable while ``provider`` stays a closed Literal; pyright treats the
+    # branches above as exhaustive, so this is a defensive backstop.
+    raise AdvisorError(f"unsupported advisor provider: {provider!r}")  # pragma: no cover
+
+
+class PydanticAIAdvisor(RoastAdvisor):
+    """Provider-agnostic PydanticAI advisor (D5 + D18).
+
+    One advisor over any provider: it consumes the :class:`Model` from
+    :func:`build_model` (or an injected model — the recorded-response test
+    seam) and owns everything provider-independent — structured output via
+    PydanticAI, versioned prompts, context-hash logging, and the typed-error
+    mapping. Failures map to the controller's vocabulary: a shape the model
+    could not produce ⇒ :class:`AdvisorMalformedOutputError`; a well-shaped
+    output that violates the ``RoastDecision`` bounds ⇒
+    :class:`AdvisorUnsafeOutputError`; any transport/API failure ⇒
+    :class:`AdvisorProviderError`. ``asyncio``-level ``TimeoutError`` is left
+    to propagate so the controller's ``wait_for`` owns the timeout.
+    """
+
+    def __init__(self, config: AdvisorConfig, *, model: Model | None = None) -> None:
+        self._config = config
+        self._model = model if model is not None else build_model(config)
+        self._agent: Agent[None, _RawRoastDecision] = Agent(
+            self._model,
+            output_type=_RawRoastDecision,
+            instructions=instructions_for(config.prompt_version),
+            model_settings=ModelSettings(temperature=config.temperature),
+        )
+
     async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
-        """Call the configured OpenRouter model via PydanticAI (E8-S2)."""
-        raise NotImplementedError("E8-S2: PydanticAI advisor")
+        """Run the configured model and return a validated recommendation."""
+        context_hash = hashlib.sha256(context.model_dump_json().encode()).hexdigest()
+        _log.info(
+            "advisory request",
+            extra={
+                "context_hash": context_hash,
+                "provider": self._config.provider,
+                "model_slug": self._config.model_slug,
+                "prompt_version": self._config.prompt_version,
+            },
+        )
+        try:
+            result = await self._agent.run(context.model_dump_json())
+        except UnexpectedModelBehavior as exc:
+            raise AdvisorMalformedOutputError(str(exc)) from exc
+        except ModelAPIError as exc:
+            raise AdvisorProviderError(str(exc)) from exc
+        try:
+            return RoastDecision.model_validate(result.output.model_dump())
+        except ValidationError as exc:
+            raise AdvisorUnsafeOutputError(str(exc)) from exc
