@@ -154,6 +154,8 @@ class ServerInfo(MCPMirror):
     package_name: str
     version: str
     transport: str
+    # Deliberately str, not MCPPhase: this is the project/runtime phase
+    # label (e.g. "Bootstrap" in the live fixtures), not the roast phase.
     current_phase: str
     roaster_driver: str
     first_crack_mode: str
@@ -246,9 +248,10 @@ class RoasterMCPClient:
         return StartRoastSessionResult.model_validate(await self._call("start_roast_session", {}))
 
     async def get_roast_state(self, session_id: str | None = None) -> RoastSessionState:
-        return RoastSessionState.model_validate(
-            await self._call("get_roast_state", {"session_id": session_id})
-        )
+        # Omit the key entirely when defaulted: JSON-RPC servers commonly
+        # treat an explicit null differently from an absent optional arg.
+        args: dict[str, object] = {} if session_id is None else {"session_id": session_id}
+        return RoastSessionState.model_validate(await self._call("get_roast_state", args))
 
     async def set_heat(self, heat_level_percent: int) -> ControlCommandResult:
         return ControlCommandResult.model_validate(
@@ -276,9 +279,8 @@ class RoasterMCPClient:
         return EventCommandResult.model_validate(await self._call("stop_cooling", {}))
 
     async def export_roast_log(self, session_id: str | None = None) -> ExportRoastLogResult:
-        return ExportRoastLogResult.model_validate(
-            await self._call("export_roast_log", {"session_id": session_id})
-        )
+        args: dict[str, object] = {} if session_id is None else {"session_id": session_id}
+        return ExportRoastLogResult.model_validate(await self._call("export_roast_log", args))
 
     async def emergency_stop(self, reason: str = "manual emergency stop") -> EventCommandResult:
         return EventCommandResult.model_validate(

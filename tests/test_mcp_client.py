@@ -229,10 +229,16 @@ async def test_arguments_are_passed_through(
     await client.set_heat(85)
     await client.get_roast_state("abc123")
     await client.emergency_stop("smoke")
+    await client.get_roast_state()
+    await client.export_roast_log()
     assert caller.calls == [
         ("set_heat", {"heat_level_percent": 85}),
         ("get_roast_state", {"session_id": "abc123"}),
         ("emergency_stop", {"reason": "smoke"}),
+        # Defaulted optionals omit the key — never an explicit null
+        # (JSON-RPC servers may treat null and absent differently).
+        ("get_roast_state", {}),
+        ("export_roast_log", {}),
     ]
 
 
