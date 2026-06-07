@@ -6,9 +6,26 @@ power-loss protection is the default bias), and a ``PRAGMA user_version``
 migration mechanism. Write paths land in E6-S2, recovery reads in E6-S3.
 """
 
+import hashlib
+import json
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import aiosqlite
+from pydantic import BaseModel
+
+from roastpilot_agent.advisor import AdvisorContext, RoastDecision
+from roastpilot_agent.config import AppConfig
+from roastpilot_agent.models import (
+    RoastCommand,
+    RoastEventKind,
+    RoastEventSource,
+    RoastPhase,
+    RoastProfile,
+    RoastTelemetry,
+)
+from roastpilot_agent.safety import SafetyEvaluation
 
 SCHEMA_V1 = """
 CREATE TABLE roast_runs (
@@ -166,6 +183,7 @@ class RoastStore:
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
         self._connection: aiosqlite.Connection | None = None
+        self._last_telemetry_elapsed: dict[str, float] = {}
 
     @property
     def db_path(self) -> Path:
@@ -240,3 +258,265 @@ class RoastStore:
         if self._connection is not None:
             await self._connection.close()
             self._connection = None
+
+    # --- E6-S2: write paths ---
+    #
+    # Every writer commits immediately: "commit per tick during active
+    # roasts" with no forced WAL checkpoint anywhere — SQLite checkpoints
+    # WAL automatically; durability comes from synchronous=FULL.
+
+    async def create_run(
+        self,
+        *,
+        run_id: str,
+        profile: RoastProfile,
+        config: AppConfig,
+        agent_phase: RoastPhase,
+        started_at_utc: str | None = None,
+    ) -> None:
+        """Insert the roast_runs row (the FK parent for everything else).
+
+        The profile and config are frozen as JSON at run start (plan §5).
+        """
+        now = started_at_utc or _utc_now()
+        frozen_config = json.dumps(
+            {
+                "controller": self._dump(config.controller),
+                "safety": self._dump(config.safety),
+            },
+            sort_keys=True,
+        )
+        await self.connection.execute(
+            "INSERT INTO roast_runs (id, agent_phase, profile_json, config_json,"
+            " started_at_utc, created_at_utc, updated_at_utc)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                agent_phase.value,
+                profile.model_dump_json(),
+                frozen_config,
+                now,
+                now,
+                now,
+            ),
+        )
+        await self.connection.commit()
+
+    async def update_run_phase(self, run_id: str, agent_phase: RoastPhase) -> None:
+        """Persist the last-known agent phase (the recovery read, E6-S3)."""
+        await self.connection.execute(
+            "UPDATE roast_runs SET agent_phase = ?, updated_at_utc = ? WHERE id = ?",
+            (agent_phase.value, _utc_now(), run_id),
+        )
+        await self.connection.commit()
+
+    async def record_event(
+        self,
+        *,
+        run_id: str,
+        kind: RoastEventKind,
+        source: RoastEventSource,
+        monotonic_seconds: float | None = None,
+        payload: object = None,
+        recorded_at_utc: str | None = None,
+    ) -> None:
+        """Append one agent-level event (plan §5 roast_events)."""
+        await self.connection.execute(
+            "INSERT INTO roast_events"
+            " (run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                kind.value,
+                source.value,
+                monotonic_seconds,
+                recorded_at_utc or _utc_now(),
+                None if payload is None else json.dumps(payload, sort_keys=True),
+            ),
+        )
+        await self.connection.commit()
+
+    async def record_telemetry(
+        self,
+        *,
+        run_id: str,
+        tick: int,
+        agent_phase: RoastPhase,
+        elapsed_seconds: float,
+        interval_seconds: float,
+        telemetry: RoastTelemetry | None,
+        mcp_phase: str | None = None,
+        heat_level_percent: int | None = None,
+        fan_level_percent: int | None = None,
+        development_percent: float | None = None,
+        raw_state_json: str | None = None,
+    ) -> bool:
+        """Persist a telemetry row, throttled to ``interval_seconds``.
+
+        The controller persists every tick; rows are only inserted every
+        ``telemetry_log_interval_seconds`` (plan §5, default 5 s). Returns
+        whether a row was written. The first row of a run always writes.
+        """
+        last = self._last_telemetry_elapsed.get(run_id)
+        if last is not None and (elapsed_seconds - last) < interval_seconds:
+            return False
+        await self.connection.execute(
+            "INSERT INTO telemetry_snapshots"
+            " (run_id, tick, recorded_at_utc, elapsed_seconds, agent_phase, mcp_phase,"
+            "  bean_temp_c, env_temp_c, bean_ror_c_per_min, env_ror_c_per_min,"
+            "  heat_level_percent, fan_level_percent, cooling_on, development_percent,"
+            "  raw_state_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                tick,
+                _utc_now(),
+                elapsed_seconds,
+                agent_phase.value,
+                mcp_phase,
+                None if telemetry is None else telemetry.bean_temp_c,
+                None if telemetry is None else telemetry.env_temp_c,
+                None if telemetry is None else telemetry.bean_ror_c_per_min,
+                None if telemetry is None else telemetry.env_ror_c_per_min,
+                heat_level_percent,
+                fan_level_percent,
+                None if telemetry is None else int(telemetry.cooling_on),
+                development_percent,
+                raw_state_json,
+            ),
+        )
+        await self.connection.commit()
+        self._last_telemetry_elapsed[run_id] = elapsed_seconds
+        return True
+
+    async def record_safety_evaluation(
+        self,
+        *,
+        run_id: str,
+        tick: int,
+        evaluation: SafetyEvaluation,
+    ) -> int:
+        """Persist a SafetyEvaluation; returns the row id for linking
+        advisor decisions and commands to their verdict."""
+        cursor = await self.connection.execute(
+            "INSERT INTO safety_evaluations"
+            " (run_id, tick, rule, verdict, input_heat, input_fan,"
+            "  adjusted_heat, adjusted_fan, reason, recorded_at_utc)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                tick,
+                evaluation.rule,
+                evaluation.verdict.value,
+                evaluation.input_heat,
+                evaluation.input_fan,
+                evaluation.adjusted_heat,
+                evaluation.adjusted_fan,
+                evaluation.reason,
+                _utc_now(),
+            ),
+        )
+        await self.connection.commit()
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
+
+    async def record_advisor_decision(
+        self,
+        *,
+        run_id: str,
+        tick: int,
+        provider: str,
+        model: str,
+        prompt_version: str,
+        context: AdvisorContext,
+        latency_ms: int | None,
+        decision: RoastDecision | None,
+        status: Literal["ok", "timeout", "malformed", "provider_error"],
+        safety_evaluation_id: int | None = None,
+    ) -> None:
+        """Persist an advisory outcome — context as a hash, never raw
+        (plan policy: log prompt input hashes, not large payloads)."""
+        context_hash = hashlib.sha256(context.model_dump_json().encode()).hexdigest()
+        await self.connection.execute(
+            "INSERT INTO advisor_decisions"
+            " (run_id, tick, provider, model, prompt_version, context_hash,"
+            "  latency_ms, decision_json, status, safety_evaluation_id, recorded_at_utc)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                tick,
+                provider,
+                model,
+                prompt_version,
+                context_hash,
+                latency_ms,
+                None if decision is None else decision.model_dump_json(),
+                status,
+                safety_evaluation_id,
+                _utc_now(),
+            ),
+        )
+        await self.connection.commit()
+
+    async def record_command(
+        self,
+        *,
+        run_id: str,
+        tick: int,
+        tool: RoastCommand,
+        source: Literal["policy", "advisor", "operator", "safety", "recovery"],
+        status: Literal["ok", "failed"],
+        args: object = None,
+        result: object = None,
+        safety_evaluation_id: int | None = None,
+    ) -> None:
+        """Append one executed/failed MCP command (the decision trace)."""
+        await self.connection.execute(
+            "INSERT INTO command_log"
+            " (run_id, tick, tool, args_json, source, safety_evaluation_id,"
+            "  status, result_json, recorded_at_utc)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                tick,
+                tool.value,
+                None if args is None else json.dumps(args, sort_keys=True),
+                source,
+                safety_evaluation_id,
+                status,
+                None if result is None else json.dumps(result, sort_keys=True),
+                _utc_now(),
+            ),
+        )
+        await self.connection.commit()
+
+    async def record_operator_action(
+        self,
+        *,
+        action: str,
+        result: Literal["accepted", "rejected", "failed"],
+        run_id: str | None = None,
+        payload: object = None,
+    ) -> None:
+        """Append one operator action (run_id nullable: actions like
+        emergency stop may precede any run record)."""
+        await self.connection.execute(
+            "INSERT INTO operator_actions (run_id, action, payload_json, result,"
+            " recorded_at_utc) VALUES (?, ?, ?, ?, ?)",
+            (
+                run_id,
+                action,
+                None if payload is None else json.dumps(payload, sort_keys=True),
+                result,
+                _utc_now(),
+            ),
+        )
+        await self.connection.commit()
+
+    @staticmethod
+    def _dump(model: BaseModel) -> dict[str, object]:
+        return model.model_dump(mode="json")
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat()
