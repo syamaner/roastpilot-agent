@@ -77,10 +77,10 @@ async def test_durability_pragmas_are_set(tmp_store: RoastStore) -> None:
 
 
 @pytest.mark.asyncio
-async def test_schema_version_is_one(tmp_store: RoastStore) -> None:
+async def test_schema_version_matches_migrations(tmp_store: RoastStore) -> None:
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 1
+        assert await tmp_store.schema_version() == len(MIGRATIONS)
     finally:
         await tmp_store.close()
 
@@ -93,7 +93,7 @@ async def test_reinitialization_is_idempotent(tmp_path: Path) -> None:
     reopened = RoastStore(db_path=store.db_path)
     await reopened.initialize()
     try:
-        assert await reopened.schema_version() == 1
+        assert await reopened.schema_version() == len(MIGRATIONS)
         assert await fetch_names(reopened, "table") == EXPECTED_TABLES
     finally:
         await reopened.close()
@@ -114,7 +114,7 @@ async def test_migration_mechanism_applies_new_versions(
     upgraded = RoastStore(db_path=store.db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 2
+        assert await upgraded.schema_version() == len(MIGRATIONS) + 1
         assert "migration_probe" in await fetch_names(upgraded, "table")
         # v1 content untouched.
         assert await fetch_names(upgraded, "table") >= EXPECTED_TABLES
@@ -166,7 +166,7 @@ async def test_failed_migration_rolls_back_atomically(
     recovered = RoastStore(db_path=store.db_path)
     await recovered.initialize()
     try:
-        assert await recovered.schema_version() == 1  # version never bumped
+        assert await recovered.schema_version() == len(MIGRATIONS)  # never bumped
         names = await fetch_names(recovered, "table")
         assert "migration_probe" not in names  # partial DDL rolled back
         assert names == EXPECTED_TABLES
@@ -506,5 +506,260 @@ async def test_advisor_failure_persists_null_decision(tmp_store: RoastStore) -> 
             tmp_store, "SELECT decision_json, status, latency_ms FROM advisor_decisions"
         )
         assert row == (None, "timeout", None)
+    finally:
+        await tmp_store.close()
+
+
+# --- E6-S3: recovery reads and immutability ---
+
+
+@pytest.mark.asyncio
+async def test_read_latest_run_on_fresh_database(tmp_store: RoastStore) -> None:
+    await tmp_store.initialize()
+    try:
+        assert await tmp_store.read_latest_run() is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase",
+    [RoastPhase.PREHEATING, RoastPhase.DEVELOPMENT, RoastPhase.COOLING],
+)
+async def test_restart_scenario_recovers_persisted_phase(tmp_path: Path, phase: RoastPhase) -> None:
+    """Plan §8: restart during preheat / development / cooling — a fresh
+    store instance (the restarted process) reads back the exact phase."""
+    store = await seeded_store(RoastStore(db_path=tmp_path / "restart.sqlite3"))
+    await store.update_run_phase("run-1", phase)
+    await store.close()  # process dies here
+
+    restarted = RoastStore(db_path=store.db_path)
+    await restarted.initialize()
+    try:
+        persisted = await restarted.read_latest_run()
+        assert persisted is not None
+        assert persisted.run_id == "run-1"
+        assert persisted.agent_phase is phase
+        assert persisted.outcome is None  # still active when the process died
+        assert persisted.profile.name == "store-test"
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_recovery_read_feeds_the_controller(tmp_path: Path) -> None:
+    """End to end across the E4/E6 seam: the persisted phase drives
+    recover_from_restart into operator_recovery_required with zero writes."""
+    from roastpilot_agent.config import ControllerConfig
+    from roastpilot_agent.controller import RoastController
+    from roastpilot_agent.safety import SafetyLimits, SafetyPolicy
+    from tests.conftest import (
+        EventSink,
+        RecordingExecutor,
+        RecordingSnapshotSink,
+        ScriptedStateReader,
+    )
+
+    store = await seeded_store(RoastStore(db_path=tmp_path / "seam.sqlite3"))
+    await store.update_run_phase("run-1", RoastPhase.DEVELOPMENT)
+    await store.close()
+
+    restarted = RoastStore(db_path=store.db_path)
+    await restarted.initialize()
+    try:
+        persisted = await restarted.read_latest_run()
+    finally:
+        await restarted.close()
+    assert persisted is not None
+
+    executor = RecordingExecutor()
+    controller = RoastController(
+        config=ControllerConfig(),
+        safety=SafetyPolicy(SafetyLimits()),
+        state_reader=ScriptedStateReader(),
+        command_executor=executor,
+        snapshot_sink=RecordingSnapshotSink(),
+        event_emitter=EventSink(),
+    )
+    await controller.recover_from_restart(persisted.agent_phase)
+    assert controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert executor.targets == [] and executor.commands == []
+
+
+@pytest.mark.asyncio
+async def test_read_latest_run_returns_the_newest(tmp_path: Path) -> None:
+    store = await seeded_store(RoastStore(db_path=tmp_path / "latest.sqlite3"))
+    await store.complete_run(run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    await store.create_run(
+        run_id="run-2",
+        profile=PROFILE,
+        config=AppConfig(),
+        agent_phase=RoastPhase.STARTING,
+        started_at_utc="2099-01-01T00:00:00+00:00",
+    )
+    try:
+        persisted = await store.read_latest_run()
+        assert persisted is not None and persisted.run_id == "run-2"
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_complete_run_finalizes_fields(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1",
+            outcome="completed",
+            agent_phase=RoastPhase.COMPLETE,
+            log_dir="/logs/run-1",
+            export_manifest={"ready": True},
+        )
+        row = await fetch_one(
+            tmp_store,
+            "SELECT outcome, agent_phase, completed_at_utc, log_dir,"
+            " export_manifest_json FROM roast_runs",
+        )
+        assert row[0] == "completed" and row[1] == "complete"
+        assert row[2] is not None
+        assert row[3] == "/logs/run-1"
+        assert '"ready": true' in str(row[4])
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_completed_runs_are_immutable(tmp_store: RoastStore) -> None:
+    """Plan §8: completed-run immutability — enforced by the v2 triggers,
+    not by application discipline."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        with pytest.raises(aiosqlite_module.IntegrityError, match="immutable"):
+            await tmp_store.update_run_phase("run-1", RoastPhase.IDLE)
+        with pytest.raises(aiosqlite_module.IntegrityError, match="immutable"):
+            await tmp_store.connection.execute(
+                "UPDATE roast_runs SET outcome = 'aborted' WHERE id = 'run-1'"
+            )
+        with pytest.raises(aiosqlite_module.IntegrityError, match="immutable"):
+            await tmp_store.connection.execute("DELETE FROM roast_runs WHERE id = 'run-1'")
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_operator_and_cloud_fields_stay_mutable(tmp_store: RoastStore) -> None:
+    """The documented immutability exceptions: rating/notes and the cloud
+    sync fields still update after completion."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("run-1", rating=4, notes="bright, clean")
+        await tmp_store.connection.execute(
+            "UPDATE roast_runs SET cloud_sync_status = 'pending_sync',"
+            " updated_at_utc = 'later' WHERE id = 'run-1'"
+        )
+        await tmp_store.connection.commit()
+        row = await fetch_one(
+            tmp_store,
+            "SELECT operator_rating, operator_notes, cloud_sync_status FROM roast_runs",
+        )
+        assert row == (4, "bright, clean", "pending_sync")
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_active_runs_remain_fully_mutable(tmp_store: RoastStore) -> None:
+    """The triggers only bite after completion — the per-tick phase
+    breadcrumb keeps working for active runs."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.update_run_phase("run-1", RoastPhase.PREHEATING)
+        await tmp_store.update_run_phase("run-1", RoastPhase.ROASTING_PRE_FIRST_CRACK)
+        row = await fetch_one(tmp_store, "SELECT agent_phase FROM roast_runs")
+        assert row[0] == "roasting_pre_first_crack"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_complete_run_on_unknown_run_raises(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no roast_run"):
+            await tmp_store.complete_run(
+                run_id="ghost-run", outcome="completed", agent_phase=RoastPhase.COMPLETE
+            )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_operator_rating_on_unknown_run_raises(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no completed roast_run"):
+            await tmp_store.set_operator_rating("ghost-run", rating=5)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_rating_an_active_run_raises(tmp_store: RoastStore) -> None:
+    """Review observation (E6-S3 PR): the store enforces completed-only
+    rating, so an in-progress run can never be silently stamped."""
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no completed roast_run"):
+            await tmp_store.set_operator_rating("run-1", rating=5)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_persisted_run_is_frozen(tmp_path: Path) -> None:
+    import pydantic
+
+    store = await seeded_store(RoastStore(db_path=tmp_path / "frozen.sqlite3"))
+    try:
+        persisted = await store.read_latest_run()
+        assert persisted is not None
+        with pytest.raises(pydantic.ValidationError):
+            persisted.agent_phase = RoastPhase.IDLE  # pyright: ignore[reportAttributeAccessIssue]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_completion_timestamps_coincide(tmp_store: RoastStore) -> None:
+    """completed_at_utc == updated_at_utc at the completion instant."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        row = await fetch_one(tmp_store, "SELECT completed_at_utc, updated_at_utc FROM roast_runs")
+        assert row[0] == row[1]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_created_at_is_trigger_guarded_too(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        with pytest.raises(aiosqlite_module.IntegrityError, match="immutable"):
+            await tmp_store.connection.execute(
+                "UPDATE roast_runs SET created_at_utc = 'rewritten' WHERE id = 'run-1'"
+            )
     finally:
         await tmp_store.close()

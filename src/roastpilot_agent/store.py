@@ -8,12 +8,13 @@ migration mechanism. Write paths land in E6-S2, recovery reads in E6-S3.
 
 import hashlib
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 import aiosqlite
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision
 from roastpilot_agent.config import AppConfig
@@ -165,10 +166,58 @@ CREATE INDEX idx_command_run_tick ON command_log(run_id, tick);
 CREATE INDEX idx_roast_runs_sync_status ON roast_runs(cloud_sync_status);
 """
 
+SCHEMA_V2_IMMUTABILITY = """
+-- Completed runs are immutable (plan §8) except the operator/cloud
+-- fields: operator_rating, operator_notes, cloud_sync_status,
+-- cloud_roast_id, public_slug (and updated_at_utc bookkeeping).
+CREATE TRIGGER roast_runs_immutable_after_completion
+BEFORE UPDATE ON roast_runs
+FOR EACH ROW
+WHEN OLD.completed_at_utc IS NOT NULL AND (
+  NEW.agent_phase != OLD.agent_phase
+  OR NEW.profile_json != OLD.profile_json
+  OR NEW.config_json != OLD.config_json
+  OR NEW.started_at_utc != OLD.started_at_utc
+  OR NEW.created_at_utc != OLD.created_at_utc
+  OR NEW.completed_at_utc IS NOT OLD.completed_at_utc
+  OR NEW.outcome IS NOT OLD.outcome
+  OR NEW.fault_reason IS NOT OLD.fault_reason
+  OR NEW.log_dir IS NOT OLD.log_dir
+  OR NEW.export_manifest_json IS NOT OLD.export_manifest_json
+  OR NEW.mcp_session_id IS NOT OLD.mcp_session_id
+)
+BEGIN
+  SELECT RAISE(ABORT, 'completed roast_runs are immutable (operator/cloud fields excepted)');
+END;
+
+CREATE TRIGGER roast_runs_undeletable_after_completion
+BEFORE DELETE ON roast_runs
+FOR EACH ROW
+WHEN OLD.completed_at_utc IS NOT NULL
+BEGIN
+  SELECT RAISE(ABORT, 'completed roast_runs are immutable (operator/cloud fields excepted)');
+END;
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
-MIGRATIONS: tuple[str, ...] = (SCHEMA_V1,)
+MIGRATIONS: tuple[str, ...] = (SCHEMA_V1, SCHEMA_V2_IMMUTABILITY)
+
+
+class PersistedRun(BaseModel):
+    """The recovery read (E6-S3): what restart classification needs —
+    feeds controller.recover_from_restart and run resumption context.
+    Frozen: a point-in-time snapshot, never mutated downstream."""
+
+    model_config = ConfigDict(frozen=True)
+
+    run_id: str
+    agent_phase: RoastPhase
+    outcome: Literal["completed", "aborted", "faulted"] | None
+    started_at_utc: str
+    completed_at_utc: str | None
+    profile: RoastProfile
 
 
 class RoastStore:
@@ -231,7 +280,13 @@ class RoastStore:
         version = int(row[0])
         for number, script in enumerate(MIGRATIONS, start=1):
             if version < number:
-                if "BEGIN" in script.upper():
+                # Transaction-opening BEGIN only — trigger bodies use
+                # BEGIN…END legitimately (e.g. the v2 immutability triggers).
+                if re.search(
+                    r"\bBEGIN\s*(;|TRANSACTION|DEFERRED|IMMEDIATE|EXCLUSIVE)",
+                    script,
+                    re.IGNORECASE,
+                ):
                     raise ValueError(
                         f"migration {number} embeds its own transaction — "
                         f"_apply_migrations owns BEGIN/COMMIT"
@@ -523,6 +578,76 @@ class RoastStore:
     @staticmethod
     def _dump(model: BaseModel) -> dict[str, object]:
         return model.model_dump(mode="json")
+
+    # --- E6-S3: recovery reads, run completion, immutability exceptions ---
+
+    async def read_latest_run(self) -> PersistedRun | None:
+        """The startup recovery read (orchestration plan § Persistence):
+        the most recent run with its last persisted phase. None on a
+        fresh database."""
+        async with self.connection.execute(
+            "SELECT id, agent_phase, outcome, started_at_utc, completed_at_utc,"
+            " profile_json FROM roast_runs ORDER BY started_at_utc DESC, rowid DESC LIMIT 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return PersistedRun(
+            run_id=str(row[0]),
+            agent_phase=RoastPhase(str(row[1])),
+            outcome=row[2],  # CHECK-constrained; None when still active
+            started_at_utc=str(row[3]),
+            completed_at_utc=None if row[4] is None else str(row[4]),
+            profile=RoastProfile.model_validate_json(str(row[5])),
+        )
+
+    async def complete_run(
+        self,
+        *,
+        run_id: str,
+        outcome: Literal["completed", "aborted", "faulted"],
+        agent_phase: RoastPhase,
+        fault_reason: str | None = None,
+        log_dir: str | None = None,
+        export_manifest: object = None,
+    ) -> None:
+        """Finalize a run; from this point the immutability triggers guard
+        everything except the operator/cloud fields."""
+        now = _utc_now()  # one instant: completed_at == updated_at at completion
+        cursor = await self.connection.execute(
+            "UPDATE roast_runs SET completed_at_utc = ?, outcome = ?, agent_phase = ?,"
+            " fault_reason = ?, log_dir = ?, export_manifest_json = ?, updated_at_utc = ?"
+            " WHERE id = ?",
+            (
+                now,
+                outcome,
+                agent_phase.value,
+                fault_reason,
+                log_dir,
+                None if export_manifest is None else json.dumps(export_manifest, sort_keys=True),
+                now,
+                run_id,
+            ),
+        )
+        await self.connection.commit()
+        if cursor.rowcount == 0:
+            raise RuntimeError(f"no roast_run with id {run_id!r}")
+
+    async def set_operator_rating(
+        self, run_id: str, *, rating: Literal[1, 2, 3, 4, 5], notes: str | None = None
+    ) -> None:
+        """Operator self-rating — one of the explicit immutability
+        exceptions on completed runs (plan §5). Completed runs only: the
+        store enforces the contract so E7 never has to (an in-progress
+        run cannot be silently stamped with a rating)."""
+        cursor = await self.connection.execute(
+            "UPDATE roast_runs SET operator_rating = ?, operator_notes = ?,"
+            " updated_at_utc = ? WHERE id = ? AND completed_at_utc IS NOT NULL",
+            (rating, notes, _utc_now(), run_id),
+        )
+        await self.connection.commit()
+        if cursor.rowcount == 0:
+            raise RuntimeError(f"no completed roast_run with id {run_id!r}")
 
 
 def _utc_now() -> str:
