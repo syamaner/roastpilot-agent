@@ -22,7 +22,12 @@ from roastpilot_agent.controller import (
     TickScheduler,
 )
 from roastpilot_agent.models import RoastEventKind, RoastProfile, RoastTelemetry
-from roastpilot_agent.safety import SafetyLimits, SafetyPolicy, SafetyVerdict
+from roastpilot_agent.safety import (
+    SafetyEvaluation,
+    SafetyLimits,
+    SafetyPolicy,
+    SafetyVerdict,
+)
 from tests.conftest import (
     EventSink,
     FakeClock,
@@ -1014,3 +1019,163 @@ async def test_stop_cooling_matrix_rejected_outside_cooling() -> None:
     assert harness.controller.phase is RoastPhase.DEVELOPMENT
     assert harness.sink.evaluations[-1].rule == "command_phase_validity"
     assert harness.executor.commands == []
+
+
+# --- E4-S4: the defense-in-depth guards, tested via drifted policies ---
+
+
+class RejectingSourcePolicy(SafetyPolicy):
+    """Simulates a future rule change where event sources get rejected —
+    the controller must honor the verdict and hold the phase."""
+
+    def evaluate_event_source(self, *, transition: str, source: object) -> SafetyEvaluation:  # pyright: ignore[reportIncompatibleMethodOverride]
+        return SafetyEvaluation(
+            rule="event_source_validity",
+            verdict=SafetyVerdict.REJECT,
+            reason="drifted policy rejects all sources",
+        )
+
+
+class PermissiveMatrixPolicy(SafetyPolicy):
+    """Simulates matrix/table drift: the matrix allows everything — the
+    controller's pre-write can_transition guards are the last line."""
+
+    def evaluate_command_phase(self, *, command: object, phase: object) -> SafetyEvaluation:  # pyright: ignore[reportIncompatibleMethodOverride]
+        return SafetyEvaluation(
+            rule="command_phase_validity",
+            verdict=SafetyVerdict.ALLOW,
+            reason="drifted permissive matrix",
+        )
+
+
+def harness_with_policy(policy: SafetyPolicy, *, steps: int = 0) -> Harness:
+    log: list[str] = []
+    clock = FakeClock()
+    reader = ScriptedStateReader([reading(t0_detected=True, first_crack_detected=True)], log)
+    executor = RecordingExecutor(log)
+    sink = RecordingSnapshotSink(log)
+    events = EventSink(log)
+    controller = RoastController(
+        config=ControllerConfig(),
+        safety=policy,
+        state_reader=reader,
+        command_executor=executor,
+        snapshot_sink=sink,
+        event_emitter=events,
+        advisor=None,
+        clock=clock,
+    )
+    harness = Harness(controller, reader, executor, sink, events, clock, log)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:steps]:
+        harness.controller.transition_to(step)
+    return harness
+
+
+@pytest.mark.asyncio
+async def test_rejected_t0_source_holds_preheating() -> None:
+    harness = harness_with_policy(RejectingSourcePolicy(SafetyLimits()), steps=2)
+    for _ in range(4):  # past the debounce threshold
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.PREHEATING  # verdict honored
+
+
+@pytest.mark.asyncio
+async def test_rejected_fc_source_holds_roasting() -> None:
+    harness = harness_with_policy(RejectingSourcePolicy(SafetyLimits()), steps=3)
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_drift_guards_block_writes_when_matrix_is_permissive() -> None:
+    """If the matrix ever allows a command whose resulting state is not
+    reachable, the pre-write guard raises BEFORE any hardware write."""
+    policy = PermissiveMatrixPolicy(SafetyLimits())
+    drop = harness_with_policy(policy, steps=6)  # COMPLETE: cooling unreachable
+    with pytest.raises(InvalidTransitionError):
+        await drop.controller.operator_drop_beans()
+    assert drop.executor.commands == []
+
+    fc = harness_with_policy(policy)  # IDLE: development unreachable
+    with pytest.raises(InvalidTransitionError):
+        await fc.controller.operator_mark_first_crack()
+    assert fc.executor.commands == []
+
+    cool = harness_with_policy(policy)  # IDLE: complete unreachable
+    with pytest.raises(InvalidTransitionError):
+        await cool.controller.operator_stop_cooling()
+    assert cool.executor.commands == []
+
+
+class RejectingCommandPolicy(SafetyPolicy):
+    def evaluate_command(
+        self, *, requested_heat: int, requested_fan: int, seconds_since_last_command: float | None
+    ) -> SafetyEvaluation:
+        return SafetyEvaluation(
+            rule="command_rate_limited",
+            verdict=SafetyVerdict.REJECT,
+            reason="drifted policy rejects all commands",
+        )
+
+
+@pytest.mark.asyncio
+async def test_rejected_initial_targets_are_not_written() -> None:
+    harness = harness_with_policy(RejectingCommandPolicy(SafetyLimits()))
+    await harness.controller.start_run(PROFILE)
+    assert harness.controller.phase is RoastPhase.PREHEATING
+    assert harness.executor.targets == []  # REJECT: _execute_targets skips
+
+
+class FaultWithoutValuesPolicy(SafetyPolicy):
+    def evaluate_telemetry(
+        self, *, phase: RoastPhase, bean_temp_c: float, env_temp_c: float, t0_confirmed: bool
+    ) -> SafetyEvaluation:
+        return SafetyEvaluation(
+            rule="synthetic_fault",
+            verdict=SafetyVerdict.FAULT,
+            reason="drifted policy faults without adjusted values",
+        )
+
+
+@pytest.mark.asyncio
+async def test_fault_without_adjusted_values_skips_hardware_off() -> None:
+    """_apply_fail_safe tolerates evaluations with no adjusted command —
+    the transition still commits."""
+    harness = harness_with_policy(FaultWithoutValuesPolicy(SafetyLimits()), steps=4)
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.executor.targets == []
+
+
+class ClampingTelemetryPolicy(SafetyPolicy):
+    def evaluate_telemetry(
+        self, *, phase: RoastPhase, bean_temp_c: float, env_temp_c: float, t0_confirmed: bool
+    ) -> SafetyEvaluation:
+        return SafetyEvaluation(
+            rule="synthetic_clamp",
+            verdict=SafetyVerdict.CLAMP,
+            adjusted_heat=50,
+            adjusted_fan=50,
+            reason="drifted policy emits CLAMP from telemetry stage",
+        )
+
+
+@pytest.mark.asyncio
+async def test_unexpected_telemetry_clamp_does_not_stop_the_tick() -> None:
+    """CLAMP/REJECT never arise from telemetry rules today; if a drifted
+    policy emits one, _act_on_safety treats it as non-blocking."""
+    harness = harness_with_policy(ClampingTelemetryPolicy(SafetyLimits()), steps=4)
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT  # tick continued
+
+
+@pytest.mark.asyncio
+async def test_estop_while_already_faulted_does_not_retransition() -> None:
+    harness = harness_in_development(readings=[reading(bean=231.0)])
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.FAULTED
+    harness.events.events.clear()
+    await harness.controller.tick()  # still hot, already faulted
+    assert harness.executor.estop_reasons[-1]  # e-stop fired again
+    assert RoastEventKind.PHASE_CHANGED not in harness.events.kinds()  # no re-transition
