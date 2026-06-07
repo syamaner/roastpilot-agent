@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 import aiosqlite
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision
 from roastpilot_agent.config import AppConfig
@@ -207,7 +207,10 @@ MIGRATIONS: tuple[str, ...] = (SCHEMA_V1, SCHEMA_V2_IMMUTABILITY)
 
 class PersistedRun(BaseModel):
     """The recovery read (E6-S3): what restart classification needs —
-    feeds controller.recover_from_restart and run resumption context."""
+    feeds controller.recover_from_restart and run resumption context.
+    Frozen: a point-in-time snapshot, never mutated downstream."""
+
+    model_config = ConfigDict(frozen=True)
 
     run_id: str
     agent_phase: RoastPhase
@@ -634,15 +637,17 @@ class RoastStore:
         self, run_id: str, *, rating: Literal[1, 2, 3, 4, 5], notes: str | None = None
     ) -> None:
         """Operator self-rating — one of the explicit immutability
-        exceptions on completed runs (plan §5)."""
+        exceptions on completed runs (plan §5). Completed runs only: the
+        store enforces the contract so E7 never has to (an in-progress
+        run cannot be silently stamped with a rating)."""
         cursor = await self.connection.execute(
             "UPDATE roast_runs SET operator_rating = ?, operator_notes = ?,"
-            " updated_at_utc = ? WHERE id = ?",
+            " updated_at_utc = ? WHERE id = ? AND completed_at_utc IS NOT NULL",
             (rating, notes, _utc_now(), run_id),
         )
         await self.connection.commit()
         if cursor.rowcount == 0:
-            raise RuntimeError(f"no roast_run with id {run_id!r}")
+            raise RuntimeError(f"no completed roast_run with id {run_id!r}")
 
 
 def _utc_now() -> str:

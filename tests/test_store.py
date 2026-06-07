@@ -704,10 +704,36 @@ async def test_complete_run_on_unknown_run_raises(tmp_store: RoastStore) -> None
 async def test_set_operator_rating_on_unknown_run_raises(tmp_store: RoastStore) -> None:
     await seeded_store(tmp_store)
     try:
-        with pytest.raises(RuntimeError, match="no roast_run"):
+        with pytest.raises(RuntimeError, match="no completed roast_run"):
             await tmp_store.set_operator_rating("ghost-run", rating=5)
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_rating_an_active_run_raises(tmp_store: RoastStore) -> None:
+    """Review observation (E6-S3 PR): the store enforces completed-only
+    rating, so an in-progress run can never be silently stamped."""
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no completed roast_run"):
+            await tmp_store.set_operator_rating("run-1", rating=5)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_persisted_run_is_frozen(tmp_path: Path) -> None:
+    import pydantic
+
+    store = await seeded_store(RoastStore(db_path=tmp_path / "frozen.sqlite3"))
+    try:
+        persisted = await store.read_latest_run()
+        assert persisted is not None
+        with pytest.raises(pydantic.ValidationError):
+            persisted.agent_phase = RoastPhase.IDLE  # pyright: ignore[reportAttributeAccessIssue]
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio
