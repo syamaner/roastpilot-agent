@@ -34,19 +34,25 @@ Acceptance criteria:
   empty-payload `beans_added` and `auto_t0` payload both accepted;
   AGENTS.md fixtures exception documented).
 
-### E5-S2 — Child-process lifecycle (D6)
+### E5-S2 — Child-process lifecycle (D6) ([#39](https://github.com/syamaner/roastpilot-agent/issues/39))
 
 Acceptance criteria:
 
-- [ ] Spawn coffee-roaster-mcp as stdio child; health check; clean shutdown.
-- [ ] The spawn command includes the `serve` positional argument
-  (`coffee-roaster-mcp serve`), matching the server.json packageArguments
-  fix on the MCP branch; a test asserts the argv.
-- [ ] Crash/restart of the child surfaces as a typed failure the controller
-  maps to recovery — never silent reconnect-and-continue.
-- [ ] Every MCP call is timeout-bounded — a hung read or write (including
-  `emergency_stop`) must raise rather than stall the tick; only the
-  advisor call is bounded today (safety-reviewer carry-forward, E4-S2 PR).
+- [x] `MCPServerProcess` spawns the stdio child via the SDK, initializes
+  the session (startup timeout), health-checks through the public surface
+  (`get_server_info`), and shuts down cleanly via AsyncExitStack. The
+  real-child integration test runs whenever `coffee-roaster-mcp` is on
+  PATH (auto-skips until E9 adds the dependency).
+- [x] Spawn argv is `coffee-roaster-mcp serve` — pinned by a test
+  (server.json packageArguments alignment).
+- [x] Every transport fault is a typed `MCPConnectionError` (dead child,
+  broken pipe, server-side isError, not-started) — one except-clause for
+  the controller's consecutive-failure rules; never silent
+  reconnect-and-continue.
+- [x] Every MCP call is bounded by `MCPConfig.call_timeout_seconds`
+  (5.0 s, justified in config) — a hung call (including `emergency_stop`)
+  raises `MCPToolTimeoutError` (E4-S2 carry-forward closed; provenance on
+  #39).
 
 ### E5-S3 — Contract fixtures
 
@@ -71,7 +77,7 @@ Acceptance criteria:
 | Story | Title | Status |
 |-------|-------|--------|
 | E5-S1 | Pydantic mirrors and typed tool wrappers | done |
-| E5-S2 | Child-process lifecycle (D6) | not started |
+| E5-S2 | Child-process lifecycle (D6) | done |
 | E5-S3 | Contract fixtures | not started |
 
-Epic status: **in progress** (E5-S1 done).
+Epic status: **in progress** (E5-S1, E5-S2 done; E5-S3 remains).
