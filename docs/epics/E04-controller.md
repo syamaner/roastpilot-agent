@@ -53,50 +53,50 @@ Acceptance criteria:
 
 Acceptance criteria:
 
-- [ ] Add-beans guidance emitted exactly once when the 170–200 °C range is
+- [x] Add-beans guidance emitted exactly once when the 170–200 °C range is
   reached; non-blocking.
-- [ ] T0 debounce: counter increments on MCP-reported T0, resets when absent,
+- [x] T0 debounce: counter increments on MCP-reported T0, resets when absent,
   transition after `t0_debounce_ticks` (default 3). Tests reflect that
   flapping originates from read faults, not MCP state (plan §2 note).
-- [ ] The debounced T0 state **replaces** E4-S2's interim
+- [x] The debounced T0 state **replaces** E4-S2's interim
   `t0_confirmed = phase is not PREHEATING` proxy in the tick's safety
   evaluation — otherwise the T0 handover window (observed-but-not-yet-
   committed) is judged against the pre-T0 charge bound and can trip a
   spurious overrun (safety-reviewer carry-forward, E4-S2 PR).
 
-### E4-S4 — Fake-MCP harness and restart recovery
+### E4-S4 — Fake-MCP harness and restart recovery ([#30](https://github.com/syamaner/roastpilot-agent/issues/30))
 
 Acceptance criteria:
 
-- [ ] `FakeMCPClient` scripted full-roast scenarios in conftest.
-- [ ] Restart with possibly-active run lands in `operator_recovery_required`;
-  heat/fan never auto-resumed; e-stop available. Specifically: the E4-S1
-  resume edges (recovery → active phases) must pair with an explicit
-  operator gate, and heat stays 0 after a resume until separately
-  commanded — the E3-S5 phase matrix alone permits SET_HEAT in resumed
-  phases (safety-reviewer carry-forward, E4-S1 PR).
-- [ ] Operator-timeout policy (D16) applies only in true operator-required
-  states — manual confirmation, manual hold, recovery — and never in normal
-  phases. UI disconnect during normal phases changes nothing: backend
-  safety continues without the UI (API-side disconnect behavior is E7-S3;
-  this story owns the controller-side policy).
-- [ ] Entry into `faulted`/`operator_recovery_required` guarantees
-  hardware-off (heat 0, safe fan) via the controller's own path — the
-  E3-S2 telemetry-validity rule is deliberately silent in those phases
-  (safety-reviewer carry-forward, E3-S2 PR).
-- [ ] A failed MCP `emergency_stop` call lands in fail-closed handling
-  (FAULT + heat-0/safe-fan write attempts), never silent continuation —
-  the e-stop evaluation deliberately carries no adjusted values
-  (safety-reviewer carry-forward, E3-S4 PR).
-- [ ] The start command is serialized: a stale `starting` phase can never
-  accept a second `start_roast_session` — the E3-S5 matrix allows the
-  command in `starting` and delegates uniqueness to the API 409 + this
-  controller guarantee (safety-reviewer carry-forward, E3-S5 PR).
-- [ ] Relayed T0/FC transitions preserve the true detection source (MCP
-  detection or operator action) — the controller never re-stamps an
-  advisor-origin event as its own or as MCP/operator, or the E3-S5
-  source-validity allowlist could be bypassed (safety-reviewer
-  carry-forward, E3-S5 PR).
+- [x] `FakeMCPClient` scripted full-roast scenarios in conftest (combined
+  StateReader + CommandExecutor; capstone test drives start → debounced
+  T0 → MCP first crack → advisor drop → operator stop-cooling → complete).
+- [x] Restart with possibly-active run lands in `operator_recovery_required`
+  (all seven possibly-active phases parametrized); heat/fan never
+  auto-resumed (no MCP write of any kind); e-stop available.
+  `operator_resume` is the explicit operator gate for the E4-S1 resume
+  edges; heat stays 0 after a resume until separately commanded (tested).
+- [x] Operator-timeout policy (D16): `operator_timeout_seconds` (600 s,
+  justified — machine is hardware-off in these states, so the timeout
+  alerts, never actuates) fires a single SAFETY_ALERT in true
+  operator-required states only; never in normal phases (tested at 10000 s).
+- [x] Entry into `faulted`/`operator_recovery_required` from safety verdicts
+  applies hardware-off (the evaluation's heat 0 / safe fan) before the
+  transition commits — the safety evaluation is the authority and
+  deliberately bypasses the command×phase matrix (heat-off is
+  monotonically toward safety in every phase); a failed write surfaces
+  COMMAND_FAILED and never blocks the fail-closed transition (E3-S2
+  carry-forward).
+- [x] A failed MCP `emergency_stop` lands in fail-closed handling (E4-S2);
+  a failed `start_roast_session` lands in `faulted` with no half-started
+  run (E3-S4 carry-forward family).
+- [x] Start command serialized: `start_run` is legal only from `idle` via
+  the transition table — a second call raises before any MCP command
+  (E3-S5 carry-forward).
+- [x] Relayed T0/FC transitions preserve the true detection source: the
+  telemetry paths stamp MCP, `operator_mark_first_crack` stamps OPERATOR,
+  both through `evaluate_event_source`, both persisted; no API accepts a
+  caller-supplied source (E3-S5 carry-forward).
 
 ## Status
 
@@ -105,6 +105,6 @@ Acceptance criteria:
 | E4-S1 | Transition table | done |
 | E4-S2 | Tick loop and scheduler | done |
 | E4-S3 | T0 debounce and add-beans guidance | done |
-| E4-S4 | Fake-MCP harness and restart recovery | not started |
+| E4-S4 | Fake-MCP harness and restart recovery | done |
 
-Epic status: **in progress** (E4-S1 through E4-S3 done; E4-S4 remains).
+Epic status: **done** — all four stories complete; next epics E5/E6/E8 are unblocked (E7 needs E4 ✅ + E6).

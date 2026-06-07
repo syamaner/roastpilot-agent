@@ -22,10 +22,16 @@ from roastpilot_agent.controller import (
     TickScheduler,
 )
 from roastpilot_agent.models import RoastEventKind, RoastProfile, RoastTelemetry
-from roastpilot_agent.safety import SafetyLimits, SafetyPolicy, SafetyVerdict
+from roastpilot_agent.safety import (
+    SafetyEvaluation,
+    SafetyLimits,
+    SafetyPolicy,
+    SafetyVerdict,
+)
 from tests.conftest import (
     EventSink,
     FakeClock,
+    FakeMCPClient,
     RecordingExecutor,
     RecordingSnapshotSink,
     ScriptedAdvisor,
@@ -418,20 +424,6 @@ async def test_second_command_inside_rate_limit_rejected() -> None:
 
 
 @pytest.mark.asyncio
-async def test_drop_recommendation_recorded_not_executed() -> None:
-    """E4-S2 records the drop-eligibility verdict; drop execution wires in
-    E4-S3/S4."""
-    advisor = ScriptedAdvisor([decision(drop=True)])
-    harness = harness_in_development(readings=[reading()], advisor=advisor)
-    harness.controller.request_advisory()
-    await harness.controller.tick()
-    drop_evaluations = [e for e in harness.sink.evaluations if e.rule == "drop_eligibility"]
-    assert len(drop_evaluations) == 1
-    assert drop_evaluations[0].verdict is SafetyVerdict.ALLOW
-    assert harness.controller.phase is RoastPhase.DEVELOPMENT  # unchanged
-
-
-@pytest.mark.asyncio
 async def test_advisory_skipped_without_profile_or_telemetry() -> None:
     harness = make_harness(readings=[None], advisor=ScriptedAdvisor([decision()]))
     harness.controller.request_advisory()
@@ -638,3 +630,555 @@ async def test_overrun_guard_rearms_on_recovery_resume_into_preheating() -> None
     await harness.controller.tick()  # hot unconfirmed preheat
     assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
     assert harness.sink.evaluations[-1].rule == "pre_t0_overrun"
+
+
+# --- E4-S4: run lifecycle, restart recovery, fake-MCP full roast ---
+
+
+@pytest.mark.asyncio
+async def test_start_run_is_serialized() -> None:
+    harness = make_harness(readings=[reading()])
+    await harness.controller.start_run(PROFILE)
+    assert harness.controller.phase is RoastPhase.PREHEATING
+    assert harness.executor.commands.count("start_session") == 1
+    with pytest.raises(InvalidTransitionError):
+        await harness.controller.start_run(PROFILE)  # second start: rejected
+    assert harness.executor.commands.count("start_session") == 1  # no second MCP call
+
+
+@pytest.mark.asyncio
+async def test_start_run_applies_validated_initial_targets() -> None:
+    harness = make_harness(readings=[reading()])
+    await harness.controller.start_run(PROFILE)
+    assert harness.executor.targets == [(70, 40)]  # profile initials via safety policy
+    rules = [e.rule for e in harness.sink.evaluations]
+    assert "all_clear" in rules
+
+
+@pytest.mark.asyncio
+async def test_failed_start_session_faults_cleanly() -> None:
+    class FailingStartExecutor(RecordingExecutor):
+        async def start_session(self) -> None:
+            raise RuntimeError("mcp down")
+
+    harness = make_harness(readings=[reading()], executor=FailingStartExecutor())
+    await harness.controller.start_run(PROFILE)
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.executor.targets == []  # no half-started run, no writes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "persisted",
+    [
+        RoastPhase.STARTING,
+        RoastPhase.PREHEATING,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        RoastPhase.DEVELOPMENT,
+        RoastPhase.COOLING,
+        RoastPhase.FAULTED,
+        RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+    ],
+)
+async def test_restart_with_possibly_active_run_enters_recovery(
+    persisted: RoastPhase,
+) -> None:
+    harness = make_harness(readings=[reading()])
+    await harness.controller.recover_from_restart(persisted)
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert harness.executor.targets == []  # heat/fan never auto-resumed
+    assert harness.executor.commands == []  # no MCP write of any kind
+    assert harness.sink.evaluations[-1].rule == "restart_recovery"
+    assert RoastEventKind.RECOVERY_REQUIRED in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persisted", [None, RoastPhase.IDLE, RoastPhase.COMPLETE])
+async def test_restart_with_no_active_run_stays_idle(persisted: RoastPhase | None) -> None:
+    harness = make_harness(readings=[reading()])
+    await harness.controller.recover_from_restart(persisted)
+    assert harness.controller.phase is RoastPhase.IDLE
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_available_in_recovery() -> None:
+    harness = make_harness(readings=[reading()])
+    await harness.controller.recover_from_restart(RoastPhase.DEVELOPMENT)
+    await harness.controller.operator_emergency_stop("operator pressed e-stop")
+    assert harness.executor.estop_reasons
+    assert harness.controller.phase is RoastPhase.FAULTED
+
+
+@pytest.mark.asyncio
+async def test_resume_requires_recovery_and_never_writes_heat() -> None:
+    harness = make_harness(readings=[reading()])
+    await harness.controller.recover_from_restart(RoastPhase.DEVELOPMENT)
+    harness.controller.operator_resume(RoastPhase.DEVELOPMENT)
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.executor.targets == []  # heat stays 0 until separately commanded
+    # And resume is gated: not callable outside recovery.
+    with pytest.raises(InvalidTransitionError):
+        harness.controller.operator_resume(RoastPhase.COOLING)
+
+
+@pytest.mark.asyncio
+async def test_resume_to_starting_is_never_legal() -> None:
+    harness = make_harness(readings=[reading()])
+    await harness.controller.recover_from_restart(RoastPhase.PREHEATING)
+    with pytest.raises(InvalidTransitionError):
+        harness.controller.operator_resume(RoastPhase.STARTING)
+
+
+@pytest.mark.asyncio
+async def test_fault_entry_applies_hardware_off() -> None:
+    """E3-S2 carry-forward: stale telemetry FAULT writes heat 0 / safe fan
+    before the transition commits."""
+    harness = harness_in_development(readings=[reading(age_seconds=10.0)])
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.executor.targets == [(0, 100)]
+
+
+@pytest.mark.asyncio
+async def test_failed_hardware_off_still_faults() -> None:
+    class FailingTargetsExecutor(RecordingExecutor):
+        async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+            raise RuntimeError("write failed")
+
+    harness = make_harness(readings=[reading(age_seconds=10.0)], executor=FailingTargetsExecutor())
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:
+        harness.controller.transition_to(step)
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_operator_timeout_alerts_once_in_recovery_only() -> None:
+    harness = make_harness(readings=[reading()])
+    await harness.controller.recover_from_restart(RoastPhase.DEVELOPMENT)
+    harness.clock.advance(601.0)
+    await harness.controller.tick()
+    await harness.controller.tick()
+    kinds = harness.events.kinds()
+    assert kinds.count(RoastEventKind.SAFETY_ALERT) == 1  # once, not per tick
+
+
+@pytest.mark.asyncio
+async def test_operator_timeout_never_fires_in_normal_phases() -> None:
+    harness = harness_in_development(readings=[reading()])
+    harness.clock.advance(10_000.0)
+    await harness.controller.tick()
+    assert RoastEventKind.SAFETY_ALERT not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_mcp_first_crack_transitions_with_source_stamp() -> None:
+    fc = reading(bean=196.0, first_crack_detected=True)
+    harness = make_harness(readings=[fc])
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:  # …→ ROASTING_PRE_FIRST_CRACK
+        harness.controller.transition_to(step)
+    harness.events.events.clear()
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    source_evals = [e for e in harness.sink.evaluations if e.rule == "event_source_validity"]
+    assert len(source_evals) == 1
+    assert source_evals[0].verdict is SafetyVerdict.ALLOW
+    kinds = harness.events.kinds()
+    assert kinds.index(RoastEventKind.FIRST_CRACK) < kinds.index(RoastEventKind.PHASE_CHANGED)
+
+
+@pytest.mark.asyncio
+async def test_operator_first_crack_override_stamped_and_gated() -> None:
+    harness = make_harness(readings=[reading()])
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    await harness.controller.operator_mark_first_crack()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert "mark_first_crack" in harness.executor.commands
+    # And gated by the matrix outside roasting:
+    harness2 = make_harness(readings=[reading()])
+    harness2.controller.load_profile(PROFILE)
+    harness2.controller.transition_to(RoastPhase.STARTING)
+    harness2.controller.transition_to(RoastPhase.PREHEATING)
+    await harness2.controller.operator_mark_first_crack()
+    assert harness2.controller.phase is RoastPhase.PREHEATING  # rejected, no transition
+    assert harness2.executor.commands == []
+
+
+@pytest.mark.asyncio
+async def test_advisor_drop_now_executes() -> None:
+    advisor = ScriptedAdvisor([decision(drop=True)])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert "drop_beans" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.COOLING
+
+
+@pytest.mark.asyncio
+async def test_full_mock_roast_with_fake_mcp() -> None:
+    """E4-S4 capstone: a complete scripted roast through the FakeMCPClient —
+    start → preheat → debounced T0 → MCP first crack → advisor drop →
+    operator stop-cooling → complete."""
+    warm = reading(bean=120.0, env=140.0)
+    charge = reading(bean=178.0, env=185.0)
+    t0 = reading(bean=95.0, t0_detected=True)  # charge drop, T0 reported
+    fc = reading(bean=196.0, t0_detected=True, first_crack_detected=True)
+    dev = reading(bean=200.0, t0_detected=True, first_crack_detected=True)
+    log: list[str] = []
+    mcp = FakeMCPClient([warm, charge, t0, t0, t0, fc, dev], log)
+    events = EventSink(log)
+    sink = RecordingSnapshotSink(log)
+    advisor = ScriptedAdvisor([decision(heat=40, fan=60, drop=True)], log)
+    clock = FakeClock()
+    controller = RoastController(
+        config=ControllerConfig(),
+        safety=SafetyPolicy(SafetyLimits()),
+        state_reader=mcp,
+        command_executor=mcp,
+        snapshot_sink=sink,
+        event_emitter=events,
+        advisor=advisor,
+        clock=clock,
+    )
+    await controller.start_run(PROFILE)
+    assert controller.phase is RoastPhase.PREHEATING
+    for _ in range(2):  # warm + charge guidance frames
+        await controller.tick()
+        clock.advance(2.5)
+    assert RoastEventKind.CHARGE_GUIDANCE in events.kinds()
+    for _ in range(3):  # T0 debounce
+        await controller.tick()
+        clock.advance(2.5)
+    assert controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    await controller.tick()  # FC frame
+    clock.advance(2.5)
+    assert controller.phase is RoastPhase.DEVELOPMENT
+    controller.request_advisory()
+    await controller.tick()  # advisory: clamp-free targets + drop
+    assert controller.phase is RoastPhase.COOLING
+    await controller.operator_stop_cooling()
+    assert controller.phase is RoastPhase.COMPLETE
+    assert mcp.commands() == [
+        "start_session",
+        "set_targets",  # profile initials
+        "set_targets",  # advisor targets
+        "drop_beans",
+        "stop_cooling",
+    ]
+    kinds = events.kinds()
+    for expected in (
+        RoastEventKind.RUN_STARTED,
+        RoastEventKind.CHARGE_GUIDANCE,
+        RoastEventKind.T0_DETECTED,
+        RoastEventKind.FIRST_CRACK,
+        RoastEventKind.ADVISORY,
+        RoastEventKind.RUN_COMPLETED,
+    ):
+        assert expected in kinds
+
+
+@pytest.mark.asyncio
+async def test_operator_early_abort_drop_from_roasting() -> None:
+    """Safety review blocker (E4-S4): an operator early-abort drop during
+    roasting_pre_first_crack must land in cooling — never fire the
+    hardware drop and then fail the transition."""
+    harness = make_harness(readings=[reading()])
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:  # …→ ROASTING_PRE_FIRST_CRACK
+        harness.controller.transition_to(step)
+    await harness.controller.operator_drop_beans()
+    assert harness.controller.phase is RoastPhase.COOLING
+    assert "drop_beans" in harness.executor.commands
+
+
+# --- E4-S4: review fixes + coverage for failure branches ---
+
+
+class FailingCommandExecutor(RecordingExecutor):
+    """Fails the named commands; records everything else."""
+
+    def __init__(self, failing: set[str], log: list[str] | None = None) -> None:
+        super().__init__(log)
+        self._failing = failing
+
+    async def mark_first_crack(self) -> None:
+        if "mark_first_crack" in self._failing:
+            raise RuntimeError("write failed")
+        await super().mark_first_crack()
+
+    async def drop_beans(self) -> None:
+        if "drop_beans" in self._failing:
+            raise RuntimeError("write failed")
+        await super().drop_beans()
+
+    async def stop_cooling(self) -> None:
+        if "stop_cooling" in self._failing:
+            raise RuntimeError("write failed")
+        await super().stop_cooling()
+
+    async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+        if "set_targets" in self._failing:
+            raise RuntimeError("write failed")
+        await super().set_targets(heat_percent=heat_percent, fan_percent=fan_percent)
+
+
+def harness_in(phase_steps: int, executor: RecordingExecutor | None = None) -> Harness:
+    harness = make_harness(readings=[reading()], executor=executor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:phase_steps]:
+        harness.controller.transition_to(step)
+    harness.events.events.clear()
+    return harness
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_returns_to_idle() -> None:
+    harness = make_harness(readings=[reading()])
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    harness.controller.operator_acknowledge_fault()
+    assert harness.controller.phase is RoastPhase.IDLE
+    acked = [p for k, p in harness.events.events if k is RoastEventKind.RECOVERY_ACKNOWLEDGED]
+    assert acked == [{"acknowledged": "faulted"}]
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_also_resets_completed_run() -> None:
+    """Review finding 4: complete → idle uses the same reset path."""
+    harness = harness_in(6)  # …→ COMPLETE
+    harness.controller.operator_acknowledge_fault()
+    assert harness.controller.phase is RoastPhase.IDLE
+    acked = [p for k, p in harness.events.events if k is RoastEventKind.RECOVERY_ACKNOWLEDGED]
+    assert acked == [{"acknowledged": "complete"}]  # truthful payload, not "fault"
+
+
+@pytest.mark.asyncio
+async def test_failed_operator_writes_surface_and_hold_phase() -> None:
+    """A failed MCP write emits COMMAND_FAILED and never moves the phase."""
+    fc = harness_in(3, FailingCommandExecutor({"mark_first_crack"}))
+    await fc.controller.operator_mark_first_crack()
+    assert fc.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert RoastEventKind.COMMAND_FAILED in fc.events.kinds()
+
+    drop = harness_in(4, FailingCommandExecutor({"drop_beans"}))
+    await drop.controller.operator_drop_beans()
+    assert drop.controller.phase is RoastPhase.DEVELOPMENT
+    assert RoastEventKind.COMMAND_FAILED in drop.events.kinds()
+
+    cool = harness_in(5, FailingCommandExecutor({"stop_cooling"}))
+    await cool.controller.operator_stop_cooling()
+    assert cool.controller.phase is RoastPhase.COOLING
+    assert RoastEventKind.COMMAND_FAILED in cool.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_failed_advisor_drop_write_holds_phase() -> None:
+    advisor = ScriptedAdvisor([decision(drop=True)])
+    harness = make_harness(
+        readings=[reading()],
+        advisor=advisor,
+        executor=FailingCommandExecutor({"drop_beans"}),
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:
+        harness.controller.transition_to(step)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_targets_surface_but_run_continues() -> None:
+    harness = make_harness(readings=[reading()], executor=FailingCommandExecutor({"set_targets"}))
+    await harness.controller.start_run(PROFILE)
+    assert harness.controller.phase is RoastPhase.PREHEATING  # run proceeds
+    assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_back_to_back_runs_are_not_rate_limited() -> None:
+    """Review finding 1: a new run resets the rate-limit baseline, so the
+    initial profile targets are never silently rejected."""
+    harness = make_harness(readings=[reading()])
+    await harness.controller.start_run(PROFILE)
+    assert harness.executor.targets == [(70, 40)]
+    # Finish the run instantly (no clock advance) and start the next.
+    for step in NORMAL_PATH[2:6]:
+        harness.controller.transition_to(step)
+    harness.controller.operator_acknowledge_fault()  # complete → idle
+    await harness.controller.start_run(PROFILE)
+    assert harness.executor.targets == [(70, 40), (70, 40)]  # second write happened
+
+
+@pytest.mark.asyncio
+async def test_stop_cooling_matrix_rejected_outside_cooling() -> None:
+    harness = harness_in(4)  # DEVELOPMENT — the D16 canonical invalid
+    await harness.controller.operator_stop_cooling()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.sink.evaluations[-1].rule == "command_phase_validity"
+    assert harness.executor.commands == []
+
+
+# --- E4-S4: the defense-in-depth guards, tested via drifted policies ---
+
+
+class RejectingSourcePolicy(SafetyPolicy):
+    """Simulates a future rule change where event sources get rejected —
+    the controller must honor the verdict and hold the phase."""
+
+    def evaluate_event_source(self, *, transition: str, source: object) -> SafetyEvaluation:  # pyright: ignore[reportIncompatibleMethodOverride]
+        return SafetyEvaluation(
+            rule="event_source_validity",
+            verdict=SafetyVerdict.REJECT,
+            reason="drifted policy rejects all sources",
+        )
+
+
+class PermissiveMatrixPolicy(SafetyPolicy):
+    """Simulates matrix/table drift: the matrix allows everything — the
+    controller's pre-write can_transition guards are the last line."""
+
+    def evaluate_command_phase(self, *, command: object, phase: object) -> SafetyEvaluation:  # pyright: ignore[reportIncompatibleMethodOverride]
+        return SafetyEvaluation(
+            rule="command_phase_validity",
+            verdict=SafetyVerdict.ALLOW,
+            reason="drifted permissive matrix",
+        )
+
+
+def harness_with_policy(policy: SafetyPolicy, *, steps: int = 0) -> Harness:
+    log: list[str] = []
+    clock = FakeClock()
+    reader = ScriptedStateReader([reading(t0_detected=True, first_crack_detected=True)], log)
+    executor = RecordingExecutor(log)
+    sink = RecordingSnapshotSink(log)
+    events = EventSink(log)
+    controller = RoastController(
+        config=ControllerConfig(),
+        safety=policy,
+        state_reader=reader,
+        command_executor=executor,
+        snapshot_sink=sink,
+        event_emitter=events,
+        advisor=None,
+        clock=clock,
+    )
+    harness = Harness(controller, reader, executor, sink, events, clock, log)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:steps]:
+        harness.controller.transition_to(step)
+    return harness
+
+
+@pytest.mark.asyncio
+async def test_rejected_t0_source_holds_preheating() -> None:
+    harness = harness_with_policy(RejectingSourcePolicy(SafetyLimits()), steps=2)
+    for _ in range(4):  # past the debounce threshold
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.PREHEATING  # verdict honored
+
+
+@pytest.mark.asyncio
+async def test_rejected_fc_source_holds_roasting() -> None:
+    harness = harness_with_policy(RejectingSourcePolicy(SafetyLimits()), steps=3)
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_drift_guards_block_writes_when_matrix_is_permissive() -> None:
+    """If the matrix ever allows a command whose resulting state is not
+    reachable, the pre-write guard raises BEFORE any hardware write."""
+    policy = PermissiveMatrixPolicy(SafetyLimits())
+    drop = harness_with_policy(policy, steps=6)  # COMPLETE: cooling unreachable
+    with pytest.raises(InvalidTransitionError):
+        await drop.controller.operator_drop_beans()
+    assert drop.executor.commands == []
+
+    fc = harness_with_policy(policy)  # IDLE: development unreachable
+    with pytest.raises(InvalidTransitionError):
+        await fc.controller.operator_mark_first_crack()
+    assert fc.executor.commands == []
+
+    cool = harness_with_policy(policy)  # IDLE: complete unreachable
+    with pytest.raises(InvalidTransitionError):
+        await cool.controller.operator_stop_cooling()
+    assert cool.executor.commands == []
+
+
+class RejectingCommandPolicy(SafetyPolicy):
+    def evaluate_command(
+        self, *, requested_heat: int, requested_fan: int, seconds_since_last_command: float | None
+    ) -> SafetyEvaluation:
+        return SafetyEvaluation(
+            rule="command_rate_limited",
+            verdict=SafetyVerdict.REJECT,
+            reason="drifted policy rejects all commands",
+        )
+
+
+@pytest.mark.asyncio
+async def test_rejected_initial_targets_are_not_written() -> None:
+    harness = harness_with_policy(RejectingCommandPolicy(SafetyLimits()))
+    await harness.controller.start_run(PROFILE)
+    assert harness.controller.phase is RoastPhase.PREHEATING
+    assert harness.executor.targets == []  # REJECT: _execute_targets skips
+
+
+class FaultWithoutValuesPolicy(SafetyPolicy):
+    def evaluate_telemetry(
+        self, *, phase: RoastPhase, bean_temp_c: float, env_temp_c: float, t0_confirmed: bool
+    ) -> SafetyEvaluation:
+        return SafetyEvaluation(
+            rule="synthetic_fault",
+            verdict=SafetyVerdict.FAULT,
+            reason="drifted policy faults without adjusted values",
+        )
+
+
+@pytest.mark.asyncio
+async def test_fault_without_adjusted_values_skips_hardware_off() -> None:
+    """_apply_fail_safe tolerates evaluations with no adjusted command —
+    the transition still commits."""
+    harness = harness_with_policy(FaultWithoutValuesPolicy(SafetyLimits()), steps=4)
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.executor.targets == []
+
+
+class ClampingTelemetryPolicy(SafetyPolicy):
+    def evaluate_telemetry(
+        self, *, phase: RoastPhase, bean_temp_c: float, env_temp_c: float, t0_confirmed: bool
+    ) -> SafetyEvaluation:
+        return SafetyEvaluation(
+            rule="synthetic_clamp",
+            verdict=SafetyVerdict.CLAMP,
+            adjusted_heat=50,
+            adjusted_fan=50,
+            reason="drifted policy emits CLAMP from telemetry stage",
+        )
+
+
+@pytest.mark.asyncio
+async def test_unexpected_telemetry_clamp_does_not_stop_the_tick() -> None:
+    """CLAMP/REJECT never arise from telemetry rules today; if a drifted
+    policy emits one, _act_on_safety treats it as non-blocking."""
+    harness = harness_with_policy(ClampingTelemetryPolicy(SafetyLimits()), steps=4)
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT  # tick continued
+
+
+@pytest.mark.asyncio
+async def test_estop_while_already_faulted_does_not_retransition() -> None:
+    harness = harness_in_development(readings=[reading(bean=231.0)])
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.FAULTED
+    harness.events.events.clear()
+    await harness.controller.tick()  # still hot, already faulted
+    assert harness.executor.estop_reasons[-1]  # e-stop fired again
+    assert RoastEventKind.PHASE_CHANGED not in harness.events.kinds()  # no re-transition
