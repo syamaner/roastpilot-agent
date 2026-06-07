@@ -33,6 +33,40 @@ class RoastPhase(Enum):
     OPERATOR_RECOVERY_REQUIRED = "operator_recovery_required"
 
 
+class RoastEventKind(Enum):
+    """Agent-level event kinds (component plan §5 ``roast_events.kind``).
+
+    The persisted superset of MCP events; the SSE stream (plan §6) emits
+    these plus the transport-only ``telemetry`` and ``heartbeat`` events,
+    which have their own table/no persistence and are not event kinds here.
+    """
+
+    RUN_STARTED = "run_started"
+    PHASE_CHANGED = "phase_changed"
+    CHARGE_GUIDANCE = "charge_guidance"
+    T0_DETECTED = "t0_detected"
+    FIRST_CRACK = "first_crack"
+    ADVISORY = "advisory"
+    COMMAND_EXECUTED = "command_executed"
+    COMMAND_FAILED = "command_failed"
+    SAFETY_ALERT = "safety_alert"
+    FAULT = "fault"
+    RECOVERY_REQUIRED = "recovery_required"
+    RECOVERY_ACKNOWLEDGED = "recovery_acknowledged"
+    LOGS_EXPORTED = "logs_exported"
+    RUN_COMPLETED = "run_completed"
+
+
+class RoastEventSource(Enum):
+    """Origin of an agent-level event (component plan §5 ``roast_events.source``)."""
+
+    CONTROLLER = "controller"
+    MCP = "mcp"
+    OPERATOR = "operator"
+    ADVISOR = "advisor"
+    SAFETY = "safety"
+
+
 class RoastProfile(BaseModel):
     """Minimal static roast profile (decision D7). Finalized in E2.
 
