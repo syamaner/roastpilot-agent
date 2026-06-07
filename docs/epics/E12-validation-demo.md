@@ -18,10 +18,16 @@ probability trace, full-workflow screen capture.
 
 The **first supervised hardware session is targeted for June** (D17 pulls
 hardware risk forward; it is also criterion 3 of the July
-harness-complete definition). That session should resolve the
-`drop_beans` cooling-behavior open item (component plan §11 item 2) —
-record the resolution in plan §11 when it happens. Demo assets must be
-recorded by **end of August** (D17), leaving September for slides.
+harness-complete definition). Demo assets must be recorded by **end of
+August** (D17), leaving September for slides.
+
+**Update 7 Jun 2026**: the `drop_beans` cooling question (plan §11 item 2)
+was resolved early by coffee-roaster-mcp's own E7-S6 live Hottop roast —
+drop+cooling is atomic (0.37 ms, `cooling_on: true` in the drop payload);
+recorded in plan §11. Live audio FC also confirmed working on hardware
+(confidence 0.907). The June agent session therefore carries one fewer
+unknown; D17 criterion 3 (one supervised roast **through the agent
+harness**) still stands.
 
 ## Stories
 

@@ -41,7 +41,10 @@ Acceptance criteria:
 Acceptance criteria:
 
 - [ ] Real `RoastSessionState` JSON captured from the actual MCP server
-  (mock driver) committed under `tests/fixtures/`.
+  (mock driver) committed under `tests/fixtures/`. Bonus material now
+  exists: coffee-roaster-mcp's 7 Jun live-roast exports (real hardware,
+  branch `e7-s6-live-roast-validation`) — field names and event kinds
+  already verified to match plan §2 with no contract drift.
 - [ ] Mirror models validate all fixtures; mcp-contract-checker sub-agent
   documented as the re-validation path on dependency bumps.
 - [ ] Read/write failure paths tested.
