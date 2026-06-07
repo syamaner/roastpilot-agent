@@ -11,6 +11,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from roastpilot_agent.models import RoastPhase
+
 
 class AdvisorContext(BaseModel):
     """Structured context provided to the advisory layer.
@@ -19,7 +21,7 @@ class AdvisorContext(BaseModel):
     decisions; ``reference_roasts`` stays empty until M2 (component plan §4).
     """
 
-    phase: str
+    phase: RoastPhase
     roast_elapsed_seconds: float
     development_elapsed_seconds: float | None
     current_bean_temp_c: float

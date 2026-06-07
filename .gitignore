@@ -27,6 +27,16 @@ logs/
 *.sqlite3-shm
 *.db
 
+# Audio, model weights, serial captures (AGENTS.md: never committed)
+*.wav
+*.mp3
+*.flac
+*.onnx
+*.pt
+*.safetensors
+*.pcap
+serial-captures/
+
 # Node / SPA (web/ arrives at E10)
 node_modules/
 web/dist/

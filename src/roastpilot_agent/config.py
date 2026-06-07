@@ -52,6 +52,9 @@ class SafetyLimits(BaseModel):
     must not invent safety numbers.
     """
 
+    # Deliberately equals models.RoastProfile.charge_guidance_max_c (200.0):
+    # the guidance band must end at or below this hard bound. A scaffold test
+    # pins charge_guidance_max_c <= pre_t0_max_bean_temp_c; change together.
     pre_t0_max_bean_temp_c: float = 200.0
 
 

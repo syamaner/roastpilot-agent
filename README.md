@@ -18,7 +18,7 @@ A local Python service that drives a roast through
   fan control.
 - **Hard safety policy** — deterministic code, not prompt text. Every
   command is validated before it reaches the roaster; verdicts are typed:
-  `ALLOW / CLAMP / REJECT / FAULT / EMERGENCY_STOP`.
+  `ALLOW / CLAMP / REJECT / RECOVERY / FAULT / EMERGENCY_STOP`.
 - **Advisory-only LLM** — returns a typed recommendation
   (heat/fan targets, drop suggestion, rationale). It never calls tools,
   never owns the loop, and its output is validated, clamped, or rejected by

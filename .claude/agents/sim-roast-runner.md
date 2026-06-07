@@ -24,8 +24,8 @@ Summarize as markdown:
 
 - **Run header**: scenario, duration, phases traversed, outcome.
 - **Decision trace table**: tick, phase, bean temp, advisor targets,
-  verdict (ALLOW/CLAMP/REJECT/FAULT/EMERGENCY_STOP), reason, executed
-  command.
+  verdict (ALLOW/CLAMP/REJECT/RECOVERY/FAULT/EMERGENCY_STOP), reason,
+  executed command.
 - **Anomalies**: missed transitions, debounce resets, advisor
   timeouts/fallbacks, safety verdicts that look wrong for their inputs.
 - **Demo-worthiness**: note whether the run contains at least one CLAMP and

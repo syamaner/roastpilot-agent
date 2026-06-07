@@ -2,9 +2,11 @@ name: CI
 
 on:
   pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   checks:
@@ -13,10 +15,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v6.0.2
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v6.2.0
         with:
           python-version: "3.11"
           cache: "pip"
@@ -33,6 +35,9 @@ jobs:
         run: python -m ruff format --check .
 
       - name: Run typecheck
+        # --pythonpath is required here (and only here): the runner has no
+        # ./.venv, so pyproject's venvPath/venv settings cannot resolve an
+        # interpreter. Locally, plain `python -m pyright` is correct.
         run: python -m pyright --pythonpath "${pythonLocation}/bin/python"
 
       - name: Run tests

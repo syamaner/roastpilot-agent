@@ -12,8 +12,9 @@ definition.
 - **Every roaster write passes safety policy.** No code path delivers
   advisor output (or operator input) to `mcp_client` without a
   `SafetyEvaluation`. Verdicts are typed —
-  `ALLOW / CLAMP / REJECT / FAULT / EMERGENCY_STOP` — and never
-  string-compared in core logic.
+  `ALLOW / CLAMP / REJECT / RECOVERY / FAULT / EMERGENCY_STOP` (six values,
+  D15) — and never string-compared in core logic. Shared enums are plain
+  `Enum`, not `StrEnum`, so a string comparison is a pyright strict error.
 - **Restart never auto-resumes heat or fan.** A restart with a
   possibly-active run enters `operator_recovery_required`; explicit operator
   action is required to resume, drop, cool, or end the run. Emergency stop
@@ -81,6 +82,10 @@ python -m ruff format --check .
 python -m pyright
 ```
 
+(CI adds `--pythonpath` because the runner has no `./.venv` for pyproject's
+`venvPath`/`venv` settings to resolve — do not "simplify" the CI step to the
+bare command.)
+
 ### CLI Smoke
 
 ```bash
@@ -94,7 +99,8 @@ roastpilot-agent --version
 src/roastpilot_agent/
   __init__.py     - package version
   cli.py          - console entrypoint
-  controller.py   - RoastPhase enum, transition table, tick() loop, T0 debounce
+  controller.py   - transition table, tick() loop, T0 debounce (re-exports
+                    RoastPhase from models.py, its home per D15)
   mcp_client.py   - typed wrapper over the 13 coffee-roaster-mcp tools; owns
                     the MCP child process (spawn, health, restart → recovery)
   advisor.py      - RoastAdvisor ABC, AdvisorContext, RoastDecision,
@@ -104,7 +110,7 @@ src/roastpilot_agent/
   api.py          - FastAPI: REST + SSE + static web/ mount; replay mode
   replay.py       - ReplaySource: recorded exports through the real SSE
                     pipeline at 1×–60×
-  models.py       - shared Pydantic models & enums (incl. RoastProfile)
+  models.py       - shared Pydantic models & enums (RoastPhase, RoastProfile)
   config.py       - ControllerConfig, AdvisorConfig, SafetyLimits, AppConfig
 tests/
   conftest.py     - fake MCP client, fake advisor, temp SQLite store,
