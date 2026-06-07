@@ -37,9 +37,11 @@ Acceptance criteria:
 
 - [ ] Supervised Hottop runs with explicit validation notes per AGENTS.md
   hardware rules (heat, fan, drop, cooling, e-stop behavior).
-- [ ] `drop_beans` cooling behavior on real hardware verified; controller's
-  fallback (`start_cooling` after configured window) confirmed or removed;
-  resolution recorded in plan §11 (closes open item 2).
+- [ ] Controller's post-drop `start_cooling` fallback validated on real
+  hardware — the cooling-behavior atomicity itself was confirmed 7 Jun
+  via coffee-roaster-mcp E7-S6 and recorded in plan §11 (open item 2
+  closed); the fallback is retained as defense-in-depth, so the remaining
+  E12-S1 work is confirming it never double-fires.
 - [ ] Unsafe/uncertain behavior fails closed and is documented.
 
 ### E12-S2 — Demo trace recording

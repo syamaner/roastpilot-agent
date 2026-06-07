@@ -27,7 +27,7 @@
 - Closing an epic = create the next epic's story issues from its spec
   file, update this registry, and flip the epic's project item to Done;
   an epic's project item goes In Progress when its first story does.
-- Epic order: E1 ✅ → E2 ✅ → E3 ✅ → E4 ✅ → **E5** (MCP client) / E6 / E8 →
+- Epic order: E1 ✅ → E2 ✅ → E3 ✅ → E4 ✅ → **E5** (MCP client) / E6 / E7 / E8 →
   E9 (vertical slice) → E10 (SPA) → E11 (packaging) → E12 (validation/demo).
 
 ## Active Context
