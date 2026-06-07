@@ -5,21 +5,30 @@ extend this suite. Mirror shapes are derived from the coffee-roaster-mcp
 source and validated here against the 7 Jun 2026 live-roast exports.
 """
 
+import asyncio
 import json
+import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
+from roastpilot_agent.config import MCPConfig
 from roastpilot_agent.mcp_client import (
     ControlCommandResult,
     EventCommandResult,
     EventSnapshot,
     ExportRoastLogResult,
+    MCPConnectionError,
+    MCPServerProcess,
+    MCPToolError,
+    MCPToolTimeoutError,
     RoasterMCPClient,
     RoastSessionState,
     RuntimeConfigSnapshot,
     ServerInfo,
     StartRoastSessionResult,
+    parse_tool_result,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "live-roast-2026-06-07"
@@ -333,3 +342,253 @@ def test_live_roast_event_kinds_match_plan(session: str) -> None:
         "cooling_stopped",
         "fault",
     }
+
+
+# --- E5-S2: stdio child-process transport (D6) ---
+
+
+@dataclass
+class FakeResult:
+    structuredContent: dict[str, object] | None = None  # noqa: N815 (mirrors SDK)
+    content: list[object] = field(default_factory=list[object])
+    isError: bool = False  # noqa: N815
+
+
+@dataclass
+class FakeTextBlock:
+    text: str
+
+
+class FakeSession:
+    def __init__(self, result: object) -> None:
+        self._result = result
+        self.calls: list[tuple[str, dict[str, object] | None]] = []
+
+    async def call_tool(self, name: str, arguments: dict[str, object] | None = None) -> object:
+        self.calls.append((name, arguments))
+        if isinstance(self._result, Exception):
+            raise self._result
+        return self._result
+
+
+class HangingSession:
+    async def call_tool(self, name: str, arguments: dict[str, object] | None = None) -> object:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+def test_spawn_argv_includes_serve_positional() -> None:
+    """server.json packageArguments fix: the spawn command is
+    `coffee-roaster-mcp serve` — pinned per the E5-S2 criterion."""
+    params = MCPServerProcess().build_server_parameters()
+    assert params.command == "coffee-roaster-mcp"
+    assert params.args == ["serve"]
+
+
+@pytest.mark.asyncio
+async def test_calls_are_timeout_bounded() -> None:
+    """E4-S2 carry-forward: a hung call raises a typed timeout instead of
+    stalling the tick — including emergency_stop."""
+    process = MCPServerProcess(MCPConfig(call_timeout_seconds=0.05), session=HangingSession())
+    with pytest.raises(MCPToolTimeoutError):
+        await asyncio.wait_for(process.call_tool("emergency_stop", {}), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_dead_child_surfaces_as_typed_failure() -> None:
+    """A crashed child raises MCPConnectionError — the controller's
+    consecutive-failure rules map it to fail-closed; never a silent
+    reconnect-and-continue."""
+    process = MCPServerProcess(session=FakeSession(RuntimeError("broken pipe")))
+    with pytest.raises(MCPConnectionError):
+        await process.call_tool("get_roast_state", {})
+
+
+@pytest.mark.asyncio
+async def test_call_without_start_is_a_typed_failure() -> None:
+    with pytest.raises(MCPConnectionError):
+        await MCPServerProcess().call_tool("get_server_info", {})
+
+
+@pytest.mark.asyncio
+async def test_server_side_error_result_raises() -> None:
+    result = FakeResult(isError=True, content=[FakeTextBlock("boom")])
+    process = MCPServerProcess(session=FakeSession(result))
+    with pytest.raises(MCPToolError):
+        await process.call_tool("set_heat", {"heat_level_percent": 50})
+
+
+@pytest.mark.asyncio
+async def test_timeout_errors_are_connection_errors() -> None:
+    """One except-clause in the controller catches every transport fault."""
+    assert issubclass(MCPToolTimeoutError, MCPConnectionError)
+    assert issubclass(MCPToolError, MCPConnectionError)
+
+
+def test_parse_structured_dataclass_result() -> None:
+    payload: dict[str, object] = {"session_id": "abc", "ready": True}
+    assert parse_tool_result(FakeResult(structuredContent=payload)) == payload
+
+
+def test_parse_structured_scalar_unwraps() -> None:
+    assert parse_tool_result(FakeResult(structuredContent={"result": 42})) == 42
+
+
+def test_parse_falls_back_to_text_json() -> None:
+    result = FakeResult(content=[FakeTextBlock('{"session_id": "abc"}')])
+    assert parse_tool_result(result) == {"session_id": "abc"}
+
+
+def test_parse_empty_result_is_typed_failure() -> None:
+    with pytest.raises(MCPConnectionError):
+        parse_tool_result(FakeResult())
+
+
+@pytest.mark.asyncio
+async def test_transport_feeds_the_typed_client() -> None:
+    """MCPServerProcess.call_tool satisfies ToolCaller: the typed client
+    validates what the transport returns."""
+    from typing import cast
+
+    payload = cast("dict[str, object]", CANNED["export_roast_log"])
+    result = FakeResult(structuredContent=dict(payload))
+    process = MCPServerProcess(session=FakeSession(result))
+    client = RoasterMCPClient(process.call_tool)
+    export = await client.export_roast_log()
+    assert export.ready is True
+
+
+@pytest.mark.skipif(
+    shutil.which("coffee-roaster-mcp") is None,
+    reason="coffee-roaster-mcp not installed (E9 adds it for the vertical slice)",
+)
+@pytest.mark.asyncio
+async def test_real_child_process_round_trip() -> None:
+    """Integration: spawn the real server (bootstrap-safe mock defaults),
+    health-check, one typed call, clean shutdown."""
+    process = MCPServerProcess()
+    await process.start()
+    try:
+        client = RoasterMCPClient(process.call_tool)
+        info = await client.get_server_info()
+        assert info.package_name == "coffee-roaster-mcp"
+        assert info.bootstrap_safe is True
+    finally:
+        await process.stop()
+    assert not process.running
+
+
+# --- E5-S2 follow-up: lifecycle coverage via injected session factory ---
+
+
+class FakeInitializableSession(FakeSession):
+    def __init__(
+        self,
+        result: object,
+        *,
+        init_hangs: bool = False,
+        init_error: Exception | None = None,
+    ) -> None:
+        super().__init__(result)
+        self._init_hangs = init_hangs
+        self._init_error = init_error
+        self.initialized = False
+
+    async def initialize(self) -> object:
+        if self._init_hangs:
+            await asyncio.Event().wait()
+        if self._init_error is not None:
+            raise self._init_error
+        self.initialized = True
+        return None
+
+
+class FactoryProbe:
+    """Session factory recording spawn params and context teardown."""
+
+    def __init__(self, session: FakeInitializableSession) -> None:
+        self.session = session
+        self.params: object | None = None
+        self.exited = False
+
+    def __call__(self, params: object) -> "FactoryProbe._Context":
+        self.params = params
+        return FactoryProbe._Context(self)
+
+    class _Context:
+        def __init__(self, probe: "FactoryProbe") -> None:
+            self._probe = probe
+
+        async def __aenter__(self) -> FakeInitializableSession:
+            return self._probe.session
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            self._probe.exited = True
+
+
+def info_result() -> FakeResult:
+    from typing import cast
+
+    return FakeResult(structuredContent=dict(cast("dict[str, object]", CANNED["get_server_info"])))
+
+
+@pytest.mark.asyncio
+async def test_start_initializes_health_checks_and_stops_cleanly() -> None:
+    session = FakeInitializableSession(info_result())
+    probe = FactoryProbe(session)
+    process = MCPServerProcess(session_factory=probe)
+    await process.start()
+    assert process.running
+    assert session.initialized
+    assert session.calls == [("get_server_info", {})]  # health check
+    params = probe.params
+    assert getattr(params, "command", None) == "coffee-roaster-mcp"
+    await process.stop()
+    assert not process.running
+    assert probe.exited  # child torn down cleanly
+
+
+@pytest.mark.asyncio
+async def test_start_unwinds_on_initialize_timeout() -> None:
+    session = FakeInitializableSession(info_result(), init_hangs=True)
+    probe = FactoryProbe(session)
+    process = MCPServerProcess(MCPConfig(startup_timeout_seconds=0.05), session_factory=probe)
+    with pytest.raises(MCPConnectionError):
+        await asyncio.wait_for(process.start(), timeout=1.0)
+    assert not process.running
+    assert probe.exited  # the wedged child is not left dangling
+
+
+@pytest.mark.asyncio
+async def test_start_unwinds_on_failed_health_check() -> None:
+    session = FakeInitializableSession(RuntimeError("server broken"))
+    probe = FactoryProbe(session)
+    process = MCPServerProcess(session_factory=probe)
+    with pytest.raises(MCPConnectionError):
+        await process.start()
+    assert not process.running
+    assert probe.exited
+
+
+@pytest.mark.asyncio
+async def test_start_with_injected_session_is_a_noop() -> None:
+    process = MCPServerProcess(session=FakeSession(info_result()))
+    await process.start()  # already attached: nothing to spawn
+    assert process.running
+
+
+@pytest.mark.asyncio
+async def test_stop_without_start_is_safe() -> None:
+    process = MCPServerProcess()
+    await process.stop()
+    assert not process.running
+
+
+@pytest.mark.asyncio
+async def test_malformed_text_result_is_typed_failure() -> None:
+    """Review finding (E5-S2 PR): a JSONDecodeError from a malformed text
+    block must surface as MCPConnectionError, not escape raw."""
+    result = FakeResult(content=[FakeTextBlock("not valid json")])
+    process = MCPServerProcess(session=FakeSession(result))
+    with pytest.raises(MCPConnectionError):
+        await process.call_tool("get_roast_state", {})

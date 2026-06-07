@@ -95,6 +95,27 @@ class SafetyLimits(BaseModel):
     max_consecutive_mcp_failures: int = Field(default=3, ge=1)
 
 
+class MCPConfig(BaseModel):
+    """coffee-roaster-mcp child-process settings (D6, E5-S2).
+
+    - ``command`` + the fixed ``serve`` positional form the spawn argv
+      (`coffee-roaster-mcp serve`, matching server.json packageArguments).
+    - ``call_timeout_seconds`` 5.0: every MCP call — including
+      ``emergency_stop`` — must raise rather than stall the tick loop
+      (safety-reviewer carry-forward, E4-S2). Five seconds ≈ five stalled
+      ticks worst case before the typed failure surfaces and the
+      consecutive-failure rules take over; far below any human reaction
+      window, far above any healthy stdio round trip.
+    - ``startup_timeout_seconds`` 15.0: the bootstrap-safe mock server
+      starts in well under a second; 15 s tolerates first-run environment
+      slowness without masking a wedged child.
+    """
+
+    command: str = Field(default="coffee-roaster-mcp", min_length=1)
+    call_timeout_seconds: float = Field(default=5.0, gt=0)
+    startup_timeout_seconds: float = Field(default=15.0, gt=0)
+
+
 class AppConfig(BaseSettings):
     """Top-level application settings, loadable from environment variables.
 
@@ -107,3 +128,4 @@ class AppConfig(BaseSettings):
     controller: ControllerConfig = Field(default_factory=ControllerConfig)
     advisor: AdvisorConfig = Field(default_factory=AdvisorConfig)
     safety: SafetyLimits = Field(default_factory=SafetyLimits)
+    mcp: MCPConfig = Field(default_factory=MCPConfig)

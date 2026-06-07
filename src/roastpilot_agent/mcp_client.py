@@ -19,10 +19,17 @@ SafetyEvaluation. All temperatures are Celsius; derived metrics are
 passed through from MCP, never recomputed.
 """
 
-from collections.abc import Awaitable, Callable
-from typing import Literal
+import asyncio
+import json
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
+from typing import Any, Literal, Protocol, cast
 
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, ConfigDict
+
+from roastpilot_agent.config import MCPConfig
 
 # --- vocabulary mirrored from coffee_roaster_mcp (session.py / config.py) ---
 
@@ -286,3 +293,188 @@ class RoasterMCPClient:
         return EventCommandResult.model_validate(
             await self._call("emergency_stop", {"reason": reason})
         )
+
+
+# --- E5-S2: stdio child-process transport (D6) ---
+
+
+class MCPConnectionError(Exception):
+    """Typed failure for any MCP transport problem (dead child, broken
+    pipe, protocol error). The controller's consecutive-failure rules map
+    it to fail-closed — never silent reconnect-and-continue."""
+
+
+class MCPToolTimeoutError(MCPConnectionError):
+    """An MCP call exceeded ``call_timeout_seconds`` — the child is wedged.
+
+    Raising (instead of stalling the tick) is the E4-S2 safety-reviewer
+    carry-forward: a hung ``get_roast_state`` — or worse, a hung
+    ``emergency_stop`` — must surface as a failure the safety rules see.
+    """
+
+
+class MCPToolError(MCPConnectionError):
+    """The server answered with ``isError`` — the call failed server-side."""
+
+
+class ToolSession(Protocol):
+    """The slice of mcp.ClientSession the transport needs (test seam)."""
+
+    async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> object:
+        """Execute one tool call and return the raw result object."""
+        ...
+
+
+class InitializableSession(ToolSession, Protocol):
+    """A ToolSession that also supports the MCP initialize handshake."""
+
+    async def initialize(self) -> object:
+        """Run the MCP initialization handshake."""
+        ...
+
+
+SessionFactory = Callable[
+    [StdioServerParameters], AbstractAsyncContextManager[InitializableSession]
+]
+
+
+@asynccontextmanager
+async def _spawn_stdio_session(
+    params: StdioServerParameters,
+) -> AsyncGenerator[ClientSession]:
+    """Default factory: spawn the child and open a ClientSession over it.
+
+    Excluded from unit coverage: this is the thin real-IO shim that only
+    runs with the actual coffee-roaster-mcp binary — exercised by
+    test_real_child_process_round_trip, which auto-activates at E9.
+    """
+    async with (  # pragma: no cover
+        stdio_client(params) as (read, write),
+        ClientSession(read, write) as session,
+    ):
+        yield session
+
+
+def parse_tool_result(result: object) -> object:
+    """Extract the payload from a CallToolResult-shaped object.
+
+    FastMCP serializes dataclass results into ``structuredContent``
+    directly; scalar results arrive wrapped as ``{"result": value}``.
+    Falls back to the first text content block parsed as JSON.
+    """
+    if getattr(result, "isError", False):
+        raise MCPToolError(f"tool call failed server-side: {_result_text(result)}")
+    structured = getattr(result, "structuredContent", None)
+    if isinstance(structured, dict):
+        structured_typed = cast("dict[str, object]", structured)
+        if set(structured_typed.keys()) == {"result"}:
+            # FastMCP wraps non-dict (scalar) tool results as {"result": x}.
+            # Invariant this relies on: every real result dataclass has more
+            # than one field, so a single-key "result" dict can only be the
+            # scalar wrapper. The mcp-contract-checker guards the invariant
+            # (a future one-field dataclass named `result` would break it).
+            return structured_typed["result"]
+        return structured_typed
+    text = _result_text(result)
+    if text is None:
+        raise MCPConnectionError("tool result carried no structured or text content")
+    return json.loads(text)
+
+
+def _result_text(result: object) -> str | None:
+    content = getattr(result, "content", None)
+    if isinstance(content, Sequence):
+        blocks = cast("Sequence[object]", content)
+        for block in blocks:
+            text = getattr(block, "text", None)
+            if isinstance(text, str):
+                return text
+    return None
+
+
+class MCPServerProcess:
+    """Owns the coffee-roaster-mcp stdio child process (D6, E5-S2).
+
+    One systemd unit: the agent spawns ``coffee-roaster-mcp serve``,
+    health-checks it (initialize + get_server_info), bounds every call
+    with ``call_timeout_seconds``, and shuts it down cleanly. An agent
+    restart therefore means a clean MCP restart into the recovery flow.
+    Implements the :data:`ToolCaller` contract for RoasterMCPClient.
+    """
+
+    def __init__(
+        self,
+        config: MCPConfig | None = None,
+        *,
+        session: ToolSession | None = None,
+        session_factory: SessionFactory | None = None,
+    ) -> None:
+        self._config = config or MCPConfig()
+        self._session: ToolSession | None = session  # injectable test seam
+        self._session_factory: SessionFactory = session_factory or _spawn_stdio_session
+        self._stack: AsyncExitStack | None = None
+
+    def build_server_parameters(self) -> StdioServerParameters:
+        """The spawn argv: ``<command> serve`` (server.json packageArguments)."""
+        return StdioServerParameters(command=self._config.command, args=["serve"])
+
+    @property
+    def running(self) -> bool:
+        """Whether a session is attached (spawned or injected)."""
+        return self._session is not None
+
+    async def start(self) -> None:
+        """Spawn the child, initialize the MCP session, health-check it."""
+        if self._session is not None:
+            return
+        stack = AsyncExitStack()
+        try:
+            session = await stack.enter_async_context(
+                self._session_factory(self.build_server_parameters())
+            )
+            await asyncio.wait_for(
+                session.initialize(), timeout=self._config.startup_timeout_seconds
+            )
+            self._stack = stack
+            self._session = session
+            # Health check through the public surface.
+            await self.call_tool("get_server_info", {})
+        except MCPConnectionError:
+            await stack.aclose()
+            self._stack = None
+            self._session = None
+            raise
+        except Exception as exc:
+            await stack.aclose()
+            self._stack = None
+            self._session = None
+            raise MCPConnectionError(f"failed to start coffee-roaster-mcp: {exc}") from exc
+
+    async def stop(self) -> None:
+        """Shut the child down cleanly."""
+        if self._stack is not None:
+            await self._stack.aclose()
+        self._stack = None
+        self._session = None
+
+    async def call_tool(self, name: str, arguments: dict[str, object]) -> object:
+        """ToolCaller implementation: timeout-bounded, typed failures only."""
+        if self._session is None:
+            raise MCPConnectionError("MCP server process is not running")
+        try:
+            result = await asyncio.wait_for(
+                self._session.call_tool(name, dict(arguments)),
+                timeout=self._config.call_timeout_seconds,
+            )
+            # Parsed inside the try: a malformed text block (JSONDecodeError)
+            # must surface as a typed failure too (review finding, E5-S2 PR).
+            return parse_tool_result(result)
+        except TimeoutError as exc:
+            raise MCPToolTimeoutError(
+                f"MCP call '{name}' exceeded {self._config.call_timeout_seconds:.1f}s "
+                f"— the child is wedged"
+            ) from exc
+        except MCPConnectionError:
+            raise
+        except Exception as exc:
+            raise MCPConnectionError(f"MCP call '{name}' failed: {exc}") from exc
