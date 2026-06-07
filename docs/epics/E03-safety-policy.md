@@ -54,6 +54,20 @@ Acceptance criteria:
   name, verdict, input/adjusted values, reason).
 - [ ] safety-reviewer sub-agent run recorded on the closing PR.
 
+### E3-S5 — Phase and source validity rules (D16)
+
+Acceptance criteria:
+
+- [ ] Command×phase validity matrix: every MCP write command is checked
+  against the current agent phase; invalid combinations (e.g. `set_heat`
+  during `cooling`, `stop_cooling` during `development`) produce REJECT
+  verdicts. The matrix is exhaustively tested (all write commands × all
+  nine phases).
+- [ ] FC/T0 source validity: first-crack and T0 state transitions are
+  accepted only from MCP detection status or explicit operator action;
+  any other source is rejected and logged.
+- [ ] Tests for both rule groups in `test_safety.py` (plan §8, D16 row).
+
 ## Status
 
 | Story | Title | Status |
@@ -62,5 +76,6 @@ Acceptance criteria:
 | E3-S2 | Telemetry validity rules | not started |
 | E3-S3 | Command validation rules | not started |
 | E3-S4 | Emergency stop and verdict plumbing | not started |
+| E3-S5 | Phase and source validity rules (D16) | not started |
 
 Epic status: **not started** — follows E2.
