@@ -328,10 +328,13 @@ class AdvisoryCallPolicy:
         telemetry: RoastTelemetry | None,
         now: float,
     ) -> None:
-        """Record that the advisor was consulted: advance the baselines the
-        next :meth:`evaluate` measures change against. Telemetry-derived
-        baselines update only when telemetry is present, so a manual consult
-        with no reading does not blank the delta baselines."""
+        """Record that the advisory step ran for a fired trigger: advance the
+        baselines the next :meth:`evaluate` measures change against. Called
+        once per triggered tick — including the no-telemetry skip path, where
+        the advisor itself is not reached — so the interval restarts from the
+        moment advice was attempted. Telemetry-derived baselines update only
+        when telemetry is present, so a skip or a manual consult with no
+        reading does not blank the delta baselines."""
         self._last_call_monotonic = now
         self._last_phase = phase
         if telemetry is not None:
@@ -689,7 +692,20 @@ class RoastController:
         becomes a REJECT evaluation with the deterministic
         hold-current-targets fallback (E3-S3).
         """
-        if self._advisor is None or telemetry is None or self._profile is None:
+        # advisor/profile are already gated in _maybe_run_advisory; kept here
+        # for type-narrowing and as a guard if ever called from elsewhere.
+        if self._advisor is None or self._profile is None:  # pragma: no cover
+            return
+        if telemetry is None:
+            # Triggered (a manual request, or the heartbeat in a terminal
+            # phase) but the sensor read came back empty this tick — the
+            # advice phases all fault on missing telemetry before reaching
+            # here, so this is the residual manual/terminal case. Surface the
+            # skip so the request is visible in the trace, then hold.
+            self._events.emit(
+                RoastEventKind.ADVISORY,
+                {"trigger": trigger.value, "skipped": "no_telemetry"},
+            )
             return
         # Command×phase matrix gate (E3-S5/D16) before the advisor is even
         # consulted: set_targets writes heat, so SET_HEAT's row (the
