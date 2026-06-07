@@ -37,7 +37,10 @@ definition.
   `coffee-roaster-mcp` in mock-driver mode. Do not mark hardware stories
   complete from mock tests alone.
 - Do not commit model weights, audio files, roast logs, SQLite databases,
-  serial captures, `.env` files, or local IDE folders.
+  serial captures, `.env` files, or local IDE folders. The one exception:
+  small contract/validation fixtures under `tests/fixtures/` (plan §8) —
+  e.g. the 7 Jun 2026 live-roast JSONL/summary excerpts the MCP mirrors
+  validate against.
 - One PR per story, branch: `feature/{issue-number}-{slug}`.
 - The PR that completes a story updates the epic file's status table in the
   same PR — file state and GitHub state never drift.

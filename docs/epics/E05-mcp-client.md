@@ -15,18 +15,24 @@ Contract fixtures recorded from the real server keep the mirrors honest.
 
 ## Stories
 
-### E5-S1 — Pydantic mirrors and typed tool wrappers
+### E5-S1 — Pydantic mirrors and typed tool wrappers ([#38](https://github.com/syamaner/roastpilot-agent/issues/38))
 
 Acceptance criteria:
 
-- [ ] Pydantic mirrors of `RoastSessionState`, `T0Status`,
-  `FirstCrackStatus`, `ExportRoastLogResult` — plus the remaining result
-  shapes the 13-tool surface implies, named explicitly so S3 stays honest:
-  `StartRoastSessionResult`, `ControlCommandResult`, `EventCommandResult`,
-  `ServerInfo`, `RuntimeConfigSnapshot` (all temps Celsius; derived
-  metrics passed through, not recomputed).
-- [ ] Typed methods for exactly the 13 tools — no arbitrary tool execution
-  surface.
+- [x] Pydantic mirrors of all nine result shapes, derived from the actual
+  coffee-roaster-mcp source: `RoastSessionState` (with nested
+  `RoasterDeviceState`/`T0Status`/`FirstCrackStatus`/`EventSnapshot`),
+  `ExportRoastLogResult`, `StartRoastSessionResult`,
+  `ControlCommandResult`, `EventCommandResult`, `ServerInfo`,
+  `RuntimeConfigSnapshot`. All temps Celsius; derived metrics passed
+  through; `extra="ignore"` so upstream additions never crash the agent
+  (drift detection is the contract checker's job).
+- [x] Typed methods for exactly the 13 tools, wire names pinned; a test
+  asserts the public surface is exactly those 13 — no generic execution.
+- [x] Mirrors validated against both 7 Jun live-roast exports from day
+  one (committed under `tests/fixtures/live-roast-2026-06-07/`; manual
+  empty-payload `beans_added` and `auto_t0` payload both accepted;
+  AGENTS.md fixtures exception documented).
 
 ### E5-S2 — Child-process lifecycle (D6)
 
@@ -64,8 +70,8 @@ Acceptance criteria:
 
 | Story | Title | Status |
 |-------|-------|--------|
-| E5-S1 | Pydantic mirrors and typed tool wrappers | not started |
+| E5-S1 | Pydantic mirrors and typed tool wrappers | done |
 | E5-S2 | Child-process lifecycle (D6) | not started |
 | E5-S3 | Contract fixtures | not started |
 
-Epic status: **not started** — depends on E2.
+Epic status: **in progress** (E5-S1 done).
