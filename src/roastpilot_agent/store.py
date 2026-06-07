@@ -187,7 +187,10 @@ class RoastStore:
         try:
             async with connection.execute("PRAGMA journal_mode=WAL") as cursor:
                 mode_row = await cursor.fetchone()
-            if mode_row is None or str(mode_row[0]).lower() != "wal":
+            if mode_row is None or str(mode_row[0]).lower() != "wal":  # pragma: no cover
+                # Environment-dependent path: WAL activation only fails on
+                # filesystems that cannot support it (e.g. some NFS mounts);
+                # not reproducible on local/CI filesystems.
                 raise RuntimeError(
                     f"could not activate WAL journal mode (got {mode_row}): "
                     f"the durability bias requires it"
