@@ -342,8 +342,16 @@ SessionFactory = Callable[
 async def _spawn_stdio_session(
     params: StdioServerParameters,
 ) -> AsyncGenerator[ClientSession]:
-    """Default factory: spawn the child and open a ClientSession over it."""
-    async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+    """Default factory: spawn the child and open a ClientSession over it.
+
+    Excluded from unit coverage: this is the thin real-IO shim that only
+    runs with the actual coffee-roaster-mcp binary — exercised by
+    test_real_child_process_round_trip, which auto-activates at E9.
+    """
+    async with (  # pragma: no cover
+        stdio_client(params) as (read, write),
+        ClientSession(read, write) as session,
+    ):
         yield session
 
 
