@@ -691,7 +691,7 @@ class RoastController:
         """
         # advisor/profile are already gated in _maybe_run_advisory; kept here
         # for type-narrowing and as a guard if ever called from elsewhere.
-        if self._advisor is None or self._profile is None:
+        if self._advisor is None or self._profile is None:  # pragma: no cover
             return
         if telemetry is None:
             # Triggered (a manual request, or the heartbeat in a terminal
