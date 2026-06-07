@@ -161,6 +161,31 @@ After completing a story:
 3. Update decision notes when behavior changed.
 4. Comment on the GitHub story issue with what changed and how it was tested.
 5. Open a PR referencing the story issue.
+6. Watch the PR to green, then resolve every review finding (see the merge
+   policy below), then squash-merge, delete the branch, and flip the story's
+   project item to Done.
+
+### PR merge policy
+
+Watching a PR, addressing its feedback, and squash-merging it is
+pre-authorized — no need to ask before merging your own story PR once it is
+clean.
+
+- **Green CI is necessary but not sufficient.** The automated code-review
+  bot (and any human reviewer) routinely leaves substantive comments while
+  CI is green — correctness edge cases, observability gaps, dead code,
+  missing coverage. Read every comment before merging.
+- For each finding: fix it (cheap, clearly-correct ones — just do them), or
+  state in the thread why it is not being actioned (reviewer marked it "no
+  action", cosmetic, or unreachable). Never merge with an un-triaged
+  comment.
+- **Coverage regressions must be sorted, not waved through.** If
+  `codecov/patch` fails, either add the missing test or tag a genuinely
+  unreachable defensive/narrowing line `# pragma: no cover` (the repo
+  convention — see `store.py`, `mcp_client.py`). Do not lower thresholds to
+  pass.
+- Re-run the checks after any fix; only merge once CI is green *and* every
+  comment is resolved or consciously dismissed.
 
 ## Claude Code
 
