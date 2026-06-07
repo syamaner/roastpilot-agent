@@ -65,6 +65,7 @@ dev = [
   "pyright>=1.1",
   "pytest>=8.0",
   "pytest-asyncio>=1.0",
+  "pytest-cov>=5.0",
   "ruff>=0.8"
 ]
 
@@ -80,6 +81,14 @@ addopts = "-q"
 pythonpath = ["src"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run]
+branch = true
+source = ["roastpilot_agent"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
 
 [tool.ruff]
 line-length = 100
