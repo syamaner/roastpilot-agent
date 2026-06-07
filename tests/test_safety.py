@@ -10,7 +10,7 @@ import pytest
 
 from roastpilot_agent.config import SafetyLimits
 from roastpilot_agent.models import ACTIVE_ROAST_PHASES, RoastPhase
-from roastpilot_agent.safety import SafetyPolicy, SafetyVerdict
+from roastpilot_agent.safety import SafetyEvaluation, SafetyPolicy, SafetyVerdict
 
 
 @pytest.fixture
@@ -409,3 +409,90 @@ def test_e3_s3_evaluations_are_persisted_ready(policy: SafetyPolicy) -> None:
     for evaluation in evaluations:
         assert evaluation.rule
         assert evaluation.reason
+
+
+# --- E3-S4: emergency stop and verdict plumbing ---
+
+
+@pytest.mark.parametrize("phase", list(RoastPhase))
+def test_emergency_stop_reachable_from_every_phase(policy: SafetyPolicy, phase: RoastPhase) -> None:
+    evaluation = policy.evaluate_emergency_stop(phase=phase)
+    assert evaluation.verdict is SafetyVerdict.EMERGENCY_STOP
+    assert evaluation.rule == "emergency_stop"
+
+
+def test_emergency_stop_is_structurally_ungated() -> None:
+    """The e-stop rule must never grow advisor/UI/cloud gates: its
+    signature accepts the phase and an operator reason — nothing else."""
+    import inspect
+
+    parameters = set(inspect.signature(SafetyPolicy.evaluate_emergency_stop).parameters)
+    assert parameters == {"self", "phase", "operator_reason"}
+
+
+def test_emergency_stop_records_operator_reason(policy: SafetyPolicy) -> None:
+    evaluation = policy.evaluate_emergency_stop(
+        phase=RoastPhase.DEVELOPMENT, operator_reason="smoke from the drum"
+    )
+    assert "smoke from the drum" in evaluation.reason
+
+
+def test_command_evaluations_record_requested_inputs(policy: SafetyPolicy) -> None:
+    """input_heat/input_fan persist exactly what was requested (plan §5),
+    including out-of-range and rate-limited requests."""
+    allowed = policy.evaluate_command(
+        requested_heat=70, requested_fan=40, seconds_since_last_command=None
+    )
+    assert (allowed.input_heat, allowed.input_fan) == (70, 40)
+
+    clamped = policy.evaluate_command(
+        requested_heat=150, requested_fan=-10, seconds_since_last_command=None
+    )
+    assert (clamped.input_heat, clamped.input_fan) == (150, -10)
+    assert (clamped.adjusted_heat, clamped.adjusted_fan) == (100, 0)
+
+    rate_limited = policy.evaluate_command(
+        requested_heat=80, requested_fan=60, seconds_since_last_command=0.5
+    )
+    assert (rate_limited.input_heat, rate_limited.input_fan) == (80, 60)
+    assert rate_limited.adjusted_heat is None
+
+
+def test_out_of_range_inputs_are_recordable() -> None:
+    """input fields are deliberately unbounded — the trace must show the
+    request exactly as made; only adjusted values are bounded."""
+    evaluation = SafetyEvaluation(
+        rule="command_bounds",
+        verdict=SafetyVerdict.CLAMP,
+        input_heat=1000,
+        input_fan=-50,
+        adjusted_heat=100,
+        adjusted_fan=0,
+        reason="recording an absurd request verbatim",
+    )
+    assert evaluation.input_heat == 1000
+    assert evaluation.input_fan == -50
+
+
+def test_every_rule_method_is_persisted_ready(policy: SafetyPolicy) -> None:
+    """E3-S4 plumbing: every evaluation from every rule method carries a
+    non-empty rule and reason, and a typed verdict."""
+    evaluations = [
+        policy.evaluate_telemetry(
+            phase=RoastPhase.DEVELOPMENT, bean_temp_c=195.0, env_temp_c=215.0, t0_confirmed=True
+        ),
+        policy.evaluate_telemetry_validity(
+            phase=RoastPhase.DEVELOPMENT, telemetry_age_seconds=None, max_stale_seconds=3.0
+        ),
+        policy.evaluate_mcp_failure(operation="read", consecutive_failures=4),
+        policy.evaluate_command(
+            requested_heat=70, requested_fan=40, seconds_since_last_command=None
+        ),
+        policy.evaluate_drop_recommendation(phase=RoastPhase.DEVELOPMENT),
+        policy.evaluate_advisor_failure(status="timeout", current_heat=50, current_fan=50),
+        policy.evaluate_emergency_stop(phase=RoastPhase.FAULTED),
+    ]
+    for evaluation in evaluations:
+        assert evaluation.rule
+        assert evaluation.reason
+        assert isinstance(evaluation.verdict, SafetyVerdict)
