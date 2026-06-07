@@ -712,6 +712,30 @@ async def test_no_automatic_advisory_in_cooling() -> None:
     assert RoastEventKind.ADVISORY not in harness.events.kinds()
 
 
+@pytest.mark.asyncio
+async def test_manual_advisory_without_telemetry_emits_skipped_event() -> None:
+    """Review follow-up (#61): a manual request that reaches the advisory step
+    with no telemetry (the residual terminal-phase case — advice phases fault
+    on missing telemetry first) must not be silently swallowed. The advisor is
+    not consulted, but a skipped ADVISORY event surfaces that the request
+    landed."""
+    advisor = FakeAdvisor([decision()])
+    harness = make_harness(readings=[None], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:6]:  # …→ COMPLETE (a non-active-roast phase)
+        harness.controller.transition_to(step)
+    assert harness.controller.phase is RoastPhase.COMPLETE
+    harness.events.events.clear()
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert advisor.contexts == []  # advisor never reached
+    assert harness.executor.targets == []
+    advisory_events = [
+        cast(dict[str, object], p) for k, p in harness.events.events if k is RoastEventKind.ADVISORY
+    ]
+    assert advisory_events == [{"trigger": AdvisoryTrigger.MANUAL.value, "skipped": "no_telemetry"}]
+
+
 # --- E4-S3: T0 debounce and add-beans guidance ---
 
 
