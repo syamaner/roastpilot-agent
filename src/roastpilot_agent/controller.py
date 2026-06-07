@@ -311,11 +311,14 @@ class RoastController:
             self._t0_streak = 0
         if self._t0_streak >= self._config.t0_debounce_ticks:
             self._t0_confirmed = True
-            self.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+            # Cause before effect: consumers see T0_DETECTED, then the
+            # PHASE_CHANGED it explains (review note, E4-S3 PR).
             self._events.emit(
                 RoastEventKind.T0_DETECTED,
                 {"debounce_ticks": self._t0_streak, "bean_temp_c": telemetry.bean_temp_c},
             )
+            self._t0_streak = 0  # unambiguous post-confirmation state
+            self.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
 
     def _maybe_emit_charge_guidance(self, telemetry: RoastTelemetry) -> None:
         if self._guidance_emitted or self._profile is None:

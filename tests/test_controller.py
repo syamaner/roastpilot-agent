@@ -552,7 +552,10 @@ async def test_t0_debounce_confirms_after_three_consecutive_ticks() -> None:
     assert harness.controller.phase is RoastPhase.PREHEATING  # 2 < 3
     await harness.controller.tick()
     assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-    assert harness.events.kinds().count(RoastEventKind.T0_DETECTED) == 1
+    kinds = harness.events.kinds()
+    assert kinds.count(RoastEventKind.T0_DETECTED) == 1
+    # Cause before effect: T0_DETECTED precedes the PHASE_CHANGED it explains.
+    assert kinds.index(RoastEventKind.T0_DETECTED) < kinds.index(RoastEventKind.PHASE_CHANGED)
 
 
 @pytest.mark.asyncio
