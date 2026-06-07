@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from roastpilot_agent.advisor import AdvisorContext, RoastAdvisor, RoastDecision
+from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastAdvisor, RoastDecision
 from roastpilot_agent.config import ControllerConfig
 from roastpilot_agent.controller import (
     TRANSITION_TABLE,
@@ -34,7 +34,6 @@ from tests.conftest import (
     FakeMCPClient,
     RecordingExecutor,
     RecordingSnapshotSink,
-    ScriptedAdvisor,
     ScriptedStateReader,
 )
 
@@ -311,7 +310,7 @@ def harness_in_development(
 async def test_tick_order_with_advisory() -> None:
     """The documented tick order: read → persist snapshot → safety →
     persist evaluation → advisory → validate/persist → execute → emit."""
-    advisor = ScriptedAdvisor([decision()])
+    advisor = FakeAdvisor([decision()])
     harness = harness_in_development(readings=[reading()], advisor=advisor)
     advisor._log = harness.log  # share the order log  # pyright: ignore[reportPrivateUsage]
     harness.controller.request_advisory()
@@ -333,7 +332,7 @@ async def test_tick_order_with_advisory() -> None:
 async def test_safety_evaluated_before_advisory_and_blocks_it() -> None:
     """A hard-ceiling breach e-stops and faults before the advisor is ever
     consulted — safety always precedes advisory calls and execution."""
-    advisor = ScriptedAdvisor([decision()])
+    advisor = FakeAdvisor([decision()])
     harness = harness_in_development(readings=[reading(bean=231.0)], advisor=advisor)
     harness.controller.request_advisory()
     await harness.controller.tick()
@@ -411,7 +410,7 @@ async def test_recovery_verdict_enters_recovery_phase() -> None:
 
 @pytest.mark.asyncio
 async def test_second_command_inside_rate_limit_rejected() -> None:
-    advisor = ScriptedAdvisor([decision(), decision(heat=70, fan=55)])
+    advisor = FakeAdvisor([decision(), decision(heat=70, fan=55)])
     harness = harness_in_development(readings=[reading()], advisor=advisor)
     harness.controller.request_advisory()
     await harness.controller.tick()
@@ -425,7 +424,7 @@ async def test_second_command_inside_rate_limit_rejected() -> None:
 
 @pytest.mark.asyncio
 async def test_advisory_skipped_without_profile_or_telemetry() -> None:
-    harness = make_harness(readings=[None], advisor=ScriptedAdvisor([decision()]))
+    harness = make_harness(readings=[None], advisor=FakeAdvisor([decision()]))
     harness.controller.request_advisory()
     await harness.controller.tick()  # idle, no profile, no telemetry: no crash
     assert harness.executor.targets == []
@@ -438,7 +437,7 @@ async def test_advisory_skipped_without_profile_or_telemetry() -> None:
 async def test_stale_advisory_request_does_not_survive_a_fault() -> None:
     """Review finding 1: an advisory requested before a fail-closed tick
     must not fire on a later tick (it would run in FAULTED phase)."""
-    advisor = ScriptedAdvisor([decision()])
+    advisor = FakeAdvisor([decision()])
     harness = harness_in_development(
         readings=[reading(bean=231.0), reading()],  # hot tick, then normal
         advisor=advisor,
@@ -456,7 +455,7 @@ async def test_advisory_gated_by_command_phase_matrix() -> None:
     """Review finding 2: the advisory path consults the E3-S5 matrix —
     SET_HEAT is invalid in cooling, so advice is rejected before the
     advisor is even called."""
-    advisor = ScriptedAdvisor([decision()])
+    advisor = FakeAdvisor([decision()])
     harness = harness_in_development(readings=[reading()], advisor=advisor)
     harness.controller.transition_to(RoastPhase.COOLING)
     harness.log.clear()
@@ -811,7 +810,7 @@ async def test_operator_first_crack_override_stamped_and_gated() -> None:
 
 @pytest.mark.asyncio
 async def test_advisor_drop_now_executes() -> None:
-    advisor = ScriptedAdvisor([decision(drop=True)])
+    advisor = FakeAdvisor([decision(drop=True)])
     harness = harness_in_development(readings=[reading()], advisor=advisor)
     harness.controller.request_advisory()
     await harness.controller.tick()
@@ -833,7 +832,7 @@ async def test_full_mock_roast_with_fake_mcp() -> None:
     mcp = FakeMCPClient([warm, charge, t0, t0, t0, fc, dev], log)
     events = EventSink(log)
     sink = RecordingSnapshotSink(log)
-    advisor = ScriptedAdvisor([decision(heat=40, fan=60, drop=True)], log)
+    advisor = FakeAdvisor([decision(heat=40, fan=60, drop=True)], log=log)
     clock = FakeClock()
     controller = RoastController(
         config=ControllerConfig(),
@@ -977,7 +976,7 @@ async def test_failed_operator_writes_surface_and_hold_phase() -> None:
 
 @pytest.mark.asyncio
 async def test_failed_advisor_drop_write_holds_phase() -> None:
-    advisor = ScriptedAdvisor([decision(drop=True)])
+    advisor = FakeAdvisor([decision(drop=True)])
     harness = make_harness(
         readings=[reading()],
         advisor=advisor,

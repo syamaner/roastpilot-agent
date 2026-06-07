@@ -17,7 +17,12 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Literal, Protocol
 
-from roastpilot_agent.advisor import AdvisorContext, RoastAdvisor
+from roastpilot_agent.advisor import (
+    AdvisorContext,
+    AdvisorMalformedOutputError,
+    AdvisorUnsafeOutputError,
+    RoastAdvisor,
+)
 from roastpilot_agent.config import ControllerConfig
 from roastpilot_agent.models import (
     RoastCommand,
@@ -556,6 +561,12 @@ class RoastController:
         except TimeoutError:
             await self._record_advisor_failure("timeout")
             return
+        except AdvisorMalformedOutputError:
+            await self._record_advisor_failure("malformed")
+            return
+        except AdvisorUnsafeOutputError:
+            await self._record_advisor_failure("unsafe")
+            return
         except Exception:
             await self._record_advisor_failure("provider_error")
             return
@@ -606,7 +617,9 @@ class RoastController:
                 )
                 self.transition_to(RoastPhase.COOLING)
 
-    async def _record_advisor_failure(self, status: Literal["timeout", "provider_error"]) -> None:
+    async def _record_advisor_failure(
+        self, status: Literal["timeout", "malformed", "unsafe", "provider_error"]
+    ) -> None:
         evaluation = self._safety.evaluate_advisor_failure(
             status=status,
             current_heat=self._current_heat,

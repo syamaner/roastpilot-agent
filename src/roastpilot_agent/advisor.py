@@ -3,15 +3,56 @@ Advisory Layer).
 
 The advisor never receives MCP write tools. It receives structured context
 and returns typed data only; safety policy validates, clamps, or rejects
-every recommendation before any hardware write. Implementations land in E8.
+every recommendation before any hardware write.
+
+Failure vocabulary (plan §4 failure handling): an advisor call ends in one
+of five outcomes — valid, malformed, unsafe, timeout, or provider error.
+At this boundary *malformed* means the provider output could not be parsed
+into the ``RoastDecision`` shape, and *unsafe* means it parsed but violated
+the field constraints (e.g. heat 150 %). Advice that is well-typed but
+rejected by safety policy (rate-limited, drop in the wrong phase) is not an
+advisor failure — that is the normal policy path. Every failure becomes a
+rejected recommendation with the deterministic hold-current-targets
+fallback (``SafetyPolicy.evaluate_advisor_failure``).
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from roastpilot_agent.models import RoastPhase
+
+
+class AdvisorError(Exception):
+    """Base class for advisor-layer failures (component plan §4)."""
+
+
+class AdvisorMalformedOutputError(AdvisorError):
+    """Provider output could not be parsed into the ``RoastDecision`` shape."""
+
+
+class AdvisorUnsafeOutputError(AdvisorError):
+    """Provider output parsed but violated ``RoastDecision`` constraints."""
+
+
+class AdvisorProviderError(AdvisorError):
+    """Transport or API failure reaching the advisory provider."""
+
+
+class AdvisorFailureMode(Enum):
+    """Scriptable advisor failure modes — one per failure status.
+
+    Plain ``Enum``, never ``StrEnum`` (D15): values are wire forms, and a
+    string comparison against one is a pyright strict error in core logic.
+    """
+
+    MALFORMED = "malformed"
+    UNSAFE = "unsafe"
+    TIMEOUT = "timeout"
+    PROVIDER_ERROR = "provider_error"
 
 
 class AdvisorContext(BaseModel):
@@ -54,12 +95,61 @@ class RoastAdvisor(ABC):
         raise NotImplementedError
 
 
+FakeAdvisorStep = RoastDecision | AdvisorFailureMode
+"""One scripted FakeAdvisor outcome: a decision to return, or a failure to raise."""
+
+
 class FakeAdvisor(RoastAdvisor):
-    """Deterministic advisor for tests and demos (E8)."""
+    """Deterministic, scriptable advisor for tests and demos (E8-S1).
+
+    Script steps are consumed in order. A ``RoastDecision`` step is returned
+    as-is; an ``AdvisorFailureMode`` step raises the matching typed error so
+    the controller exercises the rejected-recommendation fallback.
+    ``AdvisorFailureMode.TIMEOUT`` raises ``TimeoutError`` directly — the
+    deterministic equivalent of the controller's ``asyncio.wait_for``
+    expiring, without consuming the configured timeout; the real
+    elapsed-time path is covered separately by a never-resolving advisor.
+
+    When the script is exhausted, ``default_decision`` is returned if
+    configured (demo-friendly: constant deterministic advice), otherwise
+    ``AdvisorProviderError`` is raised so a test with an underscripted
+    advisor fails loudly. Received contexts are recorded on ``contexts``;
+    an optional shared ``log`` list records call order across
+    collaborators (the conftest fake convention).
+    """
+
+    def __init__(
+        self,
+        script: Sequence[FakeAdvisorStep] | None = None,
+        *,
+        default_decision: RoastDecision | None = None,
+        log: list[str] | None = None,
+    ) -> None:
+        self._script: list[FakeAdvisorStep] = list(script or [])
+        self._default_decision = default_decision
+        self._log = log if log is not None else []
+        self.contexts: list[AdvisorContext] = []
 
     async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
-        """Return a deterministic scripted recommendation (E8)."""
-        raise NotImplementedError("E8: deterministic fake advisor")
+        """Return the next scripted decision or raise the next scripted failure."""
+        self._log.append("advisor")
+        self.contexts.append(context)
+        if not self._script:
+            if self._default_decision is not None:
+                return self._default_decision
+            raise AdvisorProviderError(
+                "FakeAdvisor script exhausted and no default_decision configured"
+            )
+        step = self._script.pop(0)
+        if isinstance(step, AdvisorFailureMode):
+            if step is AdvisorFailureMode.MALFORMED:
+                raise AdvisorMalformedOutputError("scripted malformed-output failure")
+            if step is AdvisorFailureMode.UNSAFE:
+                raise AdvisorUnsafeOutputError("scripted unsafe-output failure")
+            if step is AdvisorFailureMode.TIMEOUT:
+                raise TimeoutError("scripted advisory timeout")
+            raise AdvisorProviderError("scripted provider failure")
+        return step
 
 
 class PydanticAIAdvisor(RoastAdvisor):
@@ -67,9 +157,9 @@ class PydanticAIAdvisor(RoastAdvisor):
 
     Strict Pydantic output models, versioned prompts, context hashes (not
     raw payloads) in logs; timeout/malformed/unsafe output is treated as a
-    rejected recommendation. Implementation lands in E8.
+    rejected recommendation. Implementation lands in E8-S2.
     """
 
     async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
-        """Call the configured OpenRouter model via PydanticAI (E8)."""
-        raise NotImplementedError("E8: PydanticAI advisor")
+        """Call the configured OpenRouter model via PydanticAI (E8-S2)."""
+        raise NotImplementedError("E8-S2: PydanticAI advisor")
