@@ -78,7 +78,9 @@ def test_shared_enums_are_not_str() -> None:
 def test_safety_evaluation_allows_no_adjusted_command() -> None:
     """REJECT/RECOVERY/FAULT/E-STOP carry no adjusted heat/fan (plan §5:
     nullable columns) — no fabricated 0/0 in the decision trace."""
-    evaluation = SafetyEvaluation(verdict=SafetyVerdict.REJECT, reason="unsafe drop request")
+    evaluation = SafetyEvaluation(
+        rule="drop_eligibility", verdict=SafetyVerdict.REJECT, reason="unsafe drop request"
+    )
     assert evaluation.adjusted_heat is None
     assert evaluation.adjusted_fan is None
 

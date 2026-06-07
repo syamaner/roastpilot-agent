@@ -16,15 +16,19 @@ validated, clamped, or rejected here; the LLM never bypasses it.
 
 ## Stories
 
-### E3-S1 — Temperature and overrun rules
+### E3-S1 — Temperature and overrun rules ([#6](https://github.com/syamaner/roastpilot-agent/issues/6))
 
 Acceptance criteria:
 
-- [ ] Max bean temp and max env temp rules with tests.
-- [ ] Pre-T0 overrun rule: applies only in `preheating` with no confirmed
+- [x] Max bean temp and max env temp rules with tests — breach ⇒
+  EMERGENCY_STOP (hard ceilings; bean checked first), strict bounds
+  (exactly-at-limit does not trip).
+- [x] Pre-T0 overrun rule: applies only in `preheating` with no confirmed
   T0; bean temp > configured bound (default 200 °C) ⇒ heat clamped to 0 %,
   safe fan preserved/set, controller moved to `operator_recovery_required`
   or `faulted` per configured severity. Both severities tested.
+- [x] `SafetyEvaluation` gains the `rule` field (plan §5
+  `safety_evaluations.rule`); every outcome carries rule + reason.
 
 ### E3-S2 — Telemetry validity rules
 
@@ -72,10 +76,10 @@ Acceptance criteria:
 
 | Story | Title | Status |
 |-------|-------|--------|
-| E3-S1 | Temperature and overrun rules | not started |
+| E3-S1 | Temperature and overrun rules | done |
 | E3-S2 | Telemetry validity rules | not started |
 | E3-S3 | Command validation rules | not started |
 | E3-S4 | Emergency stop and verdict plumbing | not started |
 | E3-S5 | Phase and source validity rules (D16) | not started |
 
-Epic status: **not started** — follows E2.
+Epic status: **in progress** (E3-S1 done).
