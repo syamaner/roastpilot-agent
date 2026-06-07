@@ -148,7 +148,13 @@ class FakeAdvisor(RoastAdvisor):
                 raise AdvisorUnsafeOutputError("scripted unsafe-output failure")
             if step is AdvisorFailureMode.TIMEOUT:
                 raise TimeoutError("scripted advisory timeout")
-            raise AdvisorProviderError("scripted provider failure")
+            if step is AdvisorFailureMode.PROVIDER_ERROR:
+                raise AdvisorProviderError("scripted provider failure")
+            # Exhaustive by intent: a mode added in a later story must be
+            # handled here, not silently funnelled into provider error.
+            raise AssertionError(  # pragma: no cover — exhaustiveness guard
+                f"unhandled AdvisorFailureMode: {step}"
+            )
         return step
 
 
