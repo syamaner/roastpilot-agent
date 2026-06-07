@@ -296,6 +296,10 @@ class AdvisoryCallPolicy:
         # establishes the baseline.
         if phase is not self._last_phase:
             return AdvisoryTrigger.PHASE_CHANGE
+        # Logically redundant — note_call sets ``_last_phase`` and
+        # ``_last_call_monotonic`` together, so a matched phase implies a
+        # recorded call — but it narrows the Optional for the interval check
+        # below and documents the invariant.
         if self._last_call_monotonic is None:
             return AdvisoryTrigger.PHASE_CHANGE
         if (
@@ -449,11 +453,14 @@ class RoastController:
 
     async def _maybe_run_advisory(self, telemetry: RoastTelemetry | None) -> None:
         """Consult the call-frequency policy and run the advisory step when it
-        fires. No advisor wired ⇒ nothing to consult; the manual flag is
-        cleared either way so it never survives into a later tick."""
+        fires. No advisor wired or no active run ⇒ nothing to consult; the
+        manual flag is cleared either way so it never survives into a later
+        tick. Gating on the profile here keeps a stray pre-run manual request
+        from advancing the policy's interval baseline before the advisor is
+        even reachable."""
         manual_request = self._advisory_requested
         self._advisory_requested = False
-        if self._advisor is None:
+        if self._advisor is None or self._profile is None:
             return
         trigger = self._advisory_policy.evaluate(
             phase=self._phase,
@@ -805,6 +812,9 @@ class RoastController:
         self._current_heat = 0
         self._current_fan = 0
         self._last_command_monotonic = None  # new run: rate-limit baseline resets
+        # New run: advisory baselines reset too, so the first consult in the
+        # new roast fires on its own merits, not on a previous run's timer.
+        self._advisory_policy = AdvisoryCallPolicy(self._config)
         try:
             await self._executor.start_session()
         except Exception:

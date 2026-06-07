@@ -427,10 +427,14 @@ async def test_second_command_inside_rate_limit_rejected() -> None:
 
 @pytest.mark.asyncio
 async def test_advisory_skipped_without_profile_or_telemetry() -> None:
-    harness = make_harness(readings=[None], advisor=FakeAdvisor([decision()]))
+    advisor = FakeAdvisor([decision()])
+    harness = make_harness(readings=[None], advisor=advisor)
     harness.controller.request_advisory()
     await harness.controller.tick()  # idle, no profile, no telemetry: no crash
     assert harness.executor.targets == []
+    # No active run (no profile): the advisor is never reached, so a stray
+    # pre-run manual request cannot burn the policy's interval baseline.
+    assert advisor.contexts == []
 
 
 # --- E4-S2: claude-review regression fixes ---
@@ -619,7 +623,14 @@ def test_policy_manual_takes_precedence_over_automatic_trigger() -> None:
 
 @pytest.mark.parametrize(
     "phase",
-    [RoastPhase.IDLE, RoastPhase.COOLING, RoastPhase.COMPLETE, RoastPhase.FAULTED],
+    [
+        RoastPhase.IDLE,
+        RoastPhase.STARTING,
+        RoastPhase.COOLING,
+        RoastPhase.COMPLETE,
+        RoastPhase.FAULTED,
+        RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+    ],
 )
 def test_policy_no_automatic_call_outside_advice_phases(phase: RoastPhase) -> None:
     policy = _policy()
