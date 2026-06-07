@@ -167,6 +167,24 @@ async def test_start_roast_conflicts_when_a_run_is_active(client: AsyncClient) -
 
 
 @pytest.mark.asyncio
+async def test_start_roast_conflicts_after_service_restart(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """The 409 guard reads persisted state, so it survives a restart: a fresh
+    RoastService (empty in-memory pointer) over the same store still 409s."""
+    first = await client.post("/api/roasts", json=_profile().model_dump())
+    assert first.status_code == 201
+
+    restarted = RoastService(store)  # no in-memory active_run_id
+    assert restarted.active_run_id is None
+    app = create_app(restarted)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as fresh:
+        response = await fresh.post("/api/roasts", json=_profile(name="After").model_dump())
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
 async def test_start_roast_allowed_after_prior_run_completes(
     client: AsyncClient, store: RoastStore
 ) -> None:
@@ -453,7 +471,7 @@ async def _complete_with_manifest(
 
 
 @pytest.mark.asyncio
-async def test_log_manifest_returned_and_artifact_downloads(
+async def test_log_manifest_returned(
     client: AsyncClient, store: RoastStore, tmp_path: Path
 ) -> None:
     log_dir = tmp_path / "logs-run-l"
@@ -465,9 +483,22 @@ async def test_log_manifest_returned_and_artifact_downloads(
     assert manifest.json()["ready"] is True
     assert manifest.json()["jsonl_path"].endswith("roast.jsonl")
 
-    download = await client.get("/api/roasts/run-l/log/jsonl")
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("artifact", "filename"),
+    [("jsonl", "roast.jsonl"), ("csv", "roast.csv"), ("summary", "summary.json")],
+)
+async def test_log_artifact_downloads(
+    client: AsyncClient, store: RoastStore, tmp_path: Path, artifact: str, filename: str
+) -> None:
+    log_dir = tmp_path / f"logs-run-dl-{artifact}"
+    log_dir.mkdir()
+    await _complete_with_manifest(store, f"run-dl-{artifact}", log_dir)
+
+    download = await client.get(f"/api/roasts/run-dl-{artifact}/log/{artifact}")
     assert download.status_code == 200
-    assert download.text == "contents of roast.jsonl"
+    assert download.text == f"contents of {filename}"
 
 
 @pytest.mark.asyncio

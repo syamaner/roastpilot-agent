@@ -14,6 +14,7 @@ manifest + downloads, and operator rating. The operator action queue (S2)
 and the SSE stream (S3) extend :class:`RoastService` in place.
 """
 
+import asyncio
 import uuid
 from pathlib import Path
 from typing import Annotated
@@ -38,9 +39,9 @@ from roastpilot_agent.models import (
 )
 from roastpilot_agent.store import RoastStore
 
-#: The downloadable export artifacts (plan §6 log manifest), mapped to the
-#: manifest's path fields in :meth:`RoastService.log_artifact_path`.
-LogArtifactName = str  # narrowed to a Literal at the route boundary
+#: A downloadable export artifact name (plan §6 log manifest), validated
+#: against the known artifact set in :meth:`RoastService.log_artifact_path`.
+LogArtifactName = str
 
 
 class RoastRunConflictError(Exception):
@@ -73,6 +74,12 @@ class RoastService:
         self._config = config or AppConfig()
         self._mcp = mcp
         self.active_run_id: str | None = None
+        # Serializes the active_run check + create_run insert: without a UNIQUE
+        # "at most one open run" schema constraint, two concurrent POST /roasts
+        # could both read no-active-run and both insert. One operator + a 1 s
+        # tick makes this rare, but the at-most-one-active invariant is held
+        # here, not left to chance.
+        self._start_lock = asyncio.Lock()
 
     def mcp_child_status(self) -> MCPChildStatus:
         """Liveness of the coffee-roaster-mcp child for the health route.
@@ -86,13 +93,18 @@ class RoastService:
         return MCPChildStatus.RUNNING if self._mcp.running else MCPChildStatus.STOPPED
 
     async def health(self) -> HealthResponse:
-        """Liveness + MCP child status + active run id (plan §6)."""
+        """Liveness + MCP child status + active run id (plan §6).
+
+        Reports the active run from persisted state without mutating the
+        in-memory ``active_run_id`` pointer — a GET must not have a write
+        side-effect, and once E9 wires the controller loop that pointer is the
+        loop's to own, not a health poll's.
+        """
         active = await self._store.active_run()
-        self.active_run_id = None if active is None else active.run_id
         return HealthResponse(
             version=__version__,
             mcp_child=self.mcp_child_status(),
-            active_run_id=self.active_run_id,
+            active_run_id=None if active is None else active.run_id,
         )
 
     async def start_roast(self, profile: RoastProfile) -> RoastDetail:
@@ -105,22 +117,24 @@ class RoastService:
         that advances it. The active-run check reads persisted state, so the
         guard holds across an agent restart.
         """
-        active = await self._store.active_run()
-        if active is not None:
-            raise RoastRunConflictError(
-                f"a roast is already active (run {active.run_id}, phase "
-                f"{active.agent_phase.value}); end it before starting another"
+        async with self._start_lock:
+            active = await self._store.active_run()
+            if active is not None:
+                raise RoastRunConflictError(
+                    f"a roast is already active (run {active.run_id}, phase "
+                    f"{active.agent_phase.value}); end it before starting another"
+                )
+            run_id = uuid.uuid4().hex
+            await self._store.create_run(
+                run_id=run_id,
+                profile=profile,
+                config=self._config,
+                agent_phase=RoastPhase.STARTING,
             )
-        run_id = uuid.uuid4().hex
-        await self._store.create_run(
-            run_id=run_id,
-            profile=profile,
-            config=self._config,
-            agent_phase=RoastPhase.STARTING,
-        )
-        self.active_run_id = run_id
+            self.active_run_id = run_id
         detail = await self._store.read_run(run_id)
-        assert detail is not None  # just created
+        if detail is None:  # pragma: no cover — read immediately after create
+            raise RuntimeError(f"read_run returned None for just-created run {run_id}")
         return detail
 
     async def history(self) -> RoastHistory:
@@ -205,7 +219,8 @@ class RoastService:
             )
         await self._store.set_operator_rating(run_id, rating=rating.stars, notes=rating.notes)
         rated = await self._store.read_run(run_id)
-        assert rated is not None  # immutable once completed
+        if rated is None:  # pragma: no cover — immutable once completed
+            raise RuntimeError(f"read_run returned None for rated run {run_id}")
         return rated
 
 
