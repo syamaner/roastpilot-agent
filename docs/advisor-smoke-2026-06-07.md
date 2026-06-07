@@ -179,6 +179,15 @@ This is a credible first real-advice data point.
   | Gemma 4 e4b | on (default) | ~13.8 s | ✗ | hold 60/60, no drop — sane |
   | Qwen 3.6 35B-A3B | **off** | **~2.2 s** | ✓ | hold 60/60, no drop — sane |
 
+  Provenance: all rows used the **same harness and the same grounded
+  `AdvisorContext`** (this document's source row), against the local LM
+  Studio. The two reasoning-on rows are single characterisation runs (Qwen
+  via the headroom run above; Gemma 4 e4b — also LM Studio, swapped only by
+  `MODEL_SLUG` — a single run that likewise overran the budget). The
+  reasoning-off Qwen row is the 3-iteration run above (~2.2 s mean). Treat
+  the single-run latencies as indicative; re-measure with N≥3 when E8-S4
+  formally compares candidates.
+
   (Both LM Studio models reason by default; turning it off is what makes them
   viable. A cloud non-reasoning model is the apples-to-apples comparison
   point — record each candidate's latency at the production budget.)
