@@ -20,7 +20,10 @@ Contract fixtures recorded from the real server keep the mirrors honest.
 Acceptance criteria:
 
 - [ ] Pydantic mirrors of `RoastSessionState`, `T0Status`,
-  `FirstCrackStatus`, `ExportRoastLogResult` (all temps Celsius; derived
+  `FirstCrackStatus`, `ExportRoastLogResult` — plus the remaining result
+  shapes the 13-tool surface implies, named explicitly so S3 stays honest:
+  `StartRoastSessionResult`, `ControlCommandResult`, `EventCommandResult`,
+  `ServerInfo`, `RuntimeConfigSnapshot` (all temps Celsius; derived
   metrics passed through, not recomputed).
 - [ ] Typed methods for exactly the 13 tools — no arbitrary tool execution
   surface.
@@ -30,6 +33,9 @@ Acceptance criteria:
 Acceptance criteria:
 
 - [ ] Spawn coffee-roaster-mcp as stdio child; health check; clean shutdown.
+- [ ] The spawn command includes the `serve` positional argument
+  (`coffee-roaster-mcp serve`), matching the server.json packageArguments
+  fix on the MCP branch; a test asserts the argv.
 - [ ] Crash/restart of the child surfaces as a typed failure the controller
   maps to recovery — never silent reconnect-and-continue.
 - [ ] Every MCP call is timeout-bounded — a hung read or write (including
@@ -40,11 +46,16 @@ Acceptance criteria:
 
 Acceptance criteria:
 
-- [ ] Real `RoastSessionState` JSON captured from the actual MCP server
-  (mock driver) committed under `tests/fixtures/`. Bonus material now
-  exists: coffee-roaster-mcp's 7 Jun live-roast exports (real hardware,
-  branch `e7-s6-live-roast-validation`) — field names and event kinds
-  already verified to match plan §2 with no contract drift.
+- [ ] Fixtures cover one example per tool result shape (not just
+  `get_roast_state`), captured from the actual MCP server (mock driver),
+  committed under `tests/fixtures/`.
+- [ ] The two real live-roast exports
+  (`coffee-roaster-mcp/docs/validation/2026-06-07-live-roast/{session,session-2}/`)
+  are included as validation fixtures. Note: session 1 has a **manual**
+  `beans_added` event with an empty payload while session 2 carries the
+  `auto_t0` payload (source, charge/drop metadata) — the mirrors must
+  accept both shapes (plan repo f0e9502 extends the Loop A source-marker
+  change to cover this).
 - [ ] Mirror models validate all fixtures; mcp-contract-checker sub-agent
   documented as the re-validation path on dependency bumps.
 - [ ] Read/write failure paths tested.
