@@ -15,14 +15,20 @@ behavior — all driven against a fake MCP client.
 
 ## Stories
 
-### E4-S1 — Transition table
+### E4-S1 — Transition table ([#27](https://github.com/syamaner/roastpilot-agent/issues/27))
 
 Acceptance criteria:
 
-- [ ] Explicit transition table for the 9 phases per plan §3; advisor cannot
-  trigger transitions.
-- [ ] Tests: valid normal path, invalid transition rejection, `* → faulted`,
-  `* → operator_recovery_required`.
+- [x] Explicit transition table for the 9 phases per plan §3 (completeness
+  pinned by a test); `complete → idle` reset edge added as a documented
+  refinement (a long-running service needs it; plan §3 leaves `complete`
+  exit-less); recovery exits cover operator resume/cool/end only —
+  `starting` is never a recovery target. Advisor cannot trigger
+  transitions: no transition API accepts advisor types (pinned by an
+  introspection test).
+- [x] Tests: valid normal path, invalid transition rejection (phase
+  unchanged after rejection), self-transitions rejected, `* → faulted`
+  and `* → operator_recovery_required` from every phase.
 
 ### E4-S2 — Tick loop and scheduler
 
@@ -50,7 +56,11 @@ Acceptance criteria:
 
 - [ ] `FakeMCPClient` scripted full-roast scenarios in conftest.
 - [ ] Restart with possibly-active run lands in `operator_recovery_required`;
-  heat/fan never auto-resumed; e-stop available.
+  heat/fan never auto-resumed; e-stop available. Specifically: the E4-S1
+  resume edges (recovery → active phases) must pair with an explicit
+  operator gate, and heat stays 0 after a resume until separately
+  commanded — the E3-S5 phase matrix alone permits SET_HEAT in resumed
+  phases (safety-reviewer carry-forward, E4-S1 PR).
 - [ ] Operator-timeout policy (D16) applies only in true operator-required
   states — manual confirmation, manual hold, recovery — and never in normal
   phases. UI disconnect during normal phases changes nothing: backend
@@ -78,9 +88,9 @@ Acceptance criteria:
 
 | Story | Title | Status |
 |-------|-------|--------|
-| E4-S1 | Transition table | not started |
+| E4-S1 | Transition table | done |
 | E4-S2 | Tick loop and scheduler | not started |
 | E4-S3 | T0 debounce and add-beans guidance | not started |
 | E4-S4 | Fake-MCP harness and restart recovery | not started |
 
-Epic status: **not started** — depends on E2, E3.
+Epic status: **in progress** (E4-S1 done).
