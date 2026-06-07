@@ -14,6 +14,15 @@ probability trace, full-workflow screen capture.
 - Timeline anchors (talk 17–18 Sept 2026, demo asset list):
   `roastpilot-plan/00-repository-structure.md`
 
+## D17 note — hardware pulled forward
+
+The **first supervised hardware session is targeted for June** (D17 pulls
+hardware risk forward; it is also criterion 3 of the July
+harness-complete definition). That session should resolve the
+`drop_beans` cooling-behavior open item (component plan §11 item 2) —
+record the resolution in plan §11 when it happens. Demo assets must be
+recorded by **end of August** (D17), leaving September for slides.
+
 ## Stories
 
 ### E12-S1 — Supervised hardware validation
