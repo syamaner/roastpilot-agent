@@ -1,14 +1,15 @@
-"""E3-S1: temperature and pre-T0 overrun rules (component plan §8;
-orchestration plan § Safety Policy, § Milestone 1 Module Blueprint).
+"""E3-S1/E3-S2: temperature, overrun, and telemetry-validity rules
+(component plan §8; orchestration plan § Safety Policy, § Milestone 1
+Module Blueprint).
 
-Telemetry validity (E3-S2), command validation (E3-S3), e-stop plumbing
-(E3-S4), and phase/source validity (E3-S5, D16) extend this suite.
+Command validation (E3-S3), e-stop plumbing (E3-S4), and phase/source
+validity (E3-S5, D16) extend this suite.
 """
 
 import pytest
 
 from roastpilot_agent.config import SafetyLimits
-from roastpilot_agent.models import RoastPhase
+from roastpilot_agent.models import ACTIVE_ROAST_PHASES, RoastPhase
 from roastpilot_agent.safety import SafetyPolicy, SafetyVerdict
 
 
@@ -139,5 +140,144 @@ def test_evaluations_are_persisted_ready(policy: SafetyPolicy) -> None:
         evaluation = policy.evaluate_telemetry(
             phase=phase, bean_temp_c=bean, env_temp_c=env, t0_confirmed=t0
         )
+        assert evaluation.rule
+        assert evaluation.reason
+
+
+# --- E3-S2: telemetry validity rules ---
+
+
+INACTIVE_PHASES = [
+    RoastPhase.IDLE,
+    RoastPhase.STARTING,
+    RoastPhase.COMPLETE,
+    RoastPhase.FAULTED,
+    RoastPhase.OPERATOR_RECOVERY_REQUIRED,
+]
+
+ACTIVE_PHASES = [
+    RoastPhase.PREHEATING,
+    RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    RoastPhase.DEVELOPMENT,
+    RoastPhase.COOLING,
+]
+
+
+def test_active_roast_phases_vocabulary() -> None:
+    assert frozenset(ACTIVE_PHASES) == ACTIVE_ROAST_PHASES
+
+
+@pytest.mark.parametrize("phase", ACTIVE_PHASES)
+def test_missing_telemetry_faults_closed_in_active_phases(
+    policy: SafetyPolicy, phase: RoastPhase
+) -> None:
+    evaluation = policy.evaluate_telemetry_validity(
+        phase=phase, telemetry_age_seconds=None, max_stale_seconds=3.0
+    )
+    assert evaluation.verdict is SafetyVerdict.FAULT
+    assert evaluation.rule == "missing_telemetry"
+    assert evaluation.adjusted_heat == 0
+    assert evaluation.adjusted_fan == 100
+
+
+@pytest.mark.parametrize("phase", ACTIVE_PHASES)
+def test_stale_telemetry_faults_closed_in_active_phases(
+    policy: SafetyPolicy, phase: RoastPhase
+) -> None:
+    evaluation = policy.evaluate_telemetry_validity(
+        phase=phase, telemetry_age_seconds=3.1, max_stale_seconds=3.0
+    )
+    assert evaluation.verdict is SafetyVerdict.FAULT
+    assert evaluation.rule == "stale_telemetry"
+    assert evaluation.adjusted_heat == 0
+    assert evaluation.adjusted_fan == 100
+
+
+@pytest.mark.parametrize("phase", INACTIVE_PHASES)
+def test_telemetry_validity_not_enforced_outside_active_roast(
+    policy: SafetyPolicy, phase: RoastPhase
+) -> None:
+    """idle/starting/complete/faulted/recovery: no beans in play or no
+    session telemetry yet — missing/stale telemetry must not fault."""
+    for age in (None, 60.0):
+        evaluation = policy.evaluate_telemetry_validity(
+            phase=phase, telemetry_age_seconds=age, max_stale_seconds=3.0
+        )
+        assert evaluation.verdict is SafetyVerdict.ALLOW
+
+
+def test_telemetry_exactly_at_staleness_bound_is_fresh(policy: SafetyPolicy) -> None:
+    evaluation = policy.evaluate_telemetry_validity(
+        phase=RoastPhase.DEVELOPMENT, telemetry_age_seconds=3.0, max_stale_seconds=3.0
+    )
+    assert evaluation.verdict is SafetyVerdict.ALLOW
+    assert evaluation.rule == "all_clear"
+
+
+def test_fresh_telemetry_is_all_clear(policy: SafetyPolicy) -> None:
+    evaluation = policy.evaluate_telemetry_validity(
+        phase=RoastPhase.PREHEATING, telemetry_age_seconds=0.4, max_stale_seconds=3.0
+    )
+    assert evaluation.verdict is SafetyVerdict.ALLOW
+
+
+# --- E3-S2: MCP read/write failure rules ---
+
+
+def test_zero_mcp_failures_all_clear(policy: SafetyPolicy) -> None:
+    for evaluation in (
+        policy.evaluate_mcp_failure(operation="read", consecutive_failures=0),
+        policy.evaluate_mcp_failure(operation="write", consecutive_failures=0),
+    ):
+        assert evaluation.verdict is SafetyVerdict.ALLOW
+        assert evaluation.rule == "all_clear"
+
+
+def test_transient_mcp_read_failures_tolerated(policy: SafetyPolicy) -> None:
+    for failures in (1, 2):
+        evaluation = policy.evaluate_mcp_failure(operation="read", consecutive_failures=failures)
+        assert evaluation.verdict is SafetyVerdict.ALLOW
+        assert evaluation.rule == "mcp_read_failure_tolerated"
+
+
+def test_exhausted_mcp_read_failures_fault_closed(policy: SafetyPolicy) -> None:
+    evaluation = policy.evaluate_mcp_failure(operation="read", consecutive_failures=3)
+    assert evaluation.verdict is SafetyVerdict.FAULT
+    assert evaluation.rule == "mcp_read_failures_exhausted"
+    assert evaluation.adjusted_heat == 0
+    assert evaluation.adjusted_fan == 100
+
+
+def test_exhausted_mcp_write_failures_fault_closed(policy: SafetyPolicy) -> None:
+    evaluation = policy.evaluate_mcp_failure(operation="write", consecutive_failures=5)
+    assert evaluation.verdict is SafetyVerdict.FAULT
+    assert evaluation.rule == "mcp_write_failures_exhausted"
+    assert evaluation.adjusted_heat == 0
+    assert evaluation.adjusted_fan == 100
+
+
+def test_mcp_failure_threshold_is_configurable() -> None:
+    policy = SafetyPolicy(SafetyLimits(max_consecutive_mcp_failures=1))
+    evaluation = policy.evaluate_mcp_failure(operation="write", consecutive_failures=1)
+    assert evaluation.verdict is SafetyVerdict.FAULT
+
+
+def test_negative_failure_count_is_a_programming_error(policy: SafetyPolicy) -> None:
+    with pytest.raises(ValueError):
+        policy.evaluate_mcp_failure(operation="read", consecutive_failures=-1)
+
+
+def test_e3_s2_evaluations_are_persisted_ready(policy: SafetyPolicy) -> None:
+    evaluations = [
+        policy.evaluate_telemetry_validity(
+            phase=RoastPhase.DEVELOPMENT, telemetry_age_seconds=None, max_stale_seconds=3.0
+        ),
+        policy.evaluate_telemetry_validity(
+            phase=RoastPhase.COOLING, telemetry_age_seconds=10.0, max_stale_seconds=3.0
+        ),
+        policy.evaluate_mcp_failure(operation="read", consecutive_failures=4),
+        policy.evaluate_mcp_failure(operation="write", consecutive_failures=1),
+    ]
+    for evaluation in evaluations:
         assert evaluation.rule
         assert evaluation.reason

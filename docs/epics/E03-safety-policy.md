@@ -30,13 +30,17 @@ Acceptance criteria:
 - [x] `SafetyEvaluation` gains the `rule` field (plan §5
   `safety_evaluations.rule`); every outcome carries rule + reason.
 
-### E3-S2 — Telemetry validity rules
+### E3-S2 — Telemetry validity rules ([#7](https://github.com/syamaner/roastpilot-agent/issues/7))
 
 Acceptance criteria:
 
-- [ ] Stale telemetry (> `max_stale_telemetry_seconds`) and missing
-  telemetry during an active roast produce the configured verdicts.
-- [ ] MCP read/write failure handling verdicts tested.
+- [x] Stale telemetry (> `max_stale_telemetry_seconds`) and missing
+  telemetry during an active roast produce the configured verdicts — both
+  fail closed (heat 0 %, safe fan, FAULT) in `ACTIVE_ROAST_PHASES` only;
+  strict bound; never enforced in idle/starting/complete/faulted/recovery.
+- [x] MCP read/write failure handling verdicts tested — transient failures
+  tolerated (ALLOW, controller skips/retries), `max_consecutive_mcp_failures`
+  (default 3 ≈ 3 s blind window at the 1.0 s tick) fails closed with FAULT.
 
 ### E3-S3 — Command validation rules
 
@@ -77,9 +81,9 @@ Acceptance criteria:
 | Story | Title | Status |
 |-------|-------|--------|
 | E3-S1 | Temperature and overrun rules | done |
-| E3-S2 | Telemetry validity rules | not started |
+| E3-S2 | Telemetry validity rules | done |
 | E3-S3 | Command validation rules | not started |
 | E3-S4 | Emergency stop and verdict plumbing | not started |
 | E3-S5 | Phase and source validity rules (D16) | not started |
 
-Epic status: **in progress** (E3-S1 done).
+Epic status: **in progress** (E3-S1, E3-S2 done).

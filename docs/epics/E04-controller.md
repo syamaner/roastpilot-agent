@@ -56,6 +56,10 @@ Acceptance criteria:
   phases. UI disconnect during normal phases changes nothing: backend
   safety continues without the UI (API-side disconnect behavior is E7-S3;
   this story owns the controller-side policy).
+- [ ] Entry into `faulted`/`operator_recovery_required` guarantees
+  hardware-off (heat 0, safe fan) via the controller's own path — the
+  E3-S2 telemetry-validity rule is deliberately silent in those phases
+  (safety-reviewer carry-forward, E3-S2 PR).
 
 ## Status
 

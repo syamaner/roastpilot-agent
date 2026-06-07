@@ -8,11 +8,12 @@ telemetry validity (E3-S2), command validation (E3-S3), e-stop plumbing
 """
 
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from roastpilot_agent.config import SafetyLimits
-from roastpilot_agent.models import RoastPhase
+from roastpilot_agent.models import ACTIVE_ROAST_PHASES, RoastPhase
 
 
 class SafetyVerdict(Enum):
@@ -120,6 +121,105 @@ class SafetyPolicy:
             rule="all_clear",
             verdict=SafetyVerdict.ALLOW,
             reason="telemetry within configured limits",
+        )
+
+    def evaluate_telemetry_validity(
+        self,
+        *,
+        phase: RoastPhase,
+        telemetry_age_seconds: float | None,
+        max_stale_seconds: float,
+    ) -> SafetyEvaluation:
+        """Stale/missing telemetry rules (E3-S2).
+
+        Applies only during :data:`~roastpilot_agent.models.ACTIVE_ROAST_PHASES`
+        — a hot machine with beans in play must never run blind. Missing
+        telemetry (``None``) or telemetry older than ``max_stale_seconds``
+        (caller passes ``ControllerConfig.max_stale_telemetry_seconds``)
+        fails closed: heat 0 %, safe fan, FAULT (AGENTS.md: unsafe or
+        uncertain behavior fails closed). The bound is strict — exactly
+        ``max_stale_seconds`` old is still fresh.
+        """
+        if phase not in ACTIVE_ROAST_PHASES:
+            return SafetyEvaluation(
+                rule="all_clear",
+                verdict=SafetyVerdict.ALLOW,
+                reason=f"telemetry validity not enforced in phase {phase.value}",
+            )
+        limits = self._limits
+        if telemetry_age_seconds is None:
+            return SafetyEvaluation(
+                rule="missing_telemetry",
+                verdict=SafetyVerdict.FAULT,
+                adjusted_heat=0,
+                adjusted_fan=limits.overrun_safe_fan_percent,
+                reason=(
+                    f"no telemetry during active roast (phase {phase.value}): failing closed "
+                    f"— heat 0 %, fan {limits.overrun_safe_fan_percent} %"
+                ),
+            )
+        if telemetry_age_seconds > max_stale_seconds:
+            return SafetyEvaluation(
+                rule="stale_telemetry",
+                verdict=SafetyVerdict.FAULT,
+                adjusted_heat=0,
+                adjusted_fan=limits.overrun_safe_fan_percent,
+                reason=(
+                    f"telemetry is {telemetry_age_seconds:.1f} s old (limit "
+                    f"{max_stale_seconds:.1f} s) during active roast (phase {phase.value}): "
+                    f"failing closed — heat 0 %, fan {limits.overrun_safe_fan_percent} %"
+                ),
+            )
+        return SafetyEvaluation(
+            rule="all_clear",
+            verdict=SafetyVerdict.ALLOW,
+            reason="telemetry is fresh",
+        )
+
+    def evaluate_mcp_failure(
+        self,
+        *,
+        operation: Literal["read", "write"],
+        consecutive_failures: int,
+    ) -> SafetyEvaluation:
+        """MCP read/write failure rules (E3-S2).
+
+        Transient failures are tolerated (ALLOW — the controller skips the
+        tick or retries next tick); ``max_consecutive_mcp_failures`` (default
+        3 ≈ a 3 s blind window at the 1.0 s tick) or more consecutive
+        failures fail closed with heat 0 %, safe fan, FAULT — the roaster
+        can no longer be observed (read) or controlled (write).
+        """
+        if consecutive_failures < 0:
+            raise ValueError("consecutive_failures must be >= 0")
+        limits = self._limits
+        if consecutive_failures == 0:
+            return SafetyEvaluation(
+                rule="all_clear",
+                verdict=SafetyVerdict.ALLOW,
+                reason=f"no consecutive MCP {operation} failures",
+            )
+        if consecutive_failures < limits.max_consecutive_mcp_failures:
+            return SafetyEvaluation(
+                rule=f"mcp_{operation}_failure_tolerated",
+                verdict=SafetyVerdict.ALLOW,
+                reason=(
+                    f"{consecutive_failures} consecutive MCP {operation} failure(s), below "
+                    f"the fault threshold {limits.max_consecutive_mcp_failures}: tolerated, "
+                    f"controller skips/retries next tick"
+                ),
+            )
+        return SafetyEvaluation(
+            rule=f"mcp_{operation}_failures_exhausted",
+            verdict=SafetyVerdict.FAULT,
+            adjusted_heat=0,
+            adjusted_fan=limits.overrun_safe_fan_percent,
+            reason=(
+                f"{consecutive_failures} consecutive MCP {operation} failures (threshold "
+                f"{limits.max_consecutive_mcp_failures}): the roaster can no longer be "
+                f"{'observed' if operation == 'read' else 'controlled'} — failing closed, "
+                f"heat 0 %, fan {limits.overrun_safe_fan_percent} %"
+            ),
         )
 
     def evaluate_command(self, requested_heat: int, requested_fan: int) -> SafetyEvaluation:
