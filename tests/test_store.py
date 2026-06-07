@@ -6,6 +6,7 @@ this suite.
 
 from pathlib import Path
 
+import aiosqlite as aiosqlite_module
 import pytest
 
 from roastpilot_agent import store as store_module
@@ -141,3 +142,65 @@ async def test_connection_before_initialize_is_an_error(tmp_store: RoastStore) -
     with pytest.raises(RuntimeError):
         _ = tmp_store.connection
     await tmp_store.close()  # safe on never-initialized store
+
+
+@pytest.mark.asyncio
+async def test_failed_migration_rolls_back_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review finding (E6-S1 PR): a migration that fails partway leaves no
+    half-applied DDL and no stale version — the explicit per-migration
+    transaction rolls everything back, so a clean retry is always possible."""
+    store = RoastStore(db_path=tmp_path / "atomic.sqlite3")
+    await store.initialize()
+    await store.close()
+
+    bad_v2 = (
+        "CREATE TABLE migration_probe (id INTEGER PRIMARY KEY);\n"
+        "CREATE TABLE roast_runs (id TEXT PRIMARY KEY);"  # collides: fails
+    )
+    monkeypatch.setattr(store_module, "MIGRATIONS", (*MIGRATIONS, bad_v2))
+    broken = RoastStore(db_path=store.db_path)
+    with pytest.raises(aiosqlite_module.OperationalError):
+        await broken.initialize()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    recovered = RoastStore(db_path=store.db_path)
+    await recovered.initialize()
+    try:
+        assert await recovered.schema_version() == 1  # version never bumped
+        names = await fetch_names(recovered, "table")
+        assert "migration_probe" not in names  # partial DDL rolled back
+        assert names == EXPECTED_TABLES
+    finally:
+        await recovered.close()
+
+
+@pytest.mark.asyncio
+async def test_enum_check_constraints_reject_invalid_values(
+    tmp_store: RoastStore,
+) -> None:
+    """Review finding (E6-S1 PR): the documented text-enum columns are
+    CHECK-enforced, so an E6-S2 write-path bug cannot silently store an
+    invalid verdict/status/source."""
+    import aiosqlite
+
+    await tmp_store.initialize()
+    try:
+        await tmp_store.connection.execute(
+            "INSERT INTO roast_runs (id, agent_phase, profile_json, config_json,"
+            " started_at_utc, created_at_utc, updated_at_utc)"
+            " VALUES ('run-1', 'idle', '{}', '{}', 't', 't', 't')"
+        )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await tmp_store.connection.execute(
+                "INSERT INTO safety_evaluations"
+                " (run_id, tick, rule, verdict, reason, recorded_at_utc)"
+                " VALUES ('run-1', 1, 'r', 'ALLOW', 'wrong case', 't')"
+            )
+        with pytest.raises(aiosqlite.IntegrityError):
+            await tmp_store.connection.execute(
+                "UPDATE roast_runs SET cloud_sync_status = 'uploading' WHERE id = 'run-1'"
+            )
+    finally:
+        await tmp_store.close()

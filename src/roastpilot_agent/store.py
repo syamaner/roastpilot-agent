@@ -19,14 +19,14 @@ CREATE TABLE roast_runs (
   config_json TEXT NOT NULL,                -- frozen ControllerConfig + SafetyLimits
   started_at_utc TEXT NOT NULL,
   completed_at_utc TEXT,
-  outcome TEXT,                             -- completed | aborted | faulted
+  outcome TEXT CHECK (outcome IN ('completed', 'aborted', 'faulted')),
   fault_reason TEXT,
   log_dir TEXT,                             -- from ExportRoastLogResult
   export_manifest_json TEXT,                -- jsonl/csv/summary paths + ready
   operator_rating INTEGER CHECK (operator_rating BETWEEN 1 AND 5),
   operator_notes TEXT,
-  cloud_sync_status TEXT NOT NULL DEFAULT 'local_only',
-                                            -- local_only|pending_sync|synced|sync_failed
+  cloud_sync_status TEXT NOT NULL DEFAULT 'local_only'
+    CHECK (cloud_sync_status IN ('local_only', 'pending_sync', 'synced', 'sync_failed')),
   cloud_roast_id TEXT,
   public_slug TEXT,
   created_at_utc TEXT NOT NULL,
@@ -36,8 +36,14 @@ CREATE TABLE roast_runs (
 CREATE TABLE roast_events (                 -- agent-level event log (superset of MCP events)
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL REFERENCES roast_runs(id),
-  kind TEXT NOT NULL,                       -- models.RoastEventKind values
-  source TEXT NOT NULL,                     -- models.RoastEventSource values
+  kind TEXT NOT NULL CHECK (kind IN (
+    'run_started', 'phase_changed', 'charge_guidance', 't0_detected',
+    'first_crack', 'advisory', 'command_executed', 'command_failed',
+    'safety_alert', 'fault', 'recovery_required', 'recovery_acknowledged',
+    'logs_exported', 'run_completed')),     -- models.RoastEventKind.value
+  source TEXT NOT NULL CHECK (source IN (
+    'controller', 'mcp', 'operator', 'advisor', 'safety')),
+                                            -- models.RoastEventSource.value
   monotonic_seconds REAL,
   recorded_at_utc TEXT NOT NULL,
   payload_json TEXT
@@ -64,7 +70,9 @@ CREATE TABLE safety_evaluations (
   run_id TEXT NOT NULL REFERENCES roast_runs(id),
   tick INTEGER NOT NULL,
   rule TEXT NOT NULL,                       -- which rule fired / 'all_clear'
-  verdict TEXT NOT NULL,                    -- allow|clamp|reject|recovery|fault|emergency_stop
+  verdict TEXT NOT NULL CHECK (verdict IN (
+    'allow', 'clamp', 'reject', 'recovery', 'fault', 'emergency_stop')),
+                                            -- SafetyVerdict.value (lowercase wire form)
   input_heat INTEGER, input_fan INTEGER,
   adjusted_heat INTEGER, adjusted_fan INTEGER,
   reason TEXT NOT NULL,
@@ -79,7 +87,7 @@ CREATE TABLE advisor_decisions (
   context_hash TEXT NOT NULL,               -- hash, not raw payload (plan policy)
   latency_ms INTEGER,
   decision_json TEXT,                       -- RoastDecision or NULL on failure
-  status TEXT NOT NULL,                     -- ok|timeout|malformed|provider_error
+  status TEXT NOT NULL CHECK (status IN ('ok', 'timeout', 'malformed', 'provider_error')),
   safety_evaluation_id INTEGER REFERENCES safety_evaluations(id),
   recorded_at_utc TEXT NOT NULL
 );
@@ -90,9 +98,10 @@ CREATE TABLE command_log (
   tick INTEGER NOT NULL,
   tool TEXT NOT NULL,                       -- MCP tool name (models.RoastCommand values)
   args_json TEXT,
-  source TEXT NOT NULL,                     -- policy|advisor|operator|safety|recovery
+  source TEXT NOT NULL CHECK (source IN (
+    'policy', 'advisor', 'operator', 'safety', 'recovery')),
   safety_evaluation_id INTEGER REFERENCES safety_evaluations(id),
-  status TEXT NOT NULL,                     -- ok|failed
+  status TEXT NOT NULL CHECK (status IN ('ok', 'failed')),
   result_json TEXT,
   recorded_at_utc TEXT NOT NULL
 );
@@ -102,7 +111,7 @@ CREATE TABLE operator_actions (
   run_id TEXT REFERENCES roast_runs(id),
   action TEXT NOT NULL,
   payload_json TEXT,
-  result TEXT NOT NULL,                     -- accepted|rejected|failed
+  result TEXT NOT NULL CHECK (result IN ('accepted', 'rejected', 'failed')),
   recorded_at_utc TEXT NOT NULL
 );
 
@@ -110,7 +119,7 @@ CREATE TABLE sync_jobs (                    -- M2; table ships in v1 schema
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id TEXT NOT NULL REFERENCES roast_runs(id),
   idempotency_key TEXT NOT NULL UNIQUE,
-  status TEXT NOT NULL,                     -- pending|in_flight|done|failed
+  status TEXT NOT NULL CHECK (status IN ('pending', 'in_flight', 'done', 'failed')),
   attempts INTEGER NOT NULL DEFAULT 0,
   last_error TEXT,
   created_at_utc TEXT NOT NULL,
@@ -169,10 +178,17 @@ class RoastStore:
         if self._connection is not None:
             return
         connection = await aiosqlite.connect(self._db_path)
-        await connection.execute("PRAGMA journal_mode=WAL")
-        await connection.execute("PRAGMA synchronous=FULL")
-        await connection.execute("PRAGMA foreign_keys=ON")
-        await self._apply_migrations(connection)
+        try:
+            await connection.execute("PRAGMA journal_mode=WAL")
+            await connection.execute("PRAGMA synchronous=FULL")
+            await connection.execute("PRAGMA foreign_keys=ON")
+            await self._apply_migrations(connection)
+        except BaseException:
+            # Never leak the connection (and its worker thread) on a
+            # failed open/migration — found when the rollback test hung
+            # pytest exit on the leaked aiosqlite thread.
+            await connection.close()
+            raise
         self._connection = connection
 
     async def _apply_migrations(self, connection: aiosqlite.Connection) -> None:
@@ -181,9 +197,15 @@ class RoastStore:
         version = int(row[0]) if row is not None else 0
         for number, script in enumerate(MIGRATIONS, start=1):
             if version < number:
-                await connection.executescript(script)
-                await connection.execute(f"PRAGMA user_version={number}")
-        await connection.commit()
+                # One explicit transaction per migration: SQLite DDL and
+                # PRAGMA user_version are both transactional, so a crash
+                # or failure anywhere rolls back to the previous version
+                # cleanly — never half-applied DDL with a stale version
+                # (review finding, E6-S1 PR). Migration scripts must not
+                # contain their own BEGIN/COMMIT.
+                await connection.executescript(
+                    f"BEGIN;\n{script}\nPRAGMA user_version={number};\nCOMMIT;"
+                )
 
     async def schema_version(self) -> int:
         """The applied schema version (PRAGMA user_version)."""
