@@ -54,23 +54,24 @@ Acceptance criteria:
   raises `MCPToolTimeoutError` (E4-S2 carry-forward closed; provenance on
   #39).
 
-### E5-S3 — Contract fixtures
+### E5-S3 — Contract fixtures ([#40](https://github.com/syamaner/roastpilot-agent/issues/40))
 
 Acceptance criteria:
 
-- [ ] Fixtures cover one example per tool result shape (not just
-  `get_roast_state`), captured from the actual MCP server (mock driver),
-  committed under `tests/fixtures/`.
-- [ ] The two real live-roast exports
-  (`coffee-roaster-mcp/docs/validation/2026-06-07-live-roast/{session,session-2}/`)
-  are included as validation fixtures. Note: session 1 has a **manual**
-  `beans_added` event with an empty payload while session 2 carries the
-  `auto_t0` payload (source, charge/drop metadata) — the mirrors must
-  accept both shapes (plan repo f0e9502 extends the Loop A source-marker
-  change to cover this).
-- [ ] Mirror models validate all fixtures; mcp-contract-checker sub-agent
-  documented as the re-validation path on dependency bumps.
-- [ ] Read/write failure paths tested.
+- [x] One captured fixture per tool — all 13, from the real published
+  coffee-roaster-mcp 0.1.3 in bootstrap-safe mock mode, captured through
+  the agent's own E5-S2 transport (`scripts/capture_mcp_fixtures.py`;
+  re-run on dependency bumps). Committed under
+  `tests/fixtures/mcp-tool-results/`; completeness pinned by a test.
+- [x] Both 7 Jun live-roast exports included as validation fixtures
+  (landed in E5-S1): manual empty-payload `beans_added` and `auto_t0`
+  payload both accepted.
+- [x] Every fixture validates into its mirror (parametrized over all 13);
+  the fixture→mirror map documents the re-validation path together with
+  the mcp-contract-checker sub-agent.
+- [x] Read/write failure paths tested (E5-S2's typed-failure suite:
+  timeout, dead child, server-side isError on a write tool, malformed
+  payload, not-started).
 
 ## Status
 
@@ -78,6 +79,6 @@ Acceptance criteria:
 |-------|-------|--------|
 | E5-S1 | Pydantic mirrors and typed tool wrappers | done |
 | E5-S2 | Child-process lifecycle (D6) | done |
-| E5-S3 | Contract fixtures | not started |
+| E5-S3 | Contract fixtures | done |
 
-Epic status: **in progress** (E5-S1, E5-S2 done; E5-S3 remains).
+Epic status: **done** — all three stories complete; the agent can drive the real MCP server end to end (capture run doubled as the first real-spawn validation).

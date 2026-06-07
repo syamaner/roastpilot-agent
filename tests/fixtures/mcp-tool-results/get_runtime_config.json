@@ -1,0 +1,16 @@
+{
+  "allow_manual_override": true,
+  "auto_t0_detection_enabled": false,
+  "auto_t0_drop_threshold_c": 25.0,
+  "command_interval_seconds": 0.3,
+  "config_source": null,
+  "first_crack_mode": "disabled",
+  "log_dir": "logs",
+  "model_precision": "int8",
+  "model_repo_id": "syamaner/coffee-first-crack-detection",
+  "roaster_baudrate": 115200,
+  "roaster_driver": "mock",
+  "roaster_port": null,
+  "sample_interval_seconds": 5.0,
+  "temperature_unit": "celsius"
+}

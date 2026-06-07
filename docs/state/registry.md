@@ -2,7 +2,7 @@
 
 ## Active Epic
 
-- Epic file: `docs/epics/E05-mcp-client.md`
+- Epic file: `docs/epics/E06-store.md`
 - Project: RoastPilot (GitHub user project, owner `syamaner`)
 - Repository: `syamaner/roastpilot-agent`
 - Package: `roastpilot-agent`
@@ -27,16 +27,16 @@
 - Closing an epic = create the next epic's story issues from its spec
   file, update this registry, and flip the epic's project item to Done;
   an epic's project item goes In Progress when its first story does.
-- Epic order: E1 ✅ → E2 ✅ → E3 ✅ → E4 ✅ → **E5** (MCP client) / E6 / E7 / E8 →
+- Epic order: E1 ✅ → E2 ✅ → E3 ✅ → E4 ✅ → E5 ✅ → **E6** (store) / E8, then E7 →
   E9 (vertical slice) → E10 (SPA) → E11 (packaging) → E12 (validation/demo).
 
 ## Active Context
 
-E1–E4 are complete: safety policy and the full deterministic controller
-(transition table, tick pipeline, T0 debounce, run lifecycle, restart
-recovery) are merged — 278 tests. Next up is E5 (MCP client, issues
-#38–#40): typed mirrors, stdio child lifecycle with per-call timeouts,
-contract fixtures. E6 (store) and E8 (advisor) are also unblocked.
-Notable: plan §11 items 1–2 status — item 2 (drop_beans cooling) resolved
-7 Jun via coffee-roaster-mcp's live hardware roast; real-hardware export
-fixtures now exist for E5-S3.
+E1–E5 are complete: safety policy, the deterministic controller, and the
+typed MCP client (mirrors with zero contract drift, stdio child with
+bounded calls, 13 captured per-tool fixtures + the two real-hardware
+live-roast exports) — 324 tests. The fixture capture doubled as the
+first real-spawn validation of the transport. Next: E6 (store) and E8
+(advisor) in either order — both unblock E7 (API), which unblocks E9
+(the D17 vertical-slice criterion). Plan §11 status: item 2 resolved
+(drop_beans atomic cooling); item 1 (advisor model slug) lands at E8.

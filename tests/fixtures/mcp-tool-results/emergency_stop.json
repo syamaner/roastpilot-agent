@@ -1,0 +1,19 @@
+{
+  "event": {
+    "kind": "fault",
+    "monotonic_seconds": 0.03324083299958147,
+    "payload": {
+      "cooling_on": true,
+      "driver": "mock",
+      "driver_safety_method": "emergency_stop",
+      "driver_safety_method_called": true,
+      "fan_level_percent": 100,
+      "heat_level_percent": 0,
+      "reason": "fixture capture"
+    },
+    "recorded_at_utc": "2026-06-07T15:08:32.591900+00:00"
+  },
+  "event_count": 1,
+  "phase": "fault",
+  "session_id": "90d3b67d840249fc9e31c53d6dc74a11"
+}

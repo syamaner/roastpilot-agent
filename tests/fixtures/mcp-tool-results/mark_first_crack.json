@@ -1,0 +1,11 @@
+{
+  "event": {
+    "kind": "first_crack_detected",
+    "monotonic_seconds": 0.07533187500666827,
+    "payload": {},
+    "recorded_at_utc": "2026-06-07T15:08:32.536783+00:00"
+  },
+  "event_count": 2,
+  "phase": "development",
+  "session_id": "fc2f682b89344ab58437fbfc007f7f3b"
+}

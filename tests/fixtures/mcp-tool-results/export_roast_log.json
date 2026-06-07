@@ -1,0 +1,9 @@
+{
+  "csv_path": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpmsfxwelh/logs/roasts/fc2f682b89344ab58437fbfc007f7f3b/roast.csv",
+  "jsonl_path": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpmsfxwelh/logs/roasts/fc2f682b89344ab58437fbfc007f7f3b/roast.jsonl",
+  "log_dir": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpmsfxwelh/logs/roasts/fc2f682b89344ab58437fbfc007f7f3b",
+  "note": "Snapshot CSV and summary export written from the current in-process session. JSONL is append-only during the roast.",
+  "ready": true,
+  "session_id": "fc2f682b89344ab58437fbfc007f7f3b",
+  "summary_path": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpmsfxwelh/logs/roasts/fc2f682b89344ab58437fbfc007f7f3b/summary.json"
+}
