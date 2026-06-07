@@ -681,6 +681,27 @@ async def test_emergency_stop_accepted_in_every_phase(
     )
     assert response.json()["result"] == "accepted"
     assert service.operator_queue.qsize() == 1
+    queued = service.operator_queue.get_nowait()
+    assert queued.action is OperatorAction.EMERGENCY_STOP
+    assert queued.run_id == f"run-es-{phase.value}"
+
+
+@pytest.mark.asyncio
+async def test_mark_beans_added_accepted_only_in_preheating(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    # The manual-T0 fallback is preheating-only — not the recovery phase.
+    await _make_run(store, "run-mba-pre", RoastPhase.PREHEATING)
+    accepted = await client.post(
+        "/api/roasts/run-mba-pre/operator-actions", json={"action": "mark_beans_added"}
+    )
+    assert accepted.json()["result"] == "accepted"
+
+    await _make_run(store, "run-mba-rec", RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    rejected = await client.post(
+        "/api/roasts/run-mba-rec/operator-actions", json={"action": "mark_beans_added"}
+    )
+    assert rejected.json()["result"] == "rejected"
 
 
 @pytest.mark.asyncio

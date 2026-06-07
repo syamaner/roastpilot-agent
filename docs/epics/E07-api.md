@@ -82,3 +82,8 @@ Epic status: **in progress** — depends on E4 ✅, E6 ✅.
     handlers for the actions without one today: `mark_beans_added`,
     `start_cooling`, `pause_advisory`, `resume_advisory` (the queue accepts
     and records all 9; execution of these four is wired in E9).
+  - **For E9:** `operator_queue` is unbounded (`asyncio.Queue()`); with no
+    controller drain in E7 it cannot grow. When E9 wires the drain, bound it
+    (or dedup at drain) so a spammy operator cannot grow it without limit. A
+    terminal-run guard (409/410 on actions to a COMPLETE/FAULTED run) is also
+    a reasonable E9 addition — today the phase matrix rejects the harmful ones.

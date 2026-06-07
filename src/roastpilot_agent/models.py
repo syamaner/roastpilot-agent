@@ -357,7 +357,12 @@ class OperatorAction(Enum):
 
     Plain ``Enum`` (D15): the SPA sends these wire forms, but a string
     comparison against a member in core logic is a pyright strict error.
-    ``mark_beans_added`` and ``start_cooling`` are the recovery-only members;
+
+    "Recovery-only" in plan §6 means *manual fallback*, not a single phase, and
+    the two are not symmetric (see ``safety.COMMAND_PHASE_MATRIX``):
+    ``mark_beans_added`` is the manual-T0 fallback accepted only in
+    ``preheating`` (NOT in ``operator_recovery_required``), while
+    ``start_cooling`` is accepted in ``cooling`` or ``operator_recovery_required``.
     ``pause_advisory`` / ``resume_advisory`` / ``acknowledge_recovery`` are
     control actions with no direct MCP write."""
 
