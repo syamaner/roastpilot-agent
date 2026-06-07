@@ -204,3 +204,16 @@ async def test_enum_check_constraints_reject_invalid_values(
             )
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_initialize_twice_on_same_instance_is_a_noop(
+    tmp_store: RoastStore,
+) -> None:
+    await tmp_store.initialize()
+    try:
+        first = tmp_store.connection
+        await tmp_store.initialize()  # second call: keeps the live connection
+        assert tmp_store.connection is first
+    finally:
+        await tmp_store.close()
