@@ -17,15 +17,17 @@ foundation E3 (safety) and everything else builds on.
 
 ## Stories
 
-### E2-S1 — Shared enums and event vocabulary
+### E2-S1 — Shared enums and event vocabulary ([#3](https://github.com/syamaner/roastpilot-agent/issues/3))
 
 Acceptance criteria:
 
-- [ ] `RoastPhase` (9 phases per plan §3) and agent event kinds (plan §5
-  `roast_events.kind` vocabulary) as typed enums.
-- [ ] `SafetyVerdict` + `SafetyEvaluation` finalized; no string comparison
-  possible without a type error.
-- [ ] Round-trip serialization tests for every enum.
+- [x] `RoastPhase` (9 phases per plan §3) and agent event kinds (plan §5
+  `roast_events.kind` vocabulary) as typed enums — `RoastEventKind` (14
+  kinds) and `RoastEventSource` in models.py.
+- [x] `SafetyVerdict` + `SafetyEvaluation` finalized (six verdicts, nullable
+  adjusted command per D15); no string comparison possible without a type
+  error (plain `Enum`, pinned by tests).
+- [x] Round-trip serialization tests for every enum (`tests/test_models.py`).
 
 ### E2-S2 — RoastProfile (D7)
 
@@ -52,8 +54,8 @@ Acceptance criteria:
 
 | Story | Title | Status |
 |-------|-------|--------|
-| E2-S1 | Shared enums and event vocabulary | not started |
+| E2-S1 | Shared enums and event vocabulary | done |
 | E2-S2 | RoastProfile (D7) | not started |
 | E2-S3 | Configuration surface | not started |
 
-Epic status: **not started** — next up after E1 (kickoff: E2 then E3).
+Epic status: **in progress** (E2-S1 done; kickoff order: E2 then E3).
