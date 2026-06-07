@@ -9,6 +9,12 @@
 - Import package: `roastpilot_agent`
 - Console entrypoint: `roastpilot-agent`
 - Current phase: M1 build (harness complete target: July 2026)
+- **July milestone (D17)** — "harness complete" = (1) E9 vertical slice
+  green in CI + (2) E10 dashboard usable for a live roast + (3) one
+  supervised real-hardware roast end-to-end. E11/E12 polish may run into
+  August; demo assets recorded by end of August. Every session optimizes
+  for this finish line; the first supervised hardware session is targeted
+  for **June**.
 
 ## Working Rules
 
@@ -18,6 +24,9 @@
   completes a story updates the epic file's status table in the same PR.
 - Plans live in `~/git/roastpilot-plan` and are the source of truth; record
   resolved open items in component plan §11.
+- Closing an epic = create the next epic's story issues from its spec
+  file, update this registry, and flip the epic's project item to Done;
+  an epic's project item goes In Progress when its first story does.
 - Epic order: E1 ✅ → E2 ✅ → E3 ✅ → **E4** (controller) / E5–E8 →
   E9 (vertical slice) → E10 (SPA) → E11 (packaging) → E12 (validation/demo).
 
