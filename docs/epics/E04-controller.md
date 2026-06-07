@@ -64,6 +64,15 @@ Acceptance criteria:
   (FAULT + heat-0/safe-fan write attempts), never silent continuation —
   the e-stop evaluation deliberately carries no adjusted values
   (safety-reviewer carry-forward, E3-S4 PR).
+- [ ] The start command is serialized: a stale `starting` phase can never
+  accept a second `start_roast_session` — the E3-S5 matrix allows the
+  command in `starting` and delegates uniqueness to the API 409 + this
+  controller guarantee (safety-reviewer carry-forward, E3-S5 PR).
+- [ ] Relayed T0/FC transitions preserve the true detection source (MCP
+  detection or operator action) — the controller never re-stamps an
+  advisor-origin event as its own or as MCP/operator, or the E3-S5
+  source-validity allowlist could be bypassed (safety-reviewer
+  carry-forward, E3-S5 PR).
 
 ## Status
 

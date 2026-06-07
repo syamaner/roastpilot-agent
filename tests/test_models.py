@@ -10,6 +10,7 @@ import pydantic
 import pytest
 
 from roastpilot_agent.models import (
+    RoastCommand,
     RoastEventKind,
     RoastEventSource,
     RoastPhase,
@@ -19,6 +20,7 @@ from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 
 ALL_SHARED_ENUMS: list[type[Enum]] = [
     RoastPhase,
+    RoastCommand,
     RoastEventKind,
     RoastEventSource,
     SafetyVerdict,

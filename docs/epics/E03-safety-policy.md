@@ -72,19 +72,20 @@ Acceptance criteria:
   methods.
 - [x] safety-reviewer sub-agent run recorded on the closing PR.
 
-### E3-S5 — Phase and source validity rules (D16)
+### E3-S5 — Phase and source validity rules (D16) ([#15](https://github.com/syamaner/roastpilot-agent/issues/15))
 
 Acceptance criteria:
 
-- [ ] Command×phase validity matrix: every MCP write command is checked
-  against the current agent phase; invalid combinations (e.g. `set_heat`
-  during `cooling`, `stop_cooling` during `development`) produce REJECT
-  verdicts. The matrix is exhaustively tested (all write commands × all
-  nine phases).
-- [ ] FC/T0 source validity: first-crack and T0 state transitions are
-  accepted only from MCP detection status or explicit operator action;
-  any other source is rejected and logged.
-- [ ] Tests for both rule groups in `test_safety.py` (plan §8, D16 row).
+- [x] Command×phase validity matrix (`COMMAND_PHASE_MATRIX`, rationale per
+  row): every MCP write command checked against the current agent phase;
+  invalid combinations (incl. the D16 canonical examples — `set_heat`
+  during `cooling`, `stop_cooling` during `development`) produce REJECT.
+  Exhaustively tested: all 10 commands × all 9 phases (90 cells), plus a
+  guard that the e-stop row never contradicts the E3-S4 invariant.
+- [x] FC/T0 source validity: transitions accepted only from MCP detection
+  or explicit operator action (typed `RoastEventSource`); advisor/
+  controller/safety sources REJECTed with the attempt recorded.
+- [x] Tests for both rule groups in `test_safety.py` (plan §8, D16 row).
 
 ## Status
 
@@ -94,6 +95,6 @@ Acceptance criteria:
 | E3-S2 | Telemetry validity rules | done |
 | E3-S3 | Command validation rules | done |
 | E3-S4 | Emergency stop and verdict plumbing | done |
-| E3-S5 | Phase and source validity rules (D16) | not started |
+| E3-S5 | Phase and source validity rules (D16) | done |
 
-Epic status: **in progress** (E3-S1 through E3-S4 done; E3-S5 remains).
+Epic status: **done** — all five stories complete; next epic is E4 (controller).

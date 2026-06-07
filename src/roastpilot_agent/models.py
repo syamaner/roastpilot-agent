@@ -48,6 +48,23 @@ still being created — no telemetry exists yet); ``idle``/``complete``/
 """
 
 
+class RoastCommand(Enum):
+    """MCP write commands the agent can issue (component plan §2 tool surface,
+    writes only). The command×phase validity matrix in safety.py (E3-S5,
+    D16) governs where each may execute."""
+
+    START_ROAST_SESSION = "start_roast_session"
+    SET_HEAT = "set_heat"
+    SET_FAN = "set_fan"
+    MARK_BEANS_ADDED = "mark_beans_added"
+    MARK_FIRST_CRACK = "mark_first_crack"
+    DROP_BEANS = "drop_beans"
+    START_COOLING = "start_cooling"
+    STOP_COOLING = "stop_cooling"
+    EXPORT_ROAST_LOG = "export_roast_log"
+    EMERGENCY_STOP = "emergency_stop"
+
+
 class RoastEventKind(Enum):
     """Agent-level event kinds (component plan §5 ``roast_events.kind``).
 
