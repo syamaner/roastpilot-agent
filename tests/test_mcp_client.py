@@ -20,6 +20,7 @@ from roastpilot_agent.mcp_client import (
     EventSnapshot,
     ExportRoastLogResult,
     MCPConnectionError,
+    MCPMirror,
     MCPServerProcess,
     MCPToolError,
     MCPToolTimeoutError,
@@ -592,3 +593,63 @@ async def test_malformed_text_result_is_typed_failure() -> None:
     process = MCPServerProcess(session=FakeSession(result))
     with pytest.raises(MCPConnectionError):
         await process.call_tool("get_roast_state", {})
+
+
+# --- E5-S3: per-tool contract fixtures (captured from the real server) ---
+
+
+TOOL_RESULT_FIXTURES = Path(__file__).parent / "fixtures" / "mcp-tool-results"
+
+#: tool fixture file → the mirror that must validate it. Re-capture via
+#: scripts/capture_mcp_fixtures.py on coffee-roaster-mcp dependency bumps;
+#: the mcp-contract-checker sub-agent re-derives the upstream surface and
+#: diffs it against these mirrors + fixtures.
+FIXTURE_MIRRORS: dict[str, type[MCPMirror]] = {
+    "get_server_info": ServerInfo,
+    "get_runtime_config": RuntimeConfigSnapshot,
+    "start_roast_session": StartRoastSessionResult,
+    "get_roast_state": RoastSessionState,
+    "set_heat": ControlCommandResult,
+    "set_fan": ControlCommandResult,
+    "mark_beans_added": EventCommandResult,
+    "mark_first_crack": EventCommandResult,
+    "drop_beans": EventCommandResult,
+    "start_cooling": EventCommandResult,
+    "stop_cooling": EventCommandResult,
+    "export_roast_log": ExportRoastLogResult,
+    "emergency_stop": EventCommandResult,
+}
+
+
+def test_every_tool_has_a_captured_fixture() -> None:
+    """One example per tool result shape (E5-S3 criterion) — exactly the
+    13-tool surface, no strays."""
+    captured = {path.stem for path in TOOL_RESULT_FIXTURES.glob("*.json")}
+    assert captured == set(FIXTURE_MIRRORS)
+
+
+@pytest.mark.parametrize("tool", sorted(FIXTURE_MIRRORS))
+def test_captured_fixture_validates_into_mirror(tool: str) -> None:
+    payload = json.loads((TOOL_RESULT_FIXTURES / f"{tool}.json").read_text())
+    mirror = FIXTURE_MIRRORS[tool]
+    instance = mirror.model_validate(payload)
+    assert isinstance(instance, mirror)
+
+
+def test_captured_state_is_bootstrap_safe_mock() -> None:
+    """The fixtures were captured from the real server's bootstrap-safe
+    defaults: mock driver, FC disabled — no hardware, no model download."""
+    info = ServerInfo.model_validate(
+        json.loads((TOOL_RESULT_FIXTURES / "get_server_info.json").read_text())
+    )
+    assert info.roaster_driver == "mock"
+    assert info.first_crack_mode == "disabled"
+    assert info.bootstrap_safe is True
+
+
+def test_captured_emergency_stop_records_fault() -> None:
+    result = EventCommandResult.model_validate(
+        json.loads((TOOL_RESULT_FIXTURES / "emergency_stop.json").read_text())
+    )
+    assert result.event.kind == "fault"
+    assert result.phase == "fault"

@@ -1,0 +1,75 @@
+{
+  "active": true,
+  "bean_ror_c_per_min": null,
+  "bean_temp_delta_60s_c": null,
+  "beans_added_at_utc": "2026-06-07T15:08:32.499461+00:00",
+  "beans_added_monotonic_seconds": 0.038010125019354746,
+  "beans_dropped_at_utc": null,
+  "beans_dropped_monotonic_seconds": null,
+  "cooling_on": false,
+  "cooling_started_at_utc": null,
+  "cooling_started_monotonic_seconds": null,
+  "cooling_stopped_at_utc": null,
+  "cooling_stopped_monotonic_seconds": null,
+  "created_at_utc": "2026-06-07T15:08:32.461453+00:00",
+  "development_percent": null,
+  "development_time_seconds": null,
+  "device_state": {
+    "bean_temp_c": 20.1,
+    "connected": true,
+    "cooling_on": false,
+    "driver": "mock",
+    "env_temp_c": 21.2,
+    "fan_level_percent": 40,
+    "heat_level_percent": 70,
+    "raw_vendor_data": {
+      "beans_dropped": false,
+      "sample_index": 1,
+      "telemetry_model": "fixed_step_thermal_v1"
+    }
+  },
+  "elapsed_monotonic_seconds": 0.043,
+  "env_ror_c_per_min": null,
+  "env_temp_delta_60s_c": null,
+  "events": [
+    {
+      "kind": "beans_added",
+      "monotonic_seconds": 0.038010125019354746,
+      "payload": {},
+      "recorded_at_utc": "2026-06-07T15:08:32.499461+00:00"
+    }
+  ],
+  "fan_level_percent": 40,
+  "faulted_at_utc": null,
+  "faulted_monotonic_seconds": null,
+  "first_crack_at_utc": null,
+  "first_crack_monotonic_seconds": null,
+  "first_crack_status": {
+    "allow_manual_override": true,
+    "audio_running": false,
+    "detected_at_utc": null,
+    "detected_monotonic_seconds": null,
+    "dropped_window_count": 0,
+    "emitted_window_count": 0,
+    "mode": "disabled",
+    "processed_window_count": 0,
+    "queued_window_count": 0,
+    "reason": "Automatic first-crack detection is disabled by configuration.",
+    "status": "disabled"
+  },
+  "heat_level_percent": 70,
+  "log_dir": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpmsfxwelh/logs/roasts/fc2f682b89344ab58437fbfc007f7f3b",
+  "phase": "roasting",
+  "roast_elapsed_seconds": 0.005,
+  "session_id": "fc2f682b89344ab58437fbfc007f7f3b",
+  "stopped_at_utc": null,
+  "t0_status": {
+    "auto_detection_enabled": false,
+    "charge_temperature_c": null,
+    "current_drop_c": null,
+    "detected_bean_temperature_c": null,
+    "drop_threshold_c": 25.0,
+    "reason": null,
+    "status": "detected"
+  }
+}

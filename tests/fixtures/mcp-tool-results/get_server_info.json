@@ -1,0 +1,26 @@
+{
+  "available_bootstrap_tools": [
+    "get_server_info",
+    "get_runtime_config",
+    "start_roast_session",
+    "get_roast_state",
+    "set_heat",
+    "set_fan",
+    "mark_beans_added",
+    "mark_first_crack",
+    "drop_beans",
+    "start_cooling",
+    "stop_cooling",
+    "export_roast_log",
+    "emergency_stop"
+  ],
+  "bootstrap_safe": true,
+  "current_phase": "bootstrap",
+  "first_crack_mode": "disabled",
+  "package_name": "coffee-roaster-mcp",
+  "product_name": "RoastPilot",
+  "roaster_driver": "mock",
+  "started_at_utc": "2026-06-07T15:08:32.442749+00:00",
+  "transport": "stdio",
+  "version": "0.1.3"
+}
