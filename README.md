@@ -1,5 +1,7 @@
 # RoastPilot Agent
 
+[![codecov](https://codecov.io/gh/syamaner/roastpilot-agent/branch/main/graph/badge.svg)](https://codecov.io/gh/syamaner/roastpilot-agent)
+
 Deterministic agent harness for autonomous coffee roasting with a Hottop
 KN-8828B-2K+ — **the controller owns the loop, the LLM advises**.
 

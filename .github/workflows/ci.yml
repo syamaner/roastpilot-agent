@@ -40,8 +40,13 @@ jobs:
         # interpreter. Locally, plain `python -m pyright` is correct.
         run: python -m pyright --pythonpath "${pythonLocation}/bin/python"
 
-      - name: Run tests
-        run: python -m pytest
+      - name: Run tests with coverage
+        run: python -m pytest --cov=roastpilot_agent --cov-report=xml --cov-report=term-missing:skip-covered
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
 
       - name: Run CLI smoke checks
         run: |
