@@ -328,10 +328,13 @@ class AdvisoryCallPolicy:
         telemetry: RoastTelemetry | None,
         now: float,
     ) -> None:
-        """Record that the advisor was consulted: advance the baselines the
-        next :meth:`evaluate` measures change against. Telemetry-derived
-        baselines update only when telemetry is present, so a manual consult
-        with no reading does not blank the delta baselines."""
+        """Record that the advisory step ran for a fired trigger: advance the
+        baselines the next :meth:`evaluate` measures change against. Called
+        once per triggered tick — including the no-telemetry skip path, where
+        the advisor itself is not reached — so the interval restarts from the
+        moment advice was attempted. Telemetry-derived baselines update only
+        when telemetry is present, so a skip or a manual consult with no
+        reading does not blank the delta baselines."""
         self._last_call_monotonic = now
         self._last_phase = phase
         if telemetry is not None:

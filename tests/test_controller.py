@@ -725,11 +725,12 @@ async def test_manual_advisory_without_telemetry_emits_skipped_event() -> None:
     for step in NORMAL_PATH[:6]:  # …→ COMPLETE (a non-active-roast phase)
         harness.controller.transition_to(step)
     assert harness.controller.phase is RoastPhase.COMPLETE
+    assert harness.executor.targets == []  # precondition: no writes from transitions
     harness.events.events.clear()
     harness.controller.request_advisory()
     await harness.controller.tick()
     assert advisor.contexts == []  # advisor never reached
-    assert harness.executor.targets == []
+    assert harness.executor.targets == []  # and still no write after the skip
     advisory_events = [
         cast(dict[str, object], p) for k, p in harness.events.events if k is RoastEventKind.ADVISORY
     ]
