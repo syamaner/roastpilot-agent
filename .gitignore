@@ -38,6 +38,9 @@ logs/
 *.pcap
 serial-captures/
 
+# uv (project is pip-based; un-ignore if uv is ever adopted)
+uv.lock
+
 # Node / SPA (web/ arrives at E10)
 node_modules/
 web/dist/

@@ -1,0 +1,13 @@
+coverage:
+  status:
+    patch:
+      default:
+        # The auto target equals current project coverage (~96%); allow a
+        # small margin so genuinely environment-dependent slivers (real-IO
+        # shims, filesystem-failure paths) don't red-flag otherwise
+        # fully-tested diffs. Project coverage still trends via the
+        # project status below.
+        threshold: 2%
+    project:
+      default:
+        threshold: 1%
