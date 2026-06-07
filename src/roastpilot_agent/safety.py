@@ -222,6 +222,104 @@ class SafetyPolicy:
             ),
         )
 
-    def evaluate_command(self, requested_heat: int, requested_fan: int) -> SafetyEvaluation:
-        """Validate, clamp, or reject a heat/fan command (E3-S3)."""
-        raise NotImplementedError("E3-S3: command validation rules")
+    def evaluate_command(
+        self,
+        *,
+        requested_heat: int,
+        requested_fan: int,
+        seconds_since_last_command: float | None,
+    ) -> SafetyEvaluation:
+        """Heat/fan command validation: rate limit, then bounds (E3-S3).
+
+        Rate limiting first — a command inside ``min_seconds_between_commands``
+        of the previous one is REJECTed outright (``None`` means no prior
+        command; exactly at the limit is allowed). Then bounds: requests
+        outside 0–100 % are CLAMPed, never rejected — the intent (more/less
+        heat or air) is honored at the nearest safe value. ALLOW and CLAMP
+        both carry the adjusted values to execute.
+        """
+        limits = self._limits
+        if (
+            seconds_since_last_command is not None
+            and seconds_since_last_command < limits.min_seconds_between_commands
+        ):
+            return SafetyEvaluation(
+                rule="command_rate_limited",
+                verdict=SafetyVerdict.REJECT,
+                reason=(
+                    f"command issued {seconds_since_last_command:.1f} s after the previous one "
+                    f"(minimum {limits.min_seconds_between_commands:.1f} s): rejected — the "
+                    f"Hottop serial loop runs at ~1 Hz, faster writes have no effect"
+                ),
+            )
+        clamped_heat = min(100, max(0, requested_heat))
+        clamped_fan = min(100, max(0, requested_fan))
+        if clamped_heat != requested_heat or clamped_fan != requested_fan:
+            return SafetyEvaluation(
+                rule="command_bounds",
+                verdict=SafetyVerdict.CLAMP,
+                adjusted_heat=clamped_heat,
+                adjusted_fan=clamped_fan,
+                reason=(
+                    f"requested heat {requested_heat} % / fan {requested_fan} % outside 0–100: "
+                    f"clamped to heat {clamped_heat} % / fan {clamped_fan} %"
+                ),
+            )
+        return SafetyEvaluation(
+            rule="all_clear",
+            verdict=SafetyVerdict.ALLOW,
+            adjusted_heat=requested_heat,
+            adjusted_fan=requested_fan,
+            reason="command within bounds and rate limit",
+        )
+
+    def evaluate_drop_recommendation(self, *, phase: RoastPhase) -> SafetyEvaluation:
+        """Advisor drop-eligibility rule (E3-S3).
+
+        An advisor ``should_drop`` recommendation is honored only during
+        ``development`` (component plan §3: development → cooling via
+        validated drop decision). Anywhere else it is REJECTed — dropping
+        unroasted or already-dropped beans on a model's say-so is never
+        acceptable. Operator drops are governed separately by the
+        command×phase matrix (E3-S5, D16).
+        """
+        if phase is RoastPhase.DEVELOPMENT:
+            return SafetyEvaluation(
+                rule="drop_eligibility",
+                verdict=SafetyVerdict.ALLOW,
+                reason="drop recommendation during development: eligible",
+            )
+        return SafetyEvaluation(
+            rule="drop_eligibility",
+            verdict=SafetyVerdict.REJECT,
+            reason=(
+                f"advisor drop recommendation in phase {phase.value}: rejected — advisor "
+                f"drops are honored only during development"
+            ),
+        )
+
+    def evaluate_advisor_failure(
+        self,
+        *,
+        status: Literal["timeout", "malformed", "unsafe", "provider_error"],
+        current_heat: int,
+        current_fan: int,
+    ) -> SafetyEvaluation:
+        """Advisor failure ⇒ rejected recommendation ⇒ deterministic fallback.
+
+        Timeout, malformed output, unsafe output, or a provider error never
+        blocks the tick (orchestration plan § Advisory Call Frequency): the
+        recommendation is REJECTed and the fallback is to hold the current
+        targets — the adjusted values echo the heat/fan already in effect.
+        Every outcome is persisted via the decision trace (plan §5).
+        """
+        return SafetyEvaluation(
+            rule=f"advisor_{status}",
+            verdict=SafetyVerdict.REJECT,
+            adjusted_heat=current_heat,
+            adjusted_fan=current_fan,
+            reason=(
+                f"advisor outcome '{status}': recommendation rejected, deterministic fallback "
+                f"holds current targets (heat {current_heat} %, fan {current_fan} %)"
+            ),
+        )

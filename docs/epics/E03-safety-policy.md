@@ -42,15 +42,21 @@ Acceptance criteria:
   tolerated (ALLOW, controller skips/retries), `max_consecutive_mcp_failures`
   (default 3 ≈ 3 s blind window at the 1.0 s tick) fails closed with FAULT.
 
-### E3-S3 — Command validation rules
+### E3-S3 — Command validation rules ([#8](https://github.com/syamaner/roastpilot-agent/issues/8))
 
 Acceptance criteria:
 
-- [ ] Heat/fan bounds (0–100) with clamping semantics tested.
-- [ ] Command rate limiting tested.
-- [ ] Unsafe drop recommendation rejection tested (drop eligibility).
-- [ ] Malformed/timeout advisor output ⇒ rejected recommendation ⇒
-  deterministic fallback (hold current targets).
+- [x] Heat/fan bounds (0–100) with clamping semantics tested — out-of-range
+  requests CLAMP to the nearest bound (intent honored, never rejected);
+  ALLOW/CLAMP carry the adjusted values to execute.
+- [x] Command rate limiting tested — inside `min_seconds_between_commands`
+  ⇒ REJECT (checked before bounds); exactly at the limit allowed.
+- [x] Unsafe drop recommendation rejection tested — advisor `should_drop`
+  honored only in `development`; REJECTed in all other phases (operator
+  drops are E3-S5's command×phase matrix).
+- [x] Malformed/timeout/unsafe/provider-error advisor output ⇒ rejected
+  recommendation ⇒ deterministic fallback holds current targets (adjusted
+  values echo the heat/fan in effect).
 
 ### E3-S4 — Emergency stop and verdict plumbing
 
@@ -82,8 +88,8 @@ Acceptance criteria:
 |-------|-------|--------|
 | E3-S1 | Temperature and overrun rules | done |
 | E3-S2 | Telemetry validity rules | done |
-| E3-S3 | Command validation rules | not started |
+| E3-S3 | Command validation rules | done |
 | E3-S4 | Emergency stop and verdict plumbing | not started |
 | E3-S5 | Phase and source validity rules (D16) | not started |
 
-Epic status: **in progress** (E3-S1, E3-S2 done).
+Epic status: **in progress** (E3-S1, E3-S2, E3-S3 done).

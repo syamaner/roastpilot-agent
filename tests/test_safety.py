@@ -281,3 +281,131 @@ def test_e3_s2_evaluations_are_persisted_ready(policy: SafetyPolicy) -> None:
     for evaluation in evaluations:
         assert evaluation.rule
         assert evaluation.reason
+
+
+# --- E3-S3: command validation rules ---
+
+
+def test_command_within_bounds_allowed(policy: SafetyPolicy) -> None:
+    evaluation = policy.evaluate_command(
+        requested_heat=70, requested_fan=40, seconds_since_last_command=None
+    )
+    assert evaluation.verdict is SafetyVerdict.ALLOW
+    assert evaluation.adjusted_heat == 70
+    assert evaluation.adjusted_fan == 40
+
+
+@pytest.mark.parametrize(("heat", "fan"), [(0, 0), (100, 100), (0, 100)])
+def test_command_boundary_values_allowed(policy: SafetyPolicy, heat: int, fan: int) -> None:
+    evaluation = policy.evaluate_command(
+        requested_heat=heat, requested_fan=fan, seconds_since_last_command=None
+    )
+    assert evaluation.verdict is SafetyVerdict.ALLOW
+
+
+@pytest.mark.parametrize(
+    ("heat", "fan", "expected_heat", "expected_fan"),
+    [
+        (110, 40, 100, 40),
+        (-5, 40, 0, 40),
+        (70, 101, 70, 100),
+        (70, -1, 70, 0),
+        (150, -10, 100, 0),
+    ],
+)
+def test_out_of_bounds_command_is_clamped(
+    policy: SafetyPolicy, heat: int, fan: int, expected_heat: int, expected_fan: int
+) -> None:
+    evaluation = policy.evaluate_command(
+        requested_heat=heat, requested_fan=fan, seconds_since_last_command=None
+    )
+    assert evaluation.verdict is SafetyVerdict.CLAMP
+    assert evaluation.rule == "command_bounds"
+    assert evaluation.adjusted_heat == expected_heat
+    assert evaluation.adjusted_fan == expected_fan
+
+
+def test_command_rate_limited(policy: SafetyPolicy) -> None:
+    evaluation = policy.evaluate_command(
+        requested_heat=70, requested_fan=40, seconds_since_last_command=1.0
+    )
+    assert evaluation.verdict is SafetyVerdict.REJECT
+    assert evaluation.rule == "command_rate_limited"
+    assert evaluation.adjusted_heat is None
+    assert evaluation.adjusted_fan is None
+
+
+def test_command_exactly_at_rate_limit_allowed(policy: SafetyPolicy) -> None:
+    evaluation = policy.evaluate_command(
+        requested_heat=70, requested_fan=40, seconds_since_last_command=2.0
+    )
+    assert evaluation.verdict is SafetyVerdict.ALLOW
+
+
+def test_rate_limit_checked_before_bounds(policy: SafetyPolicy) -> None:
+    """A rate-limited command is rejected outright, not clamped."""
+    evaluation = policy.evaluate_command(
+        requested_heat=150, requested_fan=40, seconds_since_last_command=0.5
+    )
+    assert evaluation.verdict is SafetyVerdict.REJECT
+    assert evaluation.rule == "command_rate_limited"
+
+
+def test_rate_limit_is_configurable() -> None:
+    policy = SafetyPolicy(SafetyLimits(min_seconds_between_commands=5.0))
+    evaluation = policy.evaluate_command(
+        requested_heat=70, requested_fan=40, seconds_since_last_command=4.9
+    )
+    assert evaluation.verdict is SafetyVerdict.REJECT
+
+
+def test_drop_recommendation_allowed_in_development(policy: SafetyPolicy) -> None:
+    evaluation = policy.evaluate_drop_recommendation(phase=RoastPhase.DEVELOPMENT)
+    assert evaluation.verdict is SafetyVerdict.ALLOW
+    assert evaluation.rule == "drop_eligibility"
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [phase for phase in RoastPhase if phase is not RoastPhase.DEVELOPMENT],
+)
+def test_drop_recommendation_rejected_outside_development(
+    policy: SafetyPolicy, phase: RoastPhase
+) -> None:
+    evaluation = policy.evaluate_drop_recommendation(phase=phase)
+    assert evaluation.verdict is SafetyVerdict.REJECT
+    assert evaluation.rule == "drop_eligibility"
+
+
+@pytest.mark.parametrize("status", ["timeout", "malformed", "unsafe", "provider_error"])
+def test_advisor_failure_rejects_and_holds_current_targets(
+    policy: SafetyPolicy, status: str
+) -> None:
+    evaluation = policy.evaluate_advisor_failure(
+        status=status,  # pyright: ignore[reportArgumentType]
+        current_heat=65,
+        current_fan=55,
+    )
+    assert evaluation.verdict is SafetyVerdict.REJECT
+    assert evaluation.rule == f"advisor_{status}"
+    assert evaluation.adjusted_heat == 65
+    assert evaluation.adjusted_fan == 55
+
+
+def test_e3_s3_evaluations_are_persisted_ready(policy: SafetyPolicy) -> None:
+    evaluations = [
+        policy.evaluate_command(
+            requested_heat=70, requested_fan=40, seconds_since_last_command=None
+        ),
+        policy.evaluate_command(
+            requested_heat=120, requested_fan=40, seconds_since_last_command=None
+        ),
+        policy.evaluate_command(
+            requested_heat=70, requested_fan=40, seconds_since_last_command=0.1
+        ),
+        policy.evaluate_drop_recommendation(phase=RoastPhase.PREHEATING),
+        policy.evaluate_advisor_failure(status="timeout", current_heat=50, current_fan=50),
+    ]
+    for evaluation in evaluations:
+        assert evaluation.rule
+        assert evaluation.reason
