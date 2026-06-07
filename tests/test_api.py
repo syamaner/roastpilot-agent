@@ -3,9 +3,10 @@
 E7-S1 covers the REST routes and their typed response models: health, roast
 lifecycle start (incl. the 409 active-run guard), history/detail reads, the
 downsampled telemetry series, the decision-trace timeline, the export-log
-manifest + downloads, and operator rating. The operator action queue (S2)
-and the SSE stream (S3) extend this suite. All hardware-free: an in-memory
-controller is never started — routes read the temp SQLite store directly.
+manifest + downloads, and operator rating. E7-S2 covers the operator action
+queue (action → operator_actions row → controller queue → safety policy). The
+SSE stream (S3) extends this suite. All hardware-free: an in-memory controller
+is never started — routes read the temp SQLite store directly.
 """
 
 from collections.abc import AsyncIterator
@@ -21,6 +22,7 @@ from roastpilot_agent.api import RoastService, create_app
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.mcp_client import MCPServerProcess
 from roastpilot_agent.models import (
+    OperatorAction,
     RoastCommand,
     RoastEventKind,
     RoastEventSource,
@@ -602,4 +604,130 @@ async def test_rate_rejects_out_of_range_stars(client: AsyncClient, store: Roast
     )
     await store.complete_run(run_id="run-b", outcome="completed", agent_phase=RoastPhase.COMPLETE)
     response = await client.post("/api/roasts/run-b/rating", json={"stars": 6})
+    assert response.status_code == 422
+
+
+# --- operator action queue (E7-S2) ---
+
+
+async def _make_run(store: RoastStore, run_id: str, phase: RoastPhase) -> None:
+    await store.create_run(run_id=run_id, profile=_profile(), config=AppConfig(), agent_phase=phase)
+
+
+async def _operator_action_rows(
+    store: RoastStore, run_id: str
+) -> list[tuple[str, str, str | None]]:
+    async with store.connection.execute(
+        "SELECT action, result, payload_json FROM operator_actions WHERE run_id = ?"
+        " ORDER BY id ASC",
+        (run_id,),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return [(str(r[0]), str(r[1]), None if r[2] is None else str(r[2])) for r in rows]
+
+
+@pytest.mark.asyncio
+async def test_operator_action_accepted_and_queued(
+    client: AsyncClient, service: RoastService, store: RoastStore
+) -> None:
+    await _make_run(store, "run-op", RoastPhase.DEVELOPMENT)
+    response = await client.post(
+        "/api/roasts/run-op/operator-actions", json={"action": "drop_beans"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["action"] == "drop_beans"
+    assert body["result"] == "accepted"
+    assert body["queued"] is True
+
+    assert service.operator_queue.qsize() == 1
+    queued = service.operator_queue.get_nowait()
+    assert queued.run_id == "run-op"
+    assert queued.action is OperatorAction.DROP_BEANS
+
+    rows = await _operator_action_rows(store, "run-op")
+    assert rows == [("drop_beans", "accepted", None)]
+
+
+@pytest.mark.asyncio
+async def test_operator_action_rejected_in_wrong_phase(
+    client: AsyncClient, service: RoastService, store: RoastStore
+) -> None:
+    # drop_beans is invalid during preheating (no beans in the drum yet).
+    await _make_run(store, "run-pre", RoastPhase.PREHEATING)
+    response = await client.post(
+        "/api/roasts/run-pre/operator-actions", json={"action": "drop_beans"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["result"] == "rejected"
+    assert body["queued"] is False
+    assert "not valid in phase preheating" in body["reason"]
+
+    assert service.operator_queue.qsize() == 0
+    rows = await _operator_action_rows(store, "run-pre")
+    assert rows == [("drop_beans", "rejected", None)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", list(RoastPhase))
+async def test_emergency_stop_accepted_in_every_phase(
+    client: AsyncClient, service: RoastService, store: RoastStore, phase: RoastPhase
+) -> None:
+    await _make_run(store, f"run-es-{phase.value}", phase)
+    response = await client.post(
+        f"/api/roasts/run-es-{phase.value}/operator-actions",
+        json={"action": "emergency_stop"},
+    )
+    assert response.json()["result"] == "accepted"
+    assert service.operator_queue.qsize() == 1
+
+
+@pytest.mark.asyncio
+async def test_control_action_accepted_without_matrix_check(
+    client: AsyncClient, service: RoastService, store: RoastStore
+) -> None:
+    # pause_advisory issues no MCP write, so it is accepted for the controller
+    # to interpret regardless of phase.
+    await _make_run(store, "run-pa", RoastPhase.COOLING)
+    response = await client.post(
+        "/api/roasts/run-pa/operator-actions", json={"action": "pause_advisory"}
+    )
+    body = response.json()
+    assert body["result"] == "accepted"
+    assert body["queued"] is True
+    assert service.operator_queue.get_nowait().action is OperatorAction.PAUSE_ADVISORY
+
+
+@pytest.mark.asyncio
+async def test_operator_action_records_payload(
+    client: AsyncClient, service: RoastService, store: RoastStore
+) -> None:
+    await _make_run(store, "run-pl", RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    response = await client.post(
+        "/api/roasts/run-pl/operator-actions",
+        json={"action": "acknowledge_recovery", "payload": {"resume_to": "cooling"}},
+    )
+    assert response.json()["result"] == "accepted"
+    queued = service.operator_queue.get_nowait()
+    assert queued.payload == {"resume_to": "cooling"}
+    rows = await _operator_action_rows(store, "run-pl")
+    assert rows[0][0] == "acknowledge_recovery"
+    assert rows[0][2] is not None and "resume_to" in rows[0][2]
+
+
+@pytest.mark.asyncio
+async def test_operator_action_unknown_run_404(client: AsyncClient) -> None:
+    response = await client.post(
+        "/api/roasts/nope/operator-actions", json={"action": "emergency_stop"}
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_operator_action_unknown_action_422(client: AsyncClient, store: RoastStore) -> None:
+    await _make_run(store, "run-bad", RoastPhase.DEVELOPMENT)
+    response = await client.post(
+        "/api/roasts/run-bad/operator-actions", json={"action": "frobnicate"}
+    )
     assert response.status_code == 422

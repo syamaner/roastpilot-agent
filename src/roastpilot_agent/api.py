@@ -17,10 +17,11 @@ and the SSE stream (S3) extend :class:`RoastService` in place.
 import asyncio
 import uuid
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, Literal
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from roastpilot_agent import __version__
 from roastpilot_agent.config import AppConfig
@@ -29,7 +30,11 @@ from roastpilot_agent.models import (
     HealthResponse,
     LogManifest,
     MCPChildStatus,
+    OperatorAction,
+    OperatorActionRequest,
+    OperatorActionResult,
     OperatorRatingRequest,
+    RoastCommand,
     RoastDetail,
     RoastHistory,
     RoastPhase,
@@ -37,7 +42,37 @@ from roastpilot_agent.models import (
     RoastTimeline,
     TelemetrySeries,
 )
+from roastpilot_agent.safety import SafetyPolicy, SafetyVerdict
 from roastpilot_agent.store import RoastStore
+
+#: Operator actions that resolve to an MCP write command, mapped to the
+#: command×phase matrix entry used for the queue's phase-validity pre-check
+#: (E7-S2). The control actions — ``pause_advisory`` / ``resume_advisory`` /
+#: ``acknowledge_recovery`` — issue no MCP write and so have no matrix entry;
+#: they are accepted at the queue and validated by the controller on drain.
+_ACTION_COMMAND: dict[OperatorAction, RoastCommand] = {
+    OperatorAction.MARK_BEANS_ADDED: RoastCommand.MARK_BEANS_ADDED,
+    OperatorAction.MARK_FIRST_CRACK: RoastCommand.MARK_FIRST_CRACK,
+    OperatorAction.DROP_BEANS: RoastCommand.DROP_BEANS,
+    OperatorAction.START_COOLING: RoastCommand.START_COOLING,
+    OperatorAction.STOP_COOLING: RoastCommand.STOP_COOLING,
+    OperatorAction.EMERGENCY_STOP: RoastCommand.EMERGENCY_STOP,
+}
+
+
+class QueuedOperatorAction(BaseModel):
+    """One operator action placed on the controller queue (E7-S2).
+
+    The transport item the controller drains each tick (E9): it carries the
+    target run, the typed action, and the operator-supplied payload. The
+    queue never bypasses safety — the controller re-runs the full policy
+    (rate limits, bounds, phase, drop eligibility) before any MCP write; the
+    queue's phase pre-check only gives the operator immediate feedback."""
+
+    run_id: str
+    action: OperatorAction
+    payload: dict[str, Any] | None = None
+
 
 #: A downloadable export artifact name (plan §6 log manifest), validated
 #: against the known artifact set in :meth:`RoastService.log_artifact_path`.
@@ -80,6 +115,13 @@ class RoastService:
         # tick makes this rare, but the at-most-one-active invariant is held
         # here, not left to chance.
         self._start_lock = asyncio.Lock()
+        # The phase-validity pre-check shares the run's configured safety
+        # limits, so the queue's verdict matches the controller's on drain.
+        self._safety = SafetyPolicy(self._config.safety)
+        #: The controller action queue (plan §6: action → operator_actions row
+        #: → controller queue → safety → MCP). The API enqueues phase-valid
+        #: actions; the controller tick loop drains and executes them (E9).
+        self.operator_queue: asyncio.Queue[QueuedOperatorAction] = asyncio.Queue()
 
     def mcp_child_status(self) -> MCPChildStatus:
         """Liveness of the coffee-roaster-mcp child for the health route.
@@ -223,6 +265,59 @@ class RoastService:
             raise RuntimeError(f"read_run returned None for rated run {run_id}")
         return rated
 
+    async def submit_operator_action(
+        self, run_id: str, request: OperatorActionRequest
+    ) -> OperatorActionResult:
+        """Queue an operator action through safety policy (plan §6).
+
+        The pipeline is: validate the action against the run's current phase
+        via the existing command×phase matrix, record an ``operator_actions``
+        row with the outcome, and — when accepted — place the action on the
+        controller queue. The controller drains the queue each tick and runs
+        the *full* safety policy again before any MCP write (E9): this method
+        never writes hardware and never bypasses or reimplements safety. The
+        phase pre-check exists only so the operator gets immediate feedback
+        (e.g. a drop requested during preheating is rejected now, not silently
+        held). 404s an unknown run id.
+
+        Control actions with no MCP write (``pause_advisory`` /
+        ``resume_advisory`` / ``acknowledge_recovery``) skip the matrix check
+        and are accepted for the controller to interpret on drain.
+        """
+        detail = await self._store.read_run(run_id)
+        if detail is None:
+            raise RoastRunNotFoundError(run_id)
+
+        command = _ACTION_COMMAND.get(request.action)
+        if command is None:
+            result: Literal["accepted", "rejected", "failed"] = "accepted"
+            reason = f"{request.action.value} accepted: queued for the controller"
+        else:
+            evaluation = self._safety.evaluate_command_phase(
+                command=command, phase=detail.agent_phase
+            )
+            if evaluation.verdict is SafetyVerdict.ALLOW:
+                result = "accepted"
+                reason = f"{request.action.value} accepted in phase {detail.agent_phase.value}"
+            else:
+                result = "rejected"
+                reason = evaluation.reason
+
+        await self._store.record_operator_action(
+            action=request.action.value,
+            result=result,
+            run_id=run_id,
+            payload=request.payload,
+        )
+        queued = result == "accepted"
+        if queued:
+            self.operator_queue.put_nowait(
+                QueuedOperatorAction(run_id=run_id, action=request.action, payload=request.payload)
+            )
+        return OperatorActionResult(
+            action=request.action, result=result, reason=reason, queued=queued
+        )
+
 
 def _get_service(request: Request) -> RoastService:
     """Dependency: the app's :class:`RoastService`, or 503 if unconfigured.
@@ -337,6 +432,24 @@ async def rate_roast(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+async def submit_operator_action(
+    run_id: str,
+    action: OperatorActionRequest,
+    service: ServiceDep,
+) -> OperatorActionResult:
+    """``POST /api/roasts/{run_id}/operator-actions`` — queue an operator action.
+
+    Always 200 with the typed :class:`OperatorActionResult`: the request was
+    recorded and its policy outcome (``accepted`` / ``rejected``) is in the
+    body, so the SPA renders one shape. 404 only when the run is unknown; an
+    unknown action value is a 422 from request validation.
+    """
+    try:
+        return await service.submit_operator_action(run_id, action)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 def create_app(service: RoastService | None = None) -> FastAPI:
     """Create the FastAPI application.
 
@@ -357,4 +470,5 @@ def create_app(service: RoastService | None = None) -> FastAPI:
     app.get("/api/roasts/{run_id}/log")(get_log_manifest)
     app.get("/api/roasts/{run_id}/log/{artifact}")(download_log)
     app.post("/api/roasts/{run_id}/rating")(rate_roast)
+    app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)
     return app
