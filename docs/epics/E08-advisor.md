@@ -50,12 +50,14 @@ Guardrails:
 
 Acceptance criteria:
 
-- [ ] Advisor called only on meaningful change: ≥1.0 °C bean temp delta,
+- [x] Advisor called only on meaningful change: ≥1.0 °C bean temp delta,
   ≥2.0 °C/min RoR delta, phase transition, ≥15 s minimum interval, or
   manual trigger; timeout-bounded; never blocks the tick.
-- [ ] Replaces the controller's interim manual-trigger-only
-  `_advisory_requested` flag (E4-S2 note).
-- [ ] Policy unit-tested against scripted telemetry sequences.
+- [x] Replaces the controller's interim manual-trigger-only
+  `_advisory_requested` flag (E4-S2 note): `request_advisory()` is now the
+  manual override into `AdvisoryCallPolicy`, which the tick consults every
+  cycle.
+- [x] Policy unit-tested against scripted telemetry sequences.
 
 ### E8-S4 — Advisor bake-off (plan §11.1) ([#57](https://github.com/syamaner/roastpilot-agent/issues/57))
 
@@ -77,7 +79,7 @@ Acceptance criteria:
 |-------|-------|--------|
 | E8-S1 | FakeAdvisor and failure fixtures | done |
 | E8-S2 | PydanticAI OpenRouter implementation | not started |
-| E8-S3 | Call-frequency policy | not started |
+| E8-S3 | Call-frequency policy | done |
 | E8-S4 | Advisor bake-off | not started |
 
 Epic status: **in progress** — E2 ✅; issues minted
