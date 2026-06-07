@@ -230,6 +230,9 @@ class RoastController:
         self._current_heat = 0
         self._current_fan = 0
         self._last_command_monotonic: float | None = None
+        self._t0_streak = 0
+        self._t0_confirmed = False
+        self._guidance_emitted = False
 
     # --- E4-S1: transitions ---
 
@@ -251,6 +254,15 @@ class RoastController:
         if not self.can_transition(target):
             raise InvalidTransitionError(self._phase, target)
         self._phase = target
+        if target in (RoastPhase.STARTING, RoastPhase.PREHEATING):
+            # Per-run latches reset (T0 confirmation, debounce streak,
+            # add-beans guidance) on a new run AND on every preheating
+            # entry: a recovery-resume into preheating declares "back
+            # before charge", so the pre-T0 overrun guard must re-arm —
+            # a stale _t0_confirmed would disarm it (safety review, E4-S3).
+            self._t0_streak = 0
+            self._t0_confirmed = False
+            self._guidance_emitted = False
         self._events.emit(RoastEventKind.PHASE_CHANGED, {"phase": target.value})
 
     # --- E4-S2: tick pipeline ---
@@ -272,8 +284,58 @@ class RoastController:
             # (it would otherwise fire in faulted/recovery).
             self._advisory_requested = False
             return
+        self._apply_phase_rules(telemetry)
         if self._advisory_requested:
             await self._run_advisory(telemetry)
+
+    def _apply_phase_rules(self, telemetry: RoastTelemetry | None) -> None:
+        """MCP-driven phase rules (E4-S3): the preheating branch.
+
+        Add-beans guidance is emitted exactly once when bean or environment
+        temperature enters the profile's charge guidance band — guidance,
+        not a blocking operator-required state. The T0 debounce counts
+        consecutive ticks of MCP-reported T0 and resets on absence *or* on
+        a read-fault tick (plan §2: flapping originates from read faults —
+        MCP latches detection internally); the transition commits only
+        after ``t0_debounce_ticks`` consecutive confirmations.
+        """
+        if self._phase is not RoastPhase.PREHEATING:
+            return
+        if telemetry is None:
+            self._t0_streak = 0  # a failed/absent read breaks the window
+            return
+        self._maybe_emit_charge_guidance(telemetry)
+        if telemetry.t0_detected:
+            self._t0_streak += 1
+        else:
+            self._t0_streak = 0
+        if self._t0_streak >= self._config.t0_debounce_ticks:
+            self._t0_confirmed = True
+            # Cause before effect: consumers see T0_DETECTED, then the
+            # PHASE_CHANGED it explains (review note, E4-S3 PR).
+            self._events.emit(
+                RoastEventKind.T0_DETECTED,
+                {"debounce_ticks": self._t0_streak, "bean_temp_c": telemetry.bean_temp_c},
+            )
+            self._t0_streak = 0  # unambiguous post-confirmation state
+            self.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+
+    def _maybe_emit_charge_guidance(self, telemetry: RoastTelemetry) -> None:
+        if self._guidance_emitted or self._profile is None:
+            return
+        low = self._profile.charge_guidance_min_c
+        high = self._profile.charge_guidance_max_c
+        if low <= telemetry.bean_temp_c <= high or low <= telemetry.env_temp_c <= high:
+            self._guidance_emitted = True
+            self._events.emit(
+                RoastEventKind.CHARGE_GUIDANCE,
+                {
+                    "bean_temp_c": telemetry.bean_temp_c,
+                    "env_temp_c": telemetry.env_temp_c,
+                    "guidance_min_c": low,
+                    "guidance_max_c": high,
+                },
+            )
 
     async def _read_telemetry(self) -> tuple[RoastTelemetry | None, bool]:
         """Read MCP state; a raised read is counted, a clean None is not
@@ -311,7 +373,9 @@ class RoastController:
             phase=self._phase,
             bean_temp_c=telemetry.bean_temp_c,
             env_temp_c=telemetry.env_temp_c,
-            t0_confirmed=self._phase is not RoastPhase.PREHEATING,
+            # The real debounced confirmation (E4-S3) — replaces the E4-S2
+            # phase-identity proxy per the safety-reviewer carry-forward.
+            t0_confirmed=self._t0_confirmed,
         )
 
     async def _act_on_safety(self, evaluation: SafetyEvaluation) -> bool:

@@ -104,7 +104,7 @@ Acceptance criteria:
 |-------|-------|--------|
 | E4-S1 | Transition table | done |
 | E4-S2 | Tick loop and scheduler | done |
-| E4-S3 | T0 debounce and add-beans guidance | not started |
+| E4-S3 | T0 debounce and add-beans guidance | done |
 | E4-S4 | Fake-MCP harness and restart recovery | not started |
 
-Epic status: **in progress** (E4-S1, E4-S2 done).
+Epic status: **in progress** (E4-S1 through E4-S3 done; E4-S4 remains).

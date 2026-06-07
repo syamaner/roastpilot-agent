@@ -496,3 +496,145 @@ async def test_failed_emergency_stop_still_faults() -> None:
     kinds = harness.events.kinds()
     assert RoastEventKind.COMMAND_FAILED in kinds
     assert RoastEventKind.FAULT in kinds
+
+
+# --- E4-S3: T0 debounce and add-beans guidance ---
+
+
+def harness_preheating(*, readings: list[RoastTelemetry | None | Exception]) -> Harness:
+    harness = make_harness(readings=readings)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING
+        harness.controller.transition_to(step)
+    harness.log.clear()
+    harness.events.events.clear()
+    return harness
+
+
+@pytest.mark.asyncio
+async def test_charge_guidance_emitted_exactly_once() -> None:
+    harness = harness_preheating(
+        readings=[
+            reading(bean=150.0, env=150.0),
+            reading(bean=175.0, env=150.0),
+            reading(bean=185.0, env=150.0),
+        ]
+    )
+    await harness.controller.tick()  # below range: nothing
+    assert RoastEventKind.CHARGE_GUIDANCE not in harness.events.kinds()
+    await harness.controller.tick()  # enters range: emitted
+    assert harness.events.kinds().count(RoastEventKind.CHARGE_GUIDANCE) == 1
+    await harness.controller.tick()  # still in range: not repeated
+    assert harness.events.kinds().count(RoastEventKind.CHARGE_GUIDANCE) == 1
+
+
+@pytest.mark.asyncio
+async def test_charge_guidance_triggers_on_environment_temperature() -> None:
+    """Plan: bean OR environment entering the band triggers guidance."""
+    harness = harness_preheating(readings=[reading(bean=120.0, env=180.0)])
+    await harness.controller.tick()
+    assert RoastEventKind.CHARGE_GUIDANCE in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_charge_guidance_only_in_preheating() -> None:
+    harness = harness_in_development(readings=[reading(bean=185.0)])
+    await harness.controller.tick()
+    assert RoastEventKind.CHARGE_GUIDANCE not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_t0_debounce_confirms_after_three_consecutive_ticks() -> None:
+    t0 = reading(bean=160.0, t0_detected=True)
+    harness = harness_preheating(readings=[t0, t0, t0])
+    await harness.controller.tick()
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.PREHEATING  # 2 < 3
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    kinds = harness.events.kinds()
+    assert kinds.count(RoastEventKind.T0_DETECTED) == 1
+    # Cause before effect: T0_DETECTED precedes the PHASE_CHANGED it explains.
+    assert kinds.index(RoastEventKind.T0_DETECTED) < kinds.index(RoastEventKind.PHASE_CHANGED)
+
+
+@pytest.mark.asyncio
+async def test_t0_debounce_resets_when_t0_absent() -> None:
+    t0 = reading(bean=160.0, t0_detected=True)
+    plain = reading(bean=160.0)
+    harness = harness_preheating(readings=[t0, t0, plain, t0, t0, t0])
+    for _ in range(5):
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.PREHEATING  # streak broken at tick 3
+    await harness.controller.tick()  # third consecutive after the break
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_t0_debounce_resets_on_read_fault() -> None:
+    """Plan §2: flapping originates from read faults — a tolerated failed
+    read breaks the confirmation window."""
+    t0 = reading(bean=160.0, t0_detected=True)
+    harness = harness_preheating(readings=[t0, t0, RuntimeError("transient"), t0, t0, t0])
+    for _ in range(5):
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.PREHEATING
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_debounced_t0_replaces_phase_proxy_in_safety() -> None:
+    """Carry-forward (E4-S2 review): the safety evaluation now receives the
+    real debounced confirmation. During the debounce window the overrun
+    rule still sees t0_confirmed=False — a hot unconfirmed preheat is an
+    overrun even while T0 is being observed."""
+    hot_t0 = reading(bean=205.0, t0_detected=True)
+    harness = harness_preheating(readings=[hot_t0])
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert harness.sink.evaluations[-1].rule == "pre_t0_overrun"
+
+
+@pytest.mark.asyncio
+async def test_per_run_latches_reset_on_new_run() -> None:
+    t0 = reading(bean=175.0, t0_detected=True)
+    harness = harness_preheating(readings=[t0, t0, t0])
+    for _ in range(3):
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    # Finish the run and start a new one: latches must be fresh.
+    for step in (
+        RoastPhase.DEVELOPMENT,
+        RoastPhase.COOLING,
+        RoastPhase.COMPLETE,
+        RoastPhase.IDLE,
+        RoastPhase.STARTING,
+    ):
+        harness.controller.transition_to(step)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    harness.events.events.clear()
+    harness.reader.readings = [t0, t0, t0]
+    await harness.controller.tick()
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.PREHEATING  # streak restarted
+    assert harness.events.kinds().count(RoastEventKind.CHARGE_GUIDANCE) == 1  # re-armed
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_overrun_guard_rearms_on_recovery_resume_into_preheating() -> None:
+    """Safety review (E4-S3): a recovery-resume into preheating declares
+    'back before charge' — a stale T0 confirmation must not disarm the
+    pre-T0 overrun rule."""
+    t0 = reading(bean=175.0, t0_detected=True)
+    harness = harness_preheating(readings=[t0, t0, t0, reading(bean=205.0)])
+    for _ in range(3):
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK  # T0 confirmed
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.controller.transition_to(RoastPhase.PREHEATING)  # operator resume
+    await harness.controller.tick()  # hot unconfirmed preheat
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert harness.sink.evaluations[-1].rule == "pre_t0_overrun"
