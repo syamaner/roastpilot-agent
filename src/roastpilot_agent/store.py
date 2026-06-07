@@ -178,6 +178,7 @@ WHEN OLD.completed_at_utc IS NOT NULL AND (
   OR NEW.profile_json != OLD.profile_json
   OR NEW.config_json != OLD.config_json
   OR NEW.started_at_utc != OLD.started_at_utc
+  OR NEW.created_at_utc != OLD.created_at_utc
   OR NEW.completed_at_utc IS NOT OLD.completed_at_utc
   OR NEW.outcome IS NOT OLD.outcome
   OR NEW.fault_reason IS NOT OLD.fault_reason
@@ -609,18 +610,19 @@ class RoastStore:
     ) -> None:
         """Finalize a run; from this point the immutability triggers guard
         everything except the operator/cloud fields."""
+        now = _utc_now()  # one instant: completed_at == updated_at at completion
         cursor = await self.connection.execute(
             "UPDATE roast_runs SET completed_at_utc = ?, outcome = ?, agent_phase = ?,"
             " fault_reason = ?, log_dir = ?, export_manifest_json = ?, updated_at_utc = ?"
             " WHERE id = ?",
             (
-                _utc_now(),
+                now,
                 outcome,
                 agent_phase.value,
                 fault_reason,
                 log_dir,
                 None if export_manifest is None else json.dumps(export_manifest, sort_keys=True),
-                _utc_now(),
+                now,
                 run_id,
             ),
         )
@@ -629,7 +631,7 @@ class RoastStore:
             raise RuntimeError(f"no roast_run with id {run_id!r}")
 
     async def set_operator_rating(
-        self, run_id: str, *, rating: int, notes: str | None = None
+        self, run_id: str, *, rating: Literal[1, 2, 3, 4, 5], notes: str | None = None
     ) -> None:
         """Operator self-rating — one of the explicit immutability
         exceptions on completed runs (plan §5)."""

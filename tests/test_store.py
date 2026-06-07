@@ -686,3 +686,54 @@ async def test_active_runs_remain_fully_mutable(tmp_store: RoastStore) -> None:
         assert row[0] == "roasting_pre_first_crack"
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_complete_run_on_unknown_run_raises(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no roast_run"):
+            await tmp_store.complete_run(
+                run_id="ghost-run", outcome="completed", agent_phase=RoastPhase.COMPLETE
+            )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_operator_rating_on_unknown_run_raises(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no roast_run"):
+            await tmp_store.set_operator_rating("ghost-run", rating=5)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_completion_timestamps_coincide(tmp_store: RoastStore) -> None:
+    """completed_at_utc == updated_at_utc at the completion instant."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        row = await fetch_one(tmp_store, "SELECT completed_at_utc, updated_at_utc FROM roast_runs")
+        assert row[0] == row[1]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_created_at_is_trigger_guarded_too(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        with pytest.raises(aiosqlite_module.IntegrityError, match="immutable"):
+            await tmp_store.connection.execute(
+                "UPDATE roast_runs SET created_at_utc = 'rewritten' WHERE id = 'run-1'"
+            )
+    finally:
+        await tmp_store.close()
