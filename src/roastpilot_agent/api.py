@@ -15,12 +15,14 @@ and the SSE stream (S3) extend :class:`RoastService` in place.
 """
 
 import asyncio
+import contextlib
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from roastpilot_agent import __version__
@@ -36,10 +38,14 @@ from roastpilot_agent.models import (
     OperatorRatingRequest,
     RoastCommand,
     RoastDetail,
+    RoastEventKind,
     RoastHistory,
     RoastPhase,
     RoastProfile,
     RoastTimeline,
+    SseEvent,
+    SseEventType,
+    TelemetryEventData,
     TelemetrySeries,
 )
 from roastpilot_agent.safety import SafetyPolicy, SafetyVerdict
@@ -74,6 +80,74 @@ class QueuedOperatorAction(BaseModel):
     payload: dict[str, Any] | None = None
 
 
+def _as_event_data(payload: object) -> dict[str, Any]:
+    """Coerce a controller event payload to the SSE ``data`` dict.
+
+    Controller emit sites always pass JSON-safe dicts; a non-dict is wrapped
+    so the typed envelope always carries a mapping."""
+    if isinstance(payload, dict):
+        return cast("dict[str, Any]", payload)
+    return {"value": payload}
+
+
+class EventBroadcaster:
+    """Typed SSE event fan-out to connected clients (E7-S3).
+
+    Implements the controller's ``EventEmitter`` protocol — the controller
+    (E9) emits agent-level events here — and also accepts the per-tick
+    telemetry the API originates. Each SSE connection subscribes a bounded
+    queue; :meth:`emit` is synchronous and non-blocking so it never stalls the
+    controller tick. A subscriber too slow to keep up overflows its queue and
+    the event is dropped for that client only (it resyncs from a snapshot on
+    reconnect) — one stalled browser tab can never back-pressure the roast.
+
+    A UI disconnect only removes that subscriber (the SSE generator's cleanup
+    calls :meth:`unsubscribe`); it triggers no cooling and no state change,
+    structurally — the broadcaster holds no controller, executor, or MCP
+    reference, so backend safety continues with no client attached.
+    """
+
+    def __init__(self, *, max_queue: int = 1000) -> None:
+        self._subscribers: set[asyncio.Queue[SseEvent]] = set()
+        self._max_queue = max_queue
+        self._sequence = 0
+
+    @property
+    def subscriber_count(self) -> int:
+        """Number of attached SSE connections."""
+        return len(self._subscribers)
+
+    def subscribe(self) -> asyncio.Queue[SseEvent]:
+        """Register a new subscriber queue for one SSE connection."""
+        queue: asyncio.Queue[SseEvent] = asyncio.Queue(maxsize=self._max_queue)
+        self._subscribers.add(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[SseEvent]) -> None:
+        """Remove a subscriber (idempotent — safe in a generator's finally)."""
+        self._subscribers.discard(queue)
+
+    def _publish(self, event_type: SseEventType, data: dict[str, Any]) -> None:
+        # Stamp the sequence at construction (never mutate post-build): one
+        # frame object is fanned out to every subscriber, read-only via
+        # render(), so no client can observe another's state.
+        self._sequence += 1
+        event = SseEvent(event=event_type, data=data, id=self._sequence)
+        for queue in self._subscribers:
+            # The client fell behind; drop rather than block the roast. It
+            # resyncs from REST snapshots on reconnect.
+            with contextlib.suppress(asyncio.QueueFull):
+                queue.put_nowait(event)
+
+    def emit(self, kind: RoastEventKind, payload: object) -> None:
+        """``EventEmitter`` protocol: publish a controller event (E9 sink)."""
+        self._publish(SseEventType(kind.value), _as_event_data(payload))
+
+    def emit_telemetry(self, data: TelemetryEventData) -> None:
+        """Publish the per-tick ``telemetry`` event (plan §6)."""
+        self._publish(SseEventType.TELEMETRY, data.model_dump(mode="json"))
+
+
 #: A downloadable export artifact name (plan §6 log manifest), validated
 #: against the known artifact set in :meth:`RoastService.log_artifact_path`.
 LogArtifactName = str
@@ -104,11 +178,19 @@ class RoastService:
         *,
         config: AppConfig | None = None,
         mcp: MCPServerProcess | None = None,
+        sse_heartbeat_seconds: float = 15.0,
     ) -> None:
         self._store = store
         self._config = config or AppConfig()
         self._mcp = mcp
         self.active_run_id: str | None = None
+        #: SSE keepalive interval (plan §6: 15 s). Injectable so tests observe
+        #: a heartbeat without waiting the full interval.
+        self.sse_heartbeat_seconds = sse_heartbeat_seconds
+        #: The typed SSE event fan-out. In E9 the controller is constructed
+        #: with this as its ``event_emitter`` so every agent event reaches the
+        #: stream; the controller also calls ``emit_telemetry`` each tick.
+        self.events = EventBroadcaster()
         # Serializes the active_run check + create_run insert: without a UNIQUE
         # "at most one open run" schema constraint, two concurrent POST /roasts
         # could both read no-active-run and both insert. One operator + a 1 s
@@ -450,6 +532,49 @@ async def submit_operator_action(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
+async def stream_events(
+    run_id: str,
+    request: Request,
+    service: ServiceDep,
+) -> StreamingResponse:
+    """``GET /api/roasts/{run_id}/events`` — the typed SSE event stream (plan §6).
+
+    Subscribes a fresh queue to the broadcaster and streams typed frames:
+    every controller event, the per-tick ``telemetry``, and a ``heartbeat``
+    every ``sse_heartbeat_seconds`` of idle. ``run_id`` names the run the
+    client expects; E7 has one active run and a global broadcaster, so the
+    stream carries that run's events. On disconnect the generator's ``finally``
+    unsubscribes — a UI disconnect removes only that subscriber and never
+    touches the controller (no cooling, no state change); backend safety runs
+    on with no client attached.
+    """
+    try:
+        await service.detail(run_id)  # 404 a stream for an unknown run
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    queue = service.events.subscribe()
+    heartbeat = service.sse_heartbeat_seconds
+
+    async def frames() -> AsyncIterator[bytes]:
+        try:
+            # An opening comment flushes headers so the client's onopen fires
+            # immediately, before the first event or heartbeat.
+            yield b": connected\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=heartbeat)
+                except TimeoutError:
+                    yield SseEvent(event=SseEventType.HEARTBEAT).render().encode()
+                    continue
+                yield event.render().encode()
+        finally:
+            service.events.unsubscribe(queue)
+
+    return StreamingResponse(frames(), media_type="text/event-stream")
+
+
 def create_app(service: RoastService | None = None) -> FastAPI:
     """Create the FastAPI application.
 
@@ -471,4 +596,5 @@ def create_app(service: RoastService | None = None) -> FastAPI:
     app.get("/api/roasts/{run_id}/log/{artifact}")(download_log)
     app.post("/api/roasts/{run_id}/rating")(rate_roast)
     app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)
+    app.get("/api/roasts/{run_id}/events")(stream_events)
     return app

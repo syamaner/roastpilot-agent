@@ -51,9 +51,9 @@ Acceptance criteria:
 |-------|-------|--------|
 | E7-S1 | REST routes | done |
 | E7-S2 | Operator action queue | done |
-| E7-S3 | SSE stream | not started |
+| E7-S3 | SSE stream | done |
 
-Epic status: **in progress** — depends on E4 ✅, E6 ✅.
+Epic status: **complete** — depends on E4 ✅, E6 ✅.
 
 ## Notes
 
@@ -87,3 +87,26 @@ Epic status: **in progress** — depends on E4 ✅, E6 ✅.
     (or dedup at drain) so a spammy operator cannot grow it without limit. A
     terminal-run guard (409/410 on actions to a COMPLETE/FAULTED run) is also
     a reasonable E9 addition — today the phase matrix rejects the harmful ones.
+- **E7-S3 (#69):** Typed SSE event stream — **E7's contract for E9/E10**.
+  `SseEventType` (the `event:` discriminator: every `RoastEventKind` +
+  transport-only `telemetry`/`heartbeat`), the `SseEvent` envelope (typed,
+  `render()` to wire format, monotonic `id`), and `TelemetryEventData` in
+  `models.py`. `EventBroadcaster` in `api.py` implements the controller's
+  `EventEmitter` protocol (the E9 sink) + `emit_telemetry`; it fans out to
+  bounded per-connection queues, non-blocking (`put_nowait`, drop-on-overflow)
+  so a slow client can never back-pressure the tick. `GET
+  /api/roasts/{id}/events` streams typed frames with a 15 s heartbeat and
+  unsubscribes on disconnect. **A UI/SSE disconnect triggers no cooling and no
+  state change** — the broadcaster holds no controller/executor/MCP reference;
+  backend safety continues with no client. Passed an adversarial
+  safety-reviewer pass. No `safety.py`/`controller.py` changes.
+  - **For E9:** construct the controller with `service.events` as its
+    `event_emitter`, and call `service.events.emit_telemetry(...)` each tick.
+    The broadcaster is global (one active run, per the 409 invariant); add
+    per-run filtering if concurrent runs ever land.
+
+## SSE contract ready
+
+E7's typed SSE event contract (`models.SseEventType` / `SseEvent` /
+`TelemetryEventData` + `EventBroadcaster`) is the surface E9 (vertical slice)
+and E10 (SPA) render from — both can now be set up against it.

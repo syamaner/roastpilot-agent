@@ -9,6 +9,7 @@ comparing a member against a raw string must be a pyright strict error
 invariant. Use ``.value`` at serialization boundaries.
 """
 
+import json
 from enum import Enum
 from typing import Any, Literal
 
@@ -399,3 +400,85 @@ class OperatorActionResult(BaseModel):
     result: Literal["accepted", "rejected", "failed"]
     reason: str
     queued: bool
+
+
+# --- E7-S3: SSE event stream (component plan §6) ---
+#
+# The typed SSE event vocabulary is E7's most important output: the E9 vertical
+# slice and the E10 SPA both render from it, so the event-type set and the
+# envelope are the stable contract. Every RoastEventKind the controller emits
+# flows to the stream, plus the two transport-only events the API itself
+# originates — per-tick ``telemetry`` and the ``heartbeat`` keepalive.
+
+
+class SseEventType(Enum):
+    """The ``event:`` field of every SSE frame (plan §6).
+
+    The superset of :class:`RoastEventKind` (so every controller event reaches
+    the SPA, including ``recovery_acknowledged``) plus the two transport-only
+    events the API originates: ``telemetry`` (every tick) and ``heartbeat``
+    (15 s keepalive). Values match ``RoastEventKind`` byte-for-byte, so
+    ``SseEventType(kind.value)`` maps a controller event to its frame type. A
+    test pins this superset relationship so the two never drift."""
+
+    RUN_STARTED = "run_started"
+    PHASE_CHANGED = "phase_changed"
+    CHARGE_GUIDANCE = "charge_guidance"
+    T0_DETECTED = "t0_detected"
+    FIRST_CRACK = "first_crack"
+    ADVISORY = "advisory"
+    COMMAND_EXECUTED = "command_executed"
+    COMMAND_FAILED = "command_failed"
+    SAFETY_ALERT = "safety_alert"
+    FAULT = "fault"
+    RECOVERY_REQUIRED = "recovery_required"
+    RECOVERY_ACKNOWLEDGED = "recovery_acknowledged"
+    LOGS_EXPORTED = "logs_exported"
+    RUN_COMPLETED = "run_completed"
+    TELEMETRY = "telemetry"
+    HEARTBEAT = "heartbeat"
+
+
+class TelemetryEventData(BaseModel):
+    """Payload of the per-tick ``telemetry`` SSE event (plan §6).
+
+    The live reading the SPA renders each tick: the agent phase plus the
+    current telemetry and applied heat/fan. The controller constructs it from
+    the tick's ``RoastTelemetry`` + phase + commanded levels and publishes it
+    through the broadcaster (E9); the SPA never infers phase locally."""
+
+    agent_phase: RoastPhase
+    bean_temp_c: float
+    env_temp_c: float
+    bean_ror_c_per_min: float | None = None
+    env_ror_c_per_min: float | None = None
+    heat_percent: int | None = None
+    fan_percent: int | None = None
+    cooling_on: bool = False
+    elapsed_seconds: float | None = None
+    t0_detected: bool = False
+    first_crack_detected: bool = False
+
+
+class SseEvent(BaseModel):
+    """One typed Server-Sent Event frame (plan §6).
+
+    The stable envelope the SPA parses: a typed ``event`` discriminator and a
+    JSON ``data`` payload. ``data`` carries the API-owned payloads
+    (``TelemetryEventData`` dumped to a dict) and the controller event payloads
+    verbatim (already JSON-safe dicts at their emit sites). ``id`` is an
+    optional monotonic sequence the broadcaster stamps for ordering/dedup."""
+
+    event: SseEventType
+    data: dict[str, Any] = Field(default_factory=dict[str, Any])
+    id: int | None = None
+
+    def render(self) -> str:
+        """Serialize to the SSE wire format (``id:``/``event:``/``data:`` +
+        blank-line terminator)."""
+        lines: list[str] = []
+        if self.id is not None:
+            lines.append(f"id: {self.id}")
+        lines.append(f"event: {self.event.value}")
+        lines.append(f"data: {json.dumps(self.data, sort_keys=True)}")
+        return "\n".join(lines) + "\n\n"
