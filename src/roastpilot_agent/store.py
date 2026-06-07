@@ -11,7 +11,7 @@ import json
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 
 import aiosqlite
 from pydantic import BaseModel, ConfigDict
@@ -19,12 +19,25 @@ from pydantic import BaseModel, ConfigDict
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.models import (
+    AdvisorTraceStatus,
+    CommandTraceSource,
+    CommandTraceStatus,
+    LogManifest,
     RoastCommand,
+    RoastDetail,
     RoastEventKind,
     RoastEventSource,
     RoastPhase,
     RoastProfile,
+    RoastSummary,
     RoastTelemetry,
+    RoastTimeline,
+    TelemetryPoint,
+    TimelineAdvisorDecision,
+    TimelineCommand,
+    TimelineEvent,
+    TimelineSafetyEvaluation,
+    TimelineVerdict,
 )
 from roastpilot_agent.safety import SafetyEvaluation
 
@@ -648,6 +661,240 @@ class RoastStore:
         await self.connection.commit()
         if cursor.rowcount == 0:
             raise RuntimeError(f"no completed roast_run with id {run_id!r}")
+
+    # --- E7-S1: API read paths (component plan §6) ---
+    #
+    # Read-only projections backing the REST surface. They return the typed
+    # response models from models.py directly: the SQL-to-DTO mapping belongs
+    # with the schema it reads, and the store already owns every other
+    # persistence concern (writes, recovery reads, immutability).
+
+    async def active_run(self) -> PersistedRun | None:
+        """The current in-progress run, or ``None``.
+
+        "Active" means a run with no ``completed_at_utc`` — ``complete_run``
+        stamps that field for every terminal outcome (completed, aborted,
+        *and* faulted), so a faulted/finished run never counts as active.
+        Backs the ``POST /api/roasts`` 409 guard and the health route's
+        active-run id; survives restart because it reads persisted state, not
+        in-memory flags."""
+        async with self.connection.execute(
+            "SELECT id, agent_phase, outcome, started_at_utc, completed_at_utc,"
+            " profile_json FROM roast_runs WHERE completed_at_utc IS NULL"
+            " ORDER BY started_at_utc DESC, rowid DESC LIMIT 1"
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return PersistedRun(
+            run_id=str(row[0]),
+            agent_phase=RoastPhase(str(row[1])),
+            outcome=row[2],
+            started_at_utc=str(row[3]),
+            completed_at_utc=None if row[4] is None else str(row[4]),
+            profile=RoastProfile.model_validate_json(str(row[5])),
+        )
+
+    async def list_runs(self) -> list[RoastSummary]:
+        """The roast history list (plan §6): newest first.
+
+        Development percent comes from the run's latest non-null telemetry
+        snapshot via a correlated subquery — one statement, no N+1 — and is
+        ``None`` for a run that never recorded one."""
+        async with self.connection.execute(
+            "SELECT r.id, r.started_at_utc, r.completed_at_utc, r.agent_phase,"
+            " r.outcome, r.profile_json, r.operator_rating,"
+            " (SELECT t.development_percent FROM telemetry_snapshots t"
+            "  WHERE t.run_id = r.id AND t.development_percent IS NOT NULL"
+            "  ORDER BY t.tick DESC LIMIT 1) AS dev_pct"
+            " FROM roast_runs r ORDER BY r.started_at_utc DESC, r.rowid DESC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        summaries: list[RoastSummary] = []
+        for row in rows:
+            profile = RoastProfile.model_validate_json(str(row[5]))
+            summaries.append(
+                RoastSummary(
+                    id=str(row[0]),
+                    started_at_utc=str(row[1]),
+                    completed_at_utc=None if row[2] is None else str(row[2]),
+                    agent_phase=RoastPhase(str(row[3])),
+                    outcome=row[4],
+                    bean_origin=profile.bean_origin,
+                    bean_varietal=profile.bean_varietal,
+                    rating=None if row[6] is None else int(row[6]),
+                    development_percent=None if row[7] is None else float(row[7]),
+                )
+            )
+        return summaries
+
+    async def read_run(self, run_id: str) -> RoastDetail | None:
+        """Run detail (plan §6): profile, phase, outcome, export manifest.
+        ``None`` when no run has that id."""
+        async with self.connection.execute(
+            "SELECT id, agent_phase, profile_json, outcome, started_at_utc,"
+            " completed_at_utc, fault_reason, operator_rating, operator_notes,"
+            " export_manifest_json FROM roast_runs WHERE id = ?",
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        manifest = None if row[9] is None else LogManifest.model_validate_json(str(row[9]))
+        return RoastDetail(
+            id=str(row[0]),
+            agent_phase=RoastPhase(str(row[1])),
+            profile=RoastProfile.model_validate_json(str(row[2])),
+            outcome=row[3],
+            started_at_utc=str(row[4]),
+            completed_at_utc=None if row[5] is None else str(row[5]),
+            fault_reason=None if row[6] is None else str(row[6]),
+            rating=None if row[7] is None else int(row[7]),
+            notes=None if row[8] is None else str(row[8]),
+            export_manifest=manifest,
+        )
+
+    async def read_telemetry_points(
+        self, run_id: str, *, downsample: int = 1
+    ) -> list[TelemetryPoint]:
+        """Tick-ordered telemetry snapshots, sampled every ``downsample`` rows.
+
+        ``downsample`` must be >= 1; ``1`` returns every snapshot. The stride
+        is index-based and keeps the first row, so the series start is stable
+        regardless of stride."""
+        if downsample < 1:
+            raise ValueError("downsample must be >= 1")
+        async with self.connection.execute(
+            "SELECT tick, elapsed_seconds, agent_phase, bean_temp_c, env_temp_c,"
+            " bean_ror_c_per_min, env_ror_c_per_min, heat_level_percent,"
+            " fan_level_percent, cooling_on, development_percent"
+            " FROM telemetry_snapshots WHERE run_id = ? ORDER BY tick ASC, id ASC",
+            (run_id,),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        sampled = rows[::downsample]
+        return [
+            TelemetryPoint(
+                tick=int(row[0]),
+                elapsed_seconds=None if row[1] is None else float(row[1]),
+                agent_phase=RoastPhase(str(row[2])),
+                bean_temp_c=None if row[3] is None else float(row[3]),
+                env_temp_c=None if row[4] is None else float(row[4]),
+                bean_ror_c_per_min=None if row[5] is None else float(row[5]),
+                env_ror_c_per_min=None if row[6] is None else float(row[6]),
+                heat_level_percent=None if row[7] is None else int(row[7]),
+                fan_level_percent=None if row[8] is None else int(row[8]),
+                cooling_on=None if row[9] is None else bool(row[9]),
+                development_percent=None if row[10] is None else float(row[10]),
+            )
+            for row in sampled
+        ]
+
+    async def read_timeline(self, run_id: str) -> RoastTimeline:
+        """The decision trace (plan §6): roast events, safety verdicts,
+        advisor decisions, and the command trail, each insertion-ordered.
+
+        Returns an empty trace for an unknown run id — distinguishing
+        not-found is the run-detail route's job, not the timeline's."""
+        async with self.connection.execute(
+            "SELECT kind, source, monotonic_seconds, recorded_at_utc, payload_json"
+            " FROM roast_events WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ) as cursor:
+            event_rows = await cursor.fetchall()
+        events = [
+            TimelineEvent(
+                kind=RoastEventKind(str(row[0])),
+                source=RoastEventSource(str(row[1])),
+                monotonic_seconds=None if row[2] is None else float(row[2]),
+                recorded_at_utc=str(row[3]),
+                payload=_loads(row[4]),
+            )
+            for row in event_rows
+        ]
+        async with self.connection.execute(
+            "SELECT tick, rule, verdict, input_heat, input_fan, adjusted_heat,"
+            " adjusted_fan, reason, recorded_at_utc FROM safety_evaluations"
+            " WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ) as cursor:
+            safety_rows = await cursor.fetchall()
+        safety_evaluations = [
+            TimelineSafetyEvaluation(
+                tick=int(row[0]),
+                rule=str(row[1]),
+                # The store CHECK constraints pin these columns to the typed
+                # wire forms; cast at the read boundary rather than re-validate.
+                verdict=cast(TimelineVerdict, str(row[2])),
+                input_heat=None if row[3] is None else int(row[3]),
+                input_fan=None if row[4] is None else int(row[4]),
+                adjusted_heat=None if row[5] is None else int(row[5]),
+                adjusted_fan=None if row[6] is None else int(row[6]),
+                reason=str(row[7]),
+                recorded_at_utc=str(row[8]),
+            )
+            for row in safety_rows
+        ]
+        async with self.connection.execute(
+            "SELECT tick, provider, model, prompt_version, latency_ms, status,"
+            " decision_json, recorded_at_utc FROM advisor_decisions"
+            " WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ) as cursor:
+            advisor_rows = await cursor.fetchall()
+        advisor_decisions = [
+            TimelineAdvisorDecision(
+                tick=int(row[0]),
+                provider=str(row[1]),
+                model=str(row[2]),
+                prompt_version=str(row[3]),
+                latency_ms=None if row[4] is None else int(row[4]),
+                status=cast(AdvisorTraceStatus, str(row[5])),
+                decision=_loads(row[6]),
+                recorded_at_utc=str(row[7]),
+            )
+            for row in advisor_rows
+        ]
+        async with self.connection.execute(
+            "SELECT tick, tool, source, status, args_json, result_json,"
+            " recorded_at_utc FROM command_log WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ) as cursor:
+            command_rows = await cursor.fetchall()
+        commands = [
+            TimelineCommand(
+                tick=int(row[0]),
+                tool=RoastCommand(str(row[1])),
+                source=cast(CommandTraceSource, str(row[2])),
+                status=cast(CommandTraceStatus, str(row[3])),
+                args=_loads(row[4]),
+                result=_loads(row[5]),
+                recorded_at_utc=str(row[6]),
+            )
+            for row in command_rows
+        ]
+        return RoastTimeline(
+            run_id=run_id,
+            events=events,
+            safety_evaluations=safety_evaluations,
+            advisor_decisions=advisor_decisions,
+            commands=commands,
+        )
+
+
+def _loads(value: Any) -> dict[str, Any] | None:
+    """Parse a stored JSON text column into a dict payload.
+
+    The trace columns (event payloads, advisor decisions, command args/results)
+    are written with ``json.dumps`` of dict payloads; a NULL column reads back
+    as ``None``. A non-object JSON value is wrapped so the typed model field
+    (``dict[str, Any] | None``) always holds a mapping."""
+    if value is None:
+        return None
+    parsed: object = json.loads(str(value))
+    if isinstance(parsed, dict):
+        return cast("dict[str, Any]", parsed)
+    return {"value": parsed}
 
 
 def _utc_now() -> str:
