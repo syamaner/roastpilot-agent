@@ -262,9 +262,16 @@ def build_model(config: AdvisorConfig) -> Model:
                 ),
             )
     except ImportError as exc:  # pragma: no cover — needs the extra uninstalled
+        # Only the native providers have their own extra; openai / ollama /
+        # openai_compatible share the openai-compatible core dependency.
+        extra = {"anthropic": "anthropic", "google": "google"}.get(provider)
+        hint = (
+            f"pip install 'roastpilot-agent[{extra}]'"
+            if extra is not None
+            else "reinstall roastpilot-agent — its openai-compatible core dependency is missing"
+        )
         raise AdvisorDependencyError(
-            f"advisor provider {provider!r} needs an optional dependency: "
-            f"pip install 'roastpilot-agent[{provider}]'"
+            f"advisor provider {provider!r} needs an optional dependency: {hint}"
         ) from exc
     # Unreachable while ``provider`` stays a closed Literal; pyright treats the
     # branches above as exhaustive, so this is a defensive backstop.
@@ -298,7 +305,8 @@ class PydanticAIAdvisor(RoastAdvisor):
 
     async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
         """Run the configured model and return a validated recommendation."""
-        context_hash = hashlib.sha256(context.model_dump_json().encode()).hexdigest()
+        context_json = context.model_dump_json()
+        context_hash = hashlib.sha256(context_json.encode()).hexdigest()
         _log.info(
             "advisory request",
             extra={
@@ -309,7 +317,7 @@ class PydanticAIAdvisor(RoastAdvisor):
             },
         )
         try:
-            result = await self._agent.run(context.model_dump_json())
+            result = await self._agent.run(context_json)
         except UnexpectedModelBehavior as exc:
             raise AdvisorMalformedOutputError(str(exc)) from exc
         except ModelAPIError as exc:
