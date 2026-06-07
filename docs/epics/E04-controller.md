@@ -53,12 +53,12 @@ Acceptance criteria:
 
 Acceptance criteria:
 
-- [ ] Add-beans guidance emitted exactly once when the 170–200 °C range is
+- [x] Add-beans guidance emitted exactly once when the 170–200 °C range is
   reached; non-blocking.
-- [ ] T0 debounce: counter increments on MCP-reported T0, resets when absent,
+- [x] T0 debounce: counter increments on MCP-reported T0, resets when absent,
   transition after `t0_debounce_ticks` (default 3). Tests reflect that
   flapping originates from read faults, not MCP state (plan §2 note).
-- [ ] The debounced T0 state **replaces** E4-S2's interim
+- [x] The debounced T0 state **replaces** E4-S2's interim
   `t0_confirmed = phase is not PREHEATING` proxy in the tick's safety
   evaluation — otherwise the T0 handover window (observed-but-not-yet-
   committed) is judged against the pre-T0 charge bound and can trip a
