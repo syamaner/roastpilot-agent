@@ -3,16 +3,20 @@
 ## Goal
 
 The advisory layer behind the `RoastAdvisor` interface: deterministic
-`FakeAdvisor` for tests/demos, the OpenRouter-backed PydanticAI
-implementation (D5), the call-frequency policy, and the advisor bake-off
-that picks the default model slug (plan §11.1). Advisory-only, always:
-typed output in, safety policy after.
+`FakeAdvisor` for tests/demos, the provider-agnostic PydanticAI
+implementation (D5 + D18 — one advisor consuming a config-built model), the
+call-frequency policy, and the advisor bake-off that picks the default
+provider/model slug (plan §11.1). Advisory-only, always: typed output in,
+safety policy after.
 
 ## Plan links
 
 - Component plan §1 (D5), §4 (advisor specifics), §8 (`test_advisor.py`),
   §11.1 (open item: model slug; bake-off resolution path recorded at the
   7 Jun 2026 product review): `roastpilot-plan/roastpilot-agent/plan.md`
+- Decision **D18** (provider-agnostic advisor via a config-selected
+  PydanticAI model factory — supersedes the OpenRouter-only reading of D5):
+  `roastpilot-plan/roastpilot-agent/plan.md`
 - Orchestration plan § PydanticAI Advisory Layer, § Advisory Call Frequency:
   `roastpilot-plan/roastpilot-agent-orchestration-plan.md`
 
@@ -28,23 +32,40 @@ Acceptance criteria:
   each produces a rejected recommendation + deterministic fallback (hold
   current targets), every outcome persisted.
 
-### E8-S2 — PydanticAI OpenRouter implementation (D5) ([#54](https://github.com/syamaner/roastpilot-agent/issues/54))
+### E8-S2 — PydanticAI provider-agnostic implementation (D5, D18) ([#54](https://github.com/syamaner/roastpilot-agent/issues/54))
 
 Acceptance criteria:
 
-- [ ] OpenAI-compatible OpenRouter endpoint via PydanticAI; strict output
-  models; versioned prompts; context hashes (not raw payloads) logged.
-- [ ] Tested behind a recorded-response double — no live calls in CI.
-- [ ] Structured-output settings confirmed; ships with a provisional
-  default model slug — the final default and the plan §11 item 1 closure
-  belong to E8-S4 (the bake-off).
+- [ ] One `PydanticAIAdvisor` consuming a PydanticAI `Model` built by a
+  `build_model(config)` factory — **not** one advisor class per provider.
+  The factory maps `AdvisorConfig.provider` → a `Model`: native
+  `openai` / `anthropic` / `google` via PydanticAI's provider classes;
+  `ollama` / `openai_compatible` via an OpenAI-compatible model at
+  `provider_base_url` (OpenRouter by default, or a LAN Ollama URL).
+- [ ] Structured output, prompt versioning, context-hash logging (not raw
+  payloads), and the typed-error mapping
+  (`AdvisorError` / `AdvisorMalformedOutputError` /
+  `AdvisorUnsafeOutputError`) live once in `PydanticAIAdvisor` —
+  provider-independent. Only `Model` construction varies per provider.
+- [ ] The API key is read at build time from the env var named by
+  `api_key_env` and handed to the provider — never stored in config or DB.
+- [ ] Native providers are optional dependency extras
+  (`anthropic`, `google`); a minimal install (`openai_compatible` /
+  `ollama` / `openai`) stays lean. Each provider value documents the extra
+  it needs.
+- [ ] Each provider path is exercised behind a recorded-response double
+  (plan §8) — no live calls in CI. The factory's provider→`Model` mapping
+  is unit-tested for every enum value.
+- [ ] Ships a working provisional default (`openai_compatible` + the
+  OpenRouter base URL). The settled default provider/`model_slug` and the
+  plan §11 item 1 closure belong to E8-S4 (the bake-off).
 
 Guardrails:
 
 - `FakeAdvisor` stays the test/CI default — no API key and no network in
   CI.
-- The OpenRouter path is exercised behind a recorded-response double
-  (plan §8) plus one manual smoke run against the live endpoint.
+- At most one manual smoke run per provider actually intended for use
+  (never in CI).
 
 ### E8-S3 — Call-frequency policy ([#55](https://github.com/syamaner/roastpilot-agent/issues/55))
 

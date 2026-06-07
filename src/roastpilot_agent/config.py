@@ -39,14 +39,31 @@ class ControllerConfig(BaseModel):
 
 
 class AdvisorConfig(BaseModel):
-    """Advisor provider configuration (decision D5: OpenRouter via PydanticAI).
+    """Advisor provider configuration (D5 + D18: provider-agnostic via a
+    config-selected PydanticAI model factory).
 
-    The exact default model slug is an open item (component plan §11.1);
-    it is confirmed and set at E8. ``api_key_env`` names the environment
-    variable holding the provider key — the key itself never lives in
-    config or the database.
+    D18 supersedes the OpenRouter-only reading of D5. ``provider`` selects
+    how the advisor's PydanticAI ``Model`` is built (see
+    ``advisor.build_model``): the native ``openai`` / ``anthropic`` /
+    ``google`` providers go direct, while ``ollama`` and
+    ``openai_compatible`` use an OpenAI-compatible endpoint at
+    ``provider_base_url``. The default — ``openai_compatible`` + the
+    OpenRouter ``provider_base_url`` — preserves the prior behavior.
+
+    ``provider_base_url`` is used only for the OpenAI-compatible providers
+    (OpenRouter via the default URL, or a LAN Ollama URL); it is inert for
+    the native providers. The API key is always read at build time from the
+    environment variable named by ``api_key_env`` and handed to the
+    provider — it never lives in config or the database.
+
+    The exact default ``model_slug`` (and whether the settled default
+    ``provider`` is native or OpenRouter) is the bake-off's call (E8-S4,
+    component plan §11.1); S2 ships a working provisional default.
     """
 
+    provider: Literal["openai", "anthropic", "google", "ollama", "openai_compatible"] = (
+        "openai_compatible"
+    )
     provider_base_url: str = "https://openrouter.ai/api/v1"
     api_key_env: str = Field(default="OPENROUTER_API_KEY", min_length=1)
     model_slug: str = ""
