@@ -22,6 +22,7 @@ from roastpilot_agent.config import ControllerConfig
 from roastpilot_agent.models import (
     RoastCommand,
     RoastEventKind,
+    RoastEventSource,
     RoastPhase,
     RoastProfile,
     RoastTelemetry,
@@ -66,8 +67,11 @@ TRANSITION_TABLE: dict[RoastPhase, frozenset[RoastPhase]] = {
     RoastPhase.STARTING: frozenset({RoastPhase.PREHEATING}),
     # MCP reports confirmed T0 (debounced, E4-S3).
     RoastPhase.PREHEATING: frozenset({RoastPhase.ROASTING_PRE_FIRST_CRACK}),
-    # First crack detected or operator override.
-    RoastPhase.ROASTING_PRE_FIRST_CRACK: frozenset({RoastPhase.DEVELOPMENT}),
+    # First crack detected or operator override — or an operator
+    # early-abort drop straight to cooling (the DROP_BEANS matrix row
+    # allows the drop here; the table must support the resulting state,
+    # safety review E4-S4).
+    RoastPhase.ROASTING_PRE_FIRST_CRACK: frozenset({RoastPhase.DEVELOPMENT, RoastPhase.COOLING}),
     # Validated drop decision or operator drop.
     RoastPhase.DEVELOPMENT: frozenset({RoastPhase.COOLING}),
     # Cooling stopped and logs exported.
@@ -113,8 +117,24 @@ class StateReader(Protocol):
 class CommandExecutor(Protocol):
     """Executes safety-approved roaster writes (E5 wraps the MCP tools)."""
 
+    async def start_session(self) -> None:
+        """Start a new MCP roast session."""
+        ...
+
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
         """Apply validated heat/fan targets."""
+        ...
+
+    async def mark_first_crack(self) -> None:
+        """Record the operator first-crack override with MCP."""
+        ...
+
+    async def drop_beans(self) -> None:
+        """Drop the beans (normal drop/cooling transition)."""
+        ...
+
+    async def stop_cooling(self) -> None:
+        """Stop the cooling cycle."""
         ...
 
     async def emergency_stop(self, *, reason: str) -> None:
@@ -233,6 +253,8 @@ class RoastController:
         self._t0_streak = 0
         self._t0_confirmed = False
         self._guidance_emitted = False
+        self._operator_state_entered: float | None = None
+        self._operator_timeout_alerted = False
 
     # --- E4-S1: transitions ---
 
@@ -263,6 +285,13 @@ class RoastController:
             self._t0_streak = 0
             self._t0_confirmed = False
             self._guidance_emitted = False
+        if target in UNIVERSAL_TARGETS:
+            # D16 operator-timeout tracking starts on entering a true
+            # operator-required state — never in normal phases.
+            self._operator_state_entered = self._clock()
+            self._operator_timeout_alerted = False
+        else:
+            self._operator_state_entered = None
         self._events.emit(RoastEventKind.PHASE_CHANGED, {"phase": target.value})
 
     # --- E4-S2: tick pipeline ---
@@ -284,41 +313,90 @@ class RoastController:
             # (it would otherwise fire in faulted/recovery).
             self._advisory_requested = False
             return
-        self._apply_phase_rules(telemetry)
+        await self._apply_phase_rules(telemetry)
+        self._check_operator_timeout()
         if self._advisory_requested:
             await self._run_advisory(telemetry)
 
-    def _apply_phase_rules(self, telemetry: RoastTelemetry | None) -> None:
-        """MCP-driven phase rules (E4-S3): the preheating branch.
-
-        Add-beans guidance is emitted exactly once when bean or environment
-        temperature enters the profile's charge guidance band — guidance,
-        not a blocking operator-required state. The T0 debounce counts
-        consecutive ticks of MCP-reported T0 and resets on absence *or* on
-        a read-fault tick (plan §2: flapping originates from read faults —
-        MCP latches detection internally); the transition commits only
-        after ``t0_debounce_ticks`` consecutive confirmations.
-        """
-        if self._phase is not RoastPhase.PREHEATING:
+    def _check_operator_timeout(self) -> None:
+        """D16: alert (once) when a true operator-required state has waited
+        past ``operator_timeout_seconds``. Never applies in normal phases —
+        the machine is hardware-off in these states, so this nags, it does
+        not actuate."""
+        if self._phase not in UNIVERSAL_TARGETS or self._operator_state_entered is None:
             return
-        if telemetry is None:
-            self._t0_streak = 0  # a failed/absent read breaks the window
+        if self._operator_timeout_alerted:
             return
-        self._maybe_emit_charge_guidance(telemetry)
-        if telemetry.t0_detected:
-            self._t0_streak += 1
-        else:
-            self._t0_streak = 0
-        if self._t0_streak >= self._config.t0_debounce_ticks:
-            self._t0_confirmed = True
-            # Cause before effect: consumers see T0_DETECTED, then the
-            # PHASE_CHANGED it explains (review note, E4-S3 PR).
+        waited = self._clock() - self._operator_state_entered
+        if waited > self._config.operator_timeout_seconds:
+            self._operator_timeout_alerted = True
             self._events.emit(
-                RoastEventKind.T0_DETECTED,
-                {"debounce_ticks": self._t0_streak, "bean_temp_c": telemetry.bean_temp_c},
+                RoastEventKind.SAFETY_ALERT,
+                {
+                    "alert": "operator_timeout",
+                    "phase": self._phase.value,
+                    "waited_seconds": waited,
+                },
             )
-            self._t0_streak = 0  # unambiguous post-confirmation state
-            self.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+
+    async def _apply_phase_rules(self, telemetry: RoastTelemetry | None) -> None:
+        """MCP-driven phase rules: preheating (E4-S3) and roasting (E4-S4).
+
+        Preheating: add-beans guidance is emitted exactly once when bean or
+        environment temperature enters the profile's charge guidance band —
+        guidance, not a blocking operator-required state. The T0 debounce
+        counts consecutive ticks of MCP-reported T0 and resets on absence
+        *or* on a read-fault tick (plan §2: flapping originates from read
+        faults — MCP latches detection internally); the transition commits
+        only after ``t0_debounce_ticks`` consecutive confirmations.
+
+        Roasting: first crack is a latched MCP event (no debounce). Both
+        transitions stamp their true detection source (MCP) through
+        evaluate_event_source (E3-S5/D16 — the controller relays, it never
+        re-stamps).
+        """
+        if self._phase is RoastPhase.PREHEATING:
+            if telemetry is None:
+                self._t0_streak = 0  # a failed/absent read breaks the window
+                return
+            self._maybe_emit_charge_guidance(telemetry)
+            if telemetry.t0_detected:
+                self._t0_streak += 1
+            else:
+                self._t0_streak = 0
+            if self._t0_streak >= self._config.t0_debounce_ticks:
+                source = self._safety.evaluate_event_source(
+                    transition="t0", source=RoastEventSource.MCP
+                )
+                await self._snapshots.persist_evaluation(source)
+                if source.verdict is not SafetyVerdict.ALLOW:
+                    return
+                self._t0_confirmed = True
+                # Cause before effect: consumers see T0_DETECTED, then the
+                # PHASE_CHANGED it explains (review note, E4-S3 PR).
+                self._events.emit(
+                    RoastEventKind.T0_DETECTED,
+                    {"debounce_ticks": self._t0_streak, "bean_temp_c": telemetry.bean_temp_c},
+                )
+                self._t0_streak = 0  # unambiguous post-confirmation state
+                self.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+            return
+        if (
+            self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+            and telemetry is not None
+            and telemetry.first_crack_detected
+        ):
+            source = self._safety.evaluate_event_source(
+                transition="first_crack", source=RoastEventSource.MCP
+            )
+            await self._snapshots.persist_evaluation(source)
+            if source.verdict is not SafetyVerdict.ALLOW:
+                return
+            self._events.emit(
+                RoastEventKind.FIRST_CRACK,
+                {"source": RoastEventSource.MCP.value, "bean_temp_c": telemetry.bean_temp_c},
+            )
+            self.transition_to(RoastPhase.DEVELOPMENT)
 
     def _maybe_emit_charge_guidance(self, telemetry: RoastTelemetry) -> None:
         if self._guidance_emitted or self._profile is None:
@@ -405,17 +483,46 @@ class RoastController:
             self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
             return True
         if verdict is SafetyVerdict.FAULT:
+            await self._apply_fail_safe(evaluation)
             if self._phase is not RoastPhase.FAULTED:
                 self.transition_to(RoastPhase.FAULTED)
             self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
             return True
         if verdict is SafetyVerdict.RECOVERY:
+            await self._apply_fail_safe(evaluation)
             if self._phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED:
                 self.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
             self._events.emit(RoastEventKind.RECOVERY_REQUIRED, evaluation.model_dump(mode="json"))
             return True
         # CLAMP/REJECT never arise from telemetry-stage rules.
         return False
+
+    async def _apply_fail_safe(self, evaluation: SafetyEvaluation) -> None:
+        """Hardware-off on faulted/recovery entry (E3-S2/E4 carry-forward).
+
+        Applies the evaluation's adjusted values (heat 0 %, safe fan)
+        before the transition commits. The safety evaluation itself is the
+        authority here — this deliberately does not consult the command×
+        phase matrix (heat-off is monotonically toward safety in every
+        phase; the matrix forbids SET_HEAT in e.g. cooling to prevent
+        re-heating, not heat-off). A failed write is surfaced
+        (COMMAND_FAILED) but never blocks the fail-closed transition.
+        """
+        if evaluation.adjusted_heat is None or evaluation.adjusted_fan is None:
+            return
+        try:
+            await self._executor.set_targets(
+                heat_percent=evaluation.adjusted_heat,
+                fan_percent=evaluation.adjusted_fan,
+            )
+        except Exception:
+            self._events.emit(
+                RoastEventKind.COMMAND_FAILED,
+                {"command": "set_targets", "context": "fail_safe", "rule": evaluation.rule},
+            )
+            return
+        self._current_heat = evaluation.adjusted_heat
+        self._current_fan = evaluation.adjusted_fan
 
     async def _run_advisory(self, telemetry: RoastTelemetry | None) -> None:
         """Advisory step: timeout-bounded, never blocks the tick.
@@ -484,8 +591,20 @@ class RoastController:
         if decision.should_drop:
             drop = self._safety.evaluate_drop_recommendation(phase=self._phase)
             await self._snapshots.persist_evaluation(drop)
-            # Drop execution wires in E4-S3/S4 (drop_beans via the matrix);
-            # E4-S2 records the eligibility verdict only.
+            if drop.verdict is SafetyVerdict.ALLOW:
+                try:
+                    await self._executor.drop_beans()
+                except Exception:
+                    self._events.emit(
+                        RoastEventKind.COMMAND_FAILED,
+                        {"command": "drop_beans", "source": "advisor"},
+                    )
+                    return
+                self._events.emit(
+                    RoastEventKind.COMMAND_EXECUTED,
+                    {"command": "drop_beans", "source": "advisor"},
+                )
+                self.transition_to(RoastPhase.COOLING)
 
     async def _record_advisor_failure(self, status: Literal["timeout", "provider_error"]) -> None:
         evaluation = self._safety.evaluate_advisor_failure(
@@ -499,14 +618,180 @@ class RoastController:
         )
 
     def load_profile(self, profile: RoastProfile) -> None:
-        """Set the active roast profile.
-
-        Interim public surface: E4-S4's run lifecycle (start/recover/end)
-        absorbs this; the advisory step requires a profile for context.
-        """
+        """Set the active roast profile (test/setup surface; start_run is
+        the real run entry point)."""
         self._profile = profile
         if self._run_started_monotonic is None:
             self._run_started_monotonic = self._clock()
+
+    # --- E4-S4: run lifecycle and operator actions ---
+
+    async def start_run(self, profile: RoastProfile) -> None:
+        """Start a new roast run (E4-S4).
+
+        Serialized by the transition table: legal only from ``idle``, so a
+        second call while a start is in flight (or any run is active)
+        raises InvalidTransitionError before any MCP command — the API 409
+        is the outer guard, this is the inner one (E3-S5 carry-forward).
+        A failed start_session lands in ``faulted`` (operator acks → idle),
+        never a half-started run.
+        """
+        self.transition_to(RoastPhase.STARTING)  # raises unless idle
+        self._profile = profile
+        self._run_started_monotonic = self._clock()
+        self._current_heat = 0
+        self._current_fan = 0
+        try:
+            await self._executor.start_session()
+        except Exception:
+            self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "start_roast_session"})
+            self.transition_to(RoastPhase.FAULTED)
+            return
+        self.transition_to(RoastPhase.PREHEATING)
+        self._events.emit(RoastEventKind.RUN_STARTED, {"profile": profile.name})
+        # Initial heat/fan per profile, through safety policy (runtime
+        # flow step 5) — never raw.
+        evaluation = self._safety.evaluate_command(
+            requested_heat=profile.initial_heat_percent,
+            requested_fan=profile.initial_fan_percent,
+            seconds_since_last_command=self._seconds_since_last_command(),
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        await self._execute_targets(evaluation)
+
+    async def _execute_targets(self, evaluation: SafetyEvaluation) -> None:
+        """Execute an ALLOW/CLAMP heat/fan evaluation; surface failures."""
+        if (
+            evaluation.verdict not in (SafetyVerdict.ALLOW, SafetyVerdict.CLAMP)
+            or evaluation.adjusted_heat is None
+            or evaluation.adjusted_fan is None
+        ):
+            return
+        try:
+            await self._executor.set_targets(
+                heat_percent=evaluation.adjusted_heat,
+                fan_percent=evaluation.adjusted_fan,
+            )
+        except Exception:
+            self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "set_targets"})
+            return
+        self._current_heat = evaluation.adjusted_heat
+        self._current_fan = evaluation.adjusted_fan
+        self._last_command_monotonic = self._clock()
+        self._events.emit(
+            RoastEventKind.COMMAND_EXECUTED,
+            {"heat_percent": evaluation.adjusted_heat, "fan_percent": evaluation.adjusted_fan},
+        )
+
+    async def recover_from_restart(self, persisted_phase: RoastPhase | None) -> None:
+        """Startup classification (orchestration plan § Persistence).
+
+        A possibly-active persisted run (anything but none/idle/complete)
+        lands in ``operator_recovery_required``: heat and fan are never
+        auto-resumed, no MCP write is issued, and emergency stop stays
+        available. Explicit operator action is required to resume, drop,
+        cool, or end the run.
+        """
+        if persisted_phase in (None, RoastPhase.IDLE, RoastPhase.COMPLETE):
+            return  # nothing possibly active: stay idle
+        evaluation = SafetyEvaluation(
+            rule="restart_recovery",
+            verdict=SafetyVerdict.RECOVERY,
+            reason=(
+                f"restart with persisted phase {persisted_phase.value}: operator recovery "
+                f"required — heat/fan deliberately not resumed"
+            ),
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        self.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+        self._events.emit(RoastEventKind.RECOVERY_REQUIRED, evaluation.model_dump(mode="json"))
+
+    def operator_resume(self, target: RoastPhase) -> None:
+        """Explicit operator resume out of recovery (the operator gate the
+        E4-S1 resume edges require). Heat stays at 0 after a resume until
+        separately commanded — this method never writes hardware."""
+        if self._phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED:
+            raise InvalidTransitionError(self._phase, target)
+        self.transition_to(target)  # table gates targets; starting is never legal
+        self._events.emit(RoastEventKind.RECOVERY_ACKNOWLEDGED, {"resumed_to": target.value})
+
+    def operator_acknowledge_fault(self) -> None:
+        """Operator acknowledgement ends a faulted run (plan §3)."""
+        self.transition_to(RoastPhase.IDLE)  # legal only from faulted/complete
+        self._events.emit(RoastEventKind.RECOVERY_ACKNOWLEDGED, {"acknowledged": "fault"})
+
+    async def operator_mark_first_crack(self) -> None:
+        """Operator FC override: matrix- and source-validated, then relayed
+        to MCP with the true OPERATOR source (E3-S5/D16)."""
+        phase_validity = self._safety.evaluate_command_phase(
+            command=RoastCommand.MARK_FIRST_CRACK, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(phase_validity)
+        if phase_validity.verdict is not SafetyVerdict.ALLOW:
+            return
+        source = self._safety.evaluate_event_source(
+            transition="first_crack", source=RoastEventSource.OPERATOR
+        )
+        await self._snapshots.persist_evaluation(source)
+        if source.verdict is not SafetyVerdict.ALLOW:
+            return
+        if not self.can_transition(RoastPhase.DEVELOPMENT):
+            raise InvalidTransitionError(self._phase, RoastPhase.DEVELOPMENT)
+        try:
+            await self._executor.mark_first_crack()
+        except Exception:
+            self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "mark_first_crack"})
+            return
+        self._events.emit(RoastEventKind.FIRST_CRACK, {"source": RoastEventSource.OPERATOR.value})
+        self.transition_to(RoastPhase.DEVELOPMENT)
+
+    async def operator_drop_beans(self) -> None:
+        """Operator drop: matrix-validated, executed, then cooling."""
+        phase_validity = self._safety.evaluate_command_phase(
+            command=RoastCommand.DROP_BEANS, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(phase_validity)
+        if phase_validity.verdict is not SafetyVerdict.ALLOW:
+            return
+        # Never write hardware unless the resulting state is reachable —
+        # a write-then-raise would diverge the FSM from the machine
+        # (safety review blocker, E4-S4).
+        if not self.can_transition(RoastPhase.COOLING):
+            raise InvalidTransitionError(self._phase, RoastPhase.COOLING)
+        try:
+            await self._executor.drop_beans()
+        except Exception:
+            self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "drop_beans"})
+            return
+        self._events.emit(
+            RoastEventKind.COMMAND_EXECUTED, {"command": "drop_beans", "source": "operator"}
+        )
+        self.transition_to(RoastPhase.COOLING)
+
+    async def operator_stop_cooling(self) -> None:
+        """Operator stop-cooling: matrix-validated; completes the run.
+        (Log export wires in E5/E9 alongside the real MCP client.)"""
+        phase_validity = self._safety.evaluate_command_phase(
+            command=RoastCommand.STOP_COOLING, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(phase_validity)
+        if phase_validity.verdict is not SafetyVerdict.ALLOW:
+            return
+        if not self.can_transition(RoastPhase.COMPLETE):
+            raise InvalidTransitionError(self._phase, RoastPhase.COMPLETE)
+        try:
+            await self._executor.stop_cooling()
+        except Exception:
+            self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "stop_cooling"})
+            return
+        self.transition_to(RoastPhase.COMPLETE)
+        self._events.emit(RoastEventKind.RUN_COMPLETED, {})
+
+    async def operator_emergency_stop(self, reason: str | None = None) -> None:
+        """Operator e-stop: always available, from every phase (E3-S4)."""
+        evaluation = self._safety.evaluate_emergency_stop(phase=self._phase, operator_reason=reason)
+        await self._snapshots.persist_evaluation(evaluation)
+        await self._act_on_safety(evaluation)
 
     def _build_advisor_context(self, telemetry: RoastTelemetry) -> AdvisorContext:
         assert self._profile is not None  # guarded by caller

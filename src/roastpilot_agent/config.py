@@ -30,6 +30,12 @@ class ControllerConfig(BaseModel):
     t0_debounce_ticks: int = Field(default=3, ge=1)
     telemetry_log_interval_seconds: float = Field(default=5.0, gt=0)
     max_stale_telemetry_seconds: float = Field(default=3.0, gt=0)
+    # D16: operator timeout applies ONLY in true operator-required states
+    # (manual confirmation, hold, recovery) — never in normal phases. The
+    # machine is already hardware-off in those states, so the timeout
+    # raises a safety alert (a nag, not an actuation); 600 s gives an
+    # operator a realistic window to return before the system complains.
+    operator_timeout_seconds: float = Field(default=600.0, gt=0)
 
 
 class AdvisorConfig(BaseModel):

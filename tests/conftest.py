@@ -31,14 +31,60 @@ class FakeClock:
 
 
 class FakeMCPClient:
-    """Test double for RoasterMCPClient.
+    """Scripted fake roaster MCP: StateReader + CommandExecutor combined.
 
-    The scripted 13-tool contract (state sequences, latched T0/FC events,
-    read/write fault injection) lands in E4/E5.
+    Feed it a full-roast telemetry script (list of RoastTelemetry / None /
+    Exception frames, last frame repeating); it records every write
+    command. E5's real client replaces it behind the same protocols;
+    E9's vertical slice reuses the scripts.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        frames: list[RoastTelemetry | None | Exception] | None = None,
+        log: list[str] | None = None,
+    ) -> None:
+        self.frames: list[RoastTelemetry | None | Exception] = list(frames or [])
+        self._log = log if log is not None else []
         self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def read_telemetry(self) -> RoastTelemetry | None:
+        self._log.append("read")
+        if not self.frames:
+            return None
+        frame = self.frames.pop(0) if len(self.frames) > 1 else self.frames[0]
+        if isinstance(frame, Exception):
+            raise frame
+        return frame
+
+    async def start_session(self) -> None:
+        self._log.append("start_session")
+        self.calls.append(("start_session", {}))
+
+    async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+        self._log.append("set_targets")
+        self.calls.append(
+            ("set_targets", {"heat_percent": heat_percent, "fan_percent": fan_percent})
+        )
+
+    async def mark_first_crack(self) -> None:
+        self._log.append("mark_first_crack")
+        self.calls.append(("mark_first_crack", {}))
+
+    async def drop_beans(self) -> None:
+        self._log.append("drop_beans")
+        self.calls.append(("drop_beans", {}))
+
+    async def stop_cooling(self) -> None:
+        self._log.append("stop_cooling")
+        self.calls.append(("stop_cooling", {}))
+
+    async def emergency_stop(self, *, reason: str) -> None:
+        self._log.append("emergency_stop")
+        self.calls.append(("emergency_stop", {"reason": reason}))
+
+    def commands(self) -> list[str]:
+        return [name for name, _ in self.calls]
 
 
 class ScriptedStateReader:
@@ -74,10 +120,27 @@ class RecordingExecutor:
         self._log = log if log is not None else []
         self.targets: list[tuple[int, int]] = []
         self.estop_reasons: list[str] = []
+        self.commands: list[str] = []
+
+    async def start_session(self) -> None:
+        self._log.append("start_session")
+        self.commands.append("start_session")
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
         self._log.append("set_targets")
         self.targets.append((heat_percent, fan_percent))
+
+    async def mark_first_crack(self) -> None:
+        self._log.append("mark_first_crack")
+        self.commands.append("mark_first_crack")
+
+    async def drop_beans(self) -> None:
+        self._log.append("drop_beans")
+        self.commands.append("drop_beans")
+
+    async def stop_cooling(self) -> None:
+        self._log.append("stop_cooling")
+        self.commands.append("stop_cooling")
 
     async def emergency_stop(self, *, reason: str) -> None:
         self._log.append("emergency_stop")
