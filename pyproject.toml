@@ -44,9 +44,25 @@ dependencies = [
   "httpx>=0.28,<1",
   "mcp>=1.0.0,<2",
   "pydantic>=2.10,<3",
-  "pydantic-ai>=1.0,<2",
+  # D18: the lean core covers the default openai_compatible path (OpenRouter
+  # via base_url), Ollama (OpenAI-compatible), and the native openai
+  # provider. Native anthropic/google are optional extras below.
+  "pydantic-ai-slim[openai]>=1.0,<2",
   "pydantic-settings>=2.7,<3",
   "uvicorn>=0.34,<1"
+]
+
+# D18 native-provider extras: install only what your configured
+# AdvisorConfig.provider needs. openai_compatible / ollama / openai work
+# with the lean core; anthropic and google each pull their SDK.
+#   provider="anthropic"  -> pip install roastpilot-agent[anthropic]
+#   provider="google"     -> pip install roastpilot-agent[google]
+[project.optional-dependencies]
+anthropic = ["pydantic-ai-slim[anthropic]>=1.0,<2"]
+google = ["pydantic-ai-slim[google]>=1.0,<2"]
+all-providers = [
+  "pydantic-ai-slim[anthropic]>=1.0,<2",
+  "pydantic-ai-slim[google]>=1.0,<2"
 ]
 
 [project.urls]
@@ -66,7 +82,11 @@ dev = [
   "pytest>=8.0",
   "pytest-asyncio>=1.0",
   "pytest-cov>=5.0",
-  "ruff>=0.8"
+  "ruff>=0.8",
+  # Native-provider SDKs so the full build_model factory (every provider
+  # value) is exercised in CI, while the runtime install stays lean.
+  "pydantic-ai-slim[anthropic]>=1.0,<2",
+  "pydantic-ai-slim[google]>=1.0,<2"
 ]
 
 [tool.hatch.build.targets.wheel]

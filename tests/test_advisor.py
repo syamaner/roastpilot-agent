@@ -1,6 +1,6 @@
 """Advisor tests (component plan §8; orchestration plan § Advisor tests).
 
-Two layers:
+Three layers:
 
 1. ``FakeAdvisor`` as a unit — deterministic script consumption, context
    recording, exhaustion behaviour, and the failure-mode → typed-exception
@@ -11,15 +11,23 @@ Two layers:
    fallback, persisted and emitted, while a valid decision is applied. This
    is the architecture invariant in action: advisor output never reaches a
    write without a SafetyEvaluation.
-
-The OpenRouter implementation behind a recorded-response double lands in
-E8-S2.
+3. ``PydanticAIAdvisor`` + the ``build_model`` factory (E8-S2 / D18): the
+   provider→Model mapping for every enum value, and the advisor's
+   structured-output / typed-error mapping exercised behind a PydanticAI
+   recorded-response double (``FunctionModel``) — no live calls, no keys.
 """
 
 import asyncio
 from dataclasses import dataclass, field
+from typing import Any
 
 import pytest
+from pydantic_ai import ModelHTTPError
+from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models.anthropic import AnthropicModel
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.models.google import GoogleModel
+from pydantic_ai.models.openai import OpenAIChatModel
 
 from roastpilot_agent.advisor import (
     AdvisorContext,
@@ -28,10 +36,13 @@ from roastpilot_agent.advisor import (
     AdvisorProviderError,
     AdvisorUnsafeOutputError,
     FakeAdvisor,
+    PydanticAIAdvisor,
     RoastAdvisor,
     RoastDecision,
+    build_model,
+    instructions_for,
 )
-from roastpilot_agent.config import ControllerConfig
+from roastpilot_agent.config import AdvisorConfig, ControllerConfig
 from roastpilot_agent.controller import RoastController, RoastPhase
 from roastpilot_agent.models import RoastEventKind, RoastProfile, RoastTelemetry
 from roastpilot_agent.safety import SafetyLimits, SafetyPolicy, SafetyVerdict
@@ -285,3 +296,183 @@ async def test_real_timeout_path_never_blocks_the_tick() -> None:
     assert harness.sink.evaluations[-1].rule == "advisor_timeout"
     assert harness.sink.evaluations[-1].verdict is SafetyVerdict.REJECT
     assert harness.executor.targets == []
+
+
+# --- PydanticAIAdvisor + build_model factory (E8-S2 / D18) ---
+
+# A valid structured-output payload the model "returns" via its output tool.
+_VALID_OUTPUT = {
+    "target_heat": 60,
+    "target_fan": 50,
+    "should_drop": False,
+    "confidence": 0.9,
+    "rationale": "steady",
+}
+
+
+def _function_model_returning(args: dict[str, Any]) -> FunctionModel:
+    """A recorded-response double: the model always calls its output tool with
+    ``args`` (the structured recommendation)."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        tool_name = info.output_tools[0].name
+        return ModelResponse(parts=[ToolCallPart(tool_name, args)])
+
+    return FunctionModel(respond)
+
+
+def _function_model_text(text: str) -> FunctionModel:
+    """A double that only ever returns prose — never the output tool, so
+    structured-output extraction exhausts retries (a malformed shape)."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        return ModelResponse(parts=[TextPart(text)])
+
+    return FunctionModel(respond)
+
+
+def _advisor_with(model: FunctionModel, **config_kwargs: object) -> PydanticAIAdvisor:
+    config = AdvisorConfig(**config_kwargs)  # type: ignore[arg-type]
+    return PydanticAIAdvisor(config, model=model)
+
+
+# build_model factory: provider → Model for every enum value.
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_type"),
+    [
+        ("openai", OpenAIChatModel),
+        ("anthropic", AnthropicModel),
+        ("google", GoogleModel),
+        ("ollama", OpenAIChatModel),
+        ("openai_compatible", OpenAIChatModel),
+    ],
+)
+def test_build_model_maps_every_provider(
+    provider: str,
+    expected_type: type,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Construction is offline — only the model type and slug are asserted, no
+    network or real key required."""
+    monkeypatch.setenv("ADVISOR_TEST_KEY", "dummy-key")
+    config = AdvisorConfig(
+        provider=provider,  # type: ignore[arg-type]
+        api_key_env="ADVISOR_TEST_KEY",
+        model_slug="some-model",
+    )
+    model = build_model(config)
+    assert isinstance(model, expected_type)
+    assert model.model_name == "some-model"
+
+
+def test_build_model_default_is_openai_compatible(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default config (openai_compatible + OpenRouter base URL) preserves
+    prior behavior: an OpenAI-compatible model."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
+    model = build_model(AdvisorConfig(model_slug="x"))
+    assert isinstance(model, OpenAIChatModel)
+
+
+def test_build_model_ollama_needs_no_key() -> None:
+    """A keyless LAN Ollama endpoint still constructs (placeholder key)."""
+    config = AdvisorConfig(
+        provider="ollama",
+        provider_base_url="http://localhost:11434/v1",
+        api_key_env="DEFINITELY_UNSET_OLLAMA_KEY",
+        model_slug="llama3",
+    )
+    assert isinstance(build_model(config), OpenAIChatModel)
+
+
+# PydanticAIAdvisor behind the recorded-response double.
+
+
+def _context() -> AdvisorContext:
+    return AdvisorContext(
+        phase=RoastPhase.DEVELOPMENT,
+        roast_elapsed_seconds=300.0,
+        development_elapsed_seconds=30.0,
+        current_bean_temp_c=200.0,
+        current_env_temp_c=210.0,
+        bean_ror_c_per_min=5.0,
+        env_ror_c_per_min=4.0,
+        target_drop_temp_c=205.0,
+        profile_name="suite",
+    )
+
+
+@pytest.mark.asyncio
+async def test_pydanticai_advisor_returns_validated_decision() -> None:
+    advisor = _advisor_with(_function_model_returning(_VALID_OUTPUT))
+    decision = await advisor.get_recommendation(_context())
+    assert isinstance(decision, RoastDecision)
+    assert (decision.target_heat, decision.target_fan, decision.should_drop) == (60, 50, False)
+
+
+@pytest.mark.asyncio
+async def test_pydanticai_advisor_out_of_range_is_unsafe() -> None:
+    """Well-shaped output that violates the RoastDecision bounds (heat 150)
+    maps to AdvisorUnsafeOutputError — not malformed."""
+    advisor = _advisor_with(_function_model_returning({**_VALID_OUTPUT, "target_heat": 150}))
+    with pytest.raises(AdvisorUnsafeOutputError):
+        await advisor.get_recommendation(_context())
+
+
+@pytest.mark.asyncio
+async def test_pydanticai_advisor_unparseable_shape_is_malformed() -> None:
+    """A model that never produces the output tool exhausts retries →
+    AdvisorMalformedOutputError."""
+    advisor = _advisor_with(_function_model_text("I cannot help with that."))
+    with pytest.raises(AdvisorMalformedOutputError):
+        await advisor.get_recommendation(_context())
+
+
+@pytest.mark.asyncio
+async def test_pydanticai_advisor_transport_failure_is_provider_error() -> None:
+    """A transport/API failure (ModelHTTPError) maps to AdvisorProviderError."""
+
+    def boom(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise ModelHTTPError(status_code=503, model_name="x", body="upstream down")
+
+    advisor = _advisor_with(FunctionModel(boom))
+    with pytest.raises(AdvisorProviderError):
+        await advisor.get_recommendation(_context())
+
+
+@pytest.mark.asyncio
+async def test_pydanticai_advisor_does_not_swallow_timeout() -> None:
+    """asyncio TimeoutError propagates so the controller's wait_for owns the
+    timeout (it must not be reclassified as a provider error)."""
+
+    def hang(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise TimeoutError("simulated cancel")
+
+    advisor = _advisor_with(FunctionModel(hang))
+    with pytest.raises(TimeoutError):
+        await advisor.get_recommendation(_context())
+
+
+@pytest.mark.asyncio
+async def test_pydanticai_advisor_logs_context_hash_not_raw_payload(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The context is logged as a hash, never as the raw payload (plan policy:
+    log prompt input hashes, not large payloads)."""
+    advisor = _advisor_with(_function_model_returning(_VALID_OUTPUT))
+    context = _context()
+    with caplog.at_level("INFO", logger="roastpilot_agent.advisor"):
+        await advisor.get_recommendation(context)
+    records = [r for r in caplog.records if r.message == "advisory request"]
+    assert records
+    record = records[0]
+    assert getattr(record, "context_hash", None)
+    # The raw profile name (a context field) must not appear in the log text.
+    assert context.profile_name not in caplog.text
+
+
+def test_instructions_for_known_and_unknown_version() -> None:
+    assert "coffee roaster" in instructions_for("v0").lower()
+    with pytest.raises(ValueError):
+        instructions_for("does-not-exist")
