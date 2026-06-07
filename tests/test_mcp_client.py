@@ -122,7 +122,7 @@ CANNED: dict[str, object] = {
         "package_name": "coffee-roaster-mcp",
         "version": "0.1.3",
         "transport": "stdio",
-        "current_phase": "Bootstrap",
+        "current_phase": "bootstrap",
         "roaster_driver": "mock",
         "first_crack_mode": "disabled",
         "bootstrap_safe": True,

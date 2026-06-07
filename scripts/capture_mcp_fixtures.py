@@ -15,6 +15,7 @@ pass a scratch-venv binary explicitly to keep the project venv clean.
 
 import asyncio
 import json
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -37,10 +38,10 @@ async def capture(command: str) -> None:
         print(f"captured {tool} -> {path.name}")
 
     # The mock server writes logs into its working directory; run from a
-    # temp dir so nothing lands in the repo.
+    # temp dir so nothing lands in the repo. CWD restored afterwards so
+    # callers (or a second capture()) never inherit a deleted directory.
+    previous_cwd = os.getcwd()
     with tempfile.TemporaryDirectory() as tmp:
-        import os
-
         os.chdir(tmp)
         process = MCPServerProcess(config)
         await process.start()
@@ -56,6 +57,10 @@ async def capture(command: str) -> None:
             save("get_roast_state", await process.call_tool("get_roast_state", {}))
             save("mark_first_crack", await process.call_tool("mark_first_crack", {}))
             save("drop_beans", await process.call_tool("drop_beans", {}))
+            # Pre-delete so a failed capture leaves a visibly missing
+            # fixture (the completeness test then fails loudly) instead of
+            # a stale file from a previous run.
+            (OUT_DIR / "start_cooling.json").unlink(missing_ok=True)
             try:
                 save("start_cooling", await process.call_tool("start_cooling", {}))
             except Exception as exc:  # noqa: BLE001 — capture-or-note, never abort
@@ -71,6 +76,7 @@ async def capture(command: str) -> None:
             )
         finally:
             await process.stop()
+            os.chdir(previous_cwd)
 
 
 if __name__ == "__main__":

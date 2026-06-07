@@ -162,7 +162,8 @@ class ServerInfo(MCPMirror):
     version: str
     transport: str
     # Deliberately str, not MCPPhase: this is the project/runtime phase
-    # label (e.g. "Bootstrap" in the live fixtures), not the roast phase.
+    # label (e.g. "bootstrap" in the captured 0.1.3 fixture), not the
+    # roast phase.
     current_phase: str
     roaster_driver: str
     first_crack_mode: str
