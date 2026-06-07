@@ -22,9 +22,9 @@ typed output in, safety policy after.
 
 Acceptance criteria:
 
-- [ ] Deterministic `FakeAdvisor` with scriptable decisions (absorbs/
+- [x] Deterministic `FakeAdvisor` with scriptable decisions (absorbs/
   replaces the conftest ScriptedAdvisor split).
-- [ ] Fixtures: valid / malformed / unsafe / timeout / provider error —
+- [x] Fixtures: valid / malformed / unsafe / timeout / provider error —
   each produces a rejected recommendation + deterministic fallback (hold
   current targets), every outcome persisted.
 
@@ -75,12 +75,12 @@ Acceptance criteria:
 
 | Story | Title | Status |
 |-------|-------|--------|
-| E8-S1 | FakeAdvisor and failure fixtures | not started |
+| E8-S1 | FakeAdvisor and failure fixtures | done |
 | E8-S2 | PydanticAI OpenRouter implementation | not started |
 | E8-S3 | Call-frequency policy | not started |
 | E8-S4 | Advisor bake-off | not started |
 
-Epic status: **not started** — E2 ✅; issues minted
+Epic status: **in progress** — E2 ✅; issues minted
 ([#53](https://github.com/syamaner/roastpilot-agent/issues/53)–[#55](https://github.com/syamaner/roastpilot-agent/issues/55),
 [#57](https://github.com/syamaner/roastpilot-agent/issues/57); epic
 tracking [#56](https://github.com/syamaner/roastpilot-agent/issues/56)).

@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from roastpilot_agent.advisor import AdvisorContext, RoastAdvisor, RoastDecision
+from roastpilot_agent.advisor import FakeAdvisor
 from roastpilot_agent.models import RoastEventKind, RoastTelemetry
 from roastpilot_agent.safety import SafetyEvaluation
 from roastpilot_agent.store import RoastStore
@@ -179,31 +179,6 @@ class EventSink:
         return [kind for kind, _ in self.events]
 
 
-class ScriptedAdvisor(RoastAdvisor):
-    """Deterministic advisor double returning pre-scripted decisions.
-
-    The full fixture set (valid / malformed / unsafe / timeout / provider
-    error) lands in E8.
-    """
-
-    def __init__(
-        self,
-        decisions: list[RoastDecision] | None = None,
-        log: list[str] | None = None,
-    ) -> None:
-        self._decisions: list[RoastDecision] = list(decisions or [])
-        self._log = log if log is not None else []
-        self.contexts: list[AdvisorContext] = []
-
-    async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
-        """Pop and return the next scripted decision."""
-        self._log.append("advisor")
-        self.contexts.append(context)
-        if not self._decisions:
-            raise AssertionError("ScriptedAdvisor has no scripted decisions left")
-        return self._decisions.pop(0)
-
-
 @pytest.fixture
 def fake_mcp_client() -> FakeMCPClient:
     """A fake MCP client with no scripted behavior yet (E4/E5)."""
@@ -211,9 +186,14 @@ def fake_mcp_client() -> FakeMCPClient:
 
 
 @pytest.fixture
-def scripted_advisor() -> ScriptedAdvisor:
-    """A deterministic advisor double with an empty script (E8)."""
-    return ScriptedAdvisor()
+def fake_advisor() -> FakeAdvisor:
+    """The deterministic scriptable advisor with an empty script (E8-S1).
+
+    The src ``FakeAdvisor`` absorbed the former conftest ScriptedAdvisor:
+    one deterministic advisor double, scriptable with decisions and
+    failure modes, shared by tests and demos.
+    """
+    return FakeAdvisor()
 
 
 @pytest.fixture
