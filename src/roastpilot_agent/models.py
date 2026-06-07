@@ -11,7 +11,7 @@ invariant. Use ``.value`` at serialization boundaries.
 
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class RoastPhase(Enum):
@@ -68,14 +68,16 @@ class RoastEventSource(Enum):
 
 
 class RoastProfile(BaseModel):
-    """Minimal static roast profile (decision D7). Finalized in E2.
+    """Minimal static roast profile (decision D7).
 
     No curve targets in M1: name, bean details, charge guidance range,
     initial heat/fan, target drop temperature, target development percent.
+    The profile is frozen into ``roast_runs.profile_json`` at run start
+    (plan §5); hardware safety limits live in config, not here.
     """
 
-    name: str
-    bean_origin: str
+    name: str = Field(min_length=1)
+    bean_origin: str = Field(min_length=1)
     bean_varietal: str | None = None
     bean_weight_grams: float = Field(gt=0)
     charge_guidance_min_c: float = 170.0
@@ -86,5 +88,26 @@ class RoastProfile(BaseModel):
     charge_guidance_max_c: float = 200.0
     initial_heat_percent: int = Field(ge=0, le=100)
     initial_fan_percent: int = Field(ge=0, le=100)
-    target_drop_temp_c: float
+    target_drop_temp_c: float = Field(gt=0)
     target_development_percent: float = Field(gt=0, lt=100)
+
+    @field_validator("name", "bean_origin", "bean_varietal")
+    @classmethod
+    def _strip_and_require_content(cls, value: str | None) -> str | None:
+        """Strip surrounding whitespace; whitespace-only strings are invalid."""
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be empty or whitespace-only")
+        return stripped
+
+    @model_validator(mode="after")
+    def _check_guidance_range(self) -> "RoastProfile":
+        """The charge guidance band must be a non-empty range."""
+        if self.charge_guidance_min_c >= self.charge_guidance_max_c:
+            raise ValueError(
+                "charge_guidance_min_c must be below charge_guidance_max_c "
+                f"({self.charge_guidance_min_c} >= {self.charge_guidance_max_c})"
+            )
+        return self

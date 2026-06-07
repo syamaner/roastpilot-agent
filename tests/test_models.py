@@ -1,14 +1,20 @@
-"""E2-S1: shared enum vocabulary tests (component plan §3, §5; D15/D16).
+"""E2-S1/E2-S2: shared model vocabulary tests (component plan §3, §5; D7, D15).
 
-Round-trip and invariant coverage for every shared enum, plus the typed
-safety handshake's JSON round trip.
+Round-trip and invariant coverage for every shared enum, the typed safety
+handshake's JSON round trip, and RoastProfile validation (D7).
 """
 
 from enum import Enum
 
+import pydantic
 import pytest
 
-from roastpilot_agent.models import RoastEventKind, RoastEventSource, RoastPhase
+from roastpilot_agent.models import (
+    RoastEventKind,
+    RoastEventSource,
+    RoastPhase,
+    RoastProfile,
+)
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 
 ALL_SHARED_ENUMS: list[type[Enum]] = [
@@ -96,3 +102,62 @@ def test_safety_evaluation_round_trip_without_adjusted_command() -> None:
     assert restored == evaluation
     assert restored.adjusted_heat is None
     assert restored.adjusted_fan is None
+
+
+def _profile(**overrides: object) -> dict[str, object]:
+    """Valid RoastProfile kwargs; override per test case."""
+    base: dict[str, object] = {
+        "name": "Ethiopia light",
+        "bean_origin": "Ethiopia",
+        "bean_weight_grams": 250.0,
+        "initial_heat_percent": 70,
+        "initial_fan_percent": 40,
+        "target_drop_temp_c": 205.0,
+        "target_development_percent": 20.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_roast_profile_defaults() -> None:
+    """D7 defaults: guidance band 170-200 °C, varietal optional."""
+    profile = RoastProfile.model_validate(_profile())
+    assert profile.charge_guidance_min_c == 170.0
+    assert profile.charge_guidance_max_c == 200.0
+    assert profile.bean_varietal is None
+
+
+def test_roast_profile_strips_whitespace() -> None:
+    profile = RoastProfile.model_validate(_profile(name="  Ethiopia light  "))
+    assert profile.name == "Ethiopia light"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"name": ""},
+        {"name": "   "},
+        {"bean_origin": ""},
+        {"bean_varietal": "   "},
+        {"bean_weight_grams": 0},
+        {"bean_weight_grams": -50.0},
+        {"initial_heat_percent": 101},
+        {"initial_heat_percent": -1},
+        {"initial_fan_percent": 101},
+        {"target_drop_temp_c": 0},
+        {"target_development_percent": 0},
+        {"target_development_percent": 100},
+        {"charge_guidance_min_c": 200.0},  # min == max
+        {"charge_guidance_min_c": 210.0},  # min > max
+        {"charge_guidance_max_c": 150.0},  # max < default min
+    ],
+)
+def test_roast_profile_rejects_nonsense(overrides: dict[str, object]) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        RoastProfile.model_validate(_profile(**overrides))
+
+
+def test_roast_profile_json_round_trip() -> None:
+    profile = RoastProfile.model_validate(_profile(bean_varietal="Heirloom"))
+    restored = RoastProfile.model_validate_json(profile.model_dump_json())
+    assert restored == profile
