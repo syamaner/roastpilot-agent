@@ -303,12 +303,18 @@ class RoastStore:
         await self.connection.commit()
 
     async def update_run_phase(self, run_id: str, agent_phase: RoastPhase) -> None:
-        """Persist the last-known agent phase (the recovery read, E6-S3)."""
-        await self.connection.execute(
+        """Persist the last-known agent phase (the recovery read, E6-S3).
+
+        A missing run is a programming error and raises — a silent no-op
+        here would corrupt the restart-recovery breadcrumb.
+        """
+        cursor = await self.connection.execute(
             "UPDATE roast_runs SET agent_phase = ?, updated_at_utc = ? WHERE id = ?",
             (agent_phase.value, _utc_now(), run_id),
         )
         await self.connection.commit()
+        if cursor.rowcount == 0:
+            raise RuntimeError(f"no roast_run with id {run_id!r}")
 
     async def record_event(
         self,
@@ -417,7 +423,8 @@ class RoastStore:
             ),
         )
         await self.connection.commit()
-        assert cursor.lastrowid is not None
+        if cursor.lastrowid is None:  # pragma: no cover — SQLite guarantees it
+            raise RuntimeError("INSERT into safety_evaluations returned no lastrowid")
         return cursor.lastrowid
 
     async def record_advisor_decision(

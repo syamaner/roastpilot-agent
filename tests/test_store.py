@@ -443,8 +443,68 @@ async def test_writes_commit_per_tick(tmp_store: RoastStore) -> None:
 async def test_update_run_phase_touches_updated_at(tmp_store: RoastStore) -> None:
     await seeded_store(tmp_store)
     try:
+        before = await fetch_one(tmp_store, "SELECT created_at_utc, updated_at_utc FROM roast_runs")
+        await asyncio_sleep_tiny()
         await tmp_store.update_run_phase("run-1", RoastPhase.PREHEATING)
-        row = await fetch_one(tmp_store, "SELECT agent_phase FROM roast_runs")
+        row = await fetch_one(
+            tmp_store, "SELECT agent_phase, created_at_utc, updated_at_utc FROM roast_runs"
+        )
         assert row[0] == "preheating"
+        assert row[1] == before[0]  # created_at untouched
+        assert row[2] != before[1]  # updated_at actually advanced
+    finally:
+        await tmp_store.close()
+
+
+async def asyncio_sleep_tiny() -> None:
+    import asyncio
+
+    await asyncio.sleep(0.002)  # isoformat carries microseconds; ensure a delta
+
+
+@pytest.mark.asyncio
+async def test_update_run_phase_on_unknown_run_raises(tmp_store: RoastStore) -> None:
+    """Review finding (E6-S2 PR): a silent no-op would corrupt the
+    restart-recovery breadcrumb."""
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no roast_run"):
+            await tmp_store.update_run_phase("ghost-run", RoastPhase.PREHEATING)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_advisor_failure_persists_null_decision(tmp_store: RoastStore) -> None:
+    """Review finding (E6-S2 PR): the timeout path — the one that fires
+    when the LLM is unreachable — stores SQL NULL, not a JSON null."""
+    await seeded_store(tmp_store)
+    try:
+        context = AdvisorContext(
+            phase=RoastPhase.DEVELOPMENT,
+            roast_elapsed_seconds=500.0,
+            development_elapsed_seconds=None,
+            current_bean_temp_c=197.0,
+            current_env_temp_c=215.0,
+            bean_ror_c_per_min=None,
+            env_ror_c_per_min=None,
+            target_drop_temp_c=205.0,
+            profile_name="store-test",
+        )
+        await tmp_store.record_advisor_decision(
+            run_id="run-1",
+            tick=12,
+            provider="openrouter",
+            model="test-model",
+            prompt_version="v0",
+            context=context,
+            latency_ms=None,
+            decision=None,
+            status="timeout",
+        )
+        row = await fetch_one(
+            tmp_store, "SELECT decision_json, status, latency_ms FROM advisor_decisions"
+        )
+        assert row == (None, "timeout", None)
     finally:
         await tmp_store.close()
