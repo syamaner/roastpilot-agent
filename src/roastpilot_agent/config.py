@@ -57,12 +57,15 @@ class AdvisorConfig(BaseModel):
     provider — it never lives in config or the database.
 
     The default ``model_slug`` and ``prompt_version`` are the bake-off's
-    outcome (E8-S4, plan §11.1 → D20): ``anthropic/claude-opus-4.8`` via
-    OpenRouter won on advice quality with comfortable latency headroom under
-    the 10 s budget, and ``v1`` is the electric-roaster prompt. To run opus
-    natively (no OpenRouter hop/markup, per D18), set ``provider=anthropic``
-    + ``api_key_env=ANTHROPIC_API_KEY``. ``OPENROUTER_API_KEY`` must be set
-    in the environment at runtime; ``FakeAdvisor`` stays the test/CI default.
+    outcome (E8-S4, plan §11.1 → D20, refined → D21): ``anthropic/
+    claude-opus-4.8`` via OpenRouter won on advice quality with comfortable
+    latency headroom under the 10 s budget, and ``v2`` is the electric-Hottop
+    prompt (fan as a coupled heat-transfer-mode lever + development-duration
+    objective). Under v2's richer prompt opus is the only frontier model that
+    still passes the latency gate. To run opus natively (no OpenRouter
+    hop/markup, per D18), set ``provider=anthropic`` +
+    ``api_key_env=ANTHROPIC_API_KEY``. ``OPENROUTER_API_KEY`` must be set in
+    the environment at runtime; ``FakeAdvisor`` stays the test/CI default.
     """
 
     provider: Literal["openai", "anthropic", "google", "ollama", "openai_compatible"] = (
@@ -73,7 +76,7 @@ class AdvisorConfig(BaseModel):
     model_slug: str = "anthropic/claude-opus-4.8"
     timeout_seconds: float = Field(default=10.0, gt=0)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    prompt_version: str = Field(default="v1", min_length=1)
+    prompt_version: str = Field(default="v2", min_length=1)
 
 
 class SafetyLimits(BaseModel):

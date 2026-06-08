@@ -155,7 +155,7 @@ async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iterations", type=int, default=3)
     parser.add_argument(
-        "--prompt-version", default="v1", help="advisor prompt version (default: v1)"
+        "--prompt-version", default="v2", help="advisor prompt version (default: v2)"
     )
     parser.add_argument("--out", type=Path, default=Path("/tmp/bakeoff.json"))
     args = parser.parse_args()
