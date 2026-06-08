@@ -137,13 +137,13 @@ python scripts/advisor_bakeoff.py --iterations 3 --prompt-version v1 --out /tmp/
 
 | Model | v0 (timid) | v1 (decisive) |
 |---|---|---|
-| qwen3.6 local | 100 (*"maintain"*) | **30** |
-| gemini-3.5-flash | 75 | **40** |
-| gpt-5.5 | 85 | **30** |
-| claude-opus-4.8 | 85 | **55** |
-| claude-sonnet-4.6 | 80 | **55** |
-| claude-haiku-4.5 | 85 | **65** |
-| gpt-5-mini | 85 | 20 (over budget) |
+| qwen3.6-35b-a3b (local) | 100 (*"maintain"*) | **30** |
+| google/gemini-3.5-flash | 75 | **40** |
+| openai/gpt-5.5 | 85 | **30** |
+| anthropic/claude-opus-4.8 | 85 | **55** |
+| anthropic/claude-sonnet-4.6 | 80 | **55** |
+| anthropic/claude-haiku-4.5 | 85 | **65** |
+| openai/gpt-5-mini | 85 | 20 (over budget) |
 
 Under `v0` every model looked timid and similar; `v1` made them all act —
 strong evidence that **the prompt, not the model, drove the behavior**.
@@ -197,6 +197,10 @@ Two operational notes:
   slate lives in `scripts/advisor_bakeoff.py`; sonnet-4.6 (deeper rationale,
   thinner margin), haiku-4.5 (fast/cheap, under-follows v1), and gemini-3.5-
   flash (cheap, aggressive) are a `MODEL_SLUG` swap away if priorities change.
+  Note the latency risk on one runner-up: **gpt-5.5 crossed the gate on a
+  single iteration under v1 (10.9 s)** — its medians pass (7.4–8.5 s) but the
+  longer prompt leaves it without margin, so a swap-in carries real
+  over-budget risk.
 
 ## Reproduce
 
