@@ -14,8 +14,8 @@ Builds on the single-model smoke run in
 
 - **Winner / default: `anthropic/claude-opus-4.8` via OpenRouter, prompt
   `v1`.** Best advice quality with comfortable latency headroom under the
-  10 s budget (~4.4 s on the bake-off prompt; ~5.7 s on v1). Confirmed by a
-  full-slate re-run under `v1`, the shipped prompt (see "Second run" below).
+  10 s budget (~4.4 s on the bake-off `v0` prompt; ~4.7–5.2 s on `v1`,
+  confirmed by the full-slate re-run — see "Second run" below).
 - **New electric-roaster prompt `v1`** is now the default
   (`AdvisorConfig.prompt_version`). The original `v0` ("small, conservative
   adjustments") was miscalibrated for an electric roaster — see below.
@@ -170,12 +170,12 @@ comparable lag reasoning, but opus is faster.
 
 | Candidate | early / mid / late | Gate |
 |---|---|---|
-| qwen3.6 local | 2.4 / 2.1 / 2.1 s | ✅ |
-| claude-haiku-4.5 | 4.4 / 3.8 / 3.6 s | ✅ |
-| **claude-opus-4.8** | **5.2 / 4.7 / 4.8 s** | ✅ |
-| gemini-3.5-flash | 4.9 / 6.9 / 6.2 s | ✅ |
+| qwen3.6-35b-a3b (local) | 2.4 / 2.1 / 2.1 s | ✅ |
+| anthropic/claude-haiku-4.5 | 4.4 / 3.8 / 3.6 s | ✅ |
+| **anthropic/claude-opus-4.8** | **5.2 / 4.7 / 4.8 s** | ✅ |
+| google/gemini-3.5-flash | 4.9 / 6.9 / 6.2 s | ✅ |
 | openai/gpt-5.5 | 7.9 / 7.4 / 8.5 s | ⚠️ pass (one iter 10.9 s) |
-| claude-sonnet-4.6 | 8.0 / 7.6 / 7.5 s | ⚠️ pass (thin margin) |
+| anthropic/claude-sonnet-4.6 | 8.0 / 7.6 / 7.5 s | ⚠️ pass (thin margin) |
 | openai/gpt-5-mini | 15.9 / 17.5 / 15.0 s | ❌ over budget |
 
 Honest correction to the first run's hypothesis: the longer `v1` prompt was
