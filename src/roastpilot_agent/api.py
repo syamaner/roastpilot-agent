@@ -16,18 +16,28 @@ and the SSE stream (S3) extend :class:`RoastService` in place.
 
 import asyncio
 import contextlib
+import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, Protocol, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from roastpilot_agent import __version__
+from roastpilot_agent.advisor import RoastAdvisor
 from roastpilot_agent.config import AppConfig
-from roastpilot_agent.mcp_client import MCPServerProcess
+from roastpilot_agent.controller import (
+    TRANSITION_TABLE,
+    CommandExecutor,
+    RoastController,
+    StateReader,
+    TickScheduler,
+)
+from roastpilot_agent.mcp_client import ExportRoastLogResult, MCPServerProcess, RoastSessionState
 from roastpilot_agent.models import (
     HealthResponse,
     LogManifest,
@@ -39,6 +49,7 @@ from roastpilot_agent.models import (
     RoastCommand,
     RoastDetail,
     RoastEventKind,
+    RoastEventSource,
     RoastHistory,
     RoastPhase,
     RoastProfile,
@@ -48,8 +59,32 @@ from roastpilot_agent.models import (
     TelemetryEventData,
     TelemetrySeries,
 )
-from roastpilot_agent.safety import SafetyPolicy, SafetyVerdict
+from roastpilot_agent.safety import SafetyEvaluation, SafetyPolicy, SafetyVerdict
 from roastpilot_agent.store import RoastStore
+
+
+#: A roaster control surface satisfies both controller protocols (read + write).
+#: The E9 live stack wires either the real ``RoasterControlAdapter`` (over the
+#: MCP child) or a test fake here — the controller never sees the MCP client.
+class RoasterControl(StateReader, CommandExecutor, Protocol): ...
+
+
+class LogExporter(Protocol):
+    """Exports the roast log at completion (the runner's step 11)."""
+
+    async def export_roast_log(self) -> ExportRoastLogResult:
+        """Export logs and return the manifest result."""
+        ...
+
+
+class RawStateSource(Protocol):
+    """Supplies the last raw MCP session state for telemetry-row enrichment."""
+
+    @property
+    def last_state(self) -> RoastSessionState | None:
+        """The most recent raw ``RoastSessionState``, or ``None``."""
+        ...
+
 
 #: Operator actions that resolve to an MCP write command, mapped to the
 #: command×phase matrix entry used for the queue's phase-validity pre-check
@@ -162,6 +197,451 @@ class RoastRunNotFoundError(Exception):
     """No run (or no requested artifact) matches the id (maps to HTTP 404)."""
 
 
+class RoastRunGoneError(Exception):
+    """An operator action targets a terminal (COMPLETE/FAULTED) run (HTTP 410).
+
+    A completed or faulted run has no live controller loop draining its queue and
+    no hot hardware to act on; the action is gone, not merely conflicting."""
+
+
+#: Fallback agent-event → source mapping for persisted ``roast_events`` rows.
+#: A ``source`` carried in the event payload (e.g. an operator/MCP first-crack,
+#: an advisor/operator command) wins over this map; it is the default for events
+#: that do not name their origin. Most controller events are the controller's.
+_EVENT_SOURCE: dict[RoastEventKind, RoastEventSource] = {
+    RoastEventKind.ADVISORY: RoastEventSource.ADVISOR,
+    RoastEventKind.FAULT: RoastEventSource.SAFETY,
+    RoastEventKind.RECOVERY_REQUIRED: RoastEventSource.SAFETY,
+    RoastEventKind.SAFETY_ALERT: RoastEventSource.SAFETY,
+    RoastEventKind.T0_DETECTED: RoastEventSource.MCP,
+}
+
+
+@dataclass(frozen=True)
+class _BufferedEvent:
+    """One controller event captured for deferred store persistence, stamped
+    with the controller-clock time it was emitted (not flush time)."""
+
+    kind: RoastEventKind
+    payload: object
+    monotonic_seconds: float
+
+
+def _event_source(event: _BufferedEvent) -> RoastEventSource:
+    """Resolve the persisted ``source`` for an event: the payload's own
+    ``source`` field when present and valid, else the fallback map, else the
+    controller."""
+    payload = event.payload
+    if isinstance(payload, dict):
+        named = cast("dict[str, Any]", payload).get("source")
+        if isinstance(named, str):
+            try:
+                return RoastEventSource(named)
+            except ValueError:  # pragma: no cover — defensive: emit sites use valid sources
+                pass
+    return _EVENT_SOURCE.get(event.kind, RoastEventSource.CONTROLLER)
+
+
+class BufferingEventEmitter:
+    """The controller's ``EventEmitter`` for a live run (E9): fan out to SSE
+    immediately, buffer for deferred store persistence.
+
+    ``emit`` is synchronous (the controller contract) and cannot ``await`` the
+    async ``record_event``; so it forwards to the broadcaster for real-time SSE
+    and appends to an in-memory buffer the runner drains and persists at the end
+    of each tick. The ``monotonic_seconds`` is captured **at emit time** so the
+    decision trace preserves intra-tick ordering (e.g. an operator drop before a
+    safety fault in the same tick), not a single flush-time stamp."""
+
+    def __init__(self, broadcaster: "EventBroadcaster", *, clock: Callable[[], float]) -> None:
+        self._broadcaster = broadcaster
+        self._clock = clock
+        self._buffer: list[_BufferedEvent] = []
+
+    def emit(self, kind: RoastEventKind, payload: object) -> None:
+        """``EventEmitter`` protocol: publish to SSE now, buffer for persistence."""
+        self._broadcaster.emit(kind, payload)
+        self._buffer.append(_BufferedEvent(kind, payload, self._clock()))
+
+    def emit_telemetry(self, data: TelemetryEventData) -> None:
+        """Publish the per-tick ``telemetry`` SSE frame (not a persisted event)."""
+        self._broadcaster.emit_telemetry(data)
+
+    def peek(self) -> list[_BufferedEvent]:
+        """A copy of the un-flushed buffer (e.g. to read a fault reason before
+        the flush drains it)."""
+        return list(self._buffer)
+
+    def drain(self) -> list[_BufferedEvent]:
+        """Return and clear the buffered events for persistence."""
+        items = self._buffer
+        self._buffer = []
+        return items
+
+
+class StoreSnapshotSink:
+    """The controller's ``SnapshotSink`` for a live run (E9).
+
+    ``persist_evaluation`` is the decision trace's verdict stream — every safety
+    evaluation lands in ``safety_evaluations`` keyed by the current tick.
+    ``persist_snapshot`` is a deliberate no-op: the runner persists an enriched
+    telemetry row post-tick (with phase, commanded heat/fan, MCP phase, dev %,
+    and the raw session dump) rather than the bare projected reading."""
+
+    def __init__(self, store: RoastStore, run_id: str, tick: Callable[[], int]) -> None:
+        self._store = store
+        self._run_id = run_id
+        self._tick = tick
+
+    async def persist_snapshot(self, telemetry: object) -> None:
+        return  # the runner owns the enriched telemetry row (see RoastRunner)
+
+    async def persist_evaluation(self, evaluation: SafetyEvaluation) -> None:
+        await self._store.record_safety_evaluation(
+            run_id=self._run_id, tick=self._tick(), evaluation=evaluation
+        )
+
+
+class _TickCounter:
+    """A shared mutable tick index — the runner advances it; the snapshot sink
+    reads it so persisted evaluations carry the same tick as the row."""
+
+    def __init__(self) -> None:
+        self.value = 0
+
+
+class RoastRunner:
+    """Drives one live roast: the controller tick loop wired to MCP, the store,
+    the operator queue, and the SSE broadcaster (E9 vertical slice).
+
+    Per tick (the documented order): drain the operator queue through the full
+    safety policy → run the controller tick → finalize on a terminal phase
+    (export logs, complete the run) → flush buffered events to the store →
+    publish + persist the telemetry row → persist a phase change. The advisor
+    only advises; every roaster write still passes through the controller's
+    safety policy. A restart never resumes heat/fan — the runner issues no
+    hardware write on construction or recovery."""
+
+    def __init__(
+        self,
+        *,
+        controller: RoastController,
+        store: RoastStore,
+        emitter: BufferingEventEmitter,
+        operator_queue: "asyncio.Queue[QueuedOperatorAction]",
+        counter: _TickCounter,
+        config: AppConfig,
+        run_id: str,
+        clock: Callable[[], float],
+        exporter: LogExporter | None = None,
+        raw_state: RawStateSource | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
+        self._controller = controller
+        self._store = store
+        self._emitter = emitter
+        self._queue = operator_queue
+        self._counter = counter
+        self._config = config
+        self._run_id = run_id
+        self._clock = clock
+        self._exporter = exporter
+        self._raw_state = raw_state
+        self._sleep = sleep
+        self._finalized = False
+        self._last_persisted_phase: RoastPhase | None = None
+        self._scheduler: TickScheduler | None = None
+
+    async def start(self, profile: RoastProfile) -> None:
+        """Begin the run: drive the controller's idle→preheating start, then
+        flush its startup events and persist the resulting phase. Issues the
+        profile's initial heat/fan through the controller's safety policy (never
+        raw) — the controller owns that, not the runner."""
+        await self._controller.start_run(profile)
+        await self._flush_events()
+        await self._persist_phase_if_changed()
+
+    async def recover(self, profile: RoastProfile, persisted_phase: RoastPhase) -> None:
+        """Restart into recovery: classify the persisted run into
+        ``operator_recovery_required`` without resuming heat or fan, persist the
+        resulting phase, and flush the recovery events. Issues no MCP write — the
+        restart-never-auto-resumes invariant (controller ``recover_from_restart``
+        owns the rule; the runner only persists and surfaces it)."""
+        self._controller.load_profile(profile)
+        await self._controller.recover_from_restart(persisted_phase)
+        await self._flush_events()
+        await self._persist_phase_if_changed()
+
+    @property
+    def finalized(self) -> bool:
+        """Whether the run reached a terminal phase and was completed."""
+        return self._finalized
+
+    async def run(self) -> None:
+        """Production loop: tick at the configured interval until the run ends."""
+        scheduler = TickScheduler(
+            interval_seconds=self._config.controller.tick_interval_seconds,
+            tick=self._tick_step,
+            clock=self._clock,
+            sleep=self._sleep,
+        )
+        self._scheduler = scheduler
+        await scheduler.run()
+
+    async def _tick_step(self) -> None:
+        if await self.tick_once() and self._scheduler is not None:
+            self._scheduler.stop()
+
+    async def tick_once(self) -> bool:
+        """Run one live tick; return whether the run is now finalized.
+
+        Order is load-bearing: drain (operator writes, safety re-checked) →
+        controller tick → completion side effects (which emit events) → single
+        event flush (last, so terminal events like ``run_completed`` /
+        ``logs_exported`` are never emitted-but-unpersisted) → telemetry."""
+        self._counter.value += 1
+        await self._drain_queue()
+        await self._controller.tick()
+        finalized = await self._handle_completion()
+        await self._flush_events()
+        await self._publish_and_persist_telemetry()
+        if not finalized:
+            await self._persist_phase_if_changed()
+        return finalized
+
+    async def _drain_queue(self) -> None:
+        """Execute every queued operator action through the controller (which
+        re-runs the full safety policy before any MCP write). Emergency stops are
+        dispatched first so a queue backlog can never delay an e-stop."""
+        batch: list[QueuedOperatorAction] = []
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            # A single service-level queue is shared across runs; drop any item
+            # left over from a prior run rather than apply it to this one.
+            if item.run_id == self._run_id:
+                batch.append(item)
+        batch.sort(key=lambda item: item.action is not OperatorAction.EMERGENCY_STOP)
+        for item in batch:
+            await self._dispatch(item)
+
+    async def _dispatch(self, item: QueuedOperatorAction) -> None:
+        """Route one operator action to its controller handler and record the
+        executed MCP command (when one was issued) in the decision trace."""
+        controller = self._controller
+        payload = item.payload or {}
+        tool: RoastCommand | None = None
+        before = len(self._emitter.peek())
+        if item.action is OperatorAction.EMERGENCY_STOP:
+            reason = payload.get("reason")
+            await controller.operator_emergency_stop(reason if isinstance(reason, str) else None)
+            tool = RoastCommand.EMERGENCY_STOP
+        elif item.action is OperatorAction.MARK_BEANS_ADDED:
+            await controller.operator_mark_beans_added()
+            tool = RoastCommand.MARK_BEANS_ADDED
+        elif item.action is OperatorAction.MARK_FIRST_CRACK:
+            await controller.operator_mark_first_crack()
+            tool = RoastCommand.MARK_FIRST_CRACK
+        elif item.action is OperatorAction.DROP_BEANS:
+            await controller.operator_drop_beans()
+            tool = RoastCommand.DROP_BEANS
+        elif item.action is OperatorAction.START_COOLING:
+            await controller.operator_start_cooling()
+            tool = RoastCommand.START_COOLING
+        elif item.action is OperatorAction.STOP_COOLING:
+            await controller.operator_stop_cooling()
+            tool = RoastCommand.STOP_COOLING
+        elif item.action is OperatorAction.PAUSE_ADVISORY:
+            controller.operator_pause_advisory()
+        elif item.action is OperatorAction.RESUME_ADVISORY:
+            controller.operator_resume_advisory()
+        elif item.action is OperatorAction.ACKNOWLEDGE_RECOVERY:
+            await self._dispatch_acknowledge(payload)
+        if tool is not None:
+            await self._record_dispatch_command(tool, item, since=before)
+
+    async def _dispatch_acknowledge(self, payload: dict[str, Any]) -> None:
+        """Phase-based ``acknowledge_recovery``: from a terminal phase it ends the
+        run (→ idle); from ``operator_recovery_required`` it resumes to the
+        ``resume_to`` target in the payload (validated against the recovery
+        transition row — ``starting`` is never legal). A missing/invalid target,
+        or any other phase, is recorded as a failed operator action — never a
+        guessed resume."""
+        phase = self._controller.phase
+        if phase in (RoastPhase.FAULTED, RoastPhase.COMPLETE):
+            self._controller.operator_acknowledge_fault()
+            return
+        if phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED:
+            target = _parse_resume_target(payload.get("resume_to"))
+            if target is None:
+                await self._store.record_operator_action(
+                    action=OperatorAction.ACKNOWLEDGE_RECOVERY.value,
+                    result="failed",
+                    run_id=self._run_id,
+                    payload=payload or None,
+                )
+                return
+            self._controller.operator_resume(target)
+            return
+        await self._store.record_operator_action(
+            action=OperatorAction.ACKNOWLEDGE_RECOVERY.value,
+            result="failed",
+            run_id=self._run_id,
+            payload=payload or None,
+        )
+
+    async def _record_dispatch_command(
+        self, tool: RoastCommand, item: QueuedOperatorAction, *, since: int
+    ) -> None:
+        """Record the operator-issued MCP command in ``command_log`` with the
+        outcome the controller's events report. A phase-rejected action issues no
+        command (its REJECT verdict is already in ``safety_evaluations``) and so
+        is not logged here."""
+        new_events = self._emitter.peek()[since:]
+        executed = any(e.kind is RoastEventKind.COMMAND_EXECUTED for e in new_events)
+        failed = any(e.kind is RoastEventKind.COMMAND_FAILED for e in new_events)
+        if not executed and not failed:
+            return
+        await self._store.record_command(
+            run_id=self._run_id,
+            tick=self._counter.value,
+            tool=tool,
+            source="operator",
+            status="ok" if executed else "failed",
+            args=item.payload,
+        )
+
+    async def _handle_completion(self) -> bool:
+        phase = self._controller.phase
+        if phase not in (RoastPhase.COMPLETE, RoastPhase.FAULTED):
+            return False
+        if self._finalized:
+            return True
+        self._finalized = True
+        if phase is RoastPhase.COMPLETE:
+            manifest = await self._export_logs()
+            await self._store.complete_run(
+                run_id=self._run_id,
+                outcome="completed",
+                agent_phase=phase,
+                log_dir=None if manifest is None else manifest.log_dir,
+                export_manifest=None if manifest is None else manifest.model_dump(mode="json"),
+            )
+        else:
+            await self._store.complete_run(
+                run_id=self._run_id,
+                outcome="faulted",
+                agent_phase=phase,
+                fault_reason=self._last_fault_reason(),
+            )
+        self._last_persisted_phase = phase
+        return True
+
+    async def _export_logs(self) -> LogManifest | None:
+        """Export the roast log at completion (step 11). Export is a diagnostic
+        file write, not a roaster control command, so it does not route through
+        the command×phase matrix. A failed export surfaces as ``command_failed``
+        and leaves the run completed without a manifest."""
+        if self._exporter is None:  # pragma: no cover — production wires the adapter exporter
+            return None
+        try:
+            result = await self._exporter.export_roast_log()
+        except Exception:
+            self._emitter.emit(RoastEventKind.COMMAND_FAILED, {"command": "export_roast_log"})
+            return None
+        manifest = LogManifest(
+            log_dir=result.log_dir,
+            jsonl_path=result.jsonl_path,
+            csv_path=result.csv_path,
+            summary_path=result.summary_path,
+            ready=result.ready,
+            note=result.note,
+        )
+        self._emitter.emit(RoastEventKind.LOGS_EXPORTED, manifest.model_dump(mode="json"))
+        return manifest
+
+    def _last_fault_reason(self) -> str | None:
+        for event in reversed(self._emitter.peek()):
+            payload = event.payload
+            if event.kind is RoastEventKind.FAULT and isinstance(payload, dict):
+                reason = cast("dict[str, Any]", payload).get("reason")
+                if isinstance(reason, str):
+                    return reason
+        return None  # pragma: no cover — every fault evaluation carries a reason
+
+    async def _flush_events(self) -> None:
+        for event in self._emitter.drain():
+            try:
+                await self._store.record_event(
+                    run_id=self._run_id,
+                    kind=event.kind,
+                    source=_event_source(event),
+                    monotonic_seconds=event.monotonic_seconds,
+                    payload=event.payload,
+                )
+            except Exception:
+                # One bad row never crashes the safety tick loop or drops a
+                # sibling event already delivered to SSE.
+                continue
+
+    async def _publish_and_persist_telemetry(self) -> None:
+        snapshot = self._controller.snapshot()
+        telemetry = snapshot.telemetry
+        raw = None if self._raw_state is None else self._raw_state.last_state
+        if telemetry is not None:
+            self._emitter.emit_telemetry(
+                TelemetryEventData(
+                    agent_phase=snapshot.phase,
+                    bean_temp_c=telemetry.bean_temp_c,
+                    env_temp_c=telemetry.env_temp_c,
+                    bean_ror_c_per_min=telemetry.bean_ror_c_per_min,
+                    env_ror_c_per_min=telemetry.env_ror_c_per_min,
+                    heat_percent=snapshot.current_heat,
+                    fan_percent=snapshot.current_fan,
+                    cooling_on=telemetry.cooling_on,
+                    elapsed_seconds=snapshot.roast_elapsed_seconds,
+                    t0_detected=telemetry.t0_detected,
+                    first_crack_detected=telemetry.first_crack_detected,
+                )
+            )
+        await self._store.record_telemetry(
+            run_id=self._run_id,
+            tick=self._counter.value,
+            agent_phase=snapshot.phase,
+            elapsed_seconds=snapshot.roast_elapsed_seconds,
+            interval_seconds=self._config.controller.telemetry_log_interval_seconds,
+            telemetry=telemetry,
+            mcp_phase=None if raw is None else raw.phase,
+            heat_level_percent=snapshot.current_heat,
+            fan_level_percent=snapshot.current_fan,
+            development_percent=None if raw is None else raw.development_percent,
+            raw_state_json=None if raw is None else raw.model_dump_json(),
+        )
+
+    async def _persist_phase_if_changed(self) -> None:
+        phase = self._controller.phase
+        if phase is self._last_persisted_phase:
+            return
+        await self._store.update_run_phase(self._run_id, phase)
+        self._last_persisted_phase = phase
+
+
+def _parse_resume_target(value: object) -> RoastPhase | None:
+    """Validate a recovery ``resume_to`` payload value: a legal target of the
+    ``operator_recovery_required`` transition row (``starting`` excluded)."""
+    if not isinstance(value, str):
+        return None
+    try:
+        target = RoastPhase(value)
+    except ValueError:
+        return None
+    if target not in TRANSITION_TABLE[RoastPhase.OPERATOR_RECOVERY_REQUIRED]:
+        return None
+    return target
+
+
 class RoastService:
     """Backend authority behind the REST + SSE surface (component plan §6).
 
@@ -172,6 +652,12 @@ class RoastService:
     drives and the read projections the SPA renders from.
     """
 
+    #: Backstop bound on the operator queue. The runner drains the whole queue
+    #: every tick, so under normal one-operator use it never approaches this;
+    #: the bound only trips on pathological spam, where the offending action is
+    #: reported ``failed`` rather than growing memory without limit.
+    OPERATOR_QUEUE_MAX = 256
+
     def __init__(
         self,
         store: RoastStore,
@@ -179,10 +665,29 @@ class RoastService:
         config: AppConfig | None = None,
         mcp: MCPServerProcess | None = None,
         sse_heartbeat_seconds: float = 15.0,
+        roaster: RoasterControl | None = None,
+        advisor: RoastAdvisor | None = None,
+        exporter: LogExporter | None = None,
+        raw_state: RawStateSource | None = None,
+        run_loop: bool = True,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._store = store
         self._config = config or AppConfig()
         self._mcp = mcp
+        #: The live roaster control surface (adapter over the MCP child, or a test
+        #: fake). When ``None`` the service is API-only (E7 mode): roasts persist a
+        #: ``starting`` row but no controller loop drives them.
+        self._roaster = roaster
+        self._advisor = advisor
+        self._exporter = exporter
+        self._raw_state = raw_state
+        self._run_loop = run_loop
+        self._clock = clock
+        #: The active run's live loop, attached by :meth:`start_roast` once a
+        #: roaster is wired; ``None`` between runs and in API-only mode.
+        self.runner: RoastRunner | None = None
+        self._loop_task: asyncio.Task[None] | None = None
         self.active_run_id: str | None = None
         #: SSE keepalive interval (plan §6: 15 s). Injectable so tests observe
         #: a heartbeat without waiting the full interval.
@@ -203,7 +708,11 @@ class RoastService:
         #: The controller action queue (plan §6: action → operator_actions row
         #: → controller queue → safety → MCP). The API enqueues phase-valid
         #: actions; the controller tick loop drains and executes them (E9).
-        self.operator_queue: asyncio.Queue[QueuedOperatorAction] = asyncio.Queue()
+        #: Bounded (``OPERATOR_QUEUE_MAX``) so a spammy operator cannot grow it
+        #: without limit now that the runner drains it.
+        self.operator_queue: asyncio.Queue[QueuedOperatorAction] = asyncio.Queue(
+            maxsize=self.OPERATOR_QUEUE_MAX
+        )
 
     def mcp_child_status(self) -> MCPChildStatus:
         """Liveness of the coffee-roaster-mcp child for the health route.
@@ -256,10 +765,96 @@ class RoastService:
                 agent_phase=RoastPhase.STARTING,
             )
             self.active_run_id = run_id
+        if self._roaster is not None:
+            await self._begin_live_run(profile, run_id)
         detail = await self._store.read_run(run_id)
         if detail is None:  # pragma: no cover — read immediately after create
             raise RuntimeError(f"read_run returned None for just-created run {run_id}")
         return detail
+
+    async def _begin_live_run(self, profile: RoastProfile, run_id: str) -> None:
+        """Construct and start the live controller loop for a run (E9).
+
+        Builds a fresh controller bound to this run id, wired to the roaster
+        control surface, the store (via the snapshot sink + the runner's
+        telemetry/event persistence), the advisor, and the SSE broadcaster. The
+        controller's idle→preheating start runs before returning; the per-tick
+        loop runs as a background task when ``run_loop`` is set (tests drive
+        ``service.runner.tick_once()`` directly with ``run_loop=False``)."""
+        runner = self._build_runner(run_id)
+        if runner is None:  # pragma: no cover — guarded by the caller
+            return
+        await runner.start(profile)
+        if self._run_loop:
+            self._loop_task = asyncio.create_task(runner.run())
+
+    def _build_runner(self, run_id: str) -> "RoastRunner | None":
+        """Construct a controller + runner bound to ``run_id`` (shared by the
+        fresh-start and restart-recovery paths). ``None`` in API-only mode."""
+        roaster = self._roaster
+        if roaster is None:  # pragma: no cover — guarded by the caller
+            return None
+        counter = _TickCounter()
+        sink = StoreSnapshotSink(self._store, run_id, lambda: counter.value)
+        emitter = BufferingEventEmitter(self.events, clock=self._clock)
+        controller = RoastController(
+            config=self._config.controller,
+            safety=self._safety,
+            state_reader=roaster,
+            command_executor=roaster,
+            snapshot_sink=sink,
+            event_emitter=emitter,
+            advisor=self._advisor,
+            clock=self._clock,
+        )
+        runner = RoastRunner(
+            controller=controller,
+            store=self._store,
+            emitter=emitter,
+            operator_queue=self.operator_queue,
+            counter=counter,
+            config=self._config,
+            run_id=run_id,
+            clock=self._clock,
+            exporter=self._exporter,
+            raw_state=self._raw_state,
+        )
+        self.runner = runner
+        return runner
+
+    async def recover_on_start(self) -> None:
+        """Restart recovery (orchestration plan § Persistence; architecture
+        invariant): a possibly-active persisted run enters
+        ``operator_recovery_required`` — heat and fan are never auto-resumed and
+        no MCP write is issued. A terminal or idle run needs no recovery. Call
+        once at agent startup before serving; a no-op in API-only mode.
+
+        Explicit operator action (resume/drop/cool/end) is then required, and
+        emergency stop stays available from recovery."""
+        if self._roaster is None:
+            return
+        persisted = await self._store.read_latest_run()
+        if persisted is None or persisted.completed_at_utc is not None:
+            return  # fresh database, or a terminal run — nothing possibly active
+        if persisted.agent_phase in (RoastPhase.IDLE, RoastPhase.COMPLETE):
+            return
+        runner = self._build_runner(persisted.run_id)
+        if runner is None:  # pragma: no cover — guarded above
+            return
+        self.active_run_id = persisted.run_id
+        await runner.recover(persisted.profile, persisted.agent_phase)
+        if self._run_loop:
+            self._loop_task = asyncio.create_task(runner.run())
+
+    async def shutdown(self) -> None:
+        """Stop the live loop and release the background task (clean teardown /
+        agent restart). Idempotent; safe in API-only mode."""
+        task = self._loop_task
+        self._loop_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     async def history(self) -> RoastHistory:
         """The roast history list, newest first (plan §6)."""
@@ -369,6 +964,13 @@ class RoastService:
         detail = await self._store.read_run(run_id)
         if detail is None:
             raise RoastRunNotFoundError(run_id)
+        if detail.completed_at_utc is not None:
+            # Terminal run (completed/aborted/faulted): no live loop drains its
+            # queue and no hot hardware to act on — the action is gone (410).
+            raise RoastRunGoneError(
+                f"run {run_id} is {detail.outcome or 'terminal'}; operator actions "
+                f"are no longer accepted"
+            )
 
         command = _ACTION_COMMAND.get(request.action)
         if command is None:
@@ -385,17 +987,28 @@ class RoastService:
                 result = "rejected"
                 reason = evaluation.reason
 
+        queued = False
+        if result == "accepted":
+            try:
+                self.operator_queue.put_nowait(
+                    QueuedOperatorAction(
+                        run_id=run_id, action=request.action, payload=request.payload
+                    )
+                )
+                queued = True
+            except asyncio.QueueFull:
+                # Backstop bound hit (pathological spam). Report failed rather
+                # than 500 or silently drop — the operator sees the action did
+                # not take. The stored row reflects the final outcome (below).
+                result = "failed"
+                reason = "operator action queue is full; action not accepted"
+
         await self._store.record_operator_action(
             action=request.action.value,
             result=result,
             run_id=run_id,
             payload=request.payload,
         )
-        queued = result == "accepted"
-        if queued:
-            self.operator_queue.put_nowait(
-                QueuedOperatorAction(run_id=run_id, action=request.action, payload=request.payload)
-            )
         return OperatorActionResult(
             action=request.action, result=result, reason=reason, queued=queued
         )
@@ -521,15 +1134,18 @@ async def submit_operator_action(
 ) -> OperatorActionResult:
     """``POST /api/roasts/{run_id}/operator-actions`` — queue an operator action.
 
-    Always 200 with the typed :class:`OperatorActionResult`: the request was
-    recorded and its policy outcome (``accepted`` / ``rejected``) is in the
-    body, so the SPA renders one shape. 404 only when the run is unknown; an
-    unknown action value is a 422 from request validation.
+    Always 200 with the typed :class:`OperatorActionResult` for a live run: the
+    request was recorded and its policy outcome (``accepted`` / ``rejected`` /
+    ``failed``) is in the body, so the SPA renders one shape. 404 when the run is
+    unknown; 410 when the run is terminal (completed/faulted); an unknown action
+    value is a 422 from request validation.
     """
     try:
         return await service.submit_operator_action(run_id, action)
     except RoastRunNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RoastRunGoneError as exc:
+        raise HTTPException(status_code=410, detail=str(exc)) from exc
 
 
 async def stream_events(
@@ -586,6 +1202,20 @@ async def stream_events(
     )
 
 
+@contextlib.asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    """Startup/teardown for a wired service: on startup classify any
+    possibly-active persisted run into recovery (never auto-resuming heat/fan,
+    the restart invariant); on shutdown stop the live tick loop cleanly. A no-op
+    for the API-only/scaffold app (no service, or no roaster wired)."""
+    service = getattr(app.state, "service", None)
+    if isinstance(service, RoastService):
+        await service.recover_on_start()
+    yield
+    if isinstance(service, RoastService):
+        await service.shutdown()
+
+
 def create_app(service: RoastService | None = None) -> FastAPI:
     """Create the FastAPI application.
 
@@ -593,9 +1223,10 @@ def create_app(service: RoastService | None = None) -> FastAPI:
     handle); when omitted, only ``/api/health`` is functional and every
     store-backed route returns 503 — the shape the E1 scaffold smoke test
     relies on. The E9 vertical slice constructs a fully-wired service and
-    passes it here.
+    passes it here; the lifespan then runs restart recovery on startup and
+    stops the live loop on shutdown.
     """
-    app = FastAPI(title="roastpilot-agent", version=__version__)
+    app = FastAPI(title="roastpilot-agent", version=__version__, lifespan=_lifespan)
     app.state.service = service
     app.get("/api/health")(health)
     app.post("/api/roasts", status_code=201)(start_roast)

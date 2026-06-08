@@ -2,7 +2,7 @@
 
 ## Active Epic
 
-- Epic file: `docs/epics/E07-api.md`
+- Epic file: `docs/epics/E09-vertical-slice.md`
 - Project: RoastPilot (GitHub user project, owner `syamaner`)
 - Repository: `syamaner/roastpilot-agent`
 - Package: `roastpilot-agent`
@@ -52,18 +52,27 @@ never calls MCP. `RoastService` in `api.py` is the backend authority and
 the E9 wiring seam (store + active-run guard + operator queue +
 `EventBroadcaster`).
 
-**M1 stories are all closed through E8.** Next is E9 + E10 (see below) —
-not yet started; awaiting a deliberate kickoff.
+**M1 stories are all closed through E8.** **E9 (vertical slice) is now
+active** — the active epic. It is a deliberate single-session, sequential,
+same-file (`controller.py`/`api.py`) safety-critical integration; parallel
+implementation is the documented anti-pattern. E10 (SPA) follows E9 and
+*is* the positive fan-out case.
 
 **E7's SSE contract is ready.** `models.SseEventType` / `SseEvent` /
 `TelemetryEventData` + `api.EventBroadcaster` are the typed event surface
 E9 (vertical slice) and E10 (SPA) render from.
 
-**Next: E9 and E10 run in parallel** (vertical slice + SPA), to be set up
-deliberately — not yet started. E9 wires the live controller tick loop +
-MCP child into `RoastService` (drain the operator queue through full
-safety; emit events + per-tick telemetry into the broadcaster) and adds
-controller handlers for the four operator actions without one today
-(`mark_beans_added`, `start_cooling`, `pause_advisory`, `resume_advisory`
-— see `docs/epics/E07-api.md` E9 notes). The E10 UI kickoff brief is
+**E9 wires the live controller tick loop + MCP child into `RoastService`**
+(drain the operator queue through full safety; emit events + per-tick
+telemetry into the broadcaster) and adds controller handlers for the four
+operator actions without one today (`mark_beans_added`, `start_cooling`,
+`pause_advisory`, `resume_advisory` — see `docs/epics/E07-api.md` E9 notes,
+D19). E9 green in CI realizes D17 criterion (1). The E10 UI kickoff brief is
 waiting in the plan repo.
+
+**E9-S1 (#80) is complete** — the E7 handoff wiring (`RoastRunner` live loop,
+4 new D19 handlers, `RoasterControlAdapter`, queue bound + 410 guard, restart
+recovery via the app lifespan) and the green 12-step mock slice
+(`tests/test_milestone1.py`). Decision trace captured in
+`docs/e9-decision-trace-2026-06-09.md`. Next: **E9-S2 (#81)** — the same flow
+against the real `coffee-roaster-mcp` subprocess in mock-driver mode.

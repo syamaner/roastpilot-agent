@@ -15,6 +15,7 @@ fan (``operator_recovery_required``).
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, Protocol
 
@@ -46,6 +47,7 @@ __all__ = [
     "AdvisoryCallPolicy",
     "AdvisoryTrigger",
     "CommandExecutor",
+    "ControllerSnapshot",
     "EventEmitter",
     "InvalidTransitionError",
     "RoastController",
@@ -138,12 +140,20 @@ class CommandExecutor(Protocol):
         """Apply validated heat/fan targets."""
         ...
 
+    async def mark_beans_added(self) -> None:
+        """Record the manual beans-added (manual-T0 fallback) with MCP."""
+        ...
+
     async def mark_first_crack(self) -> None:
         """Record the operator first-crack override with MCP."""
         ...
 
     async def drop_beans(self) -> None:
         """Drop the beans (normal drop/cooling transition)."""
+        ...
+
+    async def start_cooling(self) -> None:
+        """Start the cooling cycle (recovery action / post-drop fallback)."""
         ...
 
     async def stop_cooling(self) -> None:
@@ -342,6 +352,26 @@ class AdvisoryCallPolicy:
             self._last_bean_ror_c_per_min = telemetry.bean_ror_c_per_min
 
 
+@dataclass(frozen=True)
+class ControllerSnapshot:
+    """An atomic read of the controller's post-tick state (E9 wiring seam).
+
+    The runner reads exactly one of these after each ``tick()`` and builds
+    both the per-tick ``telemetry`` SSE frame and the persisted telemetry row
+    from it — one read, no inter-field skew between phase, commanded levels,
+    and the tick's telemetry. ``telemetry`` is the reading the tick consumed
+    (``None`` when no session/read this tick); ``current_heat``/``current_fan``
+    are the levels the controller has commanded (heat stays 0 after a restart
+    until separately commanded — the restart invariant)."""
+
+    phase: RoastPhase
+    current_heat: int
+    current_fan: int
+    roast_elapsed_seconds: float
+    telemetry: RoastTelemetry | None
+    advisory_paused: bool
+
+
 class RoastController:
     """Code-owned deterministic state machine and tick pipeline.
 
@@ -387,6 +417,11 @@ class RoastController:
         self._guidance_emitted = False
         self._operator_state_entered: float | None = None
         self._operator_timeout_alerted = False
+        # E9: the telemetry the most recent tick consumed (for the runner's
+        # post-tick snapshot — SSE telemetry frame + persisted row), and the
+        # operator advisory pause latch (pause/resume_advisory, D19).
+        self._last_telemetry: RoastTelemetry | None = None
+        self._advisory_paused = False
 
     # --- E4-S1: transitions ---
 
@@ -394,6 +429,27 @@ class RoastController:
     def phase(self) -> RoastPhase:
         """Current agent phase."""
         return self._phase
+
+    def snapshot(self) -> ControllerSnapshot:
+        """An atomic read of the controller's current state (E9 wiring seam).
+
+        The runner reads exactly one of these after each ``tick()`` to build
+        the per-tick telemetry frame and persisted row — see
+        :class:`ControllerSnapshot`. Pure: no side effects, no clock advance
+        beyond reading elapsed."""
+        return ControllerSnapshot(
+            phase=self._phase,
+            current_heat=self._current_heat,
+            current_fan=self._current_fan,
+            roast_elapsed_seconds=self._roast_elapsed_seconds(),
+            telemetry=self._last_telemetry,
+            advisory_paused=self._advisory_paused,
+        )
+
+    def _roast_elapsed_seconds(self) -> float:
+        if self._run_started_monotonic is None:
+            return 0.0
+        return self._clock() - self._run_started_monotonic
 
     def can_transition(self, target: RoastPhase) -> bool:
         """Whether ``target`` is a legal next phase from the current one."""
@@ -441,6 +497,9 @@ class RoastController:
     async def tick(self) -> None:
         """Run one controller tick in the documented order."""
         telemetry, read_failed = await self._read_telemetry()
+        # Remember the reading this tick consumed so the runner's post-tick
+        # snapshot publishes the same telemetry it acted on (E9).
+        self._last_telemetry = telemetry
         await self._snapshots.persist_snapshot(telemetry)
         evaluation = self._evaluate_safety(telemetry, read_failed=read_failed)
         await self._snapshots.persist_evaluation(evaluation)
@@ -464,6 +523,12 @@ class RoastController:
         manual_request = self._advisory_requested
         self._advisory_requested = False
         if self._advisor is None or self._profile is None:
+            return
+        if self._advisory_paused:
+            # Operator paused advice (D19). The controller keeps running every
+            # other tick rule — safety, phase transitions, the queue drain —
+            # only the advisory consult is suppressed. Clearing the manual flag
+            # above means a request raised while paused does not survive resume.
             return
         trigger = self._advisory_policy.evaluate(
             phase=self._phase,
@@ -994,16 +1059,86 @@ class RoastController:
         await self._snapshots.persist_evaluation(evaluation)
         await self._act_on_safety(evaluation)
 
+    async def operator_mark_beans_added(self) -> None:
+        """Operator manual beans-added — the manual-T0 fallback (D19, E9).
+
+        Matrix-validated (``MARK_BEANS_ADDED`` is valid only in ``preheating``)
+        then relayed to MCP. No phase transition: the ``preheating`` →
+        ``roasting_pre_first_crack`` move still goes through the debounced T0
+        path in :meth:`_apply_phase_rules`; this records the charge with MCP so
+        its detection logic can proceed."""
+        phase_validity = self._safety.evaluate_command_phase(
+            command=RoastCommand.MARK_BEANS_ADDED, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(phase_validity)
+        if phase_validity.verdict is not SafetyVerdict.ALLOW:
+            return
+        try:
+            await self._executor.mark_beans_added()
+        except Exception:
+            self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "mark_beans_added"})
+            return
+        self._events.emit(
+            RoastEventKind.COMMAND_EXECUTED, {"command": "mark_beans_added", "source": "operator"}
+        )
+
+    async def operator_start_cooling(self) -> None:
+        """Operator start-cooling — recovery action / post-drop fallback (D19, E9).
+
+        Matrix-validated (``START_COOLING`` is valid in ``cooling`` *or*
+        ``operator_recovery_required``) then executed. The two phases are not
+        symmetric: from ``cooling`` it is the post-drop fallback when the roaster
+        never reported ``cooling_on`` and does **not** transition (already
+        cooling); from ``operator_recovery_required`` it is the operator's
+        recovery resume into ``cooling`` and transitions. Hardware is never
+        written unless the resulting state is reachable (E4-S4 safety rule)."""
+        phase_validity = self._safety.evaluate_command_phase(
+            command=RoastCommand.START_COOLING, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(phase_validity)
+        if phase_validity.verdict is not SafetyVerdict.ALLOW:
+            return
+        will_transition = self._phase is not RoastPhase.COOLING
+        if will_transition and not self.can_transition(  # pragma: no cover — defensive
+            RoastPhase.COOLING
+        ):
+            # Unreachable given the matrix: the only non-cooling phase that
+            # reaches here is operator_recovery_required, whose recovery row
+            # includes cooling. Mirrors operator_drop_beans' write-safety guard.
+            raise InvalidTransitionError(self._phase, RoastPhase.COOLING)
+        try:
+            await self._executor.start_cooling()
+        except Exception:
+            self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "start_cooling"})
+            return
+        self._events.emit(
+            RoastEventKind.COMMAND_EXECUTED, {"command": "start_cooling", "source": "operator"}
+        )
+        if will_transition:
+            self.transition_to(RoastPhase.COOLING)
+
+    def operator_pause_advisory(self) -> None:
+        """Operator pauses advisory consults (D19, E9).
+
+        A pure control toggle: no MCP write and no safety evaluation (it cannot
+        actuate hardware — the advisor never controls the roaster). Surfaced as
+        an ADVISORY event so the decision trace records that advice was paused.
+        Every other tick rule — safety, phase transitions, the queue drain —
+        keeps running."""
+        self._advisory_paused = True
+        self._events.emit(RoastEventKind.ADVISORY, {"advisory_paused": True})
+
+    def operator_resume_advisory(self) -> None:
+        """Operator resumes advisory consults (D19, E9). The mirror of
+        :meth:`operator_pause_advisory`; no MCP write, no safety evaluation."""
+        self._advisory_paused = False
+        self._events.emit(RoastEventKind.ADVISORY, {"advisory_paused": False})
+
     def _build_advisor_context(self, telemetry: RoastTelemetry) -> AdvisorContext:
         assert self._profile is not None  # guarded by caller
-        elapsed = (
-            0.0
-            if self._run_started_monotonic is None
-            else self._clock() - self._run_started_monotonic
-        )
         return AdvisorContext(
             phase=self._phase,
-            roast_elapsed_seconds=elapsed,
+            roast_elapsed_seconds=self._roast_elapsed_seconds(),
             development_elapsed_seconds=None,
             current_bean_temp_c=telemetry.bean_temp_c,
             current_env_temp_c=telemetry.env_temp_c,

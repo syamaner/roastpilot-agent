@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from roastpilot_agent.advisor import FakeAdvisor
+from roastpilot_agent.mcp_client import ExportRoastLogResult
 from roastpilot_agent.models import RoastEventKind, RoastTelemetry
 from roastpilot_agent.safety import SafetyEvaluation
 from roastpilot_agent.store import RoastStore
@@ -43,10 +44,12 @@ class FakeMCPClient:
         self,
         frames: list[RoastTelemetry | None | Exception] | None = None,
         log: list[str] | None = None,
+        export_result: ExportRoastLogResult | None = None,
     ) -> None:
         self.frames: list[RoastTelemetry | None | Exception] = list(frames or [])
         self._log = log if log is not None else []
         self.calls: list[tuple[str, dict[str, object]]] = []
+        self.export_result = export_result
 
     async def read_telemetry(self) -> RoastTelemetry | None:
         self._log.append("read")
@@ -67,6 +70,10 @@ class FakeMCPClient:
             ("set_targets", {"heat_percent": heat_percent, "fan_percent": fan_percent})
         )
 
+    async def mark_beans_added(self) -> None:
+        self._log.append("mark_beans_added")
+        self.calls.append(("mark_beans_added", {}))
+
     async def mark_first_crack(self) -> None:
         self._log.append("mark_first_crack")
         self.calls.append(("mark_first_crack", {}))
@@ -75,6 +82,10 @@ class FakeMCPClient:
         self._log.append("drop_beans")
         self.calls.append(("drop_beans", {}))
 
+    async def start_cooling(self) -> None:
+        self._log.append("start_cooling")
+        self.calls.append(("start_cooling", {}))
+
     async def stop_cooling(self) -> None:
         self._log.append("stop_cooling")
         self.calls.append(("stop_cooling", {}))
@@ -82,6 +93,13 @@ class FakeMCPClient:
     async def emergency_stop(self, *, reason: str) -> None:
         self._log.append("emergency_stop")
         self.calls.append(("emergency_stop", {"reason": reason}))
+
+    async def export_roast_log(self) -> ExportRoastLogResult:
+        self._log.append("export_roast_log")
+        self.calls.append(("export_roast_log", {}))
+        if self.export_result is None:
+            raise RuntimeError("FakeMCPClient has no export_result configured")
+        return self.export_result
 
     def commands(self) -> list[str]:
         return [name for name, _ in self.calls]
@@ -130,6 +148,10 @@ class RecordingExecutor:
         self._log.append("set_targets")
         self.targets.append((heat_percent, fan_percent))
 
+    async def mark_beans_added(self) -> None:
+        self._log.append("mark_beans_added")
+        self.commands.append("mark_beans_added")
+
     async def mark_first_crack(self) -> None:
         self._log.append("mark_first_crack")
         self.commands.append("mark_first_crack")
@@ -137,6 +159,10 @@ class RecordingExecutor:
     async def drop_beans(self) -> None:
         self._log.append("drop_beans")
         self.commands.append("drop_beans")
+
+    async def start_cooling(self) -> None:
+        self._log.append("start_cooling")
+        self.commands.append("start_cooling")
 
     async def stop_cooling(self) -> None:
         self._log.append("stop_cooling")
