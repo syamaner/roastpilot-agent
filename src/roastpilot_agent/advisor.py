@@ -414,10 +414,13 @@ class PydanticAIAdvisor(RoastAdvisor):
     def __init__(self, config: AdvisorConfig, *, model: Model | None = None) -> None:
         self._config = config
         self._model = model if model is not None else build_model(config)
-        #: Token usage from the most recent *successful* call
-        #: (cost/observability); ``None`` until the first one. A failed call
-        #: raises before capture, so this is not cleared on failure — it keeps
-        #: the last good reading.
+        #: Token usage from the most recent model response (cost/observability);
+        #: ``None`` until the first one. Captured as soon as the provider
+        #: returns, so it reflects a call whose output later fails strict
+        #: re-validation (``AdvisorUnsafeOutputError``) — the tokens were still
+        #: spent. It is *not* updated when the call itself fails before
+        #: returning (malformed/provider error), so it keeps the last good
+        #: reading.
         self.last_usage: AdvisorUsage | None = None
         settings = ModelSettings(temperature=config.temperature)
         extra_body = reasoning_extra_body(config.reasoning_effort)
