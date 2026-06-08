@@ -75,13 +75,16 @@ Epic status: **complete** — depends on E4 ✅, E6 ✅.
   `emergency_stop` is accepted from every phase. The queue performs **no MCP
   write** and does not reimplement safety. Passed an adversarial
   safety-reviewer pass. No `safety.py`/`controller.py` changes.
-  - **For E9:** the controller drains `operator_queue` each tick and runs the
-    **full** safety policy (rate limits, bounds, drop eligibility, phase)
-    before any MCP write — the queue's phase pre-check verdict is advisory
-    (last-persisted phase), not authoritative. E9 also adds the controller
-    handlers for the actions without one today: `mark_beans_added`,
-    `start_cooling`, `pause_advisory`, `resume_advisory` (the queue accepts
-    and records all 9; execution of these four is wired in E9).
+  - **For E9 (plan §6 decision D19; `docs/epics/E09-vertical-slice.md` "E7
+    handoff").** Plan §6 lists 9 operator actions; E4 shipped handlers for 5
+    (`mark_first_crack`, `drop_beans`, `stop_cooling`, `emergency_stop`,
+    `acknowledge_recovery`). The controller drains `operator_queue` each tick
+    and runs the **full** safety policy (rate limits, bounds, drop eligibility,
+    phase) before any MCP write — the queue's phase pre-check verdict is
+    advisory (last-persisted phase), not authoritative. E9 also adds the
+    controller handlers for the 4 actions without one today: `mark_beans_added`,
+    `start_cooling`, `pause_advisory`, `resume_advisory` (the queue accepts and
+    records all 9; execution of these four is wired in E9).
   - **For E9:** `operator_queue` is unbounded (`asyncio.Queue()`); with no
     controller drain in E7 it cannot grow. When E9 wires the drain, bound it
     (or dedup at drain) so a spammy operator cannot grow it without limit. A
