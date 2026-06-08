@@ -4,21 +4,27 @@ E7-S1 covers the REST routes and their typed response models: health, roast
 lifecycle start (incl. the 409 active-run guard), history/detail reads, the
 downsampled telemetry series, the decision-trace timeline, the export-log
 manifest + downloads, and operator rating. E7-S2 covers the operator action
-queue (action → operator_actions row → controller queue → safety policy). The
-SSE stream (S3) extends this suite. All hardware-free: an in-memory controller
-is never started — routes read the temp SQLite store directly.
+queue (action → operator_actions row → controller queue → safety policy).
+E7-S3 covers the typed SSE event stream (event vocabulary, framing, telemetry,
+heartbeat, disconnect handling). All hardware-free: an in-memory controller is
+never started — routes read the temp SQLite store and events are published
+directly into the broadcaster.
 """
 
-from collections.abc import AsyncIterator
+import json
+from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException, Request
+from fastapi.responses import StreamingResponse
 from httpx import ASGITransport, AsyncClient
 
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import AdvisorContext, RoastDecision
-from roastpilot_agent.api import RoastService, create_app
+from roastpilot_agent.api import EventBroadcaster, RoastService, create_app, stream_events
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.mcp_client import MCPServerProcess
 from roastpilot_agent.models import (
@@ -29,6 +35,9 @@ from roastpilot_agent.models import (
     RoastPhase,
     RoastProfile,
     RoastTelemetry,
+    SseEvent,
+    SseEventType,
+    TelemetryEventData,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 from roastpilot_agent.store import RoastStore
@@ -752,3 +761,230 @@ async def test_operator_action_unknown_action_422(client: AsyncClient, store: Ro
         "/api/roasts/run-bad/operator-actions", json={"action": "frobnicate"}
     )
     assert response.status_code == 422
+
+
+# --- SSE event stream (E7-S3) ---
+#
+# The live endpoint is driven directly via stream_events() + the
+# StreamingResponse body iterator: httpx's ASGITransport buffers the whole
+# response body, which never terminates for an SSE stream, so it cannot drive
+# a keepalive stream. Driving the generator directly is deterministic and
+# exercises the same code path (subscribe, frame, heartbeat, disconnect
+# cleanup) without a real socket.
+
+
+def _parse_frame(text: str) -> dict[str, object]:
+    """Parse one rendered SSE frame into {event, data, id}, skipping comments."""
+    event_type: str | None = None
+    data: str | None = None
+    event_id: int | None = None
+    for line in text.split("\n"):
+        if line == "" or line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        value = value.lstrip()
+        if field == "event":
+            event_type = value
+        elif field == "data":
+            data = value
+        elif field == "id":
+            event_id = int(value)
+    return {
+        "event": event_type,
+        "data": None if data is None else json.loads(data),
+        "id": event_id,
+    }
+
+
+class _FakeRequest:
+    """Stands in for a Starlette Request — the SSE generator only calls
+    ``is_disconnected()``."""
+
+    def __init__(self, *, disconnected: bool = False) -> None:
+        self._disconnected = disconnected
+
+    async def is_disconnected(self) -> bool:
+        return self._disconnected
+
+
+async def _collect_frames(response: StreamingResponse, count: int) -> list[str]:
+    """Pull up to ``count`` frames from a StreamingResponse, then close it
+    (running the generator's finally → unsubscribe). Stops early if the stream
+    ends first."""
+    frames: list[str] = []
+    iterator = cast(AsyncGenerator[bytes, None], response.body_iterator)
+    try:
+        async for chunk in iterator:
+            frames.append(chunk.decode())
+            if len(frames) >= count:
+                break
+    finally:
+        await iterator.aclose()
+    return frames
+
+
+def test_sse_event_types_are_event_kinds_plus_transport() -> None:
+    sse_values = {t.value for t in SseEventType}
+    kind_values = {k.value for k in RoastEventKind}
+    # Every controller event reaches the stream; the only extras are the two
+    # transport-only events the API originates.
+    assert kind_values <= sse_values
+    assert sse_values - kind_values == {"telemetry", "heartbeat"}
+    plan_events = {
+        "run_started",
+        "phase_changed",
+        "telemetry",
+        "charge_guidance",
+        "t0_detected",
+        "first_crack",
+        "advisory",
+        "command_executed",
+        "command_failed",
+        "safety_alert",
+        "fault",
+        "recovery_required",
+        "recovery_acknowledged",
+        "logs_exported",
+        "run_completed",
+        "heartbeat",
+    }
+    assert plan_events <= sse_values
+
+
+def test_sse_event_render_wire_format() -> None:
+    event = SseEvent(event=SseEventType.PHASE_CHANGED, data={"phase": "cooling"}, id=7)
+    assert event.render() == 'id: 7\nevent: phase_changed\ndata: {"phase": "cooling"}\n\n'
+    assert SseEvent(event=SseEventType.HEARTBEAT).render() == "event: heartbeat\ndata: {}\n\n"
+
+
+def test_event_broadcaster_fans_out_with_sequence_ids() -> None:
+    broadcaster = EventBroadcaster()
+    first = broadcaster.subscribe()
+    second = broadcaster.subscribe()
+    assert broadcaster.subscriber_count == 2
+
+    broadcaster.emit(RoastEventKind.RUN_STARTED, {"profile": "House"})
+    event_a = first.get_nowait()
+    event_b = second.get_nowait()
+    assert event_a.event is SseEventType.RUN_STARTED
+    assert event_a.data == {"profile": "House"}
+    assert event_a.id == 1 and event_b.id == 1
+
+    broadcaster.unsubscribe(first)
+    assert broadcaster.subscriber_count == 1
+    broadcaster.emit(RoastEventKind.RUN_COMPLETED, {})
+    assert second.get_nowait().id == 2
+
+
+def test_event_broadcaster_emits_typed_telemetry() -> None:
+    broadcaster = EventBroadcaster()
+    queue = broadcaster.subscribe()
+    broadcaster.emit_telemetry(
+        TelemetryEventData(
+            agent_phase=RoastPhase.DEVELOPMENT,
+            bean_temp_c=200.0,
+            env_temp_c=210.0,
+            heat_percent=60,
+            fan_percent=40,
+        )
+    )
+    event = queue.get_nowait()
+    assert event.event is SseEventType.TELEMETRY
+    assert event.data["agent_phase"] == "development"
+    assert event.data["bean_temp_c"] == 200.0
+
+
+def test_event_broadcaster_wraps_non_dict_payload() -> None:
+    broadcaster = EventBroadcaster()
+    queue = broadcaster.subscribe()
+    broadcaster.emit(RoastEventKind.RUN_COMPLETED, ["done"])
+    assert queue.get_nowait().data == {"value": ["done"]}
+
+
+def test_event_broadcaster_drops_for_a_slow_consumer() -> None:
+    broadcaster = EventBroadcaster(max_queue=1)
+    queue = broadcaster.subscribe()
+    broadcaster.emit(RoastEventKind.PHASE_CHANGED, {"phase": "preheating"})
+    broadcaster.emit(RoastEventKind.PHASE_CHANGED, {"phase": "development"})  # full → dropped
+    assert queue.qsize() == 1
+    assert queue.get_nowait().data == {"phase": "preheating"}
+
+
+@pytest.mark.asyncio
+async def test_sse_endpoint_streams_typed_controller_event(
+    service: RoastService, store: RoastStore
+) -> None:
+    await _make_run(store, "run-sse", RoastPhase.PREHEATING)
+    response = await stream_events("run-sse", cast(Request, _FakeRequest()), service)
+    assert response.media_type == "text/event-stream"
+    assert response.headers["cache-control"] == "no-cache"
+    assert response.headers["connection"] == "keep-alive"
+    assert response.headers["x-accel-buffering"] == "no"
+    assert service.events.subscriber_count == 1
+
+    service.events.emit(RoastEventKind.PHASE_CHANGED, {"phase": "preheating"})
+    frames = await _collect_frames(response, 2)  # ": connected" then the event
+    assert service.events.subscriber_count == 0  # closed → unsubscribed
+
+    frame = _parse_frame(frames[1])
+    assert frame["event"] == "phase_changed"
+    assert frame["data"] == {"phase": "preheating"}
+    assert frame["id"] == 1
+
+
+@pytest.mark.asyncio
+async def test_sse_endpoint_streams_per_tick_telemetry(
+    service: RoastService, store: RoastStore
+) -> None:
+    await _make_run(store, "run-tel", RoastPhase.DEVELOPMENT)
+    response = await stream_events("run-tel", cast(Request, _FakeRequest()), service)
+    service.events.emit_telemetry(
+        TelemetryEventData(agent_phase=RoastPhase.DEVELOPMENT, bean_temp_c=201.5, env_temp_c=211.0)
+    )
+    frames = await _collect_frames(response, 2)
+    frame = _parse_frame(frames[1])
+    assert frame["event"] == "telemetry"
+    assert isinstance(frame["data"], dict)
+    assert frame["data"]["bean_temp_c"] == 201.5
+    assert frame["data"]["agent_phase"] == "development"
+
+
+@pytest.mark.asyncio
+async def test_sse_endpoint_emits_heartbeat_when_idle(store: RoastStore) -> None:
+    fast = RoastService(store, sse_heartbeat_seconds=0.05)
+    await _make_run(store, "run-hb", RoastPhase.DEVELOPMENT)
+    response = await stream_events("run-hb", cast(Request, _FakeRequest()), fast)
+    # Collect two keepalives so the loop iterates past the first (no event).
+    frames = await _collect_frames(response, 3)  # ": connected", heartbeat, heartbeat
+    assert _parse_frame(frames[1])["event"] == "heartbeat"
+    assert _parse_frame(frames[1])["data"] == {}
+    assert _parse_frame(frames[2])["event"] == "heartbeat"
+
+
+@pytest.mark.asyncio
+async def test_sse_endpoint_404_for_unknown_run(service: RoastService) -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        await stream_events("nope", cast(Request, _FakeRequest()), service)
+    assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_sse_disconnect_unsubscribes_and_backend_continues(
+    service: RoastService, store: RoastStore
+) -> None:
+    await _make_run(store, "run-dc", RoastPhase.DEVELOPMENT)
+    request = cast(Request, _FakeRequest(disconnected=True))
+    response = await stream_events("run-dc", request, service)
+    assert service.events.subscriber_count == 1
+
+    # A disconnected client: the stream sends the opening comment, sees the
+    # disconnect, and stops — no cooling, no state change, just cleanup.
+    frames = await _collect_frames(response, 5)
+    assert frames == [": connected\n\n"]
+    assert service.events.subscriber_count == 0
+
+    # Backend continues with no client: a fresh stream still receives events.
+    response2 = await stream_events("run-dc", cast(Request, _FakeRequest()), service)
+    service.events.emit(RoastEventKind.PHASE_CHANGED, {"phase": "development"})
+    frames2 = await _collect_frames(response2, 2)
+    assert _parse_frame(frames2[1])["event"] == "phase_changed"
