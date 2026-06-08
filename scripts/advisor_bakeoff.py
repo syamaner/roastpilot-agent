@@ -134,6 +134,8 @@ MOMENTS: list[tuple[str, float]] = [("early", 10.0), ("mid", 45.0), ("late", 80.
 GATE_SECONDS = 10.0  # the controller's tick-aligned advisory budget
 MEASURE_TIMEOUT = 90.0  # generous bound so over-budget advice is still captured
 
+ReasoningEffort = Literal["off", "minimal", "low", "medium", "high"]
+
 
 def _median_int(values: list[int]) -> int | None:
     return int(statistics.median(values)) if values else None
@@ -144,7 +146,7 @@ async def run_cell(
     offset: float,
     iters: int,
     prompt_version: str,
-    reasoning_effort: str | None,
+    reasoning_effort: ReasoningEffort | None,
     pricing: dict[str, tuple[float, float]],
 ) -> dict[str, object]:
     context, source_row = build_context(DEFAULT_FIXTURE, offset)
@@ -154,9 +156,7 @@ async def run_cell(
         api_key_env=cand["key_env"],
         model_slug=cand["model"],
         prompt_version=prompt_version,
-        reasoning_effort=cast(
-            'Literal["off", "minimal", "low", "medium", "high"] | None', reasoning_effort
-        ),
+        reasoning_effort=reasoning_effort,
     )
     advisor = PydanticAIAdvisor(config)
     iters_out: list[dict[str, Any]] = []
@@ -232,7 +232,10 @@ async def main() -> int:
     parser.add_argument("--out", type=Path, default=Path("/tmp/bakeoff.json"))
     args = parser.parse_args()
 
-    reasoning_effort = None if args.reasoning == "default" else args.reasoning
+    # argparse `choices` validates the value; cast once at the CLI boundary.
+    reasoning_effort: ReasoningEffort | None = (
+        None if args.reasoning == "default" else cast("ReasoningEffort", args.reasoning)
+    )
     pricing = fetch_openrouter_pricing()
     print(
         f"prompt={args.prompt_version} reasoning={args.reasoning} ({len(pricing)} models priced)",
