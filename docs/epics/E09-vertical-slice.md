@@ -48,13 +48,14 @@ before any MCP write (plan §6, decision **D19**; see `docs/epics/E07-api.md`
 
 Acceptance criteria:
 
-- [ ] All 12 steps pass end to end: start service → start roast (mock) →
+- [x] All 12 steps pass end to end: start service → start roast (mock) →
   stream state → mock auto-T0 → FC (override or mock status) → one advisory
   decision through the fake adapter → safety validation → heat/fan command
   → drop → stop cooling → export logs → restart proves completed state
-  recoverable.
-- [ ] Decision trace (advisory → verdict → command) persisted and readable
-  via the timeline route.
+  recoverable. (`tests/test_milestone1.py`, #80.)
+- [x] Decision trace (advisory → verdict → command) persisted and readable
+  via the timeline route. Captured in `docs/e9-decision-trace-2026-06-09.md`
+  (the same-day demo asset, plan §8).
 
 ### E9-S2 — Slice against real MCP server (mock driver, subprocess)
 
@@ -70,7 +71,31 @@ Acceptance criteria:
 
 | Story | Title | Status |
 |-------|-------|--------|
-| E9-S1 | 12-step slice, fake MCP | not started |
+| E9-S1 | 12-step slice, fake MCP | done |
 | E9-S2 | Slice against real MCP (mock mode) | not started |
 
-Epic status: **not started** — depends on E4–E8.
+Epic status: **in progress** — E9-S1 complete (#80); E9-S2 (#81) next.
+
+## Notes
+
+- **E9-S1 (#80):** The E7 handoff + the 12-step mock slice. Wired the live
+  controller tick loop into `RoastService` via a new `RoastRunner` (drain the
+  operator queue through full safety, per-tick telemetry + event/eval
+  persistence into the broadcaster + store, log export + run completion,
+  restart recovery on startup via a FastAPI lifespan). Added the 4 missing
+  controller handlers (D19) — `operator_mark_beans_added`,
+  `operator_start_cooling`, `operator_pause_advisory`,
+  `operator_resume_advisory` — each MCP-write handler routing through the full
+  command×phase matrix before any write, plus a `ControllerSnapshot` post-tick
+  read seam. Extended the `CommandExecutor` protocol (+ conftest fakes) with
+  `mark_beans_added`/`start_cooling`. Added the `RoasterControlAdapter` +
+  `project_session_state` in `mcp_client.py` (set_targets→set_heat+set_fan,
+  stalled-clock `age_seconds` so the stale-telemetry fault stays reachable,
+  retained raw state for telemetry-row enrichment). Bounded the operator queue
+  (`QueueFull`→`failed`, e-stop drained first) and added a 410 terminal-run
+  guard. Passed an adversarial `safety-reviewer` pass (no blockers/concerns)
+  and the `sim-roast-runner` decision-trace summary
+  (`docs/e9-decision-trace-2026-06-09.md`). Decision trace is readable via the
+  timeline route (events + safety_evaluations + command_log); the
+  `advisor_decisions` table is the provider-call channel for the real
+  `PydanticAIAdvisor`, empty under `FakeAdvisor`.

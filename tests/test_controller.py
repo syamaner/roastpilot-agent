@@ -19,6 +19,7 @@ from roastpilot_agent.controller import (
     UNIVERSAL_TARGETS,
     AdvisoryCallPolicy,
     AdvisoryTrigger,
+    ControllerSnapshot,
     InvalidTransitionError,
     RoastController,
     RoastPhase,
@@ -1164,6 +1165,11 @@ class FailingCommandExecutor(RecordingExecutor):
         super().__init__(log)
         self._failing = failing
 
+    async def mark_beans_added(self) -> None:
+        if "mark_beans_added" in self._failing:
+            raise RuntimeError("write failed")
+        await super().mark_beans_added()
+
     async def mark_first_crack(self) -> None:
         if "mark_first_crack" in self._failing:
             raise RuntimeError("write failed")
@@ -1173,6 +1179,11 @@ class FailingCommandExecutor(RecordingExecutor):
         if "drop_beans" in self._failing:
             raise RuntimeError("write failed")
         await super().drop_beans()
+
+    async def start_cooling(self) -> None:
+        if "start_cooling" in self._failing:
+            raise RuntimeError("write failed")
+        await super().start_cooling()
 
     async def stop_cooling(self) -> None:
         if "stop_cooling" in self._failing:
@@ -1440,3 +1451,147 @@ async def test_estop_while_already_faulted_does_not_retransition() -> None:
     await harness.controller.tick()  # still hot, already faulted
     assert harness.executor.estop_reasons[-1]  # e-stop fired again
     assert RoastEventKind.PHASE_CHANGED not in harness.events.kinds()  # no re-transition
+
+
+# --- E9: the four new operator handlers (D19) + snapshot ---
+
+
+def _to(harness: Harness, steps: int) -> None:
+    """Walk the harness controller down the normal path to ``steps`` edges in."""
+    for step in NORMAL_PATH[:steps]:
+        harness.controller.transition_to(step)
+
+
+@pytest.mark.asyncio
+async def test_operator_mark_beans_added_writes_without_transition() -> None:
+    """Manual beans-added (manual-T0 fallback) is matrix-valid only in
+    preheating, writes MCP, and never transitions — the T0 move stays on the
+    debounced detection path."""
+    harness = make_harness()
+    _to(harness, 2)  # → PREHEATING
+    await harness.controller.operator_mark_beans_added()
+    assert "mark_beans_added" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.PREHEATING
+    assert RoastEventKind.COMMAND_EXECUTED in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_operator_mark_beans_added_rejected_outside_preheating() -> None:
+    harness = make_harness()
+    _to(harness, 4)  # → DEVELOPMENT
+    await harness.controller.operator_mark_beans_added()
+    assert "mark_beans_added" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert any(
+        e.rule == "command_phase_validity" and e.verdict is SafetyVerdict.REJECT
+        for e in harness.sink.evaluations
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_start_cooling_from_recovery_transitions_to_cooling() -> None:
+    """From operator_recovery_required, start_cooling is a recovery resume into
+    cooling (matrix-valid, transitions)."""
+    harness = make_harness()
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    await harness.controller.operator_start_cooling()
+    assert "start_cooling" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.COOLING
+
+
+@pytest.mark.asyncio
+async def test_operator_start_cooling_in_cooling_does_not_transition() -> None:
+    """In cooling it is the post-drop fallback — writes MCP, stays in cooling."""
+    harness = make_harness()
+    _to(harness, 5)  # → COOLING
+    await harness.controller.operator_start_cooling()
+    assert "start_cooling" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.COOLING
+
+
+@pytest.mark.asyncio
+async def test_operator_start_cooling_rejected_in_development() -> None:
+    harness = make_harness()
+    _to(harness, 4)  # → DEVELOPMENT
+    await harness.controller.operator_start_cooling()
+    assert "start_cooling" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert any(
+        e.rule == "command_phase_validity" and e.verdict is SafetyVerdict.REJECT
+        for e in harness.sink.evaluations
+    )
+
+
+@pytest.mark.asyncio
+async def test_pause_advisory_suppresses_consult_until_resume() -> None:
+    """pause_advisory stops the advisor being consulted; the controller keeps
+    ticking; resume_advisory restores consults. No MCP write, no safety eval."""
+    advisor = FakeAdvisor([], default_decision=decision())
+    harness = make_harness(
+        readings=[reading(bean=200.0, env=205.0, t0_detected=True, first_crack_detected=True)],
+        advisor=advisor,
+    )
+    harness.controller.load_profile(PROFILE)
+    _to(harness, 4)  # → DEVELOPMENT (an advice phase)
+    await harness.controller.tick()  # phase-change consult establishes the baseline
+    harness.clock.advance(20.0)
+    baseline = len(advisor.contexts)
+    assert baseline >= 1
+
+    harness.controller.operator_pause_advisory()
+    assert harness.controller.snapshot().advisory_paused is True
+    writes_before_pause = len(harness.executor.targets)
+    await harness.controller.tick()
+    harness.clock.advance(20.0)
+    assert len(advisor.contexts) == baseline  # advisor not consulted
+    # And the suppressed tick issues no heat/fan write of its own.
+    assert len(harness.executor.targets) == writes_before_pause
+
+    harness.controller.operator_resume_advisory()
+    assert harness.controller.snapshot().advisory_paused is False
+    await harness.controller.tick()
+    assert len(advisor.contexts) > baseline  # consults resume
+
+
+def test_snapshot_is_an_atomic_idle_read() -> None:
+    harness = make_harness()
+    snapshot = harness.controller.snapshot()
+    assert isinstance(snapshot, ControllerSnapshot)
+    assert snapshot.phase is RoastPhase.IDLE
+    assert (snapshot.current_heat, snapshot.current_fan) == (0, 0)
+    assert snapshot.telemetry is None
+    assert snapshot.advisory_paused is False
+
+
+@pytest.mark.asyncio
+async def test_snapshot_carries_last_tick_telemetry() -> None:
+    harness = make_harness(readings=[reading(bean=190.0, env=200.0)])
+    harness.controller.load_profile(PROFILE)
+    _to(harness, 2)  # → PREHEATING
+    await harness.controller.tick()
+    snapshot = harness.controller.snapshot()
+    assert snapshot.telemetry is not None
+    assert snapshot.telemetry.bean_temp_c == 190.0
+
+
+@pytest.mark.asyncio
+async def test_mark_beans_added_write_failure_surfaces_command_failed() -> None:
+    executor = FailingCommandExecutor({"mark_beans_added"})
+    harness = make_harness(executor=executor)
+    _to(harness, 2)  # → PREHEATING
+    harness.events.events.clear()
+    await harness.controller.operator_mark_beans_added()
+    assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+    assert harness.controller.phase is RoastPhase.PREHEATING
+
+
+@pytest.mark.asyncio
+async def test_start_cooling_write_failure_surfaces_command_failed_no_transition() -> None:
+    executor = FailingCommandExecutor({"start_cooling"})
+    harness = make_harness(executor=executor)
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.events.events.clear()
+    await harness.controller.operator_start_cooling()
+    assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+    # A failed write must not transition into cooling.
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED

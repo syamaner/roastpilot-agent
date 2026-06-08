@@ -21,6 +21,7 @@ passed through from MCP, never recomputed.
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from typing import Any, Literal, Protocol, cast
@@ -30,6 +31,7 @@ from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, ConfigDict
 
 from roastpilot_agent.config import MCPConfig
+from roastpilot_agent.models import RoastTelemetry
 
 # --- vocabulary mirrored from coffee_roaster_mcp (session.py / config.py) ---
 
@@ -294,6 +296,122 @@ class RoasterMCPClient:
         return EventCommandResult.model_validate(
             await self._call("emergency_stop", {"reason": reason})
         )
+
+
+# --- E9: controller-protocol adapter over the typed client ---
+
+
+def project_session_state(state: RoastSessionState, *, age_seconds: float) -> RoastTelemetry | None:
+    """Project an MCP ``RoastSessionState`` into the controller's ``RoastTelemetry``.
+
+    Returns ``None`` when no usable reading exists — no device state, or bean/
+    environment temperature absent (the mock driver reports ``connected`` with
+    null temperatures during pre-roast). ``RoastTelemetry`` requires both
+    temperatures, so a partial reading is "no telemetry", not a zero reading.
+
+    Detection booleans come from the contract-checked Literal status fields
+    (``t0_status.status`` / ``first_crack_status.status``), not the latched
+    ``*_at_utc`` timestamps. Derived metrics (RoR) are passed through from MCP,
+    never recomputed (plan §2). ``age_seconds`` is supplied by the caller — the
+    session state carries no per-reading wall-clock age."""
+    device = state.device_state
+    if device is None or device.bean_temp_c is None or device.env_temp_c is None:
+        return None
+    return RoastTelemetry(
+        bean_temp_c=device.bean_temp_c,
+        env_temp_c=device.env_temp_c,
+        age_seconds=age_seconds,
+        bean_ror_c_per_min=state.bean_ror_c_per_min,
+        env_ror_c_per_min=state.env_ror_c_per_min,
+        t0_detected=state.t0_status.status == "detected",
+        first_crack_detected=state.first_crack_status.status == "detected",
+        cooling_on=state.cooling_on,
+    )
+
+
+class RoasterControlAdapter:
+    """Adapts :class:`RoasterMCPClient` to the controller's ``StateReader`` and
+    ``CommandExecutor`` protocols (E9 wiring seam).
+
+    Three concerns the raw client does not cover for the tick loop:
+
+    - ``set_targets`` fans a single heat/fan target out to ``set_heat`` then
+      ``set_fan``. Heat is the safety-critical lever, applied first: a fail-safe
+      heat-off lands even if the paired fan write then fails (the failure raises
+      and the controller records ``COMMAND_FAILED``). The real-Hottop ordering
+      is confirmed under E12 hardware validation.
+    - ``read_telemetry`` projects ``get_roast_state`` and derives the reading's
+      **age** from a stalled session clock: ``age_seconds`` grows only while
+      ``elapsed_monotonic_seconds`` stops advancing across reads, so the
+      stale-telemetry safety fault (``evaluate_telemetry_validity``) can actually
+      fire against a wedged-but-alive server — a hardcoded ``0.0`` would make it
+      structurally unreachable.
+    - It retains the last raw ``RoastSessionState`` (``last_state``) so the runner
+      can persist ``raw_state_json`` / ``development_percent`` / ``mcp_phase``,
+      which live on the session state, not on the projected ``RoastTelemetry``.
+
+    Transport failures (``MCPConnectionError`` / ``MCPToolTimeoutError``) are
+    **not** caught here — they propagate so the controller's consecutive-failure
+    rules see them as read/command faults (never a silent reconnect-and-continue)."""
+
+    def __init__(
+        self,
+        client: RoasterMCPClient,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._client = client
+        self._clock = clock
+        self._last_state: RoastSessionState | None = None
+        self._last_elapsed: float | None = None
+        self._last_change_monotonic: float | None = None
+
+    @property
+    def last_state(self) -> RoastSessionState | None:
+        """The most recent raw ``RoastSessionState`` read (``None`` before the
+        first read). Source of the persisted ``raw_state_json`` / dev% / MCP
+        phase fields the projected telemetry drops."""
+        return self._last_state
+
+    async def read_telemetry(self) -> RoastTelemetry | None:
+        state = await self._client.get_roast_state()
+        now = self._clock()
+        if self._last_elapsed is None or state.elapsed_monotonic_seconds != self._last_elapsed:
+            self._last_elapsed = state.elapsed_monotonic_seconds
+            self._last_change_monotonic = now
+        age = 0.0 if self._last_change_monotonic is None else now - self._last_change_monotonic
+        self._last_state = state
+        return project_session_state(state, age_seconds=age)
+
+    async def start_session(self) -> None:
+        await self._client.start_roast_session()
+
+    async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+        await self._client.set_heat(heat_percent)
+        await self._client.set_fan(fan_percent)
+
+    async def mark_beans_added(self) -> None:
+        await self._client.mark_beans_added()
+
+    async def mark_first_crack(self) -> None:
+        await self._client.mark_first_crack()
+
+    async def drop_beans(self) -> None:
+        await self._client.drop_beans()
+
+    async def start_cooling(self) -> None:
+        await self._client.start_cooling()
+
+    async def stop_cooling(self) -> None:
+        await self._client.stop_cooling()
+
+    async def emergency_stop(self, *, reason: str) -> None:
+        await self._client.emergency_stop(reason)
+
+    async def export_roast_log(self) -> ExportRoastLogResult:
+        """Export the roast log (the runner's completion step — not a control
+        write, so it is outside the ``CommandExecutor`` protocol)."""
+        return await self._client.export_roast_log()
 
 
 # --- E5-S2: stdio child-process transport (D6) ---

@@ -10,6 +10,7 @@ import json
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -24,12 +25,14 @@ from roastpilot_agent.mcp_client import (
     MCPServerProcess,
     MCPToolError,
     MCPToolTimeoutError,
+    RoasterControlAdapter,
     RoasterMCPClient,
     RoastSessionState,
     RuntimeConfigSnapshot,
     ServerInfo,
     StartRoastSessionResult,
     parse_tool_result,
+    project_session_state,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures" / "live-roast-2026-06-07"
@@ -653,3 +656,148 @@ def test_captured_emergency_stop_records_fault() -> None:
     )
     assert result.event.kind == "fault"
     assert result.phase == "fault"
+
+
+# --- E9: controller-protocol adapter + RoastSessionState projection ---
+
+
+def _state_payload(elapsed: float, **overrides: object) -> dict[str, object]:
+    payload = dict(SESSION_STATE_PAYLOAD)
+    payload["elapsed_monotonic_seconds"] = elapsed
+    payload.update(overrides)
+    return payload
+
+
+class _SequenceCaller:
+    """Returns the next payload per call; the last one repeats."""
+
+    def __init__(self, payloads: list[dict[str, object]]) -> None:
+        self._payloads = payloads
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def __call__(self, tool: str, arguments: dict[str, object]) -> object:
+        self.calls.append((tool, arguments))
+        index = min(len(self.calls) - 1, len(self._payloads) - 1)
+        return self._payloads[index]
+
+
+class _StepClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def test_project_session_state_maps_detection_and_passthrough() -> None:
+    state = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
+    telemetry = project_session_state(state, age_seconds=2.5)
+    assert telemetry is not None
+    assert (telemetry.bean_temp_c, telemetry.env_temp_c) == (196.0, 214.0)
+    assert telemetry.age_seconds == 2.5
+    assert telemetry.bean_ror_c_per_min == 8.2  # passthrough, never recomputed
+    assert telemetry.t0_detected is True  # t0_status.status == "detected"
+    assert telemetry.first_crack_detected is True
+
+
+def test_project_session_state_none_without_usable_reading() -> None:
+    no_device = RoastSessionState.model_validate({**SESSION_STATE_PAYLOAD, "device_state": None})
+    assert project_session_state(no_device, age_seconds=0.0) is None
+    null_temp_device = {
+        **cast("dict[str, object]", SESSION_STATE_PAYLOAD["device_state"]),
+        "bean_temp_c": None,
+    }
+    null_temp = RoastSessionState.model_validate(
+        {**SESSION_STATE_PAYLOAD, "device_state": null_temp_device}
+    )
+    assert project_session_state(null_temp, age_seconds=0.0) is None
+
+
+def test_project_session_state_pending_detection_is_false() -> None:
+    payload = _state_payload(
+        100.0,
+        t0_status={
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["t0_status"]),
+            "status": "pending",
+        },
+        first_crack_status={
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["first_crack_status"]),
+            "status": "pending",
+        },
+    )
+    state = RoastSessionState.model_validate(payload)
+    telemetry = project_session_state(state, age_seconds=0.0)
+    assert telemetry is not None
+    assert telemetry.t0_detected is False
+    assert telemetry.first_crack_detected is False
+
+
+@pytest.mark.asyncio
+async def test_adapter_age_resets_on_advance_grows_on_stall() -> None:
+    """The stale-telemetry safety fault depends on a real age: it stays ~0 while
+    the session clock advances and grows once it stalls."""
+    clock = _StepClock()
+    caller = _SequenceCaller([_state_payload(100.0), _state_payload(101.0), _state_payload(101.0)])
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller), clock=clock)
+
+    first = await adapter.read_telemetry()
+    assert first is not None and first.age_seconds == 0.0
+
+    clock.now = 5.0
+    second = await adapter.read_telemetry()  # elapsed advanced 100→101 → fresh
+    assert second is not None and second.age_seconds == 0.0
+
+    clock.now = 8.0
+    third = await adapter.read_telemetry()  # elapsed stalled at 101 → ages
+    assert third is not None and third.age_seconds == 3.0
+    assert adapter.last_state is not None
+    assert adapter.last_state.development_percent == 3.6
+
+
+@pytest.mark.asyncio
+async def test_adapter_set_targets_writes_heat_then_fan() -> None:
+    caller = _SequenceCaller([CANNED["set_heat"], CANNED["set_fan"]])  # type: ignore[list-item]
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+    await adapter.set_targets(heat_percent=55, fan_percent=45)
+    assert caller.calls == [
+        ("set_heat", {"heat_level_percent": 55}),
+        ("set_fan", {"fan_level_percent": 45}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_adapter_read_telemetry_propagates_transport_error() -> None:
+    """Transport failures must propagate so the controller's consecutive-failure
+    rules see a read fault — never a silent reconnect-and-continue."""
+
+    async def boom(tool: str, arguments: dict[str, object]) -> object:
+        raise MCPConnectionError("dead child")
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(boom))
+    with pytest.raises(MCPConnectionError):
+        await adapter.read_telemetry()
+
+
+@pytest.mark.asyncio
+async def test_adapter_passes_through_all_commands() -> None:
+    caller = FakeToolCaller()
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+    await adapter.start_session()
+    await adapter.mark_beans_added()
+    await adapter.mark_first_crack()
+    await adapter.drop_beans()
+    await adapter.start_cooling()
+    await adapter.stop_cooling()
+    await adapter.emergency_stop(reason="manual")
+    result = await adapter.export_roast_log()
+    assert [name for name, _ in caller.calls] == [
+        "start_roast_session",
+        "mark_beans_added",
+        "mark_first_crack",
+        "drop_beans",
+        "start_cooling",
+        "stop_cooling",
+        "emergency_stop",
+        "export_roast_log",
+    ]
+    assert result.ready is True

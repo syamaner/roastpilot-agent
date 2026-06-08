@@ -11,6 +11,7 @@ never started — routes read the temp SQLite store and events are published
 directly into the broadcaster.
 """
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
@@ -23,12 +24,20 @@ from fastapi.responses import StreamingResponse
 from httpx import ASGITransport, AsyncClient
 
 from roastpilot_agent import __version__
-from roastpilot_agent.advisor import AdvisorContext, RoastDecision
-from roastpilot_agent.api import EventBroadcaster, RoastService, create_app, stream_events
-from roastpilot_agent.config import AppConfig
+from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastDecision
+from roastpilot_agent.api import (
+    EventBroadcaster,
+    QueuedOperatorAction,
+    RoastRunGoneError,
+    RoastService,
+    create_app,
+    stream_events,
+)
+from roastpilot_agent.config import AppConfig, ControllerConfig
 from roastpilot_agent.mcp_client import MCPServerProcess
 from roastpilot_agent.models import (
     OperatorAction,
+    OperatorActionRequest,
     RoastCommand,
     RoastEventKind,
     RoastEventSource,
@@ -41,6 +50,7 @@ from roastpilot_agent.models import (
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 from roastpilot_agent.store import RoastStore
+from tests.conftest import FakeClock, FakeMCPClient
 
 
 def _profile(
@@ -988,3 +998,494 @@ async def test_sse_disconnect_unsubscribes_and_backend_continues(
     service.events.emit(RoastEventKind.PHASE_CHANGED, {"phase": "development"})
     frames2 = await _collect_frames(response2, 2)
     assert _parse_frame(frames2[1])["event"] == "phase_changed"
+
+
+# --- E9: live controller-loop wiring (the E7 handoff + restart recovery) ---
+
+
+def _reading(bean: float, env: float, **kwargs: object) -> RoastTelemetry:
+    return RoastTelemetry.model_validate({"bean_temp_c": bean, "env_temp_c": env, **kwargs})
+
+
+def _live_decision() -> RoastDecision:
+    return RoastDecision(
+        target_heat=55, target_fan=45, should_drop=False, confidence=0.9, rationale="hold"
+    )
+
+
+async def _live_service(
+    store: RoastStore, *, mcp: FakeMCPClient, clock: FakeClock
+) -> tuple[RoastService, str]:
+    """Start a live (run_loop=False) service into preheating; return it + run id."""
+    config = AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0))
+    service = RoastService(
+        store,
+        config=config,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        exporter=mcp,
+        run_loop=False,
+        clock=clock,
+    )
+    detail = await service.start_roast(_profile())
+    return service, detail.id
+
+
+async def _tick(service: RoastService, clock: FakeClock) -> bool:
+    assert service.runner is not None
+    clock.advance(3.0)
+    return await service.runner.tick_once()
+
+
+@pytest.mark.asyncio
+async def test_submit_operator_action_410_on_terminal_run(store: RoastStore) -> None:
+    """An operator action on a completed/faulted run is gone (410), not queued."""
+    await store.create_run(
+        run_id="run-done",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-done", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    service = RoastService(store)
+    with pytest.raises(RoastRunGoneError):
+        await service.submit_operator_action(
+            "run-done", OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+        )
+
+
+@pytest.mark.asyncio
+async def test_operator_queue_bound_reports_failed_when_full(store: RoastStore) -> None:
+    """A full queue (pathological spam) reports the action failed — never a 500
+    and never a silent drop."""
+    await store.create_run(
+        run_id="run-busy",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.DEVELOPMENT,
+    )
+    service = RoastService(store)
+    for _ in range(service.OPERATOR_QUEUE_MAX):
+        service.operator_queue.put_nowait(
+            QueuedOperatorAction(run_id="run-busy", action=OperatorAction.EMERGENCY_STOP)
+        )
+    result = await service.submit_operator_action(
+        "run-busy", OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    assert result.result == "failed"
+    assert result.queued is False
+
+
+@pytest.mark.asyncio
+async def test_restart_into_active_phase_enters_recovery_without_resuming(
+    store: RoastStore,
+) -> None:
+    """The restart invariant: a possibly-active persisted run recovers into
+    operator_recovery_required and resumes no hardware."""
+    await store.create_run(
+        run_id="run-crashed",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.DEVELOPMENT,
+    )
+    mcp = FakeMCPClient()
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    await service.recover_on_start()
+    recovered = await store.read_run("run-crashed")
+    assert recovered is not None
+    assert recovered.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert service.active_run_id == "run-crashed"
+    # No heat/fan/session write was issued on recovery.
+    assert mcp.commands() == []
+
+
+@pytest.mark.asyncio
+async def test_recover_on_start_noop_for_completed_run(store: RoastStore) -> None:
+    await store.create_run(
+        run_id="run-fin", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-fin", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    service = RoastService(store, roaster=FakeMCPClient(), advisor=FakeAdvisor(), run_loop=False)
+    await service.recover_on_start()
+    assert service.runner is None  # nothing to recover
+
+
+async def _drive_to_recovery(
+    store: RoastStore,
+) -> tuple[RoastService, FakeMCPClient, FakeClock, str]:
+    """Start a live run and trip the pre-T0 overrun rule → recovery."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    # A pre-T0 bean overrun (>200 °C in preheating, no T0) → RECOVERY verdict.
+    mcp.frames = [_reading(bean=205.0, env=210.0)]
+    await _tick(service, clock)
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED  # type: ignore[union-attr]
+    return service, mcp, clock, run_id
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_recovery_resumes_to_payload_target(store: RoastStore) -> None:
+    service, _mcp, clock, run_id = await _drive_to_recovery(store)
+    result = await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(
+            action=OperatorAction.ACKNOWLEDGE_RECOVERY, payload={"resume_to": "cooling"}
+        ),
+    )
+    assert result.result == "accepted"
+    await _tick(service, clock)
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.COOLING  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_recovery_rejects_missing_or_invalid_target(store: RoastStore) -> None:
+    """Recovery resume needs a valid ``resume_to`` in the recovery transition
+    row: missing, a non-phase string, and ``starting`` are all rejected — the
+    run stays in recovery (never a guessed resume)."""
+    service, _mcp, clock, run_id = await _drive_to_recovery(store)
+    for payload in (None, {"resume_to": "garbage"}, {"resume_to": "starting"}):
+        await service.submit_operator_action(
+            run_id,
+            OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_RECOVERY, payload=payload),
+        )
+        await _tick(service, clock)
+        detail = await store.read_run(run_id)
+        assert detail is not None
+        assert detail.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+
+
+@pytest.mark.asyncio
+async def test_operator_mark_beans_added_executes_via_queue(store: RoastStore) -> None:
+    """The manual-T0 fallback flows operator → queue → full safety → MCP."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)  # preheating
+    result = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.MARK_BEANS_ADDED)
+    )
+    assert result.result == "accepted"
+    await _tick(service, clock)
+    assert "mark_beans_added" in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_operator_action_route_returns_410_on_terminal_run(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="route-done",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="route-done", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    response = await client.post(
+        "/api/roasts/route-done/operator-actions", json={"action": "emergency_stop"}
+    )
+    assert response.status_code == 410
+
+
+@pytest.mark.asyncio
+async def test_recover_on_start_is_noop_in_api_only_mode(store: RoastStore) -> None:
+    service = RoastService(store)  # no roaster wired
+    await service.recover_on_start()
+    assert service.runner is None
+
+
+@pytest.mark.asyncio
+async def test_recover_on_start_is_noop_for_idle_run(store: RoastStore) -> None:
+    await store.create_run(
+        run_id="run-idle", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.IDLE
+    )
+    service = RoastService(store, roaster=FakeMCPClient(), advisor=FakeAdvisor(), run_loop=False)
+    await service.recover_on_start()
+    assert service.runner is None
+
+
+@pytest.mark.asyncio
+async def test_run_loop_runs_in_background_and_shuts_down(store: RoastStore) -> None:
+    """The production path: start_roast spawns the tick loop as a background
+    task; shutdown cancels it cleanly."""
+    config = AppConfig(
+        controller=ControllerConfig(
+            tick_interval_seconds=0.001, telemetry_log_interval_seconds=0.0001
+        )
+    )
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service = RoastService(
+        store,
+        config=config,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=True,  # real background loop
+    )
+    detail = await service.start_roast(_profile())
+    await asyncio.sleep(0.03)  # let the background loop tick a few times
+    await service.shutdown()
+    points = await store.read_telemetry_points(detail.id)
+    assert points, "the background loop persisted telemetry"
+
+
+@pytest.mark.asyncio
+async def test_recover_on_start_runs_loop_in_background(store: RoastStore) -> None:
+    await store.create_run(
+        run_id="run-rec",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.DEVELOPMENT,
+    )
+    config = AppConfig(controller=ControllerConfig(tick_interval_seconds=0.001))
+    service = RoastService(
+        store,
+        config=config,
+        roaster=FakeMCPClient([_reading(150.0, 160.0)]),
+        advisor=FakeAdvisor(),
+        run_loop=True,
+    )
+    await service.recover_on_start()
+    await asyncio.sleep(0.02)
+    await service.shutdown()
+    recovered = await store.read_run("run-rec")
+    assert recovered is not None
+    assert recovered.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+
+
+async def _drive_live_to_cooling(
+    store: RoastStore, *, exporter_ok: bool
+) -> tuple[RoastService, FakeMCPClient, FakeClock, str]:
+    """Replay a live run preheat→T0→FC→drop into cooling, ready to stop."""
+    clock = FakeClock()
+    export_result = None
+    if exporter_ok:
+        from roastpilot_agent.mcp_client import ExportRoastLogResult
+
+        export_result = ExportRoastLogResult(
+            session_id="s",
+            log_dir="d",
+            jsonl_path="d/r.jsonl",
+            csv_path="d/r.csv",
+            summary_path="d/r.summary",
+            ready=True,
+            note="ok",
+        )
+    mcp = FakeMCPClient([_reading(178.0, 185.0)], export_result=export_result)
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    await _tick(service, clock)  # preheat
+    mcp.frames = [_reading(95.0, 150.0, t0_detected=True)]
+    for _ in range(3):
+        await _tick(service, clock)
+    mcp.frames = [_reading(196.0, 205.0, t0_detected=True, first_crack_detected=True)]
+    await _tick(service, clock)  # → development
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+    )
+    mcp.frames = [_reading(205.0, 210.0, t0_detected=True, first_crack_detected=True)]
+    await _tick(service, clock)  # → cooling
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.COOLING  # type: ignore[union-attr]
+    return service, mcp, clock, run_id
+
+
+@pytest.mark.asyncio
+async def test_queue_dispatch_routes_every_control_action(store: RoastStore) -> None:
+    """Each operator action drains to its controller handler — exercised from
+    preheating (matrix-rejected actions still dispatch; pause/resume toggle)."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    for action in (
+        OperatorAction.MARK_FIRST_CRACK,
+        OperatorAction.START_COOLING,
+        OperatorAction.PAUSE_ADVISORY,
+        OperatorAction.RESUME_ADVISORY,
+    ):
+        await service.submit_operator_action(run_id, OperatorActionRequest(action=action))
+    await _tick(service, clock)
+    # Still preheating (the writes were matrix-rejected; pause/resume don't move
+    # phase) — the run survives the whole batch.
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.PREHEATING  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_via_queue_faults_and_finalizes(store: RoastStore) -> None:
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "kill"}),
+    )
+    finalized = await _tick(service, clock)
+    assert finalized
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.outcome == "faulted"
+    assert detail.agent_phase is RoastPhase.FAULTED
+    assert detail.fault_reason is not None
+    assert "emergency_stop" in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_racing_estop_does_not_strand_the_run(store: RoastStore) -> None:
+    """An acknowledge queued alongside an e-stop in the same tick must not reset
+    a live faulting run to idle: the run faults and completes (never an
+    idle-but-uncompleted run that ``active_run`` would treat as still active)."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_RECOVERY)
+    )
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    )
+    finalized = await _tick(service, clock)  # e-stop sorts first → faulted; ack ignored
+    assert finalized
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.agent_phase is RoastPhase.FAULTED
+    assert detail.outcome == "faulted"
+    assert (await store.active_run()) is None  # not left stranded as active
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_outside_recovery_is_recorded_failed(store: RoastStore) -> None:
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_RECOVERY)
+    )
+    await _tick(service, clock)
+    # Not recovery/terminal → no resume, run stays preheating.
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.PREHEATING  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_completion_export_failure_still_completes(store: RoastStore) -> None:
+    service, _mcp, clock, run_id = await _drive_live_to_cooling(store, exporter_ok=False)
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.STOP_COOLING)
+    )
+    finalized = await _tick(service, clock)
+    assert finalized
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.outcome == "completed"
+    assert detail.export_manifest is None  # export raised → no manifest, run still completes
+
+
+@pytest.mark.asyncio
+async def test_tick_once_after_finalize_is_idempotent(store: RoastStore) -> None:
+    service, _mcp, clock, run_id = await _drive_live_to_cooling(store, exporter_ok=True)
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.STOP_COOLING)
+    )
+    assert await _tick(service, clock)  # finalizes
+    assert await _tick(service, clock)  # already finalized → still True, no double complete
+
+
+@pytest.mark.asyncio
+async def test_event_flush_tolerates_a_failed_row(store: RoastStore) -> None:
+    """A persistence error on one event never crashes the tick loop."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, _run_id = await _live_service(store, mcp=mcp, clock=clock)
+    calls = {"n": 0}
+    original = store.record_event
+
+    async def flaky(**kwargs: object) -> None:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("disk blip")
+        await original(**kwargs)  # type: ignore[arg-type]
+
+    store.record_event = flaky  # type: ignore[method-assign]
+    # A tick that emits at least one event must not raise despite the failure.
+    await _tick(service, clock)
+    store.record_event = original  # type: ignore[method-assign]
+    assert calls["n"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_background_loop_stops_on_terminal_fault(store: RoastStore) -> None:
+    config = AppConfig(controller=ControllerConfig(tick_interval_seconds=0.001))
+    mcp = FakeMCPClient([_reading(250.0, 200.0)])  # bean over the hard ceiling → e-stop
+    service = RoastService(
+        store,
+        config=config,
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=True,
+    )
+    detail = await service.start_roast(_profile())
+    await asyncio.sleep(0.03)
+    await service.shutdown()
+    finished = await store.read_run(detail.id)
+    assert finished is not None
+    assert finished.outcome == "faulted"
+    assert service.runner is not None and service.runner.finalized
+
+
+@pytest.mark.asyncio
+async def test_mark_first_crack_via_queue_enters_development(store: RoastStore) -> None:
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    await _tick(service, clock)  # preheat
+    mcp.frames = [_reading(95.0, 150.0, t0_detected=True)]
+    for _ in range(3):
+        await _tick(service, clock)  # → roasting_pre_first_crack
+    mcp.frames = [_reading(190.0, 200.0, t0_detected=True)]  # no auto-FC
+    result = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.MARK_FIRST_CRACK)
+    )
+    assert result.result == "accepted"
+    await _tick(service, clock)
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.DEVELOPMENT  # type: ignore[union-attr]
+    assert "mark_first_crack" in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_start_cooling_via_queue_resumes_from_recovery(store: RoastStore) -> None:
+    service, mcp, clock, run_id = await _drive_to_recovery(store)
+    result = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.START_COOLING)
+    )
+    assert result.result == "accepted"
+    await _tick(service, clock)
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.COOLING  # type: ignore[union-attr]
+    assert "start_cooling" in mcp.commands()
+
+
+@pytest.mark.asyncio
+async def test_lifespan_runs_recovery_on_startup_and_shutdown(store: RoastStore) -> None:
+    """The app lifespan classifies a possibly-active persisted run into recovery
+    on startup and stops the loop on shutdown."""
+    await store.create_run(
+        run_id="run-life",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.DEVELOPMENT,
+    )
+    service = RoastService(
+        store,
+        roaster=FakeMCPClient([_reading(150.0, 160.0)]),
+        advisor=FakeAdvisor(),
+        run_loop=False,
+    )
+    app = create_app(service)
+    async with app.router.lifespan_context(app):
+        recovered = await store.read_run("run-life")
+        assert recovered is not None
+        assert recovered.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
