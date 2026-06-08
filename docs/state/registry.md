@@ -40,13 +40,23 @@ advisor layer behind RoastAdvisor); E8-S4 (the advisor bake-off, #57) is
 the human-operator §11.1 resolution path and stays open — it does not
 block E7.
 
-**Active: E7 (API + SSE).** Issues minted #67–#69 (epic tracking #70).
-E7 is unblocked (depends on E4 ✅, E6 ✅; no E8 dependency). The full
-REST + SSE surface the SPA renders from — one backend authority, the SPA
-never calls MCP. The typed SSE event set is E7's most important output:
-E9 (vertical slice) and E10 (SPA) both render from it. E7 establishes the
-API + SSE contract and the operator action queue; E9 wires the live
-controller tick loop + MCP child to drive it.
+**E7 (API + SSE) is complete** — #67 (REST routes), #68 (operator action
+queue), #69 (SSE stream) all merged; epic tracking #70 closed. The full
+REST + SSE surface the SPA renders from: one backend authority, the SPA
+never calls MCP. `RoastService` in `api.py` is the backend authority and
+the E9 wiring seam (store + active-run guard + operator queue +
+`EventBroadcaster`). E8-S4 (advisor bake-off, #57) remains the only open
+M1 story and is human-operator-owned.
 
-When E7 closes: E9 and E10 run in parallel next (vertical slice + SPA) —
-the E10 UI kickoff brief is waiting in the plan repo.
+**E7's SSE contract is ready.** `models.SseEventType` / `SseEvent` /
+`TelemetryEventData` + `api.EventBroadcaster` are the typed event surface
+E9 (vertical slice) and E10 (SPA) render from.
+
+**Next: E9 and E10 run in parallel** (vertical slice + SPA), to be set up
+deliberately — not yet started. E9 wires the live controller tick loop +
+MCP child into `RoastService` (drain the operator queue through full
+safety; emit events + per-tick telemetry into the broadcaster) and adds
+controller handlers for the four operator actions without one today
+(`mark_beans_added`, `start_cooling`, `pause_advisory`, `resume_advisory`
+— see `docs/epics/E07-api.md` E9 notes). The E10 UI kickoff brief is
+waiting in the plan repo.
