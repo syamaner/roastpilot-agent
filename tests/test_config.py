@@ -30,10 +30,10 @@ def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
     assert config.provider == "openai_compatible"
     assert config.provider_base_url == "https://openrouter.ai/api/v1"
     assert config.api_key_env == "OPENROUTER_API_KEY"
-    # E8-S4 bake-off winner (plan §11.1 → D20): opus-4.8 via OpenRouter,
-    # electric-roaster prompt v1.
+    # E8-S4 bake-off winner (plan §11.1 → D20, refined → D21): opus-4.8 via
+    # OpenRouter, electric-Hottop prompt v2 (fan + duration).
     assert config.model_slug == "anthropic/claude-opus-4.8"
-    assert config.prompt_version == "v1"
+    assert config.prompt_version == "v2"
     assert config.timeout_seconds == 10.0
     assert config.temperature == 0.0
 

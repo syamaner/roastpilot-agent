@@ -479,12 +479,27 @@ def test_instructions_for_known_and_unknown_version() -> None:
 
 
 def test_v1_prompt_is_electric_roaster_tuned() -> None:
-    """v1 (E8-S4) is the default prompt — it must encode the electric-roaster
-    reality the bake-off tuned for: thermal lag, decisive early action, and
-    maximizing development time."""
+    """v1 (E8-S4) encodes the electric-roaster reality the bake-off tuned for:
+    thermal lag, decisive early action, and maximizing development time."""
     v1 = instructions_for("v1").lower()
     assert "electric" in v1
     assert "thermal lag" in v1
     assert "development time" in v1
     # The advisory-only invariant survives the rewrite.
     assert "never control hardware" in v1
+
+
+def test_v2_prompt_adds_fan_and_duration() -> None:
+    """v2 (E8-S4 refinement) is the default prompt — it must encode the Hottop
+    refinements: fan as a coupled heat-transfer-mode lever, and development
+    duration (ratio) as the objective rather than a drop temperature."""
+    v2 = instructions_for("v2").lower()
+    # Fan as transfer-mode / flavor lever, not just a coolant.
+    assert "fan" in v2
+    assert "convective" in v2
+    # Duration objective + the 10-20% ratio band.
+    assert "duration" in v2
+    assert "10-20%" in v2
+    # Carried-forward invariants.
+    assert "thermal lag" in v2
+    assert "never control hardware" in v2

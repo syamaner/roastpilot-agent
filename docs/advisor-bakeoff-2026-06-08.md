@@ -13,14 +13,16 @@ Builds on the single-model smoke run in
 ## Outcome
 
 - **Winner / default: `anthropic/claude-opus-4.8` via OpenRouter, prompt
-  `v1`.** Best advice quality with comfortable latency headroom under the
-  10 s budget (~4.4 s on the bake-off `v0` prompt; ~4.7–5.2 s on `v1`,
-  confirmed by the full-slate re-run — see "Second run" below).
-- **New electric-roaster prompt `v1`** is now the default
-  (`AdvisorConfig.prompt_version`). The original `v0` ("small, conservative
-  adjustments") was miscalibrated for an electric roaster — see below.
+  `v2`.** It won the first bake-off on quality + latency, and across three
+  runs (`v0` → `v1` → `v2`) it is the only frontier model that stays under
+  the 10 s gate as the prompt gained roast craft. Latency: ~4.4 s on `v0`,
+  ~4.7–5.2 s on `v1`, ~6.2 s on `v2`.
+- **The prompt evolved with the operator's domain input, run over run:**
+  `v0` (generic "small adjustments") → `v1` (electric roaster: thermal lag,
+  decisive early heat) → `v2` (fan as a coupled heat-transfer-mode lever +
+  development *duration* as the objective). `v2` is the shipped default.
 - Set in `AdvisorConfig`: `model_slug="anthropic/claude-opus-4.8"`,
-  `prompt_version="v1"` (provider/base_url already OpenRouter). Native
+  `prompt_version="v2"` (provider/base_url already OpenRouter). Native
   Anthropic (no OpenRouter hop/markup, D18) is a config swap:
   `provider=anthropic` + `api_key_env=ANTHROPIC_API_KEY`.
 
@@ -202,26 +204,101 @@ Two operational notes:
   longer prompt leaves it without margin, so a swap-in carries real
   over-budget risk.
 
+## Third run — `v2` (fan + duration), and the new default
+
+Reading the v1 results, the operator surfaced more roast craft that v1 (and
+the eval) had under-weighted: on a **Hottop the fan is a primary,
+flavor-coupled lever** — it sets the heat-transfer *mode* (radiant/conductive
+→ convective) and prevents scorched/baked flavor — and the real development
+objective is **duration** (a ~10–20 % development ratio, ~10 % can be
+excellent), not hitting a drop temperature (which is a guide one may run
+modestly past). `v1` was heat-only and treated the drop temp as a hard stop,
+so its fan numbers were a reflex, not reasoning. **`v2`** encodes both: two
+coupled levers (heat + fan), and `should_drop` judged on the development
+ratio.
+
+```bash
+python scripts/advisor_bakeoff.py --iterations 3 --prompt-version v2 --out /tmp/bakeoff_v2.json
+```
+
+**Finding — the richer prompt is a far harsher latency filter.** `v2`
+(~1,800 chars vs v1's ~1,100) added ~1–2 s, and that pushed the borderline
+frontier models over the gate. Only three candidates pass:
+
+| Candidate | v2 latency (iter range) | Gate |
+|---|---|---|
+| qwen3.6 local | 2.3–2.6 s | ✅ |
+| anthropic/claude-haiku-4.5 | 4.3–5.5 s | ✅ |
+| **anthropic/claude-opus-4.8** | **5.7–6.8 s** | ✅ |
+| anthropic/claude-sonnet-4.6 | 8.8–11.0 s | ❌ over |
+| google/gemini-3.5-flash | 5.7–11.9 s | ❌ over |
+| openai/gpt-5.5 | 7.3–12.9 s | ❌ over |
+| openai/gpt-5-mini | 20–23 s | ❌ over |
+
+**Opus is now the only frontier model that passes** — the v1 prediction that
+sonnet would bust the gate came true under the heavier, production-
+representative prompt. The more roast craft in the prompt, the more opus's
+latency margin matters.
+
+**The prompt worked — fan + duration reasoning appears in every decision.**
+All models compute the ratio from context (e.g. "45 s dev / 587 s = 7.7 %"),
+treat fan as a transfer-mode lever, and hold `should_drop=False` at the temp
+guide (duration, not temperature, drives the drop). Opus at mid: *"~7.7 %
+ratio — too short; aim to stretch toward 10–15 %… cut heat to 35 and raise
+fan to 75 to shift toward convective transfer, evacuate smoke, and flatten
+RoR without crashing it… plan to drop once ratio reaches ~12–15 %."* Fans are
+now actively coordinated (opus 45 → 75 → 72, vs a passive 40 → 60 → 60 under
+v1).
+
+**A surprise — haiku stepped up.** It *under-followed* v1's "cut decisively"
+(only 100 → 65) but follows v2's richer, more structured instructions well
+(computes ratio, reasons about convective transfer and baked/scorched notes,
+even "if RoR drops below ~5 °C/min, nudge heat back up") — at 4.6 s and cheap.
+So v2 promoted haiku from also-ran to the viable fast/cheap alternative.
+
+**Decision: `opus` + `v2` is the new default** (was `opus` + `v1`; plan §11.1
+→ D20, refined → **D21**). Opus gives the best-rounded fan+duration advice and
+is the lone frontier gate-passer. Sonnet has marginally the sharpest rationale
+(targets a specific RoR, "drop ~195–198 °C at 10–13 % ratio") but is
+**disqualified by the gate** under the production prompt — exactly what gating
+on latency is for. Haiku-4.5 (~4.6 s) is the documented fast/cheap fallback.
+
+## Follow-up surfaced by v2 — `target_development_percent` in context
+
+The models inferred the development ratio from elapsed times + the prompt's
+"10–20 %" guidance. Making the **per-profile** target development percent an
+explicit `AdvisorContext` field (so different beans can override the general
+band) is a clean enrichment for a future story — the operator expects to
+refine the duration target and the ~195 °C darkness threshold as more roast
+data is collected.
+
 ## Reproduce
 
 ```bash
-# Full slate (set OPENROUTER_API_KEY in your shell first; never commit it):
+# Full slate under the shipped prompt (set OPENROUTER_API_KEY first; never
+# commit it). --prompt-version defaults to v2; pass v0/v1 to reproduce the
+# earlier runs.
 OPENROUTER_API_KEY=... LMSTUDIO_API_KEY=lm-studio \
-  python scripts/advisor_bakeoff.py --iterations 3 --out /tmp/bakeoff.json
+  python scripts/advisor_bakeoff.py --iterations 3 --prompt-version v2 --out /tmp/bakeoff_v2.json
 
 # Single candidate / prompt / roast moment via the smoke harness:
 OPENROUTER_API_KEY=... \
 ROASTPILOT_ADVISOR__MODEL_SLUG=anthropic/claude-opus-4.8 \
-ROASTPILOT_ADVISOR__PROMPT_VERSION=v1 \
+ROASTPILOT_ADVISOR__PROMPT_VERSION=v2 \
   python scripts/advisor_smoke.py --iterations 3 --offset-seconds 45
 ```
 
 ## Follow-ups (not blocking the default)
 
+- **`target_development_percent` in `AdvisorContext`** (surfaced by v2): make
+  the per-profile development-ratio target explicit so different beans can
+  override the prompt's general 10–20 % band.
 - **Ambient (room) temperature in `AdvisorContext`.** The operator noted
   outdoor/ambient temp affects an electric roast; the context currently
   carries chamber `env_temp_c` but not room ambient. A candidate context
   enrichment for a later prompt/profile iteration.
 - **Native-Anthropic default** (D18) once an `ANTHROPIC_API_KEY` is in play —
   avoids the OpenRouter hop/markup; a pure config swap.
+- Refine the ~195 °C darkness threshold and the duration target as more roast
+  data is collected (operator note).
 - Re-measure with N ≥ 3 if the slate or prompt changes materially.
