@@ -56,9 +56,13 @@ class AdvisorConfig(BaseModel):
     environment variable named by ``api_key_env`` and handed to the
     provider — it never lives in config or the database.
 
-    The exact default ``model_slug`` (and whether the settled default
-    ``provider`` is native or OpenRouter) is the bake-off's call (E8-S4,
-    component plan §11.1); S2 ships a working provisional default.
+    The default ``model_slug`` and ``prompt_version`` are the bake-off's
+    outcome (E8-S4, plan §11.1 → D20): ``anthropic/claude-opus-4.8`` via
+    OpenRouter won on advice quality with comfortable latency headroom under
+    the 10 s budget, and ``v1`` is the electric-roaster prompt. To run opus
+    natively (no OpenRouter hop/markup, per D18), set ``provider=anthropic``
+    + ``api_key_env=ANTHROPIC_API_KEY``. ``OPENROUTER_API_KEY`` must be set
+    in the environment at runtime; ``FakeAdvisor`` stays the test/CI default.
     """
 
     provider: Literal["openai", "anthropic", "google", "ollama", "openai_compatible"] = (
@@ -66,10 +70,10 @@ class AdvisorConfig(BaseModel):
     )
     provider_base_url: str = "https://openrouter.ai/api/v1"
     api_key_env: str = Field(default="OPENROUTER_API_KEY", min_length=1)
-    model_slug: str = ""
+    model_slug: str = "anthropic/claude-opus-4.8"
     timeout_seconds: float = Field(default=10.0, gt=0)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    prompt_version: str = Field(default="v0", min_length=1)
+    prompt_version: str = Field(default="v1", min_length=1)
 
 
 class SafetyLimits(BaseModel):
