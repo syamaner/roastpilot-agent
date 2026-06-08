@@ -434,7 +434,7 @@ def test_reasoning_extra_body_maps_effort_levels() -> None:
     assert reasoning_extra_body("high") == {"reasoning": {"effort": "high"}}
 
 
-def testusage_from_run_extracts_reasoning_tokens() -> None:
+def test_usage_from_run_extracts_reasoning_tokens() -> None:
     """Reasoning tokens are read from provider ``details`` when present, else
     ``None`` — the cost-tax signal."""
     with_reasoning = SimpleNamespace(
