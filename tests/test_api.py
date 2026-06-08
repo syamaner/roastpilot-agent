@@ -1336,9 +1336,10 @@ async def test_emergency_stop_via_queue_faults_and_finalizes(store: RoastStore) 
 
 
 @pytest.mark.asyncio
-async def test_acknowledge_from_terminal_phase_ends_run(store: RoastStore) -> None:
-    """An acknowledge queued alongside an e-stop dispatches in the faulted phase
-    and resets the controller to idle."""
+async def test_acknowledge_racing_estop_does_not_strand_the_run(store: RoastStore) -> None:
+    """An acknowledge queued alongside an e-stop in the same tick must not reset
+    a live faulting run to idle: the run faults and completes (never an
+    idle-but-uncompleted run that ``active_run`` would treat as still active)."""
     clock = FakeClock()
     mcp = FakeMCPClient([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
@@ -1348,12 +1349,13 @@ async def test_acknowledge_from_terminal_phase_ends_run(store: RoastStore) -> No
     await service.submit_operator_action(
         run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
     )
-    await _tick(service, clock)  # e-stop sorts first → faulted; ack → idle
-    # The acknowledge reset the controller out of the faulted phase to idle,
-    # persisted as the last-known phase.
+    finalized = await _tick(service, clock)  # e-stop sorts first → faulted; ack ignored
+    assert finalized
     detail = await store.read_run(run_id)
     assert detail is not None
-    assert detail.agent_phase is RoastPhase.IDLE
+    assert detail.agent_phase is RoastPhase.FAULTED
+    assert detail.outcome == "faulted"
+    assert (await store.active_run()) is None  # not left stranded as active
 
 
 @pytest.mark.asyncio

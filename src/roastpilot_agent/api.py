@@ -463,28 +463,29 @@ class RoastRunner:
             await self._record_dispatch_command(tool, item, since=before)
 
     async def _dispatch_acknowledge(self, payload: dict[str, Any]) -> None:
-        """Phase-based ``acknowledge_recovery``: from a terminal phase it ends the
-        run (→ idle); from ``operator_recovery_required`` it resumes to the
-        ``resume_to`` target in the payload (validated against the recovery
-        transition row — ``starting`` is never legal). A missing/invalid target,
-        or any other phase, is recorded as a failed operator action — never a
-        guessed resume."""
+        """Phase-based ``acknowledge_recovery``: from ``operator_recovery_required``
+        it resumes to the ``resume_to`` target in the payload (validated against
+        the recovery transition row — ``starting`` is never legal). Any other
+        phase records a failed operator action — never a guessed resume, and never
+        a reset of a live run.
+
+        A terminal phase is *not* acknowledged here. After a fault the run is
+        finalized by :meth:`_handle_completion` (and the API 410-guards a
+        completed run), then the loop stops; the next roast builds a fresh
+        controller. Resetting a live faulted run to ``idle`` from the drain would
+        beat that finalization to the phase and leave an ``idle`` run with no
+        ``completed_at`` — which ``active_run`` would treat as still active. So an
+        ack racing an e-stop in the same tick is recorded failed; the run faults
+        and completes. (Records two ``operator_actions`` rows for a control-only
+        action: the queue-acceptance row at submit, then this execution-outcome
+        row — the only meaningful outcome signal for an action with no matrix
+        pre-check.)"""
         phase = self._controller.phase
-        if phase in (RoastPhase.FAULTED, RoastPhase.COMPLETE):
-            self._controller.operator_acknowledge_fault()
-            return
         if phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED:
             target = _parse_resume_target(payload.get("resume_to"))
-            if target is None:
-                await self._store.record_operator_action(
-                    action=OperatorAction.ACKNOWLEDGE_RECOVERY.value,
-                    result="failed",
-                    run_id=self._run_id,
-                    payload=payload or None,
-                )
+            if target is not None:
+                self._controller.operator_resume(target)
                 return
-            self._controller.operator_resume(target)
-            return
         await self._store.record_operator_action(
             action=OperatorAction.ACKNOWLEDGE_RECOVERY.value,
             result="failed",
@@ -836,6 +837,10 @@ class RoastService:
         persisted = await self._store.read_latest_run()
         if persisted is None or persisted.completed_at_utc is not None:
             return  # fresh database, or a terminal run — nothing possibly active
+        # FAULTED is deliberately NOT excluded here: a properly-finalized fault has
+        # completed_at set and was caught above, but a FAULTED run with no
+        # completed_at (agent crashed mid fault-handling) must still enter recovery
+        # so the operator can end it — hardware is already off, so this is safe.
         if persisted.agent_phase in (RoastPhase.IDLE, RoastPhase.COMPLETE):
             return
         runner = self._build_runner(persisted.run_id)
