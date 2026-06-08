@@ -21,9 +21,11 @@ Usage::
 import argparse
 import asyncio
 import json
+import os
 import statistics
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any, cast
 
@@ -34,6 +36,33 @@ from advisor_smoke import DEFAULT_FIXTURE, build_context  # noqa: E402
 
 from roastpilot_agent.advisor import AdvisorError, PydanticAIAdvisor  # noqa: E402
 from roastpilot_agent.config import AdvisorConfig  # noqa: E402
+
+
+def fetch_openrouter_pricing() -> dict[str, tuple[float, float]]:
+    """Live per-model OpenRouter pricing → {slug: ($/input_token, $/output_token)}.
+
+    Reasoning tokens are billed as completion tokens, so the model's measured
+    ``output_tokens`` already includes them — output price covers the tax.
+    """
+    key = os.environ.get("OPENROUTER_API_KEY", "")
+    req = urllib.request.Request(  # noqa: S310 — fixed https endpoint
+        "https://openrouter.ai/api/v1/models",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310
+        data = cast("dict[str, Any]", json.load(resp))
+    pricing: dict[str, tuple[float, float]] = {}
+    for model in cast("list[dict[str, Any]]", data.get("data", [])):
+        price = cast("dict[str, Any]", model.get("pricing") or {})
+        try:
+            pricing[str(model["id"])] = (
+                float(price.get("prompt", 0) or 0),
+                float(price.get("completion", 0) or 0),
+            )
+        except (TypeError, ValueError):
+            continue
+    return pricing
+
 
 OPENROUTER = "https://openrouter.ai/api/v1"
 LMSTUDIO = "http://127.0.0.1:1234/v1"
@@ -101,8 +130,17 @@ GATE_SECONDS = 10.0  # the controller's tick-aligned advisory budget
 MEASURE_TIMEOUT = 90.0  # generous bound so over-budget advice is still captured
 
 
+def _median_int(values: list[int]) -> int | None:
+    return int(statistics.median(values)) if values else None
+
+
 async def run_cell(
-    cand: dict[str, str], offset: float, iters: int, prompt_version: str
+    cand: dict[str, str],
+    offset: float,
+    iters: int,
+    prompt_version: str,
+    reasoning_effort: str | None,
+    pricing: dict[str, tuple[float, float]],
 ) -> dict[str, object]:
     context, source_row = build_context(DEFAULT_FIXTURE, offset)
     config = AdvisorConfig(
@@ -111,6 +149,7 @@ async def run_cell(
         api_key_env=cand["key_env"],
         model_slug=cand["model"],
         prompt_version=prompt_version,
+        reasoning_effort=reasoning_effort,  # type: ignore[arg-type]
     )
     advisor = PydanticAIAdvisor(config)
     iters_out: list[dict[str, Any]] = []
@@ -120,11 +159,15 @@ async def run_cell(
             decision = await asyncio.wait_for(
                 advisor.get_recommendation(context), timeout=MEASURE_TIMEOUT
             )
+            u = advisor.last_usage
             iters_out.append(
                 {
                     "ok": True,
                     "latency": round(time.perf_counter() - started, 3),
                     "decision": decision.model_dump(),
+                    "input_tokens": u.input_tokens if u else None,
+                    "output_tokens": u.output_tokens if u else None,
+                    "reasoning_tokens": u.reasoning_tokens if u else None,
                 }
             )
         except (AdvisorError, TimeoutError) as exc:
@@ -135,9 +178,21 @@ async def run_cell(
                     "error": f"{type(exc).__name__}: {str(exc)[:200]}",
                 }
             )
-    lats = [float(r["latency"]) for r in iters_out if r["ok"]]
+    ok = [r for r in iters_out if r["ok"]]
+    lats = [float(r["latency"]) for r in ok]
     median = round(statistics.median(lats), 2) if lats else None
-    decision = next((r["decision"] for r in iters_out if r["ok"]), None)
+    decision = next((r["decision"] for r in ok), None)
+    in_tok = _median_int([r["input_tokens"] for r in ok if r["input_tokens"] is not None])
+    out_tok = _median_int([r["output_tokens"] for r in ok if r["output_tokens"] is not None])
+    reas_tok = _median_int([r["reasoning_tokens"] for r in ok if r["reasoning_tokens"] is not None])
+    # Cost per call from live OpenRouter pricing; local (LM Studio) is free.
+    prompt_price, completion_price = pricing.get(cand["model"], (0.0, 0.0))
+    is_local = cand["base_url"] == LMSTUDIO
+    cost_usd = (
+        None
+        if is_local or in_tok is None or out_tok is None
+        else round(in_tok * prompt_price + out_tok * completion_price, 6)
+    )
     return {
         "source_row_monotonic": float(source_row["monotonic_seconds"]),
         "bean_temp_c": float(source_row["bean_temp_c"]),
@@ -148,6 +203,10 @@ async def run_cell(
         "latency_max": round(max(lats), 2) if lats else None,
         "passes_gate": bool(median is not None and median <= GATE_SECONDS),
         "decision": decision,
+        "input_tokens_median": in_tok,
+        "output_tokens_median": out_tok,
+        "reasoning_tokens_median": reas_tok,
+        "cost_usd_per_call": cost_usd,
     }
 
 
@@ -157,14 +216,29 @@ async def main() -> int:
     parser.add_argument(
         "--prompt-version", default="v2", help="advisor prompt version (default: v2)"
     )
+    parser.add_argument(
+        "--reasoning",
+        default="default",
+        choices=["default", "off", "minimal", "low", "medium", "high"],
+        help="reasoning effort for the OpenAI-compatible path (default: provider default)",
+    )
     parser.add_argument("--out", type=Path, default=Path("/tmp/bakeoff.json"))
     args = parser.parse_args()
+
+    reasoning_effort = None if args.reasoning == "default" else args.reasoning
+    pricing = fetch_openrouter_pricing()
+    print(
+        f"prompt={args.prompt_version} reasoning={args.reasoning} ({len(pricing)} models priced)",
+        flush=True,
+    )
 
     results: list[dict[str, object]] = []
     for cand in CANDIDATES:
         for moment_label, offset in MOMENTS:
             print(f"running {cand['label']} @ {moment_label} (offset {offset}s)…", flush=True)
-            cell = await run_cell(cand, offset, args.iterations, args.prompt_version)
+            cell = await run_cell(
+                cand, offset, args.iterations, args.prompt_version, reasoning_effort, pricing
+            )
             cell.update(
                 {
                     "label": cand["label"],
@@ -173,6 +247,7 @@ async def main() -> int:
                     "moment": moment_label,
                     "offset": offset,
                     "prompt_version": args.prompt_version,
+                    "reasoning": args.reasoning,
                 }
             )
             results.append(cell)
@@ -180,10 +255,13 @@ async def main() -> int:
             verdict = "PASS" if cell["passes_gate"] else "over-budget"
             if decision is not None:
                 d = cast(dict[str, Any], decision)
+                cost = cell["cost_usd_per_call"]
+                cost_str = f"${cost:.4f}/call" if isinstance(cost, float) else "free"
                 print(
                     f"  {verdict} median={cell['latency_median']}s "
                     f"heat={d['target_heat']} fan={d['target_fan']} drop={d['should_drop']} "
-                    f"conf={d['confidence']}",
+                    f"in/out={cell['input_tokens_median']}/{cell['output_tokens_median']}tok "
+                    f"reason={cell['reasoning_tokens_median']}tok {cost_str}",
                     flush=True,
                 )
             else:

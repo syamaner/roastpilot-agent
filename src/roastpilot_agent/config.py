@@ -77,6 +77,14 @@ class AdvisorConfig(BaseModel):
     timeout_seconds: float = Field(default=10.0, gt=0)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     prompt_version: str = Field(default="v2", min_length=1)
+    # Reasoning control for the OpenAI-compatible path (OpenRouter normalizes
+    # the ``reasoning`` request param across providers). ``None`` leaves the
+    # provider default; ``"off"`` disables reasoning; the effort levels set
+    # ``reasoning.effort``. Native anthropic/google providers ignore this.
+    # Default ``None`` preserves provider behavior; the advisor's interest is
+    # fast structured advice inside the 10 s tick budget, so the bake-off
+    # measures reasoning on-vs-off (E8-S4 cost/reasoning eval).
+    reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None
 
 
 class SafetyLimits(BaseModel):

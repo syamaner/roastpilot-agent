@@ -36,6 +36,7 @@ def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
     assert config.prompt_version == "v2"
     assert config.timeout_seconds == 10.0
     assert config.temperature == 0.0
+    assert config.reasoning_effort is None  # provider default until measured
 
 
 def test_safety_limit_defaults_are_conservative() -> None:

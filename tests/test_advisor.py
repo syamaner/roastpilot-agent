@@ -41,6 +41,7 @@ from roastpilot_agent.advisor import (
     RoastDecision,
     build_model,
     instructions_for,
+    reasoning_extra_body,
 )
 from roastpilot_agent.config import AdvisorConfig, ControllerConfig
 from roastpilot_agent.controller import RoastController, RoastPhase
@@ -409,6 +410,24 @@ async def test_pydanticai_advisor_returns_validated_decision() -> None:
     decision = await advisor.get_recommendation(_context())
     assert isinstance(decision, RoastDecision)
     assert (decision.target_heat, decision.target_fan, decision.should_drop) == (60, 50, False)
+
+
+@pytest.mark.asyncio
+async def test_pydanticai_advisor_captures_last_usage() -> None:
+    """Each successful call records token usage for cost/observability."""
+    advisor = _advisor_with(_function_model_returning(_VALID_OUTPUT))
+    assert advisor.last_usage is None
+    await advisor.get_recommendation(_context())
+    assert advisor.last_usage is not None
+    assert advisor.last_usage.input_tokens > 0
+    assert advisor.last_usage.total_tokens >= advisor.last_usage.output_tokens
+
+
+def test_reasoning_extra_body_maps_effort_levels() -> None:
+    assert reasoning_extra_body(None) is None
+    assert reasoning_extra_body("off") == {"reasoning": {"enabled": False}}
+    assert reasoning_extra_body("low") == {"reasoning": {"effort": "low"}}
+    assert reasoning_extra_body("high") == {"reasoning": {"effort": "high"}}
 
 
 @pytest.mark.asyncio
