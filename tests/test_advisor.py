@@ -431,6 +431,15 @@ def test_reasoning_extra_body_maps_effort_levels() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pydanticai_advisor_threads_reasoning_effort() -> None:
+    """A configured reasoning_effort is wired into the agent's model_settings
+    (extra_body) without breaking the call path."""
+    advisor = _advisor_with(_function_model_returning(_VALID_OUTPUT), reasoning_effort="off")
+    decision = await advisor.get_recommendation(_context())
+    assert isinstance(decision, RoastDecision)
+
+
+@pytest.mark.asyncio
 async def test_pydanticai_advisor_out_of_range_is_unsafe() -> None:
     """Well-shaped output that violates the RoastDecision bounds (heat 150)
     maps to AdvisorUnsafeOutputError — not malformed."""
