@@ -22,7 +22,7 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from enum import Enum
-from typing import Any
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai import (
@@ -97,6 +97,21 @@ class RoastDecision(BaseModel):
     should_drop: bool
     confidence: float = Field(ge=0.0, le=1.0)
     rationale: str
+
+
+class AdvisorUsage(BaseModel):
+    """Token usage from one advisory call (cost/observability — E8-S4).
+
+    ``output_tokens`` includes any reasoning tokens (providers bill reasoning
+    as completion), so it is the right basis for cost; ``reasoning_tokens`` is
+    surfaced separately when the provider reports it, to expose the reasoning
+    'tax'.
+    """
+
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+    reasoning_tokens: int | None = None
 
 
 class RoastAdvisor(ABC):
@@ -285,6 +300,41 @@ class AdvisorDependencyError(AdvisorError):
     """A configured provider needs an optional dependency extra that is absent."""
 
 
+def usage_from_run(usage: Any) -> AdvisorUsage:
+    """Normalize a PydanticAI run usage into :class:`AdvisorUsage`.
+
+    ``reasoning_tokens`` is read from the provider ``details`` when present
+    (OpenRouter reports it for reasoning models); otherwise it stays ``None``.
+    """
+    raw_details = getattr(usage, "details", None)
+    details: dict[str, Any] = (
+        cast("dict[str, Any]", raw_details) if isinstance(raw_details, dict) else {}
+    )
+    reasoning: Any = details.get("reasoning_tokens")
+    return AdvisorUsage(
+        input_tokens=int(getattr(usage, "input_tokens", 0) or 0),
+        output_tokens=int(getattr(usage, "output_tokens", 0) or 0),
+        total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
+        reasoning_tokens=int(reasoning) if reasoning is not None else None,
+    )
+
+
+def reasoning_extra_body(
+    reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None,
+) -> dict[str, Any] | None:
+    """Map ``reasoning_effort`` to the OpenRouter ``reasoning`` request body.
+
+    ``None`` → no override (provider default); ``"off"`` → reasoning disabled;
+    an effort level → ``reasoning.effort``. OpenRouter normalizes this across
+    providers; native anthropic/google ignore ``extra_body``.
+    """
+    if reasoning_effort is None:
+        return None
+    if reasoning_effort == "off":
+        return {"reasoning": {"enabled": False}}
+    return {"reasoning": {"effort": reasoning_effort}}
+
+
 def build_model(config: AdvisorConfig) -> Model:
     """Build the PydanticAI ``Model`` for ``config.provider`` (D18).
 
@@ -364,11 +414,23 @@ class PydanticAIAdvisor(RoastAdvisor):
     def __init__(self, config: AdvisorConfig, *, model: Model | None = None) -> None:
         self._config = config
         self._model = model if model is not None else build_model(config)
+        #: Token usage from the most recent model response (cost/observability);
+        #: ``None`` until the first one. Captured as soon as the provider
+        #: returns, so it reflects a call whose output later fails strict
+        #: re-validation (``AdvisorUnsafeOutputError``) — the tokens were still
+        #: spent. It is *not* updated when the call itself fails before
+        #: returning (malformed/provider error), so it keeps the last good
+        #: reading.
+        self.last_usage: AdvisorUsage | None = None
+        settings = ModelSettings(temperature=config.temperature)
+        extra_body = reasoning_extra_body(config.reasoning_effort)
+        if extra_body is not None:
+            settings["extra_body"] = extra_body
         self._agent: Agent[None, _RawRoastDecision] = Agent(
             self._model,
             output_type=_RawRoastDecision,
             instructions=instructions_for(config.prompt_version),
-            model_settings=ModelSettings(temperature=config.temperature),
+            model_settings=settings,
         )
 
     async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
@@ -390,6 +452,7 @@ class PydanticAIAdvisor(RoastAdvisor):
             raise AdvisorMalformedOutputError(str(exc)) from exc
         except ModelAPIError as exc:
             raise AdvisorProviderError(str(exc)) from exc
+        self.last_usage = usage_from_run(result.usage)
         try:
             return RoastDecision.model_validate(result.output.model_dump())
         except ValidationError as exc:

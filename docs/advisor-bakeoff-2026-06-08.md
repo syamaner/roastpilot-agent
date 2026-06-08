@@ -263,6 +263,52 @@ is the lone frontier gate-passer. Sonnet has marginally the sharpest rationale
 **disqualified by the gate** under the production prompt — exactly what gating
 on latency is for. Haiku-4.5 (~4.6 s) is the documented fast/cheap fallback.
 
+## Fourth pass — measured token/cost, and reasoning on vs off
+
+The first three runs gated on latency and judged quality; they did not meter
+tokens. This pass instruments the advisor (`PydanticAIAdvisor.last_usage`) and
+prices each call against **live OpenRouter rates**, run under v2 with reasoning
+at the provider default and again with reasoning **off**
+(`--reasoning off`, which maps to OpenRouter's `reasoning:{enabled:false}`).
+
+| Model | v2 latency | gate | $/call | reasoning tok | reasoning off → |
+|---|---|---|---|---|---|
+| qwen3.6 local | 2.5 s | ✅ | free | 0 | n/a (off locally) |
+| anthropic/claude-haiku-4.5 | 4.9 s | ✅ | **$0.0033** | 0 | no-op (no reasoning) |
+| **anthropic/claude-opus-4.8** | 6.2 s | ✅ | **$0.0187** | 0 | no-op |
+| google/gemini-3.5-flash | 5.7 s | ✅ | $0.0104 | 868 | **400 — "reasoning mandatory"** |
+| anthropic/claude-sonnet-4.6 | 9.1 s | ✅ | $0.0105 | 0 | no-op (latency is structural) |
+| openai/gpt-5.5 | 10.8 s ❌ | — | $0.0174 | 316 | **2.9 s ✅, $0.0075** |
+| openai/gpt-5-mini | 19.9 s ❌ | — | $0.0035 | 1344 | **400 — "reasoning mandatory"** |
+
+Findings:
+
+- **The latency gate is also a cost filter.** The models it removes (gpt-5-mini,
+  gpt-5.5-default) are the ones spending reasoning tokens — paid for in both
+  time and dollars. opus, fast *because* it does no extended thinking, is also
+  the cheapest *frontier* answer that passes — though at **$0.0187/call it is
+  the most expensive *passing* model** (5.6× haiku, 2.5× gpt-5.5-off).
+- **Reasoning is mandatory on some endpoints.** Disabling it on
+  `gemini-3.5-flash` and `gpt-5-mini` returns a **400 "Reasoning is mandatory
+  for this endpoint and cannot be disabled."** So gpt-5-mini is *permanently*
+  over the gate (no fix), and gemini is stuck paying the reasoning tax (it
+  passes anyway). The reasoning-off lever is **not universal**.
+- **Anthropic models don't reason by default** (0 reasoning tokens for opus /
+  sonnet / haiku): their latency is *structural generation*, and reasoning-off
+  is a no-op. Sonnet's ~9 s is intrinsic — it can't be sped up.
+- **gpt-5.5 with reasoning off is transformative:** 10.8 s → **2.9 s**,
+  $0.0174 → **$0.0075**, over-budget → passing, with advice that holds its
+  shape (ratio math, decisive heat cut, convective fan, duration drop) — but
+  **cuts heat harder than opus** (e.g. 25 %/85 % fan vs opus 40 %/72 % at the
+  late moment), edging toward the stall/bake band the operator chose to avoid.
+
+**Decision: opus + v2 holds.** Cost is not a constraint (operator), opus is the
+calibrated quality leader with comfortable margin, and `reasoning_effort` stays
+**`None`** in config — forcing `"off"` would 400 on a gemini/gpt-5-mini swap-in,
+and opus does not reason anyway. The new `reasoning_effort` knob makes
+**gpt-5.5 + `reasoning_effort="off"`** a documented speed/cost alternative
+(2.9 s, $0.0075) for anyone who wants it, with the over-aggression caveat noted.
+
 ## Follow-up surfaced by v2 — `target_development_percent` in context
 
 The models inferred the development ratio from elapsed times + the prompt's
@@ -277,9 +323,14 @@ data is collected.
 ```bash
 # Full slate under the shipped prompt (set OPENROUTER_API_KEY first; never
 # commit it). --prompt-version defaults to v2; pass v0/v1 to reproduce the
-# earlier runs.
+# earlier runs. Output records latency + tokens + live-priced $/call per cell.
 OPENROUTER_API_KEY=... LMSTUDIO_API_KEY=lm-studio \
   python scripts/advisor_bakeoff.py --iterations 3 --prompt-version v2 --out /tmp/bakeoff_v2.json
+
+# Reasoning on vs off (the cost/latency diagnostic): --reasoning off disables
+# reasoning where the provider allows it (400 on gemini/gpt-5-mini).
+OPENROUTER_API_KEY=... LMSTUDIO_API_KEY=lm-studio \
+  python scripts/advisor_bakeoff.py --reasoning off --out /tmp/bakeoff_v2_off.json
 
 # Single candidate / prompt / roast moment via the smoke harness:
 OPENROUTER_API_KEY=... \
