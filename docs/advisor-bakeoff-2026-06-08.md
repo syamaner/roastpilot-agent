@@ -290,9 +290,18 @@ ROASTPILOT_ADVISOR__PROMPT_VERSION=v2 \
 
 ## Follow-ups (not blocking the default)
 
-- **`target_development_percent` in `AdvisorContext`** (surfaced by v2): make
-  the per-profile development-ratio target explicit so different beans can
-  override the prompt's general 10–20 % band.
+- **Typed context enrichment for v2** (one bundled follow-up story):
+  - `target_development_percent` — make the per-profile development-ratio
+    target explicit so different beans can override the prompt's general
+    10–20 % band.
+  - `current_heat_percent` / `current_fan_percent` — v2 asks the model to
+    *coordinate from* the current lever positions, which it currently infers
+    from the untyped `recent_telemetry_samples` (works — opus threaded the fan
+    sequence correctly — but it's not a typed contract). Add them as explicit
+    `AdvisorContext` fields alongside `target_development_percent`.
+  - `prompt_version` validation — currently a free `str`; a
+    `Literal["v0","v1","v2"]` (or a field validator) would fail at config load
+    instead of advisor init, with a clearer message.
 - **Ambient (room) temperature in `AdvisorContext`.** The operator noted
   outdoor/ambient temp affects an electric roast; the context currently
   carries chamber `env_temp_c` but not room ambient. A candidate context
