@@ -40,6 +40,8 @@ LMSTUDIO = "http://127.0.0.1:1234/v1"
 
 # The slate (E8-S4 prompt). Cloud candidates go through OpenRouter; the local
 # baseline points at LM Studio. Slugs verified live on openrouter.ai/models.
+# ``tier`` is a neutral price/locality category, not a prediction — the
+# outcome lives in the results JSON (latency/gate) and the bake-off doc.
 CANDIDATES: list[dict[str, str]] = [
     {
         "label": "qwen3.6-35b-a3b (local, reasoning-off)",
@@ -71,21 +73,21 @@ CANDIDATES: list[dict[str, str]] = [
     },
     {
         "label": "anthropic/claude-sonnet-4.6",
-        "tier": "frontier (likely winner)",
+        "tier": "frontier",
         "base_url": OPENROUTER,
         "model": "anthropic/claude-sonnet-4.6",
         "key_env": "OPENROUTER_API_KEY",
     },
     {
         "label": "anthropic/claude-opus-4.8",
-        "tier": "frontier (ceiling)",
+        "tier": "frontier",
         "base_url": OPENROUTER,
         "model": "anthropic/claude-opus-4.8",
         "key_env": "OPENROUTER_API_KEY",
     },
     {
         "label": "openai/gpt-5.5",
-        "tier": "frontier (ceiling)",
+        "tier": "frontier",
         "base_url": OPENROUTER,
         "model": "openai/gpt-5.5",
         "key_env": "OPENROUTER_API_KEY",
@@ -99,13 +101,16 @@ GATE_SECONDS = 10.0  # the controller's tick-aligned advisory budget
 MEASURE_TIMEOUT = 90.0  # generous bound so over-budget advice is still captured
 
 
-async def run_cell(cand: dict[str, str], offset: float, iters: int) -> dict[str, object]:
+async def run_cell(
+    cand: dict[str, str], offset: float, iters: int, prompt_version: str
+) -> dict[str, object]:
     context, source_row = build_context(DEFAULT_FIXTURE, offset)
     config = AdvisorConfig(
         provider="openai_compatible",
         provider_base_url=cand["base_url"],
         api_key_env=cand["key_env"],
         model_slug=cand["model"],
+        prompt_version=prompt_version,
     )
     advisor = PydanticAIAdvisor(config)
     iters_out: list[dict[str, Any]] = []
@@ -149,6 +154,9 @@ async def run_cell(cand: dict[str, str], offset: float, iters: int) -> dict[str,
 async def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument(
+        "--prompt-version", default="v1", help="advisor prompt version (default: v1)"
+    )
     parser.add_argument("--out", type=Path, default=Path("/tmp/bakeoff.json"))
     args = parser.parse_args()
 
@@ -156,7 +164,7 @@ async def main() -> int:
     for cand in CANDIDATES:
         for moment_label, offset in MOMENTS:
             print(f"running {cand['label']} @ {moment_label} (offset {offset}s)…", flush=True)
-            cell = await run_cell(cand, offset, args.iterations)
+            cell = await run_cell(cand, offset, args.iterations, args.prompt_version)
             cell.update(
                 {
                     "label": cand["label"],
@@ -164,6 +172,7 @@ async def main() -> int:
                     "model": cand["model"],
                     "moment": moment_label,
                     "offset": offset,
+                    "prompt_version": args.prompt_version,
                 }
             )
             results.append(cell)
