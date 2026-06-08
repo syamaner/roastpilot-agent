@@ -19,6 +19,7 @@ Three layers:
 
 import asyncio
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -42,6 +43,7 @@ from roastpilot_agent.advisor import (
     build_model,
     instructions_for,
     reasoning_extra_body,
+    usage_from_run,
 )
 from roastpilot_agent.config import AdvisorConfig, ControllerConfig
 from roastpilot_agent.controller import RoastController, RoastPhase
@@ -426,8 +428,24 @@ async def test_pydanticai_advisor_captures_last_usage() -> None:
 def test_reasoning_extra_body_maps_effort_levels() -> None:
     assert reasoning_extra_body(None) is None
     assert reasoning_extra_body("off") == {"reasoning": {"enabled": False}}
+    assert reasoning_extra_body("minimal") == {"reasoning": {"effort": "minimal"}}
     assert reasoning_extra_body("low") == {"reasoning": {"effort": "low"}}
+    assert reasoning_extra_body("medium") == {"reasoning": {"effort": "medium"}}
     assert reasoning_extra_body("high") == {"reasoning": {"effort": "high"}}
+
+
+def testusage_from_run_extracts_reasoning_tokens() -> None:
+    """Reasoning tokens are read from provider ``details`` when present, else
+    ``None`` — the cost-tax signal."""
+    with_reasoning = SimpleNamespace(
+        input_tokens=100, output_tokens=50, total_tokens=150, details={"reasoning_tokens": 42}
+    )
+    usage = usage_from_run(with_reasoning)
+    assert (usage.input_tokens, usage.output_tokens, usage.total_tokens) == (100, 50, 150)
+    assert usage.reasoning_tokens == 42
+
+    without = SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15, details={})
+    assert usage_from_run(without).reasoning_tokens is None
 
 
 @pytest.mark.asyncio

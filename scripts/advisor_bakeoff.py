@@ -25,9 +25,10 @@ import os
 import statistics
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # advisor_smoke
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
@@ -49,8 +50,12 @@ def fetch_openrouter_pricing() -> dict[str, tuple[float, float]]:
         "https://openrouter.ai/api/v1/models",
         headers={"Authorization": f"Bearer {key}"},
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310
-        data = cast("dict[str, Any]", json.load(resp))
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310
+            data = cast("dict[str, Any]", json.load(resp))
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        print(f"warning: OpenRouter pricing fetch failed ({exc}); $/call unavailable", flush=True)
+        return {}
     pricing: dict[str, tuple[float, float]] = {}
     for model in cast("list[dict[str, Any]]", data.get("data", [])):
         price = cast("dict[str, Any]", model.get("pricing") or {})
@@ -149,7 +154,9 @@ async def run_cell(
         api_key_env=cand["key_env"],
         model_slug=cand["model"],
         prompt_version=prompt_version,
-        reasoning_effort=reasoning_effort,  # type: ignore[arg-type]
+        reasoning_effort=cast(
+            'Literal["off", "minimal", "low", "medium", "high"] | None', reasoning_effort
+        ),
     )
     advisor = PydanticAIAdvisor(config)
     iters_out: list[dict[str, Any]] = []

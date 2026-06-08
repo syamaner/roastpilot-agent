@@ -300,7 +300,7 @@ class AdvisorDependencyError(AdvisorError):
     """A configured provider needs an optional dependency extra that is absent."""
 
 
-def _usage_from_run(usage: Any) -> AdvisorUsage:
+def usage_from_run(usage: Any) -> AdvisorUsage:
     """Normalize a PydanticAI run usage into :class:`AdvisorUsage`.
 
     ``reasoning_tokens`` is read from the provider ``details`` when present
@@ -414,8 +414,10 @@ class PydanticAIAdvisor(RoastAdvisor):
     def __init__(self, config: AdvisorConfig, *, model: Model | None = None) -> None:
         self._config = config
         self._model = model if model is not None else build_model(config)
-        #: Token usage from the most recent call (cost/observability); ``None``
-        #: until the first successful call.
+        #: Token usage from the most recent *successful* call
+        #: (cost/observability); ``None`` until the first one. A failed call
+        #: raises before capture, so this is not cleared on failure — it keeps
+        #: the last good reading.
         self.last_usage: AdvisorUsage | None = None
         settings = ModelSettings(temperature=config.temperature)
         extra_body = reasoning_extra_body(config.reasoning_effort)
@@ -447,7 +449,7 @@ class PydanticAIAdvisor(RoastAdvisor):
             raise AdvisorMalformedOutputError(str(exc)) from exc
         except ModelAPIError as exc:
             raise AdvisorProviderError(str(exc)) from exc
-        self.last_usage = _usage_from_run(result.usage)
+        self.last_usage = usage_from_run(result.usage)
         try:
             return RoastDecision.model_validate(result.output.model_dump())
         except ValidationError as exc:
