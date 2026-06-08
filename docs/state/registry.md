@@ -35,18 +35,25 @@
 E1–E6 are complete: safety policy, deterministic controller, typed MCP
 client, and SQLite persistence (schema v2 with trigger-enforced
 completed-run immutability, typed write paths with per-tick commits,
-recovery reads proven across the E4/E6 seam). E8-S1–S3 are complete (the
-advisor layer behind RoastAdvisor); E8-S4 (the advisor bake-off, #57) is
-the human-operator §11.1 resolution path and stays open — it does not
-block E7.
+recovery reads proven across the E4/E6 seam).
+
+**E8 (Advisor) is complete** — all four stories: `FakeAdvisor` (#53), the
+provider-agnostic `PydanticAIAdvisor` (#54, D18), the change-based
+call-frequency policy (#55), and the operator-judged bake-off (#57, D20).
+The bake-off set the default to `anthropic/claude-opus-4.8` via OpenRouter
+with the electric-roaster prompt `v1`, resolving plan §11 item 1 — the last
+M1 open item. Captured in `docs/advisor-bakeoff-2026-06-08.md` (reproducible
+via `scripts/advisor_bakeoff.py`); default is config-swappable (D18).
 
 **E7 (API + SSE) is complete** — #67 (REST routes), #68 (operator action
 queue), #69 (SSE stream) all merged; epic tracking #70 closed. The full
 REST + SSE surface the SPA renders from: one backend authority, the SPA
 never calls MCP. `RoastService` in `api.py` is the backend authority and
 the E9 wiring seam (store + active-run guard + operator queue +
-`EventBroadcaster`). E8-S4 (advisor bake-off, #57) remains the only open
-M1 story and is human-operator-owned.
+`EventBroadcaster`).
+
+**M1 stories are all closed through E8.** Next is E9 + E10 (see below) —
+not yet started; awaiting a deliberate kickoff.
 
 **E7's SSE contract is ready.** `models.SseEventType` / `SseEvent` /
 `TelemetryEventData` + `api.EventBroadcaster` are the typed event surface

@@ -25,14 +25,17 @@ def test_controller_defaults_match_orchestration_plan() -> None:
     assert config.max_stale_telemetry_seconds == 3.0
 
 
-def test_advisor_defaults_match_d5() -> None:
+def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
     config = AdvisorConfig()
+    assert config.provider == "openai_compatible"
     assert config.provider_base_url == "https://openrouter.ai/api/v1"
     assert config.api_key_env == "OPENROUTER_API_KEY"
-    assert config.model_slug == ""  # confirmed at E8 (plan §11.1)
+    # E8-S4 bake-off winner (plan §11.1 → D20): opus-4.8 via OpenRouter,
+    # electric-roaster prompt v1.
+    assert config.model_slug == "anthropic/claude-opus-4.8"
+    assert config.prompt_version == "v1"
     assert config.timeout_seconds == 10.0
     assert config.temperature == 0.0
-    assert config.prompt_version == "v0"
 
 
 def test_safety_limit_defaults_are_conservative() -> None:

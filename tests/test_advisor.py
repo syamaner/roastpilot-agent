@@ -476,3 +476,15 @@ def test_instructions_for_known_and_unknown_version() -> None:
     assert "coffee roaster" in instructions_for("v0").lower()
     with pytest.raises(ValueError):
         instructions_for("does-not-exist")
+
+
+def test_v1_prompt_is_electric_roaster_tuned() -> None:
+    """v1 (E8-S4) is the default prompt — it must encode the electric-roaster
+    reality the bake-off tuned for: thermal lag, decisive early action, and
+    maximizing development time."""
+    v1 = instructions_for("v1").lower()
+    assert "electric" in v1
+    assert "thermal lag" in v1
+    assert "development time" in v1
+    # The advisory-only invariant survives the rewrite.
+    assert "never control hardware" in v1

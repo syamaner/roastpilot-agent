@@ -84,15 +84,15 @@ Acceptance criteria:
 
 Acceptance criteria:
 
-- [ ] Replay the same recorded roast context — the 7 Jun 2026 live-roast
-  fixtures (`tests/fixtures/live-roast-2026-06-07/`) — through 3–4
-  candidate OpenRouter model slugs.
-- [ ] Compare `RoastDecision` quality side by side. The operator judges
-  advice quality — the story's output is the comparison document + chosen
-  default, not an automated metric.
-- [ ] Record the comparison in `docs/` (talk material).
-- [ ] Set the winning slug as the config default and resolve plan §11
-  item 1 in the plan repo in the same work session.
+- [x] Replay the same recorded roast context — the 7 Jun 2026 live-roast
+  fixtures (`tests/fixtures/live-roast-2026-06-07/`) — through the candidate
+  slate (7 candidates: local + 6 OpenRouter slugs) at 3 development moments.
+- [x] Compare `RoastDecision` quality side by side. The operator judged
+  advice quality — the output is the comparison document + chosen default,
+  not an automated metric.
+- [x] Record the comparison in `docs/` (`advisor-bakeoff-2026-06-08.md`).
+- [x] Set the winning slug as the config default (`anthropic/claude-opus-4.8`
+  + electric-roaster prompt `v1`) and resolve plan §11 item 1 as **D20**.
 
 ## Status
 
@@ -101,9 +101,10 @@ Acceptance criteria:
 | E8-S1 | FakeAdvisor and failure fixtures | done |
 | E8-S2 | PydanticAI provider-agnostic implementation | done |
 | E8-S3 | Call-frequency policy | done |
-| E8-S4 | Advisor bake-off | not started |
+| E8-S4 | Advisor bake-off | done |
 
-Epic status: **in progress** — E2 ✅; issues minted
-([#53](https://github.com/syamaner/roastpilot-agent/issues/53)–[#55](https://github.com/syamaner/roastpilot-agent/issues/55),
-[#57](https://github.com/syamaner/roastpilot-agent/issues/57); epic
-tracking [#56](https://github.com/syamaner/roastpilot-agent/issues/56)).
+Epic status: **done** — all four stories complete. The advisor layer is
+behind `RoastAdvisor`: `FakeAdvisor` (CI default), the provider-agnostic
+`PydanticAIAdvisor` (D18), the change-based call-frequency policy, and the
+operator-judged bake-off that set the default (`claude-opus-4.8` + prompt
+`v1`, plan §11.1 → D20).
