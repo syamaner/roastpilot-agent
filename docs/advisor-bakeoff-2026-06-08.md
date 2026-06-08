@@ -14,7 +14,8 @@ Builds on the single-model smoke run in
 
 - **Winner / default: `anthropic/claude-opus-4.8` via OpenRouter, prompt
   `v1`.** Best advice quality with comfortable latency headroom under the
-  10 s budget (~4.4 s on the bake-off prompt; ~5.7 s on v1).
+  10 s budget (~4.4 s on the bake-off prompt; ~5.7 s on v1). Confirmed by a
+  full-slate re-run under `v1`, the shipped prompt (see "Second run" below).
 - **New electric-roaster prompt `v1`** is now the default
   (`AdvisorConfig.prompt_version`). The original `v0` ("small, conservative
   adjustments") was miscalibrated for an electric roaster — see below.
@@ -121,6 +122,81 @@ flatten the curve and stretch development time… anticipating thermal lag."*
 Confidence rose (0.80–0.83 vs 0.78). The default config (`opus` + `v1`)
 re-confirmed under the production 10 s budget: 3/3 pass, mean **5.7 s** (v1's
 longer prompt adds ~1.3 s over bare opus, still comfortable).
+
+## Second run — the whole slate under `v1` (the shipped prompt)
+
+The first run ranked models under `v0`; the default ships `v1`. To keep the
+default evidence-based on the *actual* prompt, the full slate was re-run under
+`v1` (same context, moments, N=3):
+
+```bash
+python scripts/advisor_bakeoff.py --iterations 3 --prompt-version v1 --out /tmp/bakeoff_v1.json
+```
+
+**Finding 1 — the prompt moved every model.** Early-moment heat cut from 100 %:
+
+| Model | v0 (timid) | v1 (decisive) |
+|---|---|---|
+| qwen3.6 local | 100 (*"maintain"*) | **30** |
+| gemini-3.5-flash | 75 | **40** |
+| gpt-5.5 | 85 | **30** |
+| claude-opus-4.8 | 85 | **55** |
+| claude-sonnet-4.6 | 80 | **55** |
+| claude-haiku-4.5 | 85 | **65** |
+| gpt-5-mini | 85 | 20 (over budget) |
+
+Under `v0` every model looked timid and similar; `v1` made them all act —
+strong evidence that **the prompt, not the model, drove the behavior**.
+
+**Finding 2 — a decisiveness spectrum `v0` hid.** With every model now acting,
+they split three ways:
+
+- **Under-follows** — haiku (only 100 → 65): weakest instruction-following on
+  "cut decisively."
+- **Calibrated-decisive** — opus & sonnet (100 → 55). Sonnet even names a
+  *target*: "flatten RoR toward ~4–5 °C/min" — it cuts to hit a sane
+  development RoR, not just to cut hard.
+- **Aggressive** — gemini (40), gpt-5.5 (30), qwen (30), gpt-5-mini (20): slam
+  heat down with no stated RoR target. On a laggy electric element, 100 → 30
+  risks crashing RoR / stalling (a "baked" flick-back). Operator judgment
+  favoured the **calibrated** band: decisive enough to stretch development,
+  not so much it stalls.
+
+**Finding 3 — opus holds, now confirmed on the shipped prompt.** opus and
+sonnet give near-identical `v1` advice (heat 55/35/38 vs 55/35/40) with
+comparable lag reasoning, but opus is faster.
+
+`v1` latency vs the 10 s gate (median per moment):
+
+| Candidate | early / mid / late | Gate |
+|---|---|---|
+| qwen3.6 local | 2.4 / 2.1 / 2.1 s | ✅ |
+| claude-haiku-4.5 | 4.4 / 3.8 / 3.6 s | ✅ |
+| **claude-opus-4.8** | **5.2 / 4.7 / 4.8 s** | ✅ |
+| gemini-3.5-flash | 4.9 / 6.9 / 6.2 s | ✅ |
+| openai/gpt-5.5 | 7.9 / 7.4 / 8.5 s | ⚠️ pass (one iter 10.9 s) |
+| claude-sonnet-4.6 | 8.0 / 7.6 / 7.5 s | ⚠️ pass (thin margin) |
+| openai/gpt-5-mini | 15.9 / 17.5 / 15.0 s | ❌ over budget |
+
+Honest correction to the first run's hypothesis: the longer `v1` prompt was
+expected to push sonnet over the gate — it did **not** (sonnet held ~7.5–8.0 s,
+within noise of its `v0` 8.4 s). opus still wins on margin, but not because
+sonnet busted. `gpt-5-mini` is *worse* under `v1` (longer prompt + default
+reasoning) and stays disqualified.
+
+**Decision: opus + v1 stands.** The re-run validated the shipped default on
+the shipped prompt and refined the rationale (calibrated-decisive sweet spot).
+Two operational notes:
+
+- **Latency margin is also self-correcting.** opus at ~5 s leaves room, and
+  the E8-S3 change-based call-frequency policy re-consults the advisor on the
+  next meaningful change (≥1 °C bean / ≥2 °C·min RoR / phase / 15 s heartbeat),
+  so a slow or skipped call is corrected on the following tick — the controller
+  is never blocked waiting.
+- **The runners-up are captured and config-swappable** (D18): the candidate
+  slate lives in `scripts/advisor_bakeoff.py`; sonnet-4.6 (deeper rationale,
+  thinner margin), haiku-4.5 (fast/cheap, under-follows v1), and gemini-3.5-
+  flash (cheap, aggressive) are a `MODEL_SLUG` swap away if priorities change.
 
 ## Reproduce
 
