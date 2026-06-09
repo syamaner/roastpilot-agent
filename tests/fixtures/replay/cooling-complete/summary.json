@@ -1,0 +1,8 @@
+{
+  "active": false,
+  "cooling_stopped_mono": 88.0,
+  "last_frame_mono": 98.0,
+  "note": "SYNTHETIC fixture (E10-S1 review): a successful roast that stays under all agent ceilings and records cooling_stopped BEFORE the last telemetry frame, so the replay STOP_COOLING injection fires and the run reaches COMPLETE. Exercises the stop-cooling branch with real coverage. session-1 can't: it faults on the 240C env ceiling.",
+  "phase": "complete",
+  "synthetic": true
+}

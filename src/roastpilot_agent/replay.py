@@ -53,7 +53,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from roastpilot_agent.api import QueuedOperatorAction, RoastService, create_app
@@ -364,7 +364,14 @@ class ReplayStepResult:
     drain — the **same** id the SSE frames carry — so a Playwright caller can
     wait until the browser's ``lastEventId >= last_event_id`` before
     screenshotting, with no arbitrary sleep. ``settled`` is always true on
-    return (the step ran synchronously to completion)."""
+    return (the step ran synchronously to completion).
+
+    ``requested_marker`` / ``marker_reached`` are populated only by
+    :meth:`ReplaySource.advance_to`: ``marker_reached`` is ``False`` when the
+    marker never fired (the export exhausted first), which the control route
+    turns into a 404 so a Playwright caller fails loud on a wrong fixture rather
+    than screenshotting the wrong state. ``step`` leaves them ``None`` / ``True``
+    (count-based, no marker to miss)."""
 
     agent_phase: str
     tick: int
@@ -372,6 +379,8 @@ class ReplayStepResult:
     finalized: bool
     settled: bool
     last_event_id: int
+    requested_marker: str | None = None
+    marker_reached: bool = True
 
     def to_json(self) -> dict[str, Any]:
         """The JSON body the ``/api/replay`` control routes return."""
@@ -382,6 +391,8 @@ class ReplayStepResult:
             "finalized": self.finalized,
             "settled": self.settled,
             "last_event_id": self.last_event_id,
+            "requested_marker": self.requested_marker,
+            "marker_reached": self.marker_reached,
         }
 
 
@@ -455,6 +466,15 @@ class ReplaySource:
         """Total recorded frames in the loaded export."""
         return len(self._script.frames)
 
+    @property
+    def issued_commands(self) -> list[str]:
+        """The roaster-control command names issued so far (test/debug view).
+
+        Replay actuates nothing, but the controller still routes every write
+        through the control surface, so this is the executed-command trail —
+        e.g. asserting STOP_COOLING actually fired."""
+        return [name for name, _ in self._control.commands]
+
     async def start(self) -> str:
         """Create the run and drive the controller's idle→preheating start.
 
@@ -488,18 +508,22 @@ class ReplaySource:
         return self._result(finalized)
 
     async def advance_to(self, marker: ReplayMarker) -> ReplayStepResult:
-        """Advance until ``marker`` fires (or the run finalizes).
+        """Advance until ``marker`` fires (or the run finalizes / frames exhaust).
 
         Robust to fixture edits (markers, not tick numbers). If the marker was
-        already reached, returns the current settled state without stepping."""
+        already reached, returns the current settled state without stepping. The
+        result's ``marker_reached`` is ``False`` when the export exhausted before
+        the marker fired (e.g. ``fault`` against a roast that never faults) — the
+        control route turns that into a 404 so a caller fails loud rather than
+        screenshotting the wrong state."""
         if marker in self._reached:
-            return self._result(self._is_finalized())
+            return self._result(self._is_finalized(), marker=marker)
         finalized = False
         while marker not in self._reached and not finalized:
             if self._cursor >= len(self._script.frames):
                 break
             finalized = await self._advance_one()
-        return self._result(finalized)
+        return self._result(finalized, marker=marker)
 
     async def run(self) -> None:
         """Free-running replay: advance every frame at ``tick_interval / speed``.
@@ -638,7 +662,7 @@ class ReplaySource:
         runner = self._service.runner
         return runner is not None and runner.finalized
 
-    def _result(self, finalized: bool) -> ReplayStepResult:
+    def _result(self, finalized: bool, *, marker: ReplayMarker | None = None) -> ReplayStepResult:
         phase, elapsed, tick = self._snapshot_fields()
         return ReplayStepResult(
             agent_phase=phase,
@@ -647,6 +671,8 @@ class ReplaySource:
             finalized=finalized or self._is_finalized(),
             settled=True,
             last_event_id=self._service.events.last_event_id,
+            requested_marker=None if marker is None else marker.value,
+            marker_reached=marker is None or marker in self._reached,
         )
 
     def _snapshot_fields(self) -> tuple[str, float | None, int]:
@@ -722,13 +748,26 @@ def mount_replay_controls(app: FastAPI, source: ReplaySource) -> None:
 
     Only the ``--step`` replay app calls this. Each route advances the real
     controller synchronously and returns the settled :class:`ReplayStepResult`
-    (phase, tick, ``last_event_id`` for the deterministic wait)."""
+    (phase, tick, ``last_event_id`` for the deterministic wait). ``advance-to``
+    returns **404** when the requested marker never fires in the export, so a
+    Playwright caller fails loud on a wrong fixture/marker instead of
+    screenshotting the wrong (terminal) state."""
 
     async def step(request: ReplayStepRequest) -> dict[str, Any]:
         return (await source.step(request.ticks)).to_json()
 
     async def advance_to(request: ReplayAdvanceRequest) -> dict[str, Any]:
-        return (await source.advance_to(request.marker)).to_json()
+        result = await source.advance_to(request.marker)
+        if not result.marker_reached:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"marker {request.marker.value!r} never fired in this "
+                    f"{source.frame_count}-frame export; reached end at tick {result.tick} "
+                    f"(phase {result.agent_phase})"
+                ),
+            )
+        return result.to_json()
 
     app.post("/api/replay/step")(step)
     app.post("/api/replay/advance-to")(advance_to)

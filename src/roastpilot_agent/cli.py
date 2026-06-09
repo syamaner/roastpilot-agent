@@ -53,7 +53,7 @@ async def _serve_replay(args: argparse.Namespace) -> int:
     """Build and serve the replay app; free-run unless ``--step``."""
     import uvicorn
 
-    from roastpilot_agent.replay import create_replay_app
+    from roastpilot_agent.replay import clamp_speed, create_replay_app
 
     export_dir: Path = args.replay
     if not (export_dir / "roast.jsonl").is_file():
@@ -65,7 +65,12 @@ async def _serve_replay(args: argparse.Namespace) -> int:
         app, _service, source = await create_replay_app(
             export_dir, store_path, step_mode=args.step, speed=args.speed
         )
-        mode = "stepped (paused at tick 0)" if args.step else f"free-running at {args.speed:g}x"
+        # Report the *clamped* speed the harness actually runs at (1×–60×), not
+        # the raw request — `--speed 100` runs 60×, so the banner must say 60×.
+        effective_speed = clamp_speed(args.speed)
+        mode = (
+            "stepped (paused at tick 0)" if args.step else f"free-running at {effective_speed:g}x"
+        )
         print(
             f"replaying {export_dir.name} ({source.frame_count} frames, {mode}); "
             f"run {source.run_id} on http://{args.host}:{args.port}"

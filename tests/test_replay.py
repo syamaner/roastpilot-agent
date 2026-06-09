@@ -31,6 +31,7 @@ _FIXTURES = Path(__file__).parent / "fixtures" / "replay"
 _SESSION_2 = _FIXTURES / "session-2"
 _SESSION_1 = _FIXTURES / "session-1"
 _FAULT = _FIXTURES / "fault-pre-t0"
+_COOLING_COMPLETE = _FIXTURES / "cooling-complete"
 
 
 def _drain(queue: "asyncio.Queue[SseEvent]") -> list[SseEvent]:
@@ -128,8 +129,28 @@ async def test_replay_drives_real_phase_progression(
     assert result.agent_phase == "cooling"
 
     result = await source.advance_to(ReplayMarker.END)
-    # The recorded roast ends in cooling (auto-T0 session never stops cooling).
+    # session-2 ends in cooling: its cooling-stop is recorded past the last
+    # telemetry frame, so STOP_COOLING never injects (see step-past-end test).
     assert result.agent_phase == "cooling"
+
+
+@pytest.mark.asyncio
+async def test_advance_to_t0_marker_phase(
+    session2: tuple[RoastService, ReplaySource],
+) -> None:
+    """The ``t0`` marker fires when T0 is *detected*, which is BEFORE the agent
+    transitions out of preheating — the controller debounces T0 over several
+    ticks (``t0_debounce_ticks``) before moving to roasting. So at the ``t0``
+    marker the phase is still ``preheating``; ``roasting_pre_first_crack`` only
+    appears a few ticks later. Asserted explicitly so the debounce semantics are
+    pinned, not assumed."""
+    _service, source = session2
+    at_t0 = await source.advance_to(ReplayMarker.T0)
+    assert at_t0.marker_reached is True
+    assert at_t0.agent_phase == "preheating"
+    # A few more ticks past detection, the debounced transition has fired.
+    later = await source.advance_to(ReplayMarker.FIRST_CRACK)
+    assert later.agent_phase == "development"
 
 
 @pytest.mark.asyncio
@@ -245,8 +266,13 @@ async def test_step_advances_exact_ticks(
 async def test_step_past_end_stops_at_finalize(
     session2: tuple[RoastService, ReplaySource],
 ) -> None:
-    """Stepping more ticks than the export has stops cleanly at the last frame
-    (the run does not finalize — session-2 ends in cooling, never stopped)."""
+    """Stepping more ticks than the export has stops cleanly at the last frame.
+
+    The run ends in ``cooling`` (not ``complete``): session-2 *does* record a
+    cooling-stop, but at 1394.45 s — past its last telemetry frame (~1357 s) —
+    so the STOP_COOLING injection never lands and the controller stays in
+    cooling. (The ``cooling-complete`` fixture is the one that reaches COMPLETE.)
+    """
     _service, source = session2
     result = await source.step(10_000)
     assert result.tick == source.frame_count  # clamped at the last frame
@@ -257,15 +283,21 @@ async def test_step_past_end_stops_at_finalize(
 
 
 @pytest.mark.asyncio
-async def test_advance_to_unreached_marker_runs_to_end(
+async def test_advance_to_unreached_marker_reports_not_reached(
     session2: tuple[RoastService, ReplaySource],
 ) -> None:
     """advance_to a marker the export never produces exhausts the frames and
-    settles at the end rather than looping forever (session-2 never faults)."""
+    flags ``marker_reached=False`` (the control route turns this into a 404).
+    session-2 never faults, so ``fault`` is never reached."""
     _service, source = session2
     result = await source.advance_to(ReplayMarker.FAULT)
     assert result.tick == source.frame_count
-    assert result.agent_phase == "cooling"
+    assert result.marker_reached is False
+    assert result.requested_marker == "fault"
+    # A reached marker reports marker_reached=True with the marker echoed.
+    reached = await source.advance_to(ReplayMarker.COOLING)
+    assert reached.marker_reached is True
+    assert reached.requested_marker == "cooling"
 
 
 @pytest.mark.asyncio
@@ -331,7 +363,13 @@ async def test_fault_fixture_drives_real_recovery(tmp_path: Path) -> None:
 @pytest.mark.asyncio
 async def test_step_routes_mounted_only_in_step_mode(tmp_path: Path) -> None:
     """The /api/replay/{step,advance-to} control routes exist ONLY on the
-    --step app — never on a non-step replay app (a live control hole)."""
+    --step app — never on a non-step replay app, AND never on the LIVE app.
+
+    The live-app assertion is the load-bearing safety boundary: these routes
+    drive the controller tick loop, so they must never be reachable on a real
+    roast. Pin it directly against ``api.create_app`` (the live factory)."""
+    from roastpilot_agent.api import create_app
+
     step_app, _s1, step_src = await create_replay_app(
         _SESSION_2, tmp_path / "step.sqlite3", step_mode=True, speed=60
     )
@@ -344,6 +382,10 @@ async def test_step_routes_mounted_only_in_step_mode(tmp_path: Path) -> None:
     assert "/api/replay/advance-to" in step_routes
     assert "/api/replay/step" not in free_routes
     assert "/api/replay/advance-to" not in free_routes
+    # The LIVE app (real roast) never exposes the replay control routes.
+    live_routes = {r.path for r in create_app(service=None).routes}  # type: ignore[attr-defined]
+    assert "/api/replay/step" not in live_routes
+    assert "/api/replay/advance-to" not in live_routes
     await step_src.aclose()
     await free_src.aclose()
 
@@ -389,21 +431,50 @@ async def test_roaster_control_records_writes_without_actuating() -> None:
     ]
 
 
-# --- Run-completing replay (session-1 stops cooling → complete) ------------
+# --- Real fault-on-replay + a genuine run-completing replay ----------------
 
 
 @pytest.mark.asyncio
-async def test_session1_replay_stops_cooling_and_completes(tmp_path: Path) -> None:
-    """session-1 records a cooling-stop, so its replay injects STOP_COOLING and
-    the run finalizes (the controller completes it)."""
+async def test_session1_replay_faults_on_env_ceiling(tmp_path: Path) -> None:
+    """session-1 *faults* on replay — it is NOT a "completes" fixture.
+
+    The real roast completed (the Hottop tolerated it), but session-1 carries
+    real env-temp readings up to 242 °C, which exceed the agent's deliberately
+    conservative ``max_env_temp_c`` = 240 °C software ceiling. The **real**
+    safety policy correctly trips (EMERGENCY_STOP → FAULTED) — faithful replay
+    of a real reading, not a replay bug. (Distinct from the synthetic
+    ``fault-pre-t0`` fixture, which trips the *pre-T0 overrun* rule → RECOVERY;
+    session-1's pre-T0 bean temp stays under 200 °C.)"""
     _app, service, source = await create_replay_app(
         _SESSION_1, tmp_path / "s1.sqlite3", step_mode=True, speed=60
+    )
+    assert source.run_id is not None
+    result = await source.advance_to(ReplayMarker.FAULT)
+    assert result.agent_phase == "faulted"
+    detail = await service.detail(source.run_id)
+    assert detail.outcome == "faulted"
+    assert detail.fault_reason is not None
+    assert "exceeds the hard ceiling" in detail.fault_reason
+    await source.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cooling_complete_fixture_stops_cooling_and_completes(tmp_path: Path) -> None:
+    """The synthetic ``cooling-complete`` fixture records cooling_stopped BEFORE
+    its last telemetry frame, so the replay's STOP_COOLING injection actually
+    fires (real coverage of that branch) and the run reaches COMPLETE — the
+    genuine successful-roast baseline session-1 cannot be."""
+    _app, service, source = await create_replay_app(
+        _COOLING_COMPLETE, tmp_path / "cc.sqlite3", step_mode=True, speed=60
     )
     assert source.run_id is not None
     result = await source.advance_to(ReplayMarker.END)
     assert result.finalized is True
     detail = await service.detail(source.run_id)
+    assert detail.outcome == "completed"
     assert detail.completed_at_utc is not None
+    # The STOP_COOLING operator action was issued through the real control path.
+    assert "stop_cooling" in source.issued_commands
     await source.aclose()
 
 
@@ -430,11 +501,34 @@ async def test_http_step_routes_drive_the_replay(tmp_path: Path) -> None:
             "finalized",
             "settled",
             "last_event_id",
+            "requested_marker",
+            "marker_reached",
         }
         advanced = client.post("/api/replay/advance-to", json={"marker": "first_crack"}).json()
         assert advanced["agent_phase"] == "development"
+        assert advanced["marker_reached"] is True
+        assert advanced["requested_marker"] == "first_crack"
         assert advanced["last_event_id"] >= body["last_event_id"]
     assert source.run_id is not None
+
+
+@pytest.mark.asyncio
+async def test_http_advance_to_unreached_marker_is_404(tmp_path: Path) -> None:
+    """advance-to a marker that never fires returns 404 with a descriptive body,
+    so a Playwright global-setup fails loud on a wrong fixture/marker rather than
+    screenshotting the wrong (terminal) state."""
+    from fastapi.testclient import TestClient
+
+    app, _service, _source = await create_replay_app(
+        _SESSION_2, tmp_path / "http404.sqlite3", step_mode=True, speed=60
+    )
+    with TestClient(app) as client:
+        # session-2 never faults → the 'fault' marker can never be reached.
+        response = client.post("/api/replay/advance-to", json={"marker": "fault"})
+        assert response.status_code == 404
+        detail = response.json()["detail"]
+        assert "fault" in detail
+        assert "never fired" in detail
 
 
 @pytest.mark.asyncio
