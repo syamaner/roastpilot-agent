@@ -47,7 +47,7 @@ are **synthesized** here, clearly labelled:
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -762,7 +762,7 @@ async def create_replay_app(
     await source.start()
 
     @contextlib.asynccontextmanager
-    async def _replay_lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    async def _replay_lifespan(_app: FastAPI) -> AsyncGenerator[None]:
         # No recover_on_start — replay owns the (already-active) run; on shutdown
         # tear down the live loop (mirroring the live lifespan) and close the
         # store this factory owns, so no aiosqlite thread outlives the loop.
