@@ -18,5 +18,27 @@ export default defineConfig({
     environment: "jsdom",
     setupFiles: ["./vitest.setup.ts"],
     include: ["src/**/*.{test,spec}.{ts,tsx}"],
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "html"],
+      // Gate the foundation LOGIC the pages depend on. Excluded: type-only
+      // modules, trivial wiring, the page stubs (S3/S4/S5 own + cover those),
+      // and the dev-only harness routes.
+      include: ["src/lib/**", "src/hooks/**", "src/components/shared/**"],
+      exclude: [
+        "src/lib/types.ts", // type declarations only
+        "src/lib/queryClient.ts", // trivial QueryClient construction
+        "src/**/index.ts", // barrels
+        "src/**/*.test.{ts,tsx}",
+      ],
+      // A FLOOR (below current ~85/77/79/88) so the foundation + its tests are
+      // gated and S3/S4/S5 inherit it; raise as coverage grows, never lower to pass.
+      thresholds: {
+        statements: 80,
+        branches: 72,
+        functions: 75,
+        lines: 80,
+      },
+    },
   },
 });

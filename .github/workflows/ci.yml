@@ -94,8 +94,11 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Unit + component tests
-        run: npm run test
+      - name: Unit + component tests (with coverage gate)
+        # The coverage thresholds (vitest.config.ts) gate the foundation logic so
+        # S3/S4/S5 inherit a floor — closing the gap that hid the untested live
+        # SSE/reducer/query paths the pages ride on.
+        run: npm run test:coverage
 
   # The D24 visual gate: the scripted toHaveScreenshot() snapshot suite, run
   # INSIDE the pinned Playwright Linux image so its pixels match the committed

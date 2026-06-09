@@ -4,7 +4,7 @@ import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/lib/api";
-import { useRoast } from "./queries";
+import { useHistory, useRoast, useTelemetry, useTimeline } from "./queries";
 
 function wrapper() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -30,5 +30,49 @@ describe("useRoast (skipToken when runId is null)", () => {
       .mockResolvedValue({ id: "r1" } as Awaited<ReturnType<typeof api.roast>>);
     renderHook(() => useRoast("r1"), { wrapper: wrapper() });
     await waitFor(() => expect(spy).toHaveBeenCalledWith("r1"));
+  });
+});
+
+describe("useTimeline (skipToken when runId is null)", () => {
+  it("does not fetch when runId is null", () => {
+    const spy = vi.spyOn(api, "timeline");
+    const { result } = renderHook(() => useTimeline(null), { wrapper: wrapper() });
+    expect(spy).not.toHaveBeenCalled();
+    expect(result.current.fetchStatus).toBe("idle");
+  });
+
+  it("fetches the timeline for a real id", async () => {
+    const spy = vi
+      .spyOn(api, "timeline")
+      .mockResolvedValue({ run_id: "r1" } as Awaited<ReturnType<typeof api.timeline>>);
+    renderHook(() => useTimeline("r1"), { wrapper: wrapper() });
+    await waitFor(() => expect(spy).toHaveBeenCalledWith("r1"));
+  });
+});
+
+describe("useTelemetry (skipToken when runId is null)", () => {
+  it("does not fetch when runId is null", () => {
+    const spy = vi.spyOn(api, "telemetry");
+    const { result } = renderHook(() => useTelemetry(null), { wrapper: wrapper() });
+    expect(spy).not.toHaveBeenCalled();
+    expect(result.current.fetchStatus).toBe("idle");
+  });
+
+  it("fetches telemetry with the run id and downsample", async () => {
+    const spy = vi
+      .spyOn(api, "telemetry")
+      .mockResolvedValue({ run_id: "r1" } as Awaited<ReturnType<typeof api.telemetry>>);
+    renderHook(() => useTelemetry("r1", 5), { wrapper: wrapper() });
+    await waitFor(() => expect(spy).toHaveBeenCalledWith("r1", 5));
+  });
+});
+
+describe("useHistory", () => {
+  it("fetches the roast history list", async () => {
+    const spy = vi
+      .spyOn(api, "history")
+      .mockResolvedValue({ runs: [] } as Awaited<ReturnType<typeof api.history>>);
+    renderHook(() => useHistory(), { wrapper: wrapper() });
+    await waitFor(() => expect(spy).toHaveBeenCalled());
   });
 });

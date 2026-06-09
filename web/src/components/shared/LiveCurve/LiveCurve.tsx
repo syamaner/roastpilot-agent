@@ -288,6 +288,13 @@ function drawOverlays(
     ctx.strokeStyle = "rgba(212, 212, 216, 0.6)";
     ctx.lineWidth = 1;
     line(ctx, x, u.bbox.top, x, u.bbox.top + u.bbox.height);
+    // Label the marker (T0 / FIRST CRACK / DROP) at the top of its line —
+    // ui-prompts.md Prompt A requires labeled event markers, not bare lines.
+    ctx.fillStyle = "rgba(212, 212, 216, 0.9)";
+    ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+    ctx.textBaseline = "top";
+    ctx.textAlign = "left";
+    ctx.fillText(marker.label, x + 3, u.bbox.top + 2);
   }
 
   if (highlightTime !== null) {

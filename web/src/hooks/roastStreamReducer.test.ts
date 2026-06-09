@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { RoastDetail, SseEvent } from "@/lib/types";
+import type { OperatorAction, RoastDetail, SseEvent } from "@/lib/types";
 import {
   applyEvent,
   hydrate,
@@ -56,6 +56,37 @@ describe("roastStreamReducer", () => {
     };
     const state = applyEvent({ ...initialRoastStreamState, phase: "development" }, event);
     expect(state.phase).toBe("cooling");
+  });
+
+  it("updates enabledActions from a phase_changed event that carries them", () => {
+    // The live action-bar update mechanism (S3): the server re-sends
+    // enabled_actions on phase_changed, so the bar mirrors the new phase.
+    const prior: OperatorAction[] = ["mark_beans_added", "emergency_stop"];
+    const next: OperatorAction[] = ["start_cooling", "stop_cooling", "emergency_stop"];
+    const start = { ...initialRoastStreamState, phase: "preheating" as const, enabledActions: prior };
+    const event: SseEvent = {
+      event: "phase_changed",
+      data: { agent_phase: "cooling", enabled_actions: next },
+      id: 6,
+    };
+    const state = applyEvent(start, event);
+    expect(state.phase).toBe("cooling");
+    expect(state.enabledActions).toEqual(next);
+  });
+
+  it("preserves enabledActions when a phase_changed event omits them", () => {
+    // Forward-compat: before the E7 enabled_actions contract lands (or any frame
+    // that omits the field), a phase change must not wipe a known action set.
+    const prior: OperatorAction[] = ["mark_beans_added", "emergency_stop"];
+    const start = { ...initialRoastStreamState, phase: "preheating" as const, enabledActions: prior };
+    const event: SseEvent = {
+      event: "phase_changed",
+      data: { agent_phase: "roasting_pre_first_crack" },
+      id: 7,
+    };
+    const state = applyEvent(start, event);
+    expect(state.phase).toBe("roasting_pre_first_crack");
+    expect(state.enabledActions).toEqual(prior);
   });
 
   it("NEVER infers phase from a telemetry frame (invariant)", () => {

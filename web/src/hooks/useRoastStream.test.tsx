@@ -42,16 +42,19 @@ class FakeEventSource implements EventSourceLike {
 function Probe({
   runId,
   snapshotPhase,
+  fetchSnapshot,
   onResult,
 }: {
-  runId: string;
-  snapshotPhase: RoastPhase;
+  runId: string | null;
+  snapshotPhase?: RoastPhase;
+  /** Override the snapshot fetch (e.g. to reject, exercising the reconnect path). */
+  fetchSnapshot?: () => Promise<{ agent_phase: RoastPhase }>;
   onResult: (r: UseRoastStreamResult) => void;
 }) {
   const result = useRoastStream(runId, {
     heartbeatSeconds: 1,
     createEventSource: () => new FakeEventSource(),
-    fetchSnapshot: async () => ({ agent_phase: snapshotPhase }),
+    fetchSnapshot: fetchSnapshot ?? (async () => ({ agent_phase: snapshotPhase ?? "preheating" })),
   });
   onResult(result);
   return <span data-testid="phase">{result.phase ?? "none"}</span>;
@@ -162,5 +165,63 @@ describe("useRoastStream", () => {
     expect(second).not.toBe(first);
     act(() => second.open());
     expect(latest!.status).toBe("live");
+  });
+
+  it("does nothing when runId is null (no stream, status connecting)", () => {
+    let latest: UseRoastStreamResult | null = null;
+    render(<Probe runId={null} onResult={(r) => (latest = r)} />);
+    // The early-return branch: no EventSource is ever constructed.
+    expect(FakeEventSource.last).toBeNull();
+    expect(latest!.status).toBe("connecting");
+    expect(latest!.phase).toBeNull();
+  });
+
+  it("backs off and re-tries with a NEW EventSource when the snapshot fetch fails", async () => {
+    // The fetchSnapshot-failure → reconnect branch: a failed hydrate is treated
+    // as a dropped connection (back off, retry) — must NOT open a stream on the
+    // failed attempt, and must reconnect after the backoff delay.
+    vi.useFakeTimers();
+    let latest: UseRoastStreamResult | null = null;
+    let calls = 0;
+    const fetchSnapshot = vi.fn(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("snapshot 503");
+      return { agent_phase: "preheating" as RoastPhase };
+    });
+
+    render(<Probe runId="r1" fetchSnapshot={fetchSnapshot} onResult={(r) => (latest = r)} />);
+    // First attempt: the snapshot rejects → no stream opened, status reconnecting.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(FakeEventSource.last).toBeNull();
+    expect(latest!.status).toBe("reconnecting");
+
+    // After the first backoff (2^0 = 1s), connect() retries; the 2nd snapshot
+    // resolves and a real EventSource is created.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1500);
+    });
+    expect(fetchSnapshot).toHaveBeenCalledTimes(2);
+    expect(FakeEventSource.last).not.toBeNull();
+  });
+
+  it("exposes the latest raw frame on lastEvent (page-level pub/sub)", async () => {
+    // advisory/fault/recovery_required frames are consumed by pages off lastEvent;
+    // assert the pass-through works for an advisory frame.
+    let latest: UseRoastStreamResult | null = null;
+    await act(async () => {
+      render(<Probe runId="r1" snapshotPhase="development" onResult={(r) => (latest = r)} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const es = FakeEventSource.last!;
+    await act(async () => es.open());
+    await act(async () =>
+      es.emit("advisory", { recommended_heat_percent: 60, verdict: "clamp" }, 3),
+    );
+    expect(latest!.lastEvent?.event).toBe("advisory");
+    expect(latest!.lastEvent?.data).toMatchObject({ verdict: "clamp" });
   });
 });

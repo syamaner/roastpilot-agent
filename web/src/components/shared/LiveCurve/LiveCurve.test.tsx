@@ -72,4 +72,24 @@ describe("LiveCurve", () => {
     rerender(<LiveCurve points={POINTS} highlightTime={30} />);
     expect(window.__chart?.highlightTime).toBe(30);
   });
+
+  it("honors initialHidden (series start hidden before any interaction)", () => {
+    // S5 (detail) may mount the curve with heat/fan hidden by default.
+    render(<LiveCurve points={POINTS} initialHidden={["heat", "fan"]} />);
+    expect(window.__chart?.visible.heat).toBe(false);
+    expect(window.__chart?.visible.fan).toBe(false);
+    // The other three remain visible.
+    expect(window.__chart?.visible.bean).toBe(true);
+    expect(window.__chart?.visible.env).toBe(true);
+    expect(window.__chart?.visible.ror).toBe(true);
+    // The legend reflects the hidden state too.
+    expect(screen.getByTestId("legend-heat")).toHaveAttribute("data-visible", "false");
+  });
+
+  it("exposes event marker labels on the data hook (T0/FIRST CRACK, assert without pixels)", () => {
+    render(<LiveCurve points={POINTS} markers={MARKERS} />);
+    const labels = window.__chart?.markers.map((m) => m.label);
+    expect(labels).toContain("T0");
+    expect(labels).toContain("FIRST CRACK");
+  });
 });
