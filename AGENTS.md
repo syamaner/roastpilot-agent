@@ -214,6 +214,12 @@ clean.
   agent-driven browser/screenshots for `ui-reviewer`'s direction-match review
   (D24). Interactive sessions only; the deterministic CI gate is the scripted
   `@playwright/test` snapshot suite, not the MCP.
+- **Agent-team worktree isolation:** for a parallel fan-out, the lead creates one
+  explicit `git worktree` per teammate and each teammate self-locates every
+  command (cwd resets between bash calls) — the Agent tool's `isolation: worktree`
+  flag silently no-op'd for background team agents in this environment. Runbook:
+  `docs/agent-team-worktrees.md`. Verify `git worktree list`; serialize as the
+  fallback for any shared file surface.
 - `CLAUDE.md` contains exactly `@AGENTS.md` — rules belong here, never there.
 
 ## Hardware Safety Notes
