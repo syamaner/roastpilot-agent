@@ -84,14 +84,27 @@ realizes D17 criterion (1).**
 **E9 is complete (criterion (1) realized).** Both stories merged; epic #82
 closed.
 
-**E10 (SPA) is now active** — the active epic, and the deliberate positive
-fan-out case (the contrast to E9's single-session anti-pattern). Delivered as
-a **supervised agent team** (D23): foundation-first, then one teammate per
-page. Six single-owner stories — S1 replay harness (∥), S2 foundation (the
-shared substrate; gates Stage C), S3 dashboard / S4 history / S5 detail (the
-genuine 3-way fan-out), S6 tests + SSE behavior. Replay fixtures copied into
-`tests/fixtures/replay/` (session-1 + session-2; session-2 is the auto-T0 demo
-fixture). Playwright is treated as core foundation (set up in S2, used by
-`ui-reviewer` on the page PRs). Kickoff brief:
-`roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`. E10 realizes D17
-criterion (2) — dashboard usable for a live roast.
+**E10 (SPA) — fan-out complete; S6 close-out remaining (core done, close-out
+partial).** The deliberate positive fan-out case (the contrast to E9's
+single-session anti-pattern), delivered as a **supervised agent team** (D23):
+foundation-first, then one teammate per page. **S1–S5 all merged to `main`** —
+S1 replay harness (#101), S2 foundation (#100), the E7 `enabled_actions` contract
+(#107, D25) + its S2 foundation follow-up (#115: a `phase_changed` field drift a
+page *consumer* caught that two review passes had missed), and the genuine 3-way
+page fan-out S3 dashboard (#113) / S4 history (#114) / S5 detail (#116), built in
+parallel in isolated git worktrees after the `isolation:worktree` flag silently
+no-op'd (runbook: `docs/agent-team-worktrees.md`). **D17 criterion (2) met** —
+the dashboard is usable for a live roast.
+
+**S6 (tests + SSE behavior) is in progress.** The deterministic close lands now:
+the status-table/registry sync, the contract-fixture drift guard (pins the SPA's
+hand-mirrored types against real server frames so the `phase_changed`-class drift
+can't recur), and the `product-pm` epic audit (independent re-derivation of
+S1–S5). **Deferred to a stable session + the pending D24 revision** (the API was
+unstable on 9 Jun from the new-model release): the multi-fixture snapshot matrix
+(deferred dashboard-fault / dashboard-recovery + detail states), the consolidated
+`ui-reviewer` visual pass (MCP-heavy), and Safari/iPad SSE (§11.4, a real-device
+task). Open follow-ups: #103 (replay hardening), #104 (E11 recovery-lifespan
+guard), #105 (S2 nits), #111 (history FC-time), #112 (dashboard live-contract),
+#117 (server `acknowledge_fault`). Kickoff brief:
+`roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`.
