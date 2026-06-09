@@ -169,10 +169,10 @@ Owner: `history` teammate. Acceptance criteria:
 
 Owner: `detail` teammate. Acceptance criteria:
 
-- [ ] Detail page: full persisted curve (the shared `LiveCurve`), event
+- [x] Detail page: full persisted curve (the shared `LiveCurve`), event
   timeline, decision-trace table (all six verdicts in its column — it renders
   history), export downloads, self-rating widget.
-- [ ] Trace-row click highlights the timestamp on the curve (toggle-off on
+- [x] Trace-row click highlights the timestamp on the curve (toggle-off on
   re-click).
 
 ### E10-S6 — SPA tests and SSE behavior
@@ -195,7 +195,7 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
 | E10-S2 | SPA foundation (shared substrate) | done (#100) |
 | E10-S3 | Dashboard (live) | not started |
 | E10-S4 | History page | not started |
-| E10-S5 | Roast detail page | not started |
+| E10-S5 | Roast detail page | in review (#116) |
 | E10-S6 | SPA tests and SSE behavior | not started |
 
 Epic status: **in progress** — S1 (#101) + S2 (#100) merged to `main`; the E7

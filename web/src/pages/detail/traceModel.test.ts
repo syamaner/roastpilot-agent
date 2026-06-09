@@ -1,0 +1,174 @@
+import { describe, expect, it } from "vitest";
+
+import type { RoastTimeline, SafetyVerdict, TelemetrySeries } from "@/lib/types";
+import { FIXTURE_TELEMETRY, FIXTURE_TIMELINE } from "./fixture";
+import {
+  headlineStats,
+  tickToSeconds,
+  toCurveMarkers,
+  toCurvePoints,
+  toTraceRows,
+} from "./traceModel";
+
+describe("toCurvePoints", () => {
+  it("projects telemetry into the LiveCurve point form (x = elapsed seconds)", () => {
+    const points = toCurvePoints(FIXTURE_TELEMETRY);
+    expect(points).toHaveLength(FIXTURE_TELEMETRY.points.length);
+    expect(points[0]).toMatchObject({ t: 0 });
+    // Celsius temps + heat/fan carried through, RoR mapped from bean RoR.
+    expect(points[1].bean).toBeCloseTo(FIXTURE_TELEMETRY.points[1].bean_temp_c!);
+    expect(points[1].heat).toBe(FIXTURE_TELEMETRY.points[1].heat_level_percent);
+    expect(points[1].ror).toBe(FIXTURE_TELEMETRY.points[1].bean_ror_c_per_min);
+  });
+
+  it("drops points without an elapsed time (cannot be placed on the axis)", () => {
+    const series: TelemetrySeries = {
+      run_id: "r",
+      downsample: 1,
+      point_count: 2,
+      points: [
+        { ...FIXTURE_TELEMETRY.points[0], elapsed_seconds: null },
+        { ...FIXTURE_TELEMETRY.points[1], elapsed_seconds: 30 },
+      ],
+    };
+    expect(toCurvePoints(series)).toHaveLength(1);
+  });
+
+  it("returns [] for undefined telemetry", () => {
+    expect(toCurvePoints(undefined)).toEqual([]);
+  });
+});
+
+describe("toCurveMarkers", () => {
+  it("anchors T0 at x=0 and places FC/drop from telemetry phase transitions", () => {
+    const markers = toCurveMarkers(FIXTURE_TIMELINE, FIXTURE_TELEMETRY);
+    const byKind = Object.fromEntries(markers.map((m) => [m.kind, m]));
+    expect(byKind.t0.t).toBe(0);
+    // FC = first `development` point (tick 11 → 330 s), drop = first `cooling`
+    // point (tick 15 → 450 s). Derived from server phase, not a client guess.
+    expect(byKind.first_crack.t).toBe(330);
+    expect(byKind.drop.t).toBe(450);
+  });
+
+  it("omits T0 when no t0_detected event is present", () => {
+    const timeline: RoastTimeline = { ...FIXTURE_TIMELINE, events: [] };
+    const markers = toCurveMarkers(timeline, FIXTURE_TELEMETRY);
+    expect(markers.find((m) => m.kind === "t0")).toBeUndefined();
+  });
+
+  it("omits FC/drop when telemetry never enters those phases", () => {
+    const series: TelemetrySeries = {
+      ...FIXTURE_TELEMETRY,
+      points: FIXTURE_TELEMETRY.points.map((p) => ({
+        ...p,
+        agent_phase: "roasting_pre_first_crack",
+      })),
+    };
+    const markers = toCurveMarkers(FIXTURE_TIMELINE, series);
+    expect(markers.map((m) => m.kind)).toEqual(["t0"]);
+  });
+});
+
+describe("toTraceRows", () => {
+  it("joins safety evals to advisor decisions + commands by tick", () => {
+    const rows = toTraceRows(FIXTURE_TIMELINE, FIXTURE_TELEMETRY);
+    expect(rows).toHaveLength(FIXTURE_TIMELINE.safety_evaluations.length);
+
+    const clamp = rows.find((r) => r.verdict === "clamp")!;
+    // The recommendation it judged (from advisor_decisions.decision) ...
+    expect(clamp.recommendedHeat).toBe(105);
+    expect(clamp.confidence).toBeCloseTo(0.78);
+    expect(clamp.rationale).toContain("momentum");
+    // ... and what safety actually let through (adjusted = the clamp delta).
+    expect(clamp.executedHeat).toBe(100);
+    expect(clamp.executedFan).toBe(40);
+    // The command logged for that tick.
+    expect(clamp.commandTool).toBe("set_heat");
+    // Placed on the curve axis via telemetry's elapsed seconds (tick 8 → 240 s).
+    expect(clamp.elapsedSeconds).toBe(240);
+  });
+
+  it("falls back executed→input when nothing was adjusted", () => {
+    const rows = toTraceRows(FIXTURE_TIMELINE, FIXTURE_TELEMETRY);
+    const allow = rows.find((r) => r.verdict === "allow")!;
+    expect(allow.executedHeat).toBe(allow.recommendedHeat);
+  });
+
+  it("passes ALL SIX verdicts through unchanged (it renders history)", () => {
+    const verdicts: SafetyVerdict[] = [
+      "allow",
+      "clamp",
+      "reject",
+      "recovery",
+      "fault",
+      "emergency_stop",
+    ];
+    const timeline: RoastTimeline = {
+      ...FIXTURE_TIMELINE,
+      advisor_decisions: [],
+      commands: [],
+      safety_evaluations: verdicts.map((verdict, i) => ({
+        tick: i,
+        rule: "r",
+        verdict,
+        input_heat: null,
+        input_fan: null,
+        adjusted_heat: null,
+        adjusted_fan: null,
+        reason: "x",
+        recorded_at_utc: `2026-06-07T09:0${i}:00Z`,
+      })),
+    };
+    expect(toTraceRows(timeline, FIXTURE_TELEMETRY).map((r) => r.verdict)).toEqual(verdicts);
+  });
+
+  it("reads advisor fields defensively when the decision dict is absent", () => {
+    const timeline: RoastTimeline = {
+      ...FIXTURE_TIMELINE,
+      advisor_decisions: [],
+      commands: [],
+      safety_evaluations: [FIXTURE_TIMELINE.safety_evaluations[0]],
+    };
+    const row = toTraceRows(timeline, FIXTURE_TELEMETRY)[0];
+    expect(row.recommendedHeat).toBeNull();
+    expect(row.rationale).toBeNull();
+    expect(row.commandTool).toBeNull();
+  });
+
+  it("returns [] for an undefined timeline", () => {
+    expect(toTraceRows(undefined, FIXTURE_TELEMETRY)).toEqual([]);
+  });
+});
+
+describe("tickToSeconds", () => {
+  it("maps a tick to its telemetry elapsed seconds", () => {
+    expect(tickToSeconds(FIXTURE_TELEMETRY, 8)).toBe(240);
+  });
+  it("returns null for an unknown tick or undefined telemetry", () => {
+    expect(tickToSeconds(FIXTURE_TELEMETRY, 999)).toBeNull();
+    expect(tickToSeconds(undefined, 0)).toBeNull();
+  });
+});
+
+describe("headlineStats", () => {
+  it("derives total/FC/drop/development from telemetry phase transitions", () => {
+    const stats = headlineStats(FIXTURE_TIMELINE, FIXTURE_TELEMETRY);
+    expect(stats.totalSeconds).toBe(450); // last elapsed (tick 15).
+    expect(stats.firstCrackSeconds).toBe(330); // first development point.
+    expect(stats.firstCrackTempC).toBeCloseTo(92 + 11 * 8.2);
+    expect(stats.dropSeconds).toBe(450); // first cooling point.
+    expect(stats.developmentPercent).not.toBeNull();
+  });
+
+  it("returns all-null stats for empty telemetry", () => {
+    const stats = headlineStats(undefined, undefined);
+    expect(stats).toEqual({
+      totalSeconds: null,
+      firstCrackSeconds: null,
+      firstCrackTempC: null,
+      dropSeconds: null,
+      dropTempC: null,
+      developmentPercent: null,
+    });
+  });
+});
