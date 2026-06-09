@@ -194,7 +194,7 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
 | E10-S1 | Replay harness | done (#101) |
 | E10-S2 | SPA foundation (shared substrate) | done (#100) |
 | E10-S3 | Dashboard (live) | not started |
-| E10-S4 | History page | not started |
+| E10-S4 | History page | done (#114) |
 | E10-S5 | Roast detail page | in review (#116) |
 | E10-S6 | SPA tests and SSE behavior | not started |
 

@@ -27,6 +27,18 @@ function flag(name) {
 
 const ROUTES = {
   foundation: "/__chart-harness",
+  history: "/roasts",
+  "history-empty": "/roasts",
+};
+
+// Routes whose readiness is the chart-ready marker; others (REST-only pages like
+// history) settle on a page-specific selector instead.
+const CHART_ROUTES = new Set(["foundation"]);
+
+// The settle selector per state — the element whose visibility means "rendered".
+const READY_SELECTOR = {
+  history: "[data-testid='history-table']",
+  "history-empty": "[data-testid='history-empty']",
 };
 
 const route = ROUTES[state];
@@ -42,7 +54,10 @@ const browser = await chromium.launch({ channel: "chrome" });
 const page = await browser.newPage({ viewport: { width: 1600, height: 1000 } });
 await page.goto(`${baseUrl}${route}`, { waitUntil: "networkidle" });
 await page.evaluate(() => document.fonts.ready);
-await page.waitForSelector("[data-chart-ready='true']", { timeout: 10_000 });
+const readySelector = CHART_ROUTES.has(state)
+  ? "[data-chart-ready='true']"
+  : (READY_SELECTOR[state] ?? "body");
+await page.waitForSelector(readySelector, { timeout: 10_000 });
 
 const path = `${outDir}/${state}.png`;
 await page.screenshot({ path });
