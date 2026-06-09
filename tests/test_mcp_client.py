@@ -389,6 +389,22 @@ def test_spawn_argv_includes_serve_positional() -> None:
     assert params.args == ["serve"]
 
 
+def test_spawn_env_is_none_without_overrides() -> None:
+    """No config env → inherit the transport's default safe environment."""
+    assert MCPServerProcess().build_server_parameters().env is None
+
+
+def test_spawn_env_merges_overrides_over_parent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Config env overrides are merged over the agent's own environment (so the
+    child keeps PATH) — E9-S2 selects the mock driver this way."""
+    monkeypatch.setenv("PATH", "/usr/bin")
+    process = MCPServerProcess(MCPConfig(env={"COFFEE_ROASTER_DRIVER": "mock"}))
+    env = process.build_server_parameters().env
+    assert env is not None
+    assert env["COFFEE_ROASTER_DRIVER"] == "mock"
+    assert env["PATH"] == "/usr/bin"  # inherited, not dropped
+
+
 @pytest.mark.asyncio
 async def test_calls_are_timeout_bounded() -> None:
     """E4-S2 carry-forward: a hung call raises a typed timeout instead of

@@ -146,6 +146,14 @@ class MCPConfig(BaseModel):
     command: str = Field(default="coffee-roaster-mcp", min_length=1)
     call_timeout_seconds: float = Field(default=5.0, gt=0)
     startup_timeout_seconds: float = Field(default=15.0, gt=0)
+    #: Environment overrides for the spawned child, merged over the agent's own
+    #: environment at spawn (so ``PATH``/``HOME`` are preserved). Empty by
+    #: default — production inherits the deployment environment (the real
+    #: hardware driver). The E9-S2 vertical slice sets the coffee-roaster-mcp
+    #: mock-driver selectors here (``COFFEE_ROASTER_DRIVER=mock``,
+    #: ``COFFEE_FIRST_CRACK_MODE=disabled``) so the subprocess is hardware-,
+    #: audio-, and model-free regardless of the ambient environment.
+    env: dict[str, str] = Field(default_factory=dict[str, str])
 
 
 class AppConfig(BaseSettings):

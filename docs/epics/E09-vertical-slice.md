@@ -61,20 +61,24 @@ Acceptance criteria:
 
 Acceptance criteria:
 
-- [ ] Same flow with the agent spawning the real `coffee-roaster-mcp` as a
+- [x] Same flow with the agent spawning the real `coffee-roaster-mcp` as a
   stdio child (D6) in mock-driver mode.
-- [ ] Runs in CI (no hardware/audio/model deps).
-- [ ] sim-roast-runner sub-agent produces a markdown decision-trace summary
-  of a slice run.
+  (`tests/test_milestone1_real_mcp.py`, #81.)
+- [x] Runs in CI (no hardware/audio/model deps): `coffee-roaster-mcp==0.1.3`
+  is a dev dependency; CI installs `libportaudio2` for `sounddevice`'s import.
+- [x] sim-roast-runner sub-agent produces a markdown decision-trace summary
+  of a slice run (`docs/e9-decision-trace-real-mcp-2026-06-09.md`);
+  mcp-contract-checker confirms zero drift vs installed 0.1.3.
 
 ## Status
 
 | Story | Title | Status |
 |-------|-------|--------|
 | E9-S1 | 12-step slice, fake MCP | done |
-| E9-S2 | Slice against real MCP (mock mode) | not started |
+| E9-S2 | Slice against real MCP (mock mode) | done |
 
-Epic status: **in progress** — E9-S1 complete (#80); E9-S2 (#81) next.
+Epic status: **complete** — E9-S1 (#80) + E9-S2 (#81) merged. E9 green in CI
+realizes D17 criterion (1).
 
 ## Notes
 
@@ -99,3 +103,17 @@ Epic status: **in progress** — E9-S1 complete (#80); E9-S2 (#81) next.
   timeline route (events + safety_evaluations + command_log); the
   `advisor_decisions` table is the provider-call channel for the real
   `PydanticAIAdvisor`, empty under `FakeAdvisor`.
+- **E9-S2 (#81):** The same milestone flow against the **real**
+  `coffee-roaster-mcp` spawned as a stdio subprocess in mock-driver mode (D6).
+  Added `coffee-roaster-mcp==0.1.3` as a dev dependency and `libportaudio2` to
+  CI (for `sounddevice`'s import; mock mode never opens an audio device). Wired
+  `MCPConfig.env` → `build_server_parameters` (the E9-S2 env-forwarding gap) so
+  the child is hardware-/audio-/model-free regardless of ambient env. The slice
+  (`tests/test_milestone1_real_mcp.py`) drives the controller closed-loop over
+  the real MCP boundary: a context-aware advisor engineers the bean-temp drop
+  the server's auto-T0 detector needs (auto-T0 is config-file-only, enabled via
+  a temp YAML), first crack is the operator override (audio disabled), and
+  drop/stop-cooling are operator actions. Deterministic (mock advances one
+  virtual second per state read), ~2.8 s wall-clock, skipif-gated on the binary.
+  `mcp-contract-checker` confirmed zero drift vs installed 0.1.3; trace in
+  `docs/e9-decision-trace-real-mcp-2026-06-09.md`.

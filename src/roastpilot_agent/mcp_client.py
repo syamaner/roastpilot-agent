@@ -21,6 +21,7 @@ passed through from MCP, never recomputed.
 
 import asyncio
 import json
+import os
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
@@ -534,8 +535,14 @@ class MCPServerProcess:
         self._stack: AsyncExitStack | None = None
 
     def build_server_parameters(self) -> StdioServerParameters:
-        """The spawn argv: ``<command> serve`` (server.json packageArguments)."""
-        return StdioServerParameters(command=self._config.command, args=["serve"])
+        """The spawn argv: ``<command> serve`` (server.json packageArguments).
+
+        Config ``env`` overrides are merged over the agent's own environment so
+        the child keeps ``PATH``/``HOME`` while gaining the requested selectors
+        (E9-S2 sets the mock-driver vars). With no overrides, ``env`` stays
+        ``None`` and the transport supplies its default safe environment."""
+        env = {**os.environ, **self._config.env} if self._config.env else None
+        return StdioServerParameters(command=self._config.command, args=["serve"], env=env)
 
     @property
     def running(self) -> bool:
