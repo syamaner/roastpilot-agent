@@ -94,10 +94,15 @@ function applyByType(
       return { ...state, telemetry };
     }
     case "phase_changed": {
+      // The server emits phase_changed as `{phase, enabled_actions}` (controller
+      // emits `{phase}`, api enriches it) — distinct from the RoastDetail snapshot,
+      // which uses `agent_phase` (read on the hydrate path). Read `phase` cleanly,
+      // NO agent_phase fallback: a fallback would mask exactly this wire/contract
+      // drift instead of surfacing it.
       const data = event.data as unknown as PhaseChangedEventData;
       return {
         ...state,
-        phase: data.agent_phase,
+        phase: data.phase,
         enabledActions: data.enabled_actions ?? state.enabledActions,
       };
     }

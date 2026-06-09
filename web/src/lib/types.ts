@@ -68,11 +68,19 @@ export interface TelemetryEventData {
   first_crack_detected: boolean;
 }
 
-/** Payload of a `phase_changed` SSE frame — the sole driver of phase in the UI. */
+/**
+ * Payload of a `phase_changed` SSE frame — the sole driver of phase in the UI.
+ *
+ * The wire shape is `{phase, enabled_actions}`: the controller emits `{"phase":
+ * <value>}` (controller.py) and the API enriches it with `enabled_actions`
+ * (api.py `_phase_changed_with_actions`). NOTE the field is `phase`, NOT
+ * `agent_phase` — the latter is the `RoastDetail` snapshot's field (hydrate
+ * path), a deliberately different shape from this event.
+ */
 export interface PhaseChangedEventData {
-  agent_phase: RoastPhase;
-  // Forward-compatible with the planned E7 `enabled_actions` addition (option
-  // (a)) — the action bar mirrors server state and never hardcodes a matrix.
+  phase: RoastPhase;
+  // The E7 `enabled_actions` contract (option (a), D25) — the action bar mirrors
+  // this server-provided set and never hardcodes a command×phase matrix.
   enabled_actions?: OperatorAction[];
 }
 
