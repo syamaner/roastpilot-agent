@@ -199,7 +199,9 @@ clean.
 - Sub-agents live under `.claude/agents/`: `safety-reviewer` (PRs touching
   safety/controller/enums), `mcp-contract-checker` (dependency bumps),
   `sim-roast-runner` (mock vertical slice + decision-trace summaries),
-  `ui-reviewer` (Playwright against the replay harness).
+  `ui-reviewer` (Playwright against the replay harness), `pr-triage`
+  (independent PR-feedback triage for agent-team delivery, D23 — also the
+  `triage-pr` skill).
 - `CLAUDE.md` contains exactly `@AGENTS.md` — rules belong here, never there.
 
 ## Hardware Safety Notes

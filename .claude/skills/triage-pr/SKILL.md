@@ -5,8 +5,9 @@ context: fork
 agent: pr-triage
 ---
 
-Triage the review feedback on the target PR (default: the current branch's PR).
-Pass the PR number as the argument if it isn't the current branch.
+Triage the review feedback on the current branch's PR. **Run this from the
+target PR's branch** — the `gh` commands below operate on the current branch,
+so check out the PR's branch first (`gh pr checkout <n>`) if you're elsewhere.
 
 ## PR
 

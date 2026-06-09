@@ -37,6 +37,17 @@ fan-out is unambiguous. **Foundation first, then one teammate per page.**
   lead/PM or the `pr-triage` subagent — never the author teammate dismissing
   comments on its own PR (AGENTS.md merge policy).
 
+### Open question (resolve at the S2/S3 boundary)
+
+The operator action bar must not hardcode the command×phase matrix
+client-side (invariant), yet it needs to know *which actions are enabled in
+the current phase*. Decide in S2 (the contract owner): either (a) the server
+exposes an `enabled_actions` list on the run snapshot / an event (a small E7
+contract addition), or (b) the bar enables optimistically and relies on the
+operator-action endpoint's typed reject-with-reason (already implemented) for
+invalid attempts. (a) is the better UX; (b) needs no server change. Pick one
+before S3 builds the action bar — don't let the dashboard teammate invent it.
+
 ## Stories
 
 ### E10-S1 — Replay harness
