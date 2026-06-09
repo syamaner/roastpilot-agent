@@ -1,0 +1,16 @@
+node_modules
+dist
+dist-ssr
+*.local
+*.tsbuildinfo
+coverage
+
+# Playwright
+test-results
+playwright-report
+blob-report
+playwright/.cache
+
+# Snapshot diffs/actuals — only the committed baselines are tracked
+tests/e2e/**/*-actual.png
+tests/e2e/**/*-diff.png

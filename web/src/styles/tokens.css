@@ -1,0 +1,55 @@
+/*
+ * RoastPilot design tokens (E10 kickoff §1).
+ *
+ * Ported from the Figma Make export theme
+ * (roastpilot-plan/roastpilot-agent/sketches/live-dashboard/src/styles/theme.css).
+ * The export hides the dark palette and every `--roast-*` variable inside a
+ * `.dark {}` block and relies on a `class="dark"` on <html> the preview shell
+ * set. Dark is the ONLY theme in M1, so we define them UNCONDITIONALLY on
+ * :root — no `.dark` class, no light theme. (E10 kickoff §1 "dark-mode trap".)
+ */
+
+:root {
+  color-scheme: dark;
+
+  --font-size: 16px;
+  --radius: 0.625rem;
+  --font-weight-medium: 500;
+  --font-weight-normal: 400;
+
+  /* Base palette — the export's `.dark {}` values, promoted to :root. */
+  --background: #0f0f12;
+  --foreground: #ffffff;
+  --card: #1a1a1f;
+  --card-foreground: #ffffff;
+  --popover: #1a1a1f;
+  --popover-foreground: #ffffff;
+  --primary: #ffffff;
+  --primary-foreground: #0f0f12;
+  --secondary: #2a2a30;
+  --secondary-foreground: #ffffff;
+  --muted: #2a2a30;
+  --muted-foreground: #d4d4d8;
+  --accent: #2a2a30;
+  --accent-foreground: #ffffff;
+  --destructive: #ef4444;
+  --destructive-foreground: #ffffff;
+  --border: #3f3f46;
+  --input: #2a2a30;
+  --ring: #71717a;
+
+  /* RoastPilot domain palette — amber/copper = heat, teal = fan/air,
+   * nominal/caution/fault = verdict + safety, phase-* shifts with the roast. */
+  --roast-heat: #fbbf24;
+  --roast-heat-dim: #92400e;
+  --roast-fan: #22d3ee;
+  --roast-fan-dim: #164e63;
+  --roast-coffee: #92400e;
+  --roast-nominal: #34d399;
+  --roast-caution: #fbbf24;
+  --roast-fault: #f87171;
+  --roast-phase-preheat: #94a3b8;
+  --roast-phase-roasting: #fbbf24;
+  --roast-phase-development: #fb923c;
+  --roast-phase-cooling: #22d3ee;
+}

@@ -1,0 +1,267 @@
+/**
+ * Live roast SSE hook (E10 kickoff §6, plan §11.4).
+ *
+ * Native `EventSource` over `GET /api/roasts/{id}/events`. On every (re)connect
+ * it HYDRATES from `GET /api/roasts/{id}` THEN applies live frames, so phase and
+ * state always re-base on the server's snapshot — never replay-from-zero, never
+ * trust stale client state. PHASE COMES FROM THE SERVER ONLY (see the reducer).
+ *
+ * Liveness is a safety-relevant UI state: the operator must know whether the
+ * data on screen is fresh. We surface `live | reconnecting | stale`:
+ *   - live         : connected and a frame (incl. the 15 s heartbeat) arrived recently
+ *   - reconnecting : the EventSource dropped; we're backing off to reopen
+ *   - stale        : connected but no frame within the stale window (≈2× heartbeat)
+ */
+
+import { useEffect, useReducer, useRef, useState } from "react";
+
+import { api } from "@/lib/api";
+import type { OperatorAction, RoastPhase, SseEvent, TelemetryEventData } from "@/lib/types";
+import {
+  applyEvent,
+  hydrate,
+  initialRoastStreamState,
+  type RoastStreamState,
+} from "./roastStreamReducer";
+
+declare global {
+  interface Window {
+    /** Highest applied SSE event id (test hook, D24): the Playwright global-setup
+     *  waits until this catches up to the replay step's `last_event_id` before
+     *  screenshotting — a deterministic settle signal with no arbitrary sleep. */
+    __lastEventId?: number;
+  }
+}
+
+export type ConnectionStatus = "connecting" | "live" | "reconnecting" | "stale";
+
+export interface UseRoastStreamOptions {
+  /** Server heartbeat cadence (api default 15 s). Used to size the stale window. */
+  heartbeatSeconds?: number;
+  /** Reconnect backoff ceiling (seconds). */
+  maxBackoffSeconds?: number;
+  /** Test seam: construct an EventSource (defaults to the global). */
+  createEventSource?: (url: string) => EventSourceLike;
+  /** Test seam: snapshot fetch (defaults to the REST client). */
+  fetchSnapshot?: (runId: string) => Promise<{
+    agent_phase: RoastPhase;
+    enabled_actions?: OperatorAction[];
+  }>;
+}
+
+/** The slice of EventSource we use — narrowed so tests can supply a fake. */
+export interface EventSourceLike {
+  onopen: ((this: EventSourceLike, ev: Event) => unknown) | null;
+  onerror: ((this: EventSourceLike, ev: Event) => unknown) | null;
+  addEventListener(type: string, listener: (ev: MessageEvent) => void): void;
+  close(): void;
+}
+
+export interface UseRoastStreamResult {
+  status: ConnectionStatus;
+  phase: RoastPhase | null;
+  telemetry: TelemetryEventData | null;
+  enabledActions: OperatorAction[] | null;
+  /** The most recent raw frame, for page-level handlers (advisory/fault/etc.). */
+  lastEvent: SseEvent | null;
+}
+
+const DEFAULT_HEARTBEAT = 15;
+const DEFAULT_MAX_BACKOFF = 30;
+
+type Action =
+  | { kind: "hydrate"; snapshot: { agent_phase: RoastPhase; enabled_actions?: OperatorAction[] } }
+  | { kind: "event"; event: SseEvent };
+
+function reduce(state: RoastStreamState, action: Action): RoastStreamState {
+  if (action.kind === "hydrate") {
+    return hydrate(state, {
+      // The reducer only reads agent_phase + enabled_actions off the snapshot.
+      agent_phase: action.snapshot.agent_phase,
+      enabled_actions: action.snapshot.enabled_actions,
+    } as Parameters<typeof hydrate>[1]);
+  }
+  return applyEvent(state, action.event);
+}
+
+/** Capped exponential backoff: 1, 2, 4, … up to `maxSeconds`. */
+function backoffSeconds(attempt: number, maxSeconds: number): number {
+  return Math.min(2 ** attempt, maxSeconds);
+}
+
+/** The production EventSource factory (test seam default). */
+function defaultCreateEventSource(url: string): EventSourceLike {
+  return new EventSource(url) as unknown as EventSourceLike;
+}
+
+export function useRoastStream(
+  runId: string | null,
+  options: UseRoastStreamOptions = {},
+): UseRoastStreamResult {
+  const heartbeat = options.heartbeatSeconds ?? DEFAULT_HEARTBEAT;
+  const maxBackoff = options.maxBackoffSeconds ?? DEFAULT_MAX_BACKOFF;
+
+  const [state, dispatch] = useReducer(reduce, initialRoastStreamState);
+  const [status, setStatus] = useState<ConnectionStatus>("connecting");
+  const [lastEvent, setLastEvent] = useState<SseEvent | null>(null);
+
+  // Injected seams are held in refs (updated each render) so the connect effect
+  // depends only on the primitive inputs — supplying a fresh inline factory does
+  // not re-subscribe the stream.
+  const createEventSourceRef = useRef<(url: string) => EventSourceLike>(defaultCreateEventSource);
+  const fetchSnapshotRef = useRef<NonNullable<UseRoastStreamOptions["fetchSnapshot"]>>(api.roast);
+  createEventSourceRef.current = options.createEventSource ?? defaultCreateEventSource;
+  fetchSnapshotRef.current = options.fetchSnapshot ?? api.roast;
+
+  // Refs hold transport state the effect mutates without re-subscribing.
+  const lastFrameAt = useRef<number>(Date.now());
+
+  useEffect(() => {
+    if (runId === null) {
+      setStatus("connecting");
+      return;
+    }
+
+    let cancelled = false;
+    let source: EventSourceLike | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+    let staleTimer: ReturnType<typeof setInterval> | null = null;
+    let attempt = 0;
+
+    const markFrame = () => {
+      lastFrameAt.current = Date.now();
+      if (!cancelled) setStatus("live");
+    };
+
+    const connect = () => {
+      if (cancelled) return;
+      setStatus(attempt === 0 ? "connecting" : "reconnecting");
+      // Reset the freshness clock on every (re)connect: otherwise a reconnect
+      // that takes longer than the stale window leaves `lastFrameAt` at the old
+      // timestamp, so the watchdog can fire `stale` the instant the new stream
+      // opens — before the first frame/heartbeat has had a chance to arrive.
+      lastFrameAt.current = Date.now();
+
+      // Snapshot-first: hydrate from REST, THEN open the stream and apply frames.
+      // A failed snapshot is treated as a dropped connection (back off, retry).
+      void fetchSnapshotRef
+        .current(runId)
+        .then((snapshot) => {
+          if (cancelled) return;
+          dispatch({ kind: "hydrate", snapshot });
+          openStream();
+        })
+        .catch(() => {
+          if (!cancelled) scheduleReconnect();
+        });
+    };
+
+    const openStream = () => {
+      if (cancelled) return;
+      const es = createEventSourceRef.current(api.eventsUrl(runId));
+      source = es;
+
+      es.onopen = () => {
+        attempt = 0;
+        markFrame();
+      };
+      es.onerror = () => {
+        // EventSource will try its own reconnect, but we close and drive an
+        // explicit capped backoff so the snapshot re-hydrates each attempt and
+        // the indicator reflects reconnecting state.
+        es.close();
+        if (source === es) source = null;
+        scheduleReconnect();
+      };
+
+      // One listener per known event type so the typed `event:` field is honored
+      // (EventSource's `onmessage` only fires for the default/unnamed event).
+      for (const type of SSE_EVENT_TYPES) {
+        es.addEventListener(type, (ev) => {
+          markFrame();
+          const id = ev.lastEventId ? Number(ev.lastEventId) : null;
+          const frame: SseEvent = {
+            event: type,
+            data: parseData(ev.data),
+            id,
+          };
+          dispatch({ kind: "event", event: frame });
+          setLastEvent(frame);
+          // Test hook (D24): the Playwright global-setup waits until this catches
+          // up to the replay step's `last_event_id` before screenshotting — a
+          // deterministic settle signal, no arbitrary sleep. Same monotonic
+          // sequence the broadcaster stamps + the reducer dedups on.
+          if (id !== null && typeof window !== "undefined") {
+            window.__lastEventId = Math.max(window.__lastEventId ?? 0, id);
+          }
+        });
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (cancelled || reconnectTimer) return;
+      setStatus("reconnecting");
+      const delay = backoffSeconds(attempt, maxBackoff) * 1000;
+      attempt += 1;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        connect();
+      }, delay);
+    };
+
+    // Freshness watchdog: if no frame (incl. heartbeat) within the stale window
+    // while we believe we're connected, surface `stale`.
+    const staleWindowMs = heartbeat * 2 * 1000;
+    staleTimer = setInterval(() => {
+      if (cancelled || source === null) return;
+      if (Date.now() - lastFrameAt.current > staleWindowMs) {
+        setStatus((prev) => (prev === "reconnecting" ? prev : "stale"));
+      }
+    }, heartbeat * 1000);
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (source) source.close();
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      if (staleTimer) clearInterval(staleTimer);
+    };
+  }, [runId, heartbeat, maxBackoff]);
+
+  return {
+    status,
+    phase: state.phase,
+    telemetry: state.telemetry,
+    enabledActions: state.enabledActions,
+    lastEvent,
+  };
+}
+
+const SSE_EVENT_TYPES: SseEvent["event"][] = [
+  "run_started",
+  "phase_changed",
+  "charge_guidance",
+  "t0_detected",
+  "first_crack",
+  "advisory",
+  "command_executed",
+  "command_failed",
+  "safety_alert",
+  "fault",
+  "recovery_required",
+  "recovery_acknowledged",
+  "logs_exported",
+  "run_completed",
+  "telemetry",
+  "heartbeat",
+];
+
+function parseData(raw: string): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}

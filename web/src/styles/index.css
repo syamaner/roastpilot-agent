@@ -1,0 +1,30 @@
+@import "./tokens.css";
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    font-size: var(--font-size);
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family:
+      ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
+      Arial, sans-serif;
+  }
+
+  /* Numeric displays (temps, timers, percentages) use tabular figures so digits
+   * don't jitter as values tick — readable from 1 m at the roaster (kickoff §1).
+   * Apply `.tabular-nums` (utility) or `.numeric` on any numeric readout. */
+  .numeric {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+  }
+}
