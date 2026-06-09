@@ -37,16 +37,23 @@ fan-out is unambiguous. **Foundation first, then one teammate per page.**
   lead/PM or the `pr-triage` subagent — never the author teammate dismissing
   comments on its own PR (AGENTS.md merge policy).
 
-### Open question (resolve at the S2/S3 boundary)
+### Open question (RESOLVED at the S2/S3 boundary → option (a))
 
 The operator action bar must not hardcode the command×phase matrix
 client-side (invariant), yet it needs to know *which actions are enabled in
-the current phase*. Decide in S2 (the contract owner): either (a) the server
-exposes an `enabled_actions` list on the run snapshot / an event (a small E7
-contract addition), or (b) the bar enables optimistically and relies on the
-operator-action endpoint's typed reject-with-reason (already implemented) for
-invalid attempts. (a) is the better UX; (b) needs no server change. Pick one
-before S3 builds the action bar — don't let the dashboard teammate invent it.
+the current phase*. **Decision (S2, lead-confirmed): option (a)** — the server
+exposes an `enabled_actions: list[OperatorAction]` on the run snapshot
+(`RoastDetail`) and re-emits it on `phase_changed`, derived read-only from the
+existing `SafetyPolicy` command×phase matrix (no new safety logic). It is the
+literal expression of the "action bar mirrors server state" invariant and the
+better UX; (b) tempts a hidden client-side matrix.
+
+S2 ships the SPA types forward-compatible with `enabled_actions?` (optional).
+The server-side contract change lands as a **separate small E7-contract PR**
+(`models.py` field + `phase_changed` payload + `api.py` derivation), routed
+through `safety-reviewer` (touches the command×phase surface); it must merge
+**before S3 builds the action bar**, not before S2. Until then the action bar
+falls back to the operator-action endpoint's typed reject-with-reason.
 
 ### Playwright is core (set it up early, not at S6)
 
@@ -185,7 +192,7 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
 | Story | Title | Status |
 |-------|-------|--------|
 | E10-S1 | Replay harness | done |
-| E10-S2 | SPA foundation (shared substrate) | not started |
+| E10-S2 | SPA foundation (shared substrate) | in review (#94) |
 | E10-S3 | Dashboard (live) | not started |
 | E10-S4 | History page | not started |
 | E10-S5 | Roast detail page | not started |
