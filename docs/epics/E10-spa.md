@@ -119,7 +119,10 @@ Owner: lead / `platform` teammate. Acceptance criteria:
   canvas-mask + chart-data-assert convention, the `.mcp.json` wiring the Playwright
   MCP for `ui-reviewer`, and the `/capture` skill — so `ui-reviewer` and the
   snapshot suite can run on the page PRs (S3–S5). See "Playwright is core" +
-  "Snapshot & visual testing" above.
+  "Snapshot & visual testing" above. **Verify the Playwright MCP tool-grant on
+  first use**: `ui-reviewer` lists `mcp__playwright` (whole server); if Claude
+  Code doesn't honor the server-level grant, replace it with the explicit tool
+  names (`mcp__playwright__browser_navigate` / `_snapshot` / `_take_screenshot`).
 
 ### E10-S3 — Dashboard (live)
 
