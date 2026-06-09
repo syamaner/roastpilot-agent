@@ -13,7 +13,8 @@ export const meta = {
 }
 
 // Diff base — override with args {base:"<ref>"} (e.g. a release branch).
-const base = (args && args.base) || 'main'
+// origin/main (not local main) so a stale local branch doesn't add noise.
+const base = (args && args.base) || 'origin/main'
 const diffScope = `\`git diff ${base}...HEAD\``
 
 // --- Phase 1: Scope — what does the diff touch? -------------------------------
@@ -31,7 +32,7 @@ const SCOPE_SCHEMA = {
   },
 }
 const scope = await agent(
-  `Scope a code review of the current branch. Run \`git diff --name-only ${base}...HEAD\` and \`git diff --stat ${base}...HEAD\` in this repo. Report which areas changed: web/ (the SPA), Python (src/roastpilot_agent or tests/), and specifically safety.py / controller.py / a models.py enum (the safety-critical surface). List the changed files and a one-line summary. Do NOT review the content yet.`,
+  `Scope a code review of the current branch. Run \`git fetch origin -q\` first so the base ref is current, then \`git diff --name-only ${base}...HEAD\` and \`git diff --stat ${base}...HEAD\` in this repo. Report which areas changed: web/ (the SPA), Python (src/roastpilot_agent or tests/), and specifically safety.py / controller.py / a models.py enum (the safety-critical surface). List the changed files and a one-line summary. Do NOT review the content yet.`,
   { label: 'scope', phase: 'Scope', schema: SCOPE_SCHEMA },
 )
 if (scope) log(scope.summary)
@@ -111,7 +112,7 @@ const VERDICT_SCHEMA = {
 const verified = await parallel(
   allFindings.map((f) => () =>
     agent(
-      `A reviewer raised this finding on ${diffScope}:\n\nTitle: ${f.title}\nSeverity: ${f.severity}\nFile: ${f.file}${f.line ? ':' + f.line : ''}\nDetail: ${f.detail}\n\nAdversarially VERIFY it against the actual diff + code. Try to REFUTE it. Does it survive — a real, in-scope issue this change introduced? Default to survives=false if uncertain, already-handled, pre-existing, or out of scope.`,
+      `A reviewer raised this finding on ${diffScope}:\n\nTitle: ${f.title}\nSeverity: ${f.severity}\nFile: ${f.file}${f.line ? ':' + f.line : ''}\nDetail: ${f.detail}\n\nRun ${diffScope} and read the cited file for context first, then adversarially VERIFY it against the actual diff + code. Try to REFUTE it. Does it survive — a real, in-scope issue this change introduced? Default to survives=false if uncertain, already-handled, pre-existing, or out of scope.`,
       { label: `verify:${f.lens}`, phase: 'Verify', schema: VERDICT_SCHEMA },
     ).then((v) => ({ ...f, survives: v ? v.survives : false, verifyReason: v ? v.reason : 'verifier failed' })),
   ),
@@ -143,7 +144,7 @@ const payload = survivors.map((f) => ({
   suggestion: f.suggestion,
 }))
 const triage = await agent(
-  `You are the pr-triage adjudicator. Consolidate these adversarially-verified findings on the current branch into a single triage report. Classify each: must-fix (correctness/safety/unmet acceptance/coverage regression — blocks merge), fix-now (cheap, clearly correct), defer (file a follow-up issue), rejected (with reason). Then a single verdict: BLOCK if any must-fix, else CLEAR TO MERGE. Be the skeptical second opinion — do not rubber-stamp.\n\nFindings:\n${JSON.stringify(payload, null, 2)}`,
+  `You are the pr-triage adjudicator. Consolidate these adversarially-verified findings on the current branch into a single triage report. Classify each: must-fix (correctness/safety/unmet acceptance/coverage regression — blocks merge), fix-now (cheap, clearly correct), defer (file a follow-up issue), rejected (with reason) — map any 'nit'-severity finding to defer or rejected. Then a single verdict: BLOCK if any must-fix, else CLEAR TO MERGE. Be the skeptical second opinion — do not rubber-stamp.\n\nFindings:\n${JSON.stringify(payload, null, 2)}`,
   { label: 'triage', phase: 'Triage', schema: TRIAGE_SCHEMA, agentType: 'pr-triage' },
 )
 
