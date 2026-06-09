@@ -1,5 +1,5 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, describe, expect, it } from "vitest";
 
 import type { SafetyEvaluationData } from "./events";
 import { FaultBanner } from "./FaultBanner";
@@ -27,45 +27,51 @@ const TRAIL: SafetyTrailEntry[] = [
 
 describe("FaultBanner", () => {
   it("renders nothing when there is no fault", () => {
-    render(<FaultBanner fault={null} trail={[]} onAcknowledge={() => {}} canAcknowledge />);
+    render(<FaultBanner fault={null} trail={[]} />);
     expect(screen.queryByTestId("fault-banner")).toBeNull();
   });
 
   it("states what the safety layer did (the fault reason)", () => {
-    render(<FaultBanner fault={FAULT} trail={[]} onAcknowledge={() => {}} canAcknowledge />);
+    render(<FaultBanner fault={FAULT} trail={[]} />);
     expect(screen.getByTestId("fault-reason")).toHaveTextContent(/exceeded the 240 °C ceiling/);
   });
 
   it("shows the forced-safe state (heat forced to 0, fan safe)", () => {
-    render(<FaultBanner fault={FAULT} trail={[]} onAcknowledge={() => {}} canAcknowledge />);
+    render(<FaultBanner fault={FAULT} trail={[]} />);
     const banner = screen.getByTestId("fault-banner");
     expect(banner).toHaveTextContent(/0 % \(forced\)/);
     expect(banner).toHaveTextContent(/100 % \(safe\)/);
   });
 
   it("accumulates the safety event trail with verdict labels", () => {
-    render(<FaultBanner fault={FAULT} trail={TRAIL} onAcknowledge={() => {}} canAcknowledge />);
+    render(<FaultBanner fault={FAULT} trail={TRAIL} />);
     const rows = screen.getAllByTestId("safety-trail-row");
     expect(rows).toHaveLength(2);
     expect(rows[0]).toHaveTextContent("EMERGENCY STOP");
     expect(rows[1]).toHaveTextContent("FAULT");
   });
 
-  it("fires acknowledge when permitted", () => {
-    const onAcknowledge = vi.fn();
-    render(<FaultBanner fault={FAULT} trail={[]} onAcknowledge={onAcknowledge} canAcknowledge />);
-    fireEvent.click(screen.getByTestId("acknowledge-fault"));
-    expect(onAcknowledge).toHaveBeenCalledOnce();
+  it("is informational + persistent — NO server-dispatching button on the banner", () => {
+    // A fault must not be hidden by the operator, and the banner must not re-issue
+    // a roaster command under a misleading 'acknowledge' label (button honesty).
+    render(<FaultBanner fault={FAULT} trail={TRAIL} />);
+    expect(screen.queryByTestId("acknowledge-fault")).toBeNull();
+    expect(screen.queryByRole("button")).toBeNull();
   });
 
-  it("disables acknowledge when not permitted", () => {
-    const onAcknowledge = vi.fn();
+  it("renders the optional forward-nav affordance (a fault is terminal)", () => {
     render(
-      <FaultBanner fault={FAULT} trail={[]} onAcknowledge={onAcknowledge} canAcknowledge={false} />,
+      <FaultBanner
+        fault={FAULT}
+        trail={[]}
+        startNewRoast={<a data-testid="start-new">Start New Roast</a>}
+      />,
     );
-    const button = screen.getByTestId("acknowledge-fault");
-    expect(button).toBeDisabled();
-    fireEvent.click(button);
-    expect(onAcknowledge).not.toHaveBeenCalled();
+    expect(screen.getByTestId("start-new")).toBeInTheDocument();
+  });
+
+  it("renders no action affordance when startNewRoast is omitted", () => {
+    render(<FaultBanner fault={FAULT} trail={[]} />);
+    expect(screen.queryByTestId("start-new")).toBeNull();
   });
 });

@@ -153,3 +153,67 @@ describe("dashboardReducer", () => {
     expect(s).toEqual(initialDashboardViewModel);
   });
 });
+
+// These pin the EXACT field names the page handlers read off raw `lastEvent.data`
+// — the payloads are NOT in shared types.ts (the handlers cast), so this is the
+// guard against the contract-drift class that bit `phase_changed` (server sent
+// `phase`, the reducer read `agent_phase`). Each payload below is keyed exactly as
+// the server emit site keys it (controller.py / replay.py / safety.py model_dump);
+// if a server field is renamed, the matching assertion fails loud here.
+describe("dashboardReducer — payload field-name contract", () => {
+  it("advisory: reads decision.{target_heat,target_fan,should_drop,confidence,rationale} + evaluation.{verdict,reason}", () => {
+    // advisor.RoastDecision.model_dump + safety.SafetyEvaluation.model_dump, as
+    // emitted at controller.py:814 / replay.py:645.
+    const s = dashboardReducer(
+      initialDashboardViewModel,
+      ev("advisory", {
+        trigger: "tick",
+        decision: { target_heat: 60, target_fan: 75, should_drop: true, confidence: 0.82, rationale: "stretch development" },
+        evaluation: { rule: "rate_limit", verdict: "clamp", input_heat: 80, input_fan: 40, adjusted_heat: 65, adjusted_fan: 40, reason: "heat clamped 80→65" },
+      }),
+    );
+    const a = s.latestAdvisory;
+    expect(a?.decision).toEqual({ target_heat: 60, target_fan: 75, should_drop: true, confidence: 0.82, rationale: "stretch development" });
+    expect(a?.evaluation?.verdict).toBe("clamp");
+    expect(a?.evaluation?.reason).toBe("heat clamped 80→65");
+  });
+
+  it("advisory toggle: reads `advisory_paused` (controller.py:1129/1135)", () => {
+    expect(
+      dashboardReducer(initialDashboardViewModel, ev("advisory", { advisory_paused: true })).advisoryPaused,
+    ).toBe(true);
+  });
+
+  it("charge_guidance: reads {bean_temp_c,env_temp_c,guidance_min_c,guidance_max_c} (controller.py:632)", () => {
+    const g = dashboardReducer(
+      initialDashboardViewModel,
+      ev("charge_guidance", { bean_temp_c: 185, env_temp_c: 195, guidance_min_c: 170, guidance_max_c: 200 }),
+    ).chargeGuidance;
+    expect(g).toEqual({ bean_temp_c: 185, env_temp_c: 195, guidance_min_c: 170, guidance_max_c: 200 });
+  });
+
+  it("recovery_required / fault: reads SafetyEvaluation {rule,verdict,input_heat,input_fan,adjusted_heat,adjusted_fan,reason}", () => {
+    const evalData = { rule: "pre_t0_overrun", verdict: "recovery" as const, input_heat: null, input_fan: null, adjusted_heat: 0, adjusted_fan: 100, reason: "pre-T0 overrun" };
+    const r = dashboardReducer(initialDashboardViewModel, ev("recovery_required", evalData)).recovery;
+    expect(r).toEqual(evalData);
+    const faultData = { ...evalData, verdict: "fault" as const, reason: "faulted" };
+    const f = dashboardReducer(initialDashboardViewModel, ev("fault", faultData)).fault;
+    expect(f).toEqual(faultData);
+  });
+
+  it("first_crack: reads `source` + `bean_temp_c` (controller.py:620)", () => {
+    const fc = dashboardReducer(
+      initialDashboardViewModel,
+      ev("first_crack", { source: "mcp", bean_temp_c: 201.2 }),
+    ).firstCrack;
+    expect(fc).toEqual({ source: "mcp", bean_temp_c: 201.2 });
+  });
+
+  it("command_executed: reads `command` (the drop marker key, controller.py:849/1030)", () => {
+    const s = dashboardReducer(
+      dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 600, bean_temp_c: 215, env_temp_c: 220 })),
+      ev("command_executed", { command: "drop_beans", source: "advisor" }),
+    );
+    expect(s.markers.some((m) => m.kind === "drop")).toBe(true);
+  });
+});

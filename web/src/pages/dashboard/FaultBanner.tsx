@@ -3,17 +3,31 @@
  *
  * Full-width banner shown when the roast has FAULTED. It states what the safety
  * layer did (the fault `reason`), the current forced-safe state (heat forced to
- * 0 %, fan held at a safe level — the fail-closed posture), the accumulated
- * safety event trail (what the safety layer did and when), and the single
- * ACKNOWLEDGE FAULT action. Serious but not alarmist — an operator console.
+ * 0 %, fan held at a safe level — the fail-closed posture), and the accumulated
+ * safety event trail (what the safety layer did and when). Serious but not
+ * alarmist — an operator console.
+ *
+ * INFORMATIONAL + PERSISTENT — by design it has NO server-dispatching button.
+ * (1) The banner must not let the operator hide an ACTIVE fault: a fault is
+ *     terminal and stays on screen until the roast ends. There is no client-side
+ *     dismiss.
+ * (2) It must not re-issue a roaster command under a misleading label. M1 has no
+ *     `acknowledge_fault`/`clear_fault` action, and dispatching `emergency_stop`
+ *     from a button labelled "Acknowledge" is a button/action mismatch — in a
+ *     safety UI, button honesty matters. The genuine e-stop need in `faulted` is
+ *     served by the OperatorActionBar's EMERGENCY STOP (correctly labelled, always
+ *     enabled — its command×phase row is every phase). A real server-side
+ *     `acknowledge_fault` action is an E7/M2 follow-up (#117).
+ *
+ * The only affordance is an optional forward nav ("Start New Roast") — a fault is
+ * terminal, so starting a new run is the real next step; it navigates, it does not
+ * dispatch a roaster command.
  *
  * Driven by the real `fault` + `safety_alert` SafetyEvaluation payloads (the page
- * accumulates the trail). Acknowledge POSTs through the action bar's handler;
- * `acknowledge_recovery` is the recovery flow — a faulted run is acknowledged via
- * the emergency-stop / explicit operator path the server exposes, so the
- * Acknowledge button dispatches the action the caller wires (kept a prop so this
- * component never hardcodes which server action clears a fault).
+ * accumulates the trail). All temperatures Celsius.
  */
+
+import type { ReactNode } from "react";
 
 import { cn } from "@/lib/cn";
 import { verdictLabel } from "@/lib/verdict";
@@ -26,18 +40,16 @@ export interface FaultBannerProps {
   fault: SafetyEvaluationData | null;
   /** The accumulated safety event trail (newest entries appended). */
   trail: SafetyTrailEntry[];
-  /** Acknowledge the fault (the page wires this to the server action). */
-  onAcknowledge: () => void;
-  /** Whether acknowledge is currently permitted (mirrors server enablement). */
-  canAcknowledge: boolean;
+  /** Optional forward-nav affordance (a fault is terminal). Navigates only —
+   *  never dispatches a roaster command. Omit to render no action at all. */
+  startNewRoast?: ReactNode;
   className?: string;
 }
 
 export function FaultBanner({
   fault,
   trail,
-  onAcknowledge,
-  canAcknowledge,
+  startNewRoast,
   className,
 }: FaultBannerProps): React.JSX.Element | null {
   if (fault === null) return null;
@@ -59,21 +71,7 @@ export function FaultBanner({
             {fault.reason}
           </p>
         </div>
-        <button
-          type="button"
-          data-testid="acknowledge-fault"
-          disabled={!canAcknowledge}
-          aria-disabled={!canAcknowledge}
-          onClick={onAcknowledge}
-          className={cn(
-            "shrink-0 rounded-md border px-4 py-2 text-sm font-semibold uppercase tracking-wide transition-colors",
-            canAcknowledge
-              ? "border-roast-fault/60 bg-roast-fault/15 text-roast-fault hover:bg-roast-fault/25"
-              : "cursor-not-allowed border-border/40 text-muted-foreground/50",
-          )}
-        >
-          Acknowledge Fault
-        </button>
+        {startNewRoast && <div className="shrink-0">{startNewRoast}</div>}
       </div>
 
       {/* Current forced-safe state — the fail-closed posture (heat 0, fan safe). */}

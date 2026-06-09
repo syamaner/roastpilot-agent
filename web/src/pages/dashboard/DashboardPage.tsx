@@ -16,6 +16,7 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 
 import { AppFrame, ConnectionIndicator, LiveCurve } from "@/components/shared";
 import { useHealth, useRoast } from "@/hooks/queries";
@@ -101,15 +102,6 @@ export function DashboardPage(): React.JSX.Element {
   const showToast = !toastDismissed && view.chargeGuidance !== null;
   const inRecovery = phase === "operator_recovery_required";
 
-  // Acknowledging a fault: M1 has no dedicated `acknowledge_fault`/`clear_fault`
-  // action (a fault is terminal — the run ends), and `emergency_stop` is the only
-  // operator action the server enables in `faulted` (its command×phase row is
-  // every phase). So the banner's acknowledge dispatches `emergency_stop`, gated
-  // on the SERVER mirror (`enabled_actions`) — never a local `phase === "faulted"`
-  // inference — to stay consistent with the no-client-matrix invariant. Falls
-  // back to permitting it while the mirror is still null on first paint.
-  const canAcknowledgeFault = effectiveEnabled?.includes("emergency_stop") ?? true;
-
   const curve = useMemo(
     () => ({ points: view.points, markers: view.markers }),
     [view.points, view.markers],
@@ -118,12 +110,23 @@ export function DashboardPage(): React.JSX.Element {
   return (
     <AppFrame headerRight={<ConnectionIndicator status={status} />}>
       <div className="flex flex-col gap-4" data-testid="dashboard">
-        {/* Fault banner sits above the dashboard when faulted (Prompt B §2). */}
+        {/* Fault banner sits above the dashboard when faulted (Prompt B §2).
+            Informational + persistent: no server-dispatching button (a fault is
+            terminal and must not be hidden; e-stop lives in the action bar). The
+            only affordance is a forward nav — starting a new roast — which
+            navigates, never dispatching a roaster command. */}
         <FaultBanner
           fault={view.fault}
           trail={view.safetyTrail}
-          onAcknowledge={() => void dispatchAction("emergency_stop")}
-          canAcknowledge={canAcknowledgeFault}
+          startNewRoast={
+            <Link
+              to="/roasts"
+              data-testid="fault-start-new-roast"
+              className="inline-flex items-center rounded-md border border-roast-fault/60 bg-roast-fault/15 px-4 py-2 text-sm font-semibold uppercase tracking-wide text-roast-fault transition-colors hover:bg-roast-fault/25"
+            >
+              Start New Roast
+            </Link>
+          }
         />
 
         <RoastHeader
