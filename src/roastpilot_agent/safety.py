@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 from roastpilot_agent.config import SafetyLimits
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
+    OperatorAction,
     RoastCommand,
     RoastEventSource,
     RoastPhase,
@@ -115,6 +116,66 @@ COMMAND_PHASE_MATRIX: dict[RoastCommand, frozenset[RoastPhase]] = {
 }
 """Command×phase validity matrix (E3-S5, D16): which agent phases each MCP
 write command may execute in. Exhaustively tested per cell."""
+
+
+#: The operator actions that resolve to an MCP write command (and so are gated by
+#: :data:`COMMAND_PHASE_MATRIX`). The canonical mapping — ``api.py`` imports this
+#: rather than keeping its own copy, so the queue pre-check and the
+#: ``enabled_actions`` derivation share one source of truth.
+OPERATOR_ACTION_COMMAND: dict[OperatorAction, RoastCommand] = {
+    OperatorAction.MARK_BEANS_ADDED: RoastCommand.MARK_BEANS_ADDED,
+    OperatorAction.MARK_FIRST_CRACK: RoastCommand.MARK_FIRST_CRACK,
+    OperatorAction.DROP_BEANS: RoastCommand.DROP_BEANS,
+    OperatorAction.START_COOLING: RoastCommand.START_COOLING,
+    OperatorAction.STOP_COOLING: RoastCommand.STOP_COOLING,
+    OperatorAction.EMERGENCY_STOP: RoastCommand.EMERGENCY_STOP,
+}
+
+
+def enabled_operator_actions(phase: RoastPhase) -> list[OperatorAction]:
+    """The operator actions the server would ACCEPT in ``phase`` (E10 option (a),
+    D25). A pure PERMISSION MIRROR — "what the controller accepts" — not a render
+    list (a page may still hide a permitted-but-meaningless action; that's its
+    presentation call).
+
+    Derived READ-ONLY from the controller's existing acceptance, with NO second
+    source of truth (the drift this exists to kill):
+
+    * **MCP-write actions** (the six in :data:`OPERATOR_ACTION_COMMAND`): included
+      iff ``phase`` is in their :data:`COMMAND_PHASE_MATRIX` row — the same matrix
+      the controller enforces on drain. (``emergency_stop``'s row is every phase.)
+    * **``pause_advisory`` / ``resume_advisory``**: included in EVERY phase — the
+      controller never phase-gates them (``RoastController.operator_pause_advisory``
+      / ``operator_resume_advisory`` are unconditional toggles, no safety eval), so
+      mirroring server truth means always-enabled.
+    * **``acknowledge_recovery``**: included iff ``phase`` is
+      ``operator_recovery_required`` — the only phase from which the controller's
+      drain (``RoastRunner._dispatch_acknowledge``) acts on it; any other phase
+      records a failed action.
+
+    No new safety rule: this is a projection of acceptance the controller already
+    encodes, and every action is still re-validated by the controller before any
+    MCP write — this is enablement, never enforcement. The biconditional test
+    ``test_enabled_actions_mirror_controller_acceptance`` pins it: for all
+    (action, phase), ``controller_accepts(action, phase)`` iff
+    ``action in enabled_operator_actions(phase)``, driving the real controller.
+    Returned in :class:`OperatorAction` declaration order for a stable result.
+    """
+    enabled: list[OperatorAction] = []
+    for action in OperatorAction:
+        command = OPERATOR_ACTION_COMMAND.get(action)
+        if command is not None:
+            if phase in COMMAND_PHASE_MATRIX[command]:
+                enabled.append(action)
+        elif action in (OperatorAction.PAUSE_ADVISORY, OperatorAction.RESUME_ADVISORY):
+            # The controller never phase-gates the advisory toggles → every phase.
+            enabled.append(action)
+        elif (
+            action is OperatorAction.ACKNOWLEDGE_RECOVERY
+            and phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+        ):
+            enabled.append(action)
+    return enabled
 
 
 class SafetyPolicy:

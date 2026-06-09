@@ -39,7 +39,7 @@ from roastpilot_agent.models import (
     TimelineSafetyEvaluation,
     TimelineVerdict,
 )
-from roastpilot_agent.safety import SafetyEvaluation
+from roastpilot_agent.safety import SafetyEvaluation, enabled_operator_actions
 
 SCHEMA_V1 = """
 CREATE TABLE roast_runs (
@@ -741,9 +741,10 @@ class RoastStore:
         if row is None:
             return None
         manifest = None if row[9] is None else LogManifest.model_validate_json(str(row[9]))
+        agent_phase = RoastPhase(str(row[1]))
         return RoastDetail(
             id=str(row[0]),
-            agent_phase=RoastPhase(str(row[1])),
+            agent_phase=agent_phase,
             profile=RoastProfile.model_validate_json(str(row[2])),
             outcome=row[3],
             started_at_utc=str(row[4]),
@@ -752,6 +753,9 @@ class RoastStore:
             rating=None if row[7] is None else int(row[7]),
             notes=None if row[8] is None else str(row[8]),
             export_manifest=manifest,
+            # Derived read-only from the phase (E10 option (a)): the SPA's action
+            # bar mirrors this set; the live SSE phase_changed frame re-sends it.
+            enabled_actions=enabled_operator_actions(agent_phase),
         )
 
     async def read_telemetry_points(
