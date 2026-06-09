@@ -65,6 +65,16 @@ describe("dashboardReducer", () => {
     expect(s.advisoryHistory).toHaveLength(ADVISORY_HISTORY_LIMIT);
   });
 
+  it("assigns each advisory a unique, monotonic seq (stable list key)", () => {
+    let s = initialDashboardViewModel;
+    s = dashboardReducer(s, ev("advisory", ADVISORY_DECISION));
+    s = dashboardReducer(s, ev("advisory", ADVISORY_DECISION));
+    s = dashboardReducer(s, ev("advisory", ADVISORY_DECISION));
+    const seqs = s.advisoryHistory.map((r) => r.seq);
+    expect(new Set(seqs).size).toBe(seqs.length); // all unique
+    expect(s.advisorySeq).toBe(3);
+  });
+
   it("folds the pause/resume toggle into advisoryPaused without entering the feed", () => {
     let s = dashboardReducer(initialDashboardViewModel, ev("advisory", { advisory_paused: true }));
     expect(s.advisoryPaused).toBe(true);

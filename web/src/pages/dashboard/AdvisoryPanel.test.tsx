@@ -7,8 +7,10 @@ import type { AdvisoryRecord } from "./useDashboardEvents";
 
 afterEach(cleanup);
 
+let seq = 0;
 function record(verdict: SafetyVerdict, heat = 60): AdvisoryRecord {
   return {
+    seq: seq++,
     decision: { target_heat: heat, target_fan: 75, should_drop: false, confidence: 0.82, rationale: "RoR declining; reduce heat" },
     evaluation: {
       rule: "rate_limit",

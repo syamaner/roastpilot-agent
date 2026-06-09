@@ -38,7 +38,7 @@ export function DashboardPage(): React.JSX.Element {
   // Live SSE stream — phase/telemetry/enabledActions are server-derived; lastEvent
   // is the raw frame the page-local reducer folds.
   const { status, phase, telemetry, enabledActions, lastEvent } = useRoastStream(runId);
-  const view = useDashboardEvents(lastEvent);
+  const view = useDashboardEvents(lastEvent, runId);
 
   // The run snapshot (profile name + initial enabled actions before the first
   // phase_changed). Read-only REST snapshot, hydrated by TanStack Query.
@@ -70,6 +70,16 @@ export function DashboardPage(): React.JSX.Element {
   // development_percent, so we show time SINCE first crack — derivable from the
   // FC event vs the current elapsed. Null until FC fires.
   const [fcElapsed, setFcElapsed] = useState<number | null>(null);
+
+  // Reset the per-run local state when the run changes (the view-model resets in
+  // the hook): a new run must not inherit the previous run's FC baseline or a
+  // stale toast dismissal. The page can stay mounted across runs.
+  useEffect(() => {
+    setFcElapsed(null);
+    setToastDismissed(false);
+    setLastResult(null);
+  }, [runId]);
+
   useEffect(() => {
     if (view.firstCrack !== null && fcElapsed === null && telemetry?.elapsed_seconds != null) {
       setFcElapsed(telemetry.elapsed_seconds);
@@ -91,6 +101,15 @@ export function DashboardPage(): React.JSX.Element {
   const showToast = !toastDismissed && view.chargeGuidance !== null;
   const inRecovery = phase === "operator_recovery_required";
 
+  // Acknowledging a fault: M1 has no dedicated `acknowledge_fault`/`clear_fault`
+  // action (a fault is terminal — the run ends), and `emergency_stop` is the only
+  // operator action the server enables in `faulted` (its command×phase row is
+  // every phase). So the banner's acknowledge dispatches `emergency_stop`, gated
+  // on the SERVER mirror (`enabled_actions`) — never a local `phase === "faulted"`
+  // inference — to stay consistent with the no-client-matrix invariant. Falls
+  // back to permitting it while the mirror is still null on first paint.
+  const canAcknowledgeFault = effectiveEnabled?.includes("emergency_stop") ?? true;
+
   const curve = useMemo(
     () => ({ points: view.points, markers: view.markers }),
     [view.points, view.markers],
@@ -104,7 +123,7 @@ export function DashboardPage(): React.JSX.Element {
           fault={view.fault}
           trail={view.safetyTrail}
           onAcknowledge={() => void dispatchAction("emergency_stop")}
-          canAcknowledge={phase === "faulted"}
+          canAcknowledge={canAcknowledgeFault}
         />
 
         <RoastHeader

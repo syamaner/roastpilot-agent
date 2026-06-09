@@ -59,7 +59,11 @@ export function RoastHeader({
           className="inline-flex items-center rounded-md border px-3 py-1 text-sm font-semibold uppercase tracking-wide"
           style={
             accent
-              ? { borderColor: accent, color: accent, backgroundColor: `${"color-mix(in srgb, " + accent + " 15%, transparent)"}` }
+              ? {
+                  borderColor: accent,
+                  color: accent,
+                  backgroundColor: `color-mix(in srgb, ${accent} 15%, transparent)`,
+                }
               : undefined
           }
         >

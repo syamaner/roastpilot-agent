@@ -27,6 +27,9 @@ import type {
 
 /** One advisory recommendation rendered in the panel / decision history. */
 export interface AdvisoryRecord {
+  /** Monotonic per-run sequence — a stable React key for the history list (the
+   *  list prepends, so an array index would re-key every row each advisory). */
+  seq: number;
   /** The advisor's recommended targets + rationale (absent on gate/skip frames). */
   decision: AdvisoryEventData["decision"];
   /** The safety handshake on this advice (absent on skip/pause frames). */
@@ -64,6 +67,8 @@ export interface DashboardViewModel {
   markers: CurveMarker[];
   /** Appended live curve points (one per telemetry frame), x = elapsed seconds. */
   points: CurvePoint[];
+  /** Monotonic counter assigning each advisory record a stable key (per run). */
+  advisorySeq: number;
 }
 
 export const initialDashboardViewModel: DashboardViewModel = {
@@ -78,6 +83,7 @@ export const initialDashboardViewModel: DashboardViewModel = {
   t0: null,
   markers: [],
   points: [],
+  advisorySeq: 0,
 };
 
 /** Decision-history depth shown in the advisory panel (ui-prompts Prompt A: "last 4"). */
@@ -132,12 +138,14 @@ export function dashboardReducer(
         return state;
       }
       const record: AdvisoryRecord = {
+        seq: state.advisorySeq,
         decision: data.decision,
         evaluation: data.evaluation,
         synthesized: data.synthesized === true,
       };
       return {
         ...state,
+        advisorySeq: state.advisorySeq + 1,
         latestAdvisory: record,
         advisoryHistory: [record, ...state.advisoryHistory].slice(0, ADVISORY_HISTORY_LIMIT),
       };
@@ -193,8 +201,8 @@ export function dashboardReducer(
     case "command_executed": {
       // A drop command moves the roast to cooling; mark the drop point so the
       // curve shows it. Other executed commands (set_targets) need no marker.
-      const data = event.data as { command?: string } | undefined;
-      if (data?.command !== "drop_beans") return state;
+      const data = event.data as { command?: string };
+      if (data.command !== "drop_beans") return state;
       const at = state.points.length > 0 ? state.points[state.points.length - 1].t : 0;
       return {
         ...state,
@@ -214,10 +222,22 @@ export function dashboardReducer(
  *
  * Driven by the raw frame the shared hook surfaces — we re-dispatch each new
  * `lastEvent` exactly once (keyed by frame identity, since the hook replaces the
- * object on every applied frame). On a run change (runId), the caller resets.
+ * object on every applied frame). On a run change (`runId`) the view-model resets,
+ * so a fresh run never paints the previous run's points/markers/fault onto its
+ * curve (the page may stay mounted across runs).
  */
-export function useDashboardEvents(lastEvent: SseEvent | null): DashboardViewModel {
+export function useDashboardEvents(
+  lastEvent: SseEvent | null,
+  runId: string | null,
+): DashboardViewModel {
   const [state, dispatch] = useReducer(dashboardReducer, initialDashboardViewModel);
+
+  // Reset when the run changes (or clears) — the accumulated view-model is
+  // per-run. Runs BEFORE the lastEvent effect so a reset can't drop a frame:
+  // changing runId re-subscribes the stream, whose first frame arrives later.
+  useEffect(() => {
+    dispatch({ kind: "reset" });
+  }, [runId]);
 
   useEffect(() => {
     if (lastEvent === null) return;

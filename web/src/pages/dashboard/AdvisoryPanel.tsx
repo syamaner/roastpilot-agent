@@ -65,9 +65,9 @@ export function AdvisoryPanel({
             Decision History
           </h3>
           <ul data-testid="advisory-history" className="flex flex-col gap-1">
-            {history.map((record, i) => (
+            {history.map((record) => (
               <li
-                key={i}
+                key={record.seq}
                 data-testid="advisory-history-row"
                 className="flex items-center justify-between gap-3 rounded border border-border/60 px-3 py-1.5 text-sm"
               >
