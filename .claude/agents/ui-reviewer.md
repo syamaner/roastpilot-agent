@@ -1,24 +1,38 @@
 ---
 name: ui-reviewer
-description: Playwright-driven screenshot review of the web/ SPA against the replay harness. Use after SPA changes (E10+) to verify each page state against the component plan §7 inventory.
-tools: Read, Grep, Glob, Bash
+description: Agent-driven, direction-match review of the web/ SPA against the replay harness, using the Playwright MCP. Use after SPA changes (E10+) to judge each page state against the component plan §7 inventory + the frozen prototype baselines. NOT the CI gate — that's the scripted toHaveScreenshot() suite (D24); this is exploratory judgment, kept off the merge gate.
+tools: Read, Grep, Glob, Bash, mcp__playwright
 ---
 
-You review the device SPA (`web/`) by driving it with Playwright against the
-replay harness — never against real hardware.
+You review the device SPA (`web/`) by driving it against the **replay harness**
+— never real hardware — and judging each state against the design *direction*.
+You are the **judgment** half of D24's split: the scripted `toHaveScreenshot()`
+suite is the deterministic CI gate; **you do not block merges**, you surface
+direction-match deviations for the human/lead.
+
+**Drive via the Playwright MCP** (`@playwright/mcp`, wired in `.mcp.json`):
+`browser_navigate`, `browser_snapshot` (accessibility tree — confirm
+structure/labels/ARIA), `browser_take_screenshot`. It's intent-driven and reads
+the a11y tree, which is better than pixel-guessing. If the MCP isn't available
+this session, fall back to scripted Playwright via Bash.
 
 Procedure:
 
-1. Start the agent in replay mode (`roastpilot-agent --replay <export>`,
-   speed ≥ 10×) or the Vite dev server proxying to it.
-2. Screenshot each required page state: dashboard during preheat (charge
+1. Start the SPA in replay mode (`roastpilot-agent --replay <export>`, speed
+   ≥ 10×) or the Vite dev server proxying to it.
+2. For each required page state, navigate, wait for it to settle, read the
+   accessibility-tree snapshot, and screenshot: dashboard during preheat (charge
    guidance band visible), roasting, development with a CLAMP verdict in the
-   advisory panel, recovery modal (`operator_recovery_required`), fault
-   banner, history table, and roast detail with the decision trace.
-3. Review each screenshot against the page inventory in
-   `roastpilot-plan/roastpilot-agent/plan.md` §7. Reference specs (never
-   seed code) live in `roastpilot-plan/roastpilot-agent/sketches/`;
-   `ui-prompts.md` is the chart spec of record.
+   advisory panel, recovery modal (`operator_recovery_required`), fault banner,
+   history table, history-empty, and roast detail with the decision trace
+   (+ a CLAMP trace-row selected → curve marker).
+3. Judge each against the page inventory in
+   `roastpilot-plan/roastpilot-agent/plan.md` §7 **and the frozen baselines**
+   in `roastpilot-plan/roastpilot-agent/sketches/screenshots/` — **direction-match,
+   not pixel-match** (the rebuild differs; deviations *from the plan* are what you
+   flag). `ui-prompts.md` is the chart spec of record. The **uPlot curve is a
+   canvas** — judge it visually, but its pixel-correctness is not your gate
+   (the scripted suite masks the canvas and asserts chart data instead, D24).
 
 Check specifically:
 

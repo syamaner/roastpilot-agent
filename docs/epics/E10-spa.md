@@ -57,7 +57,27 @@ demo screen-recording rig. It must be working **by the end of S2** so
 established pattern from `roastpilot-plan/.../sketches/`: **`playwright-core` +
 system Google Chrome** (no heavy download) + the `capture.mjs` screenshot script
 (port it into `web/`). It runs **headless in CI** against the replay harness
-(S6); baselines are **direction-match, not pixel-match**.
+(S6); the prototype baselines are **direction-match, not pixel-match**.
+
+### Snapshot & visual testing — two tracks, split by job (D24)
+
+1. **CI gate = scripted `@playwright/test` `toHaveScreenshot()`** in a *pinned*
+   Playwright Docker image (`mcr.microsoft.com/playwright:vX.Y.Z`,
+   `--platform=linux/amd64` to match GitHub CI; baselines generated **inside**
+   it). Deterministic via the replay harness + fixed viewport + `fonts.ready` +
+   animations off + small tolerance (keep non-zero). Snapshots the **DOM chrome**
+   (header, advisory panel, badges, modals, tables) per replay state. These are
+   the SPA's **own** baselines (committed PNGs), distinct from the prototype
+   direction-match baselines.
+2. **The uPlot canvas is NOT pixel-snapshotted** — `mask:` it and **assert the
+   chart's data** via a test hook (the replay harness makes data deterministic);
+   ≤1 loose "did it blank/crash" canvas smoke shot. No GPU runner.
+3. **Vitest** snapshots only as sparse `toMatchInlineSnapshot` on small stable
+   mappers (SSE-event→view-model, verdict→badge) — never full-DOM shadcn/Radix.
+4. **`ui-reviewer` uses the Microsoft Playwright MCP** (`@playwright/mcp`, wired
+   in `.mcp.json`) for exploratory *direction-match* judgment — **kept off the
+   merge gate** (the scripted suite is the gate). The `/capture` skill captures a
+   named state for the reviewer / debugging / the E12 demo.
 
 ## Stories
 
@@ -89,13 +109,20 @@ Owner: lead / `platform` teammate. Acceptance criteria:
   series (bean, env on left °C axis; RoR on right; heat %/fan % step-after on
   a hidden 0–100 % scale, amber/teal), legend = live cursor readout +
   click-to-toggle, event markers (T0/FC/drop), charge band (preheating only),
-  trace-row→highlight hook. `ui-prompts.md` is the spec.
+  trace-row→highlight hook. `ui-prompts.md` is the spec. Expose a **chart-data
+  test hook** (e.g. `window.__chart` / a `data-*`) so tests assert the series
+  data without pixel-diffing the canvas (D24).
 - [ ] D15 verdict helper (ALLOW/CLAMP/REJECT badge; RECOVERY/FAULT/E-STOP are
   not badges — brief §3) + the routing shell for the three pages.
-- [ ] **Playwright + screenshot-capture harness** wired against the replay
-  harness (reuse the sketches' `playwright-core` + system-Chrome pattern, port
-  `capture.mjs`) — so `ui-reviewer` can run on the page PRs (S3–S5). See
-  "Playwright is core" above.
+- [ ] **Playwright snapshot + capture harness** (D24): the scripted
+  `@playwright/test` `toHaveScreenshot()` setup against the replay harness, the
+  canvas-mask + chart-data-assert convention, the `.mcp.json` wiring the Playwright
+  MCP for `ui-reviewer`, and the `/capture` skill — so `ui-reviewer` and the
+  snapshot suite can run on the page PRs (S3–S5). See "Playwright is core" +
+  "Snapshot & visual testing" above. **Verify the Playwright MCP tool-grant on
+  first use**: `ui-reviewer` lists `mcp__playwright` (whole server); if Claude
+  Code doesn't honor the server-level grant, replace it with the explicit tool
+  names (`mcp__playwright__browser_navigate` / `_snapshot` / `_take_screenshot`).
 
 ### E10-S3 — Dashboard (live)
 
@@ -132,8 +159,11 @@ Owner: `detail` teammate. Acceptance criteria:
 
 Owner: lead / `ui-reviewer`. Acceptance criteria:
 
-- [ ] Component tests + Playwright against the replay harness (harness set up in
-  S2); `ui-reviewer` sub-agent pass recorded against the frozen baselines.
+- [ ] Component tests + the **scripted `toHaveScreenshot()` snapshot suite**
+  (D24) running **headless in the pinned Playwright Docker image in CI** against
+  the replay harness (harness set up in S2): DOM chrome per state, canvas masked +
+  chart data asserted. `ui-reviewer` (Playwright MCP, direction-match) pass
+  recorded against the frozen baselines — not a merge gate.
 - [ ] SSE keep-alive/reconnect verified on Safari/iPadOS; resolution recorded
   in plan §11 (closes open item 4).
 

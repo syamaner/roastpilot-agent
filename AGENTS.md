@@ -206,6 +206,14 @@ clean.
   beyond coverage), `pr-triage` (independent PR-feedback triage — also the
   `triage-pr` skill), `engineer-fe` (web/ SPA), `engineer-be` (Python agent). The
   human is the lead + domain expert/architect, consulted on escalations.
+- **Skills** (`.claude/skills/`): `triage-pr` (→ `pr-triage`), `capture` (drive
+  the replay harness + SPA, screenshot a named page state — E10+).
+- **Workflows** (`.claude/workflows/`): `review-branch` (cross-checked roster
+  review of the branch diff).
+- **MCP** (`.mcp.json`): the Microsoft **Playwright MCP** (`@playwright/mcp`) —
+  agent-driven browser/screenshots for `ui-reviewer`'s direction-match review
+  (D24). Interactive sessions only; the deterministic CI gate is the scripted
+  `@playwright/test` snapshot suite, not the MCP.
 - `CLAUDE.md` contains exactly `@AGENTS.md` — rules belong here, never there.
 
 ## Hardware Safety Notes
