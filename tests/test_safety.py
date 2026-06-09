@@ -581,6 +581,15 @@ def test_enabled_actions_empty_of_writes_in_terminal_phases() -> None:
         }
 
 
+def test_every_operator_action_is_reachable_in_some_phase() -> None:
+    """Exhaustiveness: every OperatorAction is enabled in at least one phase. The
+    derivation fails OFF for an unwired action (the safe default), so this turns
+    "someone added an action and forgot to wire it into enabled_operator_actions"
+    into a red build rather than a silently-always-disabled button."""
+    reachable = {a for phase in RoastPhase for a in enabled_operator_actions(phase)}
+    assert reachable == set(OperatorAction)
+
+
 def test_emergency_stop_matrix_row_is_every_phase() -> None:
     """The matrix must never contradict the E3-S4 e-stop invariant."""
     assert COMMAND_PHASE_MATRIX[RoastCommand.EMERGENCY_STOP] == frozenset(RoastPhase)
