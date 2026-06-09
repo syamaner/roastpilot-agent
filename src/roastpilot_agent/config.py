@@ -149,10 +149,14 @@ class MCPConfig(BaseModel):
     #: Environment overrides for the spawned child, merged over the agent's own
     #: environment at spawn (so ``PATH``/``HOME`` are preserved). Empty by
     #: default — production inherits the deployment environment (the real
-    #: hardware driver). The E9-S2 vertical slice sets the coffee-roaster-mcp
-    #: mock-driver selectors here (``COFFEE_ROASTER_DRIVER=mock``,
-    #: ``COFFEE_FIRST_CRACK_MODE=disabled``) so the subprocess is hardware-,
-    #: audio-, and model-free regardless of the ambient environment.
+    #: hardware driver). The coffee-roaster-mcp mock-driver selectors can be set
+    #: here (``COFFEE_ROASTER_DRIVER=mock``, ``COFFEE_FIRST_CRACK_MODE=disabled``)
+    #: to make the subprocess hardware-, audio-, and model-free. The E9-S2 slice
+    #: points ``COFFEE_ROASTER_MCP_CONFIG`` at a temp YAML instead, because the
+    #: one selector it needs — auto-T0 detection — is config-file-only, and the
+    #: YAML carries the mock-driver + disabled-first-crack settings alongside it.
+    #: (Parameterized factory, not bare ``dict``: the repo's pyright-strict
+    #: idiom for typed defaults, as in ``advisor.AdvisorContext``.)
     env: dict[str, str] = Field(default_factory=dict[str, str])
 
 

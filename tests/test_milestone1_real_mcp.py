@@ -148,6 +148,12 @@ async def _drive_slice(real_mcp: MCPServerProcess, store: RoastStore) -> None:
         clock=clock,
     )
 
+    # Start the roast against the live child → preheating, MCP child running.
+    detail = await service.start_roast(_profile())
+    run_id = detail.id
+    assert detail.agent_phase is RoastPhase.PREHEATING
+    assert service.mcp_child_status().value == "running"
+
     async def tick() -> bool:
         assert service.runner is not None
         clock.advance(3.0)  # clear the 2 s command rate limit
@@ -162,12 +168,6 @@ async def _drive_slice(real_mcp: MCPServerProcess, store: RoastStore) -> None:
         raise AssertionError(
             f"did not reach {phase.value} within {cap} ticks (stuck at {actual.value})"
         )
-
-    # Start the roast against the live child → preheating, MCP child running.
-    detail = await service.start_roast(_profile())
-    run_id = detail.id
-    assert detail.agent_phase is RoastPhase.PREHEATING
-    assert service.mcp_child_status().value == "running"
 
     # The advisor ramps then cuts heat; the mock's resulting bean-temp drop trips
     # auto-T0, which the controller debounces into roasting_pre_first_crack.
