@@ -31,9 +31,9 @@ fan-out is unambiguous. **Foundation first, then one teammate per page.**
   **read-only** (need a shared change? message the lead — don't edit shared).
 - **Dependencies:** S2 blocks S3/S4/S5; S1 ∥ S2; S3 ∥ S4 ∥ S5; S6 last.
 - **Independent review** on every PR: GitHub Claude Code Review + codecov
-  (+ CodeRabbit, the second-reviewer experiment); `ui-reviewer` on the page
-  PRs (S3/S4/S5) against the frozen baselines (direction-match).
-- **Independent triage:** GitHub/CodeRabbit feedback is adjudicated by the
+  (+ a `/review-branch` roster pass, a second independent review); `ui-reviewer`
+  on the page PRs (S3/S4/S5) against the frozen baselines (direction-match).
+- **Independent triage:** that review feedback is adjudicated by the
   lead/PM or the `pr-triage` subagent — never the author teammate dismissing
   comments on its own PR (AGENTS.md merge policy).
 
