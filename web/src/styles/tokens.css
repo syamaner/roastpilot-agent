@@ -44,7 +44,12 @@
   --roast-heat-dim: #92400e;
   --roast-fan: #22d3ee;
   --roast-fan-dim: #164e63;
-  --roast-coffee: #92400e;
+  /* Lighter copper (was #92400e): the deep brown was near-invisible as the bean
+   * line on the #0f0f12 background vs the frozen dashboard-live baseline. #d97706
+   * is the copper the baseline shows (and the LiveCurve bean-stroke fallback).
+   * Only the LiveCurve bean line consumes this token; no component uses it as a
+   * Tailwind class, so the brightness bump is isolated. */
+  --roast-coffee: #d97706;
   --roast-nominal: #34d399;
   --roast-caution: #fbbf24;
   --roast-fault: #f87171;

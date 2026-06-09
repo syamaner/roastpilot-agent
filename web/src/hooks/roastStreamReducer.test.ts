@@ -48,14 +48,29 @@ describe("roastStreamReducer", () => {
     expect(state.enabledActions).toEqual(["drop_beans", "emergency_stop"]);
   });
 
-  it("sets phase from a phase_changed event", () => {
+  it("sets phase from a phase_changed event (wire field is `phase`)", () => {
+    // The server emits phase_changed as `{phase}` (NOT `agent_phase` — that's the
+    // RoastDetail snapshot field). The reducer must read `phase`.
     const event: SseEvent = {
       event: "phase_changed",
-      data: { agent_phase: "cooling" },
+      data: { phase: "cooling" },
       id: 5,
     };
     const state = applyEvent({ ...initialRoastStreamState, phase: "development" }, event);
     expect(state.phase).toBe("cooling");
+  });
+
+  it("a wrong-shaped phase_changed (agent_phase, no phase) does NOT set phase", () => {
+    // Regression guard for the drift this fix corrected: a frame carrying only
+    // `agent_phase` is malformed for this event, so `phase` must not silently
+    // become that value — it ends up undefined, never the stale-but-wrong field.
+    const event: SseEvent = {
+      event: "phase_changed",
+      data: { agent_phase: "cooling" } as unknown as Record<string, unknown>,
+      id: 5,
+    };
+    const state = applyEvent({ ...initialRoastStreamState, phase: "development" }, event);
+    expect(state.phase).not.toBe("cooling");
   });
 
   it("updates enabledActions from a phase_changed event that carries them", () => {
@@ -66,7 +81,7 @@ describe("roastStreamReducer", () => {
     const start = { ...initialRoastStreamState, phase: "preheating" as const, enabledActions: prior };
     const event: SseEvent = {
       event: "phase_changed",
-      data: { agent_phase: "cooling", enabled_actions: next },
+      data: { phase: "cooling", enabled_actions: next },
       id: 6,
     };
     const state = applyEvent(start, event);
@@ -81,7 +96,7 @@ describe("roastStreamReducer", () => {
     const start = { ...initialRoastStreamState, phase: "preheating" as const, enabledActions: prior };
     const event: SseEvent = {
       event: "phase_changed",
-      data: { agent_phase: "roasting_pre_first_crack" },
+      data: { phase: "roasting_pre_first_crack" },
       id: 7,
     };
     const state = applyEvent(start, event);
@@ -124,14 +139,14 @@ describe("roastStreamReducer", () => {
 
   it("drops out-of-order/duplicate frames by id", () => {
     const start = { ...initialRoastStreamState, phase: "preheating" as const, lastEventId: 10 };
-    const stale: SseEvent = { event: "phase_changed", data: { agent_phase: "cooling" }, id: 7 };
+    const stale: SseEvent = { event: "phase_changed", data: { phase: "cooling" }, id: 7 };
     const next = applyEvent(start, stale);
     expect(next).toBe(start);
     expect(next.phase).toBe("preheating");
   });
 
   it("advances lastEventId on applied frames", () => {
-    const event: SseEvent = { event: "phase_changed", data: { agent_phase: "development" }, id: 12 };
+    const event: SseEvent = { event: "phase_changed", data: { phase: "development" }, id: 12 };
     const state = applyEvent(initialRoastStreamState, event);
     expect(state.lastEventId).toBe(12);
   });

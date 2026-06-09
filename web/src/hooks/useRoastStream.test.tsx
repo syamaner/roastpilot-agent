@@ -114,8 +114,9 @@ describe("useRoastStream", () => {
     expect(latest!.phase).toBe("preheating");
     expect(latest!.telemetry?.bean_temp_c).toBe(150);
 
-    // A phase_changed frame is the only thing that moves phase.
-    await act(async () => es.emit("phase_changed", { agent_phase: "development" }, 2));
+    // A phase_changed frame is the only thing that moves phase — wire field is
+    // `phase` (not agent_phase, which is the snapshot's field).
+    await act(async () => es.emit("phase_changed", { phase: "development" }, 2));
     expect(latest!.phase).toBe("development");
   });
 
