@@ -1,21 +1,176 @@
 /**
- * PLACEHOLDER — owned by E10-S3 (`dashboard` teammate).
+ * Live roast dashboard — the demo centerpiece (plan §7, ui-prompts Prompt A/B,
+ * kickoff §2).
  *
- * The foundation (S2) ships only this route stub so the shell routes resolve and
- * the snapshot harness has a target. S3 replaces this body with the live
- * dashboard (header, LiveCurve, control row, advisory panel, operator action
- * bar, recovery modal, fault banner) per plan §7 — consuming the shared
- * foundation read-only. Do not build dashboard logic here in S2.
+ * Consumes the shared foundation READ-ONLY: `useHealth` → active run id, the
+ * `useRoastStream` SSE hook (phase / telemetry / enabledActions / lastEvent — all
+ * server-derived), the shared `LiveCurve`, `ConnectionIndicator`, and the verdict
+ * helper (via the page's components). The page-local `useDashboardEvents` folds
+ * the remaining frames (advisory / charge guidance / recovery / fault / markers)
+ * the shared reducer surfaces via `lastEvent`.
+ *
+ * INVARIANTS: phase comes from the server ONLY (never inferred here); the SPA
+ * never calls MCP (only the typed REST client + SSE); temperatures Celsius;
+ * verdict copy follows the enum (ALLOW, not ACCEPT); the action bar's enablement
+ * mirrors the server's `enabledActions`, never a hardcoded matrix.
  */
 
-import { AppFrame } from "@/components/shared";
+import { useCallback, useEffect, useMemo, useState } from "react";
+
+import { AppFrame, ConnectionIndicator, LiveCurve } from "@/components/shared";
+import { useHealth, useRoast } from "@/hooks/queries";
+import { useRoastStream } from "@/hooks/useRoastStream";
+import { api } from "@/lib/api";
+import type { OperatorAction } from "@/lib/types";
+import { AddBeansToast } from "./AddBeansToast";
+import { AdvisoryPanel } from "./AdvisoryPanel";
+import { ControlRow } from "./ControlRow";
+import { FaultBanner } from "./FaultBanner";
+import { OperatorActionBar, type OperatorActionResultView } from "./OperatorActionBar";
+import { RecoveryModal } from "./RecoveryModal";
+import { RoastHeader } from "./RoastHeader";
+import { useDashboardEvents } from "./useDashboardEvents";
 
 export function DashboardPage(): React.JSX.Element {
+  const health = useHealth();
+  const runId = health.data?.active_run_id ?? null;
+
+  // Live SSE stream — phase/telemetry/enabledActions are server-derived; lastEvent
+  // is the raw frame the page-local reducer folds.
+  const { status, phase, telemetry, enabledActions, lastEvent } = useRoastStream(runId);
+  const view = useDashboardEvents(lastEvent);
+
+  // The run snapshot (profile name + initial enabled actions before the first
+  // phase_changed). Read-only REST snapshot, hydrated by TanStack Query.
+  const detail = useRoast(runId);
+
+  // Operator action POST result (the action bar surfaces its typed reason).
+  const [lastResult, setLastResult] = useState<OperatorActionResultView | null>(null);
+  // Add-beans toast dismissal (the toast is non-blocking guidance).
+  const [toastDismissed, setToastDismissed] = useState(false);
+
+  const dispatchAction = useCallback(
+    async (action: OperatorAction) => {
+      if (runId === null) return;
+      try {
+        const result = await api.operatorAction(runId, { action });
+        setLastResult({ action, result: result.result, reason: result.reason });
+      } catch (err) {
+        setLastResult({
+          action,
+          result: "failed",
+          reason: err instanceof Error ? err.message : "request failed",
+        });
+      }
+    },
+    [runId],
+  );
+
+  // Development timer (GAP A / #112): the live telemetry frame carries no
+  // development_percent, so we show time SINCE first crack — derivable from the
+  // FC event vs the current elapsed. Null until FC fires.
+  const [fcElapsed, setFcElapsed] = useState<number | null>(null);
+  useEffect(() => {
+    if (view.firstCrack !== null && fcElapsed === null && telemetry?.elapsed_seconds != null) {
+      setFcElapsed(telemetry.elapsed_seconds);
+    }
+  }, [view.firstCrack, fcElapsed, telemetry?.elapsed_seconds]);
+  const developmentSeconds =
+    fcElapsed !== null && telemetry?.elapsed_seconds != null
+      ? telemetry.elapsed_seconds - fcElapsed
+      : null;
+
+  // Advisor targets for the control-row ghost markers (latest decision).
+  const targetHeat = view.latestAdvisory?.decision?.target_heat ?? null;
+  const targetFan = view.latestAdvisory?.decision?.target_fan ?? null;
+
+  // Effective enabled actions: the live SSE mirror once a phase_changed has
+  // arrived, else the snapshot's set (so the bar is correct on first paint).
+  const effectiveEnabled = enabledActions ?? detail.data?.enabled_actions ?? null;
+
+  const showToast = !toastDismissed && view.chargeGuidance !== null;
+  const inRecovery = phase === "operator_recovery_required";
+
+  const curve = useMemo(
+    () => ({ points: view.points, markers: view.markers }),
+    [view.points, view.markers],
+  );
+
   return (
-    <AppFrame>
-      <p className="text-sm text-muted-foreground" data-testid="page-stub-dashboard">
-        Dashboard — built in E10-S3.
-      </p>
+    <AppFrame headerRight={<ConnectionIndicator status={status} />}>
+      <div className="flex flex-col gap-4" data-testid="dashboard">
+        {/* Fault banner sits above the dashboard when faulted (Prompt B §2). */}
+        <FaultBanner
+          fault={view.fault}
+          trail={view.safetyTrail}
+          onAcknowledge={() => void dispatchAction("emergency_stop")}
+          canAcknowledge={phase === "faulted"}
+        />
+
+        <RoastHeader
+          phase={phase}
+          elapsedSeconds={telemetry?.elapsed_seconds ?? null}
+          developmentSeconds={developmentSeconds}
+          profileName={detail.data?.profile.name ?? null}
+          firstCrack={view.firstCrack}
+          mcpChild={health.data?.mcp_child}
+        />
+
+        {showToast && (
+          <AddBeansToast
+            guidance={view.chargeGuidance}
+            visible={showToast}
+            onDismiss={() => setToastDismissed(true)}
+          />
+        )}
+
+        <LiveCurve
+          points={curve.points}
+          markers={curve.markers}
+          phase={phase}
+          chargeBand={
+            detail.data
+              ? {
+                  minC: detail.data.profile.charge_guidance_min_c,
+                  maxC: detail.data.profile.charge_guidance_max_c,
+                }
+              : undefined
+          }
+        />
+
+        <ControlRow
+          heatPercent={telemetry?.heat_percent ?? null}
+          fanPercent={telemetry?.fan_percent ?? null}
+          targetHeatPercent={targetHeat}
+          targetFanPercent={targetFan}
+        />
+
+        <AdvisoryPanel
+          latest={view.latestAdvisory}
+          history={view.advisoryHistory}
+          paused={view.advisoryPaused}
+        />
+      </div>
+
+      {/* The action bar is page chrome — always visible at the bottom. */}
+      <div className="-mx-6 mt-4">
+        <OperatorActionBar
+          enabledActions={effectiveEnabled}
+          phase={phase}
+          onAction={(a) => void dispatchAction(a)}
+          lastResult={lastResult}
+        />
+      </div>
+
+      <RecoveryModal
+        open={inRecovery}
+        beanTempC={telemetry?.bean_temp_c ?? null}
+        envTempC={telemetry?.env_temp_c ?? null}
+        heatPercent={telemetry?.heat_percent ?? null}
+        fanPercent={telemetry?.fan_percent ?? null}
+        enabledActions={effectiveEnabled}
+        onAction={(a) => void dispatchAction(a)}
+      />
     </AppFrame>
   );
 }
