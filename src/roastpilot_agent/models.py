@@ -229,8 +229,50 @@ class RoastHistory(BaseModel):
     runs: list[RoastSummary]
 
 
+class OperatorAction(Enum):
+    """The operator actions the API accepts (plan §6 enum).
+
+    Plain ``Enum`` (D15): the SPA sends these wire forms, but a string
+    comparison against a member in core logic is a pyright strict error.
+
+    "Recovery-only" in plan §6 means *manual fallback*, not a single phase, and
+    the two are not symmetric (see ``safety.COMMAND_PHASE_MATRIX``):
+    ``mark_beans_added`` is the manual-T0 fallback accepted only in
+    ``preheating`` (NOT in ``operator_recovery_required``), while
+    ``start_cooling`` is accepted in ``cooling`` or ``operator_recovery_required``.
+    ``pause_advisory`` / ``resume_advisory`` / ``acknowledge_recovery`` are
+    control actions with no direct MCP write.
+
+    Declared here (before :class:`RoastDetail`) because that response model's
+    ``enabled_actions`` field references it (E10 option (a))."""
+
+    MARK_BEANS_ADDED = "mark_beans_added"
+    MARK_FIRST_CRACK = "mark_first_crack"
+    PAUSE_ADVISORY = "pause_advisory"
+    RESUME_ADVISORY = "resume_advisory"
+    DROP_BEANS = "drop_beans"
+    START_COOLING = "start_cooling"
+    STOP_COOLING = "stop_cooling"
+    EMERGENCY_STOP = "emergency_stop"
+    ACKNOWLEDGE_RECOVERY = "acknowledge_recovery"
+
+
+def _empty_actions() -> list[OperatorAction]:
+    """Typed default factory for ``RoastDetail.enabled_actions`` (keeps pyright
+    strict from inferring ``list[Unknown]`` off the bare ``list`` builtin)."""
+    return []
+
+
 class RoastDetail(BaseModel):
-    """``GET /api/roasts/{id}``: profile, phase, outcome, export manifest."""
+    """``GET /api/roasts/{id}``: profile, phase, outcome, export manifest.
+
+    ``enabled_actions`` is the operator actions valid in the current phase,
+    derived read-only from the safety command×phase matrix (E10 option (a)): the
+    SPA's action bar mirrors this server-provided set rather than re-deriving a
+    command×phase matrix client-side (the no-hardcoded-matrix invariant). It is a
+    projection of phase, not persisted state; the live SSE ``phase_changed`` frame
+    re-sends it so the bar updates on every transition.
+    """
 
     id: str
     agent_phase: RoastPhase
@@ -242,6 +284,7 @@ class RoastDetail(BaseModel):
     rating: int | None = None
     notes: str | None = None
     export_manifest: LogManifest | None = None
+    enabled_actions: list[OperatorAction] = Field(default_factory=_empty_actions)
 
 
 class TelemetryPoint(BaseModel):
@@ -351,31 +394,6 @@ class OperatorRatingRequest(BaseModel):
 
 
 # --- E7-S2: operator action queue (component plan §6) ---
-
-
-class OperatorAction(Enum):
-    """The operator actions the API accepts (plan §6 enum).
-
-    Plain ``Enum`` (D15): the SPA sends these wire forms, but a string
-    comparison against a member in core logic is a pyright strict error.
-
-    "Recovery-only" in plan §6 means *manual fallback*, not a single phase, and
-    the two are not symmetric (see ``safety.COMMAND_PHASE_MATRIX``):
-    ``mark_beans_added`` is the manual-T0 fallback accepted only in
-    ``preheating`` (NOT in ``operator_recovery_required``), while
-    ``start_cooling`` is accepted in ``cooling`` or ``operator_recovery_required``.
-    ``pause_advisory`` / ``resume_advisory`` / ``acknowledge_recovery`` are
-    control actions with no direct MCP write."""
-
-    MARK_BEANS_ADDED = "mark_beans_added"
-    MARK_FIRST_CRACK = "mark_first_crack"
-    PAUSE_ADVISORY = "pause_advisory"
-    RESUME_ADVISORY = "resume_advisory"
-    DROP_BEANS = "drop_beans"
-    START_COOLING = "start_cooling"
-    STOP_COOLING = "stop_cooling"
-    EMERGENCY_STOP = "emergency_stop"
-    ACKNOWLEDGE_RECOVERY = "acknowledge_recovery"
 
 
 class OperatorActionRequest(BaseModel):

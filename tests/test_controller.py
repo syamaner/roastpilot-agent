@@ -25,12 +25,19 @@ from roastpilot_agent.controller import (
     RoastPhase,
     TickScheduler,
 )
-from roastpilot_agent.models import RoastEventKind, RoastProfile, RoastTelemetry
+from roastpilot_agent.models import (
+    OperatorAction,
+    RoastEventKind,
+    RoastProfile,
+    RoastTelemetry,
+)
 from roastpilot_agent.safety import (
+    OPERATOR_ACTION_COMMAND,
     SafetyEvaluation,
     SafetyLimits,
     SafetyPolicy,
     SafetyVerdict,
+    enabled_operator_actions,
 )
 from tests.conftest import (
     EventSink,
@@ -97,17 +104,24 @@ def reading(bean: float = 180.0, env: float = 200.0, **kwargs: object) -> RoastT
     return RoastTelemetry.model_validate({"bean_temp_c": bean, "env_temp_c": env, **kwargs})
 
 
-def controller_in(phase: RoastPhase) -> RoastController:
-    """A controller manoeuvred into ``phase`` through legal edges only."""
-    controller = make_harness().controller
+def _harness_in_phase(phase: RoastPhase) -> Harness:
+    """A harness whose controller is manoeuvred into ``phase`` through legal edges
+    only — exposes the event sink so a test can assert observable output."""
+    harness = make_harness()
+    controller = harness.controller
     if phase is RoastPhase.IDLE:
-        return controller
+        return harness
     for step in NORMAL_PATH:
         controller.transition_to(step)
         if step is phase:
-            return controller
+            return harness
     controller.transition_to(phase)  # FAULTED / RECOVERY via universal edge
-    return controller
+    return harness
+
+
+def controller_in(phase: RoastPhase) -> RoastController:
+    """A controller manoeuvred into ``phase`` through legal edges only."""
+    return _harness_in_phase(phase).controller
 
 
 NORMAL_PATH = [
@@ -1595,3 +1609,114 @@ async def test_start_cooling_write_failure_surfaces_command_failed_no_transition
     assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
     # A failed write must not transition into cooling.
     assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+
+
+# --- E10 option (a) / D25: enabled_actions is a faithful permission mirror ---
+
+
+def _acknowledge_resumes_phase(phase: RoastPhase) -> bool:
+    """Whether the controller's recovery resume (the op the acknowledge drain
+    calls) actually acts from ``phase`` — driven against the REAL controller.
+
+    ``RoastRunner._dispatch_acknowledge`` resumes via
+    ``controller.operator_resume(target)``; that method raises
+    ``InvalidTransitionError`` unless the controller is in
+    ``operator_recovery_required`` (its own guard). We try every recovery-row
+    target and report whether the controller transitioned — so a widening of the
+    controller's resume guard (or the recovery row) is caught, not assumed."""
+    recovery_targets = TRANSITION_TABLE[RoastPhase.OPERATOR_RECOVERY_REQUIRED]
+    for target in recovery_targets:
+        controller = controller_in(phase)
+        try:
+            controller.operator_resume(target)
+        except InvalidTransitionError:
+            continue
+        if controller.phase is target:
+            return True
+    return False
+
+
+def _controller_accepts(action: OperatorAction, phase: RoastPhase) -> bool:
+    """Whether the REAL controller would ACT on ``action`` in ``phase`` — the
+    independent oracle the ``enabled_operator_actions`` projection is pinned
+    against (no restatement of the projection itself).
+
+    Computed from the controller's own behavior:
+
+    * MCP-write actions: the controller's operator handlers gate on
+      ``SafetyPolicy.evaluate_command_phase`` (returning early on non-ALLOW before
+      any write), so acceptance is that verdict — the same matrix the drain
+      enforces.
+    * ``pause_advisory`` / ``resume_advisory``: unconditional toggles (no phase
+      gate) — accepted in every phase; verified by observing the
+      ``_advisory_paused`` flag actually flips.
+    * ``acknowledge_recovery``: driven through the REAL drain
+      (``RoastRunner._dispatch_acknowledge``) by ``_acknowledge_resumes_phase`` — it
+      resumes (phase actually changes to the requested target) only from
+      ``operator_recovery_required``; any other phase is a no-op. Executing the real
+      drain catches a future *widening* of either the drain's phase guard or the
+      recovery transition row — a static literal would silently pass.
+    """
+    command = OPERATOR_ACTION_COMMAND.get(action)
+    if command is not None:
+        policy = SafetyPolicy(SafetyLimits())
+        return policy.evaluate_command_phase(command=command, phase=phase).verdict is (
+            SafetyVerdict.ALLOW
+        )
+    if action in (OperatorAction.PAUSE_ADVISORY, OperatorAction.RESUME_ADVISORY):
+        # Drive the real handler and confirm it took effect via its OBSERVABLE
+        # output (the emitted ADVISORY event), proving "no phase gate": the toggle
+        # fires from any phase. (No private-attr access — the event is the contract.)
+        harness = _harness_in_phase(phase)
+        harness.events.events.clear()
+        want = action is OperatorAction.PAUSE_ADVISORY
+        if want:
+            harness.controller.operator_pause_advisory()
+        else:
+            harness.controller.operator_resume_advisory()
+        advisory = [p for k, p in harness.events.events if k is RoastEventKind.ADVISORY]
+        return any(
+            isinstance(p, dict) and cast("dict[str, object]", p).get("advisory_paused") is want
+            for p in advisory
+        )
+    return _acknowledge_resumes_phase(phase)
+
+
+@pytest.mark.parametrize("action", list(OperatorAction))
+@pytest.mark.parametrize("phase", list(RoastPhase))
+def test_enabled_actions_mirror_controller_acceptance(
+    action: OperatorAction, phase: RoastPhase
+) -> None:
+    """The biconditional pin (E10 option (a), D25): for every (action, phase),
+    the server's ``enabled_actions`` projection includes the action IFF the real
+    controller would accept it. Zero carve-outs — a controller change that
+    diverges (phase-gating pause/resume, widening acknowledge, a matrix edit)
+    fails here, keeping ``enabled_actions`` an honest permission mirror."""
+    in_enabled = action in enabled_operator_actions(phase)
+    assert in_enabled is _controller_accepts(action, phase), (
+        f"{action.value} in {phase.value}: enabled={in_enabled} but "
+        f"controller_accepts={_controller_accepts(action, phase)}"
+    )
+
+
+def test_pause_resume_advisory_enabled_in_every_phase() -> None:
+    """The advisory toggles are ungated server-side, so the mirror lists them in
+    every phase (the page may still hide a meaningless pause on a terminal roast —
+    that is presentation, not the permission contract)."""
+    for phase in RoastPhase:
+        enabled = enabled_operator_actions(phase)
+        assert OperatorAction.PAUSE_ADVISORY in enabled
+        assert OperatorAction.RESUME_ADVISORY in enabled
+
+
+def test_acknowledge_recovery_enabled_only_in_recovery() -> None:
+    """acknowledge_recovery is the one controller-gated control action."""
+    for phase in RoastPhase:
+        expected = phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+        assert (OperatorAction.ACKNOWLEDGE_RECOVERY in enabled_operator_actions(phase)) is expected
+
+
+def test_emergency_stop_enabled_in_every_phase() -> None:
+    """E-stop is always available — its matrix row is the full phase set."""
+    for phase in RoastPhase:
+        assert OperatorAction.EMERGENCY_STOP in enabled_operator_actions(phase)

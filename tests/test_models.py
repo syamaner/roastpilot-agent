@@ -11,6 +11,7 @@ import pytest
 
 from roastpilot_agent.models import (
     RoastCommand,
+    RoastDetail,
     RoastEventKind,
     RoastEventSource,
     RoastPhase,
@@ -130,6 +131,19 @@ def test_roast_profile_defaults() -> None:
     assert profile.charge_guidance_min_c == 170.0
     assert profile.charge_guidance_max_c == 200.0
     assert profile.bean_varietal is None
+
+
+def test_roast_detail_enabled_actions_defaults_to_empty() -> None:
+    """``enabled_actions`` (E10 option (a), D25) defaults to an empty list when a
+    detail is built without it — the API always populates it from the phase, but
+    the field is non-optional with an empty default."""
+    detail = RoastDetail(
+        id="r1",
+        agent_phase=RoastPhase.PREHEATING,
+        profile=RoastProfile.model_validate(_profile()),
+        started_at_utc="2026-06-07T13:00:00Z",
+    )
+    assert detail.enabled_actions == []
 
 
 def test_roast_profile_strips_whitespace() -> None:

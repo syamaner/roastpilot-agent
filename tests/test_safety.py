@@ -11,15 +11,18 @@ import pytest
 from roastpilot_agent.config import SafetyLimits
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
+    OperatorAction,
     RoastCommand,
     RoastEventSource,
     RoastPhase,
 )
 from roastpilot_agent.safety import (
     COMMAND_PHASE_MATRIX,
+    OPERATOR_ACTION_COMMAND,
     SafetyEvaluation,
     SafetyPolicy,
     SafetyVerdict,
+    enabled_operator_actions,
 )
 
 
@@ -542,6 +545,40 @@ def test_d16_canonical_invalid_combinations(policy: SafetyPolicy) -> None:
         command=RoastCommand.STOP_COOLING, phase=RoastPhase.DEVELOPMENT
     )
     assert stop_cooling_during_development.verdict is SafetyVerdict.REJECT
+
+
+# --- E10 option (a) / D25: enabled_actions derivation over the matrix ---
+
+
+@pytest.mark.parametrize("phase", list(RoastPhase))
+def test_enabled_actions_match_matrix_for_mapped_actions(phase: RoastPhase) -> None:
+    """The MCP-write actions in ``enabled_operator_actions`` are exactly the
+    matrix rows for their backing command — a read-only projection, no second
+    matrix. (The control-only three are pinned against the real controller in
+    test_controller.py's biconditional test.)"""
+    enabled = set(enabled_operator_actions(phase))
+    for action, command in OPERATOR_ACTION_COMMAND.items():
+        assert (action in enabled) is (phase in COMMAND_PHASE_MATRIX[command])
+
+
+def test_enabled_actions_returns_declaration_order() -> None:
+    """A stable, snapshot-friendly order (OperatorAction declaration order)."""
+    enabled = enabled_operator_actions(RoastPhase.PREHEATING)
+    ordered = [a for a in OperatorAction if a in set(enabled)]
+    assert enabled == ordered
+
+
+def test_enabled_actions_empty_of_writes_in_terminal_phases() -> None:
+    """COMPLETE/FAULTED: no MCP-write action is permitted except e-stop (always),
+    and acknowledge_recovery is excluded (not the recovery phase) — only the
+    ungated advisory toggles + e-stop remain."""
+    for phase in (RoastPhase.COMPLETE, RoastPhase.FAULTED):
+        enabled = set(enabled_operator_actions(phase))
+        assert enabled == {
+            OperatorAction.EMERGENCY_STOP,
+            OperatorAction.PAUSE_ADVISORY,
+            OperatorAction.RESUME_ADVISORY,
+        }
 
 
 def test_emergency_stop_matrix_row_is_every_phase() -> None:

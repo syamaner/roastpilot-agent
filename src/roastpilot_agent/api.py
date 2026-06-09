@@ -60,7 +60,13 @@ from roastpilot_agent.models import (
     TelemetryEventData,
     TelemetrySeries,
 )
-from roastpilot_agent.safety import SafetyEvaluation, SafetyPolicy, SafetyVerdict
+from roastpilot_agent.safety import (
+    OPERATOR_ACTION_COMMAND,
+    SafetyEvaluation,
+    SafetyPolicy,
+    SafetyVerdict,
+    enabled_operator_actions,
+)
 from roastpilot_agent.store import RoastStore
 
 
@@ -87,19 +93,14 @@ class RawStateSource(Protocol):
         ...
 
 
-#: Operator actions that resolve to an MCP write command, mapped to the
-#: command×phase matrix entry used for the queue's phase-validity pre-check
-#: (E7-S2). The control actions — ``pause_advisory`` / ``resume_advisory`` /
-#: ``acknowledge_recovery`` — issue no MCP write and so have no matrix entry;
-#: they are accepted at the queue and validated by the controller on drain.
-_ACTION_COMMAND: dict[OperatorAction, RoastCommand] = {
-    OperatorAction.MARK_BEANS_ADDED: RoastCommand.MARK_BEANS_ADDED,
-    OperatorAction.MARK_FIRST_CRACK: RoastCommand.MARK_FIRST_CRACK,
-    OperatorAction.DROP_BEANS: RoastCommand.DROP_BEANS,
-    OperatorAction.START_COOLING: RoastCommand.START_COOLING,
-    OperatorAction.STOP_COOLING: RoastCommand.STOP_COOLING,
-    OperatorAction.EMERGENCY_STOP: RoastCommand.EMERGENCY_STOP,
-}
+#: Operator actions that resolve to an MCP write command, used for the queue's
+#: phase-validity pre-check (E7-S2). Aliased to the canonical map in ``safety.py``
+#: (next to the matrix) so the queue pre-check and the ``enabled_actions``
+#: derivation share one source of truth. The control actions — ``pause_advisory``
+#: / ``resume_advisory`` / ``acknowledge_recovery`` — issue no MCP write and so
+#: have no matrix entry; they are accepted at the queue and validated by the
+#: controller on drain.
+_ACTION_COMMAND = OPERATOR_ACTION_COMMAND
 
 
 class QueuedOperatorAction(BaseModel):
@@ -124,6 +125,26 @@ def _as_event_data(payload: object) -> dict[str, Any]:
     if isinstance(payload, dict):
         return cast("dict[str, Any]", payload)
     return {"value": payload}
+
+
+def _phase_changed_with_actions(data: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of a ``phase_changed`` payload with ``enabled_actions`` added.
+
+    The controller emits ``{"phase": <value>}``; this adds the operator actions
+    the server would accept in that phase (E10 option (a), D25) — a read-only
+    projection over :data:`~roastpilot_agent.safety.COMMAND_PHASE_MATRIX`. A NEW
+    dict is returned so the original (buffered for the persisted decision-trace
+    timeline) stays lean. A missing/unknown phase — never expected from the
+    controller's emit site — passes through unchanged rather than raising on the
+    SSE hot path."""
+    phase_value = data.get("phase")
+    if not isinstance(phase_value, str):
+        return data  # pragma: no cover — controller always emits a phase string
+    try:
+        phase = RoastPhase(phase_value)
+    except ValueError:  # pragma: no cover — controller emits valid phase values
+        return data
+    return {**data, "enabled_actions": [a.value for a in enabled_operator_actions(phase)]}
 
 
 class EventBroadcaster:
@@ -186,8 +207,19 @@ class EventBroadcaster:
                 queue.put_nowait(event)
 
     def emit(self, kind: RoastEventKind, payload: object) -> None:
-        """``EventEmitter`` protocol: publish a controller event (E9 sink)."""
-        self._publish(SseEventType(kind.value), _as_event_data(payload))
+        """``EventEmitter`` protocol: publish a controller event (E9 sink).
+
+        The ``phase_changed`` frame is enriched with ``enabled_actions`` — the
+        operator actions the server would accept in the new phase, a read-only
+        projection over the command×phase matrix (E10 option (a), D25) — so the
+        SPA's action bar updates on every transition without hardcoding a
+        client-side matrix. The enrichment builds a NEW payload; the controller's
+        original dict (also buffered for the lean decision-trace timeline) is
+        untouched."""
+        data = _as_event_data(payload)
+        if kind is RoastEventKind.PHASE_CHANGED:
+            data = _phase_changed_with_actions(data)
+        self._publish(SseEventType(kind.value), data)
 
     def emit_telemetry(self, data: TelemetryEventData) -> None:
         """Publish the per-tick ``telemetry`` event (plan §6)."""

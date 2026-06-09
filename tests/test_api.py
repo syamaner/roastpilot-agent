@@ -48,7 +48,7 @@ from roastpilot_agent.models import (
     SseEventType,
     TelemetryEventData,
 )
-from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
+from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
 from roastpilot_agent.store import RoastStore
 from tests.conftest import FakeClock, FakeMCPClient
 
@@ -280,6 +280,11 @@ async def test_get_roast_detail_and_404(client: AsyncClient, store: RoastStore) 
     found = await client.get("/api/roasts/run-1")
     assert found.status_code == 200
     assert found.json()["profile"]["name"] == "House Espresso"
+    # The snapshot carries enabled_actions for the run's phase (E10 option (a),
+    # D25) — the permission mirror the SPA's action bar reads.
+    assert found.json()["enabled_actions"] == [
+        a.value for a in enabled_operator_actions(RoastPhase.PREHEATING)
+    ]
 
     missing = await client.get("/api/roasts/nope")
     assert missing.status_code == 404
@@ -917,7 +922,12 @@ def test_event_broadcaster_drops_for_a_slow_consumer() -> None:
     broadcaster.emit(RoastEventKind.PHASE_CHANGED, {"phase": "preheating"})
     broadcaster.emit(RoastEventKind.PHASE_CHANGED, {"phase": "development"})  # full → dropped
     assert queue.qsize() == 1
-    assert queue.get_nowait().data == {"phase": "preheating"}
+    data = queue.get_nowait().data
+    # phase_changed is enriched with enabled_actions (E10 option (a), D25).
+    assert data["phase"] == "preheating"
+    assert data["enabled_actions"] == [
+        a.value for a in enabled_operator_actions(RoastPhase.PREHEATING)
+    ]
 
 
 @pytest.mark.asyncio
@@ -938,7 +948,12 @@ async def test_sse_endpoint_streams_typed_controller_event(
 
     frame = _parse_frame(frames[1])
     assert frame["event"] == "phase_changed"
-    assert frame["data"] == {"phase": "preheating"}
+    # phase_changed is enriched with enabled_actions (E10 option (a), D25).
+    frame_data = cast("dict[str, object]", frame["data"])
+    assert frame_data["phase"] == "preheating"
+    assert frame_data["enabled_actions"] == [
+        a.value for a in enabled_operator_actions(RoastPhase.PREHEATING)
+    ]
     assert frame["id"] == 1
 
 
