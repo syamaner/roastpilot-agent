@@ -70,9 +70,17 @@ operator actions without one today (`mark_beans_added`, `start_cooling`,
 D19). E9 green in CI realizes D17 criterion (1). The E10 UI kickoff brief is
 waiting in the plan repo.
 
-**E9-S1 (#80) is complete** — the E7 handoff wiring (`RoastRunner` live loop,
-4 new D19 handlers, `RoasterControlAdapter`, queue bound + 410 guard, restart
-recovery via the app lifespan) and the green 12-step mock slice
-(`tests/test_milestone1.py`). Decision trace captured in
-`docs/e9-decision-trace-2026-06-09.md`. Next: **E9-S2 (#81)** — the same flow
-against the real `coffee-roaster-mcp` subprocess in mock-driver mode.
+**E9 is complete** — both stories merged. **E9-S1 (#80):** the E7 handoff
+wiring (`RoastRunner` live loop, 4 new D19 handlers, `RoasterControlAdapter`,
+queue bound + 410 guard, restart recovery via the app lifespan) and the green
+12-step mock slice (`tests/test_milestone1.py`). **E9-S2 (#81):** the same flow
+against the real `coffee-roaster-mcp==0.1.3` spawned as a stdio subprocess in
+mock-driver mode (`tests/test_milestone1_real_mcp.py`); added the dev dep +
+`libportaudio2` to CI and wired `MCPConfig.env` forwarding. Traces in
+`docs/e9-decision-trace-2026-06-09.md` (fake) and
+`docs/e9-decision-trace-real-mcp-2026-06-09.md` (real). **E9 green in CI
+realizes D17 criterion (1).**
+
+**Next: E10 (SPA)** — the positive fan-out case (3 independent pages + the
+`ui-reviewer` subagent). Its UI kickoff brief is waiting in the plan repo; it
+awaits a deliberate kickoff.

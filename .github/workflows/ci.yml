@@ -27,6 +27,13 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
+      # The dev group installs coffee-roaster-mcp (the E9-S2 vertical slice
+      # spawns it in mock-driver mode), which depends on sounddevice — its
+      # import needs the PortAudio runtime even though mock mode never opens an
+      # audio device. Without it the bootstrap-safe child fails to start.
+      - name: Install system libraries (PortAudio for sounddevice)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
