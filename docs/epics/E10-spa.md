@@ -76,9 +76,18 @@ system Google Chrome** (no heavy download) + the `capture.mjs` screenshot script
    (header, advisory panel, badges, modals, tables) per replay state. These are
    the SPA's **own** baselines (committed PNGs), distinct from the prototype
    direction-match baselines.
-2. **The uPlot canvas is NOT pixel-snapshotted** — `mask:` it and **assert the
-   chart's data** via a test hook (the replay harness makes data deterministic);
-   ≤1 loose "did it blank/crash" canvas smoke shot. No GPU runner.
+2. **The uPlot canvas IS snapshotted (D26 revises D24).** ~~`mask:` it~~ — the
+   canvas is included in the page screenshots. Baselines are a **CI-only artifact**
+   (generated + diffed only inside the pinned amd64 Docker image, never on a dev
+   machine — that rule is also the macOS-Docker friction fix). Determinism kit:
+   `deviceScaleFactor: 1` (uPlot scales its backing store by DPR), wait on the
+   `window.__chart` point-count hook before shooting, `fonts.ready`, animations off,
+   replay-fixed data, residual jitter absorbed by `maxDiffPixelRatio ≈ 0.01`. The
+   **chart-data assertion stays as a complementary layer, not a replacement** — it
+   is the authoritative correctness oracle (data-assert green + pixel-diff red ⇒ a
+   render/CSS regression, not a data bug); the snapshot is a visual-smoke layer over
+   it. uPlot is 2D canvas (Skia CPU raster) — no GPU runner needed. *(Was: masked +
+   data-only, on a since-corrected "canvas pixels are unavoidably flaky" premise.)*
 3. **Vitest** snapshots only as sparse `toMatchInlineSnapshot` on small stable
    mappers (SSE-event→view-model, verdict→badge) — never full-DOM shadcn/Radix.
 4. **`ui-reviewer` uses the Microsoft Playwright MCP** (`@playwright/mcp`, wired
@@ -131,12 +140,14 @@ Owner: lead / `platform` teammate. Acceptance criteria:
   click-to-toggle, event markers (T0/FC/drop), charge band (preheating only),
   trace-row→highlight hook. `ui-prompts.md` is the spec. Expose a **chart-data
   test hook** (e.g. `window.__chart` / a `data-*`) so tests assert the series
-  data without pixel-diffing the canvas (D24).
+  data (D24). *(Under D26 the canvas is also pixel-snapshotted at S6; this hook
+  stays as the complementary authoritative correctness layer.)*
 - [ ] D15 verdict helper (ALLOW/CLAMP/REJECT badge; RECOVERY/FAULT/E-STOP are
   not badges — brief §3) + the routing shell for the three pages.
 - [ ] **Playwright snapshot + capture harness** (D24): the scripted
   `@playwright/test` `toHaveScreenshot()` setup against the replay harness, the
-  canvas-mask + chart-data-assert convention, the `.mcp.json` wiring the Playwright
+  chart-data-assert convention (canvas masked at S2; **D26 un-masks it at S6** so
+  the canvas is snapshotted too), the `.mcp.json` wiring the Playwright
   MCP for `ui-reviewer`, and the `/capture` skill — so `ui-reviewer` and the
   snapshot suite can run on the page PRs (S3–S5). See "Playwright is core" +
   "Snapshot & visual testing" above. **Verify the Playwright MCP tool-grant on
@@ -180,10 +191,29 @@ Owner: `detail` teammate. Acceptance criteria:
 Owner: lead / `ui-reviewer`. Acceptance criteria:
 
 - [ ] Component tests + the **scripted `toHaveScreenshot()` snapshot suite**
-  (D24) running **headless in the pinned Playwright Docker image in CI** against
-  the replay harness (harness set up in S2): DOM chrome per state, canvas masked +
-  chart data asserted. `ui-reviewer` (Playwright MCP, direction-match) pass
-  recorded against the frozen baselines — not a merge gate.
+  (D24/**D26**) running **headless in the pinned Playwright Docker image in CI**
+  against the replay harness (set up in S2). DOM chrome **and the uPlot canvas**
+  per state — the canvas is **no longer masked** (D26); baselines are a **CI-only
+  artifact** (generated + diffed only inside the pinned amd64 image). The
+  chart-data assertion stays as the authoritative correctness layer alongside the
+  pixel snapshot.
+- [ ] **Existing snapshots un-masked + baselines regenerated in Docker.** The
+  shipped states that masked the canvas — `dashboard-live` (S3) plus the
+  foundation / history / detail states — drop the `mask:` on the canvas selector
+  and have their baselines regenerated inside the pinned image. Remove the
+  canvas-mask convention from the S2 harness helper; keep the `window.__chart`
+  chart-data hook + assertion.
+- [ ] **New multi-fixture states, canvas un-masked from the start:**
+  `dashboard-fault`, `dashboard-recovery`, and the detail states deferred from
+  S3/S5 (their components already have component tests; S6 builds the multi-fixture
+  replay states they need). Each asserts chart data **and** snapshots the canvas.
+- [ ] **Canvas determinism kit applied** so the un-masked snapshots are stable in
+  CI: `deviceScaleFactor: 1`, wait on the `window.__chart` point-count hook before
+  shooting, `fonts.ready` + bundled axis webfont, animations off, replay-fixed
+  data, `maxDiffPixelRatio ≈ 0.01` (kept non-zero). Document that baselines are
+  **never** generated/diffed on macOS — CI Docker only.
+- [ ] `ui-reviewer` (Playwright MCP, direction-match) pass recorded against the
+  frozen prototype baselines — not a merge gate.
 - [ ] SSE keep-alive/reconnect verified on Safari/iPadOS; resolution recorded
   in plan §11 (closes open item 4).
 
@@ -196,19 +226,21 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
 | E10-S3 | Dashboard (live) | done (#113) |
 | E10-S4 | History page | done (#114) |
 | E10-S5 | Roast detail page | done (#116) |
-| E10-S6 | SPA tests and SSE behavior | not started |
+| E10-S6 | SPA tests and SSE behavior | in progress — deterministic close (D26 snapshot matrix + drift guard); ui-reviewer + Safari/iPad deferred |
 
 Epic status: **core done, close-out partial** — the page fan-out is complete:
 S1–S5 are all merged to `main` (replay #101, foundation #100, E7 `enabled_actions`
 contract #107/D25, S2 foundation follow-up #115 = phase_changed fix + types audit
 + bean token, dashboard #113, history #114, detail #116). **S6 (tests + SSE
 behavior) is in progress** — the deterministic close lands now (this status sync,
-the contract-fixture drift guard, the `product-pm` epic audit); the API-fragile /
-D24-pending parts are deferred to a stable session + the D24 revision:
-the multi-fixture snapshot matrix (the deferred dashboard-fault / dashboard-recovery
-+ detail states), the consolidated `ui-reviewer` visual pass, and Safari/iPad SSE
-(plan §11.4, a real-device/manual task). Re-sliced from 4→6 stories for parallel
-agent-team delivery (D23).
+the contract-fixture drift guard, the `product-pm` epic audit); the API-fragile parts
+are deferred to a stable session: the consolidated `ui-reviewer` visual pass and
+Safari/iPad SSE (plan §11.4, a real-device/manual task). The **multi-fixture
+snapshot matrix is now fully specified (D26)** — un-mask the existing canvas
+snapshots + regenerate baselines in Docker, and add the dashboard-fault /
+dashboard-recovery / detail states with the canvas un-masked; the scripted suite
+is deterministic so it is **not** API-blocked (it is Docker-baseline work, not a
+live-model task). Re-sliced from 4→6 stories for parallel agent-team delivery (D23).
 
 S3 notes: the dashboard renders the live curve, header (phase badge / roast +
 development timers / FC status / diagnostics drawer), control row (ghost markers =
@@ -219,7 +251,9 @@ banner + safety trail, and add-beans toast. Two contract gaps surfaced (tracked 
 #112): live `development_percent` is not on `TelemetryEventData` (show a
 development timer, omit %); no live FC-audio pipeline health signal (render real FC
 state — "listening" → detection — not a mock dot). `dashboard-live` snapshot ships
-here; `dashboard-fault` / `dashboard-recovery` snapshots deferred to S6 (their
+here (canvas masked at S3; **D26 un-masks + regenerates its baseline at S6**);
+`dashboard-fault` / `dashboard-recovery` snapshots deferred to S6 (their
 components are covered by component tests) — they need the multi-fixture replay
-harness S6 builds once. A foundation `phase_changed` field drift
+harness S6 builds once, and ship with the canvas un-masked (D26). A foundation
+`phase_changed` field drift
 (`agent_phase`→`phase`) was caught during S3 and routed to platform.

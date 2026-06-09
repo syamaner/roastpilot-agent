@@ -31,8 +31,10 @@ Procedure:
    in `roastpilot-plan/roastpilot-agent/sketches/screenshots/` — **direction-match,
    not pixel-match** (the rebuild differs; deviations *from the plan* are what you
    flag). `ui-prompts.md` is the chart spec of record. The **uPlot curve is a
-   canvas** — judge it visually, but its pixel-correctness is not your gate
-   (the scripted suite masks the canvas and asserts chart data instead, D24).
+   canvas** — judge it visually for *direction-match*; its deterministic
+   pixel-gate is the scripted suite, which now **snapshots the canvas** (un-masked,
+   CI-Docker baselines) **and** asserts chart data as the authoritative layer
+   (D26 revises D24). You are the judgment pass, not the gate.
 
 Check specifically:
 
