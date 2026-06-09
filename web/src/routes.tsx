@@ -23,6 +23,11 @@ const ChartHarnessPage = lazy(() =>
 const StreamSmokePage = lazy(() =>
   import("@/pages/harness/StreamSmokePage").then((m) => ({ default: m.StreamSmokePage })),
 );
+// E10-S5 detail snapshot harness — fixed REST-shaped data for the roast-detail /
+// roast-detail-selected baselines (deterministic without the stepped-SSE backend).
+const DetailHarnessPage = lazy(() =>
+  import("@/pages/detail/DetailHarnessPage").then((m) => ({ default: m.DetailHarnessPage })),
+);
 
 export const routes: RouteObject[] = [
   { path: "/", element: <DashboardPage /> },
@@ -33,4 +38,6 @@ export const routes: RouteObject[] = [
   // __stream-smoke: the live SSE path wired to the real replay harness (S1).
   { path: "/__chart-harness", element: <ChartHarnessPage /> },
   { path: "/__stream-smoke", element: <StreamSmokePage /> },
+  // __detail-harness: the detail page over fixed REST data (E10-S5 snapshots).
+  { path: "/__detail-harness", element: <DetailHarnessPage /> },
 ];
