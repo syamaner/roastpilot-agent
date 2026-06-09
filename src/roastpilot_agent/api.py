@@ -33,6 +33,7 @@ from roastpilot_agent.config import AppConfig
 from roastpilot_agent.controller import (
     TRANSITION_TABLE,
     CommandExecutor,
+    ControllerSnapshot,
     RoastController,
     StateReader,
     TickScheduler,
@@ -151,6 +152,16 @@ class EventBroadcaster:
     def subscriber_count(self) -> int:
         """Number of attached SSE connections."""
         return len(self._subscribers)
+
+    @property
+    def last_event_id(self) -> int:
+        """The id stamped on the most recently published frame (0 before any).
+
+        The same monotonic sequence every ``SseEvent`` carries, so a caller that
+        drove the stream synchronously (the replay step surface, E10-S1) can wait
+        until a client's ``lastEventId`` has caught up to this value — a
+        deterministic settle signal with no arbitrary sleep."""
+        return self._sequence
 
     def subscribe(self) -> asyncio.Queue[SseEvent]:
         """Register a new subscriber queue for one SSE connection."""
@@ -376,6 +387,22 @@ class RoastRunner:
     def finalized(self) -> bool:
         """Whether the run reached a terminal phase and was completed."""
         return self._finalized
+
+    def controller_snapshot(self) -> "ControllerSnapshot":
+        """The controller's current post-tick snapshot (phase + commanded levels).
+
+        A read-only projection the replay step surface (E10-S1) reads to report
+        the settled agent phase / elapsed without touching the store; the
+        controller owns the phase, never the caller."""
+        return self._controller.snapshot()
+
+    @property
+    def current_tick(self) -> int:
+        """The current tick index (the runner's shared counter).
+
+        The replay harness (E10-S1) reads it to key its synthesized advisory
+        trace to the same tick as the surrounding telemetry rows."""
+        return self._counter.value
 
     async def run(self) -> None:
         """Production loop: tick at the configured interval until the run ends."""
@@ -1221,7 +1248,15 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await service.shutdown()
 
 
-def create_app(service: RoastService | None = None) -> FastAPI:
+#: The app lifespan type: an async context manager over the FastAPI app.
+Lifespan = Callable[[FastAPI], contextlib.AbstractAsyncContextManager[None]]
+
+
+def create_app(
+    service: RoastService | None = None,
+    *,
+    lifespan: Lifespan | None = None,
+) -> FastAPI:
     """Create the FastAPI application.
 
     ``service`` is the backend authority (store + active-run state + MCP
@@ -1230,8 +1265,17 @@ def create_app(service: RoastService | None = None) -> FastAPI:
     relies on. The E9 vertical slice constructs a fully-wired service and
     passes it here; the lifespan then runs restart recovery on startup and
     stops the live loop on shutdown.
+
+    ``lifespan`` overrides that default startup/teardown. The replay harness
+    (E10-S1) passes a no-recovery lifespan: it drives the run itself and the
+    run is already active, so the restart-recovery startup would wrongly force
+    it into ``operator_recovery_required``.
     """
-    app = FastAPI(title="roastpilot-agent", version=__version__, lifespan=_lifespan)
+    app = FastAPI(
+        title="roastpilot-agent",
+        version=__version__,
+        lifespan=lifespan or _lifespan,
+    )
     app.state.service = service
     app.get("/api/health")(health)
     app.post("/api/roasts", status_code=201)(start_roast)

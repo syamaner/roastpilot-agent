@@ -1,0 +1,43 @@
+{
+  "active": true,
+  "beans_added_at_utc": "2026-06-07T13:13:25.669133+00:00",
+  "beans_dropped_at_utc": "2026-06-07T13:24:05.017980+00:00",
+  "cooling_on": true,
+  "cooling_started_at_utc": "2026-06-07T13:24:05.018320+00:00",
+  "cooling_stopped_at_utc": null,
+  "created_at_utc": "2026-06-07T13:05:09.282055+00:00",
+  "development_time_percent": 16.231,
+  "development_time_seconds": 103.77,
+  "event_count": 4,
+  "fan_level_percent": 100,
+  "faulted_at_utc": null,
+  "first_crack_at_utc": "2026-06-07T13:22:21.243877+00:00",
+  "first_crack_model": {
+    "confidence": 0.9074137558756702,
+    "confidence_threshold": 0.6,
+    "confirmation_window_seconds": 20.0,
+    "feature_extractor_filename": "onnx/int8/preprocessor_config.json",
+    "min_positive_windows": 5,
+    "onnx_model_filename": "onnx/int8/model_quantized.onnx",
+    "precision": "int8",
+    "repo_id": "syamaner/coffee-first-crack-detection",
+    "revision": "b349a919c34b6130472da97c01817be404e4f629"
+  },
+  "heat_level_percent": 0,
+  "metrics": {
+    "bean_ror_c_per_min": 8.719,
+    "bean_temp_delta_60s_c": 8.0,
+    "development_percent": 16.231,
+    "development_time_percent": 16.231,
+    "development_time_seconds": 103.77,
+    "env_ror_c_per_min": 1.09,
+    "env_temp_delta_60s_c": 1.0,
+    "roast_elapsed_seconds": 639.346
+  },
+  "phase": "cooling",
+  "roaster_driver": "hottop_kn8828b_2k_plus",
+  "session_id": "f97fc99b24e948e79954361364257b0e",
+  "started_at_utc": "2026-06-07T13:05:09.282055+00:00",
+  "stopped_at_utc": null,
+  "total_roast_seconds": 639.346
+}

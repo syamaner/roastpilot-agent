@@ -85,11 +85,24 @@ system Google Chrome** (no heavy download) + the `capture.mjs` screenshot script
 
 Owner: `replay` teammate (Python; runs ∥ with S2). Acceptance criteria:
 
-- [ ] `replay.py` + `--replay` CLI flag stream a recorded export through the
+- [x] `replay.py` + `--replay` CLI flag stream a recorded export through the
   real SSE pipeline at 1×–60×; deterministic stepping for Playwright; 1× is
-  the screen-recording rig (E12).
-- [ ] Replay fixtures copied into `tests/fixtures/replay/` (the 7-Jun
-  live-roast exports per the kickoff brief §4) — no cross-repo runtime refs.
+  the screen-recording rig (E12). Replay drives the real
+  `RoastService`/`RoastRunner`/`RoastController` via a `ReplayRoasterControl`
+  (no parallel event path; agent phase is server-derived). The deterministic
+  step API is the gated HTTP control surface `POST /api/replay/{step,advance-to}`
+  (markers: preheating/t0/first_crack/clamp/drop/cooling/recovery/fault/end),
+  mounted **only** in `--step` mode (a test pins it off the live app); each
+  call returns `{agent_phase, tick, elapsed_seconds, finalized, settled,
+  last_event_id}` for a sleepless Playwright settle.
+- [x] Replay fixtures copied into `tests/fixtures/replay/` (the 7-Jun
+  live-roast `session-1`/`session-2` exports per kickoff §4) — no cross-repo
+  runtime refs. Plus a synthetic `fault-pre-t0/` track (clearly labelled) that
+  drives the **real** `SafetyPolicy` past the pre-T0 bound for the
+  fault/recovery baselines — the real roasts never fault. The talk's CLAMP key
+  frame is synthesized demo trace (`source: replay_overlay`) whose verdict is
+  computed by the real `SafetyPolicy.evaluate_command`, persisted to the
+  timeline + emitted on SSE.
 
 ### E10-S2 — SPA foundation (the shared substrate, single-owned)
 
@@ -171,7 +184,7 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
 
 | Story | Title | Status |
 |-------|-------|--------|
-| E10-S1 | Replay harness | not started |
+| E10-S1 | Replay harness | done |
 | E10-S2 | SPA foundation (shared substrate) | not started |
 | E10-S3 | Dashboard (live) | not started |
 | E10-S4 | History page | not started |
