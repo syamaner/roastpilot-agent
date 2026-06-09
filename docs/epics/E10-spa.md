@@ -48,6 +48,17 @@ operator-action endpoint's typed reject-with-reason (already implemented) for
 invalid attempts. (a) is the better UX; (b) needs no server change. Pick one
 before S3 builds the action bar — don't let the dashboard teammate invent it.
 
+### Playwright is core (set it up early, not at S6)
+
+Playwright backs four things, so treat it as foundation: the `ui-reviewer`
+visual review, the component/E2E tests, the screenshot baselines, and the E12
+demo screen-recording rig. It must be working **by the end of S2** so
+`ui-reviewer` can run on the page PRs (S3–S5) — not deferred to S6. Reuse the
+established pattern from `roastpilot-plan/.../sketches/`: **`playwright-core` +
+system Google Chrome** (no heavy download) + the `capture.mjs` screenshot script
+(port it into `web/`). It runs **headless in CI** against the replay harness
+(S6); baselines are **direction-match, not pixel-match**.
+
 ## Stories
 
 ### E10-S1 — Replay harness
@@ -81,6 +92,10 @@ Owner: lead / `platform` teammate. Acceptance criteria:
   trace-row→highlight hook. `ui-prompts.md` is the spec.
 - [ ] D15 verdict helper (ALLOW/CLAMP/REJECT badge; RECOVERY/FAULT/E-STOP are
   not badges — brief §3) + the routing shell for the three pages.
+- [ ] **Playwright + screenshot-capture harness** wired against the replay
+  harness (reuse the sketches' `playwright-core` + system-Chrome pattern, port
+  `capture.mjs`) — so `ui-reviewer` can run on the page PRs (S3–S5). See
+  "Playwright is core" below.
 
 ### E10-S3 — Dashboard (live)
 
