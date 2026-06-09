@@ -1,0 +1,7 @@
+{
+  "active": false,
+  "note": "SYNTHETIC fixture (E10-S1): hand-authored pre-T0 thermal-overrun track. Bean temp crosses the 200C pre-T0 bound at ~frame 7 with no T0, so the real SafetyPolicy emits RECOVERY and the agent enters operator_recovery_required. Not a recorded roast; only the telemetry is synthetic, the verdict is real.",
+  "phase": "operator_recovery_required",
+  "pre_t0_max_bean_temp_c": 200.0,
+  "synthetic": true
+}
