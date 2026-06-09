@@ -9,9 +9,12 @@
  *     is empty or the filter is too narrow.
  *
  * Inline SVG, hand-rolled Tailwind (no icon dep) — matches the S2 shared
- * components. There is no "Start a roast" CTA: starting a roast is the
- * dashboard's job (out of this page's scope), so we don't fabricate an action.
+ * components. The first-run state offers a NAVIGATION link to the dashboard
+ * (where a roast is actually started) rather than a fabricated "start roast"
+ * action this page cannot fulfill — an honest route nav, not a fake control.
  */
+
+import { Link } from "react-router-dom";
 
 export function HistoryEmpty(): React.JSX.Element {
   return (
@@ -27,9 +30,17 @@ export function HistoryEmpty(): React.JSX.Element {
         </svg>
       </div>
       <h2 className="mb-2 font-mono text-xl text-foreground">No roasts yet</h2>
-      <p className="mx-auto max-w-md text-sm text-muted-foreground">
+      <p className="mx-auto mb-6 max-w-md text-sm text-muted-foreground">
         Your roast history will appear here once you complete your first roast.
       </p>
+      <Link
+        to="/"
+        data-testid="history-empty-dashboard-link"
+        className="inline-flex items-center gap-1 rounded-md border border-border bg-background px-4 py-2 font-mono text-xs uppercase tracking-wide text-foreground transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      >
+        Start a roast on the dashboard
+        <span aria-hidden="true">→</span>
+      </Link>
     </div>
   );
 }

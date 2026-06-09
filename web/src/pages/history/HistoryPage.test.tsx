@@ -69,6 +69,9 @@ describe("HistoryPage", () => {
     await screen.findByTestId("history-empty");
     expect(screen.queryByTestId("history-table")).not.toBeInTheDocument();
     expect(screen.queryByTestId("history-filter")).not.toBeInTheDocument();
+    // The empty state links to the dashboard (an honest route nav, not a
+    // fabricated "start roast" action this page can't perform).
+    expect(screen.getByTestId("history-empty-dashboard-link")).toHaveAttribute("href", "/");
   });
 
   it("shows an error state when the request fails", async () => {
