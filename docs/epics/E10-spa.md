@@ -193,11 +193,27 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
 |-------|-------|--------|
 | E10-S1 | Replay harness | done (#101) |
 | E10-S2 | SPA foundation (shared substrate) | done (#100) |
-| E10-S3 | Dashboard (live) | not started |
+| E10-S3 | Dashboard (live) | done (#95) |
 | E10-S4 | History page | done (#114) |
 | E10-S5 | Roast detail page | in review (#116) |
 | E10-S6 | SPA tests and SSE behavior | not started |
 
 Epic status: **in progress** — S1 (#101) + S2 (#100) merged to `main`; the E7
-`enabled_actions` contract (#107, D25) is in review; pages S3/S4/S5 + S6 next.
-Re-sliced from 4→6 stories for parallel agent-team delivery (D23).
+`enabled_actions` contract (#107, D25) merged; the S2 foundation follow-up (#115,
+phase_changed fix + types audit + bean token) merged; S3 (#95, the dashboard) +
+S4 (#114, history) merged; S5 (#116, detail) in review; S6 next. Re-sliced from
+4→6 stories for parallel agent-team delivery (D23).
+
+S3 notes: the dashboard renders the live curve, header (phase badge / roast +
+development timers / FC status / diagnostics drawer), control row (ghost markers =
+advisor targets), advisory panel (ALLOW/CLAMP/REJECT badges), operator action bar
+(enablement from the server `enabled_actions` mirror; confirm-press e-stop; hides
+permitted-but-meaningless toggles on terminal phases), recovery modal, fault
+banner + safety trail, and add-beans toast. Two contract gaps surfaced (tracked as
+#112): live `development_percent` is not on `TelemetryEventData` (show a
+development timer, omit %); no live FC-audio pipeline health signal (render real FC
+state — "listening" → detection — not a mock dot). `dashboard-live` snapshot ships
+here; `dashboard-fault` / `dashboard-recovery` snapshots deferred to S6 (their
+components are covered by component tests) — they need the multi-fixture replay
+harness S6 builds once. A foundation `phase_changed` field drift
+(`agent_phase`→`phase`) was caught during S3 and routed to platform.
