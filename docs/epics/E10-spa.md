@@ -191,12 +191,13 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
 
 | Story | Title | Status |
 |-------|-------|--------|
-| E10-S1 | Replay harness | done |
-| E10-S2 | SPA foundation (shared substrate) | in review (#94) |
+| E10-S1 | Replay harness | done (#101) |
+| E10-S2 | SPA foundation (shared substrate) | done (#100) |
 | E10-S3 | Dashboard (live) | not started |
 | E10-S4 | History page | not started |
 | E10-S5 | Roast detail page | not started |
 | E10-S6 | SPA tests and SSE behavior | not started |
 
-Epic status: **not started** — depends on E7 ✅. Re-sliced from 4→6 stories
-for parallel agent-team delivery (D23).
+Epic status: **in progress** — S1 (#101) + S2 (#100) merged to `main`; the E7
+`enabled_actions` contract (#107, D25) is in review; pages S3/S4/S5 + S6 next.
+Re-sliced from 4→6 stories for parallel agent-team delivery (D23).
