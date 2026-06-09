@@ -1614,6 +1614,28 @@ async def test_start_cooling_write_failure_surfaces_command_failed_no_transition
 # --- E10 option (a) / D25: enabled_actions is a faithful permission mirror ---
 
 
+def _acknowledge_resumes_phase(phase: RoastPhase) -> bool:
+    """Whether the controller's recovery resume (the op the acknowledge drain
+    calls) actually acts from ``phase`` — driven against the REAL controller.
+
+    ``RoastRunner._dispatch_acknowledge`` resumes via
+    ``controller.operator_resume(target)``; that method raises
+    ``InvalidTransitionError`` unless the controller is in
+    ``operator_recovery_required`` (its own guard). We try every recovery-row
+    target and report whether the controller transitioned — so a widening of the
+    controller's resume guard (or the recovery row) is caught, not assumed."""
+    recovery_targets = TRANSITION_TABLE[RoastPhase.OPERATOR_RECOVERY_REQUIRED]
+    for target in recovery_targets:
+        controller = controller_in(phase)
+        try:
+            controller.operator_resume(target)
+        except InvalidTransitionError:
+            continue
+        if controller.phase is target:
+            return True
+    return False
+
+
 def _controller_accepts(action: OperatorAction, phase: RoastPhase) -> bool:
     """Whether the REAL controller would ACT on ``action`` in ``phase`` — the
     independent oracle the ``enabled_operator_actions`` projection is pinned
@@ -1628,9 +1650,12 @@ def _controller_accepts(action: OperatorAction, phase: RoastPhase) -> bool:
     * ``pause_advisory`` / ``resume_advisory``: unconditional toggles (no phase
       gate) — accepted in every phase; verified by observing the
       ``_advisory_paused`` flag actually flips.
-    * ``acknowledge_recovery``: the drain resumes only from
-      ``operator_recovery_required`` (``RoastRunner._dispatch_acknowledge`` / the
-      controller's recovery transition row); any other phase is a no-op/failure.
+    * ``acknowledge_recovery``: driven through the REAL drain
+      (``RoastRunner._dispatch_acknowledge``) by ``_acknowledge_resumes_phase`` — it
+      resumes (phase actually changes to the requested target) only from
+      ``operator_recovery_required``; any other phase is a no-op. Executing the real
+      drain catches a future *widening* of either the drain's phase guard or the
+      recovery transition row — a static literal would silently pass.
     """
     command = OPERATOR_ACTION_COMMAND.get(action)
     if command is not None:
@@ -1654,8 +1679,7 @@ def _controller_accepts(action: OperatorAction, phase: RoastPhase) -> bool:
             isinstance(p, dict) and cast("dict[str, object]", p).get("advisory_paused") is want
             for p in advisory
         )
-    # acknowledge_recovery: resume is legal only from the recovery phase.
-    return phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    return _acknowledge_resumes_phase(phase)
 
 
 @pytest.mark.parametrize("action", list(OperatorAction))
