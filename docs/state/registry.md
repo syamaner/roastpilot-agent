@@ -2,7 +2,7 @@
 
 ## Active Epic
 
-- Epic file: `docs/epics/E09-vertical-slice.md`
+- Epic file: `docs/epics/E10-spa.md`
 - Project: RoastPilot (GitHub user project, owner `syamaner`)
 - Repository: `syamaner/roastpilot-agent`
 - Package: `roastpilot-agent`
@@ -81,6 +81,17 @@ mock-driver mode (`tests/test_milestone1_real_mcp.py`); added the dev dep +
 `docs/e9-decision-trace-real-mcp-2026-06-09.md` (real). **E9 green in CI
 realizes D17 criterion (1).**
 
-**Next: E10 (SPA)** — the positive fan-out case (3 independent pages + the
-`ui-reviewer` subagent). Its UI kickoff brief is waiting in the plan repo; it
-awaits a deliberate kickoff.
+**E9 is complete (criterion (1) realized).** Both stories merged; epic #82
+closed.
+
+**E10 (SPA) is now active** — the active epic, and the deliberate positive
+fan-out case (the contrast to E9's single-session anti-pattern). Delivered as
+a **supervised agent team** (D23): foundation-first, then one teammate per
+page. Six single-owner stories — S1 replay harness (∥), S2 foundation (the
+shared substrate; gates Stage C), S3 dashboard / S4 history / S5 detail (the
+genuine 3-way fan-out), S6 tests + SSE behavior. Replay fixtures copied into
+`tests/fixtures/replay/` (session-1 + session-2; session-2 is the auto-T0 demo
+fixture). Playwright is treated as core foundation (set up in S2, used by
+`ui-reviewer` on the page PRs). Kickoff brief:
+`roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`. E10 realizes D17
+criterion (2) — dashboard usable for a live roast.
