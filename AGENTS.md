@@ -186,13 +186,22 @@ clean.
   pass.
 - Re-run the checks after any fix; only merge once CI is green *and* every
   comment is resolved or consciously dismissed.
+- **Independent triage when work is delivered by an agent team (D23).** PR
+  review feedback (GitHub Claude Code Review, codecov, CodeRabbit) is
+  adjudicated by the lead/PM or the `pr-triage` subagent — *never* by the
+  author teammate self-dismissing comments on its own PR. The author fixes;
+  someone else decides what counts as resolved. (External review bots are
+  already independent of the author; this rule keeps the *triage decision*
+  independent too.)
 
 ## Claude Code
 
 - Sub-agents live under `.claude/agents/`: `safety-reviewer` (PRs touching
   safety/controller/enums), `mcp-contract-checker` (dependency bumps),
   `sim-roast-runner` (mock vertical slice + decision-trace summaries),
-  `ui-reviewer` (Playwright against the replay harness).
+  `ui-reviewer` (Playwright against the replay harness), `pr-triage`
+  (independent PR-feedback triage for agent-team delivery, D23 — also the
+  `triage-pr` skill).
 - `CLAUDE.md` contains exactly `@AGENTS.md` — rules belong here, never there.
 
 ## Hardware Safety Notes
