@@ -20,11 +20,17 @@ const DetailPage = lazy(() =>
 const ChartHarnessPage = lazy(() =>
   import("@/pages/harness/ChartHarnessPage").then((m) => ({ default: m.ChartHarnessPage })),
 );
+const StreamSmokePage = lazy(() =>
+  import("@/pages/harness/StreamSmokePage").then((m) => ({ default: m.StreamSmokePage })),
+);
 
 export const routes: RouteObject[] = [
   { path: "/", element: <DashboardPage /> },
   { path: "/roasts", element: <HistoryPage /> },
   { path: "/roasts/:runId", element: <DetailPage /> },
-  // Foundation harness — the snapshot suite's stable target (D24). Dev/test only.
+  // Foundation harnesses — dev/test only, the snapshot suite's stable targets (D24).
+  // __chart-harness: fixed-data LiveCurve/badge/indicator gallery.
+  // __stream-smoke: the live SSE path wired to the real replay harness (S1).
   { path: "/__chart-harness", element: <ChartHarnessPage /> },
+  { path: "/__stream-smoke", element: <StreamSmokePage /> },
 ];

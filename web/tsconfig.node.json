@@ -19,10 +19,5 @@
 
     "types": ["node"]
   },
-  "include": [
-    "vite.config.ts",
-    "vitest.config.ts",
-    "playwright.config.ts",
-    "scripts/**/*.mjs"
-  ]
+  "include": ["vite.config.ts", "vitest.config.ts", "scripts/**/*.mjs"]
 }

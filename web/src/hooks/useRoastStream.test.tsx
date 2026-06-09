@@ -134,4 +134,33 @@ describe("useRoastStream", () => {
     });
     expect(latest!.status).toBe("stale");
   });
+
+  it("does not flip straight to stale on a slow reconnect (lastFrameAt reset)", async () => {
+    // Regression for the reconnect false-stale bug: a reconnect that takes longer
+    // than the stale window must reset the freshness clock at connect(), so the
+    // watchdog cannot fire `stale` the instant the new stream opens.
+    vi.useFakeTimers();
+    let latest: UseRoastStreamResult | null = null;
+    render(<Probe runId="r1" snapshotPhase="preheating" onResult={(r) => (latest = r)} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const first = FakeEventSource.last!;
+    act(() => first.open());
+    expect(latest!.status).toBe("live");
+
+    // Drop the stream → backoff scheduled; let a long gap pass (> stale window).
+    act(() => first.error());
+    expect(latest!.status).toBe("reconnecting");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000); // covers backoff + reopen + a stale-tick
+    });
+
+    // The new EventSource opened; on open the status must be live — NOT stale —
+    // because connect() reset lastFrameAt for the fresh attempt.
+    const second = FakeEventSource.last!;
+    expect(second).not.toBe(first);
+    act(() => second.open());
+    expect(latest!.status).toBe("live");
+  });
 });

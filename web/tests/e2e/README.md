@@ -19,20 +19,54 @@ What the gate asserts:
   correctness is asserted via the **chart-data hook** (`readChartData` →
   `window.__chart`), not pixels.
 - ≤1 loose canvas smoke shot ("did it draw / not blank").
+- A **real-replay SSE smoke** (`stream-smoke.spec.ts`): the server-derived phase
+  reaches the SPA over the live SSE path against the actual replay backend.
 
 Determinism: fixed 1600×1000 viewport, `fonts.ready` awaited (`settle`),
 animations disabled, reduced motion, a small non-zero pixel tolerance.
 
+### Two runtimes — the suite drives the REAL replay harness (S1)
+
+Playwright manages **two webServers** (see `playwright.config.ts`):
+
+1. **The agent** in `roastpilot-agent --replay <fixture> --step` mode — the real
+   backend (REST + SSE + the gated `POST /api/replay/{step,advance-to}` routes).
+2. **The built SPA** via `vite preview`, proxying `/api` to the agent.
+
+So a replayed roast is byte-identical to live, and the specs drive deterministic
+states via `advance-to`/`step` (see `global-setup.ts`). The settle protocol is
+`window.__lastEventId` (published by the SSE reducer) ≥ the step's `last_event_id`
+— no arbitrary sleeps. `advance-to` failing loud (404) on an unreached marker is
+the harness's contract (S1).
+
+Because of (1), the snapshot job needs **both Python (the agent) and Node**.
+Replay mode never spawns the MCP child, so no `libportaudio2`/`sounddevice` is
+required (unlike the Python `checks` job). The CI `web-snapshots` job installs
+Python 3.11 + `pip install -e .` alongside Node before running the suite.
+
+**S2 scope:** the harness drives **one** real state (session-2 → `preheating`)
+to prove the webServer + deterministic stepping end-to-end via the dev-only
+`/__stream-smoke` route. The full fixture→marker state matrix (dashboard-live/
+fault/recovery, detail, history) lands with the pages (S3–S5) / S6, reusing this
+exact path and the `tests/e2e/global-setup.ts` helpers.
+
 ### Generating / updating baselines
 
-Always inside the pinned image, `--platform=linux/amd64` to match CI:
+Always inside the pinned image, `--platform=linux/amd64` to match CI. Mount the
+**repo root** (the agent + replay fixtures live there) and install both runtimes:
 
 ```bash
-# from web/
+# from the repo root
 docker run --rm --platform=linux/amd64 \
-  -v "$PWD":/work -w /work \
+  -v "$PWD":/work -w /work/web \
   mcr.microsoft.com/playwright:v1.55.1-noble \
-  bash -c "npm ci && npm run build && npx playwright test --update-snapshots"
+  bash -c '
+    apt-get update -qq && apt-get install -y -qq python3 python3-venv python3-pip
+    python3 -m venv /tmp/venv && . /tmp/venv/bin/activate
+    pip install -q -e /work
+    export PATH="/tmp/venv/bin:$PATH"
+    npm ci && npm run build && npx playwright test --update-snapshots
+  '
 ```
 
 Commit the resulting `__screenshots__/**/*-linux.png`. Bump the image tag and the

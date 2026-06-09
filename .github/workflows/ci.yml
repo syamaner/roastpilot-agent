@@ -101,6 +101,12 @@ jobs:
   # INSIDE the pinned Playwright Linux image so its pixels match the committed
   # baselines (which are generated in this same image). Local macOS/system-Chrome
   # pixels drift — they are for the /capture skill + ui-reviewer only, not this gate.
+  #
+  # The suite drives the REAL replay harness (E10-S1): one webServer is the agent
+  # in `--replay <fixture> --step` mode (REST + SSE + the gated step routes), the
+  # other is the built SPA proxying /api to it. So the container needs BOTH Python
+  # (the agent) and Node (Playwright). Replay mode never spawns the MCP child, so
+  # no libportaudio2 / sounddevice is needed here (unlike the Python `checks` job).
   web-snapshots:
     name: Web (Playwright snapshots)
     runs-on: ubuntu-latest
@@ -108,10 +114,6 @@ jobs:
     container:
       # Pinned to the @playwright/test version in web/package.json — bump both together.
       image: mcr.microsoft.com/playwright:v1.55.1-noble
-      options: --user 1001
-    defaults:
-      run:
-        working-directory: web
     steps:
       - name: Check out repository
         uses: actions/checkout@v6.0.2
@@ -123,15 +125,27 @@ jobs:
           cache: "npm"
           cache-dependency-path: web/package-lock.json
 
-      - name: Install dependencies
+      - name: Set up Python (for the replay-harness webServer)
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Install the agent (replay harness — no MCP/audio needed)
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+
+      - name: Install web dependencies
+        working-directory: web
         run: npm ci
 
       - name: Build SPA
+        working-directory: web
         run: npm run build
 
       - name: Run snapshot + e2e suite
-        # The browsers ship in the image; the config's webServer serves the built
-        # SPA and the suite asserts DOM chrome (canvas masked) + the chart data hook.
+        working-directory: web
+        # Two webServers (Playwright-managed): the agent in --replay --step mode +
+        # the built SPA. The suite asserts DOM chrome (canvas masked) + the chart
+        # data hook + the real-replay SSE smoke against committed Linux baselines.
         run: npx playwright test
 
       - name: Upload Playwright report on failure

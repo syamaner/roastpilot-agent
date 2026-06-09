@@ -18,10 +18,17 @@ import { defineConfig, devices } from "@playwright/test";
  */
 export default defineConfig({
   testDir: "./tests/e2e",
+  // Drives the replay harness to the smoke state (session-2 → preheating) after
+  // both webServers are up — deterministic real-replay state for the snapshot.
+  globalSetup: "./tests/e2e/global-setup.ts",
   // Snapshots are committed and keyed by platform; the Linux baselines (from the
   // pinned image) are the gate. {arg} keeps multiple states in one spec distinct.
   snapshotPathTemplate: "{testDir}/__screenshots__/{testFilePath}/{arg}-{platform}{ext}",
-  fullyParallel: true,
+  // The replay-backed specs drive ONE shared stepped run that advances
+  // monotonically, so they must run serially — parallel stepping would race on
+  // shared backend state. The suite is small; a single worker is fine.
+  fullyParallel: false,
+  workers: 1,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   reporter: process.env.CI ? "github" : "list",
@@ -44,16 +51,32 @@ export default defineConfig({
       use: { ...devices["Desktop Chrome"] },
     },
   ],
-  // Serve the BUILT SPA for snapshots. In S2 the harness targets the deterministic
-  // /__chart-harness route (fixed data) so the suite is green before any page
-  // exists. S3–S6 add page snapshots backed by the replay harness (S1) — wire
-  // that webServer to `roastpilot-agent --replay <fixture>` + the SPA once #93 lands.
-  webServer: {
-    command: "npm run preview -- --port 4173 --strictPort --host 127.0.0.1",
-    // Probe the root (always 200) — `vite preview` has no SPA history fallback,
-    // so a deep route like /__chart-harness 404s the readiness check.
-    url: "http://127.0.0.1:4173/",
-    reuseExistingServer: !process.env.CI,
-    timeout: 120_000,
-  },
+  // Two servers, both started by Playwright:
+  //   1. The agent in REPLAY --step mode (the real backend: REST + SSE +
+  //      the gated /api/replay/{step,advance-to} control routes). The SPA's
+  //      preview proxy forwards /api here, so a replayed roast is byte-identical
+  //      to live. session-2 is the default demo fixture (auto-T0 + the CLAMP).
+  //   2. The built SPA via `vite preview` (proxying /api to server 1).
+  // The deterministic step API + the replay harness are what make the snapshots
+  // reproducible — global-setup.ts drives states via advance-to.
+  webServer: [
+    {
+      command:
+        "roastpilot-agent --replay tests/fixtures/replay/session-2 --step " +
+        "--host 127.0.0.1 --port 8000",
+      cwd: "..",
+      // health is up as soon as the app mounts (paused at tick 0).
+      url: "http://127.0.0.1:8000/api/health",
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    {
+      command: "npm run preview -- --port 4173 --strictPort --host 127.0.0.1",
+      // Probe the root (always 200) — `vite preview` has no SPA history fallback,
+      // so a deep route 404s the readiness check.
+      url: "http://127.0.0.1:4173/",
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+  ],
 });

@@ -24,6 +24,15 @@ import {
   type RoastStreamState,
 } from "./roastStreamReducer";
 
+declare global {
+  interface Window {
+    /** Highest applied SSE event id (test hook, D24): the Playwright global-setup
+     *  waits until this catches up to the replay step's `last_event_id` before
+     *  screenshotting — a deterministic settle signal with no arbitrary sleep. */
+    __lastEventId?: number;
+  }
+}
+
 export type ConnectionStatus = "connecting" | "live" | "reconnecting" | "stale";
 
 export interface UseRoastStreamOptions {
@@ -127,6 +136,11 @@ export function useRoastStream(
     const connect = () => {
       if (cancelled) return;
       setStatus(attempt === 0 ? "connecting" : "reconnecting");
+      // Reset the freshness clock on every (re)connect: otherwise a reconnect
+      // that takes longer than the stale window leaves `lastFrameAt` at the old
+      // timestamp, so the watchdog can fire `stale` the instant the new stream
+      // opens — before the first frame/heartbeat has had a chance to arrive.
+      lastFrameAt.current = Date.now();
 
       // Snapshot-first: hydrate from REST, THEN open the stream and apply frames.
       // A failed snapshot is treated as a dropped connection (back off, retry).
@@ -165,13 +179,21 @@ export function useRoastStream(
       for (const type of SSE_EVENT_TYPES) {
         es.addEventListener(type, (ev) => {
           markFrame();
+          const id = ev.lastEventId ? Number(ev.lastEventId) : null;
           const frame: SseEvent = {
             event: type,
             data: parseData(ev.data),
-            id: ev.lastEventId ? Number(ev.lastEventId) : null,
+            id,
           };
           dispatch({ kind: "event", event: frame });
           setLastEvent(frame);
+          // Test hook (D24): the Playwright global-setup waits until this catches
+          // up to the replay step's `last_event_id` before screenshotting — a
+          // deterministic settle signal, no arbitrary sleep. Same monotonic
+          // sequence the broadcaster stamps + the reducer dedups on.
+          if (id !== null && typeof window !== "undefined") {
+            window.__lastEventId = Math.max(window.__lastEventId ?? 0, id);
+          }
         });
       }
     };

@@ -9,6 +9,13 @@ import { defineConfig } from "vite";
 // it is a plain GET; `changeOrigin` keeps the Host header sane.
 const API_TARGET = process.env.ROASTPILOT_API ?? "http://127.0.0.1:8000";
 
+const apiProxy = {
+  "/api": {
+    target: API_TARGET,
+    changeOrigin: true,
+  },
+};
+
 export default defineConfig({
   plugins: [react()],
   resolve: {
@@ -16,12 +23,9 @@ export default defineConfig({
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
   },
-  server: {
-    proxy: {
-      "/api": {
-        target: API_TARGET,
-        changeOrigin: true,
-      },
-    },
-  },
+  // Both the dev server and `vite preview` (the Playwright snapshot target)
+  // proxy /api to the agent so the SPA reaches the live/replayed roast same-origin
+  // (REST + the SSE stream) without CORS.
+  server: { proxy: apiProxy },
+  preview: { proxy: apiProxy },
 });
