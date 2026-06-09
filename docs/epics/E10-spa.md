@@ -95,7 +95,7 @@ Owner: lead / `platform` teammate. Acceptance criteria:
 - [ ] **Playwright + screenshot-capture harness** wired against the replay
   harness (reuse the sketches' `playwright-core` + system-Chrome pattern, port
   `capture.mjs`) — so `ui-reviewer` can run on the page PRs (S3–S5). See
-  "Playwright is core" below.
+  "Playwright is core" above.
 
 ### E10-S3 — Dashboard (live)
 
@@ -132,8 +132,8 @@ Owner: `detail` teammate. Acceptance criteria:
 
 Owner: lead / `ui-reviewer`. Acceptance criteria:
 
-- [ ] Component tests + Playwright against the replay harness; `ui-reviewer`
-  sub-agent pass recorded against the frozen baselines.
+- [ ] Component tests + Playwright against the replay harness (harness set up in
+  S2); `ui-reviewer` sub-agent pass recorded against the frozen baselines.
 - [ ] SSE keep-alive/reconnect verified on Safari/iPadOS; resolution recorded
   in plan §11 (closes open item 4).
 
