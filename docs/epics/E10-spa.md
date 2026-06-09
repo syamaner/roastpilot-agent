@@ -193,16 +193,22 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
 |-------|-------|--------|
 | E10-S1 | Replay harness | done (#101) |
 | E10-S2 | SPA foundation (shared substrate) | done (#100) |
-| E10-S3 | Dashboard (live) | done (#95) |
+| E10-S3 | Dashboard (live) | done (#113) |
 | E10-S4 | History page | done (#114) |
-| E10-S5 | Roast detail page | in review (#116) |
+| E10-S5 | Roast detail page | done (#116) |
 | E10-S6 | SPA tests and SSE behavior | not started |
 
-Epic status: **in progress** — S1 (#101) + S2 (#100) merged to `main`; the E7
-`enabled_actions` contract (#107, D25) merged; the S2 foundation follow-up (#115,
-phase_changed fix + types audit + bean token) merged; S3 (#95, the dashboard) +
-S4 (#114, history) merged; S5 (#116, detail) in review; S6 next. Re-sliced from
-4→6 stories for parallel agent-team delivery (D23).
+Epic status: **core done, close-out partial** — the page fan-out is complete:
+S1–S5 are all merged to `main` (replay #101, foundation #100, E7 `enabled_actions`
+contract #107/D25, S2 foundation follow-up #115 = phase_changed fix + types audit
++ bean token, dashboard #113, history #114, detail #116). **S6 (tests + SSE
+behavior) is in progress** — the deterministic close lands now (this status sync,
+the contract-fixture drift guard, the `product-pm` epic audit); the API-fragile /
+D24-pending parts are deferred to a stable session + the D24 revision:
+the multi-fixture snapshot matrix (the deferred dashboard-fault / dashboard-recovery
++ detail states), the consolidated `ui-reviewer` visual pass, and Safari/iPad SSE
+(plan §11.4, a real-device/manual task). Re-sliced from 4→6 stories for parallel
+agent-team delivery (D23).
 
 S3 notes: the dashboard renders the live curve, header (phase badge / roast +
 development timers / FC status / diagnostics drawer), control row (ghost markers =
