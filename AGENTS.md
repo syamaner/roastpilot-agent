@@ -196,12 +196,16 @@ clean.
 
 ## Claude Code
 
-- Sub-agents live under `.claude/agents/`: `safety-reviewer` (PRs touching
-  safety/controller/enums), `mcp-contract-checker` (dependency bumps),
-  `sim-roast-runner` (mock vertical slice + decision-trace summaries),
-  `ui-reviewer` (Playwright against the replay harness), `pr-triage`
-  (independent PR-feedback triage for agent-team delivery, D23 — also the
-  `triage-pr` skill).
+- Sub-agents live under `.claude/agents/`. **Domain reviewers:**
+  `safety-reviewer` (PRs touching safety/controller/enums), `mcp-contract-checker`
+  (dependency bumps), `sim-roast-runner` (mock vertical slice + decision-trace
+  summaries), `ui-reviewer` (Playwright against the replay harness). **Team
+  roles** (define each once; reuse as an agent-team teammate, standalone, or a
+  workflow stage): `product-pm` (product reviewer — audit vs plan, record
+  decisions, write the next brief; never edits src/tests), `qa` (test quality
+  beyond coverage), `pr-triage` (independent PR-feedback triage — also the
+  `triage-pr` skill), `engineer-fe` (web/ SPA), `engineer-be` (Python agent). The
+  human is the lead + domain expert/architect, consulted on escalations.
 - `CLAUDE.md` contains exactly `@AGENTS.md` — rules belong here, never there.
 
 ## Hardware Safety Notes
