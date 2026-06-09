@@ -92,6 +92,14 @@ export function LiveCurve({
   const columns = useMemo(() => toColumns(points), [points]);
   const chargeBandVisible = phase === "preheating";
 
+  // The uPlot `draw` hook is created once in the plot-build effect (keyed on
+  // [height, meta]); if it closed over markers/highlightTime/chargeBand directly
+  // it would repaint STALE values when those props change without a rebuild (the
+  // redraw effect below re-invokes the same closure). Read them through a ref
+  // that every render keeps current instead.
+  const overlayRef = useRef({ markers, highlightTime, chargeBandVisible, chargeBand });
+  overlayRef.current = { markers, highlightTime, chargeBandVisible, chargeBand };
+
   // (Re)build the plot when structural inputs change. Data-only updates go
   // through setData below to avoid tearing down the canvas every tick.
   useEffect(() => {
@@ -138,7 +146,12 @@ export function LiveCurve({
             setCursorIdx(u.cursor.idx ?? null);
           },
         ],
-        draw: [(u: uPlot) => drawOverlays(u, markers, highlightTime, chargeBandVisible, chargeBand)],
+        draw: [
+          (u: uPlot) => {
+            const o = overlayRef.current;
+            drawOverlays(u, o.markers, o.highlightTime, o.chargeBandVisible, o.chargeBand);
+          },
+        ],
       },
     };
 
