@@ -19,12 +19,36 @@ phase is server-derived, never inferred from the export.
 env-temp readings up to 242 °C, which exceed the agent's deliberately conservative
 `max_env_temp_c` = 240 °C software ceiling, so the **real** policy trips
 EMERGENCY_STOP → FAULTED (faithful replay of a real reading; the Hottop tolerated
-it but the agent is more conservative by design). That trips a *different* rule
+it but the agent is more conservative by design — a genuine *validation* of the
+conservative policy on real data, not a defect). That trips a *different* rule
 than the synthetic `fault-pre-t0` track (pre-T0 overrun → RECOVERY), so both are
 needed. No real 7-Jun roast replays cleanly to `complete` under all agent ceilings
 — hence the synthetic `cooling-complete` fixture for the COMPLETE baseline. Only
 the synthetic fixtures' telemetry is hand-authored; every verdict/phase is produced
 by the real controller + policy.
+
+## Capture-state → fixture → marker map (S3/S5/S6 consume this)
+
+The required `ui-reviewer` / snapshot baseline states (kickoff §5), each mapped to
+the exact fixture + `advance_to` marker that produces it. Boot with
+`--replay <fixture> --step`, then `POST /api/replay/advance-to {marker}` (200 →
+screenshot; 404 → wrong fixture/marker, fail loud).
+
+| Baseline state | Fixture | `advance_to` marker | Resulting phase |
+|---|---|---|---|
+| `dashboard-live` (charge band) | `session-2` | `preheating` | `preheating` |
+| advisory CLAMP key frame | `session-2` | `clamp` | `development` |
+| `dashboard-fault` (FaultBanner) | **`session-1`** (real, evidence-backed env-ceiling fault) | `fault` | `faulted` |
+| `dashboard-recovery` (RecoveryModal) | `fault-pre-t0` | `recovery` | `operator_recovery_required` |
+| `roast-detail` / `history` "complete" | `cooling-complete` | `end` | `complete` |
+| live drop → cooling | `session-2` | `drop` / `cooling` | `cooling` |
+
+Prefer **session-1 for `dashboard-fault`** — it's a real fault (more authentic +
+a strong talk frame) over anything synthetic. `fault-pre-t0` owns the *recovery*
+(operator_recovery_required) baseline specifically. For a synthetic *faulted*
+variant of the overrun, `ROASTPILOT_SAFETY__PRE_T0_OVERRUN_SEVERITY=fault` flips
+`fault-pre-t0`'s `recovery` marker to `fault` — but session-1 is the preferred
+fault asset.
 
 ## CLI
 
