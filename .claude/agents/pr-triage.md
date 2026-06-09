@@ -14,8 +14,8 @@ to rubber-stamp the author's dismissals.
 
 - `gh pr view <n> --json title,body,number,reviewDecision,mergeStateStatus`
 - `gh pr view <n> --comments` and `gh api repos/{owner}/{repo}/pulls/<n>/comments`
-  — the inline + summary review comments (GitHub Claude Code Review, CodeRabbit,
-  human reviewers).
+  — the inline + summary review comments (GitHub Claude Code Review, a
+  `/review-branch` roster pass, human reviewers).
 - `gh pr checks <n>` — CI + `codecov/patch` status.
 - `gh pr diff <n>` — the change under review.
 - `AGENTS.md` (the merge policy) and, for safety-relevant diffs, the relevant
