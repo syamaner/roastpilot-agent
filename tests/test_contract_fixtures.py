@@ -28,6 +28,7 @@ is ever added and left unmapped.
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -62,6 +63,18 @@ _SESSION_2 = _REPLAY_FIXTURES / "session-2"  # auto-T0 demo roast → most frame
 _SESSION_1 = _REPLAY_FIXTURES / "session-1"  # faults on env ceiling → `fault`
 _COOLING_COMPLETE = _REPLAY_FIXTURES / "cooling-complete"  # → `run_completed`
 _FAULT_PRE_T0 = _REPLAY_FIXTURES / "fault-pre-t0"  # → `recovery_required`
+
+# The fixture-WRITE tests are regenerate-on-demand only — they rewrite the
+# committed JSON (which carries a wall-clock ``started_at_utc`` + random run id),
+# so an unconditional run would dirty the tree on a plain ``pytest``. Gate them
+# behind an env flag: ``REGEN_CONTRACT_FIXTURES=1 pytest`` regenerates after a
+# real contract change (or the must-fail rename proof); a normal run skips them,
+# keeping the committed fixtures the stable artifact the ``test_committed_*``
+# tests (and the vitest) read.
+_regen_only = pytest.mark.skipif(
+    not os.environ.get("REGEN_CONTRACT_FIXTURES"),
+    reason="fixture-write test: set REGEN_CONTRACT_FIXTURES=1 to regenerate on demand",
+)
 
 
 def _drain(queue: "asyncio.Queue[SseEvent]") -> list[SseEvent]:
@@ -192,7 +205,7 @@ def _gap_fill_frames() -> list[SseEvent]:
     return frames
 
 
-def _advisory_variants(session2_frames: list[SseEvent]) -> list[SseEvent]:
+def _advisory_variants() -> list[SseEvent]:
     """The advisory shapes the SPA parses beyond the one the replay emits.
 
     The ``advisory`` event is multiplexed (events.ts ``AdvisoryEventData``): the
@@ -239,7 +252,7 @@ async def all_sse_frames(tmp_path: Path) -> list[SseEvent]:
             SseEventType.RECOVERY_REQUIRED,
         )
     )
-    frames.extend(_advisory_variants(frames))
+    frames.extend(_advisory_variants())
     frames.extend(_gap_fill_frames())
     return frames
 
@@ -264,6 +277,7 @@ async def test_every_sse_event_type_has_a_real_frame(all_sse_frames: list[SseEve
     assert not missing, f"no real frame captured for: {sorted(m.value for m in missing)}"
 
 
+@_regen_only
 @pytest.mark.asyncio
 async def test_write_sse_frame_fixture(all_sse_frames: list[SseEvent]) -> None:
     """Write the committed SSE-frame fixture the vitest contract test loads.
@@ -311,6 +325,7 @@ async def test_write_sse_frame_fixture(all_sse_frames: list[SseEvent]) -> None:
     assert command_variants, "no drop_beans command_executed frame captured"
 
 
+@_regen_only
 @pytest.mark.asyncio
 async def test_write_rest_snapshot_fixture(tmp_path: Path) -> None:
     """Write the committed REST-snapshot fixture (RoastDetail + RoastSummary).

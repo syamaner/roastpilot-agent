@@ -198,6 +198,9 @@ describe("dashboard page parser — folds every event it consumes", () => {
       "adjusted_fan",
       "reason",
     ]);
+    // Pin the verdict VALUE on the clamp path (the replay overlay is a CLAMP),
+    // matching the recovery test — not just key-presence.
+    expect((evaluation as unknown as Record<string, unknown>).verdict).toBe("clamp");
     expect(next.latestAdvisory?.synthesized).toBe(true);
   });
 
