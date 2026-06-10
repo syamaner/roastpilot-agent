@@ -1,0 +1,202 @@
+{
+  "advisory_variants": [
+    {
+      "data": {
+        "advisory_paused": true
+      },
+      "event": "advisory",
+      "id": 1
+    },
+    {
+      "data": {
+        "skipped": "no_telemetry",
+        "trigger": "scheduled"
+      },
+      "event": "advisory",
+      "id": 2
+    }
+  ],
+  "command_variants": [
+    {
+      "data": {
+        "command": "drop_beans",
+        "source": "operator"
+      },
+      "event": "command_executed",
+      "id": 229
+    }
+  ],
+  "frames": [
+    {
+      "data": {
+        "profile": "session-2"
+      },
+      "event": "run_started",
+      "id": 3
+    },
+    {
+      "data": {
+        "enabled_actions": [
+          "pause_advisory",
+          "resume_advisory",
+          "emergency_stop"
+        ],
+        "phase": "starting"
+      },
+      "event": "phase_changed",
+      "id": 1
+    },
+    {
+      "data": {
+        "bean_temp_c": 145.0,
+        "env_temp_c": 171.0,
+        "guidance_max_c": 200.0,
+        "guidance_min_c": 170.0
+      },
+      "event": "charge_guidance",
+      "id": 79
+    },
+    {
+      "data": {
+        "bean_temp_c": 113.0,
+        "debounce_ticks": 3
+      },
+      "event": "t0_detected",
+      "id": 107
+    },
+    {
+      "data": {
+        "bean_temp_c": 178.0,
+        "source": "mcp"
+      },
+      "event": "first_crack",
+      "id": 206
+    },
+    {
+      "data": {
+        "decision": {
+          "confidence": 0.71,
+          "rationale": "Bean RoR is crashing into the development phase; request more heat to hold momentum.",
+          "should_drop": false,
+          "target_fan": 40,
+          "target_heat": 105
+        },
+        "evaluation": {
+          "adjusted_fan": 40,
+          "adjusted_heat": 100,
+          "input_fan": 40,
+          "input_heat": 105,
+          "reason": "requested heat 105 % / fan 40 % outside 0\u2013100: clamped to heat 100 % / fan 40 %",
+          "rule": "command_bounds",
+          "verdict": "clamp"
+        },
+        "source": "replay_overlay",
+        "synthesized": true,
+        "trigger": "replay_overlay"
+      },
+      "event": "advisory",
+      "id": 209
+    },
+    {
+      "data": {
+        "fan_percent": 10,
+        "heat_percent": 80
+      },
+      "event": "command_executed",
+      "id": 4
+    },
+    {
+      "data": {
+        "command": "emergency_stop",
+        "reason": "already faulted"
+      },
+      "event": "command_failed",
+      "id": 3
+    },
+    {
+      "data": {
+        "adjusted_fan": null,
+        "adjusted_heat": null,
+        "input_fan": null,
+        "input_heat": null,
+        "reason": "operator did not confirm charge within the allowed window",
+        "rule": "operator_timeout",
+        "verdict": "reject"
+      },
+      "event": "safety_alert",
+      "id": 1
+    },
+    {
+      "data": {
+        "adjusted_fan": null,
+        "adjusted_heat": null,
+        "input_fan": null,
+        "input_heat": null,
+        "reason": "environment temperature 241.0 \u00b0C exceeds the hard ceiling 240.0 \u00b0C",
+        "rule": "max_env_temp",
+        "verdict": "emergency_stop"
+      },
+      "event": "fault",
+      "id": 208
+    },
+    {
+      "data": {
+        "adjusted_fan": 100,
+        "adjusted_heat": 0,
+        "input_fan": null,
+        "input_heat": null,
+        "reason": "bean temperature 203.0 \u00b0C exceeds the pre-T0 charge bound 200.0 \u00b0C with no confirmed T0: heat 0 %, fan 100 %, operator recovery required",
+        "rule": "pre_t0_overrun",
+        "verdict": "recovery"
+      },
+      "event": "recovery_required",
+      "id": 14
+    },
+    {
+      "data": {
+        "acknowledged": "operator_recovery_required"
+      },
+      "event": "recovery_acknowledged",
+      "id": 2
+    },
+    {
+      "data": {
+        "csv_path": "/tmp/roast-export/roast.csv",
+        "jsonl_path": "/tmp/roast-export/roast.jsonl",
+        "log_dir": "/tmp/roast-export",
+        "note": null,
+        "ready": true,
+        "summary_path": "/tmp/roast-export/summary.json"
+      },
+      "event": "logs_exported",
+      "id": 4
+    },
+    {
+      "data": {},
+      "event": "run_completed",
+      "id": 32
+    },
+    {
+      "data": {
+        "agent_phase": "preheating",
+        "bean_ror_c_per_min": null,
+        "bean_temp_c": 38.0,
+        "cooling_on": false,
+        "elapsed_seconds": 0.0013962920056656003,
+        "env_ror_c_per_min": null,
+        "env_temp_c": 43.0,
+        "fan_percent": 10,
+        "first_crack_detected": false,
+        "heat_percent": 80,
+        "t0_detected": false
+      },
+      "event": "telemetry",
+      "id": 5
+    },
+    {
+      "data": {},
+      "event": "heartbeat",
+      "id": null
+    }
+  ]
+}
