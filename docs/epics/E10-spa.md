@@ -226,23 +226,26 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
 | E10-S3 | Dashboard (live) | done (#113) |
 | E10-S4 | History page | done (#114) |
 | E10-S5 | Roast detail page | done (#116) |
-| E10-S6 | SPA tests and SSE behavior | not started — deferred (D26 snapshot matrix now unblocked + deterministic; contract-fixture drift guard; ui-reviewer + Safari/iPad need a stable API / real devices) |
+| E10-S6 | SPA tests and SSE behavior | **in progress — handoff ready (#98)**: D26 canvas snapshot matrix (un-mask the chart, CI-Docker baselines) + contract-fixture drift guard, both deterministic; ui-reviewer MCP pass + Safari/iPad SSE deferred (API-fragile / real devices) |
 
-Epic status: **core done, close-out partial** — the page fan-out is complete:
+Epic status: **core done, S6 in progress** — the page fan-out is complete:
 S1–S5 are all merged to `main` (replay #101, foundation #100, E7 `enabled_actions`
 contract #107/D25, S2 foundation follow-up #115 = phase_changed fix + types audit
-+ bean token, dashboard #113, history #114, detail #116). **S6 (tests + SSE
-behavior) is not started** — deferred. The post-fan-out close-out is done — this
-status/registry sync (#118) + the `product-pm` epic audit (PASS — S1–S5 acceptance
-+ all invariants independently re-derived from the repo). S6's own work is deferred
-to a later session: the contract-fixture drift guard, the D26 snapshot matrix, the
-consolidated `ui-reviewer` visual pass, and Safari/iPad SSE (plan §11.4, a
-real-device/manual task). The **multi-fixture
-snapshot matrix is now fully specified (D26)** — un-mask the existing canvas
-snapshots + regenerate baselines in Docker, and add the dashboard-fault /
-dashboard-recovery / detail states with the canvas un-masked; the scripted suite
-is deterministic so it is **not** API-blocked (it is Docker-baseline work, not a
-live-model task). Re-sliced from 4→6 stories for parallel agent-team delivery (D23).
++ bean token, dashboard #113, history #114, detail #116). The post-fan-out close-out
+is done — the status/registry sync (#118/#119) + the `product-pm` epic audit (PASS)
++ an independent revert audit (NOTHING TO REVERT). **S6 (#98) is now the active
+handoff**, two deterministic units:
+1. **D26 canvas snapshot matrix** — **un-mask the uPlot canvas so the screenshots
+   capture the whole page including the chart** (today they `mask:` it); regenerate
+   the existing baselines in the pinned Docker image (CI-only) and add the
+   dashboard-fault / dashboard-recovery / detail states, canvas un-masked. The
+   `window.__chart` data-assert stays as the authoritative correctness layer.
+   Deterministic — **not** API-blocked (Docker-baseline work, no live model).
+2. **contract-fixture drift guard** — pins the SPA's hand-mirrored types against
+   real server frames so the `phase_changed`-class drift can't recur.
+Deferred to a stable-API / real-device session: the consolidated `ui-reviewer`
+visual pass (MCP-heavy) and Safari/iPad SSE (plan §11.4). Re-sliced from 4→6
+stories for parallel agent-team delivery (D23).
 
 S3 notes: the dashboard renders the live curve, header (phase badge / roast +
 development timers / FC status / diagnostics drawer), control row (ghost markers =

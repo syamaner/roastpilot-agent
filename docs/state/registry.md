@@ -96,17 +96,22 @@ parallel in isolated git worktrees after the `isolation:worktree` flag silently
 no-op'd (runbook: `docs/agent-team-worktrees.md`). **D17 criterion (2) met** —
 the dashboard is usable for a live roast.
 
-**S6 (tests + SSE behavior) is NOT started — deferred.** The post-fan-out
-close-out is done: the status-table/registry sync (#118) and the `product-pm`
-epic audit (PASS — S1–S5 acceptance + all invariants independently re-derived
-from the repo; Python 726 / web 197 tests green, 92.9% coverage). **S6's own work
-is deferred to a later session** (the API was unstable on 9 Jun from the new-model
-release): the contract-fixture drift guard (would pin the SPA's hand-mirrored
-types against real server frames so the `phase_changed`-class drift can't recur),
-the **D26** multi-fixture snapshot matrix (now unblocked + deterministic —
-un-mask the canvas, CI-Docker baselines, + the dashboard-fault / dashboard-recovery
-+ detail states), the consolidated `ui-reviewer` visual pass (MCP-heavy), and
-Safari/iPad SSE (§11.4, a real-device task). Open follow-ups: #103 (replay hardening), #104 (E11 recovery-lifespan
-guard), #105 (S2 nits), #111 (history FC-time), #112 (dashboard live-contract),
-#117 (server `acknowledge_fault`). Kickoff brief:
-`roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`.
+**S6 (tests + SSE behavior) — STARTING NOW (handoff ready, issue #98).** The
+post-fan-out close-out is done: the status-table/registry sync (#118/#119) and the
+`product-pm` epic audit (PASS — S1–S5 acceptance + all invariants independently
+re-derived from the repo; Python 726 / web 197 tests green, 92.9% coverage) + an
+independent post-hoc revert audit (NOTHING TO REVERT; stale branches cleaned).
+**S6's two deterministic units are the active handoff** (engineer source of truth:
+**issue #98** — full scope/acceptance — plus plan **D26** and this epic's S6):
+1. the **D26 canvas snapshot matrix** — **un-mask the uPlot canvas so the
+   screenshots show the whole page including the chart** (currently masked),
+   CI-Docker-only baselines, all 7 required states incl. dashboard-fault /
+   dashboard-recovery; the `window.__chart` data-assert stays as the authoritative
+   layer. Deterministic — NOT API-blocked.
+2. the **contract-fixture drift guard** — pins the SPA's hand-mirrored types
+   against real server frames so the `phase_changed`-class drift can't recur.
+**Still deferred** (genuinely API-fragile / manual): the consolidated `ui-reviewer`
+visual pass (MCP-heavy) and Safari/iPad SSE (§11.4, real-device). Open follow-ups:
+#103 (replay hardening), #104 (E11 recovery-lifespan guard), #105 (S2 nits), #111
+(history FC-time), #112 (dashboard live-contract), #117 (server `acknowledge_fault`),
+#102 (pin pyright). Kickoff brief: `roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`.
