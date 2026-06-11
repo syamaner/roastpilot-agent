@@ -1,31 +1,34 @@
 /**
- * Roast detail snapshot suite (E10-S5, D24).
+ * Roast detail snapshot suite (E10-S5, D26).
  *
  * The two required baseline states (kickoff §5): `roast-detail` and
  * `roast-detail-selected` (a CLAMP trace row selected + its marker on the curve).
  *
- * Like `foundation.spec.ts`, these run against the deterministic dev/test-only
- * `/__detail-harness` route (fixed REST-shaped data via `fixture.ts`) so the
- * baselines are reproducible without the stepped-SSE replay backend — that full
- * fixture→marker matrix is S6's scope. Conventions reused: DOM-chrome
- * `toHaveScreenshot()` with the uPlot canvas MASKED, chart correctness asserted
- * via the data hook (never pixels).
+ * These run against the deterministic dev/test-only `/__detail-harness` route
+ * (fixed REST-shaped data via `fixture.ts`) so the baselines are reproducible
+ * without the stepped-SSE replay backend. D26: the uPlot canvas is UN-MASKED — the
+ * full-page shot now includes the persisted curve; chart correctness still asserted
+ * via the `window.__chart` data hook as the authoritative layer alongside the pixels.
  */
 
 import { expect, test } from "@playwright/test";
 
-import { maskCanvas, readChartData, settle } from "./helpers";
+import { readChartData, settle, waitForChartPoints } from "./helpers";
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/__detail-harness");
   await settle(page);
+  // Gate snapshots on the rendered point-count so the un-masked canvas is stable.
+  await waitForChartPoints(page, 1);
 });
 
-test("roast-detail — masked-canvas DOM snapshot of the detail page", async ({ page }) => {
-  // The decision-trace table, title block, timeline, rating, and export row are
-  // the chrome baseline; the curve canvas is masked (asserted via data below).
+test("roast-detail — full-page snapshot of the detail page (canvas un-masked)", async ({
+  page,
+}) => {
+  // The decision-trace table, title block, timeline, rating, export row, AND the
+  // persisted curve are all in the baseline now (data asserted in the test below).
   await expect(page.getByTestId("decision-trace-table")).toBeVisible();
-  await expect(page).toHaveScreenshot("roast-detail.png", { mask: maskCanvas(page) });
+  await expect(page).toHaveScreenshot("roast-detail.png");
 });
 
 test("roast-detail-selected — CLAMP row selected highlights the curve", async ({ page }) => {
@@ -38,12 +41,11 @@ test("roast-detail-selected — CLAMP row selected highlights the curve", async 
   await clampRow.click();
   await expect(clampRow).toHaveAttribute("data-selected", "true");
 
-  // Assert the cross-component highlight via the chart DATA hook (not pixels).
+  // Assert the cross-component highlight via the chart DATA hook (the authoritative
+  // layer); the un-masked snapshot also captures the highlight line on the curve.
   expect((await readChartData(page)).highlightTime).toBe(240);
 
-  await expect(page).toHaveScreenshot("roast-detail-selected.png", {
-    mask: maskCanvas(page),
-  });
+  await expect(page).toHaveScreenshot("roast-detail-selected.png");
 });
 
 test("the detail curve carries the full persisted series + T0/FC/drop markers", async ({

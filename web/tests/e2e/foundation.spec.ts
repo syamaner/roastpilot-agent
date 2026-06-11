@@ -1,31 +1,32 @@
 /**
- * Foundation snapshot suite (D24) — the S2 gate target.
+ * Foundation snapshot suite (D26).
  *
- * Proves the snapshot conventions work BEFORE any product page exists, against
- * the deterministic /__chart-harness route (fixed data). S3–S6 add page-state
- * snapshots backed by the replay harness (S1).
+ * Proves the snapshot conventions against the deterministic /__chart-harness route
+ * (fixed data) — the gallery of the shared LiveCurve + badges + indicator.
  *
  * The conventions exercised here are the ones the page suites reuse:
- *   - DOM-chrome `toHaveScreenshot()` with the uPlot canvas MASKED
- *   - chart correctness asserted via the DATA hook (readChartData), not pixels
- *   - a single loose canvas "did it draw / not blank" smoke shot
+ *   - full-page `toHaveScreenshot()` with the uPlot canvas UN-MASKED (D26)
+ *   - chart correctness ALSO asserted via the DATA hook (readChartData) — the
+ *     authoritative layer alongside the pixels
+ *   - the point-count gate (waitForChartPoints) before shooting
  */
 
 import { expect, test } from "@playwright/test";
 
-import { maskCanvas, readChartData, settle } from "./helpers";
+import { readChartData, settle, waitForChartPoints } from "./helpers";
 
 test.beforeEach(async ({ page }) => {
   await page.goto("/__chart-harness");
   await settle(page);
+  // Gate snapshots on the rendered point-count so the un-masked canvas is stable.
+  await waitForChartPoints(page, 1);
 });
 
-test("foundation chrome — masked canvas DOM snapshot", async ({ page }) => {
-  // The DOM chrome (header, connection indicator, verdict badges, legend) is the
-  // baseline; the canvas is masked because pixel-correctness is asserted via data.
-  await expect(page).toHaveScreenshot("foundation-chrome.png", {
-    mask: maskCanvas(page),
-  });
+test("foundation chrome — full-page snapshot with the un-masked canvas", async ({ page }) => {
+  // The DOM chrome (header, connection indicator, verdict badges, legend) AND the
+  // rendered curve are the baseline now; correctness is also asserted via the data
+  // hook in the tests below.
+  await expect(page).toHaveScreenshot("foundation-chrome.png");
 });
 
 test("chart data hook exposes the five series + markers (D24)", async ({ page }) => {

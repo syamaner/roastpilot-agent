@@ -100,10 +100,13 @@ jobs:
         # SSE/reducer/query paths the pages ride on.
         run: npm run test:coverage
 
-  # The D24 visual gate: the scripted toHaveScreenshot() snapshot suite, run
+  # The D24/D26 visual gate: the scripted toHaveScreenshot() snapshot suite, run
   # INSIDE the pinned Playwright Linux image so its pixels match the committed
-  # baselines (which are generated in this same image). Local macOS/system-Chrome
-  # pixels drift — they are for the /capture skill + ui-reviewer only, not this gate.
+  # baselines (which are generated in this same image — see the web-snapshots-update
+  # workflow, the canonical producer). Local macOS/system-Chrome pixels drift — they
+  # are for the /capture skill + ui-reviewer only, not this gate. D26: the uPlot
+  # canvas is UN-MASKED (the chart is in every shot); the window.__chart data-assert
+  # stays as the authoritative correctness layer alongside the pixels.
   #
   # The suite drives the REAL replay harness (E10-S1): one webServer is the agent
   # in `--replay <fixture> --step` mode (REST + SSE + the gated step routes), the
@@ -146,9 +149,11 @@ jobs:
 
       - name: Run snapshot + e2e suite
         working-directory: web
-        # Two webServers (Playwright-managed): the agent in --replay --step mode +
-        # the built SPA. The suite asserts DOM chrome (canvas masked) + the chart
-        # data hook + the real-replay SSE smoke against committed Linux baselines.
+        # Per-fixture webServer pairs (Playwright-managed): one agent in --replay
+        # --step mode + one built-SPA preview per fixture (session-2/session-1/
+        # fault-pre-t0) on distinct ports. The suite asserts the whole page INCLUDING
+        # the un-masked uPlot canvas (D26) + the window.__chart data hook + the
+        # real-replay SSE smoke against committed Linux baselines.
         run: npx playwright test
 
       - name: Upload Playwright report on failure

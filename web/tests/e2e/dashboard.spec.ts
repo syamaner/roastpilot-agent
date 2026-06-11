@@ -1,58 +1,124 @@
 /**
- * Live dashboard snapshot — `dashboard-live` (S3, D24).
+ * Live dashboard snapshot matrix — `dashboard-live` / `dashboard-fault` /
+ * `dashboard-recovery` (S6, D26).
  *
- * Drives the REAL replay harness (session-2, the existing webServer) to the
- * `preheating` marker so the charge band shows, then snapshots the live
- * dashboard's DOM chrome (canvas masked) + asserts the chart DATA via the hook.
- * Phase reaches the SPA from the server (hydrate snapshot + SSE), never inferred.
+ * D26: the uPlot canvas is UN-MASKED — every shot captures the WHOLE page,
+ * chart included. The `window.__chart` data hook stays as the authoritative
+ * correctness layer (asserted alongside the pixels). Phase always reaches the SPA
+ * from the server (hydrate snapshot + SSE), never inferred client-side.
  *
- * The `dashboard-fault` and `dashboard-recovery` states need DIFFERENT replay
- * fixtures (session-1 / fault-pre-t0), which need a multi-fixture harness — that
- * is built once in S6 (so the three page PRs don't each fork playwright.config).
- * Those two snapshots are deferred to S6; their components are covered by the
- * Vitest interaction tests here in S3.
+ * The three states need three different replay fixtures, so each spec loads the
+ * preview proxying its own agent (see urls.ts WEB_URLS / global-setup AGENTS) and
+ * drives that agent:
+ *   - dashboard-live     → session-2    → `preheating` (charge band visible)
+ *   - dashboard-fault    → session-1    → `fault`    (real env-ceiling E-STOP → faulted)
+ *   - dashboard-recovery → fault-pre-t0 → `recovery` (pre-T0 overrun → recovery_required)
  */
 
 import { expect, test } from "@playwright/test";
 
-import { advanceTo, step } from "./global-setup";
-import { maskCanvas, readChartData, settle } from "./helpers";
+import { advanceTo, AGENTS, step } from "./global-setup";
+import { readChartData, settle, waitForChartPoints } from "./helpers";
+import { WEB_URLS } from "./urls";
 
-test("dashboard-live — preheating with the charge band, masked chrome snapshot", async ({
+test("dashboard-live — preheating with the charge band, full-page snapshot (canvas un-masked)", async ({
   page,
 }) => {
-  await page.goto("/");
+  await page.goto(WEB_URLS.session2);
 
   // Phase + telemetry come from the server: wait until the stream is live.
-  await expect(page.getByTestId("connection-indicator")).toHaveAttribute(
-    "data-status",
-    "live",
-    { timeout: 15_000 },
-  );
+  await expect(page.getByTestId("connection-indicator")).toHaveAttribute("data-status", "live", {
+    timeout: 15_000,
+  });
 
   // `preheating` is the tick-0 marker (emits no new frames); step a few ticks INTO
   // preheating so telemetry frames flow to the live browser and the curve builds.
-  const reached = await advanceTo("preheating");
+  const reached = await advanceTo(AGENTS.session2, "preheating");
   expect(reached.agent_phase).toBe("preheating");
-  const stepped = await step(8);
+  const stepped = await step(AGENTS.session2, 8);
   expect(stepped.agent_phase).toBe("preheating");
-  await page.waitForFunction(
-    (id) => (window.__lastEventId ?? -1) >= id,
-    stepped.last_event_id,
-    { timeout: 15_000 },
-  );
+  await page.waitForFunction((id) => (window.__lastEventId ?? -1) >= id, stepped.last_event_id, {
+    timeout: 15_000,
+  });
 
   // The phase badge reflects the server's preheating phase.
   await expect(page.getByTestId("phase-badge")).toHaveAttribute("data-phase", "preheating");
 
   // The curve built from the stepped telemetry, and the charge band shows in
-  // preheating (asserted via DATA, not pixels — D24).
+  // preheating (asserted via DATA — the authoritative layer alongside the pixels).
   const hook = await readChartData(page);
   expect(hook.columns[0].length).toBeGreaterThan(0);
   expect(hook.chargeBandVisible).toBe(true);
 
+  // Gate the canvas shot on the rendered point-count so the un-masked snapshot is
+  // taken after the curve drew (no async-data race — D26 kit).
+  await waitForChartPoints(page, hook.columns[0].length);
   await settle(page);
-  await expect(page).toHaveScreenshot("dashboard-live.png", {
-    mask: maskCanvas(page),
+  await expect(page).toHaveScreenshot("dashboard-live.png");
+});
+
+test("dashboard-fault — real env-ceiling fault renders the fault banner + trail (canvas un-masked)", async ({
+  page,
+}) => {
+  // session-1 carries a real 242 °C env reading > the agent's 240 °C ceiling, so
+  // the REAL SafetyPolicy trips EMERGENCY_STOP → faulted (a faithful replay, not a
+  // mock). Load the preview backed by the session-1 agent.
+  await page.goto(WEB_URLS.session1);
+  await expect(page.getByTestId("connection-indicator")).toHaveAttribute("data-status", "live", {
+    timeout: 15_000,
   });
+
+  // Advance to the fault marker; 404 here means the export never faulted (fail loud).
+  const reached = await advanceTo(AGENTS.session1, "fault");
+  expect(reached.agent_phase).toBe("faulted");
+  await page.waitForFunction((id) => (window.__lastEventId ?? -1) >= id, reached.last_event_id, {
+    timeout: 15_000,
+  });
+
+  // Phase reached the SPA from the server, and the fault banner is shown.
+  await expect(page.getByTestId("phase-badge")).toHaveAttribute("data-phase", "faulted");
+  await expect(page.getByTestId("fault-banner")).toBeVisible();
+  await expect(page.getByTestId("fault-reason")).toBeVisible();
+
+  // The curve carries the persisted telemetry up to the fault (data layer).
+  const hook = await readChartData(page);
+  expect(hook.columns[0].length).toBeGreaterThan(0);
+
+  await waitForChartPoints(page, hook.columns[0].length);
+  await settle(page);
+  await expect(page).toHaveScreenshot("dashboard-fault.png");
+});
+
+test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery modal (canvas un-masked)", async ({
+  page,
+}) => {
+  // fault-pre-t0 drives the real SafetyPolicy past the pre-T0 bound → the default
+  // RECOVERY verdict → operator_recovery_required (the SPA RecoveryModal). Load the
+  // preview backed by the fault-pre-t0 agent.
+  await page.goto(WEB_URLS.faultPreT0);
+  await expect(page.getByTestId("connection-indicator")).toHaveAttribute("data-status", "live", {
+    timeout: 15_000,
+  });
+
+  const reached = await advanceTo(AGENTS.faultPreT0, "recovery");
+  expect(reached.agent_phase).toBe("operator_recovery_required");
+  await page.waitForFunction((id) => (window.__lastEventId ?? -1) >= id, reached.last_event_id, {
+    timeout: 15_000,
+  });
+
+  // Server-derived recovery phase opens the modal with the "no auto-resume" copy.
+  await expect(page.getByTestId("phase-badge")).toHaveAttribute(
+    "data-phase",
+    "operator_recovery_required",
+  );
+  await expect(page.getByTestId("recovery-modal")).toBeVisible();
+  await expect(page.getByTestId("recovery-no-auto-resume")).toBeVisible();
+
+  // The curve drew the short pre-T0 track (data layer).
+  const hook = await readChartData(page);
+  expect(hook.columns[0].length).toBeGreaterThan(0);
+
+  await waitForChartPoints(page, hook.columns[0].length);
+  await settle(page);
+  await expect(page).toHaveScreenshot("dashboard-recovery.png");
 });

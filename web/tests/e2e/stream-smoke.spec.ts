@@ -13,7 +13,7 @@
 
 import { expect, test } from "@playwright/test";
 
-import { advanceTo, step } from "./global-setup";
+import { advanceTo, AGENTS, step } from "./global-setup";
 
 // One test against the single shared stepped run (the lead-scoped S2 smoke).
 // Open the page FIRST so the SSE stream connects, THEN advance the replay — the
@@ -35,9 +35,9 @@ test("real-replay smoke — server phase reaches the SPA, chrome snapshot", asyn
   // INTO preheating: each tick emits a telemetry SSE frame the live browser
   // applies, advancing window.__lastEventId. The window is long (T0 is ~496 s in),
   // so 5 ticks stays in preheating.
-  const reached = await advanceTo("preheating");
+  const reached = await advanceTo(AGENTS.session2, "preheating");
   expect(reached.agent_phase).toBe("preheating");
-  const stepped = await step(5);
+  const stepped = await step(AGENTS.session2, 5);
   expect(stepped.agent_phase).toBe("preheating");
   await page.waitForFunction(
     (id) => (window.__lastEventId ?? -1) >= id,

@@ -1,0 +1,78 @@
+name: Web snapshots — update baselines
+
+# The canonical PRODUCER of the committed Playwright PNG baselines (D26).
+#
+# Baselines are a CI-Docker-only artifact: generated + diffed ONLY inside the
+# pinned amd64 Playwright image, NEVER on a dev machine (macOS pixels drift and
+# would poison the gate — see web/tests/e2e/README.md). This job runs
+# `playwright test --update-snapshots` inside that SAME pinned image the gate uses
+# (the `web-snapshots` job in ci.yml), then commits the regenerated
+# `__screenshots__/**/*-linux.png` back to the branch it was dispatched on.
+#
+# Trigger it from the Actions tab on your feature branch whenever a UI change moves
+# the pixels. It is manual-only (`workflow_dispatch`) so baselines never silently
+# regenerate on a normal push/PR — the gate (ci.yml) must stay an independent check.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: web-snapshots-update-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  update-baselines:
+    name: Regenerate + commit Playwright baselines
+    runs-on: ubuntu-latest
+    # The SAME pinned image as the ci.yml `web-snapshots` gate — bump both together
+    # with the @playwright/test / playwright-core versions in web/package.json.
+    container:
+      image: mcr.microsoft.com/playwright:v1.55.1-noble
+    steps:
+      - name: Check out the dispatched branch
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Set up Python (for the replay-harness webServers)
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+
+      - name: Install the agent (replay harness — no MCP/audio needed)
+        run: python -m pip install --upgrade pip && python -m pip install -e .
+
+      - name: Install web dependencies
+        working-directory: web
+        run: npm ci
+
+      - name: Build SPA
+        working-directory: web
+        run: npm run build
+
+      - name: Regenerate all baselines inside the pinned image
+        working-directory: web
+        # --update-snapshots rewrites every committed *-linux.png from this image's
+        # pixels (the only environment the gate trusts).
+        run: npx playwright test --update-snapshots
+
+      - name: Commit + push regenerated baselines (if any changed)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Mark the checkout safe (the container runs as a different uid than the mount owner).
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          if git diff --quiet -- web/tests/e2e/__screenshots__; then
+            echo "No baseline changes — nothing to commit."
+            exit 0
+          fi
+          git add web/tests/e2e/__screenshots__
+          git commit -m "ci: regenerate Playwright baselines in pinned image [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"

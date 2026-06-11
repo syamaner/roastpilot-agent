@@ -1,32 +1,49 @@
 import { defineConfig, devices } from "@playwright/test";
 
+import { WEB_URLS } from "./tests/e2e/urls";
+
 /**
- * Playwright snapshot + e2e config (D24).
+ * Playwright snapshot + e2e config (D26 — revises D24).
  *
  * TWO TRACKS, split by job:
  *   - THE CI GATE is this scripted `toHaveScreenshot()` suite. It MUST run inside
- *     the pinned `mcr.microsoft.com/playwright:v1.55.1` Linux image
+ *     the pinned `mcr.microsoft.com/playwright:v1.55.1-noble` Linux image
  *     (`--platform=linux/amd64`) so the committed PNG baselines match the GitHub
  *     runner — local macOS pixels drift and would flap the gate. Baselines are
- *     generated/updated INSIDE that image (see tests/e2e/README.md + the CI job).
+ *     generated/updated INSIDE that image only (see tests/e2e/README.md + the CI
+ *     `web-snapshots-update` workflow_dispatch job) — NEVER on macOS.
  *   - The `/capture` skill + `ui-reviewer` (Playwright MCP) use LOCAL system
  *     Chrome for direction-match judgment only — NON-GATING (see scripts/capture.mjs).
  *
- * Determinism: fixed viewport, animations disabled, `fonts.ready` awaited in the
- * specs, a small (non-zero) pixel tolerance, and the uPlot canvas is MASKED — its
- * correctness is asserted via the chart-data hook, never pixels.
+ * D26: the uPlot canvas is NO LONGER masked — the chart is included in every page
+ * screenshot. Determinism kit: `deviceScaleFactor: 1` (uPlot scales its backing
+ * store by DPR), the specs await the `window.__chart` point-count before shooting
+ * (`waitForChartPoints`), `fonts.ready` + animations off, replay-fixed data, and a
+ * small NON-ZERO `maxDiffPixelRatio`. The `window.__chart` data-assert STAYS as the
+ * authoritative correctness layer alongside the pixels (D26 §4).
+ *
+ * MULTI-FIXTURE HARNESS: the dashboard at `/` renders the live SSE stream of
+ * whatever replay fixture its agent is running, so the three dashboard states need
+ * three different fixtures. We boot one agent + one `vite preview` per fixture on
+ * distinct ports; each preview's `/api` proxy targets its own agent (vite reads
+ * ROASTPILOT_API at preview-START, so no rebuild per target). Specs pick the
+ * matching preview via its baseURL (see WEB_URLS). The route-harness pages
+ * (foundation / detail / history) are fixture-independent and use the session-2
+ * preview (the suite baseURL). The per-fixture preview origins live in
+ * ./tests/e2e/urls.ts (shared with the specs).
  */
+
 export default defineConfig({
   testDir: "./tests/e2e",
-  // Drives the replay harness to the smoke state (session-2 → preheating) after
-  // both webServers are up — deterministic real-replay state for the snapshot.
+  // Confirms every replay agent's gated step surface is mounted (fail fast if one
+  // was booted without --step) after all webServers are up.
   globalSetup: "./tests/e2e/global-setup.ts",
   // Snapshots are committed and keyed by platform; the Linux baselines (from the
   // pinned image) are the gate. {arg} keeps multiple states in one spec distinct.
   snapshotPathTemplate: "{testDir}/__screenshots__/{testFilePath}/{arg}-{platform}{ext}",
-  // The replay-backed specs drive ONE shared stepped run that advances
-  // monotonically, so they must run serially — parallel stepping would race on
-  // shared backend state. The suite is small; a single worker is fine.
+  // The replay-backed specs drive stepped runs that advance monotonically, so they
+  // must run serially — parallel stepping would race on shared backend state. The
+  // suite is small; a single worker is fine.
   fullyParallel: false,
   workers: 1,
   forbidOnly: !!process.env.CI,
@@ -34,32 +51,38 @@ export default defineConfig({
   reporter: process.env.CI ? "github" : "list",
   expect: {
     toHaveScreenshot: {
-      // Small but non-zero: absorbs sub-pixel AA noise without hiding real drift.
-      maxDiffPixelRatio: 0.02,
+      // Small but non-zero (D26): absorbs sub-pixel AA noise from the un-masked
+      // canvas without hiding real drift. NEVER widened to paper over a flake —
+      // fix determinism (point-count gate / DPR / fonts) instead.
+      maxDiffPixelRatio: 0.01,
       animations: "disabled",
     },
   },
   use: {
-    baseURL: process.env.ROASTPILOT_WEB_URL ?? "http://127.0.0.1:4173",
+    baseURL: WEB_URLS.session2,
     viewport: { width: 1600, height: 1000 },
+    // uPlot scales its backing canvas store by devicePixelRatio; pin it to 1 so the
+    // un-masked canvas rasterizes at a fixed resolution across runs (D26 kit).
+    deviceScaleFactor: 1,
     // Deterministic rendering: reduce motion via the emulated media feature.
     contextOptions: { reducedMotion: "reduce" },
   },
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"] },
+      use: { ...devices["Desktop Chrome"], deviceScaleFactor: 1 },
     },
   ],
-  // Two servers, both started by Playwright:
-  //   1. The agent in REPLAY --step mode (the real backend: REST + SSE +
-  //      the gated /api/replay/{step,advance-to} control routes). The SPA's
-  //      preview proxy forwards /api here, so a replayed roast is byte-identical
-  //      to live. session-2 is the default demo fixture (auto-T0 + the CLAMP).
-  //   2. The built SPA via `vite preview` (proxying /api to server 1).
-  // The deterministic step API + the replay harness are what make the snapshots
-  // reproducible — global-setup.ts drives states via advance-to.
+  // Per-fixture agent + SPA pairs, all started by Playwright:
+  //   agent N (REPLAY --step): the real backend (REST + SSE + the gated
+  //     /api/replay/{step,advance-to} routes), one per fixture on its own port.
+  //   preview N (vite preview): the built SPA, proxying /api to agent N
+  //     (ROASTPILOT_API picks the target at preview-start — no rebuild per fixture).
+  // session-2 is the default demo fixture (auto-T0 + the CLAMP); session-1 faults on
+  // replay (real 242 °C env reading > the 240 °C ceiling); fault-pre-t0 drives the
+  // real SafetyPolicy past the pre-T0 bound into operator_recovery_required.
   webServer: [
+    // --- session-2 (:8000 agent / :4173 SPA) → dashboard-live + route harnesses ---
     {
       command:
         "roastpilot-agent --replay tests/fixtures/replay/session-2 --step " +
@@ -75,6 +98,41 @@ export default defineConfig({
       // Probe the root (always 200) — `vite preview` has no SPA history fallback,
       // so a deep route 404s the readiness check.
       url: "http://127.0.0.1:4173/",
+      env: { ROASTPILOT_API: "http://127.0.0.1:8000" },
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    // --- session-1 (:8001 agent / :4174 SPA) → dashboard-fault ---
+    {
+      command:
+        "roastpilot-agent --replay tests/fixtures/replay/session-1 --step " +
+        "--host 127.0.0.1 --port 8001",
+      cwd: "..",
+      url: "http://127.0.0.1:8001/api/health",
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    {
+      command: "npm run preview -- --port 4174 --strictPort --host 127.0.0.1",
+      url: "http://127.0.0.1:4174/",
+      env: { ROASTPILOT_API: "http://127.0.0.1:8001" },
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    // --- fault-pre-t0 (:8002 agent / :4175 SPA) → dashboard-recovery ---
+    {
+      command:
+        "roastpilot-agent --replay tests/fixtures/replay/fault-pre-t0 --step " +
+        "--host 127.0.0.1 --port 8002",
+      cwd: "..",
+      url: "http://127.0.0.1:8002/api/health",
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    {
+      command: "npm run preview -- --port 4175 --strictPort --host 127.0.0.1",
+      url: "http://127.0.0.1:4175/",
+      env: { ROASTPILOT_API: "http://127.0.0.1:8002" },
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
     },
