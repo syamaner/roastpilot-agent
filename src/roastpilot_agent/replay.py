@@ -291,6 +291,32 @@ def _with_marker(frame: ReplayFrame, marker: ReplayMarker) -> ReplayFrame:
 # --- Replay roaster control ------------------------------------------------
 
 
+class _SimClock:
+    """A monotonic clock pinned to the recorded sim-time of the current frame.
+
+    The controller derives ``roast_elapsed_seconds`` as
+    ``clock() - run_started_clock`` (see ``RoastController``). On the live path
+    that clock is real ``time.monotonic``; on the replay path that is wrong in
+    ``--step`` mode — a stepped burst drains every frame in a few milliseconds
+    of wall time, so every telemetry frame would report the same ~instant
+    elapsed and the dashboard curve collapses onto one x (#128). Instead the
+    replay source advances this clock to each frame's recorded
+    ``monotonic_seconds`` (sim-time) before the controller reads/ticks, so
+    elapsed spreads across the recorded duration for both stepped and 1× modes.
+    Set/read through :class:`ReplaySource`; ``time.monotonic`` is never consulted
+    on the replay tick path.
+    """
+
+    def __init__(self) -> None:
+        #: The current frame's recorded sim-time, in seconds. Set by the source
+        #: before each controller interaction; read by the controller/runner.
+        self.now: float = 0.0
+
+    def __call__(self) -> float:
+        """Return the recorded sim-time of the frame currently being processed."""
+        return self.now
+
+
 class ReplayRoasterControl:
     """A ``StateReader`` + ``CommandExecutor`` backed by recorded frames.
 
@@ -425,6 +451,7 @@ class ReplaySource:
         control: ReplayRoasterControl,
         safety: SafetyPolicy,
         store: RoastStore,
+        sim_clock: _SimClock,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         tick_interval_seconds: float = 1.0,
     ) -> None:
@@ -434,6 +461,10 @@ class ReplaySource:
         self._control = control
         self._safety = safety
         self._store = store
+        #: The controller's clock on the replay path. Advanced to each frame's
+        #: recorded sim-time before the controller reads/ticks, so elapsed
+        #: tracks the recording, not wall time (#128).
+        self._sim_clock = sim_clock
         self._sleep = sleep
         self._tick_interval = tick_interval_seconds
         self._run_id: str | None = None
@@ -486,6 +517,9 @@ class ReplaySource:
         if self._started:  # pragma: no cover — guarded by callers
             raise RuntimeError("replay source already started")
         self._control.load([frame.telemetry for frame in self._script.frames])
+        # Pin the controller's clock to frame 0's recorded sim-time so the run's
+        # elapsed baseline (run_started) is captured in sim-time, not wall time.
+        self._sim_clock.now = self._script.frames[0].monotonic_seconds
         detail = await self._service.start_roast(self._script.profile)
         self._run_id = detail.id
         self._started = True
@@ -547,6 +581,10 @@ class ReplaySource:
         if self._cursor >= len(self._script.frames):
             return self._is_finalized()
         frame = self._script.frames[self._cursor]
+        # Advance the controller's clock to this frame's recorded sim-time before
+        # it reads/ticks, so roast_elapsed_seconds tracks the recording rather
+        # than wall time — the fix for stepped-burst x-axis collapse (#128).
+        self._sim_clock.now = frame.monotonic_seconds
         # Move the reader onto this frame's reading before the controller reads.
         if self._cursor > 0:
             self._control.advance()
@@ -701,6 +739,10 @@ def build_replay_service(
     control = ReplayRoasterControl()
     safety = SafetyPolicy(app_config.safety)
     store = RoastStore(store_path)
+    # One sim clock, shared: the source advances it to each frame's recorded
+    # sim-time and the service threads it into the controller + runner, so
+    # elapsed tracks the recording, not wall time (#128).
+    sim_clock = _SimClock()
     service = RoastService(
         store,
         config=app_config,
@@ -709,6 +751,7 @@ def build_replay_service(
         exporter=None,
         raw_state=control,
         run_loop=False,
+        clock=sim_clock,
     )
     source = ReplaySource(
         export_dir,
@@ -716,6 +759,7 @@ def build_replay_service(
         control=control,
         safety=safety,
         store=store,
+        sim_clock=sim_clock,
         tick_interval_seconds=app_config.controller.tick_interval_seconds,
     )
     return service, source, store
