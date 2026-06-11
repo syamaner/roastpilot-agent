@@ -33,6 +33,20 @@ describe("LiveCurve", () => {
     expect(hook?.markers).toHaveLength(2);
   });
 
+  it("exposes the rendered scale ranges on the test hook (#131 scale-covers-data guard)", () => {
+    // The hook carries the live uPlot x/°C scale ranges so an e2e test can assert
+    // the scale COVERS the data (catching the collapsed/unranged-scale bug a blank
+    // snapshot can't). Under jsdom the canvas is stubbed, so we assert the SHAPE is
+    // present (the real range values are asserted in the Playwright suite).
+    render(<LiveCurve points={POINTS} phase="development" />);
+    const scales = window.__chart?.scales;
+    expect(scales).toBeDefined();
+    // Both scale entries exist with min/max keys (values are null under the stubbed
+    // jsdom canvas; the real covering ranges are asserted in the Playwright suite).
+    expect(Object.keys(scales?.x ?? {})).toEqual(["min", "max"]);
+    expect(Object.keys(scales?.c ?? {})).toEqual(["min", "max"]);
+  });
+
   it("shows the charge band in preheating only", () => {
     const { rerender } = render(<LiveCurve points={POINTS} phase="preheating" />);
     expect(window.__chart?.chargeBandVisible).toBe(true);

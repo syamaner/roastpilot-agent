@@ -207,11 +207,12 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
   `dashboard-fault`, `dashboard-recovery`, and the detail states deferred from
   S3/S5 (their components already have component tests; S6 builds the multi-fixture
   replay states they need). Each asserts chart data **and** snapshots the canvas.
-  **Exception:** the `dashboard-developed` curve-shape state (operator review on
-  #125) is **deferred → #128** — replay `--step` emits wall-clock `elapsed_seconds`,
-  collapsing the developed curve onto one x-coordinate; it renders correctly only
-  after the stepped-elapsed fix. Curve-render regressions are guarded meanwhile by
-  the un-masked `roast-detail` spread curve (same shared `LiveCurve`).
+  The `dashboard-developed` curve-shape state (operator review on #125)
+  **shipped (#132)** once #128/#130 (replay stepped-elapsed = sim-time) landed.
+  Re-adding it surfaced **#131** — a `LiveCurve` bug where every uPlot scale was
+  built unranged from the empty mount, so the curve never drew for ANY consumer
+  (the canvas-mask hid it); #132 fixes that (a `self.data` range callback, charge
+  band folded into the °C scale) + adds a scale-covers-data guard.
 - [x] **Canvas determinism kit applied** so the un-masked snapshots are stable in
   CI: `deviceScaleFactor: 1`, wait on the `window.__chart` point-count hook before
   shooting, `fonts.ready`, animations off, replay-fixed data, `maxDiffPixelRatio ≈
@@ -236,26 +237,23 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
 | E10-S3 | Dashboard (live) | done (#113) |
 | E10-S4 | History page | done (#114) |
 | E10-S5 | Roast detail page | done (#116) |
-| E10-S6 | SPA tests and SSE behavior | **deterministic close done** — contract drift guard (#120), `useRoastStream` frame-loss fix (#122 → #123), D26 canvas un-mask matrix (#125). **Deferred:** `dashboard-developed` curve snapshot (blocked on **#128** replay stepped-elapsed), `ui-reviewer` MCP pass (API-fragile), Safari/iPad SSE (real devices) |
+| E10-S6 | SPA tests and SSE behavior | **deterministic close done** — contract drift guard (#120), `useRoastStream` frame-loss fix (#122 → #123), D26 canvas un-mask matrix (#125), replay stepped-elapsed sim-time (#128 → #130), `dashboard-developed` curve snapshot + `LiveCurve` scale-collapse fix (#131 → #132). **Deferred:** `ui-reviewer` MCP pass (API-fragile), Safari/iPad SSE (real devices) |
 
-Epic status: **core done, S6 in progress** — the page fan-out is complete:
+Epic status: **core + S6 deterministic work done** — the page fan-out is complete:
 S1–S5 are all merged to `main` (replay #101, foundation #100, E7 `enabled_actions`
 contract #107/D25, S2 foundation follow-up #115 = phase_changed fix + types audit
-+ bean token, dashboard #113, history #114, detail #116). The post-fan-out close-out
-is done — the status/registry sync (#118/#119) + the `product-pm` epic audit (PASS)
-+ an independent revert audit (NOTHING TO REVERT). **S6 (#98) is now the active
-handoff**, two deterministic units:
-1. **D26 canvas snapshot matrix** — **un-mask the uPlot canvas so the screenshots
-   capture the whole page including the chart** (today they `mask:` it); regenerate
-   the existing baselines in the pinned Docker image (CI-only) and add the
-   dashboard-fault / dashboard-recovery / detail states, canvas un-masked. The
-   `window.__chart` data-assert stays as the authoritative correctness layer.
-   Deterministic — **not** API-blocked (Docker-baseline work, no live model).
-2. **contract-fixture drift guard** — pins the SPA's hand-mirrored types against
-   real server frames so the `phase_changed`-class drift can't recur.
-Deferred to a stable-API / real-device session: the consolidated `ui-reviewer`
-visual pass (MCP-heavy) and Safari/iPad SSE (plan §11.4). Re-sliced from 4→6
-stories for parallel agent-team delivery (D23).
++ bean token, dashboard #113, history #114, detail #116). S6 (#98) shipped as five
+PRs: the **D26 canvas snapshot matrix** (un-mask the uPlot canvas so screenshots
+capture the whole page including the chart; #125), the **contract-fixture drift
+guard** (pins the SPA's hand-mirrored types against real server frames so the
+`phase_changed`-class drift can't recur; #120), the **`useRoastStream` frame-loss
+fix** (#122 → #123), the **replay stepped-elapsed sim-time fix** (#128 → #130), and
+the **`dashboard-developed` curve snapshot + `LiveCurve` scale-collapse fix**
+(#131 → #132). The un-mask + the developed curve surfaced four foundation bugs from
+the consumer side (#115-class, #122, #128, #131). **Deferred** to a stable-API /
+real-device session: the consolidated `ui-reviewer` visual pass (MCP-heavy) and
+Safari/iPad SSE (plan §11.4). Re-sliced from 4→6 stories for parallel agent-team
+delivery (D23).
 
 S3 notes: the dashboard renders the live curve, header (phase badge / roast +
 development timers / FC status / diagnostics drawer), control row (ghost markers =

@@ -9,12 +9,13 @@
  * control surface is up on EVERY agent so a misconfigured harness fails fast, not
  * mid-spec.
  *
- * MULTI-FIXTURE: the three dashboard states need three fixtures, so there are three
+ * MULTI-FIXTURE: the dashboard states need different fixtures, so there are several
  * agents (see playwright.config.ts). The `advanceTo`/`step` helpers take the agent
  * base URL so a spec drives the agent backing the preview it loaded:
- *   - session-2   → AGENTS.session2    (:8000) → dashboard-live + route harnesses
- *   - session-1   → AGENTS.session1    (:8001) → dashboard-fault
- *   - fault-pre-t0 → AGENTS.faultPreT0 (:8002) → dashboard-recovery
+ *   - session-2    → AGENTS.session2          (:8000) → dashboard-live + route harnesses
+ *   - session-1    → AGENTS.session1          (:8001) → dashboard-fault
+ *   - fault-pre-t0 → AGENTS.faultPreT0        (:8002) → dashboard-recovery
+ *   - session-2    → AGENTS.session2Developed (:8003) → dashboard-developed (first_crack)
  *
  * `advanceTo` treats any non-2xx as a HARD failure — a 404 means the marker never
  * fired (wrong fixture/marker), which must be loud, not a baseline of the wrong page.
@@ -25,6 +26,9 @@ export const AGENTS = {
   session2: process.env.ROASTPILOT_API ?? "http://127.0.0.1:8000",
   session1: process.env.ROASTPILOT_API_FAULT ?? "http://127.0.0.1:8001",
   faultPreT0: process.env.ROASTPILOT_API_RECOVERY ?? "http://127.0.0.1:8002",
+  // A second session-2 agent for the developed state (advance-to first_crack),
+  // separate from the live agent so the two specs don't share monotonic stepping.
+  session2Developed: process.env.ROASTPILOT_API_DEVELOPED ?? "http://127.0.0.1:8003",
 } as const;
 
 export interface ReplayStepResult {

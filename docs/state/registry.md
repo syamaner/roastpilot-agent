@@ -84,8 +84,8 @@ realizes D17 criterion (1).**
 **E9 is complete (criterion (1) realized).** Both stories merged; epic #82
 closed.
 
-**E10 (SPA) — fan-out complete; S6 deterministic close DONE (curve fast-follow +
-ui-reviewer/Safari deferred).** The deliberate positive fan-out case (the contrast to E9's
+**E10 (SPA) — fan-out complete; S6 deterministic close + curve fast-follow DONE
+(ui-reviewer/Safari deferred).** The deliberate positive fan-out case (the contrast to E9's
 single-session anti-pattern), delivered as a **supervised agent team** (D23):
 foundation-first, then one teammate per page. **S1–S5 all merged to `main`** —
 S1 replay harness (#101), S2 foundation (#100), the E7 `enabled_actions` contract
@@ -96,9 +96,9 @@ parallel in isolated git worktrees after the `isolation:worktree` flag silently
 no-op'd (runbook: `docs/agent-team-worktrees.md`). **D17 criterion (2) met** —
 the dashboard is usable for a live roast.
 
-**S6 (tests + SSE behavior) — deterministic close DONE (three PRs merged).** The
-post-fan-out close-out preceded it (status sync #118/#119, the `product-pm` audit
-PASS, the revert audit). S6's three deterministic PRs are on `main`:
+**S6 (tests + SSE behavior) — DONE (five PRs merged).** The post-fan-out close-out
+preceded it (status sync #118/#119, the `product-pm` audit PASS, the revert audit).
+S6's PRs on `main`:
 1. **PR2 #120** — contract-fixture drift guard: pins the SPA's hand-mirrored types
    (both `lib/types.ts` and `pages/dashboard/events.ts`) against REAL server frames
    so the `phase_changed`-class drift can't recur; must-fail-on-rename proven.
@@ -109,20 +109,26 @@ PASS, the revert audit). S6's three deterministic PRs are on `main`:
    snapshots (dashboard-live/fault/recovery, detail, history, foundation), the
    determinism kit, CI-Docker-only baselines + the `web-snapshots-update.yml`
    producer; the fault baseline shows the real `SafetyPolicy` reason.
+4. **#130** — replay `--step` stepped-elapsed = sim-time (#128): a `_SimClock` off
+   the recorded frame timestamps, so a developed-state curve spreads across the real
+   roast duration instead of collapsing onto one x.
+5. **#132** — the **`dashboard-developed` curve snapshot** (#131) + the `LiveCurve`
+   scale-collapse fix: the chart built every uPlot scale unranged from the empty
+   mount, so the curve never drew for ANY consumer (the canvas-mask hid it); a
+   `self.data` range callback (charge band folded into °C) + a scale-covers-data
+   guard fix it. ALL baselines regenerated — every curve now renders.
 
-**The fan-out's signature result: three real foundation bugs surfaced by
+**The fan-out's signature result: FOUR real foundation bugs surfaced by
 consumer-side work that review had missed — #115 (contract drift), #122 (frame
-loss), #128 (replay stepped-elapsed curve collapse).**
+loss), #128 (replay stepped-elapsed curve collapse), #131 (LiveCurve scales never
+ranged → curve never drew).**
 
-**Fast-follow + deferred (recorded, not dropped):**
-- **`dashboard-developed` curve snapshot** — blocked on **#128** (replay `--step`
-  emits wall-clock `elapsed_seconds`, collapsing the developed curve onto one x).
-  Fast-follow once #128 lands (harness approach saved by `canvas`). Curve-render
-  regressions guarded meanwhile by the un-masked `roast-detail` spread curve.
+**Deferred (recorded, not dropped):**
 - **`ui-reviewer` MCP pass** (API-fragile) + **Safari/iPad SSE** (§11.4,
   real-device) — genuinely deferred.
 
-Open follow-ups: #128 (replay stepped-elapsed), #124 (active_run_id→null fault
-teardown), #126 (detail CLAMP-highlight above viewport), #121 (contract
-continuous-auto-catch), #103/#104/#105/#111/#112/#117/#102. Kickoff brief:
+Open follow-ups: #124 (active_run_id→null fault teardown), #126 (detail
+CLAMP-highlight above viewport), #121 (contract continuous-auto-catch), #133 (S6
+review defers: ror scale in hook, scale-covers asserts on live/fault),
+#103/#104/#105/#111/#112/#117/#102. Kickoff brief:
 `roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`.
