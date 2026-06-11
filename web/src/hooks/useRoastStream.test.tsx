@@ -225,4 +225,61 @@ describe("useRoastStream", () => {
     expect(latest!.lastEvent?.event).toBe("advisory");
     expect(latest!.lastEvent?.data).toMatchObject({ verdict: "clamp" });
   });
+
+  it("buffers EVERY frame of a synchronous burst — non-lossy, unlike lastEvent (#122)", async () => {
+    // The regression: a replay `advance-to` flushes a whole run's frames into the
+    // EventSource in one synchronous batch. The single `lastEvent` slot coalesces to
+    // the LAST frame, but the non-lossy `frames`/`frameCount` buffer must hold them
+    // all, so a cursored drain delivers every one (the dropped-fault-banner bug).
+    let latest: UseRoastStreamResult | null = null;
+    await act(async () => {
+      render(<Probe runId="r1" snapshotPhase="development" onResult={(r) => (latest = r)} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const es = FakeEventSource.last!;
+    await act(async () => es.open());
+
+    // Emit a burst within ONE act() — telemetry frames then a trailing fault, exactly
+    // the shape `advance-to fault` produces.
+    await act(async () => {
+      for (let i = 1; i <= 208; i += 1) {
+        es.emit("telemetry", { elapsed_seconds: i, bean_temp_c: 100 + i }, i);
+      }
+      es.emit("fault", { rule: "max_env_temp", verdict: "emergency_stop", reason: "over ceiling" }, 209);
+    });
+
+    // The non-lossy buffer captured all 209 frames (208 telemetry + 1 fault)...
+    expect(latest!.frameCount).toBe(209);
+    expect(latest!.frames).toHaveLength(209);
+    expect(latest!.frames[208]?.event).toBe("fault");
+    expect(latest!.frames.filter((f) => f.event === "fault")).toHaveLength(1);
+
+    // ...while `lastEvent` only retained the final frame — the loss the buffer fixes.
+    expect(latest!.lastEvent?.event).toBe("fault");
+  });
+
+  it("clears the frame buffer on a run change (no cross-run replay)", async () => {
+    let latest: UseRoastStreamResult | null = null;
+    const { rerender } = render(
+      <Probe runId="r1" snapshotPhase="development" onResult={(r) => (latest = r)} />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const es = FakeEventSource.last!;
+    await act(async () => es.open());
+    await act(async () => es.emit("advisory", { verdict: "allow" }, 1));
+    expect(latest!.frameCount).toBe(1);
+
+    // A new run resubscribes; the buffer must reset to empty so the new run never
+    // folds the previous run's frames.
+    await act(async () => {
+      rerender(<Probe runId="r2" snapshotPhase="development" onResult={(r) => (latest = r)} />);
+      await Promise.resolve();
+    });
+    expect(latest!.frameCount).toBe(0);
+    expect(latest!.frames).toHaveLength(0);
+  });
 });
