@@ -193,6 +193,67 @@ async def test_snapshots_populated_for_replayed_run(
     assert timeline.events  # run_started + phase changes at minimum
 
 
+# --- #128: stepped elapsed_seconds tracks sim-time, not wall-clock ---------
+
+
+@pytest.mark.asyncio
+async def test_stepped_elapsed_seconds_spreads_over_recorded_duration(
+    session2: tuple[RoastService, ReplaySource],
+) -> None:
+    """Regression guard for #128.
+
+    In ``--step`` mode the whole burst drains in a few ms of wall time, so if
+    ``elapsed_seconds`` were wall-clock every telemetry frame would carry the
+    same ~instant value and the dashboard curve (plotted at ``t =
+    elapsed_seconds``) would collapse onto one x. With the sim clock, elapsed
+    tracks each frame's recorded ``monotonic_seconds``: it rises monotonically
+    and spans the recorded run up to first crack (~1000 s for session-2), on
+    both the live SSE frames and the persisted REST series.
+    """
+    service, source = session2
+    assert source.run_id is not None
+    subscriber = service.events.subscribe()
+
+    await source.advance_to(ReplayMarker.FIRST_CRACK)
+
+    # SSE telemetry frames: elapsed is non-decreasing and spans a real range.
+    frames = _drain(subscriber)
+    elapsed = [
+        f.data["elapsed_seconds"]
+        for f in frames
+        if f.event is SseEventType.TELEMETRY and f.data.get("elapsed_seconds") is not None
+    ]
+    assert len(elapsed) > 1
+    assert elapsed == sorted(elapsed), "elapsed must be monotonically non-decreasing"
+    # Recorded first crack lands ~1000 s into the run — far from a wall-clock
+    # collapse (which would pin every frame to a sub-second span).
+    assert elapsed[-1] - elapsed[0] > 100.0
+
+    # The persisted REST series the SPA hydrates from spreads the same way. The
+    # store throttles rows by ``telemetry_log_interval_seconds`` keyed on
+    # ``elapsed_seconds`` — under the wall-clock bug elapsed barely moved, so the
+    # throttle kept a single row (the issue's "point_count 1"). With sim-time it
+    # advances, so the throttle keeps a real spread of rows.
+    series = await service.telemetry(source.run_id, downsample=1)
+    assert series.point_count > 1
+    persisted = [p.elapsed_seconds for p in series.points if p.elapsed_seconds is not None]
+    assert persisted == sorted(persisted)
+    assert persisted[-1] - persisted[0] > 100.0
+
+    # Elapsed is derived from the recording's own sim-time: the final frame's
+    # elapsed equals its recorded monotonic offset from frame 0. This is
+    # mode-independent — the stepped and free-running (1×) paths share
+    # ``_advance_one``, so the 1× rig produces the identical spread, never a
+    # wall-clock collapse.
+    script = load_export(_SESSION_2)
+    base = script.frames[0].monotonic_seconds
+    fc_index = next(
+        i for i, frame in enumerate(script.frames) if ReplayMarker.FIRST_CRACK in frame.markers
+    )
+    expected_fc_elapsed = script.frames[fc_index].monotonic_seconds - base
+    assert abs(elapsed[-1] - expected_fc_elapsed) < 1e-6
+
+
 # --- The CLAMP key frame ---------------------------------------------------
 
 
