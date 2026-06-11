@@ -190,32 +190,42 @@ Owner: `detail` teammate. Acceptance criteria:
 
 Owner: lead / `ui-reviewer`. Acceptance criteria:
 
-- [ ] Component tests + the **scripted `toHaveScreenshot()` snapshot suite**
+- [x] Component tests + the **scripted `toHaveScreenshot()` snapshot suite**
   (D24/**D26**) running **headless in the pinned Playwright Docker image in CI**
   against the replay harness (set up in S2). DOM chrome **and the uPlot canvas**
   per state — the canvas is **no longer masked** (D26); baselines are a **CI-only
   artifact** (generated + diffed only inside the pinned amd64 image). The
   chart-data assertion stays as the authoritative correctness layer alongside the
   pixel snapshot.
-- [ ] **Existing snapshots un-masked + baselines regenerated in Docker.** The
+- [x] **Existing snapshots un-masked + baselines regenerated in Docker.** The
   shipped states that masked the canvas — `dashboard-live` (S3) plus the
   foundation / history / detail states — drop the `mask:` on the canvas selector
   and have their baselines regenerated inside the pinned image. Remove the
   canvas-mask convention from the S2 harness helper; keep the `window.__chart`
   chart-data hook + assertion.
-- [ ] **New multi-fixture states, canvas un-masked from the start:**
+- [x] **New multi-fixture states, canvas un-masked from the start:**
   `dashboard-fault`, `dashboard-recovery`, and the detail states deferred from
   S3/S5 (their components already have component tests; S6 builds the multi-fixture
   replay states they need). Each asserts chart data **and** snapshots the canvas.
-- [ ] **Canvas determinism kit applied** so the un-masked snapshots are stable in
+  **Exception:** the `dashboard-developed` curve-shape state (operator review on
+  #125) is **deferred → #128** — replay `--step` emits wall-clock `elapsed_seconds`,
+  collapsing the developed curve onto one x-coordinate; it renders correctly only
+  after the stepped-elapsed fix. Curve-render regressions are guarded meanwhile by
+  the un-masked `roast-detail` spread curve (same shared `LiveCurve`).
+- [x] **Canvas determinism kit applied** so the un-masked snapshots are stable in
   CI: `deviceScaleFactor: 1`, wait on the `window.__chart` point-count hook before
-  shooting, `fonts.ready` + bundled axis webfont, animations off, replay-fixed
-  data, `maxDiffPixelRatio ≈ 0.01` (kept non-zero). Document that baselines are
-  **never** generated/diffed on macOS — CI Docker only.
+  shooting, `fonts.ready`, animations off, replay-fixed data, `maxDiffPixelRatio ≈
+  0.01` (kept non-zero). Baselines are **never** generated/diffed on macOS — CI
+  Docker only (+ the `web-snapshots-update.yml` producer). **D26 addendum:** the
+  bundled axis webfont is **optional**, not required — baselines are generated AND
+  diffed only inside the one pinned amd64 image (Docker-vs-Docker), so the system
+  font renders identically; the webfont only matters cross-environment, which the
+  CI-only-baselines rule already eliminates. (Roster-confirmed on #125.)
 - [ ] `ui-reviewer` (Playwright MCP, direction-match) pass recorded against the
-  frozen prototype baselines — not a merge gate.
+  frozen prototype baselines — not a merge gate. **Deferred** — API-fragile;
+  stable-API session.
 - [ ] SSE keep-alive/reconnect verified on Safari/iPadOS; resolution recorded
-  in plan §11 (closes open item 4).
+  in plan §11 (closes open item 4). **Deferred** — real-device/manual.
 
 ## Status
 
@@ -226,7 +236,7 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
 | E10-S3 | Dashboard (live) | done (#113) |
 | E10-S4 | History page | done (#114) |
 | E10-S5 | Roast detail page | done (#116) |
-| E10-S6 | SPA tests and SSE behavior | **in progress — handoff ready (#98)**: D26 canvas snapshot matrix (un-mask the chart, CI-Docker baselines) + contract-fixture drift guard, both deterministic; ui-reviewer MCP pass + Safari/iPad SSE deferred (API-fragile / real devices) |
+| E10-S6 | SPA tests and SSE behavior | **deterministic close done** — contract drift guard (#120), `useRoastStream` frame-loss fix (#122 → #123), D26 canvas un-mask matrix (#125). **Deferred:** `dashboard-developed` curve snapshot (blocked on **#128** replay stepped-elapsed), `ui-reviewer` MCP pass (API-fragile), Safari/iPad SSE (real devices) |
 
 Epic status: **core done, S6 in progress** — the page fan-out is complete:
 S1–S5 are all merged to `main` (replay #101, foundation #100, E7 `enabled_actions`
