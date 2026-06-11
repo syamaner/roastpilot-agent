@@ -1,8 +1,9 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { RoastPhase } from "@/lib/types";
+import type { RoastPhase, SseEvent } from "@/lib/types";
 import {
+  useFrameDrain,
   useRoastStream,
   type EventSourceLike,
   type UseRoastStreamResult,
@@ -281,5 +282,59 @@ describe("useRoastStream", () => {
     });
     expect(latest!.frameCount).toBe(0);
     expect(latest!.frames).toHaveLength(0);
+  });
+});
+
+describe("useFrameDrain", () => {
+  const mk = (id: number): SseEvent => ({
+    event: "telemetry",
+    data: { elapsed_seconds: id } as Record<string, unknown>,
+    id,
+  });
+
+  it("drains only new frames as the buffer grows (no re-fold of seen frames)", () => {
+    const seen: number[] = [];
+    const onFrame = (f: SseEvent) => seen.push(f.id ?? -1);
+    const buffer: SseEvent[] = [mk(1), mk(2)];
+
+    const { rerender } = renderHook(
+      ({ count }: { count: number }) => useFrameDrain(buffer, count, onFrame),
+      { initialProps: { count: 2 } },
+    );
+    expect(seen).toEqual([1, 2]);
+
+    // Append two more frames; only the NEW ones drain (1,2 are not re-folded).
+    buffer.push(mk(3), mk(4));
+    rerender({ count: 4 });
+    expect(seen).toEqual([1, 2, 3, 4]);
+  });
+
+  it("resets the cursor on a run change and drains the new run from index 0 (#122)", () => {
+    // Pin "a new run never replays the old run's frames AND its own frames all drain
+    // from 0" — the frameCount < cursor reset branch, then a fresh buffer.
+    const seen: number[] = [];
+    const onFrame = (f: SseEvent) => seen.push(f.id ?? -1);
+
+    // Run 1: advance the cursor with an initial batch.
+    let buffer: SseEvent[] = [mk(10), mk(11)];
+    const { rerender } = renderHook(
+      ({ frames, count }: { frames: readonly SseEvent[]; count: number }) =>
+        useFrameDrain(frames, count, onFrame),
+      { initialProps: { frames: buffer as readonly SseEvent[], count: 2 } },
+    );
+    expect(seen).toEqual([10, 11]);
+
+    // Run change: the hook reset its buffer → shorter (empty) buffer, frameCount=0.
+    // This drives the cursor-reset branch (frameCount 0 < cursor 2).
+    buffer = [];
+    rerender({ frames: buffer as readonly SseEvent[], count: 0 });
+    expect(seen).toEqual([10, 11]); // nothing new yet; no replay of run 1
+
+    // New run's frames arrive (fresh ids). ALL must drain from index 0, and NONE of
+    // run 1's frames may reappear.
+    buffer = [mk(20), mk(21), mk(22)];
+    rerender({ frames: buffer as readonly SseEvent[], count: 3 });
+    expect(seen).toEqual([10, 11, 20, 21, 22]);
+    expect(seen.filter((id) => id < 20)).toEqual([10, 11]); // run 1 not re-folded
   });
 });
