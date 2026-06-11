@@ -24,6 +24,11 @@ export interface ChartHookSnapshot {
   markers: { kind: string; t: number; label: string }[];
   highlightTime: number | null;
   chargeBandVisible: boolean;
+  /** Rendered uPlot scale ranges — a test asserts these COVER the data (#131). */
+  scales: {
+    x: { min: number | null; max: number | null };
+    c: { min: number | null; max: number | null };
+  };
 }
 
 /** Read the LiveCurve data hook (the authoritative correctness layer — D26). */

@@ -71,6 +71,17 @@ export interface ChartTestHook {
   markers: CurveMarker[];
   highlightTime: number | null;
   chargeBandVisible: boolean;
+  /**
+   * The RENDERED uPlot scale ranges (min/max) for the x (elapsed) and c (°C)
+   * scales, read off the live plot after each draw. A test asserts these COVER the
+   * data — a collapsed/unranged scale (the bug where the curve drew off-screen /
+   * onto one point) leaves a scale that does NOT span the data, which a blank-but-
+   * byte-deterministic snapshot can't catch on its own (D26 / #131).
+   */
+  scales: {
+    x: { min: number | null; max: number | null };
+    c: { min: number | null; max: number | null };
+  };
 }
 
 declare global {

@@ -136,5 +136,28 @@ export default defineConfig({
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
     },
+    // --- session-2 developed (:8003 agent / :4176 SPA) → dashboard-developed ---
+    // A SECOND session-2 agent, advanced to first_crack so the dashboard renders the
+    // full ramping curve. The un-mask only guards rendering where the curve has
+    // SHAPE (dashboard-live's preheating is near-flat); post-#128 the stepped
+    // elapsed_seconds is sim-time, so advance-to first_crack spreads the curve across
+    // ~1031 s of x instead of collapsing it. Separate from the live agent because
+    // advance-to is monotonic-forward per agent.
+    {
+      command:
+        "roastpilot-agent --replay tests/fixtures/replay/session-2 --step " +
+        "--host 127.0.0.1 --port 8003",
+      cwd: "..",
+      url: "http://127.0.0.1:8003/api/health",
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    {
+      command: "npm run preview -- --port 4176 --strictPort --host 127.0.0.1",
+      url: "http://127.0.0.1:4176/",
+      env: { ROASTPILOT_API: "http://127.0.0.1:8003" },
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
   ],
 });

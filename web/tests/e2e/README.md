@@ -95,6 +95,18 @@ state gets its own agent + `vite preview` pair on distinct ports:
 | `dashboard-live` + route harnesses | `session-2` | :8000 | :4173 | `preheating` → preheating |
 | `dashboard-fault` | `session-1` | :8001 | :4174 | `fault` → faulted (real env-ceiling E-STOP) |
 | `dashboard-recovery` | `fault-pre-t0` | :8002 | :4175 | `recovery` → operator_recovery_required |
+| `dashboard-developed` | `session-2` | :8003 | :4176 | `first_crack` → development (full ramping curve) |
+
+`dashboard-developed` reuses `session-2` but at `first_crack` — a SECOND session-2
+agent, because `advance-to` is monotonic-forward per agent and `dashboard-live`
+holds its own agent at `preheating`. It is the state that makes the un-mask
+**pay off**: the curve has real shape (ramping bean/env/RoR spread across ~1031 s
+of elapsed-since-T0 + heat/fan step lines + the FC marker), so a broken full-roast
+curve can no longer match a near-empty preheating baseline. Its spec adds a
+curve-**shape** data assertion (bean span + x-axis spread + FC marker), not just a
+point count. (The x-axis spread depends on **#128** — stepped `elapsed_seconds` is
+sim-time, not wall-clock; before that fix an `advance-to` burst collapsed the curve
+onto one x.)
 
 Each preview proxies `/api` to its agent (`ROASTPILOT_API` set at preview-start —
 no rebuild per fixture; see `playwright.config.ts` `webServer[].env` and the shared
