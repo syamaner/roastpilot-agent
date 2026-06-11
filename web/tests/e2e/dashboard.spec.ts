@@ -55,6 +55,11 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   const hook = await readChartData(page);
   expect(hook.columns[0].length).toBeGreaterThan(0);
   expect(hook.chargeBandVisible).toBe(true);
+  // The charge band (170–200 °C) must be ON-SCREEN in preheating (E10-spa.md): the
+  // °C scale folds it in, so its max reaches the band top even though the preheating
+  // data sits at ~38–43 °C. The flag-only chargeBandVisible check missed that the
+  // band could be ranged off-screen — assert the rendered scale actually covers it.
+  expect(hook.scales.c.max ?? 0).toBeGreaterThanOrEqual(200);
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-live.png");
