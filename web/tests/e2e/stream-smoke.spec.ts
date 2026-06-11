@@ -1,14 +1,15 @@
 /**
- * Real-replay smoke (D24, S2 scope).
+ * Real-replay smoke (D24 / D26, S2 scope).
  *
  * Proves the foundation's live data path end-to-end against the REAL replay
- * harness (S1): the agent booted in `--replay session-2 --step`, global-setup
- * advanced it to `preheating`, and the SPA's `/__stream-smoke` route hydrates
- * from `GET /api/roasts/{id}` + applies typed SSE frames. We assert the
- * SERVER-DERIVED phase reached the SPA (not inferred locally) and take one
- * masked chrome snapshot — proving the webServer + deterministic stepping work
- * before any product page exists. Product page-state snapshots land with S3–S6
- * (the full fixture→marker matrix), reusing this exact path.
+ * harness (S1): the agent booted in `--replay session-2 --step`, the test advances
+ * it to `preheating` and steps a few ticks, and the SPA's `/__stream-smoke` route
+ * hydrates from `GET /api/roasts/{id}` + applies typed SSE frames. We assert the
+ * SERVER-DERIVED phase reached the SPA (not inferred locally) and take one page
+ * snapshot — proving the webServer + deterministic stepping work. (`/__stream-smoke`
+ * has no LiveCurve, so there is no canvas here; under D26 the product pages' canvas
+ * is un-masked.) Product page-state snapshots land with S3–S6 (the full
+ * fixture→marker matrix), reusing this exact path.
  */
 
 import { expect, test } from "@playwright/test";

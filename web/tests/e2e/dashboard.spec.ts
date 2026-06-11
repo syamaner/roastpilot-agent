@@ -44,15 +44,17 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   // The phase badge reflects the server's preheating phase.
   await expect(page.getByTestId("phase-badge")).toHaveAttribute("data-phase", "preheating");
 
+  // Gate the canvas shot on an INDEPENDENT minimum point-count (the stepped frames
+  // mean the curve must carry ≥1 point) BEFORE reading the hook — so the barrier
+  // can actually block on the async chart render, not a count it just read (D26 kit).
+  await waitForChartPoints(page, 1);
+
   // The curve built from the stepped telemetry, and the charge band shows in
   // preheating (asserted via DATA — the authoritative layer alongside the pixels).
   const hook = await readChartData(page);
   expect(hook.columns[0].length).toBeGreaterThan(0);
   expect(hook.chargeBandVisible).toBe(true);
 
-  // Gate the canvas shot on the rendered point-count so the un-masked snapshot is
-  // taken after the curve drew (no async-data race — D26 kit).
-  await waitForChartPoints(page, hook.columns[0].length);
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-live.png");
 });
@@ -78,13 +80,23 @@ test("dashboard-fault — real env-ceiling fault renders the fault banner + trai
   // Phase reached the SPA from the server, and the fault banner is shown.
   await expect(page.getByTestId("phase-badge")).toHaveAttribute("data-phase", "faulted");
   await expect(page.getByTestId("fault-banner")).toBeVisible();
-  await expect(page.getByTestId("fault-reason")).toBeVisible();
+  // Assert the reason TEXT, not just visibility: this is the only place the
+  // SSE-fault → real SafetyPolicy → FaultBanner copy path is exercised, and an
+  // empty/truncated reason would pass both toBeVisible() and the pixel baseline
+  // (the baseline regenerates from the same code). The exact figures come from the
+  // real policy evaluating session-1's 241 °C env reading vs the 240 °C ceiling.
+  await expect(page.getByTestId("fault-reason")).toContainText(
+    /241(\.0)?\s*°C exceeds the hard ceiling 240(\.0)?\s*°C/,
+  );
+
+  // Gate the canvas shot on an INDEPENDENT minimum point-count before reading the
+  // hook, so the barrier blocks on the async render (D26 kit).
+  await waitForChartPoints(page, 1);
 
   // The curve carries the persisted telemetry up to the fault (data layer).
   const hook = await readChartData(page);
   expect(hook.columns[0].length).toBeGreaterThan(0);
 
-  await waitForChartPoints(page, hook.columns[0].length);
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-fault.png");
 });
@@ -114,11 +126,14 @@ test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery mo
   await expect(page.getByTestId("recovery-modal")).toBeVisible();
   await expect(page.getByTestId("recovery-no-auto-resume")).toBeVisible();
 
+  // Gate the canvas shot on an INDEPENDENT minimum point-count before reading the
+  // hook, so the barrier blocks on the async render (D26 kit).
+  await waitForChartPoints(page, 1);
+
   // The curve drew the short pre-T0 track (data layer).
   const hook = await readChartData(page);
   expect(hook.columns[0].length).toBeGreaterThan(0);
 
-  await waitForChartPoints(page, hook.columns[0].length);
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-recovery.png");
 });
