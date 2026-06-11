@@ -13,9 +13,10 @@
  * All temperatures Celsius.
  */
 
-import { useEffect, useReducer } from "react";
+import { useCallback, useEffect, useReducer } from "react";
 
 import type { CurveMarker, CurvePoint } from "@/components/shared/LiveCurve/types";
+import { useFrameDrain } from "@/hooks/useRoastStream";
 import type { SseEvent, TelemetryEventData } from "@/lib/types";
 import type {
   AdvisoryEventData,
@@ -218,31 +219,36 @@ export function dashboardReducer(
 }
 
 /**
- * Fold the shared hook's `lastEvent` stream into the dashboard view-model.
+ * Fold the shared hook's NON-LOSSY frame stream into the dashboard view-model.
  *
- * Driven by the raw frame the shared hook surfaces — we re-dispatch each new
- * `lastEvent` exactly once (keyed by frame identity, since the hook replaces the
- * object on every applied frame). On a run change (`runId`) the view-model resets,
- * so a fresh run never paints the previous run's points/markers/fault onto its
- * curve (the page may stay mounted across runs).
+ * Drains every frame from `useRoastStream`'s append-only buffer via `useFrameDrain`
+ * (cursored on `frameCount`), so a burst that coalesces into one render still
+ * dispatches EVERY frame — the fault / recovery / advisory / marker frames are
+ * never dropped (#122). (The previous `[lastEvent]` single-slot input silently lost
+ * intermediate frames when a replay `advance-to` flushed a whole run at once.)
+ *
+ * On a run change (`runId`) the view-model resets, so a fresh run never paints the
+ * previous run's points/markers/fault onto its curve (the page may stay mounted
+ * across runs).
  */
 export function useDashboardEvents(
-  lastEvent: SseEvent | null,
+  frames: readonly SseEvent[],
+  frameCount: number,
   runId: string | null,
 ): DashboardViewModel {
   const [state, dispatch] = useReducer(dashboardReducer, initialDashboardViewModel);
 
   // Reset when the run changes (or clears) — the accumulated view-model is
-  // per-run. Runs BEFORE the lastEvent effect so a reset can't drop a frame:
-  // changing runId re-subscribes the stream, whose first frame arrives later.
+  // per-run. Runs BEFORE the drain effect so a reset can't drop a frame: changing
+  // runId re-subscribes the stream (clearing its buffer), whose frames arrive later.
   useEffect(() => {
     dispatch({ kind: "reset" });
   }, [runId]);
 
-  useEffect(() => {
-    if (lastEvent === null) return;
-    dispatch({ kind: "event", event: lastEvent });
-  }, [lastEvent]);
+  const onFrame = useCallback((frame: SseEvent) => {
+    dispatch({ kind: "event", event: frame });
+  }, []);
+  useFrameDrain(frames, frameCount, onFrame);
 
   return state;
 }

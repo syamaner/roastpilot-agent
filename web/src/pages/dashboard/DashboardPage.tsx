@@ -3,11 +3,12 @@
  * kickoff §2).
  *
  * Consumes the shared foundation READ-ONLY: `useHealth` → active run id, the
- * `useRoastStream` SSE hook (phase / telemetry / enabledActions / lastEvent — all
- * server-derived), the shared `LiveCurve`, `ConnectionIndicator`, and the verdict
- * helper (via the page's components). The page-local `useDashboardEvents` folds
- * the remaining frames (advisory / charge guidance / recovery / fault / markers)
- * the shared reducer surfaces via `lastEvent`.
+ * `useRoastStream` SSE hook (phase / telemetry / enabledActions / the non-lossy
+ * frame buffer — all server-derived), the shared `LiveCurve`, `ConnectionIndicator`,
+ * and the verdict helper (via the page's components). The page-local
+ * `useDashboardEvents` folds the remaining frames (advisory / charge guidance /
+ * recovery / fault / markers) by draining the buffer (frames / frameCount), so a
+ * burst never drops a frame (#122).
  *
  * INVARIANTS: phase comes from the server ONLY (never inferred here); the SPA
  * never calls MCP (only the typed REST client + SSE); temperatures Celsius;
@@ -36,10 +37,11 @@ export function DashboardPage(): React.JSX.Element {
   const health = useHealth();
   const runId = health.data?.active_run_id ?? null;
 
-  // Live SSE stream — phase/telemetry/enabledActions are server-derived; lastEvent
-  // is the raw frame the page-local reducer folds.
-  const { status, phase, telemetry, enabledActions, lastEvent } = useRoastStream(runId);
-  const view = useDashboardEvents(lastEvent, runId);
+  // Live SSE stream — phase/telemetry/enabledActions are server-derived; the
+  // page-local reducer folds the NON-LOSSY frame buffer (frames/frameCount) so a
+  // burst never drops a fault/recovery/advisory/marker frame (#122).
+  const { status, phase, telemetry, enabledActions, frames, frameCount } = useRoastStream(runId);
+  const view = useDashboardEvents(frames, frameCount, runId);
 
   // The run snapshot (profile name + initial enabled actions before the first
   // phase_changed). Read-only REST snapshot, hydrated by TanStack Query.

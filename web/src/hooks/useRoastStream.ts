@@ -62,8 +62,27 @@ export interface UseRoastStreamResult {
   phase: RoastPhase | null;
   telemetry: TelemetryEventData | null;
   enabledActions: OperatorAction[] | null;
-  /** The most recent raw frame, for page-level handlers (advisory/fault/etc.). */
+  /**
+   * The most recent raw frame. CONVENIENCE ONLY — it is a single slot and is
+   * LOSSY under a burst: when several frames arrive in one React batch (e.g. a
+   * replay `advance-to` flushing a whole run, or reconnect-hydration), every
+   * `setState` but the last coalesces, so a `[lastEvent]` effect sees only the
+   * final frame and drops the rest (#122). Use it only where missing
+   * intermediate frames is harmless. For page-local event folding that must NOT
+   * drop a frame (advisory / fault / recovery / markers), drain `frames` via the
+   * monotonic `frameCount` cursor instead — see `useFrameDrain`.
+   */
   lastEvent: SseEvent | null;
+  /**
+   * Append-only buffer of every applied frame, in arrival order — the NON-LOSSY
+   * channel (#122). Paired with `frameCount`: a consumer keeps a cursor and
+   * folds `frames.slice(cursor, frameCount)` so a burst that coalesces into one
+   * render still delivers every frame. The array identity is stable (the same
+   * ref is appended in place); react to `frameCount`, not the array.
+   */
+  frames: readonly SseEvent[];
+  /** Monotonic count of applied frames — the cursor/settle signal for `frames`. */
+  frameCount: number;
 }
 
 const DEFAULT_HEARTBEAT = 15;
@@ -105,6 +124,15 @@ export function useRoastStream(
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [lastEvent, setLastEvent] = useState<SseEvent | null>(null);
 
+  // The non-lossy frame channel (#122): every applied frame is appended to this
+  // ref synchronously inside the listener (never coalesced), and `frameCount`
+  // mirrors its length so consumers can drain new frames with a cursor. A burst
+  // that batches N `setFrameCount` calls into one render still leaves all N frames
+  // in the buffer; the consumer's drain reads them all. The buffer is reset on a
+  // run change so a new run never replays the previous run's frames.
+  const framesRef = useRef<SseEvent[]>([]);
+  const [frameCount, setFrameCount] = useState(0);
+
   // Injected seams are held in refs (updated each render) so the connect effect
   // depends only on the primitive inputs — supplying a fresh inline factory does
   // not re-subscribe the stream.
@@ -121,6 +149,12 @@ export function useRoastStream(
       setStatus("connecting");
       return;
     }
+
+    // New subscription: clear the non-lossy buffer so this run never folds the
+    // previous run's frames. The cursor consumer (useFrameDrain) resets in lockstep
+    // on the same runId change, so frameCount going back to 0 is consistent.
+    framesRef.current = [];
+    setFrameCount(0);
 
     let cancelled = false;
     let source: EventSourceLike | null = null;
@@ -187,6 +221,12 @@ export function useRoastStream(
           };
           dispatch({ kind: "event", event: frame });
           setLastEvent(frame);
+          // Non-lossy channel (#122): append every frame to the buffer (in place,
+          // synchronously) and bump the count. Even if N frames arrive in one batch
+          // and the N setFrameCount calls coalesce to a single render, all N frames
+          // are already in framesRef for the consumer's cursored drain.
+          framesRef.current.push(frame);
+          setFrameCount((n) => n + 1);
           // Test hook (D24): the Playwright global-setup waits until this catches
           // up to the replay step's `last_event_id` before screenshotting — a
           // deterministic settle signal, no arbitrary sleep. Same monotonic
@@ -235,7 +275,43 @@ export function useRoastStream(
     telemetry: state.telemetry,
     enabledActions: state.enabledActions,
     lastEvent,
+    frames: framesRef.current,
+    frameCount,
   };
+}
+
+/**
+ * Drain every new frame from `useRoastStream`'s non-lossy buffer into a per-frame
+ * handler, exactly once each, in arrival order (#122).
+ *
+ * This is the burst-safe replacement for a `[lastEvent]` effect: it keeps a cursor
+ * and, whenever `frameCount` advances, replays `frames.slice(cursor, frameCount)`,
+ * so a burst that coalesces into a single render still delivers ALL its frames. The
+ * cursor resets when `frameCount` drops below it (a run change cleared the buffer),
+ * keeping the drain consistent with the hook's per-run reset.
+ *
+ * `onFrame` is held in a ref, so passing a fresh inline closure each render does not
+ * re-drain already-seen frames.
+ */
+export function useFrameDrain(
+  frames: readonly SseEvent[],
+  frameCount: number,
+  onFrame: (frame: SseEvent) => void,
+): void {
+  const onFrameRef = useRef(onFrame);
+  onFrameRef.current = onFrame;
+  const cursorRef = useRef(0);
+
+  useEffect(() => {
+    // A run change reset the buffer (frameCount < cursor): restart the cursor so we
+    // don't index past the now-shorter buffer or skip the new run's first frames.
+    if (frameCount < cursorRef.current) cursorRef.current = 0;
+    for (let i = cursorRef.current; i < frameCount; i += 1) {
+      const frame = frames[i];
+      if (frame !== undefined) onFrameRef.current(frame);
+    }
+    cursorRef.current = frameCount;
+  }, [frames, frameCount]);
 }
 
 const SSE_EVENT_TYPES: SseEvent["event"][] = [
