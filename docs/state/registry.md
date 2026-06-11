@@ -84,8 +84,8 @@ realizes D17 criterion (1).**
 **E9 is complete (criterion (1) realized).** Both stories merged; epic #82
 closed.
 
-**E10 (SPA) — fan-out complete; S6 close-out remaining (core done, close-out
-partial).** The deliberate positive fan-out case (the contrast to E9's
+**E10 (SPA) — fan-out complete; S6 deterministic close DONE (curve fast-follow +
+ui-reviewer/Safari deferred).** The deliberate positive fan-out case (the contrast to E9's
 single-session anti-pattern), delivered as a **supervised agent team** (D23):
 foundation-first, then one teammate per page. **S1–S5 all merged to `main`** —
 S1 replay harness (#101), S2 foundation (#100), the E7 `enabled_actions` contract
@@ -96,22 +96,33 @@ parallel in isolated git worktrees after the `isolation:worktree` flag silently
 no-op'd (runbook: `docs/agent-team-worktrees.md`). **D17 criterion (2) met** —
 the dashboard is usable for a live roast.
 
-**S6 (tests + SSE behavior) — STARTING NOW (handoff ready, issue #98).** The
-post-fan-out close-out is done: the status-table/registry sync (#118/#119) and the
-`product-pm` epic audit (PASS — S1–S5 acceptance + all invariants independently
-re-derived from the repo; Python 726 / web 197 tests green, 92.9% coverage) + an
-independent post-hoc revert audit (NOTHING TO REVERT; stale branches cleaned).
-**S6's two deterministic units are the active handoff** (engineer source of truth:
-**issue #98** — full scope/acceptance — plus plan **D26** and this epic's S6):
-1. the **D26 canvas snapshot matrix** — **un-mask the uPlot canvas so the
-   screenshots show the whole page including the chart** (currently masked),
-   CI-Docker-only baselines, all 7 required states incl. dashboard-fault /
-   dashboard-recovery; the `window.__chart` data-assert stays as the authoritative
-   layer. Deterministic — NOT API-blocked.
-2. the **contract-fixture drift guard** — pins the SPA's hand-mirrored types
-   against real server frames so the `phase_changed`-class drift can't recur.
-**Still deferred** (genuinely API-fragile / manual): the consolidated `ui-reviewer`
-visual pass (MCP-heavy) and Safari/iPad SSE (§11.4, real-device). Open follow-ups:
-#103 (replay hardening), #104 (E11 recovery-lifespan guard), #105 (S2 nits), #111
-(history FC-time), #112 (dashboard live-contract), #117 (server `acknowledge_fault`),
-#102 (pin pyright). Kickoff brief: `roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`.
+**S6 (tests + SSE behavior) — deterministic close DONE (three PRs merged).** The
+post-fan-out close-out preceded it (status sync #118/#119, the `product-pm` audit
+PASS, the revert audit). S6's three deterministic PRs are on `main`:
+1. **PR2 #120** — contract-fixture drift guard: pins the SPA's hand-mirrored types
+   (both `lib/types.ts` and `pages/dashboard/events.ts`) against REAL server frames
+   so the `phase_changed`-class drift can't recur; must-fail-on-rename proven.
+2. **PR3 #123** — `useRoastStream` frame-loss fix (#122): the single-slot
+   `lastEvent` dropped page-local frames under a burst, so the dashboard could lose
+   the fault/recovery/**CLAMP** frame. Now a non-lossy append buffer + cursor drain.
+3. **PR1 #125** — the **D26 canvas un-mask matrix**: the uPlot chart is now IN the
+   snapshots (dashboard-live/fault/recovery, detail, history, foundation), the
+   determinism kit, CI-Docker-only baselines + the `web-snapshots-update.yml`
+   producer; the fault baseline shows the real `SafetyPolicy` reason.
+
+**The fan-out's signature result: three real foundation bugs surfaced by
+consumer-side work that review had missed — #115 (contract drift), #122 (frame
+loss), #128 (replay stepped-elapsed curve collapse).**
+
+**Fast-follow + deferred (recorded, not dropped):**
+- **`dashboard-developed` curve snapshot** — blocked on **#128** (replay `--step`
+  emits wall-clock `elapsed_seconds`, collapsing the developed curve onto one x).
+  Fast-follow once #128 lands (harness approach saved by `canvas`). Curve-render
+  regressions guarded meanwhile by the un-masked `roast-detail` spread curve.
+- **`ui-reviewer` MCP pass** (API-fragile) + **Safari/iPad SSE** (§11.4,
+  real-device) — genuinely deferred.
+
+Open follow-ups: #128 (replay stepped-elapsed), #124 (active_run_id→null fault
+teardown), #126 (detail CLAMP-highlight above viewport), #121 (contract
+continuous-auto-catch), #103/#104/#105/#111/#112/#117/#102. Kickoff brief:
+`roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`.
