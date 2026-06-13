@@ -13,11 +13,12 @@
  * All temperatures Celsius.
  */
 
-import { useCallback, useEffect, useReducer } from "react";
+import { useCallback, useEffect, useReducer, useRef } from "react";
 
 import type { CurveMarker, CurvePoint } from "@/components/shared/LiveCurve/types";
-import { useFrameDrain } from "@/hooks/useRoastStream";
-import type { SseEvent, TelemetryEventData } from "@/lib/types";
+import { useFrameDrain, type ConnectionStatus } from "@/hooks/useRoastStream";
+import { api } from "@/lib/api";
+import type { SseEvent, TelemetryEventData, TelemetryPoint } from "@/lib/types";
 import type {
   AdvisoryEventData,
   ChargeGuidanceData,
@@ -66,7 +67,9 @@ export interface DashboardViewModel {
   t0: T0DetectedData | null;
   /** Event markers for the curve (T0 / first crack / drop), x in seconds. */
   markers: CurveMarker[];
-  /** Appended live curve points (one per telemetry frame), x = elapsed seconds. */
+  /** Curve points, x = elapsed seconds, ascending and deduped on `t`. Seeded from
+   *  the `/telemetry` snapshot on (re)connect (#153), then appended/merged per live
+   *  telemetry frame. */
   points: CurvePoint[];
   /** Monotonic counter assigning each advisory record a stable key (per run). */
   advisorySeq: number;
@@ -92,6 +95,7 @@ export const ADVISORY_HISTORY_LIMIT = 4;
 
 type Action =
   | { kind: "event"; event: SseEvent }
+  | { kind: "seed"; points: CurvePoint[] }
   | { kind: "reset" };
 
 /** Pull the elapsed-seconds x for a telemetry frame; null frames don't plot. */
@@ -107,6 +111,61 @@ function pointFromTelemetry(t: TelemetryEventData): CurvePoint | null {
   };
 }
 
+/** Project a persisted `/telemetry` snapshot point into the curve form (x = elapsed
+ *  seconds). Null-elapsed points can't be placed on the x-axis, so they're dropped —
+ *  same rule as the live frame path (`pointFromTelemetry`). */
+function pointFromSnapshot(p: TelemetryPoint): CurvePoint | null {
+  if (p.elapsed_seconds == null) return null;
+  return {
+    t: p.elapsed_seconds,
+    bean: p.bean_temp_c,
+    env: p.env_temp_c,
+    ror: p.bean_ror_c_per_min,
+    heat: p.heat_level_percent,
+    fan: p.fan_level_percent,
+  };
+}
+
+/**
+ * Insert/replace a single point keyed by its elapsed-seconds `t`, keeping the
+ * buffer sorted ascending and DEDUPED on `t`.
+ *
+ * Dedupe key is `t` (the tick's elapsed seconds): a backfilled point and the live
+ * frame for the same tick must not double-plot (the #153 seam). The INCOMING point
+ * wins on a `t` collision — for the live append that means a fresher frame replaces
+ * its backfilled placeholder; for a re-seed it means the server snapshot refreshes
+ * what's there. Points usually arrive in order, so the common path is a cheap push.
+ */
+function upsertPoint(points: CurvePoint[], point: CurvePoint): CurvePoint[] {
+  if (points.length === 0 || point.t > points[points.length - 1].t) {
+    return [...points, point];
+  }
+  const next = points.slice();
+  // Find the insertion/replacement slot (small buffers; linear scan from the end
+  // since out-of-order/duplicate arrivals are near the tail in practice).
+  let i = next.length - 1;
+  while (i >= 0 && next[i].t > point.t) i -= 1;
+  if (i >= 0 && next[i].t === point.t) {
+    next[i] = point; // replace the duplicate tick
+  } else {
+    next.splice(i + 1, 0, point); // insert keeping ascending order
+  }
+  return next;
+}
+
+/** Merge a backfilled snapshot series into the live buffer, deduping on `t`. Existing
+ *  points (already-seen live frames) win over a re-seed's duplicates, so a reconnect
+ *  re-hydrate only FILLS the window the device missed and never double-plots or
+ *  clobbers fresher live data. */
+function mergeSeed(points: CurvePoint[], seed: CurvePoint[]): CurvePoint[] {
+  const present = new Set(points.map((p) => p.t));
+  const additions = seed.filter((p) => !present.has(p.t));
+  if (additions.length === 0) return points;
+  let merged = points;
+  for (const p of additions) merged = upsertPoint(merged, p);
+  return merged;
+}
+
 /** Append a marker iff one of that kind isn't already present (markers fire once). */
 function withMarker(markers: CurveMarker[], marker: CurveMarker): CurveMarker[] {
   if (markers.some((m) => m.kind === marker.kind)) return markers;
@@ -119,12 +178,18 @@ export function dashboardReducer(
 ): DashboardViewModel {
   if (action.kind === "reset") return initialDashboardViewModel;
 
+  if (action.kind === "seed") {
+    const merged = mergeSeed(state.points, action.points);
+    if (merged === state.points) return state;
+    return { ...state, points: merged };
+  }
+
   const event = action.event;
   switch (event.event) {
     case "telemetry": {
       const point = pointFromTelemetry(event.data as unknown as TelemetryEventData);
       if (point === null) return state;
-      return { ...state, points: [...state.points, point] };
+      return { ...state, points: upsertPoint(state.points, point) };
     }
     case "advisory": {
       const data = event.data as unknown as AdvisoryEventData;
@@ -218,6 +283,12 @@ export function dashboardReducer(
   }
 }
 
+/** Optional test seams for `useDashboardEvents`. */
+export interface UseDashboardEventsOptions {
+  /** Backfill fetch (defaults to the REST `api.telemetry`). Test seam. */
+  fetchTelemetry?: typeof api.telemetry;
+}
+
 /**
  * Fold the shared hook's NON-LOSSY frame stream into the dashboard view-model.
  *
@@ -227,6 +298,16 @@ export function dashboardReducer(
  * never dropped (#122). (The previous `[lastEvent]` single-slot input silently lost
  * intermediate frames when a replay `advance-to` flushed a whole run at once.)
  *
+ * BACKFILL (#153): the live curve is built only from `telemetry` SSE frames, so a
+ * device that opens the dashboard mid/post-roast — or RECONNECTS after backgrounding
+ * — would otherwise show a blank/partial curve (the hydrate snapshot carries no
+ * series). On every (re)connect — each transition of `status` INTO `live` — we fetch
+ * `GET /api/roasts/{id}/telemetry` and SEED the reducer's points, deduped on elapsed
+ * seconds against the live frames already folded. A reconnect re-seeds so a
+ * backgrounded device re-hydrates the window it missed (the #135 "reconnect catches
+ * up" criterion), and the full series gives LiveCurve a whole-roast x-range (no
+ * moving window). Phase is NOT touched here — it stays the server's truth (invariant).
+ *
  * On a run change (`runId`) the view-model resets, so a fresh run never paints the
  * previous run's points/markers/fault onto its curve (the page may stay mounted
  * across runs).
@@ -235,6 +316,8 @@ export function useDashboardEvents(
   frames: readonly SseEvent[],
   frameCount: number,
   runId: string | null,
+  status: ConnectionStatus,
+  options: UseDashboardEventsOptions = {},
 ): DashboardViewModel {
   const [state, dispatch] = useReducer(dashboardReducer, initialDashboardViewModel);
 
@@ -249,6 +332,50 @@ export function useDashboardEvents(
     dispatch({ kind: "event", event: frame });
   }, []);
   useFrameDrain(frames, frameCount, onFrame);
+
+  // Held in a ref so an inline test seam doesn't re-trigger the backfill effect.
+  const fetchTelemetryRef = useRef<typeof api.telemetry>(api.telemetry);
+  fetchTelemetryRef.current = options.fetchTelemetry ?? api.telemetry;
+
+  // Backfill on (re)connect: fire once per transition INTO `live`. `wasLive`
+  // tracks the previous connection state so a reconnect (reconnecting/stale → live)
+  // re-seeds, while staying-live renders don't refetch. A run change resets it so
+  // the next run's first `live` re-seeds from scratch.
+  const wasLiveRef = useRef(false);
+  useEffect(() => {
+    wasLiveRef.current = false;
+  }, [runId]);
+  useEffect(() => {
+    if (runId === null) return;
+    if (status !== "live") {
+      // Dropped/connecting: arm the next live transition to re-seed.
+      if (status === "reconnecting" || status === "stale") wasLiveRef.current = false;
+      return;
+    }
+    if (wasLiveRef.current) return; // already seeded for this connected session
+    wasLiveRef.current = true;
+
+    let cancelled = false;
+    void fetchTelemetryRef
+      .current(runId)
+      .then((series) => {
+        if (cancelled) return;
+        const seeded: CurvePoint[] = [];
+        for (const p of series.points) {
+          const point = pointFromSnapshot(p);
+          if (point !== null) seeded.push(point);
+        }
+        dispatch({ kind: "seed", points: seeded });
+      })
+      .catch(() => {
+        // A failed backfill leaves the live frames as-is and re-arms so a later
+        // (re)connect can try again — the curve degrades to live-only, never errors.
+        if (!cancelled) wasLiveRef.current = false;
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [status, runId]);
 
   return state;
 }

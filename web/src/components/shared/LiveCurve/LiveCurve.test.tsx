@@ -79,6 +79,17 @@ describe("LiveCurve", () => {
     expect(screen.getByTestId("legend-bean")).toHaveTextContent("150.0 °C");
   });
 
+  it("renders the legend time readout as M:SS for the latest point (#153)", () => {
+    // Latest point t=60 → "1:00" (not raw seconds).
+    render(<LiveCurve points={[...POINTS, { t: 66, bean: 160, env: 180, ror: 12, heat: 60, fan: 60 }]} />);
+    expect(screen.getByTestId("legend-time")).toHaveTextContent("1:06");
+  });
+
+  it("shows an em-dash time readout when there are no points", () => {
+    render(<LiveCurve points={[]} />);
+    expect(screen.getByTestId("legend-time")).toHaveTextContent("—");
+  });
+
   it("reflects the controlled highlightTime on the data hook", () => {
     const { rerender } = render(<LiveCurve points={POINTS} highlightTime={null} />);
     expect(window.__chart?.highlightTime).toBeNull();

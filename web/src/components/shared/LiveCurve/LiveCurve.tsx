@@ -24,7 +24,7 @@ import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 
 import { cn } from "@/lib/cn";
-import { formatSeriesValue, toColumns } from "./chartData";
+import { formatElapsed, formatSeriesValue, toColumns } from "./chartData";
 import {
   type ChartTestHook,
   type CurveMarker,
@@ -207,7 +207,15 @@ export function LiveCurve({
         pct: { range: [0, 100] },
       },
       axes: [
-        { stroke: token("--muted-foreground", "#a1a1aa"), grid: { show: true, stroke: token("--border", "#3f3f46") } },
+        {
+          stroke: token("--muted-foreground", "#a1a1aa"),
+          grid: { show: true, stroke: token("--border", "#3f3f46") },
+          // The x is roast-elapsed SECONDS; render the tick labels as M:SS
+          // (720 → 12:00) like roasting tools — display-only, the data stays
+          // seconds (#153). `time:false` on the x scale, so uPlot passes raw
+          // numeric splits here.
+          values: (_self, splits) => splits.map((v) => formatElapsed(v)),
+        },
         { scale: "c", stroke: token("--muted-foreground", "#a1a1aa"), grid: { show: false } },
         { scale: "ror", side: 1, stroke: token("--roast-nominal", "#34d399"), grid: { show: false } },
         // No axis for the hidden pct scale.
@@ -308,13 +316,15 @@ export function LiveCurve({
     setVisible((prev) => ({ ...prev, [key]: !prev[key] }));
 
   const readoutIdx = cursorIdx ?? (points.length > 0 ? points.length - 1 : null);
+  const readoutPoint = readoutIdx === null ? null : points[readoutIdx] ?? null;
 
   return (
     <div className={cn("flex flex-col gap-2", className)} data-testid="live-curve">
       <Legend
         meta={meta}
         visible={visible}
-        readout={readoutIdx === null ? null : points[readoutIdx] ?? null}
+        readout={readoutPoint}
+        readoutTime={readoutPoint?.t ?? null}
         onToggle={toggle}
       />
       <div
@@ -334,13 +344,19 @@ interface LegendProps {
   meta: SeriesMeta[];
   visible: Record<SeriesKey, boolean>;
   readout: { bean: number | null; env: number | null; ror: number | null; heat: number | null; fan: number | null } | null;
+  /** Elapsed seconds at the readout index (cursor, else latest point); rendered M:SS. */
+  readoutTime: number | null;
   onToggle: (key: SeriesKey) => void;
 }
 
 /** Color-keyed legend that doubles as the cursor value readout + toggle control. */
-function Legend({ meta, visible, readout, onToggle }: LegendProps): React.JSX.Element {
+function Legend({ meta, visible, readout, readoutTime, onToggle }: LegendProps): React.JSX.Element {
   return (
-    <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs" data-testid="live-curve-legend">
+    <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs" data-testid="live-curve-legend">
+      {/* The cursor/latest-point time, M:SS (#153) — same format as the x-axis ticks. */}
+      <span className="numeric font-medium text-muted-foreground" data-testid="legend-time">
+        {formatElapsed(readoutTime)}
+      </span>
       {meta.map((m) => {
         const value = readout ? readout[m.key] : null;
         return (

@@ -25,6 +25,23 @@ export function toColumns(points: CurvePoint[]): ChartColumns {
   return [x, cols.bean, cols.env, cols.ror, cols.heat, cols.fan];
 }
 
+/**
+ * Format roast-elapsed seconds as `M:SS` for the time axis + cursor readout
+ * (#153) — e.g. 720 → `12:00`, 66 → `1:06`, 5 → `0:05`.
+ *
+ * The DATA stays in seconds (the curve x-axis, markers, and dedupe key are all
+ * seconds); this is DISPLAY-ONLY. Negative or non-finite values render as `—` so a
+ * stray tick can't print a malformed label. Hours roll into the minutes field
+ * (a roast never runs an hour, but 75:00 is still well-formed).
+ */
+export function formatElapsed(seconds: number | null): string {
+  if (seconds === null || !Number.isFinite(seconds) || seconds < 0) return "—";
+  const total = Math.round(seconds);
+  const mins = Math.floor(total / 60);
+  const secs = total % 60;
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+}
+
 /** Format a series value for the legend readout. `null` → an em dash. */
 export function formatSeriesValue(key: SeriesKey, value: number | null): string {
   if (value === null || Number.isNaN(value)) return "—";
