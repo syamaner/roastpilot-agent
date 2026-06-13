@@ -268,10 +268,23 @@ order:
    detail/history (FE).
 4. 🟠 **#171** phase-dependent advisor cadence: preheat 30 s / **charged** 10 s / FC
    as-fast-as-it-returns (~5–7 s floor). "beans dropped" = **charged**. Keep change-based
-   early-fire.
+   early-fire. **PR open** (`feature/171-phase-cadence`): `ControllerConfig.advisory_min_interval_seconds`
+   is now a `dict[RoastPhase, float]` consult-floor map (default preheat 30 / pre-FC 10 /
+   development 0); `advisory_interval_for(phase)` resolves it, 0/absent = unthrottled so the
+   `AdvisoryCallPolicy` heartbeat fires every tick once the prior serial call returns. Delta
+   triggers still short-circuit sooner. **Call-frequency only — no verdict/transition/execution
+   change.** Awaiting CI + claude-review triage; not yet merged.
 5. 🟢 **#172** stage-tuned prompt — **Option 2** (one prompt, per-stage sections:
    PREHEAT / DRYING-MAILLARD / FC-DEV) + fill `AdvisorContext` gaps
    (`target_development_percent`, charge band); **bake-off-gated** (not safety).
+   **SCAFFOLD DONE, content pending bake-off (#173).** PR `feature/172-stage-tuned-prompt`:
+   added the `v3` prompt (Option 2, one prompt with explicit PREHEAT / DRYING-MAILLARD /
+   FC-DEVELOPMENT sections, first draft carrying v2's electric-Hottop framing) selectable
+   but NOT default — **`AdvisorConfig.prompt_version` stays `v2`** until the bake-off
+   validates v3; populated `AdvisorContext.target_development_percent` + the charge
+   guidance band (`charge_guidance_min_c`/`max_c`) from the frozen profile in
+   `controller._build_advisor_context`. **Prompt + context-population additive only — no
+   verdict / transition / target-execution change**; advisor stays advisory-only.
 6. 🟢 **#173** phase-dependent MODEL — fast model post-FC (haiku-4.5 / gemini-flash /
    gpt-5-mini-reasoning-off); **re-run bake-off weighting latency post-FC**; new D-number.
    **Operator-gated** (needs a valid key + operator judgment + API cost) — the one piece
