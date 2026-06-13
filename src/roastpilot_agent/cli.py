@@ -16,11 +16,14 @@ Two run modes plus the scaffold default:
 
 import argparse
 import asyncio
-import contextlib
+import logging
 import tempfile
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from roastpilot_agent import __version__
+
+_log = logging.getLogger(__name__)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -115,32 +118,48 @@ async def _serve_live(args: argparse.Namespace) -> int:
             print(f"error: could not start coffee-roaster-mcp: {exc}")
             return 1
 
-        await store.initialize()
-        spa_dir = _resolve_spa_dir(args)
-        # create_app's default lifespan IS the recovery _lifespan: on startup it
-        # runs recover_on_start (a possibly-active run → operator_recovery_required,
-        # never an auto-resume of heat/fan) and stops the loop on shutdown. The
-        # live serve path deliberately uses that recovery lifespan, not replay's
-        # no-recovery one.
-        app = create_app(service, spa_dir=spa_dir)
-        spa_note = "with SPA" if spa_dir is not None else "API only (no SPA build found)"
-        print(f"serving live roast ({spa_note}) on http://{args.host}:{args.port}")
-
-        uv = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
-        server = uvicorn.Server(uv)
+        # The MCP child is RUNNING the moment build_live_service returns, so the
+        # ENTIRE post-build phase (store init, app build, serve) is wrapped: a
+        # failure in store.initialize()/create_app() must still tear the child
+        # down rather than orphan it.
         try:
+            await store.initialize()
+            spa_dir = _resolve_spa_dir(args)
+            # create_app's default lifespan IS the recovery _lifespan: on startup
+            # it runs recover_on_start (a possibly-active run →
+            # operator_recovery_required, never an auto-resume of heat/fan) and
+            # stops the loop on shutdown. The live serve path deliberately uses
+            # that recovery lifespan, not replay's no-recovery one.
+            app = create_app(service, spa_dir=spa_dir)
+            spa_note = "with SPA" if spa_dir is not None else "API only (no SPA build found)"
+            print(f"serving live roast ({spa_note}) on http://{args.host}:{args.port}")
+
+            uv = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
+            server = uvicorn.Server(uv)
             # _lifespan runs recover_on_start (restart → recovery) on startup and
             # service.shutdown() on teardown; we stop the MCP child after the
             # server returns (graceful shutdown / SIGINT) and close the store.
             await server.serve()
         finally:
-            with contextlib.suppress(Exception):
-                await service.shutdown()
-            with contextlib.suppress(Exception):
-                await mcp.stop()
-            with contextlib.suppress(Exception):
-                await store.close()
+            # Best-effort cleanup: each step is logged-not-raised so one failure
+            # never aborts the rest of the chain (or masks the original error).
+            await _cleanup_step("service.shutdown", service.shutdown)
+            await _cleanup_step("mcp.stop", mcp.stop)
+            await _cleanup_step("store.close", store.close)
     return 0
+
+
+async def _cleanup_step(name: str, action: Callable[[], Awaitable[None]]) -> None:
+    """Run one teardown step, logging (not raising) any failure.
+
+    A failed ``service.shutdown()`` / ``mcp.stop()`` / ``store.close()`` must
+    surface in the log but not abort the remaining cleanup or mask the error
+    that triggered teardown — so each step is independently guarded and logged.
+    """
+    try:
+        await action()
+    except Exception:  # noqa: BLE001 — best-effort cleanup, logged not raised
+        _log.warning("live-serve teardown step %r failed", name, exc_info=True)
 
 
 async def _serve_replay(args: argparse.Namespace) -> int:

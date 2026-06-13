@@ -152,17 +152,25 @@ async def build_live_service(
 
 
 def default_spa_dir() -> Path | None:
-    """Resolve the repo's built SPA directory (``web/dist``), if present.
+    """Resolve the **source-checkout** built SPA directory (``web/dist``).
 
-    Returns the bundled ``web/dist`` (built by the E11 wheel build hook, or
-    locally via ``npm run build``) when it contains an ``index.html``; ``None``
-    otherwise so the caller mounts nothing. The path is resolved relative to
-    this installed package so it works from a source checkout and a wheel.
+    Resolves ``<repo-root>/web/dist`` relative to this module — i.e. the SPA a
+    developer built locally with ``npm run build`` in a source checkout. Returns
+    it only when it contains an ``index.html``; otherwise ``None`` so the caller
+    mounts nothing (and serves API-only).
+
+    This is **source-checkout only**. From a wheel install
+    (``site-packages/roastpilot_agent/live.py``) ``parents[2]`` is
+    ``site-packages/``, which has no ``web/dist``, so this returns ``None`` —
+    a wheel install must pass ``--spa-dir`` explicitly until the E11-S1 build
+    hook bundles ``web/dist`` as package data. The fallback is graceful (no
+    error, just API-only), so no behavior depends on guessing a wheel layout.
 
     Returns:
-        The ``web/dist`` path when it holds an ``index.html``, else ``None``.
+        The source-checkout ``web/dist`` path when it holds an ``index.html``,
+        else ``None``.
     """
-    # src/roastpilot_agent/live.py -> repo root is three parents up.
+    # src/roastpilot_agent/live.py -> source-checkout repo root is three parents up.
     candidate = Path(__file__).resolve().parents[2] / "web" / "dist"
     if (candidate / "index.html").is_file():
         return candidate

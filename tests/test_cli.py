@@ -208,3 +208,86 @@ def test_serve_live_happy_path(
     assert captured["coffee_driver"] == "mock"
     # The finally teardown ran in order: service.shutdown → mcp.stop → store.close.
     assert order == ["service.shutdown", "mcp.stop", "store.close"]
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_serve_no_child_leak_when_post_build_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If a post-build step (store.initialize) raises after build_live_service
+    returns a RUNNING child, the child is still stopped (no orphan) and the
+    error propagates — the whole post-build phase is inside the try/finally."""
+    from roastpilot_agent import live
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.store import RoastStore
+
+    stopped: list[str] = []
+
+    class _FakeMCP:
+        running = True
+
+        async def stop(self) -> None:
+            stopped.append("mcp.stop")
+
+    class _ExplodingStore(RoastStore):
+        async def initialize(self) -> None:
+            raise RuntimeError("aiosqlite boom on initialize")
+
+        async def close(self) -> None:
+            stopped.append("store.close")
+
+    async def _fake_build(
+        config: AppConfig, *, store_path: Path
+    ) -> tuple[RoastService, _FakeMCP, RoastStore]:
+        store = _ExplodingStore(store_path)
+        return RoastService(store), _FakeMCP(), store
+
+    monkeypatch.setattr(live, "build_live_service", _fake_build)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+
+    with pytest.raises(RuntimeError, match="aiosqlite boom on initialize"):
+        cli.main()
+    # The child started by build_live_service was torn down, not orphaned.
+    assert "mcp.stop" in stopped
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_serve_teardown_failure_is_logged_not_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failing teardown step (mcp.stop) is logged, never raised, and does not
+    abort the rest of the cleanup chain (store.close still runs)."""
+    from roastpilot_agent import live
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.store import RoastStore
+
+    ran: list[str] = []
+
+    class _FakeMCP:
+        running = True
+
+        async def stop(self) -> None:
+            ran.append("mcp.stop")
+            raise RuntimeError("stop failed")
+
+    class _RecordingStore(RoastStore):
+        async def close(self) -> None:
+            ran.append("store.close")
+            await super().close()
+
+    async def _fake_build(
+        config: AppConfig, *, store_path: Path
+    ) -> tuple[RoastService, _FakeMCP, RoastStore]:
+        store = _RecordingStore(store_path)
+        return RoastService(store), _FakeMCP(), store
+
+    monkeypatch.setattr(live, "build_live_service", _fake_build)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+
+    with caplog.at_level("WARNING"):
+        assert cli.main() == 0
+    # The failing mcp.stop was logged, not raised; store.close still ran after it.
+    assert "mcp.stop" in caplog.text
+    assert ran == ["mcp.stop", "store.close"]
