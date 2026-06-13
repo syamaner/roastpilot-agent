@@ -1288,6 +1288,7 @@ def create_app(
     service: RoastService | None = None,
     *,
     lifespan: Lifespan | None = None,
+    spa_dir: Path | None = None,
 ) -> FastAPI:
     """Create the FastAPI application.
 
@@ -1302,6 +1303,13 @@ def create_app(
     (E10-S1) passes a no-recovery lifespan: it drives the run itself and the
     run is already active, so the restart-recovery startup would wrongly force
     it into ``operator_recovery_required``.
+
+    ``spa_dir`` opts the built SPA in. When set (and it contains an
+    ``index.html``), the SPA is mounted at ``/`` *after* every ``/api/*`` route
+    so it never shadows the API; unknown ``/api/*`` paths stay JSON 404s and any
+    other path falls back to ``index.html`` for the SPA's client-side router
+    (see :func:`roastpilot_agent.live.mount_spa`). When ``None``/missing,
+    nothing is mounted — the scaffold/API-only shape is unchanged.
     """
     app = FastAPI(
         title="roastpilot-agent",
@@ -1320,4 +1328,10 @@ def create_app(
     app.post("/api/roasts/{run_id}/rating")(rate_roast)
     app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)
     app.get("/api/roasts/{run_id}/events")(stream_events)
+    if spa_dir is not None and (spa_dir / "index.html").is_file():
+        # Imported lazily so the API-only/scaffold path carries no static-mount
+        # cost and there is no import cycle (live.py imports api.create_app).
+        from roastpilot_agent.live import mount_spa
+
+        mount_spa(app, spa_dir)
     return app
