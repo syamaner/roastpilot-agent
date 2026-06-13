@@ -20,8 +20,12 @@ import logging
 import tempfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from roastpilot_agent import __version__
+
+if TYPE_CHECKING:
+    from roastpilot_agent.mcp_client import RuntimeConfigSnapshot, ToolCaller
 
 _log = logging.getLogger(__name__)
 
@@ -90,6 +94,74 @@ def _resolve_spa_dir(args: argparse.Namespace) -> Path | None:
     return default_spa_dir()
 
 
+def _format_runtime_readout(rc: "RuntimeConfigSnapshot") -> list[str]:
+    """Render the operator-facing startup readout for a runtime config snapshot.
+
+    Turns the MCP child's resolved :class:`~roastpilot_agent.mcp_client.RuntimeConfigSnapshot`
+    into a prominent, can't-miss console block answering "is it the right
+    hardware, and is first-crack audio detection on?" — the questions an
+    operator must not have to chase before a real roast. Loud ``⚠️`` warnings
+    are appended (never an exit) when the driver is the ``mock`` driver or
+    first-crack mode is not ``audio``; both are valid for a dry-run, so this
+    only warns. The readout is purely informational and read-only.
+
+    Note: the resolved microphone device name and the FC "listening" state are
+    NOT in :class:`RuntimeConfigSnapshot` — the audio device is not exposed
+    there, and ``audio_running`` only appears in ``get_roast_state``'s
+    ``first_crack_status`` once a session starts. A pointer line directs the
+    operator to confirm those on the dashboard after the roast starts.
+
+    Args:
+        rc: The runtime config snapshot read from the MCP child.
+
+    Returns:
+        The console lines to print, in order (header, fields, warnings, note).
+    """
+    port = rc.roaster_port if rc.roaster_port is not None else "—"
+    lines = [
+        "── Roaster runtime (from coffee-roaster-mcp) ──",
+        f"  driver        : {rc.roaster_driver}"
+        f"      (port {port}, {rc.roaster_baudrate}, {rc.temperature_unit})",
+        f"  first crack   : {rc.first_crack_mode}"
+        f"   (model {rc.model_repo_id} · {rc.model_precision})",
+        f"  log dir       : {rc.log_dir}",
+    ]
+    if rc.roaster_driver == "mock":
+        lines.append("⚠️  MOCK driver — NOT real hardware")
+    if rc.first_crack_mode != "audio":
+        lines.append(
+            f"⚠️  first-crack mode is {rc.first_crack_mode!r}, not audio — no audio FC detection"
+        )
+    lines.append(
+        "  mic + FC-listening: confirm on the dashboard "
+        "(FC: listening + Diagnostics window counts) once the roast starts."
+    )
+    return lines
+
+
+async def _emit_runtime_readout(call_tool: "ToolCaller") -> None:
+    """Query the MCP child's runtime config and print the startup readout.
+
+    Read-only: it calls the ``get_runtime_config`` read tool exactly once and
+    prints :func:`_format_runtime_readout`. Robustness is the contract — the
+    readout is informational and must never block startup, so any transport
+    failure (``MCPConnectionError`` / timeout, or any unexpected error) is
+    logged as a warning and swallowed; the live serve continues.
+
+    Args:
+        call_tool: The MCP child's ``call_tool`` transport (``mcp.call_tool``).
+    """
+    from roastpilot_agent.mcp_client import RoasterMCPClient
+
+    try:
+        rc = await RoasterMCPClient(call_tool).get_runtime_config()
+    except Exception as exc:  # noqa: BLE001 — informational readout, never a blocker
+        _log.warning("could not read runtime config: %s", exc)
+        return
+    for line in _format_runtime_readout(rc):
+        print(line)
+
+
 async def _serve_live(args: argparse.Namespace) -> int:
     """Build and serve the live roast app, then clean up the MCP child.
 
@@ -133,6 +205,12 @@ async def _serve_live(args: argparse.Namespace) -> int:
             app = create_app(service, spa_dir=spa_dir)
             spa_note = "with SPA" if spa_dir is not None else "API only (no SPA build found)"
             print(f"serving live roast ({spa_note}) on http://{args.host}:{args.port}")
+
+            # Startup hardware/sensing readout (#134): print what the MCP child
+            # actually resolved — real Hottop vs mock, FC mode — before uvicorn
+            # serves, so "right hardware + FC on?" is a can't-miss console line.
+            # Read-only and best-effort: a failure here never blocks the serve.
+            await _emit_runtime_readout(mcp.call_tool)
 
             uv = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
             server = uvicorn.Server(uv)

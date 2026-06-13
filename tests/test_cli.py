@@ -5,13 +5,52 @@ Hardware-free and server-free: the serve path is exercised with uvicorn's
 driven without binding a socket.
 """
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from roastpilot_agent import cli
+
+
+def _runtime_config_payload(
+    *, roaster_driver: str = "hottop_kn8828b_2k_plus", first_crack_mode: str = "audio"
+) -> dict[str, Any]:
+    """A full ``get_runtime_config`` raw payload for a fake MCP ``call_tool``.
+
+    Carries every field ``RuntimeConfigSnapshot`` requires so a fake child can
+    answer the startup readout's single read-only ``get_runtime_config`` call.
+    """
+    return {
+        "config_source": "/tmp/coffee.yaml",
+        "roaster_driver": roaster_driver,
+        "roaster_port": "/dev/cu.usbserial-XYZ",
+        "roaster_baudrate": 115200,
+        "temperature_unit": "celsius",
+        "command_interval_seconds": 1.0,
+        "first_crack_mode": first_crack_mode,
+        "model_repo_id": "syamaner/coffee-first-crack-detection",
+        "model_precision": "int8",
+        "allow_manual_override": False,
+        "log_dir": "/tmp/roast-logs",
+        "sample_interval_seconds": 1.0,
+        "auto_t0_detection_enabled": True,
+        "auto_t0_drop_threshold_c": 5.0,
+    }
+
+
+def _make_call_tool(
+    payload: dict[str, Any] | None = None,
+) -> Callable[[str, dict[str, object]], Any]:
+    """A fake MCP ``call_tool`` that answers ``get_runtime_config`` from a payload."""
+
+    async def _call_tool(name: str, arguments: dict[str, object]) -> object:
+        if name == "get_runtime_config":
+            return payload if payload is not None else _runtime_config_payload()
+        raise AssertionError(f"unexpected tool call {name!r} during readout")
+
+    return _call_tool
 
 
 def test_version_flag_exits_zero(
@@ -170,6 +209,7 @@ def test_serve_live_happy_path(
 
     class _FakeMCP:
         running = True
+        call_tool = staticmethod(_make_call_tool(_runtime_config_payload(roaster_driver="mock")))
 
         async def stop(self) -> None:
             order.append("mcp.stop")
@@ -204,6 +244,12 @@ def test_serve_live_happy_path(
     assert cli.main() == 0
     out = capsys.readouterr().out
     assert "serving live roast (with SPA)" in out
+    # The startup runtime readout printed (driver/port/FC-mode/model) before serve.
+    assert "Roaster runtime (from coffee-roaster-mcp)" in out
+    assert "/dev/cu.usbserial-XYZ" in out
+    assert "syamaner/coffee-first-crack-detection" in out
+    # The mock-driver warning fired (this fake child resolved the mock driver).
+    assert "MOCK driver — NOT real hardware" in out
     # COFFEE_* was forwarded through the CLI into config.mcp.env.
     assert captured["coffee_driver"] == "mock"
     # The finally teardown ran in order: service.shutdown → mcp.stop → store.close.
@@ -226,6 +272,7 @@ def test_serve_no_child_leak_when_post_build_raises(
 
     class _FakeMCP:
         running = True
+        call_tool = staticmethod(_make_call_tool())
 
         async def stop(self) -> None:
             stopped.append("mcp.stop")
@@ -267,6 +314,7 @@ def test_serve_teardown_failure_is_logged_not_raised(
 
     class _FakeMCP:
         running = True
+        call_tool = staticmethod(_make_call_tool())
 
         async def stop(self) -> None:
             ran.append("mcp.stop")
@@ -291,3 +339,72 @@ def test_serve_teardown_failure_is_logged_not_raised(
     # The failing mcp.stop was logged, not raised; store.close still ran after it.
     assert "mcp.stop" in caplog.text
     assert ran == ["mcp.stop", "store.close"]
+
+
+# --- startup runtime readout (#134) ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_emit_runtime_readout_prints_fields_for_real_hardware(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A real-Hottop runtime config prints driver/port/FC-mode/model with no
+    warnings (driver != mock, FC mode == audio)."""
+    await cli._emit_runtime_readout(_make_call_tool())  # pyright: ignore[reportPrivateUsage]
+    out = capsys.readouterr().out
+    assert "Roaster runtime (from coffee-roaster-mcp)" in out
+    assert "hottop_kn8828b_2k_plus" in out
+    assert "/dev/cu.usbserial-XYZ" in out
+    assert "115200" in out
+    assert "first crack   : audio" in out
+    assert "syamaner/coffee-first-crack-detection · int8" in out
+    assert "log dir       : /tmp/roast-logs" in out
+    # Real hardware + audio FC: no warnings fire.
+    assert "MOCK driver" not in out
+    assert "not audio" not in out
+    # The mic/FC-listening pointer is always present (not in RuntimeConfigSnapshot).
+    assert "mic + FC-listening: confirm on the dashboard" in out
+
+
+@pytest.mark.asyncio
+async def test_emit_runtime_readout_warns_on_mock_driver(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The loud mock-driver warning fires when roaster_driver == 'mock'."""
+    await cli._emit_runtime_readout(  # pyright: ignore[reportPrivateUsage]
+        _make_call_tool(_runtime_config_payload(roaster_driver="mock"))
+    )
+    out = capsys.readouterr().out
+    assert "⚠️" in out
+    assert "MOCK driver — NOT real hardware" in out
+
+
+@pytest.mark.asyncio
+async def test_emit_runtime_readout_warns_when_fc_mode_not_audio(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The loud FC-not-audio warning fires when first_crack_mode != 'audio'."""
+    await cli._emit_runtime_readout(  # pyright: ignore[reportPrivateUsage]
+        _make_call_tool(_runtime_config_payload(first_crack_mode="disabled"))
+    )
+    out = capsys.readouterr().out
+    assert "⚠️" in out
+    assert "first-crack mode is 'disabled', not audio" in out
+
+
+@pytest.mark.asyncio
+async def test_emit_runtime_readout_logs_and_continues_on_failure(
+    capsys: pytest.CaptureFixture[str], caplog: pytest.LogCaptureFixture
+) -> None:
+    """A get_runtime_config transport failure is logged and swallowed — the
+    readout is informational and never a startup blocker (no raise, no readout)."""
+    from roastpilot_agent.mcp_client import MCPConnectionError
+
+    async def _boom(name: str, arguments: dict[str, object]) -> object:
+        raise MCPConnectionError("MCP call 'get_runtime_config' failed: timeout")
+
+    with caplog.at_level("WARNING"):
+        await cli._emit_runtime_readout(_boom)  # pyright: ignore[reportPrivateUsage]  # must not raise
+    assert "could not read runtime config" in caplog.text
+    # No readout block printed when the read failed.
+    assert "Roaster runtime" not in capsys.readouterr().out
