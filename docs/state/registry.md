@@ -152,3 +152,33 @@ Two independent gates must clear first:
 E11 stories #136/#137/#138 are staged (Todo). Contract-buildable scaffolding may be
 pre-staged **only on explicit operator opt-in**. (D28 was recorded 13 Jun 2026 after
 this gate was lost across a session — agreed verbally, written nowhere durable.)
+
+**13 Jun bridge (E10→E11) — landed on `main`, 11 PRs (#143–#154).** Pre-E11 enabler +
+hardening, NOT a start on E11 implementation (still gated):
+- **Live-serve entrypoint (#143):** `roastpilot-agent serve [--host --port --spa-dir]`
+  builds the live stack (`live.build_live_service` → `MCPServerProcess` →
+  `RoasterControlAdapter` → `RoastService`, recovery lifespan, fail-closed) + a
+  **static SPA mount** in `create_app`. The missing glue to run the supervised roast
+  THROUGH the agent (#134); early-completes **E11-S1's "api.py serves the SPA"** (the
+  wheel build-hook + `[pi]` extra still remain). `serve` forwards `COFFEE_*` to the MCP
+  child; ⚠️ **Ctrl-C is not an e-stop** (heat stays at last setpoint → follow-up #142).
+- **Governance-as-code:** `main` is branch-protected (required checks + codecov +
+  `required_conversation_resolution` + `enforce_admins`, no bypass; auto-merge on).
+  `claude-review` posts **blocking inline** findings (`--comment`) but is intentionally
+  **NOT a required check** (fails by design on workflow-editing + Dependabot PRs; the
+  gate is the inline threads + conversation-resolution). AGENTS.md gained a **Code
+  Review Rubric** (#147).
+- **Demo/operator ergonomics:** one-command launch scripts `scripts/roast-replay.sh`
+  (#135 device test) + `scripts/roast-live.sh` (#134), wait-for-ready + rebuild-stale-SPA
+  (#150–#152); the **known-good MCP config** at
+  `docs/examples/coffee-roaster-mcp.known-good.yaml` (#149) — uses the FC
+  **library-default** profile (0.6/5/20s/overlap0.7), distinct from the Pi `pi_inference`
+  profile (0.90/3/30/0.3) E11 will bundle.
+- **Device-test fix (#154):** the dashboard live curve now backfills from `/telemetry`
+  on (re)connect + renders an **M:SS** time axis (was blank on late-join, raw seconds).
+  Low follow-ups → #155.
+
+**Gate status:** E11 still blocked on the two operator manual tests — **#135** (device
+SSE) effectively validated on iPad/iPhone (live curve + reconnect); **#134** (supervised
+hardware roast) is the remaining gate. Bridge follow-ups: #142 (shutdown→heat off),
+#155 (curve-hydration lows).

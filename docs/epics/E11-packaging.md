@@ -39,7 +39,10 @@ child, per D6), mDNS, and a deployment doc. **No Docker image; no PyTorch on the
 Acceptance criteria:
 
 - [ ] `web/dist` built in CI (Node step) and included in the wheel via a
-  hatchling force-include/build hook; `api.py` serves it as static files.
+  hatchling force-include/build hook. (**`api.py` serving the SPA as static files is
+  already DONE** — the static mount + `serve`/`--replay` `--spa-dir` landed early in the
+  13 Jun live-serve bridge, #143/#154; what remains here is the CI build + wheel
+  force-include of `web/dist`.)
 - [ ] A **`pi` optional-dependency extra** declares the **torch-free**
   `coffee-roaster-mcp` (pinned) + the Pi runtime deps (`onnxruntime`, `librosa`,
   `soundfile`, `sounddevice`, `numpy`, …) — **no `torch`/`transformers`**. The base

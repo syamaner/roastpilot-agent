@@ -186,6 +186,16 @@ clean.
   pass.
 - Re-run the checks after any fix; only merge once CI is green *and* every
   comment is resolved or consciously dismissed.
+- **`main` is branch-protected (13 Jun, enforces this policy at the platform).**
+  Required: the CI checks + `codecov/patch`, `required_conversation_resolution`
+  (every review thread resolved), and `enforce_admins` (no bypass for owner or
+  agents); force-push/deletion off; repo auto-merge on. **`claude-review` is
+  intentionally NOT a required check** — it fails by design on PRs that edit a
+  workflow file (the App's workflow-validation guard) and on Dependabot PRs (no
+  secrets), and it passes-on-findings; so the findings gate is its **inline
+  comments** (`--comment`) + conversation-resolution, not the check itself. Don't
+  re-add it as required (it would deadlock workflow PRs). Green CI alone never
+  means mergeable.
 - **Independent triage when work is delivered by an agent team (D23).** PR
   review feedback (GitHub Claude Code Review, codecov, and a `/review-branch`
   roster pass) is adjudicated by the lead/PM or the `pr-triage` subagent —
