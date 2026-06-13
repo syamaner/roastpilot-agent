@@ -81,9 +81,12 @@ for _ in $(seq 1 120); do
   Dashboard  : http://${IP}:${PORT}/
   Trace DB   : ${ROASTPILOT_DB}  (persists after shutdown — #161)
 
-  ⚠  Ctrl-C is NOT an emergency stop — it leaves the heater at its
-     last setpoint. Use the in-UI EMERGENCY STOP or cut machine power.
-     (A restart re-enters operator_recovery_required; never auto-resumes.)
+  ✓  Ctrl-C now SAFELY STOPS: graceful shutdown commands heat → 0 through
+     the safety path before the MCP child stops (#142). Prefer the in-UI
+     EMERGENCY STOP for an immediate stop while the server is up; cut machine
+     power only if a HARD kill (kill -9 / power loss) left it commanded hot —
+     that is uncatchable, so a restart re-enters operator_recovery_required
+     and never auto-resumes heat/fan.
 
   ⚠  Run the §1 COLD pre-flight BEFORE charging beans:
        • e-stop drives heat → 0

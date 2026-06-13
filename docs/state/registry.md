@@ -167,7 +167,10 @@ hardening, NOT a start on E11 implementation (still gated):
   **static SPA mount** in `create_app`. The missing glue to run the supervised roast
   THROUGH the agent (#134); early-completes **E11-S1's "api.py serves the SPA"** (the
   wheel build-hook + `[pi]` extra still remain). `serve` forwards `COFFEE_*` to the MCP
-  child; ⚠️ **Ctrl-C is not an e-stop** (heat stays at last setpoint → follow-up #142).
+  child; **Ctrl-C now safely stops** — graceful shutdown commands heat→0 through the
+  safety path (controller e-stop) BEFORE stopping the MCP child, bounded + fail-closed
+  (#142). A hard kill (SIGKILL/power loss) is uncatchable → still restart →
+  `operator_recovery_required`, never auto-resume.
 - **Governance-as-code:** `main` is branch-protected (required checks + codecov +
   `required_conversation_resolution` + `enforce_admins`, no bypass; auto-merge on).
   `claude-review` posts **blocking inline** findings (`--comment`) but is intentionally
@@ -208,5 +211,8 @@ SSE) is **DONE/CLOSED**; **#134** (supervised hardware roast) is the **sole rema
 operator gate** — operator running it 13 Jun, now with a persistent trace (#161). The
 torch-free chain (D27: `coffee-first-crack-detection#54` → `coffee-roaster-mcp#157`,
 cross-repo) is the other, independent gate. Bridge follow-ups still
-open: **#142** (graceful-shutdown → heat off), **#155** (curve-hydration lows), **#159**
-(auto-merge-vs-review governance race; interim rule: don't `--auto` substantive PRs).
+open: **#155** (curve-hydration lows), **#159** (auto-merge-vs-review governance race;
+interim rule: don't `--auto` substantive PRs). **#142** (graceful-shutdown → heat off)
+is **fixed** (PR pending safety-reviewer): SIGINT/SIGTERM commands heat→0 through the
+controller e-stop before `mcp.stop`, bounded + fail-closed; cooling-on-shutdown is a
+noted out-of-scope follow-up.

@@ -26,7 +26,9 @@ from typing import TYPE_CHECKING
 from roastpilot_agent import __version__
 
 if TYPE_CHECKING:
-    from roastpilot_agent.mcp_client import RuntimeConfigSnapshot, ToolCaller
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.mcp_client import MCPServerProcess, RuntimeConfigSnapshot, ToolCaller
+    from roastpilot_agent.store import RoastStore
 
 _log = logging.getLogger(__name__)
 
@@ -277,20 +279,50 @@ async def _serve_live(args: argparse.Namespace) -> int:
         # server returns (graceful shutdown / SIGINT) and close the store.
         await server.serve()
     finally:
-        # Best-effort cleanup: each step is logged-not-raised so one failure
-        # never aborts the rest of the chain (or masks the original error).
-        await _cleanup_step("service.shutdown", service.shutdown)
-        await _cleanup_step("mcp.stop", mcp.stop)
-        await _cleanup_step("store.close", store.close)
+        await _teardown_live(service, mcp, store)
     return 0
 
 
-async def _cleanup_step(name: str, action: Callable[[], Awaitable[None]]) -> None:
+async def _teardown_live(
+    service: "RoastService", mcp: "MCPServerProcess", store: "RoastStore"
+) -> None:
+    """Tear the live serve down in the safety-critical order (#142).
+
+    Graceful shutdown / Ctrl-C must command heat→0 through the safety path
+    **before** stopping the MCP child — the write must land while the child is
+    still alive to receive it. So the order is load-bearing:
+
+    1. ``safe_shutdown_heat_off`` — heat→0 via the controller's e-stop (bounded,
+       fail-closed; a no-op when no live run is active);
+    2. ``service.shutdown`` — cancel the tick loop;
+    3. ``mcp.stop`` — end the MCP child (after heat-off has landed);
+    4. ``store.close`` — close the decision-trace store.
+
+    (A hard kill / SIGKILL / power loss is uncatchable and skips this entirely —
+    it still relies on restart → ``operator_recovery_required``, never an
+    auto-resume of heat/fan.) Each step is best-effort: a failure is logged, not
+    raised, so one failing step never aborts the rest of the chain or masks the
+    error that triggered teardown.
+
+    Args:
+        service: The live :class:`~roastpilot_agent.api.RoastService`.
+        mcp: The MCP child process to stop after heat-off has landed.
+        store: The decision-trace store to close last.
+    """
+    await _cleanup_step("safe_shutdown_heat_off", service.safe_shutdown_heat_off)
+    await _cleanup_step("service.shutdown", service.shutdown)
+    await _cleanup_step("mcp.stop", mcp.stop)
+    await _cleanup_step("store.close", store.close)
+
+
+async def _cleanup_step(name: str, action: Callable[[], Awaitable[object]]) -> None:
     """Run one teardown step, logging (not raising) any failure.
 
-    A failed ``service.shutdown()`` / ``mcp.stop()`` / ``store.close()`` must
-    surface in the log but not abort the remaining cleanup or mask the error
-    that triggered teardown — so each step is independently guarded and logged.
+    A failed ``safe_shutdown_heat_off()`` / ``service.shutdown()`` /
+    ``mcp.stop()`` / ``store.close()`` must surface in the log but not abort the
+    remaining cleanup or mask the error that triggered teardown — so each step
+    is independently guarded and logged. The action's return value is ignored
+    (``safe_shutdown_heat_off`` returns a bool the chain does not branch on).
     """
     try:
         await action()
