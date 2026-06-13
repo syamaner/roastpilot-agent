@@ -10,7 +10,13 @@ import os
 import pydantic
 import pytest
 
-from roastpilot_agent.config import AdvisorConfig, AppConfig, ControllerConfig, SafetyLimits
+from roastpilot_agent.config import (
+    DEFAULT_ADVISOR_MODEL,
+    AdvisorConfig,
+    AppConfig,
+    ControllerConfig,
+    SafetyLimits,
+)
 from roastpilot_agent.models import RoastPhase
 
 
@@ -61,6 +67,56 @@ def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
     assert config.reasoning_effort is None  # provider default until measured
 
 
+def test_advisor_per_phase_model_default_is_opus_everywhere() -> None:
+    """#173 MECHANISM: per-phase model selection defaults to the single
+    capable model (Opus) for every phase — zero behavior change until the
+    operator-gated bake-off re-run flips the post-FC slot to a faster model."""
+    config = AdvisorConfig()
+    assert DEFAULT_ADVISOR_MODEL == "anthropic/claude-opus-4.8"
+    # The base slug and every phase override are the same single model today.
+    assert config.model_slug == DEFAULT_ADVISOR_MODEL
+    assert config.model_slug_by_phase == {
+        RoastPhase.PREHEATING: DEFAULT_ADVISOR_MODEL,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK: DEFAULT_ADVISOR_MODEL,
+        RoastPhase.DEVELOPMENT: DEFAULT_ADVISOR_MODEL,
+    }
+
+
+def test_model_for_resolves_opus_for_every_phase_by_default() -> None:
+    """The resolver returns Opus in every phase (including phases absent from
+    the map, which fall back to ``model_slug``) — the default no-op."""
+    config = AdvisorConfig()
+    for phase in RoastPhase:
+        assert config.model_for(phase) == DEFAULT_ADVISOR_MODEL
+
+
+def test_model_for_resolves_per_phase_override() -> None:
+    """A custom per-phase map resolves as set; the eventual bake-off shape —
+    capable pre-FC, fast post-FC — wired through the mechanism."""
+    config = AdvisorConfig(
+        model_slug="anthropic/claude-opus-4.8",
+        model_slug_by_phase={
+            RoastPhase.PREHEATING: "anthropic/claude-opus-4.8",
+            RoastPhase.ROASTING_PRE_FIRST_CRACK: "anthropic/claude-opus-4.8",
+            RoastPhase.DEVELOPMENT: "anthropic/claude-haiku-4.5",
+        },
+    )
+    assert config.model_for(RoastPhase.PREHEATING) == "anthropic/claude-opus-4.8"
+    assert config.model_for(RoastPhase.ROASTING_PRE_FIRST_CRACK) == "anthropic/claude-opus-4.8"
+    assert config.model_for(RoastPhase.DEVELOPMENT) == "anthropic/claude-haiku-4.5"
+
+
+def test_model_for_falls_back_to_base_slug_for_unmapped_phase() -> None:
+    """A phase absent from the override map resolves to the base ``model_slug``."""
+    config = AdvisorConfig(
+        model_slug="anthropic/claude-opus-4.8",
+        model_slug_by_phase={RoastPhase.DEVELOPMENT: "anthropic/claude-haiku-4.5"},
+    )
+    # COOLING is not in the map → base slug.
+    assert config.model_for(RoastPhase.COOLING) == "anthropic/claude-opus-4.8"
+    assert config.model_for(RoastPhase.DEVELOPMENT) == "anthropic/claude-haiku-4.5"
+
+
 def test_safety_limit_defaults_are_conservative() -> None:
     limits = SafetyLimits()
     assert limits.pre_t0_max_bean_temp_c == 200.0
@@ -88,6 +144,9 @@ def test_safety_limit_defaults_are_conservative() -> None:
         (AdvisorConfig, {"temperature": 2.1}),
         (AdvisorConfig, {"api_key_env": ""}),
         (AdvisorConfig, {"prompt_version": ""}),
+        (AdvisorConfig, {"model_slug": ""}),
+        # #173: an empty per-phase model slug is meaningless.
+        (AdvisorConfig, {"model_slug_by_phase": {RoastPhase.DEVELOPMENT: ""}}),
         (SafetyLimits, {"max_bean_temp_c": 0}),
         (SafetyLimits, {"overrun_safe_fan_percent": 101}),
         (SafetyLimits, {"pre_t0_overrun_severity": "explode"}),
