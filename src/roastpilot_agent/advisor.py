@@ -485,7 +485,7 @@ def reasoning_extra_body(
     return {"reasoning": {"effort": reasoning_effort}}
 
 
-def build_model(config: AdvisorConfig) -> Model:
+def build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
     """Build the PydanticAI ``Model`` for ``config.provider`` (D18).
 
     One factory, one advisor — only model construction varies per provider.
@@ -497,7 +497,19 @@ def build_model(config: AdvisorConfig) -> Model:
     provider — never stored. Provider SDK imports are lazy so a lean install
     only needs the extra for the provider it actually uses; a missing extra
     raises :class:`AdvisorDependencyError` with the install hint.
+
+    Args:
+        config: The advisor configuration (provider, base URL, key env var).
+        model_slug: The model slug to construct. Defaults to
+            ``config.model_slug``; the per-phase advisor (#173) passes the
+            phase-resolved slug here so one provider config can serve several
+            models. The provider is always ``config.provider`` — per-phase
+            selection varies the model, not the provider.
+
+    Returns:
+        The constructed PydanticAI ``Model`` for the given slug and provider.
     """
+    slug = model_slug if model_slug is not None else config.model_slug
     api_key = os.environ.get(config.api_key_env)
     provider = config.provider
     try:
@@ -505,17 +517,17 @@ def build_model(config: AdvisorConfig) -> Model:
             from pydantic_ai.models.openai import OpenAIChatModel
             from pydantic_ai.providers.openai import OpenAIProvider
 
-            return OpenAIChatModel(config.model_slug, provider=OpenAIProvider(api_key=api_key))
+            return OpenAIChatModel(slug, provider=OpenAIProvider(api_key=api_key))
         if provider == "anthropic":
             from pydantic_ai.models.anthropic import AnthropicModel
             from pydantic_ai.providers.anthropic import AnthropicProvider
 
-            return AnthropicModel(config.model_slug, provider=AnthropicProvider(api_key=api_key))
+            return AnthropicModel(slug, provider=AnthropicProvider(api_key=api_key))
         if provider == "google":
             from pydantic_ai.models.google import GoogleModel
             from pydantic_ai.providers.google import GoogleProvider
 
-            return GoogleModel(config.model_slug, provider=GoogleProvider(api_key=api_key))
+            return GoogleModel(slug, provider=GoogleProvider(api_key=api_key))
         if provider in ("ollama", "openai_compatible"):
             from pydantic_ai.models.openai import OpenAIChatModel
             from pydantic_ai.providers.openai import OpenAIProvider
@@ -524,7 +536,7 @@ def build_model(config: AdvisorConfig) -> Model:
             # local Ollama endpoint; fall back to a placeholder so a LAN
             # Ollama with no auth still constructs.
             return OpenAIChatModel(
-                config.model_slug,
+                slug,
                 provider=OpenAIProvider(
                     base_url=config.provider_base_url, api_key=api_key or "not-required"
                 ),
@@ -563,7 +575,11 @@ class PydanticAIAdvisor(RoastAdvisor):
 
     def __init__(self, config: AdvisorConfig, *, model: Model | None = None) -> None:
         self._config = config
-        self._model = model if model is not None else build_model(config)
+        #: An injected model (the recorded-response test seam) pins every phase
+        #: to that one model — per-phase resolution is bypassed so a test
+        #: double drives all calls. When ``None``, each phase-resolved slug
+        #: (#173) gets its own lazily-built, cached agent.
+        self._injected_model = model
         #: Token usage from the most recent model response (cost/observability);
         #: ``None`` until the first one. Captured as soon as the provider
         #: returns, so it reflects a call whose output later fails strict
@@ -576,16 +592,61 @@ class PydanticAIAdvisor(RoastAdvisor):
         extra_body = reasoning_extra_body(config.reasoning_effort)
         if extra_body is not None:
             settings["extra_body"] = extra_body
-        self._agent: Agent[None, _RawRoastDecision] = Agent(
-            self._model,
-            output_type=_RawRoastDecision,
-            instructions=instructions_for(config.prompt_version),
-            model_settings=settings,
-        )
+        self._model_settings = settings
+        self._instructions = instructions_for(config.prompt_version)
+        #: Per-slug agent cache (#173). One agent per distinct model slug —
+        #: instructions and settings are slug-independent, only the underlying
+        #: ``Model`` varies. With the Opus-everywhere default every phase
+        #: resolves to the same slug, so exactly one agent is built: a clean
+        #: behavioral no-op. Keyed by slug; ``_injected_model`` short-circuits
+        #: the cache for the test seam. ``descriptor``/``healthcheck`` warm the
+        #: base ``model_slug`` entry eagerly so the prior single-agent eager
+        #: construction (and its import-error surface) is preserved.
+        self._agents: dict[str, Agent[None, _RawRoastDecision]] = {}
+        self._agent_for(config.model_slug)
+
+    def _agent_for(self, model_slug: str) -> "Agent[None, _RawRoastDecision]":
+        """Return the cached agent for ``model_slug``, building it on first use.
+
+        An injected model (the test seam) is used for every slug; otherwise the
+        model is built once per slug via :func:`build_model` and cached. The
+        agent's instructions and settings are slug-independent — only the
+        underlying ``Model`` varies — so this is the per-phase model selection
+        seam (#173) with no other behavior change.
+
+        Args:
+            model_slug: The phase-resolved model slug to get an agent for.
+
+        Returns:
+            The cached (or newly built) agent for ``model_slug``.
+        """
+        agent = self._agents.get(model_slug)
+        if agent is None:
+            model = (
+                self._injected_model
+                if self._injected_model is not None
+                else build_model(self._config, model_slug=model_slug)
+            )
+            agent = Agent(
+                model,
+                output_type=_RawRoastDecision,
+                instructions=self._instructions,
+                model_settings=self._model_settings,
+            )
+            self._agents[model_slug] = agent
+        return agent
 
     @property
     def descriptor(self) -> AdvisorDescriptor:
-        """The configured provider/model/prompt-version trace identity (#167)."""
+        """The configured provider/model/prompt-version trace identity (#167).
+
+        The ``model`` is the base :attr:`AdvisorConfig.model_slug`. Per-phase
+        selection (#173) varies which model actually runs a given call; the
+        descriptor stays the stable advisor-level identity (every phase
+        resolves to this slug under the Opus-everywhere default, so it is
+        accurate today, and it remains the advisor's configured-model identity
+        once the FC slot is flipped).
+        """
         return AdvisorDescriptor(
             provider=self._config.provider,
             model=self._config.model_slug,
@@ -593,7 +654,17 @@ class PydanticAIAdvisor(RoastAdvisor):
         )
 
     async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
-        """Run the configured model and return a validated recommendation."""
+        """Run the phase-resolved model and return a validated recommendation.
+
+        The model slug is selected by ``context.phase`` via
+        :meth:`AdvisorConfig.model_for` (#173) — with the Opus-everywhere
+        default this is the single configured model in every phase. The
+        per-phase agent is cached, so flipping the FC/development slot to a
+        faster model after the bake-off changes only which agent runs, not the
+        call path.
+        """
+        model_slug = self._config.model_for(context.phase)
+        agent = self._agent_for(model_slug)
         context_json = context.model_dump_json()
         context_hash = hashlib.sha256(context_json.encode()).hexdigest()
         _log.info(
@@ -601,12 +672,13 @@ class PydanticAIAdvisor(RoastAdvisor):
             extra={
                 "context_hash": context_hash,
                 "provider": self._config.provider,
-                "model_slug": self._config.model_slug,
+                "model_slug": model_slug,
+                "phase": context.phase.value,
                 "prompt_version": self._config.prompt_version,
             },
         )
         try:
-            result = await self._agent.run(context_json)
+            result = await agent.run(context_json)
         except UnexpectedModelBehavior as exc:
             raise AdvisorMalformedOutputError(str(exc)) from exc
         except ModelAPIError as exc:
@@ -637,12 +709,15 @@ class PydanticAIAdvisor(RoastAdvisor):
         """
         provider = self._config.provider
         model_slug = self._config.model_slug
+        agent = self._agent_for(model_slug)
         try:
             async with asyncio.timeout(self._config.healthcheck_timeout_seconds):
                 # A trivial prompt: reachability is decided by the transport
                 # (auth/model/endpoint), not the content. The structured
-                # output_type is the advisor's own — still advisory-only.
-                await self._agent.run("ping")
+                # output_type is the advisor's own — still advisory-only. The
+                # probe uses the base model_slug — the descriptor's identity and
+                # the model every phase resolves to under the default (#173).
+                await agent.run("ping")
         except TimeoutError:
             return AdvisorHealth(
                 status=AdvisorHealthStatus.UNREACHABLE,

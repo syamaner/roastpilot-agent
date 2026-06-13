@@ -25,6 +25,7 @@ from typing import Any
 import pytest
 from pydantic_ai import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.google import GoogleModel
@@ -374,6 +375,104 @@ def test_pydantic_advisor_descriptor_reflects_config() -> None:
     assert descriptor.prompt_version == "v2"
 
 
+# --- Per-phase model selection (#173) ---
+
+
+def _context_in_phase(phase: RoastPhase) -> AdvisorContext:
+    """A minimal valid context fixed to ``phase`` (per-phase selection seam)."""
+    return AdvisorContext(
+        phase=phase,
+        roast_elapsed_seconds=120.0,
+        development_elapsed_seconds=None,
+        current_bean_temp_c=180.0,
+        current_env_temp_c=190.0,
+        bean_ror_c_per_min=4.0,
+        env_ror_c_per_min=3.0,
+        target_drop_temp_c=205.0,
+        profile_name="suite",
+    )
+
+
+def test_advisor_selects_model_by_phase_via_recorded_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#173: ``get_recommendation`` builds (and caches) the agent for the slug
+    that :meth:`AdvisorConfig.model_for` resolves for ``context.phase``.
+
+    With no injected model, each distinct resolved slug is built offline via
+    ``build_model`` (no network, no key) and cached. Asserting the cached
+    agent's ``model_name`` per phase pins that the advisor selects the model by
+    phase. The default would be Opus everywhere, so a custom map proves
+    selection: fast post-FC, capable pre-FC — the eventual bake-off shape."""
+    monkeypatch.setenv("ADVISOR_TEST_KEY", "dummy-key")
+    config = AdvisorConfig(
+        provider="anthropic",
+        api_key_env="ADVISOR_TEST_KEY",
+        model_slug="anthropic/claude-opus-4.8",
+        model_slug_by_phase={
+            RoastPhase.PREHEATING: "anthropic/claude-opus-4.8",
+            RoastPhase.ROASTING_PRE_FIRST_CRACK: "anthropic/claude-opus-4.8",
+            RoastPhase.DEVELOPMENT: "anthropic/claude-haiku-4.5",
+        },
+    )
+    advisor = PydanticAIAdvisor(config)
+
+    expected = {
+        RoastPhase.PREHEATING: "anthropic/claude-opus-4.8",
+        RoastPhase.ROASTING_PRE_FIRST_CRACK: "anthropic/claude-opus-4.8",
+        RoastPhase.DEVELOPMENT: "anthropic/claude-haiku-4.5",
+    }
+    for phase, slug in expected.items():
+        agent = advisor._agent_for(config.model_for(phase))  # type: ignore[reportPrivateUsage]
+        model = agent.model
+        assert isinstance(model, Model)
+        assert model.model_name == slug
+
+
+def test_advisor_default_pins_every_phase_to_one_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Opus-everywhere default is a clean behavioral no-op: every phase
+    resolves to the same slug, so exactly one agent is built (one cache
+    entry)."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
+    advisor = PydanticAIAdvisor(AdvisorConfig())
+    for phase in (
+        RoastPhase.PREHEATING,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        RoastPhase.DEVELOPMENT,
+    ):
+        advisor._agent_for(advisor._config.model_for(phase))  # type: ignore[reportPrivateUsage]
+    cache = advisor._agents  # type: ignore[reportPrivateUsage]
+    assert set(cache) == {"anthropic/claude-opus-4.8"}
+
+
+@pytest.mark.asyncio
+async def test_advisor_injected_model_pins_all_phases(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recorded-response test seam (an injected model) drives every phase —
+    per-phase resolution is bypassed so the double serves all calls, regardless
+    of the per-phase map."""
+    config = AdvisorConfig(
+        model_slug_by_phase={
+            RoastPhase.PREHEATING: "anthropic/claude-opus-4.8",
+            RoastPhase.DEVELOPMENT: "anthropic/claude-haiku-4.5",
+        },
+    )
+    advisor = PydanticAIAdvisor(config, model=_function_model_returning(_VALID_OUTPUT))
+    pre = await advisor.get_recommendation(_context_in_phase(RoastPhase.PREHEATING))
+    dev = await advisor.get_recommendation(_context_in_phase(RoastPhase.DEVELOPMENT))
+    assert isinstance(pre, RoastDecision)
+    assert isinstance(dev, RoastDecision)
+    # The injected double is reused across both phases — distinct slugs in the
+    # map do not build new agents when a model is injected.
+    injected = advisor._injected_model  # type: ignore[reportPrivateUsage]
+    assert injected is not None
+    agents = advisor._agents.values()  # type: ignore[reportPrivateUsage]
+    assert all(agent.model is injected for agent in agents)
+
+
 # build_model factory: provider → Model for every enum value.
 
 
@@ -705,8 +804,12 @@ async def test_pydanticai_healthcheck_times_out_unreachable(
         _function_model_returning(_VALID_OUTPUT),
         healthcheck_timeout_seconds=0.05,
     )
-    # Make the agent run hang so only the timeout can resolve the probe.
-    monkeypatch.setattr(advisor._agent, "run", _never)  # pyright: ignore[reportPrivateUsage]
+    # Make the agent run hang so only the timeout can resolve the probe. The
+    # probe uses the base-slug agent, eagerly built in __init__ and cached.
+    base_agent = advisor._agent_for(  # pyright: ignore[reportPrivateUsage]
+        advisor._config.model_slug  # pyright: ignore[reportPrivateUsage]
+    )
+    monkeypatch.setattr(base_agent, "run", _never)
     health = await _asyncio.wait_for(advisor.healthcheck(), timeout=1.0)
     assert health.status is AdvisorHealthStatus.UNREACHABLE
     assert health.error is not None
