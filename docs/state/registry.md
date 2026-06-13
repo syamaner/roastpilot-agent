@@ -212,7 +212,46 @@ operator gate** — operator running it 13 Jun, now with a persistent trace (#16
 torch-free chain (D27: `coffee-first-crack-detection#54` → `coffee-roaster-mcp#157`,
 cross-repo) is the other, independent gate. Bridge follow-ups still
 open: **#155** (curve-hydration lows), **#159** (auto-merge-vs-review governance race;
-interim rule: don't `--auto` substantive PRs). **#142** (graceful-shutdown → heat off)
-is **fixed** (PR pending safety-reviewer): SIGINT/SIGTERM commands heat→0 through the
-controller e-stop before `mcp.stop`, bounded + fail-closed; cooling-on-shutdown is a
-noted out-of-scope follow-up.
+interim rule: don't `--auto` substantive PRs). **#142** (graceful-shutdown → heat off) is
+now **DONE** — see the build order below.
+
+**#134 FIRST ATTEMPT (13 Jun 2026) — harness worked, run did NOT complete; gate still
+OPEN.** The supervised roast was attempted live: `serve` + MCP child + FC model load +
+tick loop + telemetry + dashboard + safety (537 evals: 428 ALLOW / 108 REJECT / 1
+EMERGENCY_STOP) + UI Emergency Stop **all worked**. The **only** failure: the OpenRouter
+key was a **1-day key, expired** → advisor `provider_error` every tick (401, never reached
+OpenRouter) → operator e-stopped in **preheat** before charging beans. So **no beans
+charged, no roast completed — #134 NOT passed.** Unblock = a fresh non-expiring key
+(operator). The attempt also surfaced real gaps (below). Trace persisted at
+`~/roasts/roastpilot.sqlite3`.
+
+**LOCKED PLAN (13 Jun): do ALL of the below BEFORE the next #134 attempt** (operator
+agreed). Mostly core-file (controller/advisor/config/safety/api/cli) → **sequential
+single-owner**, NOT a parallel team (shared-surface; safety-critical — the "when not to
+fan out" rule). Safety items route through **safety-reviewer**; tests via **qa**. Build
+order:
+1. ✅ **#142** Ctrl-C/SIGINT → heat off on shutdown (the safety hole hit live) — **DONE**
+   (PR #175; safety-reviewer **PASS**; reuse `operator_emergency_stop`, bounded +
+   fail-closed before `mcp.stop`). Follow-ups: #177 (wedged-child timeout), #176 (cooling).
+2. 🟠 **#168** validate advisor reachability at startup + surface errors live ("advisor
+   configured" only checks the key is *present* — would've caught the expired key).
+3. 🟠 **#167** persist `advisor_decisions` (table has ZERO call sites — trace dropped) →
+   then **#170** surface the advisor timeline in detail/history.
+4. 🟠 **#171** phase-dependent advisor cadence: preheat 30 s / **charged** 10 s / FC
+   as-fast-as-it-returns (~5–7 s floor). "beans dropped" = **charged**. Keep change-based
+   early-fire.
+5. 🟢 **#172** stage-tuned prompt — **Option 2** (one prompt, per-stage sections:
+   PREHEAT / DRYING-MAILLARD / FC-DEV) + fill `AdvisorContext` gaps
+   (`target_development_percent`, charge band); **bake-off-gated** (not safety).
+6. 🟢 **#173** phase-dependent MODEL — fast model post-FC (haiku-4.5 / gemini-flash /
+   gpt-5-mini-reasoning-off); **re-run bake-off weighting latency post-FC**; new D-number.
+   **Operator-gated** (needs a valid key + operator judgment + API cost) — the one piece
+   that cannot be fully autonomous.
+7. 🔴 **#166** advisor unavailable → **fail-closed after N** (operator's call) — needs
+   **D30** + safety-reviewer.
+8. 🟢 **#165** RoR display (from preheat, mark charge) · **#164** richer bean identity.
+
+**Operator-dependencies for "all before next roast":** every code fix is buildable/testable
+with the **FakeAdvisor** (no key). Only the **#173 / #172 bake-off model+prompt selection**
+needs a live key + operator judgment + API cost — that step is operator-gated, done as a
+focused session once the key is in hand.
