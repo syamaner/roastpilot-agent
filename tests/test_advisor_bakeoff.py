@@ -73,7 +73,7 @@ def test_roster_is_well_formed() -> None:
 
 
 def test_roster_covers_all_tiers_and_keeps_incumbent() -> None:
-    """The #173 roster has all four tiers, the incumbent, and no duplicate slugs."""
+    """The roster has every tier (incl. prior-frontier), the incumbent, no dupes."""
     tiers = {c.tier for c in bakeoff.ROSTER}
     assert tiers == set(bakeoff.Tier)
     slugs = [c.slug for c in bakeoff.ROSTER]

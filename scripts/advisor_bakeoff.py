@@ -766,7 +766,9 @@ def render_availability(results: list[AvailabilityResult]) -> str:
         lines.append("")
         lines.append(f"DROPPED ({len(dropped)}) — excluded from the comparison, with reason:")
         for r in dropped:
-            label = _DROP_REASON_LABELS.get(r.reason or DROP_REASON_OTHER, r.reason or "unknown")
+            # The DROP_REASON_* constants are themselves the human-readable
+            # labels, so the reason is shown directly (no label lookup needed).
+            label = r.reason or DROP_REASON_OTHER
             lines.append(
                 f"  - {r.slug} [{label}] (after {r.attempts} attempt"
                 f"{'s' if r.attempts != 1 else ''}): {r.error or 'unavailable'}"
@@ -782,15 +784,6 @@ def render_availability(results: list[AvailabilityResult]) -> str:
     else:
         lines.append("dropped (0): all roster slugs resolved")
     return "\n".join(lines)
-
-
-# Human-readable labels for the drop-reason classes (report only).
-_DROP_REASON_LABELS: dict[str, str] = {
-    DROP_REASON_INVALID_MODEL: "invalid-model-id",
-    DROP_REASON_NO_TOOL_USE: "no-tool-use-endpoint",
-    DROP_REASON_AUTH: "auth",
-    DROP_REASON_OTHER: "other-or-transient",
-}
 
 
 def _gate_label(cell: CellResult) -> str:
