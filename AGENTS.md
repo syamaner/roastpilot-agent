@@ -194,6 +194,45 @@ clean.
   fresh instance with no authoring context — independent of the author even when
   it's the same model; this rule keeps the *triage decision* independent too.)
 
+## Code Review Rubric
+
+The automated **Claude Code Review** (`.github/workflows/claude-code-review.yml`,
+running `/code-review --comment`) and any reviewer follow this rubric.
+
+**Inline PR comments are MERGE-BLOCKING** — `main` requires every conversation
+resolved (branch protection). So calibrate where findings go:
+
+- **Inline (blocking): only genuine must-fix / should-fix findings,** each tagged
+  severity — **blocker** (cannot merge), **medium** (fix or justify in-thread),
+  **low** (optional but worth it). Resolving the thread is the conscious triage.
+- **Summary comment (non-blocking): nits, praise, questions, observations.** Never
+  clog the merge gate with trivia — a nitpick posted inline blocks the merge.
+- **Don't duplicate CI.** `ruff` / `pyright` (strict) / `pytest` / `codecov/patch`
+  already gate; review for what they can't see, not what they catch.
+- **Be concrete:** `file:line` + the specific fix.
+
+**Must-block (the Architecture Invariants above — flag any of these as `blocker`):**
+
+- a roaster write that does not pass through safety policy;
+- the advisor handed MCP write tools, or the controller no longer owning the loop;
+- a restart path that auto-resumes heat/fan (must enter `operator_recovery_required`);
+- any Fahrenheit value or conversion (temperatures are Celsius everywhere);
+- a string-compared `SafetyVerdict`/`RoastPhase`, or a `StrEnum` where a plain
+  `Enum` is required (string comparison must stay a pyright error);
+- the SPA calling MCP directly or inferring roast phase locally.
+
+**Escalate:** any diff touching `safety.py`, `controller.py`, or `models.py` enums —
+call it out in the summary so it is routed to `safety-reviewer`.
+
+**Also verify:** tests assert real behavior (not smoke); new code is covered or
+carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`,
+`mcp_client.py`); public functions/methods have type hints + Google docstrings.
+
+> Note: `claude-review` is intentionally **not** a required status check — it fails
+> by design on PRs that edit a workflow file (the App's workflow-validation guard),
+> and it passes even when it finds bugs. The real findings-gate is these inline
+> threads + `required_conversation_resolution`; the required checks are CI + codecov.
+
 ## Claude Code
 
 - Sub-agents live under `.claude/agents/`. **Domain reviewers:**
