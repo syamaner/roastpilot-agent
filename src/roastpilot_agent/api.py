@@ -1361,6 +1361,11 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await service.recover_on_start()
     yield
     if isinstance(service, RoastService):
+        # Cancel the tick loop on lifespan teardown. The live-serve CLI path then
+        # calls service.shutdown() again in _teardown_live (which is idempotent) —
+        # that second call is a clean no-op, kept because _teardown_live also owns
+        # the safety-critical heat-off-before-mcp.stop ordering (#142) that this
+        # lifespan does not. Non-CLI uses of create_app rely on this call.
         await service.shutdown()
 
 

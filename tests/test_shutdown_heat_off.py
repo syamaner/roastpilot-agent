@@ -10,6 +10,7 @@ shutdown) still relies on restart → ``operator_recovery_required``.
 """
 
 import asyncio
+import contextlib
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import cast
@@ -115,6 +116,52 @@ async def test_shutdown_commands_heat_off_through_safety_before_mcp_stop(
     assert any(e.verdict == "emergency_stop" for e in timeline.safety_evaluations), (
         "EMERGENCY_STOP verdict persisted"
     )
+
+
+@pytest.mark.asyncio
+async def test_shutdown_heat_off_after_loop_cancelled(store: RoastStore) -> None:
+    """Heat-off still lands after the tick loop is cancelled (production sequence).
+
+    In production, uvicorn's lifespan cleanup runs ``service.shutdown()`` (which
+    cancels the tick loop task) *before* the ``_teardown_live`` ``finally`` runs
+    the heat-off step. So this exercises that order with a REAL background loop
+    task: start a roast → spawn ``runner.run()`` → let it run a tick → cancel it
+    (as ``service.shutdown()`` does) → ``safe_shutdown_heat_off()`` must still
+    issue the e-stop. The write survives because it calls
+    ``operator_emergency_stop`` directly on the controller (not through the
+    cancelled loop), and the controller / emitter / store are untouched by task
+    cancellation. ``run_loop=False`` keeps the spawn explicit and deterministic.
+    """
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    service = RoastService(
+        store,
+        config=_config(),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_decision()),
+        run_loop=False,  # spawn the loop task explicitly below for determinism
+        clock=clock,
+    )
+    detail = await service.start_roast(_profile())
+    run_id = detail.id
+    assert detail.agent_phase in ACTIVE_ROAST_PHASES
+    assert service.runner is not None
+
+    # Spawn a real background tick-loop task, let it run a tick, then cancel it
+    # exactly as service.shutdown() does on lifespan teardown.
+    loop_task = asyncio.create_task(service.runner.run())
+    await asyncio.sleep(0)  # let the loop start and run its first tick
+    loop_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await loop_task
+
+    issued = await service.safe_shutdown_heat_off()
+    assert issued is True
+    assert "emergency_stop" in mcp.commands()
+    assert service.runner is not None
+    assert service.runner.controller_snapshot().phase is RoastPhase.FAULTED
+    timeline = await service.timeline(run_id)
+    assert any(e.verdict == "emergency_stop" for e in timeline.safety_evaluations)
 
 
 @pytest.mark.asyncio
