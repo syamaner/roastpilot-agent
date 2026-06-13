@@ -276,8 +276,11 @@ order:
    gpt-5-mini-reasoning-off); **re-run bake-off weighting latency post-FC**; new D-number.
    **Operator-gated** (needs a valid key + operator judgment + API cost) — the one piece
    that cannot be fully autonomous.
-7. 🔴 **#166** advisor unavailable → **fail-closed after N** (operator's call) — needs
-   **D30** + safety-reviewer.
+7. 🟢 **#166** advisor unavailable → **fail-closed after N** (operator's call) — **D30**
+   recorded; PR open (`feature/166-advisor-fail-closed`), safety-reviewer to adjudicate
+   before merge. N consecutive *availability* failures (`provider_error`/`timeout`, default
+   N=3) → heat 0 % + `operator_recovery_required` via a **RECOVERY** verdict;
+   `malformed`/`unsafe` do not count; paused advisor never accrues.
 8. 🟢 **#165** RoR display (from preheat, mark charge) · **#164** richer bean identity.
 
 **Operator-dependencies for "all before next roast":** every code fix is buildable/testable

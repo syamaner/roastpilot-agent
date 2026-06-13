@@ -393,8 +393,14 @@ async def test_slow_advisor_never_blocks_the_tick() -> None:
     harness.controller.request_advisory()
     await asyncio.wait_for(harness.controller.tick(), timeout=1.0)
     assert harness.executor.targets == []
-    assert [e.rule for e in harness.sink.evaluations] == ["all_clear", "advisor_timeout"]
+    # A single (1st) timeout is an availability failure below the fail-closed
+    # threshold (D30): tolerated REJECT, deterministic hold — heat unchanged.
+    assert [e.rule for e in harness.sink.evaluations] == [
+        "all_clear",
+        "advisor_unavailable_tolerated",
+    ]
     assert harness.sink.evaluations[-1].verdict is SafetyVerdict.REJECT
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
 
 
 @pytest.mark.asyncio
@@ -413,8 +419,15 @@ async def test_crashing_advisor_is_a_provider_error() -> None:
     harness = harness_in_development(readings=[reading()], advisor=CrashingAdvisor())
     harness.controller.request_advisory()
     await harness.controller.tick()
-    assert harness.sink.evaluations[-1].rule == "advisor_provider_error"
+    # A single crash is a provider_error availability failure below the
+    # fail-closed threshold (D30): tolerated REJECT, deterministic hold. The
+    # trace still records it as a provider_error (#167); the safety rule is the
+    # availability-tolerated rule.
+    assert harness.sink.evaluations[-1].rule == "advisor_unavailable_tolerated"
+    assert harness.sink.evaluations[-1].verdict is SafetyVerdict.REJECT
+    assert harness.sink.advisor_decisions[-1].status == "provider_error"
     assert harness.executor.targets == []
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
 
 
 @pytest.mark.asyncio
@@ -469,6 +482,177 @@ async def test_advisory_unsafe_output_persists_as_malformed() -> None:
     assert recorded.status == "malformed"
     assert recorded.decision is None
     assert harness.sink.evaluations[-1].rule == "advisor_unsafe"
+
+
+# --- D30 (#166): advisor sustained-unavailability fail-closed ---
+
+
+@pytest.mark.asyncio
+async def test_advisor_availability_failures_below_threshold_hold() -> None:
+    """Two consecutive availability failures (default threshold 3) stay below
+    the stop: the roast holds in development, no recovery, heat unchanged."""
+    advisor = FakeAdvisor([AdvisorFailureMode.PROVIDER_ERROR, AdvisorFailureMode.TIMEOUT])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    for _ in range(2):
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert RoastEventKind.RECOVERY_REQUIRED not in harness.events.kinds()
+    advisor_rules = [e.rule for e in harness.sink.evaluations if e.rule.startswith("advisor_")]
+    assert advisor_rules == [
+        "advisor_unavailable_tolerated",
+        "advisor_unavailable_tolerated",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_nth_availability_failure_fails_closed_to_recovery() -> None:
+    """The N-th (default 3rd) consecutive availability failure drives heat→0
+    through the safety path and transitions to operator_recovery_required — not
+    a fault. Heat/fan are never auto-resumed: only an explicit operator action
+    leaves recovery."""
+    advisor = FakeAdvisor(
+        [
+            AdvisorFailureMode.PROVIDER_ERROR,
+            AdvisorFailureMode.PROVIDER_ERROR,
+            AdvisorFailureMode.TIMEOUT,
+        ]
+    )
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    # Pre-seed a non-zero commanded heat so the heat→0 write is observable.
+    harness.controller._current_heat = 80  # pyright: ignore[reportPrivateUsage]
+    harness.controller._current_fan = 20  # pyright: ignore[reportPrivateUsage]
+    for _ in range(3):
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert RoastEventKind.RECOVERY_REQUIRED in harness.events.kinds()
+    assert RoastEventKind.FAULT not in harness.events.kinds()
+    assert harness.sink.evaluations[-1].rule == "advisor_unavailable_exhausted"
+    assert harness.sink.evaluations[-1].verdict is SafetyVerdict.RECOVERY
+    # Heat was driven to 0 through the safety path (fan to the safe value).
+    assert harness.executor.targets[-1] == (0, SafetyLimits().overrun_safe_fan_percent)
+    snap = harness.controller.snapshot()
+    assert snap.current_heat == 0
+    # No auto-resume: a further tick stays in recovery and issues no heat write.
+    harness.executor.targets.clear()
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert harness.executor.targets == []
+
+
+@pytest.mark.asyncio
+async def test_ok_decision_resets_availability_streak() -> None:
+    """N-1 availability failures, then a successful ``ok`` decision, then more
+    failures must not trip early: the ``ok`` resets the counter."""
+    advisor = FakeAdvisor(
+        [
+            AdvisorFailureMode.PROVIDER_ERROR,
+            AdvisorFailureMode.TIMEOUT,
+            decision(heat=60, fan=40),  # ok → resets the streak
+            AdvisorFailureMode.PROVIDER_ERROR,
+            AdvisorFailureMode.TIMEOUT,
+        ]
+    )
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    for _ in range(5):
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+    # Five consults: 2 fail, 1 ok (reset), 2 fail — never 3 consecutive, so no
+    # fail-closed; the roast is still developing.
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert RoastEventKind.RECOVERY_REQUIRED not in harness.events.kinds()
+    rules = [e.rule for e in harness.sink.evaluations]
+    assert "advisor_unavailable_exhausted" not in rules
+
+
+@pytest.mark.asyncio
+async def test_malformed_and_unsafe_do_not_count_toward_stop() -> None:
+    """malformed / unsafe are provider-reachable (a different class): they never
+    accrue toward the availability stop. Three of them in a row hold, they do
+    not fail closed."""
+    advisor = FakeAdvisor(
+        [
+            AdvisorFailureMode.MALFORMED,
+            AdvisorFailureMode.UNSAFE,
+            AdvisorFailureMode.MALFORMED,
+        ]
+    )
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    for _ in range(3):
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert RoastEventKind.RECOVERY_REQUIRED not in harness.events.kinds()
+    advisor_rules = [e.rule for e in harness.sink.evaluations if e.rule.startswith("advisor_")]
+    assert advisor_rules == [
+        "advisor_malformed",
+        "advisor_unsafe",
+        "advisor_malformed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_malformed_interleaved_does_not_reset_availability_streak() -> None:
+    """A reachable-but-misbehaving (malformed) outcome between two availability
+    failures neither counts toward nor resets the streak: provider_error,
+    malformed, two more provider_errors → the 3rd availability failure trips."""
+    advisor = FakeAdvisor(
+        [
+            AdvisorFailureMode.PROVIDER_ERROR,  # availability #1
+            AdvisorFailureMode.MALFORMED,  # reachable: no count, no reset
+            AdvisorFailureMode.PROVIDER_ERROR,  # availability #2
+            AdvisorFailureMode.TIMEOUT,  # availability #3 → fail closed
+        ]
+    )
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    for _ in range(4):
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert harness.sink.evaluations[-1].rule == "advisor_unavailable_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_paused_advisor_does_not_accrue_failures() -> None:
+    """A paused advisor is never consulted, so its absent calls cannot accrue
+    toward the stop. Pause, run three ticks (advisor would have crashed every
+    time), then resume and fail twice more: still below the threshold."""
+    advisor = FakeAdvisor([AdvisorFailureMode.PROVIDER_ERROR] * 5)
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    harness.controller.operator_pause_advisory()
+    for _ in range(3):
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+    # No advisor consult happened while paused → no availability evaluations.
+    assert not any(e.rule.startswith("advisor_unavailable") for e in harness.sink.evaluations)
+    harness.controller.operator_resume_advisory()
+    for _ in range(2):
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+    # Only two failures accrued post-resume → below the default threshold of 3.
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert RoastEventKind.RECOVERY_REQUIRED not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_operator_resume_resets_availability_streak() -> None:
+    """After the stop trips and the operator resumes into development, the
+    counter is clear: it takes a full N failures again to re-trip, not one."""
+    advisor = FakeAdvisor([AdvisorFailureMode.PROVIDER_ERROR] * 6)
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    for _ in range(3):
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    harness.controller.operator_resume(RoastPhase.DEVELOPMENT)
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    # Two more failures: still below threshold thanks to the resume reset.
+    for _ in range(2):
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
 
 
 @pytest.mark.asyncio

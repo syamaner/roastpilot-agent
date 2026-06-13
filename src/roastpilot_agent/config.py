@@ -171,6 +171,18 @@ class SafetyLimits(BaseModel):
       ~3 s blind window before faulting — the same scale as the T0 debounce,
       long enough to ride out a transient stdio hiccup, short enough that a
       hot machine is never uncontrolled for long.
+    - ``max_consecutive_advisor_failures`` 3 (D30, #166): consecutive advisor
+      *availability* failures (``provider_error`` / ``timeout``) tolerated
+      before the controller fails closed — drives heat 0 % and enters
+      ``operator_recovery_required`` (NOT a fault: the operator explicitly
+      resumes / drops / cools). A single transient blip still just holds the
+      current targets (the E3-S3 hold-current fallback, unchanged). 3 ≈ a few
+      seconds of *sustained* outage at the advisor's consult cadence — long
+      enough to ride out one blip, short enough that a stale static profile
+      cannot run the roast up to the hard ceilings unattended (the #134
+      failure mode). ``malformed`` / ``unsafe`` are provider-*reachable*
+      (model misbehaving, a different class) and deliberately do NOT count
+      toward this stop.
     """
 
     max_bean_temp_c: float = Field(default=230.0, gt=0)
@@ -180,6 +192,7 @@ class SafetyLimits(BaseModel):
     pre_t0_overrun_severity: Literal["recovery", "fault"] = "recovery"
     min_seconds_between_commands: float = Field(default=2.0, gt=0)
     max_consecutive_mcp_failures: int = Field(default=3, ge=1)
+    max_consecutive_advisor_failures: int = Field(default=3, ge=1)
 
 
 class MCPConfig(BaseModel):
