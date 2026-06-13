@@ -267,9 +267,15 @@ def _pre_fc_context(fixture: Path) -> tuple[AdvisorContext, float]:
     fc = events["first_crack_detected"]
     drop = events["beans_dropped"]
     target = t0 + (fc - t0) * 0.5
-    pre_rows = [r for r in telemetry if t0 <= float(r["monotonic_seconds"]) <= fc]
-    row = min(pre_rows, key=lambda r: abs(float(r["monotonic_seconds"]) - target))
-    index = telemetry.index(row)
+    pre_rows = [
+        (i, r) for i, r in enumerate(telemetry) if t0 <= float(r["monotonic_seconds"]) <= fc
+    ]
+    if not pre_rows:
+        raise ValueError(
+            f"fixture {fixture} has no telemetry rows between charge (T0={t0:.1f}s) "
+            f"and first crack ({fc:.1f}s) — pre-first-crack context unavailable"
+        )
+    index, row = min(pre_rows, key=lambda ir: abs(float(ir[1]["monotonic_seconds"]) - target))
     mono = float(row["monotonic_seconds"])
     drop_row = min(telemetry, key=lambda r: abs(float(r["monotonic_seconds"]) - drop))
     context = AdvisorContext(
@@ -305,11 +311,15 @@ def _preheat_context(fixture: Path) -> tuple[AdvisorContext, float]:
     """
     telemetry, events = _load(fixture)
     t0 = events["beans_added"]
-    pre_rows = [r for r in telemetry if float(r["monotonic_seconds"]) < t0]
+    pre_rows = [(i, r) for i, r in enumerate(telemetry) if float(r["monotonic_seconds"]) < t0]
+    if not pre_rows:
+        raise ValueError(
+            f"fixture {fixture} has no telemetry rows before charge (T0={t0:.1f}s) — "
+            f"preheat context unavailable"
+        )
     # A row a little before charge: the drum has warmed and is approaching the
     # band, which is the realistic moment the advisor is consulted in preheat.
-    index = telemetry.index(pre_rows[len(pre_rows) // 2])
-    row = telemetry[index]
+    index, row = pre_rows[len(pre_rows) // 2]
     mono = float(row["monotonic_seconds"])
     context = AdvisorContext(
         phase=RoastPhase.PREHEATING,
@@ -438,9 +448,12 @@ async def availability_sweep(
         ``(survivors, results)`` — the kept candidates in roster order, and the
         per-slug :class:`AvailabilityResult` list (kept and dropped).
     """
-    results: list[AvailabilityResult] = []
-    for cand in roster:
-        results.append(await probe_slug(cand.slug, prompt_version, reasoning))
+    # Probe concurrently — each healthcheck is an independent network round trip,
+    # so a serial loop would make the operator block ~1-3 s per slug before any
+    # sampling starts. ``gather`` preserves roster order in its return value.
+    results = list(
+        await asyncio.gather(*(probe_slug(cand.slug, prompt_version, reasoning) for cand in roster))
+    )
     by_slug = {r.slug: r for r in results}
     survivors = [c for c in roster if by_slug[c.slug].available]
     return survivors, results
@@ -695,7 +708,10 @@ def cells_to_json(cells: list[CellResult]) -> list[dict[str, Any]]:
     """Serialize cells for the ``--out`` JSON artifact."""
     rows: list[dict[str, Any]] = []
     for c in cells:
-        row = dataclasses.asdict(c)
+        # Build the row by field rather than ``dataclasses.asdict`` — the latter
+        # deepcopies the ``RoastDecision`` Pydantic field only to discard it; we
+        # serialize the decision explicitly via ``model_dump``.
+        row = {f.name: getattr(c, f.name) for f in dataclasses.fields(c) if f.name != "decision"}
         row["decision"] = c.decision.model_dump() if c.decision is not None else None
         rows.append(row)
     return rows

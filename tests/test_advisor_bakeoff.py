@@ -197,6 +197,24 @@ def test_phase_contexts_warm_through_the_roast() -> None:
     assert preheat.current_bean_temp_c < pre_fc.current_bean_temp_c < dev.current_bean_temp_c
 
 
+def test_preheat_context_raises_on_fixture_without_pre_charge_rows(
+    tmp_path: Path,
+) -> None:
+    """A fixture that starts at charge yields a clear error, not an IndexError."""
+    fixture = tmp_path / "roast.jsonl"
+    # Telemetry only at/after T0, plus the three required events: no warm-up rows.
+    lines = [
+        '{"type": "event", "kind": "beans_added", "monotonic_seconds": 0.0}',
+        '{"type": "event", "kind": "first_crack_detected", "monotonic_seconds": 500.0}',
+        '{"type": "event", "kind": "beans_dropped", "monotonic_seconds": 600.0}',
+        '{"type": "telemetry", "monotonic_seconds": 10.0, "bean_temp_c": 100.0, '
+        '"env_temp_c": 150.0, "heat_level_percent": 80, "fan_level_percent": 20}',
+    ]
+    fixture.write_text("\n".join(lines))
+    with pytest.raises(ValueError, match="no telemetry rows before charge"):
+        bakeoff.build_phase_context(fixture, RoastPhase.PREHEATING)
+
+
 # --- Cell summarisation + decision table ------------------------------------
 
 
