@@ -41,7 +41,10 @@ export function DashboardPage(): React.JSX.Element {
   // page-local reducer folds the NON-LOSSY frame buffer (frames/frameCount) so a
   // burst never drops a fault/recovery/advisory/marker frame (#122).
   const { status, phase, telemetry, enabledActions, frames, frameCount } = useRoastStream(runId);
-  const view = useDashboardEvents(frames, frameCount, runId);
+  // The view-model seeds the curve from the `/telemetry` snapshot on every
+  // (re)connect — keyed on `status` — so a late-joining or reconnecting device shows
+  // the full roast curve, not just the frames it personally witnessed (#153).
+  const view = useDashboardEvents(frames, frameCount, runId, status);
 
   // The run snapshot (profile name + initial enabled actions before the first
   // phase_changed). Read-only REST snapshot, hydrated by TanStack Query.

@@ -42,6 +42,109 @@ describe("dashboardReducer", () => {
     expect(s.points).toHaveLength(0);
   });
 
+  // --- #153 backfill: seed + dedupe ---
+
+  function tp(t: number, bean = 100 + t) {
+    return {
+      tick: t,
+      elapsed_seconds: t,
+      agent_phase: "development" as const,
+      bean_temp_c: bean,
+      env_temp_c: 120 + t,
+      bean_ror_c_per_min: 12,
+      env_ror_c_per_min: 14,
+      heat_level_percent: 70,
+      fan_level_percent: 40,
+      cooling_on: false,
+      development_percent: null,
+    };
+  }
+
+  it("seeds points from a /telemetry snapshot series (TelemetryPoint → CurvePoint)", () => {
+    const s = dashboardReducer(initialDashboardViewModel, {
+      kind: "seed",
+      points: [tp(0), tp(30), tp(60)].map((p) => ({
+        t: p.elapsed_seconds,
+        bean: p.bean_temp_c,
+        env: p.env_temp_c,
+        ror: p.bean_ror_c_per_min,
+        heat: p.heat_level_percent,
+        fan: p.fan_level_percent,
+      })),
+    });
+    expect(s.points.map((p) => p.t)).toEqual([0, 30, 60]);
+    expect(s.points[0]).toMatchObject({ t: 0, bean: 100, heat: 70, fan: 40 });
+  });
+
+  it("re-seed does not duplicate already-present ticks (reconnect catch-up)", () => {
+    const seed = [
+      { t: 0, bean: 100, env: 120, ror: 12, heat: 70, fan: 40 },
+      { t: 30, bean: 130, env: 150, ror: 12, heat: 70, fan: 40 },
+    ];
+    let s = dashboardReducer(initialDashboardViewModel, { kind: "seed", points: seed });
+    // Reconnect re-seeds the SAME window plus one new tick.
+    s = dashboardReducer(s, {
+      kind: "seed",
+      points: [...seed, { t: 60, bean: 160, env: 180, ror: 12, heat: 70, fan: 40 }],
+    });
+    expect(s.points.map((p) => p.t)).toEqual([0, 30, 60]); // no dupes
+  });
+
+  it("a re-seed never clobbers a fresher live frame for the same tick", () => {
+    // Seed t=0..30, then a LIVE frame updates t=30, then a reconnect re-seeds t=30.
+    let s = dashboardReducer(initialDashboardViewModel, {
+      kind: "seed",
+      points: [
+        { t: 0, bean: 100, env: 120, ror: 12, heat: 70, fan: 40 },
+        { t: 30, bean: 130, env: 150, ror: 12, heat: 70, fan: 40 },
+      ],
+    });
+    s = dashboardReducer(
+      s,
+      ev("telemetry", { elapsed_seconds: 30, bean_temp_c: 999, env_temp_c: 150, bean_ror_c_per_min: 12, heat_percent: 70, fan_percent: 40 }),
+    );
+    s = dashboardReducer(s, {
+      kind: "seed",
+      points: [{ t: 30, bean: 130, env: 150, ror: 12, heat: 70, fan: 40 }],
+    });
+    // The live value (999) survives the re-seed (existing points win on collision).
+    expect(s.points.find((p) => p.t === 30)?.bean).toBe(999);
+  });
+
+  it("a live frame replaces, not duplicates, a seeded tick at the seam", () => {
+    let s = dashboardReducer(initialDashboardViewModel, {
+      kind: "seed",
+      points: [
+        { t: 0, bean: 100, env: 120, ror: 12, heat: 70, fan: 40 },
+        { t: 30, bean: 130, env: 150, ror: 12, heat: 70, fan: 40 },
+      ],
+    });
+    // Live frame at the last seeded tick (t=30) with a fresher value, then a new tick.
+    s = dashboardReducer(
+      s,
+      ev("telemetry", { elapsed_seconds: 30, bean_temp_c: 200, env_temp_c: 150, bean_ror_c_per_min: 12, heat_percent: 70, fan_percent: 40 }),
+    );
+    s = dashboardReducer(
+      s,
+      ev("telemetry", { elapsed_seconds: 60, bean_temp_c: 260, env_temp_c: 180, bean_ror_c_per_min: 12, heat_percent: 70, fan_percent: 40 }),
+    );
+    expect(s.points.map((p) => p.t)).toEqual([0, 30, 60]); // t=30 not duplicated
+    expect(s.points.find((p) => p.t === 30)?.bean).toBe(200); // live value won
+  });
+
+  it("keeps points ascending and deduped when a frame arrives out of order", () => {
+    let s = dashboardReducer(initialDashboardViewModel, { kind: "seed", points: [
+      { t: 0, bean: 100, env: 120, ror: 12, heat: 70, fan: 40 },
+      { t: 60, bean: 160, env: 180, ror: 12, heat: 70, fan: 40 },
+    ] });
+    // A late frame for t=30 (out of order) inserts between 0 and 60.
+    s = dashboardReducer(
+      s,
+      ev("telemetry", { elapsed_seconds: 30, bean_temp_c: 130, env_temp_c: 150, bean_ror_c_per_min: 12, heat_percent: 70, fan_percent: 40 }),
+    );
+    expect(s.points.map((p) => p.t)).toEqual([0, 30, 60]);
+  });
+
   it("sets the latest advisory + verdict from an advisory frame with a decision", () => {
     const s = dashboardReducer(initialDashboardViewModel, ev("advisory", ADVISORY_DECISION));
     expect(s.latestAdvisory?.decision?.target_heat).toBe(60);

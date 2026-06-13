@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatSeriesValue, toColumns } from "./chartData";
+import { formatElapsed, formatSeriesValue, toColumns } from "./chartData";
 import type { CurvePoint } from "./types";
 
 const POINTS: CurvePoint[] = [
@@ -37,5 +37,26 @@ describe("formatSeriesValue", () => {
   it("renders an em dash for null/NaN", () => {
     expect(formatSeriesValue("bean", null)).toBe("—");
     expect(formatSeriesValue("ror", NaN)).toBe("—");
+  });
+});
+
+describe("formatElapsed (M:SS time axis, #153)", () => {
+  it("formats elapsed seconds as M:SS with a zero-padded seconds field", () => {
+    expect(formatElapsed(0)).toBe("0:00");
+    expect(formatElapsed(5)).toBe("0:05");
+    expect(formatElapsed(66)).toBe("1:06");
+    expect(formatElapsed(720)).toBe("12:00");
+    expect(formatElapsed(531)).toBe("8:51"); // Artisan FCs reference
+  });
+
+  it("rounds fractional seconds and rolls minutes past 60 (no hours field)", () => {
+    expect(formatElapsed(89.6)).toBe("1:30");
+    expect(formatElapsed(3600)).toBe("60:00");
+  });
+
+  it("renders an em dash for null/negative/non-finite", () => {
+    expect(formatElapsed(null)).toBe("—");
+    expect(formatElapsed(-5)).toBe("—");
+    expect(formatElapsed(NaN)).toBe("—");
   });
 });
