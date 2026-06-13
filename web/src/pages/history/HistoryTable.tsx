@@ -15,6 +15,7 @@ import { cn } from "@/lib/cn";
 import type { RoastSummary } from "@/lib/types";
 
 import { beanLabel, formatDevPercent, formatStartedAt } from "./format";
+import { HistoryAdvisorCell } from "./HistoryAdvisorCell";
 import { OutcomeBadge } from "./OutcomeBadge";
 import { StarRating } from "./StarRating";
 
@@ -40,6 +41,7 @@ export function HistoryTable({ runs }: HistoryTableProps): React.JSX.Element {
               <th className={HEAD_CELL}>Date</th>
               <th className={HEAD_CELL}>Bean</th>
               <th className={HEAD_CELL}>Outcome</th>
+              <th className={HEAD_CELL}>Advisor</th>
               <th className={HEAD_CELL}>Dev %</th>
               <th className={HEAD_CELL}>Rating</th>
             </tr>
@@ -77,6 +79,9 @@ export function HistoryTable({ runs }: HistoryTableProps): React.JSX.Element {
                 </td>
                 <td className={BODY_CELL}>
                   <OutcomeBadge outcome={run.outcome} />
+                </td>
+                <td className={BODY_CELL}>
+                  <HistoryAdvisorCell runId={run.id} />
                 </td>
                 <td className={cn(BODY_CELL, "font-mono text-sm text-foreground")}>
                   {formatDevPercent(run.development_percent)}

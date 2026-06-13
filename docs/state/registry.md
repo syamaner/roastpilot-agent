@@ -141,6 +141,19 @@ review defers: ror scale in hook, scale-covers asserts on live/fault),
 #103/#104/#105/#111/#112/#117/#102. Kickoff brief:
 `roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`.
 
+**Advisor decision trace, surfaced (#167 + #170).** #167 (merged) persists
+`advisor_decisions` on both controller paths + exposes them on
+`GET /api/roasts/{id}/timeline` (`TimelineAdvisorDecision`). #170 (SPA) renders that
+trace durably: the **roast detail** page gains an advisor-spined **decision
+timeline** (one row per consult incl. preheat + failures — provider_error/timeout/
+malformed show the failure, never a blank panel — with provider/model, latency, the
+recommended heat/fan + rationale on `ok`, and the linked safety verdict joined by
+tick via the shared `VerdictBadge`), plus a summary-chip header; the **history** list
+gains a per-roast advisor summary column (consults / clamped / rejected / failed),
+derived client-side from each row's cached `/timeline` (the summary contract carries
+no advisor stats; backend untouched). New Playwright state
+`roast-detail-advisor-failed`. SPA renders from server data only.
+
 **E11 (Packaging) is next in epic order but BLOCKED — do not start (D28 + D27).**
 Two independent gates must clear first:
 1. **Operator manual tests (D28)** — human-owned (@syamaner): **#135** (E10-S6 manual

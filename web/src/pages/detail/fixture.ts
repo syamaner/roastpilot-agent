@@ -171,3 +171,71 @@ export const FIXTURE_TIMELINE: RoastTimeline = {
     { tick: 8, tool: "set_heat", source: "safety", status: "ok", args: { percent: 100 }, result: { ok: true }, recorded_at_utc: "2026-06-07T09:16:00Z" },
   ],
 };
+
+// --- Advisor-failure fixture (#170) ------------------------------------------
+//
+// A roast where the advisor NEVER returned a usable decision — every consult is a
+// `provider_error` (the #134 expired-key failure mode), so NO safety evaluation
+// was ever produced from advice. The detail page's advisor timeline must render
+// these failures (incl. the preheat consult), NOT a blank panel. Reuses the same
+// telemetry/detail so the curve still renders; only the timeline differs.
+
+export const FIXTURE_FAILED_RUN_ID = "detail-fixture-failed-001";
+
+export const FIXTURE_DETAIL_FAILED: RoastDetail = {
+  ...FIXTURE_DETAIL,
+  id: FIXTURE_FAILED_RUN_ID,
+  notes: "Advisor key expired mid-roast; controller held policy levels.",
+};
+
+export const FIXTURE_TELEMETRY_FAILED: TelemetrySeries = {
+  ...FIXTURE_TELEMETRY,
+  run_id: FIXTURE_FAILED_RUN_ID,
+};
+
+/**
+ * Advisor-failure timeline: three consults, all `provider_error`, INCLUDING a
+ * preheat consult (tick 1) — no decision payload, no safety evaluation. The
+ * advisor timeline must still render three rows with their failure status.
+ */
+export const FIXTURE_TIMELINE_FAILED: RoastTimeline = {
+  run_id: FIXTURE_FAILED_RUN_ID,
+  events: [
+    { kind: "run_started", source: "controller", monotonic_seconds: 0, recorded_at_utc: "2026-06-07T09:12:00Z", payload: { tick: 0 } },
+    { kind: "t0_detected", source: "mcp", monotonic_seconds: 0, recorded_at_utc: "2026-06-07T09:12:30Z", payload: { tick: 1 } },
+  ],
+  safety_evaluations: [],
+  advisor_decisions: [
+    {
+      tick: 1,
+      provider: "openrouter",
+      model: "anthropic/claude-opus-4.8",
+      prompt_version: "v1",
+      latency_ms: 30000,
+      status: "provider_error",
+      decision: null,
+      recorded_at_utc: "2026-06-07T09:12:30Z",
+    },
+    {
+      tick: 4,
+      provider: "openrouter",
+      model: "anthropic/claude-opus-4.8",
+      prompt_version: "v1",
+      latency_ms: 30000,
+      status: "provider_error",
+      decision: null,
+      recorded_at_utc: "2026-06-07T09:14:00Z",
+    },
+    {
+      tick: 8,
+      provider: "openrouter",
+      model: "anthropic/claude-opus-4.8",
+      prompt_version: "v1",
+      latency_ms: 30000,
+      status: "provider_error",
+      decision: null,
+      recorded_at_utc: "2026-06-07T09:16:00Z",
+    },
+  ],
+  commands: [],
+};

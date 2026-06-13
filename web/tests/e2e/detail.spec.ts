@@ -56,3 +56,25 @@ test("the detail curve carries the full persisted series + T0/FC/drop markers", 
   expect(hook.columns[0].length).toBeGreaterThan(0);
   expect(hook.markers.map((m) => m.kind).sort()).toEqual(["drop", "first_crack", "t0"]);
 });
+
+test.describe("advisor-failure detail (#170)", () => {
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/__detail-harness-failed");
+    await settle(page);
+    await waitForChartPoints(page, 1);
+  });
+
+  test("roast-detail-advisor-failed — the advisor timeline renders failures, not a blank panel", async ({
+    page,
+  }) => {
+    // Every consult in this fixture is a provider_error → the advisor timeline must
+    // show the failure rows (the safety-spined decision-trace table is empty here).
+    const timeline = page.getByTestId("advisor-timeline");
+    await expect(timeline).toBeVisible();
+    await expect(page.getByTestId("advisor-row")).toHaveCount(3);
+    await expect(page.getByTestId("advisor-status").first()).toHaveText("PROVIDER ERROR");
+    await expect(page.getByTestId("advisor-summary-failed")).toHaveText("3 failed");
+    await expect(page.getByTestId("advisor-timeline-empty")).toHaveCount(0);
+    await expect(page).toHaveScreenshot("roast-detail-advisor-failed.png");
+  });
+});
