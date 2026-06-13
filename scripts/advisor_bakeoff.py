@@ -1056,7 +1056,10 @@ async def run_replay_bakeoff(
         # measurement), so the concurrency is at the (candidate) level only.
         # ``gather`` preserves ``survivors`` order; progress is printed after
         # each cell resolves so the buffered output stays readable.
-        print(f"replaying {len(survivors)} survivors (prompt {pv}) over {len(roasts)} roasts…")
+        print(
+            f"replaying {len(survivors)} survivors (prompt {pv}) over {len(roasts)} roasts…",
+            flush=True,
+        )
         cells_for_pv = list(
             await asyncio.gather(
                 *(
