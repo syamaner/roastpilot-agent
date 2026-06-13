@@ -3,9 +3,9 @@
 # roast-live.sh — supervised live roast THROUGH the agent (issue #134).
 # REQUIRES the Hottop (USB serial) + USB mic. Supervised, abort-ready.
 #
-# Points the agent's spawned coffee-roaster-mcp child at your proven MCP config
-# (the one that did a real FC-detecting roast), does setup, prints the dashboard
-# URL, then launches. Stay at the machine.
+# Points the agent's spawned coffee-roaster-mcp child at your proven MCP config,
+# does setup, waits until the server is ACTUALLY serving, prints the dashboard
+# URL + the safety banner, then runs. Stay at the machine.
 #
 # Usage:   OPENROUTER_API_KEY=sk-... ./scripts/roast-live.sh
 #          (omit the key to run advisory-paused — controller still runs safety)
@@ -46,12 +46,25 @@ IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null |
 ADV="advisor configured"
 [ -n "${OPENROUTER_API_KEY:-}" ] || ADV="ADVISORY-PAUSED (no OPENROUTER_API_KEY)"
 
-cat <<BANNER
+echo "→ starting agent + spawning MCP child (takes a few seconds — don't Ctrl-C yet)…"
+echo "  MCP config: ${COFFEE_ROASTER_MCP_CONFIG}"
+roastpilot-agent serve --host 0.0.0.0 --port "$PORT" &
+SRV=$!
+trap 'kill "$SRV" 2>/dev/null || true' INT TERM
+
+# Wait until serving, OR exits during startup (e.g. MCP child fails closed).
+for _ in $(seq 1 120); do
+  if ! kill -0 "$SRV" 2>/dev/null; then
+    echo "✗ agent exited during startup — likely the MCP child / Hottop could not start (fail-closed). See output above." >&2
+    wait "$SRV" || true
+    exit 1
+  fi
+  if curl -sf -o /dev/null "http://127.0.0.1:${PORT}/api/health"; then
+    cat <<BANNER
 
 ════════════════════════════════════════════════════════════════════
-  SUPERVISED LIVE ROAST (#134) — stay at the machine, abort-ready.
+  ✅ READY — SUPERVISED LIVE ROAST (#134). Stay at the machine, abort-ready.
 
-  MCP config : ${COFFEE_ROASTER_MCP_CONFIG}
   Advisor    : ${ADV}
   Dashboard  : http://${IP}:${PORT}/
 
@@ -66,5 +79,12 @@ cat <<BANNER
 ════════════════════════════════════════════════════════════════════
 
 BANNER
+    wait "$SRV"
+    exit $?
+  fi
+  sleep 0.5
+done
 
-exec roastpilot-agent serve --host 0.0.0.0 --port "$PORT"
+echo "✗ agent did not become ready within ~60s." >&2
+kill "$SRV" 2>/dev/null || true
+exit 1
