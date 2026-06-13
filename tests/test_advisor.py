@@ -47,7 +47,7 @@ from roastpilot_agent.advisor import (
     reasoning_extra_body,
     usage_from_run,
 )
-from roastpilot_agent.config import AdvisorConfig, ControllerConfig
+from roastpilot_agent.config import AdvisorConfig, ControllerConfig, SafetyLimits
 from roastpilot_agent.controller import RoastController, RoastPhase
 from roastpilot_agent.models import (
     AdvisorHealth,
@@ -56,7 +56,7 @@ from roastpilot_agent.models import (
     RoastProfile,
     RoastTelemetry,
 )
-from roastpilot_agent.safety import SafetyLimits, SafetyPolicy, SafetyVerdict
+from roastpilot_agent.safety import SafetyPolicy, SafetyVerdict
 from tests.conftest import (
     EventSink,
     FakeClock,
