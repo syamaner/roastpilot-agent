@@ -337,7 +337,7 @@ def _outcome(
     )
 
 
-def testdrop_confusion_counts_tp_fp_tn_fn_from_known_sequence() -> None:
+def test_drop_confusion_counts_tp_fp_tn_fn_from_known_sequence() -> None:
     """A canned drop sequence produces the expected TP/FP/TN/FN."""
     no_drop = _synthetic_tick(real_should_drop=False)
     real_drop = _synthetic_tick(real_should_drop=True)
@@ -361,7 +361,7 @@ def testdrop_confusion_counts_tp_fp_tn_fn_from_known_sequence() -> None:
     assert confusion.total == len(outcomes)
 
 
-def testdrop_confusion_ignores_no_decision_ticks() -> None:
+def test_drop_confusion_ignores_no_decision_ticks() -> None:
     """A tick with no decision contributes to neither the matrix nor the total."""
     no_drop = _synthetic_tick(real_should_drop=False)
     outcomes = [
@@ -374,7 +374,7 @@ def testdrop_confusion_ignores_no_decision_ticks() -> None:
 
 
 @pytest.mark.asyncio
-async def testdrop_confusion_is_consistent_with_precision_recall_f1() -> None:
+async def test_drop_confusion_is_consistent_with_precision_recall_f1() -> None:
     """Over a real replay, the 2×2 TP/FP/FN match the DropMetrics fields.
 
     The matrix must be derived from the same ground-truth label the F1 uses, so
@@ -399,7 +399,7 @@ async def testdrop_confusion_is_consistent_with_precision_recall_f1() -> None:
     assert score.drop_confusion.total == score.ok_count
 
 
-def testheat_direction_confusion_3x3_from_known_sequence() -> None:
+def test_heat_direction_confusion_3x3_from_known_sequence() -> None:
     """A canned heat-direction sequence produces the expected 3×3 counts.
 
     Each tick carries a previous real heat setpoint; the real move (prev→real)
@@ -454,7 +454,7 @@ def testheat_direction_confusion_3x3_from_known_sequence() -> None:
     assert confusion.agreement == 0.75
 
 
-def testheat_direction_confusion_empty_when_no_previous_setpoints() -> None:
+def test_heat_direction_confusion_empty_when_no_previous_setpoints() -> None:
     """With no tick carrying a previous setpoint the matrix is empty, agreement None."""
     outcomes = [
         _outcome(
