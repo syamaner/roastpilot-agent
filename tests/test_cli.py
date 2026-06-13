@@ -271,6 +271,10 @@ def test_serve_live_happy_path(
     assert "syamaner/coffee-first-crack-detection" in out
     # The mock-driver warning fired (this fake child resolved the mock driver).
     assert "MOCK driver — NOT real hardware" in out
+    # The advisor reachability readout printed before serve (#168). This fake
+    # service has no advisor, so the probe reports NOT CONFIGURED — a regression
+    # that silently dropped the readout call would fail here.
+    assert "advisor NOT CONFIGURED" in out
     # COFFEE_* was forwarded through the CLI into config.mcp.env.
     assert captured["coffee_driver"] == "mock"
     # The finally teardown ran in order: service.shutdown → mcp.stop → store.close.

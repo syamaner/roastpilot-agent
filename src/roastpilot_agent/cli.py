@@ -250,7 +250,10 @@ def _format_advisor_readout(health: "AdvisorHealth") -> list[str]:
         target = ""
         if health.provider is not None or health.model_slug is not None:
             target = f" (provider={health.provider}, model={health.model_slug})"
-        lines.append(f"⚠️  advisor UNREACHABLE{target}: {health.error}")
+        # `error` is typed `str | None`; every UNREACHABLE path sets it, but
+        # guard so the operator never sees a bare "UNREACHABLE: None".
+        error_msg = health.error or "(no error detail)"
+        lines.append(f"⚠️  advisor UNREACHABLE{target}: {error_msg}")
         lines.append(
             "    the roast can still start (advisory-paused); the controller "
             "runs deterministically without advice"
