@@ -58,6 +58,7 @@ from pydantic import BaseModel
 
 from roastpilot_agent.api import QueuedOperatorAction, RoastService, create_app
 from roastpilot_agent.config import AppConfig
+from roastpilot_agent.live import mount_spa
 from roastpilot_agent.models import (
     OperatorAction,
     RoastEventKind,
@@ -824,6 +825,7 @@ async def create_replay_app(
     config: AppConfig | None = None,
     step_mode: bool = False,
     speed: float = 1.0,
+    spa_dir: Path | None = None,
 ) -> tuple[FastAPI, RoastService, ReplaySource]:
     """Build a fully-wired replay FastAPI app over a recorded export.
 
@@ -838,6 +840,10 @@ async def create_replay_app(
     drives it), so the live app's restart-recovery startup would wrongly force
     it into ``operator_recovery_required``. Replay owns the run lifecycle, so
     its lifespan only stops the live loop on shutdown.
+
+    ``spa_dir`` (when set) serves the built SPA at ``/`` so the recorded roast
+    renders in the real dashboard, mounted after the API routes exactly as the
+    live serve path mounts it.
     """
     service, source, store = build_replay_service(export_dir, store_path, config=config)
     source.set_speed(speed)
@@ -853,7 +859,12 @@ async def create_replay_app(
         await service.shutdown()
         await store.close()
 
+    # The SPA mount (a catch-all at "/") must be registered AFTER the gated
+    # /api/replay/* control routes, or it would shadow them; so create_app mounts
+    # no SPA here and mount_spa runs last, once every /api route exists.
     app = create_app(service, lifespan=_replay_lifespan)
     if step_mode:
         mount_replay_controls(app, source)
+    if spa_dir is not None and (spa_dir / "index.html").is_file():
+        mount_spa(app, spa_dir)
     return app, service, source

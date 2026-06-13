@@ -88,3 +88,53 @@ def test_replay_free_running_drives_the_roast(
     )
     assert cli.main() == 0
     assert "free-running at 60x" in capsys.readouterr().out
+
+
+def test_parser_serve_defaults() -> None:
+    """``serve`` parses with the default host/port/spa-dir."""
+    args = cli._build_parser().parse_args(["serve"])  # pyright: ignore[reportPrivateUsage]
+    assert args.action == "serve"
+    assert args.host == "127.0.0.1"
+    assert args.port == 8000
+    assert args.spa_dir is None
+
+
+def test_parser_serve_with_spa_dir(tmp_path: Path) -> None:
+    """``serve --spa-dir`` parses the override path."""
+    parser = cli._build_parser()  # pyright: ignore[reportPrivateUsage]
+    args = parser.parse_args(["serve", "--spa-dir", str(tmp_path)])
+    assert args.action == "serve"
+    assert args.spa_dir == tmp_path
+
+
+def test_resolve_spa_dir_prefers_explicit_when_valid(tmp_path: Path) -> None:
+    """An explicit --spa-dir with index.html is used verbatim."""
+    (tmp_path / "index.html").write_text("<title>x</title>", encoding="utf-8")
+    parser = cli._build_parser()  # pyright: ignore[reportPrivateUsage]
+    args = parser.parse_args(["serve", "--spa-dir", str(tmp_path)])
+    assert cli._resolve_spa_dir(args) == tmp_path  # pyright: ignore[reportPrivateUsage]
+
+
+def test_resolve_spa_dir_none_when_explicit_invalid(tmp_path: Path) -> None:
+    """An explicit --spa-dir without index.html resolves to None (mount nothing)."""
+    parser = cli._build_parser()  # pyright: ignore[reportPrivateUsage]
+    args = parser.parse_args(["serve", "--spa-dir", str(tmp_path)])
+    assert cli._resolve_spa_dir(args) is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_serve_fails_closed_on_mcp_start_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``serve`` returns a non-zero exit with a clear message when the MCP child
+    cannot start — fail-closed, no socket bound."""
+    from roastpilot_agent import live
+    from roastpilot_agent.mcp_client import MCPConnectionError
+
+    async def _boom(config: object, *, store_path: object) -> object:  # noqa: ANN401
+        raise MCPConnectionError("no coffee-roaster-mcp on PATH")
+
+    monkeypatch.setattr(live, "build_live_service", _boom)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+    assert cli.main() == 1
+    assert "could not start coffee-roaster-mcp" in capsys.readouterr().out
