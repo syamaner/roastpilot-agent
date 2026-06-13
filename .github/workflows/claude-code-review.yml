@@ -44,7 +44,14 @@ jobs:
           # obvious choice but has no effect in agent mode (custom prompt);
           # see anthropics/claude-code-action#1108.
           track_progress: true
-          prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          # --comment posts each finding as an INLINE PR review comment (a
+          # resolvable thread), not just one summary issue comment. Combined
+          # with the `required_conversation_resolution` branch-protection rule
+          # on main, every finding then BLOCKS merge until its thread is
+          # explicitly resolved — i.e. a "needs change" comment can't be merged
+          # past without conscious triage. (A summary issue comment is not a
+          # resolvable thread and does not block; that was the gap on #143.)
+          prompt: '/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
           # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
           # or https://code.claude.com/docs/en/cli-reference for available options
 
