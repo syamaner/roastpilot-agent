@@ -971,8 +971,15 @@ class RoastService:
                 short enough never to wedge a Ctrl-C).
 
         Returns:
-            ``True`` if a heat-off e-stop was confirmed issued; ``False`` if it
-            was a no-op (no active run) or did not confirm (timeout / error).
+            ``True`` if the heat-off safety path ran and the controller faulted
+            (the e-stop was dispatched through ``operator_emergency_stop``).
+            Note this is *not* a hardware acknowledgement: if the MCP
+            ``emergency_stop`` write itself fails, ``operator_emergency_stop``
+            still emits ``COMMAND_FAILED``, faults the run, and reports success
+            here — fail-safe is the controller's job, not the caller's.
+            ``False`` if it was a no-op (no active run / already hardware-off) or
+            the safety path did not run to completion (the ``wait_for`` timeout
+            or an unexpected error in this method, both logged + swallowed).
         """
         runner = self.runner
         if runner is None:
