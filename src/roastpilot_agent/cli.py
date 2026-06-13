@@ -17,6 +17,7 @@ Two run modes plus the scaffold default:
 import argparse
 import asyncio
 import logging
+import os
 import tempfile
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -75,9 +76,61 @@ def _build_parser() -> argparse.ArgumentParser:
             "web/dist when present); applies to both 'serve' and --replay"
         ),
     )
+    parser.add_argument(
+        "--db",
+        metavar="PATH",
+        type=Path,
+        default=None,
+        help=(
+            "SQLite path for the live decision trace ('serve' only); persists "
+            "across restart so recovery can read prior run state. Defaults to "
+            "$ROASTPILOT_DB, else $XDG_STATE_HOME/roastpilot/roastpilot.sqlite3 "
+            "(else ~/.local/state/...). Replay is always ephemeral and ignores this."
+        ),
+    )
     parser.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="bind port (default 8000)")
     return parser
+
+
+def _resolve_live_store_path(args: argparse.Namespace) -> Path:
+    """Resolve the persistent SQLite path for a live ``serve`` (issue #161).
+
+    A **live** roast must persist its agent decision trace — per-tick
+    telemetry, every CLAMP/REJECT :class:`SafetyEvaluation`, advisor decisions,
+    and events — so it survives shutdown and a restart can read prior run state
+    for the recovery flow. (Replay is the opposite: an ephemeral tempdir is
+    correct there, so this resolver is **not** used on the replay path.)
+
+    Precedence:
+
+    1. ``--db PATH`` — explicit operator choice;
+    2. ``ROASTPILOT_DB`` environment variable;
+    3. default ``$XDG_STATE_HOME/roastpilot/roastpilot.sqlite3``, or
+       ``~/.local/state/roastpilot/roastpilot.sqlite3`` when ``XDG_STATE_HOME``
+       is unset.
+
+    The parent directory is created (``parents=True, exist_ok=True``) so the
+    first live roast on a fresh machine just works.
+
+    Args:
+        args: Parsed CLI namespace; ``args.db`` is the explicit override.
+
+    Returns:
+        The resolved SQLite file path, with its parent directory ensured.
+    """
+    env_db = os.environ.get("ROASTPILOT_DB")
+    if args.db is not None:
+        path = args.db
+    elif env_db:
+        path = Path(env_db)
+    else:
+        state_home = os.environ.get("XDG_STATE_HOME")
+        base = Path(state_home) if state_home else Path.home() / ".local" / "state"
+        path = base / "roastpilot" / "roastpilot.sqlite3"
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def _resolve_spa_dir(args: argparse.Namespace) -> Path | None:
@@ -181,49 +234,54 @@ async def _serve_live(args: argparse.Namespace) -> int:
     # Let the operator configure the Hottop with plain `export COFFEE_…`.
     forward_coffee_env(config)
 
-    with tempfile.TemporaryDirectory(prefix="roastpilot-live-") as tmp:
-        store_path = Path(tmp) / "roastpilot.sqlite3"
-        try:
-            service, mcp, store = await build_live_service(config, store_path=store_path)
-        except MCPConnectionError as exc:
-            # Fail closed: the child is already stopped by build_live_service.
-            print(f"error: could not start coffee-roaster-mcp: {exc}")
-            return 1
+    # Live runs persist to a stable on-disk path (issue #161) — NOT a tempdir
+    # like replay — so the agent decision trace survives shutdown and a restart
+    # can read prior run state for recovery.
+    store_path = _resolve_live_store_path(args)
+    try:
+        service, mcp, store = await build_live_service(config, store_path=store_path)
+    except MCPConnectionError as exc:
+        # Fail closed: the child is already stopped by build_live_service.
+        print(f"error: could not start coffee-roaster-mcp: {exc}")
+        return 1
 
-        # The MCP child is RUNNING the moment build_live_service returns, so the
-        # ENTIRE post-build phase (store init, app build, serve) is wrapped: a
-        # failure in store.initialize()/create_app() must still tear the child
-        # down rather than orphan it.
-        try:
-            await store.initialize()
-            spa_dir = _resolve_spa_dir(args)
-            # create_app's default lifespan IS the recovery _lifespan: on startup
-            # it runs recover_on_start (a possibly-active run →
-            # operator_recovery_required, never an auto-resume of heat/fan) and
-            # stops the loop on shutdown. The live serve path deliberately uses
-            # that recovery lifespan, not replay's no-recovery one.
-            app = create_app(service, spa_dir=spa_dir)
-            spa_note = "with SPA" if spa_dir is not None else "API only (no SPA build found)"
-            print(f"serving live roast ({spa_note}) on http://{args.host}:{args.port}")
+    # The MCP child is RUNNING the moment build_live_service returns, so the
+    # ENTIRE post-build phase (store init, app build, serve) is wrapped: a
+    # failure in store.initialize()/create_app() must still tear the child
+    # down rather than orphan it.
+    try:
+        await store.initialize()
+        spa_dir = _resolve_spa_dir(args)
+        # create_app's default lifespan IS the recovery _lifespan: on startup
+        # it runs recover_on_start (a possibly-active run →
+        # operator_recovery_required, never an auto-resume of heat/fan) and
+        # stops the loop on shutdown. The live serve path deliberately uses
+        # that recovery lifespan, not replay's no-recovery one.
+        app = create_app(service, spa_dir=spa_dir)
+        spa_note = "with SPA" if spa_dir is not None else "API only (no SPA build found)"
+        print(f"serving live roast ({spa_note}) on http://{args.host}:{args.port}")
+        # The persistent trace path is part of the operator readout: it tells
+        # them where the roast is being recorded and survives shutdown.
+        print(f"  decision trace → {store_path}")
 
-            # Startup hardware/sensing readout (#134): print what the MCP child
-            # actually resolved — real Hottop vs mock, FC mode — before uvicorn
-            # serves, so "right hardware + FC on?" is a can't-miss console line.
-            # Read-only and best-effort: a failure here never blocks the serve.
-            await _emit_runtime_readout(mcp.call_tool)
+        # Startup hardware/sensing readout (#134): print what the MCP child
+        # actually resolved — real Hottop vs mock, FC mode — before uvicorn
+        # serves, so "right hardware + FC on?" is a can't-miss console line.
+        # Read-only and best-effort: a failure here never blocks the serve.
+        await _emit_runtime_readout(mcp.call_tool)
 
-            uv = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
-            server = uvicorn.Server(uv)
-            # _lifespan runs recover_on_start (restart → recovery) on startup and
-            # service.shutdown() on teardown; we stop the MCP child after the
-            # server returns (graceful shutdown / SIGINT) and close the store.
-            await server.serve()
-        finally:
-            # Best-effort cleanup: each step is logged-not-raised so one failure
-            # never aborts the rest of the chain (or masks the original error).
-            await _cleanup_step("service.shutdown", service.shutdown)
-            await _cleanup_step("mcp.stop", mcp.stop)
-            await _cleanup_step("store.close", store.close)
+        uv = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
+        server = uvicorn.Server(uv)
+        # _lifespan runs recover_on_start (restart → recovery) on startup and
+        # service.shutdown() on teardown; we stop the MCP child after the
+        # server returns (graceful shutdown / SIGINT) and close the store.
+        await server.serve()
+    finally:
+        # Best-effort cleanup: each step is logged-not-raised so one failure
+        # never aborts the rest of the chain (or masks the original error).
+        await _cleanup_step("service.shutdown", service.shutdown)
+        await _cleanup_step("mcp.stop", mcp.stop)
+        await _cleanup_step("store.close", store.close)
     return 0
 
 

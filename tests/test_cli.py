@@ -14,6 +14,20 @@ import pytest
 from roastpilot_agent import cli
 
 
+@pytest.fixture(autouse=True)
+def isolate_live_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a serve test write the live DB into the real ``~/.local/state``.
+
+    ``_serve_live`` resolves a PERSISTENT store path (#161) and creates its
+    parent directory, so by default any serve test would ``mkdir`` under the
+    real home. Pin the default at a per-test tmp via ``XDG_STATE_HOME`` and
+    clear any ambient ``ROASTPILOT_DB``; tests that assert precedence override
+    these themselves (a later ``monkeypatch.setenv`` wins).
+    """
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
+    monkeypatch.delenv("ROASTPILOT_DB", raising=False)
+
+
 def _runtime_config_payload(
     *, roaster_driver: str = "hottop_kn8828b_2k_plus", first_crack_mode: str = "audio"
 ) -> dict[str, Any]:
@@ -224,6 +238,7 @@ def test_serve_live_happy_path(
     ) -> tuple[RoastService, _FakeMCP, RoastStore]:
         # Assert the CLI forwarded COFFEE_* into the config before building.
         captured["coffee_driver"] = config.mcp.env.get("COFFEE_ROASTER_DRIVER")
+        captured["store_path"] = store_path
         store = _RecordingStore(store_path)
         service = RoastService(store)
         original_shutdown = service.shutdown
@@ -235,15 +250,21 @@ def test_serve_live_happy_path(
         monkeypatch.setattr(service, "shutdown", _tracked_shutdown)
         return service, _FakeMCP(), store
 
+    live_db = tmp_path / "trace" / "live.sqlite3"
     monkeypatch.setattr(live, "build_live_service", _fake_build)
     monkeypatch.setattr(
         "sys.argv",
-        ["roastpilot-agent", "serve", "--port", "0", "--spa-dir", str(spa)],
+        ["roastpilot-agent", "serve", "--port", "0", "--spa-dir", str(spa), "--db", str(live_db)],
     )
 
     assert cli.main() == 0
     out = capsys.readouterr().out
     assert "serving live roast (with SPA)" in out
+    # #161: the live store is the PERSISTENT --db path (never a tempdir), its
+    # parent dir was created, and the path is printed in the operator readout.
+    assert captured["store_path"] == live_db
+    assert live_db.parent.is_dir()
+    assert f"decision trace → {live_db}" in out
     # The startup runtime readout printed (driver/port/FC-mode/model) before serve.
     assert "Roaster runtime (from coffee-roaster-mcp)" in out
     assert "/dev/cu.usbserial-XYZ" in out
@@ -254,6 +275,50 @@ def test_serve_live_happy_path(
     assert captured["coffee_driver"] == "mock"
     # The finally teardown ran in order: service.shutdown → mcp.stop → store.close.
     assert order == ["service.shutdown", "mcp.stop", "store.close"]
+
+
+def test_resolve_live_store_path_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--db`` > ``ROASTPILOT_DB`` > ``$XDG_STATE_HOME`` default, and the
+    parent directory is always created (issue #161)."""
+    import argparse
+
+    # 1. Explicit --db wins over env and default; parent is created.
+    flag_db = tmp_path / "flag" / "explicit.sqlite3"
+    monkeypatch.setenv("ROASTPILOT_DB", str(tmp_path / "env" / "from-env.sqlite3"))
+    resolved = cli._resolve_live_store_path(argparse.Namespace(db=flag_db))  # pyright: ignore[reportPrivateUsage]
+    assert resolved == flag_db
+    assert flag_db.parent.is_dir()
+
+    # 2. ROASTPILOT_DB wins over the XDG default when no --db.
+    env_db = tmp_path / "env" / "from-env.sqlite3"
+    monkeypatch.setenv("ROASTPILOT_DB", str(env_db))
+    resolved = cli._resolve_live_store_path(argparse.Namespace(db=None))  # pyright: ignore[reportPrivateUsage]
+    assert resolved == env_db
+    assert env_db.parent.is_dir()
+
+    # 3. Default is $XDG_STATE_HOME/roastpilot/roastpilot.sqlite3.
+    monkeypatch.delenv("ROASTPILOT_DB", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+    resolved = cli._resolve_live_store_path(argparse.Namespace(db=None))  # pyright: ignore[reportPrivateUsage]
+    assert resolved == tmp_path / "xdg" / "roastpilot" / "roastpilot.sqlite3"
+    assert resolved.parent.is_dir()
+
+
+def test_resolve_live_store_path_home_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no ``--db``/``ROASTPILOT_DB``/``XDG_STATE_HOME``, the default is
+    ``~/.local/state/roastpilot/roastpilot.sqlite3`` (issue #161)."""
+    import argparse
+
+    monkeypatch.delenv("ROASTPILOT_DB", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "home")
+    resolved = cli._resolve_live_store_path(argparse.Namespace(db=None))  # pyright: ignore[reportPrivateUsage]
+    assert resolved == tmp_path / "home" / ".local" / "state" / "roastpilot" / "roastpilot.sqlite3"
+    assert resolved.parent.is_dir()
 
 
 @pytest.mark.usefixtures("no_serve")
