@@ -976,7 +976,10 @@ class RoastController:
         # _act_on_safety reuses the recovery machinery; it acts on (does not
         # re-persist) the evaluation already persisted above.
         if evaluation.verdict is SafetyVerdict.RECOVERY:
-            await self._act_on_safety(evaluation)
+            # The stop-tick return is deliberately discarded: this is already
+            # the last step of the advisory path (the caller returns straight
+            # after), so there is no remaining tick work to short-circuit.
+            _ = await self._act_on_safety(evaluation)
 
     def _elapsed_ms(self, started: float) -> int:
         """Milliseconds elapsed since ``started`` on the controller clock."""

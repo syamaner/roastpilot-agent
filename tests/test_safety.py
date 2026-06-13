@@ -6,6 +6,8 @@ Command validation (E3-S3), e-stop plumbing (E3-S4), and phase/source
 validity (E3-S5, D16) extend this suite.
 """
 
+from typing import Literal
+
 import pytest
 
 from roastpilot_agent.config import SafetyLimits
@@ -390,12 +392,15 @@ def test_drop_recommendation_rejected_outside_development(
     assert evaluation.rule == "drop_eligibility"
 
 
-@pytest.mark.parametrize("status", ["timeout", "malformed", "unsafe", "provider_error"])
+@pytest.mark.parametrize("status", ["malformed", "unsafe"])
 def test_advisor_failure_rejects_and_holds_current_targets(
-    policy: SafetyPolicy, status: str
+    policy: SafetyPolicy, status: Literal["malformed", "unsafe"]
 ) -> None:
+    # timeout / provider_error are the availability class (D30): they route to
+    # evaluate_advisor_availability, not here — this rule is now the
+    # reachable-but-misbehaving (malformed / unsafe) hold only.
     evaluation = policy.evaluate_advisor_failure(
-        status=status,  # pyright: ignore[reportArgumentType]
+        status=status,
         current_heat=65,
         current_fan=55,
     )
@@ -470,7 +475,10 @@ def test_e3_s3_evaluations_are_persisted_ready(policy: SafetyPolicy) -> None:
             requested_heat=70, requested_fan=40, seconds_since_last_command=0.1
         ),
         policy.evaluate_drop_recommendation(phase=RoastPhase.PREHEATING),
-        policy.evaluate_advisor_failure(status="timeout", current_heat=50, current_fan=50),
+        policy.evaluate_advisor_failure(status="malformed", current_heat=50, current_fan=50),
+        policy.evaluate_advisor_availability(
+            consecutive_failures=1, current_heat=50, current_fan=50
+        ),
     ]
     for evaluation in evaluations:
         assert evaluation.rule
@@ -555,7 +563,10 @@ def test_every_rule_method_is_persisted_ready(policy: SafetyPolicy) -> None:
             requested_heat=70, requested_fan=40, seconds_since_last_command=None
         ),
         policy.evaluate_drop_recommendation(phase=RoastPhase.DEVELOPMENT),
-        policy.evaluate_advisor_failure(status="timeout", current_heat=50, current_fan=50),
+        policy.evaluate_advisor_failure(status="malformed", current_heat=50, current_fan=50),
+        policy.evaluate_advisor_availability(
+            consecutive_failures=4, current_heat=50, current_fan=50
+        ),
         policy.evaluate_emergency_stop(phase=RoastPhase.FAULTED),
     ]
     for evaluation in evaluations:

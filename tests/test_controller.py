@@ -656,6 +656,27 @@ async def test_operator_resume_resets_availability_streak() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_run_resets_availability_streak() -> None:
+    """A new run starts the availability counter clean (D30): after failures
+    accrued in a prior session, ``start_run`` clears them so the next run takes
+    a full N failures to trip — not a single one."""
+    advisor = FakeAdvisor([AdvisorFailureMode.PROVIDER_ERROR] * 4)
+    harness = make_harness(readings=[reading()], advisor=advisor)
+    # Pre-seed a stale streak from a prior (acknowledged) session.
+    harness.controller._consecutive_advisor_failures = 2  # pyright: ignore[reportPrivateUsage]
+    await harness.controller.start_run(PROFILE)  # idle → preheating; resets the streak
+    assert harness.controller.phase is RoastPhase.PREHEATING
+    # Two failures in the fresh run: with a clean reset this stays below the
+    # default threshold of 3, so the roast keeps preheating. Without the reset
+    # the pre-seeded 2 + these 2 would have tripped on the first failure.
+    for _ in range(2):
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.PREHEATING
+    assert RoastEventKind.RECOVERY_REQUIRED not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
 async def test_read_failures_tolerated_then_fault_closed() -> None:
     """Two read faults are tolerated (ticks continue); the third (default
     threshold) fails closed into FAULTED."""

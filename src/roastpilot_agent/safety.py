@@ -435,17 +435,24 @@ class SafetyPolicy:
     def evaluate_advisor_failure(
         self,
         *,
-        status: Literal["timeout", "malformed", "unsafe", "provider_error"],
+        status: Literal["malformed", "unsafe"],
         current_heat: int,
         current_fan: int,
     ) -> SafetyEvaluation:
-        """Advisor failure ⇒ rejected recommendation ⇒ deterministic fallback.
+        """Provider-reachable advisor failure ⇒ rejected recommendation ⇒ hold.
 
-        Timeout, malformed output, unsafe output, or a provider error never
-        blocks the tick (orchestration plan § Advisory Call Frequency): the
-        recommendation is REJECTed and the fallback is to hold the current
-        targets — the adjusted values echo the heat/fan already in effect.
-        Every outcome is persisted via the decision trace (plan §5).
+        The reachable-but-misbehaving failures — ``malformed`` (output the
+        model could not produce) and ``unsafe`` (a well-shaped but
+        out-of-bounds command) — never block the tick (orchestration plan
+        § Advisory Call Frequency): the recommendation is REJECTed and the
+        fallback holds the current targets (the adjusted values echo the
+        heat/fan already in effect). Every outcome is persisted via the
+        decision trace (plan §5).
+
+        The *availability* failures (``timeout`` / ``provider_error``) are a
+        different class — they route to :meth:`evaluate_advisor_availability`
+        (D30, #166), which counts consecutive outages toward the fail-closed
+        stop — and deliberately never reach this rule.
         """
         return SafetyEvaluation(
             rule=f"advisor_{status}",
