@@ -841,7 +841,7 @@ class RoastStore:
         ]
         async with self.connection.execute(
             "SELECT tick, provider, model, prompt_version, latency_ms, status,"
-            " decision_json, recorded_at_utc FROM advisor_decisions"
+            " decision_json, safety_evaluation_id, recorded_at_utc FROM advisor_decisions"
             " WHERE run_id = ? ORDER BY id ASC",
             (run_id,),
         ) as cursor:
@@ -855,7 +855,8 @@ class RoastStore:
                 latency_ms=None if row[4] is None else int(row[4]),
                 status=cast(AdvisorTraceStatus, str(row[5])),
                 decision=_loads(row[6]),
-                recorded_at_utc=str(row[7]),
+                safety_evaluation_id=None if row[7] is None else int(row[7]),
+                recorded_at_utc=str(row[8]),
             )
             for row in advisor_rows
         ]

@@ -23,7 +23,12 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-from roastpilot_agent.advisor import AdvisorContext, RoastAdvisor, RoastDecision
+from roastpilot_agent.advisor import (
+    AdvisorContext,
+    AdvisorDescriptor,
+    RoastAdvisor,
+    RoastDecision,
+)
 from roastpilot_agent.api import RoastService
 from roastpilot_agent.config import AppConfig, ControllerConfig, MCPConfig
 from roastpilot_agent.mcp_client import MCPServerProcess, RoasterControlAdapter, RoasterMCPClient
@@ -66,6 +71,10 @@ class _ChargeDropAdvisor(RoastAdvisor):
     bean temperature falls — the drop the server's auto-T0 detector needs. Stays
     well below the pre-T0 overrun bound (200 °C); the controller's safety policy
     still validates and clamps every target."""
+
+    @property
+    def descriptor(self) -> AdvisorDescriptor:
+        return AdvisorDescriptor(provider="test", model="charge-drop", prompt_version="t")
 
     async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
         if context.current_bean_temp_c < _CHARGE_RAMP_CEILING_C:

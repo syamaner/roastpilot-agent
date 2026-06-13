@@ -7,13 +7,19 @@ scripted MCP contract (E4/E5), advisor fixtures (E8), temp SQLite store
 ``log`` list so tests can assert cross-collaborator call order.
 """
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from roastpilot_agent.advisor import FakeAdvisor
+from roastpilot_agent.advisor import (
+    AdvisorContext,
+    AdvisorDescriptor,
+    FakeAdvisor,
+    RoastDecision,
+)
 from roastpilot_agent.mcp_client import ExportRoastLogResult
-from roastpilot_agent.models import RoastEventKind, RoastTelemetry
+from roastpilot_agent.models import AdvisorTraceStatus, RoastEventKind, RoastTelemetry
 from roastpilot_agent.safety import SafetyEvaluation
 from roastpilot_agent.store import RoastStore
 
@@ -173,21 +179,64 @@ class RecordingExecutor:
         self.estop_reasons.append(reason)
 
 
+@dataclass
+class RecordedAdvisorDecision:
+    """One advisor decision recorded by :class:`RecordingSnapshotSink` (#167)."""
+
+    descriptor: AdvisorDescriptor
+    context: AdvisorContext
+    latency_ms: int | None
+    decision: RoastDecision | None
+    status: AdvisorTraceStatus
+    safety_evaluation_id: int | None
+
+
 class RecordingSnapshotSink:
-    """SnapshotSink protocol fake recording persisted ticks."""
+    """SnapshotSink protocol fake recording persisted ticks.
+
+    ``persist_evaluation`` hands back a synthetic, monotonically increasing
+    row id (as the SQLite sink does) so advisor decisions can record the
+    safety_evaluation_id they linked to — the #167 trace join.
+    """
 
     def __init__(self, log: list[str] | None = None) -> None:
         self._log = log if log is not None else []
         self.snapshots: list[RoastTelemetry | None] = []
         self.evaluations: list[SafetyEvaluation] = []
+        self.advisor_decisions: list[RecordedAdvisorDecision] = []
+        self._next_evaluation_id = 0
 
     async def persist_snapshot(self, telemetry: RoastTelemetry | None) -> None:
         self._log.append("persist_snapshot")
         self.snapshots.append(telemetry)
 
-    async def persist_evaluation(self, evaluation: SafetyEvaluation) -> None:
+    async def persist_evaluation(self, evaluation: SafetyEvaluation) -> int | None:
         self._log.append(f"persist_evaluation:{evaluation.rule}")
         self.evaluations.append(evaluation)
+        self._next_evaluation_id += 1
+        return self._next_evaluation_id
+
+    async def persist_advisor_decision(
+        self,
+        *,
+        descriptor: AdvisorDescriptor,
+        context: AdvisorContext,
+        latency_ms: int | None,
+        decision: RoastDecision | None,
+        status: AdvisorTraceStatus,
+        safety_evaluation_id: int | None,
+    ) -> None:
+        self._log.append(f"persist_advisor_decision:{status}")
+        self.advisor_decisions.append(
+            RecordedAdvisorDecision(
+                descriptor=descriptor,
+                context=context,
+                latency_ms=latency_ms,
+                decision=decision,
+                status=status,
+                safety_evaluation_id=safety_evaluation_id,
+            )
+        )
 
 
 class EventSink:

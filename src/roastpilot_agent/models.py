@@ -393,7 +393,12 @@ class TimelineSafetyEvaluation(BaseModel):
 
 
 class TimelineAdvisorDecision(BaseModel):
-    """One advisory outcome in the decision trace (plan §5 ``advisor_decisions``)."""
+    """One advisory outcome in the decision trace (plan §5 ``advisor_decisions``).
+
+    ``safety_evaluation_id`` links to the :class:`TimelineSafetyEvaluation` the
+    call produced (#167), so the FE can join an advisor decision to its verdict;
+    ``None`` only for rows persisted before the FK was wired.
+    """
 
     tick: int
     provider: str
@@ -402,6 +407,7 @@ class TimelineAdvisorDecision(BaseModel):
     latency_ms: int | None = None
     status: AdvisorTraceStatus
     decision: dict[str, Any] | None = None
+    safety_evaluation_id: int | None = None
     recorded_at_utc: str
 
 

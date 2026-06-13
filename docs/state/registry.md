@@ -243,8 +243,16 @@ order:
    The result is exposed on `GET /api/health` (`advisor` field) so the dashboard can
    render an ADVISOR-OFFLINE state. Remaining: the **in-roast** dashboard ADVISOR-OFFLINE
    render (FE task — data is now available) + the distinct in-roast error indicator.
-3. 🟠 **#167** persist `advisor_decisions` (table has ZERO call sites — trace dropped) →
-   then **#170** surface the advisor timeline in detail/history.
+3. 🟢 **#167** persist `advisor_decisions` (table had ZERO call sites — trace dropped).
+   **DONE** (PR feature/167): the controller now records an advisor row on **both** paths
+   — success (`status='ok'`, the `RoastDecision`, latency, provider/model/prompt) and
+   failure (`timeout`/`malformed`/`provider_error`; `unsafe`→`malformed`, `decision=None`)
+   — each linked to the `safety_evaluation_id` of the verdict it produced (`persist_evaluation`
+   now returns the row id; new `SnapshotSink.persist_advisor_decision`; advisor exposes a
+   provider-agnostic `descriptor`). The timeline route already returns the rows, now enriched
+   with the linked `safety_evaluation_id`. Controller diff is persistence-wiring only — no
+   transition/verdict/call-policy change. Next: **#170** surface the advisor timeline in
+   detail/history (FE).
 4. 🟠 **#171** phase-dependent advisor cadence: preheat 30 s / **charged** 10 s / FC
    as-fast-as-it-returns (~5–7 s floor). "beans dropped" = **charged**. Keep change-based
    early-fire.

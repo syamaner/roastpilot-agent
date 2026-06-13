@@ -12,7 +12,14 @@ from typing import cast
 
 import pytest
 
-from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastAdvisor, RoastDecision
+from roastpilot_agent.advisor import (
+    AdvisorContext,
+    AdvisorDescriptor,
+    AdvisorFailureMode,
+    FakeAdvisor,
+    RoastAdvisor,
+    RoastDecision,
+)
 from roastpilot_agent.config import ControllerConfig
 from roastpilot_agent.controller import (
     TRANSITION_TABLE,
@@ -341,6 +348,7 @@ async def test_tick_order_with_advisory() -> None:
         "persist_evaluation:all_clear",
         "advisor",
         "persist_evaluation:all_clear",
+        "persist_advisor_decision:ok",
         "emit:advisory",
         "set_targets",
         "emit:command_executed",
@@ -369,6 +377,10 @@ async def test_slow_advisor_never_blocks_the_tick() -> None:
     rejected recommendation and the deterministic hold fallback."""
 
     class NeverAdvisor(RoastAdvisor):
+        @property
+        def descriptor(self) -> AdvisorDescriptor:
+            return AdvisorDescriptor(provider="test", model="never", prompt_version="t")
+
         async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
@@ -388,6 +400,10 @@ async def test_slow_advisor_never_blocks_the_tick() -> None:
 @pytest.mark.asyncio
 async def test_crashing_advisor_is_a_provider_error() -> None:
     class CrashingAdvisor(RoastAdvisor):
+        @property
+        def descriptor(self) -> AdvisorDescriptor:
+            return AdvisorDescriptor(provider="test", model="crash", prompt_version="t")
+
         async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
             raise RuntimeError("boom")
 
@@ -399,6 +415,60 @@ async def test_crashing_advisor_is_a_provider_error() -> None:
     await harness.controller.tick()
     assert harness.sink.evaluations[-1].rule == "advisor_provider_error"
     assert harness.executor.targets == []
+
+
+@pytest.mark.asyncio
+async def test_advisory_success_persists_decision_linked_to_verdict() -> None:
+    """The success path persists one advisor_decisions row (#167): status 'ok',
+    the RoastDecision, and the safety_evaluation_id of the verdict it produced —
+    the controller wiring that was missing (zero call sites)."""
+    advisor = FakeAdvisor([decision(heat=65, fan=50)])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert len(harness.sink.advisor_decisions) == 1
+    recorded = harness.sink.advisor_decisions[0]
+    assert recorded.status == "ok"
+    assert recorded.decision is not None and recorded.decision.target_heat == 65
+    assert recorded.descriptor.provider == "fake"
+    # The link points at the command evaluation persisted just before it (the
+    # second evaluation: all_clear → the advisory verdict). RecordingSnapshotSink
+    # hands back monotonic ids, so the linked id is that second evaluation.
+    assert recorded.safety_evaluation_id == len(harness.sink.evaluations)
+    assert recorded.latency_ms is not None and recorded.latency_ms >= 0
+
+
+@pytest.mark.asyncio
+async def test_advisory_failure_persists_null_decision_linked_to_reject() -> None:
+    """The failure path persists one advisor_decisions row (#167): the failure
+    status, decision=None, and the safety_evaluation_id of the REJECT it
+    produced — so the #134 provider_error trace is no longer thrown away."""
+    advisor = FakeAdvisor([AdvisorFailureMode.PROVIDER_ERROR])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert len(harness.sink.advisor_decisions) == 1
+    recorded = harness.sink.advisor_decisions[0]
+    assert recorded.status == "provider_error"
+    assert recorded.decision is None
+    assert recorded.safety_evaluation_id == len(harness.sink.evaluations)
+    assert harness.sink.evaluations[-1].verdict is SafetyVerdict.REJECT
+
+
+@pytest.mark.asyncio
+async def test_advisory_unsafe_output_persists_as_malformed() -> None:
+    """An unsafe (out-of-bounds) advisor output has no distinct trace status; it
+    persists as 'malformed' with decision=None (#167), while the safety verdict
+    keeps its own 'advisor_unsafe' rule for the verdict stream."""
+    advisor = FakeAdvisor([AdvisorFailureMode.UNSAFE])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert len(harness.sink.advisor_decisions) == 1
+    recorded = harness.sink.advisor_decisions[0]
+    assert recorded.status == "malformed"
+    assert recorded.decision is None
+    assert harness.sink.evaluations[-1].rule == "advisor_unsafe"
 
 
 @pytest.mark.asyncio

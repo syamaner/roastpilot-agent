@@ -29,7 +29,12 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from roastpilot_agent import __version__
-from roastpilot_agent.advisor import RoastAdvisor
+from roastpilot_agent.advisor import (
+    AdvisorContext,
+    AdvisorDescriptor,
+    RoastAdvisor,
+    RoastDecision,
+)
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.controller import (
     TRANSITION_TABLE,
@@ -43,6 +48,7 @@ from roastpilot_agent.mcp_client import ExportRoastLogResult, MCPServerProcess, 
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
     AdvisorHealth,
+    AdvisorTraceStatus,
     HealthResponse,
     LogManifest,
     MCPChildStatus,
@@ -344,9 +350,32 @@ class StoreSnapshotSink:
     async def persist_snapshot(self, telemetry: object) -> None:
         return  # the runner owns the enriched telemetry row (see RoastRunner)
 
-    async def persist_evaluation(self, evaluation: SafetyEvaluation) -> None:
-        await self._store.record_safety_evaluation(
+    async def persist_evaluation(self, evaluation: SafetyEvaluation) -> int | None:
+        return await self._store.record_safety_evaluation(
             run_id=self._run_id, tick=self._tick(), evaluation=evaluation
+        )
+
+    async def persist_advisor_decision(
+        self,
+        *,
+        descriptor: AdvisorDescriptor,
+        context: AdvisorContext,
+        latency_ms: int | None,
+        decision: RoastDecision | None,
+        status: AdvisorTraceStatus,
+        safety_evaluation_id: int | None,
+    ) -> None:
+        await self._store.record_advisor_decision(
+            run_id=self._run_id,
+            tick=self._tick(),
+            provider=descriptor.provider,
+            model=descriptor.model,
+            prompt_version=descriptor.prompt_version,
+            context=context,
+            latency_ms=latency_ms,
+            decision=decision,
+            status=status,
+            safety_evaluation_id=safety_evaluation_id,
         )
 
 
