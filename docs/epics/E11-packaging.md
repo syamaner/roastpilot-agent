@@ -16,12 +16,14 @@ child, per D6), mDNS, and a deployment doc. **No Docker image; no PyTorch on the
 > torch-free MCP release.
 
 > **BLOCKED — operator manual-test gate (D28):** do **not** begin E11
-> implementation until **both** operator-owned (@syamaner) manual test tasks are
-> Done: **#134** (E12-S1 supervised hardware roast through the agent harness, D17
-> criterion 3) and **#135** (E10-S6 manual Safari/iPadOS SSE on real devices). This
-> is *separate from and additional to* the D27 torch-free gate above. Contract-
-> buildable scaffolding may be pre-staged only on explicit operator opt-in. (Prove
-> the harness on real hardware + devices before packaging it.)
+> implementation until **both** operator-owned (@syamaner) manual test tasks are Done.
+> **#135** (E10-S6 manual Safari/iPadOS SSE on real devices) is **✅ DONE/CLOSED**
+> (13 Jun, iPad + iPhone Safari). **#134** (E12-S1 supervised hardware roast through the
+> agent harness, D17 criterion 3) is the **sole remaining gate** — operator running it
+> 13 Jun, now with a persistent decision trace (#161). This is *separate from and
+> additional to* the D27 torch-free gate above. Contract-buildable scaffolding may be
+> pre-staged only on explicit operator opt-in. (Prove the harness on real hardware +
+> devices before packaging it.)
 
 ## Plan links
 
@@ -77,7 +79,9 @@ Acceptance criteria:
 | E11-S2 | Native installer, systemd unit, bundled model, deploy doc | not started |
 
 Epic status: **not started — BLOCKED.** Two gates before any story starts: (1) the
-**operator manual tests #134 + #135** (D28) and (2) the **torch-free
-`coffee-roaster-mcp`** (D27 rollout Phase 2, which is gated on FC-repo Phase 1 #54).
-Re-sliced for native-only + torch-free + bundled-model distribution (D27, 11 Jun
-2026); manual-test gate recorded as D28 (13 Jun 2026).
+**operator manual tests** (D28) — **#135 ✅ DONE**, **#134** the sole remaining operator
+gate (running 13 Jun); and (2) the **torch-free `coffee-roaster-mcp`** (D27 rollout
+Phase 2 = `coffee-roaster-mcp#157`, gated on FC-repo Phase 1 `coffee-first-crack-detection#54`
+— both cross-repo, NOT this repo's #134/#135/#54/#157). Re-sliced for native-only +
+torch-free + bundled-model distribution (D27, 11 Jun 2026); manual-test gate recorded as
+D28 (13 Jun 2026).
