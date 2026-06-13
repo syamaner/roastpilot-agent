@@ -111,11 +111,23 @@ operator-judged bake-off that set the default (`claude-opus-4.8` + prompt
 
 Follow-up tooling (post-E8, [#172](https://github.com/syamaner/roastpilot-agent/issues/172)
 / [#173](https://github.com/syamaner/roastpilot-agent/issues/173)):
-`scripts/advisor_bakeoff.py` is extended for the per-phase prompt + model
-selection re-run — the #173 candidate roster encoded as data, an OpenRouter
-availability sweep that drops + reports unresolvable slugs, grounded
-preheat / pre-FC / first-crack contexts, and a paste-able operator decision
-table (latency-weighted FC slot, full advice text, **no auto-pick**, D20). The
-harness only *measures*; pinning the winning prompt default and the per-phase
-`model_slug_by_phase` values into `config.py` is a **separate** post-bake-off
-PR with its own D-number, gated on the operator running the harness with a key.
+`scripts/advisor_bakeoff.py` + `scripts/bakeoff_replay.py` are extended for the
+per-phase prompt + model selection re-run — the #173 candidate roster encoded as
+data, an OpenRouter availability sweep that drops + reports unresolvable slugs,
+and two report modes (no auto-pick, D20):
+
+- **`--mode replay` (default) — quantitative scoring against the two known-good
+  7-Jun Hottop roasts.** Replays each roast tick-by-tick, reconstructs the
+  `AdvisorContext` per tick, and scores recommendations vs the good roast: drop
+  F1 / precision / recall + drop-timing error (s and °C), heat/fan MAE +
+  directional agreement, per-phase latency. **Honest framing:** these measure
+  *agreement with a known-good roast*, NOT correctness — a quantitative aid to
+  the operator's judgement, never a replacement.
+- **`--mode per-phase`** — the lighter latency/advice table over grounded
+  preheat / pre-FC / first-crack synthetic moments (latency-weighted FC slot).
+
+The replay + metric + report machinery is fully tested **without an API key**
+(canned recommender); only the real-candidate run needs `OPENROUTER_API_KEY`.
+The harness only *measures*; pinning the winning prompt default and the per-phase
+`model_slug_by_phase` values into `config.py` is a **separate** post-bake-off PR
+with its own D-number, gated on the operator running the harness with a key.

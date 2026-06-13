@@ -4,27 +4,35 @@ Extends the D20 bake-off methodology — *operator-judged advice quality under a
 hard latency gate*, no auto-pick — to the per-phase prompt + model selection
 that #172 (the ``v3`` per-stage prompt) and #173 (``model_slug_by_phase``)
 introduce. It runs the real :class:`~roastpilot_agent.advisor.PydanticAIAdvisor`
-(D5 + D18) over a candidate roster across three grounded roast moments — a
-**preheat**, a **charge / pre-first-crack**, and a **first-crack** context — and
-emits a paste-able decision table the operator reads to pick (a) the default
-prompt version and (b) the per-phase model for the ``model_slug_by_phase`` slot.
+(D5 + D18) over a candidate roster and emits a paste-able report the operator
+reads to pick (a) the default prompt version and (b) the per-phase model for the
+``model_slug_by_phase`` slot. The default ``replay`` mode scores recommendations
+quantitatively against the two known-good 7-Jun roasts; the ``per-phase`` mode is
+a lighter latency/advice table over three grounded synthetic moments.
 
-Pipeline (a run, in order):
+Two modes; both start with the availability sweep and never auto-pick (D20):
 
-1. **Availability sweep** — every roster slug is probed for reachability on
-   OpenRouter (the #168 ``healthcheck`` mechanism). A slug that resolves is
-   kept; a 404 / provider error is **dropped and reported** so the comparison
-   contains no phantom winners. Several roster slugs look next-gen and may not
-   exist yet.
-2. **Per-phase sampling** — each surviving (model, phase) pair runs
-   ``get_recommendation`` N=3 (D20) against the phase-appropriate grounded
-   context, under the prompt version(s) requested (``--prompt-version v2 v3``
-   compares both, since #172 is part of this bake-off).
-3. **Measure + report** — latency (min / median / max), pass/fail the hard
-   latency gate (≤ 10 s, and a tighter first-crack threshold — the #171
-   unthrottled-cadence target), and the full advice text per cell, so the
-   operator judges quality. The first-crack slot's ranking is **latency-
-   weighted**. NO model is auto-selected — D20 is operator-judged.
+1. **Availability sweep** (always first) — every roster slug is probed for
+   reachability on OpenRouter (the #168 ``healthcheck`` mechanism). A slug that
+   resolves is kept; a 404 / provider error is **dropped and reported** so the
+   comparison contains no phantom winners. Several roster slugs look next-gen and
+   may not exist yet.
+2. **``--mode replay`` (default) — quantitative real-roast scoring.** Replay each
+   of the two known-good 7-Jun Hottop roasts tick-by-tick, reconstruct the
+   ``AdvisorContext`` at each decision tick, run each surviving (model, prompt)
+   over it, and **score the recommendations against what the real good roast
+   did**: drop F1 / precision / recall + drop-timing error (s and °C), heat/fan
+   MAE + directional agreement, and per-phase latency. See ``bakeoff_replay`` for
+   the honest-framing caveat — these measure *agreement with a known-good roast*,
+   NOT correctness.
+3. **``--mode per-phase`` — synthetic-moment latency/advice table.** The lighter
+   pass: each surviving (model, phase) runs ``get_recommendation`` N=3 (D20)
+   against one grounded preheat / pre-FC / first-crack moment under each prompt,
+   reporting latency (min/median/max) vs the hard gate (≤ 10 s, tighter at FC)
+   and the advice text. The FC slot is latency-weighted.
+
+Both compare prompt **v2 vs v3** by default (#172 is part of this bake-off) and
+emit a paste-able operator report + a JSON artifact.
 
 **Manual / local only — spends real OpenRouter credits.** Reads
 ``OPENROUTER_API_KEY`` from the environment at run; the key never enters config
@@ -32,15 +40,20 @@ or the repo. Nothing here changes production config defaults: pinning the
 winning prompt / per-phase model into ``config.py`` is a *separate* post-bake-off
 PR with its own D-number.
 
-Exact operator run command::
+Exact operator run commands::
 
+    # Quantitative scorecard vs the two known-good roasts (default mode):
     OPENROUTER_API_KEY=sk-or-... \\
-    python scripts/advisor_bakeoff.py --iterations 3 \\
-        --prompt-version v2 v3 --out /tmp/bakeoff.json
+    python scripts/advisor_bakeoff.py --prompt-version v2 v3 \\
+        --out /tmp/bakeoff.json --report-md /tmp/bakeoff.md
 
-(``--iterations 3`` is the D20 N=3; ``--prompt-version v2 v3`` compares the
-#172 candidate prompt against today's default. Drop to a single version to
-isolate one.)
+    # Lighter per-phase latency/advice table:
+    OPENROUTER_API_KEY=sk-or-... \\
+    python scripts/advisor_bakeoff.py --mode per-phase --iterations 3 \\
+        --prompt-version v2 v3 --out /tmp/bakeoff-perphase.json
+
+The replay machinery (replay + metrics + report) is testable WITHOUT a key via a
+canned recommender; only the real-candidate run needs ``OPENROUTER_API_KEY``.
 """
 
 from __future__ import annotations
@@ -53,6 +66,7 @@ import json
 import statistics
 import sys
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -60,6 +74,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))  # advisor_smoke
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from advisor_smoke import DEFAULT_FIXTURE, build_context  # noqa: E402
+from bakeoff_replay import (  # noqa: E402
+    GroundTruth,
+    PhaseLatency,
+    RoastScore,
+    TickOutcome,
+    build_ticks,
+    replay_roast,
+    score_roast,
+    score_to_json,
+)
 
 from roastpilot_agent.advisor import (  # noqa: E402
     AdvisorContext,
@@ -71,6 +95,18 @@ from roastpilot_agent.config import AdvisorConfig  # noqa: E402
 from roastpilot_agent.models import AdvisorHealthStatus, RoastPhase  # noqa: E402
 
 OPENROUTER = "https://openrouter.ai/api/v1"
+
+# The two known-good 7-Jun Hottop roasts used as the replay test set. Both are
+# GOOD roasts (operator ground truth), NOT provably optimal — the scoring
+# measures agreement with a known-good roast, not absolute correctness.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+REPLAY_ROASTS: tuple[Path, ...] = (
+    REPO_ROOT / "tests" / "fixtures" / "live-roast-2026-06-07" / "session-1" / "roast.jsonl",
+    REPO_ROOT / "tests" / "fixtures" / "live-roast-2026-06-07" / "session-2" / "roast.jsonl",
+)
+# Roast-time spacing between scored decision ticks in a replay (a real run
+# spends a model call per tick per model per prompt per roast).
+DEFAULT_CADENCE_SECONDS = 30.0
 
 # The hard latency gate (D20): the controller's tick-aligned advisory budget.
 GATE_SECONDS = 10.0
@@ -717,6 +753,312 @@ def cells_to_json(cells: list[CellResult]) -> list[dict[str, Any]]:
     return rows
 
 
+# --- Real-roast replay scoring (the quantitative layer) ---------------------
+
+# Roast moments to surface advice samples for in the report — the operator reads
+# the model's actual recommendation at each, since the metrics are agreement-
+# only (see the honest-framing note). Labels map to a fraction between the
+# anchoring events; the nearest scored tick is shown.
+_SAMPLE_MOMENTS: tuple[str, ...] = ("charge", "maillard", "first-crack", "development")
+
+
+@dataclasses.dataclass
+class ReplayCell:
+    """One (model, prompt) candidate scored across all replay roasts.
+
+    Attributes:
+        slug: The model slug.
+        tier: The candidate's tier value.
+        prompt_version: The prompt version under test.
+        latency_risk: Whether the candidate is flagged latency-risk.
+        scores: Per-roast scorecards.
+        samples: Per-roast advice samples at the key moments (for operator
+            quality judgement, since the metrics are agreement-only).
+    """
+
+    slug: str
+    tier: str
+    prompt_version: str
+    latency_risk: bool
+    scores: list[RoastScore]
+    samples: dict[str, list[tuple[str, TickOutcome]]]
+
+
+def _sample_outcomes(
+    outcomes: list[TickOutcome], ground: GroundTruth
+) -> list[tuple[str, TickOutcome]]:
+    """Pick the advice-sample ticks nearest each key roast moment."""
+    targets = {
+        "charge": ground.t0_seconds + 5.0,
+        "maillard": ground.t0_seconds + (ground.first_crack_seconds - ground.t0_seconds) * 0.6,
+        "first-crack": ground.first_crack_seconds + 5.0,
+        "development": ground.first_crack_seconds
+        + (ground.drop_seconds - ground.first_crack_seconds) * 0.6,
+    }
+    ok = [o for o in outcomes if o.decision is not None]
+    picks: list[tuple[str, TickOutcome]] = []
+    for label in _SAMPLE_MOMENTS:
+        target = targets[label]
+        pool = ok or outcomes
+        nearest = min(pool, key=lambda o: abs(o.tick.monotonic_seconds - target))
+        picks.append((label, nearest))
+    return picks
+
+
+async def run_replay_cell(
+    cand: Candidate,
+    prompt_version: str,
+    reasoning: ReasoningEffort | None,
+    roasts: tuple[Path, ...],
+    cadence_seconds: float,
+) -> ReplayCell:
+    """Replay every roast through ``cand`` under ``prompt_version`` and score it.
+
+    Builds one advisor for the cell and runs its ``get_recommendation`` over
+    each roast's reconstructed ticks, scoring drop / heat / fan / latency
+    against the known-good roast and capturing advice samples at the key
+    moments.
+
+    Args:
+        cand: The candidate model.
+        prompt_version: The prompt version under test (``v2`` / ``v3``).
+        reasoning: Reasoning effort, or ``None`` for the provider default.
+        roasts: The replay roast fixtures.
+        cadence_seconds: Roast-time spacing between scored ticks.
+
+    Returns:
+        The :class:`ReplayCell`.
+    """
+    advisor = PydanticAIAdvisor(_make_config(cand.slug, prompt_version, reasoning))
+
+    async def recommend(context: AdvisorContext) -> RoastDecision:
+        return await asyncio.wait_for(advisor.get_recommendation(context), timeout=MEASURE_TIMEOUT)
+
+    return await score_candidate(cand, prompt_version, recommend, roasts, cadence_seconds)
+
+
+async def score_candidate(
+    cand: Candidate,
+    prompt_version: str,
+    recommend: Callable[[AdvisorContext], Awaitable[RoastDecision]],
+    roasts: tuple[Path, ...],
+    cadence_seconds: float,
+    *,
+    clock: Callable[[], float] | None = None,
+) -> ReplayCell:
+    """Score one candidate's recommender over the replay roasts (key-free seam).
+
+    Separated from :func:`run_replay_cell` so the scoring path can be driven by
+    any async recommender — the real advisor (a key) or a canned callable (the
+    test path) — with an injectable clock for deterministic latency in tests.
+
+    Args:
+        cand: The candidate model.
+        prompt_version: The prompt version under test.
+        recommend: The async recommender to score (real or canned).
+        roasts: The replay roast fixtures.
+        cadence_seconds: Roast-time spacing between scored ticks.
+        clock: Monotonic clock; defaults to ``time.perf_counter``.
+
+    Returns:
+        The :class:`ReplayCell`.
+    """
+    tick_clock = clock if clock is not None else time.perf_counter
+    scores: list[RoastScore] = []
+    samples: dict[str, list[tuple[str, TickOutcome]]] = {}
+    for fixture in roasts:
+        ticks, ground = build_ticks(fixture, cadence_seconds=cadence_seconds)
+        outcomes = await replay_roast(ticks, recommend, clock=tick_clock)
+        roast_name = f"{fixture.parent.parent.name}/{fixture.parent.name}"
+        scores.append(score_roast(outcomes, ground, roast_name))
+        samples[roast_name] = _sample_outcomes(outcomes, ground)
+    return ReplayCell(
+        slug=cand.slug,
+        tier=cand.tier.value,
+        prompt_version=prompt_version,
+        latency_risk=cand.latency_risk,
+        scores=scores,
+        samples=samples,
+    )
+
+
+_HONEST_FRAMING = (
+    "> **Read first — what these numbers mean.** The ground truth is a "
+    "known-GOOD roast, *not* a provably optimal one. Every metric below measures "
+    "**agreement with a known-good roast**, NOT absolute correctness: a capable "
+    "model may legitimately differ from what the human did and still roast well, "
+    "and high agreement is not proof of quality. Drop F1 = 1.0 means *matched "
+    "this one good roast*, not *correct*. Use these as a quantitative aid to the "
+    "operator's judgement (the advice samples + the latency gate), never a "
+    "replacement for it."
+)
+
+
+def _phase_latency_str(phase_latency: list[PhaseLatency]) -> str:
+    """Render per-phase latency compactly for a table cell."""
+    parts: list[str] = []
+    for pl in phase_latency:
+        if pl.median_seconds is None:
+            continue
+        short = {"preheating": "pre", "roasting_pre_first_crack": "preFC", "development": "FC"}.get(
+            pl.phase, pl.phase
+        )
+        parts.append(f"{short}={pl.median_seconds}s")
+    return " ".join(parts) if parts else "—"
+
+
+def render_replay_report(cells: list[ReplayCell], roasts: tuple[Path, ...]) -> str:
+    """Render the quantitative replay report (markdown) — agreement, NOT truth.
+
+    Per (model, prompt): the drop F1 / precision / recall / timing, heat & fan
+    MAE + directional agreement, and per-phase latency for each roast, followed
+    by the advice samples at charge / Maillard / first-crack / development. The
+    honest-framing caveat heads the report; no model is auto-selected (D20).
+
+    Args:
+        cells: The scored replay cells.
+        roasts: The replay roast fixtures (for the header).
+
+    Returns:
+        The markdown report.
+    """
+    out: list[str] = []
+    out.append("# Advisor bake-off — real-roast replay scorecard (#172/#173, D20)")
+    out.append("")
+    out.append(_HONEST_FRAMING)
+    out.append("")
+    roast_names = ", ".join(f"{p.parent.parent.name}/{p.parent.name}" for p in roasts)
+    out.append(f"Test set (known-good 7-Jun Hottop roasts): {roast_names}")
+    out.append(
+        "Drop = should_drop agreement over ticks (F1/precision/recall) + first-drop "
+        "timing error (s and °C vs the real drop). Heat/Fan = MAE (percentage "
+        "points) + directional agreement (did the model move the lever the way the "
+        "human did). Latency = median per phase, FC tightest. NO auto-pick."
+    )
+
+    prompt_versions = sorted({c.prompt_version for c in cells})
+    for pv in prompt_versions:
+        out.append("")
+        out.append(f"## prompt_version = {pv}")
+        for cell in [c for c in cells if c.prompt_version == pv]:
+            out.append("")
+            risk = " [latency-risk]" if cell.latency_risk else ""
+            out.append(f"### {cell.slug} ({cell.tier}){risk}")
+            for score in cell.scores:
+                out.append(_render_score_line(score))
+            out.append("")
+            out.append("  advice samples (operator judges quality — agreement ≠ correct):")
+            for roast_name, picks in cell.samples.items():
+                for label, outcome in picks:
+                    out.append(_render_sample_line(roast_name, label, outcome))
+    return "\n".join(out)
+
+
+def _render_score_line(score: RoastScore) -> str:
+    """Render one roast's metric line for a cell."""
+    d = score.drop
+    timing = (
+        f"timing={d.timing_error_seconds:+}s/{d.timing_error_c:+}°C"
+        if d.timing_error_seconds is not None
+        else "timing=never-dropped"
+    )
+    heat_dir = (
+        "—" if score.heat.directional_agreement is None else f"{score.heat.directional_agreement}"
+    )
+    fan_dir = (
+        "—" if score.fan.directional_agreement is None else f"{score.fan.directional_agreement}"
+    )
+    return (
+        f"- {score.roast_name} (truth DTR {score.development_time_ratio_truth}%, "
+        f"{score.ok_count}/{score.tick_count} ok): "
+        f"drop F1={d.f1} P={d.precision} R={d.recall} {timing}; "
+        f"heat MAE={score.heat.mae} dir={heat_dir}; "
+        f"fan MAE={score.fan.mae} dir={fan_dir}; "
+        f"latency {_phase_latency_str(score.phase_latency)}"
+    )
+
+
+def _render_sample_line(roast_name: str, label: str, outcome: TickOutcome) -> str:
+    """Render one advice-sample line for the report."""
+    ctx = outcome.tick.context
+    where = (
+        f"{roast_name} {label} @ {outcome.tick.monotonic_seconds:.0f}s "
+        f"bean={ctx.current_bean_temp_c}°C ror={ctx.bean_ror_c_per_min} "
+        f"real(heat/fan)={outcome.tick.real_heat_percent}/{outcome.tick.real_fan_percent}"
+    )
+    if outcome.decision is None:
+        return f"    - {where}: (no advice) error={outcome.error}"
+    dec = outcome.decision
+    return (
+        f"    - {where}: model heat={dec.target_heat}% fan={dec.target_fan}% "
+        f"drop={dec.should_drop} conf={dec.confidence} — {dec.rationale!r}"
+    )
+
+
+def replay_cells_to_json(cells: list[ReplayCell]) -> list[dict[str, Any]]:
+    """Serialize replay cells (scores + samples) for the ``--out`` JSON."""
+    rows: list[dict[str, Any]] = []
+    for cell in cells:
+        samples_json: dict[str, list[dict[str, Any]]] = {}
+        for roast_name, picks in cell.samples.items():
+            samples_json[roast_name] = [
+                {
+                    "moment": label,
+                    "monotonic_seconds": o.tick.monotonic_seconds,
+                    "bean_temp_c": o.tick.context.current_bean_temp_c,
+                    "real_heat_percent": o.tick.real_heat_percent,
+                    "real_fan_percent": o.tick.real_fan_percent,
+                    "decision": o.decision.model_dump() if o.decision is not None else None,
+                    "latency_seconds": o.latency_seconds,
+                }
+                for label, o in picks
+            ]
+        rows.append(
+            {
+                "slug": cell.slug,
+                "tier": cell.tier,
+                "prompt_version": cell.prompt_version,
+                "latency_risk": cell.latency_risk,
+                "scores": [score_to_json(s) for s in cell.scores],
+                "samples": samples_json,
+            }
+        )
+    return rows
+
+
+async def run_replay_bakeoff(
+    roster: tuple[Candidate, ...],
+    roasts: tuple[Path, ...],
+    prompt_versions: list[str],
+    reasoning: ReasoningEffort | None,
+    cadence_seconds: float,
+) -> tuple[list[AvailabilityResult], list[ReplayCell]]:
+    """Run the replay pipeline: availability sweep, then score survivors.
+
+    Args:
+        roster: The candidate roster.
+        roasts: The replay roast fixtures (the known-good test set).
+        prompt_versions: Prompt versions to compare (e.g. ``["v2", "v3"]``).
+        reasoning: Reasoning effort, or ``None`` for the provider default.
+        cadence_seconds: Roast-time spacing between scored ticks.
+
+    Returns:
+        ``(availability_results, replay_cells)``.
+    """
+    survivors, availability = await availability_sweep(roster, prompt_versions[0], reasoning)
+    print(render_availability(availability), flush=True)
+    print("", flush=True)
+    cells: list[ReplayCell] = []
+    for pv in prompt_versions:
+        for cand in survivors:
+            print(f"replaying {cand.slug} (prompt {pv}) over {len(roasts)} roasts…", flush=True)
+            cell = await run_replay_cell(cand, pv, reasoning, roasts, cadence_seconds)
+            cells.append(cell)
+            for score in cell.scores:
+                print(f"  {score.roast_name}: {_render_score_line(score)[2:]}", flush=True)
+    return availability, cells
+
+
 # --- Run loop ---------------------------------------------------------------
 
 
@@ -761,16 +1103,28 @@ async def run_bakeoff(
 
 
 async def main() -> int:
-    """CLI entrypoint — runs the bake-off and prints the decision table.
+    """CLI entrypoint — runs the bake-off and writes the report(s).
+
+    The default ``replay`` mode scores candidates tick-by-tick against the two
+    known-good 7-Jun roasts (the quantitative layer); ``per-phase`` runs the
+    lighter synthetic-moment latency/advice table. Both write a JSON artifact and
+    print the report; neither auto-picks a model (D20).
 
     Returns:
-        ``0`` on a completed run (the report is operator-judged; a completed run
-        is success regardless of which models passed the gate).
+        ``0`` on a completed run (operator-judged; a completed run is success
+        regardless of which models passed the gate).
     """
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--iterations", type=int, default=3, help="iterations per cell (D20 N=3)")
+    parser.add_argument(
+        "--mode",
+        choices=["replay", "per-phase"],
+        default="replay",
+        help="replay = score vs the known-good roasts (default); per-phase = "
+        "synthetic-moment latency/advice table",
+    )
+    parser.add_argument("--iterations", type=int, default=3, help="per-phase cell iters (D20 N=3)")
     parser.add_argument(
         "--prompt-version",
         nargs="+",
@@ -783,26 +1137,69 @@ async def main() -> int:
         choices=["default", "off", "minimal", "low", "medium", "high"],
         help="reasoning effort for the OpenAI-compatible path (default: provider default)",
     )
-    parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
+    parser.add_argument(
+        "--cadence-seconds",
+        type=float,
+        default=DEFAULT_CADENCE_SECONDS,
+        help="replay mode: roast-time spacing between scored ticks (default: 30)",
+    )
+    parser.add_argument(
+        "--fixture",
+        type=Path,
+        default=DEFAULT_FIXTURE,
+        help="per-phase mode: the grounding live-roast fixture",
+    )
     parser.add_argument("--out", type=Path, default=Path("/tmp/bakeoff.json"))
+    parser.add_argument(
+        "--report-md",
+        type=Path,
+        default=None,
+        help="replay mode: also write the markdown scorecard here",
+    )
     args = parser.parse_args()
 
     reasoning: ReasoningEffort | None = (
         None if args.reasoning == "default" else cast("ReasoningEffort", args.reasoning)
     )
     prompt_versions = cast("list[str]", args.prompt_version)
-    availability, cells = await run_bakeoff(
-        ROSTER, args.fixture, args.iterations, prompt_versions, reasoning
-    )
 
-    report = render_decision_table(cells)
+    if args.mode == "per-phase":
+        availability, cells = await run_bakeoff(
+            ROSTER, args.fixture, args.iterations, prompt_versions, reasoning
+        )
+        print("\n" + render_decision_table(cells), flush=True)
+        args.out.write_text(
+            json.dumps(
+                {
+                    "mode": "per-phase",
+                    "availability": [dataclasses.asdict(a) for a in availability],
+                    "cells": cells_to_json(cells),
+                },
+                indent=2,
+            )
+        )
+        print(f"\nwrote artifact -> {args.out}", flush=True)
+        return 0
+
+    availability, replay_cells = await run_replay_bakeoff(
+        ROSTER, REPLAY_ROASTS, prompt_versions, reasoning, args.cadence_seconds
+    )
+    report = render_replay_report(replay_cells, REPLAY_ROASTS)
     print("\n" + report, flush=True)
-    artifact = {
-        "availability": [dataclasses.asdict(a) for a in availability],
-        "cells": cells_to_json(cells),
-    }
-    args.out.write_text(json.dumps(artifact, indent=2))
+    args.out.write_text(
+        json.dumps(
+            {
+                "mode": "replay",
+                "availability": [dataclasses.asdict(a) for a in availability],
+                "cells": replay_cells_to_json(replay_cells),
+            },
+            indent=2,
+        )
+    )
     print(f"\nwrote artifact -> {args.out}", flush=True)
+    if args.report_md is not None:
+        args.report_md.write_text(report)
+        print(f"wrote markdown report -> {args.report_md}", flush=True)
     return 0
 
 

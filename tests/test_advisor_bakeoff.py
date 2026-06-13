@@ -19,8 +19,15 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import advisor_bakeoff as bakeoff  # noqa: E402
+from bakeoff_replay import (  # noqa: E402
+    DropMetrics,
+    LeverMetrics,
+    PhaseLatency,
+    RoastScore,
+)
 
 from roastpilot_agent.advisor import (  # noqa: E402
+    AdvisorContext,
     AdvisorProviderError,
     PydanticAIAdvisor,
     RoastDecision,
@@ -386,3 +393,118 @@ async def test_run_bakeoff_end_to_end_mocked(
     # The JSON artifact round-trips the decision.
     rows = bakeoff.cells_to_json(cells)
     assert all(r["decision"] is not None for r in rows)
+
+
+# --- Replay-mode orchestration (real-roast scoring, mocked recommender) -----
+
+
+async def _canned_recommend(context: AdvisorContext) -> RoastDecision:
+    """Canned recommender: cut heat post-FC, drop near the real drop temp."""
+    if context.first_crack_detected:
+        return RoastDecision(
+            target_heat=35,
+            target_fan=55,
+            should_drop=context.current_bean_temp_c >= 196.0,
+            confidence=0.85,
+            rationale="development: cut heat, raise fan",
+        )
+    return RoastDecision(
+        target_heat=80,
+        target_fan=30,
+        should_drop=False,
+        confidence=0.8,
+        rationale="drying: ease RoR toward FC",
+    )
+
+
+@pytest.mark.asyncio
+async def test_score_candidate_over_both_roasts() -> None:
+    """A candidate is scored across both replay roasts with an injected clock."""
+    clock_state = {"t": 0.0}
+
+    def clock() -> float:
+        clock_state["t"] += 0.7
+        return clock_state["t"]
+
+    cand = bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.INCUMBENT, bakeoff.PHASE_ORDER)
+    cell = await bakeoff.score_candidate(
+        cand, "v3", _canned_recommend, bakeoff.REPLAY_ROASTS, 30.0, clock=clock
+    )
+    assert cell.prompt_version == "v3"
+    assert len(cell.scores) == len(bakeoff.REPLAY_ROASTS)
+    # Each roast contributes advice samples at the four key moments.
+    for picks in cell.samples.values():
+        assert [label for label, _ in picks] == [
+            "charge",
+            "maillard",
+            "first-crack",
+            "development",
+        ]
+
+
+def test_render_replay_report_carries_honest_framing_and_no_autopick() -> None:
+    """The report leads with the agreement-not-correctness caveat; no winner."""
+    drop = DropMetrics(
+        precision=1.0,
+        recall=1.0,
+        f1=1.0,
+        true_positives=1,
+        false_positives=0,
+        false_negatives=0,
+        first_drop_seconds=1200.0,
+        timing_error_seconds=0.0,
+        timing_error_c=0.0,
+    )
+    lever = LeverMetrics(mae=8.0, directional_agreement=0.6, directional_samples=5)
+    score = RoastScore(
+        roast_name="live-roast-2026-06-07/session-1",
+        tick_count=10,
+        ok_count=10,
+        drop=drop,
+        heat=lever,
+        fan=lever,
+        phase_latency=[PhaseLatency("development", 3, 1.2, 1.4)],
+        development_time_ratio_truth=15.0,
+    )
+    cell = bakeoff.ReplayCell(
+        slug=_OK_SLUG,
+        tier="incumbent",
+        prompt_version="v3",
+        latency_risk=False,
+        scores=[score],
+        samples={"live-roast-2026-06-07/session-1": []},
+    )
+    report = bakeoff.render_replay_report([cell], bakeoff.REPLAY_ROASTS)
+
+    assert "agreement with a known-good roast" in report
+    assert "not* a provably optimal" in report or "not a provably optimal" in report
+    assert "drop F1=1.0" in report
+    assert "winner" not in report.lower()
+    assert "NO auto-pick" in report
+
+
+@pytest.mark.asyncio
+async def test_run_replay_bakeoff_drops_unavailable_then_scores(
+    mock_healthcheck: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replay run sweeps first (dropping a 404), then scores only survivors."""
+
+    async def fake_reco(self: PydanticAIAdvisor, context: AdvisorContext) -> RoastDecision:
+        return await _canned_recommend(context)
+
+    monkeypatch.setattr(PydanticAIAdvisor, "get_recommendation", fake_reco)
+    roster = (
+        bakeoff.Candidate(_DEAD_SLUG, bakeoff.Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
+        bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.INCUMBENT, bakeoff.PHASE_ORDER),
+    )
+    availability, cells = await bakeoff.run_replay_bakeoff(
+        roster, bakeoff.REPLAY_ROASTS, ["v2"], None, 60.0
+    )
+
+    assert {a.slug for a in availability} == {_DEAD_SLUG, _OK_SLUG}
+    assert [c.slug for c in cells] == [_OK_SLUG]
+    # The artifact serialises with scores + samples.
+    rows = bakeoff.replay_cells_to_json(cells)
+    assert rows[0]["slug"] == _OK_SLUG
+    assert rows[0]["scores"]
+    assert rows[0]["samples"]
