@@ -1,18 +1,29 @@
 """Console entrypoint for the roastpilot-agent service.
 
-``--replay`` streams a recorded roast export through the real SSE pipeline
-(E10-S1): UI development without hardware, deterministic Playwright snapshots
-(``--step``), and the talk's 1× screen-recording rig (``--speed 1``). Serving
-a *live* roast (the wired MCP child) is the E9/E11 surface and is not wired
-here yet.
+Two run modes plus the scaffold default:
+
+- ``serve`` drives a **live** roast: it spawns the wired ``coffee-roaster-mcp``
+  child, assembles the live :class:`~roastpilot_agent.api.RoastService` (with the
+  recovery lifespan, so an agent restart enters ``operator_recovery_required``
+  and never auto-resumes heat/fan), mounts the built SPA, and serves REST + SSE.
+  This is the entrypoint the supervised hardware roast uses.
+- ``--replay`` streams a recorded roast export through the real SSE pipeline
+  (E10-S1): UI development without hardware, deterministic Playwright snapshots
+  (``--step``), and the talk's 1× screen-recording rig (``--speed 1``). It serves
+  the same built SPA so the recorded roast renders in the real dashboard.
+- No arguments prints help (the E1 scaffold smoke contract).
 """
 
 import argparse
 import asyncio
+import logging
 import tempfile
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from roastpilot_agent import __version__
+
+_log = logging.getLogger(__name__)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -21,6 +32,12 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Deterministic agent harness for autonomous coffee roasting.",
     )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["serve"],
+        help="'serve' drives a live roast against the wired coffee-roaster-mcp child",
+    )
     parser.add_argument(
         "--replay",
         metavar="EXPORT_DIR",
@@ -44,9 +61,105 @@ def _build_parser() -> argparse.ArgumentParser:
             "control routes for deterministic Playwright stepping (replay mode only)"
         ),
     )
+    parser.add_argument(
+        "--spa-dir",
+        metavar="PATH",
+        type=Path,
+        default=None,
+        help=(
+            "directory of the built SPA to serve at / (defaults to the bundled "
+            "web/dist when present); applies to both 'serve' and --replay"
+        ),
+    )
     parser.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="bind port (default 8000)")
     return parser
+
+
+def _resolve_spa_dir(args: argparse.Namespace) -> Path | None:
+    """The SPA dir to serve: an explicit ``--spa-dir`` else the bundled default.
+
+    An explicit ``--spa-dir`` that lacks an ``index.html`` resolves to ``None``
+    (mount nothing) rather than serving a broken tree — the SPA is optional, and
+    a missing build should not wedge the entrypoint.
+    """
+    from roastpilot_agent.live import default_spa_dir
+
+    if args.spa_dir is not None:
+        return args.spa_dir if (args.spa_dir / "index.html").is_file() else None
+    return default_spa_dir()
+
+
+async def _serve_live(args: argparse.Namespace) -> int:
+    """Build and serve the live roast app, then clean up the MCP child.
+
+    Uses the recovery lifespan (``create_app``'s default — restart →
+    ``operator_recovery_required``, never an auto-resume of heat/fan).
+    Fail-closed: an MCP start failure prints a clear message and returns a
+    non-zero exit, with the child cleaned up by
+    :func:`~roastpilot_agent.live.build_live_service`."""
+    import uvicorn
+
+    from roastpilot_agent.api import create_app
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.live import build_live_service, forward_coffee_env
+    from roastpilot_agent.mcp_client import MCPConnectionError
+
+    config = AppConfig()
+    # Let the operator configure the Hottop with plain `export COFFEE_…`.
+    forward_coffee_env(config)
+
+    with tempfile.TemporaryDirectory(prefix="roastpilot-live-") as tmp:
+        store_path = Path(tmp) / "roastpilot.sqlite3"
+        try:
+            service, mcp, store = await build_live_service(config, store_path=store_path)
+        except MCPConnectionError as exc:
+            # Fail closed: the child is already stopped by build_live_service.
+            print(f"error: could not start coffee-roaster-mcp: {exc}")
+            return 1
+
+        # The MCP child is RUNNING the moment build_live_service returns, so the
+        # ENTIRE post-build phase (store init, app build, serve) is wrapped: a
+        # failure in store.initialize()/create_app() must still tear the child
+        # down rather than orphan it.
+        try:
+            await store.initialize()
+            spa_dir = _resolve_spa_dir(args)
+            # create_app's default lifespan IS the recovery _lifespan: on startup
+            # it runs recover_on_start (a possibly-active run →
+            # operator_recovery_required, never an auto-resume of heat/fan) and
+            # stops the loop on shutdown. The live serve path deliberately uses
+            # that recovery lifespan, not replay's no-recovery one.
+            app = create_app(service, spa_dir=spa_dir)
+            spa_note = "with SPA" if spa_dir is not None else "API only (no SPA build found)"
+            print(f"serving live roast ({spa_note}) on http://{args.host}:{args.port}")
+
+            uv = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
+            server = uvicorn.Server(uv)
+            # _lifespan runs recover_on_start (restart → recovery) on startup and
+            # service.shutdown() on teardown; we stop the MCP child after the
+            # server returns (graceful shutdown / SIGINT) and close the store.
+            await server.serve()
+        finally:
+            # Best-effort cleanup: each step is logged-not-raised so one failure
+            # never aborts the rest of the chain (or masks the original error).
+            await _cleanup_step("service.shutdown", service.shutdown)
+            await _cleanup_step("mcp.stop", mcp.stop)
+            await _cleanup_step("store.close", store.close)
+    return 0
+
+
+async def _cleanup_step(name: str, action: Callable[[], Awaitable[None]]) -> None:
+    """Run one teardown step, logging (not raising) any failure.
+
+    A failed ``service.shutdown()`` / ``mcp.stop()`` / ``store.close()`` must
+    surface in the log but not abort the remaining cleanup or mask the error
+    that triggered teardown — so each step is independently guarded and logged.
+    """
+    try:
+        await action()
+    except Exception:  # noqa: BLE001 — best-effort cleanup, logged not raised
+        _log.warning("live-serve teardown step %r failed", name, exc_info=True)
 
 
 async def _serve_replay(args: argparse.Namespace) -> int:
@@ -63,7 +176,11 @@ async def _serve_replay(args: argparse.Namespace) -> int:
     with tempfile.TemporaryDirectory(prefix="roastpilot-replay-") as tmp:
         store_path = Path(tmp) / "replay.sqlite3"
         app, _service, source = await create_replay_app(
-            export_dir, store_path, step_mode=args.step, speed=args.speed
+            export_dir,
+            store_path,
+            step_mode=args.step,
+            speed=args.speed,
+            spa_dir=_resolve_spa_dir(args),
         )
         # Report the *clamped* speed the harness actually runs at (1×–60×), not
         # the raw request — `--speed 100` runs 60×, so the banner must say 60×.
@@ -87,10 +204,12 @@ async def _serve_replay(args: argparse.Namespace) -> int:
 def main() -> int:
     """Parse arguments and run the agent service.
 
-    ``--replay`` serves the replay harness; without it the scaffold entrypoint
-    prints help (the live-serve path lands in E9/E11)."""
+    ``serve`` drives a live roast; ``--replay`` serves the replay harness;
+    without either the scaffold entrypoint prints help."""
     parser = _build_parser()
     args = parser.parse_args()
+    if args.action == "serve":
+        return asyncio.run(_serve_live(args))
     if args.replay is not None:
         return asyncio.run(_serve_replay(args))
     parser.print_help()

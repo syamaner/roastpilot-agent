@@ -452,6 +452,30 @@ async def test_step_routes_mounted_only_in_step_mode(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_replay_serves_spa_when_spa_dir_given(tmp_path: Path) -> None:
+    """``create_replay_app(..., spa_dir=...)`` mounts the built SPA at / so the
+    recorded roast renders in the real dashboard, without shadowing the API:
+    GET / returns index.html and /api/health still works."""
+    from fastapi.testclient import TestClient
+
+    spa = tmp_path / "dist"
+    spa.mkdir()
+    (spa / "index.html").write_text("<title>RoastPilot Replay</title>", encoding="utf-8")
+
+    app, _service, source = await create_replay_app(
+        _SESSION_2, tmp_path / "replay-spa.sqlite3", step_mode=True, speed=60, spa_dir=spa
+    )
+    try:
+        with TestClient(app) as client:
+            root = client.get("/")
+            assert root.status_code == 200
+            assert "RoastPilot Replay" in root.text
+            assert client.get("/api/health").status_code == 200
+    finally:
+        await source.aclose()
+
+
+@pytest.mark.asyncio
 async def test_speed_clamp_bounds_are_exposed() -> None:
     """The 1x-60x band constants back the screen-recording (1x) + dev (60x)
     rates the kickoff brief calls for."""
