@@ -393,8 +393,7 @@ def _context_in_phase(phase: RoastPhase) -> AdvisorContext:
     )
 
 
-@pytest.mark.asyncio
-async def test_advisor_selects_model_by_phase_via_recorded_slug(
+def test_advisor_selects_model_by_phase_via_recorded_slug(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """#173: ``get_recommendation`` builds (and caches) the agent for the slug
@@ -430,8 +429,7 @@ async def test_advisor_selects_model_by_phase_via_recorded_slug(
         assert model.model_name == slug
 
 
-@pytest.mark.asyncio
-async def test_advisor_default_pins_every_phase_to_one_agent(
+def test_advisor_default_pins_every_phase_to_one_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The Opus-everywhere default is a clean behavioral no-op: every phase
