@@ -186,6 +186,7 @@ export function DashboardPage(): React.JSX.Element {
           phase={phase}
           elapsedSeconds={telemetry?.elapsed_seconds ?? null}
           developmentSeconds={developmentSeconds}
+          beanRorCPerMin={telemetry?.bean_ror_c_per_min ?? null}
           profileName={detail.data?.profile.name ?? null}
           firstCrack={view.firstCrack}
           mcpChild={health.data?.mcp_child}
