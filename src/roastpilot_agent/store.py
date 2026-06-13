@@ -722,6 +722,9 @@ class RoastStore:
                     outcome=row[4],
                     bean_origin=profile.bean_origin,
                     bean_varietal=profile.bean_varietal,
+                    country=profile.country,
+                    bean_species=profile.bean_species,
+                    is_blend=profile.is_blend,
                     rating=None if row[6] is None else int(row[6]),
                     development_percent=None if row[7] is None else float(row[7]),
                 )

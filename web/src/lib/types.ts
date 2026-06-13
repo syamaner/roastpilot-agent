@@ -123,10 +123,22 @@ export type SafetyVerdict =
 
 export type RoastOutcome = "completed" | "aborted" | "faulted";
 
+/** Botanical bean species (#164) — mirrors `models.BeanSpecies` (a Literal, not
+ *  an enum). Distinct from `bean_varietal` (cultivar). */
+export type BeanSpecies = "arabica" | "robusta" | "liberica" | "excelsa";
+
 export interface RoastProfile {
   name: string;
   bean_origin: string;
   bean_varietal: string | null;
+  // Bean identity (#164): all optional / defaulted for back-compat with frozen
+  // pre-#164 profiles. For a blend (`is_blend`), the structured fields describe
+  // the primary bean and the secondaries are recorded in `description`.
+  country?: string | null;
+  farm?: string | null;
+  description?: string | null;
+  bean_species?: BeanSpecies | null;
+  is_blend?: boolean;
   bean_weight_grams: number;
   charge_guidance_min_c: number;
   charge_guidance_max_c: number;
@@ -153,6 +165,13 @@ export interface RoastSummary {
   outcome: RoastOutcome | null;
   bean_origin: string;
   bean_varietal: string | null;
+  // Bean identity (#164) projected from the frozen profile; typed optional for
+  // forward/back-compat tolerance (a pre-#164 build or fixture may omit them).
+  // The current server always serializes `is_blend` (it defaults to `false`),
+  // so consumers treat a missing value identically to `false`.
+  country?: string | null;
+  bean_species?: BeanSpecies | null;
+  is_blend?: boolean;
   rating: number | null;
   development_percent: number | null;
 }

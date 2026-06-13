@@ -211,6 +211,54 @@ async def test_start_roast_creates_an_active_run(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_roast_carries_bean_identity_to_detail(client: AsyncClient) -> None:
+    """#164: the richer bean-identity fields flow through ``POST /api/roasts``
+    and back out on the detail projection (the SPA renders from server data)."""
+    profile = _profile().model_dump()
+    profile.update(
+        {
+            "country": "Ethiopia",
+            "farm": "Gedeb — Worka Sakaro",
+            "description": "Washed; 70% this + 30% Brazil natural.",
+            "bean_species": "arabica",
+            "is_blend": True,
+        }
+    )
+    created = await client.post("/api/roasts", json=profile)
+    assert created.status_code == 201
+    run_id = created.json()["id"]
+
+    detail = await client.get(f"/api/roasts/{run_id}")
+    assert detail.status_code == 200
+    body_profile = detail.json()["profile"]
+    assert body_profile["country"] == "Ethiopia"
+    assert body_profile["farm"] == "Gedeb — Worka Sakaro"
+    assert body_profile["description"] == "Washed; 70% this + 30% Brazil natural."
+    assert body_profile["bean_species"] == "arabica"
+    assert body_profile["is_blend"] is True
+
+
+@pytest.mark.asyncio
+async def test_history_summary_projects_bean_identity(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#164: the history list projects country / species / blend marker from the
+    frozen profile so the table can show them without opening each run."""
+    profile = _profile().model_dump()
+    profile.update({"country": "Colombia", "bean_species": "arabica", "is_blend": True})
+    created = await client.post("/api/roasts", json=profile)
+    run_id = created.json()["id"]
+    await store.complete_run(run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+
+    history = await client.get("/api/roasts")
+    assert history.status_code == 200
+    row = next(r for r in history.json()["runs"] if r["id"] == run_id)
+    assert row["country"] == "Colombia"
+    assert row["bean_species"] == "arabica"
+    assert row["is_blend"] is True
+
+
+@pytest.mark.asyncio
 async def test_start_roast_conflicts_when_a_run_is_active(client: AsyncClient) -> None:
     first = await client.post("/api/roasts", json=_profile().model_dump())
     assert first.status_code == 201

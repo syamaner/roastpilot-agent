@@ -72,9 +72,22 @@ export function HistoryTable({ runs }: HistoryTableProps): React.JSX.Element {
                   {formatStartedAt(run.started_at_utc)}
                 </td>
                 <td className={BODY_CELL}>
-                  <div className="text-sm font-medium text-foreground">{run.bean_origin}</div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-medium text-foreground">{run.bean_origin}</span>
+                    {run.is_blend ? (
+                      <span
+                        data-testid="history-blend-badge"
+                        className="inline-flex items-center rounded border border-border bg-muted/40 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground"
+                      >
+                        Blend
+                      </span>
+                    ) : null}
+                  </div>
                   {run.bean_varietal ? (
                     <div className="text-xs text-muted-foreground">{run.bean_varietal}</div>
+                  ) : null}
+                  {run.country ? (
+                    <div className="text-xs text-muted-foreground">{run.country}</div>
                   ) : null}
                 </td>
                 <td className={BODY_CELL}>

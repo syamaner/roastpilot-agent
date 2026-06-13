@@ -119,18 +119,57 @@ class RoastTelemetry(BaseModel):
     cooling_on: bool = False
 
 
-class RoastProfile(BaseModel):
-    """Minimal static roast profile (decision D7).
+# Bean species (botanical) — a constrained ``Literal`` deliberately, NOT a
+# ``models.py`` ``Enum``: an enum here would trip the safety-reviewer escalation
+# (the rubric routes any ``models.py`` enum change through it) even though bean
+# identity is not safety-bearing. A ``Literal`` keeps the change lead-verifiable
+# and is equally cloud-friendly (D29): structured, not free text. Species is the
+# botanical level (arabica/robusta/…) and is distinct from the cultivar carried
+# by ``bean_varietal`` (Heirloom, Bourbon, SL28…).
+BeanSpecies = Literal["arabica", "robusta", "liberica", "excelsa"]
 
-    No curve targets in M1: name, bean details, charge guidance range,
+
+class RoastProfile(BaseModel):
+    """Minimal static roast profile (decision D7) with richer bean identity (#164).
+
+    No curve targets in M1: name, bean identity, charge guidance range,
     initial heat/fan, target drop temperature, target development percent.
     The profile is frozen into ``roast_runs.profile_json`` at run start
     (plan §5); hardware safety limits live in config, not here.
+
+    Bean identity (#164) records what was actually in the drum. Beyond the
+    original flat ``bean_origin`` + optional ``bean_varietal`` (cultivar), it
+    captures the producing ``country``, the specific ``farm`` / co-op / washing
+    station / region, the botanical ``bean_species``, an ``is_blend`` flag, and a
+    free-text ``description`` (process, tasting notes, lot, and — for a blend —
+    the secondary beans). The blend model is deliberately simple: the *primary*
+    bean carries the structured fields and the secondaries live in
+    ``description`` — a fully structured component list is out of scope (#164).
+
+    Backward compatibility: every #164 field is optional / defaulted so a frozen
+    ``roast_runs.profile_json`` from before #164 (which carried only
+    ``bean_origin`` + ``bean_varietal``) still deserializes unchanged.
     """
 
     name: str = Field(min_length=1)
     bean_origin: str = Field(min_length=1)
     bean_varietal: str | None = None
+    country: str | None = None
+    """Producing country (e.g. Ethiopia, Colombia, Brazil). Optional for
+    back-compat; for a blend this is the primary bean's country."""
+    farm: str | None = None
+    """The specific farm / co-op / washing station / region (e.g. "Gedeb —
+    Worka Sakaro", "Finca El Injerto"). Optional for back-compat."""
+    description: str | None = None
+    """Free text: process (washed/natural/honey), tasting notes, lot, and — for
+    a blend — the secondary beans / components. Optional for back-compat."""
+    bean_species: BeanSpecies | None = None
+    """Botanical species (arabica/robusta/liberica/excelsa) — distinct from the
+    cultivar in ``bean_varietal``. A constrained ``Literal``, not an ``Enum``
+    (see ``BeanSpecies``). Optional for back-compat."""
+    is_blend: bool = False
+    """Whether the drum held a blend. When true, the structured fields describe
+    the primary bean and the secondaries are recorded in ``description``."""
     bean_weight_grams: float = Field(gt=0)
     charge_guidance_min_c: float = 170.0
     # The guidance ceiling deliberately equals the pre-T0 safety bound
@@ -153,6 +192,20 @@ class RoastProfile(BaseModel):
         if not stripped:
             raise ValueError("must not be empty or whitespace-only")
         return stripped
+
+    @field_validator("country", "farm", "description")
+    @classmethod
+    def _strip_optional_identity(cls, value: str | None) -> str | None:
+        """Strip surrounding whitespace on the optional identity fields.
+
+        Unlike the required fields, an empty / whitespace-only value normalizes
+        to ``None`` rather than raising: these are optional metadata an operator
+        may leave blank, and a blank field is simply "unset", not invalid.
+        """
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
     @model_validator(mode="after")
     def _check_guidance_range(self) -> "RoastProfile":
@@ -254,7 +307,13 @@ class LogManifest(BaseModel):
 
 
 class RoastSummary(BaseModel):
-    """History list item (plan §6: id, started, outcome, bean, rating, dev %)."""
+    """History list item (plan §6: id, started, outcome, bean, rating, dev %).
+
+    The richer bean-identity fields (#164: ``country``, ``bean_species``,
+    ``is_blend``) are projected from the frozen profile so the history list can
+    show producing country and a blend marker without opening each run. They are
+    optional / defaulted for back-compat with pre-#164 frozen profiles.
+    """
 
     id: str
     started_at_utc: str
@@ -263,6 +322,9 @@ class RoastSummary(BaseModel):
     outcome: Literal["completed", "aborted", "faulted"] | None = None
     bean_origin: str
     bean_varietal: str | None = None
+    country: str | None = None
+    bean_species: BeanSpecies | None = None
+    is_blend: bool = False
     rating: int | None = None
     development_percent: float | None = None
 
