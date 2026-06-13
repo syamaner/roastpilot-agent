@@ -24,6 +24,7 @@ from roastpilot_agent.mcp_client import (
     MCPServerProcess,
     RoasterControlAdapter,
 )
+from roastpilot_agent.models import RoastPhase, RoastProfile
 from roastpilot_agent.store import RoastStore
 
 # Reuse the canned tool fixtures + fake-session doubles from the mcp_client tests.
@@ -167,6 +168,8 @@ async def test_build_live_service_wires_adapter_as_reader_and_executor(
     """The service's roaster surface is the RoasterControlAdapter over the MCP
     child (reader + executor are the same adapter, the controller never sees the
     raw client)."""
+    # No API key in the environment → the advisory-paused path (advisor is None).
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     session = _info_session()
     monkeypatch.setattr(live, "MCPServerProcess", _good_process_factory(session))
     config = AppConfig()
@@ -181,6 +184,9 @@ async def test_build_live_service_wires_adapter_as_reader_and_executor(
         assert isinstance(reader, RoasterControlAdapter)
         assert service._raw_state is reader  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         assert service._exporter is reader  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        # Advisory-paused: no API key → the advisor is None (a regression that
+        # wired a non-None advisor without a key would be caught here).
+        assert service._advisor is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
         assert service.mcp_child_status().value == "running"
     finally:
         await mcp.stop()
@@ -345,6 +351,76 @@ async def test_serve_smoke_live_service_with_spa(
         await store.close()
 
 
+# --- restart-recovery invariant (positive) --------------------------------------
+
+
+def _profile() -> RoastProfile:
+    return RoastProfile(
+        name="House Espresso",
+        bean_origin="Ethiopia",
+        bean_varietal="Heirloom",
+        bean_weight_grams=250.0,
+        initial_heat_percent=70,
+        initial_fan_percent=40,
+        target_drop_temp_c=205.0,
+        target_development_percent=20.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_serve_recovery_resolves_active_run_without_auto_resume(
+    tmp_path: Path, spa_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persisted, non-terminal run is classified into
+    ``operator_recovery_required`` on serve startup — positively proving the
+    restart-never-auto-resumes invariant (heat/fan are NOT auto-resumed).
+
+    Seeds a run mid-roast (``preheating``) into the live store path, builds the
+    live service over a fake MCP child, then runs the app through ``TestClient``
+    so the recovery lifespan fires; the run must resolve to
+    ``operator_recovery_required``, not stay in/advance from ``preheating``.
+    """
+    store_path = tmp_path / "recover.sqlite3"
+
+    # Pre-seed a possibly-active run at preheating (no completed_at → recoverable).
+    seed_store = RoastStore(store_path)
+    await seed_store.initialize()
+    await seed_store.create_run(
+        run_id="run-recover",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    await seed_store.close()
+
+    # build_live_service must NOT auto-start a background loop while we assert the
+    # recovered phase, so disable run_loop on the constructed service.
+    session = _info_session()
+    monkeypatch.setattr(live, "MCPServerProcess", _good_process_factory(session))
+    service, mcp, store = await live.build_live_service(AppConfig(), store_path=store_path)
+    # The service was built with the default run_loop=True; pin it off for a
+    # deterministic assertion (recover persists the phase synchronously at
+    # startup regardless, but this keeps the fake child from being polled).
+    service._run_loop = False  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+    await store.initialize()
+    try:
+        app = create_app(service, spa_dir=spa_dir)
+        with TestClient(app) as client:
+            # The recovery lifespan ran at startup. The run must be in recovery,
+            # never auto-resumed to a hardware-active phase.
+            health = client.get("/api/health")
+            assert health.status_code == 200
+            assert health.json()["active_run_id"] == "run-recover"
+
+            detail = client.get("/api/roasts/run-recover")
+            assert detail.status_code == 200
+            assert detail.json()["agent_phase"] == RoastPhase.OPERATOR_RECOVERY_REQUIRED.value
+    finally:
+        await service.shutdown()
+        await mcp.stop()
+        await store.close()
+
+
 # --- default spa-dir resolution -------------------------------------------------
 
 
@@ -357,3 +433,17 @@ def test_default_spa_dir_returns_web_dist_when_present() -> None:
         assert resolved == expected
     else:  # pragma: no cover — only when web/dist is absent in a checkout
         assert resolved is None
+
+
+def test_default_spa_dir_none_when_build_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When no built SPA exists at <pkg>/../../web/dist, default_spa_dir is None.
+
+    Isolated from repo state: point the module's ``__file__`` three levels under
+    a tmp dir with no ``web/dist`` so ``parents[2]`` resolves there.
+    """
+    fake_pkg = tmp_path / "src" / "roastpilot_agent"
+    fake_pkg.mkdir(parents=True)
+    monkeypatch.setattr(live, "__file__", str(fake_pkg / "live.py"))
+    assert live.default_spa_dir() is None

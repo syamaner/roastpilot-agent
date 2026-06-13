@@ -138,3 +138,73 @@ def test_serve_fails_closed_on_mcp_start_failure(
     monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
     assert cli.main() == 1
     assert "could not start coffee-roaster-mcp" in capsys.readouterr().out
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_serve_live_happy_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``serve`` builds the live app over a fake MCP child, prints the banner,
+    serves (no-op), and runs the ``finally`` teardown in order: service.shutdown
+    → mcp.stop → store.close.
+
+    Exercises the whole ``_serve_live`` happy path + teardown without a real MCP,
+    a socket, or a network call. Also covers COFFEE_* forwarding through the CLI
+    (it is forwarded into config.mcp.env before build_live_service runs) and the
+    SPA-dir resolution (an explicit --spa-dir with index.html is mounted).
+    """
+    from roastpilot_agent import live
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.store import RoastStore
+
+    # Operator-style env: COFFEE_* must reach config.mcp.env via forward_coffee_env.
+    monkeypatch.setenv("COFFEE_ROASTER_DRIVER", "mock")
+
+    spa = tmp_path / "dist"
+    spa.mkdir()
+    (spa / "index.html").write_text("<title>RoastPilot</title>", encoding="utf-8")
+
+    order: list[str] = []
+    captured: dict[str, object] = {}
+
+    class _FakeMCP:
+        running = True
+
+        async def stop(self) -> None:
+            order.append("mcp.stop")
+
+    class _RecordingStore(RoastStore):
+        async def close(self) -> None:
+            order.append("store.close")
+            await super().close()
+
+    async def _fake_build(
+        config: AppConfig, *, store_path: Path
+    ) -> tuple[RoastService, _FakeMCP, RoastStore]:
+        # Assert the CLI forwarded COFFEE_* into the config before building.
+        captured["coffee_driver"] = config.mcp.env.get("COFFEE_ROASTER_DRIVER")
+        store = _RecordingStore(store_path)
+        service = RoastService(store)
+        original_shutdown = service.shutdown
+
+        async def _tracked_shutdown() -> None:
+            order.append("service.shutdown")
+            await original_shutdown()
+
+        monkeypatch.setattr(service, "shutdown", _tracked_shutdown)
+        return service, _FakeMCP(), store
+
+    monkeypatch.setattr(live, "build_live_service", _fake_build)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "serve", "--port", "0", "--spa-dir", str(spa)],
+    )
+
+    assert cli.main() == 0
+    out = capsys.readouterr().out
+    assert "serving live roast (with SPA)" in out
+    # COFFEE_* was forwarded through the CLI into config.mcp.env.
+    assert captured["coffee_driver"] == "mock"
+    # The finally teardown ran in order: service.shutdown → mcp.stop → store.close.
+    assert order == ["service.shutdown", "mcp.stop", "store.close"]
