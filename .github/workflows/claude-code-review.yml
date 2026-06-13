@@ -12,11 +12,12 @@ on:
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
+    # Skip Dependabot PRs: GitHub withholds repository secrets from Dependabot
+    # `pull_request` runs (read-only token), so CLAUDE_CODE_OAUTH_TOKEN is empty
+    # and the action fails. Dependency bumps don't need a Claude code review —
+    # CI + codecov cover them. (claude-review is not a required check, so a
+    # Dependabot PR is never blocked; this just removes the spurious red X.)
+    if: ${{ github.actor != 'dependabot[bot]' }}
 
     runs-on: ubuntu-latest
     permissions:
