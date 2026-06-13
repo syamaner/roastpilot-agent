@@ -194,8 +194,8 @@ function VerdictColumn({
   if (verdict === null) {
     return <span className="text-muted-foreground">—</span>;
   }
-  const badge = <VerdictBadge verdict={verdict} />;
-  // `VerdictBadge` returns null for recovery/fault/emergency_stop; show a label.
+  // `VerdictBadge` renders null for recovery/fault/emergency_stop, so branch on
+  // those FIRST and show a plain label; the badge handles allow/clamp/reject.
   if (verdict === "recovery" || verdict === "fault" || verdict === "emergency_stop") {
     return (
       <span
@@ -206,7 +206,7 @@ function VerdictColumn({
       </span>
     );
   }
-  return badge;
+  return <VerdictBadge verdict={verdict} />;
 }
 
 interface RationaleProps {

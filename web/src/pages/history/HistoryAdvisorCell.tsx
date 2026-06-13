@@ -8,8 +8,16 @@
  * Server data only; nothing inferred. The count of consults + how many were
  * clamped/rejected/failed comes straight off the persisted timeline rows.
  *
- * Lazy-by-row: each visible history row issues its own cached timeline query. The
- * cell degrades gracefully — em dash while loading or on error (the list still
+ * Lazy-by-row: each visible history row issues its OWN `useTimeline(runId)` query,
+ * so a freshly-loaded history page fires N parallel `/timeline` requests (one per
+ * visible row). This is a DELIBERATE M1 trade-off, not an oversight: there is no
+ * advisor-summary field on the `GET /api/roasts` list contract and the backend is
+ * read-only for this story, so per-row derivation is the only server-data-only path
+ * (the alternative — a backend summary column — is a future contract change). For
+ * M1's handful of local roasts the cost is negligible, and TanStack Query caches
+ * per-run so a revisit or cross-navigation to the detail page is free.
+ *
+ * The cell degrades gracefully — em dash while loading or on error (the list still
  * renders), a "no advice" hint for a roast with zero consults.
  */
 
