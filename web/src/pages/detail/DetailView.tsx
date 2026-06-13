@@ -17,6 +17,9 @@ import { useMemo, useState } from "react";
 
 import { LiveCurve } from "@/components/shared";
 import type { RoastDetail, RoastTimeline, TelemetrySeries } from "@/lib/types";
+import { AdvisorSummaryChips } from "./AdvisorSummaryChips";
+import { AdvisorTimeline } from "./AdvisorTimeline";
+import { advisorSummary, toAdvisorRows } from "./advisorModel";
 import { DecisionTraceTable } from "./DecisionTraceTable";
 import { EventTimeline } from "./EventTimeline";
 import { ExportOptions } from "./ExportOptions";
@@ -45,6 +48,8 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
   const points = useMemo(() => toCurvePoints(telemetry), [telemetry]);
   const markers = useMemo(() => toCurveMarkers(timeline, telemetry), [timeline, telemetry]);
   const rows = useMemo(() => toTraceRows(timeline, telemetry), [timeline, telemetry]);
+  const advisorRows = useMemo(() => toAdvisorRows(timeline, telemetry), [timeline, telemetry]);
+  const advisor = useMemo(() => advisorSummary(timeline), [timeline]);
   const stats = useMemo(() => headlineStats(timeline, telemetry), [timeline, telemetry]);
 
   const highlightTime =
@@ -65,6 +70,18 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
           highlightTime={highlightTime}
         />
       </div>
+
+      <section className="flex flex-col gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h2 className="text-sm font-semibold tracking-tight">Advisor decisions</h2>
+          <AdvisorSummaryChips summary={advisor} />
+        </div>
+        <AdvisorTimeline
+          rows={advisorRows}
+          selectedTick={selectedTick}
+          onSelect={onSelectRow}
+        />
+      </section>
 
       <section className="flex flex-col gap-2">
         <h2 className="text-sm font-semibold tracking-tight">Decision trace</h2>

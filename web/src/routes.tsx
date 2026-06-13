@@ -28,6 +28,13 @@ const StreamSmokePage = lazy(() =>
 const DetailHarnessPage = lazy(() =>
   import("@/pages/detail/DetailHarnessPage").then((m) => ({ default: m.DetailHarnessPage })),
 );
+// #170 advisor-failure detail snapshot — every consult a provider_error, proving
+// the advisor timeline renders failures (not a blank panel).
+const DetailHarnessFailedPage = lazy(() =>
+  import("@/pages/detail/DetailHarnessFailedPage").then((m) => ({
+    default: m.DetailHarnessFailedPage,
+  })),
+);
 
 export const routes: RouteObject[] = [
   { path: "/", element: <DashboardPage /> },
@@ -40,4 +47,6 @@ export const routes: RouteObject[] = [
   { path: "/__stream-smoke", element: <StreamSmokePage /> },
   // __detail-harness: the detail page over fixed REST data (E10-S5 snapshots).
   { path: "/__detail-harness", element: <DetailHarnessPage /> },
+  // __detail-harness-failed: advisor-failure detail state (#170 snapshot).
+  { path: "/__detail-harness-failed", element: <DetailHarnessFailedPage /> },
 ];
