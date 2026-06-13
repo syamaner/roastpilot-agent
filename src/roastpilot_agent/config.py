@@ -12,6 +12,23 @@ from typing import Literal
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from .models import RoastPhase
+
+# Phase-keyed advisor consult floors (#171, operator 13 Jun): the minimum
+# seconds between *automatic* advisor consults, scaling with roast criticality.
+# Change-based triggers (temp/RoR delta, phase change, manual) still fire
+# sooner — these are floors, not the only cause to consult.
+#   - preheating: 30 s (low criticality, machine warming, no beans)
+#   - roasting pre-first-crack (beans charged): 10 s
+#   - development (first crack onward): 0 = unthrottled — consult again as
+#     soon as the previous call returns; the practical floor is advisor
+#     latency (~5–7 s, serial), not this value.
+DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float] = {
+    RoastPhase.PREHEATING: 30.0,
+    RoastPhase.ROASTING_PRE_FIRST_CRACK: 10.0,
+    RoastPhase.DEVELOPMENT: 0.0,
+}
+
 
 class ControllerConfig(BaseModel):
     """Controller timing and advisory-call thresholds.
@@ -25,7 +42,14 @@ class ControllerConfig(BaseModel):
     tick_interval_seconds: float = Field(default=1.0, gt=0)
     advisory_min_temp_delta_c: float = Field(default=1.0, gt=0)
     advisory_min_ror_delta_c_per_min: float = Field(default=2.0, gt=0)
-    advisory_min_interval_seconds: float = Field(default=15.0, gt=0)
+    # Phase-keyed consult floors (#171): seconds between automatic consults,
+    # by agent phase. A phase absent from the map (or mapped to 0) is
+    # unthrottled — the heartbeat never gates it; change-based triggers and
+    # the advisor's own latency are the only limiter. Defaults: preheat 30 s,
+    # charged/pre-FC 10 s, development (FC onward) 0 = unthrottled.
+    advisory_min_interval_seconds: dict[RoastPhase, float] = Field(
+        default_factory=lambda: dict(DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS)
+    )
     advisory_timeout_seconds: float = Field(default=10.0, gt=0)
     t0_debounce_ticks: int = Field(default=3, ge=1)
     telemetry_log_interval_seconds: float = Field(default=5.0, gt=0)
@@ -36,6 +60,23 @@ class ControllerConfig(BaseModel):
     # raises a safety alert (a nag, not an actuation); 600 s gives an
     # operator a realistic window to return before the system complains.
     operator_timeout_seconds: float = Field(default=600.0, gt=0)
+
+    def advisory_interval_for(self, phase: RoastPhase) -> float:
+        """Return the minimum-interval consult floor for ``phase`` in seconds.
+
+        Looks the phase up in :attr:`advisory_min_interval_seconds`. A phase
+        absent from the map returns ``0.0`` — unthrottled, so the heartbeat
+        trigger never fires for it and the advisor is consulted as soon as the
+        previous call returns (bounded only by advisor latency). This is the
+        intended behavior for first-crack / development (#171).
+
+        Args:
+            phase: The agent phase the controller is currently in.
+
+        Returns:
+            The consult floor in seconds; ``0.0`` means unthrottled.
+        """
+        return self.advisory_min_interval_seconds.get(phase, 0.0)
 
 
 class AdvisorConfig(BaseModel):

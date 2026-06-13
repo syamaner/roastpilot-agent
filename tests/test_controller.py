@@ -619,12 +619,16 @@ def test_policy_phase_transition_triggers() -> None:
 
 
 def test_policy_bean_temp_delta_triggers_at_threshold_not_below() -> None:
+    # A throttled phase (10 s floor) so the sub-threshold case is genuinely
+    # silent; under #171 DEVELOPMENT is unthrottled and would heartbeat.
     policy = _policy()
-    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=200.0), now=0.0)
+    policy.note_call(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=reading(bean=200.0), now=0.0
+    )
     # +0.5 °C, well inside the interval: no trigger.
     assert (
         policy.evaluate(
-            phase=RoastPhase.DEVELOPMENT,
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
             telemetry=reading(bean=200.5),
             now=1.0,
             manual_request=False,
@@ -634,7 +638,7 @@ def test_policy_bean_temp_delta_triggers_at_threshold_not_below() -> None:
     # +1.0 °C reaches the threshold.
     assert (
         policy.evaluate(
-            phase=RoastPhase.DEVELOPMENT,
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
             telemetry=reading(bean=201.0),
             now=1.0,
             manual_request=False,
@@ -660,36 +664,101 @@ def test_policy_ror_delta_triggers_at_threshold() -> None:
     assert trigger is AdvisoryTrigger.ROR_DELTA
 
 
-def test_policy_min_interval_heartbeat() -> None:
+def test_policy_min_interval_heartbeat_preheat_is_30s() -> None:
+    """#171: preheating's consult floor is 30 s — silent before, fires at."""
     policy = _policy()
     flat = reading(bean=200.0, bean_ror_c_per_min=5.0)
-    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=0.0)
-    # Flat telemetry just shy of the interval: silent (no per-tick spam).
+    policy.note_call(phase=RoastPhase.PREHEATING, telemetry=flat, now=0.0)
+    # Flat telemetry just shy of the 30 s floor: silent (no per-tick spam).
+    assert (
+        policy.evaluate(phase=RoastPhase.PREHEATING, telemetry=flat, now=29.9, manual_request=False)
+        is None
+    )
+    # At the floor the heartbeat fires.
+    assert (
+        policy.evaluate(phase=RoastPhase.PREHEATING, telemetry=flat, now=30.0, manual_request=False)
+        is AdvisoryTrigger.MIN_INTERVAL
+    )
+
+
+def test_policy_min_interval_heartbeat_charged_is_10s() -> None:
+    """#171: beans-charged / pre-FC roasting floor is 10 s."""
+    policy = _policy()
+    flat = reading(bean=200.0, bean_ror_c_per_min=5.0)
+    policy.note_call(phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=flat, now=0.0)
     assert (
         policy.evaluate(
-            phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=14.9, manual_request=False
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=flat,
+            now=9.9,
+            manual_request=False,
         )
         is None
     )
-    # At the interval the heartbeat fires.
     assert (
         policy.evaluate(
-            phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=15.0, manual_request=False
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=flat,
+            now=10.0,
+            manual_request=False,
         )
         is AdvisoryTrigger.MIN_INTERVAL
     )
 
 
-def test_policy_does_not_fire_every_tick_on_flat_telemetry() -> None:
-    """The whole point: a stable roast between heartbeats is silent."""
+def test_policy_development_is_unthrottled_back_to_back() -> None:
+    """#171: development (first crack onward) has a 0 floor — the heartbeat
+    fires on the very next tick after a consult returns, so consults run
+    back-to-back, bounded only by advisor latency (calls are serial)."""
     policy = _policy()
     flat = reading(bean=200.0, bean_ror_c_per_min=5.0)
     policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=0.0)
+    # 1 s later (one tick), with no temp/RoR change, the consult fires again.
+    assert (
+        policy.evaluate(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=1.0, manual_request=False)
+        is AdvisoryTrigger.MIN_INTERVAL
+    )
+    # And again the next tick after recording the prior call.
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=1.0)
+    assert (
+        policy.evaluate(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=2.0, manual_request=False)
+        is AdvisoryTrigger.MIN_INTERVAL
+    )
+
+
+def test_policy_does_not_fire_every_tick_on_flat_telemetry_when_throttled() -> None:
+    """The whole point of a non-zero floor: a stable roast between heartbeats
+    is silent. In charged/pre-FC (10 s floor) flat ticks before 10 s are
+    quiet."""
+    policy = _policy()
+    flat = reading(bean=200.0, bean_ror_c_per_min=5.0)
+    policy.note_call(phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=flat, now=0.0)
     fired = [
-        policy.evaluate(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=t, manual_request=False)
-        for t in (1.0, 2.0, 3.0, 10.0, 14.0)
+        policy.evaluate(
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=flat,
+            now=t,
+            manual_request=False,
+        )
+        for t in (1.0, 2.0, 3.0, 5.0, 9.0)
     ]
     assert fired == [None, None, None, None, None]
+
+
+def test_policy_change_trigger_fires_early_within_phase_interval() -> None:
+    """#171: the interval is a floor, not a gate — a large bean-temp jump
+    consults *before* the phase interval elapses (preheat's 30 s floor here),
+    preserving the responsive change-based behavior."""
+    policy = _policy()
+    policy.note_call(phase=RoastPhase.PREHEATING, telemetry=reading(bean=200.0), now=0.0)
+    # 1 s in, far short of the 30 s floor, a +5 °C jump fires immediately.
+    trigger = policy.evaluate(
+        phase=RoastPhase.PREHEATING,
+        telemetry=reading(bean=205.0),
+        now=1.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.BEAN_TEMP_DELTA
 
 
 def test_policy_manual_bypasses_phase_scoping_and_interval() -> None:
@@ -735,22 +804,27 @@ def test_policy_no_automatic_call_outside_advice_phases(phase: RoastPhase) -> No
 
 def test_policy_baseline_advances_on_each_call() -> None:
     """Deltas measure from the last call, not the start: after a call at
-    201 °C, a further +0.5 °C is below threshold again."""
+    201 °C, a further +0.5 °C is below threshold again. Uses a throttled
+    phase (10 s floor) so the below-threshold tick is silent under #171."""
     policy = _policy()
-    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=200.0), now=0.0)
+    policy.note_call(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=reading(bean=200.0), now=0.0
+    )
     assert (
         policy.evaluate(
-            phase=RoastPhase.DEVELOPMENT,
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
             telemetry=reading(bean=201.0),
             now=1.0,
             manual_request=False,
         )
         is AdvisoryTrigger.BEAN_TEMP_DELTA
     )
-    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=201.0), now=1.0)
+    policy.note_call(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=reading(bean=201.0), now=1.0
+    )
     assert (
         policy.evaluate(
-            phase=RoastPhase.DEVELOPMENT,
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
             telemetry=reading(bean=201.5),
             now=2.0,
             manual_request=False,

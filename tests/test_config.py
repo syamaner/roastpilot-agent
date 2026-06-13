@@ -11,6 +11,7 @@ import pydantic
 import pytest
 
 from roastpilot_agent.config import AdvisorConfig, AppConfig, ControllerConfig, SafetyLimits
+from roastpilot_agent.models import RoastPhase
 
 
 def test_controller_defaults_match_orchestration_plan() -> None:
@@ -18,11 +19,32 @@ def test_controller_defaults_match_orchestration_plan() -> None:
     assert config.tick_interval_seconds == 1.0
     assert config.advisory_min_temp_delta_c == 1.0
     assert config.advisory_min_ror_delta_c_per_min == 2.0
-    assert config.advisory_min_interval_seconds == 15.0
+    # #171: phase-keyed consult floors replace the single 15 s heartbeat.
+    assert config.advisory_min_interval_seconds == {
+        RoastPhase.PREHEATING: 30.0,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK: 10.0,
+        RoastPhase.DEVELOPMENT: 0.0,
+    }
     assert config.advisory_timeout_seconds == 10.0
     assert config.t0_debounce_ticks == 3
     assert config.telemetry_log_interval_seconds == 5.0
     assert config.max_stale_telemetry_seconds == 3.0
+
+
+def test_advisory_interval_for_resolves_per_phase_and_defaults_unthrottled() -> None:
+    config = ControllerConfig()
+    assert config.advisory_interval_for(RoastPhase.PREHEATING) == 30.0
+    assert config.advisory_interval_for(RoastPhase.ROASTING_PRE_FIRST_CRACK) == 10.0
+    # Development is unthrottled (0); a phase absent from the map is too.
+    assert config.advisory_interval_for(RoastPhase.DEVELOPMENT) == 0.0
+    assert config.advisory_interval_for(RoastPhase.COOLING) == 0.0
+
+
+def test_advisory_interval_is_config_tunable() -> None:
+    config = ControllerConfig(advisory_min_interval_seconds={RoastPhase.PREHEATING: 45.0})
+    assert config.advisory_interval_for(RoastPhase.PREHEATING) == 45.0
+    # Unspecified phases fall back to unthrottled.
+    assert config.advisory_interval_for(RoastPhase.ROASTING_PRE_FIRST_CRACK) == 0.0
 
 
 def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
