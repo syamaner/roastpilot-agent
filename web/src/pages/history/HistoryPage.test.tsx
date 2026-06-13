@@ -6,7 +6,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api, ApiError } from "@/lib/api";
-import type { RoastHistory, RoastSummary } from "@/lib/types";
+import type { RoastHistory, RoastSummary, RoastTimeline } from "@/lib/types";
 
 import { HistoryPage } from "./HistoryPage";
 
@@ -51,6 +51,22 @@ afterEach(() => vi.restoreAllMocks());
 
 function mockHistory(runs: RoastSummary[]): void {
   vi.spyOn(api, "history").mockResolvedValue({ runs } satisfies RoastHistory);
+  // Each visible row lazily fetches its own advisor timeline (#170). Stub it so
+  // the rows render the advisor cell deterministically (and never leak rejects).
+  vi.spyOn(api, "timeline").mockImplementation(async (runId: string) =>
+    ({
+      run_id: runId,
+      events: [],
+      safety_evaluations: [
+        { tick: 8, rule: "bounds", verdict: "clamp", input_heat: null, input_fan: null, adjusted_heat: null, adjusted_fan: null, reason: "", recorded_at_utc: "t" },
+      ],
+      advisor_decisions: [
+        { tick: 4, provider: "openrouter", model: "m", prompt_version: "v1", latency_ms: 100, status: "ok", decision: null, recorded_at_utc: "t" },
+        { tick: 8, provider: "openrouter", model: "m", prompt_version: "v1", latency_ms: 100, status: "ok", decision: null, recorded_at_utc: "t" },
+      ],
+      commands: [],
+    }) satisfies RoastTimeline,
+  );
 }
 
 describe("HistoryPage", () => {
@@ -61,6 +77,19 @@ describe("HistoryPage", () => {
     const first = screen.getAllByTestId("history-row")[0];
     expect(within(first).getByText("Ethiopian Yirgacheffe")).toBeInTheDocument();
     expect(within(first).getByTestId("outcome-badge")).toHaveTextContent("COMPLETED");
+  });
+
+  it("renders a per-roast advisor summary column from the timeline (#170)", async () => {
+    mockHistory(FIXTURE);
+    renderPage();
+    await waitFor(() => expect(screen.getAllByTestId("history-row")).toHaveLength(3));
+    // Each row resolves its own timeline query independently; wait for all three.
+    await waitFor(() =>
+      expect(screen.getAllByTestId("history-advisor")).toHaveLength(3),
+    );
+    const cells = screen.getAllByTestId("history-advisor");
+    expect(cells[0]).toHaveTextContent("2 consults");
+    expect(cells[0]).toHaveTextContent("1 clamped");
   });
 
   it("renders the first-run empty state when there are no roasts", async () => {

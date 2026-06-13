@@ -236,6 +236,30 @@ describe("dashboardReducer", () => {
     expect(s.markers.find((m) => m.kind === "first_crack")?.t).toBe(500);
   });
 
+  it("marks the charge (T0) turning point at x=0 labeled 'T0' (#165)", () => {
+    // The charge marker anchors the curve origin so the operator can read the
+    // meaningful post-charge RoR; pre-charge RoR stays on the curve (not hidden).
+    const s = dashboardReducer(initialDashboardViewModel, ev("t0_detected", { bean_temp_c: 175 }));
+    const t0 = s.markers.find((m) => m.kind === "t0");
+    expect(t0).toEqual({ kind: "t0", t: 0, label: "T0" });
+  });
+
+  it("plots pre-charge (preheat) RoR — pre-T0 RoR is shown, not hidden (#165)", () => {
+    // Operator clarification 13 Jun: pre-charge RoR is real probe data; the curve
+    // shows it from the start and just marks the charge point — no pre-T0 gating.
+    let s = dashboardReducer(
+      initialDashboardViewModel,
+      ev("telemetry", { elapsed_seconds: -30, bean_temp_c: 60, env_temp_c: 180, bean_ror_c_per_min: 22 }),
+    );
+    s = dashboardReducer(
+      s,
+      ev("telemetry", { elapsed_seconds: -10, bean_temp_c: 90, env_temp_c: 195, bean_ror_c_per_min: 18 }),
+    );
+    expect(s.points).toHaveLength(2);
+    expect(s.points.every((p) => p.ror !== null)).toBe(true);
+    expect(s.points[0]).toMatchObject({ t: -30, ror: 22 });
+  });
+
   it("adds a drop marker on a drop_beans command_executed", () => {
     let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 600, bean_temp_c: 215, env_temp_c: 220 }));
     s = dashboardReducer(s, ev("command_executed", { command: "drop_beans", source: "operator" }));

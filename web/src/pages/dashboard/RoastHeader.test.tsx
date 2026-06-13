@@ -9,6 +9,7 @@ const BASE = {
   phase: "development" as const,
   elapsedSeconds: 582,
   developmentSeconds: 72,
+  beanRorCPerMin: 8.4,
   profileName: "Ethiopian Yirgacheffe — Medium",
   firstCrack: null,
   mcpChild: "running" as const,
@@ -26,6 +27,31 @@ describe("RoastHeader", () => {
     render(<RoastHeader {...BASE} />);
     expect(screen.getByTestId("roast-timer")).toHaveTextContent("09:42");
     expect(screen.getByTestId("development-timer")).toHaveTextContent("01:12");
+  });
+
+  it("shows the live bean RoR readout in °C/min (#165)", () => {
+    render(<RoastHeader {...BASE} beanRorCPerMin={8.4} />);
+    const ror = screen.getByTestId("ror-readout");
+    expect(ror).toHaveTextContent("8.4 °C/min");
+  });
+
+  it("shows the RoR readout from the start incl. preheat (real data, not hidden) (#165)", () => {
+    // Operator clarification: pre-charge RoR is real probe data and stays shown;
+    // the charge (T0) marker on the curve flags the meaningful turning point.
+    render(
+      <RoastHeader
+        {...BASE}
+        phase="preheating"
+        developmentSeconds={null}
+        beanRorCPerMin={14.2}
+      />,
+    );
+    expect(screen.getByTestId("ror-readout")).toHaveTextContent("14.2 °C/min");
+  });
+
+  it("renders the RoR readout as a placeholder when no rate yet (null-safe)", () => {
+    render(<RoastHeader {...BASE} beanRorCPerMin={null} />);
+    expect(screen.getByTestId("ror-readout")).toHaveTextContent("— °C/min");
   });
 
   it("omits the development timer before first crack (GAP A — no dev% invented)", () => {

@@ -141,6 +141,19 @@ review defers: ror scale in hook, scale-covers asserts on live/fault),
 #103/#104/#105/#111/#112/#117/#102. Kickoff brief:
 `roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`.
 
+**Advisor decision trace, surfaced (#167 + #170).** #167 (merged) persists
+`advisor_decisions` on both controller paths + exposes them on
+`GET /api/roasts/{id}/timeline` (`TimelineAdvisorDecision`). #170 (SPA) renders that
+trace durably: the **roast detail** page gains an advisor-spined **decision
+timeline** (one row per consult incl. preheat + failures — provider_error/timeout/
+malformed show the failure, never a blank panel — with provider/model, latency, the
+recommended heat/fan + rationale on `ok`, and the linked safety verdict joined by
+tick via the shared `VerdictBadge`), plus a summary-chip header; the **history** list
+gains a per-roast advisor summary column (consults / clamped / rejected / failed),
+derived client-side from each row's cached `/timeline` (the summary contract carries
+no advisor stats; backend untouched). New Playwright state
+`roast-detail-advisor-failed`. SPA renders from server data only.
+
 **E11 (Packaging) is next in epic order but BLOCKED — do not start (D28 + D27).**
 Two independent gates must clear first:
 1. **Operator manual tests (D28)** — human-owned (@syamaner): **#135** (E10-S6 manual
@@ -276,12 +289,18 @@ order:
    gpt-5-mini-reasoning-off); **re-run bake-off weighting latency post-FC**; new D-number.
    **Operator-gated** (needs a valid key + operator judgment + API cost) — the one piece
    that cannot be fully autonomous.
-7. 🟢 **#166** advisor unavailable → **fail-closed after N** (operator's call) — **D30**
-   recorded; PR open (`feature/166-advisor-fail-closed`), safety-reviewer to adjudicate
-   before merge. N consecutive *availability* failures (`provider_error`/`timeout`, default
-   N=3) → heat 0 % + `operator_recovery_required` via a **RECOVERY** verdict;
-   `malformed`/`unsafe` do not count; paused advisor never accrues.
-8. 🟢 **#165** RoR display (from preheat, mark charge) · **#164** richer bean identity.
+7. ✅ **#166** advisor unavailable → **fail-closed after N** (operator's call) — **DONE**
+   (PR #185, **D30**, safety-reviewer **PASS**). N consecutive *availability* failures
+   (`provider_error`/`timeout`, default N=3) → heat 0 % + overrun-safe fan +
+   `operator_recovery_required` via a **RECOVERY** verdict; `malformed`/`unsafe` are
+   **transparent** (don't count or reset the streak); paused advisor never accrues; resets
+   on `ok`/`start_run`/`operator_resume`.
+8. 🟢 **#165** RoR display (from preheat, mark charge) — **DONE** (PR #186): RoR was already
+   plumbed bean RoR → telemetry/SSE → SPA and plotted by the shared `LiveCurve` (right-axis
+   green series + legend °C/min + cursor) on dashboard AND detail; finished with an
+   operator-facing live RoR readout in the dashboard `RoastHeader` + confirmed the charge
+   (T0) marker; pre-charge RoR **shown, not hidden** (13 Jun operator clarification). Display
+   only. · **#164** richer bean identity — **LAST remaining** (runs ∥ #173-mechanism).
 
 **Operator-dependencies for "all before next roast":** every code fix is buildable/testable
 with the **FakeAdvisor** (no key). Only the **#173 / #172 bake-off model+prompt selection**
