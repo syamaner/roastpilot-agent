@@ -24,11 +24,27 @@ export interface TitleBlockProps {
   className?: string;
 }
 
+/** Capitalize a bean-species literal for display (e.g. "arabica" → "Arabica"). */
+function speciesLabel(species: string): string {
+  return species.charAt(0).toUpperCase() + species.slice(1);
+}
+
 export function TitleBlock({ detail, stats, className }: TitleBlockProps): React.JSX.Element {
   const { profile, outcome } = detail;
   const title = profile.bean_varietal
     ? `${profile.name} — ${profile.bean_varietal}`
     : profile.name;
+
+  // Bean identity (#164), all read from the frozen profile (no client inference):
+  // a "Country · Farm" line, a species/blend tag row, and the free-text
+  // description. Each renders only when present, so pre-#164 profiles are
+  // unaffected.
+  const originParts = [profile.country, profile.farm].filter(
+    (part): part is string => typeof part === "string" && part.length > 0,
+  );
+  const tags: string[] = [];
+  if (profile.bean_species) tags.push(speciesLabel(profile.bean_species));
+  if (profile.is_blend) tags.push("Blend");
 
   return (
     <div className={cn("flex flex-col gap-3", className)} data-testid="title-block">
@@ -54,6 +70,32 @@ export function TitleBlock({ detail, stats, className }: TitleBlockProps): React
       <p className="text-sm text-muted-foreground" data-testid="bean-origin">
         {profile.bean_origin}
       </p>
+
+      {originParts.length > 0 && (
+        <p className="text-sm text-muted-foreground" data-testid="bean-provenance">
+          {originParts.join(" · ")}
+        </p>
+      )}
+
+      {tags.length > 0 && (
+        <div className="flex flex-wrap gap-2" data-testid="bean-tags">
+          {tags.map((tag) => (
+            <span
+              key={tag}
+              data-testid={`bean-tag-${tag.toLowerCase()}`}
+              className="inline-flex items-center rounded-md border border-border bg-muted/40 px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-muted-foreground"
+            >
+              {tag}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {profile.description && (
+        <p className="text-sm text-muted-foreground" data-testid="bean-description">
+          {profile.description}
+        </p>
+      )}
 
       {detail.fault_reason ? (
         <p

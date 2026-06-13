@@ -24,13 +24,23 @@ import { useState } from "react";
 
 import { cn } from "@/lib/cn";
 import { ApiError } from "@/lib/api";
-import type { RoastProfile } from "@/lib/types";
+import type { BeanSpecies, RoastProfile } from "@/lib/types";
 
-/** The form's string-keyed draft (inputs are strings; we parse on submit). */
+/**
+ * The form's string-keyed draft (text/number inputs are strings; we parse on
+ * submit). `is_blend` is a boolean checkbox; `bean_species` a select whose empty
+ * value means "unset" (mapped to `null`).
+ */
 interface Draft {
   name: string;
   bean_origin: string;
   bean_varietal: string;
+  // Bean identity (#164).
+  country: string;
+  farm: string;
+  bean_species: string;
+  is_blend: boolean;
+  description: string;
   bean_weight_grams: string;
   charge_guidance_min_c: string;
   charge_guidance_max_c: string;
@@ -40,12 +50,27 @@ interface Draft {
   target_development_percent: string;
 }
 
+/** The botanical species select options (#164); mirrors `BeanSpecies`. The empty
+ *  value is "unset" → `null` on submit. */
+const SPECIES_OPTIONS: { value: BeanSpecies | ""; label: string }[] = [
+  { value: "", label: "—" },
+  { value: "arabica", label: "Arabica" },
+  { value: "robusta", label: "Robusta" },
+  { value: "liberica", label: "Liberica" },
+  { value: "excelsa", label: "Excelsa" },
+];
+
 /** Pre-filled defaults (mirror `models.RoastProfile` field defaults). The
- *  operator mainly fills name + bean_origin + weight. */
+ *  operator mainly fills name + bean_origin + weight; identity fields optional. */
 const DEFAULT_DRAFT: Draft = {
   name: "",
   bean_origin: "",
   bean_varietal: "",
+  country: "",
+  farm: "",
+  bean_species: "",
+  is_blend: false,
+  description: "",
   bean_weight_grams: "",
   charge_guidance_min_c: "170",
   charge_guidance_max_c: "200",
@@ -84,6 +109,11 @@ function validate(draft: Draft): { profile: RoastProfile } | { errors: Errors } 
   const beanOrigin = draft.bean_origin.trim();
   if (beanOrigin === "") errors.bean_origin = "Required.";
   const varietalRaw = draft.bean_varietal.trim();
+  // Optional identity fields (#164): trimmed; blank → null (server normalizes too).
+  const countryRaw = draft.country.trim();
+  const farmRaw = draft.farm.trim();
+  const descriptionRaw = draft.description.trim();
+  const species = draft.bean_species === "" ? null : (draft.bean_species as BeanSpecies);
 
   const weight = Number(draft.bean_weight_grams);
   if (draft.bean_weight_grams.trim() === "" || !Number.isFinite(weight) || weight <= 0)
@@ -125,6 +155,11 @@ function validate(draft: Draft): { profile: RoastProfile } | { errors: Errors } 
       name,
       bean_origin: beanOrigin,
       bean_varietal: varietalRaw === "" ? null : varietalRaw,
+      country: countryRaw === "" ? null : countryRaw,
+      farm: farmRaw === "" ? null : farmRaw,
+      bean_species: species,
+      is_blend: draft.is_blend,
+      description: descriptionRaw === "" ? null : descriptionRaw,
       bean_weight_grams: weight,
       charge_guidance_min_c: minC,
       charge_guidance_max_c: maxC,
@@ -143,9 +178,16 @@ export function StartRoastForm({ onStart, className }: StartRoastFormProps): Rea
   /** A submit-level error (e.g. 409 conflict / network) distinct from field errors. */
   const [submitError, setSubmitError] = useState<string | null>(null);
 
-  const set = (field: keyof Draft) => (e: React.ChangeEvent<HTMLInputElement>) => {
-    const { value } = e.target;
-    setDraft((d) => ({ ...d, [field]: value }));
+  const set =
+    (field: keyof Draft) =>
+    (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>) => {
+      const { value } = e.target;
+      setDraft((d) => ({ ...d, [field]: value }));
+    };
+
+  const setBlend = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const { checked } = e.target;
+    setDraft((d) => ({ ...d, is_blend: checked }));
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -196,7 +238,9 @@ export function StartRoastForm({ onStart, className }: StartRoastFormProps): Rea
       </header>
 
       <fieldset className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-        <legend className="sr-only">Roast profile</legend>
+        <legend className="col-span-full text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          Bean identity
+        </legend>
         <Field
           id="name"
           label="Profile name"
@@ -214,13 +258,45 @@ export function StartRoastForm({ onStart, className }: StartRoastFormProps): Rea
           placeholder="Ethiopia Guji"
         />
         <Field
+          id="country"
+          label="Country (optional)"
+          value={draft.country}
+          onChange={set("country")}
+          error={errors.country}
+          placeholder="Ethiopia"
+          hint="Producing country"
+        />
+        <Field
+          id="farm"
+          label="Farm / region (optional)"
+          value={draft.farm}
+          onChange={set("farm")}
+          error={errors.farm}
+          placeholder="Gedeb — Worka Sakaro"
+          hint="Farm / co-op / washing station / region"
+        />
+        <SpeciesSelect value={draft.bean_species} onChange={set("bean_species")} />
+        <Field
           id="bean_varietal"
-          label="Varietal (optional)"
+          label="Varietal / cultivar (optional)"
           value={draft.bean_varietal}
           onChange={set("bean_varietal")}
           error={errors.bean_varietal}
           placeholder="Heirloom"
+          hint="Cultivar — distinct from species"
         />
+        <BlendToggle checked={draft.is_blend} onChange={setBlend} />
+        <DescriptionField
+          value={draft.description}
+          onChange={set("description")}
+          isBlend={draft.is_blend}
+        />
+      </fieldset>
+
+      <fieldset className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+        <legend className="col-span-full text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          Roast targets
+        </legend>
         <Field
           id="bean_weight_grams"
           label="Bean weight (g)"
@@ -410,6 +486,122 @@ function Field({
           </span>
         )
       )}
+    </div>
+  );
+}
+
+interface SpeciesSelectProps {
+  value: string;
+  onChange: (e: React.ChangeEvent<HTMLSelectElement>) => void;
+}
+
+/** Bean-species select (#164) — a constrained vocabulary (mirrors the
+ *  `BeanSpecies` Literal); the empty option means "unset". Distinct from the
+ *  free-text varietal/cultivar field. */
+function SpeciesSelect({ value, onChange }: SpeciesSelectProps): React.JSX.Element {
+  const hintId = "bean_species-hint";
+  return (
+    <div className="flex flex-col gap-1">
+      <label
+        htmlFor="bean_species"
+        className="text-xs font-semibold uppercase tracking-wide text-muted-foreground"
+      >
+        Species (optional)
+      </label>
+      <select
+        id="bean_species"
+        name="bean_species"
+        value={value}
+        onChange={onChange}
+        aria-describedby={hintId}
+        data-testid="start-roast-bean_species"
+        className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus:ring-1 focus:ring-ring"
+      >
+        {SPECIES_OPTIONS.map((opt) => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
+      <span id={hintId} className="text-xs text-muted-foreground">
+        Botanical species — distinct from cultivar
+      </span>
+    </div>
+  );
+}
+
+interface BlendToggleProps {
+  checked: boolean;
+  onChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
+}
+
+/** Single-origin vs blend toggle (#164). When on, the secondary beans go in the
+ *  description (no structured component list in this story). */
+function BlendToggle({ checked, onChange }: BlendToggleProps): React.JSX.Element {
+  return (
+    <div className="flex flex-col gap-1 sm:col-span-2">
+      <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        Blend
+      </span>
+      <label htmlFor="is_blend" className="flex items-center gap-2 text-sm">
+        <input
+          id="is_blend"
+          name="is_blend"
+          type="checkbox"
+          checked={checked}
+          onChange={onChange}
+          data-testid="start-roast-is_blend"
+          className="h-4 w-4 rounded border-input bg-background accent-roast-coffee"
+        />
+        <span>This is a blend (not single-origin)</span>
+      </label>
+      <span className="text-xs text-muted-foreground">
+        {checked
+          ? "Put the secondary beans / components in the description below."
+          : "Single origin — leave off, or turn on for a blend."}
+      </span>
+    </div>
+  );
+}
+
+interface DescriptionFieldProps {
+  value: string;
+  onChange: (e: React.ChangeEvent<HTMLTextAreaElement>) => void;
+  isBlend: boolean;
+}
+
+/** Free-text description (#164): process, tasting notes, lot — and, for a blend,
+ *  the secondary beans. A textarea (multi-line) rather than the single-line
+ *  `Field`. */
+function DescriptionField({ value, onChange, isBlend }: DescriptionFieldProps): React.JSX.Element {
+  const hintId = "description-hint";
+  const hint = isBlend
+    ? "Process, tasting notes, and the secondary beans / components of the blend."
+    : "Process (washed/natural/honey), tasting notes, lot.";
+  return (
+    <div className="flex flex-col gap-1 sm:col-span-2">
+      <label
+        htmlFor="description"
+        className="text-xs font-semibold uppercase tracking-wide text-muted-foreground"
+      >
+        Description (optional)
+      </label>
+      <textarea
+        id="description"
+        name="description"
+        rows={2}
+        value={value}
+        onChange={onChange}
+        aria-describedby={hintId}
+        data-testid="start-roast-description"
+        placeholder={
+          isBlend ? "60% Brazil Cerrado + 40% Ethiopia Guji; washed; chocolate, citrus." : "Washed; jasmine, bergamot, stone fruit."
+        }
+        className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus:ring-1 focus:ring-ring"
+      />
+      <span id={hintId} className="text-xs text-muted-foreground">
+        {hint}
+      </span>
     </div>
   );
 }

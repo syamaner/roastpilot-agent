@@ -4,6 +4,7 @@ Round-trip and invariant coverage for every shared enum, the typed safety
 handshake's JSON round trip, and RoastProfile validation (D7).
 """
 
+import json
 from enum import Enum
 
 import pydantic
@@ -133,6 +134,113 @@ def test_roast_profile_defaults() -> None:
     assert profile.bean_varietal is None
 
 
+def test_roast_profile_bean_identity_defaults() -> None:
+    """#164 bean-identity fields default to unset / single-origin so a minimal
+    profile (the pre-#164 shape) is valid unchanged."""
+    profile = RoastProfile.model_validate(_profile())
+    assert profile.country is None
+    assert profile.farm is None
+    assert profile.description is None
+    assert profile.bean_species is None
+    assert profile.is_blend is False
+
+
+def test_roast_profile_bean_identity_populated() -> None:
+    """#164 bean-identity fields round-trip a fully-specified single origin."""
+    profile = RoastProfile.model_validate(
+        _profile(
+            country="Ethiopia",
+            farm="Gedeb — Worka Sakaro",
+            description="Washed; jasmine, bergamot, stone fruit.",
+            bean_species="arabica",
+            bean_varietal="Heirloom",
+            is_blend=False,
+        )
+    )
+    assert profile.country == "Ethiopia"
+    assert profile.farm == "Gedeb — Worka Sakaro"
+    assert profile.description == "Washed; jasmine, bergamot, stone fruit."
+    assert profile.bean_species == "arabica"
+    assert profile.is_blend is False
+
+
+def test_roast_profile_blend_secondaries_in_description() -> None:
+    """#164 blend model: ``is_blend`` true with secondaries in ``description`` —
+    the primary carries the structured fields, no structured component list."""
+    profile = RoastProfile.model_validate(
+        _profile(
+            country="Brazil",
+            bean_species="arabica",
+            is_blend=True,
+            description="60% Brazil Cerrado + 40% Ethiopia Guji natural.",
+        )
+    )
+    assert profile.is_blend is True
+    assert profile.description is not None
+    assert "Ethiopia" in profile.description
+
+
+def test_roast_profile_optional_identity_blank_normalizes_to_none() -> None:
+    """Whitespace-only optional identity fields normalize to ``None`` (unset),
+    not a validation error — unlike the required ``name`` / ``bean_origin``."""
+    profile = RoastProfile.model_validate(_profile(country="   ", farm="", description="  "))
+    assert profile.country is None
+    assert profile.farm is None
+    assert profile.description is None
+
+
+def test_roast_profile_strips_optional_identity_whitespace() -> None:
+    """Surrounding whitespace is stripped from the optional identity fields."""
+    profile = RoastProfile.model_validate(
+        _profile(country="  Colombia  ", farm="  Finca El Injerto ")
+    )
+    assert profile.country == "Colombia"
+    assert profile.farm == "Finca El Injerto"
+
+
+@pytest.mark.parametrize("species", ["arabica", "robusta", "liberica", "excelsa"])
+def test_roast_profile_bean_species_accepts_known_values(species: str) -> None:
+    """All four botanical species literals are accepted."""
+    profile = RoastProfile.model_validate(_profile(bean_species=species))
+    assert profile.bean_species == species
+
+
+def test_roast_profile_rejects_unknown_bean_species() -> None:
+    """``bean_species`` is a constrained ``Literal`` — an unknown value is
+    rejected (proves it is not a free ``str``)."""
+    with pytest.raises(pydantic.ValidationError):
+        RoastProfile.model_validate(_profile(bean_species="kona"))
+
+
+def test_roast_profile_old_shape_json_back_compat() -> None:
+    """A frozen ``roast_runs.profile_json`` from before #164 (no country / farm /
+    description / bean_species / is_blend) still deserializes — completed runs
+    are immutable, so this must never break."""
+    old_json = json.dumps(
+        {
+            "name": "Ethiopia light",
+            "bean_origin": "Ethiopia",
+            "bean_varietal": "Heirloom",
+            "bean_weight_grams": 250.0,
+            "charge_guidance_min_c": 170.0,
+            "charge_guidance_max_c": 200.0,
+            "initial_heat_percent": 70,
+            "initial_fan_percent": 40,
+            "target_drop_temp_c": 205.0,
+            "target_development_percent": 20.0,
+        }
+    )
+    profile = RoastProfile.model_validate_json(old_json)
+    assert profile.bean_origin == "Ethiopia"
+    assert profile.bean_varietal == "Heirloom"
+    # The #164 additions take their back-compat defaults.
+    assert profile.country is None
+    assert profile.farm is None
+    assert profile.description is None
+    assert profile.bean_species is None
+    assert profile.is_blend is False
+
+
 def test_roast_detail_enabled_actions_defaults_to_empty() -> None:
     """``enabled_actions`` (E10 option (a), D25) defaults to an empty list when a
     detail is built without it — the API always populates it from the phase, but
@@ -177,6 +285,15 @@ def test_roast_profile_rejects_nonsense(overrides: dict[str, object]) -> None:
 
 
 def test_roast_profile_json_round_trip() -> None:
-    profile = RoastProfile.model_validate(_profile(bean_varietal="Heirloom"))
+    profile = RoastProfile.model_validate(
+        _profile(
+            bean_varietal="Heirloom",
+            country="Ethiopia",
+            farm="Gedeb — Worka Sakaro",
+            description="Washed; jasmine, bergamot.",
+            bean_species="arabica",
+            is_blend=False,
+        )
+    )
     restored = RoastProfile.model_validate_json(profile.model_dump_json())
     assert restored == profile

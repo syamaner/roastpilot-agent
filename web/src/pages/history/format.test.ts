@@ -34,6 +34,16 @@ describe("beanLabel", () => {
   it("omits a null varietal", () => {
     expect(beanLabel(run({ bean_varietal: null }))).toBe("Ethiopian Yirgacheffe");
   });
+
+  it("includes the country when present so search matches it (#164)", () => {
+    expect(beanLabel(run({ bean_varietal: null, country: "Ethiopia" }))).toBe(
+      "Ethiopian Yirgacheffe Ethiopia",
+    );
+  });
+
+  it("omits unset #164 identity fields (back-compat)", () => {
+    expect(beanLabel(run({ bean_varietal: null, country: null }))).toBe("Ethiopian Yirgacheffe");
+  });
 });
 
 describe("formatStartedAt", () => {

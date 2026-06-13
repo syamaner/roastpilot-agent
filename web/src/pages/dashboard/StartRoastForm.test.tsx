@@ -46,6 +46,12 @@ describe("StartRoastForm", () => {
       name: "Morning batch",
       bean_origin: "Ethiopia Guji",
       bean_varietal: null,
+      // #164 identity fields take their unset / single-origin defaults.
+      country: null,
+      farm: null,
+      bean_species: null,
+      is_blend: false,
+      description: null,
       bean_weight_grams: 250,
       charge_guidance_min_c: 170,
       charge_guidance_max_c: 200,
@@ -54,6 +60,52 @@ describe("StartRoastForm", () => {
       target_drop_temp_c: 205,
       target_development_percent: 20,
     });
+  });
+
+  it("renders the bean-identity fields and the blend toggle (#164)", () => {
+    render(<StartRoastForm onStart={vi.fn()} />);
+    expect(screen.getByTestId("start-roast-country")).toBeInTheDocument();
+    expect(screen.getByTestId("start-roast-farm")).toBeInTheDocument();
+    expect(screen.getByTestId("start-roast-bean_species")).toBeInTheDocument();
+    expect(screen.getByTestId("start-roast-description")).toBeInTheDocument();
+    expect(screen.getByTestId("start-roast-is_blend")).not.toBeChecked();
+  });
+
+  it("passes the bean-identity fields through when provided (#164)", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    fireEvent.change(screen.getByTestId("start-roast-country"), { target: { value: "Ethiopia" } });
+    fireEvent.change(screen.getByTestId("start-roast-farm"), {
+      target: { value: "Gedeb — Worka Sakaro" },
+    });
+    fireEvent.change(screen.getByTestId("start-roast-bean_species"), {
+      target: { value: "arabica" },
+    });
+    fireEvent.change(screen.getByTestId("start-roast-description"), {
+      target: { value: "Washed; jasmine, bergamot." },
+    });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
+    const profile = onStart.mock.calls[0][0] as RoastProfile;
+    expect(profile.country).toBe("Ethiopia");
+    expect(profile.farm).toBe("Gedeb — Worka Sakaro");
+    expect(profile.bean_species).toBe("arabica");
+    expect(profile.description).toBe("Washed; jasmine, bergamot.");
+    expect(profile.is_blend).toBe(false);
+  });
+
+  it("the blend toggle sets is_blend and hints secondaries go in the description (#164)", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    const toggle = screen.getByTestId("start-roast-is_blend");
+    fireEvent.click(toggle);
+    expect(toggle).toBeChecked();
+    expect(screen.getAllByText(/secondary beans/i).length).toBeGreaterThan(0);
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
+    expect((onStart.mock.calls[0][0] as RoastProfile).is_blend).toBe(true);
   });
 
   it("passes an optional varietal through when provided", async () => {

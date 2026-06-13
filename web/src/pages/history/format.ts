@@ -27,11 +27,15 @@ export const EMPTY_FILTERS: HistoryFilters = {
   minRating: ANY,
 };
 
-/** The bean display: origin, optionally qualified by varietal (two-line cell). */
+/**
+ * The bean display used for the search match + the row aria-label: origin,
+ * optionally qualified by varietal and country (#164), so searching by country
+ * works. The visual cell renders these on separate lines.
+ */
 export function beanLabel(run: RoastSummary): string {
-  return run.bean_varietal
-    ? `${run.bean_origin} ${run.bean_varietal}`
-    : run.bean_origin;
+  return [run.bean_origin, run.bean_varietal, run.country]
+    .filter((part): part is string => typeof part === "string" && part.length > 0)
+    .join(" ");
 }
 
 /**

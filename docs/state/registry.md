@@ -300,7 +300,16 @@ order:
    green series + legend °C/min + cursor) on dashboard AND detail; finished with an
    operator-facing live RoR readout in the dashboard `RoastHeader` + confirmed the charge
    (T0) marker; pre-charge RoR **shown, not hidden** (13 Jun operator clarification). Display
-   only. · **#164** richer bean identity — **LAST remaining** (runs ∥ #173-mechanism).
+   only. · ✅ **#164** richer bean identity — **DONE** (PR #187): `RoastProfile` gains
+   optional/defaulted `country` / `farm` / `description` / `bean_species` (a constrained
+   `Literal`, **not** a `models.py` Enum — no safety-reviewer escalation) / `is_blend`,
+   keeping `bean_origin` + `bean_varietal` (cultivar). Blend model = `is_blend` flag, primary
+   carries the structured fields, secondaries in `description` (no structured component list).
+   Back-compat: pre-#164 frozen `profile_json` still deserializes (test). Surfaced on the Start
+   Roast form (identity vs roast-targets fieldsets + blend toggle), detail TitleBlock
+   (provenance line + species/blend tags + description), and history (country + Blend badge);
+   summary projection carries country/species/is_blend. **Identity metadata only — no
+   safety/controller/enum behavior change.** Plan: D7 extension wants a new D-number (lead).
 
 **Operator-dependencies for "all before next roast":** every code fix is buildable/testable
 with the **FakeAdvisor** (no key). Only the **#173 / #172 bake-off model+prompt selection**
