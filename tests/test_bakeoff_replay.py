@@ -277,6 +277,221 @@ async def test_recommender_failure_is_captured_not_fatal() -> None:
     assert score.tick_count == len(ticks)
 
 
+# --- confusion matrices (derived from per-tick data; NO new calls) ----------
+
+
+def _synthetic_tick(
+    *,
+    real_should_drop: bool,
+    real_heat: int = 50,
+    prev_real_heat: int | None = None,
+) -> replay.ReplayTick:
+    """A minimal :class:`ReplayTick` for confusion-matrix tests (canned data).
+
+    Only the fields the confusion matrices read are meaningful here; the context
+    is a plausible grounded development tick so the dataclass is well-formed.
+    """
+    context = AdvisorContext(
+        phase=RoastPhase.DEVELOPMENT,
+        roast_elapsed_seconds=600.0,
+        development_elapsed_seconds=60.0,
+        current_bean_temp_c=195.0,
+        current_env_temp_c=210.0,
+        bean_ror_c_per_min=5.0,
+        env_ror_c_per_min=4.0,
+        target_drop_temp_c=197.0,
+        target_development_percent=15.0,
+        profile_name="synthetic",
+        recent_telemetry_samples=[],
+        first_crack_detected=True,
+        first_crack_timestamp_seconds=540.0,
+    )
+    return replay.ReplayTick(
+        context=context,
+        real_heat_percent=real_heat,
+        real_fan_percent=50,
+        prev_real_heat_percent=prev_real_heat,
+        prev_real_fan_percent=None,
+        real_should_drop=real_should_drop,
+        monotonic_seconds=600.0,
+    )
+
+
+def _outcome(
+    tick: replay.ReplayTick,
+    *,
+    model_should_drop: bool,
+    model_heat: int = 50,
+) -> replay.TickOutcome:
+    """Wrap a synthetic tick with a canned model decision (no recommender)."""
+    return replay.TickOutcome(
+        tick=tick,
+        decision=RoastDecision(
+            target_heat=model_heat,
+            target_fan=50,
+            should_drop=model_should_drop,
+            confidence=0.8,
+            rationale="synthetic",
+        ),
+        latency_seconds=1.0,
+    )
+
+
+def testdrop_confusion_counts_tp_fp_tn_fn_from_known_sequence() -> None:
+    """A canned drop sequence produces the expected TP/FP/TN/FN."""
+    no_drop = _synthetic_tick(real_should_drop=False)
+    real_drop = _synthetic_tick(real_should_drop=True)
+    outcomes = [
+        # TN: model holds, real not yet dropped.
+        _outcome(no_drop, model_should_drop=False),
+        _outcome(no_drop, model_should_drop=False),
+        # FP: model drops early, real not yet dropped.
+        _outcome(no_drop, model_should_drop=True),
+        # TP: model drops at the real drop tick.
+        _outcome(real_drop, model_should_drop=True),
+        # FN: a (second) real-drop tick the model held on.
+        _outcome(real_drop, model_should_drop=False),
+    ]
+    confusion = replay.drop_confusion(outcomes)
+    assert confusion.true_positives == 1
+    assert confusion.false_positives == 1
+    assert confusion.true_negatives == 2
+    assert confusion.false_negatives == 1
+    # Totals reconcile with the tick count.
+    assert confusion.total == len(outcomes)
+
+
+def testdrop_confusion_ignores_no_decision_ticks() -> None:
+    """A tick with no decision contributes to neither the matrix nor the total."""
+    no_drop = _synthetic_tick(real_should_drop=False)
+    outcomes = [
+        _outcome(no_drop, model_should_drop=False),
+        replay.TickOutcome(tick=no_drop, decision=None, latency_seconds=None, error="boom"),
+    ]
+    confusion = replay.drop_confusion(outcomes)
+    assert confusion.total == 1
+    assert confusion.true_negatives == 1
+
+
+@pytest.mark.asyncio
+async def testdrop_confusion_is_consistent_with_precision_recall_f1() -> None:
+    """Over a real replay, the 2×2 TP/FP/FN match the DropMetrics fields.
+
+    The matrix must be derived from the same ground-truth label the F1 uses, so
+    the shared cells reconcile exactly and only ``true_negatives`` is additional.
+    """
+    ticks, ground = replay.build_ticks(_S1, cadence_seconds=30.0)
+
+    async def recommend(context: AdvisorContext) -> RoastDecision:
+        # Early dropper: produces both TPs/FNs and FPs, so all cells exercise.
+        should_drop = context.first_crack_detected and context.current_bean_temp_c >= 190.0
+        return RoastDecision(
+            target_heat=40, target_fan=50, should_drop=should_drop, confidence=0.9, rationale="x"
+        )
+
+    outcomes = await replay.replay_roast(ticks, recommend, clock=_deterministic_clock())
+    score = replay.score_roast(outcomes, ground, "s1")
+
+    assert score.drop_confusion.true_positives == score.drop.true_positives
+    assert score.drop_confusion.false_positives == score.drop.false_positives
+    assert score.drop_confusion.false_negatives == score.drop.false_negatives
+    # The matrix reconciles with the ok-tick count.
+    assert score.drop_confusion.total == score.ok_count
+
+
+def testheat_direction_confusion_3x3_from_known_sequence() -> None:
+    """A canned heat-direction sequence produces the expected 3×3 counts.
+
+    Each tick carries a previous real heat setpoint; the real move (prev→real)
+    and the model move (prev→model) each classify cut / hold / raise, indexing
+    one cell with rows = real move, cols = model move.
+    """
+    outcomes = [
+        # real raise (50→60), model raise (50→70) → (raise, raise) diagonal.
+        _outcome(
+            _synthetic_tick(real_should_drop=False, real_heat=60, prev_real_heat=50),
+            model_should_drop=False,
+            model_heat=70,
+        ),
+        # real raise (50→60), model cut (50→40) → (raise, cut) off-diagonal.
+        _outcome(
+            _synthetic_tick(real_should_drop=False, real_heat=60, prev_real_heat=50),
+            model_should_drop=False,
+            model_heat=40,
+        ),
+        # real cut (50→40), model cut (50→30) → (cut, cut) diagonal.
+        _outcome(
+            _synthetic_tick(real_should_drop=False, real_heat=40, prev_real_heat=50),
+            model_should_drop=False,
+            model_heat=30,
+        ),
+        # real hold (50→50), model hold (50→50) → (hold, hold) diagonal.
+        _outcome(
+            _synthetic_tick(real_should_drop=False, real_heat=50, prev_real_heat=50),
+            model_should_drop=False,
+            model_heat=50,
+        ),
+        # No previous setpoint → excluded from the matrix entirely.
+        _outcome(
+            _synthetic_tick(real_should_drop=False, real_heat=60, prev_real_heat=None),
+            model_should_drop=False,
+            model_heat=70,
+        ),
+    ]
+    confusion = replay.heat_direction_confusion(outcomes)
+    assert confusion.labels == ("cut", "hold", "raise")
+    # rows = real (cut=0, hold=1, raise=2); cols = model (cut=0, hold=1, raise=2).
+    assert confusion.matrix == (
+        (1, 0, 0),  # real cut: 1 model-cut
+        (0, 1, 0),  # real hold: 1 model-hold
+        (1, 0, 1),  # real raise: 1 model-cut, 1 model-raise
+    )
+    # Four classified ticks (the no-previous tick is excluded).
+    assert confusion.samples == 4
+    # Totals reconcile: the grid sums to the sample count.
+    assert sum(sum(row) for row in confusion.matrix) == confusion.samples
+    # Diagonal agreement = 3/4 = 0.75 (cut/cut, hold/hold, raise/raise).
+    assert confusion.agreement == 0.75
+
+
+def testheat_direction_confusion_empty_when_no_previous_setpoints() -> None:
+    """With no tick carrying a previous setpoint the matrix is empty, agreement None."""
+    outcomes = [
+        _outcome(
+            _synthetic_tick(real_should_drop=False, real_heat=60, prev_real_heat=None),
+            model_should_drop=False,
+            model_heat=40,
+        )
+    ]
+    confusion = replay.heat_direction_confusion(outcomes)
+    assert confusion.samples == 0
+    assert confusion.agreement is None
+    assert sum(sum(row) for row in confusion.matrix) == 0
+
+
+def test_confusion_matrices_render_to_markdown() -> None:
+    """Both matrices render compact markdown lines for the report."""
+    drop_md = replay.render_drop_confusion_md(
+        replay.DropConfusion(
+            true_positives=1, false_positives=2, true_negatives=20, false_negatives=0
+        )
+    )
+    joined = "\n".join(drop_md)
+    assert "TP=1" in joined and "FP=2" in joined and "TN=20" in joined and "FN=0" in joined
+    assert "drop-timing error" in joined  # the honest-framing reminder
+
+    heat_md = replay.render_heat_direction_confusion_md(
+        replay.HeatDirectionConfusion(
+            labels=replay.HEAT_DIRECTION_LABELS,
+            matrix=((1, 0, 0), (0, 1, 0), (1, 0, 1)),
+            samples=4,
+        )
+    )
+    heat_joined = "\n".join(heat_md)
+    assert "cut" in heat_joined and "hold" in heat_joined and "raise" in heat_joined
+    assert "agreement=0.75" in heat_joined
+
+
 def test_score_to_json_round_trips() -> None:
     """The scorecard serialises to a JSON-ready dict with the metric fields."""
     drop = replay.DropMetrics(
@@ -296,6 +511,14 @@ def test_score_to_json_round_trips() -> None:
         tick_count=10,
         ok_count=10,
         drop=drop,
+        drop_confusion=replay.DropConfusion(
+            true_positives=1, false_positives=0, true_negatives=9, false_negatives=0
+        ),
+        heat_direction_confusion=replay.HeatDirectionConfusion(
+            labels=replay.HEAT_DIRECTION_LABELS,
+            matrix=((1, 0, 0), (0, 2, 0), (0, 0, 1)),
+            samples=4,
+        ),
         heat=lever,
         fan=lever,
         phase_latency=[replay.PhaseLatency("development", 3, 1.2, 1.5)],
@@ -305,3 +528,12 @@ def test_score_to_json_round_trips() -> None:
     assert out["drop"]["f1"] == 1.0
     assert out["heat"]["directional_agreement"] == 0.5
     assert out["phase_latency"][0]["phase"] == "development"
+    # Confusion matrices are exposed in the JSON.
+    assert out["drop_confusion"]["true_positives"] == 1
+    assert out["drop_confusion"]["true_negatives"] == 9
+    assert out["drop_confusion"]["total"] == 10
+    assert out["heat_direction_confusion"]["labels"] == ["cut", "hold", "raise"]
+    assert out["heat_direction_confusion"]["matrix"] == [[1, 0, 0], [0, 2, 0], [0, 0, 1]]
+    assert out["heat_direction_confusion"]["samples"] == 4
+    # All four samples are on the diagonal → perfect agreement.
+    assert out["heat_direction_confusion"]["agreement"] == 1.0
