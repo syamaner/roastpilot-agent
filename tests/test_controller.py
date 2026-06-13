@@ -20,7 +20,7 @@ from roastpilot_agent.advisor import (
     RoastAdvisor,
     RoastDecision,
 )
-from roastpilot_agent.config import ControllerConfig
+from roastpilot_agent.config import ControllerConfig, SafetyLimits
 from roastpilot_agent.controller import (
     TRANSITION_TABLE,
     UNIVERSAL_TARGETS,
@@ -43,7 +43,6 @@ from roastpilot_agent.models import (
 from roastpilot_agent.safety import (
     OPERATOR_ACTION_COMMAND,
     SafetyEvaluation,
-    SafetyLimits,
     SafetyPolicy,
     SafetyVerdict,
     enabled_operator_actions,

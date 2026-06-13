@@ -104,7 +104,7 @@ path = "src/roastpilot_agent/__init__.py"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-pythonpath = ["src"]
+pythonpath = ["src", "scripts"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
 
@@ -126,6 +126,11 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 [tool.pyright]
 pythonVersion = "3.11"
 typeCheckingMode = "strict"
-include = ["src", "tests"]
+include = ["src", "tests", "scripts"]
+# The manual bake-off / smoke scripts import each other (``advisor_bakeoff``
+# imports ``advisor_smoke``) and the tests that drive the harness import it the
+# same way, both by adding ``scripts`` to ``sys.path`` at runtime. Mirror that
+# for the type checker so the harness and its tests are strict-checked.
+extraPaths = ["scripts"]
 venvPath = "."
 venv = ".venv"

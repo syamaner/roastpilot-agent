@@ -551,9 +551,9 @@ async def test_restart_scenario_recovers_persisted_phase(tmp_path: Path, phase: 
 async def test_recovery_read_feeds_the_controller(tmp_path: Path) -> None:
     """End to end across the E4/E6 seam: the persisted phase drives
     recover_from_restart into operator_recovery_required with zero writes."""
-    from roastpilot_agent.config import ControllerConfig
+    from roastpilot_agent.config import ControllerConfig, SafetyLimits
     from roastpilot_agent.controller import RoastController
-    from roastpilot_agent.safety import SafetyLimits, SafetyPolicy
+    from roastpilot_agent.safety import SafetyPolicy
     from tests.conftest import (
         EventSink,
         RecordingExecutor,

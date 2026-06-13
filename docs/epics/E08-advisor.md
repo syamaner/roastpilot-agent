@@ -108,3 +108,14 @@ behind `RoastAdvisor`: `FakeAdvisor` (CI default), the provider-agnostic
 `PydanticAIAdvisor` (D18), the change-based call-frequency policy, and the
 operator-judged bake-off that set the default (`claude-opus-4.8` + prompt
 `v1`, plan §11.1 → D20).
+
+Follow-up tooling (post-E8, [#172](https://github.com/syamaner/roastpilot-agent/issues/172)
+/ [#173](https://github.com/syamaner/roastpilot-agent/issues/173)):
+`scripts/advisor_bakeoff.py` is extended for the per-phase prompt + model
+selection re-run — the #173 candidate roster encoded as data, an OpenRouter
+availability sweep that drops + reports unresolvable slugs, grounded
+preheat / pre-FC / first-crack contexts, and a paste-able operator decision
+table (latency-weighted FC slot, full advice text, **no auto-pick**, D20). The
+harness only *measures*; pinning the winning prompt default and the per-phase
+`model_slug_by_phase` values into `config.py` is a **separate** post-bake-off
+PR with its own D-number, gated on the operator running the harness with a key.
