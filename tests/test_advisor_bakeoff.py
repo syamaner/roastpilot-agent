@@ -20,7 +20,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 import advisor_bakeoff as bakeoff  # noqa: E402
 from bakeoff_replay import (  # noqa: E402
+    HEAT_DIRECTION_LABELS,
+    DropConfusion,
     DropMetrics,
+    HeatDirectionConfusion,
     LeverMetrics,
     PhaseLatency,
     RoastScore,
@@ -70,7 +73,7 @@ def test_roster_is_well_formed() -> None:
 
 
 def test_roster_covers_all_tiers_and_keeps_incumbent() -> None:
-    """The #173 roster has all four tiers, the incumbent, and no duplicate slugs."""
+    """The roster has every tier (incl. prior-frontier), the incumbent, no dupes."""
     tiers = {c.tier for c in bakeoff.ROSTER}
     assert tiers == set(bakeoff.Tier)
     slugs = [c.slug for c in bakeoff.ROSTER]
@@ -159,6 +162,123 @@ def test_render_availability_all_resolved() -> None:
     report = bakeoff.render_availability(results)
     assert "dropped (0)" in report
     assert "DROPPED" not in report
+
+
+# --- Sweep retry + drop-reason classification -------------------------------
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        ('400 "not a valid model ID"', bakeoff.DROP_REASON_INVALID_MODEL),
+        ("invalid model id supplied", bakeoff.DROP_REASON_INVALID_MODEL),
+        ('404 "No endpoints found that support tool use"', bakeoff.DROP_REASON_NO_TOOL_USE),
+        ("the model has no endpoints for tool-use", bakeoff.DROP_REASON_NO_TOOL_USE),
+        ("401 invalid api key", bakeoff.DROP_REASON_AUTH),
+        ("connection reset by peer", bakeoff.DROP_REASON_OTHER),
+        (None, bakeoff.DROP_REASON_OTHER),
+    ],
+)
+def test_classify_drop_reason(error: str | None, expected: str) -> None:
+    """The healthcheck error text classifies into the right drop reason."""
+    assert bakeoff.classify_drop_reason(error) == expected
+
+
+@pytest.mark.asyncio
+async def test_probe_slug_retries_a_transient_failure_then_succeeds() -> None:
+    """A first-attempt UNREACHABLE that recovers is kept, recording the retry."""
+    calls = {"n": 0}
+
+    async def flaky_healthcheck(self: PydanticAIAdvisor) -> AdvisorHealth:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return AdvisorHealth(
+                status=AdvisorHealthStatus.UNREACHABLE,
+                provider="openai_compatible",
+                model_slug=self.descriptor.model,
+                error="transient blip",
+            )
+        return AdvisorHealth(
+            status=AdvisorHealthStatus.REACHABLE,
+            provider="openai_compatible",
+            model_slug=self.descriptor.model,
+        )
+
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(PydanticAIAdvisor, "healthcheck", flaky_healthcheck)
+        result = await bakeoff.probe_slug(_OK_SLUG, "v2", None, sleep=fake_sleep)
+
+    assert result.available is True
+    assert result.attempts == 2
+    assert result.reason is None
+    assert slept, "a transient failure must back off before the retry"
+
+
+@pytest.mark.asyncio
+async def test_probe_slug_drops_after_exhausting_retries_with_reason() -> None:
+    """A genuine 400 fails every attempt and is dropped with its classified reason."""
+
+    async def dead_healthcheck(self: PydanticAIAdvisor) -> AdvisorHealth:
+        return AdvisorHealth(
+            status=AdvisorHealthStatus.UNREACHABLE,
+            provider="openai_compatible",
+            model_slug=self.descriptor.model,
+            error='400 "not a valid model ID"',
+        )
+
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(PydanticAIAdvisor, "healthcheck", dead_healthcheck)
+        result = await bakeoff.probe_slug(_DEAD_SLUG, "v2", None, attempts=2, sleep=fake_sleep)
+
+    assert result.available is False
+    assert result.attempts == 2
+    assert result.reason == bakeoff.DROP_REASON_INVALID_MODEL
+    assert result.error is not None and "not a valid model ID" in result.error
+
+
+def test_render_availability_shows_reason_and_tool_use_note() -> None:
+    """The dropped section names the reason; a no-tool-use drop adds the filter note."""
+    results = [
+        bakeoff.AvailabilityResult(slug=_OK_SLUG, available=True, attempts=1),
+        bakeoff.AvailabilityResult(
+            slug="dead/model",
+            available=False,
+            error='400 "not a valid model ID"',
+            attempts=2,
+            reason=bakeoff.DROP_REASON_INVALID_MODEL,
+        ),
+        bakeoff.AvailabilityResult(
+            slug="exists/no-tools",
+            available=False,
+            error='404 "No endpoints found that support tool use"',
+            attempts=2,
+            reason=bakeoff.DROP_REASON_NO_TOOL_USE,
+        ),
+    ]
+    report = bakeoff.render_availability(results)
+    assert "DROPPED (2)" in report
+    assert "invalid-model-id" in report
+    assert "no-tool-use-endpoint" in report
+    # The tool-use filter is documented as a real candidate filter.
+    assert "Tool-use requirement" in report
+    assert "fast-reasoning tier" in report
+
+
+def test_render_availability_flags_recovered_transient() -> None:
+    """A slug kept only after a retry is annotated as a recovered transient."""
+    results = [
+        bakeoff.AvailabilityResult(slug=_OK_SLUG, available=True, attempts=2),
+    ]
+    report = bakeoff.render_availability(results)
+    assert "resolved only on attempt 2" in report
 
 
 # --- Per-phase contexts -----------------------------------------------------
@@ -477,6 +597,14 @@ def test_render_replay_report_carries_honest_framing_and_no_autopick() -> None:
         tick_count=10,
         ok_count=10,
         drop=drop,
+        drop_confusion=DropConfusion(
+            true_positives=1, false_positives=0, true_negatives=9, false_negatives=0
+        ),
+        heat_direction_confusion=HeatDirectionConfusion(
+            labels=HEAT_DIRECTION_LABELS,
+            matrix=((1, 0, 0), (0, 3, 0), (1, 0, 0)),
+            samples=5,
+        ),
         heat=lever,
         fan=lever,
         phase_latency=[PhaseLatency("development", 3, 1.2, 1.4)],

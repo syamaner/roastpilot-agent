@@ -318,6 +318,79 @@ class DropMetrics:
 
 
 @dataclasses.dataclass(frozen=True)
+class DropConfusion:
+    """The 2×2 drop-decision confusion matrix over the ok ticks.
+
+    Predicted is the model's ``should_drop`` at a tick; actual is whether the
+    tick is at/after the real drop tick (the same ground-truth label the
+    F1/precision/recall in :class:`DropMetrics` derive from, so the counts are
+    *consistent* with those — ``true_positives``/``false_positives``/
+    ``false_negatives`` here equal the matching :class:`DropMetrics` fields, with
+    ``true_negatives`` added).
+
+    Honest framing: the per-tick drop classes are heavily imbalanced — almost
+    every tick is "no drop yet", so ``true_negatives`` dominates and inflates any
+    accuracy read. Read this matrix *with* the drop-timing-error metric, never
+    alone.
+
+    Attributes:
+        true_positives: Model dropped and the tick was at/after the real drop.
+        false_positives: Model dropped while the real roast had not yet dropped.
+        true_negatives: Model held and the real roast had not yet dropped.
+        false_negatives: Model held on a tick at/after the real drop.
+    """
+
+    true_positives: int
+    false_positives: int
+    true_negatives: int
+    false_negatives: int
+
+    @property
+    def total(self) -> int:
+        """Total scored (ok) ticks the matrix reconciles against."""
+        return (
+            self.true_positives + self.false_positives + self.true_negatives + self.false_negatives
+        )
+
+
+# The ordered heat-direction classes for the 3×3 confusion matrix. Index in this
+# tuple is the matrix row/column index; the labels are stable for the report and
+# the JSON.
+HEAT_DIRECTION_LABELS: tuple[str, str, str] = ("cut", "hold", "raise")
+
+
+@dataclasses.dataclass(frozen=True)
+class HeatDirectionConfusion:
+    """The 3×3 heat-direction confusion matrix (cut / hold / raise).
+
+    Per tick (with a previous setpoint), the model's recommended heat change vs
+    the previous real setpoint is classified cut / hold / raise (a small
+    dead-band around 0), as is the real roast's heat change at that tick; the
+    pair indexes one cell. This visualises anticipatory-cut agreement — the more
+    informative control-behaviour view than the imbalanced 2×2 drop matrix.
+
+    Attributes:
+        labels: The ordered class labels (rows = actual, columns = predicted).
+        matrix: A 3×3 count grid; ``matrix[actual][predicted]`` is the number of
+            ticks whose real move was ``labels[actual]`` and whose model move was
+            ``labels[predicted]``.
+        samples: Total ticks classified (ticks with a previous setpoint).
+    """
+
+    labels: tuple[str, str, str]
+    matrix: tuple[tuple[int, int, int], tuple[int, int, int], tuple[int, int, int]]
+    samples: int
+
+    @property
+    def agreement(self) -> float | None:
+        """Fraction on the diagonal (model move matched the real move)."""
+        if self.samples == 0:
+            return None
+        diagonal = sum(self.matrix[i][i] for i in range(3))
+        return round(diagonal / self.samples, 3)
+
+
+@dataclasses.dataclass(frozen=True)
 class LeverMetrics:
     """Heat-or-fan agreement vs the real setpoints.
 
@@ -353,6 +426,8 @@ class RoastScore:
     tick_count: int
     ok_count: int
     drop: DropMetrics
+    drop_confusion: DropConfusion
+    heat_direction_confusion: HeatDirectionConfusion
     heat: LeverMetrics
     fan: LeverMetrics
     phase_latency: list[PhaseLatency]
@@ -400,6 +475,86 @@ def _lever_metrics(
         mae=round(statistics.mean(abs_errors), 2) if abs_errors else 0.0,
         directional_agreement=round(dir_hits / dir_total, 3) if dir_total else None,
         directional_samples=dir_total,
+    )
+
+
+def drop_confusion(outcomes: list[TickOutcome]) -> DropConfusion:
+    """Build the 2×2 drop-decision confusion matrix from the ok ticks.
+
+    Predicted = the model's ``should_drop``; actual = the tick's
+    ``real_should_drop`` (at/after the real drop tick) — the *same* label
+    :func:`score_roast` uses for precision/recall/F1, so the TP/FP/FN counts here
+    match the :class:`DropMetrics` fields and only ``true_negatives`` is new.
+
+    Args:
+        outcomes: Per-tick outcomes; only ticks with a decision are counted.
+
+    Returns:
+        The :class:`DropConfusion` matrix.
+    """
+    tp = fp = tn = fn = 0
+    for o in outcomes:
+        if o.decision is None:
+            continue
+        predicted = o.decision.should_drop
+        actual = o.tick.real_should_drop
+        if predicted and actual:
+            tp += 1
+        elif predicted and not actual:
+            fp += 1
+        elif not predicted and actual:
+            fn += 1
+        else:
+            tn += 1
+    return DropConfusion(
+        true_positives=tp,
+        false_positives=fp,
+        true_negatives=tn,
+        false_negatives=fn,
+    )
+
+
+def heat_direction_confusion(outcomes: list[TickOutcome]) -> HeatDirectionConfusion:
+    """Build the 3×3 heat-direction (cut / hold / raise) confusion matrix.
+
+    Per tick with a previous real setpoint, classify the model's recommended
+    heat (vs that previous setpoint) and the real roast's heat at the tick (vs
+    the same previous setpoint) into cut / hold / raise with the shared
+    dead-band, and tally the (actual, predicted) cell. Rows are the actual move,
+    columns the model's move; the order follows :data:`HEAT_DIRECTION_LABELS`.
+
+    Args:
+        outcomes: Per-tick outcomes; only ok ticks with a previous setpoint are
+            classified.
+
+    Returns:
+        The :class:`HeatDirectionConfusion` matrix.
+    """
+    # _direction returns -1 / 0 / +1 → map to the row/column index 0 / 1 / 2.
+    index_of = {-1: 0, 0: 1, 1: 2}
+    grid = [[0, 0, 0], [0, 0, 0], [0, 0, 0]]
+    samples = 0
+    for o in outcomes:
+        if o.decision is None:
+            continue
+        prev = o.tick.prev_real_heat_percent
+        real_dir = _direction(prev, o.tick.real_heat_percent)
+        if real_dir is None:
+            continue
+        model_dir = _direction(prev, o.decision.target_heat)
+        # model_dir is non-None whenever real_dir is (same non-None prev).
+        assert model_dir is not None
+        grid[index_of[real_dir]][index_of[model_dir]] += 1
+        samples += 1
+    matrix = (
+        (grid[0][0], grid[0][1], grid[0][2]),
+        (grid[1][0], grid[1][1], grid[1][2]),
+        (grid[2][0], grid[2][1], grid[2][2]),
+    )
+    return HeatDirectionConfusion(
+        labels=HEAT_DIRECTION_LABELS,
+        matrix=matrix,
+        samples=samples,
     )
 
 
@@ -497,6 +652,8 @@ def score_roast(outcomes: list[TickOutcome], ground: GroundTruth, roast_name: st
         tick_count=len(outcomes),
         ok_count=len(ok),
         drop=drop,
+        drop_confusion=drop_confusion(ok),
+        heat_direction_confusion=heat_direction_confusion(ok),
         heat=heat,
         fan=fan,
         phase_latency=phase_latency,
@@ -547,6 +704,60 @@ async def replay_roast(
     return outcomes
 
 
+def render_drop_confusion_md(confusion: DropConfusion) -> list[str]:
+    """Render the 2×2 drop matrix as compact markdown lines.
+
+    The honest-framing note is left to the report header; this just lays the
+    counts out as a readable 2×2 with totals so the operator can reconcile it
+    against the F1/precision/recall already shown.
+
+    Args:
+        confusion: The drop confusion matrix.
+
+    Returns:
+        Markdown lines (a small table) for the report.
+    """
+    c = confusion
+    return [
+        "    drop confusion (rows = actual drop?, cols = model said drop):",
+        "    |            | model: drop | model: hold |",
+        "    |------------|-------------|-------------|",
+        f"    | real: drop |  TP={c.true_positives:<5}  |  FN={c.false_negatives:<5}  |",
+        f"    | real: hold |  FP={c.false_positives:<5}  |  TN={c.true_negatives:<5}  |",
+        f"    (total ticks={c.total}; TN dominates — read WITH drop-timing error)",
+    ]
+
+
+def render_heat_direction_confusion_md(confusion: HeatDirectionConfusion) -> list[str]:
+    """Render the 3×3 heat-direction matrix as compact markdown lines.
+
+    Rows are the real roast's heat move (cut / hold / raise); columns are the
+    model's recommended move. The diagonal is agreement.
+
+    Args:
+        confusion: The heat-direction confusion matrix.
+
+    Returns:
+        Markdown lines (a small table) for the report.
+    """
+    labels = confusion.labels
+    agreement = confusion.agreement
+    agreement_str = "—" if agreement is None else f"{agreement}"
+    lines = [
+        "    heat-direction confusion (rows = real move, cols = model move):",
+        f"    |  real \\ model | {labels[0]:>5} | {labels[1]:>5} | {labels[2]:>5} |",
+        "    |--------------|-------|-------|-------|",
+    ]
+    for i, label in enumerate(labels):
+        row = confusion.matrix[i]
+        lines.append(f"    | {label:>12} | {row[0]:>5} | {row[1]:>5} | {row[2]:>5} |")
+    lines.append(
+        f"    (n={confusion.samples}; diagonal agreement={agreement_str} — "
+        "the more informative control-behaviour view)"
+    )
+    return lines
+
+
 def score_to_json(score: RoastScore) -> dict[str, Any]:
     """Serialize a :class:`RoastScore` to a JSON-ready dict."""
     return {
@@ -555,6 +766,17 @@ def score_to_json(score: RoastScore) -> dict[str, Any]:
         "ok_count": score.ok_count,
         "development_time_ratio_truth": score.development_time_ratio_truth,
         "drop": dataclasses.asdict(score.drop),
+        "drop_confusion": {
+            **dataclasses.asdict(score.drop_confusion),
+            "total": score.drop_confusion.total,
+        },
+        "heat_direction_confusion": {
+            "labels": list(score.heat_direction_confusion.labels),
+            # rows = actual move, columns = model move (HEAT_DIRECTION_LABELS order).
+            "matrix": [list(row) for row in score.heat_direction_confusion.matrix],
+            "samples": score.heat_direction_confusion.samples,
+            "agreement": score.heat_direction_confusion.agreement,
+        },
         "heat": dataclasses.asdict(score.heat),
         "fan": dataclasses.asdict(score.fan),
         "phase_latency": [dataclasses.asdict(p) for p in score.phase_latency],

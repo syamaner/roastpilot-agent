@@ -80,6 +80,8 @@ from bakeoff_replay import (  # noqa: E402
     RoastScore,
     TickOutcome,
     build_ticks,
+    render_drop_confusion_md,
+    render_heat_direction_confusion_md,
     replay_roast,
     score_roast,
     score_to_json,
@@ -136,6 +138,7 @@ class Tier(enum.Enum):
     SPEED_AND_POWER = "speed-and-power"
     FAST_REASONING = "fast-reasoning"
     INCUMBENT = "incumbent"
+    PRIOR_FRONTIER = "prior-frontier"
 
 
 # Agent phases sampled, in roast order. The first-crack slot is the one #171
@@ -179,6 +182,9 @@ ROSTER: tuple[Candidate, ...] = (
     Candidate("deepseek/deepseek-v4-flash", Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
     Candidate("openai/gpt-4.1-mini", Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
     Candidate("openai/gpt-5.4-nano", Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
+    # Frontier-fast option: frontier quality at flash-ish speed — a prime FC-slot
+    # candidate (operator-approved bonus).
+    Candidate("anthropic/claude-opus-4.8-fast", Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
     # Speed & Power tier (high logic, 500 ms-1 s → charge / pre-FC slot).
     Candidate(
         "meta-llama/llama-3.3-70b-instruct",
@@ -186,12 +192,12 @@ ROSTER: tuple[Candidate, ...] = (
         (RoastPhase.ROASTING_PRE_FIRST_CRACK,),
     ),
     Candidate(
-        "qwen/qwen3.5-35b-instruct",
+        "qwen/qwen3.5-35b-a3b",
         Tier.SPEED_AND_POWER,
         (RoastPhase.ROASTING_PRE_FIRST_CRACK,),
     ),
     Candidate(
-        "qwen/qwen3.5-coder",
+        "qwen/qwen3-coder",
         Tier.SPEED_AND_POWER,
         (RoastPhase.ROASTING_PRE_FIRST_CRACK,),
     ),
@@ -202,13 +208,13 @@ ROSTER: tuple[Candidate, ...] = (
     ),
     # Fast-Reasoning tier (brief <think> before output → pre-FC, latency-risk).
     Candidate(
-        "deepseek/deepseek-r1-distill-qwen-32b",
+        "deepseek/deepseek-r1",
         Tier.FAST_REASONING,
         (RoastPhase.ROASTING_PRE_FIRST_CRACK,),
         latency_risk=True,
     ),
     Candidate(
-        "microsoft/phi-4",
+        "openai/o4-mini",
         Tier.FAST_REASONING,
         (RoastPhase.ROASTING_PRE_FIRST_CRACK,),
         latency_risk=True,
@@ -218,6 +224,35 @@ ROSTER: tuple[Candidate, ...] = (
         "anthropic/claude-opus-4.8",
         Tier.INCUMBENT,
         PHASE_ORDER,
+    ),
+    # Prior-frontier baselines — the rest of the D20 slate, measured in every
+    # phase (``PHASE_ORDER``) like the incumbent. These are the quality floor a
+    # new ultra-flash candidate must match or beat: if a sub-500 ms model cannot
+    # roast at least as well as these established frontier models did, the speed
+    # is not worth the quality regression.
+    Candidate(
+        "anthropic/claude-sonnet-4.6",
+        Tier.PRIOR_FRONTIER,
+        PHASE_ORDER,
+    ),
+    Candidate(
+        "openai/gpt-5.5",
+        Tier.PRIOR_FRONTIER,
+        PHASE_ORDER,
+    ),
+    Candidate(
+        "anthropic/claude-haiku-4.5",
+        Tier.PRIOR_FRONTIER,
+        PHASE_ORDER,
+    ),
+    # gpt-5-mini reasons before answering (~12-16 s) — included deliberately as
+    # the "quality competes but the latency fails the FC gate" case, so the
+    # operator can see a strong-advice / over-gate trade-off explicitly.
+    Candidate(
+        "openai/gpt-5-mini",
+        Tier.PRIOR_FRONTIER,
+        PHASE_ORDER,
+        latency_risk=True,
     ),
 )
 
@@ -424,6 +459,55 @@ def _recent_samples(rows: list[dict[str, Any]], index: int) -> list[dict[str, An
 # --- Availability sweep -----------------------------------------------------
 
 
+# Probe retry policy. A keyed re-probe showed the sweep had *transiently*
+# false-dropped a valid model (``meta-llama/llama-3.3-70b-instruct`` came back
+# reachable on a clean re-run). A single network blip must not exclude a real
+# candidate, so the sweep retries an UNREACHABLE probe a couple of times with a
+# short backoff before declaring the slug unavailable. A genuine 400/404 simply
+# fails again on each attempt — cheap and idempotent — and is still dropped.
+_PROBE_ATTEMPTS = 2
+_PROBE_BACKOFF_SECONDS = 1.0
+
+
+# Drop-reason classes for the report. The healthcheck error message already
+# distinguishes "does not exist" (400 invalid model ID) from "exists but lacks
+# the structured-output / tool-use the advisor requires" (404 no tool-use
+# endpoints) — the latter is a real candidate filter, separate from latency,
+# and it knocks out the whole fast-reasoning tier. ``transient`` is reserved for
+# a probe that failed every retry without a recognised provider verdict.
+DROP_REASON_INVALID_MODEL = "invalid-model-id"
+DROP_REASON_NO_TOOL_USE = "no-tool-use-endpoint"
+DROP_REASON_AUTH = "auth"
+DROP_REASON_OTHER = "other-or-transient"
+
+
+def classify_drop_reason(error: str | None) -> str:
+    """Classify a dropped slug's healthcheck error into a report reason.
+
+    Reads the provider error text the #168 healthcheck captured — the transport
+    verdict, not the slug — so the operator sees *why* a candidate was excluded:
+    a non-existent model (400 invalid ID), a model that exists but lacks the
+    tool-use / structured-output the advisor requires (404 no endpoints), an
+    auth problem, or an unrecognised / transient failure.
+
+    Args:
+        error: The captured healthcheck error message, or ``None``.
+
+    Returns:
+        One of the ``DROP_REASON_*`` constants.
+    """
+    text = (error or "").lower()
+    if "tool use" in text or "tool-use" in text or "no endpoints" in text:
+        return DROP_REASON_NO_TOOL_USE
+    if "not a valid model" in text or "invalid model" in text:
+        return DROP_REASON_INVALID_MODEL
+    if "400" in text and "model" in text:
+        return DROP_REASON_INVALID_MODEL
+    if "401" in text or "402" in text or "auth" in text or "api key" in text:
+        return DROP_REASON_AUTH
+    return DROP_REASON_OTHER
+
+
 @dataclasses.dataclass(frozen=True)
 class AvailabilityResult:
     """Outcome of probing one candidate slug for reachability.
@@ -431,39 +515,71 @@ class AvailabilityResult:
     Attributes:
         slug: The probed model slug.
         available: ``True`` if the slug resolved (kept), ``False`` if it was
-            dropped (404 / provider error).
+            dropped (400/404 / provider error after all retries).
         error: The captured error message when dropped, else ``None``.
+        attempts: How many probe attempts were made (>= 2 only when an earlier
+            attempt failed and was retried — surfaces a recovered transient).
+        reason: The :func:`classify_drop_reason` class when dropped, else
+            ``None``; tells the operator WHY the slug was excluded.
     """
 
     slug: str
     available: bool
     error: str | None = None
+    attempts: int = 1
+    reason: str | None = None
 
 
 async def probe_slug(
-    slug: str, prompt_version: str, reasoning: ReasoningEffort | None
+    slug: str,
+    prompt_version: str,
+    reasoning: ReasoningEffort | None,
+    *,
+    attempts: int = _PROBE_ATTEMPTS,
+    backoff_seconds: float = _PROBE_BACKOFF_SECONDS,
+    sleep: Callable[[float], Awaitable[None]] | None = None,
 ) -> AvailabilityResult:
     """Probe one slug's reachability on OpenRouter via the #168 healthcheck.
 
     Reuses :meth:`PydanticAIAdvisor.healthcheck` — a cheap, bounded, never-
     raising completion that decides reachability by the transport (a 404 model,
     a 401/402 key, an unreachable endpoint), not the content. A ``REACHABLE``
-    result keeps the slug; ``UNREACHABLE`` drops it and carries the error.
+    result keeps the slug; an ``UNREACHABLE`` result is **retried** up to
+    ``attempts`` times with ``backoff_seconds`` between tries, so a transient
+    blip does not false-drop a valid candidate (a keyed re-probe caught exactly
+    that). Only a slug that fails every attempt is dropped, carrying the last
+    error and a classified :func:`classify_drop_reason`.
 
     Args:
         slug: The candidate model slug to probe.
         prompt_version: The prompt version (so the probe builds the same agent
             shape the run uses; immaterial to reachability).
         reasoning: Reasoning effort, or ``None`` for the provider default.
+        attempts: Maximum probe attempts before declaring the slug unavailable.
+        backoff_seconds: Delay between attempts.
+        sleep: Async sleep used between attempts; defaults to
+            :func:`asyncio.sleep` (injectable so tests stay instant).
 
     Returns:
         The :class:`AvailabilityResult` for ``slug``.
     """
+    do_sleep = sleep if sleep is not None else asyncio.sleep
     advisor = PydanticAIAdvisor(_make_config(slug, prompt_version, reasoning))
-    health = await advisor.healthcheck()
-    if health.status is AdvisorHealthStatus.REACHABLE:
-        return AvailabilityResult(slug=slug, available=True)
-    return AvailabilityResult(slug=slug, available=False, error=health.error)
+    last_error: str | None = None
+    for attempt in range(1, attempts + 1):
+        health = await advisor.healthcheck()
+        if health.status is AdvisorHealthStatus.REACHABLE:
+            return AvailabilityResult(slug=slug, available=True, attempts=attempt)
+        last_error = health.error
+        if attempt < attempts:
+            await do_sleep(backoff_seconds)
+    return AvailabilityResult(
+        slug=slug,
+        available=False,
+        error=last_error,
+        attempts=attempts,
+        reason=classify_drop_reason(last_error),
+    )
 
 
 async def availability_sweep(
@@ -630,18 +746,41 @@ def render_availability(results: list[AvailabilityResult]) -> str:
         results: All per-slug probe results (kept and dropped).
 
     Returns:
-        A text block listing kept slugs and, separately, the dropped slugs with
-        their errors (so the operator sees exactly what was excluded and why).
+        A text block listing kept slugs (flagging any that needed a retry) and,
+        separately, the dropped slugs with their classified drop reason + error
+        (so the operator sees exactly what was excluded and WHY).
     """
-    kept = [r.slug for r in results if r.available]
+    kept = [r for r in results if r.available]
     dropped = [r for r in results if not r.available]
     lines = ["## Availability sweep (OpenRouter reachability)", ""]
-    lines.append(f"kept ({len(kept)}): " + (", ".join(kept) if kept else "(none)"))
+    kept_slugs = ", ".join(r.slug for r in kept) if kept else "(none)"
+    lines.append(f"kept ({len(kept)}): {kept_slugs}")
+    # Surface a recovered transient: a slug that only resolved after a retry.
+    recovered = [r for r in kept if r.attempts > 1]
+    for r in recovered:
+        lines.append(
+            f"  - NOTE {r.slug} resolved only on attempt {r.attempts} "
+            "(transient first failure — the retry saved a valid candidate)"
+        )
     if dropped:
         lines.append("")
-        lines.append(f"DROPPED ({len(dropped)}) — excluded from the comparison:")
+        lines.append(f"DROPPED ({len(dropped)}) — excluded from the comparison, with reason:")
         for r in dropped:
-            lines.append(f"  - {r.slug}: {r.error or 'unavailable'}")
+            # The DROP_REASON_* constants are themselves the human-readable
+            # labels, so the reason is shown directly (no label lookup needed).
+            label = r.reason or DROP_REASON_OTHER
+            lines.append(
+                f"  - {r.slug} [{label}] (after {r.attempts} attempt"
+                f"{'s' if r.attempts != 1 else ''}): {r.error or 'unavailable'}"
+            )
+        if any(r.reason == DROP_REASON_NO_TOOL_USE for r in dropped):
+            lines.append("")
+            lines.append(
+                "  Tool-use requirement: a model tagged [no-tool-use-endpoint] EXISTS but "
+                "lacks the structured-output / tool-use the advisor requires — a real "
+                "candidate filter distinct from latency, and it knocks out the whole "
+                "fast-reasoning tier here."
+            )
     else:
         lines.append("dropped (0): all roster slugs resolved")
     return "\n".join(lines)
@@ -935,6 +1074,15 @@ def render_replay_report(cells: list[ReplayCell], roasts: tuple[Path, ...]) -> s
         "points) + directional agreement (did the model move the lever the way the "
         "human did). Latency = median per phase, FC tightest. NO auto-pick."
     )
+    out.append("")
+    out.append(
+        "Confusion matrices below are derived purely from the per-tick replay data "
+        "(no extra calls). The 2×2 drop matrix is consistent with the F1/P/R above "
+        "but is heavily class-imbalanced — almost every tick is no-drop, so TN "
+        "dominates; read it WITH the drop-timing error, never alone. The 3×3 "
+        "heat-direction matrix (cut/hold/raise) is the more informative view of "
+        "control behaviour and anticipatory-cut agreement."
+    )
 
     prompt_versions = sorted({c.prompt_version for c in cells})
     for pv in prompt_versions:
@@ -946,6 +1094,8 @@ def render_replay_report(cells: list[ReplayCell], roasts: tuple[Path, ...]) -> s
             out.append(f"### {cell.slug} ({cell.tier}){risk}")
             for score in cell.scores:
                 out.append(_render_score_line(score))
+                out.extend(render_drop_confusion_md(score.drop_confusion))
+                out.extend(render_heat_direction_confusion_md(score.heat_direction_confusion))
             out.append("")
             out.append("  advice samples (operator judges quality — agreement ≠ correct):")
             for roast_name, picks in cell.samples.items():
