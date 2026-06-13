@@ -22,7 +22,7 @@ import { useState } from "react";
 
 import { cn } from "@/lib/cn";
 import type { MCPChildStatus, RoastPhase } from "@/lib/types";
-import { formatClock, formatTempC, PHASE_LABEL, phaseAccentVar } from "./format";
+import { formatClock, formatRoR, formatTempC, PHASE_LABEL, phaseAccentVar } from "./format";
 import type { FirstCrackData } from "./events";
 
 export interface RoastHeaderProps {
@@ -31,6 +31,13 @@ export interface RoastHeaderProps {
   elapsedSeconds: number | null;
   /** Seconds since the first-crack event (the development timer); null pre-FC. */
   developmentSeconds: number | null;
+  /**
+   * Live bean Rate of Rise (°C/min) from the current telemetry frame; null until
+   * the server has computed a rate. Shown from the start (incl. preheat) — it is
+   * real probe data; the charge (T0) marker on the curve flags where the
+   * meaningful post-charge RoR begins (#165, operator clarification 13 Jun).
+   */
+  beanRorCPerMin: number | null;
   profileName: string | null;
   /** Real FC detection from the `first_crack` event; null until it fires. */
   firstCrack: FirstCrackData | null;
@@ -42,6 +49,7 @@ export function RoastHeader({
   phase,
   elapsedSeconds,
   developmentSeconds,
+  beanRorCPerMin,
   profileName,
   firstCrack,
   mcpChild,
@@ -71,6 +79,14 @@ export function RoastHeader({
         </span>
 
         <Metric label="Roast Time" value={formatClock(elapsedSeconds)} testid="roast-timer" />
+        {/* Live Rate of Rise — the signal roasters steer by, and the same signal
+            the advisor reasons on (operator parity, #165). Bean °C/min, Celsius. */}
+        <Metric
+          label="RoR (bean)"
+          value={formatRoR(beanRorCPerMin)}
+          testid="ror-readout"
+          accent="var(--roast-nominal)"
+        />
         {developmentSeconds !== null && (
           <Metric
             label="Development"
@@ -104,15 +120,22 @@ function Metric({
   label,
   value,
   testid,
+  accent,
 }: {
   label: string;
   value: string;
   testid: string;
+  /** Optional CSS color for the value (e.g. the RoR readout matches its series). */
+  accent?: string;
 }): React.JSX.Element {
   return (
     <div className="flex flex-col">
       <span className="text-xs uppercase tracking-wide text-muted-foreground">{label}</span>
-      <span data-testid={testid} className="numeric text-lg font-semibold">
+      <span
+        data-testid={testid}
+        className="numeric text-lg font-semibold"
+        style={accent ? { color: accent } : undefined}
+      >
         {value}
       </span>
     </div>

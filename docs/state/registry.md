@@ -291,7 +291,17 @@ order:
    that cannot be fully autonomous.
 7. 🔴 **#166** advisor unavailable → **fail-closed after N** (operator's call) — needs
    **D30** + safety-reviewer.
-8. 🟢 **#165** RoR display (from preheat, mark charge) · **#164** richer bean identity.
+8. 🟢 **#165** RoR display (from preheat, mark charge) — **DONE** (PR `feature/165-ror-display`):
+   verified RoR was already plumbed bean RoR → telemetry/SSE → SPA and plotted by the shared
+   `LiveCurve` (right-axis green series + legend °C/min readout + cursor value) on dashboard
+   AND detail; **finished** it with an operator-facing **live RoR readout** (bean °C/min) in
+   the dashboard `RoastHeader` next to Roast Time, and confirmed the **charge (T0) marker**
+   (vertical line, x=0, label "T0") already annotates the turning point on both curves. Per
+   the 13 Jun operator clarification, pre-charge/preheat RoR is **shown, not hidden** (real
+   probe data) — the charge marker flags where the meaningful post-charge RoR begins. Display
+   only; no controller/safety/contract change. Tests: RoastHeader readout (incl. preheat +
+   null-safe), reducer covers pre-charge RoR plotted + T0 marker at x=0; dashboard Playwright
+   baselines refreshed (4 states, header now carries the readout). · **#164** richer bean identity.
 
 **Operator-dependencies for "all before next roast":** every code fix is buildable/testable
 with the **FakeAdvisor** (no key). Only the **#173 / #172 bake-off model+prompt selection**

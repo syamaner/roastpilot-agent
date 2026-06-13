@@ -61,6 +61,10 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   // band could be ranged off-screen — assert the rendered scale actually covers it.
   expect(hook.scales.c.max ?? 0).toBeGreaterThanOrEqual(200);
 
+  // The live RoR readout is surfaced as an operator-facing metric (#165) and is
+  // shown from the start incl. preheat (real probe data — not hidden pre-charge).
+  await expect(page.getByTestId("ror-readout")).toContainText("°C/min");
+
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-live.png");
 });
