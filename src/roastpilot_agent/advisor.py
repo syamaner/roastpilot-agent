@@ -25,7 +25,7 @@ from collections.abc import Sequence
 from enum import Enum
 from typing import Any, Literal, cast
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic_ai import (
     Agent,
     ModelAPIError,
@@ -115,8 +115,37 @@ class AdvisorUsage(BaseModel):
     reasoning_tokens: int | None = None
 
 
+class AdvisorDescriptor(BaseModel):
+    """Stable identity of an advisor for the decision trace (#167).
+
+    The provider/model/prompt-version triple that the controller persists with
+    every advisor row so post-roast diagnosis can read *which* configuration
+    produced (or failed to produce) a decision — the field that the #134
+    failure could not be recovered from the database. It is identity metadata,
+    not a provider concept the controller reasons over: the controller only
+    reads it to forward it to the store.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    provider: str
+    model: str
+    prompt_version: str
+
+
 class RoastAdvisor(ABC):
     """Advisor interface — the controller never depends on provider concepts."""
+
+    @property
+    @abstractmethod
+    def descriptor(self) -> AdvisorDescriptor:
+        """The advisor's identity for the decision trace (#167).
+
+        Provider, model slug, and prompt version — persisted with every
+        advisor decision so the trace records which configuration ran. Static
+        per advisor instance; no provider round trip.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
@@ -184,6 +213,11 @@ class FakeAdvisor(RoastAdvisor):
         #: non-blocking, error-capturing guarantee); ``None`` defaults to a
         #: deterministic ``REACHABLE`` so a no-key test just works.
         self._health = health
+
+    @property
+    def descriptor(self) -> AdvisorDescriptor:
+        """The fake advisor's fixed trace identity (#167)."""
+        return AdvisorDescriptor(provider="fake", model="fake-model", prompt_version="fake")
 
     async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
         """Return the next scripted decision or raise the next scripted failure."""
@@ -477,6 +511,15 @@ class PydanticAIAdvisor(RoastAdvisor):
             output_type=_RawRoastDecision,
             instructions=instructions_for(config.prompt_version),
             model_settings=settings,
+        )
+
+    @property
+    def descriptor(self) -> AdvisorDescriptor:
+        """The configured provider/model/prompt-version trace identity (#167)."""
+        return AdvisorDescriptor(
+            provider=self._config.provider,
+            model=self._config.model_slug,
+            prompt_version=self._config.prompt_version,
         )
 
     async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:

@@ -21,12 +21,15 @@ from typing import Literal, Protocol
 
 from roastpilot_agent.advisor import (
     AdvisorContext,
+    AdvisorDescriptor,
     AdvisorMalformedOutputError,
     AdvisorUnsafeOutputError,
     RoastAdvisor,
+    RoastDecision,
 )
 from roastpilot_agent.config import ControllerConfig
 from roastpilot_agent.models import (
+    AdvisorTraceStatus,
     RoastCommand,
     RoastEventKind,
     RoastEventSource,
@@ -172,8 +175,32 @@ class SnapshotSink(Protocol):
         """Persist the raw telemetry snapshot for this tick."""
         ...
 
-    async def persist_evaluation(self, evaluation: SafetyEvaluation) -> None:
-        """Persist a safety evaluation."""
+    async def persist_evaluation(self, evaluation: SafetyEvaluation) -> int | None:
+        """Persist a safety evaluation.
+
+        Returns the persisted row id so an advisor decision can link to the
+        verdict it produced (#167). Sinks that do not persist (tests, no-op
+        sinks) may return ``None``.
+        """
+        ...
+
+    async def persist_advisor_decision(
+        self,
+        *,
+        descriptor: AdvisorDescriptor,
+        context: AdvisorContext,
+        latency_ms: int | None,
+        decision: RoastDecision | None,
+        status: AdvisorTraceStatus,
+        safety_evaluation_id: int | None,
+    ) -> None:
+        """Persist one advisory outcome — the advisor decision trace (#167).
+
+        Records the provider/model/prompt-version (from ``descriptor``), the
+        call status, latency, the ``RoastDecision`` (``None`` on failure), and
+        the id of the safety evaluation the call produced, so the trace joins
+        each advisor decision to its verdict.
+        """
         ...
 
 
@@ -761,6 +788,10 @@ class RoastController:
         # for type-narrowing and as a guard if ever called from elsewhere.
         if self._advisor is None or self._profile is None:  # pragma: no cover
             return
+        # The trace identity (provider/model/prompt) persisted with the advisor
+        # decision on every outcome path below (#167) — captured once, here,
+        # where the advisor is narrowed non-None.
+        descriptor = self._advisor.descriptor
         if telemetry is None:
             # Triggered (a manual request, or the heartbeat in a terminal
             # phase) but the sensor read came back empty this tick — the
@@ -787,29 +818,43 @@ class RoastController:
             )
             return
         context = self._build_advisor_context(telemetry)
+        started = self._clock()
         try:
             decision = await asyncio.wait_for(
                 self._advisor.get_recommendation(context),
                 timeout=self._config.advisory_timeout_seconds,
             )
         except TimeoutError:
-            await self._record_advisor_failure("timeout", trigger)
+            await self._record_advisor_failure("timeout", trigger, context, started, descriptor)
             return
         except AdvisorMalformedOutputError:
-            await self._record_advisor_failure("malformed", trigger)
+            await self._record_advisor_failure("malformed", trigger, context, started, descriptor)
             return
         except AdvisorUnsafeOutputError:
-            await self._record_advisor_failure("unsafe", trigger)
+            await self._record_advisor_failure("unsafe", trigger, context, started, descriptor)
             return
         except Exception:
-            await self._record_advisor_failure("provider_error", trigger)
+            await self._record_advisor_failure(
+                "provider_error", trigger, context, started, descriptor
+            )
             return
+        latency_ms = self._elapsed_ms(started)
         evaluation = self._safety.evaluate_command(
             requested_heat=decision.target_heat,
             requested_fan=decision.target_fan,
             seconds_since_last_command=self._seconds_since_last_command(),
         )
-        await self._snapshots.persist_evaluation(evaluation)
+        safety_evaluation_id = await self._snapshots.persist_evaluation(evaluation)
+        # Persist the advisor decision and link it to the verdict it produced
+        # (#167) — the trace lost the provider/model/decision before this wiring.
+        await self._snapshots.persist_advisor_decision(
+            descriptor=descriptor,
+            context=context,
+            latency_ms=latency_ms,
+            decision=decision,
+            status="ok",
+            safety_evaluation_id=safety_evaluation_id,
+        )
         self._events.emit(
             RoastEventKind.ADVISORY,
             {
@@ -856,17 +901,40 @@ class RoastController:
         self,
         status: Literal["timeout", "malformed", "unsafe", "provider_error"],
         trigger: AdvisoryTrigger,
+        context: AdvisorContext,
+        started: float,
+        descriptor: AdvisorDescriptor,
     ) -> None:
+        latency_ms = self._elapsed_ms(started)
         evaluation = self._safety.evaluate_advisor_failure(
             status=status,
             current_heat=self._current_heat,
             current_fan=self._current_fan,
         )
-        await self._snapshots.persist_evaluation(evaluation)
+        safety_evaluation_id = await self._snapshots.persist_evaluation(evaluation)
+        # Persist the failed advisor outcome with no decision, linked to the
+        # REJECT it produced (#167) — the #134 roast lost every failure's
+        # provider/model/status this way. ``unsafe`` (out-of-bounds output) has
+        # no distinct trace status; it stores as ``malformed`` (a validation
+        # failure), while the safety evaluation keeps its own rule for the
+        # verdict stream.
+        stored_status: AdvisorTraceStatus = "malformed" if status == "unsafe" else status
+        await self._snapshots.persist_advisor_decision(
+            descriptor=descriptor,
+            context=context,
+            latency_ms=latency_ms,
+            decision=None,
+            status=stored_status,
+            safety_evaluation_id=safety_evaluation_id,
+        )
         self._events.emit(
             RoastEventKind.ADVISORY,
             {"trigger": trigger.value, "evaluation": evaluation.model_dump(mode="json")},
         )
+
+    def _elapsed_ms(self, started: float) -> int:
+        """Milliseconds elapsed since ``started`` on the controller clock."""
+        return max(0, int((self._clock() - started) * 1000))
 
     def load_profile(self, profile: RoastProfile) -> None:
         """Set the active roast profile (test/setup surface; start_run is

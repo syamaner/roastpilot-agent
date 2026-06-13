@@ -201,6 +201,19 @@ async def test_twelve_step_vertical_slice_against_fake_mcp(
         "command in events"
     )
     assert timeline.commands, "operator commands in command_log"
+    # The advisor decision trace is persisted (#167): the fake-advisor 'ok'
+    # decision wrote an advisor_decisions row carrying the decision and linked
+    # to the safety verdict it produced. An empty table here is the original
+    # bug — record_advisor_decision had zero call sites.
+    assert timeline.advisor_decisions, "advisor decision trace persisted"
+    ok_rows = [a for a in timeline.advisor_decisions if a.status == "ok"]
+    assert ok_rows, "an ok advisor decision was persisted"
+    ok = ok_rows[0]
+    assert ok.decision is not None, "the RoastDecision is recorded"
+    assert ok.provider == "fake" and ok.model == "fake-model"
+    assert ok.safety_evaluation_id is not None, "linked to its safety verdict"
+    linked_ids = {s.tick for s in timeline.safety_evaluations}
+    assert linked_ids, "safety verdicts exist to link to"
     event_kinds = {e.kind for e in timeline.events}
     assert {
         RoastEventKind.RUN_STARTED,
@@ -227,3 +240,67 @@ async def test_twelve_step_vertical_slice_against_fake_mcp(
     assert recovered.export_manifest is not None
     # A completed run is not active, so a fresh roast is unblocked after restart.
     assert (await store.active_run()) is None
+
+
+@pytest.mark.asyncio
+async def test_provider_error_persists_advisor_row_with_null_decision(
+    store: RoastStore, tmp_path: Path
+) -> None:
+    """A forced advisor ``provider_error`` writes an advisor_decisions row
+    (#167): ``status='provider_error'``, ``decision_json IS NULL``, and linked
+    to the REJECT safety verdict the failure produced — the #134 trace that was
+    thrown away. Backstops the failure path the success roast cannot exercise."""
+    from roastpilot_agent.advisor import AdvisorFailureMode
+
+    clock = FakeClock()
+    config = AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0))
+    mcp = FakeMCPClient(
+        [_reading(bean=205.0, env=210.0, t0_detected=True, first_crack_detected=True)],
+        export_result=_export_result(tmp_path),
+    )
+    # Every advisory call fails as a provider error (the #134 failure mode).
+    advisor = FakeAdvisor([AdvisorFailureMode.PROVIDER_ERROR] * 8)
+    service = RoastService(
+        store,
+        config=config,
+        roaster=mcp,
+        advisor=advisor,
+        exporter=mcp,
+        run_loop=False,
+        clock=clock,
+    )
+
+    async def tick() -> bool:
+        assert service.runner is not None
+        clock.advance(3.0)
+        return await service.runner.tick_once()
+
+    detail = await service.start_roast(_profile())
+    run_id = detail.id
+    # Drive to DEVELOPMENT (an advice phase) and request advice; the advisor
+    # raises a provider error, which becomes a REJECT verdict + a failure row.
+    mcp.frames = [_reading(bean=95.0, env=150.0, t0_detected=True)]
+    for _ in range(config.controller.t0_debounce_ticks):
+        await tick()
+    mcp.frames = [_reading(bean=196.0, env=205.0, t0_detected=True, first_crack_detected=True)]
+    await tick()
+    mcp.frames = [_reading(bean=205.0, env=210.0, t0_detected=True, first_crack_detected=True)]
+    await tick()
+
+    timeline = await service.timeline(run_id)
+    failures = [a for a in timeline.advisor_decisions if a.status == "provider_error"]
+    assert failures, "the provider_error advisor outcome was persisted"
+    failure = failures[0]
+    assert failure.decision is None, "no decision on a provider error"
+    assert failure.safety_evaluation_id is not None, "linked to the REJECT verdict"
+
+    # The linked id resolves to a real safety_evaluations row, and it is a REJECT.
+    async with store.connection.execute(
+        "SELECT verdict FROM safety_evaluations WHERE id = ?",
+        (failure.safety_evaluation_id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None, "the linked safety_evaluation row exists"
+    assert row[0] == "reject", "an advisor failure rejects and holds (E3-S3)"
+
+    await service.shutdown()

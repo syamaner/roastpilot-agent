@@ -32,6 +32,7 @@ from pydantic_ai.models.openai import OpenAIChatModel
 
 from roastpilot_agent.advisor import (
     AdvisorContext,
+    AdvisorDescriptor,
     AdvisorFailureMode,
     AdvisorMalformedOutputError,
     AdvisorProviderError,
@@ -291,6 +292,10 @@ async def test_real_timeout_path_never_blocks_the_tick() -> None:
     still completes with the hold fallback."""
 
     class NeverAdvisor(RoastAdvisor):
+        @property
+        def descriptor(self) -> AdvisorDescriptor:
+            return AdvisorDescriptor(provider="test", model="never", prompt_version="t")
+
         async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
@@ -346,6 +351,22 @@ def _function_model_text(text: str) -> FunctionModel:
 def _advisor_with(model: FunctionModel, **config_kwargs: object) -> PydanticAIAdvisor:
     config = AdvisorConfig(**config_kwargs)  # type: ignore[arg-type]
     return PydanticAIAdvisor(config, model=model)
+
+
+def test_pydantic_advisor_descriptor_reflects_config() -> None:
+    """The advisor's trace descriptor (#167) carries the configured
+    provider/model-slug/prompt-version — the identity persisted with every
+    advisor decision so the #134-style failure is diagnosable from the DB."""
+    advisor = _advisor_with(
+        _function_model_text("{}"),
+        provider="anthropic",
+        model_slug="anthropic/claude-opus-4.8",
+        prompt_version="v2",
+    )
+    descriptor = advisor.descriptor
+    assert descriptor.provider == "anthropic"
+    assert descriptor.model == "anthropic/claude-opus-4.8"
+    assert descriptor.prompt_version == "v2"
 
 
 # build_model factory: provider → Model for every enum value.

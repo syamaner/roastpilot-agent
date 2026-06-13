@@ -153,13 +153,15 @@ async def test_probe_advisor_health_is_bounded(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_advisor_healthcheck_receives_no_mcp_write_tools() -> None:
-    """The advisor protocol exposes only advice + reachability — never any MCP
-    write surface (the advisory-only invariant). A reviewer-readable assertion
-    that the probe capability did not smuggle hardware control onto the advisor."""
+    """The advisor protocol exposes only advice, reachability, and the trace
+    descriptor — never any MCP write surface (the advisory-only invariant). A
+    reviewer-readable assertion that neither the probe capability nor the #167
+    decision-trace ``descriptor`` smuggled hardware control onto the advisor.
+    ``descriptor`` is read-only identity metadata (provider/model/prompt)."""
     from roastpilot_agent.advisor import RoastAdvisor
 
     methods = {name for name in dir(RoastAdvisor) if not name.startswith("_")}
-    assert methods == {"get_recommendation", "healthcheck"}
+    assert methods == {"descriptor", "get_recommendation", "healthcheck"}
 
 
 # --- build_live_service ---------------------------------------------------------
