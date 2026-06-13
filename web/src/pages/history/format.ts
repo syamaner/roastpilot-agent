@@ -13,7 +13,7 @@ export const ANY = "all";
 
 /** Filter state: search text (bean), an outcome, and a minimum star rating. */
 export interface HistoryFilters {
-  /** Case-insensitive substring match against bean origin + varietal. */
+  /** Case-insensitive substring match against bean origin + varietal + country (#164). */
   search: string;
   /** A `RoastOutcome` value, or `ANY`. */
   outcome: RoastOutcome | typeof ANY;
@@ -33,6 +33,8 @@ export const EMPTY_FILTERS: HistoryFilters = {
  * works. The visual cell renders these on separate lines.
  */
 export function beanLabel(run: RoastSummary): string {
+  // species excluded intentionally: of the #164 identity fields only country is
+  // searchable (species is a 4-value tag, not a useful free-text search term).
   return [run.bean_origin, run.bean_varietal, run.country]
     .filter((part): part is string => typeof part === "string" && part.length > 0)
     .join(" ");

@@ -165,8 +165,10 @@ export interface RoastSummary {
   outcome: RoastOutcome | null;
   bean_origin: string;
   bean_varietal: string | null;
-  // Bean identity (#164) projected from the frozen profile; optional/defaulted
-  // for back-compat with pre-#164 runs.
+  // Bean identity (#164) projected from the frozen profile; typed optional for
+  // forward/back-compat tolerance (a pre-#164 build or fixture may omit them).
+  // The current server always serializes `is_blend` (it defaults to `false`),
+  // so consumers treat a missing value identically to `false`.
   country?: string | null;
   bean_species?: BeanSpecies | null;
   is_blend?: boolean;
