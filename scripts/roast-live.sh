@@ -35,8 +35,14 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 python -m pip install -q -e . --group dev
-if [ ! -f web/dist/index.html ]; then
-  ( cd web && npm install && npm run build )
+# Build the SPA if web/dist is missing OR stale vs the source — so a `git pull`
+# that changed web/ doesn't keep serving an old bundle (e.g. a pre-dashboard stub).
+if [ ! -f web/dist/index.html ] || \
+   [ -n "$(find web/src web/package.json -type f -newer web/dist/index.html -print -quit 2>/dev/null)" ]; then
+  echo "  building SPA (web/dist missing or stale)…"
+  ( cd web && { [ -d node_modules ] || npm install; }; npm run build )
+else
+  echo "  SPA up to date."
 fi
 
 IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
