@@ -240,17 +240,21 @@ async def test_valid_decision_is_evaluated_and_applied() -> None:
 @pytest.mark.parametrize(
     ("mode", "rule"),
     [
+        # Provider-reachable failures (model misbehaved): unchanged hold rule.
         (AdvisorFailureMode.MALFORMED, "advisor_malformed"),
         (AdvisorFailureMode.UNSAFE, "advisor_unsafe"),
-        (AdvisorFailureMode.TIMEOUT, "advisor_timeout"),
-        (AdvisorFailureMode.PROVIDER_ERROR, "advisor_provider_error"),
+        # Availability failures (1st, below the D30 fail-closed threshold):
+        # tolerated REJECT, still the deterministic hold.
+        (AdvisorFailureMode.TIMEOUT, "advisor_unavailable_tolerated"),
+        (AdvisorFailureMode.PROVIDER_ERROR, "advisor_unavailable_tolerated"),
     ],
 )
 async def test_failure_outcomes_reject_and_hold_current_targets(
     mode: AdvisorFailureMode, rule: str
 ) -> None:
     """Every failure mode ⇒ REJECT with the named rule, no write issued, the
-    rejected recommendation persisted and an ADVISORY event emitted."""
+    rejected recommendation persisted and an ADVISORY event emitted (a single
+    failure is below the D30 fail-closed threshold for every mode)."""
     harness = harness_in_development(advisor=FakeAdvisor([mode]))
     harness.controller.request_advisory()
     await harness.controller.tick()
@@ -310,7 +314,8 @@ async def test_real_timeout_path_never_blocks_the_tick() -> None:
     harness.controller.request_advisory()
     await asyncio.wait_for(harness.controller.tick(), timeout=1.0)
 
-    assert harness.sink.evaluations[-1].rule == "advisor_timeout"
+    # 1st timeout: availability failure below the D30 threshold → tolerated.
+    assert harness.sink.evaluations[-1].rule == "advisor_unavailable_tolerated"
     assert harness.sink.evaluations[-1].verdict is SafetyVerdict.REJECT
     assert harness.executor.targets == []
 

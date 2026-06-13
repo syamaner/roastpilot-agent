@@ -6,6 +6,8 @@ Command validation (E3-S3), e-stop plumbing (E3-S4), and phase/source
 validity (E3-S5, D16) extend this suite.
 """
 
+from typing import Literal
+
 import pytest
 
 from roastpilot_agent.config import SafetyLimits
@@ -390,12 +392,15 @@ def test_drop_recommendation_rejected_outside_development(
     assert evaluation.rule == "drop_eligibility"
 
 
-@pytest.mark.parametrize("status", ["timeout", "malformed", "unsafe", "provider_error"])
+@pytest.mark.parametrize("status", ["malformed", "unsafe"])
 def test_advisor_failure_rejects_and_holds_current_targets(
-    policy: SafetyPolicy, status: str
+    policy: SafetyPolicy, status: Literal["malformed", "unsafe"]
 ) -> None:
+    # timeout / provider_error are the availability class (D30): they route to
+    # evaluate_advisor_availability, not here — this rule is now the
+    # reachable-but-misbehaving (malformed / unsafe) hold only.
     evaluation = policy.evaluate_advisor_failure(
-        status=status,  # pyright: ignore[reportArgumentType]
+        status=status,
         current_heat=65,
         current_fan=55,
     )
@@ -403,6 +408,59 @@ def test_advisor_failure_rejects_and_holds_current_targets(
     assert evaluation.rule == f"advisor_{status}"
     assert evaluation.adjusted_heat == 65
     assert evaluation.adjusted_fan == 55
+
+
+@pytest.mark.parametrize("failures", [1, 2])
+def test_advisor_availability_below_threshold_holds_current_targets(
+    policy: SafetyPolicy, failures: int
+) -> None:
+    """D30 (#166): availability failures below the default threshold (3) are
+    tolerated — REJECT holding the current targets, exactly the prior
+    hold-current behavior."""
+    evaluation = policy.evaluate_advisor_availability(
+        consecutive_failures=failures, current_heat=70, current_fan=30
+    )
+    assert evaluation.verdict is SafetyVerdict.REJECT
+    assert evaluation.rule == "advisor_unavailable_tolerated"
+    assert evaluation.adjusted_heat == 70
+    assert evaluation.adjusted_fan == 30
+
+
+def test_advisor_availability_at_threshold_fails_closed_to_recovery(policy: SafetyPolicy) -> None:
+    """At the threshold the verdict is RECOVERY — heat 0 %, the configured safe
+    fan — so the controller enters operator_recovery_required (not a fault)."""
+    evaluation = policy.evaluate_advisor_availability(
+        consecutive_failures=3, current_heat=70, current_fan=30
+    )
+    assert evaluation.verdict is SafetyVerdict.RECOVERY
+    assert evaluation.rule == "advisor_unavailable_exhausted"
+    assert evaluation.adjusted_heat == 0
+    assert evaluation.adjusted_fan == SafetyLimits().overrun_safe_fan_percent
+
+
+def test_advisor_availability_threshold_is_configurable() -> None:
+    """``max_consecutive_advisor_failures`` arms the stop sooner/later."""
+    policy = SafetyPolicy(SafetyLimits(max_consecutive_advisor_failures=2))
+    assert (
+        policy.evaluate_advisor_availability(
+            consecutive_failures=1, current_heat=50, current_fan=50
+        ).verdict
+        is SafetyVerdict.REJECT
+    )
+    assert (
+        policy.evaluate_advisor_availability(
+            consecutive_failures=2, current_heat=50, current_fan=50
+        ).verdict
+        is SafetyVerdict.RECOVERY
+    )
+
+
+def test_advisor_availability_rejects_zero_failures(policy: SafetyPolicy) -> None:
+    """The rule is only ever called after a failure: 0 is a programming error."""
+    with pytest.raises(ValueError):
+        policy.evaluate_advisor_availability(
+            consecutive_failures=0, current_heat=50, current_fan=50
+        )
 
 
 def test_e3_s3_evaluations_are_persisted_ready(policy: SafetyPolicy) -> None:
@@ -417,7 +475,10 @@ def test_e3_s3_evaluations_are_persisted_ready(policy: SafetyPolicy) -> None:
             requested_heat=70, requested_fan=40, seconds_since_last_command=0.1
         ),
         policy.evaluate_drop_recommendation(phase=RoastPhase.PREHEATING),
-        policy.evaluate_advisor_failure(status="timeout", current_heat=50, current_fan=50),
+        policy.evaluate_advisor_failure(status="malformed", current_heat=50, current_fan=50),
+        policy.evaluate_advisor_availability(
+            consecutive_failures=1, current_heat=50, current_fan=50
+        ),
     ]
     for evaluation in evaluations:
         assert evaluation.rule
@@ -502,7 +563,10 @@ def test_every_rule_method_is_persisted_ready(policy: SafetyPolicy) -> None:
             requested_heat=70, requested_fan=40, seconds_since_last_command=None
         ),
         policy.evaluate_drop_recommendation(phase=RoastPhase.DEVELOPMENT),
-        policy.evaluate_advisor_failure(status="timeout", current_heat=50, current_fan=50),
+        policy.evaluate_advisor_failure(status="malformed", current_heat=50, current_fan=50),
+        policy.evaluate_advisor_availability(
+            consecutive_failures=4, current_heat=50, current_fan=50
+        ),
         policy.evaluate_emergency_stop(phase=RoastPhase.FAULTED),
     ]
     for evaluation in evaluations:

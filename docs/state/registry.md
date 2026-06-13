@@ -289,19 +289,18 @@ order:
    gpt-5-mini-reasoning-off); **re-run bake-off weighting latency post-FC**; new D-number.
    **Operator-gated** (needs a valid key + operator judgment + API cost) — the one piece
    that cannot be fully autonomous.
-7. 🔴 **#166** advisor unavailable → **fail-closed after N** (operator's call) — needs
-   **D30** + safety-reviewer.
-8. 🟢 **#165** RoR display (from preheat, mark charge) — **DONE** (PR `feature/165-ror-display`):
-   verified RoR was already plumbed bean RoR → telemetry/SSE → SPA and plotted by the shared
-   `LiveCurve` (right-axis green series + legend °C/min readout + cursor value) on dashboard
-   AND detail; **finished** it with an operator-facing **live RoR readout** (bean °C/min) in
-   the dashboard `RoastHeader` next to Roast Time, and confirmed the **charge (T0) marker**
-   (vertical line, x=0, label "T0") already annotates the turning point on both curves. Per
-   the 13 Jun operator clarification, pre-charge/preheat RoR is **shown, not hidden** (real
-   probe data) — the charge marker flags where the meaningful post-charge RoR begins. Display
-   only; no controller/safety/contract change. Tests: RoastHeader readout (incl. preheat +
-   null-safe), reducer covers pre-charge RoR plotted + T0 marker at x=0; dashboard Playwright
-   baselines refreshed (4 states, header now carries the readout). · **#164** richer bean identity.
+7. ✅ **#166** advisor unavailable → **fail-closed after N** (operator's call) — **DONE**
+   (PR #185, **D30**, safety-reviewer **PASS**). N consecutive *availability* failures
+   (`provider_error`/`timeout`, default N=3) → heat 0 % + overrun-safe fan +
+   `operator_recovery_required` via a **RECOVERY** verdict; `malformed`/`unsafe` are
+   **transparent** (don't count or reset the streak); paused advisor never accrues; resets
+   on `ok`/`start_run`/`operator_resume`.
+8. 🟢 **#165** RoR display (from preheat, mark charge) — **DONE** (PR #186): RoR was already
+   plumbed bean RoR → telemetry/SSE → SPA and plotted by the shared `LiveCurve` (right-axis
+   green series + legend °C/min + cursor) on dashboard AND detail; finished with an
+   operator-facing live RoR readout in the dashboard `RoastHeader` + confirmed the charge
+   (T0) marker; pre-charge RoR **shown, not hidden** (13 Jun operator clarification). Display
+   only. · **#164** richer bean identity — **LAST remaining** (runs ∥ #173-mechanism).
 
 **Operator-dependencies for "all before next roast":** every code fix is buildable/testable
 with the **FakeAdvisor** (no key). Only the **#173 / #172 bake-off model+prompt selection**

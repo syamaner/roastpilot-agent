@@ -444,6 +444,13 @@ class RoastController:
         self._profile: RoastProfile | None = None
         self._run_started_monotonic: float | None = None
         self._consecutive_read_failures = 0
+        # D30 (#166): consecutive advisor *availability* failures
+        # (provider_error / timeout). Incremented in _record_advisor_failure on
+        # those statuses only, reset to 0 on a successful ``ok`` decision and on
+        # run/recovery lifecycle edges. At max_consecutive_advisor_failures the
+        # controller fails closed into operator_recovery_required. malformed /
+        # unsafe (provider-reachable) never touch this counter.
+        self._consecutive_advisor_failures = 0
         self._advisory_requested = False
         self._advisory_policy = AdvisoryCallPolicy(config)
         self._current_heat = 0
@@ -848,6 +855,13 @@ class RoastController:
                 "provider_error", trigger, context, started, descriptor
             )
             return
+        # A reachable advisor that returned a usable decision (``ok``) clears
+        # the availability-failure streak (D30, #166): the sustained-outage
+        # stop only arms on *consecutive* provider_error/timeout failures, so
+        # one good call resets the count. Reset here — before the command
+        # verdict — because availability is about reaching the advisor, not
+        # whether its advice was then allowed/clamped.
+        self._consecutive_advisor_failures = 0
         latency_ms = self._elapsed_ms(started)
         evaluation = self._safety.evaluate_command(
             requested_heat=decision.target_heat,
@@ -916,14 +930,27 @@ class RoastController:
         descriptor: AdvisorDescriptor,
     ) -> None:
         latency_ms = self._elapsed_ms(started)
-        evaluation = self._safety.evaluate_advisor_failure(
-            status=status,
-            current_heat=self._current_heat,
-            current_fan=self._current_fan,
-        )
+        # D30 (#166): only the *availability* failures (provider_error /
+        # timeout) accrue toward the sustained-outage stop. malformed / unsafe
+        # are provider-*reachable* (the model misbehaved, a different class) —
+        # they keep the unchanged hold-current REJECT and never touch the
+        # counter, so they neither trip nor reset the availability streak.
+        if status in ("timeout", "provider_error"):
+            self._consecutive_advisor_failures += 1
+            evaluation = self._safety.evaluate_advisor_availability(
+                consecutive_failures=self._consecutive_advisor_failures,
+                current_heat=self._current_heat,
+                current_fan=self._current_fan,
+            )
+        else:
+            evaluation = self._safety.evaluate_advisor_failure(
+                status=status,
+                current_heat=self._current_heat,
+                current_fan=self._current_fan,
+            )
         safety_evaluation_id = await self._snapshots.persist_evaluation(evaluation)
         # Persist the failed advisor outcome with no decision, linked to the
-        # REJECT it produced (#167) — the #134 roast lost every failure's
+        # verdict it produced (#167) — the #134 roast lost every failure's
         # provider/model/status this way. ``unsafe`` (out-of-bounds output) has
         # no distinct trace status; it stores as ``malformed`` (a validation
         # failure), while the safety evaluation keeps its own rule for the
@@ -941,6 +968,18 @@ class RoastController:
             RoastEventKind.ADVISORY,
             {"trigger": trigger.value, "evaluation": evaluation.model_dump(mode="json")},
         )
+        # A sustained-outage RECOVERY verdict fails closed through the same
+        # safety-action path as the telemetry-stage rules (D30, #166): drive
+        # heat 0 % / safe fan and enter operator_recovery_required. This never
+        # auto-resumes heat/fan — the operator must explicitly resume / drop /
+        # cool (the architecture invariant, preserved). Routing through
+        # _act_on_safety reuses the recovery machinery; it acts on (does not
+        # re-persist) the evaluation already persisted above.
+        if evaluation.verdict is SafetyVerdict.RECOVERY:
+            # The stop-tick return is deliberately discarded: this is already
+            # the last step of the advisory path (the caller returns straight
+            # after), so there is no remaining tick work to short-circuit.
+            _ = await self._act_on_safety(evaluation)
 
     def _elapsed_ms(self, started: float) -> int:
         """Milliseconds elapsed since ``started`` on the controller clock."""
@@ -974,6 +1013,7 @@ class RoastController:
         # New run: advisory baselines reset too, so the first consult in the
         # new roast fires on its own merits, not on a previous run's timer.
         self._advisory_policy = AdvisoryCallPolicy(self._config)
+        self._consecutive_advisor_failures = 0  # new run: availability streak resets (D30)
         try:
             await self._executor.start_session()
         except Exception:
@@ -1045,6 +1085,11 @@ class RoastController:
         separately commanded — this method never writes hardware."""
         if self._phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED:
             raise InvalidTransitionError(self._phase, target)
+        # The operator has dealt with the recovery state (e.g. a sustained
+        # advisor outage, D30): clear the availability streak so a resumed
+        # roast starts the counter fresh rather than re-tripping on the next
+        # single failure.
+        self._consecutive_advisor_failures = 0
         self.transition_to(target)  # table gates targets; starting is never legal
         self._events.emit(RoastEventKind.RECOVERY_ACKNOWLEDGED, {"resumed_to": target.value})
 

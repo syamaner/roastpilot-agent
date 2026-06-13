@@ -435,17 +435,24 @@ class SafetyPolicy:
     def evaluate_advisor_failure(
         self,
         *,
-        status: Literal["timeout", "malformed", "unsafe", "provider_error"],
+        status: Literal["malformed", "unsafe"],
         current_heat: int,
         current_fan: int,
     ) -> SafetyEvaluation:
-        """Advisor failure ⇒ rejected recommendation ⇒ deterministic fallback.
+        """Provider-reachable advisor failure ⇒ rejected recommendation ⇒ hold.
 
-        Timeout, malformed output, unsafe output, or a provider error never
-        blocks the tick (orchestration plan § Advisory Call Frequency): the
-        recommendation is REJECTed and the fallback is to hold the current
-        targets — the adjusted values echo the heat/fan already in effect.
-        Every outcome is persisted via the decision trace (plan §5).
+        The reachable-but-misbehaving failures — ``malformed`` (output the
+        model could not produce) and ``unsafe`` (a well-shaped but
+        out-of-bounds command) — never block the tick (orchestration plan
+        § Advisory Call Frequency): the recommendation is REJECTed and the
+        fallback holds the current targets (the adjusted values echo the
+        heat/fan already in effect). Every outcome is persisted via the
+        decision trace (plan §5).
+
+        The *availability* failures (``timeout`` / ``provider_error``) are a
+        different class — they route to :meth:`evaluate_advisor_availability`
+        (D30, #166), which counts consecutive outages toward the fail-closed
+        stop — and deliberately never reach this rule.
         """
         return SafetyEvaluation(
             rule=f"advisor_{status}",
@@ -455,6 +462,77 @@ class SafetyPolicy:
             reason=(
                 f"advisor outcome '{status}': recommendation rejected, deterministic fallback "
                 f"holds current targets (heat {current_heat} %, fan {current_fan} %)"
+            ),
+        )
+
+    def evaluate_advisor_availability(
+        self,
+        *,
+        consecutive_failures: int,
+        current_heat: int,
+        current_fan: int,
+    ) -> SafetyEvaluation:
+        """Sustained advisor-availability outage ⇒ fail closed after N (D30, #166).
+
+        Mirrors :meth:`evaluate_mcp_failure` for the advisor, but escalates to
+        RECOVERY rather than FAULT: a sustained advisor outage is an
+        operator-in-the-loop stop, not a machine fault. The caller counts only
+        the *availability* failures (``provider_error`` / ``timeout``) toward
+        ``consecutive_failures`` — ``malformed`` / ``unsafe`` are
+        provider-reachable (a different class) and never reach this rule.
+
+        Below ``max_consecutive_advisor_failures`` the recommendation is
+        REJECTed and the deterministic fallback holds the current targets
+        (the E3-S3 behavior, unchanged) — a single transient blip never stops
+        the roast. At or above the threshold the verdict is RECOVERY carrying
+        heat 0 % and the configured safe fan: the controller drives heat down
+        through the safety path and enters ``operator_recovery_required``,
+        where the operator must explicitly resume / drop / cool. The hard
+        temperature ceilings and emergency stop stay active throughout
+        regardless of this rule.
+
+        Args:
+            consecutive_failures: Consecutive advisor *availability* failures
+                observed (``>= 1``; the caller increments only on
+                ``provider_error`` / ``timeout`` and resets on a successful
+                ``ok`` decision).
+            current_heat: The heat level currently in effect (held on REJECT).
+            current_fan: The fan level currently in effect (held on REJECT).
+
+        Returns:
+            A :class:`SafetyEvaluation`: REJECT holding current targets below
+            the threshold, RECOVERY with heat 0 % / safe fan at or above it.
+
+        Raises:
+            ValueError: If ``consecutive_failures`` is less than 1.
+        """
+        if consecutive_failures < 1:
+            raise ValueError("consecutive_failures must be >= 1")
+        limits = self._limits
+        if consecutive_failures < limits.max_consecutive_advisor_failures:
+            return SafetyEvaluation(
+                rule="advisor_unavailable_tolerated",
+                verdict=SafetyVerdict.REJECT,
+                adjusted_heat=current_heat,
+                adjusted_fan=current_fan,
+                reason=(
+                    f"{consecutive_failures} consecutive advisor availability failure(s), below "
+                    f"the fail-closed threshold {limits.max_consecutive_advisor_failures}: "
+                    f"recommendation rejected, deterministic fallback holds current targets "
+                    f"(heat {current_heat} %, fan {current_fan} %)"
+                ),
+            )
+        return SafetyEvaluation(
+            rule="advisor_unavailable_exhausted",
+            verdict=SafetyVerdict.RECOVERY,
+            adjusted_heat=0,
+            adjusted_fan=limits.overrun_safe_fan_percent,
+            reason=(
+                f"{consecutive_failures} consecutive advisor availability failures (threshold "
+                f"{limits.max_consecutive_advisor_failures}): the advisor is sustainedly "
+                f"unavailable — failing closed, heat 0 %, fan "
+                f"{limits.overrun_safe_fan_percent} %, operator recovery required (resume / "
+                f"drop / cool)"
             ),
         )
 
