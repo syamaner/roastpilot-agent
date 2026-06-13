@@ -167,7 +167,10 @@ hardening, NOT a start on E11 implementation (still gated):
   **static SPA mount** in `create_app`. The missing glue to run the supervised roast
   THROUGH the agent (#134); early-completes **E11-S1's "api.py serves the SPA"** (the
   wheel build-hook + `[pi]` extra still remain). `serve` forwards `COFFEE_*` to the MCP
-  child; ⚠️ **Ctrl-C is not an e-stop** (heat stays at last setpoint → follow-up #142).
+  child; **Ctrl-C now safely stops** — graceful shutdown commands heat→0 through the
+  safety path (controller e-stop) BEFORE stopping the MCP child, bounded + fail-closed
+  (#142). A hard kill (SIGKILL/power loss) is uncatchable → still restart →
+  `operator_recovery_required`, never auto-resume.
 - **Governance-as-code:** `main` is branch-protected (required checks + codecov +
   `required_conversation_resolution` + `enforce_admins`, no bypass; auto-merge on).
   `claude-review` posts **blocking inline** findings (`--comment`) but is intentionally
@@ -208,8 +211,9 @@ SSE) is **DONE/CLOSED**; **#134** (supervised hardware roast) is the **sole rema
 operator gate** — operator running it 13 Jun, now with a persistent trace (#161). The
 torch-free chain (D27: `coffee-first-crack-detection#54` → `coffee-roaster-mcp#157`,
 cross-repo) is the other, independent gate. Bridge follow-ups still
-open: **#142** (graceful-shutdown → heat off), **#155** (curve-hydration lows), **#159**
-(auto-merge-vs-review governance race; interim rule: don't `--auto` substantive PRs).
+open: **#155** (curve-hydration lows), **#159** (auto-merge-vs-review governance race;
+interim rule: don't `--auto` substantive PRs). **#142** (graceful-shutdown → heat off) is
+now **DONE** — see the build order below.
 
 **#134 FIRST ATTEMPT (13 Jun 2026) — harness worked, run did NOT complete; gate still
 OPEN.** The supervised roast was attempted live: `serve` + MCP child + FC model load +
@@ -226,9 +230,9 @@ agreed). Mostly core-file (controller/advisor/config/safety/api/cli) → **seque
 single-owner**, NOT a parallel team (shared-surface; safety-critical — the "when not to
 fan out" rule). Safety items route through **safety-reviewer**; tests via **qa**. Build
 order:
-1. 🔴 **#142** Ctrl-C/SIGINT → heat off on shutdown (the safety hole hit live: killing
-   serve orphaned the Hottop hot with no control surface). decision-B recorded; needs
-   safety-reviewer. **STARTED.**
+1. ✅ **#142** Ctrl-C/SIGINT → heat off on shutdown (the safety hole hit live) — **DONE**
+   (PR #175; safety-reviewer **PASS**; reuse `operator_emergency_stop`, bounded +
+   fail-closed before `mcp.stop`). Follow-ups: #177 (wedged-child timeout), #176 (cooling).
 2. 🟠 **#168** validate advisor reachability at startup + surface errors live ("advisor
    configured" only checks the key is *present* — would've caught the expired key).
 3. 🟠 **#167** persist `advisor_decisions` (table has ZERO call sites — trace dropped) →

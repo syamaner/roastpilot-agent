@@ -16,6 +16,7 @@ and the SSE stream (S3) extend :class:`RoastService` in place.
 
 import asyncio
 import contextlib
+import logging
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
@@ -40,6 +41,7 @@ from roastpilot_agent.controller import (
 )
 from roastpilot_agent.mcp_client import ExportRoastLogResult, MCPServerProcess, RoastSessionState
 from roastpilot_agent.models import (
+    ACTIVE_ROAST_PHASES,
     HealthResponse,
     LogManifest,
     MCPChildStatus,
@@ -68,6 +70,8 @@ from roastpilot_agent.safety import (
     enabled_operator_actions,
 )
 from roastpilot_agent.store import RoastStore
+
+_log = logging.getLogger(__name__)
 
 
 #: A roaster control surface satisfies both controller protocols (read + write).
@@ -414,6 +418,41 @@ class RoastRunner:
         await self._controller.recover_from_restart(persisted_phase)
         await self._flush_events()
         await self._persist_phase_if_changed()
+
+    async def shutdown_heat_off(self) -> bool:
+        """Command heat off on graceful shutdown, through the safety path (#142).
+
+        A graceful ``serve`` teardown (Ctrl-C / SIGTERM) must not leave the
+        Hottop commanded hot with no software control surface left: once the
+        process dies the UI Emergency Stop is gone too. So before the MCP child
+        is stopped, while it can still receive a write, drive heat to 0 through
+        the controller's :meth:`RoastController.operator_emergency_stop` — the
+        existing, tested heat-off path that produces a typed
+        ``EMERGENCY_STOP`` :class:`~roastpilot_agent.safety.SafetyEvaluation`,
+        commands the MCP ``emergency_stop`` write, and faults the run. This is
+        an operator-initiated stop, not an auto-resume, so it does not weaken
+        the restart→``operator_recovery_required`` invariant (a hard kill that
+        skips this still relies on that path).
+
+        Only acts when the controller is in an
+        :data:`~roastpilot_agent.models.ACTIVE_ROAST_PHASES` phase — a phase in
+        which the machine may be hot with control active. In ``idle`` /
+        ``starting`` / ``complete`` / ``faulted`` /
+        ``operator_recovery_required`` there is no live heat to command off, so
+        this is a no-op (heat is already off or never engaged). The emitted
+        events + the ``EMERGENCY_STOP`` evaluation are flushed and the phase
+        change persisted so the decision trace records the shutdown stop.
+
+        Returns:
+            ``True`` if a heat-off e-stop was issued this call; ``False`` if it
+            was a no-op (no active hot phase).
+        """
+        if self._controller.phase not in ACTIVE_ROAST_PHASES:
+            return False
+        await self._controller.operator_emergency_stop(reason="graceful shutdown")
+        await self._flush_events()
+        await self._persist_phase_if_changed()
+        return True
 
     @property
     def finalized(self) -> bool:
@@ -910,6 +949,58 @@ class RoastService:
         if self._run_loop:
             self._loop_task = asyncio.create_task(runner.run())
 
+    async def safe_shutdown_heat_off(self, *, timeout_seconds: float = 5.0) -> bool:
+        """Drive heat off through the safety path on graceful shutdown (#142).
+
+        Called by the live-serve teardown **before** the MCP child is stopped —
+        the write must land while the child is still alive. Delegates to
+        :meth:`RoastRunner.shutdown_heat_off`, which routes through the
+        controller's ``operator_emergency_stop`` (heat→0 + a typed
+        ``EMERGENCY_STOP`` evaluation). A no-op in API-only mode or when no live
+        run is active.
+
+        Bounded and fail-closed: the heat-off write is wrapped in a short
+        :func:`asyncio.wait_for` so a wedged MCP child can never hang shutdown.
+        A timeout or any error is logged loudly (the operator must know the
+        commanded stop did not confirm and may need the power switch) and
+        swallowed so the rest of teardown — including ``mcp.stop`` — still runs.
+
+        Args:
+            timeout_seconds: Upper bound on the heat-off write before shutdown
+                proceeds regardless (default 5 s — generous for one MCP call,
+                short enough never to wedge a Ctrl-C).
+
+        Returns:
+            ``True`` if the heat-off safety path ran and the controller faulted
+            (the e-stop was dispatched through ``operator_emergency_stop``).
+            Note this is *not* a hardware acknowledgement: if the MCP
+            ``emergency_stop`` write itself fails, ``operator_emergency_stop``
+            still emits ``COMMAND_FAILED``, faults the run, and reports success
+            here — fail-safe is the controller's job, not the caller's.
+            ``False`` if it was a no-op (no active run / already hardware-off) or
+            the safety path did not run to completion (the ``wait_for`` timeout
+            or an unexpected error in this method, both logged + swallowed).
+        """
+        runner = self.runner
+        if runner is None:
+            return False
+        try:
+            return await asyncio.wait_for(runner.shutdown_heat_off(), timeout=timeout_seconds)
+        except TimeoutError:
+            _log.error(
+                "SHUTDOWN heat-off did not confirm within %.1fs — the roaster may still "
+                "be commanded hot; use the Hottop power switch if needed",
+                timeout_seconds,
+            )
+            return False
+        except Exception:  # noqa: BLE001 — fail closed: log loudly, never block teardown
+            _log.error(
+                "SHUTDOWN heat-off failed — the roaster may still be commanded hot; "
+                "use the Hottop power switch if needed",
+                exc_info=True,
+            )
+            return False
+
     async def shutdown(self) -> None:
         """Stop the live loop and release the background task (clean teardown /
         agent restart). Idempotent; safe in API-only mode."""
@@ -1277,6 +1368,11 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
         await service.recover_on_start()
     yield
     if isinstance(service, RoastService):
+        # Cancel the tick loop on lifespan teardown. The live-serve CLI path then
+        # calls service.shutdown() again in _teardown_live (which is idempotent) —
+        # that second call is a clean no-op, kept because _teardown_live also owns
+        # the safety-critical heat-off-before-mcp.stop ordering (#142) that this
+        # lifespan does not. Non-CLI uses of create_app rely on this call.
         await service.shutdown()
 
 
