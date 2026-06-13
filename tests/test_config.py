@@ -81,6 +81,8 @@ def test_safety_limit_defaults_are_conservative() -> None:
         (ControllerConfig, {"t0_debounce_ticks": 0}),
         (ControllerConfig, {"advisory_timeout_seconds": 0}),
         (ControllerConfig, {"max_stale_telemetry_seconds": 0}),
+        # #171: a negative phase consult floor is meaningless (0 = unthrottled).
+        (ControllerConfig, {"advisory_min_interval_seconds": {RoastPhase.PREHEATING: -1.0}}),
         (AdvisorConfig, {"timeout_seconds": 0}),
         (AdvisorConfig, {"temperature": -0.1}),
         (AdvisorConfig, {"temperature": 2.1}),

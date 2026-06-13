@@ -7,7 +7,7 @@ deliberately conservative software ceilings pending supervised hardware
 validation at E12 (E12-S1).
 """
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -46,8 +46,14 @@ class ControllerConfig(BaseModel):
     # by agent phase. A phase absent from the map (or mapped to 0) is
     # unthrottled — the heartbeat never gates it; change-based triggers and
     # the advisor's own latency are the only limiter. Defaults: preheat 30 s,
-    # charged/pre-FC 10 s, development (FC onward) 0 = unthrottled.
-    advisory_min_interval_seconds: dict[RoastPhase, float] = Field(
+    # charged/pre-FC 10 s, development (FC onward) 0 = unthrottled. Values are
+    # ``ge=0`` (0 = unthrottled; a negative floor would be meaningless).
+    #
+    # NOTE (#171): this replaced the prior scalar ``float`` (15 s). An env var
+    # of the old shape — ``ROASTPILOT_CONTROLLER__ADVISORY_MIN_INTERVAL_SECONDS=15``
+    # — no longer coerces; supply per-phase values keyed by ``RoastPhase``
+    # value (e.g. ``{"preheating": 30, "roasting_pre_first_crack": 10}``).
+    advisory_min_interval_seconds: dict[RoastPhase, Annotated[float, Field(ge=0)]] = Field(
         default_factory=lambda: dict(DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS)
     )
     advisory_timeout_seconds: float = Field(default=10.0, gt=0)
@@ -65,10 +71,11 @@ class ControllerConfig(BaseModel):
         """Return the minimum-interval consult floor for ``phase`` in seconds.
 
         Looks the phase up in :attr:`advisory_min_interval_seconds`. A phase
-        absent from the map returns ``0.0`` — unthrottled, so the heartbeat
-        trigger never fires for it and the advisor is consulted as soon as the
-        previous call returns (bounded only by advisor latency). This is the
-        intended behavior for first-crack / development (#171).
+        absent from the map returns ``0.0`` — unthrottled: the interval never
+        gates the heartbeat (``MIN_INTERVAL`` fires on every eligible tick),
+        so the advisor is consulted as soon as the previous serial call
+        returns, bounded only by advisor latency. This is the intended
+        behavior for first-crack / development (#171).
 
         Args:
             phase: The agent phase the controller is currently in.

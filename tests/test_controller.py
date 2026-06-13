@@ -594,7 +594,8 @@ async def test_failed_emergency_stop_still_faults() -> None:
 
 def _policy() -> AdvisoryCallPolicy:
     """A policy with the default ControllerConfig thresholds (temp 1.0 °C,
-    RoR 2.0 °C/min, interval 15 s)."""
+    RoR 2.0 °C/min, phase-keyed floors: preheat 30 s / pre-FC 10 s /
+    development 0 = unthrottled, #171)."""
     return AdvisoryCallPolicy(ControllerConfig())
 
 
@@ -648,15 +649,17 @@ def test_policy_bean_temp_delta_triggers_at_threshold_not_below() -> None:
 
 
 def test_policy_ror_delta_triggers_at_threshold() -> None:
+    # Throttled phase (10 s floor): the RoR delta is the *only* reason to fire
+    # at 1 s, not the interval — under #171 DEVELOPMENT would heartbeat here.
     policy = _policy()
     policy.note_call(
-        phase=RoastPhase.DEVELOPMENT,
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
         telemetry=reading(bean=200.0, bean_ror_c_per_min=5.0),
         now=0.0,
     )
     # Same bean temp, RoR jumps +2.0 °C/min: RoR is the live trigger.
     trigger = policy.evaluate(
-        phase=RoastPhase.DEVELOPMENT,
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
         telemetry=reading(bean=200.0, bean_ror_c_per_min=7.0),
         now=1.0,
         manual_request=False,
