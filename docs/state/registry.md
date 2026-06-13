@@ -255,7 +255,12 @@ order:
    detail/history (FE).
 4. 🟠 **#171** phase-dependent advisor cadence: preheat 30 s / **charged** 10 s / FC
    as-fast-as-it-returns (~5–7 s floor). "beans dropped" = **charged**. Keep change-based
-   early-fire.
+   early-fire. **PR open** (`feature/171-phase-cadence`): `ControllerConfig.advisory_min_interval_seconds`
+   is now a `dict[RoastPhase, float]` consult-floor map (default preheat 30 / pre-FC 10 /
+   development 0); `advisory_interval_for(phase)` resolves it, 0/absent = unthrottled so the
+   `AdvisoryCallPolicy` heartbeat fires every tick once the prior serial call returns. Delta
+   triggers still short-circuit sooner. **Call-frequency only — no verdict/transition/execution
+   change.** Awaiting CI + claude-review triage; not yet merged.
 5. 🟢 **#172** stage-tuned prompt — **Option 2** (one prompt, per-stage sections:
    PREHEAT / DRYING-MAILLARD / FC-DEV) + fill `AdvisorContext` gaps
    (`target_development_percent`, charge band); **bake-off-gated** (not safety).

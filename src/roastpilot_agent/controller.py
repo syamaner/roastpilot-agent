@@ -289,9 +289,10 @@ class AdvisoryCallPolicy:
     Change-based, never every tick: an automatic call fires only on a
     meaningful change since the last call — a phase transition, a bean-temp
     move of ``advisory_min_temp_delta_c``, a RoR move of
-    ``advisory_min_ror_delta_c_per_min``, or the
-    ``advisory_min_interval_seconds`` heartbeat (the plan emphasises this
-    during development; applied across all active-roast phases here). A
+    ``advisory_min_ror_delta_c_per_min``, or a **phase-keyed** consult-floor
+    heartbeat (``advisory_min_interval_seconds`` mapped per agent phase, #171:
+    preheat 30 s, beans-charged/pre-FC 10 s, development 0 = unthrottled).
+    The interval is a floor only — the change-based triggers fire sooner. A
     manual operator request bypasses every gate, including phase scoping, so
     the operator always gets a response (the command×phase matrix then
     decides whether that advice can apply).
@@ -354,7 +355,16 @@ class AdvisoryCallPolicy:
             >= self._config.advisory_min_ror_delta_c_per_min
         ):
             return AdvisoryTrigger.ROR_DELTA
-        if now - self._last_call_monotonic >= self._config.advisory_min_interval_seconds:
+        # Phase-keyed consult floor (#171). The interval scales with roast
+        # criticality: preheat 30 s, charged/pre-FC 10 s, development 0 =
+        # unthrottled. A 0 floor makes this condition fire every eligible
+        # tick once the prior call has returned (calls are serial, awaited in
+        # the tick), so first-crack/development consults run back-to-back at
+        # the advisor's own latency — the change-based triggers above still
+        # short-circuit sooner in any phase. Resolved from the *current*
+        # phase, not the phase at the last call, so the floor follows the
+        # roast forward.
+        if now - self._last_call_monotonic >= self._config.advisory_interval_for(phase):
             return AdvisoryTrigger.MIN_INTERVAL
         return None
 
