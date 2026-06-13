@@ -233,8 +233,16 @@ order:
 1. ✅ **#142** Ctrl-C/SIGINT → heat off on shutdown (the safety hole hit live) — **DONE**
    (PR #175; safety-reviewer **PASS**; reuse `operator_emergency_stop`, bounded +
    fail-closed before `mcp.stop`). Follow-ups: #177 (wedged-child timeout), #176 (cooling).
-2. 🟠 **#168** validate advisor reachability at startup + surface errors live ("advisor
+2. 🟢 **#168** validate advisor reachability at startup + surface errors live ("advisor
    configured" only checks the key is *present* — would've caught the expired key).
+   **Startup half DONE** (PR feature/168): a bounded, best-effort reachability probe
+   (`RoastAdvisor.healthcheck()` → `AdvisorHealth`; `PydanticAIAdvisor` runs a cheap
+   completion, `FakeAdvisor` is deterministic) prints **"advisor REACHABLE (provider/
+   model)"** vs a loud **"⚠️ advisor UNREACHABLE: <error>"** at `serve` startup — as
+   prominent as the mock-driver warning, never blocks serve (advisory-paused is valid).
+   The result is exposed on `GET /api/health` (`advisor` field) so the dashboard can
+   render an ADVISOR-OFFLINE state. Remaining: the **in-roast** dashboard ADVISOR-OFFLINE
+   render (FE task — data is now available) + the distinct in-roast error indicator.
 3. 🟠 **#167** persist `advisor_decisions` (table has ZERO call sites — trace dropped) →
    then **#170** surface the advisor timeline in detail/history.
 4. 🟠 **#171** phase-dependent advisor cadence: preheat 30 s / **charged** 10 s / FC

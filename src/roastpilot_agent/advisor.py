@@ -16,6 +16,7 @@ rejected recommendation with the deterministic hold-current-targets
 fallback (``SafetyPolicy.evaluate_advisor_failure``).
 """
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -34,7 +35,7 @@ from pydantic_ai import (
 from pydantic_ai.models import Model
 
 from roastpilot_agent.config import AdvisorConfig
-from roastpilot_agent.models import RoastPhase
+from roastpilot_agent.models import AdvisorHealth, AdvisorHealthStatus, RoastPhase
 
 _log = logging.getLogger(__name__)
 
@@ -122,6 +123,25 @@ class RoastAdvisor(ABC):
         """Return a typed advisory recommendation."""
         raise NotImplementedError
 
+    @abstractmethod
+    async def healthcheck(self) -> AdvisorHealth:
+        """Probe advisor reachability (issue #168).
+
+        A cheap, read-only liveness probe run at ``serve`` startup so the
+        operator learns the advisor is dead *before* charging beans, rather
+        than after every in-roast call fails (the #134 expired-key failure).
+        It returns reachable-or-error and never raises: a probe failure (auth
+        401/402, model 404, transport, or timeout) is captured into an
+        ``UNREACHABLE`` :class:`~roastpilot_agent.models.AdvisorHealth` so a
+        hung or rejecting provider can never wedge or abort startup. The probe
+        is advisory-only — it never receives MCP write tools.
+
+        Returns:
+            The reachability result with the configured provider/model and, on
+            failure, the captured provider error message.
+        """
+        raise NotImplementedError
+
 
 FakeAdvisorStep = RoastDecision | AdvisorFailureMode
 """One scripted FakeAdvisor outcome: a decision to return, or a failure to raise."""
@@ -152,11 +172,18 @@ class FakeAdvisor(RoastAdvisor):
         *,
         default_decision: RoastDecision | None = None,
         log: list[str] | None = None,
+        health: "AdvisorHealth | BaseException | None" = None,
     ) -> None:
         self._script: list[FakeAdvisorStep] = list(script or [])
         self._default_decision = default_decision
         self._log = log if log is not None else []
         self.contexts: list[AdvisorContext] = []
+        #: Scriptable :meth:`healthcheck` outcome (issue #168). An
+        #: :class:`~roastpilot_agent.models.AdvisorHealth` is returned as-is; a
+        #: ``BaseException`` is raised (to exercise the probe wrapper's
+        #: non-blocking, error-capturing guarantee); ``None`` defaults to a
+        #: deterministic ``REACHABLE`` so a no-key test just works.
+        self._health = health
 
     async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
         """Return the next scripted decision or raise the next scripted failure."""
@@ -184,6 +211,25 @@ class FakeAdvisor(RoastAdvisor):
                 f"unhandled AdvisorFailureMode: {step}"
             )
         return step
+
+    async def healthcheck(self) -> AdvisorHealth:
+        """Return the scripted reachability outcome (deterministic, no key).
+
+        Defaults to a ``REACHABLE`` result so a test needs no API key; a
+        configured ``AdvisorHealth`` is returned as-is, and a configured
+        ``BaseException`` is raised so a test can exercise the probe wrapper's
+        bounded, error-capturing guarantee.
+        """
+        self._log.append("advisor.healthcheck")
+        if isinstance(self._health, BaseException):
+            raise self._health
+        if self._health is not None:
+            return self._health
+        return AdvisorHealth(
+            status=AdvisorHealthStatus.REACHABLE,
+            provider="fake",
+            model_slug="fake-model",
+        )
 
 
 class _RawRoastDecision(BaseModel):
@@ -457,3 +503,61 @@ class PydanticAIAdvisor(RoastAdvisor):
             return RoastDecision.model_validate(result.output.model_dump())
         except ValidationError as exc:
             raise AdvisorUnsafeOutputError(str(exc)) from exc
+
+    async def healthcheck(self) -> AdvisorHealth:
+        """Probe reachability with a cheap, bounded completion (issue #168).
+
+        Runs one minimal structured completion against the configured provider
+        and model. The point is the *transport*: an expired/invalid key
+        (401/402), an unavailable model slug (404), or an unreachable endpoint
+        fails before any output is produced — exactly the #134 failure that
+        "advisor configured" hid until mid-roast. A malformed/unsafe *output*
+        still counts as REACHABLE (the provider answered; the round trip
+        works). The call is bounded by ``config.healthcheck_timeout_seconds``
+        and never raises — a timeout or any provider error is captured into an
+        ``UNREACHABLE`` result so it can never wedge or abort ``serve``
+        startup. Advisory-only: no MCP write tools are ever passed.
+
+        Returns:
+            ``REACHABLE`` with provider/model when the probe round-trips, else
+            ``UNREACHABLE`` carrying the provider error (or timeout) message.
+        """
+        provider = self._config.provider
+        model_slug = self._config.model_slug
+        try:
+            async with asyncio.timeout(self._config.healthcheck_timeout_seconds):
+                # A trivial prompt: reachability is decided by the transport
+                # (auth/model/endpoint), not the content. The structured
+                # output_type is the advisor's own — still advisory-only.
+                await self._agent.run("ping")
+        except TimeoutError:
+            return AdvisorHealth(
+                status=AdvisorHealthStatus.UNREACHABLE,
+                provider=provider,
+                model_slug=model_slug,
+                error=(
+                    f"reachability probe timed out after "
+                    f"{self._config.healthcheck_timeout_seconds:g}s"
+                ),
+            )
+        except UnexpectedModelBehavior as exc:
+            # The provider answered but the output was malformed — the round
+            # trip works, so the advisor IS reachable.
+            _log.warning("advisor reachable but probe output was malformed: %s", exc)
+            return AdvisorHealth(
+                status=AdvisorHealthStatus.REACHABLE,
+                provider=provider,
+                model_slug=model_slug,
+            )
+        except Exception as exc:  # noqa: BLE001 — probe must never raise (best-effort)
+            return AdvisorHealth(
+                status=AdvisorHealthStatus.UNREACHABLE,
+                provider=provider,
+                model_slug=model_slug,
+                error=str(exc),
+            )
+        return AdvisorHealth(
+            status=AdvisorHealthStatus.REACHABLE,
+            provider=provider,
+            model_slug=model_slug,
+        )

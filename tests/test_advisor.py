@@ -47,7 +47,13 @@ from roastpilot_agent.advisor import (
 )
 from roastpilot_agent.config import AdvisorConfig, ControllerConfig
 from roastpilot_agent.controller import RoastController, RoastPhase
-from roastpilot_agent.models import RoastEventKind, RoastProfile, RoastTelemetry
+from roastpilot_agent.models import (
+    AdvisorHealth,
+    AdvisorHealthStatus,
+    RoastEventKind,
+    RoastProfile,
+    RoastTelemetry,
+)
 from roastpilot_agent.safety import SafetyLimits, SafetyPolicy, SafetyVerdict
 from tests.conftest import (
     EventSink,
@@ -288,6 +294,9 @@ async def test_real_timeout_path_never_blocks_the_tick() -> None:
         async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
+
+        async def healthcheck(self) -> AdvisorHealth:
+            return AdvisorHealth(status=AdvisorHealthStatus.REACHABLE)
 
     harness = harness_in_development(
         advisor=NeverAdvisor(),
@@ -549,3 +558,100 @@ def test_v2_prompt_adds_fan_and_duration() -> None:
     # Carried-forward invariants.
     assert "thermal lag" in v2
     assert "never control hardware" in v2
+
+
+# --- healthcheck reachability probe (issue #168) ---
+
+
+@pytest.mark.asyncio
+async def test_fake_advisor_healthcheck_defaults_to_reachable() -> None:
+    """A bare FakeAdvisor probes REACHABLE deterministically — no key needed."""
+    advisor = FakeAdvisor()
+    health = await advisor.healthcheck()
+    assert health.status is AdvisorHealthStatus.REACHABLE
+    assert health.provider == "fake"
+    assert health.model_slug == "fake-model"
+
+
+@pytest.mark.asyncio
+async def test_fake_advisor_healthcheck_returns_configured_health() -> None:
+    """A configured AdvisorHealth is returned as-is (scriptable UNREACHABLE)."""
+    scripted = AdvisorHealth(
+        status=AdvisorHealthStatus.UNREACHABLE,
+        provider="openai_compatible",
+        model_slug="anthropic/claude-opus-4.8",
+        error="401 Unauthorized",
+    )
+    advisor = FakeAdvisor(health=scripted)
+    assert await advisor.healthcheck() == scripted
+
+
+@pytest.mark.asyncio
+async def test_fake_advisor_healthcheck_raises_configured_exception() -> None:
+    """A configured BaseException is raised so the probe wrapper can be tested."""
+    advisor = FakeAdvisor(health=RuntimeError("boom"))
+    with pytest.raises(RuntimeError, match="boom"):
+        await advisor.healthcheck()
+
+
+@pytest.mark.asyncio
+async def test_pydanticai_healthcheck_reachable_on_round_trip() -> None:
+    """A provider that answers the probe (even with a valid decision) is
+    REACHABLE, carrying the configured provider + model."""
+    advisor = _advisor_with(
+        _function_model_returning(_VALID_OUTPUT),
+        model_slug="some-model",
+    )
+    health = await advisor.healthcheck()
+    assert health.status is AdvisorHealthStatus.REACHABLE
+    assert health.model_slug == "some-model"
+    assert health.error is None
+
+
+@pytest.mark.asyncio
+async def test_pydanticai_healthcheck_malformed_output_is_still_reachable() -> None:
+    """A malformed *output* means the round trip works — the provider answered,
+    so the advisor is reachable (auth/model/endpoint are fine)."""
+    advisor = _advisor_with(_function_model_text("not a tool call"))
+    health = await advisor.healthcheck()
+    assert health.status is AdvisorHealthStatus.REACHABLE
+    assert health.error is None
+
+
+@pytest.mark.asyncio
+async def test_pydanticai_healthcheck_transport_failure_is_unreachable() -> None:
+    """A transport/auth failure (the #134 expired-key 401/503) is UNREACHABLE
+    and carries the provider error — the probe itself never raises."""
+
+    def boom(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise ModelHTTPError(status_code=401, model_name="x", body="invalid api key")
+
+    advisor = _advisor_with(FunctionModel(boom))
+    health = await advisor.healthcheck()
+    assert health.status is AdvisorHealthStatus.UNREACHABLE
+    assert health.error is not None
+    assert "401" in health.error
+
+
+@pytest.mark.asyncio
+async def test_pydanticai_healthcheck_times_out_unreachable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hung provider trips the bounded probe timeout → UNREACHABLE, never a
+    wedge. The timeout is driven low so the test is fast."""
+    import asyncio as _asyncio
+
+    async def _never(*_args: object, **_kwargs: object) -> object:
+        await _asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    advisor = _advisor_with(
+        _function_model_returning(_VALID_OUTPUT),
+        healthcheck_timeout_seconds=0.05,
+    )
+    # Make the agent run hang so only the timeout can resolve the probe.
+    monkeypatch.setattr(advisor._agent, "run", _never)  # pyright: ignore[reportPrivateUsage]
+    health = await _asyncio.wait_for(advisor.healthcheck(), timeout=1.0)
+    assert health.status is AdvisorHealthStatus.UNREACHABLE
+    assert health.error is not None
+    assert "timed out" in health.error

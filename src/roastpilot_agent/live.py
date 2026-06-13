@@ -20,6 +20,7 @@ Invariants this module is bound by (AGENTS.md):
 - Temperatures are Celsius end to end; the SPA renders from server events.
 """
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -38,6 +39,7 @@ from roastpilot_agent.mcp_client import (
     RoasterControlAdapter,
     RoasterMCPClient,
 )
+from roastpilot_agent.models import AdvisorHealth, AdvisorHealthStatus
 from roastpilot_agent.store import RoastStore
 
 _log = logging.getLogger(__name__)
@@ -94,6 +96,53 @@ def build_advisor(config: AppConfig) -> RoastAdvisor | None:
         config.advisor.api_key_env,
     )
     return None
+
+
+#: Hard ceiling on the startup advisor probe (issue #168). The advisor's own
+#: ``healthcheck`` is already bounded, but this is a belt-and-braces wrapper
+#: bound so even a misbehaving advisor whose ``healthcheck`` hangs (or raises
+#: outside its own guard) can never wedge ``serve`` startup. A small margin
+#: over the default ``healthcheck_timeout_seconds`` so the inner bound trips
+#: first under normal operation.
+ADVISOR_PROBE_WRAP_TIMEOUT_SECONDS = 8.0
+
+
+async def probe_advisor_health(advisor: RoastAdvisor | None) -> AdvisorHealth:
+    """Probe advisor reachability for the startup readout (issue #168).
+
+    Best-effort and **non-blocking**: it returns a typed
+    :class:`~roastpilot_agent.models.AdvisorHealth` and never raises or stalls.
+    A ``None`` advisor (no API key / advisory-paused) reports
+    ``NOT_CONFIGURED``. Otherwise the advisor's own bounded
+    :meth:`~roastpilot_agent.advisor.RoastAdvisor.healthcheck` is awaited under
+    an outer :func:`asyncio.wait_for` ceiling
+    (:data:`ADVISOR_PROBE_WRAP_TIMEOUT_SECONDS`) so even a ``healthcheck`` that
+    hangs or raises cannot wedge or abort startup — the controller still runs
+    deterministically without advice. The probe is advisory-only: it never
+    touches MCP write tools.
+
+    Args:
+        advisor: The wired advisor, or ``None`` when none is configured.
+
+    Returns:
+        The reachability result: ``NOT_CONFIGURED``, ``REACHABLE``, or
+        ``UNREACHABLE`` with the captured error.
+    """
+    if advisor is None:
+        return AdvisorHealth(status=AdvisorHealthStatus.NOT_CONFIGURED)
+    try:
+        return await asyncio.wait_for(
+            advisor.healthcheck(), timeout=ADVISOR_PROBE_WRAP_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        return AdvisorHealth(
+            status=AdvisorHealthStatus.UNREACHABLE,
+            error=(
+                f"reachability probe did not return within {ADVISOR_PROBE_WRAP_TIMEOUT_SECONDS:g}s"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 — startup probe must never block serve
+        return AdvisorHealth(status=AdvisorHealthStatus.UNREACHABLE, error=str(exc))
 
 
 async def build_live_service(

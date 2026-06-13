@@ -187,13 +187,57 @@ class MCPChildStatus(Enum):
     NOT_CONFIGURED = "not_configured"
 
 
+class AdvisorHealthStatus(Enum):
+    """Advisor reachability state for the startup readout + ``/api/health``.
+
+    Plain ``Enum`` (D15): a string comparison against a member is a pyright
+    strict error. The advisor is advisory-only, so ``UNREACHABLE`` is an
+    observability signal, never a serve blocker.
+    """
+
+    REACHABLE = "reachable"
+    UNREACHABLE = "unreachable"
+    NOT_CONFIGURED = "not_configured"
+
+
+class AdvisorHealth(BaseModel):
+    """Advisor reachability probe result (issue #168).
+
+    Carried in the startup readout and exposed on ``GET /api/health`` so the
+    operator learns the advisor is dead *before* committing a real roast,
+    rather than after (the #134 expired-key failure: ``advisor configured``
+    was a comforting half-truth). The advisor is advisory-only, so this is
+    pure observability — an unreachable advisor never blocks serve.
+
+    States:
+
+    - ``REACHABLE`` — a cheap probe completion returned; the configured
+      provider + model answered.
+    - ``UNREACHABLE`` — the probe failed (auth 401/402, model 404, transport,
+      or timeout); ``error`` carries the provider message.
+    - ``NOT_CONFIGURED`` — no advisor is wired (advisory-paused mode); the
+      controller runs deterministically without advice.
+    """
+
+    status: AdvisorHealthStatus
+    provider: str | None = None
+    model_slug: str | None = None
+    error: str | None = None
+
+
 class HealthResponse(BaseModel):
-    """``GET /api/health``: liveness + MCP child status + active run id."""
+    """``GET /api/health``: liveness + MCP child status + active run id.
+
+    ``advisor`` carries the most recent advisor reachability probe (issue
+    #168) so the dashboard can render an ADVISOR-OFFLINE state; it is ``None``
+    when no probe has run (e.g. the E7 API-only contract path).
+    """
 
     status: Literal["ok"] = "ok"
     version: str
     mcp_child: MCPChildStatus
     active_run_id: str | None = None
+    advisor: AdvisorHealth | None = None
 
 
 class LogManifest(BaseModel):

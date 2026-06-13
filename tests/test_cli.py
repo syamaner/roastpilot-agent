@@ -488,3 +488,98 @@ async def test_emit_runtime_readout_logs_and_continues_on_failure(
     assert "could not read runtime config" in caplog.text
     # No readout block printed when the read failed.
     assert "Roaster runtime" not in capsys.readouterr().out
+
+
+# --- startup advisor reachability readout (issue #168) --------------------------
+
+
+def _advisor_health(status: str, **kw: object) -> Any:
+    from roastpilot_agent.models import AdvisorHealth, AdvisorHealthStatus
+
+    return AdvisorHealth(status=AdvisorHealthStatus(status), **kw)  # type: ignore[arg-type]
+
+
+def test_format_advisor_readout_reachable() -> None:
+    """A REACHABLE probe prints provider + model, no warning glyph."""
+    lines = cli._format_advisor_readout(  # pyright: ignore[reportPrivateUsage]
+        _advisor_health("reachable", provider="anthropic", model_slug="claude-opus-4.8")
+    )
+    text = "\n".join(lines)
+    assert "advisor REACHABLE" in text
+    assert "provider=anthropic" in text
+    assert "model=claude-opus-4.8" in text
+    assert "⚠️" not in text
+
+
+def test_format_advisor_readout_unreachable_carries_error() -> None:
+    """An UNREACHABLE probe prints a loud ⚠️ line with the actual provider error
+    and notes the roast can still start advisory-paused."""
+    lines = cli._format_advisor_readout(  # pyright: ignore[reportPrivateUsage]
+        _advisor_health(
+            "unreachable",
+            provider="openai_compatible",
+            model_slug="anthropic/claude-opus-4.8",
+            error="401 Unauthorized (invalid api key)",
+        )
+    )
+    text = "\n".join(lines)
+    assert "⚠️" in text
+    assert "advisor UNREACHABLE" in text
+    assert "401 Unauthorized" in text
+    assert "can still start" in text
+
+
+def test_format_advisor_readout_not_configured() -> None:
+    """A NOT_CONFIGURED probe notes the advisory-paused mode (no key)."""
+    lines = cli._format_advisor_readout(  # pyright: ignore[reportPrivateUsage]
+        _advisor_health("not_configured")
+    )
+    text = "\n".join(lines)
+    assert "advisor NOT CONFIGURED" in text
+    assert "advisory-paused" in text
+
+
+@pytest.mark.asyncio
+async def test_emit_advisor_readout_records_health_and_prints(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The readout probes the service's advisor, prints REACHABLE, and records
+    the result on the service so /api/health can surface it."""
+    from roastpilot_agent.advisor import FakeAdvisor
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.models import AdvisorHealthStatus
+    from roastpilot_agent.store import RoastStore
+
+    store = RoastStore(tmp_path / "t.sqlite3")
+    await store.initialize()
+    try:
+        service = RoastService(store, advisor=FakeAdvisor())
+        health = await cli._emit_advisor_readout(service)  # pyright: ignore[reportPrivateUsage]
+        assert health.status is AdvisorHealthStatus.REACHABLE
+        assert "advisor REACHABLE" in capsys.readouterr().out
+        # The probe result is recorded on the service for /api/health.
+        served = await service.health()
+        assert served.advisor is not None
+        assert served.advisor.status is AdvisorHealthStatus.REACHABLE
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_emit_advisor_readout_unreachable_does_not_block(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An advisor whose probe fails surfaces UNREACHABLE loudly but the readout
+    still returns normally — serve is never blocked (advisory-paused is valid)."""
+    from roastpilot_agent.advisor import AdvisorProviderError, FakeAdvisor
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.models import AdvisorHealthStatus
+    from roastpilot_agent.store import RoastStore
+
+    advisor = FakeAdvisor(health=AdvisorProviderError("402 Payment Required"))
+    service = RoastService(RoastStore(tmp_path / "t.sqlite3"), advisor=advisor)
+    health = await cli._emit_advisor_readout(service)  # pyright: ignore[reportPrivateUsage]
+    assert health.status is AdvisorHealthStatus.UNREACHABLE
+    out = capsys.readouterr().out
+    assert "⚠️" in out
+    assert "402 Payment Required" in out

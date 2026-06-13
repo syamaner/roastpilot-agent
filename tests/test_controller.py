@@ -26,6 +26,8 @@ from roastpilot_agent.controller import (
     TickScheduler,
 )
 from roastpilot_agent.models import (
+    AdvisorHealth,
+    AdvisorHealthStatus,
     OperatorAction,
     RoastEventKind,
     RoastProfile,
@@ -371,6 +373,9 @@ async def test_slow_advisor_never_blocks_the_tick() -> None:
             await asyncio.Event().wait()
             raise AssertionError("unreachable")
 
+        async def healthcheck(self) -> AdvisorHealth:
+            return AdvisorHealth(status=AdvisorHealthStatus.REACHABLE)
+
     config = ControllerConfig(advisory_timeout_seconds=0.05)
     harness = harness_in_development(readings=[reading()], advisor=NeverAdvisor(), config=config)
     harness.controller.request_advisory()
@@ -385,6 +390,9 @@ async def test_crashing_advisor_is_a_provider_error() -> None:
     class CrashingAdvisor(RoastAdvisor):
         async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
             raise RuntimeError("boom")
+
+        async def healthcheck(self) -> AdvisorHealth:
+            return AdvisorHealth(status=AdvisorHealthStatus.REACHABLE)
 
     harness = harness_in_development(readings=[reading()], advisor=CrashingAdvisor())
     harness.controller.request_advisory()

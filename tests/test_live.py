@@ -94,6 +94,74 @@ def test_build_advisor_constructs_when_key_present(monkeypatch: pytest.MonkeyPat
     assert isinstance(advisor, PydanticAIAdvisor)
 
 
+# --- advisor reachability probe (issue #168) ------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_probe_advisor_health_none_is_not_configured() -> None:
+    """No advisor (advisory-paused) → NOT_CONFIGURED, never an error."""
+    from roastpilot_agent.models import AdvisorHealthStatus
+
+    health = await live.probe_advisor_health(None)
+    assert health.status is AdvisorHealthStatus.NOT_CONFIGURED
+
+
+@pytest.mark.asyncio
+async def test_probe_advisor_health_reachable() -> None:
+    """A reachable FakeAdvisor surfaces its REACHABLE result through the probe."""
+    from roastpilot_agent.advisor import FakeAdvisor
+    from roastpilot_agent.models import AdvisorHealthStatus
+
+    health = await live.probe_advisor_health(FakeAdvisor())
+    assert health.status is AdvisorHealthStatus.REACHABLE
+    assert health.provider == "fake"
+
+
+@pytest.mark.asyncio
+async def test_probe_advisor_health_captures_raised_error() -> None:
+    """A healthcheck that raises a provider error becomes UNREACHABLE with the
+    error — the probe never propagates the exception (serve must not be blocked)."""
+    from roastpilot_agent.advisor import AdvisorProviderError, FakeAdvisor
+    from roastpilot_agent.models import AdvisorHealthStatus
+
+    advisor = FakeAdvisor(health=AdvisorProviderError("401 invalid key"))
+    health = await live.probe_advisor_health(advisor)
+    assert health.status is AdvisorHealthStatus.UNREACHABLE
+    assert health.error is not None
+    assert "401" in health.error
+
+
+@pytest.mark.asyncio
+async def test_probe_advisor_health_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A healthcheck that hangs is bounded by the wrapper timeout → UNREACHABLE,
+    never a wedge. The wrapper bound is driven low so the test is fast."""
+    import asyncio
+
+    from roastpilot_agent.advisor import FakeAdvisor
+    from roastpilot_agent.models import AdvisorHealth, AdvisorHealthStatus
+
+    monkeypatch.setattr(live, "ADVISOR_PROBE_WRAP_TIMEOUT_SECONDS", 0.05)
+
+    class _HangingAdvisor(FakeAdvisor):
+        async def healthcheck(self) -> AdvisorHealth:
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    health = await asyncio.wait_for(live.probe_advisor_health(_HangingAdvisor()), timeout=1.0)
+    assert health.status is AdvisorHealthStatus.UNREACHABLE
+    assert health.error is not None
+
+
+def test_advisor_healthcheck_receives_no_mcp_write_tools() -> None:
+    """The advisor protocol exposes only advice + reachability — never any MCP
+    write surface (the advisory-only invariant). A reviewer-readable assertion
+    that the probe capability did not smuggle hardware control onto the advisor."""
+    from roastpilot_agent.advisor import RoastAdvisor
+
+    methods = {name for name in dir(RoastAdvisor) if not name.startswith("_")}
+    assert methods == {"get_recommendation", "healthcheck"}
+
+
 # --- build_live_service ---------------------------------------------------------
 
 

@@ -42,6 +42,7 @@ from roastpilot_agent.controller import (
 from roastpilot_agent.mcp_client import ExportRoastLogResult, MCPServerProcess, RoastSessionState
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
+    AdvisorHealth,
     HealthResponse,
     LogManifest,
     MCPChildStatus,
@@ -779,6 +780,11 @@ class RoastService:
         #: ``starting`` row but no controller loop drives them.
         self._roaster = roaster
         self._advisor = advisor
+        #: The most recent advisor reachability probe (issue #168), set at
+        #: ``serve`` startup via :meth:`set_advisor_health` and surfaced on
+        #: ``GET /api/health`` so the dashboard can render an ADVISOR-OFFLINE
+        #: state. ``None`` until a probe runs (e.g. the E7 API-only path).
+        self._advisor_health: AdvisorHealth | None = None
         self._exporter = exporter
         self._raw_state = raw_state
         self._run_loop = run_loop
@@ -824,19 +830,43 @@ class RoastService:
             return MCPChildStatus.NOT_CONFIGURED
         return MCPChildStatus.RUNNING if self._mcp.running else MCPChildStatus.STOPPED
 
+    @property
+    def advisor(self) -> RoastAdvisor | None:
+        """The wired advisor, or ``None`` when none is configured (issue #168).
+
+        Read-only accessor so the ``serve`` entrypoint can run the startup
+        reachability probe without reaching into private state; the advisor
+        stays advisory-only (the controller still owns the loop).
+        """
+        return self._advisor
+
+    def set_advisor_health(self, health: AdvisorHealth) -> None:
+        """Record the startup advisor reachability probe result (issue #168).
+
+        Set once by the ``serve`` entrypoint after :func:`live.probe_advisor_health`
+        runs, so ``GET /api/health`` can surface whether the advisor answered
+        before charge. Pure observability — the advisor is advisory-only.
+
+        Args:
+            health: The reachability probe result to surface on ``/api/health``.
+        """
+        self._advisor_health = health
+
     async def health(self) -> HealthResponse:
-        """Liveness + MCP child status + active run id (plan §6).
+        """Liveness + MCP child status + active run id + advisor health (plan §6).
 
         Reports the active run from persisted state without mutating the
         in-memory ``active_run_id`` pointer — a GET must not have a write
         side-effect, and once E9 wires the controller loop that pointer is the
-        loop's to own, not a health poll's.
+        loop's to own, not a health poll's. ``advisor`` carries the startup
+        reachability probe (issue #168) when one has run.
         """
         active = await self._store.active_run()
         return HealthResponse(
             version=__version__,
             mcp_child=self.mcp_child_status(),
             active_run_id=None if active is None else active.run_id,
+            advisor=self._advisor_health,
         )
 
     async def start_roast(self, profile: RoastProfile) -> RoastDetail:
