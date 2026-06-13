@@ -1223,6 +1223,9 @@ class RoastController:
             bean_ror_c_per_min=telemetry.bean_ror_c_per_min,
             env_ror_c_per_min=telemetry.env_ror_c_per_min,
             target_drop_temp_c=self._profile.target_drop_temp_c,
+            target_development_percent=self._profile.target_development_percent,
+            charge_guidance_min_c=self._profile.charge_guidance_min_c,
+            charge_guidance_max_c=self._profile.charge_guidance_max_c,
             profile_name=self._profile.name,
             first_crack_detected=telemetry.first_crack_detected,
         )

@@ -581,6 +581,36 @@ def test_v2_prompt_adds_fan_and_duration() -> None:
     assert "never control hardware" in v2
 
 
+def test_v3_prompt_has_explicit_per_stage_sections() -> None:
+    """v3 (#172, Option 2) is one prompt with explicit per-stage sections —
+    PREHEAT / DRYING-MAILLARD / FC-DEVELOPMENT — each aimed at its target, while
+    keeping v2's electric Hottop framing and the advisory-only invariant. It is
+    a first draft pending bake-off validation (#173); v2 stays the default."""
+    v3 = instructions_for("v3").lower()
+    # All three stage sections are present and labelled.
+    assert "preheat" in v3
+    assert "maillard" in v3
+    assert "first crack" in v3
+    assert "development" in v3
+    # PREHEAT aims at the charge guidance band.
+    assert "charge_guidance_min_c" in v3
+    assert "charge_guidance_max_c" in v3
+    # FC/development aims at the development-ratio target.
+    assert "target_development_percent" in v3
+    # Carried-forward electric Hottop framing + advisory-only invariant.
+    assert "thermal lag" in v3
+    assert "convective" in v3
+    assert "never control hardware" in v3
+
+
+def test_v3_is_not_the_default_prompt_version() -> None:
+    """v3 is selectable but additive: the shipped default stays v2 until the
+    bake-off (#173) validates v3."""
+    assert AdvisorConfig().prompt_version == "v2"
+    # Both are resolvable, and v3 is distinct from v2.
+    assert instructions_for("v3") != instructions_for("v2")
+
+
 # --- healthcheck reachability probe (issue #168) ---
 
 

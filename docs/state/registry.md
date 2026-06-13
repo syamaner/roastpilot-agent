@@ -264,6 +264,14 @@ order:
 5. 🟢 **#172** stage-tuned prompt — **Option 2** (one prompt, per-stage sections:
    PREHEAT / DRYING-MAILLARD / FC-DEV) + fill `AdvisorContext` gaps
    (`target_development_percent`, charge band); **bake-off-gated** (not safety).
+   **SCAFFOLD DONE, content pending bake-off (#173).** PR `feature/172-stage-tuned-prompt`:
+   added the `v3` prompt (Option 2, one prompt with explicit PREHEAT / DRYING-MAILLARD /
+   FC-DEVELOPMENT sections, first draft carrying v2's electric-Hottop framing) selectable
+   but NOT default — **`AdvisorConfig.prompt_version` stays `v2`** until the bake-off
+   validates v3; populated `AdvisorContext.target_development_percent` + the charge
+   guidance band (`charge_guidance_min_c`/`max_c`) from the frozen profile in
+   `controller._build_advisor_context`. **Prompt + context-population additive only — no
+   verdict / transition / target-execution change**; advisor stays advisory-only.
 6. 🟢 **#173** phase-dependent MODEL — fast model post-FC (haiku-4.5 / gemini-flash /
    gpt-5-mini-reasoning-off); **re-run bake-off weighting latency post-FC**; new D-number.
    **Operator-gated** (needs a valid key + operator judgment + API cost) — the one piece
