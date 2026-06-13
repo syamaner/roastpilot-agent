@@ -11,6 +11,8 @@
 #          (omit the key to run advisory-paused — controller still runs safety)
 # Env:     PORT=8000
 #          COFFEE_ROASTER_MCP_CONFIG=~/roasts/coffee-roaster-mcp.yaml  (default)
+#          ROASTPILOT_DB=~/roasts/roastpilot.sqlite3  (default) — the agent
+#            decision trace; persists across shutdown/restart (issue #161).
 #
 set -euo pipefail
 
@@ -20,6 +22,10 @@ cd "$REPO"
 PORT="${PORT:-8000}"
 : "${COFFEE_ROASTER_MCP_CONFIG:=$HOME/roasts/coffee-roaster-mcp.yaml}"
 export COFFEE_ROASTER_MCP_CONFIG
+# Persist the live decision trace next to the MCP config + logs (issue #161),
+# so the operator finds it and it survives a Ctrl-C / restart for recovery.
+: "${ROASTPILOT_DB:=$HOME/roasts/roastpilot.sqlite3}"
+export ROASTPILOT_DB
 
 if [ ! -f "$COFFEE_ROASTER_MCP_CONFIG" ]; then
   echo "ERROR: MCP config not found: $COFFEE_ROASTER_MCP_CONFIG" >&2
@@ -73,6 +79,7 @@ for _ in $(seq 1 120); do
 
   Advisor    : ${ADV}
   Dashboard  : http://${IP}:${PORT}/
+  Trace DB   : ${ROASTPILOT_DB}  (persists after shutdown — #161)
 
   ⚠  Ctrl-C is NOT an emergency stop — it leaves the heater at its
      last setpoint. Use the in-UI EMERGENCY STOP or cut machine power.
