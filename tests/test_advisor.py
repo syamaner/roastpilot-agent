@@ -25,8 +25,8 @@ from typing import Any
 import pytest
 from pydantic_ai import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
-from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models import Model
+from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.openai import OpenAIChatModel
