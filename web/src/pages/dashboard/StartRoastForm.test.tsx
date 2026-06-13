@@ -102,7 +102,7 @@ describe("StartRoastForm", () => {
     expect(onStart).not.toHaveBeenCalled();
   });
 
-  it("rejects charge min >= max", () => {
+  it("rejects charge min > max", () => {
     const onStart = vi.fn();
     render(<StartRoastForm onStart={onStart} />);
     fillMinimum();
@@ -113,6 +113,68 @@ describe("StartRoastForm", () => {
     expect(screen.getByTestId("start-roast-charge_guidance_max_c-error")).toHaveTextContent(
       /above min/i,
     );
+    expect(onStart).not.toHaveBeenCalled();
+  });
+
+  it("rejects charge min == max (the equality / >= path)", () => {
+    const onStart = vi.fn();
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    // Both set to the same in-range value: 200 == 200 must be rejected.
+    fireEvent.change(screen.getByTestId("start-roast-charge_guidance_min_c"), {
+      target: { value: "200" },
+    });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    expect(screen.getByTestId("start-roast-charge_guidance_max_c-error")).toHaveTextContent(
+      /above min/i,
+    );
+    expect(onStart).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["charge_guidance_min_c", "90"],
+    ["charge_guidance_max_c", "260"],
+    ["target_drop_temp_c", "2050"],
+  ] as const)("rejects an out-of-range Celsius temperature on %s (=%s)", (field, value) => {
+    const onStart = vi.fn();
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    fireEvent.change(screen.getByTestId(`start-roast-${field}`), { target: { value } });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    expect(screen.getByTestId(`start-roast-${field}-error`)).toBeInTheDocument();
+    expect(onStart).not.toHaveBeenCalled();
+  });
+
+  it("accepts temperatures at the inclusive Celsius bounds (100 and 240)", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    fireEvent.change(screen.getByTestId("start-roast-charge_guidance_min_c"), {
+      target: { value: "100" },
+    });
+    fireEvent.change(screen.getByTestId("start-roast-charge_guidance_max_c"), {
+      target: { value: "240" },
+    });
+    fireEvent.change(screen.getByTestId("start-roast-target_drop_temp_c"), {
+      target: { value: "240" },
+    });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
+    const profile = onStart.mock.calls[0][0] as RoastProfile;
+    expect(profile.charge_guidance_min_c).toBe(100);
+    expect(profile.charge_guidance_max_c).toBe(240);
+    expect(profile.target_drop_temp_c).toBe(240);
+  });
+
+  it("rejects development percent at the lower 0 boundary (exclusive)", () => {
+    const onStart = vi.fn();
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    fireEvent.change(screen.getByTestId("start-roast-target_development_percent"), {
+      target: { value: "0" },
+    });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    expect(screen.getByTestId("start-roast-target_development_percent-error")).toBeInTheDocument();
     expect(onStart).not.toHaveBeenCalled();
   });
 

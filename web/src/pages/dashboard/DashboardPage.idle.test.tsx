@@ -98,6 +98,9 @@ describe("DashboardPage idle/active wiring (#158)", () => {
     expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
     // The live dashboard is NOT mounted in the idle branch.
     expect(screen.queryByTestId("dashboard")).toBeNull();
+    // The idle header shows a neutral label, not the "connecting" stream indicator
+    // (there is no run to connect to) — #160 review item 3.
+    expect(screen.getByTestId("idle-indicator")).toHaveTextContent(/no active roast/i);
   });
 
   it("shows the live dashboard (not the form) when a run is active", () => {

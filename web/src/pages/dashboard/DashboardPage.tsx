@@ -140,8 +140,19 @@ export function DashboardPage(): React.JSX.Element {
   // a roast without `curl` (E11 headless appliance). Once a roast is active this
   // branch is not taken and the live dashboard below renders, server-driven.
   if (isIdle) {
+    // No run to connect to, so the "connecting" stream indicator would be
+    // misleading — show a neutral idle label instead (#160 review item 3).
     return (
-      <AppFrame headerRight={<ConnectionIndicator status={status} />}>
+      <AppFrame
+        headerRight={
+          <span
+            data-testid="idle-indicator"
+            className="text-xs font-semibold uppercase tracking-wide text-muted-foreground"
+          >
+            No active roast
+          </span>
+        }
+      >
         <div className="flex flex-col gap-4" data-testid="dashboard-idle">
           <StartRoastForm onStart={handleStartRoast} />
         </div>
