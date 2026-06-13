@@ -79,6 +79,22 @@ def test_load_roast_rejects_fixture_missing_events(tmp_path: Path) -> None:
         replay.load_roast(fixture)
 
 
+def test_load_roast_rejects_fixture_with_no_telemetry(tmp_path: Path) -> None:
+    """A fixture with the events but zero telemetry rows raises a clear error."""
+    fixture = tmp_path / "roast.jsonl"
+    fixture.write_text(
+        "\n".join(
+            [
+                '{"type": "event", "kind": "beans_added", "monotonic_seconds": 0.0}',
+                '{"type": "event", "kind": "first_crack_detected", "monotonic_seconds": 500.0}',
+                '{"type": "event", "kind": "beans_dropped", "monotonic_seconds": 600.0}',
+            ]
+        )
+    )
+    with pytest.raises(ValueError, match="no telemetry rows"):
+        replay.load_roast(fixture)
+
+
 # --- build_ticks -------------------------------------------------------------
 
 

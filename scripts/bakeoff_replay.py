@@ -135,6 +135,8 @@ def load_roast(fixture: Path) -> tuple[list[dict[str, Any]], GroundTruth]:
     missing = {"beans_added", "first_crack_detected", "beans_dropped"} - events.keys()
     if missing:
         raise ValueError(f"fixture {fixture} lacks required events: {sorted(missing)}")
+    if not telemetry:
+        raise ValueError(f"fixture {fixture} has no telemetry rows")
     t0 = events["beans_added"]
     fc = events["first_crack_detected"]
     drop = events["beans_dropped"]

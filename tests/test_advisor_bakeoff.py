@@ -222,6 +222,22 @@ def test_preheat_context_raises_on_fixture_without_pre_charge_rows(
         bakeoff.build_phase_context(fixture, RoastPhase.PREHEATING)
 
 
+def test_pre_fc_context_raises_on_fixture_without_pre_fc_rows(tmp_path: Path) -> None:
+    """A fixture with no charge→FC telemetry yields a clear error, not a crash."""
+    fixture = tmp_path / "roast.jsonl"
+    # charge and first crack coincide → no pre-first-crack telemetry window.
+    lines = [
+        '{"type": "event", "kind": "beans_added", "monotonic_seconds": 500.0}',
+        '{"type": "event", "kind": "first_crack_detected", "monotonic_seconds": 500.0}',
+        '{"type": "event", "kind": "beans_dropped", "monotonic_seconds": 600.0}',
+        '{"type": "telemetry", "monotonic_seconds": 550.0, "bean_temp_c": 185.0, '
+        '"env_temp_c": 200.0, "heat_level_percent": 60, "fan_level_percent": 40}',
+    ]
+    fixture.write_text("\n".join(lines))
+    with pytest.raises(ValueError, match="no telemetry rows between charge"):
+        bakeoff.build_phase_context(fixture, RoastPhase.ROASTING_PRE_FIRST_CRACK)
+
+
 # --- Cell summarisation + decision table ------------------------------------
 
 

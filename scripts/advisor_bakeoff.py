@@ -1050,12 +1050,25 @@ async def run_replay_bakeoff(
     print("", flush=True)
     cells: list[ReplayCell] = []
     for pv in prompt_versions:
-        for cand in survivors:
-            print(f"replaying {cand.slug} (prompt {pv}) over {len(roasts)} roasts…", flush=True)
-            cell = await run_replay_cell(cand, pv, reasoning, roasts, cadence_seconds)
-            cells.append(cell)
+        # Candidates are independent (each calls a different model), so run them
+        # concurrently — same rationale as the concurrent availability sweep.
+        # Within a single roast the ticks must stay serial (per-tick latency
+        # measurement), so the concurrency is at the (candidate) level only.
+        # ``gather`` preserves ``survivors`` order; progress is printed after
+        # each cell resolves so the buffered output stays readable.
+        print(f"replaying {len(survivors)} survivors (prompt {pv}) over {len(roasts)} roasts…")
+        cells_for_pv = list(
+            await asyncio.gather(
+                *(
+                    run_replay_cell(cand, pv, reasoning, roasts, cadence_seconds)
+                    for cand in survivors
+                )
+            )
+        )
+        for cell in cells_for_pv:
             for score in cell.scores:
-                print(f"  {score.roast_name}: {_render_score_line(score)[2:]}", flush=True)
+                print(f"  {cell.slug}: {_render_score_line(score)[2:]}", flush=True)
+        cells.extend(cells_for_pv)
     return availability, cells
 
 
