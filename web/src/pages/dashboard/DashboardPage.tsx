@@ -17,10 +17,11 @@
  */
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 
 import { AppFrame, ConnectionIndicator, LiveCurve } from "@/components/shared";
-import { useHealth, useRoast } from "@/hooks/queries";
+import { roastKeys, useHealth, useRoast } from "@/hooks/queries";
 import { useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
 import type { OperatorAction } from "@/lib/types";
@@ -31,11 +32,20 @@ import { FaultBanner } from "./FaultBanner";
 import { OperatorActionBar, type OperatorActionResultView } from "./OperatorActionBar";
 import { RecoveryModal } from "./RecoveryModal";
 import { RoastHeader } from "./RoastHeader";
+import { StartRoastForm } from "./StartRoastForm";
 import { useDashboardEvents } from "./useDashboardEvents";
 
 export function DashboardPage(): React.JSX.Element {
   const health = useHealth();
   const runId = health.data?.active_run_id ?? null;
+
+  // Idle state (#158): health has loaded and reports NO active run. The dashboard
+  // then shows the Start-roast form instead of the (empty) live view. We render the
+  // form only once health has resolved so it does not flash before the active run is
+  // known. The transition to live is server-driven: on a 201 the next `useHealth`
+  // refetch surfaces the new `active_run_id`, the page re-renders with a runId, and
+  // `useRoastStream` connects — the SPA renders from server state, never fabricated.
+  const isIdle = health.isSuccess && runId === null;
 
   // Live SSE stream — phase/telemetry/enabledActions are server-derived; the
   // page-local reducer folds the NON-LOSSY frame buffer (frames/frameCount) so a
@@ -54,6 +64,20 @@ export function DashboardPage(): React.JSX.Element {
   const [lastResult, setLastResult] = useState<OperatorActionResultView | null>(null);
   // Add-beans toast dismissal (the toast is non-blocking guidance).
   const [toastDismissed, setToastDismissed] = useState(false);
+
+  const queryClient = useQueryClient();
+
+  // Start a roast from the idle form (#158). On 201 we refetch health so the new
+  // `active_run_id` is discovered and the dashboard swaps to the live view — we do
+  // NOT fabricate a runId here (render from server state). Errors (e.g. 409) are
+  // surfaced inline by the form, which catches the thrown ApiError.
+  const handleStartRoast = useCallback(
+    async (profile: Parameters<typeof api.startRoast>[0]) => {
+      await api.startRoast(profile);
+      await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+    },
+    [queryClient],
+  );
 
   const dispatchAction = useCallback(
     async (action: OperatorAction) => {
@@ -111,6 +135,19 @@ export function DashboardPage(): React.JSX.Element {
     () => ({ points: view.points, markers: view.markers }),
     [view.points, view.markers],
   );
+
+  // IDLE: no active run. Show the Start-roast form (#158) so the operator can start
+  // a roast without `curl` (E11 headless appliance). Once a roast is active this
+  // branch is not taken and the live dashboard below renders, server-driven.
+  if (isIdle) {
+    return (
+      <AppFrame headerRight={<ConnectionIndicator status={status} />}>
+        <div className="flex flex-col gap-4" data-testid="dashboard-idle">
+          <StartRoastForm onStart={handleStartRoast} />
+        </div>
+      </AppFrame>
+    );
+  }
 
   return (
     <AppFrame headerRight={<ConnectionIndicator status={status} />}>
