@@ -321,6 +321,21 @@ def test_resolve_live_store_path_home_fallback(
     assert resolved.parent.is_dir()
 
 
+def test_db_with_replay_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--db`` is live-serve only; combining it with ``--replay`` exits 2 with a
+    clear message rather than silently ignoring the flag (issue #161)."""
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", "somedir", "--db", "/tmp/x.sqlite3"],
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+    assert "--db is only valid for 'serve'" in capsys.readouterr().err
+
+
 @pytest.mark.usefixtures("no_serve")
 def test_serve_no_child_leak_when_post_build_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

@@ -344,6 +344,10 @@ def main() -> int:
     without either the scaffold entrypoint prints help."""
     parser = _build_parser()
     args = parser.parse_args()
+    # --db is live-serve only; replay is always ephemeral. Combining them would
+    # silently ignore --db, so reject it up front rather than mislead (#161).
+    if args.replay is not None and args.db is not None:
+        parser.error("--db is only valid for 'serve'; replay uses an ephemeral store")
     if args.action == "serve":
         return asyncio.run(_serve_live(args))
     if args.replay is not None:
