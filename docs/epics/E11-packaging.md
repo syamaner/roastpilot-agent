@@ -16,12 +16,14 @@ child, per D6), mDNS, and a deployment doc. **No Docker image; no PyTorch on the
 > torch-free MCP release.
 
 > **BLOCKED — operator manual-test gate (D28):** do **not** begin E11
-> implementation until **both** operator-owned (@syamaner) manual test tasks are
-> Done: **#134** (E12-S1 supervised hardware roast through the agent harness, D17
-> criterion 3) and **#135** (E10-S6 manual Safari/iPadOS SSE on real devices). This
-> is *separate from and additional to* the D27 torch-free gate above. Contract-
-> buildable scaffolding may be pre-staged only on explicit operator opt-in. (Prove
-> the harness on real hardware + devices before packaging it.)
+> implementation until **both** operator-owned (@syamaner) manual test tasks are Done.
+> **#135** (E10-S6 manual Safari/iPadOS SSE on real devices) is **✅ DONE/CLOSED**
+> (13 Jun, iPad + iPhone Safari). **#134** (E12-S1 supervised hardware roast through the
+> agent harness, D17 criterion 3) is the **sole remaining gate** — operator running it
+> 13 Jun, now with a persistent decision trace (#161). This is *separate from and
+> additional to* the D27 torch-free gate above. Contract-buildable scaffolding may be
+> pre-staged only on explicit operator opt-in. (Prove the harness on real hardware +
+> devices before packaging it.)
 
 ## Plan links
 

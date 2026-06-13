@@ -5,10 +5,11 @@
 - Epic file: `docs/epics/E11-packaging.md` — **BLOCKED, do not start (D28 + D27)**.
   E10 closed 11 Jun 2026. E11 is next in order but **gated**: do **not** begin E11
   implementation (#136/#137/#138) until **both** operator manual tests are Done —
-  **#134** (supervised hardware roast, D17 criterion 3) and **#135** (real-device
-  Safari/iPad SSE) — **and** the torch-free chain is green (**D27**: #54 → #157).
-  See **D28**. Until then there is no agent-startable story; the next session should
-  verify those gates before touching E11.
+  **#135** (real-device Safari/iPad SSE) is **✅ DONE**; **#134** (supervised hardware
+  roast, D17 criterion 3) is the **sole remaining operator gate** (running 13 Jun) —
+  **and** the torch-free chain is green (**D27**: #54 → #157). See **D28**. Until both
+  gates clear there is no agent-startable story; the next session should verify them
+  before touching E11.
 - Project: RoastPilot (GitHub user project, owner `syamaner`)
 - Repository: `syamaner/roastpilot-agent`
 - Package: `roastpilot-agent`
@@ -141,11 +142,13 @@ review defers: ror scale in hook, scale-covers asserts on live/fault),
 
 **E11 (Packaging) is next in epic order but BLOCKED — do not start (D28 + D27).**
 Two independent gates must clear first:
-1. **Operator manual tests (D28)** — human-owned (@syamaner): **#134** (E12-S1
-   supervised hardware roast through the agent harness, D17 criterion 3) and
-   **#135** (E10-S6 manual Safari/iPadOS SSE on real devices). *Both* must be Done
-   before E11 implementation begins. Rationale: prove the harness on real hardware +
-   devices before packaging/distributing it.
+1. **Operator manual tests (D28)** — human-owned (@syamaner): **#135** (E10-S6 manual
+   Safari/iPadOS SSE on real devices) is **✅ DONE/CLOSED** (validated on iPad + iPhone
+   Safari, latest iPadOS/iOS — connects/streams + reconnect + the critical GET-only
+   check); **#134** (E12-S1 supervised hardware roast through the agent harness, D17
+   criterion 3) is the **sole remaining gate** (operator running it 13 Jun). *Both*
+   must be Done before E11 implementation begins. Rationale: prove the harness on real
+   hardware + devices before packaging/distributing it.
 2. **Torch-free chain (D27)** — Phase 1 **#54** (FC-repo librosa filterbank +
    accuracy gate ≥96.86 % acc / 96.9 % precision on the 191-sample v2 set) → Phase 2
    **#157** (torch-free `coffee-roaster-mcp` release); E11's `[pi]` extra pins #157.
@@ -153,7 +156,7 @@ E11 stories #136/#137/#138 are staged (Todo). Contract-buildable scaffolding may
 pre-staged **only on explicit operator opt-in**. (D28 was recorded 13 Jun 2026 after
 this gate was lost across a session — agreed verbally, written nowhere durable.)
 
-**13 Jun bridge (E10→E11) — landed on `main`, 11 PRs (#143–#154).** Pre-E11 enabler +
+**13 Jun bridge (E10→E11) — landed on `main`, #143–#162.** Pre-E11 enabler +
 hardening, NOT a start on E11 implementation (still gated):
 - **Live-serve entrypoint (#143):** `roastpilot-agent serve [--host --port --spa-dir]`
   builds the live stack (`live.build_live_service` → `MCPServerProcess` →
@@ -177,8 +180,29 @@ hardening, NOT a start on E11 implementation (still gated):
 - **Device-test fix (#154):** the dashboard live curve now backfills from `/telemetry`
   on (re)connect + renders an **M:SS** time axis (was blank on late-join, raw seconds).
   Low follow-ups → #155.
+- **Hardware-sensing startup readout (#157):** `serve` prints the MCP child's resolved
+  runtime (real Hottop vs `mock` driver, port, FC mode/model) before uvicorn serves —
+  a can't-miss "right hardware + FC on?" console block for the #134 roast.
+- **Start Roast button (#158/#160):** the dashboard idle state renders a **Start Roast**
+  form (`POST /api/roasts`) — operate the roast without `curl`. Celsius 100–240 °C bounds
+  on the temp inputs. The ONLY operator entry-point added; per the **automated-roaster
+  minimal-UX** principle, heat/fan stay read-outs, not dials (no manual `set_heat`/`set_fan`).
+- **Persistent live decision trace (#161/#162):** `serve` now writes the agent store to a
+  **persistent** path (`--db` > `ROASTPILOT_DB` > `$XDG_STATE_HOME/roastpilot/…`), not a
+  tempdir — the per-tick telemetry + every CLAMP/REJECT `SafetyEvaluation` + advisor
+  decisions survive shutdown and a restart can read prior run state for recovery. Found
+  *during* the #134 roast (operator asked where logs go). `roast-live.sh` defaults the
+  trace to `~/roasts/roastpilot.sqlite3` and shows it in the READY banner. Replay stays
+  ephemeral. (`--db` + `--replay` together now errors, not silently ignored.)
 
-**Gate status:** E11 still blocked on the two operator manual tests — **#135** (device
-SSE) effectively validated on iPad/iPhone (live curve + reconnect); **#134** (supervised
-hardware roast) is the remaining gate. Bridge follow-ups: #142 (shutdown→heat off),
-#155 (curve-hydration lows).
+**Profile UX (D29, 13 Jun):** profiles stay inline-per-roast (D7) — no saved-profile
+library / dropdown / clone / post-start edit. Profile *selection / reuse / rating-matched
+recommendation* is deferred to **roastpilot-cloud** (feedback-learning), not yet fully
+planned. Keeps the appliance UX minimal; the cloud owns the profile/feedback brain.
+
+**Gate status:** E11 still blocked. Of the two D28 operator manual tests, **#135** (device
+SSE) is **DONE/CLOSED**; **#134** (supervised hardware roast) is the **sole remaining
+operator gate** — operator running it 13 Jun, now with a persistent trace (#161). The
+torch-free chain (D27: #54 → #157) is the other, independent gate. Bridge follow-ups still
+open: **#142** (graceful-shutdown → heat off), **#155** (curve-hydration lows), **#159**
+(auto-merge-vs-review governance race; interim rule: don't `--auto` substantive PRs).
