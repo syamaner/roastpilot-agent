@@ -869,6 +869,22 @@ async def test_automatic_advisory_fires_without_manual_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_advisor_context_carries_profile_stage_targets() -> None:
+    """The advisor context is populated with the frozen profile's stage targets
+    (#172): the development-ratio target and the charge guidance band, so the
+    stage-tuned prompt has explicit goals to aim at. Context-population only —
+    no control logic reads these back."""
+    advisor = FakeAdvisor([decision(heat=60, fan=50)])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    await harness.controller.tick()
+    assert advisor.contexts
+    ctx = advisor.contexts[-1]
+    assert ctx.target_development_percent == PROFILE.target_development_percent
+    assert ctx.charge_guidance_min_c == PROFILE.charge_guidance_min_c
+    assert ctx.charge_guidance_max_c == PROFILE.charge_guidance_max_c
+
+
+@pytest.mark.asyncio
 async def test_no_automatic_advisory_in_cooling() -> None:
     """The automatic policy is silent outside advice phases — cooling gets no
     advisory call or rejection-spam (manual would still be answered)."""

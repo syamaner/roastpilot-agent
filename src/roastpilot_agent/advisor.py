@@ -74,6 +74,15 @@ class AdvisorContext(BaseModel):
 
     Built from the MCP roast state, the frozen profile, and recent
     decisions; ``reference_roasts`` stays empty until M2 (component plan §4).
+
+    ``target_development_percent`` and the charge guidance band
+    (``charge_guidance_min_c`` / ``charge_guidance_max_c``) are copied from the
+    frozen profile so the stage-tuned prompt (``v3``) has explicit targets to
+    aim at — the development-ratio goal for the FC/development section and the
+    charge-temperature band for the preheat section. They are context only and
+    carry no control authority; the controller and safety policy never read
+    them back. They default to ``None`` so a context built without a profile
+    (or by an older caller) stays valid.
     """
 
     phase: RoastPhase
@@ -84,6 +93,9 @@ class AdvisorContext(BaseModel):
     bean_ror_c_per_min: float | None
     env_ror_c_per_min: float | None
     target_drop_temp_c: float
+    target_development_percent: float | None = None
+    charge_guidance_min_c: float | None = None
+    charge_guidance_max_c: float | None = None
     profile_name: str
     recent_telemetry_samples: list[dict[str, Any]] = Field(default_factory=list[dict[str, Any]])
     first_crack_detected: bool = False
@@ -362,6 +374,64 @@ _PROMPTS: dict[str, str] = {
         "cut heat substantially AND raise fan toward convective transfer — "
         "coordinate the two, minding the heat:fan balance (too much fan with "
         "too little heat crashes RoR and stalls/bakes).\n"
+        "Bias toward decisive, coordinated heat-and-fan control over timid "
+        "single-lever nudging."
+    ),
+    # v3 (issue #172): Option 2 — ONE prompt with explicit per-stage sections.
+    # v2 is a single generalist block and leaves the model to infer which
+    # advice applies to the current phase; v3 keeps v2's electric Hottop
+    # framing (two coupled levers, thermal lag, development = duration) but
+    # organizes the guidance into PREHEAT / DRYING-MAILLARD / FC-DEVELOPMENT
+    # sections so the model follows the one matching context.phase, and it aims
+    # the sections at the new context targets (charge guidance band, target
+    # development percent). FIRST DRAFT — content is pending bake-off validation
+    # (#173) before it can become the default; v2 stays the default until then.
+    "v3": (
+        "You are an advisory assistant for an electric Hottop drum coffee "
+        "roaster. You never control hardware — a deterministic safety policy "
+        "validates, clamps, or rejects every recommendation. All temperatures "
+        "are Celsius. Return target_heat, target_fan (0-100), should_drop, "
+        "confidence (0-1), and a short rationale.\n"
+        "Two coupled levers, true in every stage — reason about both and their "
+        "balance:\n"
+        "- Heat sets energy into the drum. The electric element has THERMAL LAG "
+        "— a change takes time to show in bean temperature, so act EARLY and "
+        "DECISIVELY, anticipating it; timid trims react too late.\n"
+        "- Fan/airflow sets the MODE of heat transfer and protects flavor: "
+        "raising it shifts from radiant/conductive drum heat toward CONVECTIVE "
+        "heat (more even, prevents scorched/baked flavor) and evacuates smoke "
+        "and chaff. It is not just a coolant. Too much fan with too little heat "
+        "crashes the rate-of-rise (RoR) and stalls/bakes the roast.\n"
+        "The context JSON includes the current phase — follow the matching "
+        "section below.\n"
+        "PREHEAT (before the beans are charged): the goal is to bring the drum "
+        "to the charge band given by charge_guidance_min_c / "
+        "charge_guidance_max_c and hold it steady there. Guide heat/fan to reach "
+        "and stabilize inside that band; advise on charge readiness and timing "
+        "via the rationale (ready to charge once stable in band, hold or trim if "
+        "over/under). Do not recommend should_drop in preheat.\n"
+        "DRYING / MAILLARD (charged through to just before first crack): manage "
+        "the RoR DECLINE. The charge dunks the drum temperature, then bean "
+        "temperature climbs and RoR should ease smoothly downward toward first "
+        "crack — never flatten to a stall (baking) and never flick back upward. "
+        "Because of the thermal lag this is the stage that needs EARLY, often "
+        "DRASTIC heat cuts: reduce heat well before the RoR is visibly wrong, "
+        "and coordinate fan to steer convective transfer. Do not drop here.\n"
+        "FIRST CRACK / DEVELOPMENT (first crack detected onward): the objective "
+        "is DURATION, not a temperature. Aim for a development ratio "
+        "(development time / total roast time since charge) near "
+        "target_development_percent; a ratio in roughly the 10-20% range makes "
+        "an excellent roast and around 10% can be plenty. target_drop_temp_c is "
+        "a GUIDE, not a hard stop — it is fine to develop modestly past it to "
+        "hit the duration target (the safety policy owns the true ceiling), but "
+        "beans can turn too dark pushed well past ~195 C, and that threshold is "
+        "bean-dependent; favor the development-ratio target and don't chase "
+        "temperature. To stretch development when post-crack RoR is high, cut "
+        "heat substantially AND raise fan toward convective transfer. Judge "
+        "should_drop primarily on the development ratio and resulting flavor; "
+        "recommend the drop decisively once the ratio target is met — do not "
+        "rush it because the temperature guide is reached, nor dither once it is "
+        "developed. FC consults are rapid: be concise and decisive.\n"
         "Bias toward decisive, coordinated heat-and-fan control over timid "
         "single-lever nudging."
     ),
