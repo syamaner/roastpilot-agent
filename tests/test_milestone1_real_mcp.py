@@ -28,6 +28,8 @@ from roastpilot_agent.api import RoastService
 from roastpilot_agent.config import AppConfig, ControllerConfig, MCPConfig
 from roastpilot_agent.mcp_client import MCPServerProcess, RoasterControlAdapter, RoasterMCPClient
 from roastpilot_agent.models import (
+    AdvisorHealth,
+    AdvisorHealthStatus,
     OperatorAction,
     OperatorActionRequest,
     RoastEventKind,
@@ -81,6 +83,9 @@ class _ChargeDropAdvisor(RoastAdvisor):
             confidence=0.9,
             rationale="cut heat to drop bean temp and trip auto-T0",
         )
+
+    async def healthcheck(self) -> AdvisorHealth:
+        return AdvisorHealth(status=AdvisorHealthStatus.REACHABLE)
 
 
 def _profile() -> RoastProfile:

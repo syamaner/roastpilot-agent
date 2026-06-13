@@ -28,6 +28,7 @@ from roastpilot_agent import __version__
 if TYPE_CHECKING:
     from roastpilot_agent.api import RoastService
     from roastpilot_agent.mcp_client import MCPServerProcess, RuntimeConfigSnapshot, ToolCaller
+    from roastpilot_agent.models import AdvisorHealth
     from roastpilot_agent.store import RoastStore
 
 _log = logging.getLogger(__name__)
@@ -217,6 +218,75 @@ async def _emit_runtime_readout(call_tool: "ToolCaller") -> None:
         print(line)
 
 
+def _format_advisor_readout(health: "AdvisorHealth") -> list[str]:
+    """Render the operator-facing advisor reachability readout (issue #168).
+
+    Turns the startup :class:`~roastpilot_agent.models.AdvisorHealth` probe
+    into a prominent console line — as can't-miss as the mock-driver ``⚠️``
+    warning — so the operator learns the advisor is dead *before* charging
+    beans (the #134 expired-key failure that "advisor configured" hid). A
+    ``REACHABLE`` advisor prints provider/model; ``UNREACHABLE`` prints a loud
+    ``⚠️`` line carrying the actual provider error (401/402/404/timeout);
+    ``NOT_CONFIGURED`` notes the roast will run advisory-paused. Read-only and
+    informational — an unreachable advisor never blocks serve.
+
+    Args:
+        health: The advisor reachability probe result.
+
+    Returns:
+        The console lines to print, in order.
+    """
+    from roastpilot_agent.models import AdvisorHealthStatus
+
+    lines = ["── Advisor (reachability probe) ──"]
+    if health.status is AdvisorHealthStatus.REACHABLE:
+        lines.append(f"  advisor REACHABLE (provider={health.provider}, model={health.model_slug})")
+    elif health.status is AdvisorHealthStatus.NOT_CONFIGURED:
+        lines.append(
+            "  advisor NOT CONFIGURED — the roast runs advisory-paused "
+            "(the controller issues no advisory writes without an advisor)"
+        )
+    else:
+        target = ""
+        if health.provider is not None or health.model_slug is not None:
+            target = f" (provider={health.provider}, model={health.model_slug})"
+        # `error` is typed `str | None`; every UNREACHABLE path sets it, but
+        # guard so the operator never sees a bare "UNREACHABLE: None".
+        error_msg = health.error or "(no error detail)"
+        lines.append(f"⚠️  advisor UNREACHABLE{target}: {error_msg}")
+        lines.append(
+            "    the roast can still start (advisory-paused); the controller "
+            "runs deterministically without advice"
+        )
+    return lines
+
+
+async def _emit_advisor_readout(service: "RoastService") -> "AdvisorHealth":
+    """Probe advisor reachability, print the readout, and record it (issue #168).
+
+    Best-effort and **non-blocking**: it runs the bounded
+    :func:`~roastpilot_agent.live.probe_advisor_health` over the service's
+    advisor (advisory-only — no MCP write tools), prints
+    :func:`_format_advisor_readout`, and stores the result on the service so
+    ``GET /api/health`` can surface it. The probe never raises or stalls, so it
+    can never wedge or abort startup — an unreachable advisor warns loudly but
+    serve still proceeds.
+
+    Args:
+        service: The live :class:`~roastpilot_agent.api.RoastService`.
+
+    Returns:
+        The advisor reachability probe result (also recorded on the service).
+    """
+    from roastpilot_agent.live import probe_advisor_health
+
+    health = await probe_advisor_health(service.advisor)
+    service.set_advisor_health(health)
+    for line in _format_advisor_readout(health):
+        print(line)
+    return health
+
+
 async def _serve_live(args: argparse.Namespace) -> int:
     """Build and serve the live roast app, then clean up the MCP child.
 
@@ -271,6 +341,13 @@ async def _serve_live(args: argparse.Namespace) -> int:
         # serves, so "right hardware + FC on?" is a can't-miss console line.
         # Read-only and best-effort: a failure here never blocks the serve.
         await _emit_runtime_readout(mcp.call_tool)
+
+        # Advisor reachability probe (#168): a cheap, bounded liveness check so
+        # the operator learns a dead advisor (expired key, bad model slug)
+        # BEFORE charging, not after every in-roast call fails. Best-effort and
+        # non-blocking — an unreachable advisor warns loudly but serve proceeds
+        # (advisory-paused is valid); the result is exposed on /api/health.
+        await _emit_advisor_readout(service)
 
         uv = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
         server = uvicorn.Server(uv)

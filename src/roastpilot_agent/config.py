@@ -75,6 +75,13 @@ class AdvisorConfig(BaseModel):
     api_key_env: str = Field(default="OPENROUTER_API_KEY", min_length=1)
     model_slug: str = "anthropic/claude-opus-4.8"
     timeout_seconds: float = Field(default=10.0, gt=0)
+    # Bound on the startup reachability probe (issue #168). Deliberately short
+    # — the probe is a cheap pre-charge liveness check, not an advice call, and
+    # it must never wedge ``serve`` startup: a hung provider trips this and the
+    # readout reports UNREACHABLE so the operator can decide to proceed
+    # advisory-paused. 5 s catches a slow-but-alive provider while still being
+    # well inside an operator's pre-roast attention window.
+    healthcheck_timeout_seconds: float = Field(default=5.0, gt=0)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
     prompt_version: str = Field(default="v2", min_length=1)
     # Reasoning control for the OpenAI-compatible path (OpenRouter normalizes

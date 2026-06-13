@@ -106,6 +106,38 @@ async def test_health_reports_version_and_no_active_run(client: AsyncClient) -> 
 
 
 @pytest.mark.asyncio
+async def test_health_advisor_is_null_until_probed(client: AsyncClient) -> None:
+    """``advisor`` is null on /api/health until a startup probe records one
+    (issue #168) — the E7 contract path has no advisor reachability yet."""
+    body = (await client.get("/api/health")).json()
+    assert body["advisor"] is None
+
+
+@pytest.mark.asyncio
+async def test_health_surfaces_recorded_advisor_probe(store: RoastStore) -> None:
+    """A recorded reachability probe is surfaced on /api/health so the dashboard
+    can render an ADVISOR-OFFLINE state (issue #168)."""
+    from roastpilot_agent.models import AdvisorHealth, AdvisorHealthStatus
+
+    service = RoastService(store)
+    service.set_advisor_health(
+        AdvisorHealth(
+            status=AdvisorHealthStatus.UNREACHABLE,
+            provider="openai_compatible",
+            model_slug="anthropic/claude-opus-4.8",
+            error="401 Unauthorized",
+        )
+    )
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as instance:
+        body = (await instance.get("/api/health")).json()
+    assert body["advisor"]["status"] == "unreachable"
+    assert body["advisor"]["error"] == "401 Unauthorized"
+    assert body["advisor"]["model_slug"] == "anthropic/claude-opus-4.8"
+
+
+@pytest.mark.asyncio
 async def test_health_reports_active_run(client: AsyncClient, store: RoastStore) -> None:
     await store.create_run(
         run_id="run-active",
