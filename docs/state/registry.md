@@ -300,7 +300,7 @@ order:
    green series + legend °C/min + cursor) on dashboard AND detail; finished with an
    operator-facing live RoR readout in the dashboard `RoastHeader` + confirmed the charge
    (T0) marker; pre-charge RoR **shown, not hidden** (13 Jun operator clarification). Display
-   only. · ✅ **#164** richer bean identity — **DONE** (PR #187): `RoastProfile` gains
+   only. · ✅ **#164** richer bean identity — **DONE** (PR #188): `RoastProfile` gains
    optional/defaulted `country` / `farm` / `description` / `bean_species` (a constrained
    `Literal`, **not** a `models.py` Enum — no safety-reviewer escalation) / `is_blend`,
    keeping `bean_origin` + `bean_varietal` (cultivar). Blend model = `is_blend` flag, primary
