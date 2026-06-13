@@ -29,6 +29,29 @@ DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float] = {
     RoastPhase.DEVELOPMENT: 0.0,
 }
 
+# The single capable advisor model — the E8-S4 bake-off winner (plan §11.1 →
+# D20/D21): ``anthropic/claude-opus-4.8`` via OpenRouter, which won on advice
+# quality with comfortable latency headroom under the 10 s budget. This is the
+# base slug AND the default for every phase (see ``model_slug_by_phase``); the
+# per-phase mechanism (#173) exists so the operator-gated bake-off re-run can
+# later flip the FC/development slot to a faster model, without any behavior
+# change until then.
+DEFAULT_ADVISOR_MODEL = "anthropic/claude-opus-4.8"
+
+# Phase-keyed advisor MODEL selection (#173, operator 13 Jun): the model slug
+# the advisor uses, by agent phase. The MECHANISM only — every phase defaults
+# to ``DEFAULT_ADVISOR_MODEL`` (Opus everywhere), so there is zero behavior
+# change until the operator-gated, latency-weighted bake-off re-run (#173 gate)
+# picks a faster post-FC model and records it as a new D-number. The eventual
+# intent (from the issue): keep the capable model for preheat → pre-FC, and a
+# fast model (~1-2 s) for FC/development where the #171 cadence is unthrottled
+# and latency-bound. A phase absent from the map falls back to ``model_slug``.
+DEFAULT_ADVISOR_MODEL_BY_PHASE: dict[RoastPhase, str] = {
+    RoastPhase.PREHEATING: DEFAULT_ADVISOR_MODEL,
+    RoastPhase.ROASTING_PRE_FIRST_CRACK: DEFAULT_ADVISOR_MODEL,
+    RoastPhase.DEVELOPMENT: DEFAULT_ADVISOR_MODEL,
+}
+
 
 class ControllerConfig(BaseModel):
     """Controller timing and advisory-call thresholds.
@@ -114,6 +137,16 @@ class AdvisorConfig(BaseModel):
     hop/markup, per D18), set ``provider=anthropic`` +
     ``api_key_env=ANTHROPIC_API_KEY``. ``OPENROUTER_API_KEY`` must be set in
     the environment at runtime; ``FakeAdvisor`` stays the test/CI default.
+
+    Per-phase model selection (#173): ``model_slug`` is the base/default slug
+    (the identity in the decision-trace descriptor and the reachability probe),
+    and ``model_slug_by_phase`` is an optional per-phase override map resolved
+    by :meth:`model_for`. By default every phase resolves to
+    ``DEFAULT_ADVISOR_MODEL`` — Opus everywhere — so this is purely additive
+    plumbing with zero behavior change; the operator-gated, latency-weighted
+    bake-off re-run (#173 gate) is what later flips the FC/development slot to a
+    faster model. A phase absent from the override map falls back to
+    ``model_slug``.
     """
 
     provider: Literal["openai", "anthropic", "google", "ollama", "openai_compatible"] = (
@@ -121,7 +154,18 @@ class AdvisorConfig(BaseModel):
     )
     provider_base_url: str = "https://openrouter.ai/api/v1"
     api_key_env: str = Field(default="OPENROUTER_API_KEY", min_length=1)
-    model_slug: str = "anthropic/claude-opus-4.8"
+    model_slug: str = Field(default=DEFAULT_ADVISOR_MODEL, min_length=1)
+    # Phase-keyed model override map (#173). The MECHANISM for phase-dependent
+    # model selection — defaults to ``DEFAULT_ADVISOR_MODEL`` for preheat /
+    # pre-FC / development (Opus everywhere), so :meth:`model_for` resolves to
+    # the current single model in every phase: zero behavior change until the
+    # operator-gated bake-off re-run picks a fast post-FC model. A phase absent
+    # from this map falls back to ``model_slug``. Each slug is ``min_length=1``
+    # (an empty model slug is meaningless). Parameterized factory, not a bare
+    # ``dict`` default, per the repo's pyright-strict typed-default idiom.
+    model_slug_by_phase: dict[RoastPhase, Annotated[str, Field(min_length=1)]] = Field(
+        default_factory=lambda: dict(DEFAULT_ADVISOR_MODEL_BY_PHASE)
+    )
     timeout_seconds: float = Field(default=10.0, gt=0)
     # Bound on the startup reachability probe (issue #168). Deliberately short
     # — the probe is a cheap pre-charge liveness check, not an advice call, and
@@ -140,6 +184,25 @@ class AdvisorConfig(BaseModel):
     # fast structured advice inside the 10 s tick budget, so the bake-off
     # measures reasoning on-vs-off (E8-S4 cost/reasoning eval).
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None
+
+    def model_for(self, phase: RoastPhase) -> str:
+        """Return the advisor model slug to use for ``phase`` (#173).
+
+        Looks ``phase`` up in :attr:`model_slug_by_phase`, falling back to the
+        base :attr:`model_slug` when the phase carries no override. With the
+        default map (Opus for every phase) this always resolves to
+        :attr:`model_slug`, so per-phase selection is a behavioral no-op until
+        the operator-gated bake-off re-run (#173 gate) populates the map with a
+        faster post-FC model.
+
+        Args:
+            phase: The agent phase the controller is currently in.
+
+        Returns:
+            The model slug for ``phase`` — its override if present, else the
+            base ``model_slug``.
+        """
+        return self.model_slug_by_phase.get(phase, self.model_slug)
 
 
 class SafetyLimits(BaseModel):

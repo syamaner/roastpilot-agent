@@ -287,8 +287,17 @@ order:
    verdict / transition / target-execution change**; advisor stays advisory-only.
 6. 🟢 **#173** phase-dependent MODEL — fast model post-FC (haiku-4.5 / gemini-flash /
    gpt-5-mini-reasoning-off); **re-run bake-off weighting latency post-FC**; new D-number.
-   **Operator-gated** (needs a valid key + operator judgment + API cost) — the one piece
-   that cannot be fully autonomous.
+   **MECHANISM DONE** (PR `feature/173-per-phase-model`): `AdvisorConfig` gains a per-phase
+   override map `model_slug_by_phase: dict[RoastPhase, str]` + a `model_for(phase)` resolver
+   (falls back to base `model_slug`); `DEFAULT_ADVISOR_MODEL` (`anthropic/claude-opus-4.8`)
+   is fanned across preheat/pre-FC/development so **the default is Opus everywhere — zero
+   behavior change**. `PydanticAIAdvisor` selects the model by `context.phase` at
+   `get_recommendation` time via a per-slug agent cache (`build_model(config, model_slug=…)`);
+   the injected-model test seam still pins all phases; descriptor/healthcheck keep the base
+   slug. **Additive config + selection only — no verdict/transition/call-policy change**;
+   advisor stays advisory-only. **The bake-off SETS THE VALUES** (operator-gated: needs a
+   valid key + operator judgment + API cost, weighting latency post-FC) → new D-number — the
+   one piece that cannot be fully autonomous.
 7. ✅ **#166** advisor unavailable → **fail-closed after N** (operator's call) — **DONE**
    (PR #185, **D30**, safety-reviewer **PASS**). N consecutive *availability* failures
    (`provider_error`/`timeout`, default N=3) → heat 0 % + overrun-safe fan +
