@@ -1,0 +1,66 @@
+# coffee-roaster-mcp — KNOWN-GOOD config (first successful FC-detecting Hottop roast)
+#
+# Captured from /Users/sertanyamaner/roasts/coffee-roaster-mcp.yaml — the config that
+# drove a real roast on the Hottop with working audio first-crack detection and the
+# correct microphone (run via Warp's MCP: `uvx coffee-roaster-mcp==0.1.3 serve`).
+# Machine-specific values (port, mic, log path) are placeholdered — see comments.
+#
+# IMPORTANT — two FC profiles, don't conflate them:
+#   * THIS file = the LIBRARY-DEFAULT profile (threshold 0.6 / 5 windows / 20 s /
+#     overlap 0.7 / onnx_threads 8). It is what actually detected first crack on a Mac
+#     (which has cores to spare). Proven.
+#   * The Pi appliance (D27 / E11) uses the `pi_inference` profile instead
+#     (threshold 0.90 / min 3 / 30 s / overlap 0.3 / onnx_threads 2) — tuned for the
+#     Pi 5's ~2.5 s/window latency + fewer free cores. Do NOT assume one is the other.
+#
+# To drive a roast THROUGH the roastpilot-agent (issue #134) using this config, point
+# the agent's spawned MCP child at a copy of it:
+#   export COFFEE_ROASTER_MCP_CONFIG=/path/to/this.yaml
+#   roastpilot-agent serve --host 0.0.0.0 --port 8000
+# (serve forwards COFFEE_* into the MCP child; coffee-roaster-mcp==0.1.3 is a dep.)
+
+transport:
+  type: stdio
+
+roaster:
+  driver: hottop_kn8828b_2k_plus
+  port: /dev/cu.usbserial-XXXXXXXX   # your Hottop's USB serial — `ls /dev/cu.usbserial-*`
+  baudrate: 115200
+  temperature_unit: auto             # auto-detect the Hottop's unit; agent works in °C
+  command_interval_seconds: 0.3
+
+first_crack:
+  mode: audio
+  repo_id: syamaner/coffee-first-crack-detection
+  revision: b349a919c34b6130472da97c01817be404e4f629   # pinned known-good model revision
+  precision: int8
+  local_model_dir: null
+  onnx_threads: 8                    # Mac; the Pi appliance uses 2 (leaves cores for MCP+UI)
+  confidence_threshold: 0.6          # library default — detected FC on the Mac roast
+  min_positive_windows: 5
+  confirmation_window_seconds: 20.0
+  allow_manual_override: true
+
+audio:
+  source: microphone
+  input_device: "USB PnP"            # device-name substring match; list: python -c "import sounddevice as sd; print(sd.query_devices())"
+  sample_rate: 16000
+  wav_path: null
+  replay_mode: realtime
+  window_seconds: 10.0               # the model is trained on 10 s windows — required
+  overlap: 0.7                       # 3 s hop (Mac); the Pi profile uses 0.3 (7 s hop)
+  hop_seconds: null
+
+logging:
+  log_dir: ./logs                    # was an absolute path on the roast machine
+  sample_interval_seconds: 5.0
+  export_formats:
+    - jsonl
+    - csv
+    - summary
+
+session:
+  auto_t0_detection_enabled: true
+  auto_t0_drop_threshold_c: 25.0
+  ror_window_seconds: 60
+  ror_min_sample_seconds: 10
