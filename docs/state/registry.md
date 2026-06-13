@@ -7,8 +7,9 @@
   implementation (#136/#137/#138) until **both** operator manual tests are Done —
   **#135** (real-device Safari/iPad SSE) is **✅ DONE**; **#134** (supervised hardware
   roast, D17 criterion 3) is the **sole remaining operator gate** (running 13 Jun) —
-  **and** the torch-free chain is green (**D27**: #54 → #157). See **D28**. Until both
-  gates clear there is no agent-startable story; the next session should verify them
+  **and** the torch-free chain is green (**D27**: `coffee-first-crack-detection#54` →
+  `coffee-roaster-mcp#157` — cross-repo, NOT this repo's #54/#157). See **D28**. Until
+  both gates clear there is no agent-startable story; the next session should verify them
   before touching E11.
 - Project: RoastPilot (GitHub user project, owner `syamaner`)
 - Repository: `syamaner/roastpilot-agent`
@@ -149,9 +150,11 @@ Two independent gates must clear first:
    criterion 3) is the **sole remaining gate** (operator running it 13 Jun). *Both*
    must be Done before E11 implementation begins. Rationale: prove the harness on real
    hardware + devices before packaging/distributing it.
-2. **Torch-free chain (D27)** — Phase 1 **#54** (FC-repo librosa filterbank +
-   accuracy gate ≥96.86 % acc / 96.9 % precision on the 191-sample v2 set) → Phase 2
-   **#157** (torch-free `coffee-roaster-mcp` release); E11's `[pi]` extra pins #157.
+2. **Torch-free chain (D27)** — Phase 1 **`coffee-first-crack-detection#54`** (FC-repo
+   librosa filterbank + accuracy gate ≥96.86 % acc / 96.9 % precision on the 191-sample
+   v2 set) → Phase 2 **`coffee-roaster-mcp#157`** (torch-free MCP release); E11's `[pi]`
+   extra pins `coffee-roaster-mcp#157`. (Both are CROSS-REPO — NOT this repo's #54 [E8-S2
+   advisor] or #157 [the hardware-readout PR].)
 E11 stories #136/#137/#138 are staged (Todo). Contract-buildable scaffolding may be
 pre-staged **only on explicit operator opt-in**. (D28 was recorded 13 Jun 2026 after
 this gate was lost across a session — agreed verbally, written nowhere durable.)
@@ -203,6 +206,7 @@ planned. Keeps the appliance UX minimal; the cloud owns the profile/feedback bra
 **Gate status:** E11 still blocked. Of the two D28 operator manual tests, **#135** (device
 SSE) is **DONE/CLOSED**; **#134** (supervised hardware roast) is the **sole remaining
 operator gate** — operator running it 13 Jun, now with a persistent trace (#161). The
-torch-free chain (D27: #54 → #157) is the other, independent gate. Bridge follow-ups still
+torch-free chain (D27: `coffee-first-crack-detection#54` → `coffee-roaster-mcp#157`,
+cross-repo) is the other, independent gate. Bridge follow-ups still
 open: **#142** (graceful-shutdown → heat off), **#155** (curve-hydration lows), **#159**
 (auto-merge-vs-review governance race; interim rule: don't `--auto` substantive PRs).
