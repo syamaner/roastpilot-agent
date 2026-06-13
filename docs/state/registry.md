@@ -2,7 +2,13 @@
 
 ## Active Epic
 
-- Epic file: `docs/epics/E10-spa.md`
+- Epic file: `docs/epics/E11-packaging.md` — **BLOCKED, do not start (D28 + D27)**.
+  E10 closed 11 Jun 2026. E11 is next in order but **gated**: do **not** begin E11
+  implementation (#136/#137/#138) until **both** operator manual tests are Done —
+  **#134** (supervised hardware roast, D17 criterion 3) and **#135** (real-device
+  Safari/iPad SSE) — **and** the torch-free chain is green (**D27**: #54 → #157).
+  See **D28**. Until then there is no agent-startable story; the next session should
+  verify those gates before touching E11.
 - Project: RoastPilot (GitHub user project, owner `syamaner`)
 - Repository: `syamaner/roastpilot-agent`
 - Package: `roastpilot-agent`
@@ -132,3 +138,17 @@ CLAMP-highlight above viewport), #121 (contract continuous-auto-catch), #133 (S6
 review defers: ror scale in hook, scale-covers asserts on live/fault),
 #103/#104/#105/#111/#112/#117/#102. Kickoff brief:
 `roastpilot-plan/roastpilot-agent/e10-ui-kickoff.md`.
+
+**E11 (Packaging) is next in epic order but BLOCKED — do not start (D28 + D27).**
+Two independent gates must clear first:
+1. **Operator manual tests (D28)** — human-owned (@syamaner): **#134** (E12-S1
+   supervised hardware roast through the agent harness, D17 criterion 3) and
+   **#135** (E10-S6 manual Safari/iPadOS SSE on real devices). *Both* must be Done
+   before E11 implementation begins. Rationale: prove the harness on real hardware +
+   devices before packaging/distributing it.
+2. **Torch-free chain (D27)** — Phase 1 **#54** (FC-repo librosa filterbank +
+   accuracy gate ≥96.86 % acc / 96.9 % precision on the 191-sample v2 set) → Phase 2
+   **#157** (torch-free `coffee-roaster-mcp` release); E11's `[pi]` extra pins #157.
+E11 stories #136/#137/#138 are staged (Todo). Contract-buildable scaffolding may be
+pre-staged **only on explicit operator opt-in**. (D28 was recorded 13 Jun 2026 after
+this gate was lost across a session — agreed verbally, written nowhere durable.)
