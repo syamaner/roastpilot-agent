@@ -467,6 +467,28 @@ async def test_advisory_failure_persists_null_decision_linked_to_reject() -> Non
     assert harness.sink.evaluations[-1].verdict is SafetyVerdict.REJECT
 
 
+class _PhaseModelAdvisor(FakeAdvisor):
+    """A fake advisor whose per-phase descriptor tags the model with the phase
+    — to prove the controller records the phase-RESOLVED model (#189)."""
+
+    def descriptor_for(self, phase: RoastPhase) -> AdvisorDescriptor:
+        return AdvisorDescriptor(
+            provider="fake", model=f"resolved-{phase.value}", prompt_version="t"
+        )
+
+
+@pytest.mark.asyncio
+async def test_advisory_records_phase_resolved_model() -> None:
+    """#189: the advisor_decisions row records descriptor_for(phase) — the model
+    that actually answered this phase's call — not the base descriptor, so the
+    trace stays honest once the FC/development slot is flipped to a faster model."""
+    advisor = _PhaseModelAdvisor([decision()])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)  # phase=DEVELOPMENT
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert harness.sink.advisor_decisions[0].descriptor.model == "resolved-development"
+
+
 @pytest.mark.asyncio
 async def test_advisory_unsafe_output_persists_as_malformed() -> None:
     """An unsafe (out-of-bounds) advisor output has no distinct trace status; it
