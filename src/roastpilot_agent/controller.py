@@ -378,8 +378,16 @@ class AdvisoryCallPolicy:
             )
             if turned or timed_out:
                 self._settle_released = True
-            else:
-                return None
+                # The release tick IS the first real post-charge consult, so
+                # fire it as a PHASE_CHANGE rather than falling through to the
+                # delta/interval checks. A manual no-telemetry skip earlier in
+                # the window can have advanced _last_phase without setting a
+                # delta baseline; with no MIN_INTERVAL floor in pre-first-crack
+                # the fallthrough would then return None and starve the advisor
+                # until near-FC (Codex review #213). The telemetry-None guard
+                # above guarantees this release tick carries a reading.
+                return AdvisoryTrigger.PHASE_CHANGE
+            return None
         # First consult in an advice phase, or any phase transition since the
         # last call: ``_last_phase`` starts None, so the first eligible tick
         # establishes the baseline.

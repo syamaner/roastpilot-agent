@@ -1153,6 +1153,34 @@ def test_policy_post_charge_settle_releases_on_timeout() -> None:
     assert trigger is AdvisoryTrigger.PHASE_CHANGE
 
 
+def test_policy_post_charge_settle_release_preserves_first_consult_after_no_telemetry_skip() -> (
+    None
+):
+    """#213 (Codex P2): a MANUAL request during the settle window on a
+    no-telemetry tick bypasses the gate and lands in _run_advisory as a
+    no_telemetry skip; _maybe_run_advisory then calls note_call(telemetry=None),
+    which advances _last_phase to pre-first-crack WITHOUT setting the temp/RoR
+    delta baselines. Pre-first-crack has no MIN_INTERVAL floor, so if the settle
+    release merely fell through it would find phase==_last_phase, no delta
+    baseline, and return None — starving the advisor for the whole drying phase.
+    The release must itself fire the first consult as a PHASE_CHANGE."""
+    policy = _policy()
+    policy.note_charge(now=0.0)
+    # A manual no-telemetry consult mid-window advances _last_phase but leaves
+    # the delta baselines unset (the exact note_call the controller makes after
+    # a no_telemetry skip).
+    policy.note_call(phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=None, now=1.0)
+    # The bean turns on a real reading: the release IS the first real consult,
+    # preserved as PHASE_CHANGE rather than swallowed to None by the fallthrough.
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
+        now=5.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
 def test_policy_post_charge_settle_latches_released() -> None:
     """The release is a one-way latch (#209): once the bean has turned, a later
     RoR dip back below the turning point must NOT re-suppress. After release the
