@@ -91,12 +91,18 @@ COMMAND_PHASE_MATRIX: dict[RoastCommand, frozenset[RoastPhase]] = {
         {RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT}
     ),
     # start_cooling is recovery-only (plan §6) plus the controller's
-    # post-drop fallback when cooling_on is not observed (plan §3).
+    # post-drop fallback when cooling_on is not observed (plan §3). Also valid
+    # in `faulted`: a fault/e-stop can leave the machine hot, and the operator
+    # must be able to engage cooling on a faulted-but-physically-active roaster
+    # (#206). Cooling is never the hazard — moving air only aids cooling.
     RoastCommand.START_COOLING: frozenset(
-        {RoastPhase.COOLING, RoastPhase.OPERATOR_RECOVERY_REQUIRED}
+        {RoastPhase.COOLING, RoastPhase.OPERATOR_RECOVERY_REQUIRED, RoastPhase.FAULTED}
     ),
-    # The D16 canonical invalid example: stop_cooling during development.
-    RoastCommand.STOP_COOLING: frozenset({RoastPhase.COOLING}),
+    # The D16 canonical invalid example: stop_cooling during development. Valid in
+    # `faulted` (#206): an e-stop can engage cooling, and the operator must be able
+    # to stop it without power-cycling. This is the loss-of-control gap #206 fixes;
+    # `set_heat` is deliberately NOT extended to faulted (heat stays off).
+    RoastCommand.STOP_COOLING: frozenset({RoastPhase.COOLING, RoastPhase.FAULTED}),
     # Export is a file write, not roaster control: valid whenever a session
     # exists (faulted runs export for diagnosis).
     RoastCommand.EXPORT_ROAST_LOG: frozenset(
