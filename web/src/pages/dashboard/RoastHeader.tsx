@@ -21,9 +21,10 @@
 import { useState } from "react";
 
 import { cn } from "@/lib/cn";
-import type { MCPChildStatus, RoastPhase } from "@/lib/types";
+import type { MCPChildStatus, MicStatus, RoastPhase } from "@/lib/types";
 import { formatClock, formatRoR, formatTempC, PHASE_LABEL, phaseAccentVar } from "./format";
 import type { FirstCrackData } from "./events";
+import { MicStatusIcon } from "./MicStatusIcon";
 
 export interface RoastHeaderProps {
   phase: RoastPhase | null;
@@ -43,6 +44,12 @@ export interface RoastHeaderProps {
   firstCrack: FirstCrackData | null;
   /** MCP child link health (the roaster-link dot); undefined while unknown. */
   mcpChild?: MCPChildStatus;
+  /**
+   * Capture-alive mic / first-crack health (#197), server-derived from the live
+   * telemetry frame (or the run snapshot before the first frame). null/undefined
+   * renders the icon as idle — no info, NOT a fault.
+   */
+  micStatus?: MicStatus | null;
 }
 
 export function RoastHeader({
@@ -53,6 +60,7 @@ export function RoastHeader({
   profileName,
   firstCrack,
   mcpChild,
+  micStatus,
 }: RoastHeaderProps): React.JSX.Element {
   const accent = phaseAccentVar(phase);
   return (
@@ -104,6 +112,7 @@ export function RoastHeader({
           </span>
         </div>
         <FirstCrackStatus phase={phase} firstCrack={firstCrack} />
+        <MicStatusIcon micStatus={micStatus} />
         <RoasterLink status={mcpChild} />
         <DiagnosticsDrawer
           phase={phase}

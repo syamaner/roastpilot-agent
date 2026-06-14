@@ -81,6 +81,30 @@ describe("RoastHeader", () => {
     expect(screen.getByTestId("roaster-link")).toHaveAttribute("data-status", "stopped");
   });
 
+  it("renders the mic-status icon from the server mic_status (#197)", () => {
+    render(
+      <RoastHeader
+        {...BASE}
+        micStatus={{
+          mic_health: "ok",
+          audio_running: true,
+          fc_status: "pending",
+          queued_window_count: 0,
+          emitted_window_count: 0,
+          dropped_window_count: 0,
+          processed_window_count: 0,
+          reason: null,
+        }}
+      />,
+    );
+    expect(screen.getByTestId("mic-status")).toHaveAttribute("data-health", "ok");
+  });
+
+  it("renders the mic icon as idle when mic_status is absent (null → idle, not red)", () => {
+    render(<RoastHeader {...BASE} />);
+    expect(screen.getByTestId("mic-status")).toHaveAttribute("data-health", "idle");
+  });
+
   it("opens the diagnostics drawer over real signals only", () => {
     render(<RoastHeader {...BASE} />);
     expect(screen.queryByTestId("diagnostics-drawer")).toBeNull();

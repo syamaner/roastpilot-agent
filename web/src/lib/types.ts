@@ -52,6 +52,44 @@ export interface SseEvent<T = Record<string, unknown>> {
   id?: number | null;
 }
 
+// --- Microphone / first-crack capture-alive health (models.MicHealth /
+// models.MicStatus, #197). Pure observability: a read-only projection of the MCP
+// first-crack pipeline the SPA renders as a green/red/amber mic icon. NEVER a
+// control or safety signal, and NEVER inferred client-side — it rides the server's
+// telemetry frame + the run snapshot, identical to every other rendered field.
+
+/** The derived health the icon color maps to (`MicHealth`'s `.value`):
+ *  `ok` → green, `error` → red, `idle` → amber/grey. `null` mic_status → idle. */
+export type MicHealth = "ok" | "error" | "idle";
+
+/** The MCP first-crack runtime status (models.FirstCrackStatusLiteral). */
+export type FcStatus =
+  | "disabled"
+  | "manual"
+  | "pending"
+  | "detected"
+  | "faulted"
+  | "unavailable";
+
+/**
+ * Capture-alive health of the mic / first-crack audio pipeline (models.MicStatus).
+ *
+ * `mic_health` is the value the icon tints by; the remaining fields back the
+ * hover tooltip. Carries only counters the MCP already computes (Pi performance:
+ * no per-window RMS/level work). The configured device NAME is deliberately
+ * absent — the contract does not promise it.
+ */
+export interface MicStatus {
+  mic_health: MicHealth;
+  audio_running: boolean;
+  fc_status: FcStatus;
+  queued_window_count: number;
+  emitted_window_count: number;
+  dropped_window_count: number;
+  processed_window_count: number;
+  reason: string | null;
+}
+
 // --- Per-tick telemetry payload (models.TelemetryEventData). The live reading
 // the SPA renders each tick; carries the server-authoritative phase.
 export interface TelemetryEventData {
@@ -66,6 +104,9 @@ export interface TelemetryEventData {
   elapsed_seconds: number | null;
   t0_detected: boolean;
   first_crack_detected: boolean;
+  // Capture-alive mic / first-crack health (#197); nullable — null = no active
+  // session / no info, which the icon renders as idle (NOT error/red).
+  mic_status: MicStatus | null;
 }
 
 /**
@@ -195,6 +236,10 @@ export interface RoastDetail {
   // Forward-compatible with the planned E7 `enabled_actions` addition (option
   // (a), separate PR). Optional until that contract change lands.
   enabled_actions?: OperatorAction[];
+  // Capture-alive mic / first-crack health (#197), server-derived. Populated only
+  // for the *active* run (the live MCP state); historical runs carry null. Lets the
+  // header paint the mic icon on first paint, before the first telemetry frame.
+  mic_status?: MicStatus | null;
 }
 
 export interface TelemetryPoint {

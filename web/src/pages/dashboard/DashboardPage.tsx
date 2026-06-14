@@ -190,6 +190,10 @@ export function DashboardPage(): React.JSX.Element {
           profileName={detail.data?.profile.name ?? null}
           firstCrack={view.firstCrack}
           mcpChild={health.data?.mcp_child}
+          // Capture-alive mic health (#197): prefer the live telemetry frame; fall
+          // back to the run snapshot so the icon paints correctly before the first
+          // frame. Both are server-derived (never inferred). null → idle.
+          micStatus={telemetry?.mic_status ?? detail.data?.mic_status ?? null}
         />
 
         {showToast && (
