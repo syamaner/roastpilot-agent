@@ -1,0 +1,229 @@
+{
+  "selected": [
+    {
+      "label": "artisan-01",
+      "origin": "alisan",
+      "fixture": ".artisan-fixtures/artisan-01/roast.jsonl",
+      "drop_temp_c": 189.0,
+      "development_time_ratio_percent": 20.5,
+      "telemetry_rows": 631
+    },
+    {
+      "label": "artisan-02",
+      "origin": "taiwan",
+      "fixture": ".artisan-fixtures/artisan-02/roast.jsonl",
+      "drop_temp_c": 190.0,
+      "development_time_ratio_percent": 17.9,
+      "telemetry_rows": 701
+    },
+    {
+      "label": "artisan-03",
+      "origin": "tw-nantouu",
+      "fixture": ".artisan-fixtures/artisan-03/roast.jsonl",
+      "drop_temp_c": 190.0,
+      "development_time_ratio_percent": 19.0,
+      "telemetry_rows": 774
+    },
+    {
+      "label": "artisan-04",
+      "origin": "brazil",
+      "fixture": ".artisan-fixtures/artisan-04/roast.jsonl",
+      "drop_temp_c": 191.3,
+      "development_time_ratio_percent": 15.7,
+      "telemetry_rows": 575
+    },
+    {
+      "label": "artisan-05",
+      "origin": "taiwan-nantou",
+      "fixture": ".artisan-fixtures/artisan-05/roast.jsonl",
+      "drop_temp_c": 191.7,
+      "development_time_ratio_percent": 19.5,
+      "telemetry_rows": 775
+    },
+    {
+      "label": "artisan-06",
+      "origin": "alisan",
+      "fixture": ".artisan-fixtures/artisan-06/roast.jsonl",
+      "drop_temp_c": 192.7,
+      "development_time_ratio_percent": 20.7,
+      "telemetry_rows": 666
+    },
+    {
+      "label": "artisan-07",
+      "origin": "brazil",
+      "fixture": ".artisan-fixtures/artisan-07/roast.jsonl",
+      "drop_temp_c": 193.0,
+      "development_time_ratio_percent": 17.2,
+      "telemetry_rows": 575
+    },
+    {
+      "label": "artisan-08",
+      "origin": "brazil",
+      "fixture": ".artisan-fixtures/artisan-08/roast.jsonl",
+      "drop_temp_c": 193.0,
+      "development_time_ratio_percent": 16.6,
+      "telemetry_rows": 590
+    },
+    {
+      "label": "artisan-09",
+      "origin": "brazil",
+      "fixture": ".artisan-fixtures/artisan-09/roast.jsonl",
+      "drop_temp_c": 193.0,
+      "development_time_ratio_percent": 15.3,
+      "telemetry_rows": 578
+    },
+    {
+      "label": "artisan-10",
+      "origin": "tw-alisan",
+      "fixture": ".artisan-fixtures/artisan-10/roast.jsonl",
+      "drop_temp_c": 193.0,
+      "development_time_ratio_percent": 24.3,
+      "telemetry_rows": 653
+    },
+    {
+      "label": "artisan-11",
+      "origin": "costarica-hermosa",
+      "fixture": ".artisan-fixtures/artisan-11/roast.jsonl",
+      "drop_temp_c": 193.7,
+      "development_time_ratio_percent": 14.0,
+      "telemetry_rows": 613
+    },
+    {
+      "label": "artisan-12",
+      "origin": "costarica-hermosa",
+      "fixture": ".artisan-fixtures/artisan-12/roast.jsonl",
+      "drop_temp_c": 194.0,
+      "development_time_ratio_percent": 14.4,
+      "telemetry_rows": 707
+    },
+    {
+      "label": "artisan-13",
+      "origin": "costarica",
+      "fixture": ".artisan-fixtures/artisan-13/roast.jsonl",
+      "drop_temp_c": 194.0,
+      "development_time_ratio_percent": 19.9,
+      "telemetry_rows": 633
+    },
+    {
+      "label": "artisan-14",
+      "origin": "costarica-hermosa",
+      "fixture": ".artisan-fixtures/artisan-14/roast.jsonl",
+      "drop_temp_c": 194.3,
+      "development_time_ratio_percent": 17.7,
+      "telemetry_rows": 610
+    },
+    {
+      "label": "artisan-15",
+      "origin": "alisan",
+      "fixture": ".artisan-fixtures/artisan-15/roast.jsonl",
+      "drop_temp_c": 194.7,
+      "development_time_ratio_percent": 22.0,
+      "telemetry_rows": 687
+    },
+    {
+      "label": "artisan-16",
+      "origin": "australia",
+      "fixture": ".artisan-fixtures/artisan-16/roast.jsonl",
+      "drop_temp_c": 195.0,
+      "development_time_ratio_percent": 13.4,
+      "telemetry_rows": 722
+    },
+    {
+      "label": "artisan-17",
+      "origin": "costarica-hermosa",
+      "fixture": ".artisan-fixtures/artisan-17/roast.jsonl",
+      "drop_temp_c": 195.0,
+      "development_time_ratio_percent": 25.5,
+      "telemetry_rows": 588
+    },
+    {
+      "label": "artisan-18",
+      "origin": "kona",
+      "fixture": ".artisan-fixtures/artisan-18/roast.jsonl",
+      "drop_temp_c": 195.3,
+      "development_time_ratio_percent": 13.6,
+      "telemetry_rows": 728
+    },
+    {
+      "label": "artisan-19",
+      "origin": "au-nica",
+      "fixture": ".artisan-fixtures/artisan-19/roast.jsonl",
+      "drop_temp_c": 195.3,
+      "development_time_ratio_percent": 12.4,
+      "telemetry_rows": 727
+    },
+    {
+      "label": "artisan-20",
+      "origin": "roast",
+      "fixture": ".artisan-fixtures/artisan-20/roast.jsonl",
+      "drop_temp_c": 196.0,
+      "development_time_ratio_percent": 19.6,
+      "telemetry_rows": 664
+    },
+    {
+      "label": "artisan-21",
+      "origin": "jamaice",
+      "fixture": ".artisan-fixtures/artisan-21/roast.jsonl",
+      "drop_temp_c": 196.0,
+      "development_time_ratio_percent": 16.5,
+      "telemetry_rows": 746
+    },
+    {
+      "label": "artisan-22",
+      "origin": "kona",
+      "fixture": ".artisan-fixtures/artisan-22/roast.jsonl",
+      "drop_temp_c": 196.3,
+      "development_time_ratio_percent": 14.6,
+      "telemetry_rows": 735
+    },
+    {
+      "label": "artisan-23",
+      "origin": "vietnam",
+      "fixture": ".artisan-fixtures/artisan-23/roast.jsonl",
+      "drop_temp_c": 196.3,
+      "development_time_ratio_percent": 12.7,
+      "telemetry_rows": 897
+    },
+    {
+      "label": "artisan-24",
+      "origin": "australia",
+      "fixture": ".artisan-fixtures/artisan-24/roast.jsonl",
+      "drop_temp_c": 197.0,
+      "development_time_ratio_percent": 24.1,
+      "telemetry_rows": 680
+    },
+    {
+      "label": "artisan-25",
+      "origin": "cuba",
+      "fixture": ".artisan-fixtures/artisan-25/roast.jsonl",
+      "drop_temp_c": 197.0,
+      "development_time_ratio_percent": 14.0,
+      "telemetry_rows": 808
+    },
+    {
+      "label": "artisan-26",
+      "origin": "ind",
+      "fixture": ".artisan-fixtures/artisan-26/roast.jsonl",
+      "drop_temp_c": 197.0,
+      "development_time_ratio_percent": 20.5,
+      "telemetry_rows": 789
+    },
+    {
+      "label": "artisan-27",
+      "origin": "jamaica",
+      "fixture": ".artisan-fixtures/artisan-27/roast.jsonl",
+      "drop_temp_c": 197.0,
+      "development_time_ratio_percent": 17.8,
+      "telemetry_rows": 690
+    },
+    {
+      "label": "artisan-28",
+      "origin": "kona",
+      "fixture": ".artisan-fixtures/artisan-28/roast.jsonl",
+      "drop_temp_c": 197.3,
+      "development_time_ratio_percent": 13.6,
+      "telemetry_rows": 781
+    }
+  ],
+  "skipped_count": 19
+}

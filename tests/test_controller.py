@@ -1447,6 +1447,64 @@ async def test_operator_first_crack_override_stamped_and_gated() -> None:
 
 
 @pytest.mark.asyncio
+async def test_development_elapsed_none_before_first_crack() -> None:
+    """The advisor context carries ``development_elapsed_seconds=None`` until
+    first crack arms the development clock."""
+    advisor = FakeAdvisor([decision()])
+    harness = make_harness(readings=[reading()], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:  # …→ ROASTING_PRE_FIRST_CRACK
+        harness.controller.transition_to(step)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert advisor.contexts[-1].development_elapsed_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_development_elapsed_tracks_seconds_since_first_crack() -> None:
+    """Once first crack transitions into development, the context's
+    ``development_elapsed_seconds`` is the wall-clock time since that
+    transition (the DTR clock the advisor reasons about)."""
+    advisor = FakeAdvisor([decision()])
+    harness = make_harness(readings=[reading()], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    harness.clock.advance(300.0)  # pre-FC roast time
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)  # arms the FC clock
+    harness.clock.advance(45.0)  # development time
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    # FakeClock advances by exact floats, so the elapsed is exactly 45.0.
+    assert advisor.contexts[-1].development_elapsed_seconds == 45.0
+
+
+@pytest.mark.asyncio
+async def test_development_clock_resets_on_new_run() -> None:
+    """A new run/preheat clears the development clock, so a stale FC time from
+    a prior run never leaks into the next run's advisor context."""
+    advisor = FakeAdvisor([decision(), decision()])
+    harness = make_harness(readings=[reading(), reading()], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:  # …→ DEVELOPMENT (arms the clock)
+        harness.controller.transition_to(step)
+    # Finish the run, then start a fresh one along the legal path. The
+    # STARTING/PREHEATING entry must clear the development clock.
+    for step in [
+        RoastPhase.COOLING,
+        RoastPhase.COMPLETE,
+        RoastPhase.IDLE,
+        RoastPhase.STARTING,
+        RoastPhase.PREHEATING,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    ]:
+        harness.controller.transition_to(step)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert advisor.contexts[-1].development_elapsed_seconds is None
+
+
+@pytest.mark.asyncio
 async def test_advisor_drop_now_executes() -> None:
     advisor = FakeAdvisor([decision(drop=True)])
     harness = harness_in_development(readings=[reading()], advisor=advisor)

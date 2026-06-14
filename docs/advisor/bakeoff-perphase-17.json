@@ -1,0 +1,1764 @@
+{
+  "mode": "per-phase",
+  "availability": [
+    {
+      "slug": "google/gemini-3.1-flash-lite",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "google/gemini-3.5-flash",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "deepseek/deepseek-v4-flash",
+      "available": true,
+      "error": null,
+      "attempts": 2,
+      "reason": null
+    },
+    {
+      "slug": "openai/gpt-4.1-mini",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "openai/gpt-5.4-nano",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8-fast",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "meta-llama/llama-3.3-70b-instruct",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "qwen/qwen3.5-35b-a3b",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "qwen/qwen3-coder",
+      "available": false,
+      "error": "reachability probe timed out after 5s",
+      "attempts": 2,
+      "reason": "other-or-transient"
+    },
+    {
+      "slug": "nvidia/nemotron-3-ultra-550b-a55b",
+      "available": false,
+      "error": "reachability probe timed out after 5s",
+      "attempts": 2,
+      "reason": "other-or-transient"
+    },
+    {
+      "slug": "deepseek/deepseek-r1",
+      "available": false,
+      "error": "reachability probe timed out after 5s",
+      "attempts": 2,
+      "reason": "other-or-transient"
+    },
+    {
+      "slug": "openai/o4-mini",
+      "available": true,
+      "error": null,
+      "attempts": 2,
+      "reason": null
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "anthropic/claude-sonnet-4.6",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "openai/gpt-5.5",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "anthropic/claude-haiku-4.5",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "openai/gpt-5-mini",
+      "available": false,
+      "error": "reachability probe timed out after 5s",
+      "attempts": 2,
+      "reason": "other-or-transient"
+    }
+  ],
+  "cells": [
+    {
+      "slug": "google/gemini-3.1-flash-lite",
+      "tier": "ultra-flash",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 0.98,
+      "latency_median": 1.02,
+      "latency_max": 1.05,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 1.0,
+        "rationale": "The roaster is still in the preheating phase. The bean temperature is low (64C), and the environment temperature is rising steadily. Maintaining maximum heat (100%) and low fan (10%) is appropriate to build the necessary thermal energy for the charge. No changes needed yet."
+      }
+    },
+    {
+      "slug": "google/gemini-3.1-flash-lite",
+      "tier": "ultra-flash",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 0.98,
+      "latency_median": 1.07,
+      "latency_max": 1.32,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 50,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "RoR is healthy at 11.3 C/min. We are approaching the Maillard phase and first crack. Maintaining heat at 100% while increasing fan to 50% will help manage the transition, ensuring convective heat transfer increases as we approach the end of the roast, while keeping the momentum steady."
+      }
+    },
+    {
+      "slug": "google/gemini-3.1-flash-lite",
+      "tier": "ultra-flash",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.32,
+      "latency_median": 1.33,
+      "latency_max": 1.39,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 60,
+        "target_fan": 60,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "Development time is 45s out of 586s total (approx 7.7%). To reach a 10-12% development ratio, I need to extend the roast by another 20-30 seconds. The RoR is healthy at 11C/min. I will maintain current settings to allow a gentle, controlled finish without stalling, aiming to drop around 194-195C."
+      }
+    },
+    {
+      "slug": "google/gemini-3.5-flash",
+      "tier": "ultra-flash",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.76,
+      "latency_median": 3.47,
+      "latency_max": 3.63,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 1.0,
+        "rationale": "Currently in the preheating phase at 64\u00b0C. Maintaining maximum heat (100%) and low fan (10%) to efficiently drive the roaster up to the target charge temperature range of 180\u00b0C - 200\u00b0C."
+      }
+    },
+    {
+      "slug": "google/gemini-3.5-flash",
+      "tier": "ultra-flash",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 6.55,
+      "latency_median": 6.77,
+      "latency_max": 7.66,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 90,
+        "target_fan": 40,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Bean temperature is at 138\u00b0C, approaching the Maillard phase. To anticipate thermal lag and establish a steadily declining RoR, we reduce heat to 90% and increase the fan to 40%. This coordinated adjustment shifts the heat transfer mix toward convection, helps evacuate early moisture, and prevents the RoR from spiking as the beans dry."
+      }
+    },
+    {
+      "slug": "google/gemini-3.5-flash",
+      "tier": "ultra-flash",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 5.77,
+      "latency_median": 5.92,
+      "latency_max": 9.67,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 40,
+        "target_fan": 80,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "Bean RoR is high at ~11\u00b0C/min in early development (7.7% dev ratio). To stretch development and avoid rushing past the target drop temp, we need to decisively reduce heat to 40% and increase fan to 80% to shift to convective cooling, anticipating the thermal lag of the previous adjustment."
+      }
+    },
+    {
+      "slug": "deepseek/deepseek-v4-flash",
+      "tier": "ultra-flash",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 7.82,
+      "latency_median": 7.95,
+      "latency_max": 8.83,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.95,
+        "rationale": "Preheating phase \u2014 env temp at 80\u00b0C, well below the 180\u2013200\u00b0C charge target. Keep heat at 100% and fan at 10% (low airflow retains heat in the drum for fastest warm-up). Env RoR of ~32\u00b0C/min suggests we'll reach charge temp in ~3 minutes. No beans yet to manage development; do not drop."
+      }
+    },
+    {
+      "slug": "deepseek/deepseek-v4-flash",
+      "tier": "ultra-flash",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.67,
+      "latency_median": 4.52,
+      "latency_max": 5.36,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 30,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Pre-first-crack phase at 138\u00b0C with 11.3\u00b0C/min RoR \u2014 strong momentum. Heat stays at 100 to carry through the endothermic first-crack transition; fan at 30 (up from 10) to improve convective balance and clear early smoke without dragging down RoR. No drop \u2014 first crack hasn't occurred yet."
+      }
+    },
+    {
+      "slug": "deepseek/deepseek-v4-flash",
+      "tier": "ultra-flash",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 6.47,
+      "latency_median": 8.35,
+      "latency_max": 15.04,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 30,
+        "target_fan": 80,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Development is only 45s in (7.7% of total 587s roast \u2014 well under 10% target). Bean temp 189\u00b0C, RoR still high at ~11\u00b0C/min. Need to stretch development time. Cut heat decisively to 30% to crash the RoR, and raise fan to 80% to shift to convective transfer \u2014 this prevents scorching/baking while the high airflow keeps energy moving into the beans gently. Target ~60-70s more development to hit ~10-12% development ratio. Do not drop yet despite being near 197\u00b0C guide \u2014 the duration target is the priority."
+      }
+    },
+    {
+      "slug": "openai/gpt-4.1-mini",
+      "tier": "ultra-flash",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.48,
+      "latency_median": 1.52,
+      "latency_max": 1.52,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "In preheating phase with bean temperature at 64\u00b0C and high RoR (~25\u00b0C/min), maintain full heat at 100% to continue energy input and low fan at 10% to keep more radiant heat for warming the drum and beans. No drop yet as first crack not detected and development phase has not started."
+      }
+    },
+    {
+      "slug": "openai/gpt-4.1-mini",
+      "tier": "ultra-flash",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.46,
+      "latency_median": 1.65,
+      "latency_max": 3.06,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 20,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "Pre-first crack phase with bean temp 138\u00b0C and high RoR of 11.3\u00b0C/min indicates strong heat build-up. Maintaining max heat (100%) to push heat into the drum, but reducing fan slightly from 30% to 20% to balance thermal lag and prevent too rapid cooling, while ensuring some convective airflow to avoid scorching. Not near target drop temp or development, so no drop advised."
+      }
+    },
+    {
+      "slug": "openai/gpt-4.1-mini",
+      "tier": "ultra-flash",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.54,
+      "latency_median": 2.63,
+      "latency_max": 3.08,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 50,
+        "target_fan": 70,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "Development phase with a current roast duration of 45s and bean temp at 189C indicates the roast is progressing. Bean RoR is high (10.97C/min), so to stretch development and prevent overshoot, reduce heat from 60% to 50% and increase fan from 60% to 70% to enhance convective cooling and moderate RoR. Do not drop yet; development likely needs more duration within the target development ratio."
+      }
+    },
+    {
+      "slug": "openai/gpt-5.4-nano",
+      "tier": "ultra-flash",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.15,
+      "latency_median": 1.25,
+      "latency_max": 1.29,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 20,
+        "should_drop": false,
+        "confidence": 0.66,
+        "rationale": "Preheating: bean temp is still far from charge guidance (180\u2013200 C) and no first crack yet. Keep heat fully on to overcome thermal lag and accelerate approach, while modestly increasing fan (from ~10%) to ensure stable convection and smoke/chaff management without over-stalling RoR."
+      }
+    },
+    {
+      "slug": "openai/gpt-5.4-nano",
+      "tier": "ultra-flash",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.1,
+      "latency_median": 1.45,
+      "latency_max": 1.5,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 55,
+        "target_fan": 45,
+        "should_drop": false,
+        "confidence": 0.62,
+        "rationale": "Pre\u2013first crack with relatively high bean RoR (~11.3 C/min) and bean still well below the 197\u00b0C guide (138\u00b0C). To avoid overshooting into hard-color while heat lags, reduce heat decisively and increase fan toward more convective/evaporative transfer for steadier ramp and smoke/chaff handling. Hold until pre-crack rate stabilizes; don\u2019t drop yet."
+      }
+    },
+    {
+      "slug": "openai/gpt-5.4-nano",
+      "tier": "ultra-flash",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.45,
+      "latency_median": 1.57,
+      "latency_max": 1.86,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 45,
+        "target_fan": 75,
+        "should_drop": false,
+        "confidence": 0.72,
+        "rationale": "Post\u2013first crack, bean temp is ~189\u00b0C and rising with RoR ~11\u00b0C/min. To target duration (development ~10\u201320% of total), cut heat substantially now (accounting for thermal lag) and increase fan toward more convective/even heat transfer to prevent overshoot while maintaining steady progression. Development elapsed/total is ~45s / 587s \u2248 7\u20138%, so avoid dropping yet; continue developing modestly past the 197\u00b0C guide while staying below the real safety ceiling."
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8-fast",
+      "tier": "ultra-flash",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.56,
+      "latency_median": 2.78,
+      "latency_max": 3.16,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "Still in preheat/charge-warmup with bean temp only 64 C and a healthy ~25 C/min rise toward the 180-200 C charge window. Keep heat at full to build drum energy and keep fan low to conserve it and let bean temp climb efficiently. No development concerns yet; far from first crack and the drop guide."
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8-fast",
+      "tier": "ultra-flash",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.45,
+      "latency_median": 2.97,
+      "latency_max": 7.74,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 30,
+        "should_drop": false,
+        "confidence": 0.8,
+        "rationale": "Pre-first-crack at 138 C, ~4.5 min in, with a healthy bean RoR of ~11 C/min. Plenty of road left to first crack (~150-160 C), so keep heat at full to drive momentum through the energy-intensive ramp. Fan at 30 gives reasonable convective transfer and chaff/smoke evacuation without crashing RoR. Hold this course; I'll plan to cut heat and lift fan once first crack arrives to manage development."
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8-fast",
+      "tier": "ultra-flash",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.93,
+      "latency_median": 3.91,
+      "latency_max": 12.04,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 40,
+        "target_fan": 75,
+        "should_drop": false,
+        "confidence": 0.78,
+        "rationale": "Development is only 45s in (~7.7% of a 587s roast), so we need more time in development \u2014 don't drop yet. Bean temp is 189C with a still-brisk post-crack RoR of ~11 C/min, which would race past the 197C guide and risk darkening well before hitting a healthy 12-18% development ratio. The earlier cut to 60/60 helped but RoR is still high. Cut heat decisively to 40 and raise fan to 75 to shift toward convective transfer, evacuate smoke, and stretch development while still keeping enough energy to avoid stalling/baking. Reassess as RoR settles."
+      }
+    },
+    {
+      "slug": "meta-llama/llama-3.3-70b-instruct",
+      "tier": "speed-and-power",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.99,
+      "latency_median": 2.23,
+      "latency_max": 2.28,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.8,
+        "rationale": "Preheating phase, increasing heat to reach target temperature"
+      }
+    },
+    {
+      "slug": "meta-llama/llama-3.3-70b-instruct",
+      "tier": "speed-and-power",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.81,
+      "latency_median": 3.76,
+      "latency_max": 3.76,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 30,
+        "should_drop": false,
+        "confidence": 0.8,
+        "rationale": "We are in the roasting_pre_first_crack phase and the bean temperature is 138.0 C, which is still below the target drop temperature of 197.0 C. The bean RoR is 11.278 C/min, which is relatively high. To continue the roast, we will maintain the current heat level and fan speed."
+      }
+    },
+    {
+      "slug": "meta-llama/llama-3.3-70b-instruct",
+      "tier": "speed-and-power",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.72,
+      "latency_median": 3.09,
+      "latency_max": 3.15,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 40,
+        "target_fan": 80,
+        "should_drop": false,
+        "confidence": 0.8,
+        "rationale": "development ratio is 7.68%, which is below the target range of 10-20%. To stretch development, cut heat substantially and raise fan toward convective transfer."
+      }
+    },
+    {
+      "slug": "qwen/qwen3.5-35b-a3b",
+      "tier": "speed-and-power",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 4.23,
+      "latency_median": 4.47,
+      "latency_max": 4.99,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.95,
+        "rationale": "Preheating phase with healthy RoR (~25\u00b0C/min). Maintain 100% heat to build thermal mass and reach charge guidance (180-200\u00b0C). Low fan (10%) maximizes conductive/radiant transfer during preheat. No first crack yet, so continue aggressive heat/fan balance to efficiently progress toward charge."
+      }
+    },
+    {
+      "slug": "qwen/qwen3.5-35b-a3b",
+      "tier": "speed-and-power",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 3.58,
+      "latency_median": 3.97,
+      "latency_max": 4.61,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 65,
+        "target_fan": 55,
+        "should_drop": false,
+        "confidence": 0.82,
+        "rationale": "Pre-first crack at 138\u00b0C with high bean RoR (11.3\u00b0C/min) requires decisive heat reduction to slow development. Coordinated fan increase shifts to convective transfer, preventing scorch while maintaining heat transfer. Heat:fan balance prevents RoR crash - too much fan with too little heat would bake. Development ratio target applies post-first crack; continue roast."
+      }
+    },
+    {
+      "slug": "qwen/qwen3.5-35b-a3b",
+      "tier": "speed-and-power",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 4.06,
+      "latency_median": 4.63,
+      "latency_max": 4.82,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 25,
+        "target_fan": 75,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Development ratio only 7.7% (need 10-20%). High RoR (10.97\u00b0C/min) requires cutting heat substantially AND raising fan to stretch development. Coordinated move: heat 60\u219225% to slow temp rise, fan 60\u219275% for convective transfer and even development. Don't chase 197\u00b0C target - focus on duration. Thermal lag means act decisively now."
+      }
+    },
+    {
+      "slug": "openai/o4-mini",
+      "tier": "fast-reasoning",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": true,
+      "ok_count": 3,
+      "latency_min": 5.84,
+      "latency_median": 6.53,
+      "latency_max": 10.58,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "Still in preheat: drum temp (bean probe) only 64 \u00b0C, far from charge guidance (180\u2013200 \u00b0C). Maximize heating (100%) with minimal airflow (10%) to build drum temperature rapidly for charging."
+      }
+    },
+    {
+      "slug": "openai/o4-mini",
+      "tier": "fast-reasoning",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": true,
+      "ok_count": 3,
+      "latency_min": 7.24,
+      "latency_median": 9.43,
+      "latency_max": 9.5,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 20,
+        "should_drop": false,
+        "confidence": 0.75,
+        "rationale": "Pre-crack ramp looks healthy (bean RoR ~11 \u00b0C/min). With heat already at 100%, reduce fan from 30% to 20% to lower convective losses and modestly boost bean and environment rise. Maintain full power to drive toward first crack without overshooting."
+      }
+    },
+    {
+      "slug": "openai/o4-mini",
+      "tier": "fast-reasoning",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": true,
+      "ok_count": 3,
+      "latency_min": 4.7,
+      "latency_median": 4.92,
+      "latency_max": 7.05,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 45,
+        "target_fan": 80,
+        "should_drop": false,
+        "confidence": 0.75,
+        "rationale": "At 45s development (7.7% of ~586s roast), we need ~14s more to hit a 10% development ratio. Current ROR (~11\u00b0C/min) is too high and will overshoot projection. Cutting heat to 45% and raising fan to 80% shifts to convective mode, slowing ROR to around 6\u20138\u00b0C/min, stretching development time without chasing temperature. Monitoring will ensure we hit ~58s post-crack before drop."
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8",
+      "tier": "incumbent",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 4.77,
+      "latency_median": 5.34,
+      "latency_max": 5.61,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "Still in preheat/early charge phase with bean temp only 64C, far below the 180-200C charge guidance and 210C drop target. RoR ~25C/min is healthy for this stage. Keep heat at 100% to build momentum toward charge temp and keep fan low (10%) to retain energy and let the drum load up. No reason to drop. Will reassess fan/heat balance as we approach the turnaround and drying-phase RoR to avoid an overly steep climb later."
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8",
+      "tier": "incumbent",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 5.4,
+      "latency_median": 5.81,
+      "latency_max": 6.38,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 30,
+        "should_drop": false,
+        "confidence": 0.78,
+        "rationale": "Pre-first-crack at 138C with bean RoR ~11C/min \u2014 healthy momentum building toward first crack (typically ~196-200C env / ~150-160C bean for many beans, but FC will come well before drop temp). We're ~4.5 min in with plenty of energy needed to carry through the endothermic drying-to-browning transition and into first crack. Hold heat at 100% to maintain drive \u2014 cutting now risks a stall before FC. Keep fan at 30 for steady convective transfer and chaff/smoke evacuation; this balance is good and the RoR is reasonable, not runaway. No reason to touch drop yet \u2014 we're far from development. I'll plan to ease heat and lift fan once first crack is detected to manage the post-crack RoR spike and stretch development."
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8",
+      "tier": "incumbent",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 5.93,
+      "latency_median": 6.08,
+      "latency_max": 7.12,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 35,
+        "target_fan": 75,
+        "should_drop": false,
+        "confidence": 0.8,
+        "rationale": "Development is only 45s into a ~587s roast (~7.7% ratio) \u2014 too short to drop; aim to stretch toward the 10-20% band. Bean temp 189C with RoR still ~11 C/min is climbing fast and will hit the 197C guide quickly if unchecked. You already made a good first cut (100\u219260 heat, 30\u219260 fan), but RoR is still high, so coordinate further: cut heat decisively to ~35 to flatten the climb while raising fan to ~75 to shift toward even convective transfer, evacuate smoke, and protect flavor without crashing RoR. This buys roughly another 60-90s of development to reach a ~13-15% ratio, landing near or modestly past the 197C guide. Reassess as RoR settles toward a gentle 4-6 C/min glide; don't chase temperature."
+      }
+    },
+    {
+      "slug": "anthropic/claude-sonnet-4.6",
+      "tier": "prior-frontier",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 4.82,
+      "latency_median": 5.48,
+      "latency_max": 5.68,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.97,
+        "rationale": "Still in preheating phase \u2014 bean temp is only 64 \u00b0C, well below the charge window of 180\u2013200 \u00b0C. RoR is healthy at ~25 \u00b0C/min. Keep heat at full 100% to drive the drum up to charge temperature as efficiently as possible. Fan stays low at 10% to retain drum heat and avoid slowing the preheat. No development has begun; drop is not appropriate. No changes needed \u2014 hold current settings and monitor for the charge window."
+      }
+    },
+    {
+      "slug": "anthropic/claude-sonnet-4.6",
+      "tier": "prior-frontier",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 8.69,
+      "latency_median": 9.91,
+      "latency_max": 10.09,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 85,
+        "target_fan": 30,
+        "should_drop": false,
+        "confidence": 0.82,
+        "rationale": "Bean temp is 138\u00b0C at ~4.5 min, RoR a healthy 11.3\u00b0C/min, well pre-first crack (typically ~195\u00b0C target drop). Environment is already at 203\u00b0C and climbing, with heat at 100% \u2014 this is a good moment to begin tapering heat to avoid a runaway RoR into and through first crack. Thermal lag means a cut now will show its effect in ~60\u201390 seconds. Dropping from 100\u219285 is a decisive but not aggressive reduction; it should gently flatten the RoR curve so we arrive at first crack with a controlled, moderate rate (~8\u201310\u00b0C/min) that gives us room to manage development duration afterward. Fan stays at 30% \u2014 no change needed here; airflow is appropriate for this pre-crack phase and we don't want to over-cool or shift to convective mode prematurely. No drop \u2014 first crack hasn't occurred and we're ~59\u00b0C below target drop temp."
+      }
+    },
+    {
+      "slug": "anthropic/claude-sonnet-4.6",
+      "tier": "prior-frontier",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 8.2,
+      "latency_median": 10.11,
+      "latency_max": 10.6,
+      "passes_gate": false,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 45,
+        "target_fan": 70,
+        "should_drop": false,
+        "confidence": 0.82,
+        "rationale": "Development ratio: 45.2s / 586.7s = 7.7% \u2014 still short of the ~10\u201320% target. Bean temp is 189\u00b0C vs. 197\u00b0C guide, so there's room to develop further. However, RoR is high at ~11\u00b0C/min with heat still at 60% \u2014 this will overshoot quickly. Action: cut heat decisively to 45% (anticipating thermal lag from the element) and raise fan to 70% to shift toward convective transfer, which will even out heat delivery and help moderate RoR without stalling it. This coordinated move should bring RoR down toward 6\u20138\u00b0C/min, giving a controlled development stretch toward the 10\u201312% ratio target (~60\u201370s total development time). Do not drop yet \u2014 the duration target hasn't been met and flavor development is still underway."
+      }
+    },
+    {
+      "slug": "openai/gpt-5.5",
+      "tier": "prior-frontier",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 3.6,
+      "latency_median": 5.12,
+      "latency_max": 5.24,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.93,
+        "rationale": "Preheating is far below the 180-200C charge window; keep full heat with low fan to build drum/environment energy efficiently. No drop/charge yet."
+      }
+    },
+    {
+      "slug": "openai/gpt-5.5",
+      "tier": "prior-frontier",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 6.34,
+      "latency_median": 6.87,
+      "latency_max": 10.35,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 90,
+        "target_fan": 35,
+        "should_drop": false,
+        "confidence": 0.78,
+        "rationale": "Pre-first-crack at 138C with healthy ~11C/min RoR and only slowly rising environment: keep strong momentum, but begin a modest early heat reduction for electric lag and raise fan slightly for more even convective transfer. Do not drop."
+      }
+    },
+    {
+      "slug": "openai/gpt-5.5",
+      "tier": "prior-frontier",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 7.07,
+      "latency_median": 7.5,
+      "latency_max": 9.02,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 30,
+        "target_fan": 75,
+        "should_drop": false,
+        "confidence": 0.84,
+        "rationale": "Do not drop yet: development is only ~7.7%, so aim for at least ~60s post-crack. RoR is still high and ET rising, so cut heat decisively and raise fan for cleaner convective development while avoiding an immediate stall."
+      }
+    },
+    {
+      "slug": "anthropic/claude-haiku-4.5",
+      "tier": "prior-frontier",
+      "phase": "preheating",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 3.01,
+      "latency_median": 3.18,
+      "latency_max": 3.26,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Preheating phase: beans at 64\u00b0C with strong RoR (~25\u00b0C/min). Heat is already maxed at 100% and performing well\u2014thermal lag means the element is driving steady energy into the drum. Fan at 10% is appropriate for preheating (minimal convection needed yet; focus is on building drum energy). Maintain current settings to reach charge window (180\u2013200\u00b0C) efficiently. No drop yet\u2014first crack not detected. Continue aggressive heating."
+      }
+    },
+    {
+      "slug": "anthropic/claude-haiku-4.5",
+      "tier": "prior-frontier",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 3.5,
+      "latency_median": 3.56,
+      "latency_max": 3.78,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 30,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Pre-first-crack phase at 138 \u00b0C bean temp with strong RoR of 11.3 \u00b0C/min. Heat is maxed at 100% and fan at 30%, driving steady progression toward first crack. Bean temp is still ~59 \u00b0C below target drop (197 \u00b0C), and RoR is healthy. Maintain current aggressive settings to reach first crack efficiently. No drop yet \u2014 we are in the charge/development ramp phase. Continue monitoring RoR; if it accelerates excessively post-crack, will coordinate heat cut + fan raise to hit ~20% development ratio."
+      }
+    },
+    {
+      "slug": "anthropic/claude-haiku-4.5",
+      "tier": "prior-frontier",
+      "phase": "development",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 4.19,
+      "latency_median": 4.37,
+      "latency_max": 4.52,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 45,
+        "target_fan": 70,
+        "should_drop": false,
+        "confidence": 0.78,
+        "rationale": "Development is only 45s into a roast at 189\u00b0C with RoR ~11\u00b0C/min\u2014still early. Target is 197\u00b0C (8\u00b0C away). Development ratio is ~7.7% (45s/586s), well below the 10\u201320% target. Recent heat cut to 60% has slowed RoR appropriately, but at current pace you'll hit 197\u00b0C in ~45s more, landing at ~90s development (~15% ratio)\u2014acceptable but tight. Cut heat decisively to 45% and raise fan to 70% to shift toward convective transfer, stretch development time, and build complexity. This coordinated move prevents overshooting while maintaining gentle, even development. Monitor RoR; if it crashes below ~3\u00b0C/min, raise heat slightly. Do not drop yet."
+      }
+    },
+    {
+      "slug": "google/gemini-3.1-flash-lite",
+      "tier": "ultra-flash",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 0.93,
+      "latency_median": 0.93,
+      "latency_max": 1.0,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 1.0,
+        "rationale": "Preheat is progressing, but the environment temperature (80C) is still well below the target charge band (180-200C). Maintain maximum heat to reach the target range efficiently."
+      }
+    },
+    {
+      "slug": "google/gemini-3.1-flash-lite",
+      "tier": "ultra-flash",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 0.93,
+      "latency_median": 0.97,
+      "latency_max": 1.04,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 80,
+        "target_fan": 50,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "RoR is healthy at 11.3 C/min, but we are approaching the Maillard phase. To ensure a smooth decline and prevent a late-roast spike, I am increasing fan to 50% to shift toward convective heat and reducing heat to 80% to begin managing the energy input proactively."
+      }
+    },
+    {
+      "slug": "google/gemini-3.1-flash-lite",
+      "tier": "ultra-flash",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.03,
+      "latency_median": 1.22,
+      "latency_max": 1.43,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 30,
+        "target_fan": 80,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "Development time is 45 seconds, which is ~7.7% of total roast time. RoR is still healthy at 11C/min. I am reducing heat further to manage the momentum and increasing fan to 80% to ensure convective heat transfer and smoke evacuation as we approach the end of development. Aiming to drop around 194-195C to reach a ~12-15% development ratio."
+      }
+    },
+    {
+      "slug": "google/gemini-3.5-flash",
+      "tier": "ultra-flash",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.78,
+      "latency_median": 3.06,
+      "latency_max": 3.16,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.95,
+        "rationale": "Currently in preheat phase. Bean temperature (64.0 C) is well below the charge guidance band of 180.0 C - 200.0 C. Maintain maximum heat (100%) and low fan (10%) to continue driving the temperature upward efficiently. Do not charge yet."
+      }
+    },
+    {
+      "slug": "google/gemini-3.5-flash",
+      "tier": "ultra-flash",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 3.84,
+      "latency_median": 4.3,
+      "latency_max": 4.48,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 70,
+        "target_fan": 50,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "We are mid-Maillard at 138C with a healthy RoR of 11.3 C/min. To manage a smooth RoR decline and avoid entering first crack with too much momentum, we must make an early, decisive heat cut now to account for thermal lag. Reducing heat to 70% and increasing fan to 50% shifts the roast toward convective transfer and begins steering the RoR downward."
+      }
+    },
+    {
+      "slug": "google/gemini-3.5-flash",
+      "tier": "ultra-flash",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 5.56,
+      "latency_median": 6.09,
+      "latency_max": 7.0,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 30,
+        "target_fan": 80,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "Development ratio is currently at 7.7% with a high bean RoR of 11\u00b0C/min. To stretch development and avoid rushing to the target drop temp, cut heat to 30% and increase fan to 80%. This convective shift will help control the RoR and ensure even development."
+      }
+    },
+    {
+      "slug": "deepseek/deepseek-v4-flash",
+      "tier": "ultra-flash",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.78,
+      "latency_median": 2.91,
+      "latency_max": 3.94,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Preheat phase: drum is still well below the charge band (180\u2013200\u00b0C) at 80\u00b0C env / 64\u00b0C bean. Heat at 100% and fan at 10% (minimal airflow to retain heat) is correct for rapid warmup. The env RoR of ~32\u00b0C/min is strong \u2014 continue full heat until env temp approaches ~170\u00b0C, then begin trimming heat to avoid overshoot. Not ready to charge; hold current settings and monitor."
+      }
+    },
+    {
+      "slug": "deepseek/deepseek-v4-flash",
+      "tier": "ultra-flash",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 3.39,
+      "latency_median": 4.5,
+      "latency_max": 5.85,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 60,
+        "target_fan": 50,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "At 4m29s, bean temp 138\u00b0C, RoR 11.3\u00b0C/min \u2014 still in Maillard, approaching first crack. Heat is still at 100% which is dangerously late to cut given thermal lag. Need a decisive heat reduction NOW (to 60%) to prevent a flick or flat RoR near FC. Simultaneously raise fan to 50% to shift toward convective transfer, smoothing the decline and protecting flavor. This is the critical EARLY cut \u2014 waiting will bake or flick the roast."
+      }
+    },
+    {
+      "slug": "deepseek/deepseek-v4-flash",
+      "tier": "ultra-flash",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 3.33,
+      "latency_median": 3.73,
+      "latency_max": 5.4,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 30,
+        "target_fan": 80,
+        "should_drop": false,
+        "confidence": 0.75,
+        "rationale": "FC at 541s, now 45s into development (ratio ~7.7%). RoR is still high at 10.97 C/min \u2014 need to cut heat hard and raise fan to stretch development toward a good ratio (10-20%). Dropping heat from 60\u219230 and fan from 60\u219280 shifts to convective transfer, slowing the climb and preventing scorching. Target drop temp 197C is a guide; we have ~8C of runway. Do not drop yet \u2014 let development ratio build. Reassess in ~30s."
+      }
+    },
+    {
+      "slug": "openai/gpt-4.1-mini",
+      "tier": "ultra-flash",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.76,
+      "latency_median": 1.82,
+      "latency_max": 2.76,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 85,
+        "target_fan": 15,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "Bean temp is rising steadily but still below charge range (180-200\u00b0C). Reduce heat slightly from 100% to avoid overshoot, increase fan moderately to enhance convective heat transfer and stabilize temp. Maintain preheat, no drop."
+      }
+    },
+    {
+      "slug": "openai/gpt-4.1-mini",
+      "tier": "ultra-flash",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.42,
+      "latency_median": 1.64,
+      "latency_max": 2.98,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 65,
+        "target_fan": 50,
+        "should_drop": false,
+        "confidence": 0.95,
+        "rationale": "RoR is still high but beginning to decline; cut heat substantially early to manage RoR decline smoothly and raise fan to shift toward convective transfer to avoid stall/bake. Coordinated reduction anticipates thermal lag and stabilizes development before first crack. Do not drop yet."
+      }
+    },
+    {
+      "slug": "openai/gpt-4.1-mini",
+      "tier": "ultra-flash",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.54,
+      "latency_median": 1.55,
+      "latency_max": 1.69,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 35,
+        "target_fan": 85,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "In development phase with moderately high RoR (around 11 C/min) and bean temp close to target drop. To stretch development and avoid pushing temperature too high, cut heat substantially to 35% and raise fan to 85% for better convective transfer and air flow. Hold off drop as development time is still short; aim to extend development ratio with this balanced control."
+      }
+    },
+    {
+      "slug": "openai/gpt-5.4-nano",
+      "tier": "ultra-flash",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.29,
+      "latency_median": 1.43,
+      "latency_max": 1.48,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 90,
+        "target_fan": 20,
+        "should_drop": false,
+        "confidence": 0.62,
+        "rationale": "Preheating: drum/beans are still far below the 180\u2013200\u00b0C charge band (bean ~64\u00b0C vs target band). Heat is currently maxed but the fan is very low; increase fan modestly to improve convective evenness and stabilize approach without risking a roast-mode stall. Aim to ramp drum/bean toward the lower-mid of the charge band and hold there\u2014charge only once stable in 180\u2013200\u00b0C; keep no drop action in preheat."
+      }
+    },
+    {
+      "slug": "openai/gpt-5.4-nano",
+      "tier": "ultra-flash",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.32,
+      "latency_median": 1.37,
+      "latency_max": 1.39,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 95,
+        "target_fan": 35,
+        "should_drop": false,
+        "confidence": 0.66,
+        "rationale": "Pre\u2013first crack: bean temp is rising (138 C) with still-high RoR (~11 C/min) and you\u2019re likely still in drying/early Maillard. Because of thermal lag, trim heat decisively to start easing RoR down smoothly before first crack, while nudging fan up moderately for more even convective transfer and smoke/chaff evacuation without pushing RoR into a stall. Hold: no drop in preheat/through FC stages."
+      }
+    },
+    {
+      "slug": "openai/gpt-5.4-nano",
+      "tier": "ultra-flash",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.33,
+      "latency_median": 1.48,
+      "latency_max": 1.52,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 45,
+        "target_fan": 72,
+        "should_drop": false,
+        "confidence": 0.62,
+        "rationale": "Post\u2013first crack: you\u2019re at 189\u00b0C with fairly high RoR (~11\u00b0C/min) and development only ~45s so far, so prioritize duration/controlled development over chasing temperature. Cut heat substantially (accounts for thermal lag) and raise fan to shift toward convective transfer, preventing baking while extending development. Don\u2019t drop yet; wait until development-ratio target is met (temperature guide is secondary)."
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8-fast",
+      "tier": "ultra-flash",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 1.84,
+      "latency_median": 2.14,
+      "latency_max": 2.34,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "Preheat in progress: drum env at 80C, well below the 180-200C charge band. Keep heat at 100% with low fan (10%) to climb efficiently toward the band. Not ready to charge yet \u2014 continue holding full heat until env temp approaches ~180C, then I'll advise trimming heat to stabilize inside the band before charging."
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8-fast",
+      "tier": "ultra-flash",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.42,
+      "latency_median": 2.55,
+      "latency_max": 3.12,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 75,
+        "target_fan": 40,
+        "should_drop": false,
+        "confidence": 0.78,
+        "rationale": "Drying/Maillard at ~138C bean, ~4.5 min in, with heat pinned at 100% the whole way. RoR is a healthy ~11 C/min now, but with the element at full and thermal lag, holding 100% risks the RoR flicking back up or spiking into first crack too hot. Cut heat decisively to 75% now to set up a smooth RoR decline toward FC, and nudge fan to 40 to push more convective transfer (evens the roast, evacuates smoke/chaff) without crashing the rate. Watch for FC and be ready to ease heat further as crack approaches."
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8-fast",
+      "tier": "ultra-flash",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.23,
+      "latency_median": 2.63,
+      "latency_max": 2.64,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 45,
+        "target_fan": 70,
+        "should_drop": false,
+        "confidence": 0.78,
+        "rationale": "Only ~45s into development (~7.7% ratio) at 189C with post-crack RoR still ~11 C/min \u2014 too hot and too early to drop. Cut heat to 45 and raise fan to 70 to push convective transfer, tame the RoR, and stretch development cleanly. Aim to reach the ~10-15% development window (roughly another 60-90s); reassess before drop near 195-197C."
+      }
+    },
+    {
+      "slug": "meta-llama/llama-3.3-70b-instruct",
+      "tier": "speed-and-power",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.39,
+      "latency_median": 2.39,
+      "latency_max": 2.95,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 80,
+        "target_fan": 20,
+        "should_drop": false,
+        "confidence": 0.8,
+        "rationale": "preheat: drum temperature is rising, but still below the charge guidance band; reduce heat and increase fan to stabilize temperature"
+      }
+    },
+    {
+      "slug": "meta-llama/llama-3.3-70b-instruct",
+      "tier": "speed-and-power",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.01,
+      "latency_median": 2.18,
+      "latency_max": 3.25,
+      "passes_gate": true,
+      "passes_fc_gate": true,
+      "error": null,
+      "decision": {
+        "target_heat": 80,
+        "target_fan": 40,
+        "should_drop": false,
+        "confidence": 0.8,
+        "rationale": "reduce heat to manage RoR decline and increase fan for convective transfer"
+      }
+    },
+    {
+      "slug": "meta-llama/llama-3.3-70b-instruct",
+      "tier": "speed-and-power",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.26,
+      "latency_median": 2.72,
+      "latency_max": 3.22,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 50,
+        "target_fan": 80,
+        "should_drop": false,
+        "confidence": 0.8,
+        "rationale": "Development phase, reduce heat and increase fan to stretch development time and prevent over-roasting."
+      }
+    },
+    {
+      "slug": "qwen/qwen3.5-35b-a3b",
+      "tier": "speed-and-power",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 6.24,
+      "latency_median": 6.26,
+      "latency_max": 7.52,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.9,
+        "rationale": "Preheat phase - drum at 64\u00b0C, need to reach 180-200\u00b0C charge band. Heat at 100% is appropriate to maximize energy input. Keep fan low (10%) to focus on radiant/conductive drum heating rather than convective cooling. Not ready to charge yet - continue heating until stable in charge band. Monitor for stabilization before charging."
+      }
+    },
+    {
+      "slug": "qwen/qwen3.5-35b-a3b",
+      "tier": "speed-and-power",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 3.96,
+      "latency_median": 4.0,
+      "latency_max": 5.12,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 65,
+        "target_fan": 55,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Bean RoR at 11.3\u00b0C/min is dangerously high for pre-FC stage. Heat at 100% with only 30% fan is creating aggressive radiant/conductive heating that will likely cause RoR to spike or stall. Cut heat decisively to 65% (anticipating thermal lag) and raise fan to 55% to shift toward convective transfer, smooth the RoR decline, and prevent baking. Do not wait for RoR to visibly worsen\u2014act now to preserve development window."
+      }
+    },
+    {
+      "slug": "qwen/qwen3.5-35b-a3b",
+      "tier": "speed-and-power",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 5.82,
+      "latency_median": 6.37,
+      "latency_max": 6.85,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 60,
+        "target_fan": 60,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Development ratio at 7.7% (45s/587s) is below ideal 10-20% range. Bean temp 189\u00b0C still 8\u00b0C below target. RoR ~11\u00b0C/min is high but declining from recent heat cut. Maintain current heat/fan balance to allow gradual development without stalling. Do not drop yet - need more development time to reach target ratio."
+      }
+    },
+    {
+      "slug": "openai/o4-mini",
+      "tier": "fast-reasoning",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": true,
+      "ok_count": 3,
+      "latency_min": 4.09,
+      "latency_median": 5.94,
+      "latency_max": 5.95,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.92,
+        "rationale": "Drum air temp (80 \u00b0C) is far below the 180\u2013200 \u00b0C charge band. Maintain full power and minimal fan to build heat quickly. Continue until drum stabilizes in the charge guidance range; do not drop beans before then."
+      }
+    },
+    {
+      "slug": "openai/o4-mini",
+      "tier": "fast-reasoning",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": true,
+      "ok_count": 3,
+      "latency_min": 7.75,
+      "latency_median": 8.49,
+      "latency_max": 8.74,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 60,
+        "target_fan": 60,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Bean RoR remains high (~11 \u00b0C/min) at 4.5 min pre-first-crack; to enforce a smooth RoR decline, enact an early, decisive cut in heat and boost fan for more convective transfer. This prevents a stall later and promotes balanced drying/Maillard progression."
+      }
+    },
+    {
+      "slug": "openai/o4-mini",
+      "tier": "fast-reasoning",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": true,
+      "ok_count": 3,
+      "latency_min": 5.54,
+      "latency_median": 5.93,
+      "latency_max": 7.13,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 35,
+        "target_fan": 80,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Development ratio (~7.7%) is below the 10\u201320% sweet spot and RoR is still high. To stretch development time, cut heat substantially and boost airflow for more convective transfer."
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8",
+      "tier": "incumbent",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 4.79,
+      "latency_median": 4.82,
+      "latency_max": 5.19,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Preheating, drum still well below the 180-200C charge band (bean 64C, env 80C). Keep heat at 100 and fan low at 10 to climb efficiently toward the band. Not ready to charge yet \u2014 continue heating. As env temp approaches ~190C, ease heat to settle and stabilize inside the band before charging."
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8",
+      "tier": "incumbent",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 5.26,
+      "latency_median": 5.89,
+      "latency_max": 6.46,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 75,
+        "target_fan": 40,
+        "should_drop": false,
+        "confidence": 0.8,
+        "rationale": "Drying/Maillard at ~138C bean, ~4.5 min in, with heat pinned at 100% and RoR ~11C/min. First crack is approaching as we near the 150-160C band, so the classic thermal-lag heat cut needs to happen now \u2014 decisively pulling heat off 100% to about 75% so the RoR eases smoothly downward into first crack rather than spiking through it. Nudge fan up to ~40 to shift toward convective transfer for even roasting and to clear smoke/chaff, while keeping enough drum energy to avoid a stall. Hold this and reassess as we approach FC."
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8",
+      "tier": "incumbent",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 4.27,
+      "latency_median": 4.53,
+      "latency_max": 5.22,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 45,
+        "target_fan": 70,
+        "should_drop": false,
+        "confidence": 0.78,
+        "rationale": "Only 45s into development (~7.7% ratio) at 189C \u2014 too early to drop; aim to stretch toward a ~12-15% ratio. Post-crack RoR is still ~11 C/min, which would race past the temperature guide before development matures. Cut heat from 60 to 45 and raise fan from 60 to 70 to shift toward convective transfer, ease the RoR, and protect flavor without stalling. Hold and reassess as the ratio climbs."
+      }
+    },
+    {
+      "slug": "anthropic/claude-sonnet-4.6",
+      "tier": "prior-frontier",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 5.8,
+      "latency_median": 6.06,
+      "latency_max": 8.75,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.93,
+        "rationale": "Still deep in preheat \u2014 bean temp 64 \u00b0C, env temp 80 \u00b0C, both well below the charge band of 180\u2013200 \u00b0C. RoR is healthy and climbing (env ~32 \u00b0C/min, bean ~25 \u00b0C/min). Keep heat at full 100% to drive the drum up as quickly as possible; no reason to back off yet. Fan stays at 10% \u2014 low airflow during preheat retains drum heat and speeds the climb. Monitor closely as env temp approaches ~170 \u00b0C and be ready to trim heat to stabilize inside the 180\u2013200 \u00b0C band. Not ready to charge \u2014 still ~100 \u00b0C below target."
+      }
+    },
+    {
+      "slug": "anthropic/claude-sonnet-4.6",
+      "tier": "prior-frontier",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 7.27,
+      "latency_median": 7.55,
+      "latency_max": 8.17,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 80,
+        "target_fan": 30,
+        "should_drop": false,
+        "confidence": 0.82,
+        "rationale": "Bean temp is 138\u00b0C at ~4.5 min with RoR at 11.3\u00b0C/min \u2014 still strong and climbing. At this trajectory, first crack arrives around 195\u2013200\u00b0C in roughly 5\u20136 more minutes. The RoR needs to begin a smooth, controlled decline now; 11+ \u00b0C/min is too aggressive for this stage and risks a flick or stall later if left unchecked. Heat has been pinned at 100% the entire roast \u2014 due to thermal lag, a decisive cut to 80% now will take 60\u201390 seconds to register in bean temp, so acting early is critical. Fan stays at 30% to maintain convective balance without crashing RoR. This cut should begin bending RoR down toward the 7\u20139\u00b0C/min range through Maillard, setting up a gentle approach to first crack."
+      }
+    },
+    {
+      "slug": "anthropic/claude-sonnet-4.6",
+      "tier": "prior-frontier",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 8.69,
+      "latency_median": 9.24,
+      "latency_max": 9.49,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 45,
+        "target_fan": 70,
+        "should_drop": false,
+        "confidence": 0.78,
+        "rationale": "Development: 45s elapsed out of 586s total roast time = ~7.7% development ratio. No target_development_percent set, but 10\u201320% is the healthy range and ~10% is a solid minimum. At current RoR of ~11\u00b0C/min, beans are climbing fast \u2014 at this pace we'll hit 197\u00b0C (drop guide) in roughly 45s and 10% dev ratio (~58s total dev) almost simultaneously. Heat was just cut from 100\u219260 and fan raised to 60; that's a good move but RoR is still high at 11\u00b0C/min. Cut heat further to 45 and raise fan to 70 to shift more toward convective transfer, slow the RoR, and stretch development time without scorching. Env temp at 238\u00b0C is elevated \u2014 more fan will help evacuate heat and protect flavor clarity. Do not drop yet; target ~58\u201365s development (\u226510%) before dropping. Reassess in ~15s."
+      }
+    },
+    {
+      "slug": "openai/gpt-5.5",
+      "tier": "prior-frontier",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 2.44,
+      "latency_median": 3.28,
+      "latency_max": 4.84,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.94,
+        "rationale": "Preheat is far below the 180-200C charge band and still climbing; keep full heat with low fan to build drum energy. Not ready to charge\u2014continue until stable in band, then trim/hold."
+      }
+    },
+    {
+      "slug": "openai/gpt-5.5",
+      "tier": "prior-frontier",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 6.36,
+      "latency_median": 6.76,
+      "latency_max": 7.83,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 70,
+        "target_fan": 45,
+        "should_drop": false,
+        "confidence": 0.78,
+        "rationale": "Pre-FC RoR is still strong (~11 C/min) with ET rising and heat at 100%; cut early for lag and raise fan to shift more convective/clear air while preserving momentum. Aim for a smooth declining RoR, no drop."
+      }
+    },
+    {
+      "slug": "openai/gpt-5.5",
+      "tier": "prior-frontier",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 5.51,
+      "latency_median": 7.31,
+      "latency_max": 7.89,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 20,
+        "target_fan": 85,
+        "should_drop": false,
+        "confidence": 0.86,
+        "rationale": "Development is only ~7.7%; not ready to drop yet. Post-crack RoR is high, so cut heat decisively and raise fan to shift convective/smoke-clearing and stretch development. Reassess in ~15-25s; drop once development reaches ~10%."
+      }
+    },
+    {
+      "slug": "anthropic/claude-haiku-4.5",
+      "tier": "prior-frontier",
+      "phase": "preheating",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 3.36,
+      "latency_median": 3.49,
+      "latency_max": 3.67,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 100,
+        "target_fan": 10,
+        "should_drop": false,
+        "confidence": 0.85,
+        "rationale": "Preheat phase: drum (env) at 80 \u00b0C, target band 180\u2013200 \u00b0C. Bean RoR 25 \u00b0C/min and env RoR 32 \u00b0C/min show strong, steady climb. Heat is at 100% and fan at 10% \u2014 this aggressive setup is appropriate for early preheat. Maintain full heat and low fan to build drum energy efficiently. Expect to reach charge band in ~3\u20134 minutes. Monitor for overshoot; be ready to trim heat once env approaches 195 \u00b0C to stabilize in band before charge."
+      }
+    },
+    {
+      "slug": "anthropic/claude-haiku-4.5",
+      "tier": "prior-frontier",
+      "phase": "roasting_pre_first_crack",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 4.4,
+      "latency_median": 4.52,
+      "latency_max": 4.7,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 75,
+        "target_fan": 35,
+        "should_drop": false,
+        "confidence": 0.75,
+        "rationale": "Pre-first-crack phase at 138 \u00b0C bean temp, 269 s elapsed. RoR is strong at 11.3 \u00b0C/min and env is climbing steadily (203 \u00b0C). Heat is maxed at 100% and fan at 30%. To manage the RoR decline smoothly toward first crack and avoid a stall or bake, cut heat decisively to 75% now\u2014thermal lag means this change will take effect over the next 30\u201360 s. Raise fan to 35% to shift toward convective transfer and help stabilize the rise. The bean is still in the drying/Maillard phase; early, coordinated heat reduction prevents the RoR from flattening later. Monitor the next 1\u20132 min: if RoR remains above 8\u20139 \u00b0C/min, hold these settings; if it drops below 6 \u00b0C/min, trim heat further or raise fan more. Do not drop yet."
+      }
+    },
+    {
+      "slug": "anthropic/claude-haiku-4.5",
+      "tier": "prior-frontier",
+      "phase": "development",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "ok_count": 3,
+      "latency_min": 3.39,
+      "latency_median": 3.56,
+      "latency_max": 3.7,
+      "passes_gate": true,
+      "passes_fc_gate": false,
+      "error": null,
+      "decision": {
+        "target_heat": 40,
+        "target_fan": 75,
+        "should_drop": false,
+        "confidence": 0.75,
+        "rationale": "Development phase, 45s post-crack. Bean at 189\u00b0C, RoR 11\u00b0C/min still elevated. Target drop is 197\u00b0C (8\u00b0C away). Development ratio ~7.7% (45s/586s) \u2014 well below typical 10\u201320% target. Heat cut from 60\u219240% and fan raised to 75% to shift toward convective transfer, moderate the RoR, and extend development time to hit duration target. Do not drop yet; prioritize development ratio over temperature guide. Monitor RoR decline and bean progression over next 30\u201345s before reconsidering drop."
+      }
+    }
+  ]
+}

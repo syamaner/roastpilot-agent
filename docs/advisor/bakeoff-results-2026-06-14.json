@@ -1,0 +1,3577 @@
+{
+  "mode": "replay",
+  "availability": [
+    {
+      "slug": "google/gemini-3.1-flash-lite",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "openai/gpt-5.4-nano",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "openai/gpt-4.1-mini",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8-fast",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "meta-llama/llama-3.3-70b-instruct",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8",
+      "available": true,
+      "error": null,
+      "attempts": 1,
+      "reason": null
+    }
+  ],
+  "cells": [
+    {
+      "slug": "google/gemini-3.1-flash-lite",
+      "tier": "ultra-flash",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "scores": [
+        {
+          "roast_name": "live-roast-2026-06-07/session-1",
+          "tick_count": 41,
+          "ok_count": 41,
+          "development_time_ratio_truth": 15.0,
+          "drop": {
+            "precision": 1.0,
+            "recall": 1.0,
+            "f1": 1.0,
+            "true_positives": 1,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "first_drop_seconds": 1275.6114411670133,
+            "timing_error_seconds": -0.4,
+            "timing_error_c": 0.0
+          },
+          "drop_confusion": {
+            "true_positives": 1,
+            "false_positives": 0,
+            "true_negatives": 40,
+            "false_negatives": 0,
+            "total": 41
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                3,
+                32,
+                2
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 40,
+            "agreement": 0.875
+          },
+          "heat": {
+            "mae": 10,
+            "directional_agreement": 0.875,
+            "directional_samples": 40
+          },
+          "fan": {
+            "mae": 5.24,
+            "directional_agreement": 0.725,
+            "directional_samples": 40
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 21,
+              "median_seconds": 0.95,
+              "max_seconds": 2.04
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 1.0,
+              "max_seconds": 1.19
+            },
+            {
+              "phase": "development",
+              "count": 4,
+              "median_seconds": 1.13,
+              "max_seconds": 1.2
+            }
+          ]
+        },
+        {
+          "roast_name": "live-roast-2026-06-07/session-2",
+          "tick_count": 38,
+          "ok_count": 38,
+          "development_time_ratio_truth": 16.2,
+          "drop": {
+            "precision": 1.0,
+            "recall": 1.0,
+            "f1": 1.0,
+            "true_positives": 1,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "first_drop_seconds": 1136.173210582987,
+            "timing_error_seconds": 0.4,
+            "timing_error_c": 0.0
+          },
+          "drop_confusion": {
+            "true_positives": 1,
+            "false_positives": 0,
+            "true_negatives": 37,
+            "false_negatives": 0,
+            "total": 38
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                4,
+                30,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 37,
+            "agreement": 0.892
+          },
+          "heat": {
+            "mae": 7.89,
+            "directional_agreement": 0.892,
+            "directional_samples": 37
+          },
+          "fan": {
+            "mae": 7.89,
+            "directional_agreement": 0.649,
+            "directional_samples": 37
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 17,
+              "median_seconds": 0.88,
+              "max_seconds": 1.05
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 0.98,
+              "max_seconds": 1.17
+            },
+            {
+              "phase": "development",
+              "count": 5,
+              "median_seconds": 1.06,
+              "max_seconds": 1.24
+            }
+          ]
+        }
+      ],
+      "samples": {
+        "live-roast-2026-06-07/session-1": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 639.0940014169901,
+            "bean_temp_c": 148.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 10,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The roast has experienced a severe, unexplained crash in bean temperature (from 193C to 148C in ~15 seconds), likely due to a sensor error or a massive environmental disturbance. Given the current bean temperature of 148C and the high environmental temperature, I am maintaining maximum heat to recover the momentum. Fan is kept low to prioritize conductive heat recovery."
+            },
+            "latency_seconds": 1.117
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 960.1298406670103,
+            "bean_temp_c": 146.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 30,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "RoR is healthy (9.6 C/min) and the bean temperature is approaching the transition to first crack. Maintaining current heat and fan settings to keep momentum steady as we approach the end of the drying/Maillard phase. No changes needed yet."
+            },
+            "latency_seconds": 0.904
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1195.52238983399,
+            "bean_temp_c": 184.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 70,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "First crack occurred at ~541s. Development is very early (15s). RoR is healthy at ~10C/min. To reach a 15% development ratio (approx 85-90s total development time), I need to maintain a steady, gentle glide. Reducing heat to 70% and increasing fan to 50% will shift toward convective heat, preventing scorching while allowing for a controlled, extended development phase."
+            },
+            "latency_seconds": 1.075
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1225.5587454590132,
+            "bean_temp_c": 189.0,
+            "real_heat_percent": 60,
+            "real_fan_percent": 60,
+            "decision": {
+              "target_heat": 40,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "RoR is currently ~11\u00b0C/min, which is healthy for development. Total roast time is ~630s, and development time is ~45s (7% of total). To reach a 15% development ratio, I need ~95s total development time (50s more). I am reducing heat to 40% and increasing fan to 80% to manage the momentum and ensure a gentle, convective finish without stalling the roast. Drop is not yet indicated."
+            },
+            "latency_seconds": 1.195
+          }
+        ],
+        "live-roast-2026-06-07/session-2": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 486.3741288749734,
+            "bean_temp_c": 186.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The roaster is currently in the preheating phase, preparing to charge the beans. The current environment temperature is 221\u00b0C, which is slightly above the recommended charge range (180-200\u00b0C). I am setting the heat to 0 and fan to 100 to cool the drum down to the target charge range before the beans are added."
+            },
+            "latency_seconds": 0.971
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 808.6600722500007,
+            "bean_temp_c": 141.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 20,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The roast is progressing steadily toward first crack. With an RoR of ~11 C/min and bean temperature at 141 C, we are in a good position. I am maintaining full heat to ensure momentum through the drying/Maillard transition, but increasing the fan slightly to 20% to begin clearing moisture and preparing for the increased airflow needs as we approach first crack."
+            },
+            "latency_seconds": 1.063
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1034.442036374996,
+            "bean_temp_c": 178.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 60,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "First crack has just begun. The RoR is healthy (9.28 C/min). To manage the development phase and ensure a smooth, controlled finish toward the 16% development target, I am reducing heat to prevent a spike and increasing fan to shift toward convective heat transfer, which will help maintain a steady, gentle development."
+            },
+            "latency_seconds": 1.032
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1096.1291325419734,
+            "bean_temp_c": 187.0,
+            "real_heat_percent": 30,
+            "real_fan_percent": 70,
+            "decision": {
+              "target_heat": 20,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "Development is at ~10.7% (64s/599s). To reach the 16.2% target, I need about 33 more seconds of development. RoR is stable at 8.7\u00b0C/min. I will maintain low heat and moderate fan to gently coast toward the drop, ensuring the roast doesn't stall while avoiding a spike in RoR."
+            },
+            "latency_seconds": 0.98
+          }
+        ]
+      }
+    },
+    {
+      "slug": "openai/gpt-5.4-nano",
+      "tier": "ultra-flash",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "scores": [
+        {
+          "roast_name": "live-roast-2026-06-07/session-1",
+          "tick_count": 41,
+          "ok_count": 41,
+          "development_time_ratio_truth": 15.0,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 40,
+            "false_negatives": 1,
+            "total": 41
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                31,
+                4,
+                2
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 40,
+            "agreement": 0.175
+          },
+          "heat": {
+            "mae": 19.68,
+            "directional_agreement": 0.175,
+            "directional_samples": 40
+          },
+          "fan": {
+            "mae": 13.63,
+            "directional_agreement": 0.125,
+            "directional_samples": 40
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 21,
+              "median_seconds": 1.4,
+              "max_seconds": 2.5
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 1.52,
+              "max_seconds": 1.69
+            },
+            {
+              "phase": "development",
+              "count": 4,
+              "median_seconds": 1.61,
+              "max_seconds": 1.67
+            }
+          ]
+        },
+        {
+          "roast_name": "live-roast-2026-06-07/session-2",
+          "tick_count": 38,
+          "ok_count": 38,
+          "development_time_ratio_truth": 16.2,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 37,
+            "false_negatives": 1,
+            "total": 38
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                34,
+                0,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 37,
+            "agreement": 0.081
+          },
+          "heat": {
+            "mae": 23.34,
+            "directional_agreement": 0.081,
+            "directional_samples": 37
+          },
+          "fan": {
+            "mae": 15.61,
+            "directional_agreement": 0.108,
+            "directional_samples": 37
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 17,
+              "median_seconds": 1.37,
+              "max_seconds": 1.83
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 1.48,
+              "max_seconds": 1.93
+            },
+            {
+              "phase": "development",
+              "count": 5,
+              "median_seconds": 1.75,
+              "max_seconds": 2.1
+            }
+          ]
+        }
+      ],
+      "samples": {
+        "live-roast-2026-06-07/session-1": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 639.0940014169901,
+            "bean_temp_c": 148.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 72,
+              "target_fan": 65,
+              "should_drop": false,
+              "confidence": 0.62,
+              "rationale": "Pre\u2013first crack: current bean temp ~148 C with strongly negative RoR indicates active cooling/instability after an earlier overshoot; use decisive heat reduction to avoid further overshoot, while raising fan toward convective mode to stabilize bean temp rise and clear smoke/chaff. Not dropping since first crack not reached and development ratio target applies later."
+            },
+            "latency_seconds": 1.686
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 960.1298406670103,
+            "bean_temp_c": 146.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 85,
+              "target_fan": 35,
+              "should_drop": false,
+              "confidence": 0.62,
+              "rationale": "Pre\u2013first crack: bean temp is still ~146\u00b0C and RoR is rising but not near development; keep heat moderately high to maintain momentum, while increasing fan slightly for more even convective heating and smoke/chaff clearance. Do not drop since first crack not detected and duration target is for post-crack."
+            },
+            "latency_seconds": 1.523
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1195.52238983399,
+            "bean_temp_c": 184.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 55,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.74,
+              "rationale": "Post\u2013first crack development is only ~15% (556.6s elapsed with 15.1s dev), near the 10\u201320% target, so don\u2019t drop yet. Bean temp ~184\u00b0C is still below the 197\u00b0C guide and RoR is still high (~10\u00b0C/min), so cut heat substantially but increase fan toward more convective transfer to extend duration smoothly and avoid overshooting into dark/baked flavor."
+            },
+            "latency_seconds": 1.619
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1225.5587454590132,
+            "bean_temp_c": 189.0,
+            "real_heat_percent": 60,
+            "real_fan_percent": 60,
+            "decision": {
+              "target_heat": 35,
+              "target_fan": 75,
+              "should_drop": false,
+              "confidence": 0.68,
+              "rationale": "Post-crack development target ~15%: you\u2019re at ~45.2s/586.7s \u22487.7%, so duration is short and should not drop yet. Bean temp ~189\u00b0C with RoR ~11\u00b0C/min is running a bit hot; reduce heat decisively (accounting for thermal lag) while raising fan to more convective transfer to slow overshoot and even out heat. Fan+lower heat balance should stretch development toward the target without chasing the 197\u00b0C guide."
+            },
+            "latency_seconds": 1.608
+          }
+        ],
+        "live-roast-2026-06-07/session-2": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 486.3741288749734,
+            "bean_temp_c": 186.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 85,
+              "target_fan": 35,
+              "should_drop": false,
+              "confidence": 0.66,
+              "rationale": "Preheating/approach to charge: bean is ~186\u00b0C with high RoR (~19\u00b0C/min) and no first crack yet. Reduce heat from max to avoid overshooting due to thermal lag, while raising fan to increase convective/evacuative transfer and prevent uneven, baked flavor as you move toward the 180\u2013200\u00b0C guidance band. Keep running toward charge; do not drop (development ratio target not applicable yet)."
+            },
+            "latency_seconds": 1.448
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 808.6600722500007,
+            "bean_temp_c": 141.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 85,
+              "target_fan": 25,
+              "should_drop": false,
+              "confidence": 0.63,
+              "rationale": "Pre\u2013first crack: bean temp is rising slowly (RoR ~11 C/min) and far from the 193 C guide; keep heat fairly high but begin coordinating airflow upward to reduce lag and keep heat transfer even as you approach the turning point. Fan increased modestly (more convective transfer) without starving drum heat."
+            },
+            "latency_seconds": 1.376
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1034.442036374996,
+            "bean_temp_c": 178.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 55,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.74,
+              "rationale": "Post\u2013first crack with high bean RoR (~9.3 C/min). Bean is still below drop guide (178\u2192) and you\u2019re only ~16.2% into development, so prioritize duration: cut heat substantially to tame RoR (thermal lag), and raise fan to favor convective/evacuate smoke for even development rather than rushing to a temperature-based drop."
+            },
+            "latency_seconds": 1.53
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1096.1291325419734,
+            "bean_temp_c": 187.0,
+            "real_heat_percent": 30,
+            "real_fan_percent": 70,
+            "decision": {
+              "target_heat": 35,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.74,
+              "rationale": "Post\u2013first crack and development target ~16%: at ~600s elapsed with ~64s into development, you\u2019re near the duration goal. Bean RoR remains high (~8.8\u00b0C/min), so reduce drum energy now (anticipating thermal lag) to prevent baking past the ~193\u00b0C guide, while raising fan to increase convective heat transfer and smoke/chaff evacuation for a controlled, even finish. Drop is deferred since development ratio is not clearly overshot and temp ceiling (~195\u00b0C+ bean-dependent) can be managed with the heat reduction."
+            },
+            "latency_seconds": 2.074
+          }
+        ]
+      }
+    },
+    {
+      "slug": "openai/gpt-4.1-mini",
+      "tier": "ultra-flash",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "scores": [
+        {
+          "roast_name": "live-roast-2026-06-07/session-1",
+          "tick_count": 41,
+          "ok_count": 41,
+          "development_time_ratio_truth": 15.0,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 40,
+            "false_negatives": 1,
+            "total": 41
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                14,
+                21,
+                2
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 40,
+            "agreement": 0.6
+          },
+          "heat": {
+            "mae": 10,
+            "directional_agreement": 0.6,
+            "directional_samples": 40
+          },
+          "fan": {
+            "mae": 7.68,
+            "directional_agreement": 0.325,
+            "directional_samples": 40
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 21,
+              "median_seconds": 1.79,
+              "max_seconds": 2.92
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 2.06,
+              "max_seconds": 2.67
+            },
+            {
+              "phase": "development",
+              "count": 4,
+              "median_seconds": 1.9,
+              "max_seconds": 2.17
+            }
+          ]
+        },
+        {
+          "roast_name": "live-roast-2026-06-07/session-2",
+          "tick_count": 38,
+          "ok_count": 38,
+          "development_time_ratio_truth": 16.2,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 37,
+            "false_negatives": 1,
+            "total": 38
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                7,
+                27,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 37,
+            "agreement": 0.811
+          },
+          "heat": {
+            "mae": 5.92,
+            "directional_agreement": 0.811,
+            "directional_samples": 37
+          },
+          "fan": {
+            "mae": 6.11,
+            "directional_agreement": 0.432,
+            "directional_samples": 37
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 17,
+              "median_seconds": 1.84,
+              "max_seconds": 2.12
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 1.87,
+              "max_seconds": 3.35
+            },
+            {
+              "phase": "development",
+              "count": 5,
+              "median_seconds": 2.03,
+              "max_seconds": 2.4
+            }
+          ]
+        }
+      ],
+      "samples": {
+        "live-roast-2026-06-07/session-1": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 639.0940014169901,
+            "bean_temp_c": 148.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 15,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "In the pre-first crack phase with a dropping bean RoR and current bean temperature at 148\u00b0C, maintain full heat (100%) to drive temperature rise. Slightly increase fan from 10% to 15% to improve convective heat transfer and evacuate chaff/smoke without cooling excessively. No drop now; wait for first crack detection or development phase initiation."
+            },
+            "latency_seconds": 1.823
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 960.1298406670103,
+            "bean_temp_c": 146.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 95,
+              "target_fan": 35,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Pre-first crack phase with a bean RoR of 9.64 C/min is moderately high but stable. Current bean temperature is 146 C, climbing steadily. Slightly reducing heat from max to 95% will anticipate thermal lag and prevent overshooting while increasing fan slightly to 35% improves convective heat transfer and smoke evacuation. These coordinated adjustments support controlled temperature rise without risking baked flavor. Not ready to drop: no first crack detected, target development not yet relevant."
+            },
+            "latency_seconds": 2.072
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1195.52238983399,
+            "bean_temp_c": 184.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 60,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "RoR is high at ~10 C/min during development with a short elapsed development time of 15s and development ratio ~2.7%. To extend development toward the target 15% ratio, reduce heat significantly and increase fan substantially to shift heat mode toward convective and lower RoR without stalling progress or risking baked flavor. Temperature at 184 C is below the target drop temp of 197 C, so no drop yet."
+            },
+            "latency_seconds": 1.868
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1225.5587454590132,
+            "bean_temp_c": 189.0,
+            "real_heat_percent": 60,
+            "real_fan_percent": 60,
+            "decision": {
+              "target_heat": 50,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "In development phase with development ratio around 7.7% (45.157/586.677), target ratio is 15%. Bean temp is 189C, below target_drop 197C, but RoR is relatively high (10.97 C/min). Reduce heat to 50% to slow rate, raise fan to 70% to increase convective cooling and avoid scorching, stretching development. Do not drop yet to reach target development ratio."
+            },
+            "latency_seconds": 2.174
+          }
+        ],
+        "live-roast-2026-06-07/session-2": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 486.3741288749734,
+            "bean_temp_c": 186.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 90,
+              "target_fan": 15,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "In preheating phase with bean temp at 186\u00b0C and rising, heat is slightly reduced from max to avoid overshoot due to thermal lag, while fan is gently raised to 15 to enhance convective heat transfer and protect flavor. No drop is recommended as first crack hasn't occurred and development hasn't started."
+            },
+            "latency_seconds": 1.881
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 808.6600722500007,
+            "bean_temp_c": 141.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 25,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Pre-first crack, bean temperature is rising steadily with a healthy RoR of 11.1 C/min. To maintain an efficient rise and avoid stalling, maintain full heat and moderately increase fan from 10 to 25 to improve heat transfer and smoke/chaff evacuation. No drop yet as development hasn't started and temperature is well below target drop 193 C."
+            },
+            "latency_seconds": 1.898
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1034.442036374996,
+            "bean_temp_c": 178.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 85,
+              "target_fan": 45,
+              "should_drop": false,
+              "confidence": 0.85,
+              "rationale": "Development phase just started (2.48s) with bean temp rising steadily and RoR high but not excessive. To extend development time toward the target 16.2% ratio, reduce heat moderately from full and increase fan to enhance convective heat transfer and avoid baking. No drop yet as development ratio is far from target and temperature is below 193C guide."
+            },
+            "latency_seconds": 1.82
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1096.1291325419734,
+            "bean_temp_c": 187.0,
+            "real_heat_percent": 30,
+            "real_fan_percent": 70,
+            "decision": {
+              "target_heat": 15,
+              "target_fan": 85,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Development is about 10.7% of total roast time, near the target of 16.2%. Bean temperature is below the 193\u00b0C drop target but RoR is somewhat high (8.75\u00b0C/min). To stretch development and avoid overshooting temperature, lower heat decisively and increase fan to favor convective heat transfer and slow RoR while preserving flavor. Not yet time to drop."
+            },
+            "latency_seconds": 2.034
+          }
+        ]
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8-fast",
+      "tier": "ultra-flash",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "scores": [
+        {
+          "roast_name": "live-roast-2026-06-07/session-1",
+          "tick_count": 41,
+          "ok_count": 41,
+          "development_time_ratio_truth": 15.0,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 40,
+            "false_negatives": 1,
+            "total": 41
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                13,
+                22,
+                2
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 40,
+            "agreement": 0.625
+          },
+          "heat": {
+            "mae": 14.88,
+            "directional_agreement": 0.625,
+            "directional_samples": 40
+          },
+          "fan": {
+            "mae": 5.41,
+            "directional_agreement": 0.625,
+            "directional_samples": 40
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 21,
+              "median_seconds": 2.39,
+              "max_seconds": 10.37
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 2.96,
+              "max_seconds": 9.02
+            },
+            {
+              "phase": "development",
+              "count": 4,
+              "median_seconds": 3.29,
+              "max_seconds": 3.84
+            }
+          ]
+        },
+        {
+          "roast_name": "live-roast-2026-06-07/session-2",
+          "tick_count": 38,
+          "ok_count": 38,
+          "development_time_ratio_truth": 16.2,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 37,
+            "false_negatives": 1,
+            "total": 38
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                14,
+                20,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 37,
+            "agreement": 0.622
+          },
+          "heat": {
+            "mae": 10.39,
+            "directional_agreement": 0.622,
+            "directional_samples": 37
+          },
+          "fan": {
+            "mae": 5.39,
+            "directional_agreement": 0.649,
+            "directional_samples": 37
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 17,
+              "median_seconds": 2.46,
+              "max_seconds": 3.58
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 3.09,
+              "max_seconds": 9.25
+            },
+            {
+              "phase": "development",
+              "count": 5,
+              "median_seconds": 2.83,
+              "max_seconds": 3.16
+            }
+          ]
+        }
+      ],
+      "samples": {
+        "live-roast-2026-06-07/session-1": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 639.0940014169901,
+            "bean_temp_c": 148.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 80,
+              "target_fan": 15,
+              "should_drop": false,
+              "confidence": 0.3,
+              "rationale": "The telemetry is inconsistent: roast_elapsed is ~0.2s (just charged) yet the recent samples show ~640s of history with bean temp peaking at 193C then falling sharply to 148C. This pattern \u2014 env temp steady ~223C while bean temp drops from 193 to 148 over the last ~25s \u2014 looks like the beans were just charged into the drum (the dramatic negative RoR of -29 C/min is the classic post-charge turnaround dip), OR a sensor/probe disturbance. Treating this as a fresh charge approaching the turning point: I'm keeping heat firm to drive recovery toward first crack but not full 100% (the prior full-blast appears to have caused an unstable spike). Fan stays low to retain energy for the climb. Do not drop \u2014 we are pre-first-crack with no development underway. Low confidence given the contradictory timestamps; please verify the probe and elapsed-time signal."
+            },
+            "latency_seconds": 3.154
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 960.1298406670103,
+            "bean_temp_c": 146.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 85,
+              "target_fan": 40,
+              "should_drop": false,
+              "confidence": 0.78,
+              "rationale": "Pre-first-crack at 146C, ~5:20 in, with bean RoR ~9.6 C/min \u2014 a healthy, slightly declining ramp. Heat has been pinned at 100% with a low 30% fan, which risks a scorched/baked edge and traps chaff/smoke as we approach first crack (~195-205C env, bean ~196). I'm easing heat to 85% to begin a gentle RoR decline into the crack (anticipating thermal lag) and raising fan to 40% to shift toward more even convective transfer and clear smoke. Not near drop \u2014 keep developing."
+            },
+            "latency_seconds": 3.273
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1195.52238983399,
+            "bean_temp_c": 184.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 50,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Just 15s into development at 184C with heat pinned at 100% and fan only 30% \u2014 bean RoR ~10C/min is too hot for a controlled development and will race past the temperature guide before reaching the duration target. At 556s total, a 15% development ratio needs roughly 100s of development, so we have plenty of time to stretch. Cut heat decisively from 100 to ~50 to tame RoR while keeping some momentum, and raise fan from 30 to ~50 to shift toward convective transfer, evening out heat and protecting flavor (avoiding scorched/baked notes). This coordinated move slows the climb so we hit the duration target around 195C rather than overshooting. Not dropping \u2014 only ~15s of development so far."
+            },
+            "latency_seconds": 3.282
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1225.5587454590132,
+            "bean_temp_c": 189.0,
+            "real_heat_percent": 60,
+            "real_fan_percent": 60,
+            "decision": {
+              "target_heat": 40,
+              "target_fan": 75,
+              "should_drop": false,
+              "confidence": 0.78,
+              "rationale": "Development is only 45s (~7.7% of total) \u2014 too early to drop; target is 15%, roughly 88s of development. Bean temp 189C is below the 197C guide. RoR is still ~11 C/min, which would carry us past 195C too fast and risk a dark/baked result. The prior heat cut to 60 already helped, but to stretch development I'm cutting heat decisively to 40 and raising fan to 75 to shift toward convective transfer, evening out the roast and evacuating smoke while easing RoR. Watch that RoR doesn't crash \u2014 reassess in the next 20-30s as we approach ~12-15% development."
+            },
+            "latency_seconds": 2.777
+          }
+        ],
+        "live-roast-2026-06-07/session-2": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 486.3741288749734,
+            "bean_temp_c": 186.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 10,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Preheating, ~10s before charge. Bean temp 186 C sits comfortably within the 180-200 C charge window, so the drum is ready. Keep heat at 100 and fan low (10) to bank energy for the cold-bean charge, when the thermal mass will drop bean temp sharply and we'll want maximum stored heat to drive the turnaround. No development consideration yet; do not drop."
+            },
+            "latency_seconds": 2.502
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 808.6600722500007,
+            "bean_temp_c": 141.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 85,
+              "target_fan": 25,
+              "should_drop": false,
+              "confidence": 0.78,
+              "rationale": "Mid-roast at 141C, ~5min in, pre-first-crack with a healthy ~11 C/min bean RoR \u2014 momentum is good and we're approaching the Maillard-to-crack transition. Heat has been pinned at 100% with fan very low (10), which risks scorching the bean surface and uneven/baked development as we near first crack. I'm easing heat off slightly (to 85) ahead of crack to avoid a RoR spike and surface scorch \u2014 acting early for thermal lag \u2014 while raising fan to 25 to shift toward convective transfer, even out the heat, and start evacuating smoke/chaff. Still well below the drop guide (193C) with no crack yet, so do not drop."
+            },
+            "latency_seconds": 2.562
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1034.442036374996,
+            "bean_temp_c": 178.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 60,
+              "target_fan": 45,
+              "should_drop": false,
+              "confidence": 0.82,
+              "rationale": "First crack just hit (~2.5s into development) at 178C with heat pinned at 100% and a still-brisk bean RoR of ~9.3 C/min. To reach a ~16% development ratio we need roughly 90-100s of development from a ~535s roast, so I want a controlled, gentle climb \u2014 not a spike that races past the 193C guide and darkens the beans. Cut heat decisively from 100% to ~60% to bleed off the thermal-lag-driven surge that's still in the pipeline, and raise fan from 30% to ~45% to shift toward convective heat for even development and to clear smoke. This balance trims RoR without crashing it (avoiding a stall/bake). Hold for the drop until development time stretches into the target window."
+            },
+            "latency_seconds": 2.828
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1096.1291325419734,
+            "bean_temp_c": 187.0,
+            "real_heat_percent": 30,
+            "real_fan_percent": 70,
+            "decision": {
+              "target_heat": 25,
+              "target_fan": 75,
+              "should_drop": false,
+              "confidence": 0.78,
+              "rationale": "Development is at 64s / ~10.7% of total roast \u2014 short of the 16.2% target, so keep developing. Bean temp 187C with RoR already eased to ~8.8 C/min after the earlier heat cuts (100\u219260\u219230); that's a healthy gentle glide. I'm trimming heat slightly more (30\u219225) and nudging fan up (70\u219275) to keep convective transfer dominant, evacuate smoke, and slow the climb so we stretch development toward ~14-16% before reaching the ~193C guide. Hold for now; expect to drop in roughly another 30-40s once the ratio lands in target and bean temp is near 190-193C. Don't rush the drop on temperature alone."
+            },
+            "latency_seconds": 2.97
+          }
+        ]
+      }
+    },
+    {
+      "slug": "meta-llama/llama-3.3-70b-instruct",
+      "tier": "speed-and-power",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "scores": [
+        {
+          "roast_name": "live-roast-2026-06-07/session-1",
+          "tick_count": 41,
+          "ok_count": 41,
+          "development_time_ratio_truth": 15.0,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 40,
+            "false_negatives": 1,
+            "total": 41
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                4,
+                31,
+                2
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 40,
+            "agreement": 0.85
+          },
+          "heat": {
+            "mae": 12.93,
+            "directional_agreement": 0.85,
+            "directional_samples": 40
+          },
+          "fan": {
+            "mae": 5.12,
+            "directional_agreement": 0.875,
+            "directional_samples": 40
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 21,
+              "median_seconds": 2.19,
+              "max_seconds": 54.2
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 2.62,
+              "max_seconds": 5.11
+            },
+            {
+              "phase": "development",
+              "count": 4,
+              "median_seconds": 2.35,
+              "max_seconds": 7.48
+            }
+          ]
+        },
+        {
+          "roast_name": "live-roast-2026-06-07/session-2",
+          "tick_count": 38,
+          "ok_count": 38,
+          "development_time_ratio_truth": 16.2,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 37,
+            "false_negatives": 1,
+            "total": 38
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                5,
+                29,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 37,
+            "agreement": 0.865
+          },
+          "heat": {
+            "mae": 6.84,
+            "directional_agreement": 0.865,
+            "directional_samples": 37
+          },
+          "fan": {
+            "mae": 3.68,
+            "directional_agreement": 0.892,
+            "directional_samples": 37
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 17,
+              "median_seconds": 2.55,
+              "max_seconds": 7.22
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 2.26,
+              "max_seconds": 16.11
+            },
+            {
+              "phase": "development",
+              "count": 5,
+              "median_seconds": 2.15,
+              "max_seconds": 2.4
+            }
+          ]
+        }
+      ],
+      "samples": {
+        "live-roast-2026-06-07/session-1": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 639.0940014169901,
+            "bean_temp_c": 148.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 10,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Pre-first crack, high heat and low fan to promote radiant and conductive heating."
+            },
+            "latency_seconds": 5.11
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 960.1298406670103,
+            "bean_temp_c": 146.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 30,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Maintain current heat and fan settings to continue roasting pre-first crack."
+            },
+            "latency_seconds": 2.07
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1195.52238983399,
+            "bean_temp_c": 184.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 50,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "development ratio target not yet reached, continue roasting with balanced heat and fan"
+            },
+            "latency_seconds": 2.188
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1225.5587454590132,
+            "bean_temp_c": 189.0,
+            "real_heat_percent": 60,
+            "real_fan_percent": 60,
+            "decision": {
+              "target_heat": 40,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Cut heat substantially and raise fan toward convective transfer to stretch development when post-crack RoR is high."
+            },
+            "latency_seconds": 2.504
+          }
+        ],
+        "live-roast-2026-06-07/session-2": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 486.3741288749734,
+            "bean_temp_c": 186.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 80,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Preheating phase, increase heat and fan to reach target temperature"
+            },
+            "latency_seconds": 3.609
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 808.6600722500007,
+            "bean_temp_c": 141.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 10,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Pre-first crack, maintain high heat and low fan to continue temperature increase."
+            },
+            "latency_seconds": 2.269
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1034.442036374996,
+            "bean_temp_c": 178.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 50,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "development ratio target not yet reached, continue roasting with balanced heat and fan"
+            },
+            "latency_seconds": 2.146
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1096.1291325419734,
+            "bean_temp_c": 187.0,
+            "real_heat_percent": 30,
+            "real_fan_percent": 70,
+            "decision": {
+              "target_heat": 20,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "development ratio target"
+            },
+            "latency_seconds": 2.148
+          }
+        ]
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8",
+      "tier": "incumbent",
+      "prompt_version": "v2",
+      "latency_risk": false,
+      "scores": [
+        {
+          "roast_name": "live-roast-2026-06-07/session-1",
+          "tick_count": 41,
+          "ok_count": 41,
+          "development_time_ratio_truth": 15.0,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 40,
+            "false_negatives": 1,
+            "total": 41
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                15,
+                20,
+                2
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 40,
+            "agreement": 0.575
+          },
+          "heat": {
+            "mae": 15.85,
+            "directional_agreement": 0.575,
+            "directional_samples": 40
+          },
+          "fan": {
+            "mae": 5.41,
+            "directional_agreement": 0.575,
+            "directional_samples": 40
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 21,
+              "median_seconds": 4.38,
+              "max_seconds": 7.63
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 6.07,
+              "max_seconds": 12.02
+            },
+            {
+              "phase": "development",
+              "count": 4,
+              "median_seconds": 6.76,
+              "max_seconds": 7.25
+            }
+          ]
+        },
+        {
+          "roast_name": "live-roast-2026-06-07/session-2",
+          "tick_count": 38,
+          "ok_count": 38,
+          "development_time_ratio_truth": 16.2,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 37,
+            "false_negatives": 1,
+            "total": 38
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                16,
+                18,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 37,
+            "agreement": 0.568
+          },
+          "heat": {
+            "mae": 11.53,
+            "directional_agreement": 0.568,
+            "directional_samples": 37
+          },
+          "fan": {
+            "mae": 5.92,
+            "directional_agreement": 0.622,
+            "directional_samples": 37
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 17,
+              "median_seconds": 4.44,
+              "max_seconds": 5.67
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 6.19,
+              "max_seconds": 9.2
+            },
+            {
+              "phase": "development",
+              "count": 5,
+              "median_seconds": 6.12,
+              "max_seconds": 7.19
+            }
+          ]
+        }
+      ],
+      "samples": {
+        "live-roast-2026-06-07/session-1": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 639.0940014169901,
+            "bean_temp_c": 148.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 80,
+              "target_fan": 15,
+              "should_drop": false,
+              "confidence": 0.4,
+              "rationale": "The telemetry is internally inconsistent: roast_elapsed is ~0.2s yet recent samples show ~640s of history with bean temp peaking near 193C then dropping sharply to 148C. The most likely reading is that we are well into the roast and the bean probe just registered a sudden plunge (probe artifact, charge of a second batch, or a real heat-transfer disruption) \u2014 the -28.9 C/min RoR is almost certainly a sensor glitch rather than physical bean behavior. I'm treating this as pre-first-crack with no FC detected, so do NOT drop. Given the ambiguity, I'm pulling heat back from 100 to a moderate 80 to avoid scorching if the probe recovers and the real bean temp is actually near the high-180s/190s, while keeping enough energy to drive momentum if temps truly dropped. Fan nudged to 15 for slightly more even convective transfer and smoke/chaff evacuation. Low confidence \u2014 recommend verifying the bean probe seating before trusting the next recommendation."
+            },
+            "latency_seconds": 9.156
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 960.1298406670103,
+            "bean_temp_c": 146.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 80,
+              "target_fan": 40,
+              "should_drop": false,
+              "confidence": 0.78,
+              "rationale": "Pre-first-crack at 146C, ~5:20 in, bean RoR ~9.6 C/min \u2014 healthy momentum. Heat has been pinned at 100% with fan only 30, so anticipating thermal lag I'm trimming heat to 80 now to avoid charging into first crack with too steep a RoR (which would compress development). I'm simultaneously raising fan to 40 to shift toward convective transfer for more even roasting and to start evacuating chaff/smoke as we approach the crack. Roughly 50C still to go to the ~197C guide, so plenty of runway \u2014 hold, don't drop. Reassess RoR after the heat cut shows up."
+            },
+            "latency_seconds": 5.278
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1195.52238983399,
+            "bean_temp_c": 184.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 60,
+              "target_fan": 45,
+              "should_drop": false,
+              "confidence": 0.82,
+              "rationale": "Just 15s into development (~2.7% ratio) at 184C with bean RoR ~10 C/min and heat pinned at 100% \u2014 too hot, this will blow past the temperature guide before reaching a 10-20% development ratio. To hit ~15% I need roughly 80-100s of development, which means slowing the climb decisively now. Cutting heat from 100 to 60 anticipates thermal lag and tames RoR, while raising fan from 30 to 45 shifts toward convective transfer for even, smoke-free development \u2014 coordinated so RoR eases without crashing/baking. Re-evaluate as RoR settles; expect to drop around 193-197C once the duration target is in range."
+            },
+            "latency_seconds": 6.77
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1225.5587454590132,
+            "bean_temp_c": 189.0,
+            "real_heat_percent": 60,
+            "real_fan_percent": 60,
+            "decision": {
+              "target_heat": 40,
+              "target_fan": 75,
+              "should_drop": false,
+              "confidence": 0.78,
+              "rationale": "Development is only 45s in (~7.7% ratio) \u2014 well short of the ~15% target (~104s, i.e. ~88s more). Bean temp 189C with RoR still ~11 C/min is too hot; at this pace it would race past the 197C guide and risk baking/over-darkening before hitting the duration target. The prior cut to 60/60 helped but RoR is still high, so cut heat decisively to 40 and raise fan to ~75 to shift toward convective transfer \u2014 this stretches development and evacuates smoke without crashing RoR. Hold; reassess as we approach ~10-15% development and ~195C."
+            },
+            "latency_seconds": 5.275
+          }
+        ],
+        "live-roast-2026-06-07/session-2": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 486.3741288749734,
+            "bean_temp_c": 186.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 80,
+              "target_fan": 20,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Preheating, charge imminent at ~186 C bean temp, within the 180-200 C charge window. Beans are not yet in. I'd ease heat from a full 100% toward 80% so that after charge the element isn't slamming energy into a cold mass with too much thermal lag, and bring fan up slightly to 20% for early chaff/smoke evacuation and more even convective transfer once beans hit the drum. Not dropping \u2014 the roast hasn't started. Reassess RoR immediately after charge when the temperature crashes and recovers."
+            },
+            "latency_seconds": 5.311
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 808.6600722500007,
+            "bean_temp_c": 141.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 85,
+              "target_fan": 25,
+              "should_drop": false,
+              "confidence": 0.74,
+              "rationale": "Pre-first-crack at 141 C, ~5:12 in, bean RoR ~11 C/min and climbing steadily \u2014 healthy momentum toward first crack (~196 C env / ~150-160 C bean range coming). Heat has been pinned at 100% with fan at only 10%, a heat-heavy, low-convection setup that risks scorching and uneven roasting as we approach the crack. I'm trimming heat to 85% to begin anticipating thermal lag and avoid an RoR spike into first crack, while raising fan to 25% to shift toward convective transfer and start evacuating smoke/chaff for cleaner flavor. This keeps RoR robust (no stall) but more controlled. Hold for now \u2014 nowhere near drop."
+            },
+            "latency_seconds": 5.765
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1034.442036374996,
+            "bean_temp_c": 178.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 70,
+              "target_fan": 45,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "First crack just hit (2.5s into development, bean 178C). We're at the very start of development and need to build duration toward ~16% of total roast time \u2014 at ~538s elapsed, a 16% ratio means roughly 90-100s of development, so no drop. Heat is pinned at 100% with fan only at 30% \u2014 that's too much radiant drive into the early development window and risks racing past the temp guide and baking. Cut heat decisively to 70% to ease RoR (currently ~9C/min) so development stretches, and raise fan to 45% to shift toward convective transfer for even heat, smoke/chaff evacuation, and flavor protection \u2014 keeping the heat:fan balance from crashing RoR. Reassess as we approach the 193C guide and the duration target."
+            },
+            "latency_seconds": 6.699
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1096.1291325419734,
+            "bean_temp_c": 187.0,
+            "real_heat_percent": 30,
+            "real_fan_percent": 70,
+            "decision": {
+              "target_heat": 25,
+              "target_fan": 75,
+              "should_drop": false,
+              "confidence": 0.78,
+              "rationale": "Development is at ~64s of ~600s total (~10.7%), below the 16.2% target, so keep developing. Bean RoR has come down nicely to ~8.7 C/min and heat was already cut to 30%; I'm trimming heat slightly to 25% to ease RoR further and stretch development while nudging fan to 75 to favor convective, even heat transfer and clear smoke. At 187 C with the 193 C guide nearby, there's headroom to develop toward ~16% (roughly another 30-40s) without pushing dangerously dark. Hold the drop for now and reassess as the ratio climbs."
+            },
+            "latency_seconds": 6.118
+          }
+        ]
+      }
+    },
+    {
+      "slug": "google/gemini-3.1-flash-lite",
+      "tier": "ultra-flash",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "scores": [
+        {
+          "roast_name": "live-roast-2026-06-07/session-1",
+          "tick_count": 41,
+          "ok_count": 41,
+          "development_time_ratio_truth": 15.0,
+          "drop": {
+            "precision": 1.0,
+            "recall": 1.0,
+            "f1": 1.0,
+            "true_positives": 1,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "first_drop_seconds": 1275.6114411670133,
+            "timing_error_seconds": -0.4,
+            "timing_error_c": 0.0
+          },
+          "drop_confusion": {
+            "true_positives": 1,
+            "false_positives": 0,
+            "true_negatives": 40,
+            "false_negatives": 0,
+            "total": 41
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                13,
+                22,
+                2
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 40,
+            "agreement": 0.625
+          },
+          "heat": {
+            "mae": 18.66,
+            "directional_agreement": 0.625,
+            "directional_samples": 40
+          },
+          "fan": {
+            "mae": 8.66,
+            "directional_agreement": 0.625,
+            "directional_samples": 40
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 21,
+              "median_seconds": 1.05,
+              "max_seconds": 6.87
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 1.09,
+              "max_seconds": 1.42
+            },
+            {
+              "phase": "development",
+              "count": 4,
+              "median_seconds": 1.21,
+              "max_seconds": 1.57
+            }
+          ]
+        },
+        {
+          "roast_name": "live-roast-2026-06-07/session-2",
+          "tick_count": 38,
+          "ok_count": 38,
+          "development_time_ratio_truth": 16.2,
+          "drop": {
+            "precision": 0.5,
+            "recall": 1.0,
+            "f1": 0.667,
+            "true_positives": 1,
+            "false_positives": 1,
+            "false_negatives": 0,
+            "first_drop_seconds": 1126.162812458002,
+            "timing_error_seconds": -9.6,
+            "timing_error_c": -2.0
+          },
+          "drop_confusion": {
+            "true_positives": 1,
+            "false_positives": 1,
+            "true_negatives": 36,
+            "false_negatives": 0,
+            "total": 38
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                10,
+                24,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 37,
+            "agreement": 0.73
+          },
+          "heat": {
+            "mae": 12.11,
+            "directional_agreement": 0.73,
+            "directional_samples": 37
+          },
+          "fan": {
+            "mae": 8.68,
+            "directional_agreement": 0.622,
+            "directional_samples": 37
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 17,
+              "median_seconds": 1.07,
+              "max_seconds": 1.79
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 1.18,
+              "max_seconds": 2.67
+            },
+            {
+              "phase": "development",
+              "count": 5,
+              "median_seconds": 1.21,
+              "max_seconds": 1.73
+            }
+          ]
+        }
+      ],
+      "samples": {
+        "live-roast-2026-06-07/session-1": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 639.0940014169901,
+            "bean_temp_c": 148.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 10,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The bean temperature has plummeted from 193C to 148C in under 20 seconds, indicating a massive sensor error or a catastrophic event (e.g., beans ejected or probe failure). Given the current telemetry, the roast is effectively stalled or the data is invalid. I am maintaining maximum heat to attempt recovery, but this roast is likely compromised."
+            },
+            "latency_seconds": 1.013
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 960.1298406670103,
+            "bean_temp_c": 146.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 80,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "RoR is healthy at 9.6 C/min as we approach first crack. Maintaining 100% heat is no longer appropriate as we approach the end of Maillard; reducing heat to 80% and increasing fan to 50% will help manage the momentum and transition smoothly into first crack without stalling."
+            },
+            "latency_seconds": 1.357
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1195.52238983399,
+            "bean_temp_c": 184.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 60,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Development is at 15.1s out of a total roast time of 556.6s (2.7%). To reach a 15% development ratio, we need ~83s of development time. We are currently at 184C with a healthy RoR. Maintaining 100% heat will likely push the temperature too high before the development target is met. Reducing heat to 60% and increasing fan to 60% will manage the RoR and transition to convective heat to ensure even development."
+            },
+            "latency_seconds": 1.072
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1225.5587454590132,
+            "bean_temp_c": 189.0,
+            "real_heat_percent": 60,
+            "real_fan_percent": 60,
+            "decision": {
+              "target_heat": 60,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "Current development ratio is ~7.7% (45s / 586s). To reach the 15% target, we need approximately 43 more seconds of development. RoR is currently 11C/min, which is appropriate for a controlled finish. Maintaining current heat/fan settings to allow a steady, gentle climb toward the target development time. Will monitor for the 15% mark to drop."
+            },
+            "latency_seconds": 1.234
+          }
+        ],
+        "live-roast-2026-06-07/session-2": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 486.3741288749734,
+            "bean_temp_c": 186.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 0,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 1.0,
+              "rationale": "The drum is currently at 221\u00b0C, which is above the charge guidance range (180-200\u00b0C). I am reducing heat to 0% and increasing fan to 50% to accelerate cooling toward the target charge range. Ready to charge once the environment temperature stabilizes within the 180-200\u00b0C band."
+            },
+            "latency_seconds": 1.327
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 808.6600722500007,
+            "bean_temp_c": 141.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 30,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "RoR is healthy at 11C/min, but we are approaching the Maillard phase. Increasing fan to 30% will shift heat transfer toward convection to ensure even development and prepare for the upcoming crack, while maintaining 100% heat to keep the momentum steady before the inevitable pre-crack heat reduction."
+            },
+            "latency_seconds": 1.034
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1034.442036374996,
+            "bean_temp_c": 178.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 60,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "First crack just started. Development is at 0.5%. Need to reduce heat and increase fan to manage the RoR and ensure a controlled development phase. Target development time is ~87s (16.2% of 538s). Reducing heat to 60% and increasing fan to 60% to shift to convective heat and prevent a spike."
+            },
+            "latency_seconds": 1.208
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1096.1291325419734,
+            "bean_temp_c": 187.0,
+            "real_heat_percent": 30,
+            "real_fan_percent": 70,
+            "decision": {
+              "target_heat": 0,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "Current development ratio is ~10.7%. To reach the 16.2% target, we need ~32 more seconds of development. RoR is stable at 8.7C/min. Reducing heat to 0% and maintaining fan at 70% will allow a gentle, controlled finish to the target ratio without overshooting the temperature. Ready to drop in ~30-35 seconds."
+            },
+            "latency_seconds": 1.725
+          }
+        ]
+      }
+    },
+    {
+      "slug": "openai/gpt-5.4-nano",
+      "tier": "ultra-flash",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "scores": [
+        {
+          "roast_name": "live-roast-2026-06-07/session-1",
+          "tick_count": 41,
+          "ok_count": 41,
+          "development_time_ratio_truth": 15.0,
+          "drop": {
+            "precision": 0.333,
+            "recall": 1.0,
+            "f1": 0.5,
+            "true_positives": 1,
+            "false_positives": 2,
+            "false_negatives": 0,
+            "first_drop_seconds": 1225.5587454590132,
+            "timing_error_seconds": -50.4,
+            "timing_error_c": -8.0
+          },
+          "drop_confusion": {
+            "true_positives": 1,
+            "false_positives": 2,
+            "true_negatives": 38,
+            "false_negatives": 0,
+            "total": 41
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                35,
+                0,
+                2
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 40,
+            "agreement": 0.075
+          },
+          "heat": {
+            "mae": 22.44,
+            "directional_agreement": 0.075,
+            "directional_samples": 40
+          },
+          "fan": {
+            "mae": 16.71,
+            "directional_agreement": 0.1,
+            "directional_samples": 40
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 21,
+              "median_seconds": 1.59,
+              "max_seconds": 2.1
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 1.6,
+              "max_seconds": 3.11
+            },
+            {
+              "phase": "development",
+              "count": 4,
+              "median_seconds": 1.62,
+              "max_seconds": 1.74
+            }
+          ]
+        },
+        {
+          "roast_name": "live-roast-2026-06-07/session-2",
+          "tick_count": 38,
+          "ok_count": 38,
+          "development_time_ratio_truth": 16.2,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 1,
+            "false_negatives": 1,
+            "first_drop_seconds": 1034.442036374996,
+            "timing_error_seconds": -101.3,
+            "timing_error_c": -15.0
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 1,
+            "true_negatives": 36,
+            "false_negatives": 1,
+            "total": 38
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                32,
+                2,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 37,
+            "agreement": 0.135
+          },
+          "heat": {
+            "mae": 21.5,
+            "directional_agreement": 0.135,
+            "directional_samples": 37
+          },
+          "fan": {
+            "mae": 14.03,
+            "directional_agreement": 0.135,
+            "directional_samples": 37
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 17,
+              "median_seconds": 1.58,
+              "max_seconds": 1.97
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 1.49,
+              "max_seconds": 2.45
+            },
+            {
+              "phase": "development",
+              "count": 5,
+              "median_seconds": 1.61,
+              "max_seconds": 1.7
+            }
+          ]
+        }
+      ],
+      "samples": {
+        "live-roast-2026-06-07/session-1": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 639.0940014169901,
+            "bean_temp_c": 148.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 15,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.62,
+              "rationale": "Pre-first-crack: bean temp has plunged from ~190\u2013193\u00b0C down to ~148\u00b0C after charging (thermal lag/charge dunk). With RoR currently strongly negative (~-28.9\u00b0C/min), this indicates the beans are still recovering and you need early, decisive steering rather than timid heat trims. Cut heat substantially (from prior 100%) to avoid overshooting once lag catches up, and raise fan to ~70% to increase convective/evaporative transfer and stabilize the climb smoothly toward ~first-crack range. Hold/not drop in preheat-stage behavior; continue until bean temp stabilizes in the approach band."
+            },
+            "latency_seconds": 1.926
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 960.1298406670103,
+            "bean_temp_c": 146.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 88,
+              "target_fan": 45,
+              "should_drop": false,
+              "confidence": 0.66,
+              "rationale": "Pre\u2013first crack: beans at 146\u00b0C and still climbing; RoR is relatively high and not yet eased. Because of thermal lag, cut heat decisively from 100% and shift toward more convective transfer to smooth the RoR decline. Keep should_drop false in this phase and aim to hold a steady climb toward the ~197\u00b0C region without a stall."
+            },
+            "latency_seconds": 1.631
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1195.52238983399,
+            "bean_temp_c": 184.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 35,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.67,
+              "rationale": "Post\u2013first-crack development is on track (15.12s / 556.64s \u2248 2.7% from charge, well below the 15% target), and bean temp is still rising at ~10.0\u00b0C/min. Cut heat substantially to avoid overshooting while raising fan toward convective transfer to shape RoR and broaden development without baking; drop only once the development-ratio target is met, so not yet."
+            },
+            "latency_seconds": 1.494
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1225.5587454590132,
+            "bean_temp_c": 189.0,
+            "real_heat_percent": 60,
+            "real_fan_percent": 60,
+            "decision": {
+              "target_heat": 45,
+              "target_fan": 72,
+              "should_drop": true,
+              "confidence": 0.72,
+              "rationale": "Post\u2013first crack development: elapsed since charge ~45s of ~586s total (development ratio \u22487.7% so you\u2019re a bit ahead of the ~10\u201320% sweet spot but already at the target zone for exiting). Bean temp ~189C with high RoR (~11C/min) suggests heat is still driving fast rise; cut heat substantially and raise fan to keep it from baking/overextending while finishing the last fraction. Dropping now is decisive to match the development-duration goal rather than chasing the 197C guide."
+            },
+            "latency_seconds": 1.698
+          }
+        ],
+        "live-roast-2026-06-07/session-2": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 486.3741288749734,
+            "bean_temp_c": 186.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 78,
+              "target_fan": 18,
+              "should_drop": false,
+              "confidence": 0.74,
+              "rationale": "Preheat goal is to reach/hold the 180\u2013200\u202f\u00b0C charge band once the drum stabilizes. Beans are already at ~186\u202f\u00b0C (within band) while drum/env is ~221\u202f\u00b0C and still climbing with high RoR, so reduce heat decisively to prevent overshoot from thermal lag. Keep fan modest to maintain even convective transfer and chaff/smoke evacuation without overcooling. Hold (no drop) until charge is clearly stable in-band."
+            },
+            "latency_seconds": 1.622
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 808.6600722500007,
+            "bean_temp_c": 141.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 92,
+              "target_fan": 16,
+              "should_drop": false,
+              "confidence": 0.62,
+              "rationale": "Pre\u20131st-crack: beans are ~141\u00b0C and still climbing with fairly high RoR (~11.1\u00b0C/min); keep heat strong but begin a controlled, slightly earlier reduction to avoid later RoR being too high once thermal lag catches up. Increase fan modestly to support steadier convective transfer and smoke/chaff evacuation while not over-driving airflow (to avoid RoR stalling). Hold should_drop=false during this stage."
+            },
+            "latency_seconds": 1.434
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1034.442036374996,
+            "bean_temp_c": 178.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 35,
+              "target_fan": 75,
+              "should_drop": true,
+              "confidence": 0.66,
+              "rationale": "Post\u2013first crack with very small development timer (only ~2.5s into development; development ratio far below target ~16%). RoR is still high (~9.3\u00b0C/min), so anticipate thermal lag by cutting heat substantially and shifting to convective airflow (higher fan) to control RoR and prevent overshoot/baking. Drop decisively because ratio target is not met yet would be incorrect; however development_elapsed is tiny\u2014likely just after FC detection\u2014so defer drop and keep steering. Recommend should_drop=false."
+            },
+            "latency_seconds": 1.559
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1096.1291325419734,
+            "bean_temp_c": 187.0,
+            "real_heat_percent": 30,
+            "real_fan_percent": 70,
+            "decision": {
+              "target_heat": 30,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.64,
+              "rationale": "Post\u2013first-crack development: development ratio = 64.17s / 599.74s \u2248 10.7%, below target 16.2%, so don\u2019t drop yet. Bean temp (187\u00b0C) is below the 193\u00b0C guide and RoR is fairly high (8.75\u00b0C/min), indicating heat still feeding fast enough; cut heat substantially but shift to higher fan for controlled convective transfer to stretch development without driving too hot. Reassess for drop once development ratio approaches ~16%."
+            },
+            "latency_seconds": 1.613
+          }
+        ]
+      }
+    },
+    {
+      "slug": "openai/gpt-4.1-mini",
+      "tier": "ultra-flash",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "scores": [
+        {
+          "roast_name": "live-roast-2026-06-07/session-1",
+          "tick_count": 41,
+          "ok_count": 41,
+          "development_time_ratio_truth": 15.0,
+          "drop": {
+            "precision": 1.0,
+            "recall": 1.0,
+            "f1": 1.0,
+            "true_positives": 1,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "first_drop_seconds": 1275.6114411670133,
+            "timing_error_seconds": -0.4,
+            "timing_error_c": 0.0
+          },
+          "drop_confusion": {
+            "true_positives": 1,
+            "false_positives": 0,
+            "true_negatives": 40,
+            "false_negatives": 0,
+            "total": 41
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                27,
+                8,
+                2
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 40,
+            "agreement": 0.275
+          },
+          "heat": {
+            "mae": 24.39,
+            "directional_agreement": 0.275,
+            "directional_samples": 40
+          },
+          "fan": {
+            "mae": 13.54,
+            "directional_agreement": 0.25,
+            "directional_samples": 40
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 21,
+              "median_seconds": 1.91,
+              "max_seconds": 2.89
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 2.04,
+              "max_seconds": 3.02
+            },
+            {
+              "phase": "development",
+              "count": 4,
+              "median_seconds": 1.86,
+              "max_seconds": 3.3
+            }
+          ]
+        },
+        {
+          "roast_name": "live-roast-2026-06-07/session-2",
+          "tick_count": 38,
+          "ok_count": 38,
+          "development_time_ratio_truth": 16.2,
+          "drop": {
+            "precision": 0.5,
+            "recall": 1.0,
+            "f1": 0.667,
+            "true_positives": 1,
+            "false_positives": 1,
+            "false_negatives": 0,
+            "first_drop_seconds": 1126.162812458002,
+            "timing_error_seconds": -9.6,
+            "timing_error_c": -2.0
+          },
+          "drop_confusion": {
+            "true_positives": 1,
+            "false_positives": 1,
+            "true_negatives": 36,
+            "false_negatives": 0,
+            "total": 38
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                28,
+                6,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 37,
+            "agreement": 0.243
+          },
+          "heat": {
+            "mae": 24.47,
+            "directional_agreement": 0.243,
+            "directional_samples": 37
+          },
+          "fan": {
+            "mae": 14.87,
+            "directional_agreement": 0.243,
+            "directional_samples": 37
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 17,
+              "median_seconds": 2.01,
+              "max_seconds": 4.56
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 2.34,
+              "max_seconds": 2.81
+            },
+            {
+              "phase": "development",
+              "count": 5,
+              "median_seconds": 2.54,
+              "max_seconds": 3.28
+            }
+          ]
+        }
+      ],
+      "samples": {
+        "live-roast-2026-06-07/session-1": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 639.0940014169901,
+            "bean_temp_c": 148.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 70,
+              "target_fan": 30,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Bean temperature dropped significantly at charge with a steep negative RoR indicating thermal lag. To assist early climb and smooth RoR decline, reduce heat from max to 70% to prevent overshoot and raise fan to 30% to promote convective heat transfer, preventing stall or baked flavor pre-first crack."
+            },
+            "latency_seconds": 2.017
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 960.1298406670103,
+            "bean_temp_c": 146.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 70,
+              "target_fan": 40,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "In drying/maillard phase with bean RoR declining but still quite high at 9.64\u00b0C/min. Current heat at 100% is risking overshoot and possible stall later. Recommended cutting heat decisively to 70% to avoid flattening RoR, and increasing fan moderately to 40% to improve convective heat transfer and chaff removal. No drop yet as first crack not detected and roast still developing."
+            },
+            "latency_seconds": 2.119
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1195.52238983399,
+            "bean_temp_c": 184.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 65,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "In development phase with 15% development ratio target, current ratio is just about 2.7%. Bean temperature near 184\u00b0C, RoR is still moderate. To meet development time goal, reduce heat substantially and raise fan to shift heat mode for gentle, even convection and slow down temp rise. Too early to drop; focus on controlling development duration and preventing overshoot on temp."
+            },
+            "latency_seconds": 1.784
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1225.5587454590132,
+            "bean_temp_c": 189.0,
+            "real_heat_percent": 60,
+            "real_fan_percent": 60,
+            "decision": {
+              "target_heat": 25,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Development phase with 7.7% development ratio, high RoR (~11 C/min) and bean temp (189 C), approaching target drop temp (197 C). Cut heat substantially and increase fan to shift to convective heat and slow development to stretch development duration to meet 15% target. Not ready to drop yet."
+            },
+            "latency_seconds": 1.779
+          }
+        ],
+        "live-roast-2026-06-07/session-2": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 486.3741288749734,
+            "bean_temp_c": 186.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 90,
+              "target_fan": 10,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Bean temp is stable within the charge band (180-200\u00b0C) and rising steadily; maintain heat slightly reduced from max to hold temp steady. Fan at 10% ensures stable convection without rapid cooling. Ready to charge once temp is stable in band."
+            },
+            "latency_seconds": 1.798
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 808.6600722500007,
+            "bean_temp_c": 141.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 80,
+              "target_fan": 30,
+              "should_drop": false,
+              "confidence": 0.85,
+              "rationale": "Bean temperature is climbing steadily but the rate of rise (RoR) is still relatively high at 11 C/min. To smoothly decline RoR toward first crack without stalling or baking, reduce heat decisively from full 100% to about 80% to prevent overshoot. Increase fan from 10% to 30% to shift toward more convective heat transfer and support even drying. No drop recommended; focus on managing RoR decline with early coordinated heat and fan adjustment."
+            },
+            "latency_seconds": 2.601
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1034.442036374996,
+            "bean_temp_c": 178.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 40,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "This is very early in development with a high bean RoR (~9.3 C/min) and temperature (178C rising). To extend development time and avoid pushing bean temp too fast past the target (~193C), cut heat substantially and raise fan to promote convective cooling and slow roasting. Not yet ready to drop: development time is only 2.48s and development ratio is far below target (~0.46%)."
+            },
+            "latency_seconds": 1.932
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1096.1291325419734,
+            "bean_temp_c": 187.0,
+            "real_heat_percent": 30,
+            "real_fan_percent": 70,
+            "decision": {
+              "target_heat": 15,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Beans are at 187C, below target drop 193C, development time is 64s with a target development percentage of 16.2%. Rate-of-rise is still high (8.7C/min), so reduce heat significantly to slow temperature rise and increase fan to shift toward convective heat, extending development time and avoiding overshooting temperature. No drop yet; focus on hitting development ratio target."
+            },
+            "latency_seconds": 1.833
+          }
+        ]
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8-fast",
+      "tier": "ultra-flash",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "scores": [
+        {
+          "roast_name": "live-roast-2026-06-07/session-1",
+          "tick_count": 41,
+          "ok_count": 41,
+          "development_time_ratio_truth": 15.0,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 40,
+            "false_negatives": 1,
+            "total": 41
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                20,
+                15,
+                2
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 40,
+            "agreement": 0.45
+          },
+          "heat": {
+            "mae": 21.34,
+            "directional_agreement": 0.45,
+            "directional_samples": 40
+          },
+          "fan": {
+            "mae": 7.07,
+            "directional_agreement": 0.4,
+            "directional_samples": 40
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 21,
+              "median_seconds": 2.26,
+              "max_seconds": 4.43
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 2.79,
+              "max_seconds": 4.41
+            },
+            {
+              "phase": "development",
+              "count": 4,
+              "median_seconds": 2.47,
+              "max_seconds": 2.77
+            }
+          ]
+        },
+        {
+          "roast_name": "live-roast-2026-06-07/session-2",
+          "tick_count": 38,
+          "ok_count": 38,
+          "development_time_ratio_truth": 16.2,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 37,
+            "false_negatives": 1,
+            "total": 38
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                21,
+                13,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 37,
+            "agreement": 0.432
+          },
+          "heat": {
+            "mae": 18.29,
+            "directional_agreement": 0.432,
+            "directional_samples": 37
+          },
+          "fan": {
+            "mae": 6.84,
+            "directional_agreement": 0.405,
+            "directional_samples": 37
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 17,
+              "median_seconds": 2.33,
+              "max_seconds": 4.59
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 2.82,
+              "max_seconds": 3.84
+            },
+            {
+              "phase": "development",
+              "count": 5,
+              "median_seconds": 2.66,
+              "max_seconds": 2.97
+            }
+          ]
+        }
+      ],
+      "samples": {
+        "live-roast-2026-06-07/session-1": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 639.0940014169901,
+            "bean_temp_c": 148.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 15,
+              "should_drop": false,
+              "confidence": 0.82,
+              "rationale": "This is the post-charge dunk: bean temp has dropped from ~193 to 148 C as cool beans hit the drum, hence the steeply negative bean RoR. We're at the very start of drying with environment temp ~223 C. Hold heat at full to drive recovery and re-establish a climbing bean temp through the turning point; keep fan low (15) to favor conductive/radiant energy into the charge while still evacuating early chaff and smoke. Once the bean temp bottoms out and RoR turns positive, I'll begin the early, decisive heat cuts to shape a smoothly declining RoR toward first crack. No drop in drying."
+            },
+            "latency_seconds": 4.413
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 960.1298406670103,
+            "bean_temp_c": 146.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 70,
+              "target_fan": 40,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "We're ~5:20 into drying/Maillard at 146C bean, climbing toward first crack with heat pinned at 100% and fan low at 30. Bean RoR is ~9.6 C/min \u2014 reasonable but heat at full power will keep pushing it and risks a flick/spike into FC. Because of thermal lag, cut heat now and decisively to 70% to set up a smooth RoR decline into first crack rather than reacting late. Bump fan to 40 to shift toward convective transfer for even heating and to start clearing chaff/smoke as we approach the crack. Hold this and watch for FC; don't let RoR flatten into a stall."
+            },
+            "latency_seconds": 2.778
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1195.52238983399,
+            "bean_temp_c": 184.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 60,
+              "target_fan": 45,
+              "should_drop": false,
+              "confidence": 0.82,
+              "rationale": "Just 15s into development (ratio ~2.7%, target 15%). Bean at 184C with RoR ~10C/min on full heat \u2014 that's too hot to stretch development and will run to drop temp far too fast. Cut heat decisively from 100 to ~60 and raise fan 30->45 to shift toward convective transfer, easing RoR so development can extend toward the 15% ratio (~85s+ to go). Far too early to drop \u2014 hold and let the duration build."
+            },
+            "latency_seconds": 2.536
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1225.5587454590132,
+            "bean_temp_c": 189.0,
+            "real_heat_percent": 60,
+            "real_fan_percent": 60,
+            "decision": {
+              "target_heat": 45,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Development is only ~7.7% (45s of 587s) \u2014 short of the 15% target. Post-FC RoR is still ~11 C/min, too hot to stretch cleanly. Cut heat to 45 and raise fan to 70 to shift toward convective transfer, ease the RoR, and protect flavor while extending development. At 189 C there's room before darkening; hold and re-check as the ratio climbs toward target."
+            },
+            "latency_seconds": 2.099
+          }
+        ],
+        "live-roast-2026-06-07/session-2": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 486.3741288749734,
+            "bean_temp_c": 186.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 60,
+              "target_fan": 15,
+              "should_drop": false,
+              "confidence": 0.82,
+              "rationale": "Drum is at 186 C, already inside the 180-200 C charge band, but heat is pinned at 100% and the bean temp is still climbing ~19 C/min \u2014 it will overshoot the band if held. Cut heat decisively to ~60% now (thermal lag means the rise will continue briefly) to arrest the climb and let it settle near mid-band. Nudge fan to 15 to even out drum heat and stabilize. Hold and let it stabilize for ~30-60s; ready to charge once steady in band (~185-190 C). Do not charge while still ramping."
+            },
+            "latency_seconds": 2.233
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 808.6600722500007,
+            "bean_temp_c": 141.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 70,
+              "target_fan": 25,
+              "should_drop": false,
+              "confidence": 0.78,
+              "rationale": "At ~5:12, BT 141C and still on 100% heat / 10% fan. Bean RoR is a healthy ~11 C/min but you're approaching the Maillard-to-FC transition, and with thermal lag full heat now will overshoot and spike the RoR right into first crack. Cut heat decisively to ~70% to begin the smooth RoR decline ahead of the lag, and raise fan to ~25% to shift toward convective transfer, even out the heat, and start clearing smoke/chaff. Do not drop \u2014 pre-FC. Watch for a flick-up; if RoR climbs further trim heat again rather than wait."
+            },
+            "latency_seconds": 3.098
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1034.442036374996,
+            "bean_temp_c": 178.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 70,
+              "target_fan": 45,
+              "should_drop": false,
+              "confidence": 0.84,
+              "rationale": "First crack just began (~2s in, ratio <1%). Heat is pinned at 100% with low fan 30% and bean RoR ~9 C/min \u2014 too hot for a controlled development. Cut heat decisively to 70% and lift fan to 45% to shift toward convective transfer, ease the RoR, and evacuate smoke. Target ratio ~16% means developing roughly 80-90s; far too early to drop. Bean temp 178 C with room before the 193 C guide. Hold and let development stretch."
+            },
+            "latency_seconds": 2.658
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1096.1291325419734,
+            "bean_temp_c": 187.0,
+            "real_heat_percent": 30,
+            "real_fan_percent": 70,
+            "decision": {
+              "target_heat": 25,
+              "target_fan": 75,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Development is ~64s into a ~600s roast = ~10.7% ratio, short of the 16.2% target. Bean temp 187C with a controlled ~8.8 C/min RoR \u2014 good, healthy decline. Hold a low heat (25) and keep fan high (75) for convective, even development without spiking RoR. Continue developing toward the ratio target; expect to drop in roughly another 30-40s as the ratio approaches ~15-16% (around 192-195C). Not yet."
+            },
+            "latency_seconds": 2.51
+          }
+        ]
+      }
+    },
+    {
+      "slug": "meta-llama/llama-3.3-70b-instruct",
+      "tier": "speed-and-power",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "scores": [
+        {
+          "roast_name": "live-roast-2026-06-07/session-1",
+          "tick_count": 41,
+          "ok_count": 41,
+          "development_time_ratio_truth": 15.0,
+          "drop": {
+            "precision": 1.0,
+            "recall": 1.0,
+            "f1": 1.0,
+            "true_positives": 1,
+            "false_positives": 0,
+            "false_negatives": 0,
+            "first_drop_seconds": 1275.6114411670133,
+            "timing_error_seconds": -0.4,
+            "timing_error_c": 0.0
+          },
+          "drop_confusion": {
+            "true_positives": 1,
+            "false_positives": 0,
+            "true_negatives": 40,
+            "false_negatives": 0,
+            "total": 41
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                29,
+                6,
+                2
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 40,
+            "agreement": 0.225
+          },
+          "heat": {
+            "mae": 26.1,
+            "directional_agreement": 0.225,
+            "directional_samples": 40
+          },
+          "fan": {
+            "mae": 10.98,
+            "directional_agreement": 0.275,
+            "directional_samples": 40
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 21,
+              "median_seconds": 2.37,
+              "max_seconds": 5.71
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 2.3,
+              "max_seconds": 3.14
+            },
+            {
+              "phase": "development",
+              "count": 4,
+              "median_seconds": 2.15,
+              "max_seconds": 2.35
+            }
+          ]
+        },
+        {
+          "roast_name": "live-roast-2026-06-07/session-2",
+          "tick_count": 38,
+          "ok_count": 38,
+          "development_time_ratio_truth": 16.2,
+          "drop": {
+            "precision": 0.5,
+            "recall": 1.0,
+            "f1": 0.667,
+            "true_positives": 1,
+            "false_positives": 1,
+            "false_negatives": 0,
+            "first_drop_seconds": 1096.1291325419734,
+            "timing_error_seconds": -39.6,
+            "timing_error_c": -6.0
+          },
+          "drop_confusion": {
+            "true_positives": 1,
+            "false_positives": 1,
+            "true_negatives": 36,
+            "false_negatives": 0,
+            "total": 38
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                27,
+                7,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 37,
+            "agreement": 0.27
+          },
+          "heat": {
+            "mae": 23.16,
+            "directional_agreement": 0.27,
+            "directional_samples": 37
+          },
+          "fan": {
+            "mae": 8.82,
+            "directional_agreement": 0.324,
+            "directional_samples": 37
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 17,
+              "median_seconds": 2.91,
+              "max_seconds": 7.94
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 2.33,
+              "max_seconds": 4.56
+            },
+            {
+              "phase": "development",
+              "count": 5,
+              "median_seconds": 2.21,
+              "max_seconds": 2.27
+            }
+          ]
+        }
+      ],
+      "samples": {
+        "live-roast-2026-06-07/session-1": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 639.0940014169901,
+            "bean_temp_c": 148.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Early in the roast, high heat and moderate fan to balance convective and radiant heat transfer."
+            },
+            "latency_seconds": 2.43
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 960.1298406670103,
+            "bean_temp_c": 146.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 80,
+              "target_fan": 40,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "reduce heat to manage RoR decline and increase fan for convective transfer"
+            },
+            "latency_seconds": 2.126
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1195.52238983399,
+            "bean_temp_c": 184.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 80,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Development phase, adjusting heat and fan to maintain a steady rate of rise and reach the target development ratio."
+            },
+            "latency_seconds": 2.355
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1225.5587454590132,
+            "bean_temp_c": 189.0,
+            "real_heat_percent": 60,
+            "real_fan_percent": 60,
+            "decision": {
+              "target_heat": 50,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "development phase, reduce heat and increase fan to stretch development time"
+            },
+            "latency_seconds": 2.092
+          }
+        ],
+        "live-roast-2026-06-07/session-2": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 486.3741288749734,
+            "bean_temp_c": 186.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 80,
+              "target_fan": 20,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "preheat: reduce heat to stabilize drum temperature within charge guidance band"
+            },
+            "latency_seconds": 3.904
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 808.6600722500007,
+            "bean_temp_c": 141.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 80,
+              "target_fan": 20,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "reduce heat to manage RoR decline and increase fan for convective transfer"
+            },
+            "latency_seconds": 2.152
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1034.442036374996,
+            "bean_temp_c": 178.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 50,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Reduce heat and increase fan to stretch development time and prevent over-roasting."
+            },
+            "latency_seconds": 2.135
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1096.1291325419734,
+            "bean_temp_c": 187.0,
+            "real_heat_percent": 30,
+            "real_fan_percent": 70,
+            "decision": {
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.9,
+              "rationale": "Development ratio target met, dropping beans to prevent over-development."
+            },
+            "latency_seconds": 2.267
+          }
+        ]
+      }
+    },
+    {
+      "slug": "anthropic/claude-opus-4.8",
+      "tier": "incumbent",
+      "prompt_version": "v3",
+      "latency_risk": false,
+      "scores": [
+        {
+          "roast_name": "live-roast-2026-06-07/session-1",
+          "tick_count": 41,
+          "ok_count": 41,
+          "development_time_ratio_truth": 15.0,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 40,
+            "false_negatives": 1,
+            "total": 41
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                21,
+                14,
+                2
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 40,
+            "agreement": 0.425
+          },
+          "heat": {
+            "mae": 21.59,
+            "directional_agreement": 0.425,
+            "directional_samples": 40
+          },
+          "fan": {
+            "mae": 7.07,
+            "directional_agreement": 0.4,
+            "directional_samples": 40
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 21,
+              "median_seconds": 4.37,
+              "max_seconds": 7.91
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 5.61,
+              "max_seconds": 11.33
+            },
+            {
+              "phase": "development",
+              "count": 4,
+              "median_seconds": 4.79,
+              "max_seconds": 5.8
+            }
+          ]
+        },
+        {
+          "roast_name": "live-roast-2026-06-07/session-2",
+          "tick_count": 38,
+          "ok_count": 38,
+          "development_time_ratio_truth": 16.2,
+          "drop": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": 1,
+            "first_drop_seconds": null,
+            "timing_error_seconds": null,
+            "timing_error_c": null
+          },
+          "drop_confusion": {
+            "true_positives": 0,
+            "false_positives": 0,
+            "true_negatives": 37,
+            "false_negatives": 1,
+            "total": 38
+          },
+          "heat_direction_confusion": {
+            "labels": [
+              "cut",
+              "hold",
+              "raise"
+            ],
+            "matrix": [
+              [
+                2,
+                0,
+                0
+              ],
+              [
+                23,
+                11,
+                0
+              ],
+              [
+                0,
+                0,
+                1
+              ]
+            ],
+            "samples": 37,
+            "agreement": 0.378
+          },
+          "heat": {
+            "mae": 19.34,
+            "directional_agreement": 0.378,
+            "directional_samples": 37
+          },
+          "fan": {
+            "mae": 6.97,
+            "directional_agreement": 0.432,
+            "directional_samples": 37
+          },
+          "phase_latency": [
+            {
+              "phase": "preheating",
+              "count": 17,
+              "median_seconds": 4.38,
+              "max_seconds": 5.79
+            },
+            {
+              "phase": "roasting_pre_first_crack",
+              "count": 16,
+              "median_seconds": 5.65,
+              "max_seconds": 12.19
+            },
+            {
+              "phase": "development",
+              "count": 5,
+              "median_seconds": 4.63,
+              "max_seconds": 5.36
+            }
+          ]
+        }
+      ],
+      "samples": {
+        "live-roast-2026-06-07/session-1": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 639.0940014169901,
+            "bean_temp_c": 148.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 100,
+              "target_fan": 20,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Fresh charge just detected (elapsed ~0s): the bean probe shows the expected charge dunk \u2014 falling from ~193C toward 148C as cold beans hit the drum. We're at the very start of drying, so keep heat full at 100 to drive recovery decisively through the thermal lag and establish a strong initial RoR. Nudge fan from 10 to 20 to improve convective evenness and evacuate early chaff/smoke without crashing the rebuild of bean temp. Watch for the turning point, then we'll begin the early, drastic heat cuts well before RoR misbehaves as we approach Maillard/first crack. No drop in drying."
+            },
+            "latency_seconds": 5.95
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 960.1298406670103,
+            "bean_temp_c": 146.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 75,
+              "target_fan": 40,
+              "should_drop": false,
+              "confidence": 0.78,
+              "rationale": "Pre-FC at 146C, ~5:20 in, running heat pinned at 100% with low fan 30%. Bean RoR is only ~9.6 C/min and easing \u2014 but with full heat still applied and thermal lag, energy is banked and we risk a late RoR spike or scorched/baked flavor from too little convection. Cut heat decisively to 75% now (ahead of the lag) and lift fan to 40% to shift toward convective transfer, even out the bean pile, and evacuate smoke/chaff. This sets up a smooth RoR decline into first crack rather than a flatten or flick-up. Hold for the next minute and reassess as we approach FC."
+            },
+            "latency_seconds": 6.367
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1195.52238983399,
+            "bean_temp_c": 184.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 75,
+              "target_fan": 45,
+              "should_drop": false,
+              "confidence": 0.84,
+              "rationale": "Just 15s into development (~2.7% ratio); need to reach ~15% near 83s of development. Bean is 184C with RoR ~10C/min, still on full heat at 100% \u2014 that will run away past target before development matures. Cut heat decisively to 75 and lift fan to 45 to shift toward convective transfer, evacuate smoke, and ease RoR so development stretches without darkening too fast. Hold; reassess as ratio builds toward target."
+            },
+            "latency_seconds": 4.843
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1225.5587454590132,
+            "bean_temp_c": 189.0,
+            "real_heat_percent": 60,
+            "real_fan_percent": 60,
+            "decision": {
+              "target_heat": 45,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Development is only ~45s into a ~587s roast, a ratio of ~7.7% \u2014 well short of the 15% target, so keep going. Post-crack bean RoR is still ~11 C/min, too hot to stretch development cleanly. Cut heat to 45 and raise fan to 70 to shift toward convective transfer, ease the RoR, and protect flavor. At 189 C you have room to develop toward and modestly past the 197 C guide while building duration. Reassess for drop as the ratio approaches ~12-15%."
+            },
+            "latency_seconds": 4.734
+          }
+        ],
+        "live-roast-2026-06-07/session-2": [
+          {
+            "moment": "charge",
+            "monotonic_seconds": 486.3741288749734,
+            "bean_temp_c": 186.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 60,
+              "target_fan": 15,
+              "should_drop": false,
+              "confidence": 0.82,
+              "rationale": "Drum is at 186 C, already inside the 180-200 C charge band, but heat is pinned at 100% and bean temp is still climbing ~19 C/min \u2014 left alone it will overshoot the band. Cut heat decisively to ~60% now (thermal lag means the current rise will continue for a bit) to arrest the climb and let it settle near the band midpoint. Nudge fan to 15 for a touch more convective evenness and to evacuate any chaff. Not ready to charge this second \u2014 hold ~30-60s for the temperature to stabilize, then charge once it's steady around 190-195 C."
+            },
+            "latency_seconds": 5.21
+          },
+          {
+            "moment": "maillard",
+            "monotonic_seconds": 808.6600722500007,
+            "bean_temp_c": 141.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 10,
+            "decision": {
+              "target_heat": 75,
+              "target_fan": 25,
+              "should_drop": false,
+              "confidence": 0.78,
+              "rationale": "At ~5:12, bean temp 141C climbing toward first crack with heat pinned at 100% and fan at only 10%. That's a lot of stored energy in the element with minimal convective transfer \u2014 classic setup for an RoR spike into FC and scorched/baked flavor. Cut heat decisively now to anticipate thermal lag (a trim won't bite in time), and raise fan to shift toward convective heat for even roasting and to start evacuating chaff/smoke. RoR is currently a healthy ~11 C/min and easing; this keeps the decline smooth into first crack without stalling. Not dropping \u2014 pre-FC."
+            },
+            "latency_seconds": 6.033
+          },
+          {
+            "moment": "first-crack",
+            "monotonic_seconds": 1034.442036374996,
+            "bean_temp_c": 178.0,
+            "real_heat_percent": 100,
+            "real_fan_percent": 30,
+            "decision": {
+              "target_heat": 70,
+              "target_fan": 45,
+              "should_drop": false,
+              "confidence": 0.82,
+              "rationale": "First crack just hit (2.5s in, ratio ~0.5%) \u2014 far from the 16.2% target. Heat is pinned at 100% with post-crack RoR still ~9 C/min, which would race through development. Cut heat decisively to 70% to tame the rise and raise fan to 45 for convective evenness and smoke/chaff evacuation, stretching development. Hold; reassess as bean temp approaches the 193 C guide and the ratio builds toward target."
+            },
+            "latency_seconds": 4.316
+          },
+          {
+            "moment": "development",
+            "monotonic_seconds": 1096.1291325419734,
+            "bean_temp_c": 187.0,
+            "real_heat_percent": 30,
+            "real_fan_percent": 70,
+            "decision": {
+              "target_heat": 35,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "Development is only ~64s (10.7% ratio) vs 16.2% target, so keep developing. Bean RoR has eased nicely to ~8.8 C/min at 187 C \u2014 already cut hard to 30%. Hold heat low (35%) with fan at 70% to sustain convective transfer and a gentle climb without spiking RoR. Aim to drop around 90-100s development (~16%), likely near 191-193 C. Not yet."
+            },
+            "latency_seconds": 4.509
+          }
+        ]
+      }
+    }
+  ]
+}
