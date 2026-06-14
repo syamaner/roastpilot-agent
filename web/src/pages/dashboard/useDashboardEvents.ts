@@ -4,9 +4,11 @@
  * The shared `useRoastStream` reducer folds ONLY phase / telemetry /
  * enabledActions and surfaces every other frame via `lastEvent` (the designed
  * seam). The dashboard folds those remaining frames here: the advisory feed
- * (latest + recent history), the charge-guidance toast, the recovery handshake,
- * the fault handshake + safety event trail, the event markers, and the live curve
- * point buffer.
+ * (latest + recent history), the recovery handshake, the fault handshake + safety
+ * event trail, the event markers, and the live curve point buffer. The
+ * `charge_guidance` frame is NOT folded — since #211 the live add-beans cue is the
+ * derived `ChargeBanner` (phase + telemetry + the profile band), so the frame is
+ * left in the raw event buffer (future trace panel) rather than a view-model field.
  *
  * The reducer is pure and exported so its folding is unit-testable. It NEVER sets
  * phase — phase is the server's truth, owned by the shared reducer (invariant).
@@ -21,7 +23,6 @@ import { api } from "@/lib/api";
 import type { SseEvent, TelemetryEventData, TelemetryPoint } from "@/lib/types";
 import type {
   AdvisoryEventData,
-  ChargeGuidanceData,
   FirstCrackData,
   SafetyEvaluationData,
   T0DetectedData,
@@ -53,8 +54,11 @@ export interface DashboardViewModel {
   advisoryHistory: AdvisoryRecord[];
   /** Whether the advisor is paused (from the pause/resume toggle frames). */
   advisoryPaused: boolean;
-  /** The latest charge-guidance payload (the add-beans toast); null until fired. */
-  chargeGuidance: ChargeGuidanceData | null;
+  // NOTE (#211/#215): the live add-beans cue is now DERIVED (`ChargeBanner` from
+  // phase + telemetry + the profile band), so the dashboard no longer folds the
+  // `charge_guidance` frame into a view-model field — nothing read it. The raw
+  // frame remains in the event buffer for any future trace panel; its wire shape is
+  // documented by `ChargeGuidanceData` in `events.ts`.
   /** The recovery handshake (drives the RecoveryModal); null unless in recovery. */
   recovery: SafetyEvaluationData | null;
   /** The fault handshake (drives the FaultBanner); null unless faulted. */
@@ -79,7 +83,6 @@ export const initialDashboardViewModel: DashboardViewModel = {
   latestAdvisory: null,
   advisoryHistory: [],
   advisoryPaused: false,
-  chargeGuidance: null,
   recovery: null,
   fault: null,
   safetyTrail: [],
@@ -216,8 +219,6 @@ export function dashboardReducer(
         advisoryHistory: [record, ...state.advisoryHistory].slice(0, ADVISORY_HISTORY_LIMIT),
       };
     }
-    case "charge_guidance":
-      return { ...state, chargeGuidance: event.data as unknown as ChargeGuidanceData };
     case "recovery_required": {
       const evaluation = event.data as unknown as SafetyEvaluationData;
       return {
@@ -277,8 +278,9 @@ export function dashboardReducer(
     }
     default:
       // run_started / command_failed / logs_exported / run_completed / heartbeat
-      // / phase_changed — not folded here (phase is the shared reducer's; the
-      // rest aren't dashboard view-model state).
+      // / phase_changed / charge_guidance — not folded here (phase is the shared
+      // reducer's; charge_guidance is now consumed via the derived ChargeBanner,
+      // #211; the rest aren't dashboard view-model state).
       return state;
   }
 }

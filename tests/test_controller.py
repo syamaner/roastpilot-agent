@@ -1420,11 +1420,22 @@ async def test_charge_guidance_emitted_exactly_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_charge_guidance_triggers_on_environment_temperature() -> None:
-    """Plan: bean OR environment entering the band triggers guidance."""
+async def test_charge_guidance_does_not_trigger_on_environment_alone() -> None:
+    """#211: the cue keys on the BEAN probe only. With env inside the band but
+    the bean probe still below it (the empty-drum case where env leads bean),
+    no guidance fires — the cue must track the reading the operator watches."""
     harness = harness_preheating(readings=[reading(bean=120.0, env=180.0)])
     await harness.controller.tick()
-    assert RoastEventKind.CHARGE_GUIDANCE in harness.events.kinds()
+    assert RoastEventKind.CHARGE_GUIDANCE not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_charge_guidance_triggers_on_bean_with_env_out_of_band() -> None:
+    """Bean inside the band fires the cue even when env is out of band — the
+    bean probe is the sole trigger (#211)."""
+    harness = harness_preheating(readings=[reading(bean=180.0, env=120.0)])
+    await harness.controller.tick()
+    assert harness.events.kinds().count(RoastEventKind.CHARGE_GUIDANCE) == 1
 
 
 @pytest.mark.asyncio

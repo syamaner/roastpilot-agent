@@ -195,12 +195,15 @@ describe("dashboardReducer", () => {
     expect(s.advisoryHistory).toHaveLength(0);
   });
 
-  it("captures charge guidance for the toast", () => {
+  it("does not fold charge_guidance into the view-model (#211/#215: cue is derived via ChargeBanner)", () => {
+    // The live add-beans cue is now derived (ChargeBanner from phase + telemetry +
+    // band), so the reducer no longer surfaces the charge_guidance frame; it's a
+    // no-op here (the raw frame stays in the event buffer for a future trace panel).
     const s = dashboardReducer(
       initialDashboardViewModel,
       ev("charge_guidance", { bean_temp_c: 180, env_temp_c: 190, guidance_min_c: 170, guidance_max_c: 200 }),
     );
-    expect(s.chargeGuidance?.guidance_min_c).toBe(170);
+    expect(s).toBe(initialDashboardViewModel);
   });
 
   it("captures a recovery handshake and adds it to the safety trail", () => {
@@ -311,12 +314,15 @@ describe("dashboardReducer — payload field-name contract", () => {
     ).toBe(true);
   });
 
-  it("charge_guidance: reads {bean_temp_c,env_temp_c,guidance_min_c,guidance_max_c} (controller.py:632)", () => {
-    const g = dashboardReducer(
+  it("charge_guidance: not folded into the view-model (#211/#215 — cue derived via ChargeBanner)", () => {
+    // The reducer no longer reads the charge_guidance payload; the live cue derives
+    // from phase + telemetry + the profile band. The wire shape is documented by
+    // `ChargeGuidanceData` in events.ts and guarded by the contract-fixture test.
+    const next = dashboardReducer(
       initialDashboardViewModel,
       ev("charge_guidance", { bean_temp_c: 185, env_temp_c: 195, guidance_min_c: 170, guidance_max_c: 200 }),
-    ).chargeGuidance;
-    expect(g).toEqual({ bean_temp_c: 185, env_temp_c: 195, guidance_min_c: 170, guidance_max_c: 200 });
+    );
+    expect(next).toBe(initialDashboardViewModel);
   });
 
   it("recovery_required / fault: reads SafetyEvaluation {rule,verdict,input_heat,input_fan,adjusted_heat,adjusted_fan,reason}", () => {

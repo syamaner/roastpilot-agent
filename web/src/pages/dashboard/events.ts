@@ -55,7 +55,11 @@ export interface AdvisoryEventData {
   synthesized?: boolean;
 }
 
-/** The `charge_guidance` payload — drives the non-blocking add-beans toast. */
+/** Wire shape of the `charge_guidance` frame; consumed via the raw event buffer /
+ *  future trace panel. The LIVE add-beans cue is now the persistent `ChargeBanner`
+ *  derived from phase + telemetry + the profile band (#211/#215), so the dashboard
+ *  reducer no longer folds this frame into a view-model field — but the type stays
+ *  here to document the wire contract (the controller still emits the frame). */
 export interface ChargeGuidanceData {
   bean_temp_c: number;
   env_temp_c: number;

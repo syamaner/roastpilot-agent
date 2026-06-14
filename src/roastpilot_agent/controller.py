@@ -755,9 +755,12 @@ class RoastController:
     async def _apply_phase_rules(self, telemetry: RoastTelemetry | None) -> None:
         """MCP-driven phase rules: preheating (E4-S3) and roasting (E4-S4).
 
-        Preheating: add-beans guidance is emitted exactly once when bean or
-        environment temperature enters the profile's charge guidance band —
-        guidance, not a blocking operator-required state. The T0 debounce
+        Preheating: add-beans guidance is emitted exactly once when the bean
+        temperature enters the profile's charge guidance band — guidance, not
+        a blocking operator-required state. (#211: the env clause is dropped;
+        on an empty drum the env probe leads the bean probe, which mistimed
+        the cue — it now tracks the bean probe the operator watches and that
+        auto-T0 uses.) The T0 debounce
         counts consecutive ticks of MCP-reported T0 and resets on absence
         *or* on a read-fault tick (plan §2: flapping originates from read
         faults — MCP latches detection internally); the transition commits
@@ -821,11 +824,24 @@ class RoastController:
             self.transition_to(RoastPhase.DEVELOPMENT)
 
     def _maybe_emit_charge_guidance(self, telemetry: RoastTelemetry) -> None:
+        """Emit the one-shot add-beans cue when the BEAN probe enters the band.
+
+        The trigger keys on ``bean_temp_c`` only (#211). On an empty preheating
+        drum the environment probe leads the bean probe, so an env-or-bean
+        trigger fired the cue early — while the bean probe the operator watches
+        ("when we hit 170") was still below the band. Keying on the bean probe
+        aligns the cue with both the reading the operator acts on and the signal
+        auto-T0 uses. The emitted payload still carries ``env_temp_c`` (and the
+        band bounds) for the decision trace; only the trigger field changed.
+
+        Args:
+            telemetry: The latest validated reading for this tick.
+        """
         if self._guidance_emitted or self._profile is None:
             return
         low = self._profile.charge_guidance_min_c
         high = self._profile.charge_guidance_max_c
-        if low <= telemetry.bean_temp_c <= high or low <= telemetry.env_temp_c <= high:
+        if low <= telemetry.bean_temp_c <= high:
             self._guidance_emitted = True
             self._events.emit(
                 RoastEventKind.CHARGE_GUIDANCE,

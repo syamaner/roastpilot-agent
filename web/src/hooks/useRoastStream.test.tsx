@@ -283,6 +283,105 @@ describe("useRoastStream", () => {
     expect(latest!.frameCount).toBe(0);
     expect(latest!.frames).toHaveLength(0);
   });
+
+  it("clears telemetry (and phase) on a run change so a new run can't read the prior run's stale frame (#215 FIX H)", async () => {
+    // The bug: hydrate only re-bases PHASE, not telemetry, so a dashboard that
+    // stays mounted across runs would keep run 1's last telemetry into run 2's
+    // preheat — briefly combining the new `preheating` phase with a stale bean temp
+    // (a false "CHARGE NOW"). The hook must reset telemetry to null on a run change,
+    // so a fresh run has no telemetry until ITS first frame arrives.
+    let latest: UseRoastStreamResult | null = null;
+    const { rerender } = render(
+      <Probe runId="r1" snapshotPhase="preheating" onResult={(r) => (latest = r)} />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const es = FakeEventSource.last!;
+    await act(async () => es.open());
+    await act(async () =>
+      es.emit(
+        "telemetry",
+        {
+          agent_phase: "preheating",
+          bean_temp_c: 185,
+          env_temp_c: 195,
+          bean_ror_c_per_min: null,
+          env_ror_c_per_min: null,
+          heat_percent: 80,
+          fan_percent: 40,
+          cooling_on: false,
+          elapsed_seconds: 120,
+          t0_detected: false,
+          first_crack_detected: false,
+        },
+        1,
+      ),
+    );
+    expect(latest!.telemetry?.bean_temp_c).toBe(185);
+
+    // A new run resubscribes. BEFORE the new run's snapshot resolves / first frame
+    // arrives, telemetry must already be null — never the stale 185 °C reading.
+    act(() => {
+      rerender(<Probe runId="r2" snapshotPhase="preheating" onResult={(r) => (latest = r)} />);
+    });
+    expect(latest!.telemetry).toBeNull();
+    expect(latest!.lastEvent).toBeNull();
+
+    // After the new run hydrates, phase is the server's (preheating) but telemetry
+    // stays null until r2's own first frame — no carry-over of r1's reading.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(latest!.telemetry).toBeNull();
+    expect(latest!.phase).toBe("preheating");
+  });
+
+  it("clears telemetry when the run goes to null (idle), not just on a run swap (#215 FIX H)", async () => {
+    let latest: UseRoastStreamResult | null = null;
+    const { rerender } = render(
+      <Probe runId="r1" snapshotPhase="preheating" onResult={(r) => (latest = r)} />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const es = FakeEventSource.last!;
+    await act(async () => es.open());
+    await act(async () =>
+      es.emit(
+        "telemetry",
+        {
+          agent_phase: "preheating",
+          bean_temp_c: 185,
+          env_temp_c: 195,
+          bean_ror_c_per_min: null,
+          env_ror_c_per_min: null,
+          heat_percent: 80,
+          fan_percent: 40,
+          cooling_on: false,
+          elapsed_seconds: 120,
+          t0_detected: false,
+          first_crack_detected: false,
+        },
+        1,
+      ),
+    );
+    expect(latest!.telemetry?.bean_temp_c).toBe(185);
+    // The frame was also buffered into the non-lossy channel.
+    expect(latest!.frameCount).toBe(1);
+
+    act(() => {
+      rerender(<Probe runId={null} onResult={(r) => (latest = r)} />);
+    });
+    expect(latest!.telemetry).toBeNull();
+    expect(latest!.phase).toBeNull();
+    // FIX I: the non-lossy append buffer is cleared on the idle transition too —
+    // the connect effect's buffer-clear only ran for a non-null run, so without the
+    // reset-effect clear `frames` would still expose run 1's buffered frame at idle.
+    expect(latest!.lastEvent).toBeNull();
+    expect(latest!.frameCount).toBe(0);
+    expect(latest!.frames).toHaveLength(0);
+  });
 });
 
 describe("useFrameDrain", () => {

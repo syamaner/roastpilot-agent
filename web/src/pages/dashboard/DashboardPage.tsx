@@ -24,8 +24,9 @@ import { roastKeys, useHealth, useRoast } from "@/hooks/queries";
 import { useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
 import type { OperatorAction } from "@/lib/types";
-import { AddBeansToast } from "./AddBeansToast";
 import { AdvisoryPanel } from "./AdvisoryPanel";
+import { ChargeBanner } from "./ChargeBanner";
+import { chargeCueState } from "./chargeWindow";
 import { ControlRow } from "./ControlRow";
 import { FaultBanner } from "./FaultBanner";
 import { resolveMicStatus } from "./micStatus";
@@ -74,8 +75,6 @@ export function DashboardPage(): React.JSX.Element {
 
   // Operator action POST result (the action bar surfaces its typed reason).
   const [lastResult, setLastResult] = useState<OperatorActionResultView | null>(null);
-  // Add-beans toast dismissal (the toast is non-blocking guidance).
-  const [toastDismissed, setToastDismissed] = useState(false);
 
   const queryClient = useQueryClient();
 
@@ -138,12 +137,17 @@ export function DashboardPage(): React.JSX.Element {
   // FC event vs the current elapsed. Null until FC fires.
   const [fcElapsed, setFcElapsed] = useState<number | null>(null);
 
+  // Charge-window dwell (#211): the elapsed time at which the bean first entered
+  // the charge window. The banner shows how long the bean has been in the window
+  // to discourage over-preheating an empty drum (the 2nd-roast failure mode).
+  const [chargeEnteredElapsed, setChargeEnteredElapsed] = useState<number | null>(null);
+
   // Reset the per-run local state when the run changes (the view-model resets in
   // the hook): a new run must not inherit the previous run's FC baseline or a
   // stale toast dismissal. The page can stay mounted across runs.
   useEffect(() => {
     setFcElapsed(null);
-    setToastDismissed(false);
+    setChargeEnteredElapsed(null);
     setLastResult(null);
   }, [runId]);
 
@@ -176,7 +180,43 @@ export function DashboardPage(): React.JSX.Element {
   // arrived, else the snapshot's set (so the bar is correct on first paint).
   const effectiveEnabled = enabledActions ?? detail.data?.enabled_actions ?? null;
 
-  const showToast = !toastDismissed && view.chargeGuidance !== null;
+  // Persistent charge cue (#211): derive the cue's display state from the SERVER
+  // phase (preheating), the live bean temperature, and the profile's charge band
+  // from the REST snapshot. Tri-state so the cue never goes silent on an
+  // over-preheat (hidden / in_window / over_window). This is a PRESENTATION
+  // derivation — phase still comes only from the server; we never infer phase here.
+  // Memoised on the band figures so it's referentially stable across renders (it
+  // feeds both the ChargeBanner and the LiveCurve, which would otherwise see a new
+  // object every render). Behaviour is identical.
+  const chargeMinC = detail.data?.profile.charge_guidance_min_c ?? null;
+  const chargeMaxC = detail.data?.profile.charge_guidance_max_c ?? null;
+  const chargeBand = useMemo(
+    () => (chargeMinC !== null && chargeMaxC !== null ? { minC: chargeMinC, maxC: chargeMaxC } : null),
+    [chargeMinC, chargeMaxC],
+  );
+  const beanTempC = telemetry?.bean_temp_c ?? null;
+  const chargeCue = chargeCueState(phase, beanTempC, chargeBand);
+  // The cue is shown (dwell tracked) once the bean reaches charge temperature —
+  // both in-window and over-window count, since the dwell discourages exactly the
+  // over-preheat the warning escalates on.
+  const chargeCueShown = chargeCue !== "hidden";
+
+  // Stamp the elapsed time the bean first reached the charge zone; clear it when it
+  // drops back below / leaves preheating (so a re-entry restarts the dwell). Derived
+  // from server telemetry + the presentation cue state — not phase inference.
+  const elapsedSeconds = telemetry?.elapsed_seconds ?? null;
+  useEffect(() => {
+    if (chargeCueShown) {
+      setChargeEnteredElapsed((prev) => (prev === null ? elapsedSeconds : prev));
+    } else {
+      setChargeEnteredElapsed(null);
+    }
+  }, [chargeCueShown, elapsedSeconds]);
+  const dwellSeconds =
+    chargeCueShown && chargeEnteredElapsed !== null && elapsedSeconds !== null
+      ? elapsedSeconds - chargeEnteredElapsed
+      : null;
+
   const inRecovery = phase === "operator_recovery_required";
 
   const curve = useMemo(
@@ -248,26 +288,24 @@ export function DashboardPage(): React.JSX.Element {
           micStatus={resolveMicStatus(telemetry, detail.data?.mic_status)}
         />
 
-        {showToast && (
-          <AddBeansToast
-            guidance={view.chargeGuidance}
-            visible={showToast}
-            onDismiss={() => setToastDismissed(true)}
-          />
-        )}
+        {/* Persistent charge-window banner (#211): replaces the easily-missed
+            one-shot add-beans toast. It stays on screen the WHOLE time the
+            operator should be charging — server phase `preheating` AND the live
+            bean temperature inside the profile's charge band — and disappears on
+            its own when the server transitions to `roasting_pre_first_crack`
+            (beans added). Guidance only; it issues no roaster command. */}
+        <ChargeBanner
+          phase={phase}
+          beanTempC={beanTempC}
+          chargeBand={chargeBand}
+          dwellSeconds={dwellSeconds}
+        />
 
         <LiveCurve
           points={curve.points}
           markers={curve.markers}
           phase={phase}
-          chargeBand={
-            detail.data
-              ? {
-                  minC: detail.data.profile.charge_guidance_min_c,
-                  maxC: detail.data.profile.charge_guidance_max_c,
-                }
-              : undefined
-          }
+          chargeBand={chargeBand ?? undefined}
         />
 
         <ControlRow

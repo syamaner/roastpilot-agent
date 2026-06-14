@@ -10,10 +10,12 @@
  * The states need different replay fixtures, so each spec loads the preview
  * proxying its own agent (see urls.ts WEB_URLS / global-setup AGENTS) and drives
  * that agent:
- *   - dashboard-live      → session-2    → `preheating`  (charge band visible)
- *   - dashboard-fault     → session-1    → `fault`       (real env-ceiling E-STOP → faulted)
- *   - dashboard-recovery  → fault-pre-t0 → `recovery`    (pre-T0 overrun → recovery_required)
- *   - dashboard-developed → session-2    → `first_crack` (full ramping curve; own agent)
+ *   - dashboard-live          → session-2    → `preheating`  (charge band visible, bean below band)
+ *   - dashboard-fault         → session-1    → `fault`       (real env-ceiling E-STOP → faulted)
+ *   - dashboard-recovery      → fault-pre-t0 → `recovery`    (pre-T0 overrun → recovery_required)
+ *   - dashboard-developed     → session-2    → `first_crack` (full ramping curve; own agent)
+ *   - dashboard-charge-window → session-2    → preheating + bean IN the charge band → the
+ *                               persistent ChargeBanner shows (#211; own agent)
  */
 
 import { expect, test } from "@playwright/test";
@@ -204,4 +206,49 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-developed.png");
+});
+
+test("dashboard-charge-window — preheating + bean in the charge band shows the persistent banner (#211)", async ({
+  page,
+}) => {
+  // The 2nd-hardware-roast fix (#211): the old one-shot add-beans toast was easy to
+  // miss, so the operator preheated an empty drum ~8 min past the charge point. This
+  // state proves the PERSISTENT ChargeBanner: still in the server's `preheating`
+  // phase (beans NOT yet added → no T0), but the bean has risen INTO the profile's
+  // 170–200 °C charge band, so the unmissable "CHARGE NOW" banner is on screen.
+  await page.goto(WEB_URLS.session2ChargeWindow);
+  await expect(page.getByTestId("connection-indicator")).toHaveAttribute("data-status", "live", {
+    timeout: 15_000,
+  });
+
+  // start() leaves the cursor at frame 0 (preheating, bean ~38 °C). Step forward —
+  // still PRE-T0 — until the bean is in the band: in the session-2 fixture frame ~90
+  // reads bean ~177 °C while phase is still preheating (T0/charge is frame 99). Step
+  // 90 to land comfortably mid-band with margin before T0; assert phase to fail loud
+  // if the fixture shifts (we never want a baseline of the wrong state).
+  const stepped = await step(AGENTS.session2ChargeWindow, 90);
+  expect(stepped.agent_phase).toBe("preheating");
+  await page.waitForFunction((id) => (window.__lastEventId ?? -1) >= id, stepped.last_event_id, {
+    timeout: 15_000,
+  });
+
+  // Phase reached the SPA from the server (still preheating — beans not yet added).
+  await expect(page.getByTestId("phase-badge")).toHaveAttribute("data-phase", "preheating");
+
+  // The persistent charge banner is visible with the unmissable CTA + the live bean
+  // temp and the window range. This is the whole point of #211 — assert the COPY, not
+  // just visibility, so a broken/empty banner fails here (not just the pixel baseline,
+  // which regenerates from the same code).
+  await expect(page.getByTestId("charge-banner")).toBeVisible();
+  await expect(page.getByTestId("charge-banner-cta")).toContainText(/charge now/i);
+  await expect(page.getByTestId("charge-banner")).toContainText(/charge window/i);
+  await expect(page.getByTestId("charge-banner")).toContainText("°C");
+
+  // The curve built from the stepped preheat telemetry (data layer).
+  await waitForChartPoints(page, 1);
+  const hook = await readChartData(page);
+  expect(hook.columns[0].length).toBeGreaterThan(0);
+
+  await settle(page);
+  await expect(page).toHaveScreenshot("dashboard-charge-window.png");
 });

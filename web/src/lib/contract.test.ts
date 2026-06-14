@@ -270,18 +270,21 @@ describe("dashboard page parser — folds every event it consumes", () => {
     expect(next.latestAdvisory).toBeNull();
   });
 
-  it("charge_guidance folds the add-beans toast payload", () => {
-    const next = dashboardReducer(initialDashboardViewModel, {
-      kind: "event",
-      event: frame("charge_guidance"),
-    });
-    expect(next.chargeGuidance).not.toBeNull();
-    expectKeys(next.chargeGuidance as unknown as Record<string, unknown>, [
+  it("charge_guidance frame carries the documented wire payload (ChargeGuidanceData)", () => {
+    // Since #211/#215 the dashboard reducer no longer FOLDS this frame (the live
+    // add-beans cue derives from phase + telemetry + band via ChargeBanner). The
+    // wire-contract drift guard now asserts the raw frame payload off disk directly,
+    // so a server-side field rename/drop still fails here. Folding it through the
+    // reducer is verified to be a no-op below.
+    const f = frame("charge_guidance");
+    expectKeys(f.data as unknown as Record<string, unknown>, [
       "bean_temp_c",
       "env_temp_c",
       "guidance_min_c",
       "guidance_max_c",
     ]);
+    const next = dashboardReducer(initialDashboardViewModel, { kind: "event", event: f });
+    expect(next).toBe(initialDashboardViewModel);
   });
 
   it("fault folds the SafetyEvaluation handshake (verdict + reason)", () => {
