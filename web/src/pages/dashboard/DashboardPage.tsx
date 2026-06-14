@@ -26,7 +26,7 @@ import { api } from "@/lib/api";
 import type { OperatorAction } from "@/lib/types";
 import { AdvisoryPanel } from "./AdvisoryPanel";
 import { ChargeBanner } from "./ChargeBanner";
-import { isInChargeWindow } from "./chargeWindow";
+import { chargeCueState } from "./chargeWindow";
 import { ControlRow } from "./ControlRow";
 import { FaultBanner } from "./FaultBanner";
 import { resolveMicStatus } from "./micStatus";
@@ -180,32 +180,40 @@ export function DashboardPage(): React.JSX.Element {
   // arrived, else the snapshot's set (so the bar is correct on first paint).
   const effectiveEnabled = enabledActions ?? detail.data?.enabled_actions ?? null;
 
-  // Persistent charge cue (#211): derive "bean is in the charge window" from the
-  // SERVER phase (preheating), the live bean temperature, and the profile's charge
-  // band from the REST snapshot. This is a PRESENTATION derivation — phase still
-  // comes only from the server; we never infer phase here.
-  const chargeBand = detail.data
-    ? {
-        minC: detail.data.profile.charge_guidance_min_c,
-        maxC: detail.data.profile.charge_guidance_max_c,
-      }
-    : null;
+  // Persistent charge cue (#211): derive the cue's display state from the SERVER
+  // phase (preheating), the live bean temperature, and the profile's charge band
+  // from the REST snapshot. Tri-state so the cue never goes silent on an
+  // over-preheat (hidden / in_window / over_window). This is a PRESENTATION
+  // derivation — phase still comes only from the server; we never infer phase here.
+  // Memoised on the band figures so it's referentially stable across renders (it
+  // feeds both the ChargeBanner and the LiveCurve, which would otherwise see a new
+  // object every render). Behaviour is identical.
+  const chargeMinC = detail.data?.profile.charge_guidance_min_c ?? null;
+  const chargeMaxC = detail.data?.profile.charge_guidance_max_c ?? null;
+  const chargeBand = useMemo(
+    () => (chargeMinC !== null && chargeMaxC !== null ? { minC: chargeMinC, maxC: chargeMaxC } : null),
+    [chargeMinC, chargeMaxC],
+  );
   const beanTempC = telemetry?.bean_temp_c ?? null;
-  const inChargeWindow = isInChargeWindow(phase, beanTempC, chargeBand);
+  const chargeCue = chargeCueState(phase, beanTempC, chargeBand);
+  // The cue is shown (dwell tracked) once the bean reaches charge temperature —
+  // both in-window and over-window count, since the dwell discourages exactly the
+  // over-preheat the warning escalates on.
+  const chargeCueShown = chargeCue !== "hidden";
 
-  // Stamp the elapsed time the bean first entered the window; clear it when it
-  // leaves (so a re-entry restarts the dwell). Derived from server telemetry +
-  // the presentation in-window boolean — not phase inference.
+  // Stamp the elapsed time the bean first reached the charge zone; clear it when it
+  // drops back below / leaves preheating (so a re-entry restarts the dwell). Derived
+  // from server telemetry + the presentation cue state — not phase inference.
   const elapsedSeconds = telemetry?.elapsed_seconds ?? null;
   useEffect(() => {
-    if (inChargeWindow) {
+    if (chargeCueShown) {
       setChargeEnteredElapsed((prev) => (prev === null ? elapsedSeconds : prev));
     } else {
       setChargeEnteredElapsed(null);
     }
-  }, [inChargeWindow, elapsedSeconds]);
+  }, [chargeCueShown, elapsedSeconds]);
   const dwellSeconds =
-    inChargeWindow && chargeEnteredElapsed !== null && elapsedSeconds !== null
+    chargeCueShown && chargeEnteredElapsed !== null && elapsedSeconds !== null
       ? elapsedSeconds - chargeEnteredElapsed
       : null;
 

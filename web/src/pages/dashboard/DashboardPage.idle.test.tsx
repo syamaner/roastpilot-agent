@@ -73,7 +73,6 @@ vi.mock("./useDashboardEvents", () => ({
     markers: [],
     fault: viewState.fault,
     firstCrack: null,
-    chargeGuidance: null,
     recovery: null,
     latestAdvisory: null,
     advisoryHistory: [],
