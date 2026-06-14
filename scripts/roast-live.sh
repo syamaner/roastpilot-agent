@@ -34,6 +34,20 @@ if [ ! -f "$COFFEE_ROASTER_MCP_CONFIG" ]; then
   exit 1
 fi
 
+# --- LOCAL-ONLY pre-start cleanup (NOT committed; temporary until #212) -------
+# A wedged previous run (graceful shutdown can hang — #212, SIGTERM ignored) or
+# a stray manually-launched coffee-roaster-mcp leaves the USB serial port / mic /
+# :PORT held, which destabilises the new run (the duplicate-MCP contention +
+# mcp_read_failures seen 14 Jun). Force-kill any lingering agent + MCP first.
+# pkill returns non-zero when nothing matches, so guard each with `|| true`
+# (set -e would otherwise abort). NOTE: a force-kill does NOT run the heat-off
+# path — if a prior run left the Hottop commanded hot, power it off AT THE
+# MACHINE; this only frees host resources so the new run can start clean.
+echo "→ clearing any wedged/leftover roast processes (local-only safeguard)…"
+pkill -9 -f 'roastpilot-agent serve' 2>/dev/null || true
+pkill -9 -f 'coffee-roaster-mcp'     2>/dev/null || true   # agent child + any stray uvx
+sleep 1   # let the OS release the serial port + the :PORT socket
+
 echo "→ preparing (venv, deps, SPA build)…"
 if [ ! -x .venv/bin/python ]; then
   python3.11 -m venv .venv
