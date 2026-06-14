@@ -158,6 +158,10 @@ def enabled_operator_actions(phase: RoastPhase) -> list[OperatorAction]:
       ``operator_recovery_required`` — the only phase from which the controller's
       drain (``RoastRunner._dispatch_acknowledge``) acts on it; any other phase
       records a failed action.
+    * **``acknowledge_fault``** (#206): included iff ``phase`` is ``faulted`` — the
+      only phase from which the controller's drain acts on it (it finalises the
+      operable-faulted run). Mirrors ``acknowledge_recovery``; any other phase
+      records a failed action. No MCP write.
 
     No new safety rule: this is a projection of acceptance the controller already
     encodes, and every action is still re-validated by the controller before any
@@ -177,9 +181,12 @@ def enabled_operator_actions(phase: RoastPhase) -> list[OperatorAction]:
             # The controller never phase-gates the advisory toggles → every phase.
             enabled.append(action)
         elif (
+            # Each acknowledge action mirrors exactly one phase: acknowledge_recovery
+            # iff operator_recovery_required, acknowledge_fault iff faulted (#206) —
+            # the only phase from which the controller's drain acts on it.
             action is OperatorAction.ACKNOWLEDGE_RECOVERY
             and phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
-        ):
+        ) or (action is OperatorAction.ACKNOWLEDGE_FAULT and phase is RoastPhase.FAULTED):
             enabled.append(action)
     return enabled
 

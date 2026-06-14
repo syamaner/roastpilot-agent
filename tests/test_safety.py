@@ -632,17 +632,33 @@ def test_enabled_actions_returns_declaration_order() -> None:
     assert enabled == ordered
 
 
-def test_enabled_actions_empty_of_writes_in_terminal_phases() -> None:
-    """COMPLETE/FAULTED: no MCP-write action is permitted except e-stop (always),
-    and acknowledge_recovery is excluded (not the recovery phase) — only the
-    ungated advisory toggles + e-stop remain."""
-    for phase in (RoastPhase.COMPLETE, RoastPhase.FAULTED):
-        enabled = set(enabled_operator_actions(phase))
-        assert enabled == {
-            OperatorAction.EMERGENCY_STOP,
-            OperatorAction.PAUSE_ADVISORY,
-            OperatorAction.RESUME_ADVISORY,
-        }
+def test_enabled_actions_empty_of_writes_in_complete() -> None:
+    """COMPLETE: no MCP-write action is permitted except e-stop (always), and
+    acknowledge_recovery/acknowledge_fault are excluded (not their phase) — only
+    the ungated advisory toggles + e-stop remain."""
+    enabled = set(enabled_operator_actions(RoastPhase.COMPLETE))
+    assert enabled == {
+        OperatorAction.EMERGENCY_STOP,
+        OperatorAction.PAUSE_ADVISORY,
+        OperatorAction.RESUME_ADVISORY,
+    }
+
+
+def test_enabled_actions_in_faulted_allow_cooling_and_acknowledge() -> None:
+    """FAULTED (#206): the operable-faulted state must surface the cooling
+    controls (start/stop), e-stop (always), and acknowledge_fault — so a fault
+    never strands a physically-running machine — plus the ungated advisory
+    toggles. SET_HEAT is NOT here (heat stays off); acknowledge_recovery is
+    excluded (not the recovery phase)."""
+    enabled = set(enabled_operator_actions(RoastPhase.FAULTED))
+    assert enabled == {
+        OperatorAction.START_COOLING,
+        OperatorAction.STOP_COOLING,
+        OperatorAction.EMERGENCY_STOP,
+        OperatorAction.ACKNOWLEDGE_FAULT,
+        OperatorAction.PAUSE_ADVISORY,
+        OperatorAction.RESUME_ADVISORY,
+    }
 
 
 def test_every_operator_action_is_reachable_in_some_phase() -> None:

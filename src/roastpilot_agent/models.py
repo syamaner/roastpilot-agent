@@ -463,8 +463,14 @@ class OperatorAction(Enum):
     ``mark_beans_added`` is the manual-T0 fallback accepted only in
     ``preheating`` (NOT in ``operator_recovery_required``), while
     ``start_cooling`` is accepted in ``cooling`` or ``operator_recovery_required``.
-    ``pause_advisory`` / ``resume_advisory`` / ``acknowledge_recovery`` are
-    control actions with no direct MCP write.
+    ``pause_advisory`` / ``resume_advisory`` / ``acknowledge_recovery`` /
+    ``acknowledge_fault`` are control actions with no direct MCP write.
+
+    ``acknowledge_fault`` (#206) finalises an operable-faulted run: a fault no
+    longer auto-finalises the run (so the operator can still engage/stop cooling
+    on a physically-running machine), and acknowledging it is what stamps the
+    ``faulted`` outcome and stops the loop. It is enabled iff the phase is
+    ``faulted`` (mirror of ``acknowledge_recovery`` vs ``operator_recovery_required``).
 
     Declared here (before :class:`RoastDetail`) because that response model's
     ``enabled_actions`` field references it (E10 option (a))."""
@@ -478,6 +484,7 @@ class OperatorAction(Enum):
     STOP_COOLING = "stop_cooling"
     EMERGENCY_STOP = "emergency_stop"
     ACKNOWLEDGE_RECOVERY = "acknowledge_recovery"
+    ACKNOWLEDGE_FAULT = "acknowledge_fault"
 
 
 def _empty_actions() -> list[OperatorAction]:

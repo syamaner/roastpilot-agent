@@ -135,7 +135,8 @@ export type OperatorAction =
   | "start_cooling"
   | "stop_cooling"
   | "emergency_stop"
-  | "acknowledge_recovery";
+  | "acknowledge_recovery"
+  | "acknowledge_fault";
 
 export interface OperatorActionRequest {
   action: OperatorAction;

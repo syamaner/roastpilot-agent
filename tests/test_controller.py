@@ -1873,10 +1873,12 @@ async def test_drift_guards_block_writes_when_matrix_is_permissive() -> None:
         await fc.controller.operator_mark_first_crack()
     assert fc.executor.commands == []
 
-    cool = harness_with_policy(policy)  # IDLE: complete unreachable
-    with pytest.raises(InvalidTransitionError):
-        await cool.controller.operator_stop_cooling()
-    assert cool.executor.commands == []
+    # stop_cooling's drift guard now fires only when it would COMPLETE the run —
+    # i.e. only from COOLING (#206: from faulted it issues the cooling write with
+    # no transition, so there is no unreachable-COMPLETE to guard). COOLING →
+    # COMPLETE is structurally always reachable in the transition table, so the
+    # guard's raising branch is unreachable in practice (the foundation tags it
+    # `# pragma: no cover`); the drop/FC cells above still exercise the pattern.
 
 
 class RejectingCommandPolicy(SafetyPolicy):
@@ -2022,6 +2024,63 @@ async def test_operator_start_cooling_rejected_in_development() -> None:
 
 
 @pytest.mark.asyncio
+async def test_operator_start_cooling_in_faulted_does_not_transition() -> None:
+    """#206: from faulted, start_cooling engages cooling on a hot faulted machine
+    and issues the MCP write WITHOUT a phase transition — the run stays faulted
+    (heat off) until the operator acknowledges it."""
+    harness = make_harness()
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    harness.events.events.clear()
+    await harness.controller.operator_start_cooling()
+    assert "start_cooling" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.FAULTED
+    # No completion event — the faulted run is not finalised by cooling.
+    assert RoastEventKind.RUN_COMPLETED not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_operator_stop_cooling_in_faulted_does_not_transition() -> None:
+    """#206: from faulted, stop_cooling stops the cooling fan an e-stop/fault
+    engaged and issues the MCP write WITHOUT completing the run — the run stays
+    faulted until acknowledged (no power cycle needed to stop the fan)."""
+    harness = make_harness()
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    harness.events.events.clear()
+    await harness.controller.operator_stop_cooling()
+    assert "stop_cooling" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert RoastEventKind.RUN_COMPLETED not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_recover_into_faulted_re_enters_faulted_heat_off_no_write() -> None:
+    """#206: a restart finding a persisted FAULTED run re-enters the operable-
+    faulted state — no MCP write, heat/fan not auto-resumed — distinct from the
+    active-roast → operator_recovery_required path. A FAULT event records it."""
+    harness = make_harness()
+    harness.events.events.clear()
+    await harness.controller.recover_into_faulted(RoastPhase.FAULTED)
+    assert harness.controller.phase is RoastPhase.FAULTED
+    # No hardware write on recovery (restart-never-auto-resumes).
+    assert harness.executor.commands == []
+    snapshot = harness.controller.snapshot()
+    assert (snapshot.current_heat, snapshot.current_fan) == (0, 0)
+    assert RoastEventKind.FAULT in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_recover_into_faulted_noop_for_non_faulted_phase() -> None:
+    """recover_into_faulted only acts on a persisted FAULTED phase; an active-roast
+    phase is a no-op here (the caller routes it to recover_from_restart)."""
+    harness = make_harness()
+    harness.events.events.clear()
+    await harness.controller.recover_into_faulted(RoastPhase.DEVELOPMENT)
+    assert harness.controller.phase is RoastPhase.IDLE
+    assert harness.executor.commands == []
+    assert RoastEventKind.FAULT not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
 async def test_pause_advisory_suppresses_consult_until_resume() -> None:
     """pause_advisory stops the advisor being consulted; the controller keeps
     ticking; resume_advisory restores consults. No MCP write, no safety eval."""
@@ -2141,6 +2200,10 @@ def _controller_accepts(action: OperatorAction, phase: RoastPhase) -> bool:
       ``operator_recovery_required``; any other phase is a no-op. Executing the real
       drain catches a future *widening* of either the drain's phase guard or the
       recovery transition row — a static literal would silently pass.
+    * ``acknowledge_fault`` (#206): the drain
+      (``RoastRunner._dispatch_acknowledge_fault``) acts iff the controller is in
+      ``faulted`` (it flips the runner's finalise flag); the
+      controller-observable acceptance condition is exactly "phase is FAULTED".
     """
     command = OPERATOR_ACTION_COMMAND.get(action)
     if command is not None:
@@ -2164,6 +2227,12 @@ def _controller_accepts(action: OperatorAction, phase: RoastPhase) -> bool:
             isinstance(p, dict) and cast("dict[str, object]", p).get("advisory_paused") is want
             for p in advisory
         )
+    if action is OperatorAction.ACKNOWLEDGE_FAULT:
+        # The acknowledge-fault drain (RoastRunner._dispatch_acknowledge_fault)
+        # acts — flips the runner's _fault_acknowledged flag so the run finalises —
+        # iff the controller is in FAULTED; any other phase records a failed action.
+        # The controller-observable condition is exactly "phase is FAULTED".
+        return phase is RoastPhase.FAULTED
     return _acknowledge_resumes_phase(phase)
 
 
@@ -2199,6 +2268,14 @@ def test_acknowledge_recovery_enabled_only_in_recovery() -> None:
     for phase in RoastPhase:
         expected = phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
         assert (OperatorAction.ACKNOWLEDGE_RECOVERY in enabled_operator_actions(phase)) is expected
+
+
+def test_acknowledge_fault_enabled_only_in_faulted() -> None:
+    """acknowledge_fault (#206) mirrors acknowledge_recovery: enabled iff the
+    phase is faulted — the only phase the drain acts on it."""
+    for phase in RoastPhase:
+        expected = phase is RoastPhase.FAULTED
+        assert (OperatorAction.ACKNOWLEDGE_FAULT in enabled_operator_actions(phase)) is expected
 
 
 def test_emergency_stop_enabled_in_every_phase() -> None:

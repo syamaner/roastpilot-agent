@@ -91,14 +91,30 @@ export function DashboardPage(): React.JSX.Element {
     [queryClient],
   );
 
-  // #124: the operator acknowledges a fault by starting a new roast. Drop the
-  // sticky-faulted pin and re-fetch health (now reporting no active run) so the
-  // page returns to the idle Start-roast form — never trapping the operator on
-  // the faulted view. No roaster command is issued (a GET re-fetch only).
+  // #206: the operator acknowledges a fault by POSTing the `acknowledge_fault`
+  // control action. Post-#206 a fault no longer auto-finalises the run — it stays
+  // operable (loop alive, heat off) so the operator can still cool the machine —
+  // so the run is finalised (outcome `faulted`) only by this acknowledgement.
+  // Acknowledging clears `active_run_id` on the server; we then drop the sticky-
+  // faulted pin and re-fetch health, returning the page to the idle Start-roast
+  // form (never trapping the operator on the faulted view, #124). `acknowledge_fault`
+  // issues no roaster command (heat is already off in faulted and stays off).
   const handleAcknowledgeFault = useCallback(async () => {
+    const ackRunId = runId;
+    // Drop the sticky-faulted pin optimistically so the page returns to idle as
+    // soon as health reports no active run — the acknowledgement is the operator's
+    // explicit intent and the server finalisation below makes it authoritative.
     setStickyFaultedRunId(null);
+    if (ackRunId !== null) {
+      try {
+        await api.operatorAction(ackRunId, { action: "acknowledge_fault" });
+      } catch {
+        // Best-effort: a failed acknowledge (e.g. transient) still re-fetches
+        // health below; the operator can retry from the live view.
+      }
+    }
     await queryClient.invalidateQueries({ queryKey: roastKeys.health });
-  }, [queryClient]);
+  }, [queryClient, runId]);
 
   const dispatchAction = useCallback(
     async (action: OperatorAction) => {
@@ -196,11 +212,13 @@ export function DashboardPage(): React.JSX.Element {
     <AppFrame headerRight={<ConnectionIndicator status={status} />}>
       <div className="flex flex-col gap-4" data-testid="dashboard">
         {/* Fault banner sits above the dashboard when faulted (Prompt B §2).
-            Informational + persistent: no server-dispatching button (a fault is
-            terminal and must not be hidden; e-stop lives in the action bar). The
-            only affordance acknowledges the fault — it clears the sticky-faulted
-            pin (#124) and re-fetches health, returning to the idle Start-roast
-            form; it issues no roaster command (a GET re-fetch only). */}
+            Informational + persistent: the fault stays on screen until the
+            operator acknowledges it; cooling/e-stop live in the action bar (the
+            faulted run stays operable, #206). The "Start New Roast" affordance
+            dispatches the genuine `acknowledge_fault` action — finalising the
+            operable-faulted run server-side — then clears the sticky-faulted pin
+            (#124) and re-fetches health, returning to the idle Start-roast form.
+            `acknowledge_fault` issues no roaster command (heat is already off). */}
         <FaultBanner
           fault={view.fault}
           trail={view.safetyTrail}

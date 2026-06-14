@@ -1133,6 +1133,44 @@ class RoastController:
         self.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
         self._events.emit(RoastEventKind.RECOVERY_REQUIRED, evaluation.model_dump(mode="json"))
 
+    async def recover_into_faulted(self, persisted_phase: RoastPhase | None) -> None:
+        """Restart classification for a persisted **faulted** run (#206).
+
+        A hard fault (or e-stop) before the restart must NOT offer
+        resume-into-roasting — that would be re-applying heat into an aborted
+        run. Such a run re-enters the *operable-faulted* state instead of
+        ``operator_recovery_required``: the loop stays alive, heat/fan are NOT
+        auto-resumed (``faulted`` is heat-off), emergency stop stays available,
+        and the operator may still engage/stop cooling on a physically-running
+        machine and then acknowledge the fault to finalise it.
+
+        Mirrors :meth:`recover_from_restart` for the fault case: no MCP write is
+        issued and no resume-into-roast edge exists out of ``faulted`` (the
+        ``FAULTED -> {IDLE}`` transition row is unchanged). Active-roast phases
+        still route through :meth:`recover_from_restart` to recovery.
+
+        Args:
+            persisted_phase: The ``agent_phase`` read back from the store. Only
+                ``faulted`` re-enters the operable-faulted state here; any other
+                value is a no-op (the caller routes it to
+                :meth:`recover_from_restart`).
+        """
+        if persisted_phase is not RoastPhase.FAULTED:
+            return  # not a persisted fault: caller handles via recover_from_restart
+        evaluation = SafetyEvaluation(
+            rule="restart_recovery",
+            verdict=SafetyVerdict.FAULT,
+            reason=(
+                "restart with persisted phase faulted: re-entering operable-faulted — "
+                "heat/fan deliberately not resumed; cooling/e-stop remain available until "
+                "the operator acknowledges the fault"
+            ),
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        if self._phase is not RoastPhase.FAULTED:
+            self.transition_to(RoastPhase.FAULTED)
+        self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
+
     def operator_resume(self, target: RoastPhase) -> None:
         """Explicit operator resume out of recovery (the operator gate the
         E4-S1 resume edges require). Heat stays at 0 after a resume until
