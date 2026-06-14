@@ -707,11 +707,12 @@ def test_v3_prompt_has_explicit_per_stage_sections() -> None:
     assert "never control hardware" in v3
 
 
-def test_v3_is_not_the_default_prompt_version() -> None:
-    """v3 is selectable but additive: the shipped default stays v2 until the
-    bake-off (#173) validates v3."""
-    assert AdvisorConfig().prompt_version == "v2"
-    # Both are resolvable, and v3 is distinct from v2.
+def test_v4_is_the_default_prompt_version() -> None:
+    """v4 is the shipped default (D34, the #194 prompt bake-off) — the
+    profile-anchored drop that closed v2's recall gap. v2/v3 remain selectable
+    and distinct."""
+    assert AdvisorConfig().prompt_version == "v4"
+    assert instructions_for("v4") != instructions_for("v2")
     assert instructions_for("v3") != instructions_for("v2")
 
 

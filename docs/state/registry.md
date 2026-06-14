@@ -59,9 +59,11 @@ from the operator's Artisan `.alog` history **re-pinned the model to
 reliably calls the drop; opus + frontier/slow models over-hold. A prompt sweep
 (#194) found **`v4`** (profile-anchored drop) closes a recall gap in `v2`
 (recall 0.68→1.0); validated on 19 held-out roasts (generalizes 19/19) + a
-target-sensitivity addendum. **`v4` re-pin = D34, pending operator go** on branch
-`feature/194-advisor-prompt-v4-v8` (not merged). Full record + tables:
-`docs/advisor/experiment.md`.
+target-sensitivity addendum. **`v4` re-pinned (D34, operator-approved 15 Jun)** on
+branch `feature/194-advisor-prompt-v4-v8` — PR open. Full record + tables:
+`docs/advisor/experiment.md`. Pre-roast deps remaining before #134: #189
+(phase-resolved slug), #191 (D32 cadence), allowed_bots; mic-check shipped
+(`coffee-roaster-mcp==0.1.4`).
 
 **E7 (API + SSE) is complete** — #67 (REST routes), #68 (operator action
 queue), #69 (SSE stream) all merged; epic tracking #70 closed. The full

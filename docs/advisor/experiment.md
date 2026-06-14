@@ -19,11 +19,10 @@ that give the best advice, measured against real roasts.
 - **Model — `google/gemini-3.1-flash-lite`** (D33, merged). On 28 real roasts it
   is the only model that reliably calls the flavor-critical drop; the frontier
   and slow models over-hold (never drop = past the bitter ceiling).
-- **Prompt — `v4`** (profile-anchored drop), recommended (D34, pending operator
-  go). Closes a drop-recall gap in `v2`: recall 0.68 → 1.0, F1 0.66 → 0.88,
-  precision up, anticipatory heat cut held. Generalizes on held-out roasts
-  (19/19) and, given a correct target, lands over-dark roasts back in the
-  [193, 196] band (Phase 5). Re-pin awaiting operator go.
+- **Prompt — `v4`** (profile-anchored drop), pinned (D34). Closes a drop-recall
+  gap in `v2`: recall 0.68 → 1.0, F1 0.66 → 0.88, precision up, anticipatory heat
+  cut held. Generalizes on held-out roasts (19/19) and, given a correct target,
+  lands over-dark roasts back in the [193, 196] band (Phase 5).
 
 ---
 
@@ -288,7 +287,8 @@ cost **≈ $5.5** total.
 
 - **D20/D21/D22** — original pin: `opus-4.8` + `v2`; latency/cost/reasoning findings.
 - **D33** — model re-pinned to `gemini-3.1-flash-lite` on the 28-roast Artisan run. *Merged.*
-- **D34** — recommended prompt re-pin to **v4**. *Pending operator go + Phase 5.*
+- **D34** — prompt re-pinned **v2 → v4** (drop-recall fix). *Applied on the #194
+  branch; operator-approved 15 Jun.*
 
 ## 7. Reproduce
 

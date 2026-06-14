@@ -60,9 +60,10 @@ def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
     assert config.api_key_env == "OPENROUTER_API_KEY"
     # Artisan-expanded bake-off winner (D33, 14 Jun): gemini-3.1-flash-lite via
     # OpenRouter — the only model that reliably calls the drop on 28 real roasts
-    # (opus + the frontier/slow models over-hold). Electric-Hottop prompt v2.
+    # (opus + the frontier/slow models over-hold). Prompt v4 (D34, #194) — the
+    # profile-anchored drop that closes v2's recall gap.
     assert config.model_slug == "google/gemini-3.1-flash-lite"
-    assert config.prompt_version == "v2"
+    assert config.prompt_version == "v4"
     assert config.timeout_seconds == 10.0
     assert config.temperature == 0.0
     assert config.reasoning_effort is None  # provider default until measured
