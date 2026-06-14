@@ -411,6 +411,14 @@ class RoasterControlAdapter:
         return project_session_state(state, age_seconds=age)
 
     async def start_session(self) -> None:
+        # A new session must not inherit the previous roast's cached read. Until
+        # the first read_telemetry tick lands, last_state (and the age tracking)
+        # would otherwise expose the prior session's state — e.g. a stale mic
+        # icon on a back-to-back roast (#200/Codex), or a stale raw_state_json /
+        # dev% / mcp_phase persisted for the new run's first tick. Reset on start.
+        self._last_state = None
+        self._last_elapsed = None
+        self._last_change_monotonic = None
         await self._client.start_roast_session()
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:

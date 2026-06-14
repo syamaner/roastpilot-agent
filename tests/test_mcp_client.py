@@ -878,3 +878,16 @@ async def test_adapter_passes_through_all_commands() -> None:
         "export_roast_log",
     ]
     assert result.ready is True
+
+
+@pytest.mark.asyncio
+async def test_adapter_start_session_clears_cached_state() -> None:
+    """A new session must not inherit the previous roast's cached read. A reused
+    adapter (back-to-back roasts) would otherwise expose the prior session's
+    last_state — e.g. a stale mic icon, or stale raw_state_json/dev%/phase
+    persisted for the new run's first tick — until the next read (#200/Codex)."""
+    adapter = RoasterControlAdapter(RoasterMCPClient(FakeToolCaller()))
+    await adapter.read_telemetry()  # a prior roast leaves cached state
+    assert adapter.last_state is not None
+    await adapter.start_session()  # the next session must start from a clean cache
+    assert adapter.last_state is None

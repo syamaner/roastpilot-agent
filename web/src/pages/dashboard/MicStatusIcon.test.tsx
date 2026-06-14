@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { MicStatus } from "@/lib/types";
 import { MicStatusIcon } from "./MicStatusIcon";
+import { resolveMicStatus } from "./micStatus";
 
 afterEach(cleanup);
 
@@ -102,5 +103,30 @@ describe("MicStatusIcon", () => {
     render(<MicStatusIcon micStatus={OK} />);
     const tooltip = within(screen.getByTestId("mic-status-tooltip"));
     expect(tooltip.getByText(/listening/i)).toBeInTheDocument();
+  });
+});
+
+describe("resolveMicStatus (#200/Codex — live frame is authoritative)", () => {
+  const SNAPSHOT: MicStatus = { ...OK, mic_health: "ok" };
+
+  it("uses the run snapshot before any telemetry frame (hydrate paint)", () => {
+    expect(resolveMicStatus(null, SNAPSHOT)).toBe(SNAPSHOT);
+    expect(resolveMicStatus(undefined, SNAPSHOT)).toBe(SNAPSHOT);
+  });
+
+  it("uses the live frame's mic_status once a frame exists", () => {
+    const live: MicStatus = { ...OK, mic_health: "error", fc_status: "faulted" };
+    expect(resolveMicStatus({ mic_status: live }, SNAPSHOT)).toBe(live);
+  });
+
+  it("passes a live null THROUGH (idle) instead of the stale snapshot — the bug", () => {
+    // A telemetry frame carrying mic_status: null is the documented idle case;
+    // the icon must return to idle, NOT stick on the snapshot's green/red.
+    expect(resolveMicStatus({ mic_status: null }, SNAPSHOT)).toBeNull();
+  });
+
+  it("returns null when neither source has a status", () => {
+    expect(resolveMicStatus(null, null)).toBeNull();
+    expect(resolveMicStatus(null, undefined)).toBeNull();
   });
 });

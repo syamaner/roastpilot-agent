@@ -29,6 +29,7 @@ import { AddBeansToast } from "./AddBeansToast";
 import { AdvisoryPanel } from "./AdvisoryPanel";
 import { ControlRow } from "./ControlRow";
 import { FaultBanner } from "./FaultBanner";
+import { resolveMicStatus } from "./micStatus";
 import { OperatorActionBar, type OperatorActionResultView } from "./OperatorActionBar";
 import { RecoveryModal } from "./RecoveryModal";
 import { RoastHeader } from "./RoastHeader";
@@ -190,10 +191,10 @@ export function DashboardPage(): React.JSX.Element {
           profileName={detail.data?.profile.name ?? null}
           firstCrack={view.firstCrack}
           mcpChild={health.data?.mcp_child}
-          // Capture-alive mic health (#197): prefer the live telemetry frame; fall
-          // back to the run snapshot so the icon paints correctly before the first
-          // frame. Both are server-derived (never inferred). null → idle.
-          micStatus={telemetry?.mic_status ?? detail.data?.mic_status ?? null}
+          // Capture-alive mic health (#197/#200): live frame is authoritative once
+          // present (its null = idle passes through, not the stale snapshot); the
+          // snapshot only paints on hydrate before the first frame. Server-derived.
+          micStatus={resolveMicStatus(telemetry, detail.data?.mic_status)}
         />
 
         {showToast && (
