@@ -48,6 +48,8 @@ Three principles, fixed from the first run:
 - **Heat / fan** — MAE + **directional agreement** (did the model move the lever
   the way the human did — especially the anticipatory pre-first-crack cut).
 - **Latency** — median per phase against the tick budget (tightest at FC).
+- **Cost** — $ per advisor call; a roast-economics check and, as Phase 0 found, a
+  proxy for the latency gate (slow models spend reasoning tokens). See *Cost* below.
 
 ## 2. Who and what fed it
 
@@ -200,6 +202,36 @@ managed when handed 200 °C? Runner:
 | v2 | 199.7 °C | _pending_ | _pending_ |
 | v4 | 197.8 °C | _pending_ | _pending_ |
 | v5 | 198.3 °C | _pending_ | _pending_ |
+
+### Cost
+
+Cost is an eval dimension, not an afterthought — in Phase 0 the latency gate
+turned out to *also* be a cost filter (the slow models were the reasoning-token
+spenders). The pinned model is the cheap one, which is part of why it wins.
+
+**Per-call (realized averages):**
+
+| model | $ / advisor call | source |
+|---|---|---|
+| **google/gemini-3.1-flash-lite** | **$0.00045** | measured — Phase 3: $1.86 ÷ 4,098 calls |
+| anthropic/claude-opus-4.8 | ~$0.019 (≈ **42×**) | measured — D22 cost pass |
+
+At the eval's 30 s cadence a full roast is ~25 advisor calls ⇒ **≈ $0.011 per
+roast** with the pinned model; in production it is less, because the advisor is
+not called every tick (D32 cadence: preheat off, drying change-based). A whole
+real roast costs about a cent in advice.
+
+**Per run (OpenRouter spend):**
+
+| phase | run | calls | cost |
+|---|---|---|---|
+| 2 | model bake-off (5 models × 28, incl. opus) | 2,801 | **$2.29** (measured) |
+| 3 | prompt sweep (gemini × 6 prompts × 28) | 4,098 | **$1.86** (measured) |
+| 4 | held-out (gemini × 3 × 19) | 1,545 | ≈ $0.70 (calls × per-call) |
+| 5 | addendum (gemini × 3 × 19) | ~1,545 | _pending_ |
+
+Phase 2 is the priciest despite fewer calls than Phase 3 — opus's 84 spot-check
+calls cost more than the other 2,717 combined. Total evaluation campaign ≈ **$7**.
 
 ## 4. What we learned
 
