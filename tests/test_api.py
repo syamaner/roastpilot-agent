@@ -34,8 +34,9 @@ from roastpilot_agent.api import (
     stream_events,
 )
 from roastpilot_agent.config import AppConfig, ControllerConfig
-from roastpilot_agent.mcp_client import MCPServerProcess
+from roastpilot_agent.mcp_client import FirstCrackStatus, MCPServerProcess, RoastSessionState
 from roastpilot_agent.models import (
+    MicHealth,
     OperatorAction,
     OperatorActionRequest,
     RoastCommand,
@@ -1130,6 +1131,140 @@ async def _tick(service: RoastService, clock: FakeClock) -> bool:
     assert service.runner is not None
     clock.advance(3.0)
     return await service.runner.tick_once()
+
+
+def _session_state(*, fc_status: str, audio_running: bool) -> RoastSessionState:
+    """A minimal valid ``RoastSessionState`` with the first-crack status set (#197)."""
+    fc = FirstCrackStatus(
+        mode="audio",
+        status=fc_status,  # type: ignore[arg-type]  # parametrized over the Literal
+        detected_at_utc=None,
+        detected_monotonic_seconds=None,
+        allow_manual_override=True,
+        audio_running=audio_running,
+    )
+    return RoastSessionState(
+        session_id="s1",
+        active=True,
+        phase="roasting",
+        created_at_utc="2026-06-07T12:00:00+00:00",
+        stopped_at_utc=None,
+        elapsed_monotonic_seconds=10.0,
+        heat_level_percent=50,
+        fan_level_percent=30,
+        cooling_on=False,
+        beans_added_at_utc=None,
+        first_crack_at_utc=None,
+        beans_dropped_at_utc=None,
+        cooling_started_at_utc=None,
+        cooling_stopped_at_utc=None,
+        faulted_at_utc=None,
+        beans_added_monotonic_seconds=None,
+        first_crack_monotonic_seconds=None,
+        beans_dropped_monotonic_seconds=None,
+        cooling_started_monotonic_seconds=None,
+        cooling_stopped_monotonic_seconds=None,
+        faulted_monotonic_seconds=None,
+        roast_elapsed_seconds=None,
+        development_time_seconds=None,
+        development_percent=None,
+        bean_temp_delta_60s_c=None,
+        env_temp_delta_60s_c=None,
+        bean_ror_c_per_min=None,
+        env_ror_c_per_min=None,
+        device_state=None,
+        t0_status={  # type: ignore[arg-type]  # pydantic coerces the dict to T0Status
+            "auto_detection_enabled": True,
+            "status": "pending",
+            "charge_temperature_c": None,
+            "current_drop_c": None,
+            "drop_threshold_c": 25.0,
+            "detected_bean_temperature_c": None,
+        },
+        first_crack_status=fc,
+        events=(),
+        log_dir=None,
+    )
+
+
+class _FakeRawState:
+    """A ``RawStateSource`` returning a fixed ``RoastSessionState`` (#197 test seam)."""
+
+    def __init__(self, state: RoastSessionState | None) -> None:
+        self._state = state
+
+    @property
+    def last_state(self) -> RoastSessionState | None:
+        return self._state
+
+
+@pytest.mark.asyncio
+async def test_detail_enriches_active_run_with_live_mic_status(store: RoastStore) -> None:
+    """detail() projects the live MCP first-crack status onto the active run's
+    ``mic_status`` (#197) — running + detected → OK (green)."""
+    await store.create_run(
+        run_id="run-live",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+    service = RoastService(
+        store,
+        raw_state=_FakeRawState(_session_state(fc_status="detected", audio_running=True)),
+    )
+    service.active_run_id = "run-live"
+    detail = await service.detail("run-live")
+    assert detail.mic_status is not None
+    assert detail.mic_status.mic_health is MicHealth.OK
+    assert detail.mic_status.fc_status == "detected"
+
+
+@pytest.mark.asyncio
+async def test_detail_mic_status_none_for_non_active_run(store: RoastStore) -> None:
+    """A non-active run carries no live mic_status even when a raw state exists (#197)."""
+    await store.create_run(
+        run_id="run-old",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    service = RoastService(
+        store,
+        raw_state=_FakeRawState(_session_state(fc_status="detected", audio_running=True)),
+    )
+    service.active_run_id = "run-active-other"  # not this run
+    detail = await service.detail("run-old")
+    assert detail.mic_status is None
+
+
+@pytest.mark.asyncio
+async def test_detail_mic_status_none_before_first_read(store: RoastStore) -> None:
+    """The active run carries no mic_status until the first MCP read (#197)."""
+    await store.create_run(
+        run_id="run-fresh",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    service = RoastService(store, raw_state=_FakeRawState(None))
+    service.active_run_id = "run-fresh"
+    detail = await service.detail("run-fresh")
+    assert detail.mic_status is None
+
+
+@pytest.mark.asyncio
+async def test_detail_mic_status_none_when_no_raw_state_source(store: RoastStore) -> None:
+    """API-only mode (no raw-state source wired) → mic_status is None (#197)."""
+    await store.create_run(
+        run_id="run-apionly",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    service = RoastService(store)  # no raw_state
+    service.active_run_id = "run-apionly"
+    detail = await service.detail("run-apionly")
+    assert detail.mic_status is None
 
 
 @pytest.mark.asyncio

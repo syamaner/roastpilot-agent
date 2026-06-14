@@ -44,7 +44,12 @@ from roastpilot_agent.controller import (
     StateReader,
     TickScheduler,
 )
-from roastpilot_agent.mcp_client import ExportRoastLogResult, MCPServerProcess, RoastSessionState
+from roastpilot_agent.mcp_client import (
+    ExportRoastLogResult,
+    MCPServerProcess,
+    RoastSessionState,
+    project_mic_status,
+)
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
     AdvisorHealth,
@@ -52,6 +57,7 @@ from roastpilot_agent.models import (
     HealthResponse,
     LogManifest,
     MCPChildStatus,
+    MicStatus,
     OperatorAction,
     OperatorActionRequest,
     OperatorActionResult,
@@ -733,6 +739,7 @@ class RoastRunner:
                     elapsed_seconds=snapshot.roast_elapsed_seconds,
                     t0_detected=telemetry.t0_detected,
                     first_crack_detected=telemetry.first_crack_detected,
+                    mic_status=telemetry.mic_status,
                 )
             )
         await self._store.record_telemetry(
@@ -1075,11 +1082,33 @@ class RoastService:
         return RoastHistory(runs=await self._store.list_runs())
 
     async def detail(self, run_id: str) -> RoastDetail:
-        """Run detail, or 404 (plan §6)."""
+        """Run detail, or 404 (plan §6).
+
+        For the *active* run the response is enriched with the live capture-alive
+        ``mic_status`` (#197) projected from the MCP first-crack status — the
+        store has no persisted mic status (it is transient), so historical runs
+        carry ``None``. A pure read-only projection, mirroring the
+        ``enabled_actions`` server-derived precedent (D25)."""
         detail = await self._store.read_run(run_id)
         if detail is None:
             raise RoastRunNotFoundError(run_id)
+        mic_status = self._live_mic_status(run_id)
+        if mic_status is not None:
+            detail = detail.model_copy(update={"mic_status": mic_status})
         return detail
+
+    def _live_mic_status(self, run_id: str) -> MicStatus | None:
+        """The active run's live capture-alive mic status, or ``None`` (#197).
+
+        ``None`` for any non-active run, when no roaster/raw-state source is
+        wired (API-only mode), or before the first MCP read. Read-only — never
+        a write or a safety evaluation."""
+        if run_id != self.active_run_id or self._raw_state is None:
+            return None
+        state = self._raw_state.last_state
+        if state is None:
+            return None
+        return project_mic_status(state.first_crack_status)
 
     async def telemetry(self, run_id: str, *, downsample: int) -> TelemetrySeries:
         """The downsampled telemetry series for a run, or 404 (plan §6)."""

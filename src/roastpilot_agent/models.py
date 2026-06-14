@@ -101,12 +101,128 @@ class RoastEventSource(Enum):
     SAFETY = "safety"
 
 
+# --- #197: microphone / first-crack capture-alive health (observability) ---
+#
+# The MCP audio first-crack pipeline reports a rich liveness status
+# (``mcp_client.FirstCrackStatus``); the agent projects a small, capture-alive
+# slice of it onto the SSE telemetry frame and the run snapshot so the SPA can
+# render a green/red/amber mic icon. This is pure observability — no safety
+# logic, no controller-loop change, advisory-only. Per the Raspberry Pi
+# performance constraint it carries ONLY the counters the MCP already computes;
+# no RMS / per-window level work is done here (deferred follow-up, #33).
+
+#: The MCP's first-crack runtime status, mirrored here as the SPA-facing wire
+#: form (matches ``mcp_client.FirstCrackRuntimeStatus`` byte-for-byte). Spelled
+#: as a ``Literal`` rather than imported from ``mcp_client``: that module imports
+#: *this* one, so importing it back would cycle. A test pins the two in sync.
+FirstCrackStatusLiteral = Literal[
+    "disabled", "manual", "pending", "detected", "faulted", "unavailable"
+]
+
+
+class MicHealth(Enum):
+    """Derived microphone / first-crack capture health the SPA icon maps to.
+
+    Plain ``Enum`` (D15): a string comparison against a member is a pyright
+    strict error. Observability-only — never a control or safety signal.
+
+    The mapping from the MCP first-crack status (component plan §7 diagnostics):
+
+    - ``OK`` (green) — audio capture is running and the detector is live:
+      ``audio_running`` is true and FC status is ``pending`` or ``detected``.
+    - ``ERROR`` (red) — the device won't open or the detector failed: FC status
+      is ``faulted`` or ``unavailable``.
+    - ``IDLE`` (amber/grey) — no active audio capture: FC mode is disabled or
+      manual, or capture has not started yet (any other state).
+    """
+
+    OK = "ok"
+    ERROR = "error"
+    IDLE = "idle"
+
+
+class MicStatus(BaseModel):
+    """Capture-alive health of the microphone / first-crack audio pipeline (#197).
+
+    A read-only projection of ``mcp_client.FirstCrackStatus`` onto the operator
+    surface: the derived :class:`MicHealth` the icon renders, plus the raw
+    capture-alive fields behind it for the tooltip. It carries only counters the
+    MCP already computes (Pi performance: no per-window level work, #33).
+
+    The configured microphone *device name* is deliberately absent: it is not on
+    the MCP ``FirstCrackStatus`` (nor the runtime-config snapshot), so this
+    contract does not promise it.
+    """
+
+    mic_health: MicHealth
+    audio_running: bool
+    fc_status: FirstCrackStatusLiteral
+    queued_window_count: int
+    emitted_window_count: int
+    dropped_window_count: int
+    processed_window_count: int
+    reason: str | None = None
+
+    @classmethod
+    def from_first_crack_status(
+        cls,
+        *,
+        status: FirstCrackStatusLiteral,
+        audio_running: bool,
+        queued_window_count: int,
+        emitted_window_count: int,
+        dropped_window_count: int,
+        processed_window_count: int,
+        reason: str | None = None,
+    ) -> "MicStatus":
+        """Project the MCP first-crack status fields into a :class:`MicStatus`.
+
+        Takes the raw scalar fields (not the ``mcp_client.FirstCrackStatus``
+        mirror itself) so this module stays free of an import cycle with
+        ``mcp_client`` (which imports this module). The derived
+        :class:`MicHealth` follows the mapping documented on that enum.
+
+        Args:
+            status: The MCP first-crack runtime status.
+            audio_running: Whether the audio capture loop is alive.
+            queued_window_count: Windows queued for inference.
+            emitted_window_count: Windows emitted to the detector.
+            dropped_window_count: Windows dropped (backpressure).
+            processed_window_count: Windows the detector processed.
+            reason: Optional MCP-supplied reason / last-error string.
+
+        Returns:
+            The projected capture-alive status with its derived health.
+        """
+        if status in ("faulted", "unavailable"):
+            health = MicHealth.ERROR
+        elif audio_running and status in ("pending", "detected"):
+            health = MicHealth.OK
+        else:
+            health = MicHealth.IDLE
+        return cls(
+            mic_health=health,
+            audio_running=audio_running,
+            fc_status=status,
+            queued_window_count=queued_window_count,
+            emitted_window_count=emitted_window_count,
+            dropped_window_count=dropped_window_count,
+            processed_window_count=processed_window_count,
+            reason=reason,
+        )
+
+
 class RoastTelemetry(BaseModel):
     """Minimal controller-facing telemetry reading (E4).
 
     E5's typed MCP mirrors construct this from ``RoastSessionState``; the
     controller's tick pipeline consumes it. Derived metrics (RoR) are
     passed through from MCP, never recomputed (plan §2).
+
+    ``mic_status`` is the capture-alive projection (#197), carried here so it
+    rides the same live/replay telemetry path as ``first_crack_detected``;
+    ``None`` when the source state exposes no first-crack status (e.g. a flat
+    replay export, whose ``last_state`` is ``None``).
     """
 
     bean_temp_c: float
@@ -117,6 +233,7 @@ class RoastTelemetry(BaseModel):
     t0_detected: bool = False
     first_crack_detected: bool = False
     cooling_on: bool = False
+    mic_status: MicStatus | None = None
 
 
 # Bean species (botanical) — a constrained ``Literal`` deliberately, NOT a
@@ -391,6 +508,12 @@ class RoastDetail(BaseModel):
     notes: str | None = None
     export_manifest: LogManifest | None = None
     enabled_actions: list[OperatorAction] = Field(default_factory=_empty_actions)
+    mic_status: MicStatus | None = None
+    """Capture-alive mic / first-crack health (#197), mirroring the
+    ``enabled_actions`` server-derived precedent (D25): the SPA reads it
+    read-only to render the mic icon. Populated only for the *active* run from
+    the live MCP first-crack status; ``None`` for historical runs read from the
+    store (the capture-alive status is transient, not persisted)."""
 
 
 class TelemetryPoint(BaseModel):
@@ -588,6 +711,10 @@ class TelemetryEventData(BaseModel):
     elapsed_seconds: float | None = None
     t0_detected: bool = False
     first_crack_detected: bool = False
+    mic_status: MicStatus | None = None
+    """Capture-alive mic / first-crack health (#197), server-derived and
+    read-only on the SPA — mirrors the ``enabled_actions`` precedent (D25).
+    ``None`` when no first-crack status is available this tick."""
 
 
 class SseEvent(BaseModel):
