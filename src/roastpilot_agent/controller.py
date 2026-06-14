@@ -834,10 +834,6 @@ class RoastController:
         # for type-narrowing and as a guard if ever called from elsewhere.
         if self._advisor is None or self._profile is None:  # pragma: no cover
             return
-        # The trace identity (provider/model/prompt) persisted with the advisor
-        # decision on every outcome path below (#167) — captured once, here,
-        # where the advisor is narrowed non-None.
-        descriptor = self._advisor.descriptor
         if telemetry is None:
             # Triggered (a manual request, or the heartbeat in a terminal
             # phase) but the sensor read came back empty this tick — the
@@ -864,6 +860,11 @@ class RoastController:
             )
             return
         context = self._build_advisor_context(telemetry)
+        # The trace identity persisted on every outcome path below (#167),
+        # carrying the PHASE-RESOLVED model (#189): the row records the model
+        # that actually answered this phase's call, not the base slug — so once
+        # the FC/development slot is flipped to a faster model the trace is honest.
+        descriptor = self._advisor.descriptor_for(context.phase)
         started = self._clock()
         try:
             decision = await asyncio.wait_for(

@@ -157,11 +157,13 @@ def test_advisor_healthcheck_receives_no_mcp_write_tools() -> None:
     descriptor — never any MCP write surface (the advisory-only invariant). A
     reviewer-readable assertion that neither the probe capability nor the #167
     decision-trace ``descriptor`` smuggled hardware control onto the advisor.
-    ``descriptor`` is read-only identity metadata (provider/model/prompt)."""
+    ``descriptor`` / ``descriptor_for`` are read-only identity metadata
+    (provider/model/prompt) — ``descriptor_for(phase)`` is the same identity with
+    the phase-resolved model (#189), still no hardware surface."""
     from roastpilot_agent.advisor import RoastAdvisor
 
     methods = {name for name in dir(RoastAdvisor) if not name.startswith("_")}
-    assert methods == {"descriptor", "get_recommendation", "healthcheck"}
+    assert methods == {"descriptor", "descriptor_for", "get_recommendation", "healthcheck"}
 
 
 # --- build_live_service ---------------------------------------------------------

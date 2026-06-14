@@ -429,6 +429,40 @@ def test_advisor_selects_model_by_phase_via_recorded_slug(
         assert model.model_name == slug
 
 
+def test_descriptor_for_records_the_phase_resolved_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#189: descriptor_for(phase) carries the model that actually answers the
+    phase's call (model_for(phase)), so the persisted advisor-decision row is
+    honest once the FC/development slot is flipped — provider + prompt unchanged."""
+    monkeypatch.setenv("ADVISOR_TEST_KEY", "dummy-key")
+    config = AdvisorConfig(
+        provider="anthropic",
+        api_key_env="ADVISOR_TEST_KEY",
+        model_slug="anthropic/claude-opus-4.8",
+        prompt_version="v4",
+        model_slug_by_phase={RoastPhase.DEVELOPMENT: "anthropic/claude-haiku-4.5"},
+    )
+    advisor = PydanticAIAdvisor(config)
+    # Development resolves to the fast model; a phase absent from the map falls
+    # back to the base slug.
+    assert advisor.descriptor_for(RoastPhase.DEVELOPMENT).model == "anthropic/claude-haiku-4.5"
+    assert advisor.descriptor_for(RoastPhase.PREHEATING).model == "anthropic/claude-opus-4.8"
+    # Provider + prompt version stay the advisor-level identity.
+    dev = advisor.descriptor_for(RoastPhase.DEVELOPMENT)
+    assert dev.provider == "anthropic"
+    assert dev.prompt_version == "v4"
+
+
+def test_descriptor_for_defaults_to_base_descriptor() -> None:
+    """The ABC default (advisors without per-phase selection) returns the base
+    descriptor for every phase — e.g. FakeAdvisor."""
+    advisor = FakeAdvisor([decision()])
+    base = advisor.descriptor
+    for phase in RoastPhase:
+        assert advisor.descriptor_for(phase) == base
+
+
 def test_advisor_default_pins_every_phase_to_one_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
