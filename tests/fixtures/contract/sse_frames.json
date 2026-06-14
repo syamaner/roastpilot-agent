@@ -182,12 +182,22 @@
         "bean_ror_c_per_min": null,
         "bean_temp_c": 38.0,
         "cooling_on": false,
-        "elapsed_seconds": 0.0013962920056656003,
+        "elapsed_seconds": 0.0,
         "env_ror_c_per_min": null,
         "env_temp_c": 43.0,
         "fan_percent": 10,
         "first_crack_detected": false,
         "heat_percent": 80,
+        "mic_status": {
+          "audio_running": true,
+          "dropped_window_count": 0,
+          "emitted_window_count": 0,
+          "fc_status": "pending",
+          "mic_health": "ok",
+          "processed_window_count": 0,
+          "queued_window_count": 0,
+          "reason": null
+        },
         "t0_detected": false
       },
       "event": "telemetry",

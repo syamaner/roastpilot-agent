@@ -11,6 +11,8 @@ import pydantic
 import pytest
 
 from roastpilot_agent.models import (
+    MicHealth,
+    MicStatus,
     RoastCommand,
     RoastDetail,
     RoastEventKind,
@@ -26,6 +28,7 @@ ALL_SHARED_ENUMS: list[type[Enum]] = [
     RoastEventKind,
     RoastEventSource,
     SafetyVerdict,
+    MicHealth,
 ]
 
 
@@ -252,6 +255,82 @@ def test_roast_detail_enabled_actions_defaults_to_empty() -> None:
         started_at_utc="2026-06-07T13:00:00Z",
     )
     assert detail.enabled_actions == []
+
+
+def test_roast_detail_mic_status_defaults_to_none() -> None:
+    """``mic_status`` (#197) defaults to None — historical runs have no live
+    capture-alive status; only the active run's detail is enriched."""
+    detail = RoastDetail(
+        id="r1",
+        agent_phase=RoastPhase.PREHEATING,
+        profile=RoastProfile.model_validate(_profile()),
+        started_at_utc="2026-06-07T13:00:00Z",
+    )
+    assert detail.mic_status is None
+
+
+@pytest.mark.parametrize(
+    ("status", "audio_running", "expected"),
+    [
+        ("detected", True, MicHealth.OK),
+        ("pending", True, MicHealth.OK),
+        ("detected", False, MicHealth.IDLE),  # status alive but capture not running
+        ("pending", False, MicHealth.IDLE),
+        ("faulted", True, MicHealth.ERROR),
+        ("faulted", False, MicHealth.ERROR),
+        ("unavailable", True, MicHealth.ERROR),
+        ("unavailable", False, MicHealth.ERROR),
+        ("disabled", False, MicHealth.IDLE),
+        ("manual", False, MicHealth.IDLE),
+    ],
+)
+def test_mic_status_health_mapping(status: str, audio_running: bool, expected: MicHealth) -> None:
+    """The derived MicHealth follows the documented capture-alive mapping (#197)."""
+    mic = MicStatus.from_first_crack_status(
+        status=status,  # type: ignore[arg-type]  # parametrized over the Literal values
+        audio_running=audio_running,
+        queued_window_count=1,
+        emitted_window_count=2,
+        dropped_window_count=0,
+        processed_window_count=2,
+        reason=None,
+    )
+    assert mic.mic_health is expected
+    # Capture-alive fields are forwarded verbatim (no per-window work, #33).
+    assert mic.fc_status == status
+    assert (mic.queued_window_count, mic.emitted_window_count) == (1, 2)
+
+
+def test_mic_status_json_round_trip() -> None:
+    """MicStatus serializes by enum value and reconstructs (the SSE/REST wire)."""
+    mic = MicStatus.from_first_crack_status(
+        status="detected",
+        audio_running=True,
+        queued_window_count=0,
+        emitted_window_count=311,
+        dropped_window_count=0,
+        processed_window_count=311,
+        reason=None,
+    )
+    raw = json.loads(mic.model_dump_json())
+    assert raw["mic_health"] == "ok"
+    assert raw["fc_status"] == "detected"
+    assert MicStatus.model_validate(raw).mic_health is MicHealth.OK
+
+
+def test_mic_status_fc_literal_matches_mcp_mirror() -> None:
+    """The SPA-facing FC-status Literal mirrors the MCP one byte-for-byte (#197).
+
+    ``models.FirstCrackStatusLiteral`` is hand-mirrored from
+    ``mcp_client.FirstCrackRuntimeStatus`` (the modules can't import the other
+    way without a cycle); pin them in sync so a future MCP rename can't drift the
+    contract silently."""
+    from typing import get_args
+
+    from roastpilot_agent.mcp_client import FirstCrackRuntimeStatus
+    from roastpilot_agent.models import FirstCrackStatusLiteral
+
+    assert get_args(FirstCrackStatusLiteral) == get_args(FirstCrackRuntimeStatus)
 
 
 def test_roast_profile_strips_whitespace() -> None:

@@ -32,7 +32,7 @@ from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, ConfigDict
 
 from roastpilot_agent.config import MCPConfig
-from roastpilot_agent.models import RoastTelemetry
+from roastpilot_agent.models import MicStatus, RoastTelemetry
 
 # --- vocabulary mirrored from coffee_roaster_mcp (session.py / config.py) ---
 
@@ -302,6 +302,31 @@ class RoasterMCPClient:
 # --- E9: controller-protocol adapter over the typed client ---
 
 
+def project_mic_status(status: FirstCrackStatus) -> MicStatus:
+    """Project an MCP ``FirstCrackStatus`` into the SPA-facing ``MicStatus`` (#197).
+
+    A pure, read-only observability projection — no safety logic, no MCP write.
+    It forwards only the capture-alive fields the MCP already computes (the Pi
+    performance constraint: no per-window level work, #33) and lets
+    :meth:`MicStatus.from_first_crack_status` derive the health the icon maps to.
+
+    Args:
+        status: The MCP first-crack status from ``RoastSessionState``.
+
+    Returns:
+        The capture-alive mic status with its derived :class:`MicHealth`.
+    """
+    return MicStatus.from_first_crack_status(
+        status=status.status,
+        audio_running=status.audio_running,
+        queued_window_count=status.queued_window_count,
+        emitted_window_count=status.emitted_window_count,
+        dropped_window_count=status.dropped_window_count,
+        processed_window_count=status.processed_window_count,
+        reason=status.reason,
+    )
+
+
 def project_session_state(state: RoastSessionState, *, age_seconds: float) -> RoastTelemetry | None:
     """Project an MCP ``RoastSessionState`` into the controller's ``RoastTelemetry``.
 
@@ -327,6 +352,7 @@ def project_session_state(state: RoastSessionState, *, age_seconds: float) -> Ro
         t0_detected=state.t0_status.status == "detected",
         first_crack_detected=state.first_crack_status.status == "detected",
         cooling_on=state.cooling_on,
+        mic_status=project_mic_status(state.first_crack_status),
     )
 
 
@@ -385,6 +411,14 @@ class RoasterControlAdapter:
         return project_session_state(state, age_seconds=age)
 
     async def start_session(self) -> None:
+        # A new session must not inherit the previous roast's cached read. Until
+        # the first read_telemetry tick lands, last_state (and the age tracking)
+        # would otherwise expose the prior session's state — e.g. a stale mic
+        # icon on a back-to-back roast (#200/Codex), or a stale raw_state_json /
+        # dev% / mcp_phase persisted for the new run's first tick. Reset on start.
+        self._last_state = None
+        self._last_elapsed = None
+        self._last_change_monotonic = None
         await self._client.start_roast_session()
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:

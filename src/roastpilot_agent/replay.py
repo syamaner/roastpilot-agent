@@ -60,6 +60,7 @@ from roastpilot_agent.api import QueuedOperatorAction, RoastService, create_app
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.live import mount_spa
 from roastpilot_agent.models import (
+    MicStatus,
     OperatorAction,
     RoastEventKind,
     RoastEventSource,
@@ -168,6 +169,27 @@ def _profile_for(name: str) -> RoastProfile:
     )
 
 
+def _synthesized_mic_status(*, first_crack: bool) -> MicStatus:
+    """A faithful audio-capture mic status for a recorded roast (#197).
+
+    The flat exports carry no first-crack pipeline counters, so — like the
+    latched detection booleans — replay synthesizes a plausible *capture-alive*
+    status: audio is running, the detector is ``pending`` until FC latches then
+    ``detected``. Window counts are left at zero (the export records none); the
+    derived :class:`~roastpilot_agent.models.MicHealth` is OK either way. This
+    is what lets the committed contract fixture pin the real ``MicStatus`` shape
+    on the telemetry frame rather than ``null``."""
+    return MicStatus.from_first_crack_status(
+        status="detected" if first_crack else "pending",
+        audio_running=True,
+        queued_window_count=0,
+        emitted_window_count=0,
+        dropped_window_count=0,
+        processed_window_count=0,
+        reason=None,
+    )
+
+
 def _telemetry_from_record(
     record: dict[str, Any], *, t0: bool, first_crack: bool
 ) -> RoastTelemetry:
@@ -175,7 +197,9 @@ def _telemetry_from_record(
 
     Detection booleans are *latched* by the caller (once T0/FC is reached in
     the recording it stays true), mirroring the real MCP status fields rather
-    than the raw per-frame export, which carries no detection flags."""
+    than the raw per-frame export, which carries no detection flags. The
+    capture-alive ``mic_status`` (#197) is synthesized the same way — see
+    :func:`_synthesized_mic_status`."""
     return RoastTelemetry(
         bean_temp_c=float(record["bean_temp_c"]),
         env_temp_c=float(record["env_temp_c"]),
@@ -184,6 +208,7 @@ def _telemetry_from_record(
         t0_detected=t0,
         first_crack_detected=first_crack,
         cooling_on=bool(record.get("cooling_on", False)),
+        mic_status=_synthesized_mic_status(first_crack=first_crack),
     )
 
 

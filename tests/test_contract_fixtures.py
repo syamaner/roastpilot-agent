@@ -36,11 +36,13 @@ import pytest
 import pytest_asyncio
 
 from roastpilot_agent.models import (
+    MicStatus,
     RoastDetail,
     RoastEventKind,
     RoastSummary,
     SseEvent,
     SseEventType,
+    TelemetryEventData,
 )
 from roastpilot_agent.replay import (
     ReplayMarker,
@@ -347,6 +349,25 @@ async def test_write_rest_snapshot_fixture(tmp_path: Path) -> None:
     assert history.runs, "completed replay produced no history row"
     summary = next((r for r in history.runs if r.id == detail.id), history.runs[0])
 
+    # The completed replay's detail carries mic_status=None (the run is no longer
+    # active and the flat export has no live MCP first-crack status). Pin the
+    # mic_status shape (#197) on the committed snapshot the SPA's TS mirror reads
+    # by enriching with a real projection — the same one detail() applies live to
+    # the active run. This keeps the contract field exercised, not null.
+    detail = detail.model_copy(
+        update={
+            "mic_status": MicStatus.from_first_crack_status(
+                status="detected",
+                audio_running=True,
+                queued_window_count=0,
+                emitted_window_count=0,
+                dropped_window_count=0,
+                processed_window_count=0,
+                reason=None,
+            )
+        }
+    )
+
     payload = {
         "roast_detail": detail.model_dump(mode="json"),
         "roast_summary": summary.model_dump(mode="json"),
@@ -375,6 +396,49 @@ async def test_roast_detail_snapshot_carries_enabled_actions(tmp_path: Path) -> 
         await source.aclose()
     # preheating: the operator can mark beans added / emergency stop, etc.
     assert detail.enabled_actions, "RoastDetail.enabled_actions is empty in preheating"
+
+
+@pytest.mark.asyncio
+async def test_telemetry_frame_carries_mic_status(tmp_path: Path) -> None:
+    """The live ``telemetry`` SSE frame carries a real ``MicStatus`` (#197).
+
+    The SPA renders the mic icon from ``telemetry.mic_status``; a server that
+    stopped projecting it would silently grey the icon. Pin the field on the
+    real wire frame (the replay synthesizes a capture-alive status) so the
+    fixture the vitest contract test loads always exercises the ``MicStatus``
+    shape, and re-validate it through the real model."""
+    frames = await _collect_session2_frames(tmp_path)
+    telemetry_frames = [f for f in frames if f.event is SseEventType.TELEMETRY]
+    assert telemetry_frames, "replay emitted no telemetry frame"
+    mic_payloads = [
+        f.data["mic_status"] for f in telemetry_frames if f.data.get("mic_status") is not None
+    ]
+    assert mic_payloads, "no telemetry frame carried a non-null mic_status"
+    # Round-trips through both the field's model and its container.
+    for raw in mic_payloads:
+        MicStatus.model_validate(raw)
+    TelemetryEventData.model_validate(telemetry_frames[0].data)
+
+
+def test_committed_rest_fixture_carries_mic_status() -> None:
+    """The committed RoastDetail snapshot pins the ``MicStatus`` shape (#197).
+
+    The SPA's hydrate path reads ``snapshot.mic_status``; pin a non-null, real
+    ``MicStatus`` on the committed fixture so its TS mirror is exercised, not
+    only the ``None`` branch."""
+    raw = json.loads(_REST_SNAPSHOTS_PATH.read_text())
+    mic = raw["roast_detail"]["mic_status"]
+    assert mic is not None, "committed RoastDetail snapshot has null mic_status — regenerate it"
+    MicStatus.model_validate(mic)
+
+
+def test_committed_sse_fixture_carries_mic_status() -> None:
+    """The committed SSE telemetry frame pins the ``MicStatus`` shape (#197)."""
+    raw = json.loads(_SSE_FRAMES_PATH.read_text())
+    telemetry = next(f for f in raw["frames"] if f["event"] == SseEventType.TELEMETRY.value)
+    mic = telemetry["data"]["mic_status"]
+    assert mic is not None, "committed telemetry frame has null mic_status — regenerate it"
+    MicStatus.model_validate(mic)
 
 
 def test_committed_sse_fixture_matches_models() -> None:

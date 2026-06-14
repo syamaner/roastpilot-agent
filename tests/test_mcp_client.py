@@ -32,8 +32,10 @@ from roastpilot_agent.mcp_client import (
     ServerInfo,
     StartRoastSessionResult,
     parse_tool_result,
+    project_mic_status,
     project_session_state,
 )
+from roastpilot_agent.models import MicHealth
 
 FIXTURES = Path(__file__).parent / "fixtures" / "live-roast-2026-06-07"
 
@@ -748,6 +750,65 @@ def test_project_session_state_pending_detection_is_false() -> None:
     assert telemetry.first_crack_detected is False
 
 
+def _state_with_fc(**fc_overrides: object) -> RoastSessionState:
+    """A session state with the first-crack status fields overridden (#197)."""
+    payload = _state_payload(
+        100.0,
+        first_crack_status={
+            **cast("dict[str, object]", SESSION_STATE_PAYLOAD["first_crack_status"]),
+            **fc_overrides,
+        },
+    )
+    return RoastSessionState.model_validate(payload)
+
+
+def test_project_mic_status_running_and_detecting_is_ok() -> None:
+    """audio_running + pending/detected → OK (green), counters forwarded (#197)."""
+    state = _state_with_fc(status="detected", audio_running=True, emitted_window_count=311)
+    mic = project_mic_status(state.first_crack_status)
+    assert mic.mic_health is MicHealth.OK
+    assert mic.audio_running is True
+    assert mic.fc_status == "detected"
+    assert mic.emitted_window_count == 311  # forwarded, not recomputed
+
+    pending = _state_with_fc(status="pending", audio_running=True)
+    assert project_mic_status(pending.first_crack_status).mic_health is MicHealth.OK
+
+
+def test_project_mic_status_faulted_or_unavailable_is_error() -> None:
+    """faulted / unavailable → ERROR (red), regardless of audio_running (#197)."""
+    faulted = _state_with_fc(status="faulted", audio_running=False, reason="device busy")
+    error = project_mic_status(faulted.first_crack_status)
+    assert error.mic_health is MicHealth.ERROR
+    assert error.reason == "device busy"
+
+    # ERROR wins even if the capture loop reports running but the status faulted.
+    unavailable = _state_with_fc(status="unavailable", audio_running=True)
+    assert project_mic_status(unavailable.first_crack_status).mic_health is MicHealth.ERROR
+
+
+def test_project_mic_status_disabled_or_manual_is_idle() -> None:
+    """disabled / manual mode, or capture not yet running → IDLE (amber) (#197)."""
+    disabled = _state_with_fc(mode="disabled", status="disabled", audio_running=False)
+    assert project_mic_status(disabled.first_crack_status).mic_health is MicHealth.IDLE
+
+    manual = _state_with_fc(mode="manual", status="manual", audio_running=False)
+    assert project_mic_status(manual.first_crack_status).mic_health is MicHealth.IDLE
+
+    # pending but capture not yet alive is IDLE, not OK (audio_running gates OK).
+    not_running = _state_with_fc(status="pending", audio_running=False)
+    assert project_mic_status(not_running.first_crack_status).mic_health is MicHealth.IDLE
+
+
+def test_project_session_state_carries_mic_status() -> None:
+    """The telemetry projection rides mic_status alongside detection (#197)."""
+    state = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
+    telemetry = project_session_state(state, age_seconds=0.0)
+    assert telemetry is not None
+    assert telemetry.mic_status is not None
+    assert telemetry.mic_status.mic_health is MicHealth.OK
+
+
 @pytest.mark.asyncio
 async def test_adapter_age_resets_on_advance_grows_on_stall() -> None:
     """The stale-telemetry safety fault depends on a real age: it stays ~0 while
@@ -817,3 +878,16 @@ async def test_adapter_passes_through_all_commands() -> None:
         "export_roast_log",
     ]
     assert result.ready is True
+
+
+@pytest.mark.asyncio
+async def test_adapter_start_session_clears_cached_state() -> None:
+    """A new session must not inherit the previous roast's cached read. A reused
+    adapter (back-to-back roasts) would otherwise expose the prior session's
+    last_state — e.g. a stale mic icon, or stale raw_state_json/dev%/phase
+    persisted for the new run's first tick — until the next read (#200/Codex)."""
+    adapter = RoasterControlAdapter(RoasterMCPClient(FakeToolCaller()))
+    await adapter.read_telemetry()  # a prior roast leaves cached state
+    assert adapter.last_state is not None
+    await adapter.start_session()  # the next session must start from a clean cache
+    assert adapter.last_state is None

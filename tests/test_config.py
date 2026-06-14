@@ -25,12 +25,16 @@ def test_controller_defaults_match_orchestration_plan() -> None:
     assert config.tick_interval_seconds == 1.0
     assert config.advisory_min_temp_delta_c == 1.0
     assert config.advisory_min_ror_delta_c_per_min == 2.0
-    # #171: phase-keyed consult floors replace the single 15 s heartbeat.
+    # D32 (#191): cadence by FC-proximity. Preheat is OFF (not in the map +
+    # excluded from auto-advice phases); pre-first-crack has NO fixed heartbeat
+    # (None — change-based + the near-FC boost only); development unthrottled.
+    # None (not inf) so the frozen-config JSON stays valid (PR #201 / Codex).
     assert config.advisory_min_interval_seconds == {
-        RoastPhase.PREHEATING: 30.0,
-        RoastPhase.ROASTING_PRE_FIRST_CRACK: 10.0,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK: None,
         RoastPhase.DEVELOPMENT: 0.0,
     }
+    assert config.advisory_near_fc_bean_temp_c == 170.0
+    assert config.advisory_near_fc_interval_seconds == 10.0
     assert config.advisory_timeout_seconds == 10.0
     assert config.t0_debounce_ticks == 3
     assert config.telemetry_log_interval_seconds == 5.0
@@ -39,10 +43,12 @@ def test_controller_defaults_match_orchestration_plan() -> None:
 
 def test_advisory_interval_for_resolves_per_phase_and_defaults_unthrottled() -> None:
     config = ControllerConfig()
-    assert config.advisory_interval_for(RoastPhase.PREHEATING) == 30.0
-    assert config.advisory_interval_for(RoastPhase.ROASTING_PRE_FIRST_CRACK) == 10.0
-    # Development is unthrottled (0); a phase absent from the map is too.
+    # Pre-first-crack has NO fixed heartbeat (None — change-based + near-FC only).
+    assert config.advisory_interval_for(RoastPhase.ROASTING_PRE_FIRST_CRACK) is None
+    # Development is unthrottled (0); phases absent from the map are too —
+    # preheat (not an auto-advice phase) and cooling.
     assert config.advisory_interval_for(RoastPhase.DEVELOPMENT) == 0.0
+    assert config.advisory_interval_for(RoastPhase.PREHEATING) == 0.0
     assert config.advisory_interval_for(RoastPhase.COOLING) == 0.0
 
 
@@ -51,6 +57,31 @@ def test_advisory_interval_is_config_tunable() -> None:
     assert config.advisory_interval_for(RoastPhase.PREHEATING) == 45.0
     # Unspecified phases fall back to unthrottled.
     assert config.advisory_interval_for(RoastPhase.ROASTING_PRE_FIRST_CRACK) == 0.0
+
+
+def test_frozen_controller_config_is_strict_json_valid() -> None:
+    """The controller config is frozen into ``roast_runs.config_json`` via
+    ``model_dump(mode="json")`` + ``json.dumps`` (``RoastStore.create_run``).
+    A non-JSON float token (``Infinity``/``NaN``) there is invalid JSON — SQLite
+    ``json_valid`` and the SPA's ``JSON.parse`` reject it (PR #201 / Codex). The
+    "no fixed heartbeat" sentinel must serialize as ``null``, never ``Infinity``.
+
+    Regression guard: ``json.loads`` with a ``parse_constant`` that raises makes
+    any bare ``Infinity``/``-Infinity``/``NaN`` a hard failure, not a silent
+    Python-only round-trip (``json`` accepts those by default; strict readers
+    do not)."""
+    import json
+
+    dumped = ControllerConfig().model_dump(mode="json")
+
+    def _reject_constant(token: str) -> float:
+        raise AssertionError(f"frozen config emitted non-JSON constant {token!r}")
+
+    round_tripped = json.loads(json.dumps(dumped), parse_constant=_reject_constant)
+    assert round_tripped["advisory_min_interval_seconds"] == {
+        RoastPhase.ROASTING_PRE_FIRST_CRACK.value: None,
+        RoastPhase.DEVELOPMENT.value: 0.0,
+    }
 
 
 def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
@@ -142,6 +173,9 @@ def test_safety_limit_defaults_are_conservative() -> None:
         (ControllerConfig, {"max_stale_telemetry_seconds": 0}),
         # #171: a negative phase consult floor is meaningless (0 = unthrottled).
         (ControllerConfig, {"advisory_min_interval_seconds": {RoastPhase.PREHEATING: -1.0}}),
+        # D32 (#191): near-FC threshold and interval must be positive.
+        (ControllerConfig, {"advisory_near_fc_bean_temp_c": 0}),
+        (ControllerConfig, {"advisory_near_fc_interval_seconds": 0}),
         (AdvisorConfig, {"timeout_seconds": 0}),
         (AdvisorConfig, {"temperature": -0.1}),
         (AdvisorConfig, {"temperature": 2.1}),
