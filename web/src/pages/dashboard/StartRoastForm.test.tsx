@@ -25,8 +25,8 @@ describe("StartRoastForm", () => {
     expect(screen.getByTestId("start-roast-charge_guidance_max_c")).toHaveValue(200);
     expect(screen.getByTestId("start-roast-initial_heat_percent")).toHaveValue(70);
     expect(screen.getByTestId("start-roast-initial_fan_percent")).toHaveValue(40);
-    expect(screen.getByTestId("start-roast-target_drop_temp_c")).toHaveValue(205);
-    expect(screen.getByTestId("start-roast-target_development_percent")).toHaveValue(20);
+    expect(screen.getByTestId("start-roast-target_drop_temp_c")).toHaveValue(195);
+    expect(screen.getByTestId("start-roast-target_development_percent")).toHaveValue(15);
   });
 
   it("warns that starting commands real heat", () => {
@@ -57,8 +57,8 @@ describe("StartRoastForm", () => {
       charge_guidance_max_c: 200,
       initial_heat_percent: 70,
       initial_fan_percent: 40,
-      target_drop_temp_c: 205,
-      target_development_percent: 20,
+      target_drop_temp_c: 195,
+      target_development_percent: 15,
     });
   });
 

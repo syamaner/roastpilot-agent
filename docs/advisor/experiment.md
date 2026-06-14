@@ -293,10 +293,16 @@ cost **≈ $5.5** total.
 ## 7. Reproduce
 
 ```bash
-python scripts/alog_to_fixture.py "<roasting-logs-dir>" --out-dir .artisan-fixtures   # drop<198 = 28-roast set
-OPENROUTER_API_KEY=sk-or-... python docs/advisor/bakeoff-run-artisan.py     # model selection (Phase 2)
-OPENROUTER_API_KEY=sk-or-... python docs/advisor/bakeoff-run-prompts.py     # prompt sweep   (Phase 3)
-OPENROUTER_API_KEY=sk-or-... python docs/advisor/bakeoff-holdout-prompts.py # held-out       (Phase 4)
+# Two fixture sets from the same Artisan logs. The default --max-drop-c 198
+# keeps the 28 "good" roasts; --max-drop-c 999 keeps ALL of them, and the
+# holdout scripts then select the disjoint drop≥198 over-dark subset internally
+# (HELD_OUT_MIN_DROP_C) — so the held-out set never overlaps the training set.
+python scripts/alog_to_fixture.py "<roasting-logs-dir>" --out-dir .artisan-fixtures                   # drop<198  → 28-roast "good" set (Phases 2–3)
+python scripts/alog_to_fixture.py "<roasting-logs-dir>" --out-dir .artisan-holdout --max-drop-c 999   # all roasts → scripts pick drop≥198 (Phases 4–5)
+OPENROUTER_API_KEY=sk-or-... python docs/advisor/bakeoff-run-artisan.py       # model selection (Phase 2)
+OPENROUTER_API_KEY=sk-or-... python docs/advisor/bakeoff-run-prompts.py       # prompt sweep   (Phase 3)
+OPENROUTER_API_KEY=sk-or-... python docs/advisor/bakeoff-holdout-prompts.py   # held-out       (Phase 4)
+OPENROUTER_API_KEY=sk-or-... python docs/advisor/bakeoff-holdout-addendum.py  # target-sensitivity addendum (Phase 5)
 ```
 
 The replay + scoring + report layer is fully testable without a key via a fake

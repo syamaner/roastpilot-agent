@@ -164,8 +164,13 @@ def _profile_for(name: str) -> RoastProfile:
         bean_weight_grams=250.0,
         initial_heat_percent=80,
         initial_fan_percent=10,
-        target_drop_temp_c=205.0,
-        target_development_percent=20.0,
+        # Default target aligned with prompt v4 + the operator's empirical median
+        # across the 28 good roasts (drop 195 °C / 15 % DTR): 205 °C anchored v4
+        # above the ≤196 °C bitter ceiling, with no deterministic 196 ceiling in
+        # safety to catch it (advisory-only; safety owns only the 230 hard max).
+        # #199 (Codex #196-#1).
+        target_drop_temp_c=195.0,
+        target_development_percent=15.0,
     )
 
 

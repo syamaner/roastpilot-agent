@@ -76,8 +76,12 @@ const DEFAULT_DRAFT: Draft = {
   charge_guidance_max_c: "200",
   initial_heat_percent: "70",
   initial_fan_percent: "40",
-  target_drop_temp_c: "205",
-  target_development_percent: "20",
+  // Aligned with prompt v4 + the operator's empirical median across the 28 good
+  // roasts (drop 195 °C / 15 % DTR). 205 anchored v4 above the ≤196 °C bitter
+  // ceiling and there is no deterministic 196 ceiling in safety to catch it
+  // (advisory-only; safety owns only the 230 hard max). #199 (Codex #196-#1).
+  target_drop_temp_c: "195",
+  target_development_percent: "15",
 };
 
 export interface StartRoastFormProps {

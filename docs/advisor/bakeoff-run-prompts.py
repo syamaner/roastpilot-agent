@@ -64,6 +64,10 @@ CADENCE_SECONDS = 30.0
 
 FIXTURES = REPO_ROOT / ".artisan-fixtures"
 ALL_ROASTS: tuple[Path, ...] = tuple(sorted((FIXTURES).glob("artisan-*/roast.jsonl")))
+# The quality-filtered Artisan set is exactly 28 roasts (drop < 198 °C). The dir
+# is gitignored, so a partial/stale regeneration would silently spend credits and
+# compute "mean across 28" over the wrong population (#199 / Codex #196-#3).
+EXPECTED_ROAST_COUNT = 28
 
 OUT_JSON = REPO_ROOT / "docs" / "advisor" / "bakeoff-results-prompts-2026-06-14.json"
 OUT_MD = REPO_ROOT / "docs" / "advisor" / "bakeoff-results-prompts-2026-06-14.md"
@@ -153,6 +157,15 @@ async def main() -> int:
     """Run the prompt sweep on the pinned model and write the scorecard."""
     if not ALL_ROASTS:
         print("fixtures missing — run scripts/alog_to_fixture.py first", flush=True)
+        return 1
+    if len(ALL_ROASTS) != EXPECTED_ROAST_COUNT:
+        print(
+            f"fixture count mismatch: found {len(ALL_ROASTS)} roasts in {FIXTURES}, "
+            f"expected exactly {EXPECTED_ROAST_COUNT} (drop < 198 °C). A partial or "
+            f"stale .artisan-fixtures would skew the 'mean across 28' result and spend "
+            f"credits on the wrong population — regenerate via scripts/alog_to_fixture.py.",
+            flush=True,
+        )
         return 1
 
     print(
