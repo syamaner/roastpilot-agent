@@ -455,6 +455,22 @@ class AdvisoryCallPolicy:
         self._charge_monotonic = now
         self._settle_released = False
 
+    def rearm_post_charge_settle_on_resume(self, *, now: float) -> None:
+        """Re-arm the post-charge settle window on a recovery-resume into
+        pre-first-crack (#209/#213), but ONLY if the policy holds no charge on
+        record — i.e. a fresh policy after a process restart, where a resume can
+        land mid-crash and the gate would otherwise be inert. When the policy
+        still carries the prior roast's charge state (in-process recovery, e.g.
+        a D30 fail-closed mid-drying), preserve it — including an already-released
+        latch — so a normal post-turn RoR dip after the resume is not
+        re-suppressed.
+
+        Args:
+            now: The controller-clock instant of the recovery resume.
+        """
+        if self._charge_monotonic is None:
+            self.note_charge(now=now)
+
     def note_call(
         self,
         *,
@@ -1271,13 +1287,19 @@ class RoastController:
         self.transition_to(target)  # table gates targets; starting is never legal
         if target is RoastPhase.ROASTING_PRE_FIRST_CRACK:
             # Re-arm the post-charge settle window on a resume into early
-            # roasting (#209, Codex review #213): a restart can land mid-crash,
-            # and resume transitions without a fresh T0/note_charge, so the gate
-            # would otherwise be inert and the first resumed consult could see
-            # the same negative-RoR charge crash. Reference the settle to the
-            # resume instant — RoR-driven release means it suppresses only while
-            # the bean is still crashing and releases at once if already turned.
-            self._advisory_policy.note_charge(now=self._clock())
+            # roasting (#209, Codex review #213), but CONDITIONALLY (#213 FIX 6):
+            #   - process RESTART → fresh policy with no charge on record
+            #     (_charge_monotonic is None): re-arm, so a resume that lands
+            #     mid-crash is protected (RoR-driven release frees it at once if
+            #     the bean has already turned);
+            #   - IN-PROCESS recovery (e.g. a D30 fail-closed mid-drying) → the
+            #     policy still carries the prior roast's charge state, long past
+            #     the turning point: preserve it (including an already-released
+            #     latch) so a normal post-turn RoR dip is not re-suppressed for
+            #     up to the fallback window.
+            # The guard lives in the policy method; reference the settle to the
+            # resume instant when it does re-arm.
+            self._advisory_policy.rearm_post_charge_settle_on_resume(now=self._clock())
         self._events.emit(RoastEventKind.RECOVERY_ACKNOWLEDGED, {"resumed_to": target.value})
 
     def operator_acknowledge_fault(self) -> None:

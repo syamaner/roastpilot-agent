@@ -1665,14 +1665,20 @@ async def test_resume_requires_recovery_and_never_writes_heat() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resume_into_pre_first_crack_rearms_post_charge_settle() -> None:
-    """#213 (Codex): a restart can land mid-crash, and a recovery resume into
-    pre-first-crack transitions WITHOUT a fresh T0/note_charge — so the settle
-    gate would be inert and the first resumed consult could fire PHASE_CHANGE on
-    the still-crashing bean (re-exposing #209). The resume re-arms the policy's
-    settle window referenced to the resume instant: a crashing bean (RoR < 0) is
-    suppressed, a turned bean (RoR >= 0) releases at once."""
+async def test_resume_into_pre_first_crack_rearms_post_charge_settle_after_restart() -> None:
+    """#213 FIX 6 — the RESTART case: a process restart leaves a fresh policy
+    with NO charge on record (``_charge_monotonic is None``), and the recovery
+    resume into pre-first-crack transitions WITHOUT a fresh T0/note_charge — so
+    the gate would be inert and the first resumed consult could fire PHASE_CHANGE
+    on a still-crashing bean (re-exposing #209). Because the policy holds no
+    charge, the resume re-arms the settle window referenced to the resume
+    instant: a crashing bean (RoR < 0) is suppressed, a turned bean (RoR >= 0)
+    releases at once. (The in-process recovery case — where re-arming would be
+    wrong — is covered by the policy-level test below.)"""
     harness = make_harness(readings=[reading()])
+    # Fresh policy after a restart: no prior charge on record.
+    policy = harness.controller._advisory_policy  # pyright: ignore[reportPrivateUsage]
+    assert policy._charge_monotonic is None  # pyright: ignore[reportPrivateUsage]
     await harness.controller.recover_from_restart(RoastPhase.ROASTING_PRE_FIRST_CRACK)
     assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
     harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
@@ -1697,6 +1703,48 @@ async def test_resume_into_pre_first_crack_rearms_post_charge_settle() -> None:
         manual_request=False,
     )
     assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
+def test_rearm_on_resume_preserves_released_latch_in_process() -> None:
+    """#213 FIX 6 — the IN-PROCESS case: when the policy still carries the prior
+    roast's charge state (an in-process recovery — e.g. a D30 fail-closed
+    mid-drying — long past the turning point), a recovery resume must NOT re-arm
+    the settle window. Unconditional re-arming (FIX 2's first cut) would treat a
+    normal post-turn RoR dip as a fresh charge crash and suppress advice for up
+    to the 90 s fallback, defeating the one-way latch. ``_charge_monotonic`` is
+    set and ``_settle_released`` is True, so the guard skips the re-arm and the
+    latch is preserved."""
+    policy = _policy()
+    # Charge, then turn → the settle latch releases (one real roast, in-process).
+    policy.note_charge(now=0.0)
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
+            now=5.0,
+            manual_request=False,
+        )
+        is AdvisoryTrigger.PHASE_CHANGE
+    )
+    policy.note_call(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
+        now=5.0,
+    )
+    assert policy._settle_released is True  # pyright: ignore[reportPrivateUsage]
+    # An in-process recovery resume: the policy still holds the charge, so the
+    # guard preserves the released latch rather than re-arming.
+    policy.rearm_post_charge_settle_on_resume(now=10.0)
+    assert policy._settle_released is True  # pyright: ignore[reportPrivateUsage]
+    # A normal post-turn RoR dip (bean temp flat so only the RoR delta can fire)
+    # is NOT re-suppressed — it returns its real trigger, not None-by-settle.
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=95.0, bean_ror_c_per_min=-30.0),
+        now=11.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.ROR_DELTA
 
 
 @pytest.mark.asyncio
