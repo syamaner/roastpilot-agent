@@ -130,6 +130,25 @@ def test_build_ticks_respects_cadence() -> None:
     assert sum(t.real_should_drop for t in coarse) == 1
 
 
+def test_build_ticks_target_override_replaces_profile_targets() -> None:
+    """The target overrides stamp every context with the given profile targets
+    (a target-sensitivity replay) without altering the scoring ground truth."""
+    base, ground = replay.build_ticks(_S1, cadence_seconds=30.0)
+    overridden, ground_o = replay.build_ticks(
+        _S1,
+        cadence_seconds=30.0,
+        target_drop_c_override=195.0,
+        target_development_percent_override=15.0,
+    )
+    # Every tick carries the override, regardless of the roast's actual drop.
+    assert all(t.context.target_drop_temp_c == 195.0 for t in overridden)
+    assert all(t.context.target_development_percent == 15.0 for t in overridden)
+    # The default path is unchanged (uses the roast's actual drop), and the
+    # ground truth the scorer compares against is identical in both cases.
+    assert base[0].context.target_drop_temp_c == ground.drop_temp_c
+    assert ground_o.drop_temp_c == ground.drop_temp_c
+
+
 # --- scoring: drop classification + timing ----------------------------------
 
 

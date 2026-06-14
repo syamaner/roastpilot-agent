@@ -190,6 +190,8 @@ def build_ticks(
     *,
     cadence_seconds: float = 30.0,
     profile_name: str | None = None,
+    target_drop_c_override: float | None = None,
+    target_development_percent_override: float | None = None,
 ) -> tuple[list[ReplayTick], GroundTruth]:
     """Reconstruct the per-tick advisor contexts for a replayed roast.
 
@@ -209,6 +211,15 @@ def build_ticks(
             to score the curve while keeping a key-spending run affordable.
         profile_name: Optional profile name to stamp into the contexts; defaults
             to the fixture's ``parent/parent`` label.
+        target_drop_c_override: If set, the ``target_drop_temp_c`` stamped into
+            every context, instead of the roast's actual drop temperature. Lets a
+            roast be replayed *as if* a different profile drop target were set — a
+            target-sensitivity / counterfactual analysis (e.g. feeding an
+            over-dark roast the operator's intended ~195 °C target to isolate the
+            advisor's behavior from the actual over-dark drop). Scoring is still
+            against the real drop in ``ground``.
+        target_development_percent_override: Likewise for
+            ``target_development_percent``.
 
     Returns:
         ``(ticks, ground_truth)``.
@@ -252,8 +263,14 @@ def build_ticks(
             current_env_temp_c=float(row["env_temp_c"]),
             bean_ror_c_per_min=_ror(telemetry, index, "bean_temp_c"),
             env_ror_c_per_min=_ror(telemetry, index, "env_temp_c"),
-            target_drop_temp_c=ground.drop_temp_c,
-            target_development_percent=round(ground.development_time_ratio * 100, 1),
+            target_drop_temp_c=(
+                target_drop_c_override if target_drop_c_override is not None else ground.drop_temp_c
+            ),
+            target_development_percent=(
+                target_development_percent_override
+                if target_development_percent_override is not None
+                else round(ground.development_time_ratio * 100, 1)
+            ),
             charge_guidance_min_c=180.0 if phase is RoastPhase.PREHEATING else None,
             charge_guidance_max_c=200.0 if phase is RoastPhase.PREHEATING else None,
             profile_name=name,

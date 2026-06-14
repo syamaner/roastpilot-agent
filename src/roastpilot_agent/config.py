@@ -137,9 +137,10 @@ class AdvisorConfig(BaseModel):
     reliably makes the flavor-critical drop call (drop F1 0.63, 18/28, best
     heat-direction 0.88, fastest ~1.2 s), where the prior incumbent
     ``anthropic/claude-opus-4.8`` (D20/D21) and every frontier/slow model
-    over-hold (never drop). ``v2`` is the electric-Hottop prompt (fan as a
-    coupled heat-transfer-mode lever + development-duration objective); v3 lost
-    to v2 in the first run. See ``docs/advisor/bakeoff-artisan-summary.md``. To
+    over-hold (never drop). The prompt is ``v4`` (D34, the #194 prompt bake-off):
+    the profile-anchored drop prompt that closes v2's drop-recall gap on the same
+    28 roasts (recall 0.68→1.0, F1 0.66→0.88) and generalizes 19/19 on the
+    held-out roasts. See ``docs/advisor/experiment.md``. To
     run a model on its native provider (no OpenRouter hop/markup, per D18), set
     ``provider`` + the matching ``api_key_env``. ``OPENROUTER_API_KEY`` must be
     set in the environment at runtime; ``FakeAdvisor`` stays the test/CI default.
@@ -181,7 +182,13 @@ class AdvisorConfig(BaseModel):
     # well inside an operator's pre-roast attention window.
     healthcheck_timeout_seconds: float = Field(default=5.0, gt=0)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    prompt_version: str = Field(default="v2", min_length=1)
+    # v4 (D34, the #194 prompt bake-off): the profile-anchored drop prompt closes
+    # v2's drop-recall gap (recall 0.68→1.0, F1 0.66→0.88, precision up, heat
+    # direction held; generalizes 19/19 on held-out roasts). v2 told the model to
+    # "develop past the guide, don't rush the drop" — exactly what made the pinned
+    # gemini model over-hold; v4 anchors the drop on the profile target + a
+    # development floor, ≤196 °C bitter ceiling. See docs/advisor/experiment.md.
+    prompt_version: str = Field(default="v4", min_length=1)
     # Reasoning control for the OpenAI-compatible path (OpenRouter normalizes
     # the ``reasoning`` request param across providers). ``None`` leaves the
     # provider default; ``"off"`` disables reasoning; the effort levels set
