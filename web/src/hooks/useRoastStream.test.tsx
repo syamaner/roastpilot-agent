@@ -367,12 +367,20 @@ describe("useRoastStream", () => {
       ),
     );
     expect(latest!.telemetry?.bean_temp_c).toBe(185);
+    // The frame was also buffered into the non-lossy channel.
+    expect(latest!.frameCount).toBe(1);
 
     act(() => {
       rerender(<Probe runId={null} onResult={(r) => (latest = r)} />);
     });
     expect(latest!.telemetry).toBeNull();
     expect(latest!.phase).toBeNull();
+    // FIX I: the non-lossy append buffer is cleared on the idle transition too —
+    // the connect effect's buffer-clear only ran for a non-null run, so without the
+    // reset-effect clear `frames` would still expose run 1's buffered frame at idle.
+    expect(latest!.lastEvent).toBeNull();
+    expect(latest!.frameCount).toBe(0);
+    expect(latest!.frames).toHaveLength(0);
   });
 });
 

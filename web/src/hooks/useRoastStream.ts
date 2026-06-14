@@ -160,10 +160,18 @@ export function useRoastStream(
   // hydrate/frames apply on a clean slate — never on the prior run's stale
   // telemetry. The pure reducer's `reset` returns the shared initial reference, so
   // a no-op reset on first mount doesn't churn renders. `lastEvent` is cleared too
-  // so a `[lastEvent]` consumer can't read the previous run's final frame.
+  // so a `[lastEvent]` consumer can't read the previous run's final frame, and the
+  // non-lossy append buffer (`framesRef`/`frameCount`) is cleared here as well
+  // (#215 FIX I) so `frames` never exposes the prior run's frames on a run change
+  // OR when idle (`runId === null`) — the connect effect's clear below only ran for
+  // a non-null run, leaving the buffer stale on the idle transition. The cursor
+  // consumer (useFrameDrain) resets in lockstep on the same runId change, so
+  // frameCount going back to 0 is consistent.
   useEffect(() => {
     dispatch({ kind: "reset" });
     setLastEvent(null);
+    framesRef.current = [];
+    setFrameCount(0);
   }, [runId]);
 
   useEffect(() => {
@@ -171,12 +179,6 @@ export function useRoastStream(
       setStatus("connecting");
       return;
     }
-
-    // New subscription: clear the non-lossy buffer so this run never folds the
-    // previous run's frames. The cursor consumer (useFrameDrain) resets in lockstep
-    // on the same runId change, so frameCount going back to 0 is consistent.
-    framesRef.current = [];
-    setFrameCount(0);
 
     let cancelled = false;
     let source: EventSourceLike | null = null;
