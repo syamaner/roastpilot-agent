@@ -90,9 +90,19 @@ const DEFAULT_MAX_BACKOFF = 30;
 
 type Action =
   | { kind: "hydrate"; snapshot: { agent_phase: RoastPhase; enabled_actions?: OperatorAction[] } }
-  | { kind: "event"; event: SseEvent };
+  | { kind: "event"; event: SseEvent }
+  | { kind: "reset" };
 
 function reduce(state: RoastStreamState, action: Action): RoastStreamState {
+  if (action.kind === "reset") {
+    // A run change (or clearing the run): drop ALL per-run derived state — phase,
+    // telemetry, enabledActions, lastEventId — back to the pre-first-frame null so
+    // the next run starts clean (#215 FIX H). Without this, `useRoastStream` keeps
+    // the PRIOR run's last telemetry (hydrate only updates phase), so a new preheat
+    // could combine the new `preheating` phase with a stale bean temp and briefly
+    // render a false "CHARGE NOW" before the first real frame.
+    return initialRoastStreamState;
+  }
   if (action.kind === "hydrate") {
     return hydrate(state, {
       // The reducer only reads agent_phase + enabled_actions off the snapshot.
@@ -143,6 +153,18 @@ export function useRoastStream(
 
   // Refs hold transport state the effect mutates without re-subscribing.
   const lastFrameAt = useRef<number>(Date.now());
+
+  // Reset per-run state the instant the run changes (or clears), BEFORE the
+  // connect effect below re-subscribes (#215 FIX H). This runs in render-commit
+  // order ahead of the connect effect (declared earlier), so the new run's first
+  // hydrate/frames apply on a clean slate — never on the prior run's stale
+  // telemetry. The pure reducer's `reset` returns the shared initial reference, so
+  // a no-op reset on first mount doesn't churn renders. `lastEvent` is cleared too
+  // so a `[lastEvent]` consumer can't read the previous run's final frame.
+  useEffect(() => {
+    dispatch({ kind: "reset" });
+    setLastEvent(null);
+  }, [runId]);
 
   useEffect(() => {
     if (runId === null) {

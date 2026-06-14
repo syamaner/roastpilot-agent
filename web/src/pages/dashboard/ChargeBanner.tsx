@@ -62,15 +62,15 @@ export function ChargeBanner({
   const over = state === "over_window";
 
   return (
+    // The OUTER container is NOT a live region (#215 FIX G): the live bean-temp
+    // figure + dwell timer below tick every telemetry frame, and an assertive
+    // wrapper here re-announced the whole alert each tick. Instead ONLY the CTA
+    // heading is assertive — it announces once on appear and again when the copy
+    // changes on escalation (in_window → over_window), which is the intended
+    // behaviour. The frequently-changing figures live OUTSIDE that subtree.
     <div
       data-testid="charge-banner"
       data-state={state}
-      role="alert"
-      // The CTA/heading + the figures announce ONCE when the cue appears (or when
-      // it escalates to over-window — the copy changes). The ticking dwell timer is
-      // pulled OUT of this assertive region below (#215 FIX B) so it isn't
-      // re-announced every second.
-      aria-live="assertive"
       className={cn(
         "flex flex-col gap-1 rounded-lg border-l-8 px-5 py-4 shadow-lg motion-safe:animate-pulse",
         // in-window: the nominal (green = go) token. over-window: escalated amber
@@ -82,8 +82,12 @@ export function ChargeBanner({
       )}
     >
       <div className="flex items-baseline justify-between gap-4">
+        {/* The ONLY assertive region: the CTA copy. `role="alert"` implies
+            aria-live=assertive; it announces on appear + on the escalation copy
+            change, and excludes the ticking figures so they never re-announce. */}
         <span
           data-testid="charge-banner-cta"
+          role="alert"
           className={cn(
             "text-lg font-extrabold uppercase tracking-wide",
             over ? "text-roast-caution" : "text-roast-nominal",
@@ -92,10 +96,8 @@ export function ChargeBanner({
           {over ? "Over charge temperature — add beans now or reduce heat" : "Charge now — add beans"}
         </span>
         {showDwell && (
-          // Dwell ticks every second; keep it OUT of the assertive live region so a
-          // screen reader doesn't re-announce the whole alert each tick (#215 FIX B).
-          // `aria-hidden` removes only this node from the announcement; the visual
-          // is unchanged.
+          // Dwell ticks every second; aria-hidden keeps it out of announcements
+          // (it's already outside the assertive CTA above). The visual is unchanged.
           <span
             data-testid="charge-banner-dwell"
             aria-hidden="true"
@@ -106,7 +108,9 @@ export function ChargeBanner({
           </span>
         )}
       </div>
-      <span className="numeric text-sm text-foreground/80">
+      {/* The live bean temp ticks every telemetry frame — OUTSIDE the assertive CTA
+          so a screen reader doesn't re-announce the alert each tick (#215 FIX G). */}
+      <span data-testid="charge-banner-readout" className="numeric text-sm text-foreground/80">
         Bean {formatTempC(beanTempC)} · charge window {formatTempC(chargeBand.minC)}–
         {formatTempC(chargeBand.maxC)}
       </span>

@@ -32,25 +32,39 @@ describe("ChargeBanner", () => {
     expect(banner).toHaveTextContent("200.0 °C");
   });
 
-  it("is an assertive alert (announced, not a dismissible toast)", () => {
+  it("announces ONLY the CTA assertively — not the outer banner (announced once, not a dismissible toast)", () => {
     render(<ChargeBanner phase="preheating" beanTempC={185} chargeBand={BAND} />);
     const banner = screen.getByTestId("charge-banner");
-    expect(banner).toHaveAttribute("role", "alert");
-    expect(banner).toHaveAttribute("aria-live", "assertive");
+    // The OUTER container is NOT a live region (#215 FIX G) — otherwise the ticking
+    // figures it wraps would re-announce the whole alert every telemetry tick.
+    expect(banner).not.toHaveAttribute("role", "alert");
+    expect(banner).not.toHaveAttribute("aria-live");
+    // The assertive region is the CTA heading alone.
+    const cta = screen.getByTestId("charge-banner-cta");
+    expect(cta).toHaveAttribute("role", "alert");
+    expect(cta).toHaveTextContent(/charge now/i);
     // No dismiss control — it persists while the condition holds.
     expect(screen.queryByRole("button")).toBeNull();
   });
 
-  it("keeps the ticking dwell timer OUT of the assertive region (aria-hidden) so it is not re-announced each second (#215)", () => {
+  it("excludes the frequently-changing figures from the assertive region so they don't re-announce each tick (#215 FIX G)", () => {
     render(
-      <ChargeBanner phase="preheating" beanTempC={185} chargeBand={BAND} dwellSeconds={95} />,
+      <ChargeBanner phase="preheating" beanTempC={185.7} chargeBand={BAND} dwellSeconds={95} />,
     );
-    const banner = screen.getByTestId("charge-banner");
-    // The banner itself stays assertive (CTA/heading announce once).
-    expect(banner).toHaveAttribute("aria-live", "assertive");
+    // The assertive element (the CTA, role=alert) must NOT contain the live bean
+    // temp — otherwise a screen reader re-announces the alert every telemetry tick.
+    const cta = screen.getByTestId("charge-banner-cta");
+    expect(cta).toHaveAttribute("role", "alert");
+    expect(cta).not.toHaveTextContent("185.7 °C");
+    // The live bean-temp readout lives OUTSIDE the assertive subtree.
+    const readout = screen.getByTestId("charge-banner-readout");
+    expect(readout).toHaveTextContent("185.7 °C");
+    expect(cta).not.toContainElement(readout);
+    // The ticking dwell timer is aria-hidden (and also outside the CTA).
     const dwell = screen.getByTestId("charge-banner-dwell");
     expect(dwell).toHaveAttribute("aria-hidden", "true");
     expect(dwell).toHaveTextContent("01:35");
+    expect(cta).not.toContainElement(dwell);
   });
 
   it("hides when preheating but the bean is below the band (not yet at charge)", () => {
