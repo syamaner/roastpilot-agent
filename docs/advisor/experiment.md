@@ -22,7 +22,8 @@ that give the best advice, measured against real roasts.
 - **Prompt — `v4`** (profile-anchored drop), recommended (D34, pending operator
   go). Closes a drop-recall gap in `v2`: recall 0.68 → 1.0, F1 0.66 → 0.88,
   precision up, anticipatory heat cut held. Generalizes on held-out roasts
-  (19/19). Re-pin awaiting the target-sensitivity addendum below.
+  (19/19) and, given a correct target, lands over-dark roasts back in the
+  [193, 196] band (Phase 5). Re-pin awaiting operator go.
 
 ---
 
@@ -138,14 +139,19 @@ operator — because v2 told it "`target_drop_temp_c` is a guide, develop modest
 past it, don't rush the drop." Five new variants (v4–v8), each a distinct
 drop-decision strategy grounded in §2's research. Pinned model, same 28 roasts.
 
-| prompt | drop F1 | precision | recall | drop called | timing (s/°C) | heat-dir |
-|---|---|---|---|---|---|---|
-| v2 (baseline) | 0.655 | 0.643 | 0.68 | 19/28 | −0.5 / −0.07 | 0.887 |
-| **v4 — profile-anchor** ✅ | **0.881** | **0.821** | **1.00** | **28/28** | −2.4 / −0.27 | 0.851 |
-| v5 — DTR-target | 0.881 | 0.821 | 1.00 | 28/28 | −2.8 / −0.32 | 0.826 |
-| v8 — concise synthesis | 0.786 | 0.679 | 1.00 | 28/28 | −7.4 / −1.1 | 0.911 |
-| v6 — two-sided window | 0.744 | 0.631 | 1.00 | 28/28 | −13.5 / −2.1 | 0.902 |
-| v7 — lag-anticipation | 0.620 | 0.467 | 1.00 | 28/28 | −33.0 / −5.2 | 0.818 |
+| prompt | drop F1 | precision | recall | drop called | timing (s/°C) | DTR @ drop | heat-dir |
+|---|---|---|---|---|---|---|---|
+| v2 (baseline) | 0.655 | 0.643 | 0.68 | 19/28 | −0.5 / −0.07 | 18.8 % | 0.887 |
+| **v4 — profile-anchor** ✅ | **0.881** | **0.821** | **1.00** | **28/28** | −2.4 / −0.27 | 17.3 % | 0.851 |
+| v5 — DTR-target | 0.881 | 0.821 | 1.00 | 28/28 | −2.8 / −0.32 | 17.2 % | 0.826 |
+| v8 — concise synthesis | 0.786 | 0.679 | 1.00 | 28/28 | −7.4 / −1.1 | 16.7 % | 0.911 |
+| v6 — two-sided window | 0.744 | 0.631 | 1.00 | 28/28 | −13.5 / −2.1 | 15.9 % | 0.902 |
+| v7 — lag-anticipation | 0.620 | 0.467 | 1.00 | 28/28 | −33.0 / −5.2 | 13.2 % | 0.818 |
+
+On the good roasts v4 drops at **DTR 17.3 %** *and* at the right temp (−0.27 °C vs
+the human) — the dev target met at a low drop, the good-roast signature. The DTR @
+drop column also exposes the over-correction directly: v7's −33 s early drops land
+at **13.2 % DTR** — under-developed, not just imprecise.
 
 **v4 wins**, stated precisely (paired tests over the 28 roasts):
 - **Recall win is statistically robust** — v4 calls the drop on 9 roasts v2 missed
@@ -169,11 +175,20 @@ v4–v8 were authored from the operator's profile (the aggregate of the same 28
 roasts) — a population-level train-on-test risk. Validation on the **19 UNSEEN
 over-dark roasts** (drop ≥ 198 °C) the prompt work never touched.
 
-| prompt | recall (drop called) | wins [193, < actual] | mean rec. drop | ≤196 °C |
-|---|---|---|---|---|
-| v2 | 11/19 | 2/12 | 199.7 °C | 0 |
-| **v4** | **19/19** | **11/19** | 197.8 °C | 4 |
-| v5 | 19/19 | 9/19 | 198.3 °C | 2 |
+| prompt | recall (drop called) | wins [193, < actual] | mean rec. drop | DTR @ drop | ≤196 °C |
+|---|---|---|---|---|---|
+| v2 | 11/19 | 2/12 | 199.7 °C | 14.3 % | 0 |
+| **v4** | **19/19** | **11/19** | 197.8 °C | 13.5 % | 4 |
+| v5 | 19/19 | 9/19 | 198.3 °C | 13.8 % | 2 |
+
+> **DTR @ drop is the coupling check** (operator: dev-time % only helps if you
+> *slowed the roast enough* to hit it while the drop temp is still low — hitting
+> DTR at a high temp is a bad roast). Here v4 drops cooler than the human (good)
+> but at **13.5 % DTR vs the human's ~14 %+** — slightly *under*-developed. On a
+> roast that ran hot there is no drop tick that hits both a low temp *and* a full
+> DTR: these over-dark roasts were a **heat-management failure** (should have been
+> slowed earlier), not a drop-timing one, and a replay can't slow the trajectory.
+> The advisor's drop logic does the honest best on a fixed bad curve.
 
 - **Generalization: clean.** v4 calls the drop on **19/19** unseen roasts; v2 stays
   at 11/19 (the over-hold gap persists on unseen data). v4's recall fix is **not** a
@@ -184,24 +199,35 @@ over-dark roasts** (drop ≥ 198 °C) the prompt work never touched.
   (4/19 ≤196) — right direction, doesn't fully enforce the ceiling under a too-high
   target. → the addendum. Raw: [`bakeoff-holdout-2026-06-14.{md,json}`](bakeoff-holdout-2026-06-14.md).
 
-### Phase 5 — target-sensitivity addendum (a "what-if", running)
-
-> **Status: running — results placeholder.** Filled on completion.
+### Phase 5 — target-sensitivity addendum (a "what-if", complete)
 
 A counterfactual (vary one input, hold model + prompt fixed — *not* an ablation):
 replay the same 19 over-dark roasts feeding the operator's **intended** target
 (195 °C / 15 % DTR) instead of the actual over-dark drop, isolating how much the
-recommended drop follows the target vs the prompt's own ≤196 ceiling. The question:
-with a *correct* target, does v4 land in [193, 196] more fully than the 197.8 °C it
-managed when handed 200 °C? Runner:
+recommended drop follows the target vs the prompt's own ≤196 ceiling. Runner:
 [`bakeoff-holdout-addendum.py`](bakeoff-holdout-addendum.py); scorecard
-`bakeoff-holdout-addendum-2026-06-14.json`.
+`bakeoff-holdout-addendum-2026-06-14.json`. Cost ~$0.69.
 
-| prompt | mean rec. drop (target 200, Phase 4) | mean rec. drop (target 195, addendum) | wins [193,196] |
-|---|---|---|---|
-| v2 | 199.7 °C | _pending_ | _pending_ |
-| v4 | 197.8 °C | _pending_ | _pending_ |
-| v5 | 198.3 °C | _pending_ | _pending_ |
+| prompt | rec. drop @ 200 | rec. drop @ 195 | DTR @ drop (195) | in [193, 196] | recall |
+|---|---|---|---|---|---|
+| v2 | 199.7 °C | 197.4 °C | 16.6 % (n=6) | 1/19 | **5/19** |
+| **v4** | 197.8 °C | **196.1 °C** | 12.3 % | **11/19** | 19/19 |
+| v5 | 198.3 °C | 195.8 °C | 12.2 % | 12/19 | 19/19 |
+
+Note the DTR @ drop falls to ~12 % with the 195 target — dropping cooler on a
+hot-running roast buys a lower temp at the cost of development, confirming the
+coupling: the only way to get *both* on these roasts is to slow the roast earlier
+(a heat-management fix upstream of the drop, which the replay holds fixed).
+
+**Conclusion: Phase 4's "only pulls to 197.8 °C" was the over-dark target's doing.**
+Given a *correct* 195 °C target, v4 lands the over-dark roasts right in the band —
+mean **196.1 °C**, **11/19** fully in [193, 196] — while still calling the drop on
+19/19. So v4 both *follows a sane target* and *enforces its ceiling* against a
+too-high one (Phase 4). Two corroborating notes: v5 edges v4 here (12/19 in band)
+— a near-tie that doesn't overturn v4's win on the training-set discriminators
+(heat-direction, timing); and **v2's recall collapses to 5/19** with the lower
+target — it over-holds *worse* when told to aim cooler, the exact pathology v4 was
+written to fix.
 
 ### Cost
 
@@ -228,10 +254,11 @@ real roast costs about a cent in advice.
 | 2 | model bake-off (5 models × 28, incl. opus) | 2,801 | **$2.29** (measured) |
 | 3 | prompt sweep (gemini × 6 prompts × 28) | 4,098 | **$1.86** (measured) |
 | 4 | held-out (gemini × 3 × 19) | 1,545 | ≈ $0.70 (calls × per-call) |
-| 5 | addendum (gemini × 3 × 19) | ~1,545 | _pending_ |
+| 5 | addendum (gemini × 3 × 19) | 1,545 | ≈ $0.69 (measured) |
 
 Phase 2 is the priciest despite fewer calls than Phase 3 — opus's 84 spot-check
-calls cost more than the other 2,717 combined. Total evaluation campaign ≈ **$7**.
+calls cost more than the other 2,717 combined. The Artisan campaign (Phases 2–5)
+cost **≈ $5.5** total.
 
 ## 4. What we learned
 
