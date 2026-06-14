@@ -992,6 +992,16 @@ def test_policy_manual_bypasses_phase_scoping_and_interval() -> None:
     assert trigger is AdvisoryTrigger.MANUAL
 
 
+def test_policy_manual_request_reaches_preheat_despite_auto_off() -> None:
+    """D32 (#191): preheat is OFF for AUTOMATIC consults, but a manual operator
+    request still reaches it — manual bypasses the auto-advice-phase scope."""
+    policy = _policy()
+    trigger = policy.evaluate(
+        phase=RoastPhase.PREHEATING, telemetry=reading(), now=0.0, manual_request=True
+    )
+    assert trigger is AdvisoryTrigger.MANUAL
+
+
 def test_policy_manual_takes_precedence_over_automatic_trigger() -> None:
     policy = _policy()
     policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=200.0), now=0.0)
