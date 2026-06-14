@@ -4,7 +4,8 @@
  * The shared `useRoastStream` reducer folds ONLY phase / telemetry /
  * enabledActions and surfaces every other frame via `lastEvent` (the designed
  * seam). The dashboard folds those remaining frames here: the advisory feed
- * (latest + recent history), the charge-guidance toast, the recovery handshake,
+ * (latest + recent history), the charge-guidance frame (trace-only since #211 —
+ * the live add-beans cue is the derived `ChargeBanner`), the recovery handshake,
  * the fault handshake + safety event trail, the event markers, and the live curve
  * point buffer.
  *
@@ -53,7 +54,8 @@ export interface DashboardViewModel {
   advisoryHistory: AdvisoryRecord[];
   /** Whether the advisor is paused (from the pause/resume toggle frames). */
   advisoryPaused: boolean;
-  /** The latest charge-guidance payload (the add-beans toast); null until fired. */
+  /** The latest charge-guidance payload (kept for the trace; the live add-beans cue
+   *  is the derived `ChargeBanner`, #211); null until fired. */
   chargeGuidance: ChargeGuidanceData | null;
   /** The recovery handshake (drives the RecoveryModal); null unless in recovery. */
   recovery: SafetyEvaluationData | null;

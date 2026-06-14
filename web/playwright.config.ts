@@ -159,5 +159,28 @@ export default defineConfig({
       reuseExistingServer: !process.env.CI,
       timeout: 120_000,
     },
+    // --- session-2 charge-window (:8004 agent / :4177 SPA) → dashboard-charge-window ---
+    // A THIRD session-2 agent (#211). dashboard-live lands at the START of preheating
+    // (bean ~38 °C, below the charge band) so its baseline does NOT show the persistent
+    // ChargeBanner. This state steps further INTO preheating — but still pre-T0 — until
+    // the bean rises into the 170–200 °C charge band, exercising the banner's
+    // unmissable "CHARGE NOW" state. Its own agent because advance-to/step is
+    // monotonic-forward per agent (same reason as the developed agent).
+    {
+      command:
+        "roastpilot-agent --replay tests/fixtures/replay/session-2 --step " +
+        "--host 127.0.0.1 --port 8004",
+      cwd: "..",
+      url: "http://127.0.0.1:8004/api/health",
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
+    {
+      command: "npm run preview -- --port 4177 --strictPort --host 127.0.0.1",
+      url: "http://127.0.0.1:4177/",
+      env: { ROASTPILOT_API: "http://127.0.0.1:8004" },
+      reuseExistingServer: !process.env.CI,
+      timeout: 120_000,
+    },
   ],
 });

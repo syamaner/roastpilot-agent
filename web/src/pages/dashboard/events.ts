@@ -55,7 +55,9 @@ export interface AdvisoryEventData {
   synthesized?: boolean;
 }
 
-/** The `charge_guidance` payload — drives the non-blocking add-beans toast. */
+/** The `charge_guidance` payload. Retained in the reducer/trace (still emitted by
+ *  the controller), but the LIVE add-beans cue is now the persistent `ChargeBanner`
+ *  derived from phase + telemetry + the profile band (#211), not this one-shot event. */
 export interface ChargeGuidanceData {
   bean_temp_c: number;
   env_temp_c: number;

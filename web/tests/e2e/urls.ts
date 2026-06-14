@@ -11,6 +11,7 @@
  *   session-1          :8001 ⇄ :4174  → dashboard-fault
  *   fault-pre-t0       :8002 ⇄ :4175  → dashboard-recovery
  *   session-2 (devel.) :8003 ⇄ :4176  → dashboard-developed
+ *   session-2 (charge) :8004 ⇄ :4177  → dashboard-charge-window (#211)
  *
  * `dashboard-developed` reuses the session-2 fixture but at a LATER marker
  * (`first_crack`) than `dashboard-live` (`preheating`). `advance-to` is
@@ -27,4 +28,7 @@ export const WEB_URLS = {
   faultPreT0: process.env.ROASTPILOT_WEB_URL_RECOVERY ?? "http://127.0.0.1:4175",
   /** session-2 (own agent) → dashboard-developed (advance-to first_crack: real curve). */
   session2Developed: process.env.ROASTPILOT_WEB_URL_DEVELOPED ?? "http://127.0.0.1:4176",
+  /** session-2 (own agent) → dashboard-charge-window: stepped into preheating until the
+   *  bean is in the charge band, so the persistent ChargeBanner shows (#211). */
+  session2ChargeWindow: process.env.ROASTPILOT_WEB_URL_CHARGE ?? "http://127.0.0.1:4177",
 } as const;
