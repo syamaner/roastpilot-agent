@@ -19,9 +19,10 @@
  *     enabled — its command×phase row is every phase). A real server-side
  *     `acknowledge_fault` action is an E7/M2 follow-up (#117).
  *
- * The only affordance is an optional forward nav ("Start New Roast") — a fault is
- * terminal, so starting a new run is the real next step; it navigates, it does not
- * dispatch a roaster command.
+ * The only affordance is an optional "Start New Roast" action — a fault is
+ * terminal, so starting a new run is the real next step. It acknowledges the fault
+ * (clears the dashboard's sticky-faulted pin and re-fetches health → the idle Start
+ * form, #124); it issues a GET re-fetch only and never dispatches a roaster command.
  *
  * Driven by the real `fault` + `safety_alert` SafetyEvaluation payloads (the page
  * accumulates the trail). All temperatures Celsius.
@@ -40,8 +41,9 @@ export interface FaultBannerProps {
   fault: SafetyEvaluationData | null;
   /** The accumulated safety event trail (newest entries appended). */
   trail: SafetyTrailEntry[];
-  /** Optional forward-nav affordance (a fault is terminal). Navigates only —
-   *  never dispatches a roaster command. Omit to render no action at all. */
+  /** Optional "Start New Roast" affordance (a fault is terminal). Acknowledges
+   *  the fault (clears the sticky-faulted pin + re-fetches health → idle form,
+   *  #124); a GET re-fetch only, never a roaster command. Omit for no action. */
   startNewRoast?: ReactNode;
   className?: string;
 }
