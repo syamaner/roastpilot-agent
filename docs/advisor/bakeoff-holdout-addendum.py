@@ -34,6 +34,7 @@ from bakeoff_replay import build_ticks, replay_roast, score_roast, score_to_json
 
 from roastpilot_agent.advisor import PydanticAIAdvisor  # noqa: E402
 from roastpilot_agent.config import AdvisorConfig  # noqa: E402
+from roastpilot_agent.models import AdvisorHealthStatus  # noqa: E402
 
 PINNED_MODEL = "google/gemini-3.1-flash-lite"
 PROMPT_VERSIONS = ["v2", "v4", "v5"]
@@ -63,6 +64,20 @@ async def main() -> int:
     if len(roasts) < 10:
         print(f"only {len(roasts)} held-out roasts — regenerate .artisan-holdout first")
         return 1
+    # Preflight: a bad/expired OPENROUTER_API_KEY otherwise yields an all-zero
+    # scorecard that reads like real (terrible) model behavior. Fail fast here,
+    # before spending on a single call (#199 / Codex #196-#4).
+    probe = PydanticAIAdvisor(
+        AdvisorConfig(model_slug=PINNED_MODEL, prompt_version=PROMPT_VERSIONS[0])
+    )
+    health = await probe.healthcheck()
+    if health.status is not AdvisorHealthStatus.REACHABLE:
+        print(
+            f"advisor unreachable ({health.status.value}: {health.error}) — check "
+            f"OPENROUTER_API_KEY; aborting before any spend",
+            flush=True,
+        )
+        return 1
     print(
         f"target-sensitivity addendum: {len(roasts)} unseen roasts, "
         f"intended target {TARGET_DROP_C:.0f} °C / {TARGET_DEVELOPMENT_PERCENT:.0f}% DTR",
@@ -83,7 +98,18 @@ async def main() -> int:
                 ticks, advisor.get_recommendation, clock=time.perf_counter
             )
             name = fixture.parent.name
-            score = score_to_json(score_roast(outcomes, ground, name))
+            roast_score = score_roast(outcomes, ground, name)
+            if roast_score.ok_count == 0:
+                # Every advisor call on this roast failed — not model behavior but
+                # a broken run (expired key, rate-limit wall, model outage). Abort
+                # rather than write a misleading all-zero scorecard (#199).
+                print(
+                    f"  {pv} {name}: ok_count=0 — every advisor call failed; aborting "
+                    f"(do not trust an all-zero scorecard)",
+                    flush=True,
+                )
+                return 1
+            score = score_to_json(roast_score)
             score["human_drop_temp_c"] = round(ground.drop_temp_c, 1)
             cells.append(score)
             print(f"  {pv} {name}: drop F1={score['drop']['f1']}", flush=True)  # type: ignore[index]
