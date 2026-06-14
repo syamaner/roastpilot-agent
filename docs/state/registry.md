@@ -2,6 +2,24 @@
 
 ## Active Epic
 
+> **ACTIVE DIRECTION — D35 (14 Jun 2026): the deterministic-control-loop advisor
+> redesign is the priority, in a PREP phase (NO build until engineers are brought in;
+> operator decision).** The supervised hardware roasts (#134 attempts 2–4) surfaced that
+> the free-form LLM advisor mishandles in-roast control — it baked a batch (#218: fan
+> overkill, heat 70→40→20→0, self-contradiction). D35 splits the control path at first
+> crack: **deterministic pre-FC** (controller owns the levers; no LLM), **LLM advises
+> heat+fan+drop post-FC** inside a safety box. Grounded in the operator's working n8n
+> system, where the LLM merely *follows* a deterministic decision tree (tool-calling),
+> rather than freely controlling the levers — the controller still owns the loop. Plan:
+> `roastpilot-plan/roastpilot-agent/deterministic-control-loop-plan.md` + `plan.md` §1 D35.
+> Tracking: **epic #221** (phases #222 pre-FC determinism / #223 post-FC LLM+box / #224
+> test-harness+corpus+eval). **Superseded:** #214, #172 (prompt work, closed). **Subsumes:**
+> #209 (settle window → no-op). **Promoted load-bearing:** #205, #219. **§7 forward goals:**
+> parameterised plan interface (a future learning loop → anticipatory pre-FC) + outcome-
+> labelled roast logs as a fine-tune training corpus (learning brain → roastpilot-cloud, D29).
+> Forward-looking #209/#211 (charge cluster) are MERGED; #210/#212 (operability) deferred to
+> after the next roast. **E11 (packaging) remains gated** behind D35 + the D28/D27 gates below.
+
 - Epic file: `docs/epics/E11-packaging.md` — **BLOCKED, do not start (D28 + D27)**.
   E10 closed 11 Jun 2026. E11 is next in order but **gated**: do **not** begin E11
   implementation (#136/#137/#138) until **both** operator manual tests are Done —
