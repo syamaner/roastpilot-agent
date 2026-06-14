@@ -16,7 +16,7 @@ import pytest
 import pytest_asyncio
 
 from roastpilot_agent.api import RoastService
-from roastpilot_agent.models import SseEvent, SseEventType
+from roastpilot_agent.models import RoastEventKind, RoastPhase, SseEvent, SseEventType
 from roastpilot_agent.replay import (
     MAX_SPEED,
     MIN_SPEED,
@@ -529,17 +529,31 @@ async def test_session1_replay_faults_on_env_ceiling(tmp_path: Path) -> None:
     safety policy correctly trips (EMERGENCY_STOP → FAULTED) — faithful replay
     of a real reading, not a replay bug. (Distinct from the synthetic
     ``fault-pre-t0`` fixture, which trips the *pre-T0 overrun* rule → RECOVERY;
-    session-1's pre-T0 bean temp stays under 200 °C.)"""
+    session-1's pre-T0 bean temp stays under 200 °C.)
+
+    Post-#206 a fault no longer auto-finalises the run: the run reaches FAULTED
+    and stays operable (loop alive, ``completed_at`` null, outcome not yet set)
+    until the operator acknowledges it, so a fault never strands a physically-
+    running machine. The fault reason is therefore asserted on the live FAULT
+    event in the decision trace, not on the (not-yet-persisted) outcome."""
     _app, service, source = await create_replay_app(
         _SESSION_1, tmp_path / "s1.sqlite3", step_mode=True, speed=60
     )
     assert source.run_id is not None
     result = await source.advance_to(ReplayMarker.FAULT)
     assert result.agent_phase == "faulted"
+    # Operable-faulted (#206): faulted, but NOT finalised — outcome/completed_at
+    # stay unset until the operator acknowledges the fault.
     detail = await service.detail(source.run_id)
-    assert detail.outcome == "faulted"
-    assert detail.fault_reason is not None
-    assert "exceeds the hard ceiling" in detail.fault_reason
+    assert detail.agent_phase is RoastPhase.FAULTED
+    assert detail.outcome is None
+    assert detail.completed_at_utc is None
+    # The real safety reason is on the FAULT event in the decision trace.
+    timeline = await service.timeline(source.run_id)
+    fault_events = [e for e in timeline.events if e.kind is RoastEventKind.FAULT]
+    assert fault_events, "expected a FAULT event in the trace"
+    reasons = [(e.payload or {}).get("reason") for e in fault_events if isinstance(e.payload, dict)]
+    assert any(isinstance(r, str) and "exceeds the hard ceiling" in r for r in reasons)
     await source.aclose()
 
 

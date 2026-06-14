@@ -6,13 +6,28 @@
  * page's idle-detection branch (the form + the stream hook have their own specs).
  */
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ConnectionStatus } from "@/hooks/useRoastStream";
 import { DashboardPage } from "./DashboardPage";
+
+// Spy on the typed REST client so the acknowledge-fault POST can be asserted (#206).
+// `vi.hoisted` lets the mock fn exist before the hoisted `vi.mock` factory runs.
+const operatorActionMock = vi.hoisted(() =>
+  vi.fn(async () => ({
+    action: "acknowledge_fault",
+    result: "accepted" as const,
+    reason: "acknowledged",
+    queued: true,
+  })),
+);
+vi.mock("@/lib/api", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
+  return { ...actual, api: { ...actual.api, operatorAction: operatorActionMock } };
+});
 
 // --- Mocks for the read-only foundation hooks the page consumes. ---
 const healthState = {
@@ -83,6 +98,7 @@ beforeEach(() => {
   healthState.data = undefined;
   healthState.isSuccess = false;
   viewState.fault = null;
+  operatorActionMock.mockClear();
 });
 
 describe("DashboardPage idle/active wiring (#158)", () => {
@@ -139,15 +155,21 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
   });
 
-  it("returns to the idle Start form when the operator acknowledges the fault", () => {
-    // Faulted, and the server already reports no active run (post-finalize).
+  it("acknowledges the fault by POSTing acknowledge_fault, then returns to idle", async () => {
+    // Faulted, with a live active run (post-#206 a fault stays operable until ack).
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
     viewState.fault = { reason: "env ceiling exceeded" };
     renderPage();
-    // Pinned: even though we now flip health to no-active-run, the banner holds.
+    // The server finalises the run on acknowledgement → health reports no active run.
     healthState.data = { active_run_id: null };
     fireEvent.click(screen.getByTestId("fault-start-new-roast"));
+    // #206: the affordance dispatches the genuine acknowledge_fault control action.
+    await waitFor(() =>
+      expect(operatorActionMock).toHaveBeenCalledWith("run-fault", {
+        action: "acknowledge_fault",
+      }),
+    );
     // Acknowledging clears the pin → no active run → idle Start form.
     expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
     expect(screen.queryByTestId("dashboard")).toBeNull();

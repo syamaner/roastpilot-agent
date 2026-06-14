@@ -7,22 +7,22 @@
  * safety event trail (what the safety layer did and when). Serious but not
  * alarmist — an operator console.
  *
- * INFORMATIONAL + PERSISTENT — by design it has NO server-dispatching button.
- * (1) The banner must not let the operator hide an ACTIVE fault: a fault is
- *     terminal and stays on screen until the roast ends. There is no client-side
- *     dismiss.
- * (2) It must not re-issue a roaster command under a misleading label. M1 has no
- *     `acknowledge_fault`/`clear_fault` action, and dispatching `emergency_stop`
- *     from a button labelled "Acknowledge" is a button/action mismatch — in a
- *     safety UI, button honesty matters. The genuine e-stop need in `faulted` is
- *     served by the OperatorActionBar's EMERGENCY STOP (correctly labelled, always
- *     enabled — its command×phase row is every phase). A real server-side
- *     `acknowledge_fault` action is an E7/M2 follow-up (#117).
+ * INFORMATIONAL + PERSISTENT — the banner must not let the operator hide an ACTIVE
+ * fault: it stays on screen until the operator explicitly acknowledges it. There is
+ * no client-side dismiss.
  *
- * The only affordance is an optional "Start New Roast" action — a fault is
- * terminal, so starting a new run is the real next step. It acknowledges the fault
- * (clears the dashboard's sticky-faulted pin and re-fetches health → the idle Start
- * form, #124); it issues a GET re-fetch only and never dispatches a roaster command.
+ * Post-#206 a fault no longer auto-finalises the run: the faulted run stays operable
+ * (loop alive, heat forced to 0) so the operator can still engage/stop cooling on a
+ * physically-running machine — that genuine cooling/e-stop need in `faulted` is
+ * served by the OperatorActionBar (START/STOP COOLING + the always-enabled, correctly
+ * labelled EMERGENCY STOP, all surfaced from the server's `enabled_actions`).
+ *
+ * The banner's only affordance is an optional "Start New Roast" action — the real
+ * next step once the operator is done. It dispatches the genuine `acknowledge_fault`
+ * control action (#206), which finalises the run (outcome `faulted`) server-side and
+ * clears `active_run_id`; the page then drops its sticky-faulted pin and re-fetches
+ * health → the idle Start form (#124). `acknowledge_fault` issues NO roaster command
+ * (heat is already off in `faulted`), so the button label is honest.
  *
  * Driven by the real `fault` + `safety_alert` SafetyEvaluation payloads (the page
  * accumulates the trail). All temperatures Celsius.
@@ -41,9 +41,10 @@ export interface FaultBannerProps {
   fault: SafetyEvaluationData | null;
   /** The accumulated safety event trail (newest entries appended). */
   trail: SafetyTrailEntry[];
-  /** Optional "Start New Roast" affordance (a fault is terminal). Acknowledges
-   *  the fault (clears the sticky-faulted pin + re-fetches health → idle form,
-   *  #124); a GET re-fetch only, never a roaster command. Omit for no action. */
+  /** Optional "Start New Roast" affordance. Dispatches the `acknowledge_fault`
+   *  control action (#206) — finalising the operable-faulted run server-side —
+   *  then clears the sticky-faulted pin + re-fetches health → idle form (#124).
+   *  Issues no roaster command (heat is already off in faulted). Omit for none. */
   startNewRoast?: ReactNode;
   className?: string;
 }

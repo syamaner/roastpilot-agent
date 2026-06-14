@@ -1316,6 +1316,32 @@ async def test_submit_operator_action_410_on_terminal_run(store: RoastStore) -> 
 
 
 @pytest.mark.asyncio
+async def test_faulted_unacknowledged_run_does_not_410(store: RoastStore) -> None:
+    """#206: a FAULTED run with no ``completed_at`` (the post-#206 common case —
+    a fault no longer auto-finalises) is NOT terminal, so an operator action is
+    NOT 410'd: stop_cooling / start_cooling / emergency_stop / acknowledge_fault
+    are all accepted, so a fault never strands a physically-running machine."""
+    await store.create_run(
+        run_id="run-faulted",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    service = RoastService(store)
+    for action in (
+        OperatorAction.STOP_COOLING,
+        OperatorAction.START_COOLING,
+        OperatorAction.EMERGENCY_STOP,
+        OperatorAction.ACKNOWLEDGE_FAULT,
+    ):
+        result = await service.submit_operator_action(
+            "run-faulted", OperatorActionRequest(action=action)
+        )
+        assert result.result == "accepted", action
+        assert result.queued is True, action
+
+
+@pytest.mark.asyncio
 async def test_operator_queue_bound_reports_failed_when_full(store: RoastStore) -> None:
     """A full queue (pathological spam) reports the action failed — never a 500
     and never a silent drop."""
@@ -1364,6 +1390,88 @@ async def test_restart_into_active_phase_enters_recovery_without_resuming(
     assert service.active_run_id == "run-crashed"
     # No heat/fan/session write was issued on recovery.
     assert mcp.commands() == []
+
+
+@pytest.mark.asyncio
+async def test_recover_on_start_faulted_run_re_enters_operable_faulted(
+    store: RoastStore,
+) -> None:
+    """#206 (fail-closed restart): a persisted FAULTED run with no ``completed_at``
+    (the post-#206 common case) re-enters the operable-FAULTED state — NOT
+    operator_recovery_required (whose row would permit resume-into-roasting). The
+    loop is alive, no heat/fan/session write is issued, and the operator can still
+    cool / e-stop / acknowledge. This is distinct from the active-roast →
+    recovery path (tested separately)."""
+    await store.create_run(
+        run_id="run-faulted-crash",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    mcp = FakeMCPClient()
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    await service.recover_on_start()
+    recovered = await store.read_run("run-faulted-crash")
+    assert recovered is not None
+    assert recovered.agent_phase is RoastPhase.FAULTED  # NOT operator_recovery_required
+    assert recovered.completed_at_utc is None  # operable, awaiting acknowledgement
+    assert service.active_run_id == "run-faulted-crash"
+    assert service.runner is not None
+    assert service.runner.controller_snapshot().phase is RoastPhase.FAULTED
+    # No resume-into-roast: heat/fan are not auto-resumed, no MCP write on recovery.
+    assert mcp.commands() == []
+    snapshot = service.runner.controller_snapshot()
+    assert (snapshot.current_heat, snapshot.current_fan) == (0, 0)
+    # The operable-faulted state surfaces cooling/e-stop/ack, never resume-to-roast.
+    enabled = enabled_operator_actions(RoastPhase.FAULTED)
+    assert OperatorAction.STOP_COOLING in enabled
+    assert OperatorAction.ACKNOWLEDGE_FAULT in enabled
+
+
+@pytest.mark.asyncio
+async def test_recover_faulted_then_acknowledge_preserves_fault_reason(
+    store: RoastStore,
+) -> None:
+    """#206 regression: recover_faulted() must latch _captured_fault_reason BEFORE
+    _flush_events() drains the FAULT event from the emitter buffer. Without the
+    latch, the fault_reason column is None after restart→acknowledge because the
+    buffer is empty when _handle_completion fires on the first tick after ack."""
+    await store.create_run(
+        run_id="run-fault-reason",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    clock = FakeClock()
+    mcp = FakeMCPClient()
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=clock,
+    )
+    await service.recover_on_start()
+    assert service.runner is not None
+
+    # Acknowledge the fault → finalises on the next tick.
+    accepted = await service.submit_operator_action(
+        "run-fault-reason", OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    assert accepted.result == "accepted"
+    finalized = await _tick(service, clock)
+    assert finalized
+
+    final = await store.read_run("run-fault-reason")
+    assert final is not None
+    assert final.outcome == "faulted"
+    assert final.fault_reason is not None  # the latch fix — was None before #206 patch
 
 
 @pytest.mark.asyncio
@@ -1576,7 +1684,11 @@ async def test_queue_dispatch_routes_every_control_action(store: RoastStore) -> 
 
 
 @pytest.mark.asyncio
-async def test_emergency_stop_via_queue_faults_and_finalizes(store: RoastStore) -> None:
+async def test_emergency_stop_via_queue_faults_but_stays_operable(store: RoastStore) -> None:
+    """#206: an e-stop faults the run but NO LONGER auto-finalises it. The faulted
+    run stays operable — loop alive, run still active, completed_at null, not 410'd
+    — so the operator can still engage/stop cooling on a physically-running machine
+    before acknowledging the fault."""
     clock = FakeClock()
     mcp = FakeMCPClient([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
@@ -1585,20 +1697,32 @@ async def test_emergency_stop_via_queue_faults_and_finalizes(store: RoastStore) 
         OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "kill"}),
     )
     finalized = await _tick(service, clock)
-    assert finalized
+    assert not finalized  # the fault does not finalise — the loop keeps running
+    assert service.runner is not None and not service.runner.finalized
     detail = await store.read_run(run_id)
     assert detail is not None
-    assert detail.outcome == "faulted"
     assert detail.agent_phase is RoastPhase.FAULTED
-    assert detail.fault_reason is not None
+    assert detail.completed_at_utc is None  # still live until acknowledged
+    assert detail.outcome is None
     assert "emergency_stop" in mcp.commands()
+    # The run is still the active run, so an operator action is NOT 410'd.
+    assert (await store.active_run()) is not None
+    accepted = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.STOP_COOLING)
+    )
+    assert accepted.result == "accepted"
 
 
 @pytest.mark.asyncio
-async def test_acknowledge_racing_estop_does_not_strand_the_run(store: RoastStore) -> None:
-    """An acknowledge queued alongside an e-stop in the same tick must not reset
-    a live faulting run to idle: the run faults and completes (never an
-    idle-but-uncompleted run that ``active_run`` would treat as still active)."""
+async def test_acknowledge_recovery_racing_estop_does_not_strand_the_run(
+    store: RoastStore,
+) -> None:
+    """An ``acknowledge_recovery`` queued alongside an e-stop in the same tick must
+    not reset a faulting run to idle: the e-stop sorts first → faulted, and a
+    recovery-ack from faulted is a no-op (it only resumes from
+    operator_recovery_required). Post-#206 the fault no longer auto-finalises, so
+    the run stays operable-faulted (active, completed_at null) — never an
+    idle-but-uncompleted run that ``active_run`` would treat as still active."""
     clock = FakeClock()
     mcp = FakeMCPClient([_reading(178.0, 185.0)])
     service, run_id = await _live_service(store, mcp=mcp, clock=clock)
@@ -1609,12 +1733,12 @@ async def test_acknowledge_racing_estop_does_not_strand_the_run(store: RoastStor
         run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
     )
     finalized = await _tick(service, clock)  # e-stop sorts first → faulted; ack ignored
-    assert finalized
+    assert not finalized  # the fault does not finalise (#206)
     detail = await store.read_run(run_id)
     assert detail is not None
     assert detail.agent_phase is RoastPhase.FAULTED
-    assert detail.outcome == "faulted"
-    assert (await store.active_run()) is None  # not left stranded as active
+    assert detail.completed_at_utc is None  # operable-faulted, not idle-stranded
+    assert (await store.active_run()) is not None  # still the active run
 
 
 @pytest.mark.asyncio
@@ -1677,7 +1801,13 @@ async def test_event_flush_tolerates_a_failed_row(store: RoastStore) -> None:
 
 
 @pytest.mark.asyncio
-async def test_background_loop_stops_on_terminal_fault(store: RoastStore) -> None:
+async def test_background_loop_stays_alive_on_fault_until_acknowledged(
+    store: RoastStore,
+) -> None:
+    """#206: a hard fault no longer stops the background loop — it keeps ticking
+    so the operator can still control cooling on a physically-running machine. The
+    loop stops only once the operator acknowledges the fault, which finalises the
+    run with outcome ``faulted``."""
     config = AppConfig(controller=ControllerConfig(tick_interval_seconds=0.001))
     mcp = FakeMCPClient([_reading(250.0, 200.0)])  # bean over the hard ceiling → e-stop
     service = RoastService(
@@ -1689,11 +1819,92 @@ async def test_background_loop_stops_on_terminal_fault(store: RoastStore) -> Non
     )
     detail = await service.start_roast(_profile())
     await asyncio.sleep(0.03)
+    # The run has faulted but the loop is still alive (not finalised) — operable.
+    faulting = await store.read_run(detail.id)
+    assert faulting is not None
+    assert faulting.agent_phase is RoastPhase.FAULTED
+    assert faulting.completed_at_utc is None
+    assert service.runner is not None and not service.runner.finalized
+    # The operator acknowledges the fault → finalises (outcome faulted) + loop stops.
+    await service.submit_operator_action(
+        detail.id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    await asyncio.sleep(0.03)
     await service.shutdown()
     finished = await store.read_run(detail.id)
     assert finished is not None
     assert finished.outcome == "faulted"
+    assert finished.completed_at_utc is not None
+    assert service.runner.finalized
+
+
+@pytest.mark.asyncio
+async def test_206_estop_in_preheating_then_cool_then_acknowledge(store: RoastStore) -> None:
+    """The exact #206 scenario, end to end: an e-stop in preheating faults the run
+    but does NOT finalise it (no power cycle); the operator then STOPS COOLING on
+    the still-live faulted run (accepted, MCP write issued), then ACKNOWLEDGES the
+    fault, which finalises the run (outcome ``faulted``) and stops the loop."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)  # preheating
+
+    # 1) E-stop in preheating → fault, but the run stays live (not finalised).
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"})
+    )
+    assert not await _tick(service, clock)
+    faulted = await store.read_run(run_id)
+    assert faulted is not None
+    assert faulted.agent_phase is RoastPhase.FAULTED
+    assert faulted.completed_at_utc is None
+    assert "emergency_stop" in mcp.commands()
+
+    # 2) STOP COOLING is accepted on the faulted run (no power cycle) and the MCP
+    #    write is issued on the next tick — the run stays faulted, not completed.
+    accepted = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.STOP_COOLING)
+    )
+    assert accepted.result == "accepted"
+    assert not await _tick(service, clock)
+    assert "stop_cooling" in mcp.commands()
+    still_faulted = await store.read_run(run_id)
+    assert still_faulted is not None
+    assert still_faulted.agent_phase is RoastPhase.FAULTED
+    assert still_faulted.completed_at_utc is None
+
+    # 3) ACKNOWLEDGE the fault → finalises with outcome faulted and the loop stops.
+    ack = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    assert ack.result == "accepted"
+    assert await _tick(service, clock)  # finalises this tick → loop stops
+    final = await store.read_run(run_id)
+    assert final is not None
+    assert final.outcome == "faulted"
+    assert final.completed_at_utc is not None
     assert service.runner is not None and service.runner.finalized
+    # Now terminal: a further operator action is 410'd.
+    with pytest.raises(RoastRunGoneError):
+        await service.submit_operator_action(
+            run_id, OperatorActionRequest(action=OperatorAction.STOP_COOLING)
+        )
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_outside_faulted_is_recorded_failed(store: RoastStore) -> None:
+    """acknowledge_fault is meaningless outside FAULTED: from preheating the drain
+    records a failed operator action and never finalises the run."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)  # preheating
+    await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    assert not await _tick(service, clock)
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.agent_phase is RoastPhase.PREHEATING
+    assert detail.completed_at_utc is None
 
 
 @pytest.mark.asyncio

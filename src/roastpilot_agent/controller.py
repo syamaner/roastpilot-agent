@@ -1133,6 +1133,44 @@ class RoastController:
         self.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
         self._events.emit(RoastEventKind.RECOVERY_REQUIRED, evaluation.model_dump(mode="json"))
 
+    async def recover_into_faulted(self, persisted_phase: RoastPhase | None) -> None:
+        """Restart classification for a persisted **faulted** run (#206).
+
+        A hard fault (or e-stop) before the restart must NOT offer
+        resume-into-roasting — that would be re-applying heat into an aborted
+        run. Such a run re-enters the *operable-faulted* state instead of
+        ``operator_recovery_required``: the loop stays alive, heat/fan are NOT
+        auto-resumed (``faulted`` is heat-off), emergency stop stays available,
+        and the operator may still engage/stop cooling on a physically-running
+        machine and then acknowledge the fault to finalise it.
+
+        Mirrors :meth:`recover_from_restart` for the fault case: no MCP write is
+        issued and no resume-into-roast edge exists out of ``faulted`` (the
+        ``FAULTED -> {IDLE}`` transition row is unchanged). Active-roast phases
+        still route through :meth:`recover_from_restart` to recovery.
+
+        Args:
+            persisted_phase: The ``agent_phase`` read back from the store. Only
+                ``faulted`` re-enters the operable-faulted state here; any other
+                value is a no-op (the caller routes it to
+                :meth:`recover_from_restart`).
+        """
+        if persisted_phase is not RoastPhase.FAULTED:
+            return  # not a persisted fault: caller handles via recover_from_restart
+        evaluation = SafetyEvaluation(
+            rule="restart_recovery",
+            verdict=SafetyVerdict.FAULT,
+            reason=(
+                "restart with persisted phase faulted: re-entering operable-faulted — "
+                "heat/fan deliberately not resumed; cooling/e-stop remain available until "
+                "the operator acknowledges the fault"
+            ),
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        if self._phase is not RoastPhase.FAULTED:
+            self.transition_to(RoastPhase.FAULTED)
+        self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
+
     def operator_resume(self, target: RoastPhase) -> None:
         """Explicit operator resume out of recovery (the operator gate the
         E4-S1 resume edges require). Heat stays at 0 after a resume until
@@ -1209,15 +1247,22 @@ class RoastController:
         self.transition_to(RoastPhase.COOLING)
 
     async def operator_stop_cooling(self) -> None:
-        """Operator stop-cooling: matrix-validated; completes the run.
-        (Log export wires in E5/E9 alongside the real MCP client.)"""
+        """Operator stop-cooling: matrix-validated.
+
+        From ``cooling`` it stops the cooling cycle and **completes** the run.
+        From ``faulted`` (#206) it stops the cooling an e-stop/fault engaged
+        **without a phase transition**: the faulted run stays faulted (heat off)
+        until the operator acknowledges it, so a fault never strands a running
+        cooling fan with no way to stop it. (Log export wires in E5/E9 alongside
+        the real MCP client.)"""
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.STOP_COOLING, phase=self._phase
         )
         await self._snapshots.persist_evaluation(phase_validity)
         if phase_validity.verdict is not SafetyVerdict.ALLOW:
             return
-        if not self.can_transition(RoastPhase.COMPLETE):
+        completes = self._phase is RoastPhase.COOLING
+        if completes and not self.can_transition(RoastPhase.COMPLETE):  # pragma: no cover
             raise InvalidTransitionError(self._phase, RoastPhase.COMPLETE)
         try:
             await self._executor.stop_cooling()
@@ -1227,8 +1272,9 @@ class RoastController:
         self._events.emit(
             RoastEventKind.COMMAND_EXECUTED, {"command": "stop_cooling", "source": "operator"}
         )
-        self.transition_to(RoastPhase.COMPLETE)
-        self._events.emit(RoastEventKind.RUN_COMPLETED, {})
+        if completes:
+            self.transition_to(RoastPhase.COMPLETE)
+            self._events.emit(RoastEventKind.RUN_COMPLETED, {})
 
     async def operator_emergency_stop(self, reason: str | None = None) -> None:
         """Operator e-stop: always available, from every phase (E3-S4)."""
@@ -1262,25 +1308,30 @@ class RoastController:
     async def operator_start_cooling(self) -> None:
         """Operator start-cooling — recovery action / post-drop fallback (D19, E9).
 
-        Matrix-validated (``START_COOLING`` is valid in ``cooling`` *or*
-        ``operator_recovery_required``) then executed. The two phases are not
-        symmetric: from ``cooling`` it is the post-drop fallback when the roaster
-        never reported ``cooling_on`` and does **not** transition (already
-        cooling); from ``operator_recovery_required`` it is the operator's
-        recovery resume into ``cooling`` and transitions. Hardware is never
-        written unless the resulting state is reachable (E4-S4 safety rule)."""
+        Matrix-validated (``START_COOLING`` is valid in ``cooling``,
+        ``operator_recovery_required`` *or* ``faulted``) then executed. The phases
+        are not symmetric: from ``cooling`` it is the post-drop fallback when the
+        roaster never reported ``cooling_on`` (no transition, already cooling);
+        from ``operator_recovery_required`` it is the operator's recovery resume
+        into ``cooling`` (transitions); from ``faulted`` (#206) it engages cooling
+        on a hot faulted machine **without a transition** (the run stays faulted,
+        heat off, until acknowledged). Hardware is never written unless the
+        resulting state is reachable (E4-S4 safety rule)."""
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.START_COOLING, phase=self._phase
         )
         await self._snapshots.persist_evaluation(phase_validity)
         if phase_validity.verdict is not SafetyVerdict.ALLOW:
             return
-        will_transition = self._phase is not RoastPhase.COOLING
+        # Transition only on the recovery-resume case. From `cooling` (post-drop
+        # fallback) and `faulted` (#206 safe-ing) the command issues with no phase
+        # change — a faulted run stays faulted until the operator acknowledges it.
+        will_transition = self._phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
         if will_transition and not self.can_transition(  # pragma: no cover — defensive
             RoastPhase.COOLING
         ):
-            # Unreachable given the matrix: the only non-cooling phase that
-            # reaches here is operator_recovery_required, whose recovery row
+            # Unreachable given the matrix: the only phase that sets
+            # will_transition is operator_recovery_required, whose recovery row
             # includes cooling. Mirrors operator_drop_beans' write-safety guard.
             raise InvalidTransitionError(self._phase, RoastPhase.COOLING)
         try:

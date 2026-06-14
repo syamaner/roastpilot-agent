@@ -91,12 +91,18 @@ COMMAND_PHASE_MATRIX: dict[RoastCommand, frozenset[RoastPhase]] = {
         {RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT}
     ),
     # start_cooling is recovery-only (plan §6) plus the controller's
-    # post-drop fallback when cooling_on is not observed (plan §3).
+    # post-drop fallback when cooling_on is not observed (plan §3). Also valid
+    # in `faulted`: a fault/e-stop can leave the machine hot, and the operator
+    # must be able to engage cooling on a faulted-but-physically-active roaster
+    # (#206). Cooling is never the hazard — moving air only aids cooling.
     RoastCommand.START_COOLING: frozenset(
-        {RoastPhase.COOLING, RoastPhase.OPERATOR_RECOVERY_REQUIRED}
+        {RoastPhase.COOLING, RoastPhase.OPERATOR_RECOVERY_REQUIRED, RoastPhase.FAULTED}
     ),
-    # The D16 canonical invalid example: stop_cooling during development.
-    RoastCommand.STOP_COOLING: frozenset({RoastPhase.COOLING}),
+    # The D16 canonical invalid example: stop_cooling during development. Valid in
+    # `faulted` (#206): an e-stop can engage cooling, and the operator must be able
+    # to stop it without power-cycling. This is the loss-of-control gap #206 fixes;
+    # `set_heat` is deliberately NOT extended to faulted (heat stays off).
+    RoastCommand.STOP_COOLING: frozenset({RoastPhase.COOLING, RoastPhase.FAULTED}),
     # Export is a file write, not roaster control: valid whenever a session
     # exists (faulted runs export for diagnosis).
     RoastCommand.EXPORT_ROAST_LOG: frozenset(
@@ -152,6 +158,10 @@ def enabled_operator_actions(phase: RoastPhase) -> list[OperatorAction]:
       ``operator_recovery_required`` — the only phase from which the controller's
       drain (``RoastRunner._dispatch_acknowledge``) acts on it; any other phase
       records a failed action.
+    * **``acknowledge_fault``** (#206): included iff ``phase`` is ``faulted`` — the
+      only phase from which the controller's drain acts on it (it finalises the
+      operable-faulted run). Mirrors ``acknowledge_recovery``; any other phase
+      records a failed action. No MCP write.
 
     No new safety rule: this is a projection of acceptance the controller already
     encodes, and every action is still re-validated by the controller before any
@@ -171,9 +181,12 @@ def enabled_operator_actions(phase: RoastPhase) -> list[OperatorAction]:
             # The controller never phase-gates the advisory toggles → every phase.
             enabled.append(action)
         elif (
+            # Each acknowledge action mirrors exactly one phase: acknowledge_recovery
+            # iff operator_recovery_required, acknowledge_fault iff faulted (#206) —
+            # the only phase from which the controller's drain acts on it.
             action is OperatorAction.ACKNOWLEDGE_RECOVERY
             and phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
-        ):
+        ) or (action is OperatorAction.ACKNOWLEDGE_FAULT and phase is RoastPhase.FAULTED):
             enabled.append(action)
     return enabled
 

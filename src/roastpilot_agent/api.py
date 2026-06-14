@@ -114,9 +114,9 @@ class RawStateSource(Protocol):
 #: phase-validity pre-check (E7-S2). Aliased to the canonical map in ``safety.py``
 #: (next to the matrix) so the queue pre-check and the ``enabled_actions``
 #: derivation share one source of truth. The control actions — ``pause_advisory``
-#: / ``resume_advisory`` / ``acknowledge_recovery`` — issue no MCP write and so
-#: have no matrix entry; they are accepted at the queue and validated by the
-#: controller on drain.
+#: / ``resume_advisory`` / ``acknowledge_recovery`` / ``acknowledge_fault`` (#206)
+#: — issue no MCP write and so have no matrix entry; they are accepted at the
+#: queue and validated by the controller on drain.
 _ACTION_COMMAND = OPERATOR_ACTION_COMMAND
 
 
@@ -432,6 +432,14 @@ class RoastRunner:
         self._raw_state = raw_state
         self._sleep = sleep
         self._finalized = False
+        # Whether the operator has acknowledged a fault (#206). A fault no longer
+        # auto-finalises: the run stays live (loop ticking, heat at 0) until
+        # acknowledge_fault flips this and _handle_completion finalises it.
+        self._fault_acknowledged = False
+        # The fault reason latched on FAULTED entry (#206). A fault finalises on a
+        # later tick (after ack), by which point the FAULT event was already flushed
+        # from the emitter buffer — so the reason must be captured before the flush.
+        self._captured_fault_reason: str | None = None
         self._last_persisted_phase: RoastPhase | None = None
         self._scheduler: TickScheduler | None = None
 
@@ -452,6 +460,28 @@ class RoastRunner:
         owns the rule; the runner only persists and surfaces it)."""
         self._controller.load_profile(profile)
         await self._controller.recover_from_restart(persisted_phase)
+        await self._flush_events()
+        await self._persist_phase_if_changed()
+
+    async def recover_faulted(self, profile: RoastProfile) -> None:
+        """Restart into the operable-faulted state for a persisted fault (#206).
+
+        A hard fault (or e-stop) before the restart must NOT offer
+        resume-into-roasting (the ``operator_recovery_required`` row permits it).
+        This re-enters ``faulted`` via
+        :meth:`RoastController.recover_into_faulted`: the loop stays alive, heat
+        and fan are NOT auto-resumed (``faulted`` is heat-off), emergency stop and
+        engage/stop-cooling remain available, and the run finalises only when the
+        operator acknowledges the fault. Issues no MCP write — same
+        restart-never-auto-resumes invariant as :meth:`recover`."""
+        self._controller.load_profile(profile)
+        await self._controller.recover_into_faulted(RoastPhase.FAULTED)
+        # Latch before flush — the FAULT event is about to be drained from the
+        # emitter buffer, and _captured_fault_reason must survive to finalisation
+        # (#206: the normal multi-tick path latches in _handle_completion, but
+        # that fires after the flush, so the recover path needs its own latch).
+        if self._captured_fault_reason is None:
+            self._captured_fault_reason = self._last_fault_reason()
         await self._flush_events()
         await self._persist_phase_if_changed()
 
@@ -593,6 +623,8 @@ class RoastRunner:
             controller.operator_resume_advisory()
         elif item.action is OperatorAction.ACKNOWLEDGE_RECOVERY:
             await self._dispatch_acknowledge(payload)
+        elif item.action is OperatorAction.ACKNOWLEDGE_FAULT:  # pragma: no cover — exhaustive chain
+            await self._dispatch_acknowledge_fault(payload)
         if tool is not None:
             await self._record_dispatch_command(tool, item, since=before)
 
@@ -603,17 +635,17 @@ class RoastRunner:
         phase records a failed operator action — never a guessed resume, and never
         a reset of a live run.
 
-        A terminal phase is *not* acknowledged here. After a fault the run is
-        finalized by :meth:`_handle_completion` (and the API 410-guards a
-        completed run), then the loop stops; the next roast builds a fresh
-        controller. Resetting a live faulted run to ``idle`` from the drain would
-        beat that finalization to the phase and leave an ``idle`` run with no
+        A terminal phase is *not* acknowledged here. Post-#206 a fault no longer
+        auto-finalises: the faulted run stays operable (loop alive, heat off) until
+        the operator acknowledges it via ``acknowledge_fault``
+        (:meth:`_dispatch_acknowledge_fault`). Resetting a live faulted run to
+        ``idle`` from the drain would leave an ``idle`` run with no
         ``completed_at`` — which ``active_run`` would treat as still active. So an
-        ack racing an e-stop in the same tick is recorded failed; the run faults
-        and completes. (Records two ``operator_actions`` rows for a control-only
-        action: the queue-acceptance row at submit, then this execution-outcome
-        row — the only meaningful outcome signal for an action with no matrix
-        pre-check.)"""
+        ``acknowledge_recovery`` racing an e-stop in the same tick is recorded
+        failed; the run becomes operable-faulted, not idle. (Records two
+        ``operator_actions`` rows for a control-only action: the queue-acceptance
+        row at submit, then this execution-outcome row — the only meaningful
+        outcome signal for an action with no matrix pre-check.)"""
         phase = self._controller.phase
         if phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED:
             target = _parse_resume_target(payload.get("resume_to"))
@@ -622,6 +654,34 @@ class RoastRunner:
                 return
         await self._store.record_operator_action(
             action=OperatorAction.ACKNOWLEDGE_RECOVERY.value,
+            result="failed",
+            run_id=self._run_id,
+            payload=payload or None,
+        )
+
+    async def _dispatch_acknowledge_fault(self, payload: dict[str, Any]) -> None:
+        """Phase-based ``acknowledge_fault`` (#206): from ``faulted`` it flips the
+        ``_fault_acknowledged`` flag so :meth:`_handle_completion` finalises the
+        run this tick (outcome ``faulted``) and the loop stops; it issues NO MCP
+        write (heat is already off in ``faulted`` and stays off). Any other phase
+        records a failed operator action — acknowledging a fault is meaningless
+        outside ``faulted``.
+
+        Records the execution-outcome ``operator_actions`` row (the queue-
+        acceptance row was already written at submit) so the trace carries the
+        only meaningful outcome signal for a control-only action with no matrix
+        pre-check, mirroring :meth:`_dispatch_acknowledge`."""
+        if self._controller.phase is RoastPhase.FAULTED:
+            self._fault_acknowledged = True
+            await self._store.record_operator_action(
+                action=OperatorAction.ACKNOWLEDGE_FAULT.value,
+                result="accepted",
+                run_id=self._run_id,
+                payload=payload or None,
+            )
+            return
+        await self._store.record_operator_action(
+            action=OperatorAction.ACKNOWLEDGE_FAULT.value,
             result="failed",
             run_id=self._run_id,
             payload=payload or None,
@@ -649,8 +709,31 @@ class RoastRunner:
         )
 
     async def _handle_completion(self) -> bool:
+        """Finalise the run on a terminal phase — but a fault no longer
+        auto-finalises (#206).
+
+        ``complete`` finalises immediately. ``faulted`` finalises ONLY after the
+        operator has acknowledged it (``self._fault_acknowledged``): until then
+        the faulted run stays live (the loop keeps ticking and draining the
+        queue, heat already forced to 0) so the operator can still engage or stop
+        cooling on a physically-running machine — a fault must never strand a hot
+        roaster with no software control surface (the #206 loss-of-control gap).
+
+        Returns:
+            ``True`` once the run is finalized (the loop should stop);
+            ``False`` while it must keep running (no terminal phase, or a faulted
+            run awaiting acknowledgement).
+        """
         phase = self._controller.phase
-        if phase not in (RoastPhase.COMPLETE, RoastPhase.FAULTED):
+        if phase is RoastPhase.FAULTED and self._captured_fault_reason is None:
+            # Latch the reason while the FAULT event is still in the emitter
+            # buffer — finalisation happens on a later (acknowledge) tick, after
+            # the flush has drained it (#206).
+            self._captured_fault_reason = self._last_fault_reason()
+        finalise = phase is RoastPhase.COMPLETE or (
+            phase is RoastPhase.FAULTED and self._fault_acknowledged
+        )
+        if not finalise:
             return False
         if self._finalized:
             return True
@@ -665,11 +748,14 @@ class RoastRunner:
                 export_manifest=None if manifest is None else manifest.model_dump(mode="json"),
             )
         else:
+            # The reason was latched when the run entered FAULTED (the FAULT
+            # event is no longer in the buffer at this later finalise tick, #206);
+            # fall back to a live read for a same-tick fault+ack edge case.
             await self._store.complete_run(
                 run_id=self._run_id,
                 outcome="faulted",
                 agent_phase=phase,
-                fault_reason=self._last_fault_reason(),
+                fault_reason=self._captured_fault_reason or self._last_fault_reason(),
             )
         self._last_persisted_phase = phase
         return True
@@ -989,29 +1075,43 @@ class RoastService:
 
     async def recover_on_start(self) -> None:
         """Restart recovery (orchestration plan § Persistence; architecture
-        invariant): a possibly-active persisted run enters
-        ``operator_recovery_required`` — heat and fan are never auto-resumed and
-        no MCP write is issued. A terminal or idle run needs no recovery. Call
-        once at agent startup before serving; a no-op in API-only mode.
+        invariant): a possibly-active persisted run is brought back without ever
+        auto-resuming heat or fan and without issuing any MCP write. A terminal
+        or idle run needs no recovery. Call once at agent startup before serving;
+        a no-op in API-only mode.
 
-        Explicit operator action (resume/drop/cool/end) is then required, and
-        emergency stop stays available from recovery."""
+        Two non-terminal restart cases, fail-closed both ways:
+
+        * **A persisted ``faulted`` run (#206)** re-enters the *operable-faulted*
+          state via :meth:`RoastRunner.recover_faulted` — NOT
+          ``operator_recovery_required``. A hard fault (or e-stop) must never
+          offer resume-into-roasting (which the recovery transition row permits),
+          because that would re-apply heat into an aborted run (operator decision,
+          14 Jun). The loop stays alive, heat is off, and the operator may still
+          engage/stop cooling or e-stop, then acknowledge the fault to finalise it.
+        * **An active-roast phase** (preheating / pre-FC / development / cooling)
+          enters ``operator_recovery_required`` via :meth:`RoastRunner.recover`,
+          where explicit operator action (resume/drop/cool/end) is required and
+          emergency stop stays available.
+        """
         if self._roaster is None:
             return
         persisted = await self._store.read_latest_run()
         if persisted is None or persisted.completed_at_utc is not None:
             return  # fresh database, or a terminal run — nothing possibly active
-        # FAULTED is deliberately NOT excluded here: a properly-finalized fault has
-        # completed_at set and was caught above, but a FAULTED run with no
-        # completed_at (agent crashed mid fault-handling) must still enter recovery
-        # so the operator can end it — hardware is already off, so this is safe.
         if persisted.agent_phase in (RoastPhase.IDLE, RoastPhase.COMPLETE):
             return
         runner = self._build_runner(persisted.run_id)
         if runner is None:  # pragma: no cover — guarded above
             return
         self.active_run_id = persisted.run_id
-        await runner.recover(persisted.profile, persisted.agent_phase)
+        if persisted.agent_phase is RoastPhase.FAULTED:
+            # Fail-closed: a persisted hard fault with no completed_at (the now
+            # common case — a fault no longer auto-finalises, #206) re-enters the
+            # operable-faulted state, never resume-into-roast recovery.
+            await runner.recover_faulted(persisted.profile)
+        else:
+            await runner.recover(persisted.profile, persisted.agent_phase)
         if self._run_loop:
             self._loop_task = asyncio.create_task(runner.run())
 
@@ -1209,8 +1309,15 @@ class RoastService:
         held). 404s an unknown run id.
 
         Control actions with no MCP write (``pause_advisory`` /
-        ``resume_advisory`` / ``acknowledge_recovery``) skip the matrix check
-        and are accepted for the controller to interpret on drain.
+        ``resume_advisory`` / ``acknowledge_recovery`` / ``acknowledge_fault``)
+        skip the matrix check and are accepted for the controller to interpret on
+        drain.
+
+        A faulted-but-unacknowledged run (#206) is NOT terminal here — its
+        ``completed_at_utc`` is null until the operator acknowledges it — so it is
+        NOT 410'd and correctly accepts ``stop_cooling`` / ``start_cooling`` /
+        ``emergency_stop`` / ``acknowledge_fault`` so a fault never strands a
+        physically-running machine.
         """
         detail = await self._store.read_run(run_id)
         if detail is None:

@@ -89,6 +89,29 @@ describe("OperatorActionBar", () => {
     expect(screen.getByTestId("action-pause_advisory")).toHaveAttribute("data-enabled", "true");
   });
 
+  it("surfaces START/STOP COOLING + EMERGENCY STOP while faulted (#206)", () => {
+    // Post-#206 a faulted run stays operable: the server's enabledActions include
+    // the cooling controls (matrix-derived), so the operator can cool a still-
+    // running machine without a power cycle. The bar mirrors the server set — no
+    // client matrix decides this. Heat-bearing actions (drop) stay disabled.
+    const onAction = vi.fn();
+    render(
+      <OperatorActionBar
+        enabledActions={["start_cooling", "stop_cooling", "emergency_stop"]}
+        phase="faulted"
+        onAction={onAction}
+      />,
+    );
+    expect(screen.getByTestId("action-start_cooling")).toHaveAttribute("data-enabled", "true");
+    expect(screen.getByTestId("action-stop_cooling")).toHaveAttribute("data-enabled", "true");
+    expect(screen.getByTestId("action-emergency_stop")).toBeEnabled();
+    // Not in the server set → disabled (mirrors server, never re-derived).
+    expect(screen.getByTestId("action-drop_beans")).toHaveAttribute("data-enabled", "false");
+    // The cooling controls dispatch through the same typed path.
+    fireEvent.click(screen.getByTestId("action-stop_cooling"));
+    expect(onAction).toHaveBeenCalledWith("stop_cooling");
+  });
+
   it("surfaces the server's typed reason on a rejected result", () => {
     render(
       <OperatorActionBar
