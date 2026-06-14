@@ -14,18 +14,29 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .models import RoastPhase
 
-# Phase-keyed advisor consult floors (#171, operator 13 Jun): the minimum
-# seconds between *automatic* advisor consults, scaling with roast criticality.
-# Change-based triggers (temp/RoR delta, phase change, manual) still fire
-# sooner — these are floors, not the only cause to consult.
-#   - preheating: 30 s (low criticality, machine warming, no beans)
-#   - roasting pre-first-crack (beans charged): 10 s
-#   - development (first crack onward): 0 = unthrottled — consult again as
-#     soon as the previous call returns; the practical floor is advisor
-#     latency (~5–7 s, serial), not this value.
-DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float] = {
-    RoastPhase.PREHEATING: 30.0,
-    RoastPhase.ROASTING_PRE_FIRST_CRACK: 10.0,
+# Phase-keyed advisor consult floors — advisor cadence scales with first-crack
+# proximity (D32 / #191, refining #171). The advisor is consulted where it adds
+# optimization judgment, which ramps toward FC:
+#   - preheating: OFF — preheat is NOT an automatic-advice phase (see
+#     ``_AUTO_ADVICE_PHASES`` in controller.py). Reaching the charge band is a
+#     deterministic ramp; charge is an operator action; charge-guidance is
+#     already emitted. (Also removes the #134 preheat error-spam surface.) A
+#     manual operator request still works — it bypasses phase scoping.
+#   - roasting pre-first-crack (beans charged → FC): NO fixed heartbeat
+#     (``inf`` floor) — change-based triggers (temp/RoR delta) only, PLUS the
+#     near-FC boost below so the anticipatory cut isn't missed if RoR flattens.
+#   - development (first crack onward): 0 = unthrottled — consult again as soon
+#     as the previous call returns; the practical floor is advisor latency.
+# Change-based triggers (temp/RoR delta, phase change, manual) still fire sooner.
+#
+# ``None`` (not ``math.inf``) encodes "no heartbeat floor": this map is frozen
+# into the run config via ``model_dump(mode="json")`` + ``json.dumps``, and a
+# float ``inf`` serializes to a bare ``Infinity`` token that is invalid JSON
+# (SQLite ``json_valid`` and strict/JS readers reject it). ``None`` round-trips
+# as ``null``; the disabled-heartbeat behavior lives in ``advisory_interval_for``
+# + the controller (PR #201 / Codex).
+DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float | None] = {
+    RoastPhase.ROASTING_PRE_FIRST_CRACK: None,
     RoastPhase.DEVELOPMENT: 0.0,
 }
 
@@ -68,20 +79,33 @@ class ControllerConfig(BaseModel):
     tick_interval_seconds: float = Field(default=1.0, gt=0)
     advisory_min_temp_delta_c: float = Field(default=1.0, gt=0)
     advisory_min_ror_delta_c_per_min: float = Field(default=2.0, gt=0)
-    # Phase-keyed consult floors (#171): seconds between automatic consults,
-    # by agent phase. A phase absent from the map (or mapped to 0) is
-    # unthrottled — the heartbeat never gates it; change-based triggers and
-    # the advisor's own latency are the only limiter. Defaults: preheat 30 s,
-    # charged/pre-FC 10 s, development (FC onward) 0 = unthrottled. Values are
-    # ``ge=0`` (0 = unthrottled; a negative floor would be meaningless).
+    # Phase-keyed consult floors (D32 / #191, refining #171): seconds between
+    # automatic consults, by agent phase. Defaults: preheat OFF (absent from
+    # the map — not an automatic-advice phase), pre-first-crack ``None`` (no
+    # fixed heartbeat — change-based + near-FC boost only), development 0.0 =
+    # unthrottled. A phase absent from the map returns 0.0 (unthrottled). A
+    # mapped ``None`` disables the MIN_INTERVAL heartbeat for that phase entirely
+    # (distinct from 0: ``None`` → skip the check; 0 → check fires every tick).
+    # Values are ``ge=0`` or ``None`` (a negative floor would be meaningless).
     #
-    # NOTE (#171): this replaced the prior scalar ``float`` (15 s). An env var
-    # of the old shape — ``ROASTPILOT_CONTROLLER__ADVISORY_MIN_INTERVAL_SECONDS=15``
-    # — no longer coerces; supply per-phase values keyed by ``RoastPhase``
-    # value (e.g. ``{"preheating": 30, "roasting_pre_first_crack": 10}``).
-    advisory_min_interval_seconds: dict[RoastPhase, Annotated[float, Field(ge=0)]] = Field(
+    # NOTE (#171 → D32): replaced the prior scalar ``float`` (15 s). An env var
+    # of the old scalar shape no longer coerces; supply per-phase values keyed
+    # by ``RoastPhase`` value
+    # (e.g. ``{"roasting_pre_first_crack": null, "development": 0}``).
+    advisory_min_interval_seconds: dict[RoastPhase, Annotated[float, Field(ge=0)] | None] = Field(
         default_factory=lambda: dict(DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS)
     )
+    # Near-FC cadence boost (D32 / #191): the Maillard-approach is the advisor's
+    # highest-value window (the anticipatory heat cut that must precede FC, where
+    # thermal + ~12–21 s detector lag compound). Since pre-first-crack has no
+    # fixed heartbeat (change-based only), guarantee a heartbeat once the bean is
+    # near the FC band so the pre-emptive cut isn't missed if RoR flattens into
+    # the crack. ``advisory_near_fc_bean_temp_c`` is the approach threshold
+    # (default 170 °C — within a few °C of the operator's empirical ~178 °C FC on
+    # this probe; roaster/probe-specific, hence tunable); above it, in
+    # pre-first-crack, the consult floor becomes ``advisory_near_fc_interval_seconds``.
+    advisory_near_fc_bean_temp_c: float = Field(default=170.0, gt=0)
+    advisory_near_fc_interval_seconds: float = Field(default=10.0, gt=0)
     advisory_timeout_seconds: float = Field(default=10.0, gt=0)
     t0_debounce_ticks: int = Field(default=3, ge=1)
     telemetry_log_interval_seconds: float = Field(default=5.0, gt=0)
@@ -93,7 +117,7 @@ class ControllerConfig(BaseModel):
     # operator a realistic window to return before the system complains.
     operator_timeout_seconds: float = Field(default=600.0, gt=0)
 
-    def advisory_interval_for(self, phase: RoastPhase) -> float:
+    def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.
 
         Looks the phase up in :attr:`advisory_min_interval_seconds`. A phase
@@ -101,13 +125,16 @@ class ControllerConfig(BaseModel):
         gates the heartbeat (``MIN_INTERVAL`` fires on every eligible tick),
         so the advisor is consulted as soon as the previous serial call
         returns, bounded only by advisor latency. This is the intended
-        behavior for first-crack / development (#171).
+        behavior for first-crack / development (#171). A mapped ``None`` means
+        NO fixed heartbeat — ``MIN_INTERVAL`` never fires for that phase, which
+        is left to its change-based / near-FC triggers (D32: pre-first-crack).
 
         Args:
             phase: The agent phase the controller is currently in.
 
         Returns:
-            The consult floor in seconds; ``0.0`` means unthrottled.
+            The consult floor in seconds; ``0.0`` means unthrottled, ``None``
+            means no fixed heartbeat (the controller skips ``MIN_INTERVAL``).
         """
         return self.advisory_min_interval_seconds.get(phase, 0.0)
 
