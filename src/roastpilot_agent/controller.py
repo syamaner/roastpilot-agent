@@ -298,8 +298,9 @@ class AdvisoryCallPolicy:
     a bean-temp move of ``advisory_min_temp_delta_c``, a RoR move of
     ``advisory_min_ror_delta_c_per_min`` — plus, by phase:
     **preheat → OFF** (not an automatic-advice phase); **pre-first-crack → no
-    fixed heartbeat** (``advisory_min_interval_seconds`` is ``inf`` — change-based
-    only) **plus a near-FC boost** (a short heartbeat once bean temp reaches
+    fixed heartbeat** (``advisory_min_interval_seconds`` mapped to ``None`` —
+    change-based only) **plus a near-FC boost** (a short heartbeat once bean temp
+    reaches
     ``advisory_near_fc_bean_temp_c``, so the anticipatory cut isn't missed if RoR
     flattens); **development → unthrottled** (floor 0). The interval is a floor
     only — the change-based triggers fire sooner. A manual operator request

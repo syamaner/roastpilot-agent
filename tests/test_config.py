@@ -173,6 +173,9 @@ def test_safety_limit_defaults_are_conservative() -> None:
         (ControllerConfig, {"max_stale_telemetry_seconds": 0}),
         # #171: a negative phase consult floor is meaningless (0 = unthrottled).
         (ControllerConfig, {"advisory_min_interval_seconds": {RoastPhase.PREHEATING: -1.0}}),
+        # D32 (#191): near-FC threshold and interval must be positive.
+        (ControllerConfig, {"advisory_near_fc_bean_temp_c": 0}),
+        (ControllerConfig, {"advisory_near_fc_interval_seconds": 0}),
         (AdvisorConfig, {"timeout_seconds": 0}),
         (AdvisorConfig, {"temperature": -0.1}),
         (AdvisorConfig, {"temperature": 2.1}),

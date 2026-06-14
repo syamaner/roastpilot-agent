@@ -820,8 +820,9 @@ async def test_failed_emergency_stop_still_faults() -> None:
 
 def _policy() -> AdvisoryCallPolicy:
     """A policy with the default ControllerConfig thresholds (temp 1.0 °C,
-    RoR 2.0 °C/min, phase-keyed floors: preheat 30 s / pre-FC 10 s /
-    development 0 = unthrottled, #171)."""
+    RoR 2.0 °C/min, phase-keyed floors: preheat OFF / pre-FC None (no fixed
+    heartbeat) / development 0 = unthrottled, near-FC boost at 170 °C / 10 s,
+    D32 #191)."""
     return AdvisoryCallPolicy(ControllerConfig())
 
 
@@ -1037,8 +1038,9 @@ def test_policy_no_automatic_call_outside_advice_phases(phase: RoastPhase) -> No
 
 def test_policy_baseline_advances_on_each_call() -> None:
     """Deltas measure from the last call, not the start: after a call at
-    201 °C, a further +0.5 °C is below threshold again. Uses a throttled
-    phase (10 s floor) so the below-threshold tick is silent under #171."""
+    201 °C, a further +0.5 °C is below threshold again. Pre-first-crack has
+    no MIN_INTERVAL floor (None); the near-FC boost (10 s) has not elapsed
+    (only 1 s since the last call), so the sub-threshold tick is silent."""
     policy = _policy()
     policy.note_call(
         phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=reading(bean=200.0), now=0.0

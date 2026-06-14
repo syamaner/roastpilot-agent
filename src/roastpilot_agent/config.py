@@ -79,17 +79,19 @@ class ControllerConfig(BaseModel):
     tick_interval_seconds: float = Field(default=1.0, gt=0)
     advisory_min_temp_delta_c: float = Field(default=1.0, gt=0)
     advisory_min_ror_delta_c_per_min: float = Field(default=2.0, gt=0)
-    # Phase-keyed consult floors (#171): seconds between automatic consults,
-    # by agent phase. A phase absent from the map (or mapped to 0) is
-    # unthrottled — the heartbeat never gates it; change-based triggers and
-    # the advisor's own latency are the only limiter. Defaults: preheat 30 s,
-    # charged/pre-FC 10 s, development (FC onward) 0 = unthrottled. Values are
-    # ``ge=0`` (0 = unthrottled; a negative floor would be meaningless).
+    # Phase-keyed consult floors (D32 / #191, refining #171): seconds between
+    # automatic consults, by agent phase. Defaults: preheat OFF (absent from
+    # the map — not an automatic-advice phase), pre-first-crack ``None`` (no
+    # fixed heartbeat — change-based + near-FC boost only), development 0.0 =
+    # unthrottled. A phase absent from the map returns 0.0 (unthrottled). A
+    # mapped ``None`` disables the MIN_INTERVAL heartbeat for that phase entirely
+    # (distinct from 0: ``None`` → skip the check; 0 → check fires every tick).
+    # Values are ``ge=0`` or ``None`` (a negative floor would be meaningless).
     #
-    # NOTE (#171): this replaced the prior scalar ``float`` (15 s). An env var
-    # of the old shape — ``ROASTPILOT_CONTROLLER__ADVISORY_MIN_INTERVAL_SECONDS=15``
-    # — no longer coerces; supply per-phase values keyed by ``RoastPhase``
-    # value (e.g. ``{"preheating": 30, "roasting_pre_first_crack": 10}``).
+    # NOTE (#171 → D32): replaced the prior scalar ``float`` (15 s). An env var
+    # of the old scalar shape no longer coerces; supply per-phase values keyed
+    # by ``RoastPhase`` value
+    # (e.g. ``{"roasting_pre_first_crack": null, "development": 0}``).
     advisory_min_interval_seconds: dict[RoastPhase, Annotated[float, Field(ge=0)] | None] = Field(
         default_factory=lambda: dict(DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS)
     )
