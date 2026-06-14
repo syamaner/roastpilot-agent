@@ -52,3 +52,4 @@ web/dist/
 
 # Derived Artisan bake-off fixtures (personal roast logs — not committed, AGENTS.md)
 .artisan-fixtures/
+.artisan-holdout/
