@@ -1230,6 +1230,65 @@ def test_policy_post_charge_settle_does_not_apply_in_development() -> None:
     assert trigger is AdvisoryTrigger.PHASE_CHANGE
 
 
+def test_policy_post_charge_settle_no_telemetry_tick_does_not_release() -> None:
+    """#213 (augmentcode): the settle window must never release on a
+    no-telemetry tick. A tolerated read-fail tick that the safety layer lets
+    through reaches the gate with telemetry=None; releasing there would fall to
+    PHASE_CHANGE, whose _run_advisory emits a no_telemetry skip while note_call
+    still advances the baseline — consuming the first real post-charge consult.
+    So even past the fallback timeout, a None-telemetry tick stays suppressed;
+    release happens only on the next tick that carries a real reading."""
+    policy = _policy()
+    policy.note_charge(now=0.0)
+    # Past the 90 s timeout, but no reading this tick: still suppressed.
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=None,
+            now=91.0,
+            manual_request=False,
+        )
+        is None
+    )
+    # The next tick carries a reading: the timeout releases it (PHASE_CHANGE),
+    # so the no-telemetry tick merely deferred release rather than consuming it.
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=120.0, bean_ror_c_per_min=-80.0),
+        now=92.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
+def test_policy_post_charge_settle_rearms_on_second_charge() -> None:
+    """#213 (claude): ``note_charge`` re-arms the latch. After a first roast
+    releases on its turning point, a second charge resets ``_settle_released``
+    to False, so the crashing post-charge bean of the new roast is suppressed
+    again — the gate is not a one-shot for the policy's lifetime."""
+    policy = _policy()
+    policy.note_charge(now=0.0)
+    # First roast: release on the turning point.
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
+            now=5.0,
+            manual_request=False,
+        )
+        is AdvisoryTrigger.PHASE_CHANGE
+    )
+    # Second charge re-arms the window.
+    policy.note_charge(now=100.0)
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=160.0, bean_ror_c_per_min=-80.0),
+        now=101.0,
+        manual_request=False,
+    )
+    assert trigger is None
+
+
 @pytest.mark.asyncio
 async def test_automatic_advisory_fires_without_manual_request() -> None:
     """Integration: entering development consults the advisor automatically
@@ -1575,6 +1634,41 @@ async def test_resume_requires_recovery_and_never_writes_heat() -> None:
     # And resume is gated: not callable outside recovery.
     with pytest.raises(InvalidTransitionError):
         harness.controller.operator_resume(RoastPhase.COOLING)
+
+
+@pytest.mark.asyncio
+async def test_resume_into_pre_first_crack_rearms_post_charge_settle() -> None:
+    """#213 (Codex): a restart can land mid-crash, and a recovery resume into
+    pre-first-crack transitions WITHOUT a fresh T0/note_charge — so the settle
+    gate would be inert and the first resumed consult could fire PHASE_CHANGE on
+    the still-crashing bean (re-exposing #209). The resume re-arms the policy's
+    settle window referenced to the resume instant: a crashing bean (RoR < 0) is
+    suppressed, a turned bean (RoR >= 0) releases at once."""
+    harness = make_harness(readings=[reading()])
+    await harness.controller.recover_from_restart(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    now = harness.clock.now
+    policy = harness.controller._advisory_policy  # pyright: ignore[reportPrivateUsage]
+    # Still crashing at the resume instant: suppressed (no first-consult flood).
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=reading(bean=140.0, bean_ror_c_per_min=-40.0),
+            now=now + 1.0,
+            manual_request=False,
+        )
+        is None
+    )
+    # Already turned (e.g. the restart landed after the turning point): releases.
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=150.0, bean_ror_c_per_min=3.0),
+        now=now + 2.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.PHASE_CHANGE
 
 
 @pytest.mark.asyncio

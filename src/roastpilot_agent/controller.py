@@ -360,9 +360,16 @@ class AdvisoryCallPolicy:
             and self._charge_monotonic is not None
             and not self._settle_released
         ):
+            # Only judge the turning point / release on a tick with a real
+            # reading: a no-telemetry tick would produce a no_telemetry skip in
+            # _run_advisory that still advances note_call's baseline, consuming
+            # the first real post-charge consult (augmentcode review, #213).
+            # Persistent missing telemetry is the safety layer's concern (it
+            # faults), not this gate's.
+            if telemetry is None:
+                return None
             turned = (
-                telemetry is not None
-                and telemetry.bean_ror_c_per_min is not None
+                telemetry.bean_ror_c_per_min is not None
                 and telemetry.bean_ror_c_per_min
                 >= self._config.advisory_post_charge_turning_point_ror_c_per_min
             )
@@ -618,6 +625,10 @@ class RoastController:
             # A new run/preheat is "back before charge": clear the charge clock
             # so ``seconds_since_charge`` is None and the settle window is
             # re-armed (#209). It is restamped at the debounced T0 transition.
+            # The ``_advisory_policy`` needs no corresponding reset here: its
+            # ``_settle_released`` (left True by a prior roast's release) makes
+            # the gate harmlessly inert until ``note_charge`` re-arms it on the
+            # next T0 or recovery-resume (claude review, #213).
             self._charge_monotonic = None
         if previous is RoastPhase.ROASTING_PRE_FIRST_CRACK and target is RoastPhase.DEVELOPMENT:
             # Arm the development clock only on the true first-crack edge — both
@@ -1250,6 +1261,15 @@ class RoastController:
         # single failure.
         self._consecutive_advisor_failures = 0
         self.transition_to(target)  # table gates targets; starting is never legal
+        if target is RoastPhase.ROASTING_PRE_FIRST_CRACK:
+            # Re-arm the post-charge settle window on a resume into early
+            # roasting (#209, Codex review #213): a restart can land mid-crash,
+            # and resume transitions without a fresh T0/note_charge, so the gate
+            # would otherwise be inert and the first resumed consult could see
+            # the same negative-RoR charge crash. Reference the settle to the
+            # resume instant — RoR-driven release means it suppresses only while
+            # the bean is still crashing and releases at once if already turned.
+            self._advisory_policy.note_charge(now=self._clock())
         self._events.emit(RoastEventKind.RECOVERY_ACKNOWLEDGED, {"resumed_to": target.value})
 
     def operator_acknowledge_fault(self) -> None:
