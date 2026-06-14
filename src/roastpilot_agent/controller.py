@@ -382,11 +382,12 @@ class AdvisoryCallPolicy:
         # phase so it follows the roast forward: development 0 = unthrottled (a
         # 0 floor fires every eligible tick once the prior serial call returns,
         # so FC/development consults run back-to-back at advisor latency);
-        # pre-first-crack ``inf`` = NO fixed heartbeat (change-based + the near-FC
+        # pre-first-crack ``None`` = NO fixed heartbeat (change-based + the near-FC
         # boost above are its only automatic triggers); preheat is not an
         # automatic-advice phase at all. The change-based triggers above still
         # short-circuit sooner in any phase.
-        if now - self._last_call_monotonic >= self._config.advisory_interval_for(phase):
+        floor = self._config.advisory_interval_for(phase)
+        if floor is not None and now - self._last_call_monotonic >= floor:
             return AdvisoryTrigger.MIN_INTERVAL
         return None
 

@@ -7,7 +7,6 @@ deliberately conservative software ceilings pending supervised hardware
 validation at E12 (E12-S1).
 """
 
-import math
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
@@ -29,8 +28,15 @@ from .models import RoastPhase
 #   - development (first crack onward): 0 = unthrottled — consult again as soon
 #     as the previous call returns; the practical floor is advisor latency.
 # Change-based triggers (temp/RoR delta, phase change, manual) still fire sooner.
-DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float] = {
-    RoastPhase.ROASTING_PRE_FIRST_CRACK: math.inf,
+#
+# ``None`` (not ``math.inf``) encodes "no heartbeat floor": this map is frozen
+# into the run config via ``model_dump(mode="json")`` + ``json.dumps``, and a
+# float ``inf`` serializes to a bare ``Infinity`` token that is invalid JSON
+# (SQLite ``json_valid`` and strict/JS readers reject it). ``None`` round-trips
+# as ``null``; the disabled-heartbeat behavior lives in ``advisory_interval_for``
+# + the controller (PR #201 / Codex).
+DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float | None] = {
+    RoastPhase.ROASTING_PRE_FIRST_CRACK: None,
     RoastPhase.DEVELOPMENT: 0.0,
 }
 
@@ -84,7 +90,7 @@ class ControllerConfig(BaseModel):
     # of the old shape — ``ROASTPILOT_CONTROLLER__ADVISORY_MIN_INTERVAL_SECONDS=15``
     # — no longer coerces; supply per-phase values keyed by ``RoastPhase``
     # value (e.g. ``{"preheating": 30, "roasting_pre_first_crack": 10}``).
-    advisory_min_interval_seconds: dict[RoastPhase, Annotated[float, Field(ge=0)]] = Field(
+    advisory_min_interval_seconds: dict[RoastPhase, Annotated[float, Field(ge=0)] | None] = Field(
         default_factory=lambda: dict(DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS)
     )
     # Near-FC cadence boost (D32 / #191): the Maillard-approach is the advisor's
@@ -109,7 +115,7 @@ class ControllerConfig(BaseModel):
     # operator a realistic window to return before the system complains.
     operator_timeout_seconds: float = Field(default=600.0, gt=0)
 
-    def advisory_interval_for(self, phase: RoastPhase) -> float:
+    def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.
 
         Looks the phase up in :attr:`advisory_min_interval_seconds`. A phase
@@ -117,13 +123,16 @@ class ControllerConfig(BaseModel):
         gates the heartbeat (``MIN_INTERVAL`` fires on every eligible tick),
         so the advisor is consulted as soon as the previous serial call
         returns, bounded only by advisor latency. This is the intended
-        behavior for first-crack / development (#171).
+        behavior for first-crack / development (#171). A mapped ``None`` means
+        NO fixed heartbeat — ``MIN_INTERVAL`` never fires for that phase, which
+        is left to its change-based / near-FC triggers (D32: pre-first-crack).
 
         Args:
             phase: The agent phase the controller is currently in.
 
         Returns:
-            The consult floor in seconds; ``0.0`` means unthrottled.
+            The consult floor in seconds; ``0.0`` means unthrottled, ``None``
+            means no fixed heartbeat (the controller skips ``MIN_INTERVAL``).
         """
         return self.advisory_min_interval_seconds.get(phase, 0.0)
 
