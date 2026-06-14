@@ -1083,6 +1083,240 @@ def test_policy_manual_consult_with_no_telemetry_keeps_delta_baseline() -> None:
     assert trigger is AdvisoryTrigger.BEAN_TEMP_DELTA
 
 
+# --- #209: post-charge SETTLE window (AdvisoryCallPolicy) ---
+
+
+def test_policy_post_charge_settle_suppresses_first_consult_on_crash() -> None:
+    """Regression (#209): the consult that previously floored heat. Right after
+    charge, the post-charge bean is still crashing (bean RoR << 0). The settle
+    window suppresses the first automatic PHASE_CHANGE consult so the advisor
+    never sees, and misreads, the not-yet-turned bean."""
+    policy = _policy()
+    policy.note_charge(now=0.0)
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=160.0, bean_ror_c_per_min=-80.0),
+        now=1.0,
+        manual_request=False,
+    )
+    assert trigger is None
+
+
+def test_policy_post_charge_settle_releases_on_turning_point() -> None:
+    """Once the bean turns (bean RoR >= the turning-point threshold, default 0),
+    the settle window releases and the first real consult fires as a
+    PHASE_CHANGE on the settled, turned bean."""
+    policy = _policy()
+    policy.note_charge(now=0.0)
+    # Still crashing: suppressed.
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=reading(bean=160.0, bean_ror_c_per_min=-80.0),
+            now=1.0,
+            manual_request=False,
+        )
+        is None
+    )
+    # Turned (RoR crossed zero): released, first real consult.
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
+        now=5.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
+def test_policy_post_charge_settle_releases_on_timeout() -> None:
+    """The fallback timeout bounds suppression: a stuck/negative RoR that never
+    crosses the turning point cannot suppress automatic advice forever — past
+    ``advisory_post_charge_settle_max_seconds`` (90 s) the window releases."""
+    policy = _policy()
+    policy.note_charge(now=0.0)
+    # Bean RoR stays deeply negative throughout: only the timeout can release.
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=reading(bean=120.0, bean_ror_c_per_min=-80.0),
+            now=45.0,
+            manual_request=False,
+        )
+        is None
+    )
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=120.0, bean_ror_c_per_min=-80.0),
+        now=91.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
+def test_policy_post_charge_settle_release_preserves_first_consult_after_no_telemetry_skip() -> (
+    None
+):
+    """#213 (Codex P2): a MANUAL request during the settle window on a
+    no-telemetry tick bypasses the gate and lands in _run_advisory as a
+    no_telemetry skip; _maybe_run_advisory then calls note_call(telemetry=None),
+    which advances _last_phase to pre-first-crack WITHOUT setting the temp/RoR
+    delta baselines. Pre-first-crack has no MIN_INTERVAL floor, so if the settle
+    release merely fell through it would find phase==_last_phase, no delta
+    baseline, and return None — starving the advisor for the whole drying phase.
+    The release must itself fire the first consult as a PHASE_CHANGE."""
+    policy = _policy()
+    policy.note_charge(now=0.0)
+    # A manual no-telemetry consult mid-window advances _last_phase but leaves
+    # the delta baselines unset (the exact note_call the controller makes after
+    # a no_telemetry skip).
+    policy.note_call(phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=None, now=1.0)
+    # The bean turns on a real reading: the release IS the first real consult,
+    # preserved as PHASE_CHANGE rather than swallowed to None by the fallthrough.
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
+        now=5.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
+def test_policy_post_charge_settle_latches_released() -> None:
+    """The release is a one-way latch (#209): once the bean has turned, a later
+    RoR dip back below the turning point must NOT re-suppress. After release the
+    policy behaves per its normal cadence — here the change-based RoR delta
+    fires; crucially it is not None-by-settle."""
+    policy = _policy()
+    policy.note_charge(now=0.0)
+    # Release on the turning point, recording the call so the baselines advance.
+    released = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
+        now=5.0,
+        manual_request=False,
+    )
+    assert released is AdvisoryTrigger.PHASE_CHANGE
+    policy.note_call(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
+        now=5.0,
+    )
+    # RoR dips back well below the turning point (a normal post-turn wobble),
+    # bean temp held flat so the bean-temp delta cannot fire — the >= 2 °C/min
+    # RoR move is the only live trigger. The settle gate is latched released, so
+    # the result is that real trigger, unambiguously NOT a settle-suppressed None.
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=95.0, bean_ror_c_per_min=-30.0),
+        now=8.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.ROR_DELTA
+
+
+def test_policy_manual_wins_during_post_charge_settle() -> None:
+    """A manual operator request bypasses the settle gate (it is evaluated
+    before phase scoping and the settle window): the operator always gets a
+    response even on the crashing post-charge bean (#209)."""
+    policy = _policy()
+    policy.note_charge(now=0.0)
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=160.0, bean_ror_c_per_min=-80.0),
+        now=1.0,
+        manual_request=True,
+    )
+    assert trigger is AdvisoryTrigger.MANUAL
+
+
+def test_policy_post_charge_settle_inert_without_note_charge() -> None:
+    """Back-compat (#209): the settle gate is inert until ``note_charge`` is
+    called. Without it, ``_charge_monotonic`` is None and the first pre-FC
+    consult is the unchanged PHASE_CHANGE — even on a crashing bean."""
+    policy = _policy()
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=160.0, bean_ror_c_per_min=-80.0),
+        now=1.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
+def test_policy_post_charge_settle_does_not_apply_in_development() -> None:
+    """The settle gate is scoped to ROASTING_PRE_FIRST_CRACK only (#209). A
+    development-phase consult after ``note_charge`` is not suppressed — it fires
+    its normal PHASE_CHANGE even with a momentarily negative RoR."""
+    policy = _policy()
+    policy.note_charge(now=0.0)
+    trigger = policy.evaluate(
+        phase=RoastPhase.DEVELOPMENT,
+        telemetry=reading(bean=200.0, bean_ror_c_per_min=-30.0),
+        now=1.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
+def test_policy_post_charge_settle_no_telemetry_tick_does_not_release() -> None:
+    """#213 (augmentcode): the settle window must never release on a
+    no-telemetry tick. A tolerated read-fail tick that the safety layer lets
+    through reaches the gate with telemetry=None; releasing there would fall to
+    PHASE_CHANGE, whose _run_advisory emits a no_telemetry skip while note_call
+    still advances the baseline — consuming the first real post-charge consult.
+    So even past the fallback timeout, a None-telemetry tick stays suppressed;
+    release happens only on the next tick that carries a real reading."""
+    policy = _policy()
+    policy.note_charge(now=0.0)
+    # Past the 90 s timeout, but no reading this tick: still suppressed.
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=None,
+            now=91.0,
+            manual_request=False,
+        )
+        is None
+    )
+    # The next tick carries a reading: the timeout releases it (PHASE_CHANGE),
+    # so the no-telemetry tick merely deferred release rather than consuming it.
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=120.0, bean_ror_c_per_min=-80.0),
+        now=92.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
+def test_policy_post_charge_settle_rearms_on_second_charge() -> None:
+    """#213 (claude): ``note_charge`` re-arms the latch. After a first roast
+    releases on its turning point, a second charge resets ``_settle_released``
+    to False, so the crashing post-charge bean of the new roast is suppressed
+    again — the gate is not a one-shot for the policy's lifetime."""
+    policy = _policy()
+    policy.note_charge(now=0.0)
+    # First roast: release on the turning point.
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
+            now=5.0,
+            manual_request=False,
+        )
+        is AdvisoryTrigger.PHASE_CHANGE
+    )
+    # Second charge re-arms the window.
+    policy.note_charge(now=100.0)
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=160.0, bean_ror_c_per_min=-80.0),
+        now=101.0,
+        manual_request=False,
+    )
+    assert trigger is None
+
+
 @pytest.mark.asyncio
 async def test_automatic_advisory_fires_without_manual_request() -> None:
     """Integration: entering development consults the advisor automatically
@@ -1213,6 +1447,50 @@ async def test_t0_debounce_confirms_after_three_consecutive_ticks() -> None:
     assert kinds.count(RoastEventKind.T0_DETECTED) == 1
     # Cause before effect: T0_DETECTED precedes the PHASE_CHANGED it explains.
     assert kinds.index(RoastEventKind.T0_DETECTED) < kinds.index(RoastEventKind.PHASE_CHANGED)
+
+
+@pytest.mark.asyncio
+async def test_debounced_t0_charges_policy_and_populates_seconds_since_charge() -> None:
+    """Controller wiring (#209): the debounced T0 transition stamps the charge
+    clock and opens the settle window on the SAME tick, before the advisory
+    consult runs (the tick pipeline runs _apply_phase_rules before
+    _maybe_run_advisory). So (a) the first pre-first-crack consult is suppressed
+    while the post-charge bean is still crashing (bean RoR < 0), and (b) once it
+    fires, the advisor context carries seconds_since_charge ≈ elapsed."""
+    # Charge: bean crashes (RoR << 0) for the T0 ticks and one tick after, then
+    # turns (RoR > 0) so the settle window releases and the advisor is reached.
+    crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
+    turned = reading(bean=95.0, t0_detected=True, bean_ror_c_per_min=5.0)
+    advisor = FakeAdvisor([decision(heat=40, fan=60)])
+    harness = make_harness(readings=[crashing], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING
+        harness.controller.transition_to(step)
+    harness.log.clear()
+    harness.events.events.clear()
+    # Three consecutive T0 ticks debounce → transition into pre-first-crack on
+    # the third; that tick stamps the charge clock and opens the settle window.
+    for _ in range(3):
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    # (a) The advisor was NOT consulted: the first pre-FC consult landed inside
+    # the settle window on the crashing bean and was suppressed.
+    assert advisor.contexts == []
+    # A further crashing tick stays suppressed (bean still has not turned).
+    await harness.controller.tick()
+    harness.clock.advance(1.0)
+    assert advisor.contexts == []
+    # (b) The bean turns: the settle window releases, the advisor is consulted,
+    # and the context carries seconds_since_charge ≈ elapsed since the T0 stamp.
+    harness.reader.readings = [turned]
+    await harness.controller.tick()
+    assert advisor.contexts  # consulted now that the bean has turned
+    ctx = advisor.contexts[-1]
+    assert ctx.seconds_since_charge is not None
+    # T0 stamped on the 3rd tick at clock=2.0; the turned consult runs at
+    # clock=4.0 (3 loop ticks advance 0→3.0, the crashing tick advances to 4.0).
+    assert ctx.seconds_since_charge == pytest.approx(2.0)
 
 
 @pytest.mark.asyncio
@@ -1384,6 +1662,89 @@ async def test_resume_requires_recovery_and_never_writes_heat() -> None:
     # And resume is gated: not callable outside recovery.
     with pytest.raises(InvalidTransitionError):
         harness.controller.operator_resume(RoastPhase.COOLING)
+
+
+@pytest.mark.asyncio
+async def test_resume_into_pre_first_crack_rearms_post_charge_settle_after_restart() -> None:
+    """#213 FIX 6 — the RESTART case: a process restart leaves a fresh policy
+    with NO charge on record (``_charge_monotonic is None``), and the recovery
+    resume into pre-first-crack transitions WITHOUT a fresh T0/note_charge — so
+    the gate would be inert and the first resumed consult could fire PHASE_CHANGE
+    on a still-crashing bean (re-exposing #209). Because the policy holds no
+    charge, the resume re-arms the settle window referenced to the resume
+    instant: a crashing bean (RoR < 0) is suppressed, a turned bean (RoR >= 0)
+    releases at once. (The in-process recovery case — where re-arming would be
+    wrong — is covered by the policy-level test below.)"""
+    harness = make_harness(readings=[reading()])
+    # Fresh policy after a restart: no prior charge on record.
+    policy = harness.controller._advisory_policy  # pyright: ignore[reportPrivateUsage]
+    assert policy._charge_monotonic is None  # pyright: ignore[reportPrivateUsage]
+    await harness.controller.recover_from_restart(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    now = harness.clock.now
+    policy = harness.controller._advisory_policy  # pyright: ignore[reportPrivateUsage]
+    # Still crashing at the resume instant: suppressed (no first-consult flood).
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=reading(bean=140.0, bean_ror_c_per_min=-40.0),
+            now=now + 1.0,
+            manual_request=False,
+        )
+        is None
+    )
+    # Already turned (e.g. the restart landed after the turning point): releases.
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=150.0, bean_ror_c_per_min=3.0),
+        now=now + 2.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
+def test_rearm_on_resume_preserves_released_latch_in_process() -> None:
+    """#213 FIX 6 — the IN-PROCESS case: when the policy still carries the prior
+    roast's charge state (an in-process recovery — e.g. a D30 fail-closed
+    mid-drying — long past the turning point), a recovery resume must NOT re-arm
+    the settle window. Unconditional re-arming (FIX 2's first cut) would treat a
+    normal post-turn RoR dip as a fresh charge crash and suppress advice for up
+    to the 90 s fallback, defeating the one-way latch. ``_charge_monotonic`` is
+    set and ``_settle_released`` is True, so the guard skips the re-arm and the
+    latch is preserved."""
+    policy = _policy()
+    # Charge, then turn → the settle latch releases (one real roast, in-process).
+    policy.note_charge(now=0.0)
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
+            now=5.0,
+            manual_request=False,
+        )
+        is AdvisoryTrigger.PHASE_CHANGE
+    )
+    policy.note_call(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
+        now=5.0,
+    )
+    assert policy._settle_released is True  # pyright: ignore[reportPrivateUsage]
+    # An in-process recovery resume: the policy still holds the charge, so the
+    # guard preserves the released latch rather than re-arming.
+    policy.rearm_post_charge_settle_on_resume(now=10.0)
+    assert policy._settle_released is True  # pyright: ignore[reportPrivateUsage]
+    # A normal post-turn RoR dip (bean temp flat so only the RoR delta can fire)
+    # is NOT re-suppressed — it returns its real trigger, not None-by-settle.
+    trigger = policy.evaluate(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=95.0, bean_ror_c_per_min=-30.0),
+        now=11.0,
+        manual_request=False,
+    )
+    assert trigger is AdvisoryTrigger.ROR_DELTA
 
 
 @pytest.mark.asyncio

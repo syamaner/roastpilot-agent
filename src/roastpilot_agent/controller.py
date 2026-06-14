@@ -320,6 +320,13 @@ class AdvisoryCallPolicy:
         self._last_bean_temp_c: float | None = None
         self._last_bean_ror_c_per_min: float | None = None
         self._last_phase: RoastPhase | None = None
+        # Post-charge SETTLE window (#209): the monotonic instant charge (T0)
+        # opened the window, and a one-way latch that releases it once the bean
+        # turns (or the fallback timeout elapses). ``_charge_monotonic`` stays
+        # None until ``note_charge`` records the debounced T0, so the gate is
+        # inert for a never-charged run.
+        self._charge_monotonic: float | None = None
+        self._settle_released: bool = False
 
     def evaluate(
         self,
@@ -339,6 +346,47 @@ class AdvisoryCallPolicy:
         if manual_request:
             return AdvisoryTrigger.MANUAL
         if phase not in _AUTO_ADVICE_PHASES:
+            return None
+        # Post-charge SETTLE window (#209): T0 is the transition into
+        # pre-first-crack, and the charge dunks the bean — temp falls fast
+        # (RoR << 0) for tens of seconds until the turning point. The first
+        # automatic consult (PHASE_CHANGE, below) would otherwise land on this
+        # crash and misread it as a stall, flooring heat. Suppress AUTOMATIC
+        # advice until the bean turns (bean RoR >= the turning-point threshold)
+        # or a fallback timeout elapses, then latch released so a later RoR dip
+        # never re-suppresses. Manual requests bypassed this above.
+        if (
+            phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+            and self._charge_monotonic is not None
+            and not self._settle_released
+        ):
+            # Only judge the turning point / release on a tick with a real
+            # reading: a no-telemetry tick would produce a no_telemetry skip in
+            # _run_advisory that still advances note_call's baseline, consuming
+            # the first real post-charge consult (augmentcode review, #213).
+            # Persistent missing telemetry is the safety layer's concern (it
+            # faults), not this gate's.
+            if telemetry is None:
+                return None
+            turned = (
+                telemetry.bean_ror_c_per_min is not None
+                and telemetry.bean_ror_c_per_min
+                >= self._config.advisory_post_charge_turning_point_ror_c_per_min
+            )
+            timed_out = (
+                now - self._charge_monotonic >= self._config.advisory_post_charge_settle_max_seconds
+            )
+            if turned or timed_out:
+                self._settle_released = True
+                # The release tick IS the first real post-charge consult, so
+                # fire it as a PHASE_CHANGE rather than falling through to the
+                # delta/interval checks. A manual no-telemetry skip earlier in
+                # the window can have advanced _last_phase without setting a
+                # delta baseline; with no MIN_INTERVAL floor in pre-first-crack
+                # the fallthrough would then return None and starve the advisor
+                # until near-FC (Codex review #213). The telemetry-None guard
+                # above guarantees this release tick carries a reading.
+                return AdvisoryTrigger.PHASE_CHANGE
             return None
         # First consult in an advice phase, or any phase transition since the
         # last call: ``_last_phase`` starts None, so the first eligible tick
@@ -391,6 +439,37 @@ class AdvisoryCallPolicy:
         if floor is not None and now - self._last_call_monotonic >= floor:
             return AdvisoryTrigger.MIN_INTERVAL
         return None
+
+    def note_charge(self, *, now: float) -> None:
+        """Record that charge (T0) just happened: open the post-charge settle
+        window (#209).
+
+        The controller calls this once, at the debounced T0 transition into
+        ``ROASTING_PRE_FIRST_CRACK``, before the advisory consult runs on the
+        same tick — so the policy suppresses automatic advice on the crashing
+        post-charge bean until it passes its turning point.
+
+        Args:
+            now: The controller-clock instant of the debounced T0 transition.
+        """
+        self._charge_monotonic = now
+        self._settle_released = False
+
+    def rearm_post_charge_settle_on_resume(self, *, now: float) -> None:
+        """Re-arm the post-charge settle window on a recovery-resume into
+        pre-first-crack (#209/#213), but ONLY if the policy holds no charge on
+        record — i.e. a fresh policy after a process restart, where a resume can
+        land mid-crash and the gate would otherwise be inert. When the policy
+        still carries the prior roast's charge state (in-process recovery, e.g.
+        a D30 fail-closed mid-drying), preserve it — including an already-released
+        latch — so a normal post-turn RoR dip after the resume is not
+        re-suppressed.
+
+        Args:
+            now: The controller-clock instant of the recovery resume.
+        """
+        if self._charge_monotonic is None:
+            self.note_charge(now=now)
 
     def note_call(
         self,
@@ -472,6 +551,12 @@ class RoastController:
         # ``development_elapsed_seconds`` in the advisor context — the DTR clock
         # the advisor reasons about near the drop.
         self._first_crack_monotonic: float | None = None
+        # Monotonic instant of the debounced T0/charge transition into
+        # ROASTING_PRE_FIRST_CRACK (#209), set in ``_apply_phase_rules`` and
+        # cleared on a new run/preheat. Stamps the charge clock for both the
+        # advisor's ``seconds_since_charge`` context and the post-charge settle
+        # window (notified to ``_advisory_policy.note_charge`` on the same tick).
+        self._charge_monotonic: float | None = None
         self._consecutive_read_failures = 0
         # D30 (#166): consecutive advisor *availability* failures
         # (provider_error / timeout). Incremented in _record_advisor_failure on
@@ -561,6 +646,14 @@ class RoastController:
             # A new run/preheat resets the development clock; it is (re)armed
             # only on the first-crack transition below.
             self._first_crack_monotonic = None
+            # A new run/preheat is "back before charge": clear the charge clock
+            # so ``seconds_since_charge`` is None and the settle window is
+            # re-armed (#209). It is restamped at the debounced T0 transition.
+            # The ``_advisory_policy`` needs no corresponding reset here: its
+            # ``_settle_released`` (left True by a prior roast's release) makes
+            # the gate harmlessly inert until ``note_charge`` re-arms it on the
+            # next T0 or recovery-resume (claude review, #213).
+            self._charge_monotonic = None
         if previous is RoastPhase.ROASTING_PRE_FIRST_CRACK and target is RoastPhase.DEVELOPMENT:
             # Arm the development clock only on the true first-crack edge — both
             # FC paths (MCP detection and the operator override) cross it. A
@@ -700,6 +793,15 @@ class RoastController:
                 )
                 self._t0_streak = 0  # unambiguous post-confirmation state
                 self.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+                # Stamp the charge clock and open the post-charge settle window
+                # on the SAME tick, BEFORE the advisory consult runs later in
+                # this tick (#209): the tick pipeline runs _apply_phase_rules
+                # before _maybe_run_advisory, so the first pre-first-crack
+                # consult is suppressed on the crashing post-charge bean until
+                # it turns, and ``seconds_since_charge`` reads from this instant.
+                now = self._clock()
+                self._charge_monotonic = now
+                self._advisory_policy.note_charge(now=now)
             return
         if (
             self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
@@ -1183,6 +1285,21 @@ class RoastController:
         # single failure.
         self._consecutive_advisor_failures = 0
         self.transition_to(target)  # table gates targets; starting is never legal
+        if target is RoastPhase.ROASTING_PRE_FIRST_CRACK:
+            # Re-arm the post-charge settle window on a resume into early
+            # roasting (#209, Codex review #213), but CONDITIONALLY (#213 FIX 6):
+            #   - process RESTART → fresh policy with no charge on record
+            #     (_charge_monotonic is None): re-arm, so a resume that lands
+            #     mid-crash is protected (RoR-driven release frees it at once if
+            #     the bean has already turned);
+            #   - IN-PROCESS recovery (e.g. a D30 fail-closed mid-drying) → the
+            #     policy still carries the prior roast's charge state, long past
+            #     the turning point: preserve it (including an already-released
+            #     latch) so a normal post-turn RoR dip is not re-suppressed for
+            #     up to the fallback window.
+            # The guard lives in the policy method; reference the settle to the
+            # resume instant when it does re-arm.
+            self._advisory_policy.rearm_post_charge_settle_on_resume(now=self._clock())
         self._events.emit(RoastEventKind.RECOVERY_ACKNOWLEDGED, {"resumed_to": target.value})
 
     def operator_acknowledge_fault(self) -> None:
@@ -1378,6 +1495,9 @@ class RoastController:
             charge_guidance_max_c=self._profile.charge_guidance_max_c,
             profile_name=self._profile.name,
             first_crack_detected=telemetry.first_crack_detected,
+            seconds_since_charge=(
+                None if self._charge_monotonic is None else self._clock() - self._charge_monotonic
+            ),
         )
 
     def _seconds_since_last_command(self) -> float | None:

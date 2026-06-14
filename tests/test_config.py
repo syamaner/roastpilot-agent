@@ -35,10 +35,27 @@ def test_controller_defaults_match_orchestration_plan() -> None:
     }
     assert config.advisory_near_fc_bean_temp_c == 170.0
     assert config.advisory_near_fc_interval_seconds == 10.0
+    # #209: post-charge settle window — fallback timeout 90 s, turning-point RoR
+    # threshold 0.0 (RoR crosses zero).
+    assert config.advisory_post_charge_settle_max_seconds == 90.0
+    assert config.advisory_post_charge_turning_point_ror_c_per_min == 0.0
     assert config.advisory_timeout_seconds == 10.0
     assert config.t0_debounce_ticks == 3
     assert config.telemetry_log_interval_seconds == 5.0
     assert config.max_stale_telemetry_seconds == 3.0
+
+
+def test_post_charge_turning_point_ror_threshold_is_unbounded() -> None:
+    """#209: the turning-point RoR threshold carries no gt/ge bound — exactly
+    0.0 (the default zero-crossing) must validate, and a negative threshold
+    (release a touch before the bean fully turns) is also a legal tuning."""
+    assert ControllerConfig(advisory_post_charge_turning_point_ror_c_per_min=0.0)
+    assert (
+        ControllerConfig(
+            advisory_post_charge_turning_point_ror_c_per_min=-5.0
+        ).advisory_post_charge_turning_point_ror_c_per_min
+        == -5.0
+    )
 
 
 def test_advisory_interval_for_resolves_per_phase_and_defaults_unthrottled() -> None:
@@ -176,6 +193,9 @@ def test_safety_limit_defaults_are_conservative() -> None:
         # D32 (#191): near-FC threshold and interval must be positive.
         (ControllerConfig, {"advisory_near_fc_bean_temp_c": 0}),
         (ControllerConfig, {"advisory_near_fc_interval_seconds": 0}),
+        # #209: the post-charge settle fallback timeout must be positive
+        # (gt=0); the turning-point RoR threshold has no bound (0 is valid).
+        (ControllerConfig, {"advisory_post_charge_settle_max_seconds": 0}),
         (AdvisorConfig, {"timeout_seconds": 0}),
         (AdvisorConfig, {"temperature": -0.1}),
         (AdvisorConfig, {"temperature": 2.1}),
