@@ -29,23 +29,26 @@ DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float] = {
     RoastPhase.DEVELOPMENT: 0.0,
 }
 
-# The single capable advisor model — the E8-S4 bake-off winner (plan §11.1 →
-# D20/D21): ``anthropic/claude-opus-4.8`` via OpenRouter, which won on advice
-# quality with comfortable latency headroom under the 10 s budget. This is the
-# base slug AND the default for every phase (see ``model_slug_by_phase``); the
-# per-phase mechanism (#173) exists so the operator-gated bake-off re-run can
-# later flip the FC/development slot to a faster model, without any behavior
-# change until then.
-DEFAULT_ADVISOR_MODEL = "anthropic/claude-opus-4.8"
+# The advisor model — the Artisan-expanded bake-off winner (D33, 14 Jun 2026):
+# ``google/gemini-3.1-flash-lite`` via OpenRouter. On 28 real quality-filtered
+# Hottop roasts it was the ONLY model that reliably makes the flavor-critical
+# drop call (drop F1 0.63, called the drop on 18/28 with the best heat-direction
+# agreement 0.88 and the fastest latency ~1.2 s); every other candidate —
+# including the prior incumbent ``anthropic/claude-opus-4.8`` (D20/D21) and all
+# the frontier/slow models — essentially never calls the drop (over-holds past
+# the ≤196 °C bitter ceiling, the dangerous direction). See
+# ``docs/advisor/bakeoff-artisan-summary.md``. This is the base slug AND the
+# default for every phase; the per-phase mechanism (#173) is retained so a
+# future fast/slow split can flip a slot without a behavior change until then.
+DEFAULT_ADVISOR_MODEL = "google/gemini-3.1-flash-lite"
 
 # Phase-keyed advisor MODEL selection (#173, operator 13 Jun): the model slug
 # the advisor uses, by agent phase. The MECHANISM only — every phase defaults
-# to ``DEFAULT_ADVISOR_MODEL`` (Opus everywhere), so there is zero behavior
-# change until the operator-gated, latency-weighted bake-off re-run (#173 gate)
-# picks a faster post-FC model and records it as a new D-number. The eventual
-# intent (from the issue): keep the capable model for preheat → pre-FC, and a
-# fast model (~1-2 s) for FC/development where the #171 cadence is unthrottled
-# and latency-bound. A phase absent from the map falls back to ``model_slug``.
+# to ``DEFAULT_ADVISOR_MODEL`` (gemini-3.1-flash-lite everywhere, D33), which is
+# fast enough for every phase including the tight FC gate, so there is no
+# per-phase split today. The map is kept so a future re-run can flip a slot
+# (e.g. a more capable preheat/pre-FC model) and record it as a new D-number. A
+# phase absent from the map falls back to ``model_slug``.
 DEFAULT_ADVISOR_MODEL_BY_PHASE: dict[RoastPhase, str] = {
     RoastPhase.PREHEATING: DEFAULT_ADVISOR_MODEL,
     RoastPhase.ROASTING_PRE_FIRST_CRACK: DEFAULT_ADVISOR_MODEL,
@@ -128,25 +131,27 @@ class AdvisorConfig(BaseModel):
     provider — it never lives in config or the database.
 
     The default ``model_slug`` and ``prompt_version`` are the bake-off's
-    outcome (E8-S4, plan §11.1 → D20, refined → D21): ``anthropic/
-    claude-opus-4.8`` via OpenRouter won on advice quality with comfortable
-    latency headroom under the 10 s budget, and ``v2`` is the electric-Hottop
-    prompt (fan as a coupled heat-transfer-mode lever + development-duration
-    objective). Under v2's richer prompt opus is the only frontier model that
-    still passes the latency gate. To run opus natively (no OpenRouter
-    hop/markup, per D18), set ``provider=anthropic`` +
-    ``api_key_env=ANTHROPIC_API_KEY``. ``OPENROUTER_API_KEY`` must be set in
-    the environment at runtime; ``FakeAdvisor`` stays the test/CI default.
+    outcome. The Artisan-expanded re-run (D33, 14 Jun 2026 — 28 real
+    quality-filtered Hottop roasts, fixing the original N=2 sample) picked
+    ``google/gemini-3.1-flash-lite`` via OpenRouter: the only model that
+    reliably makes the flavor-critical drop call (drop F1 0.63, 18/28, best
+    heat-direction 0.88, fastest ~1.2 s), where the prior incumbent
+    ``anthropic/claude-opus-4.8`` (D20/D21) and every frontier/slow model
+    over-hold (never drop). ``v2`` is the electric-Hottop prompt (fan as a
+    coupled heat-transfer-mode lever + development-duration objective); v3 lost
+    to v2 in the first run. See ``docs/advisor/bakeoff-artisan-summary.md``. To
+    run a model on its native provider (no OpenRouter hop/markup, per D18), set
+    ``provider`` + the matching ``api_key_env``. ``OPENROUTER_API_KEY`` must be
+    set in the environment at runtime; ``FakeAdvisor`` stays the test/CI default.
 
     Per-phase model selection (#173): ``model_slug`` is the base/default slug
     (the identity in the decision-trace descriptor and the reachability probe),
     and ``model_slug_by_phase`` is an optional per-phase override map resolved
     by :meth:`model_for`. By default every phase resolves to
-    ``DEFAULT_ADVISOR_MODEL`` — Opus everywhere — so this is purely additive
-    plumbing with zero behavior change; the operator-gated, latency-weighted
-    bake-off re-run (#173 gate) is what later flips the FC/development slot to a
-    faster model. A phase absent from the override map falls back to
-    ``model_slug``.
+    ``DEFAULT_ADVISOR_MODEL`` — gemini-3.1-flash-lite everywhere (D33) — so the
+    map is retained additive plumbing with zero behavior change; a future re-run
+    could flip a phase slot to a different model. A phase absent from the
+    override map falls back to ``model_slug``.
     """
 
     provider: Literal["openai", "anthropic", "google", "ollama", "openai_compatible"] = (
@@ -157,10 +162,11 @@ class AdvisorConfig(BaseModel):
     model_slug: str = Field(default=DEFAULT_ADVISOR_MODEL, min_length=1)
     # Phase-keyed model override map (#173). The MECHANISM for phase-dependent
     # model selection — defaults to ``DEFAULT_ADVISOR_MODEL`` for preheat /
-    # pre-FC / development (Opus everywhere), so :meth:`model_for` resolves to
-    # the current single model in every phase: zero behavior change until the
-    # operator-gated bake-off re-run picks a fast post-FC model. A phase absent
-    # from this map falls back to ``model_slug``. Each slug is ``min_length=1``
+    # pre-FC / development (gemini-3.1-flash-lite everywhere, D33), so
+    # :meth:`model_for` resolves to the single pinned model in every phase. The
+    # map is retained so a future re-run could flip a phase slot to a different
+    # model. A phase absent from this map falls back to ``model_slug``. Each slug
+    # is ``min_length=1``
     # (an empty model slug is meaningless). Parameterized factory, not a bare
     # ``dict`` default, per the repo's pyright-strict typed-default idiom.
     model_slug_by_phase: dict[RoastPhase, Annotated[str, Field(min_length=1)]] = Field(
@@ -190,10 +196,10 @@ class AdvisorConfig(BaseModel):
 
         Looks ``phase`` up in :attr:`model_slug_by_phase`, falling back to the
         base :attr:`model_slug` when the phase carries no override. With the
-        default map (Opus for every phase) this always resolves to
-        :attr:`model_slug`, so per-phase selection is a behavioral no-op until
-        the operator-gated bake-off re-run (#173 gate) populates the map with a
-        faster post-FC model.
+        default map (gemini-3.1-flash-lite for every phase, D33) this always
+        resolves to :attr:`model_slug`, so per-phase selection is a behavioral
+        no-op until a future re-run populates the map with a different per-phase
+        model.
 
         Args:
             phase: The agent phase the controller is currently in.

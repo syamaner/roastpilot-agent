@@ -432,9 +432,9 @@ def test_advisor_selects_model_by_phase_via_recorded_slug(
 def test_advisor_default_pins_every_phase_to_one_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The Opus-everywhere default is a clean behavioral no-op: every phase
-    resolves to the same slug, so exactly one agent is built (one cache
-    entry)."""
+    """The pinned-model-everywhere default (gemini-3.1-flash-lite, D33) is a
+    clean behavioral no-op: every phase resolves to the same slug, so exactly
+    one agent is built (one cache entry)."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
     advisor = PydanticAIAdvisor(AdvisorConfig())
     for phase in (
@@ -444,7 +444,7 @@ def test_advisor_default_pins_every_phase_to_one_agent(
     ):
         advisor._agent_for(advisor._config.model_for(phase))  # type: ignore[reportPrivateUsage]
     cache = advisor._agents  # type: ignore[reportPrivateUsage]
-    assert set(cache) == {"anthropic/claude-opus-4.8"}
+    assert set(cache) == {"google/gemini-3.1-flash-lite"}
 
 
 @pytest.mark.asyncio

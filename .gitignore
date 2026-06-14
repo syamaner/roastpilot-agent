@@ -49,3 +49,6 @@ web/dist/
 .idea/
 .vscode/
 .DS_Store
+
+# Derived Artisan bake-off fixtures (personal roast logs — not committed, AGENTS.md)
+.artisan-fixtures/

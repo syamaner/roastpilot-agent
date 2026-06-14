@@ -33,6 +33,44 @@ First-crack detection comes from an audio model
 ([dataset, model, and live demo on Hugging Face](https://huggingface.co/syamaner/coffee-first-crack-detection))
 running inside the MCP server on a Raspberry Pi 5.
 
+## How the advisor model is chosen (the eval)
+
+The advisor model and prompt are not picked by vibes — they are chosen by a
+**replay bake-off** that scores candidate models against real roasts:
+
+- **Test set:** known-good Hottop roasts replayed tick-by-tick. The current
+  set is the operator's annotated Artisan `.alog` history, quality-filtered to
+  drop below the operator's bitterness ceiling (< 198 °C) and converted to the
+  replay format by [`scripts/alog_to_fixture.py`](scripts/alog_to_fixture.py)
+  (it decodes the BT/ET curve, the charge/first-crack/drop marks, and the
+  manual heat/fan control track). The roast logs themselves are personal and
+  are **not** committed; only the anonymized scorecard is.
+- **What's scored** (`scripts/bakeoff_replay.py`): the **drop decision** as a
+  binary classification over ticks — precision / recall / **F1** + the
+  drop-timing error in seconds and °C; **heat & fan** as MAE + directional
+  agreement (did the model move the lever the way the human did, especially the
+  anticipatory pre-first-crack cut); and **latency** per phase against the tick
+  budget (tightest at first crack).
+- **The honest framing — read it before trusting a number.** Ground truth is a
+  *known-good* roast, not a provably optimal one. Every metric measures
+  **agreement with what the human did**, NOT absolute correctness: F1 = 1.0
+  means *matched this roast's drop*, not *correct*. The scores are a
+  quantitative **aid** to the operator's judgement (advice samples + the
+  latency gate + the controller's own ≤ 196 °C ceiling), never a replacement.
+
+Run it (needs an OpenRouter key; the replay/scoring layer is fully testable
+without one via a fake advisor):
+
+```bash
+OPENROUTER_API_KEY=sk-or-... python scripts/advisor_bakeoff.py \
+  --prompt-version v2 --out /tmp/bakeoff.json --report-md /tmp/bakeoff.md
+```
+
+Latest outcome (28-roast Artisan re-run, 14 Jun 2026): the cheap, fast
+`google/gemini-3.1-flash-lite` + prompt `v2` was the only model that reliably
+makes the drop call; the frontier and slow models over-hold (never drop). See
+[`docs/advisor/bakeoff-artisan-summary.md`](docs/advisor/bakeoff-artisan-summary.md).
+
 ## Development setup
 
 Requires Python 3.11+.

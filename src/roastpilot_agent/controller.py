@@ -443,6 +443,11 @@ class RoastController:
         self._phase: RoastPhase = RoastPhase.IDLE
         self._profile: RoastProfile | None = None
         self._run_started_monotonic: float | None = None
+        # Monotonic time of the first-crack transition into DEVELOPMENT, set in
+        # ``transition_to`` and cleared on a new run/preheat. Drives
+        # ``development_elapsed_seconds`` in the advisor context — the DTR clock
+        # the advisor reasons about near the drop.
+        self._first_crack_monotonic: float | None = None
         self._consecutive_read_failures = 0
         # D30 (#166): consecutive advisor *availability* failures
         # (provider_error / timeout). Incremented in _record_advisor_failure on
@@ -495,6 +500,17 @@ class RoastController:
             return 0.0
         return self._clock() - self._run_started_monotonic
 
+    def _development_elapsed_seconds(self) -> float | None:
+        """Seconds since first crack, or ``None`` before it is detected.
+
+        The development clock the advisor reasons about near the drop (DTR is
+        ``development_elapsed / roast_elapsed``). ``None`` until the first-crack
+        transition arms ``_first_crack_monotonic`` in :meth:`transition_to`.
+        """
+        if self._first_crack_monotonic is None:
+            return None
+        return self._clock() - self._first_crack_monotonic
+
     def can_transition(self, target: RoastPhase) -> bool:
         """Whether ``target`` is a legal next phase from the current one."""
         if target is self._phase:
@@ -507,6 +523,7 @@ class RoastController:
         """Commit a phase transition or raise :class:`InvalidTransitionError`."""
         if not self.can_transition(target):
             raise InvalidTransitionError(self._phase, target)
+        previous = self._phase
         self._phase = target
         if target in (RoastPhase.STARTING, RoastPhase.PREHEATING):
             # Per-run latches reset (T0 confirmation, debounce streak,
@@ -517,6 +534,18 @@ class RoastController:
             self._t0_streak = 0
             self._t0_confirmed = False
             self._guidance_emitted = False
+            # A new run/preheat resets the development clock; it is (re)armed
+            # only on the first-crack transition below.
+            self._first_crack_monotonic = None
+        if previous is RoastPhase.ROASTING_PRE_FIRST_CRACK and target is RoastPhase.DEVELOPMENT:
+            # Arm the development clock only on the true first-crack edge — both
+            # FC paths (MCP detection and the operator override) cross it. A
+            # recovery resume into development (OPERATOR_RECOVERY_REQUIRED →
+            # DEVELOPMENT) is NOT a fresh FC: it must not restamp the clock to
+            # now, or an already-developed run would read elapsed≈0. On such a
+            # resume the in-memory FC time is preserved (same process) or stays
+            # None (after a restart) — advisory-only either way (safety review).
+            self._first_crack_monotonic = self._clock()
         if target in UNIVERSAL_TARGETS:
             # D16 operator-timeout tracking starts on entering a true
             # operator-required state — never in normal phases.
@@ -1262,7 +1291,7 @@ class RoastController:
         return AdvisorContext(
             phase=self._phase,
             roast_elapsed_seconds=self._roast_elapsed_seconds(),
-            development_elapsed_seconds=None,
+            development_elapsed_seconds=self._development_elapsed_seconds(),
             current_bean_temp_c=telemetry.bean_temp_c,
             current_env_temp_c=telemetry.env_temp_c,
             bean_ror_c_per_min=telemetry.bean_ror_c_per_min,
