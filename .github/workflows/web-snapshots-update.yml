@@ -69,10 +69,15 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           # Mark the checkout safe (the container runs as a different uid than the mount owner).
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          if git diff --quiet -- web/tests/e2e/__screenshots__; then
+          # Stage first, THEN check the staged diff. `git diff --quiet` (working
+          # tree) does not see brand-new untracked files, so a NEW spec's first-
+          # ever baselines would be silently dropped (the bug that left
+          # mic-status.spec.ts without baselines). `git add` + `--cached` catches
+          # both modified and newly-added PNGs.
+          git add web/tests/e2e/__screenshots__
+          if git diff --cached --quiet -- web/tests/e2e/__screenshots__; then
             echo "No baseline changes — nothing to commit."
             exit 0
           fi
-          git add web/tests/e2e/__screenshots__
           git commit -m "ci: regenerate Playwright baselines in pinned image [skip ci]"
           git push origin "HEAD:${GITHUB_REF_NAME}"
