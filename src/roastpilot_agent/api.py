@@ -1092,9 +1092,15 @@ class RoastService:
         detail = await self._store.read_run(run_id)
         if detail is None:
             raise RoastRunNotFoundError(run_id)
-        mic_status = self._live_mic_status(run_id)
-        if mic_status is not None:
-            detail = detail.model_copy(update={"mic_status": mic_status})
+        # Only a live (not-yet-completed) run is enriched. ``active_run_id`` is
+        # set on start/recovery and not cleared at finalize, so a just-completed
+        # run can still match the active pointer with ``raw_state.last_state``
+        # populated; the persisted ``completed_at_utc`` is the authoritative
+        # "this run is history" signal and history carries ``None`` (#200/Codex).
+        if detail.completed_at_utc is None:
+            mic_status = self._live_mic_status(run_id)
+            if mic_status is not None:
+                detail = detail.model_copy(update={"mic_status": mic_status})
         return detail
 
     def _live_mic_status(self, run_id: str) -> MicStatus | None:
@@ -1102,7 +1108,9 @@ class RoastService:
 
         ``None`` for any non-active run, when no roaster/raw-state source is
         wired (API-only mode), or before the first MCP read. Read-only — never
-        a write or a safety evaluation."""
+        a write or a safety evaluation. The caller additionally suppresses this
+        for completed runs (``completed_at_utc``), since the active pointer is
+        not cleared at finalize."""
         if run_id != self.active_run_id or self._raw_state is None:
             return None
         state = self._raw_state.last_state

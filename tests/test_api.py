@@ -1220,6 +1220,35 @@ async def test_detail_enriches_active_run_with_live_mic_status(store: RoastStore
 
 
 @pytest.mark.asyncio
+async def test_detail_mic_status_none_for_completed_run_with_stale_active_pointer(
+    store: RoastStore,
+) -> None:
+    """A completed run never carries live mic_status, even while ``active_run_id``
+    still points at it with a populated raw state (#200/Codex).
+
+    ``active_run_id`` is set on start/recovery and not cleared at finalize, so the
+    just-completed run can still match the active pointer; ``completed_at_utc`` is
+    the authoritative "this is history" gate and history carries ``None``."""
+    await store.create_run(
+        run_id="run-just-done",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+    await store.complete_run(
+        run_id="run-just-done", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    service = RoastService(
+        store,
+        raw_state=_FakeRawState(_session_state(fc_status="detected", audio_running=True)),
+    )
+    service.active_run_id = "run-just-done"  # finalize did not clear the pointer
+    detail = await service.detail("run-just-done")
+    assert detail.completed_at_utc is not None
+    assert detail.mic_status is None
+
+
+@pytest.mark.asyncio
 async def test_detail_mic_status_none_for_non_active_run(store: RoastStore) -> None:
     """A non-active run carries no live mic_status even when a raw state exists (#197)."""
     await store.create_run(
