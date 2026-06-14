@@ -159,6 +159,17 @@ class RoastAdvisor(ABC):
         """
         raise NotImplementedError
 
+    def descriptor_for(self, phase: RoastPhase) -> AdvisorDescriptor:
+        """The trace identity for a call made in ``phase`` (#189).
+
+        Defaults to :attr:`descriptor`. Advisors with per-phase model selection
+        (#173) override this so the persisted advisor-decision row records the
+        model that actually answered the call (the phase-RESOLVED slug), not the
+        base slug — which matters once the FC/development slot is flipped to a
+        faster model and base ≠ resolved.
+        """
+        return self.descriptor
+
     @abstractmethod
     async def get_recommendation(self, context: AdvisorContext) -> RoastDecision:
         """Return a typed advisory recommendation."""
@@ -876,6 +887,21 @@ class PydanticAIAdvisor(RoastAdvisor):
         return AdvisorDescriptor(
             provider=self._config.provider,
             model=self._config.model_slug,
+            prompt_version=self._config.prompt_version,
+        )
+
+    def descriptor_for(self, phase: RoastPhase) -> AdvisorDescriptor:
+        """The trace identity with the PHASE-RESOLVED model slug (#189).
+
+        Records the model that actually answered this phase's call
+        (``model_for(phase)``), not the base ``model_slug`` — so once the
+        FC/development slot is flipped to a faster model the ``advisor_decisions``
+        rows report the model truly called. Same provider + prompt version as
+        :attr:`descriptor`; identical to it under a single-model default.
+        """
+        return AdvisorDescriptor(
+            provider=self._config.provider,
+            model=self._config.model_for(phase),
             prompt_version=self._config.prompt_version,
         )
 
