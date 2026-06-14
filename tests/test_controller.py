@@ -2081,6 +2081,22 @@ async def test_recover_into_faulted_noop_for_non_faulted_phase() -> None:
 
 
 @pytest.mark.asyncio
+async def test_recover_into_faulted_is_idempotent_when_already_faulted() -> None:
+    """Calling recover_into_faulted when the controller is already FAULTED is a
+    no-op transition (the defensive `if self._phase is not FAULTED` guard): it
+    re-records the fault but never attempts an illegal FAULTED→FAULTED move."""
+    harness = make_harness()
+    await harness.controller.recover_into_faulted(RoastPhase.FAULTED)
+    assert harness.controller.phase is RoastPhase.FAULTED
+    harness.events.events.clear()
+    # Second call: already FAULTED → the guard skips the transition (no raise).
+    await harness.controller.recover_into_faulted(RoastPhase.FAULTED)
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.executor.commands == []
+    assert RoastEventKind.FAULT in harness.events.kinds()
+
+
+@pytest.mark.asyncio
 async def test_pause_advisory_suppresses_consult_until_resume() -> None:
     """pause_advisory stops the advisor being consulted; the controller keeps
     ticking; resume_advisory restores consults. No MCP write, no safety eval."""

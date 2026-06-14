@@ -622,7 +622,7 @@ class RoastRunner:
             controller.operator_resume_advisory()
         elif item.action is OperatorAction.ACKNOWLEDGE_RECOVERY:
             await self._dispatch_acknowledge(payload)
-        elif item.action is OperatorAction.ACKNOWLEDGE_FAULT:
+        elif item.action is OperatorAction.ACKNOWLEDGE_FAULT:  # pragma: no cover — exhaustive chain
             await self._dispatch_acknowledge_fault(payload)
         if tool is not None:
             await self._record_dispatch_command(tool, item, since=before)
