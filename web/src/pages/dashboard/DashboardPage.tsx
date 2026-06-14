@@ -18,7 +18,6 @@
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Link } from "react-router-dom";
 
 import { AppFrame, ConnectionIndicator, LiveCurve } from "@/components/shared";
 import { roastKeys, useHealth, useRoast } from "@/hooks/queries";
@@ -38,14 +37,26 @@ import { useDashboardEvents } from "./useDashboardEvents";
 
 export function DashboardPage(): React.JSX.Element {
   const health = useHealth();
-  const runId = health.data?.active_run_id ?? null;
+  const serverRunId = health.data?.active_run_id ?? null;
 
-  // Idle state (#158): health has loaded and reports NO active run. The dashboard
-  // then shows the Start-roast form instead of the (empty) live view. We render the
-  // form only once health has resolved so it does not flash before the active run is
-  // known. The transition to live is server-driven: on a 201 the next `useHealth`
-  // refetch surfaces the new `active_run_id`, the page re-renders with a runId, and
-  // `useRoastStream` connects — the SPA renders from server state, never fabricated.
+  // #124: a fault finalizes the run server-side (`complete_run` stamps
+  // `completed_at_utc`, so `active_run()` — and thus `active_run_id` — goes
+  // null), but a transient `useHealth` refetch (a reconnect after a device
+  // sleep/wifi blip mid-roast) must NOT drop the fault banner before the
+  // operator has seen and acted on it. Keep showing the faulted run we were
+  // already watching until the operator explicitly starts a new roast. The
+  // fault itself is server-delivered (the SSE fault frame); we only refuse to
+  // DISCARD it on a refetch — we never infer phase locally (invariant intact).
+  const [stickyFaultedRunId, setStickyFaultedRunId] = useState<string | null>(null);
+  const runId = serverRunId ?? stickyFaultedRunId;
+
+  // Idle state (#158): health has loaded and reports NO active run (and no
+  // faulted run is pinned). The dashboard then shows the Start-roast form
+  // instead of the (empty) live view. We render the form only once health has
+  // resolved so it does not flash before the active run is known. The transition
+  // to live is server-driven: on a 201 the next `useHealth` refetch surfaces the
+  // new `active_run_id`, the page re-renders with a runId, and `useRoastStream`
+  // connects — the SPA renders from server state, never fabricated.
   const isIdle = health.isSuccess && runId === null;
 
   // Live SSE stream — phase/telemetry/enabledActions are server-derived; the
@@ -80,6 +91,15 @@ export function DashboardPage(): React.JSX.Element {
     [queryClient],
   );
 
+  // #124: the operator acknowledges a fault by starting a new roast. Drop the
+  // sticky-faulted pin and re-fetch health (now reporting no active run) so the
+  // page returns to the idle Start-roast form — never trapping the operator on
+  // the faulted view. No roaster command is issued (a GET re-fetch only).
+  const handleAcknowledgeFault = useCallback(async () => {
+    setStickyFaultedRunId(null);
+    await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+  }, [queryClient]);
+
   const dispatchAction = useCallback(
     async (action: OperatorAction) => {
       if (runId === null) return;
@@ -110,6 +130,17 @@ export function DashboardPage(): React.JSX.Element {
     setToastDismissed(false);
     setLastResult(null);
   }, [runId]);
+
+  // #124: pin the run as soon as it faults, so a later `active_run_id`→null from
+  // a health refetch resolves `runId` back to this faulted run (via the `??`
+  // above) instead of collapsing to idle and dropping the fault banner. Pinning
+  // the id of the run we are already watching is not phase inference — the fault
+  // came from the server's SSE frame; cleared by `handleAcknowledgeFault`.
+  useEffect(() => {
+    if (view.fault !== null && runId !== null) {
+      setStickyFaultedRunId(runId);
+    }
+  }, [view.fault, runId]);
 
   useEffect(() => {
     if (view.firstCrack !== null && fcElapsed === null && telemetry?.elapsed_seconds != null) {
@@ -167,19 +198,21 @@ export function DashboardPage(): React.JSX.Element {
         {/* Fault banner sits above the dashboard when faulted (Prompt B §2).
             Informational + persistent: no server-dispatching button (a fault is
             terminal and must not be hidden; e-stop lives in the action bar). The
-            only affordance is a forward nav — starting a new roast — which
-            navigates, never dispatching a roaster command. */}
+            only affordance acknowledges the fault — it clears the sticky-faulted
+            pin (#124) and re-fetches health, returning to the idle Start-roast
+            form; it issues no roaster command (a GET re-fetch only). */}
         <FaultBanner
           fault={view.fault}
           trail={view.safetyTrail}
           startNewRoast={
-            <Link
-              to="/roasts"
+            <button
+              type="button"
+              onClick={handleAcknowledgeFault}
               data-testid="fault-start-new-roast"
               className="inline-flex items-center rounded-md border border-roast-fault/60 bg-roast-fault/15 px-4 py-2 text-sm font-semibold uppercase tracking-wide text-roast-fault transition-colors hover:bg-roast-fault/25"
             >
               Start New Roast
-            </Link>
+            </button>
           }
         />
 

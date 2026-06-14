@@ -6,7 +6,7 @@
  * page's idle-detection branch (the form + the stream hook have their own specs).
  */
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -50,11 +50,13 @@ vi.mock("@/hooks/useRoastStream", () => ({
 }));
 
 // The view-model folds frames; for this wiring test an empty view is enough.
+// `fault` is mutable so the #124 sticky-faulted-pin behavior can be exercised.
+const viewState: { fault: unknown } = { fault: null };
 vi.mock("./useDashboardEvents", () => ({
   useDashboardEvents: () => ({
     points: [],
     markers: [],
-    fault: null,
+    fault: viewState.fault,
     firstCrack: null,
     chargeGuidance: null,
     recovery: null,
@@ -80,6 +82,7 @@ afterEach(cleanup);
 beforeEach(() => {
   healthState.data = undefined;
   healthState.isSuccess = false;
+  viewState.fault = null;
 });
 
 describe("DashboardPage idle/active wiring (#158)", () => {
@@ -109,5 +112,44 @@ describe("DashboardPage idle/active wiring (#158)", () => {
     renderPage();
     expect(screen.getByTestId("dashboard")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+});
+
+describe("DashboardPage faulted-run sticky banner (#124)", () => {
+  it("keeps the faulted dashboard when active_run_id goes null on a refetch", () => {
+    // A run is active and has faulted (the SSE fault frame is in the view).
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
+    viewState.fault = { reason: "env ceiling exceeded" };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("dashboard")).toBeInTheDocument();
+
+    // The fault finalizes the run server-side and a health refetch (reconnect)
+    // reports no active run. The dashboard must NOT collapse to the idle form —
+    // the fault banner stays until the operator acknowledges it (#124).
+    healthState.data = { active_run_id: null };
+    rerender(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <DashboardPage />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+    expect(screen.getByTestId("dashboard")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("returns to the idle Start form when the operator acknowledges the fault", () => {
+    // Faulted, and the server already reports no active run (post-finalize).
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
+    viewState.fault = { reason: "env ceiling exceeded" };
+    renderPage();
+    // Pinned: even though we now flip health to no-active-run, the banner holds.
+    healthState.data = { active_run_id: null };
+    fireEvent.click(screen.getByTestId("fault-start-new-roast"));
+    // Acknowledging clears the pin → no active run → idle Start form.
+    expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
+    expect(screen.queryByTestId("dashboard")).toBeNull();
   });
 });
