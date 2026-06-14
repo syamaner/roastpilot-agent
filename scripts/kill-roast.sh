@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# kill-roast.sh — LOCAL-ONLY, UNCOMMITTED. Force-terminate EVERY RoastPilot agent
+# kill-roast.sh — operator tooling (not part of the agent runtime). Force-terminate EVERY RoastPilot agent
 # + coffee-roaster-mcp instance (the agent's own child AND any stray uvx one) and
 # free the USB serial port / mic / :8000.
 #
@@ -16,6 +16,8 @@
 #   frees host resources so a clean run can start.
 
 set -uo pipefail   # NOT -e: pkill returns non-zero when nothing matches; that's fine.
+
+PORT="${PORT:-8000}"   # match roast-live.sh's PORT override for the :PORT free-check below
 
 echo "⚠  Force-kill does NOT turn off heat. If a run left the Hottop hot, power it"
 echo "   off at the machine — this only frees host processes/ports."
@@ -33,13 +35,13 @@ sleep 1   # let the OS release the serial port + the :8000 socket
 
 echo
 echo "→ after:"
-LEFT="$(ps -Ao pid,command | grep -iE 'roastpilot-agent serve|coffee-roaster-mcp' | grep -v grep || true)"
+LEFT="$(ps -Ao pid,command | grep -iE 'roastpilot-agent serve|coffee-roaster-mcp|uvx coffee' | grep -v grep || true)"
 if [ -n "$LEFT" ]; then
   echo "  STILL ALIVE (investigate):"; echo "$LEFT"
 else
   echo "  ✓ no agent / MCP processes remain"
 fi
-lsof -nP -iTCP:8000 -sTCP:LISTEN 2>/dev/null && echo "  ⚠ :8000 still held" || echo "  ✓ :8000 free"
+lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null && echo "  ⚠ :$PORT still held" || echo "  ✓ :$PORT free"
 # Best-effort serial check (device path may vary; ignore if not present).
 SERIAL="$(ls /dev/cu.usbserial-* 2>/dev/null | head -1 || true)"
 if [ -n "$SERIAL" ]; then

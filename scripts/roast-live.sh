@@ -34,7 +34,7 @@ if [ ! -f "$COFFEE_ROASTER_MCP_CONFIG" ]; then
   exit 1
 fi
 
-# --- LOCAL-ONLY pre-start cleanup (NOT committed; temporary until #212) -------
+# --- Pre-start cleanup (operator tooling, interim until #212 lands) ----------
 # A wedged previous run (graceful shutdown can hang — #212, SIGTERM ignored) or
 # a stray manually-launched coffee-roaster-mcp leaves the USB serial port / mic /
 # :PORT held, which destabilises the new run (the duplicate-MCP contention +
@@ -45,7 +45,8 @@ fi
 # MACHINE; this only frees host resources so the new run can start clean.
 echo "→ clearing any wedged/leftover roast processes (local-only safeguard)…"
 pkill -9 -f 'roastpilot-agent serve' 2>/dev/null || true
-pkill -9 -f 'coffee-roaster-mcp'     2>/dev/null || true   # agent child + any stray uvx
+pkill -9 -f 'coffee-roaster-mcp'     2>/dev/null || true   # agent child (also matches uvx coffee-roaster-mcp)
+pkill -9 -f 'uvx coffee'             2>/dev/null || true   # any stray uvx coffee-roaster (belt-and-braces, matches kill-roast.sh)
 sleep 1   # let the OS release the serial port + the :PORT socket
 
 echo "→ preparing (venv, deps, SPA build)…"
