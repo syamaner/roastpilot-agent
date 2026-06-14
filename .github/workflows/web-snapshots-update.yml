@@ -65,10 +65,14 @@ jobs:
 
       - name: Commit + push regenerated baselines (if any changed)
         run: |
+          # Mark the checkout safe FIRST. The container runs as root over a mount
+          # owned by a different uid; until git trusts the dir, even a *local*
+          # `git config` write fails with "fatal: not in a git directory" (exit
+          # 128) — which is what silently broke this producer. This must precede
+          # every other git command.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Mark the checkout safe (the container runs as a different uid than the mount owner).
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           # Stage first, THEN check the staged diff. `git diff --quiet` (working
           # tree) does not see brand-new untracked files, so a NEW spec's first-
           # ever baselines would be silently dropped (the bug that left
