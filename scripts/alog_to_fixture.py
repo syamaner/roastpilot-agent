@@ -60,12 +60,14 @@ class RoastMarks:
         charge_seconds: ``beans_added`` time (``timex`` at the CHARGE index).
         first_crack_seconds: First-crack time (``timex`` at the FCs index).
         drop_seconds: Bean-drop time (``timex`` at the DROP index).
+        first_crack_temp_c: Bean temperature at the first-crack sample.
         drop_temp_c: Bean temperature at the drop sample.
     """
 
     charge_seconds: float
     first_crack_seconds: float
     drop_seconds: float
+    first_crack_temp_c: float
     drop_temp_c: float
 
 
@@ -169,6 +171,7 @@ def extract_marks(profile: dict[str, Any]) -> RoastMarks:
         charge_seconds=float(timex[charge_i]),
         first_crack_seconds=float(timex[fc_i]),
         drop_seconds=float(timex[drop_i]),
+        first_crack_temp_c=float(bean[fc_i]),
         drop_temp_c=float(bean[drop_i]),
     )
 
@@ -252,7 +255,7 @@ def _summary(profile: dict[str, Any], marks: RoastMarks) -> dict[str, Any]:
         "phase": "complete",
         "source": "artisan-alog",
         "roaster_driver": "hottop_kn8828b_2k_plus",
-        "first_crack_temp_c": round(float([float(v) for v in profile.get("temp2", [0.0])][0]), 1),
+        "first_crack_temp_c": round(marks.first_crack_temp_c, 1),
         "drop_temp_c": round(marks.drop_temp_c, 1),
         "development_time_seconds": round(dev, 1),
         "development_time_percent": round(dev / span * 100, 1) if span > 0 else None,

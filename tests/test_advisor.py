@@ -715,6 +715,45 @@ def test_v3_is_not_the_default_prompt_version() -> None:
     assert instructions_for("v3") != instructions_for("v2")
 
 
+def test_drop_recall_variants_keep_heat_fan_and_invariants() -> None:
+    """v4-v8 (#194) target the gemini drop-recall gap. Each must KEEP v2's
+    heat/fan control guidance (anticipatory thermal-lag cut + fan as a
+    convective heat-transfer-mode lever — the 0.88 heat-direction must not
+    regress) and the advisory-only / Celsius invariants, and must reason from
+    the profile/live context rather than hardcoded textbook temperatures.
+    Each must also be distinct from v2 and the others."""
+    variants = {v: instructions_for(v) for v in ("v4", "v5", "v6", "v7", "v8")}
+    texts = list(variants.values())
+    # All distinct from one another and from v2 (five real strategies, not one).
+    assert len({*texts, instructions_for("v2")}) == 6
+    for version, prompt in variants.items():
+        lower = prompt.lower()
+        # Carried-forward heat/fan control guidance.
+        assert "thermal lag" in lower, version
+        assert "convective" in lower, version
+        # Carried-forward invariants.
+        assert "never control hardware" in lower, version
+        assert "celsius" in lower, version
+        # Reason from the profile/live context, not textbook numbers, and honor
+        # the ~196 C indicated bitter ceiling (the irreversible-error guard).
+        assert "indicated" in lower, version
+        assert "196" in prompt, version
+        assert "target_drop_temp_c" in prompt or "target_development_percent" in prompt, version
+
+
+def test_drop_recall_variants_encode_distinct_strategies() -> None:
+    """The five drop-recall variants are DISTINCT strategies, not rewordings:
+    v4 anchors the profile drop target, v5 the profile development target, v6 the
+    full two-sided window + flick guard, v7 is FC-detector-lag-aware, v8 is the
+    concise rule-forward synthesis."""
+    assert "target_drop_temp_c" in instructions_for("v4")
+    assert "target_development_percent" in instructions_for("v5")
+    v6 = instructions_for("v6").lower()
+    assert "floor" in v6 and "ceiling" in v6 and "flick guard" in v6
+    assert "12-21 s" in instructions_for("v7") and "lower bound" in instructions_for("v7").lower()
+    assert "drop rule" in instructions_for("v8").lower()
+
+
 # --- healthcheck reachability probe (issue #168) ---
 
 
