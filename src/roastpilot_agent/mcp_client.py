@@ -2,8 +2,11 @@
 
 E5-S1: Pydantic mirrors of every tool result shape, derived from the
 actual coffee-roaster-mcp source (`mcp_server.py` dataclasses, v0.1.3
-surface verified in plan §2) and validated against the 7 Jun 2026
-live-roast exports. The mirrors use ``extra="ignore"`` so new optional
+surface verified in plan §2 — unchanged through v0.1.5, the pinned
+version: 0.1.4 added the `mic-check` CLI and 0.1.5 made a transient mic
+overflow recoverable, neither touching the 13-tool surface;
+mcp-contract-checker confirmed zero drift) and validated against the
+7 Jun 2026 live-roast exports. The mirrors use ``extra="ignore"`` so new optional
 upstream fields never break the agent — drift is detected by the
 mcp-contract-checker sub-agent and the contract fixtures (E5-S3), not by
 runtime crashes.
