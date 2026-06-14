@@ -432,19 +432,14 @@ class RoastRunner:
         self._raw_state = raw_state
         self._sleep = sleep
         self._finalized = False
+        # Whether the operator has acknowledged a fault (#206). A fault no longer
+        # auto-finalises: the run stays live (loop ticking, heat at 0) until
+        # acknowledge_fault flips this and _handle_completion finalises it.
         self._fault_acknowledged = False
-        """Whether the operator has acknowledged a fault (#206). A fault no longer
-        auto-finalises the run: a faulted run stays live (loop ticking, queue
-        draining, heat already forced to 0) so the operator can still engage/stop
-        cooling on a physically-running machine, until ``acknowledge_fault`` flips
-        this and :meth:`_handle_completion` finalises with outcome ``faulted``."""
+        # The fault reason latched on FAULTED entry (#206). A fault finalises on a
+        # later tick (after ack), by which point the FAULT event was already flushed
+        # from the emitter buffer — so the reason must be captured before the flush.
         self._captured_fault_reason: str | None = None
-        """The fault reason latched when the run first entered FAULTED (#206).
-
-        A fault now finalises on a LATER tick (after acknowledgement) than the one
-        it occurred on, by which point the FAULT event has been drained from the
-        emitter buffer. So the reason is captured from the buffer the moment the
-        run enters FAULTED — before the flush — and persisted at finalisation."""
         self._last_persisted_phase: RoastPhase | None = None
         self._scheduler: TickScheduler | None = None
 
@@ -481,6 +476,12 @@ class RoastRunner:
         restart-never-auto-resumes invariant as :meth:`recover`."""
         self._controller.load_profile(profile)
         await self._controller.recover_into_faulted(RoastPhase.FAULTED)
+        # Latch before flush — the FAULT event is about to be drained from the
+        # emitter buffer, and _captured_fault_reason must survive to finalisation
+        # (#206: the normal multi-tick path latches in _handle_completion, but
+        # that fires after the flush, so the recover path needs its own latch).
+        if self._captured_fault_reason is None:
+            self._captured_fault_reason = self._last_fault_reason()
         await self._flush_events()
         await self._persist_phase_if_changed()
 
@@ -634,17 +635,17 @@ class RoastRunner:
         phase records a failed operator action — never a guessed resume, and never
         a reset of a live run.
 
-        A terminal phase is *not* acknowledged here. After a fault the run is
-        finalized by :meth:`_handle_completion` (and the API 410-guards a
-        completed run), then the loop stops; the next roast builds a fresh
-        controller. Resetting a live faulted run to ``idle`` from the drain would
-        beat that finalization to the phase and leave an ``idle`` run with no
+        A terminal phase is *not* acknowledged here. Post-#206 a fault no longer
+        auto-finalises: the faulted run stays operable (loop alive, heat off) until
+        the operator acknowledges it via ``acknowledge_fault``
+        (:meth:`_dispatch_acknowledge_fault`). Resetting a live faulted run to
+        ``idle`` from the drain would leave an ``idle`` run with no
         ``completed_at`` — which ``active_run`` would treat as still active. So an
-        ack racing an e-stop in the same tick is recorded failed; the run faults
-        and completes. (Records two ``operator_actions`` rows for a control-only
-        action: the queue-acceptance row at submit, then this execution-outcome
-        row — the only meaningful outcome signal for an action with no matrix
-        pre-check.)"""
+        ``acknowledge_recovery`` racing an e-stop in the same tick is recorded
+        failed; the run becomes operable-faulted, not idle. (Records two
+        ``operator_actions`` rows for a control-only action: the queue-acceptance
+        row at submit, then this execution-outcome row — the only meaningful
+        outcome signal for an action with no matrix pre-check.)"""
         phase = self._controller.phase
         if phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED:
             target = _parse_resume_target(payload.get("resume_to"))

@@ -1435,6 +1435,46 @@ async def test_recover_on_start_faulted_run_re_enters_operable_faulted(
 
 
 @pytest.mark.asyncio
+async def test_recover_faulted_then_acknowledge_preserves_fault_reason(
+    store: RoastStore,
+) -> None:
+    """#206 regression: recover_faulted() must latch _captured_fault_reason BEFORE
+    _flush_events() drains the FAULT event from the emitter buffer. Without the
+    latch, the fault_reason column is None after restart→acknowledge because the
+    buffer is empty when _handle_completion fires on the first tick after ack."""
+    await store.create_run(
+        run_id="run-fault-reason",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.FAULTED,
+    )
+    clock = FakeClock()
+    mcp = FakeMCPClient()
+    service = RoastService(
+        store,
+        roaster=mcp,
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=clock,
+    )
+    await service.recover_on_start()
+    assert service.runner is not None
+
+    # Acknowledge the fault → finalises on the next tick.
+    accepted = await service.submit_operator_action(
+        "run-fault-reason", OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    assert accepted.result == "accepted"
+    finalized = await _tick(service, clock)
+    assert finalized
+
+    final = await store.read_run("run-fault-reason")
+    assert final is not None
+    assert final.outcome == "faulted"
+    assert final.fault_reason is not None  # the latch fix — was None before #206 patch
+
+
+@pytest.mark.asyncio
 async def test_recover_on_start_noop_for_completed_run(store: RoastStore) -> None:
     await store.create_run(
         run_id="run-fin", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
