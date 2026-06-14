@@ -66,21 +66,19 @@ OPENROUTER_API_KEY=sk-or-... python scripts/advisor_bakeoff.py \
   --prompt-version v2 --out /tmp/bakeoff.json --report-md /tmp/bakeoff.md
 ```
 
-The selection runs in two phases — first the **model** (latency is a hard wall,
-quality is the judgment), then the **prompt** on the pinned model — with a third
-held-out run validating the winner. The full record, with both result tables and
-the honest caveats, is in
-[`docs/advisor/advisor-evaluation.md`](docs/advisor/advisor-evaluation.md):
+**Current state:**
 
-- **Model (D33):** `google/gemini-3.1-flash-lite` is the only model that reliably
-  makes the drop call (drop F1 0.63); the frontier and slow models over-hold
-  (never drop).
+- **Model (D33):** `google/gemini-3.1-flash-lite` — the only model that reliably
+  makes the drop call (drop F1 0.63 on 28 real roasts); the frontier and slow
+  models over-hold (never drop).
 - **Prompt (#194):** `v4` (profile-anchored drop) closes a recall gap in `v2` —
-  recall 0.68 → 1.0, F1 0.66 → 0.88, precision up, heat-direction held. The
-  variants that pushed *earlier* over-corrected into premature drops.
+  recall 0.68 → 1.0, F1 0.66 → 0.88, precision up, heat-direction held;
+  generalizes on held-out roasts (19/19). Recommended (D34, pending).
 
-Per-run scorecards: [`bakeoff-artisan-summary.md`](docs/advisor/bakeoff-artisan-summary.md)
-(model), `bakeoff-results-prompts-2026-06-14.md` (prompt).
+The full story — the design, every run from the first bake-off to now, the data
+(past + the operator's roast history), the domain-expert and research-agent inputs,
+the result tables, the honest caveats, and where it landed — is in
+**[`docs/advisor/experiment.md`](docs/advisor/experiment.md)**.
 
 ## Development setup
 
