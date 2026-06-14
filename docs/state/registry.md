@@ -53,6 +53,16 @@ with the electric-roaster prompt `v1`, resolving plan §11 item 1 — the last
 M1 open item. Captured in `docs/advisor-bakeoff-2026-06-08.md` (reproducible
 via `scripts/advisor_bakeoff.py`); default is config-swappable (D18).
 
+**Advisor re-evaluated on real roasts (14–15 Jun).** A 28-roast bake-off built
+from the operator's Artisan `.alog` history **re-pinned the model to
+`google/gemini-3.1-flash-lite` (D33, merged #195)** — the only model that
+reliably calls the drop; opus + frontier/slow models over-hold. A prompt sweep
+(#194) found **`v4`** (profile-anchored drop) closes a recall gap in `v2`
+(recall 0.68→1.0); validated on 19 held-out roasts (generalizes 19/19) + a
+target-sensitivity addendum. **`v4` re-pin = D34, pending operator go** on branch
+`feature/194-advisor-prompt-v4-v8` (not merged). Full record + tables:
+`docs/advisor/experiment.md`.
+
 **E7 (API + SSE) is complete** — #67 (REST routes), #68 (operator action
 queue), #69 (SSE stream) all merged; epic tracking #70 closed. The full
 REST + SSE surface the SPA renders from: one backend authority, the SPA
