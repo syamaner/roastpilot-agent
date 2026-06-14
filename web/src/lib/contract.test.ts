@@ -35,6 +35,9 @@ import {
   initialDashboardViewModel,
 } from "@/pages/dashboard/useDashboardEvents";
 import type {
+  FcStatus,
+  MicHealth,
+  MicStatus,
   RoastDetail,
   RoastPhase,
   RoastSummary,
@@ -101,6 +104,18 @@ const PHASES: readonly RoastPhase[] = [
   "operator_recovery_required",
 ];
 
+// The mic-icon vocab the SPA renders (#197) — pinned so a server `MicHealth` /
+// `FirstCrackStatusLiteral` value the TS union doesn't mirror is caught here.
+const MIC_HEALTHS: readonly MicHealth[] = ["ok", "error", "idle"];
+const FC_STATUSES: readonly FcStatus[] = [
+  "disabled",
+  "manual",
+  "pending",
+  "detected",
+  "faulted",
+  "unavailable",
+];
+
 describe("SSE contract — every event type has a real frame", () => {
   // The Python dump pins the full SseEventType set; mirror that here so a server
   // that adds a type (and regenerates the fixture) forces a conscious TS edit.
@@ -165,9 +180,36 @@ describe("telemetry — every field the SPA renders is present", () => {
       "elapsed_seconds",
       "t0_detected",
       "first_crack_detected",
+      // #197: the capture-alive mic status rides the telemetry frame.
+      "mic_status",
     ]);
     expect(typeof t.bean_temp_c).toBe("number");
     expect(PHASES).toContain(t.agent_phase);
+  });
+
+  it("the telemetry frame carries the full MicStatus shape (#197)", () => {
+    // The replay path synthesizes a capture-alive mic_status, so the fixture pins
+    // the real MicStatus shape (not null). A server-side rename/reshape of any
+    // MicStatus field the TS mirror doesn't track makes a key assertion below RED.
+    const next = applyEvent(initialRoastStreamState, frame("telemetry"));
+    const mic = (next.telemetry as TelemetryEventData).mic_status;
+    expect(mic).not.toBeNull();
+    expectKeys(mic as unknown as Record<string, unknown>, [
+      "mic_health",
+      "audio_running",
+      "fc_status",
+      "queued_window_count",
+      "emitted_window_count",
+      "dropped_window_count",
+      "processed_window_count",
+      "reason",
+    ]);
+    // mic_health is one of the three the icon tints by (the union the SPA renders).
+    expect(MIC_HEALTHS).toContain((mic as MicStatus).mic_health);
+    // fc_status is one of the FC runtime-status literals.
+    expect(FC_STATUSES).toContain((mic as MicStatus).fc_status);
+    expect(typeof (mic as MicStatus).audio_running).toBe("boolean");
+    expect(typeof (mic as MicStatus).queued_window_count).toBe("number");
   });
 });
 
@@ -337,6 +379,20 @@ describe("REST snapshot contract", () => {
       "export_manifest",
       "enabled_actions",
     ]);
+    // #197: the active-run snapshot carries the capture-alive mic status the
+    // header paints the icon from before the first telemetry frame.
+    expect(rest.roast_detail.mic_status).not.toBeNull();
+    expectKeys(rest.roast_detail.mic_status as unknown as Record<string, unknown>, [
+      "mic_health",
+      "audio_running",
+      "fc_status",
+      "queued_window_count",
+      "emitted_window_count",
+      "dropped_window_count",
+      "processed_window_count",
+      "reason",
+    ]);
+    expect(MIC_HEALTHS).toContain((rest.roast_detail.mic_status as MicStatus).mic_health);
     // The nested profile the detail/header render from.
     expectKeys(rest.roast_detail.profile as unknown as Record<string, unknown>, [
       "name",
