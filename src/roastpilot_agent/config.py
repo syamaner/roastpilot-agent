@@ -7,6 +7,7 @@ deliberately conservative software ceilings pending supervised hardware
 validation at E12 (E12-S1).
 """
 
+import math
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
@@ -14,18 +15,22 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .models import RoastPhase
 
-# Phase-keyed advisor consult floors (#171, operator 13 Jun): the minimum
-# seconds between *automatic* advisor consults, scaling with roast criticality.
-# Change-based triggers (temp/RoR delta, phase change, manual) still fire
-# sooner — these are floors, not the only cause to consult.
-#   - preheating: 30 s (low criticality, machine warming, no beans)
-#   - roasting pre-first-crack (beans charged): 10 s
-#   - development (first crack onward): 0 = unthrottled — consult again as
-#     soon as the previous call returns; the practical floor is advisor
-#     latency (~5–7 s, serial), not this value.
+# Phase-keyed advisor consult floors — advisor cadence scales with first-crack
+# proximity (D32 / #191, refining #171). The advisor is consulted where it adds
+# optimization judgment, which ramps toward FC:
+#   - preheating: OFF — preheat is NOT an automatic-advice phase (see
+#     ``_AUTO_ADVICE_PHASES`` in controller.py). Reaching the charge band is a
+#     deterministic ramp; charge is an operator action; charge-guidance is
+#     already emitted. (Also removes the #134 preheat error-spam surface.) A
+#     manual operator request still works — it bypasses phase scoping.
+#   - roasting pre-first-crack (beans charged → FC): NO fixed heartbeat
+#     (``inf`` floor) — change-based triggers (temp/RoR delta) only, PLUS the
+#     near-FC boost below so the anticipatory cut isn't missed if RoR flattens.
+#   - development (first crack onward): 0 = unthrottled — consult again as soon
+#     as the previous call returns; the practical floor is advisor latency.
+# Change-based triggers (temp/RoR delta, phase change, manual) still fire sooner.
 DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float] = {
-    RoastPhase.PREHEATING: 30.0,
-    RoastPhase.ROASTING_PRE_FIRST_CRACK: 10.0,
+    RoastPhase.ROASTING_PRE_FIRST_CRACK: math.inf,
     RoastPhase.DEVELOPMENT: 0.0,
 }
 
@@ -82,6 +87,17 @@ class ControllerConfig(BaseModel):
     advisory_min_interval_seconds: dict[RoastPhase, Annotated[float, Field(ge=0)]] = Field(
         default_factory=lambda: dict(DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS)
     )
+    # Near-FC cadence boost (D32 / #191): the Maillard-approach is the advisor's
+    # highest-value window (the anticipatory heat cut that must precede FC, where
+    # thermal + ~12–21 s detector lag compound). Since pre-first-crack has no
+    # fixed heartbeat (change-based only), guarantee a heartbeat once the bean is
+    # near the FC band so the pre-emptive cut isn't missed if RoR flattens into
+    # the crack. ``advisory_near_fc_bean_temp_c`` is the approach threshold
+    # (default 170 °C — within a few °C of the operator's empirical ~178 °C FC on
+    # this probe; roaster/probe-specific, hence tunable); above it, in
+    # pre-first-crack, the consult floor becomes ``advisory_near_fc_interval_seconds``.
+    advisory_near_fc_bean_temp_c: float = Field(default=170.0, gt=0)
+    advisory_near_fc_interval_seconds: float = Field(default=10.0, gt=0)
     advisory_timeout_seconds: float = Field(default=10.0, gt=0)
     t0_debounce_ticks: int = Field(default=3, ge=1)
     telemetry_log_interval_seconds: float = Field(default=5.0, gt=0)

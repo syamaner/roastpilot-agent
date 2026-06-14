@@ -827,8 +827,12 @@ def _policy() -> AdvisoryCallPolicy:
 
 def test_policy_first_consult_in_advice_phase_is_phase_change() -> None:
     policy = _policy()
+    # Pre-first-crack is an auto-advice phase (preheat is not, post-D32).
     trigger = policy.evaluate(
-        phase=RoastPhase.PREHEATING, telemetry=reading(), now=0.0, manual_request=False
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(),
+        now=0.0,
+        manual_request=False,
     )
     assert trigger is AdvisoryTrigger.PHASE_CHANGE
 
@@ -846,17 +850,18 @@ def test_policy_phase_transition_triggers() -> None:
 
 
 def test_policy_bean_temp_delta_triggers_at_threshold_not_below() -> None:
-    # A throttled phase (10 s floor) so the sub-threshold case is genuinely
-    # silent; under #171 DEVELOPMENT is unthrottled and would heartbeat.
+    # Pre-first-crack DRYING (bean 150 °C, below the near-FC band) has no fixed
+    # heartbeat and no near-FC boost, so the sub-threshold case is genuinely
+    # silent — isolating the change-based trigger.
     policy = _policy()
     policy.note_call(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=reading(bean=200.0), now=0.0
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=reading(bean=150.0), now=0.0
     )
-    # +0.5 °C, well inside the interval: no trigger.
+    # +0.5 °C, below the delta threshold: no trigger.
     assert (
         policy.evaluate(
             phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-            telemetry=reading(bean=200.5),
+            telemetry=reading(bean=150.5),
             now=1.0,
             manual_request=False,
         )
@@ -866,7 +871,7 @@ def test_policy_bean_temp_delta_triggers_at_threshold_not_below() -> None:
     assert (
         policy.evaluate(
             phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-            telemetry=reading(bean=201.0),
+            telemetry=reading(bean=151.0),
             now=1.0,
             manual_request=False,
         )
@@ -875,45 +880,31 @@ def test_policy_bean_temp_delta_triggers_at_threshold_not_below() -> None:
 
 
 def test_policy_ror_delta_triggers_at_threshold() -> None:
-    # Throttled phase (10 s floor): the RoR delta is the *only* reason to fire
-    # at 1 s, not the interval — under #171 DEVELOPMENT would heartbeat here.
+    # Pre-first-crack drying (no fixed heartbeat, below the near-FC band): the
+    # RoR delta is the *only* reason to fire at 1 s.
     policy = _policy()
     policy.note_call(
         phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=200.0, bean_ror_c_per_min=5.0),
+        telemetry=reading(bean=150.0, bean_ror_c_per_min=5.0),
         now=0.0,
     )
     # Same bean temp, RoR jumps +2.0 °C/min: RoR is the live trigger.
     trigger = policy.evaluate(
         phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=200.0, bean_ror_c_per_min=7.0),
+        telemetry=reading(bean=150.0, bean_ror_c_per_min=7.0),
         now=1.0,
         manual_request=False,
     )
     assert trigger is AdvisoryTrigger.ROR_DELTA
 
 
-def test_policy_min_interval_heartbeat_preheat_is_30s() -> None:
-    """#171: preheating's consult floor is 30 s — silent before, fires at."""
+def test_policy_near_fc_boost_fires_when_approaching_fc() -> None:
+    """D32 (#191): once the bean nears the FC band (>= advisory_near_fc_bean_temp_c,
+    170 °C default) a heartbeat is GUARANTEED — the near-FC boost — so the
+    anticipatory cut isn't missed if RoR flattens into the crack. Silent just
+    shy of the boost interval, fires at it, even with flat telemetry."""
     policy = _policy()
-    flat = reading(bean=200.0, bean_ror_c_per_min=5.0)
-    policy.note_call(phase=RoastPhase.PREHEATING, telemetry=flat, now=0.0)
-    # Flat telemetry just shy of the 30 s floor: silent (no per-tick spam).
-    assert (
-        policy.evaluate(phase=RoastPhase.PREHEATING, telemetry=flat, now=29.9, manual_request=False)
-        is None
-    )
-    # At the floor the heartbeat fires.
-    assert (
-        policy.evaluate(phase=RoastPhase.PREHEATING, telemetry=flat, now=30.0, manual_request=False)
-        is AdvisoryTrigger.MIN_INTERVAL
-    )
-
-
-def test_policy_min_interval_heartbeat_charged_is_10s() -> None:
-    """#171: beans-charged / pre-FC roasting floor is 10 s."""
-    policy = _policy()
-    flat = reading(bean=200.0, bean_ror_c_per_min=5.0)
+    flat = reading(bean=172.0, bean_ror_c_per_min=5.0)  # at/above the near-FC band
     policy.note_call(phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=flat, now=0.0)
     assert (
         policy.evaluate(
@@ -931,7 +922,7 @@ def test_policy_min_interval_heartbeat_charged_is_10s() -> None:
             now=10.0,
             manual_request=False,
         )
-        is AdvisoryTrigger.MIN_INTERVAL
+        is AdvisoryTrigger.NEAR_FC
     )
 
 
@@ -955,12 +946,12 @@ def test_policy_development_is_unthrottled_back_to_back() -> None:
     )
 
 
-def test_policy_does_not_fire_every_tick_on_flat_telemetry_when_throttled() -> None:
-    """The whole point of a non-zero floor: a stable roast between heartbeats
-    is silent. In charged/pre-FC (10 s floor) flat ticks before 10 s are
-    quiet."""
+def test_policy_drying_has_no_heartbeat_stays_silent_when_flat() -> None:
+    """D32 (#191): pre-first-crack DRYING (below the near-FC band) has NO fixed
+    heartbeat — a flat roast stays silent however long it sits, so stable drying
+    is quiet (only change-based triggers + the near-FC boost ever fire here)."""
     policy = _policy()
-    flat = reading(bean=200.0, bean_ror_c_per_min=5.0)
+    flat = reading(bean=150.0, bean_ror_c_per_min=5.0)  # drying, below the FC band
     policy.note_call(phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=flat, now=0.0)
     fired = [
         policy.evaluate(
@@ -969,21 +960,23 @@ def test_policy_does_not_fire_every_tick_on_flat_telemetry_when_throttled() -> N
             now=t,
             manual_request=False,
         )
-        for t in (1.0, 2.0, 3.0, 5.0, 9.0)
+        for t in (1.0, 10.0, 30.0, 120.0, 600.0)  # well past any old heartbeat floor
     ]
     assert fired == [None, None, None, None, None]
 
 
 def test_policy_change_trigger_fires_early_within_phase_interval() -> None:
-    """#171: the interval is a floor, not a gate — a large bean-temp jump
-    consults *before* the phase interval elapses (preheat's 30 s floor here),
-    preserving the responsive change-based behavior."""
+    """The change-based triggers are never gated by the floor — a large bean-temp
+    jump consults immediately even in pre-first-crack (which has no fixed
+    heartbeat), preserving responsive behavior."""
     policy = _policy()
-    policy.note_call(phase=RoastPhase.PREHEATING, telemetry=reading(bean=200.0), now=0.0)
-    # 1 s in, far short of the 30 s floor, a +5 °C jump fires immediately.
+    policy.note_call(
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=reading(bean=150.0), now=0.0
+    )
+    # 1 s in, a +5 °C jump fires immediately (drying, below the near-FC band).
     trigger = policy.evaluate(
-        phase=RoastPhase.PREHEATING,
-        telemetry=reading(bean=205.0),
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        telemetry=reading(bean=155.0),
         now=1.0,
         manual_request=False,
     )
@@ -1015,6 +1008,7 @@ def test_policy_manual_takes_precedence_over_automatic_trigger() -> None:
 @pytest.mark.parametrize(
     "phase",
     [
+        RoastPhase.PREHEATING,  # D32 (#191): preheat is NOT an automatic-advice phase
         RoastPhase.IDLE,
         RoastPhase.STARTING,
         RoastPhase.COOLING,

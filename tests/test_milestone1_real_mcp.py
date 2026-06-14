@@ -183,9 +183,15 @@ async def _drive_slice(real_mcp: MCPServerProcess, store: RoastStore) -> None:
             f"did not reach {phase.value} within {cap} ticks (stuck at {actual.value})"
         )
 
-    # The advisor ramps then cuts heat; the mock's resulting bean-temp drop trips
-    # auto-T0, which the controller debounces into roasting_pre_first_crack.
-    await run_until(RoastPhase.ROASTING_PRE_FIRST_CRACK, cap=250)
+    # D32 (#191): the advisor is OFF in preheat, so reaching T0 is the OPERATOR's
+    # charge action (mark_beans_added — the manual-T0 fallback), not an
+    # advisor-driven heat cut. Charge promptly, before the profile's 100 % warm-up
+    # heat overruns the pre-T0 ceiling, then advance to roasting_pre_first_crack.
+    charge = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.MARK_BEANS_ADDED)
+    )
+    assert charge.result == "accepted"
+    await run_until(RoastPhase.ROASTING_PRE_FIRST_CRACK, cap=10)
 
     # First crack is the operator override (audio detection disabled).
     result = await service.submit_operator_action(

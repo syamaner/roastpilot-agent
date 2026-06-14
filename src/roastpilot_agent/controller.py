@@ -274,28 +274,38 @@ class AdvisoryTrigger(Enum):
     BEAN_TEMP_DELTA = "bean_temp_delta"
     ROR_DELTA = "ror_delta"
     MIN_INTERVAL = "min_interval"
+    NEAR_FC = "near_fc"
 
 
 # Advice is only worth requesting in phases where its output (a heat/fan
 # target) could legally execute — the SET_HEAT row of the command×phase
 # matrix is the single source of truth, so this never drifts from safety.
 _ADVICE_PHASES: frozenset[RoastPhase] = COMMAND_PHASE_MATRIX[RoastCommand.SET_HEAT]
+# Phases the advisor is consulted in AUTOMATICALLY (D32 / #191): preheat is
+# excluded — the LLM adds no judgment over the deterministic warm-up ramp, and
+# its preheat calls were the #134 error-spam surface. A manual operator request
+# still reaches every advice phase (it bypasses this scope); the command×phase
+# matrix then decides whether the resulting advice can apply.
+_AUTO_ADVICE_PHASES: frozenset[RoastPhase] = _ADVICE_PHASES - {RoastPhase.PREHEATING}
 
 
 class AdvisoryCallPolicy:
     """Decides when the advisor is consulted (orchestration plan § Advisory
     Call Frequency).
 
-    Change-based, never every tick: an automatic call fires only on a
-    meaningful change since the last call — a phase transition, a bean-temp
-    move of ``advisory_min_temp_delta_c``, a RoR move of
-    ``advisory_min_ror_delta_c_per_min``, or a **phase-keyed** consult-floor
-    heartbeat (``advisory_min_interval_seconds`` mapped per agent phase, #171:
-    preheat 30 s, beans-charged/pre-FC 10 s, development 0 = unthrottled).
-    The interval is a floor only — the change-based triggers fire sooner. A
-    manual operator request bypasses every gate, including phase scoping, so
-    the operator always gets a response (the command×phase matrix then
-    decides whether that advice can apply).
+    Cadence scales with first-crack proximity (D32 / #191): an automatic call
+    fires only on a meaningful change since the last call — a phase transition,
+    a bean-temp move of ``advisory_min_temp_delta_c``, a RoR move of
+    ``advisory_min_ror_delta_c_per_min`` — plus, by phase:
+    **preheat → OFF** (not an automatic-advice phase); **pre-first-crack → no
+    fixed heartbeat** (``advisory_min_interval_seconds`` is ``inf`` — change-based
+    only) **plus a near-FC boost** (a short heartbeat once bean temp reaches
+    ``advisory_near_fc_bean_temp_c``, so the anticipatory cut isn't missed if RoR
+    flattens); **development → unthrottled** (floor 0). The interval is a floor
+    only — the change-based triggers fire sooner. A manual operator request
+    bypasses every gate, including phase scoping, so the operator always gets a
+    response (the command×phase matrix then decides whether that advice can
+    apply).
 
     Pure and deterministic: :meth:`evaluate` only reads state, and the
     controller calls :meth:`note_call` after an actual consult to advance
@@ -327,7 +337,7 @@ class AdvisoryCallPolicy:
         """
         if manual_request:
             return AdvisoryTrigger.MANUAL
-        if phase not in _ADVICE_PHASES:
+        if phase not in _AUTO_ADVICE_PHASES:
             return None
         # First consult in an advice phase, or any phase transition since the
         # last call: ``_last_phase`` starts None, so the first eligible tick
@@ -355,15 +365,27 @@ class AdvisoryCallPolicy:
             >= self._config.advisory_min_ror_delta_c_per_min
         ):
             return AdvisoryTrigger.ROR_DELTA
-        # Phase-keyed consult floor (#171). The interval scales with roast
-        # criticality: preheat 30 s, charged/pre-FC 10 s, development 0 =
-        # unthrottled. A 0 floor makes this condition fire every eligible
-        # tick once the prior call has returned (calls are serial, awaited in
-        # the tick), so first-crack/development consults run back-to-back at
-        # the advisor's own latency — the change-based triggers above still
-        # short-circuit sooner in any phase. Resolved from the *current*
-        # phase, not the phase at the last call, so the floor follows the
-        # roast forward.
+        # Near-FC cadence boost (D32 / #191): the Maillard-approach is the
+        # advisor's highest-value window — the anticipatory heat cut that must
+        # precede FC (thermal + ~12–21 s detector lag compound). Pre-first-crack
+        # has no fixed heartbeat, so once the bean nears the FC band guarantee a
+        # heartbeat here, so the pre-emptive cut isn't missed if RoR flattens
+        # into the crack and the change-based triggers above go quiet.
+        if (
+            phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+            and telemetry is not None
+            and telemetry.bean_temp_c >= self._config.advisory_near_fc_bean_temp_c
+            and now - self._last_call_monotonic >= self._config.advisory_near_fc_interval_seconds
+        ):
+            return AdvisoryTrigger.NEAR_FC
+        # Phase-keyed consult floor (D32 / #171), resolved from the *current*
+        # phase so it follows the roast forward: development 0 = unthrottled (a
+        # 0 floor fires every eligible tick once the prior serial call returns,
+        # so FC/development consults run back-to-back at advisor latency);
+        # pre-first-crack ``inf`` = NO fixed heartbeat (change-based + the near-FC
+        # boost above are its only automatic triggers); preheat is not an
+        # automatic-advice phase at all. The change-based triggers above still
+        # short-circuit sooner in any phase.
         if now - self._last_call_monotonic >= self._config.advisory_interval_for(phase):
             return AdvisoryTrigger.MIN_INTERVAL
         return None

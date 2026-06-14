@@ -25,12 +25,15 @@ def test_controller_defaults_match_orchestration_plan() -> None:
     assert config.tick_interval_seconds == 1.0
     assert config.advisory_min_temp_delta_c == 1.0
     assert config.advisory_min_ror_delta_c_per_min == 2.0
-    # #171: phase-keyed consult floors replace the single 15 s heartbeat.
+    # D32 (#191): cadence by FC-proximity. Preheat is OFF (not in the map +
+    # excluded from auto-advice phases); pre-first-crack has NO fixed heartbeat
+    # (inf — change-based + the near-FC boost only); development unthrottled.
     assert config.advisory_min_interval_seconds == {
-        RoastPhase.PREHEATING: 30.0,
-        RoastPhase.ROASTING_PRE_FIRST_CRACK: 10.0,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK: float("inf"),
         RoastPhase.DEVELOPMENT: 0.0,
     }
+    assert config.advisory_near_fc_bean_temp_c == 170.0
+    assert config.advisory_near_fc_interval_seconds == 10.0
     assert config.advisory_timeout_seconds == 10.0
     assert config.t0_debounce_ticks == 3
     assert config.telemetry_log_interval_seconds == 5.0
@@ -39,10 +42,12 @@ def test_controller_defaults_match_orchestration_plan() -> None:
 
 def test_advisory_interval_for_resolves_per_phase_and_defaults_unthrottled() -> None:
     config = ControllerConfig()
-    assert config.advisory_interval_for(RoastPhase.PREHEATING) == 30.0
-    assert config.advisory_interval_for(RoastPhase.ROASTING_PRE_FIRST_CRACK) == 10.0
-    # Development is unthrottled (0); a phase absent from the map is too.
+    # Pre-first-crack has NO fixed heartbeat (inf — change-based + near-FC only).
+    assert config.advisory_interval_for(RoastPhase.ROASTING_PRE_FIRST_CRACK) == float("inf")
+    # Development is unthrottled (0); phases absent from the map are too —
+    # preheat (not an auto-advice phase) and cooling.
     assert config.advisory_interval_for(RoastPhase.DEVELOPMENT) == 0.0
+    assert config.advisory_interval_for(RoastPhase.PREHEATING) == 0.0
     assert config.advisory_interval_for(RoastPhase.COOLING) == 0.0
 
 
