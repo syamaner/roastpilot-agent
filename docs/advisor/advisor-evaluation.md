@@ -83,19 +83,30 @@ indicator; **v6** is a full two-sided window (floor / ≤196 ceiling / post-FC f
 guard), floor-biased; **v7** is lag-aware (the clock under-reports development);
 **v8** is a concise synthesis.
 
-**Conclusion:** **v4 wins and cleanly beats v2** — recall 0.68 → **1.0** (zero
-misses across 28), F1 0.655 → **0.881**, precision *up* 0.643 → 0.821, with the
-anticipatory heat cut essentially held (0.851 vs 0.887). v4's only cost is calling
-the drop ~2.4 s early on 10/28 roasts — all **exactly one tick** (worst −25 s /
-−2 °C), near-matches, never under-developed. The variants that pushed *earlier*
-(**v6, v7**) over-corrected into chronic early drops (v7 −33 s, precision 0.47,
-*worse than v2*) — confirming the failure mode the eval was watching for.
+**Conclusion:** **v4 is the pick** — but stated precisely, not as a clean sweep
+(paired tests over the 28 roasts):
+
+- **Recall improvement is statistically robust.** v4 calls the drop on **9 roasts
+  v2 missed and misses none v2 caught** → exact McNemar **p = 0.0039**. This is the
+  safety-relevant direction: a missed drop is an over-roast past the bitter ceiling.
+- **F1 improves on net (mean 0.655 → 0.881, Δ +0.23) but more modestly than the
+  means imply.** Per-roast, v4 is better on 9, **worse on 3**, tied on 16. The 3
+  regressions are roasts where v2 made a clean call and v4 added a one-tick-early
+  false positive (F1 1.0 → 0.67). Magnitude-weighted (Wilcoxon signed-rank, W = 6)
+  the gain is significant; the plain sign test is borderline (p = 0.15). So: a real,
+  worthwhile gain, not a statistically airtight sweep.
+- **Mean precision rises** 0.643 → 0.821 — because v4 converts 9 of v2's
+  precision-0 *misses* into catches — while the anticipatory heat cut holds (0.851
+  vs 0.887).
+
+Net: **v4 trades +9 caught drops for 3 one-tick-early near-matches** on roasts v2
+already nailed (all FPs exactly one tick, worst −25 s / −2 °C — never
+under-developed). A good trade. The variants that pushed *earlier* (**v6, v7**)
+over-corrected into chronic early drops (v7 −33 s, precision 0.47, *worse than v2*)
+— confirming the failure mode the eval was watching for.
 **Recommended pin: v4 (D34 — pending operator go + held-out validation below).**
 
-## Phase 3 — Held-out validation (running)
-
-> **Status: in progress.** Conclusion pending — this section is filled when the
-> run completes.
+## Phase 3 — Held-out validation (the train-on-test mitigation)
 
 The v4–v8 prompts were authored from the operator's profile, which is the
 aggregate of the same 28 roasts — a population-level train-on-test risk. This run
@@ -103,7 +114,27 @@ validates the winner (v4) and runner-up (v5), with v2 as baseline, against the
 **19 UNSEEN roasts** the prompt work never touched: the over-dark logs the
 operator excluded (drop **≥ 198 °C**). Runner:
 [`bakeoff-holdout-prompts.py`](bakeoff-holdout-prompts.py); scorecard
-`bakeoff-holdout-2026-06-14.{md,json}` (written on completion).
+`bakeoff-holdout-2026-06-14.{md,json}`.
+
+**Result.**
+
+| prompt | recall (drop called) | wins [193, < actual] | mean recommended drop | ≤196 °C |
+|---|---|---|---|---|
+| v2 | 11/19 | 2/12 | 199.7 °C | 0 |
+| **v4** | **19/19** | **11/19** | 197.8 °C | 4 |
+| v5 | 19/19 | 9/19 | 198.3 °C | 2 |
+
+- **Generalization (the anti-overfit signal): clean.** v4 called the drop on
+  **19/19** unseen roasts (v5 too); v2 stayed at 11/19 — the same over-hold gap on
+  data the prompt never saw. So v4's recall fix is **not** an artifact of
+  train-on-test; it recognizes the drop window on roasts it never informed.
+- **Caught the over-roast (operator criterion): partially, and far better than
+  v2.** v4 pulled the drop *lower than the operator's over-dark drop, ≥ 193 °C* on
+  **11/19** roasts (v2: 2/12 — it rode the target to a mean 199.7 °C). But with the
+  harness feeding the *actual over-dark target* (≈200 °C), v4 only pulls to a mean
+  **197.8 °C** (4/19 fully ≤196) — it moves the right direction but, handed a
+  too-high target, does not fully enforce the 196 ceiling. Whether a *correct*
+  target gets it into [193, 196] is the addendum below.
 
 Read on two axes:
 - **Generalization (clean):** does the prompt reliably *recognize the drop window*
@@ -116,6 +147,34 @@ Read on two axes:
   is **not** correctness here (the human over-roasted) — a lower-agreement
   *earlier* drop is the better outcome; read recall + the drop-temperature
   distribution, not F1 alone.
+
+**Operator success criterion (14 Jun).** On these over-dark (≥198 °C) roasts a
+recommended drop is a **WIN if it lands lower than the operator's actual drop AND
+at or above 193 °C** — i.e. the advisor pulls the drop down toward the ≤196 band
+(catching the over-roast) without going below the 193 °C development floor (the
+operator's proxy threshold for these unlabelled logs). A drop at the operator's
+actual 198–202 °C is a *loss* (it merely followed the over-dark target); a drop
+below 193 °C is a *loss* (under-developed). Target window ≈ **[193, ~196] °C**.
+Measured per roast as `recommended_drop_°C = human_drop_°C + timing_error_°C`
+(observable because the replay only sees the advisor drop at or before the human's
+tick).
+
+### Addendum — target sensitivity (a "what-if", not the conclusion)
+
+> **Status: running.** Filled on completion.
+
+The stringent run above feeds each over-dark roast its *actual* drop (≈200 °C) as
+the profile target — so it tests whether v4's ≤196 ceiling overrides a too-high
+target. This addendum replays the **same 19 roasts with the operator's *intended*
+target (195 °C / 15 % DTR)** instead, isolating how much the recommended drop
+follows the target vs the prompt's own ceiling logic. It is a target-**sensitivity
+/ counterfactual** analysis (vary one input, hold model + prompt fixed) — *not* an
+ablation (no component removed). Runner:
+[`bakeoff-holdout-addendum.py`](bakeoff-holdout-addendum.py) (uses the
+`target_*_override` params added to `build_ticks`); scorecard
+`bakeoff-holdout-addendum-2026-06-14.json`. The question: with a *correct* target,
+does v4 land in [193, 196] more fully than the 197.8 °C it managed when handed
+200 °C?
 
 **Honest limitation:** there are no unseen *good* roasts left (all 28 informed the
 prompt design), so this validates generalization + ceiling logic on the over-dark
