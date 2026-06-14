@@ -13,10 +13,15 @@ sys.path.insert(0, "/Users/sertanyamaner/git/roastpilot-agent/src")
 
 sys.argv = [
     "advisor_bakeoff.py",
-    "--mode", "replay",
-    "--prompt-version", "v2", "v3",
-    "--out", "/tmp/bakeoff-final.json",
-    "--report-md", "/tmp/bakeoff-final.md",
+    "--mode",
+    "replay",
+    "--prompt-version",
+    "v2",
+    "v3",
+    "--out",
+    "/tmp/bakeoff-final.json",
+    "--report-md",
+    "/tmp/bakeoff-final.md",
 ]
 
 import advisor_bakeoff as b  # noqa: E402

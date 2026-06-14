@@ -523,6 +523,7 @@ class RoastController:
         """Commit a phase transition or raise :class:`InvalidTransitionError`."""
         if not self.can_transition(target):
             raise InvalidTransitionError(self._phase, target)
+        previous = self._phase
         self._phase = target
         if target in (RoastPhase.STARTING, RoastPhase.PREHEATING):
             # Per-run latches reset (T0 confirmation, debounce streak,
@@ -536,9 +537,14 @@ class RoastController:
             # A new run/preheat resets the development clock; it is (re)armed
             # only on the first-crack transition below.
             self._first_crack_monotonic = None
-        if target is RoastPhase.DEVELOPMENT:
-            # Both FC paths (MCP detection and the operator override) funnel
-            # through here, so the development clock starts in one place.
+        if previous is RoastPhase.ROASTING_PRE_FIRST_CRACK and target is RoastPhase.DEVELOPMENT:
+            # Arm the development clock only on the true first-crack edge — both
+            # FC paths (MCP detection and the operator override) cross it. A
+            # recovery resume into development (OPERATOR_RECOVERY_REQUIRED →
+            # DEVELOPMENT) is NOT a fresh FC: it must not restamp the clock to
+            # now, or an already-developed run would read elapsed≈0. On such a
+            # resume the in-memory FC time is preserved (same process) or stays
+            # None (after a restart) — advisory-only either way (safety review).
             self._first_crack_monotonic = self._clock()
         if target in UNIVERSAL_TARGETS:
             # D16 operator-timeout tracking starts on entering a true

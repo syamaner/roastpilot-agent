@@ -1505,6 +1505,30 @@ async def test_development_clock_resets_on_new_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_development_clock_survives_recovery_resume() -> None:
+    """A recovery resume into development is NOT a fresh first crack: it must
+    not restamp the development clock, or an already-developed run resumed from
+    ``operator_recovery_required`` would read elapsed≈0. Within one process the
+    original FC time is preserved, so the clock keeps elapsing."""
+    advisor = FakeAdvisor([decision()])
+    harness = make_harness(readings=[reading()], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)  # FC edge arms the clock
+    harness.clock.advance(60.0)
+    # Recovery, then resume back into development — a non-FC re-entry.
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.clock.advance(30.0)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    harness.clock.advance(10.0)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    # Elapsed since the ORIGINAL FC (60+30+10), not reset to ~10.
+    assert advisor.contexts[-1].development_elapsed_seconds == 100.0
+
+
+@pytest.mark.asyncio
 async def test_advisor_drop_now_executes() -> None:
     advisor = FakeAdvisor([decision(drop=True)])
     harness = harness_in_development(readings=[reading()], advisor=advisor)
