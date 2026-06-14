@@ -1,0 +1,4653 @@
+{
+  "mode": "replay-holdout-addendum",
+  "kind": "target-sensitivity",
+  "pinned_model": "google/gemini-3.1-flash-lite",
+  "intended_target_drop_c": 195.0,
+  "intended_target_development_percent": 15.0,
+  "roasts": [
+    "artisan-29",
+    "artisan-30",
+    "artisan-31",
+    "artisan-32",
+    "artisan-33",
+    "artisan-34",
+    "artisan-35",
+    "artisan-36",
+    "artisan-37",
+    "artisan-38",
+    "artisan-39",
+    "artisan-40",
+    "artisan-41",
+    "artisan-42",
+    "artisan-43",
+    "artisan-44",
+    "artisan-45",
+    "artisan-46",
+    "artisan-47"
+  ],
+  "results": {
+    "v2": [
+      {
+        "roast_name": "artisan-29",
+        "tick_count": 24,
+        "ok_count": 24,
+        "development_time_ratio_truth": 14.1,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 23,
+          "false_negatives": 1,
+          "total": 24
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              0,
+              18,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 23,
+          "agreement": 1.0
+        },
+        "heat": {
+          "mae": 1.67,
+          "directional_agreement": 1.0,
+          "directional_samples": 23
+        },
+        "fan": {
+          "mae": 8.12,
+          "directional_agreement": 0.609,
+          "directional_samples": 23
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 2,
+            "median_seconds": 1.4,
+            "max_seconds": 1.86
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 18,
+            "median_seconds": 1.18,
+            "max_seconds": 1.54
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.23,
+            "max_seconds": 1.35
+          }
+        ],
+        "human_drop_temp_c": 198.0
+      },
+      {
+        "roast_name": "artisan-30",
+        "tick_count": 34,
+        "ok_count": 34,
+        "development_time_ratio_truth": 16.5,
+        "drop": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "true_positives": 1,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "first_drop_seconds": 986.77,
+          "timing_error_seconds": 0.0,
+          "timing_error_c": 0.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 0,
+          "true_negatives": 33,
+          "false_negatives": 0,
+          "total": 34
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              1,
+              0,
+              0
+            ],
+            [
+              5,
+              24,
+              2
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 33,
+          "agreement": 0.788
+        },
+        "heat": {
+          "mae": 16.76,
+          "directional_agreement": 0.788,
+          "directional_samples": 33
+        },
+        "fan": {
+          "mae": 12.5,
+          "directional_agreement": 0.455,
+          "directional_samples": 33
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 8,
+            "median_seconds": 1.1,
+            "max_seconds": 1.58
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.15,
+            "max_seconds": 1.68
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.25,
+            "max_seconds": 1.42
+          }
+        ],
+        "human_drop_temp_c": 198.0
+      },
+      {
+        "roast_name": "artisan-31",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 14.9,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 25,
+          "false_negatives": 1,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              1,
+              20,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.96
+        },
+        "heat": {
+          "mae": 6.92,
+          "directional_agreement": 0.96,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 14.23,
+          "directional_agreement": 0.44,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.16,
+            "max_seconds": 1.16
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.15,
+            "max_seconds": 1.46
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.26,
+            "max_seconds": 1.66
+          }
+        ],
+        "human_drop_temp_c": 198.0
+      },
+      {
+        "roast_name": "artisan-32",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 16.9,
+        "drop": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "true_positives": 1,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "first_drop_seconds": 745.54,
+          "timing_error_seconds": 0.0,
+          "timing_error_c": 0.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 0,
+          "true_negatives": 25,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              1,
+              19,
+              0
+            ],
+            [
+              2,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.88
+        },
+        "heat": {
+          "mae": 7.31,
+          "directional_agreement": 0.88,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 16.15,
+          "directional_agreement": 0.4,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 2,
+            "median_seconds": 0.93,
+            "max_seconds": 1.02
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 19,
+            "median_seconds": 1.09,
+            "max_seconds": 2.89
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.11,
+            "max_seconds": 1.29
+          }
+        ],
+        "human_drop_temp_c": 198.0
+      },
+      {
+        "roast_name": "artisan-33",
+        "tick_count": 24,
+        "ok_count": 24,
+        "development_time_ratio_truth": 18.3,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 1,
+          "false_negatives": 1,
+          "first_drop_seconds": 661.624,
+          "timing_error_seconds": -22.0,
+          "timing_error_c": -3.6
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 1,
+          "true_negatives": 22,
+          "false_negatives": 1,
+          "total": 24
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              1,
+              17,
+              0
+            ],
+            [
+              0,
+              0,
+              2
+            ]
+          ],
+          "samples": 23,
+          "agreement": 0.957
+        },
+        "heat": {
+          "mae": 2.92,
+          "directional_agreement": 0.957,
+          "directional_samples": 23
+        },
+        "fan": {
+          "mae": 7.29,
+          "directional_agreement": 0.609,
+          "directional_samples": 23
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.48,
+            "max_seconds": 1.48
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 18,
+            "median_seconds": 1.1,
+            "max_seconds": 1.52
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.22,
+            "max_seconds": 1.37
+          }
+        ],
+        "human_drop_temp_c": 198.3
+      },
+      {
+        "roast_name": "artisan-34",
+        "tick_count": 30,
+        "ok_count": 30,
+        "development_time_ratio_truth": 20.9,
+        "drop": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "true_positives": 1,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "first_drop_seconds": 862.607,
+          "timing_error_seconds": 0.0,
+          "timing_error_c": 0.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 0,
+          "true_negatives": 29,
+          "false_negatives": 0,
+          "total": 30
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              1,
+              24,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 29,
+          "agreement": 0.966
+        },
+        "heat": {
+          "mae": 8,
+          "directional_agreement": 0.966,
+          "directional_samples": 29
+        },
+        "fan": {
+          "mae": 7,
+          "directional_agreement": 0.655,
+          "directional_samples": 29
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 6,
+            "median_seconds": 1.0,
+            "max_seconds": 1.42
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 18,
+            "median_seconds": 1.14,
+            "max_seconds": 1.49
+          },
+          {
+            "phase": "development",
+            "count": 6,
+            "median_seconds": 1.23,
+            "max_seconds": 1.33
+          }
+        ],
+        "human_drop_temp_c": 198.7
+      },
+      {
+        "roast_name": "artisan-35",
+        "tick_count": 25,
+        "ok_count": 25,
+        "development_time_ratio_truth": 13.7,
+        "drop": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "true_positives": 1,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "first_drop_seconds": 713.271,
+          "timing_error_seconds": 0.0,
+          "timing_error_c": 0.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 0,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 25
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              1,
+              19,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 24,
+          "agreement": 0.958
+        },
+        "heat": {
+          "mae": 2,
+          "directional_agreement": 0.958,
+          "directional_samples": 24
+        },
+        "fan": {
+          "mae": 17.2,
+          "directional_agreement": 0.375,
+          "directional_samples": 24
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.06,
+            "max_seconds": 1.06
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.25,
+            "max_seconds": 2.03
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.22,
+            "max_seconds": 1.7
+          }
+        ],
+        "human_drop_temp_c": 198.7
+      },
+      {
+        "roast_name": "artisan-36",
+        "tick_count": 27,
+        "ok_count": 27,
+        "development_time_ratio_truth": 17.6,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 752.373,
+          "timing_error_seconds": -11.0,
+          "timing_error_c": -2.4
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 25,
+          "false_negatives": 0,
+          "total": 27
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              1,
+              19,
+              0
+            ],
+            [
+              1,
+              0,
+              1
+            ]
+          ],
+          "samples": 26,
+          "agreement": 0.923
+        },
+        "heat": {
+          "mae": 13.33,
+          "directional_agreement": 0.923,
+          "directional_samples": 26
+        },
+        "fan": {
+          "mae": 14.44,
+          "directional_agreement": 0.423,
+          "directional_samples": 26
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.39,
+            "max_seconds": 1.39
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.09,
+            "max_seconds": 1.65
+          },
+          {
+            "phase": "development",
+            "count": 6,
+            "median_seconds": 1.18,
+            "max_seconds": 1.62
+          }
+        ],
+        "human_drop_temp_c": 198.7
+      },
+      {
+        "roast_name": "artisan-37",
+        "tick_count": 25,
+        "ok_count": 25,
+        "development_time_ratio_truth": 14.0,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 24,
+          "false_negatives": 1,
+          "total": 25
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              1,
+              19,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 24,
+          "agreement": 0.958
+        },
+        "heat": {
+          "mae": 7.2,
+          "directional_agreement": 0.958,
+          "directional_samples": 24
+        },
+        "fan": {
+          "mae": 10.4,
+          "directional_agreement": 0.417,
+          "directional_samples": 24
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 3,
+            "median_seconds": 0.97,
+            "max_seconds": 1.04
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 18,
+            "median_seconds": 1.09,
+            "max_seconds": 1.74
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.44,
+            "max_seconds": 1.57
+          }
+        ],
+        "human_drop_temp_c": 199.0
+      },
+      {
+        "roast_name": "artisan-38",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 13.3,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 25,
+          "false_negatives": 1,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              1,
+              20,
+              0
+            ],
+            [
+              1,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.92
+        },
+        "heat": {
+          "mae": 3.85,
+          "directional_agreement": 0.92,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 16.73,
+          "directional_agreement": 0.32,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.34,
+            "max_seconds": 1.34
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.22,
+            "max_seconds": 1.57
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.36,
+            "max_seconds": 1.6
+          }
+        ],
+        "human_drop_temp_c": 199.0
+      },
+      {
+        "roast_name": "artisan-39",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 12.4,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 25,
+          "false_negatives": 1,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              20,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.92
+        },
+        "heat": {
+          "mae": 4.23,
+          "directional_agreement": 0.92,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 14.42,
+          "directional_agreement": 0.4,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 0.9,
+            "max_seconds": 0.9
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.24,
+            "max_seconds": 1.74
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.37,
+            "max_seconds": 1.6
+          }
+        ],
+        "human_drop_temp_c": 200.0
+      },
+      {
+        "roast_name": "artisan-40",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 14.2,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 25,
+          "false_negatives": 1,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              1,
+              18,
+              1
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.92
+        },
+        "heat": {
+          "mae": 8.46,
+          "directional_agreement": 0.92,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 13.85,
+          "directional_agreement": 0.4,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 2,
+            "median_seconds": 0.95,
+            "max_seconds": 1.04
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.06,
+            "max_seconds": 2.08
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.32,
+            "max_seconds": 1.54
+          }
+        ],
+        "human_drop_temp_c": 200.0
+      },
+      {
+        "roast_name": "artisan-41",
+        "tick_count": 29,
+        "ok_count": 29,
+        "development_time_ratio_truth": 13.5,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 28,
+          "false_negatives": 1,
+          "total": 29
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              1,
+              22,
+              1
+            ],
+            [
+              0,
+              0,
+              2
+            ]
+          ],
+          "samples": 28,
+          "agreement": 0.929
+        },
+        "heat": {
+          "mae": 8.28,
+          "directional_agreement": 0.929,
+          "directional_samples": 28
+        },
+        "fan": {
+          "mae": 9.83,
+          "directional_agreement": 0.536,
+          "directional_samples": 28
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 5,
+            "median_seconds": 1.1,
+            "max_seconds": 1.5
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.13,
+            "max_seconds": 1.84
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.26,
+            "max_seconds": 1.45
+          }
+        ],
+        "human_drop_temp_c": 200.0
+      },
+      {
+        "roast_name": "artisan-42",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 12.7,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 25,
+          "false_negatives": 1,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              1,
+              21,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.96
+        },
+        "heat": {
+          "mae": 4.62,
+          "directional_agreement": 0.96,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 5.96,
+          "directional_agreement": 0.68,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.12,
+            "max_seconds": 1.12
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.13,
+            "max_seconds": 1.53
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.31,
+            "max_seconds": 1.68
+          }
+        ],
+        "human_drop_temp_c": 200.3
+      },
+      {
+        "roast_name": "artisan-43",
+        "tick_count": 25,
+        "ok_count": 25,
+        "development_time_ratio_truth": 10.5,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 24,
+          "false_negatives": 1,
+          "total": 25
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              1,
+              20,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 24,
+          "agreement": 0.958
+        },
+        "heat": {
+          "mae": 6.4,
+          "directional_agreement": 0.958,
+          "directional_samples": 24
+        },
+        "fan": {
+          "mae": 8.4,
+          "directional_agreement": 0.5,
+          "directional_samples": 24
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.02,
+            "max_seconds": 1.02
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.12,
+            "max_seconds": 1.57
+          },
+          {
+            "phase": "development",
+            "count": 3,
+            "median_seconds": 1.24,
+            "max_seconds": 1.31
+          }
+        ],
+        "human_drop_temp_c": 201.0
+      },
+      {
+        "roast_name": "artisan-44",
+        "tick_count": 28,
+        "ok_count": 28,
+        "development_time_ratio_truth": 13.2,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 27,
+          "false_negatives": 1,
+          "total": 28
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              1,
+              19,
+              1
+            ],
+            [
+              0,
+              0,
+              2
+            ]
+          ],
+          "samples": 27,
+          "agreement": 0.926
+        },
+        "heat": {
+          "mae": 6.07,
+          "directional_agreement": 0.926,
+          "directional_samples": 27
+        },
+        "fan": {
+          "mae": 12.86,
+          "directional_agreement": 0.444,
+          "directional_samples": 27
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 4,
+            "median_seconds": 1.0,
+            "max_seconds": 1.01
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.14,
+            "max_seconds": 1.64
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.43,
+            "max_seconds": 1.53
+          }
+        ],
+        "human_drop_temp_c": 201.0
+      },
+      {
+        "roast_name": "artisan-45",
+        "tick_count": 29,
+        "ok_count": 29,
+        "development_time_ratio_truth": 12.3,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 28,
+          "false_negatives": 1,
+          "total": 29
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              22,
+              1
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 28,
+          "agreement": 0.893
+        },
+        "heat": {
+          "mae": 6.21,
+          "directional_agreement": 0.893,
+          "directional_samples": 28
+        },
+        "fan": {
+          "mae": 11.9,
+          "directional_agreement": 0.464,
+          "directional_samples": 28
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 5,
+            "median_seconds": 1.01,
+            "max_seconds": 1.24
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.05,
+            "max_seconds": 1.52
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.06,
+            "max_seconds": 1.36
+          }
+        ],
+        "human_drop_temp_c": 201.0
+      },
+      {
+        "roast_name": "artisan-46",
+        "tick_count": 33,
+        "ok_count": 33,
+        "development_time_ratio_truth": 13.6,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 32,
+          "false_negatives": 1,
+          "total": 33
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              1,
+              26,
+              2
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 32,
+          "agreement": 0.906
+        },
+        "heat": {
+          "mae": 11.52,
+          "directional_agreement": 0.906,
+          "directional_samples": 32
+        },
+        "fan": {
+          "mae": 14.09,
+          "directional_agreement": 0.438,
+          "directional_samples": 32
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 8,
+            "median_seconds": 0.89,
+            "max_seconds": 1.22
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.18,
+            "max_seconds": 2.18
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.27,
+            "max_seconds": 1.44
+          }
+        ],
+        "human_drop_temp_c": 201.3
+      },
+      {
+        "roast_name": "artisan-47",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 12.8,
+        "drop": {
+          "precision": 0.0,
+          "recall": 0.0,
+          "f1": 0.0,
+          "true_positives": 0,
+          "false_positives": 0,
+          "false_negatives": 1,
+          "first_drop_seconds": null,
+          "timing_error_seconds": null,
+          "timing_error_c": null
+        },
+        "drop_confusion": {
+          "true_positives": 0,
+          "false_positives": 0,
+          "true_negatives": 25,
+          "false_negatives": 1,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              1,
+              20,
+              0
+            ],
+            [
+              0,
+              0,
+              2
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.96
+        },
+        "heat": {
+          "mae": 4.23,
+          "directional_agreement": 0.96,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 14.42,
+          "directional_agreement": 0.4,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 0.86,
+            "max_seconds": 0.86
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.35,
+            "max_seconds": 2.62
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.73,
+            "max_seconds": 2.19
+          }
+        ],
+        "human_drop_temp_c": 202.0
+      }
+    ],
+    "v4": [
+      {
+        "roast_name": "artisan-29",
+        "tick_count": 24,
+        "ok_count": 24,
+        "development_time_ratio_truth": 14.1,
+        "drop": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "true_positives": 1,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "first_drop_seconds": 689.374,
+          "timing_error_seconds": 0.0,
+          "timing_error_c": 0.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 0,
+          "true_negatives": 23,
+          "false_negatives": 0,
+          "total": 24
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              1,
+              17,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 23,
+          "agreement": 0.957
+        },
+        "heat": {
+          "mae": 4.38,
+          "directional_agreement": 0.957,
+          "directional_samples": 23
+        },
+        "fan": {
+          "mae": 12.71,
+          "directional_agreement": 0.391,
+          "directional_samples": 23
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 2,
+            "median_seconds": 1.26,
+            "max_seconds": 1.47
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 18,
+            "median_seconds": 1.3,
+            "max_seconds": 1.84
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.21,
+            "max_seconds": 1.41
+          }
+        ],
+        "human_drop_temp_c": 198.0
+      },
+      {
+        "roast_name": "artisan-30",
+        "tick_count": 34,
+        "ok_count": 34,
+        "development_time_ratio_truth": 16.5,
+        "drop": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "true_positives": 1,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "first_drop_seconds": 986.77,
+          "timing_error_seconds": 0.0,
+          "timing_error_c": 0.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 0,
+          "true_negatives": 33,
+          "false_negatives": 0,
+          "total": 34
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              1,
+              0,
+              0
+            ],
+            [
+              7,
+              23,
+              1
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 33,
+          "agreement": 0.758
+        },
+        "heat": {
+          "mae": 12.65,
+          "directional_agreement": 0.758,
+          "directional_samples": 33
+        },
+        "fan": {
+          "mae": 12.65,
+          "directional_agreement": 0.515,
+          "directional_samples": 33
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 8,
+            "median_seconds": 1.19,
+            "max_seconds": 1.49
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.17,
+            "max_seconds": 1.78
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.21,
+            "max_seconds": 1.51
+          }
+        ],
+        "human_drop_temp_c": 198.0
+      },
+      {
+        "roast_name": "artisan-31",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 14.9,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 722.254,
+          "timing_error_seconds": -2.0,
+          "timing_error_c": -0.7
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              4,
+              17,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.84
+        },
+        "heat": {
+          "mae": 7.88,
+          "directional_agreement": 0.84,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 14.23,
+          "directional_agreement": 0.52,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.37,
+            "max_seconds": 1.37
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.26,
+            "max_seconds": 1.58
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.38,
+            "max_seconds": 1.74
+          }
+        ],
+        "human_drop_temp_c": 198.0
+      },
+      {
+        "roast_name": "artisan-32",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 16.9,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 722.54,
+          "timing_error_seconds": -23.0,
+          "timing_error_c": -4.7
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              3,
+              17,
+              0
+            ],
+            [
+              2,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.8
+        },
+        "heat": {
+          "mae": 15.38,
+          "directional_agreement": 0.8,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 14.42,
+          "directional_agreement": 0.48,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 2,
+            "median_seconds": 1.07,
+            "max_seconds": 1.16
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 19,
+            "median_seconds": 1.25,
+            "max_seconds": 1.65
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.16,
+            "max_seconds": 1.44
+          }
+        ],
+        "human_drop_temp_c": 198.0
+      },
+      {
+        "roast_name": "artisan-33",
+        "tick_count": 24,
+        "ok_count": 24,
+        "development_time_ratio_truth": 18.3,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 661.624,
+          "timing_error_seconds": -22.0,
+          "timing_error_c": -3.6
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 22,
+          "false_negatives": 0,
+          "total": 24
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              1,
+              17,
+              0
+            ],
+            [
+              1,
+              0,
+              1
+            ]
+          ],
+          "samples": 23,
+          "agreement": 0.913
+        },
+        "heat": {
+          "mae": 8.96,
+          "directional_agreement": 0.913,
+          "directional_samples": 23
+        },
+        "fan": {
+          "mae": 11.67,
+          "directional_agreement": 0.435,
+          "directional_samples": 23
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.05,
+            "max_seconds": 1.05
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 18,
+            "median_seconds": 1.23,
+            "max_seconds": 1.56
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.54,
+            "max_seconds": 1.68
+          }
+        ],
+        "human_drop_temp_c": 198.3
+      },
+      {
+        "roast_name": "artisan-34",
+        "tick_count": 30,
+        "ok_count": 30,
+        "development_time_ratio_truth": 20.9,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 841.607,
+          "timing_error_seconds": -21.0,
+          "timing_error_c": -4.7
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 28,
+          "false_negatives": 0,
+          "total": 30
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              3,
+              21,
+              1
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 29,
+          "agreement": 0.862
+        },
+        "heat": {
+          "mae": 10.67,
+          "directional_agreement": 0.862,
+          "directional_samples": 29
+        },
+        "fan": {
+          "mae": 10.67,
+          "directional_agreement": 0.483,
+          "directional_samples": 29
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 6,
+            "median_seconds": 1.3,
+            "max_seconds": 1.74
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 18,
+            "median_seconds": 1.18,
+            "max_seconds": 1.64
+          },
+          {
+            "phase": "development",
+            "count": 6,
+            "median_seconds": 1.2,
+            "max_seconds": 1.56
+          }
+        ],
+        "human_drop_temp_c": 198.7
+      },
+      {
+        "roast_name": "artisan-35",
+        "tick_count": 25,
+        "ok_count": 25,
+        "development_time_ratio_truth": 13.7,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 692.271,
+          "timing_error_seconds": -21.0,
+          "timing_error_c": -3.7
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 23,
+          "false_negatives": 0,
+          "total": 25
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              1,
+              19,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 24,
+          "agreement": 0.958
+        },
+        "heat": {
+          "mae": 7.2,
+          "directional_agreement": 0.958,
+          "directional_samples": 24
+        },
+        "fan": {
+          "mae": 16.2,
+          "directional_agreement": 0.417,
+          "directional_samples": 24
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 0.98,
+            "max_seconds": 0.98
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.13,
+            "max_seconds": 1.75
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.24,
+            "max_seconds": 1.45
+          }
+        ],
+        "human_drop_temp_c": 198.7
+      },
+      {
+        "roast_name": "artisan-36",
+        "tick_count": 27,
+        "ok_count": 27,
+        "development_time_ratio_truth": 17.6,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 752.373,
+          "timing_error_seconds": -11.0,
+          "timing_error_c": -2.4
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 25,
+          "false_negatives": 0,
+          "total": 27
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              2,
+              18,
+              0
+            ],
+            [
+              0,
+              0,
+              2
+            ]
+          ],
+          "samples": 26,
+          "agreement": 0.923
+        },
+        "heat": {
+          "mae": 7.41,
+          "directional_agreement": 0.923,
+          "directional_samples": 26
+        },
+        "fan": {
+          "mae": 14.44,
+          "directional_agreement": 0.423,
+          "directional_samples": 26
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.09,
+            "max_seconds": 1.09
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.22,
+            "max_seconds": 1.94
+          },
+          {
+            "phase": "development",
+            "count": 6,
+            "median_seconds": 1.11,
+            "max_seconds": 1.57
+          }
+        ],
+        "human_drop_temp_c": 198.7
+      },
+      {
+        "roast_name": "artisan-37",
+        "tick_count": 25,
+        "ok_count": 25,
+        "development_time_ratio_truth": 14.0,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 691.967,
+          "timing_error_seconds": -1.0,
+          "timing_error_c": -0.3
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 23,
+          "false_negatives": 0,
+          "total": 25
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              4,
+              16,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 24,
+          "agreement": 0.833
+        },
+        "heat": {
+          "mae": 8,
+          "directional_agreement": 0.833,
+          "directional_samples": 24
+        },
+        "fan": {
+          "mae": 11.2,
+          "directional_agreement": 0.5,
+          "directional_samples": 24
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 3,
+            "median_seconds": 0.97,
+            "max_seconds": 1.13
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 18,
+            "median_seconds": 1.1,
+            "max_seconds": 1.6
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.07,
+            "max_seconds": 1.41
+          }
+        ],
+        "human_drop_temp_c": 199.0
+      },
+      {
+        "roast_name": "artisan-38",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 13.3,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 721.741,
+          "timing_error_seconds": -23.0,
+          "timing_error_c": -4.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              19,
+              0
+            ],
+            [
+              1,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.88
+        },
+        "heat": {
+          "mae": 13.08,
+          "directional_agreement": 0.88,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 19.42,
+          "directional_agreement": 0.28,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.86,
+            "max_seconds": 1.86
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.12,
+            "max_seconds": 1.65
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.22,
+            "max_seconds": 1.62
+          }
+        ],
+        "human_drop_temp_c": 199.0
+      },
+      {
+        "roast_name": "artisan-39",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 12.4,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 722.577,
+          "timing_error_seconds": -26.0,
+          "timing_error_c": -5.3
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              3,
+              19,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.88
+        },
+        "heat": {
+          "mae": 7.5,
+          "directional_agreement": 0.88,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 13.08,
+          "directional_agreement": 0.48,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 2.04,
+            "max_seconds": 2.04
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.13,
+            "max_seconds": 1.43
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.1,
+            "max_seconds": 1.29
+          }
+        ],
+        "human_drop_temp_c": 200.0
+      },
+      {
+        "roast_name": "artisan-40",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 14.2,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 722.752,
+          "timing_error_seconds": -12.0,
+          "timing_error_c": -2.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              1,
+              18,
+              1
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.92
+        },
+        "heat": {
+          "mae": 6.54,
+          "directional_agreement": 0.92,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 14.23,
+          "directional_agreement": 0.4,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 2,
+            "median_seconds": 1.1,
+            "max_seconds": 1.32
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.08,
+            "max_seconds": 1.72
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.4,
+            "max_seconds": 1.57
+          }
+        ],
+        "human_drop_temp_c": 200.0
+      },
+      {
+        "roast_name": "artisan-41",
+        "tick_count": 29,
+        "ok_count": 29,
+        "development_time_ratio_truth": 13.5,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 812.388,
+          "timing_error_seconds": -13.0,
+          "timing_error_c": -2.7
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 27,
+          "false_negatives": 0,
+          "total": 29
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              3,
+              20,
+              1
+            ],
+            [
+              0,
+              1,
+              1
+            ]
+          ],
+          "samples": 28,
+          "agreement": 0.821
+        },
+        "heat": {
+          "mae": 8.62,
+          "directional_agreement": 0.821,
+          "directional_samples": 28
+        },
+        "fan": {
+          "mae": 12.24,
+          "directional_agreement": 0.536,
+          "directional_samples": 28
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 5,
+            "median_seconds": 0.9,
+            "max_seconds": 1.04
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.15,
+            "max_seconds": 1.57
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.14,
+            "max_seconds": 1.2
+          }
+        ],
+        "human_drop_temp_c": 200.0
+      },
+      {
+        "roast_name": "artisan-42",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 12.7,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 721.332,
+          "timing_error_seconds": -29.0,
+          "timing_error_c": -6.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              3,
+              19,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.88
+        },
+        "heat": {
+          "mae": 13.65,
+          "directional_agreement": 0.88,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 8.65,
+          "directional_agreement": 0.6,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.0,
+            "max_seconds": 1.0
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.16,
+            "max_seconds": 1.48
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.14,
+            "max_seconds": 1.16
+          }
+        ],
+        "human_drop_temp_c": 200.3
+      },
+      {
+        "roast_name": "artisan-43",
+        "tick_count": 25,
+        "ok_count": 25,
+        "development_time_ratio_truth": 10.5,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 692.823,
+          "timing_error_seconds": -24.0,
+          "timing_error_c": -5.3
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 23,
+          "false_negatives": 0,
+          "total": 25
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              3,
+              18,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 24,
+          "agreement": 0.875
+        },
+        "heat": {
+          "mae": 5.8,
+          "directional_agreement": 0.875,
+          "directional_samples": 24
+        },
+        "fan": {
+          "mae": 11.4,
+          "directional_agreement": 0.417,
+          "directional_samples": 24
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.66,
+            "max_seconds": 1.66
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.16,
+            "max_seconds": 2.35
+          },
+          {
+            "phase": "development",
+            "count": 3,
+            "median_seconds": 1.44,
+            "max_seconds": 1.49
+          }
+        ],
+        "human_drop_temp_c": 201.0
+      },
+      {
+        "roast_name": "artisan-44",
+        "tick_count": 28,
+        "ok_count": 28,
+        "development_time_ratio_truth": 13.2,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 781.4,
+          "timing_error_seconds": -28.0,
+          "timing_error_c": -5.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 26,
+          "false_negatives": 0,
+          "total": 28
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              3,
+              18,
+              0
+            ],
+            [
+              0,
+              0,
+              2
+            ]
+          ],
+          "samples": 27,
+          "agreement": 0.889
+        },
+        "heat": {
+          "mae": 6.07,
+          "directional_agreement": 0.889,
+          "directional_samples": 27
+        },
+        "fan": {
+          "mae": 15.18,
+          "directional_agreement": 0.407,
+          "directional_samples": 27
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 4,
+            "median_seconds": 1.26,
+            "max_seconds": 1.4
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.12,
+            "max_seconds": 1.47
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.08,
+            "max_seconds": 2.56
+          }
+        ],
+        "human_drop_temp_c": 201.0
+      },
+      {
+        "roast_name": "artisan-45",
+        "tick_count": 29,
+        "ok_count": 29,
+        "development_time_ratio_truth": 12.3,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 812.371,
+          "timing_error_seconds": -19.0,
+          "timing_error_c": -5.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 27,
+          "false_negatives": 0,
+          "total": 29
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              3,
+              21,
+              1
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 28,
+          "agreement": 0.857
+        },
+        "heat": {
+          "mae": 7.93,
+          "directional_agreement": 0.857,
+          "directional_samples": 28
+        },
+        "fan": {
+          "mae": 13.45,
+          "directional_agreement": 0.5,
+          "directional_samples": 28
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 5,
+            "median_seconds": 1.12,
+            "max_seconds": 1.47
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.1,
+            "max_seconds": 1.48
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.31,
+            "max_seconds": 10.25
+          }
+        ],
+        "human_drop_temp_c": 201.0
+      },
+      {
+        "roast_name": "artisan-46",
+        "tick_count": 33,
+        "ok_count": 33,
+        "development_time_ratio_truth": 13.6,
+        "drop": {
+          "precision": 0.333,
+          "recall": 1.0,
+          "f1": 0.5,
+          "true_positives": 1,
+          "false_positives": 2,
+          "false_negatives": 0,
+          "first_drop_seconds": 902.514,
+          "timing_error_seconds": -34.0,
+          "timing_error_c": -6.6
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 2,
+          "true_negatives": 30,
+          "false_negatives": 0,
+          "total": 33
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              4,
+              22,
+              3
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 32,
+          "agreement": 0.781
+        },
+        "heat": {
+          "mae": 15.76,
+          "directional_agreement": 0.781,
+          "directional_samples": 32
+        },
+        "fan": {
+          "mae": 14.24,
+          "directional_agreement": 0.469,
+          "directional_samples": 32
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 8,
+            "median_seconds": 1.22,
+            "max_seconds": 4.39
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.13,
+            "max_seconds": 1.94
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.13,
+            "max_seconds": 1.62
+          }
+        ],
+        "human_drop_temp_c": 201.3
+      },
+      {
+        "roast_name": "artisan-47",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 12.8,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 721.572,
+          "timing_error_seconds": -18.0,
+          "timing_error_c": -4.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              19,
+              0
+            ],
+            [
+              1,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.88
+        },
+        "heat": {
+          "mae": 6.92,
+          "directional_agreement": 0.88,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 16.73,
+          "directional_agreement": 0.36,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 0.83,
+            "max_seconds": 0.83
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.12,
+            "max_seconds": 1.51
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.18,
+            "max_seconds": 1.54
+          }
+        ],
+        "human_drop_temp_c": 202.0
+      }
+    ],
+    "v5": [
+      {
+        "roast_name": "artisan-29",
+        "tick_count": 24,
+        "ok_count": 24,
+        "development_time_ratio_truth": 14.1,
+        "drop": {
+          "precision": 1.0,
+          "recall": 1.0,
+          "f1": 1.0,
+          "true_positives": 1,
+          "false_positives": 0,
+          "false_negatives": 0,
+          "first_drop_seconds": 689.374,
+          "timing_error_seconds": 0.0,
+          "timing_error_c": 0.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 0,
+          "true_negatives": 23,
+          "false_negatives": 0,
+          "total": 24
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              0,
+              18,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 23,
+          "agreement": 1.0
+        },
+        "heat": {
+          "mae": 2.08,
+          "directional_agreement": 1.0,
+          "directional_samples": 23
+        },
+        "fan": {
+          "mae": 12.5,
+          "directional_agreement": 0.391,
+          "directional_samples": 23
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 2,
+            "median_seconds": 1.19,
+            "max_seconds": 1.41
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 18,
+            "median_seconds": 1.07,
+            "max_seconds": 1.65
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.09,
+            "max_seconds": 1.29
+          }
+        ],
+        "human_drop_temp_c": 198.0
+      },
+      {
+        "roast_name": "artisan-30",
+        "tick_count": 34,
+        "ok_count": 34,
+        "development_time_ratio_truth": 16.5,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 962.77,
+          "timing_error_seconds": -24.0,
+          "timing_error_c": -5.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 32,
+          "false_negatives": 0,
+          "total": 34
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              1,
+              0,
+              0
+            ],
+            [
+              8,
+              22,
+              1
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 33,
+          "agreement": 0.727
+        },
+        "heat": {
+          "mae": 18.82,
+          "directional_agreement": 0.727,
+          "directional_samples": 33
+        },
+        "fan": {
+          "mae": 15,
+          "directional_agreement": 0.485,
+          "directional_samples": 33
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 8,
+            "median_seconds": 1.04,
+            "max_seconds": 1.36
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.13,
+            "max_seconds": 1.78
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.23,
+            "max_seconds": 1.59
+          }
+        ],
+        "human_drop_temp_c": 198.0
+      },
+      {
+        "roast_name": "artisan-31",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 14.9,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 722.254,
+          "timing_error_seconds": -2.0,
+          "timing_error_c": -0.7
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              3,
+              18,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.88
+        },
+        "heat": {
+          "mae": 11.54,
+          "directional_agreement": 0.88,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 18.46,
+          "directional_agreement": 0.4,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 0.92,
+            "max_seconds": 0.92
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.19,
+            "max_seconds": 1.59
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.19,
+            "max_seconds": 1.59
+          }
+        ],
+        "human_drop_temp_c": 198.0
+      },
+      {
+        "roast_name": "artisan-32",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 16.9,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 722.54,
+          "timing_error_seconds": -23.0,
+          "timing_error_c": -4.7
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              4,
+              16,
+              0
+            ],
+            [
+              2,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.76
+        },
+        "heat": {
+          "mae": 18.85,
+          "directional_agreement": 0.76,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 18.46,
+          "directional_agreement": 0.4,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 2,
+            "median_seconds": 1.07,
+            "max_seconds": 1.12
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 19,
+            "median_seconds": 1.23,
+            "max_seconds": 1.75
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.27,
+            "max_seconds": 1.47
+          }
+        ],
+        "human_drop_temp_c": 198.0
+      },
+      {
+        "roast_name": "artisan-33",
+        "tick_count": 24,
+        "ok_count": 24,
+        "development_time_ratio_truth": 18.3,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 661.624,
+          "timing_error_seconds": -22.0,
+          "timing_error_c": -3.6
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 22,
+          "false_negatives": 0,
+          "total": 24
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              1,
+              17,
+              0
+            ],
+            [
+              1,
+              0,
+              1
+            ]
+          ],
+          "samples": 23,
+          "agreement": 0.913
+        },
+        "heat": {
+          "mae": 8.75,
+          "directional_agreement": 0.913,
+          "directional_samples": 23
+        },
+        "fan": {
+          "mae": 10.83,
+          "directional_agreement": 0.565,
+          "directional_samples": 23
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.19,
+            "max_seconds": 1.19
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 18,
+            "median_seconds": 1.24,
+            "max_seconds": 1.51
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.16,
+            "max_seconds": 1.38
+          }
+        ],
+        "human_drop_temp_c": 198.3
+      },
+      {
+        "roast_name": "artisan-34",
+        "tick_count": 30,
+        "ok_count": 30,
+        "development_time_ratio_truth": 20.9,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 841.607,
+          "timing_error_seconds": -21.0,
+          "timing_error_c": -4.7
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 28,
+          "false_negatives": 0,
+          "total": 30
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              2,
+              23,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 29,
+          "agreement": 0.931
+        },
+        "heat": {
+          "mae": 9,
+          "directional_agreement": 0.931,
+          "directional_samples": 29
+        },
+        "fan": {
+          "mae": 8.83,
+          "directional_agreement": 0.517,
+          "directional_samples": 29
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 6,
+            "median_seconds": 1.2,
+            "max_seconds": 1.24
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 18,
+            "median_seconds": 1.29,
+            "max_seconds": 1.65
+          },
+          {
+            "phase": "development",
+            "count": 6,
+            "median_seconds": 1.4,
+            "max_seconds": 5.02
+          }
+        ],
+        "human_drop_temp_c": 198.7
+      },
+      {
+        "roast_name": "artisan-35",
+        "tick_count": 25,
+        "ok_count": 25,
+        "development_time_ratio_truth": 13.7,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 692.271,
+          "timing_error_seconds": -21.0,
+          "timing_error_c": -3.7
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 23,
+          "false_negatives": 0,
+          "total": 25
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              2,
+              18,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 24,
+          "agreement": 0.917
+        },
+        "heat": {
+          "mae": 5.2,
+          "directional_agreement": 0.917,
+          "directional_samples": 24
+        },
+        "fan": {
+          "mae": 15.8,
+          "directional_agreement": 0.375,
+          "directional_samples": 24
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.13,
+            "max_seconds": 1.13
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.15,
+            "max_seconds": 1.49
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.27,
+            "max_seconds": 1.65
+          }
+        ],
+        "human_drop_temp_c": 198.7
+      },
+      {
+        "roast_name": "artisan-36",
+        "tick_count": 27,
+        "ok_count": 27,
+        "development_time_ratio_truth": 17.6,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 752.373,
+          "timing_error_seconds": -11.0,
+          "timing_error_c": -2.4
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 25,
+          "false_negatives": 0,
+          "total": 27
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              0,
+              20,
+              0
+            ],
+            [
+              1,
+              0,
+              1
+            ]
+          ],
+          "samples": 26,
+          "agreement": 0.962
+        },
+        "heat": {
+          "mae": 8.89,
+          "directional_agreement": 0.962,
+          "directional_samples": 26
+        },
+        "fan": {
+          "mae": 17.78,
+          "directional_agreement": 0.308,
+          "directional_samples": 26
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.43,
+            "max_seconds": 1.43
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.12,
+            "max_seconds": 3.16
+          },
+          {
+            "phase": "development",
+            "count": 6,
+            "median_seconds": 1.11,
+            "max_seconds": 1.54
+          }
+        ],
+        "human_drop_temp_c": 198.7
+      },
+      {
+        "roast_name": "artisan-37",
+        "tick_count": 25,
+        "ok_count": 25,
+        "development_time_ratio_truth": 14.0,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 691.967,
+          "timing_error_seconds": -1.0,
+          "timing_error_c": -0.3
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 23,
+          "false_negatives": 0,
+          "total": 25
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              3,
+              0,
+              0
+            ],
+            [
+              2,
+              17,
+              1
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 24,
+          "agreement": 0.875
+        },
+        "heat": {
+          "mae": 12,
+          "directional_agreement": 0.875,
+          "directional_samples": 24
+        },
+        "fan": {
+          "mae": 10.4,
+          "directional_agreement": 0.458,
+          "directional_samples": 24
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 3,
+            "median_seconds": 1.09,
+            "max_seconds": 1.29
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 18,
+            "median_seconds": 1.18,
+            "max_seconds": 1.42
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.29,
+            "max_seconds": 1.52
+          }
+        ],
+        "human_drop_temp_c": 199.0
+      },
+      {
+        "roast_name": "artisan-38",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 13.3,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 721.741,
+          "timing_error_seconds": -23.0,
+          "timing_error_c": -4.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              1,
+              20,
+              0
+            ],
+            [
+              1,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.92
+        },
+        "heat": {
+          "mae": 6.54,
+          "directional_agreement": 0.92,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 19.23,
+          "directional_agreement": 0.28,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.09,
+            "max_seconds": 1.09
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.21,
+            "max_seconds": 2.3
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.23,
+            "max_seconds": 1.5
+          }
+        ],
+        "human_drop_temp_c": 199.0
+      },
+      {
+        "roast_name": "artisan-39",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 12.4,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 722.577,
+          "timing_error_seconds": -26.0,
+          "timing_error_c": -5.3
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              5,
+              17,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.8
+        },
+        "heat": {
+          "mae": 9.62,
+          "directional_agreement": 0.8,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 16.35,
+          "directional_agreement": 0.36,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 0.88,
+            "max_seconds": 0.88
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.12,
+            "max_seconds": 1.64
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.25,
+            "max_seconds": 1.6
+          }
+        ],
+        "human_drop_temp_c": 200.0
+      },
+      {
+        "roast_name": "artisan-40",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 14.2,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 722.752,
+          "timing_error_seconds": -12.0,
+          "timing_error_c": -2.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              3,
+              16,
+              1
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.84
+        },
+        "heat": {
+          "mae": 12.69,
+          "directional_agreement": 0.84,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 15.19,
+          "directional_agreement": 0.36,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 2,
+            "median_seconds": 1.22,
+            "max_seconds": 1.44
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.14,
+            "max_seconds": 1.6
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.2,
+            "max_seconds": 1.45
+          }
+        ],
+        "human_drop_temp_c": 200.0
+      },
+      {
+        "roast_name": "artisan-41",
+        "tick_count": 29,
+        "ok_count": 29,
+        "development_time_ratio_truth": 13.5,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 812.388,
+          "timing_error_seconds": -13.0,
+          "timing_error_c": -2.7
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 27,
+          "false_negatives": 0,
+          "total": 29
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              4,
+              20,
+              0
+            ],
+            [
+              0,
+              1,
+              1
+            ]
+          ],
+          "samples": 28,
+          "agreement": 0.821
+        },
+        "heat": {
+          "mae": 8.97,
+          "directional_agreement": 0.821,
+          "directional_samples": 28
+        },
+        "fan": {
+          "mae": 15.17,
+          "directional_agreement": 0.393,
+          "directional_samples": 28
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 5,
+            "median_seconds": 0.96,
+            "max_seconds": 1.29
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.22,
+            "max_seconds": 1.53
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.23,
+            "max_seconds": 1.51
+          }
+        ],
+        "human_drop_temp_c": 200.0
+      },
+      {
+        "roast_name": "artisan-42",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 12.7,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 721.332,
+          "timing_error_seconds": -29.0,
+          "timing_error_c": -6.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              5,
+              17,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.8
+        },
+        "heat": {
+          "mae": 14.23,
+          "directional_agreement": 0.8,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 11.35,
+          "directional_agreement": 0.4,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 0.88,
+            "max_seconds": 0.88
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.17,
+            "max_seconds": 1.4
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.25,
+            "max_seconds": 1.33
+          }
+        ],
+        "human_drop_temp_c": 200.3
+      },
+      {
+        "roast_name": "artisan-43",
+        "tick_count": 25,
+        "ok_count": 25,
+        "development_time_ratio_truth": 10.5,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 692.823,
+          "timing_error_seconds": -24.0,
+          "timing_error_c": -5.3
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 23,
+          "false_negatives": 0,
+          "total": 25
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              19,
+              0
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 24,
+          "agreement": 0.917
+        },
+        "heat": {
+          "mae": 3.6,
+          "directional_agreement": 0.917,
+          "directional_samples": 24
+        },
+        "fan": {
+          "mae": 10.4,
+          "directional_agreement": 0.375,
+          "directional_samples": 24
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.03,
+            "max_seconds": 1.03
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.17,
+            "max_seconds": 1.55
+          },
+          {
+            "phase": "development",
+            "count": 3,
+            "median_seconds": 1.24,
+            "max_seconds": 1.35
+          }
+        ],
+        "human_drop_temp_c": 201.0
+      },
+      {
+        "roast_name": "artisan-44",
+        "tick_count": 28,
+        "ok_count": 28,
+        "development_time_ratio_truth": 13.2,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 781.4,
+          "timing_error_seconds": -28.0,
+          "timing_error_c": -5.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 26,
+          "false_negatives": 0,
+          "total": 28
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              4,
+              0,
+              0
+            ],
+            [
+              2,
+              19,
+              0
+            ],
+            [
+              0,
+              0,
+              2
+            ]
+          ],
+          "samples": 27,
+          "agreement": 0.926
+        },
+        "heat": {
+          "mae": 6.07,
+          "directional_agreement": 0.926,
+          "directional_samples": 27
+        },
+        "fan": {
+          "mae": 15.18,
+          "directional_agreement": 0.333,
+          "directional_samples": 27
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 4,
+            "median_seconds": 1.07,
+            "max_seconds": 1.42
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.1,
+            "max_seconds": 1.64
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.03,
+            "max_seconds": 1.1
+          }
+        ],
+        "human_drop_temp_c": 201.0
+      },
+      {
+        "roast_name": "artisan-45",
+        "tick_count": 29,
+        "ok_count": 29,
+        "development_time_ratio_truth": 12.3,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 812.371,
+          "timing_error_seconds": -19.0,
+          "timing_error_c": -5.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 27,
+          "false_negatives": 0,
+          "total": 29
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              5,
+              19,
+              1
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 28,
+          "agreement": 0.786
+        },
+        "heat": {
+          "mae": 11.03,
+          "directional_agreement": 0.786,
+          "directional_samples": 28
+        },
+        "fan": {
+          "mae": 15.17,
+          "directional_agreement": 0.464,
+          "directional_samples": 28
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 5,
+            "median_seconds": 1.06,
+            "max_seconds": 1.77
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.09,
+            "max_seconds": 1.42
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.29,
+            "max_seconds": 1.48
+          }
+        ],
+        "human_drop_temp_c": 201.0
+      },
+      {
+        "roast_name": "artisan-46",
+        "tick_count": 33,
+        "ok_count": 33,
+        "development_time_ratio_truth": 13.6,
+        "drop": {
+          "precision": 0.333,
+          "recall": 1.0,
+          "f1": 0.5,
+          "true_positives": 1,
+          "false_positives": 2,
+          "false_negatives": 0,
+          "first_drop_seconds": 902.514,
+          "timing_error_seconds": -34.0,
+          "timing_error_c": -6.6
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 2,
+          "true_negatives": 30,
+          "false_negatives": 0,
+          "total": 33
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              6,
+              21,
+              2
+            ],
+            [
+              0,
+              0,
+              1
+            ]
+          ],
+          "samples": 32,
+          "agreement": 0.75
+        },
+        "heat": {
+          "mae": 14.09,
+          "directional_agreement": 0.75,
+          "directional_samples": 32
+        },
+        "fan": {
+          "mae": 14.39,
+          "directional_agreement": 0.469,
+          "directional_samples": 32
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 8,
+            "median_seconds": 1.09,
+            "max_seconds": 1.32
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 20,
+            "median_seconds": 1.2,
+            "max_seconds": 1.48
+          },
+          {
+            "phase": "development",
+            "count": 5,
+            "median_seconds": 1.12,
+            "max_seconds": 1.27
+          }
+        ],
+        "human_drop_temp_c": 201.3
+      },
+      {
+        "roast_name": "artisan-47",
+        "tick_count": 26,
+        "ok_count": 26,
+        "development_time_ratio_truth": 12.8,
+        "drop": {
+          "precision": 0.5,
+          "recall": 1.0,
+          "f1": 0.667,
+          "true_positives": 1,
+          "false_positives": 1,
+          "false_negatives": 0,
+          "first_drop_seconds": 721.572,
+          "timing_error_seconds": -18.0,
+          "timing_error_c": -4.0
+        },
+        "drop_confusion": {
+          "true_positives": 1,
+          "false_positives": 1,
+          "true_negatives": 24,
+          "false_negatives": 0,
+          "total": 26
+        },
+        "heat_direction_confusion": {
+          "labels": [
+            "cut",
+            "hold",
+            "raise"
+          ],
+          "matrix": [
+            [
+              2,
+              0,
+              0
+            ],
+            [
+              2,
+              19,
+              0
+            ],
+            [
+              1,
+              0,
+              1
+            ]
+          ],
+          "samples": 25,
+          "agreement": 0.88
+        },
+        "heat": {
+          "mae": 8.08,
+          "directional_agreement": 0.88,
+          "directional_samples": 25
+        },
+        "fan": {
+          "mae": 16.73,
+          "directional_agreement": 0.36,
+          "directional_samples": 25
+        },
+        "phase_latency": [
+          {
+            "phase": "preheating",
+            "count": 1,
+            "median_seconds": 1.02,
+            "max_seconds": 1.02
+          },
+          {
+            "phase": "roasting_pre_first_crack",
+            "count": 21,
+            "median_seconds": 1.12,
+            "max_seconds": 1.45
+          },
+          {
+            "phase": "development",
+            "count": 4,
+            "median_seconds": 1.36,
+            "max_seconds": 1.48
+          }
+        ],
+        "human_drop_temp_c": 202.0
+      }
+    ]
+  }
+}
