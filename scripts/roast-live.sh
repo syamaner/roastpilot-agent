@@ -46,7 +46,7 @@ fi
 echo "→ clearing any wedged/leftover roast processes (local-only safeguard)…"
 pkill -9 -f 'roastpilot-agent serve' 2>/dev/null || true
 pkill -9 -f 'coffee-roaster-mcp'     2>/dev/null || true   # agent child (also matches uvx coffee-roaster-mcp)
-pkill -9 -f 'uvx coffee'             2>/dev/null || true   # any stray uvx coffee-roaster (belt-and-braces, matches kill-roast.sh)
+pkill -9 -f 'uvx coffee-roaster-mcp'             2>/dev/null || true   # any stray uvx coffee-roaster (belt-and-braces, matches kill-roast.sh)
 sleep 1   # let the OS release the serial port + the :PORT socket
 
 echo "→ preparing (venv, deps, SPA build)…"

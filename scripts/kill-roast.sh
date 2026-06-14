@@ -24,18 +24,18 @@ echo "   off at the machine — this only frees host processes/ports."
 echo
 
 echo "→ before:"
-ps -Ao pid,ppid,command | grep -iE 'roastpilot-agent serve|coffee-roaster-mcp|uvx coffee' | grep -v grep || echo "  (none running)"
+ps -Ao pid,ppid,command | grep -iE 'roastpilot-agent serve|coffee-roaster-mcp|uvx coffee-roaster-mcp' | grep -v grep || echo "  (none running)"
 echo
 
 echo "→ SIGKILL all roastpilot-agent + coffee-roaster-mcp (agent child + any stray uvx)…"
 pkill -9 -f 'roastpilot-agent serve' && echo "  killed: roastpilot-agent" || echo "  (no roastpilot-agent)"
 pkill -9 -f 'coffee-roaster-mcp'     && echo "  killed: coffee-roaster-mcp"  || echo "  (no coffee-roaster-mcp)"
-pkill -9 -f 'uvx coffee'             && echo "  killed: uvx coffee-roaster"   || echo "  (no uvx coffee)"
+pkill -9 -f 'uvx coffee-roaster-mcp'             && echo "  killed: uvx coffee-roaster"   || echo "  (no uvx coffee)"
 sleep 1   # let the OS release the serial port + the :8000 socket
 
 echo
 echo "→ after:"
-LEFT="$(ps -Ao pid,command | grep -iE 'roastpilot-agent serve|coffee-roaster-mcp|uvx coffee' | grep -v grep || true)"
+LEFT="$(ps -Ao pid,command | grep -iE 'roastpilot-agent serve|coffee-roaster-mcp|uvx coffee-roaster-mcp' | grep -v grep || true)"
 if [ -n "$LEFT" ]; then
   echo "  STILL ALIVE (investigate):"; echo "$LEFT"
 else
