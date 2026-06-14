@@ -9,7 +9,8 @@
 > overkill, heat 70→40→20→0, self-contradiction). D35 splits the control path at first
 > crack: **deterministic pre-FC** (controller owns the levers; no LLM), **LLM advises
 > heat+fan+drop post-FC** inside a safety box. Grounded in the operator's working n8n
-> dual-loop system (a deterministic decision tree the LLM executes). Plan:
+> system, where the LLM merely *follows* a deterministic decision tree (tool-calling),
+> rather than freely controlling the levers — the controller still owns the loop. Plan:
 > `roastpilot-plan/roastpilot-agent/deterministic-control-loop-plan.md` + `plan.md` §1 D35.
 > Tracking: **epic #221** (phases #222 pre-FC determinism / #223 post-FC LLM+box / #224
 > test-harness+corpus+eval). **Superseded:** #214, #172 (prompt work, closed). **Subsumes:**
