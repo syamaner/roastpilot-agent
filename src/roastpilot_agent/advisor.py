@@ -83,6 +83,13 @@ class AdvisorContext(BaseModel):
     carry no control authority; the controller and safety policy never read
     them back. They default to ``None`` so a context built without a profile
     (or by an older caller) stays valid.
+
+    ``seconds_since_charge`` is the seconds elapsed since the debounced
+    T0/charge instant (``None`` before charge); it is advisory context only,
+    with no control authority — the controller and safety policy never read it
+    back. It lets the model reason that a freshly-charged bean is in early
+    drying, so its RoR will be negative and then turn, rather than mistaking
+    the post-charge crash for a stall (#209).
     """
 
     phase: RoastPhase
@@ -100,6 +107,12 @@ class AdvisorContext(BaseModel):
     recent_telemetry_samples: list[dict[str, Any]] = Field(default_factory=list[dict[str, Any]])
     first_crack_detected: bool = False
     first_crack_timestamp_seconds: float | None = None
+    # Seconds since the debounced T0/charge instant (None before charge);
+    # advisory context only, no control authority — the controller and safety
+    # policy never read it back. Lets the model reason "just charged → early
+    # drying, RoR will be negative then turn" rather than misreading the
+    # post-charge crash as a stall (#209).
+    seconds_since_charge: float | None = None
 
 
 class RoastDecision(BaseModel):

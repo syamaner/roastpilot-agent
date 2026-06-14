@@ -106,6 +106,28 @@ class ControllerConfig(BaseModel):
     # pre-first-crack, the consult floor becomes ``advisory_near_fc_interval_seconds``.
     advisory_near_fc_bean_temp_c: float = Field(default=170.0, gt=0)
     advisory_near_fc_interval_seconds: float = Field(default=10.0, gt=0)
+    # Post-charge SETTLE window (#209), the inverse of the near-FC boost above.
+    # T0 is the transition into pre-first-crack, and the charge dunks the cold
+    # beans into the hot drum — bean temp falls fast (RoR << 0) for tens of
+    # seconds until the *turning point*, where it stops falling and starts
+    # rising. The very first automatic consult (PHASE_CHANGE) would otherwise
+    # land on this crash and misread the not-yet-turned bean as a stall,
+    # flooring heat (the 2nd-hardware-roast advisor-flood failure). These two
+    # fields bound a deterministic suppression of AUTOMATIC advice after charge
+    # until the bean turns; a manual operator request always bypasses it.
+    #
+    # ``advisory_post_charge_settle_max_seconds``: the fallback timeout — the
+    # max seconds after charge to suppress automatic advice if the turning
+    # point is never detected (a stuck/None RoR must never suppress forever).
+    # ~90 s comfortably exceeds a normal Hottop turning point (~30–60 s) while
+    # bounding the suppression so advice is never withheld indefinitely.
+    advisory_post_charge_settle_max_seconds: float = Field(default=90.0, gt=0)
+    # ``advisory_post_charge_turning_point_ror_c_per_min``: the bean-RoR
+    # threshold (°C/min) that marks the turning point — once bean RoR is at or
+    # above it the bean has stopped falling and the settle window releases.
+    # Default 0.0 (RoR crosses zero). No ``gt``/``ge`` bound — a threshold of
+    # exactly 0 must be valid (it is the natural zero-crossing default).
+    advisory_post_charge_turning_point_ror_c_per_min: float = Field(default=0.0)
     advisory_timeout_seconds: float = Field(default=10.0, gt=0)
     t0_debounce_ticks: int = Field(default=3, ge=1)
     telemetry_log_interval_seconds: float = Field(default=5.0, gt=0)
