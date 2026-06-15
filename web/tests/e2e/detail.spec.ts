@@ -15,6 +15,21 @@ import { expect, test } from "@playwright/test";
 
 import { readChartData, settle, waitForChartPoints } from "./helpers";
 
+// The five columns the decision-trace table renders, in order
+// (DecisionTraceTable.tsx). The detail snapshot asserts the live header row
+// matches this EXACTLY, so a trace column added / removed / reordered fails
+// structurally even when the pixel diff stays under `maxDiffPixelRatio` — the
+// same blind spot #241 closed for the history table (#253). Scoped to the
+// trace table's own testid so a second table on the page can never make this
+// match the wrong header row.
+const EXPECTED_TRACE_COLUMNS = [
+  "Time",
+  "Recommended",
+  "Verdict",
+  "Executed",
+  "Rationale",
+] as const;
+
 test.beforeEach(async ({ page }) => {
   await page.goto("/__detail-harness");
   await settle(page);
@@ -28,6 +43,13 @@ test("roast-detail — full-page snapshot of the detail page (canvas un-masked)"
   // The decision-trace table, title block, timeline, rating, export row, AND the
   // persisted curve are all in the baseline now (data asserted in the test below).
   await expect(page.getByTestId("decision-trace-table")).toBeVisible();
+  // Structural guard (#253, mirroring #241): the rendered trace-table header row
+  // must match the five columns exactly. Fails fast on an added/removed/reordered
+  // trace column even when the pixel diff stays under tolerance. Scoped to the
+  // trace table's own `thead` so a second table on the page can't match it.
+  await expect(page.locator("[data-testid='decision-trace-table'] thead th")).toHaveText([
+    ...EXPECTED_TRACE_COLUMNS,
+  ]);
   await expect(page).toHaveScreenshot("roast-detail.png");
 });
 
