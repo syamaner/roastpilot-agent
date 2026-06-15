@@ -549,6 +549,53 @@ async def test_restart_scenario_recovers_persisted_phase(tmp_path: Path, phase: 
 
 
 @pytest.mark.asyncio
+async def test_t0_detected_at_round_trips_across_restart(tmp_path: Path) -> None:
+    """#235: the absolute charge/T0 instant persists and reads back across a
+    restart, so recovery can restore the advisory DTR clock. A run that never
+    charged reads back ``None`` (the v3 column is nullable)."""
+    store = await seeded_store(RoastStore(db_path=tmp_path / "t0.sqlite3"))
+    await store.update_run_phase("run-1", RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    charged_at = "2026-06-15T10:00:00+00:00"
+    await store.record_t0_detected_at("run-1", charged_at)
+    await store.close()  # process dies here
+
+    restarted = RoastStore(db_path=store.db_path)
+    await restarted.initialize()
+    try:
+        persisted = await restarted.read_latest_run()
+        assert persisted is not None
+        assert persisted.t0_detected_at_utc == charged_at
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_t0_detected_at_defaults_to_none_before_charge(tmp_store: RoastStore) -> None:
+    """#235: a run that has not yet charged reads back ``t0_detected_at_utc`` as
+    ``None`` — the recovery read treats that as "charge clock unknown" (the
+    conservative pre-#235 behaviour)."""
+    await seeded_store(tmp_store)
+    try:
+        persisted = await tmp_store.read_latest_run()
+        assert persisted is not None
+        assert persisted.t0_detected_at_utc is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_record_t0_detected_at_unknown_run_raises(tmp_store: RoastStore) -> None:
+    """#235: stamping the charge instant on a missing run is a programming error
+    and raises (a silent no-op would lose the recovery breadcrumb)."""
+    await tmp_store.initialize()
+    try:
+        with pytest.raises(RuntimeError):
+            await tmp_store.record_t0_detected_at("no-such-run", "2026-06-15T10:00:00+00:00")
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_recovery_read_feeds_the_controller(tmp_path: Path) -> None:
     """End to end across the E4/E6 seam: the persisted phase drives
     recover_from_restart into operator_recovery_required with zero writes."""

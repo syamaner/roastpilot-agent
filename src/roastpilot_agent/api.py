@@ -441,6 +441,11 @@ class RoastRunner:
         # from the emitter buffer — so the reason must be captured before the flush.
         self._captured_fault_reason: str | None = None
         self._last_persisted_phase: RoastPhase | None = None
+        # Whether the absolute charge/T0 instant has been persisted for this run
+        # (#235). Written once, the first tick the controller reports its charge
+        # clock stamped, so a later restart→resume can restore the advisory DTR
+        # clock. A restore on recovery seeds this True so it is never re-stamped.
+        self._t0_persisted = False
         self._scheduler: TickScheduler | None = None
 
     async def start(self, profile: RoastProfile) -> None:
@@ -452,13 +457,29 @@ class RoastRunner:
         await self._flush_events()
         await self._persist_phase_if_changed()
 
-    async def recover(self, profile: RoastProfile, persisted_phase: RoastPhase) -> None:
+    async def recover(
+        self,
+        profile: RoastProfile,
+        persisted_phase: RoastPhase,
+        *,
+        t0_detected_at_utc: str | None = None,
+    ) -> None:
         """Restart into recovery: classify the persisted run into
         ``operator_recovery_required`` without resuming heat or fan, persist the
         resulting phase, and flush the recovery events. Issues no MCP write — the
         restart-never-auto-resumes invariant (controller ``recover_from_restart``
-        owns the rule; the runner only persists and surfaces it)."""
+        owns the rule; the runner only persists and surfaces it).
+
+        When the persisted run had already charged (``t0_detected_at_utc`` set,
+        #235) the advisory DTR clock is restored from that absolute instant so a
+        later operator-resume into pre-FC/development keeps a non-zero
+        seconds-since-charge denominator. The restore seeds ``_t0_persisted`` so
+        the live tick never re-stamps it, and is advisory/display-only — it
+        touches no transition, verdict, or hardware write."""
         self._controller.load_profile(profile)
+        if t0_detected_at_utc is not None:
+            self._controller.restore_charge_clock(t0_detected_at_utc)
+            self._t0_persisted = True
         await self._controller.recover_from_restart(persisted_phase)
         await self._flush_events()
         await self._persist_phase_if_changed()
@@ -807,8 +828,29 @@ class RoastRunner:
                 # sibling event already delivered to SSE.
                 continue
 
+    async def _persist_t0_if_charged(self, snapshot: ControllerSnapshot) -> None:
+        """Persist the absolute charge/T0 instant once, when the controller first
+        reports its charge clock stamped (#235).
+
+        Restart recovery restores the advisory DTR clock from this timestamp, so
+        the charge-referenced roast clock survives a resume instead of resetting
+        to ``0.0``. Advisory/display-only — nothing safety-gating reads it. A
+        store failure is swallowed (like the event flush): a missing recovery
+        breadcrumb only degrades a later resumed run's DTR to the pre-#235
+        behaviour, it never affects the live safety tick."""
+        if self._t0_persisted or not snapshot.charge_detected:
+            return
+        try:
+            await self._store.record_t0_detected_at(self._run_id)
+        except Exception:  # pragma: no cover — fail-safe: a store error on this
+            # advisory-only breadcrumb must never crash the safety tick; the only
+            # cost is a resumed run's DTR degrading to the pre-#235 behaviour.
+            return
+        self._t0_persisted = True
+
     async def _publish_and_persist_telemetry(self) -> None:
         snapshot = self._controller.snapshot()
+        await self._persist_t0_if_charged(snapshot)
         telemetry = snapshot.telemetry
         raw = None if self._raw_state is None else self._raw_state.last_state
         if telemetry is not None:
@@ -1113,7 +1155,11 @@ class RoastService:
             # operable-faulted state, never resume-into-roast recovery.
             await runner.recover_faulted(persisted.profile)
         else:
-            await runner.recover(persisted.profile, persisted.agent_phase)
+            await runner.recover(
+                persisted.profile,
+                persisted.agent_phase,
+                t0_detected_at_utc=persisted.t0_detected_at_utc,
+            )
         if self._run_loop:
             self._loop_task = asyncio.create_task(runner.run())
 

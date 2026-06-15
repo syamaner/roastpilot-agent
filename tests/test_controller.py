@@ -8,6 +8,7 @@ extend this suite.
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from typing import cast
 
 import pytest
@@ -1714,6 +1715,79 @@ async def test_resume_into_pre_first_crack_rearms_post_charge_settle_after_resta
         manual_request=False,
     )
     assert trigger is AdvisoryTrigger.PHASE_CHANGE
+
+
+@pytest.mark.asyncio
+async def test_restore_charge_clock_survives_restart_into_resumed_advice() -> None:
+    """#235: a restart→operator-resume restores the advisory DTR clock.
+
+    Before this fix the controller never restored ``_charge_monotonic`` on a
+    recovery resume, so ``_charge_elapsed_seconds`` read ``None`` → the advisor
+    context's ``roast_elapsed_seconds`` (the DTR denominator from #219) collapsed
+    to ``0.0`` for the rest of the resumed run. The store persists the *absolute*
+    charge instant; ``restore_charge_clock`` reconstructs the monotonic anchor
+    from it so the seconds-since-charge denominator survives.
+
+    Drives the real advisory path: after restore + resume into pre-first-crack,
+    a turned-bean tick consults the advisor, and the captured context carries the
+    restored elapsed (≈120 s), NOT 0.0. Advisory/display-only — heat/fan are
+    never auto-resumed and the resume gate is unchanged.
+    """
+    # The persisted absolute charge instant: 120 s before "now".
+    charged_at = datetime.now(UTC) - timedelta(seconds=120.0)
+    # Turned bean (RoR >= 0) so the post-charge settle window releases at once and
+    # the resumed pre-first-crack consult actually reaches the advisor.
+    turned = reading(bean=150.0, bean_ror_c_per_min=4.0)
+    advisor = FakeAdvisor([decision(heat=50, fan=55)])
+    harness = make_harness(readings=[turned], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+
+    # Restart recovery: restore the charge clock from the persisted instant, then
+    # classify into operator_recovery_required (no heat/fan write).
+    harness.controller.restore_charge_clock(charged_at.isoformat())
+    await harness.controller.recover_from_restart(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert harness.executor.targets == []  # restart never auto-resumes heat/fan
+
+    # Operator resumes into pre-first-crack, then a tick consults the advisor.
+    harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert advisor.contexts, "advisor should have been consulted after resume"
+    ctx = advisor.contexts[-1]
+    # The DTR denominator is the restored charge clock — non-zero and ≈120 s
+    # (the wall-clock gap between the persisted instant and now), NOT 0.0.
+    assert ctx.roast_elapsed_seconds > 0.0
+    assert ctx.roast_elapsed_seconds == pytest.approx(120.0, abs=5.0)
+    # And the snapshot's charge-referenced reads agree (display-only parity).
+    assert harness.controller.snapshot().charge_detected is True
+
+
+def test_restore_charge_clock_ignores_malformed_timestamp() -> None:
+    """#235: a malformed persisted timestamp leaves the charge clock unset
+    (the conservative pre-fix behaviour — a missing breadcrumb degrades the DTR,
+    it never raises)."""
+    harness = make_harness(readings=[reading()])
+    harness.controller.restore_charge_clock("not-a-timestamp")
+    assert harness.controller.snapshot().charge_detected is False
+
+
+def test_restore_charge_clock_clamps_future_instant() -> None:
+    """#235: clock skew that would place charge in the future clamps to
+    "charge now" (elapsed 0) rather than fabricating a future-referenced clock —
+    the charge clock is stamped but reads ~0 seconds elapsed."""
+    future = (datetime.now(UTC) + timedelta(seconds=60.0)).isoformat()
+    harness = make_harness(readings=[reading()])
+    harness.controller.restore_charge_clock(future)
+    snapshot = harness.controller.snapshot()
+    assert snapshot.charge_detected is True
+    # roast_elapsed (charge-referenced) is clamped to ~0, never negative.
+    assert snapshot.roast_elapsed_seconds >= 0.0
+    assert harness.controller._charge_elapsed_seconds() == pytest.approx(  # pyright: ignore[reportPrivateUsage]
+        0.0, abs=1.0
+    )
 
 
 def test_rearm_on_resume_preserves_released_latch_in_process() -> None:
