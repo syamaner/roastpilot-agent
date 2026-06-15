@@ -42,10 +42,24 @@ test("roast-detail-selected — CLAMP row selected highlights the curve", async 
   await expect(clampRow).toHaveAttribute("data-selected", "true");
 
   // Assert the cross-component highlight via the chart DATA hook (the authoritative
-  // layer); the un-masked snapshot also captures the highlight line on the curve.
+  // layer): the selected CLAMP tick maps to t=240 on the curve.
   expect((await readChartData(page)).highlightTime).toBe(240);
 
-  await expect(page).toHaveScreenshot("roast-detail-selected.png");
+  // The CLAMP highlight is drawn on the LiveCurve, which sits at the TOP of the page;
+  // clicking the trace row (far below) scrolls the chart ABOVE the viewport, so the
+  // old full-page-viewport baseline never contained the highlight (#126). Bring the
+  // chart back into frame and capture it element-scoped, so the committed baseline
+  // ACTUALLY shows the highlight line — the state this snapshot exists to prove.
+  const curve = page.getByTestId("live-curve");
+  await curve.scrollIntoViewIfNeeded();
+  // Structural, pixel-INDEPENDENT guard (#241 lesson): assert the highlight-bearing
+  // chart is genuinely in the viewport before the shot. Combined with the data-hook
+  // assertion above (highlightTime === 240), a missing highlight now fails the suite
+  // regardless of pixel tolerance — the chart not being framed fails HERE, the
+  // highlight not being set fails the hook.
+  await expect(curve).toBeInViewport();
+  await settle(page);
+  await expect(curve).toHaveScreenshot("roast-detail-selected.png");
 });
 
 test("the detail curve carries the full persisted series + T0/FC/drop markers", async ({
