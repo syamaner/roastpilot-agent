@@ -1,0 +1,81 @@
+name: Mirror Playwright image to GHCR
+
+# Why this exists (#262): the required `Web (Playwright snapshots)` gate in
+# ci.yml pulls the pinned Playwright container at "Initialize containers".
+# Pulling it anonymously from mcr.microsoft.com on GitHub's shared runner IPs
+# gets rate-limited (`toomanyrequests` / `unauthorized`), failing the REQUIRED
+# check on EVERY PR and blocking the merge gate repo-wide.
+#
+# The durable fix: mirror MCR -> GHCR here, on a schedule / version-bump, and
+# have the consumers (ci.yml + web-snapshots-update.yml) pull from GHCR instead.
+# GHCR authenticates with the built-in GITHUB_TOKEN inside Actions and is NOT
+# subject to MCR's anonymous-pull limit for the repo's own packages. NO repo
+# secret is needed anywhere — GITHUB_TOKEN throughout.
+#
+# This decoupled job is the ONLY place that pulls from MCR, and only on a
+# version bump (push to this file) or weekly — keeping the hot PR path off MCR.
+#
+# Bump the v1.55.1-noble pin together with the @playwright/test version in
+# web/package.json AND the GHCR refs in ci.yml + web-snapshots-update.yml.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Monday 04:17 UTC — refresh the mirror so a deleted/expired GHCR
+    # package self-heals without waiting for the next version bump.
+    - cron: "17 4 * * 1"
+  push:
+    # Bootstrap / self-seed: when this very file lands on a branch, run the
+    # mirror so GHCR is populated before any PR tries to pull from it.
+    paths:
+      - ".github/workflows/mirror-playwright.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: mirror-playwright-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Mirror MCR Playwright image to GHCR
+    runs-on: ubuntu-latest
+    env:
+      PW_IMAGE: mcr.microsoft.com/playwright:v1.55.1-noble
+      GHCR_IMAGE: ghcr.io/${{ github.repository }}/playwright:v1.55.1-noble
+    steps:
+      - name: Log in to GHCR
+        run: docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull Playwright image from MCR (retry with backoff)
+        run: |
+          # MCR is rate-limiting anonymous pulls right now (#262). Retry with
+          # increasing backoff and succeed as soon as one pull works. This is
+          # the ONLY place that touches MCR — the PR hot path pulls from GHCR.
+          set -u
+          backoffs="15 30 60 120 180 300"
+          attempt=0
+          if docker pull "$PW_IMAGE"; then
+            echo "Pulled $PW_IMAGE on first attempt."
+            exit 0
+          fi
+          for sleep_s in $backoffs; do
+            attempt=$((attempt + 1))
+            echo "Pull failed; backing off ${sleep_s}s before retry #${attempt}..."
+            sleep "$sleep_s"
+            if docker pull "$PW_IMAGE"; then
+              echo "Pulled $PW_IMAGE on retry #${attempt}."
+              exit 0
+            fi
+          done
+          echo "::error::Failed to pull $PW_IMAGE after $((attempt + 1)) attempts (MCR rate-limit?)."
+          exit 1
+
+      - name: Tag + push to GHCR
+        run: |
+          set -eu
+          docker tag "$PW_IMAGE" "$GHCR_IMAGE"
+          docker push "$GHCR_IMAGE"
+          echo "Mirrored: $PW_IMAGE -> $GHCR_IMAGE"

@@ -135,9 +135,21 @@ jobs:
     name: Web (Playwright snapshots)
     runs-on: ubuntu-latest
     needs: web
+    # packages: read lets the container pull the GHCR-mirrored Playwright image
+    # with the built-in GITHUB_TOKEN (#262). contents: read is the checkout floor.
+    permissions:
+      contents: read
+      packages: read
     container:
-      # Pinned to the @playwright/test version in web/package.json — bump both together.
-      image: mcr.microsoft.com/playwright:v1.55.1-noble
+      # GHCR mirror of mcr.microsoft.com/playwright (#262): MCR rate-limits
+      # anonymous pulls from shared-runner IPs and fails this REQUIRED gate.
+      # The mirror-playwright.yml workflow keeps this ref in sync — bump the
+      # v1.55.1-noble pin together with mirror-playwright.yml,
+      # web-snapshots-update.yml, and the @playwright/test version in web/package.json.
+      image: ghcr.io/${{ github.repository }}/playwright:v1.55.1-noble
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v6.0.2
