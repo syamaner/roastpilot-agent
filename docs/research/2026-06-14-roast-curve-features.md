@@ -25,10 +25,16 @@ peer-reviewed. Quality is flagged per claim below.
    smoothness/lag tradeoff compounds with our 12–21 s detector lag — tune deliberately.
    *(artisan-roasterscope, blog)*
 
-2. **Predicted-FC ETA by extrapolating smoothed RoR — NOT a hardcoded temperature.** This is
-   the established practitioner method: Artisan's live dry-end / first-crack time predictions
-   and projection lines are computed by **extrapolating the smoothed RoR**, not a fixed temp.
-   *(artisan-roasterscope, blog)* Commercial ML precedent: **Cropster ships AI first-crack
+2. **Predicted-FC ETA by extrapolating RoR — NOT a hardcoded temperature, and project off
+   RAW/low-lag RoR.** This is the established practitioner method: Artisan's live dry-end /
+   first-crack time predictions and projection lines extrapolate the RoR, not a fixed temp.
+   **Important:** for a live ETA, extrapolate the **raw (unsmoothed) or explicitly low-lag
+   RoR**, reserving smoothing for display / noise handling — the verified Artisan source
+   projects off `unfiltereddelta2_pure` (raw) *specifically* to avoid the smoothing phase-lag
+   (see the Artisan section), which would otherwise make the ETA late for control. (A
+   practitioner blog says predictions use "smoothed RoR"; the source code is the authority and
+   uses raw.) *(artisan-roasterscope, blog; Artisan source)* Commercial ML precedent:
+   **Cropster ships AI first-crack
    prediction**, surfaced as a window **~3 minutes before** predicted FC, trained on roast
    data rather than a threshold. *(cropster, secondary)* → **Directly validates** the D36 /
    #223 decision to feed a *profile-band ETA from RoR extrapolation* instead of "expected FC
@@ -187,16 +193,22 @@ if it meaningfully sharpens the audio mark, but not load-bearing for D36's antic
 
 ## What this changes
 
-- **#223 / D36:** confirmed as-written. The ETA-from-RoR (not hardcoded 180), live DTR,
-  distance-from-reference, and the steady-RoR / no-twiddle anti-thrash design all have
-  external support.
-- **#229:** re-rank — promote control-signal stability + FC-ETA + RoR-curvature to Tier 1;
-  **demote TP/recovery-as-predictor to "validate on our own data first"**; treat crash/flick
-  as observed RoR events, drop the causal folklore; replace the vague "control-signal entropy"
-  with the three concrete methods above.
-- **Honest gaps:** TP/recovery predictive value is unproven here; most roasting-practice claims
-  are practitioner-blog grade; the harness synthesis + one Artisan-prediction fetch failed
-  (claims still captured from other sources).
+- **#223 / D36 — what has external support:** the **ETA-from-RoR** (not hardcoded 180), **live
+  DTR**, and the **steady-RoR / no-twiddle anti-thrash design**. These are the validated ones.
+- **NOT externally validated in this pass — treat as candidate features, validate on our own
+  `.alog` set before trusting as control context:** **distance-from-reference-curve** (sensible
+  and standard practice, but this pass surfaced no confirming source) and **TP/recovery as a
+  *predictor*** (live-computable, predictive value unproven). **Do not feed either to the
+  post-FC advisor as trusted context on the first D35 roast** — that would reintroduce
+  folklore-grade control input, the exact thing D35/D36 exists to avoid. Compute/display them,
+  gate their use behind #229 validation.
+- **#229:** re-rank — promote control-signal stability + FC-ETA + RoR-curvature (+ AUC) to
+  Tier 1; **hold distance-from-reference and TP/recovery as empirical-validation candidates**;
+  treat crash/flick as observed RoR events, drop the causal folklore; replace the vague
+  "control-signal entropy" with the three concrete methods above.
+- **Honest gaps:** TP/recovery and distance-from-reference are unproven here; most
+  roasting-practice claims are practitioner-blog grade; the harness synthesis + one
+  Artisan-prediction fetch failed (claims still captured from other sources).
 
 ## Key sources
 
