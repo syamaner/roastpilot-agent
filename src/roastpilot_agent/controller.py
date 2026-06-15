@@ -16,6 +16,7 @@ import asyncio
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Literal, Protocol
 
@@ -519,6 +520,11 @@ class ControllerSnapshot:
     development_percent: float | None
     telemetry: RoastTelemetry | None
     advisory_paused: bool
+    #: Whether the charge/T0 clock has been stamped (``_charge_monotonic`` set,
+    #: #235). The runner persists the absolute charge instant once this first
+    #: reads ``True`` so a later restart→resume can restore the DTR clock. A
+    #: pure read; advisory/display-only and never safety-gating.
+    charge_detected: bool
 
 
 class RoastController:
@@ -613,6 +619,7 @@ class RoastController:
             development_percent=self._development_percent(),
             telemetry=self._last_telemetry,
             advisory_paused=self._advisory_paused,
+            charge_detected=self._charge_monotonic is not None,
         )
 
     def _roast_elapsed_seconds(self) -> float:
@@ -1291,6 +1298,46 @@ class RoastController:
             RoastEventKind.COMMAND_EXECUTED,
             {"heat_percent": evaluation.adjusted_heat, "fan_percent": evaluation.adjusted_fan},
         )
+
+    def restore_charge_clock(self, t0_detected_at_utc: str) -> None:
+        """Restore the charge-referenced DTR clock after a restart (#235).
+
+        The charge clock (``_charge_monotonic``) lives in the process-local
+        ``time.monotonic`` reference, which resets on restart, so it cannot be
+        persisted directly. Instead the store persists the *absolute* UTC instant
+        of the debounced T0 transition; this reconstructs the monotonic anchor
+        from it as ``now_monotonic - (now_utc - t0_detected_at)``, so
+        :meth:`_charge_elapsed_seconds` (the advisor's DTR denominator, #219)
+        reads the true seconds-since-charge again instead of resetting to ``0.0``
+        for the rest of the resumed run.
+
+        Advisory/display-only: ``_charge_monotonic`` feeds the advisor context
+        and the operator DTR readout, never a transition, verdict, or hardware
+        write — the worst case of a bad restore is a conservative advisory miss,
+        never an unsafe drop. It does **not** re-stamp the charge guidance or the
+        post-charge settle window; those are handled by ``operator_resume``.
+
+        A clock skew that would place charge in the future (a negative elapsed)
+        is clamped to "charge now" (elapsed 0) rather than fabricating a
+        future-referenced clock. A bad stored value is ignored (the clock stays
+        ``None`` — the conservative path): both a non-ISO string (``ValueError``)
+        and a timezone-NAIVE one (a valid ISO string that parses fine, then
+        raises ``TypeError`` on the aware-minus-naive subtraction). Production
+        only ever writes ``+00:00`` (``_utc_now``), but recovery must never crash
+        on a malformed persisted value.
+
+        Args:
+            t0_detected_at_utc: ISO-8601 UTC timestamp of the persisted charge/T0
+                detection (``PersistedRun.t0_detected_at_utc``).
+        """
+        try:
+            charged_at = datetime.fromisoformat(t0_detected_at_utc)
+            elapsed = (datetime.now(UTC) - charged_at).total_seconds()
+        except (ValueError, TypeError):
+            return  # malformed/naive persisted value: stay conservative (clock None)
+        if elapsed < 0.0:
+            elapsed = 0.0  # clock skew: never fabricate a future charge instant
+        self._charge_monotonic = self._clock() - elapsed
 
     async def recover_from_restart(self, persisted_phase: RoastPhase | None) -> None:
         """Startup classification (orchestration plan § Persistence).

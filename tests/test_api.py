@@ -14,6 +14,7 @@ directly into the broadcaster.
 import asyncio
 import json
 from collections.abc import AsyncGenerator, AsyncIterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -1432,6 +1433,86 @@ async def test_recover_on_start_faulted_run_re_enters_operable_faulted(
     enabled = enabled_operator_actions(RoastPhase.FAULTED)
     assert OperatorAction.STOP_COOLING in enabled
     assert OperatorAction.ACKNOWLEDGE_FAULT in enabled
+
+
+@pytest.mark.asyncio
+async def test_live_run_persists_t0_detected_at_on_charge(store: RoastStore) -> None:
+    """#235: the live runner persists the absolute charge/T0 instant once the
+    controller stamps its charge clock (the debounced T0 transition), so a later
+    restart can restore the advisory DTR clock. Before charge the column is
+    ``None``; after the debounced T0 it is set and the recovery read carries it."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)  # preheating
+    # Not charged yet: no T0 instant persisted.
+    assert (await store.read_latest_run()).t0_detected_at_utc is None  # type: ignore[union-attr]
+    # Debounce T0: the default t0_debounce_ticks consecutive T0 readings transition
+    # into pre-first-crack and stamp the charge clock.
+    mcp.frames = [_reading(bean=178.0, env=185.0, t0_detected=True)]
+    for _ in range(ControllerConfig().t0_debounce_ticks + 1):
+        await _tick(service, clock)
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.agent_phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    persisted = await store.read_latest_run()
+    assert persisted is not None
+    assert persisted.t0_detected_at_utc is not None  # charge instant now recorded
+
+
+@pytest.mark.asyncio
+async def test_restart_restores_charge_clock_so_resumed_dtr_survives(store: RoastStore) -> None:
+    """#235 end to end: a persisted charge instant restores the advisory DTR clock
+    across a restart→operator-resume, so the advisor context's charge-referenced
+    ``roast_elapsed_seconds`` (the DTR denominator, #219) is non-zero and correct
+    instead of collapsing to ``0.0``. Advisory/display-only: recovery still enters
+    operator_recovery_required and never auto-resumes heat/fan."""
+    # A run that crashed mid pre-first-crack with the charge instant 120 s ago.
+    await store.create_run(
+        run_id="run-resume-dtr",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+    charged_at = (datetime.now(UTC) - timedelta(seconds=120.0)).isoformat()
+    await store.record_t0_detected_at("run-resume-dtr", charged_at)
+
+    clock = FakeClock()
+    mcp = FakeMCPClient()
+    advisor = FakeAdvisor([], default_decision=_live_decision())
+    service = RoastService(
+        store,
+        config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+        roaster=mcp,
+        advisor=advisor,
+        run_loop=False,
+        clock=clock,
+    )
+    await service.recover_on_start()
+    assert mcp.commands() == []  # restart never auto-resumes heat/fan
+    recovered = await store.read_run("run-resume-dtr")
+    assert recovered is not None
+    assert recovered.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+
+    # Operator resumes into pre-first-crack; a turned-bean tick consults the advisor.
+    await service.submit_operator_action(
+        "run-resume-dtr",
+        OperatorActionRequest(
+            action=OperatorAction.ACKNOWLEDGE_RECOVERY,
+            payload={"resume_to": "roasting_pre_first_crack"},
+        ),
+    )
+    assert service.runner is not None
+    # The resume tick re-arms the settle window; a turned bean (RoR >= 0) releases
+    # it at once, so the pre-first-crack PHASE_CHANGE advisory fires automatically.
+    mcp.frames = [_reading(bean=150.0, env=185.0, bean_ror_c_per_min=4.0)]
+    await _tick(service, clock)  # drains the resume action
+    await _tick(service, clock)  # turned-bean consult
+
+    assert advisor.contexts, "advisor should be consulted after resume"
+    ctx = advisor.contexts[-1]
+    # The DTR denominator is the restored charge clock — non-zero, ≈120 s, NOT 0.0.
+    assert ctx.roast_elapsed_seconds > 0.0
+    assert ctx.roast_elapsed_seconds == pytest.approx(120.0, abs=10.0)
 
 
 @pytest.mark.asyncio

@@ -212,10 +212,27 @@ BEGIN
 END;
 """
 
+SCHEMA_V3_T0_DETECTED_AT = """
+-- #235: persist the absolute charge/T0 instant so the advisor's
+-- charge-referenced DTR clock (#219) survives a restart→operator-resume.
+-- Nullable and advisory/display-only — no safety gate reads it (the safety
+-- box keys on temperature, never DTR). Pre-existing rows read back NULL,
+-- which the recovery read treats as "charge clock unknown" (the prior
+-- behaviour: a resumed run with no stored T0 keeps a None charge clock).
+-- Intentionally OUTSIDE the v2 completed-run immutability set: it is written
+-- exactly once on an ACTIVE run (the debounced T0 transition), never after
+-- completion, so the immutability trigger never needs to guard it.
+ALTER TABLE roast_runs ADD COLUMN t0_detected_at_utc TEXT;
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
-MIGRATIONS: tuple[str, ...] = (SCHEMA_V1, SCHEMA_V2_IMMUTABILITY)
+MIGRATIONS: tuple[str, ...] = (
+    SCHEMA_V1,
+    SCHEMA_V2_IMMUTABILITY,
+    SCHEMA_V3_T0_DETECTED_AT,
+)
 
 
 class PersistedRun(BaseModel):
@@ -231,6 +248,10 @@ class PersistedRun(BaseModel):
     started_at_utc: str
     completed_at_utc: str | None
     profile: RoastProfile
+    #: Absolute UTC instant of the debounced charge/T0 transition (#235), or
+    #: ``None`` when the run never charged or predates the v3 column. Recovery
+    #: restores the advisory DTR clock from it; nothing safety-gating reads it.
+    t0_detected_at_utc: str | None = None
 
 
 class RoastStore:
@@ -385,6 +406,37 @@ class RoastStore:
         cursor = await self.connection.execute(
             "UPDATE roast_runs SET agent_phase = ?, updated_at_utc = ? WHERE id = ?",
             (agent_phase.value, _utc_now(), run_id),
+        )
+        await self.connection.commit()
+        if cursor.rowcount == 0:
+            raise RuntimeError(f"no roast_run with id {run_id!r}")
+
+    async def record_t0_detected_at(
+        self, run_id: str, t0_detected_at_utc: str | None = None
+    ) -> None:
+        """Persist the absolute charge/T0 instant for restart recovery (#235).
+
+        Written once, when the controller first stamps its charge clock (the
+        debounced T0 transition into pre-first-crack), so the persisted instant
+        is the detection tick's wall-clock time. On a later
+        restart→operator-resume the recovery read restores the advisor's
+        charge-referenced DTR clock from it, so the DTR denominator survives
+        instead of resetting to ``0.0``.
+
+        Advisory/display-only: no safety gate reads ``t0_detected_at_utc`` (the
+        safety policy keys on temperature, never DTR). A missing run is a
+        programming error and raises, like :meth:`update_run_phase` — a silent
+        no-op would lose the recovery breadcrumb.
+
+        Args:
+            run_id: The active run whose charge instant is being stamped.
+            t0_detected_at_utc: ISO-8601 UTC timestamp of the charge/T0 detection;
+                defaults to now (the same-tick detection instant).
+        """
+        charged_at = t0_detected_at_utc or _utc_now()
+        cursor = await self.connection.execute(
+            "UPDATE roast_runs SET t0_detected_at_utc = ?, updated_at_utc = ? WHERE id = ?",
+            (charged_at, _utc_now(), run_id),
         )
         await self.connection.commit()
         if cursor.rowcount == 0:
@@ -606,7 +658,8 @@ class RoastStore:
         fresh database."""
         async with self.connection.execute(
             "SELECT id, agent_phase, outcome, started_at_utc, completed_at_utc,"
-            " profile_json FROM roast_runs ORDER BY started_at_utc DESC, rowid DESC LIMIT 1"
+            " t0_detected_at_utc, profile_json FROM roast_runs"
+            " ORDER BY started_at_utc DESC, rowid DESC LIMIT 1"
         ) as cursor:
             row = await cursor.fetchone()
         if row is None:
@@ -619,6 +672,9 @@ class RoastStore:
             completed_at_utc=None
             if row["completed_at_utc"] is None
             else str(row["completed_at_utc"]),
+            t0_detected_at_utc=None
+            if row["t0_detected_at_utc"] is None
+            else str(row["t0_detected_at_utc"]),
             profile=RoastProfile.model_validate_json(str(row["profile_json"])),
         )
 
