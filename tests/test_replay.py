@@ -11,6 +11,7 @@ are exercised here for their *real* downstream verdicts (a genuine CLAMP from
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 import pytest_asyncio
@@ -727,7 +728,7 @@ async def test_create_replay_app_closes_store_when_start_fails(
         captured["store"] = store
         return service, source, store
 
-    async def _boom(self: ReplaySource) -> str:
+    async def _boom(self: ReplaySource) -> NoReturn:
         raise RuntimeError("synthetic start failure")
 
     monkeypatch.setattr(replay_module, "build_replay_service", _capturing_build)
