@@ -32,6 +32,7 @@ import { FaultBanner } from "./FaultBanner";
 import { resolveMicStatus } from "./micStatus";
 import { OperatorActionBar, type OperatorActionResultView } from "./OperatorActionBar";
 import { RecoveryModal } from "./RecoveryModal";
+import { smoothRorForDisplay } from "./rorSmoothing";
 import { RoastHeader } from "./RoastHeader";
 import { StartRoastForm } from "./StartRoastForm";
 import { useDashboardEvents } from "./useDashboardEvents";
@@ -217,8 +218,11 @@ export function DashboardPage(): React.JSX.Element {
 
   const inRecovery = phase === "operator_recovery_required";
 
+  // #205: smooth the RoR series for DISPLAY ONLY (raw `bean_ror_c_per_min` still
+  // feeds the advisor/safety server-side, untouched). The staircase comes from the
+  // 1 Hz quantised RoR; a centered moving average dissolves it without lag.
   const curve = useMemo(
-    () => ({ points: view.points, markers: view.markers }),
+    () => ({ points: smoothRorForDisplay(view.points), markers: view.markers }),
     [view.points, view.markers],
   );
 
