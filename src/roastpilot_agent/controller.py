@@ -1319,8 +1319,12 @@ class RoastController:
 
         A clock skew that would place charge in the future (a negative elapsed)
         is clamped to "charge now" (elapsed 0) rather than fabricating a
-        future-referenced clock. A malformed timestamp is ignored (the clock
-        stays ``None`` — the prior, conservative behaviour).
+        future-referenced clock. A bad stored value is ignored (the clock stays
+        ``None`` — the conservative path): both a non-ISO string (``ValueError``)
+        and a timezone-NAIVE one (a valid ISO string that parses fine, then
+        raises ``TypeError`` on the aware-minus-naive subtraction). Production
+        only ever writes ``+00:00`` (``_utc_now``), but recovery must never crash
+        on a malformed persisted value.
 
         Args:
             t0_detected_at_utc: ISO-8601 UTC timestamp of the persisted charge/T0
@@ -1328,9 +1332,9 @@ class RoastController:
         """
         try:
             charged_at = datetime.fromisoformat(t0_detected_at_utc)
-        except ValueError:
-            return  # malformed persisted value: stay conservative (clock None)
-        elapsed = (datetime.now(UTC) - charged_at).total_seconds()
+            elapsed = (datetime.now(UTC) - charged_at).total_seconds()
+        except (ValueError, TypeError):
+            return  # malformed/naive persisted value: stay conservative (clock None)
         if elapsed < 0.0:
             elapsed = 0.0  # clock skew: never fabricate a future charge instant
         self._charge_monotonic = self._clock() - elapsed

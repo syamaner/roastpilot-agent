@@ -1774,6 +1774,20 @@ def test_restore_charge_clock_ignores_malformed_timestamp() -> None:
     assert harness.controller.snapshot().charge_detected is False
 
 
+def test_restore_charge_clock_ignores_naive_timestamp_without_crashing() -> None:
+    """#235 (recovery-path crash guard): a timezone-NAIVE ISO string is valid ISO
+    and parses without ``ValueError``, but the aware-minus-naive subtraction would
+    raise ``TypeError`` — which, uncaught, would propagate through ``recover`` and
+    crash the recovery lifespan. The broadened guard catches it: the call does NOT
+    raise and the charge clock stays unset (the conservative path). Production only
+    ever writes ``+00:00`` (``_utc_now``), but recovery must never crash on a bad
+    stored value."""
+    harness = make_harness(readings=[reading()])
+    # No assertion of "raises" — the whole point is that it must NOT raise.
+    harness.controller.restore_charge_clock("2026-06-15T10:00:00")  # naive: no offset
+    assert harness.controller.snapshot().charge_detected is False
+
+
 def test_restore_charge_clock_clamps_future_instant() -> None:
     """#235: clock skew that would place charge in the future clamps to
     "charge now" (elapsed 0) rather than fabricating a future-referenced clock —

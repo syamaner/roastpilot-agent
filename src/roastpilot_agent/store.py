@@ -219,6 +219,9 @@ SCHEMA_V3_T0_DETECTED_AT = """
 -- box keys on temperature, never DTR). Pre-existing rows read back NULL,
 -- which the recovery read treats as "charge clock unknown" (the prior
 -- behaviour: a resumed run with no stored T0 keeps a None charge clock).
+-- Intentionally OUTSIDE the v2 completed-run immutability set: it is written
+-- exactly once on an ACTIVE run (the debounced T0 transition), never after
+-- completion, so the immutability trigger never needs to guard it.
 ALTER TABLE roast_runs ADD COLUMN t0_detected_at_utc TEXT;
 """
 
