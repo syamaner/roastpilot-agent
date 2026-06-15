@@ -143,9 +143,12 @@ export function LiveCurve({
         // callback recomputes x's min/max from the data uPlot is about to draw, so x
         // always covers the loaded elapsed-time range (the fixed c/ror always cover the
         // roast).
+        // A `range` callback fires unconditionally, so `auto` has no effect and is
+        // omitted (#133): `rangeFn` pins c/ror to FIXED_SCALE_RANGES and re-ranges x
+        // to the data on every setData.
         x: { time: false, range: rangeFn },
-        c: { auto: true, range: rangeFn },
-        ror: { auto: true, range: rangeFn },
+        c: { range: rangeFn },
+        ror: { range: rangeFn },
         // Hidden 0–100 % scale for the control lines — fixed range, no axis.
         pct: { range: [0, 100] },
       },
@@ -233,10 +236,15 @@ export function LiveCurve({
   }, [chargeBandVisible, chargeBand]);
 
   // Expose the test hook — assert DATA + the rendered scale ranges (D24 / #131).
-  // The `setData` effect above re-ranges the scales synchronously before this
-  // effect runs (effects fire in declaration order), so `plotRef.scales` here
-  // reflects the just-drawn ranges — letting a test assert the scale COVERS the
-  // data (catching the collapsed/unranged-scale bug a blank snapshot can't).
+  // For `plotRef.scales` here to reflect the just-drawn ranges, two things must
+  // hold: (1) React runs the `setData` effect above before this one (effects fire
+  // in declaration order, so a column change is applied first), AND (2) uPlot's
+  // `setData` re-ranges the scales SYNCHRONOUSLY (a uPlot 1.6.x behaviour — it
+  // recomputes ranges and redraws within the call, NOT a React guarantee). Both
+  // together let a test assert the scale COVERS the data (catching the
+  // collapsed/unranged-scale bug a blank snapshot can't). If a future uPlot defers
+  // the re-range, this hook would read stale ranges and the assertion must move
+  // behind an explicit redraw.
   useEffect(() => {
     const plot = plotRef.current;
     const sx = plot?.scales.x;
