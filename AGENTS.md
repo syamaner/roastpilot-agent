@@ -211,14 +211,17 @@ clean.
 Code (auggie)`.** The automated **Claude Code Review**
 (`.github/workflows/claude-code-review.yml`, running `/code-review --comment`),
 the **Augment Code** review (auggie, `augmentcode[bot]`), and any human reviewer
-follow this rubric. The ChatGPT/OpenAI **Codex connector is NOT part of the
-roster** — it was removed because its push-triggered re-reviews re-posted the
-same findings on every commit and churned the conversation-resolution merge gate
-(each `update-branch`/push re-opened threads, blocking auto-merge with no new
-signal). If the Codex bot still posts (until its GitHub App access is revoked in
-repo settings), its comments are **out-of-roster and non-authoritative**: triage
-may resolve them by pointing at the roster rule, and they never block a merge on
-their own.
+follow this rubric. **No other review bots are in the roster — the ChatGPT/OpenAI
+Codex connector and CodeRabbit are disabled** (operator, 15 Jun 2026). Codex was
+removed because its push-triggered re-reviews re-posted the same findings on every
+commit and churned the conversation-resolution merge gate (each `update-branch`/push
+re-opened threads, blocking auto-merge with no new signal); the roster is curated to
+two complementary lenses rather than a pile-on. If a disabled bot still posts (until
+its GitHub App access is revoked in repo settings), its comments are **out-of-roster
+and non-authoritative**: triage may resolve them by pointing at the roster rule, and
+they never block a merge on their own. (Curating the roster is not "fewer eyes" — a
+removed bot can still surface real findings; the constraint it must satisfy is *not
+re-litigating resolved threads on every push under `required_conversation_resolution`*.)
 
 **Inline PR comments are MERGE-BLOCKING** — `main` requires every conversation
 resolved (branch protection). So calibrate where findings go:
