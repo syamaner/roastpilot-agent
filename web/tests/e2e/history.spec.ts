@@ -124,8 +124,12 @@ test("history — populated table", async ({ page }) => {
   // Structural guard (#241): the rendered header row must match the contract's
   // seven columns exactly. This fails fast on an added/removed/reordered column
   // even when the pixel diff stays under tolerance — the gap that left the
-  // populated baseline blind to the Advisor (#181) and FC (#111) columns.
-  await expect(page.locator("thead th")).toHaveText([...EXPECTED_COLUMNS]);
+  // populated baseline blind to the Advisor (#181) and FC (#111) columns. Scoped
+  // to the history table's own `thead` (not a page-global `thead th`) so a second
+  // table on the page could never make this assertion match the wrong header row.
+  await expect(page.locator("[data-testid='history-table'] thead th")).toHaveText([
+    ...EXPECTED_COLUMNS,
+  ]);
   await settle(page);
   await expect(page).toHaveScreenshot("history.png");
 });
