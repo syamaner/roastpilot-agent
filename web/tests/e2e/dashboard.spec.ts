@@ -224,7 +224,10 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   await expect(page.getByTestId("development-timer")).toBeVisible();
   await expect(page.getByTestId("development-timer")).toHaveText(/^\d{2}:\d{2}$/);
   await expect(page.getByTestId("dtr-readout")).toBeVisible();
-  await expect(page.getByTestId("dtr-readout")).toHaveText(/%$/);
+  // Numeric-only match (NOT `/%$/`, which the "— %" pre-FC placeholder also
+  // satisfies): a server regression reverting development_percent to null post-FC
+  // must fail HERE, not only in the regenerated baseline.
+  await expect(page.getByTestId("dtr-readout")).toHaveText(/^\d+\.\d+ %$/);
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-developed.png");

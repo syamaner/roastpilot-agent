@@ -266,8 +266,11 @@ them onto `TelemetryEventData`, and the dashboard `RoastHeader` renders the
 the %; it is now server-authoritative, no client-side derivation). The chart
 x-origin is UNCHANGED — re-referencing the curve to charge (Artisan-style 0:00) is
 a separate operator UX decision still held. SPA contract mirror (`lib/types.ts`)
-and the #236/#121 contract fixtures regenerated for the new fields. New
-`dashboard-developed-dtr` Playwright baseline (post-FC, dev-time + DTR visible).
+and the #236/#121 contract fixtures regenerated for the new fields. The existing
+`dashboard-developed` Playwright baseline was EXTENDED (its post-FC state now shows
+the dev-time + DTR readouts; no new snapshot state added — the developed state
+already reaches `development`), and its test gained data-level assertions on both
+readouts.
 
 Epic status: **core + S6 deterministic work done** — the page fan-out is complete:
 S1–S5 are all merged to `main` (replay #101, foundation #100, E7 `enabled_actions`
