@@ -246,9 +246,10 @@ pinned (`scales.ts` `FIXED_SCALE_RANGES`): temperature `c` → 0–210 °C, RoR 
 auto-zooms to the current sensor reading, and the 170–200 charge band is always in
 frame without stretching the domain. The x (time) axis stays data-driven (#131
 scale-covers-data guard preserved). A fixed scale is also snapshot-stable; the D26
-Playwright baselines for every curve-rendering page state were regenerated in the
-pinned image. Replaces the previous charge-band-driven °C auto-fit and the RoR
-data-range auto-fit.
+Playwright baselines that shifted were regenerated in the pinned image
+(`dashboard-live`, `dashboard-charge-window`, `foundation-chrome`, `mic-green`,
+`mic-error`). Replaces the previous charge-band-driven °C auto-fit and the RoR
+data-range auto-fit. Delivered on PR #232.
 
 Epic status: **core + S6 deterministic work done** — the page fan-out is complete:
 S1–S5 are all merged to `main` (replay #101, foundation #100, E7 `enabled_actions`
