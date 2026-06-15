@@ -39,7 +39,7 @@ from roastpilot_agent.models import (
     TimelineSafetyEvaluation,
     TimelineVerdict,
 )
-from roastpilot_agent.safety import SafetyEvaluation, enabled_operator_actions
+from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
 
 SCHEMA_V1 = """
 CREATE TABLE roast_runs (
@@ -726,7 +726,14 @@ class RoastStore:
         last-wins-by-tick join the SPA did against the timeline rows). The
         ``idx_advisor_run_tick`` / ``idx_safety_run_tick`` indexes cover the
         lookups; all are correlated subqueries (one statement, no N+1). A run with
-        no advisor decisions yields zeros, which the SPA renders as "no advice"."""
+        no advisor decisions yields zeros, which the SPA renders as "no advice".
+
+        The clamp/reject verdict values the clamped/rejected subqueries compare
+        against are sourced from the typed :class:`SafetyVerdict` enum
+        (``SafetyVerdict.CLAMP.value`` / ``SafetyVerdict.REJECT.value``) and
+        **bound as query parameters**, never raw SQL string literals (D15: a
+        verdict rename must surface as a type error, not silently dodge the
+        compare)."""
         async with self.connection.execute(
             "SELECT r.id, r.started_at_utc, r.completed_at_utc, r.agent_phase,"
             " r.outcome, r.profile_json, r.operator_rating,"
@@ -743,12 +750,16 @@ class RoastStore:
             " (SELECT COUNT(*) FROM advisor_decisions a WHERE a.run_id = r.id AND"
             "  (SELECT s.verdict FROM safety_evaluations s"
             "   WHERE s.run_id = r.id AND s.tick = a.tick"
-            "   ORDER BY s.id DESC LIMIT 1) = 'clamp') AS advisor_clamped,"
+            "   ORDER BY s.id DESC LIMIT 1) = ?) AS advisor_clamped,"
             " (SELECT COUNT(*) FROM advisor_decisions a WHERE a.run_id = r.id AND"
             "  (SELECT s.verdict FROM safety_evaluations s"
             "   WHERE s.run_id = r.id AND s.tick = a.tick"
-            "   ORDER BY s.id DESC LIMIT 1) = 'reject') AS advisor_rejected"
-            " FROM roast_runs r ORDER BY r.started_at_utc DESC, r.rowid DESC"
+            "   ORDER BY s.id DESC LIMIT 1) = ?) AS advisor_rejected"
+            " FROM roast_runs r ORDER BY r.started_at_utc DESC, r.rowid DESC",
+            # D15: the verdict values bound as query parameters come from the typed
+            # SafetyVerdict enum, never raw SQL string literals — a rename of an
+            # enum member is a pyright error here, not a silently-passing string.
+            (SafetyVerdict.CLAMP.value, SafetyVerdict.REJECT.value),
         ) as cursor:
             rows = await cursor.fetchall()
         summaries: list[RoastSummary] = []

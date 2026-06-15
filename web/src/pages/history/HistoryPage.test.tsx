@@ -73,11 +73,13 @@ describe("HistoryPage", () => {
 
   it("renders a per-roast advisor summary column from the summary fields (#184)", async () => {
     mockHistory(FIXTURE);
+    // Spy BEFORE render so it observes any mount/render-time call — making the
+    // N+1 regression guard reliable: the column renders synchronously off the
+    // already-loaded summary, so a future re-introduced per-row /timeline fetch
+    // (the N+1 #184 removed) would be caught here, not silently missed.
+    const timelineSpy = vi.spyOn(api, "timeline");
     renderPage();
     await waitFor(() => expect(screen.getAllByTestId("history-row")).toHaveLength(3));
-    // The column renders synchronously off the already-loaded summary — no
-    // per-row /timeline fetch (the N+1 #184 removed); api.timeline is never called.
-    const timelineSpy = vi.spyOn(api, "timeline");
     const cells = screen.getAllByTestId("history-advisor");
     expect(cells).toHaveLength(3);
     expect(cells[0]).toHaveTextContent("2 consults");
