@@ -502,12 +502,21 @@ class ControllerSnapshot:
     and the tick's telemetry. ``telemetry`` is the reading the tick consumed
     (``None`` when no session/read this tick); ``current_heat``/``current_fan``
     are the levels the controller has commanded (heat stays 0 after a restart
-    until separately commanded — the restart invariant)."""
+    until separately commanded — the restart invariant).
+
+    ``development_elapsed_seconds`` (seconds since first crack) and
+    ``development_percent`` (DTR — that duration as a share of the
+    charge-referenced roast clock, #220) are read-only projections of the
+    already-computed clocks the advisor reasons on; both ``None`` before first
+    crack. The runner copies them onto the per-tick telemetry SSE frame so the
+    operator sees the live development time + DTR (no client-side derivation)."""
 
     phase: RoastPhase
     current_heat: int
     current_fan: int
     roast_elapsed_seconds: float
+    development_elapsed_seconds: float | None
+    development_percent: float | None
     telemetry: RoastTelemetry | None
     advisory_paused: bool
 
@@ -600,6 +609,8 @@ class RoastController:
             current_heat=self._current_heat,
             current_fan=self._current_fan,
             roast_elapsed_seconds=self._roast_elapsed_seconds(),
+            development_elapsed_seconds=self._development_elapsed_seconds(),
+            development_percent=self._development_percent(),
             telemetry=self._last_telemetry,
             advisory_paused=self._advisory_paused,
         )
@@ -651,6 +662,27 @@ class RoastController:
         if self._first_crack_monotonic is None:
             return None
         return self._clock() - self._first_crack_monotonic
+
+    def _development_percent(self) -> float | None:
+        """DTR (development time ratio) as a percentage of the WHOLE roast (#220).
+
+        ``development_elapsed / charge_elapsed * 100`` — the SAME ratio the
+        advisor computes (``development_elapsed_seconds /
+        roast_elapsed_seconds`` in :class:`AdvisorContext`), so the operator's
+        readout and the advisor's DTR agree. Charge-referenced
+        (:meth:`_charge_elapsed_seconds`, #219), NOT the run/serve clock.
+        ``None`` before first crack (no development yet) and guarded against a
+        zero/negative charge clock (FC can only follow charge, but stay defensive
+        so a clock edge never divides by zero). A pure read of already-computed
+        clocks: it commands nothing and changes no transition/verdict.
+        """
+        development_elapsed = self._development_elapsed_seconds()
+        if development_elapsed is None:
+            return None
+        charge_elapsed = self._charge_elapsed_seconds()
+        if charge_elapsed <= 0.0:
+            return None
+        return development_elapsed / charge_elapsed * 100.0
 
     def can_transition(self, target: RoastPhase) -> bool:
         """Whether ``target`` is a legal next phase from the current one."""

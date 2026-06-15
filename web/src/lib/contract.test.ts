@@ -178,6 +178,9 @@ describe("telemetry — every field the SPA renders is present", () => {
       "fan_percent",
       "cooling_on",
       "elapsed_seconds",
+      // #220: live development time + DTR ride the telemetry frame (null pre-FC).
+      "development_elapsed_seconds",
+      "development_percent",
       "t0_detected",
       "first_crack_detected",
       // #197: the capture-alive mic status rides the telemetry frame.

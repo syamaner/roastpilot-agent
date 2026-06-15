@@ -2085,6 +2085,84 @@ async def test_advisor_charge_clock_resets_on_new_run() -> None:
     assert advisor.contexts[-1].roast_elapsed_seconds == 0.0
 
 
+# --- #220: the snapshot surfaces development time + DTR for the live readouts.
+# Read-only projections of the already-computed advisor clocks; charge-referenced
+# DTR, NOT a chart re-origin (the snapshot roast clock above stays run-referenced).
+
+
+def test_snapshot_development_fields_none_before_first_crack() -> None:
+    """Before first crack the snapshot carries no development time / DTR (#220):
+    there is no development yet, so both readouts render '—'. Holds even after
+    charge + pre-FC roast time has elapsed."""
+    crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
+    harness = make_harness(readings=[crashing])
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    snap = harness.controller.snapshot()
+    assert snap.development_elapsed_seconds is None
+    assert snap.development_percent is None
+
+
+@pytest.mark.asyncio
+async def test_snapshot_development_fields_post_fc_are_charge_referenced() -> None:
+    """Post-FC the snapshot exposes BOTH live readouts (#220): development time
+    (seconds since FC) and DTR as a percentage of the WHOLE roast, computed on
+    the charge-referenced clock (consistent with the advisor's DTR, #219). With a
+    long preheat, charge → 100 s pre-FC → FC → 25 s development, DTR =
+    25 / 125 * 100 = 20% (NOT 25 / (preheat + 125))."""
+    crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
+    harness = make_harness(readings=[crashing])
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    harness.clock.advance(600.0)  # long preheat — would dominate a run-start clock
+    for _ in range(3):  # debounce → charge stamp on the 3rd tick (clock=602.0)
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    harness.clock.advance(100.0 - 1.0)  # 100 s since the charge stamp at FC
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)  # FC edge arms dev clock
+    harness.clock.advance(25.0)  # development time
+    snap = harness.controller.snapshot()
+    assert snap.development_elapsed_seconds == pytest.approx(25.0)
+    assert snap.development_percent == pytest.approx(20.0)  # 25 / 125 * 100
+    # The two readouts are DISTINCT (a duration vs a ratio), and the snapshot's
+    # chart clock still counts from run start (~600 preheat + ~100 + 25, NOT the
+    # charge-referenced ~125) — the chart origin is unchanged by #220.
+    assert snap.roast_elapsed_seconds > 700.0
+
+
+@pytest.mark.asyncio
+async def test_snapshot_dtr_matches_advisor_dtr() -> None:
+    """The operator's DTR readout and the advisor's DTR are the SAME number (#220):
+    the snapshot's ``development_percent`` is exactly the advisor context's
+    ``development_elapsed / roast_elapsed`` * 100, so the dashboard never disagrees
+    with the loop driving the drop."""
+    crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
+    advisor = FakeAdvisor([decision()])
+    harness = make_harness(readings=[crashing], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    harness.clock.advance(600.0)
+    for _ in range(3):
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    harness.clock.advance(100.0 - 1.0)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    harness.clock.advance(25.0)
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    ctx = advisor.contexts[-1]
+    assert ctx.development_elapsed_seconds is not None
+    advisor_dtr_percent = ctx.development_elapsed_seconds / ctx.roast_elapsed_seconds * 100.0
+    snap = harness.controller.snapshot()
+    assert snap.development_percent == pytest.approx(advisor_dtr_percent)
+
+
 @pytest.mark.asyncio
 async def test_advisor_drop_now_executes() -> None:
     advisor = FakeAdvisor([decision(drop=True)])

@@ -9,6 +9,7 @@ const BASE = {
   phase: "development" as const,
   elapsedSeconds: 582,
   developmentSeconds: 72,
+  developmentPercent: 18.5,
   beanRorCPerMin: 8.4,
   profileName: "Ethiopian Yirgacheffe — Medium",
   firstCrack: null,
@@ -57,6 +58,29 @@ describe("RoastHeader", () => {
   it("omits the development timer before first crack (GAP A — no dev% invented)", () => {
     render(<RoastHeader {...BASE} developmentSeconds={null} />);
     expect(screen.queryByTestId("development-timer")).toBeNull();
+  });
+
+  it("shows the DTR readout as a percentage (one decimal) post-FC (#220)", () => {
+    render(<RoastHeader {...BASE} developmentPercent={18.5} />);
+    expect(screen.getByTestId("dtr-readout")).toHaveTextContent("18.5 %");
+  });
+
+  it("renders development time and DTR as TWO DISTINCT readouts (#220)", () => {
+    render(<RoastHeader {...BASE} developmentSeconds={72} developmentPercent={18.5} />);
+    // The timer is mm:ss; DTR is a percent — distinct values, distinct testids.
+    expect(screen.getByTestId("development-timer")).toHaveTextContent("01:12");
+    expect(screen.getByTestId("dtr-readout")).toHaveTextContent("18.5 %");
+  });
+
+  it("omits the DTR readout before first crack (no DTR pre-FC) (#220)", () => {
+    render(<RoastHeader {...BASE} developmentSeconds={null} developmentPercent={null} />);
+    expect(screen.queryByTestId("dtr-readout")).toBeNull();
+  });
+
+  it("renders the DTR readout as a placeholder when the percent is null post-FC", () => {
+    // Edge: FC fired (timer shown) but the server hasn't a DTR this frame — show "—".
+    render(<RoastHeader {...BASE} developmentSeconds={72} developmentPercent={null} />);
+    expect(screen.getByTestId("dtr-readout")).toHaveTextContent("— %");
   });
 
   it("shows FC 'listening' while roasting pre-first-crack, no mock audio dot", () => {

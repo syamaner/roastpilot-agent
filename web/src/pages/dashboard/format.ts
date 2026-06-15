@@ -29,6 +29,14 @@ export function formatPercent(value: number | null | undefined): string {
   return `${Math.round(value)} %`;
 }
 
+/** `18.5 %` from a (possibly null) percent; `— %` when unknown. One decimal —
+ *  the precision DTR needs (15.x% vs 20% is a real roasting difference), matching
+ *  the detail page's `Development` stat (#220). */
+export function formatPercent1(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "— %";
+  return `${value.toFixed(1)} %`;
+}
+
 /** `8.2 °C/min` from a (possibly null) rate; `— °C/min` when unknown. */
 export function formatRoR(value: number | null | undefined): string {
   if (value == null || !Number.isFinite(value)) return "— °C/min";

@@ -1664,6 +1664,66 @@ async def _drive_live_to_cooling(
 
 
 @pytest.mark.asyncio
+async def test_telemetry_frame_surfaces_development_time_and_dtr(store: RoastStore) -> None:
+    """#220: the live telemetry SSE frame carries server-authoritative development
+    time + DTR. Pre-FC both are null (the operator readouts show '—'); once first
+    crack transitions the run into development, the frame carries
+    ``development_elapsed_seconds`` and a charge-referenced ``development_percent``
+    (DTR as a share of the whole roast) the dashboard renders directly — no
+    client-side derivation. Asserted on the real publish path."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, _run_id = await _live_service(store, mcp=mcp, clock=clock)
+    queue = service.events.subscribe()
+
+    def latest_telemetry() -> TelemetryEventData:
+        frames = [
+            f
+            for f in _drain_queue(queue)
+            if f.event is SseEventType.TELEMETRY and f.data.get("bean_temp_c") is not None
+        ]
+        assert frames, "no telemetry frame published"
+        return TelemetryEventData.model_validate(frames[-1].data)
+
+    # Pre-FC: development readouts are null.
+    await _tick(service, clock)  # preheat
+    pre_fc = latest_telemetry()
+    assert pre_fc.development_elapsed_seconds is None
+    assert pre_fc.development_percent is None
+
+    # Charge (debounced T0), then first crack → development.
+    mcp.frames = [_reading(95.0, 150.0, t0_detected=True)]
+    for _ in range(3):
+        await _tick(service, clock)
+    assert service.runner is not None
+    assert service.runner.controller_snapshot().phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    mcp.frames = [_reading(196.0, 205.0, t0_detected=True, first_crack_detected=True)]
+    await _tick(service, clock)  # → development (FC instant: dev elapsed == 0)
+    # One more tick so development time has actually elapsed past the FC instant.
+    mcp.frames = [_reading(200.0, 208.0, t0_detected=True, first_crack_detected=True)]
+    await _tick(service, clock)
+    post_fc = latest_telemetry()
+    assert post_fc.development_elapsed_seconds is not None
+    assert post_fc.development_elapsed_seconds > 0.0
+    assert post_fc.development_percent is not None
+    # DTR is a percentage of the WHOLE (charge-referenced) roast: a sane share
+    # bounded above by 100 (development can't exceed the charge clock it divides).
+    assert 0.0 < post_fc.development_percent <= 100.0
+    # The two readouts are DISTINCT values, not a ratio of each other.
+    assert post_fc.development_percent != post_fc.development_elapsed_seconds
+
+
+def _drain_queue(queue: "asyncio.Queue[SseEvent]") -> list[SseEvent]:
+    frames: list[SseEvent] = []
+    while True:
+        try:
+            frames.append(queue.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    return frames
+
+
+@pytest.mark.asyncio
 async def test_queue_dispatch_routes_every_control_action(store: RoastStore) -> None:
     """Each operator action drains to its controller handler — exercised from
     preheating (matrix-rejected actions still dispatch; pause/resume toggle)."""

@@ -182,6 +182,8 @@
         "bean_ror_c_per_min": null,
         "bean_temp_c": 38.0,
         "cooling_on": false,
+        "development_elapsed_seconds": null,
+        "development_percent": null,
         "elapsed_seconds": 0.0,
         "env_ror_c_per_min": null,
         "env_temp_c": 43.0,

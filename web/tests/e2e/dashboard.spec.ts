@@ -216,6 +216,19 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   // x stays data-driven (#131): it must span the elapsed range, never collapse onto one x.
   expect((hook.scales.x.max ?? 0) - (hook.scales.x.min ?? 0)).toBeGreaterThan(300);
 
+  // Live development time + DTR (#220): post-FC the header surfaces BOTH distinct
+  // server-authoritative readouts. Assert the data renders (not just the pixels) so a
+  // regression fails HERE, not only in the regenerated baseline — the timer is mm:ss,
+  // the DTR a percentage. The replay reaches FC at the first development tick, so the
+  // exact values are small but present (the rendered baseline captures them).
+  await expect(page.getByTestId("development-timer")).toBeVisible();
+  await expect(page.getByTestId("development-timer")).toHaveText(/^\d{2}:\d{2}$/);
+  await expect(page.getByTestId("dtr-readout")).toBeVisible();
+  // Numeric-only match (NOT `/%$/`, which the "— %" pre-FC placeholder also
+  // satisfies): a server regression reverting development_percent to null post-FC
+  // must fail HERE, not only in the regenerated baseline.
+  await expect(page.getByTestId("dtr-readout")).toHaveText(/^\d+\.\d+ %$/);
+
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-developed.png");
 });

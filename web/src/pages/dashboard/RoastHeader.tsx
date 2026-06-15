@@ -6,10 +6,12 @@
  * status, and a diagnostics drawer.
  *
  * Renders only REAL contract state (kickoff §8 — surface gaps, never invent):
- *  - Development %: the live `telemetry` frame carries NO `development_percent`
- *    (it is only on the REST series), so we show a development TIMER (time since
- *    the first-crack event) and OMIT the %. Tracked for a faithful server-field
- *    fix as #112. (Don't synthesize a % the live frame can't support.)
+ *  - Development time + DTR (#220, closes the #112 gap): the live `telemetry`
+ *    frame now carries BOTH `development_elapsed_seconds` (time since first crack)
+ *    and `development_percent` (DTR — that duration as a share of the WHOLE,
+ *    CHARGE-referenced roast, consistent with the advisor's DTR, #219). We render
+ *    them as TWO DISTINCT readouts post-FC (a duration and a ratio); both hidden
+ *    pre-FC. No client-side derivation — the server is authoritative.
  *  - First-crack-audio health: the contract carries no FC-audio pipeline health
  *    signal, so we show real FC STATE — "listening" pre-FC, then "detected at
  *    HH:MM · X °C · source" from the real `first_crack` event — not a mock
@@ -22,7 +24,14 @@ import { useState } from "react";
 
 import { cn } from "@/lib/cn";
 import type { MCPChildStatus, MicStatus, RoastPhase } from "@/lib/types";
-import { formatClock, formatRoR, formatTempC, PHASE_LABEL, phaseAccentVar } from "./format";
+import {
+  formatClock,
+  formatPercent1,
+  formatRoR,
+  formatTempC,
+  PHASE_LABEL,
+  phaseAccentVar,
+} from "./format";
 import type { FirstCrackData } from "./events";
 import { MicStatusIcon } from "./MicStatusIcon";
 
@@ -30,8 +39,16 @@ export interface RoastHeaderProps {
   phase: RoastPhase | null;
   /** Seconds since the run started (the roast timer); from telemetry.elapsed. */
   elapsedSeconds: number | null;
-  /** Seconds since the first-crack event (the development timer); null pre-FC. */
+  /** Seconds since the first-crack event (the development timer); null pre-FC.
+   *  Server-authoritative (telemetry.development_elapsed_seconds, #220). */
   developmentSeconds: number | null;
+  /**
+   * DTR (development time ratio) as a PERCENT of the whole, charge-referenced
+   * roast (telemetry.development_percent, #220); null pre-FC. A DISTINCT readout
+   * from the development timer — the share of the roast spent in development, the
+   * same DTR the advisor reasons on (#219). Render "—" when null.
+   */
+  developmentPercent: number | null;
   /**
    * Live bean Rate of Rise (°C/min) from the current telemetry frame; null until
    * the server has computed a rate. Shown from the start (incl. preheat) — it is
@@ -56,6 +73,7 @@ export function RoastHeader({
   phase,
   elapsedSeconds,
   developmentSeconds,
+  developmentPercent,
   beanRorCPerMin,
   profileName,
   firstCrack,
@@ -95,12 +113,18 @@ export function RoastHeader({
           testid="ror-readout"
           accent="var(--roast-nominal)"
         />
+        {/* Post-FC only (#220): TWO distinct readouts — the development TIME
+            (since first crack) and DTR (that time as a % of the whole roast).
+            Both server-authoritative; hidden pre-FC (no development yet). */}
         {developmentSeconds !== null && (
           <Metric
             label="Development"
             value={formatClock(developmentSeconds)}
             testid="development-timer"
           />
+        )}
+        {developmentSeconds !== null && (
+          <Metric label="DTR" value={formatPercent1(developmentPercent)} testid="dtr-readout" />
         )}
       </div>
 
