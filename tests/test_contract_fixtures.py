@@ -124,9 +124,17 @@ def _normalize_sse_frame(raw: _JsonObj) -> _JsonObj:
 
     ``id`` is the broadcaster's monotonic sequence (varies with tick count); the
     telemetry frame's ``elapsed_seconds`` is wall-clock-derived. Both are pinned
-    so a regeneration is deterministic. A ``null`` id (the API-built heartbeat)
-    stays ``null`` — that is a real contract distinction (``int | None``), not a
-    volatile value.
+    so a regeneration is deterministic.
+
+    Every value normalization here guards on **non-null**, never mere key
+    existence: a ``null`` is a real contract state these fields can take
+    (``id`` is ``int | None`` — the API-built heartbeat carries no id;
+    ``elapsed_seconds`` is ``float | None``), so a server regression that turns a
+    present value into ``null`` MUST survive normalization to fail the byte
+    compare. Key-existence normalization would silently rewrite a present-but-null
+    field to the sentinel and mask that drift — and the SPA treats null
+    ``elapsed_seconds`` differently (it drops the point from the chart), so the
+    distinction is behaviourally meaningful, not cosmetic.
 
     Args:
         raw: One ``SseEvent.model_dump(mode="json")`` dict.
@@ -136,8 +144,8 @@ def _normalize_sse_frame(raw: _JsonObj) -> _JsonObj:
     """
     if raw.get("id") is not None:
         raw["id"] = _SENTINEL_SSE_ID
-    data = raw.get("data")
-    if isinstance(data, dict) and "elapsed_seconds" in data:
+    data: _JsonObj | None = raw.get("data")
+    if data is not None and data.get("elapsed_seconds") is not None:
         data["elapsed_seconds"] = _SENTINEL_ELAPSED
     return raw
 
@@ -149,13 +157,21 @@ def _normalize_rest_snapshot(raw: _JsonObj) -> _JsonObj:
     wall-clock. All three are pinned so the snapshot regenerates deterministically
     while still exercising the field shape (a present, non-null ISO string / id).
 
+    As in :func:`_normalize_sse_frame`, every normalization guards on **non-null**
+    so a value→``null`` server regression survives to fail the byte compare. ``id``
+    is a non-null ``str`` in the models today (a run always has one), but a
+    regression to ``null`` would break the SPA's run keying (detail/history route
+    by id), so guarding on non-null is the consistent, defence-in-depth choice
+    rather than masking it. ``completed_at_utc`` is legitimately ``null`` for an
+    in-progress run, so the non-null guard preserves that real distinction.
+
     Args:
         raw: A ``RoastDetail`` or ``RoastSummary`` ``model_dump(mode="json")`` dict.
 
     Returns:
         The same dict, mutated in place, with volatile fields normalized.
     """
-    if "id" in raw:
+    if raw.get("id") is not None:
         raw["id"] = _SENTINEL_RUN_ID
     for key in ("started_at_utc", "completed_at_utc"):
         if raw.get(key) is not None:
@@ -657,3 +673,47 @@ async def test_in_sync_guard_fails_on_injected_server_drift(
         "the in-sync guard did NOT detect an injected `phase`→`agent_phase` rename "
         "— it has stopped catching server drift"
     )
+
+
+def test_normalize_preserves_present_but_null_elapsed_seconds() -> None:
+    """A present-but-null ``elapsed_seconds`` is NOT rewritten to the sentinel.
+
+    The guard's value normalizations key on non-null, never key existence. If
+    ``elapsed_seconds`` regressed ``float`` → ``null`` server-side, normalizing it
+    to ``0.0`` would byte-match the committed fixture and hide the drift — yet the
+    SPA treats null elapsed differently (drops the point from the chart), so it is
+    a real contract change. This pins that the null survives normalization (so the
+    byte compare would catch it), and that a present float is still pinned.
+    """
+    null_frame = _normalize_sse_frame(
+        {"event": "telemetry", "id": 42, "data": {"elapsed_seconds": None}}
+    )
+    assert null_frame["data"]["elapsed_seconds"] is None, (
+        "present-but-null elapsed_seconds was normalized to the sentinel — a "
+        "float→null server regression would be masked"
+    )
+    # The id still normalizes (it was a non-null int).
+    assert null_frame["id"] == _SENTINEL_SSE_ID
+
+    value_frame = _normalize_sse_frame(
+        {"event": "telemetry", "id": 7, "data": {"elapsed_seconds": 123.4}}
+    )
+    assert value_frame["data"]["elapsed_seconds"] == _SENTINEL_ELAPSED
+
+
+def test_normalize_preserves_null_id_fields() -> None:
+    """Null ``id`` fields survive normalization (the value→null guard, both sides).
+
+    The heartbeat frame's ``id`` is legitimately null; a REST snapshot ``id``
+    regressing to null would break the SPA's run keying. Both must survive
+    normalization so the byte compare catches a value→null regression rather than
+    rewriting it to the sentinel.
+    """
+    heartbeat = _normalize_sse_frame({"event": "heartbeat", "id": None, "data": {}})
+    assert heartbeat["id"] is None, "null SSE id (heartbeat) was rewritten to the sentinel"
+
+    null_run_id = _normalize_rest_snapshot({"id": None, "started_at_utc": None})
+    assert null_run_id["id"] is None, "present-but-null REST id was rewritten to the sentinel"
+    # A present run id still normalizes.
+    real_run_id = _normalize_rest_snapshot({"id": "deadbeef", "started_at_utc": None})
+    assert real_run_id["id"] == _SENTINEL_RUN_ID
