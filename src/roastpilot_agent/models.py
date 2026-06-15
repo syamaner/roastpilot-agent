@@ -716,6 +716,17 @@ class TelemetryEventData(BaseModel):
     fan_percent: int | None = None
     cooling_on: bool = False
     elapsed_seconds: float | None = None
+    development_elapsed_seconds: float | None = None
+    """Seconds since first crack — the live development clock (#220). ``None``
+    before first crack. Server-authoritative (the controller's
+    ``_development_elapsed_seconds``): the SPA renders this directly rather than
+    deriving it from the FC event vs ``elapsed_seconds`` (the #112 gap)."""
+    development_percent: float | None = None
+    """DTR (development time ratio) as a *percentage* of the WHOLE roast (#220):
+    ``development_elapsed / charge_elapsed * 100``. Charge-referenced
+    (consistent with the advisor's DTR, #219) — NOT the run/serve clock.
+    ``None`` before first crack (or before charge). A live readout DISTINCT from
+    ``development_elapsed_seconds``: one is a duration, the other a ratio."""
     t0_detected: bool = False
     first_crack_detected: bool = False
     mic_status: MicStatus | None = None

@@ -823,6 +823,8 @@ class RoastRunner:
                     fan_percent=snapshot.current_fan,
                     cooling_on=telemetry.cooling_on,
                     elapsed_seconds=snapshot.roast_elapsed_seconds,
+                    development_elapsed_seconds=snapshot.development_elapsed_seconds,
+                    development_percent=snapshot.development_percent,
                     t0_detected=telemetry.t0_detected,
                     first_crack_detected=telemetry.first_crack_detected,
                     mic_status=telemetry.mic_status,

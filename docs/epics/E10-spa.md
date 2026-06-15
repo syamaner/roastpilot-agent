@@ -251,6 +251,24 @@ Playwright baselines that shifted were regenerated in the pinned image
 `mic-error`). Replaces the previous charge-band-driven °C auto-fit and the RoR
 data-range auto-fit. Delivered on PR #232.
 
+Post-E10 observability follow-up (D35 #220 cluster, not an E10 story): **#220 —
+live development time + DTR on the dashboard** (ROAST-CRITICAL, operator 14 Jun;
+needed before the first roast and by the post-FC LLM loop #223). Two DISTINCT
+server-authoritative readouts now ride the per-tick `telemetry` SSE frame:
+`development_elapsed_seconds` (time since first crack) and `development_percent`
+(DTR — that duration as a share of the WHOLE, CHARGE-referenced roast,
+`development_elapsed / charge_elapsed * 100`, the same DTR the advisor reasons on,
+#219). The controller already computed both clocks for the advisor context; #220
+is read-only display plumbing — `ControllerSnapshot` projects them, `api.py` copies
+them onto `TelemetryEventData`, and the dashboard `RoastHeader` renders the
+`Development` timer + a new `DTR` readout (both hidden pre-FC). This CLOSES the
+#112 gap (the dashboard previously showed a client-derived dev timer and omitted
+the %; it is now server-authoritative, no client-side derivation). The chart
+x-origin is UNCHANGED — re-referencing the curve to charge (Artisan-style 0:00) is
+a separate operator UX decision still held. SPA contract mirror (`lib/types.ts`)
+and the #236/#121 contract fixtures regenerated for the new fields. New
+`dashboard-developed-dtr` Playwright baseline (post-FC, dev-time + DTR visible).
+
 Epic status: **core + S6 deterministic work done** — the page fan-out is complete:
 S1–S5 are all merged to `main` (replay #101, foundation #100, E7 `enabled_actions`
 contract #107/D25, S2 foundation follow-up #115 = phase_changed fix + types audit
@@ -274,7 +292,9 @@ advisor targets), advisory panel (ALLOW/CLAMP/REJECT badges), operator action ba
 permitted-but-meaningless toggles on terminal phases), recovery modal, fault
 banner + safety trail, and add-beans toast. Two contract gaps surfaced (tracked as
 #112): live `development_percent` is not on `TelemetryEventData` (show a
-development timer, omit %); no live FC-audio pipeline health signal (render real FC
+development timer, omit %) — **RESOLVED by #220** (both `development_elapsed_seconds`
+and `development_percent`/DTR now ride the live frame, server-authoritative); no
+live FC-audio pipeline health signal (render real FC
 state — "listening" → detection — not a mock dot). `dashboard-live` snapshot ships
 here (canvas masked at S3; **D26 un-masks + regenerates its baseline at S6**);
 `dashboard-fault` / `dashboard-recovery` snapshots deferred to S6 (their

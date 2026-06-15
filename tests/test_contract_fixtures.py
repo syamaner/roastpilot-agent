@@ -591,6 +591,27 @@ def test_committed_sse_fixture_carries_mic_status() -> None:
     MicStatus.model_validate(mic)
 
 
+def test_committed_sse_fixture_carries_development_time_and_dtr() -> None:
+    """The committed SSE telemetry frame pins the development-time + DTR keys (#220).
+
+    The dashboard renders the live ``Development`` timer + ``DTR`` readout from
+    ``telemetry.development_elapsed_seconds`` and ``telemetry.development_percent``;
+    a server that stopped projecting them would silently blank both. The
+    representative frame is pre-first-crack, so the values are ``null`` (the
+    readouts show '—'), but the KEYS must be present on the wire shape the SPA's TS
+    mirror reads. (DTR is charge-referenced per #219 — see the controller tests for
+    the post-FC value semantics.)"""
+    raw = json.loads(_SSE_FRAMES_PATH.read_text())
+    telemetry = next(f for f in raw["frames"] if f["event"] == SseEventType.TELEMETRY.value)
+    data = telemetry["data"]
+    assert "development_elapsed_seconds" in data, (
+        "committed telemetry frame is missing development_elapsed_seconds — regenerate it"
+    )
+    assert "development_percent" in data, (
+        "committed telemetry frame is missing development_percent — regenerate it"
+    )
+
+
 def test_committed_sse_fixture_matches_models() -> None:
     """The committed SSE fixture on disk still validates against the models.
 

@@ -132,10 +132,14 @@ export function DashboardPage(): React.JSX.Element {
     [runId],
   );
 
-  // Development timer (GAP A / #112): the live telemetry frame carries no
-  // development_percent, so we show time SINCE first crack — derivable from the
-  // FC event vs the current elapsed. Null until FC fires.
-  const [fcElapsed, setFcElapsed] = useState<number | null>(null);
+  // Development time + DTR (#220, closes the #112 gap): the live telemetry frame
+  // now carries BOTH server-authoritative values — `development_elapsed_seconds`
+  // (time since first crack) and `development_percent` (DTR — that time as a share
+  // of the WHOLE, charge-referenced roast, consistent with the advisor's DTR,
+  // #219). We render them DIRECTLY; no client-side FC-baseline derivation. Both
+  // null pre-FC (the header omits the readouts).
+  const developmentSeconds = telemetry?.development_elapsed_seconds ?? null;
+  const developmentPercent = telemetry?.development_percent ?? null;
 
   // Charge-window dwell (#211): the elapsed time at which the bean first entered
   // the charge window. The banner shows how long the bean has been in the window
@@ -146,7 +150,6 @@ export function DashboardPage(): React.JSX.Element {
   // the hook): a new run must not inherit the previous run's FC baseline or a
   // stale toast dismissal. The page can stay mounted across runs.
   useEffect(() => {
-    setFcElapsed(null);
     setChargeEnteredElapsed(null);
     setLastResult(null);
   }, [runId]);
@@ -161,16 +164,6 @@ export function DashboardPage(): React.JSX.Element {
       setStickyFaultedRunId(runId);
     }
   }, [view.fault, runId]);
-
-  useEffect(() => {
-    if (view.firstCrack !== null && fcElapsed === null && telemetry?.elapsed_seconds != null) {
-      setFcElapsed(telemetry.elapsed_seconds);
-    }
-  }, [view.firstCrack, fcElapsed, telemetry?.elapsed_seconds]);
-  const developmentSeconds =
-    fcElapsed !== null && telemetry?.elapsed_seconds != null
-      ? telemetry.elapsed_seconds - fcElapsed
-      : null;
 
   // Advisor targets for the control-row ghost markers (latest decision).
   const targetHeat = view.latestAdvisory?.decision?.target_heat ?? null;
@@ -283,6 +276,7 @@ export function DashboardPage(): React.JSX.Element {
           phase={phase}
           elapsedSeconds={telemetry?.elapsed_seconds ?? null}
           developmentSeconds={developmentSeconds}
+          developmentPercent={developmentPercent}
           beanRorCPerMin={telemetry?.bean_ror_c_per_min ?? null}
           profileName={detail.data?.profile.name ?? null}
           firstCrack={view.firstCrack}
