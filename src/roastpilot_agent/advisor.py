@@ -94,6 +94,13 @@ class AdvisorContext(BaseModel):
 
     phase: RoastPhase
     roast_elapsed_seconds: float
+    """Seconds since charge (T0) — the advisor's DTR denominator (#219). ``0.0``
+    before charge. Charge-referenced (not run/preheat start) so the model's DTR =
+    ``development_elapsed_seconds / roast_elapsed_seconds`` matches the v4-prompt
+    definition the bake-off validated (its context fixtures start at charge). This
+    is advisory context only: it is NOT the run-referenced clock the SPA charts
+    (``ControllerSnapshot.roast_elapsed_seconds`` / the SSE ``elapsed_seconds``),
+    whose origin stays run/preheat-start until #220 re-origins the chart."""
     development_elapsed_seconds: float | None
     current_bean_temp_c: float
     current_env_temp_c: float

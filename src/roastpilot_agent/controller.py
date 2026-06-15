@@ -605,16 +605,48 @@ class RoastController:
         )
 
     def _roast_elapsed_seconds(self) -> float:
+        """Seconds since run/preheat start (``start_run``), or ``0.0`` if no run.
+
+        The monotonic run clock that feeds :class:`ControllerSnapshot` and so the
+        SSE/persisted telemetry the SPA renders (the chart x-value + the operator
+        ROAST TIME readout). Deliberately **run/preheat-referenced**: the dashboard
+        plots each point at ``t = elapsed_seconds`` and must keep showing the
+        pre-charge preheat/RoR curve (#165) — a charge-referenced value would
+        collapse every pre-charge row onto ``x=0``. Re-origining the chart at charge
+        (Artisan-style 0:00) is a deliberate UX change held for #220, not #219.
+
+        For the advisor's DTR clock (charge-referenced, #219) see
+        :meth:`_charge_elapsed_seconds`.
+        """
         if self._run_started_monotonic is None:
             return 0.0
         return self._clock() - self._run_started_monotonic
 
+    def _charge_elapsed_seconds(self) -> float:
+        """Charge-referenced roast clock: seconds since charge (T0), ``0.0``
+        before charge (#219).
+
+        Referenced to the debounced charge/T0 instant (``_charge_monotonic``,
+        the same instant ``seconds_since_charge`` and the post-charge settle
+        window use), **not** run/preheat start. This is the advisor's DTR
+        denominator only — DTR = ``development_elapsed / charge_elapsed`` — which
+        the v4 prompt and the bake-off fixtures define charge-referenced; it has
+        no meaning before there is a bean on the drum. It feeds
+        :attr:`AdvisorContext.roast_elapsed_seconds` and nothing the SPA renders;
+        the chart/readout clock is the run-referenced :meth:`_roast_elapsed_seconds`.
+        """
+        if self._charge_monotonic is None:
+            return 0.0
+        return self._clock() - self._charge_monotonic
+
     def _development_elapsed_seconds(self) -> float | None:
         """Seconds since first crack, or ``None`` before it is detected.
 
-        The development clock the advisor reasons about near the drop (DTR is
-        ``development_elapsed / roast_elapsed``). ``None`` until the first-crack
-        transition arms ``_first_crack_monotonic`` in :meth:`transition_to`.
+        The development clock the advisor reasons about near the drop. The DTR
+        the advisor computes is ``development_elapsed / charge_elapsed`` (the
+        charge-referenced roast clock, :meth:`_charge_elapsed_seconds`). ``None``
+        until the first-crack transition arms ``_first_crack_monotonic`` in
+        :meth:`transition_to`.
         """
         if self._first_crack_monotonic is None:
             return None
@@ -1499,7 +1531,11 @@ class RoastController:
         assert self._profile is not None  # guarded by caller
         return AdvisorContext(
             phase=self._phase,
-            roast_elapsed_seconds=self._roast_elapsed_seconds(),
+            # Charge-referenced (#219): the DTR denominator the advisor reasons
+            # about (development / time-since-charge), matching the v4 prompt and
+            # the bake-off fixtures. NOT the run-referenced snapshot clock the SPA
+            # charts — that stays run-referenced (chart x / ROAST TIME unchanged).
+            roast_elapsed_seconds=self._charge_elapsed_seconds(),
             development_elapsed_seconds=self._development_elapsed_seconds(),
             current_bean_temp_c=telemetry.bean_temp_c,
             current_env_temp_c=telemetry.env_temp_c,

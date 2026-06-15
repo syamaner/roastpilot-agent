@@ -14,7 +14,9 @@
 > `roastpilot-plan/roastpilot-agent/deterministic-control-loop-plan.md` + `plan.md` §1 D35.
 > Tracking: **epic #221** (phases #222 pre-FC determinism / #223 post-FC LLM+box / #224
 > test-harness+corpus+eval). **Superseded:** #214, #172 (prompt work, closed). **Subsumes:**
-> #209 (settle window → no-op). **Promoted load-bearing:** #205, #219. **§7 forward goals:**
+> #209 (settle window → no-op). **Promoted load-bearing:** #205, #219 (**#219 charge-references
+> the advisor DTR clock, server-side only; the SPA chart/readout origin stays run-referenced —
+> charge-origin chart deferred to #220**). **§7 forward goals:**
 > parameterised plan interface (a future learning loop → anticipatory pre-FC) + outcome-
 > labelled roast logs as a fine-tune training corpus (learning brain → roastpilot-cloud, D29).
 > Forward-looking #209/#211 (charge cluster) are MERGED; #210/#212 (operability) deferred to
