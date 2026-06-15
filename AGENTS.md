@@ -210,8 +210,8 @@ clean.
 **The PR review roster (operator, 15 Jun 2026): `Claude Code Review` + `Augment
 Code (auggie)`.** The automated **Claude Code Review**
 (`.github/workflows/claude-code-review.yml`, running `/code-review --comment`),
-the **Augment Code** review (auggie, `augmentcode[bot]`), and any human reviewer
-follow this rubric. **No other review bots are in the roster — the ChatGPT/OpenAI
+the **Augment Code** review (auggie — whatever account the installed Augment
+GitHub App posts its reviews as), and any human reviewer follow this rubric. **No other review bots are in the roster — the ChatGPT/OpenAI
 Codex connector and CodeRabbit are disabled** (operator, 15 Jun 2026). Codex was
 removed because its push-triggered re-reviews re-posted the same findings on every
 commit and churned the conversation-resolution merge gate (each `update-branch`/push
