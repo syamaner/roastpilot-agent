@@ -141,6 +141,45 @@ liftable algorithms (citations are `file:line` in `src/artisanlib/`):
   Our live "development-so-far" and live DTR-so-far are still trivially computable
   (`(now-FC)/(now-charge)`); just note Artisan's *canonical* DTR is a post-drop number.
 
+## FC detection from the curve — the Scott Rao ET-RoR-trough method (15 Jun)
+
+A dedicated pass on Scott Rao's curve-based FC method (his blog, primary). **It is a
+different question from the FC-ETA above:** the ETA *anticipates* FC; Rao's method *detects
+the event as it happens*.
+
+- **The signal:** a **trough (local minimum) in the ET (environment/exhaust) RoR**, with a
+  **simultaneous crash in the BT RoR**. Rao marks the ET-RoR trough as the "real" start of
+  FC. He explicitly says the raw ET *curve's* arc is too vague — it's the **derivative (ET
+  RoR)** that carries the mark. Source: Rao, *"How to Use Cropster To (Almost Always) Know
+  Exactly When First Crack Began"* (scottrao.com, 25 Nov 2018). Artisan tracked an
+  implementation (issue #309) but closed it without a validated, documented algorithm.
+- **Retrospective, NOT predictive.** The trough is only confirmable once the curve turns
+  back up, so it is **back-marked** after the fact (the Artisan proposal waits ~X s past a
+  ~180 °C BT threshold with no new low, then marks the prior lowest ET-RoR point). **No
+  advance warning** — do not confuse it with Cropster's predictive ML FC window.
+- **Mechanism is asserted, not evidenced:** moisture/gas release at fracture increases hot-air
+  flow past the ET probe (ET RoR up-turn) while escaping moisture cools bean surfaces and
+  deflects heat (BT RoR crash). Rao himself: *"I don't claim to completely understand the
+  dynamic."* Note this is a **moisture story for FC onset**, distinct from the *exothermic*
+  flick later in FC — don't conflate.
+- **Reliability:** hedged and unquantified — "**usually** the best indicator", with named
+  failure cases (gas reduced just before the trough; erratic/gentle-cracking coffees, some
+  decafs/naturals). Credible expert heuristic, **not** a measured study. The forum framing
+  ("almost always know exactly") overstates his own qualified wording.
+- **Telemetry demands:** needs (a) an **ET probe** and (b) **heavy RoR smoothing + a robust
+  trough-finder** — RoR is a derivative, so a trough off raw ~5 s telemetry is dominated by
+  noise/quantisation and will throw spurious minima. Rao frames it entirely inside Cropster's
+  smoothed RoR.
+
+**Verdict for us:** our rig *does* have an env-temp channel, so the ET-RoR trough is
+computable in principle — but its realistic value is a **secondary thermal confirmation to
+debounce / cross-check the audio FC mark** (tightening *when FC began*, partially offsetting
+the 12–21 s audio lag), **only** with proper ET-RoR smoothing + trough detection. It is **not**
+a standalone live detector and gives **no anticipation**. So: **audio stays the FC event
+detector, the RoR-extrapolation ETA stays the anticipation tool, and the ET-RoR trough is an
+optional Tier-2 cross-check** — worth prototyping on the recorded roasts (we have ET) to see
+if it meaningfully sharpens the audio mark, but not load-bearing for D36's anticipatory trim.
+
 ## What this changes
 
 - **#223 / D36:** confirmed as-written. The ETA-from-RoR (not hardcoded 180), live DTR,
