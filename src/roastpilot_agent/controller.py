@@ -672,8 +672,8 @@ class RoastController:
         (:meth:`_charge_elapsed_seconds` and :meth:`_development_elapsed_seconds`)
         reference it, so the development time, the charge-referenced roast clock,
         and the derived DTR (#220) all freeze together at their drop values
-        rather than climbing into cooling. ``min`` keeps it monotone-safe against
-        any clock edge (it never reports a time before the drop).
+        rather than climbing into cooling. ``min`` clamps post-drop reads to the
+        drop instant — it never reports a time after the drop.
 
         Advisory/display-only: it bounds nothing on the control path — no
         transition, verdict, executor, or drop gate reads these clocks.
