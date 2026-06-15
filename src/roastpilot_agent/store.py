@@ -714,7 +714,19 @@ class RoastStore:
         ``id`` would then return the wrong FC time. The stored value is always
         ``datetime.now(UTC).isoformat()`` (see :func:`_utc_now`) — a fixed-width
         ISO-8601 string with a constant ``+00:00`` offset — so a lexicographic
-        ``ORDER BY`` on the text column is also chronological."""
+        ``ORDER BY`` on the text column is also chronological.
+
+        Advisor stats (#184) — consults, clamped, rejected, failed — are
+        aggregated here from ``advisor_decisions`` so the history list no longer
+        N+1s ``GET /api/roasts/{id}/timeline`` to derive them client-side. The
+        counts reproduce the SPA's prior ``advisorSummary`` exactly: ``consults``
+        is every persisted decision row; ``failed`` is those whose ``status`` is
+        not ``ok``; ``clamped`` / ``rejected`` count a consult against the
+        *latest* safety evaluation at the consult's ``tick`` (the same
+        last-wins-by-tick join the SPA did against the timeline rows). The
+        ``idx_advisor_run_tick`` / ``idx_safety_run_tick`` indexes cover the
+        lookups; all are correlated subqueries (one statement, no N+1). A run with
+        no advisor decisions yields zeros, which the SPA renders as "no advice"."""
         async with self.connection.execute(
             "SELECT r.id, r.started_at_utc, r.completed_at_utc, r.agent_phase,"
             " r.outcome, r.profile_json, r.operator_rating,"
@@ -723,7 +735,19 @@ class RoastStore:
             "  ORDER BY t.tick DESC LIMIT 1) AS dev_pct,"
             " (SELECT e.recorded_at_utc FROM roast_events e"
             "  WHERE e.run_id = r.id AND e.kind = 'first_crack'"
-            "  ORDER BY e.recorded_at_utc ASC LIMIT 1) AS fc_at"
+            "  ORDER BY e.recorded_at_utc ASC LIMIT 1) AS fc_at,"
+            " (SELECT COUNT(*) FROM advisor_decisions a"
+            "  WHERE a.run_id = r.id) AS advisor_consults,"
+            " (SELECT COUNT(*) FROM advisor_decisions a"
+            "  WHERE a.run_id = r.id AND a.status != 'ok') AS advisor_failed,"
+            " (SELECT COUNT(*) FROM advisor_decisions a WHERE a.run_id = r.id AND"
+            "  (SELECT s.verdict FROM safety_evaluations s"
+            "   WHERE s.run_id = r.id AND s.tick = a.tick"
+            "   ORDER BY s.id DESC LIMIT 1) = 'clamp') AS advisor_clamped,"
+            " (SELECT COUNT(*) FROM advisor_decisions a WHERE a.run_id = r.id AND"
+            "  (SELECT s.verdict FROM safety_evaluations s"
+            "   WHERE s.run_id = r.id AND s.tick = a.tick"
+            "   ORDER BY s.id DESC LIMIT 1) = 'reject') AS advisor_rejected"
             " FROM roast_runs r ORDER BY r.started_at_utc DESC, r.rowid DESC"
         ) as cursor:
             rows = await cursor.fetchall()
@@ -745,6 +769,10 @@ class RoastStore:
                     is_blend=profile.is_blend,
                     rating=None if row[6] is None else int(row[6]),
                     development_percent=None if row[7] is None else float(row[7]),
+                    advisor_consults=int(row[9]),
+                    advisor_failed=int(row[10]),
+                    advisor_clamped=int(row[11]),
+                    advisor_rejected=int(row[12]),
                 )
             )
         return summaries

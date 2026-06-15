@@ -450,6 +450,22 @@ class RoastSummary(BaseModel):
     is_blend: bool = False
     rating: int | None = None
     development_percent: float | None = None
+    advisor_consults: int = 0
+    """Total persisted advisor consults for this run (#184), aggregated
+    server-side from ``advisor_decisions``. Mirrors the history advisor column's
+    consult count, which until now the SPA derived per-row from
+    ``GET /api/roasts/{id}/timeline`` (an N+1). ``0`` for a run that never
+    consulted the advisor (back-compat: pre-advisor runs render "no advice")."""
+    advisor_clamped: int = 0
+    """Of this run's consults, how many produced a ``CLAMP`` safety verdict
+    (#184) — counted per consult against the latest safety evaluation at the
+    consult's tick, matching the SPA's prior client-side join. ``0`` when none."""
+    advisor_rejected: int = 0
+    """Of this run's consults, how many produced a ``REJECT`` safety verdict
+    (#184), counted as in :attr:`advisor_clamped`. ``0`` when none."""
+    advisor_failed: int = 0
+    """Of this run's consults, how many did NOT return a usable decision (#184) —
+    a ``timeout`` / ``malformed`` / ``provider_error`` status. ``0`` when none."""
 
 
 class RoastHistory(BaseModel):

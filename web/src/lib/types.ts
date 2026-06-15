@@ -228,6 +228,15 @@ export interface RoastSummary {
   is_blend?: boolean;
   rating: number | null;
   development_percent: number | null;
+  // Advisor stats (#184) aggregated server-side from `advisor_decisions`, so the
+  // history advisor column renders without N+1ing `GET /api/roasts/{id}/timeline`.
+  // `advisor_consults` is every persisted consult; `advisor_failed` the non-`ok`
+  // statuses; `advisor_clamped` / `advisor_rejected` count a consult against the
+  // safety verdict at its tick. All default to `0` for a run with no consults.
+  advisor_consults: number;
+  advisor_clamped: number;
+  advisor_rejected: number;
+  advisor_failed: number;
 }
 
 export interface RoastHistory {

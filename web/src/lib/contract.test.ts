@@ -426,6 +426,10 @@ describe("REST snapshot contract", () => {
       "bean_varietal",
       "rating",
       "development_percent",
+      "advisor_consults",
+      "advisor_clamped",
+      "advisor_rejected",
+      "advisor_failed",
     ]);
   });
 });

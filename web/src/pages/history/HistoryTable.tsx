@@ -95,7 +95,7 @@ export function HistoryTable({ runs }: HistoryTableProps): React.JSX.Element {
                   <OutcomeBadge outcome={run.outcome} />
                 </td>
                 <td className={BODY_CELL}>
-                  <HistoryAdvisorCell runId={run.id} />
+                  <HistoryAdvisorCell run={run} />
                 </td>
                 <td
                   data-testid="history-fc"

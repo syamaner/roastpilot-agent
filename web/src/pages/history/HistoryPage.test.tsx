@@ -6,7 +6,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api, ApiError } from "@/lib/api";
-import type { RoastHistory, RoastSummary, RoastTimeline } from "@/lib/types";
+import type { RoastHistory, RoastSummary } from "@/lib/types";
 
 import { HistoryPage } from "./HistoryPage";
 
@@ -22,6 +22,11 @@ function summary(overrides: Partial<RoastSummary> = {}): RoastSummary {
     bean_varietal: "Medium",
     rating: 4,
     development_percent: 19,
+    // Advisor stats now ride the summary contract (#184) — no per-row /timeline.
+    advisor_consults: 2,
+    advisor_clamped: 1,
+    advisor_rejected: 0,
+    advisor_failed: 0,
     ...overrides,
   };
 }
@@ -51,23 +56,9 @@ function renderPage() {
 afterEach(() => vi.restoreAllMocks());
 
 function mockHistory(runs: RoastSummary[]): void {
+  // The advisor column now reads the summary's aggregate fields (#184) — no
+  // per-row `/timeline` fetch to stub (the N+1 this story removed).
   vi.spyOn(api, "history").mockResolvedValue({ runs } satisfies RoastHistory);
-  // Each visible row lazily fetches its own advisor timeline (#170). Stub it so
-  // the rows render the advisor cell deterministically (and never leak rejects).
-  vi.spyOn(api, "timeline").mockImplementation(async (runId: string) =>
-    ({
-      run_id: runId,
-      events: [],
-      safety_evaluations: [
-        { tick: 8, rule: "bounds", verdict: "clamp", input_heat: null, input_fan: null, adjusted_heat: null, adjusted_fan: null, reason: "", recorded_at_utc: "t" },
-      ],
-      advisor_decisions: [
-        { tick: 4, provider: "openrouter", model: "m", prompt_version: "v1", latency_ms: 100, status: "ok", decision: null, recorded_at_utc: "t" },
-        { tick: 8, provider: "openrouter", model: "m", prompt_version: "v1", latency_ms: 100, status: "ok", decision: null, recorded_at_utc: "t" },
-      ],
-      commands: [],
-    }) satisfies RoastTimeline,
-  );
 }
 
 describe("HistoryPage", () => {
@@ -80,17 +71,18 @@ describe("HistoryPage", () => {
     expect(within(first).getByTestId("outcome-badge")).toHaveTextContent("COMPLETED");
   });
 
-  it("renders a per-roast advisor summary column from the timeline (#170)", async () => {
+  it("renders a per-roast advisor summary column from the summary fields (#184)", async () => {
     mockHistory(FIXTURE);
     renderPage();
     await waitFor(() => expect(screen.getAllByTestId("history-row")).toHaveLength(3));
-    // Each row resolves its own timeline query independently; wait for all three.
-    await waitFor(() =>
-      expect(screen.getAllByTestId("history-advisor")).toHaveLength(3),
-    );
+    // The column renders synchronously off the already-loaded summary — no
+    // per-row /timeline fetch (the N+1 #184 removed); api.timeline is never called.
+    const timelineSpy = vi.spyOn(api, "timeline");
     const cells = screen.getAllByTestId("history-advisor");
+    expect(cells).toHaveLength(3);
     expect(cells[0]).toHaveTextContent("2 consults");
     expect(cells[0]).toHaveTextContent("1 clamped");
+    expect(timelineSpy).not.toHaveBeenCalled();
   });
 
   it("renders the first-run empty state when there are no roasts", async () => {
