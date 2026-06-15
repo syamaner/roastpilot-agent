@@ -11,6 +11,7 @@ are exercised here for their *real* downstream verdicts (a genuine CLAMP from
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 import pytest_asyncio
@@ -376,22 +377,26 @@ async def test_advance_to_is_idempotent_once_reached(
 @pytest.mark.asyncio
 async def test_free_running_replay_completes_with_injected_sleep(tmp_path: Path) -> None:
     """The free-running run() path drives the whole export; an injected no-op
-    sleep keeps it instant (it shares the stepping core, so the same events)."""
+    sleep keeps it instant (it shares the stepping core, so the same events).
+
+    The no-op sleep is plumbed through the public ``create_replay_app(sleep=...)``
+    factory parameter (#103) — not by reaching into the source's private
+    ``_sleep`` — so the wiring a real caller would use is the wiring under test.
+    """
     sleeps: list[float] = []
 
     async def fake_sleep(delay: float) -> None:
         sleeps.append(delay)
 
     _app, service, source = await create_replay_app(
-        _SESSION_2, tmp_path / "free.sqlite3", step_mode=False, speed=60
+        _SESSION_2, tmp_path / "free.sqlite3", step_mode=False, speed=60, sleep=fake_sleep
     )
-    # Swap in the no-op sleep so the wall clock never advances.
-    source._sleep = fake_sleep  # type: ignore[attr-defined]  # noqa: SLF001 — test injection
     await source.run()
     assert source.run_id is not None
     detail = await service.detail(source.run_id)
     assert detail.agent_phase.value == "cooling"
-    # 60x over a 1 s tick → ~0.0167 s requested delay each inter-tick gap.
+    # 60x over a 1 s tick → ~0.0167 s requested delay each inter-tick gap. That
+    # the injected sleep was actually awaited proves the factory threaded it in.
     assert sleeps and all(abs(d - 1.0 / 60.0) < 1e-9 for d in sleeps)
     await source.aclose()
 
@@ -434,21 +439,27 @@ async def test_step_routes_mounted_only_in_step_mode(tmp_path: Path) -> None:
     step_app, _s1, step_src = await create_replay_app(
         _SESSION_2, tmp_path / "step.sqlite3", step_mode=True, speed=60
     )
-    free_app, _s2, free_src = await create_replay_app(
-        _SESSION_2, tmp_path / "free.sqlite3", step_mode=False, speed=60
-    )
-    step_routes = {r.path for r in step_app.routes}  # type: ignore[attr-defined]
-    free_routes = {r.path for r in free_app.routes}  # type: ignore[attr-defined]
-    assert "/api/replay/step" in step_routes
-    assert "/api/replay/advance-to" in step_routes
-    assert "/api/replay/step" not in free_routes
-    assert "/api/replay/advance-to" not in free_routes
-    # The LIVE app (real roast) never exposes the replay control routes.
-    live_routes = {r.path for r in create_app(service=None).routes}  # type: ignore[attr-defined]
-    assert "/api/replay/step" not in live_routes
-    assert "/api/replay/advance-to" not in live_routes
-    await step_src.aclose()
-    await free_src.aclose()
+    # try/finally so a failure building the SECOND app (or any assertion below)
+    # still tears down the FIRST source's store + aiosqlite worker (#103).
+    try:
+        free_app, _s2, free_src = await create_replay_app(
+            _SESSION_2, tmp_path / "free.sqlite3", step_mode=False, speed=60
+        )
+        try:
+            step_routes = {r.path for r in step_app.routes}  # type: ignore[attr-defined]
+            free_routes = {r.path for r in free_app.routes}  # type: ignore[attr-defined]
+            assert "/api/replay/step" in step_routes
+            assert "/api/replay/advance-to" in step_routes
+            assert "/api/replay/step" not in free_routes
+            assert "/api/replay/advance-to" not in free_routes
+            # The LIVE app (real roast) never exposes the replay control routes.
+            live_routes = {r.path for r in create_app(service=None).routes}  # type: ignore[attr-defined]
+            assert "/api/replay/step" not in live_routes
+            assert "/api/replay/advance-to" not in live_routes
+        finally:
+            await free_src.aclose()
+    finally:
+        await step_src.aclose()
 
 
 @pytest.mark.asyncio
@@ -638,6 +649,169 @@ async def test_empty_export_raises(tmp_path: Path) -> None:
     (bad / "roast.jsonl").write_text("\n  \n", encoding="utf-8")
     with pytest.raises(ValueError, match="no telemetry records"):
         load_export(bad)
+
+
+def test_load_export_skips_unrecognised_record_type(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-``event`` record with an unexpected ``type`` is skipped + warned, not
+    silently coerced into a telemetry frame (#103).
+
+    The old open ``else`` treated EVERY non-event record as telemetry, so a
+    future ``type="summary"`` body would become a bogus telemetry frame (and
+    crash on the missing temperature keys). This pins the guard: a ``summary``
+    record is dropped with a warning, and parsing still yields exactly the real
+    telemetry frames — proving the unexpected record never entered the series.
+    """
+    export = tmp_path / "with-summary"
+    export.mkdir()
+    lines = [
+        '{"type": "telemetry", "bean_temp_c": 38.0, "env_temp_c": 43.0, "monotonic_seconds": 1.0}',
+        '{"type": "summary", "drop_temp_c": 195.0, "dtr": 0.15}',
+        '{"type": "telemetry", "bean_temp_c": 40.0, "env_temp_c": 45.0, "monotonic_seconds": 2.0}',
+        '{"type": "event", "kind": "beans_added", "monotonic_seconds": 1.5}',
+    ]
+    (export / "roast.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        script = load_export(export)
+
+    # Exactly the two real telemetry frames — the summary record is NOT among them.
+    assert len(script.frames) == 2
+    assert [f.telemetry.bean_temp_c for f in script.frames] == [38.0, 40.0]
+    # And it warned loudly about the unrecognised type (mentioning 'summary').
+    assert any("summary" in rec.message and "unrecognised" in rec.message for rec in caplog.records)
+
+
+def test_load_export_treats_missing_type_as_telemetry(tmp_path: Path) -> None:
+    """A record with no ``type`` field stays telemetry (back-compat with any
+    pre-typed export), distinct from an *unexpected* explicit type (#103)."""
+    export = tmp_path / "legacy"
+    export.mkdir()
+    (export / "roast.jsonl").write_text(
+        '{"bean_temp_c": 38.0, "env_temp_c": 43.0, "monotonic_seconds": 1.0}\n',
+        encoding="utf-8",
+    )
+    script = load_export(export)
+    assert len(script.frames) == 1
+    assert script.frames[0].telemetry.bean_temp_c == 38.0
+
+
+@pytest.mark.asyncio
+async def test_create_replay_app_closes_store_when_start_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``source.start()`` failure during ``create_replay_app`` tears the store
+    (and its aiosqlite worker thread) down rather than leaking it (#103).
+
+    Before the guard, a raise from ``start()`` after ``store.initialize()`` left
+    the opened store — and its background worker thread — orphaned: no app is
+    returned, so no lifespan ever runs to close it. This injects that failure and
+    asserts (a) the error propagates and (b) the captured store was closed (its
+    public ``connection`` property now raises "not initialized"), which is what
+    joins the worker thread. A net thread count back at baseline confirms no
+    worker outlived the failed bring-up.
+    """
+    import threading
+
+    import roastpilot_agent.replay as replay_module
+    from roastpilot_agent.replay import ReplaySource
+    from roastpilot_agent.store import RoastStore
+
+    captured: dict[str, RoastStore] = {}
+    real_build = replay_module.build_replay_service
+
+    def _capturing_build(
+        export_dir: Path, store_path: Path, **kwargs: object
+    ) -> tuple[object, ReplaySource, RoastStore]:
+        service, source, store = real_build(export_dir, store_path, **kwargs)  # type: ignore[arg-type]
+        captured["store"] = store
+        return service, source, store
+
+    async def _boom(self: ReplaySource) -> NoReturn:
+        raise RuntimeError("synthetic start failure")
+
+    monkeypatch.setattr(replay_module, "build_replay_service", _capturing_build)
+    monkeypatch.setattr(ReplaySource, "start", _boom)
+
+    baseline_threads = threading.active_count()
+    with pytest.raises(RuntimeError, match="synthetic start failure"):
+        await create_replay_app(_SESSION_2, tmp_path / "leak.sqlite3", step_mode=True, speed=60)
+
+    store = captured["store"]
+    # The store the factory opened was closed by the guard — its public
+    # ``connection`` accessor raises once closed, and the close is what stops the
+    # aiosqlite worker thread.
+    with pytest.raises(RuntimeError, match="not initialized"):
+        _ = store.connection
+    # And no worker thread outlived the failed bring-up (give it a beat to join).
+    for _ in range(50):
+        if threading.active_count() <= baseline_threads:
+            break
+        await asyncio.sleep(0.01)
+    assert threading.active_count() <= baseline_threads
+
+
+@pytest.mark.asyncio
+async def test_clamp_persists_before_sse_emit_no_double_emit_on_store_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLAMP overlay persists BEFORE the SSE flush, so a store-write failure
+    emits nothing and the once-only guard stays unset for a clean retry (#103).
+
+    Mirrors the live ``tick_once`` persist-then-flush ordering. The old order
+    (emit-then-persist) could double-emit the advisory to SSE if a store write
+    failed after the emit but before ``_clamp_emitted`` latched. This makes the
+    CLAMP overlay's FIRST ``record_safety_evaluation`` write fail (other
+    per-tick evaluations pass through untouched) — so nothing is persisted AND,
+    because the emit now runs last, nothing is broadcast — then lets the retry
+    succeed and asserts exactly ONE advisory frame and ONE CLAMP verdict, never
+    two.
+    """
+    from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
+    from roastpilot_agent.store import RoastStore
+
+    real_record_eval = RoastStore.record_safety_evaluation
+    clamp_calls = {"n": 0}
+
+    async def flaky_record_eval(
+        self: RoastStore, *, run_id: str, tick: int, evaluation: SafetyEvaluation
+    ) -> int:
+        # Only the synthesized CLAMP overlay's write is made to fail (once); the
+        # ordinary per-tick evaluations the controller persists pass through.
+        if evaluation.verdict is SafetyVerdict.CLAMP:
+            clamp_calls["n"] += 1
+            if clamp_calls["n"] == 1:
+                raise RuntimeError("synthetic store failure")
+        return await real_record_eval(self, run_id=run_id, tick=tick, evaluation=evaluation)
+
+    monkeypatch.setattr(RoastStore, "record_safety_evaluation", flaky_record_eval)
+
+    _app, service, source = await create_replay_app(
+        _SESSION_2, tmp_path / "clamp-fail.sqlite3", step_mode=True, speed=60
+    )
+    try:
+        subscriber = service.events.subscribe()
+        # First attempt: stepping to the CLAMP trigger raises out of the FIRST
+        # store write — and because the SSE emit now runs AFTER persistence, no
+        # advisory frame was broadcast.
+        with pytest.raises(RuntimeError, match="synthetic store failure"):
+            await source.advance_to(ReplayMarker.CLAMP)
+        first = [f for f in _drain(subscriber) if f.event is SseEventType.ADVISORY]
+        assert first == [], "no advisory must reach SSE when the store write failed"
+
+        # Retry succeeds (the next call to the patched method passes through):
+        # exactly one advisory now reaches SSE (no double-emit), and exactly one
+        # CLAMP verdict lands in the timeline.
+        await source.advance_to(ReplayMarker.CLAMP)
+        second = [f for f in _drain(subscriber) if f.event is SseEventType.ADVISORY]
+        assert len(second) == 1
+        assert source.run_id is not None
+        timeline = await service.timeline(source.run_id)
+        clamps = [e for e in timeline.safety_evaluations if e.verdict == "clamp"]
+        assert len(clamps) == 1
+    finally:
+        await source.aclose()
 
 
 @pytest.mark.asyncio
