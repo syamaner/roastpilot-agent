@@ -10,13 +10,14 @@
 
 import type uPlot from "uplot";
 
-// Column indices per scale (x, bean, env, ror, heat, fan). The x scale is the
-// elapsed-seconds column; the °C scale "c" is fed by bean+env; "ror" by the RoR
-// column. Used to recompute the (data-driven) x extent from the data uPlot holds.
+// Column indices per scale (x, bean, env, ror, heat, fan). Only the `x` entry is
+// consulted at runtime — `makeAutoRange` returns the FIXED range for `c`/`ror`
+// BEFORE reading this map (#217), so the `c`/`ror` entries are documentation-only
+// (they record which data columns feed each scale; not used to range them).
 export const SCALE_COLUMNS: Record<string, number[]> = {
   x: [0],
-  c: [1, 2],
-  ror: [3],
+  c: [1, 2], // doc-only: bean + env feed °C (fixed range — not data-driven)
+  ror: [3], // doc-only: RoR column feeds the RoR axis (fixed range — not data-driven)
 };
 
 /**

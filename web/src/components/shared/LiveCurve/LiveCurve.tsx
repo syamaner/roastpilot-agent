@@ -107,8 +107,10 @@ export function LiveCurve({
     const host = hostRef.current;
     if (!host) return;
 
-    // The range callback reads the LIVE charge band off the overlay ref, so the °C
-    // scale keeps the band on-screen during preheating without rebuilding the plot.
+    // The value axes are FIXED (#217), so the °C range no longer depends on the live
+    // charge band (the 0–210 range always contains the 170–200 band). The charge-band
+    // getter is passed only for API symmetry — `makeAutoRange` ignores it — and the
+    // band is still read live off `overlayRef` by the `draw` overlay, not the range.
     const rangeFn = makeAutoRange(() => ({
       visible: overlayRef.current.chargeBandVisible,
       minC: overlayRef.current.chargeBand.minC,
@@ -125,15 +127,16 @@ export function LiveCurve({
       },
       legend: { show: false }, // we render our own legend (readout + toggle)
       scales: {
-        // Every data scale re-ranges to the CURRENT data on each setData via
-        // `rangeFn`. The plot is built once (on [height, meta]) while the
-        // dashboard's live series is still EMPTY (it mounts before SSE frames
-        // arrive), so uPlot left the scales unranged — x ended up {min:null,max:null},
-        // which collapsed the series to a single point at index 0 (invisible), and
-        // the °C scale stayed pinned to the early preheating range. `setData` was not
-        // re-ranging them; the explicit `range` callback recomputes min/max from the
-        // data uPlot is about to draw (folding in the charge band on °C), so x/°C/RoR
-        // always cover what is loaded.
+        // `rangeFn` (#217) pins the two VALUE scales to fixed ranges (c → 0–210 °C,
+        // ror → −20..+30 °C/min) so they never auto-zoom to the current sensor reading,
+        // and re-ranges only the x (time) scale to the loaded data on each setData.
+        // The plot is built once (on [height, meta]) while the dashboard's live series
+        // is still EMPTY (it mounts before SSE frames arrive), so uPlot leaves x
+        // unranged — {min:null,max:null}, which collapsed the series to a single point
+        // at index 0 (invisible). `setData` was not re-ranging it; the explicit `range`
+        // callback recomputes x's min/max from the data uPlot is about to draw, so x
+        // always covers the loaded elapsed-time range (the fixed c/ror always cover the
+        // roast).
         x: { time: false, range: rangeFn },
         c: { auto: true, range: rangeFn },
         ror: { auto: true, range: rangeFn },
@@ -216,11 +219,11 @@ export function LiveCurve({
 
   // The °C range is fixed (#217), so the band overlay no longer re-ranges the scale —
   // but when it appears/disappears or moves, the canvas overlay (drawn in the `draw`
-  // hook) must repaint. Re-applying the current data fires that draw hook.
+  // hook) must repaint. A plain `redraw()` fires that draw hook (same mechanism as the
+  // markers/highlight effect above); no `setData` round-trip is needed now the range
+  // is fixed.
   useEffect(() => {
-    const plot = plotRef.current;
-    if (!plot) return;
-    plot.setData(plot.data);
+    plotRef.current?.redraw();
   }, [chargeBandVisible, chargeBand]);
 
   // Expose the test hook — assert DATA + the rendered scale ranges (D24 / #131).
