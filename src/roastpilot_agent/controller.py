@@ -572,6 +572,12 @@ class RoastController:
         # advisor's ``seconds_since_charge`` context and the post-charge settle
         # window (notified to ``_advisory_policy.note_charge`` on the same tick).
         self._charge_monotonic: float | None = None
+        # Monotonic instant of the drop (the transition into COOLING), set in
+        # ``transition_to`` and cleared on a new run/preheat (#239). Freezes the
+        # development + charge clocks — and so the derived DTR (#220) — at their
+        # drop values: post-drop the readout must hold the drop figure, not keep
+        # climbing into cooling. Advisory/display-only; clamps no control path.
+        self._drop_monotonic: float | None = None
         self._consecutive_read_failures = 0
         # D30 (#166): consecutive advisor *availability* failures
         # (provider_error / timeout). Incremented in _record_advisor_failure on
@@ -655,20 +661,43 @@ class RoastController:
         """
         if self._charge_monotonic is None:
             return 0.0
-        return self._clock() - self._charge_monotonic
+        return self._effective_now() - self._charge_monotonic
+
+    def _effective_now(self) -> float:
+        """The clock instant the elapsed-time readouts reference, frozen at drop.
+
+        Returns ``self._clock()`` during the live roast, but once a drop is
+        recorded (``_drop_monotonic`` set on the COOLING transition, #239) it
+        returns the drop instant instead. Both elapsed clocks
+        (:meth:`_charge_elapsed_seconds` and :meth:`_development_elapsed_seconds`)
+        reference it, so the development time, the charge-referenced roast clock,
+        and the derived DTR (#220) all freeze together at their drop values
+        rather than climbing into cooling. ``min`` keeps it monotone-safe against
+        any clock edge (it never reports a time before the drop).
+
+        Advisory/display-only: it bounds nothing on the control path — no
+        transition, verdict, executor, or drop gate reads these clocks.
+        """
+        now = self._clock()
+        if self._drop_monotonic is None:
+            return now
+        return min(now, self._drop_monotonic)
 
     def _development_elapsed_seconds(self) -> float | None:
-        """Seconds since first crack, or ``None`` before it is detected.
+        """Seconds since first crack, frozen at drop, or ``None`` before FC.
 
         The development clock the advisor reasons about near the drop. The DTR
         the advisor computes is ``development_elapsed / charge_elapsed`` (the
         charge-referenced roast clock, :meth:`_charge_elapsed_seconds`). ``None``
         until the first-crack transition arms ``_first_crack_monotonic`` in
-        :meth:`transition_to`.
+        :meth:`transition_to`; once a drop is recorded it freezes at
+        ``drop_monotonic - first_crack_monotonic`` (#239) via
+        :meth:`_effective_now` — the post-drop readout holds the drop figure
+        instead of counting into cooling.
         """
         if self._first_crack_monotonic is None:
             return None
-        return self._clock() - self._first_crack_monotonic
+        return self._effective_now() - self._first_crack_monotonic
 
     def _development_percent(self) -> float | None:
         """DTR (development time ratio) as a percentage of the WHOLE roast (#220).
@@ -725,6 +754,19 @@ class RoastController:
             # the gate harmlessly inert until ``note_charge`` re-arms it on the
             # next T0 or recovery-resume (claude review, #213).
             self._charge_monotonic = None
+            # A new run/preheat un-freezes the elapsed clocks (#239): clear the
+            # drop instant so the next roast's development time and DTR run live
+            # again rather than staying frozen at the prior roast's drop value.
+            self._drop_monotonic = None
+        if target is RoastPhase.COOLING and self._drop_monotonic is None:
+            # The drop instant (#239): every drop path lands in COOLING (the
+            # advisor drop, the operator drop, and the pre-FC early-abort drop),
+            # so freezing here covers them all. Stamp once — guard against a
+            # re-entry never restamping a later instant. From here the
+            # development + charge clocks (and the derived DTR) hold their drop
+            # values instead of climbing into cooling. Advisory/display-only:
+            # bounds no transition, verdict, executor, or drop gate.
+            self._drop_monotonic = self._clock()
         if previous is RoastPhase.ROASTING_PRE_FIRST_CRACK and target is RoastPhase.DEVELOPMENT:
             # Arm the development clock only on the true first-crack edge — both
             # FC paths (MCP detection and the operator override) cross it. A

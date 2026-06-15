@@ -2016,6 +2016,101 @@ async def test_development_clock_survives_recovery_resume() -> None:
     assert advisor.contexts[-1].development_elapsed_seconds == 100.0
 
 
+# --- #239: development time + DTR freeze at the drop (no climb into cooling) ---
+
+
+def _charged_developed_harness() -> Harness:
+    """A harness driven (charge clock stamped) → development, FC armed.
+
+    Stamps the charge clock the real way (it is set only on the debounced-T0
+    path / on the ROASTING_PRE_FIRST_CRACK entry from PREHEATING), so the
+    charge-referenced DTR denominator is non-zero — a bare ``transition_to``
+    into pre-FC would leave it 0.0 and make the DTR undefined.
+    """
+    harness = make_harness(readings=[reading()])
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    # Stamp the charge clock explicitly at the current instant (the debounced-T0
+    # transition does this in _apply_phase_rules; a bare transition_to does not).
+    harness.controller._charge_monotonic = harness.clock.now  # pyright: ignore[reportPrivateUsage]
+    harness.controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    return harness
+
+
+def test_development_and_dtr_freeze_at_drop_on_snapshot() -> None:
+    """#239: once the beans are dropped (transition into COOLING), the snapshot's
+    development_elapsed_seconds and development_percent (the #220 display fields)
+    FREEZE at their drop values instead of climbing into cooling.
+
+    Before the fix ``_development_elapsed_seconds`` returned ``now - fc`` unbounded,
+    so the post-drop readout kept counting. Advisory/display-only: no
+    transition/verdict/executor/drop-gate reads these clocks."""
+    harness = _charged_developed_harness()
+    harness.clock.advance(120.0)  # pre-FC roast time (charge → FC)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)  # arms the FC clock
+    harness.clock.advance(60.0)  # 60 s of development before the drop
+
+    at_drop = harness.controller.snapshot()
+    assert at_drop.development_elapsed_seconds == 60.0
+    # DTR = development / charge = 60 / (120 + 60) = 33.33…%.
+    assert at_drop.development_percent == pytest.approx(60.0 / 180.0 * 100.0)
+
+    # Drop the beans → COOLING stamps the drop instant.
+    harness.controller.transition_to(RoastPhase.COOLING)
+    # Cooling runs on for two more minutes — the readouts must NOT move.
+    harness.clock.advance(120.0)
+
+    frozen = harness.controller.snapshot()
+    assert frozen.development_elapsed_seconds == 60.0  # frozen, not 180.0
+    assert frozen.development_percent == pytest.approx(60.0 / 180.0 * 100.0)
+    # Identical to the values AT the drop — the whole point of #239.
+    assert frozen.development_elapsed_seconds == at_drop.development_elapsed_seconds
+    assert frozen.development_percent == at_drop.development_percent
+
+
+def test_advisor_context_development_clock_frozen_after_drop() -> None:
+    """#239: the advisor context's development_elapsed_seconds AND
+    roast_elapsed_seconds (the DTR numerator + denominator) freeze at their drop
+    values. The advisor is not consulted in cooling, so this asserts the context
+    *mapping* directly (``_build_advisor_context``): the field a post-drop build
+    would carry holds the drop figures, not values climbing into cooling.
+    Advisory/display-only — the context feeds no control/safety path."""
+    harness = _charged_developed_harness()
+    harness.clock.advance(120.0)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    harness.clock.advance(60.0)
+    harness.controller.transition_to(RoastPhase.COOLING)  # drop
+    harness.clock.advance(90.0)  # cooling time that must not leak into the clocks
+
+    ctx = harness.controller._build_advisor_context(reading())  # pyright: ignore[reportPrivateUsage]
+    assert ctx.development_elapsed_seconds == 60.0  # frozen at drop, not 150.0
+    assert ctx.roast_elapsed_seconds == 180.0  # charge clock frozen at drop, not 270.0
+
+
+def test_drop_clock_resets_on_new_run_so_next_roast_runs_live() -> None:
+    """#239: a new run/preheat un-freezes the clocks — the drop instant is cleared
+    so the next roast's development time runs live again rather than staying frozen
+    at the prior roast's drop value."""
+    harness = _charged_developed_harness()
+    harness.clock.advance(120.0)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    harness.clock.advance(60.0)
+    harness.controller.transition_to(RoastPhase.COOLING)  # freezes the clocks
+    # Finish and start a fresh roast through the legal path.
+    harness.controller.transition_to(RoastPhase.COMPLETE)
+    harness.controller.transition_to(RoastPhase.IDLE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    # The new run's clocks are live again (drop instant cleared) — no leak.
+    harness.controller._charge_monotonic = harness.clock.now  # pyright: ignore[reportPrivateUsage]
+    harness.controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    harness.clock.advance(25.0)
+    snap = harness.controller.snapshot()
+    assert snap.development_elapsed_seconds == 25.0  # live, not the prior 60.0
+
+
 # --- #219: the advisor's DTR clock is charge-referenced (T0), server-side only.
 # The chart/readout clock (ControllerSnapshot.roast_elapsed_seconds) stays
 # run/preheat-referenced — re-origining the chart at charge is deferred to #220.
