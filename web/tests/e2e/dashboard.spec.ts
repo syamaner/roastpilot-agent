@@ -67,6 +67,11 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   // The RoR axis is fixed too — pinned even in preheating before any RoR develops.
   expect(hook.scales.ror.min).toBe(-20);
   expect(hook.scales.ror.max).toBe(30);
+  // x spans the loaded telemetry, never collapses onto one x (#133 item 2, #131).
+  // Use the `(max ?? 0) - (min ?? 0) > N` form so a NULL bound (unranged/collapsed
+  // scale) yields 0 and FAILS — `x.min <= dataMin` passes spuriously when x.min is
+  // null (`null <= n` === true in JS). The 8 stepped preheat frames span > 0 s.
+  expect((hook.scales.x.max ?? 0) - (hook.scales.x.min ?? 0)).toBeGreaterThan(0);
 
   // The live RoR readout is surfaced as an operator-facing metric (#165) and is
   // shown from the start incl. preheat (real probe data — not hidden pre-charge).
@@ -120,14 +125,15 @@ test("dashboard-fault — real env-ceiling fault renders the fault banner + trai
   // byte-deterministic snapshot, so the regression must fail HERE. Closes the gap
   // where this assertion lived only in dashboard-live/-developed.
   const x = hook.columns[0].filter((v): v is number => v !== null);
-  expect(x.length).toBeGreaterThan(0);
+  expect(x.length).toBeGreaterThan(1);
   expect(hook.scales.c.min).toBe(0);
   expect(hook.scales.c.max).toBe(210);
   expect(hook.scales.ror.min).toBe(-20);
   expect(hook.scales.ror.max).toBe(30);
-  // x covers the data extent (degenerate single-point fixtures span 0, so use ≥).
-  expect(hook.scales.x.min).toBeLessThanOrEqual(Math.min(...x));
-  expect(hook.scales.x.max).toBeGreaterThanOrEqual(Math.max(...x));
+  // x spans the loaded telemetry, never collapses (#131). The `(max ?? 0) - (min ??
+  // 0) > 0` form FAILS on a null bound (a collapsed/unranged scale) — `x.min <=
+  // dataMin` passes spuriously when x.min is null (`null <= n` === true in JS).
+  expect((hook.scales.x.max ?? 0) - (hook.scales.x.min ?? 0)).toBeGreaterThan(0);
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-fault.png");
@@ -169,13 +175,13 @@ test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery mo
   // Scale-covers-data guard (#133): same regression class as the other curve
   // states — FIXED c/ror bounds, x spanning the loaded track (never collapsed).
   const x = hook.columns[0].filter((v): v is number => v !== null);
-  expect(x.length).toBeGreaterThan(0);
+  expect(x.length).toBeGreaterThan(1);
   expect(hook.scales.c.min).toBe(0);
   expect(hook.scales.c.max).toBe(210);
   expect(hook.scales.ror.min).toBe(-20);
   expect(hook.scales.ror.max).toBe(30);
-  expect(hook.scales.x.min).toBeLessThanOrEqual(Math.min(...x));
-  expect(hook.scales.x.max).toBeGreaterThanOrEqual(Math.max(...x));
+  // x spans the loaded track, never collapses (#131) — null-safe form (see fault).
+  expect((hook.scales.x.max ?? 0) - (hook.scales.x.min ?? 0)).toBeGreaterThan(0);
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-recovery.png");
@@ -295,10 +301,22 @@ test("dashboard-charge-window — preheating + bean in the charge band shows the
   await expect(page.getByTestId("charge-banner")).toContainText(/charge window/i);
   await expect(page.getByTestId("charge-banner")).toContainText("°C");
 
-  // The curve built from the stepped preheat telemetry (data layer).
-  await waitForChartPoints(page, 1);
+  // The curve built from the stepped preheat telemetry (data layer). 90 stepped
+  // frames → a multi-point curve, so gate on a real minimum, not just ≥1.
+  await waitForChartPoints(page, 2);
   const hook = await readChartData(page);
-  expect(hook.columns[0].length).toBeGreaterThan(0);
+  const x = hook.columns[0].filter((v): v is number => v !== null);
+  expect(x.length).toBeGreaterThan(1);
+
+  // Scale-covers-data guard (#133 item 2): this state loads real telemetry (90
+  // stepped frames), so assert the FIXED c/ror bounds (#217) AND that x spans the
+  // loaded preheat track. Null-safe span form (see fault) so a collapsed/unranged
+  // scale FAILS rather than slipping through `x.min <= dataMin`.
+  expect(hook.scales.c.min).toBe(0);
+  expect(hook.scales.c.max).toBe(210);
+  expect(hook.scales.ror.min).toBe(-20);
+  expect(hook.scales.ror.max).toBe(30);
+  expect((hook.scales.x.max ?? 0) - (hook.scales.x.min ?? 0)).toBeGreaterThan(0);
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-charge-window.png");
