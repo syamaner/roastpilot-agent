@@ -194,6 +194,11 @@ export function DashboardPage(): React.JSX.Element {
     () => (chargeMinC !== null && chargeMaxC !== null ? { minC: chargeMinC, maxC: chargeMaxC } : null),
     [chargeMinC, chargeMaxC],
   );
+  // Charge-readiness cue is driven off the BEAN PROBE (operator decision, confirmed
+  // attempt-3): roasters charge on the bean-probe reading, not the drum/env. The
+  // earlier "cue didn't show" was the bean correctly still below the 170 floor, made
+  // worse by the #217 fixed-axis scaling that made the high env look alarming — NOT a
+  // reason to key the cue on env. (A brief env-cue experiment was reverted.)
   const beanTempC = telemetry?.bean_temp_c ?? null;
   const chargeCue = chargeCueState(phase, beanTempC, chargeBand);
   // The cue is shown (dwell tracked) once the bean reaches charge temperature —

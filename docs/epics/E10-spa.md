@@ -239,6 +239,17 @@ Owner: lead / `ui-reviewer`. Acceptance criteria:
 | E10-S5 | Roast detail page | done (#116) |
 | E10-S6 | SPA tests and SSE behavior | **deterministic close done** — contract drift guard (#120), `useRoastStream` frame-loss fix (#122 → #123), D26 canvas un-mask matrix (#125), replay stepped-elapsed sim-time (#128 → #130), `dashboard-developed` curve snapshot + `LiveCurve` scale-collapse fix (#131 → #132). **Deferred:** `ui-reviewer` MCP pass (API-fragile), Safari/iPad SSE (real devices) |
 
+Post-E10 observability follow-up (D35 #220 cluster, not an E10 story): **#217 —
+`LiveCurve` FIXED Y-axis scales** (operator decision, 14 Jun). Both value axes are
+pinned (`scales.ts` `FIXED_SCALE_RANGES`): temperature `c` → 0–210 °C, RoR `ror` →
+−20..+30 °C/min — so the live curve reads against an unchanging frame and never
+auto-zooms to the current sensor reading, and the 170–200 charge band is always in
+frame without stretching the domain. The x (time) axis stays data-driven (#131
+scale-covers-data guard preserved). A fixed scale is also snapshot-stable; the D26
+Playwright baselines for every curve-rendering page state were regenerated in the
+pinned image. Replaces the previous charge-band-driven °C auto-fit and the RoR
+data-range auto-fit.
+
 Epic status: **core + S6 deterministic work done** — the page fan-out is complete:
 S1–S5 are all merged to `main` (replay #101, foundation #100, E7 `enabled_actions`
 contract #107/D25, S2 foundation follow-up #115 = phase_changed fix + types audit

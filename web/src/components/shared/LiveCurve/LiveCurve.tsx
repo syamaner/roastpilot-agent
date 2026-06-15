@@ -25,6 +25,7 @@ import "uplot/dist/uPlot.min.css";
 
 import { cn } from "@/lib/cn";
 import { formatElapsed, formatSeriesValue, toColumns } from "./chartData";
+import { makeAutoRange } from "./scales";
 import {
   type ChartTestHook,
   type CurveMarker,
@@ -40,73 +41,6 @@ interface SeriesMeta {
   stroke: string;
   /** Step-after rendering for the control lines (heat/fan). */
   step: boolean;
-}
-
-// Column indices per scale (x, bean, env, ror, heat, fan). The x scale is the
-// elapsed-seconds column; the °C scale "c" is fed by bean+env; "ror" by the RoR
-// column. Used by `autoRange` to recompute a scale's extent from the data uPlot
-// currently holds.
-const SCALE_COLUMNS: Record<string, number[]> = {
-  x: [0],
-  c: [1, 2],
-  ror: [3],
-};
-
-/** The charge-band extent to keep on-screen while it is shown (preheating). */
-interface ChargeBandRange {
-  visible: boolean;
-  minC: number;
-  maxC: number;
-}
-
-/**
- * Build a uPlot `scales.<key>.range` callback that ALWAYS fits the current data.
- *
- * The plot is built ONCE (on [height, meta]) while the live series is still
- * EMPTY — the dashboard mounts LiveCurve before any SSE frame arrives — so uPlot
- * initialises every scale with no data and leaves the range unset (`x` ended up
- * `{min:null,max:null}`, which made the series draw a single point at index 0:
- * invisible). `setData` streams the real data in but was NOT re-ranging those
- * scales. This callback recomputes each scale's extent from `self.data` on every
- * setData, so x/°C/RoR always cover what is loaded.
- *
- * x is ranged tight (no padding — it is the time axis); the value scales get
- * uPlot's normal soft padding via `rangeNum` so they look like a default auto scale.
- *
- * The °C scale ALSO folds in the charge band (170–200 °C) while it is shown
- * (preheating): the band is drawn as an overlay, so a data-only range (~38–43 °C
- * in preheating) would push it off-screen — the spec requires it visible. The band
- * is read through `getChargeBand` so it tracks the live overlay without rebuilding.
- */
-function makeAutoRange(getChargeBand: () => ChargeBandRange): uPlot.Scale.Range {
-  return (self: uPlot, _min: number, _max: number, scaleKey: string): uPlot.Range.MinMax => {
-    const cols = SCALE_COLUMNS[scaleKey] ?? [];
-    let lo = Infinity;
-    let hi = -Infinity;
-    for (const ci of cols) {
-      const series = self.data[ci];
-      if (!series) continue;
-      for (const v of series) {
-        if (v == null || !Number.isFinite(v)) continue;
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
-      }
-    }
-    // The °C scale keeps the charge band on-screen whenever it is shown, even if the
-    // (early/preheating) data sits well below it.
-    if (scaleKey === "c") {
-      const band = getChargeBand();
-      if (band.visible) {
-        lo = Math.min(lo, band.minC);
-        hi = Math.max(hi, band.maxC);
-      }
-    }
-    // No finite data and no band (empty mount): let uPlot keep whatever it passed.
-    if (lo === Infinity || hi === -Infinity) return [_min, _max];
-    // The x (time) axis is ranged tight; value axes get uPlot's soft padding.
-    if (scaleKey === "x") return [lo, hi];
-    return uPlot.rangeNum(lo, hi, 0.1, true);
-  };
 }
 
 // CSS custom properties resolve to the roast palette; uPlot needs concrete
@@ -280,9 +214,9 @@ export function LiveCurve({
     plotRef.current?.redraw();
   }, [markers, highlightTime]);
 
-  // When the charge band appears/disappears or moves, the °C scale must re-range
-  // (the band is folded into its extent), which a plain `redraw()` does NOT do — so
-  // re-apply the current data to re-run the range callbacks, then repaint.
+  // The °C range is fixed (#217), so the band overlay no longer re-ranges the scale —
+  // but when it appears/disappears or moves, the canvas overlay (drawn in the `draw`
+  // hook) must repaint. Re-applying the current data fires that draw hook.
   useEffect(() => {
     const plot = plotRef.current;
     if (!plot) return;
@@ -298,6 +232,7 @@ export function LiveCurve({
     const plot = plotRef.current;
     const sx = plot?.scales.x;
     const sc = plot?.scales.c;
+    const sror = plot?.scales.ror;
     const hook: ChartTestHook = {
       columns,
       visible,
@@ -307,6 +242,7 @@ export function LiveCurve({
       scales: {
         x: { min: sx?.min ?? null, max: sx?.max ?? null },
         c: { min: sc?.min ?? null, max: sc?.max ?? null },
+        ror: { min: sror?.min ?? null, max: sror?.max ?? null },
       },
     };
     if (typeof window !== "undefined") window.__chart = hook;

@@ -72,15 +72,18 @@ export interface ChartTestHook {
   highlightTime: number | null;
   chargeBandVisible: boolean;
   /**
-   * The RENDERED uPlot scale ranges (min/max) for the x (elapsed) and c (°C)
-   * scales, read off the live plot after each draw. A test asserts these COVER the
-   * data — a collapsed/unranged scale (the bug where the curve drew off-screen /
-   * onto one point) leaves a scale that does NOT span the data, which a blank-but-
-   * byte-deterministic snapshot can't catch on its own (D26 / #131).
+   * The RENDERED uPlot scale ranges (min/max) for the x (elapsed), c (°C) and ror
+   * (°C/min) scales, read off the live plot after each draw. The x scale is asserted
+   * to COVER the data — a collapsed/unranged scale (the bug where the curve drew
+   * off-screen / onto one point) leaves a scale that does NOT span the data, which a
+   * blank-but-byte-deterministic snapshot can't catch on its own (D26 / #131). The c
+   * and ror scales are FIXED (#217), so a test asserts they hold their pinned bounds
+   * (0–210 °C, −20..+30 °C/min) regardless of the data.
    */
   scales: {
     x: { min: number | null; max: number | null };
     c: { min: number | null; max: number | null };
+    ror: { min: number | null; max: number | null };
   };
 }
 
