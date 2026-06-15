@@ -264,6 +264,12 @@ class RoastStore:
         if self._connection is not None:
             return
         connection = await aiosqlite.connect(self._db_path)
+        # Name-keyed rows everywhere: the read projections map columns by name
+        # (``row["col"]``), so adding or reordering a SELECT column never silently
+        # shifts a positional ``row[N]`` index into the wrong field (#242). A
+        # ``sqlite3.Row`` is still positionally indexable, so the single-column
+        # PRAGMA reads below keep using ``row[0]``.
+        connection.row_factory = aiosqlite.Row
         try:
             async with connection.execute("PRAGMA journal_mode=WAL") as cursor:
                 mode_row = await cursor.fetchone()
@@ -606,12 +612,14 @@ class RoastStore:
         if row is None:
             return None
         return PersistedRun(
-            run_id=str(row[0]),
-            agent_phase=RoastPhase(str(row[1])),
-            outcome=row[2],  # CHECK-constrained; None when still active
-            started_at_utc=str(row[3]),
-            completed_at_utc=None if row[4] is None else str(row[4]),
-            profile=RoastProfile.model_validate_json(str(row[5])),
+            run_id=str(row["id"]),
+            agent_phase=RoastPhase(str(row["agent_phase"])),
+            outcome=row["outcome"],  # CHECK-constrained; None when still active
+            started_at_utc=str(row["started_at_utc"]),
+            completed_at_utc=None
+            if row["completed_at_utc"] is None
+            else str(row["completed_at_utc"]),
+            profile=RoastProfile.model_validate_json(str(row["profile_json"])),
         )
 
     async def complete_run(
@@ -687,12 +695,14 @@ class RoastStore:
         if row is None:
             return None
         return PersistedRun(
-            run_id=str(row[0]),
-            agent_phase=RoastPhase(str(row[1])),
-            outcome=row[2],
-            started_at_utc=str(row[3]),
-            completed_at_utc=None if row[4] is None else str(row[4]),
-            profile=RoastProfile.model_validate_json(str(row[5])),
+            run_id=str(row["id"]),
+            agent_phase=RoastPhase(str(row["agent_phase"])),
+            outcome=row["outcome"],
+            started_at_utc=str(row["started_at_utc"]),
+            completed_at_utc=None
+            if row["completed_at_utc"] is None
+            else str(row["completed_at_utc"]),
+            profile=RoastProfile.model_validate_json(str(row["profile_json"])),
         )
 
     async def list_runs(self) -> list[RoastSummary]:
@@ -764,26 +774,28 @@ class RoastStore:
             rows = await cursor.fetchall()
         summaries: list[RoastSummary] = []
         for row in rows:
-            profile = RoastProfile.model_validate_json(str(row[5]))
+            profile = RoastProfile.model_validate_json(str(row["profile_json"]))
             summaries.append(
                 RoastSummary(
-                    id=str(row[0]),
-                    started_at_utc=str(row[1]),
-                    completed_at_utc=None if row[2] is None else str(row[2]),
-                    first_crack_at_utc=None if row[8] is None else str(row[8]),
-                    agent_phase=RoastPhase(str(row[3])),
-                    outcome=row[4],
+                    id=str(row["id"]),
+                    started_at_utc=str(row["started_at_utc"]),
+                    completed_at_utc=None
+                    if row["completed_at_utc"] is None
+                    else str(row["completed_at_utc"]),
+                    first_crack_at_utc=None if row["fc_at"] is None else str(row["fc_at"]),
+                    agent_phase=RoastPhase(str(row["agent_phase"])),
+                    outcome=row["outcome"],
                     bean_origin=profile.bean_origin,
                     bean_varietal=profile.bean_varietal,
                     country=profile.country,
                     bean_species=profile.bean_species,
                     is_blend=profile.is_blend,
-                    rating=None if row[6] is None else int(row[6]),
-                    development_percent=None if row[7] is None else float(row[7]),
-                    advisor_consults=int(row[9]),
-                    advisor_failed=int(row[10]),
-                    advisor_clamped=int(row[11]),
-                    advisor_rejected=int(row[12]),
+                    rating=None if row["operator_rating"] is None else int(row["operator_rating"]),
+                    development_percent=None if row["dev_pct"] is None else float(row["dev_pct"]),
+                    advisor_consults=int(row["advisor_consults"]),
+                    advisor_failed=int(row["advisor_failed"]),
+                    advisor_clamped=int(row["advisor_clamped"]),
+                    advisor_rejected=int(row["advisor_rejected"]),
                 )
             )
         return summaries
@@ -800,18 +812,24 @@ class RoastStore:
             row = await cursor.fetchone()
         if row is None:
             return None
-        manifest = None if row[9] is None else LogManifest.model_validate_json(str(row[9]))
-        agent_phase = RoastPhase(str(row[1]))
+        manifest = (
+            None
+            if row["export_manifest_json"] is None
+            else LogManifest.model_validate_json(str(row["export_manifest_json"]))
+        )
+        agent_phase = RoastPhase(str(row["agent_phase"]))
         return RoastDetail(
-            id=str(row[0]),
+            id=str(row["id"]),
             agent_phase=agent_phase,
-            profile=RoastProfile.model_validate_json(str(row[2])),
-            outcome=row[3],
-            started_at_utc=str(row[4]),
-            completed_at_utc=None if row[5] is None else str(row[5]),
-            fault_reason=None if row[6] is None else str(row[6]),
-            rating=None if row[7] is None else int(row[7]),
-            notes=None if row[8] is None else str(row[8]),
+            profile=RoastProfile.model_validate_json(str(row["profile_json"])),
+            outcome=row["outcome"],
+            started_at_utc=str(row["started_at_utc"]),
+            completed_at_utc=None
+            if row["completed_at_utc"] is None
+            else str(row["completed_at_utc"]),
+            fault_reason=None if row["fault_reason"] is None else str(row["fault_reason"]),
+            rating=None if row["operator_rating"] is None else int(row["operator_rating"]),
+            notes=None if row["operator_notes"] is None else str(row["operator_notes"]),
             export_manifest=manifest,
             # Derived read-only from the phase (E10 option (a)): the SPA's action
             # bar mirrors this set; the live SSE phase_changed frame re-sends it.
@@ -839,17 +857,29 @@ class RoastStore:
         sampled = rows[::downsample]
         return [
             TelemetryPoint(
-                tick=int(row[0]),
-                elapsed_seconds=None if row[1] is None else float(row[1]),
-                agent_phase=RoastPhase(str(row[2])),
-                bean_temp_c=None if row[3] is None else float(row[3]),
-                env_temp_c=None if row[4] is None else float(row[4]),
-                bean_ror_c_per_min=None if row[5] is None else float(row[5]),
-                env_ror_c_per_min=None if row[6] is None else float(row[6]),
-                heat_level_percent=None if row[7] is None else int(row[7]),
-                fan_level_percent=None if row[8] is None else int(row[8]),
-                cooling_on=None if row[9] is None else bool(row[9]),
-                development_percent=None if row[10] is None else float(row[10]),
+                tick=int(row["tick"]),
+                elapsed_seconds=None
+                if row["elapsed_seconds"] is None
+                else float(row["elapsed_seconds"]),
+                agent_phase=RoastPhase(str(row["agent_phase"])),
+                bean_temp_c=None if row["bean_temp_c"] is None else float(row["bean_temp_c"]),
+                env_temp_c=None if row["env_temp_c"] is None else float(row["env_temp_c"]),
+                bean_ror_c_per_min=None
+                if row["bean_ror_c_per_min"] is None
+                else float(row["bean_ror_c_per_min"]),
+                env_ror_c_per_min=None
+                if row["env_ror_c_per_min"] is None
+                else float(row["env_ror_c_per_min"]),
+                heat_level_percent=None
+                if row["heat_level_percent"] is None
+                else int(row["heat_level_percent"]),
+                fan_level_percent=None
+                if row["fan_level_percent"] is None
+                else int(row["fan_level_percent"]),
+                cooling_on=None if row["cooling_on"] is None else bool(row["cooling_on"]),
+                development_percent=None
+                if row["development_percent"] is None
+                else float(row["development_percent"]),
             )
             for row in sampled
         ]
@@ -868,11 +898,13 @@ class RoastStore:
             event_rows = await cursor.fetchall()
         events = [
             TimelineEvent(
-                kind=RoastEventKind(str(row[0])),
-                source=RoastEventSource(str(row[1])),
-                monotonic_seconds=None if row[2] is None else float(row[2]),
-                recorded_at_utc=str(row[3]),
-                payload=_loads(row[4]),
+                kind=RoastEventKind(str(row["kind"])),
+                source=RoastEventSource(str(row["source"])),
+                monotonic_seconds=None
+                if row["monotonic_seconds"] is None
+                else float(row["monotonic_seconds"]),
+                recorded_at_utc=str(row["recorded_at_utc"]),
+                payload=_loads(row["payload_json"]),
             )
             for row in event_rows
         ]
@@ -885,17 +917,17 @@ class RoastStore:
             safety_rows = await cursor.fetchall()
         safety_evaluations = [
             TimelineSafetyEvaluation(
-                tick=int(row[0]),
-                rule=str(row[1]),
+                tick=int(row["tick"]),
+                rule=str(row["rule"]),
                 # The store CHECK constraints pin these columns to the typed
                 # wire forms; cast at the read boundary rather than re-validate.
-                verdict=cast(TimelineVerdict, str(row[2])),
-                input_heat=None if row[3] is None else int(row[3]),
-                input_fan=None if row[4] is None else int(row[4]),
-                adjusted_heat=None if row[5] is None else int(row[5]),
-                adjusted_fan=None if row[6] is None else int(row[6]),
-                reason=str(row[7]),
-                recorded_at_utc=str(row[8]),
+                verdict=cast(TimelineVerdict, str(row["verdict"])),
+                input_heat=None if row["input_heat"] is None else int(row["input_heat"]),
+                input_fan=None if row["input_fan"] is None else int(row["input_fan"]),
+                adjusted_heat=None if row["adjusted_heat"] is None else int(row["adjusted_heat"]),
+                adjusted_fan=None if row["adjusted_fan"] is None else int(row["adjusted_fan"]),
+                reason=str(row["reason"]),
+                recorded_at_utc=str(row["recorded_at_utc"]),
             )
             for row in safety_rows
         ]
@@ -908,15 +940,17 @@ class RoastStore:
             advisor_rows = await cursor.fetchall()
         advisor_decisions = [
             TimelineAdvisorDecision(
-                tick=int(row[0]),
-                provider=str(row[1]),
-                model=str(row[2]),
-                prompt_version=str(row[3]),
-                latency_ms=None if row[4] is None else int(row[4]),
-                status=cast(AdvisorTraceStatus, str(row[5])),
-                decision=_loads(row[6]),
-                safety_evaluation_id=None if row[7] is None else int(row[7]),
-                recorded_at_utc=str(row[8]),
+                tick=int(row["tick"]),
+                provider=str(row["provider"]),
+                model=str(row["model"]),
+                prompt_version=str(row["prompt_version"]),
+                latency_ms=None if row["latency_ms"] is None else int(row["latency_ms"]),
+                status=cast(AdvisorTraceStatus, str(row["status"])),
+                decision=_loads(row["decision_json"]),
+                safety_evaluation_id=None
+                if row["safety_evaluation_id"] is None
+                else int(row["safety_evaluation_id"]),
+                recorded_at_utc=str(row["recorded_at_utc"]),
             )
             for row in advisor_rows
         ]
@@ -928,13 +962,13 @@ class RoastStore:
             command_rows = await cursor.fetchall()
         commands = [
             TimelineCommand(
-                tick=int(row[0]),
-                tool=RoastCommand(str(row[1])),
-                source=cast(CommandTraceSource, str(row[2])),
-                status=cast(CommandTraceStatus, str(row[3])),
-                args=_loads(row[4]),
-                result=_loads(row[5]),
-                recorded_at_utc=str(row[6]),
+                tick=int(row["tick"]),
+                tool=RoastCommand(str(row["tool"])),
+                source=cast(CommandTraceSource, str(row["source"])),
+                status=cast(CommandTraceStatus, str(row["status"])),
+                args=_loads(row["args_json"]),
+                result=_loads(row["result_json"]),
+                recorded_at_utc=str(row["recorded_at_utc"]),
             )
             for row in command_rows
         ]

@@ -996,3 +996,121 @@ async def test_list_runs_advisor_clamp_counts_latest_verdict_per_tick(
         assert summary.advisor_rejected == 1
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_connection_uses_name_keyed_rows(tmp_store: RoastStore) -> None:
+    """The connection's row factory is name-keyed ``aiosqlite.Row`` (#242).
+
+    The read projections address columns by name (``row["col"]``) rather than by
+    positional index, so adding or reordering a SELECT column can never silently
+    shift a downstream index into the wrong field. This pins the mechanism that
+    makes that possible: a regression to the default tuple factory would make the
+    keyed reads fail outright.
+    """
+    await tmp_store.initialize()
+    try:
+        assert tmp_store.connection.row_factory is aiosqlite_module.Row
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_maps_every_column_to_its_field(tmp_store: RoastStore) -> None:
+    """``list_runs`` maps each SELECT column to the correct ``RoastSummary`` field (#242).
+
+    Every projected field is seeded with a *distinct, type-distinguishable* value
+    so that a positional ``row[N]`` shift — the exact regression named-column
+    access prevents — would land a value in the wrong field and fail an assertion.
+    Same-type fields (the four advisor counts; the two ISO timestamps) carry
+    distinct values too, so even a within-type column reorder is caught.
+    """
+    profile = RoastProfile(
+        name="map-test",
+        bean_origin="Colombia",
+        bean_varietal="Caturra",
+        country="Colombia",
+        bean_species="arabica",
+        is_blend=True,
+        bean_weight_grams=300.0,
+        initial_heat_percent=65,
+        initial_fan_percent=35,
+        target_drop_temp_c=204.0,
+        target_development_percent=18.0,
+    )
+    await tmp_store.initialize()
+    try:
+        await tmp_store.create_run(
+            run_id="map-run",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+            started_at_utc="2026-06-07T13:00:00+00:00",
+        )
+        # A telemetry snapshot carrying a distinct development_percent.
+        wrote = await tmp_store.record_telemetry(
+            run_id="map-run",
+            tick=10,
+            agent_phase=RoastPhase.DEVELOPMENT,
+            elapsed_seconds=120.0,
+            interval_seconds=5.0,
+            telemetry=None,
+            development_percent=17.5,
+        )
+        assert wrote
+        # A distinct first-crack event time (≠ started/completed timestamps).
+        await tmp_store.record_event(
+            run_id="map-run",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc="2026-06-07T13:09:30+00:00",
+        )
+        # Advisor consults: distinct clamp/reject/fail counts so no two of the
+        # four count fields share a value (2 clamped, 1 rejected, 3 failed,
+        # 6 consults total — all different).
+        await _record_consult(
+            tmp_store, tick=1, status="ok", verdict=SafetyVerdict.CLAMP, run_id="map-run"
+        )
+        await _record_consult(
+            tmp_store, tick=2, status="ok", verdict=SafetyVerdict.CLAMP, run_id="map-run"
+        )
+        await _record_consult(
+            tmp_store, tick=3, status="ok", verdict=SafetyVerdict.REJECT, run_id="map-run"
+        )
+        await _record_consult(tmp_store, tick=4, status="timeout", verdict=None, run_id="map-run")
+        await _record_consult(tmp_store, tick=5, status="malformed", verdict=None, run_id="map-run")
+        await _record_consult(
+            tmp_store, tick=6, status="provider_error", verdict=None, run_id="map-run"
+        )
+        # Complete the run, then rate it: distinct completed time, outcome, rating.
+        await tmp_store.complete_run(
+            run_id="map-run",
+            outcome="completed",
+            agent_phase=RoastPhase.COMPLETE,
+        )
+        await tmp_store.set_operator_rating("map-run", rating=4, notes="balanced")
+
+        runs = await tmp_store.list_runs()
+        assert len(runs) == 1
+        summary = runs[0]
+        # Each assertion pins a column→field mapping; a positional shift breaks one.
+        assert summary.id == "map-run"
+        assert summary.started_at_utc == "2026-06-07T13:00:00+00:00"
+        assert summary.first_crack_at_utc == "2026-06-07T13:09:30+00:00"
+        assert summary.agent_phase is RoastPhase.COMPLETE
+        assert summary.outcome == "completed"
+        assert summary.completed_at_utc is not None
+        assert summary.completed_at_utc != summary.started_at_utc
+        assert summary.bean_origin == "Colombia"
+        assert summary.bean_varietal == "Caturra"
+        assert summary.country == "Colombia"
+        assert summary.bean_species == "arabica"
+        assert summary.is_blend is True
+        assert summary.rating == 4
+        assert summary.development_percent == 17.5
+        assert summary.advisor_consults == 6
+        assert summary.advisor_clamped == 2
+        assert summary.advisor_rejected == 1
+        assert summary.advisor_failed == 3
+    finally:
+        await tmp_store.close()
