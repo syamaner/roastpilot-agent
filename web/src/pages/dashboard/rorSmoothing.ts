@@ -58,12 +58,16 @@ export const ROR_SMOOTHING_WINDOW_SECONDS = 15;
  * is returned, suitable for a memoised render input).
  *
  * Behaviour:
- *   - `null` RoR samples are gaps: they are skipped when averaging neighbours and
- *     stay `null` in the output (a gap never becomes a fabricated value).
- *   - A point whose own RoR is `null` stays `null` even if neighbours have values
- *     (we smooth real samples, we do not interpolate across gaps).
+ *   - A point whose own RoR is `null` stays `null` (a gap never becomes a
+ *     fabricated value).
+ *   - A `null` neighbour BOUNDS the window: the scan stops at the gap on that
+ *     side, so values from the far side of a missing-signal gap never enter the
+ *     average. We smooth a contiguous run of real samples; we do not interpolate
+ *     across gaps. (A point sitting next to a gap is averaged only with the real
+ *     samples between it and the gap, never across it.)
  *   - Points are assumed ascending in `t` (the curve invariant); the window is a
- *     symmetric scan outward from each index, bounded by the time band.
+ *     symmetric scan outward from each index, bounded by the time band AND by any
+ *     gap.
  *
  * @param points  The curve points (ascending `t`, seconds since T0).
  * @param windowSeconds  Total centered window width in seconds; defaults to
@@ -85,23 +89,25 @@ export function smoothRorForDisplay(
     let sum = point.ror;
     let count = 1;
 
-    // Walk left while within the half-window time band.
+    // Walk left while within the half-window time band. A null neighbour is a
+    // missing-signal gap: it STOPS the walk (it is not merely skipped), so a value
+    // from the FAR side of a gap never enters the average — we smooth a contiguous
+    // run of real samples, we do not interpolate across a gap (the documented
+    // contract). The gap therefore bounds the window on this side.
     for (let j = i - 1; j >= 0; j -= 1) {
       if (tCenter - points[j].t > half) break;
       const v = points[j].ror;
-      if (v !== null) {
-        sum += v;
-        count += 1;
-      }
+      if (v === null) break;
+      sum += v;
+      count += 1;
     }
-    // Walk right while within the half-window time band.
+    // Walk right while within the half-window time band (same gap-stop rule).
     for (let j = i + 1; j < points.length; j += 1) {
       if (points[j].t - tCenter > half) break;
       const v = points[j].ror;
-      if (v !== null) {
-        sum += v;
-        count += 1;
-      }
+      if (v === null) break;
+      sum += v;
+      count += 1;
     }
 
     const smoothed = sum / count;

@@ -93,13 +93,37 @@ describe("smoothRorForDisplay", () => {
     expect(interiorDev).toBeLessThan(lastDev);
   });
 
-  it("keeps null RoR samples as gaps and never fabricates a value across them", () => {
+  it("keeps a null RoR sample as a gap (the gap point itself stays null)", () => {
     const withGap = curve([10, 10, null, 12, 12]);
     const smoothed = rorOf(smoothRorForDisplay(withGap, 9));
     expect(smoothed[2]).toBeNull(); // the gap stays a gap
-    // Neighbours of the gap are still averaged from the real samples around them.
-    expect(smoothed[0]).not.toBeNull();
-    expect(smoothed[3]).not.toBeNull();
+  });
+
+  it("does NOT average across a gap — a gap bounds the window on each side", () => {
+    // [10, null, 30] at 1 Hz with a wide (15 s) window: under the BUGGY
+    // skip-and-continue walk, index 0 would skip the null and reach index 2 (30),
+    // smoothing 10 → mean(10,30)=20 (interpolating ACROSS the missing signal).
+    // With a gap-STOP walk, the null bounds the window: index 0 has no real
+    // neighbour on its right within the contiguous run, so it stays 10, and index 2
+    // likewise stays 30. This case would FAIL under the old behaviour.
+    const acrossGap = curve([10, null, 30]);
+    const smoothed = rorOf(smoothRorForDisplay(acrossGap, 15));
+    expect(smoothed[0]).toBe(10); // not pulled toward 30 across the gap
+    expect(smoothed[1]).toBeNull(); // the gap stays a gap
+    expect(smoothed[2]).toBe(30); // not pulled toward 10 across the gap
+  });
+
+  it("smooths only within the contiguous run on each side of a gap", () => {
+    // [10, 10, null, 12, 12]: index 0/1 form a left run (both 10 → stay 10);
+    // index 3/4 form a right run (both 12 → stay 12). Neither side reaches across
+    // the gap, so no value mixes the 10s with the 12s.
+    const withGap = curve([10, 10, null, 12, 12]);
+    const smoothed = rorOf(smoothRorForDisplay(withGap, 15));
+    expect(smoothed[0]).toBe(10);
+    expect(smoothed[1]).toBe(10);
+    expect(smoothed[2]).toBeNull();
+    expect(smoothed[3]).toBe(12);
+    expect(smoothed[4]).toBe(12);
   });
 
   it("leaves every non-RoR channel untouched (display smoothing is RoR-only)", () => {
