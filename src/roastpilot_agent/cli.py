@@ -59,7 +59,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--speed",
         type=float,
         default=1.0,
-        help="replay speed multiplier 1x-60x (1x is the screen-recording rig); ignored with --step",
+        help=(
+            "replay speed multiplier 1x-60x (1x is the screen-recording rig); "
+            "ignored with --step. Free-running replay keeps SERVING the final "
+            "frame after the recorded roast ends (it does not exit) so the rig "
+            "can screenshot the terminal state — stop it with Ctrl-C"
+        ),
     )
     parser.add_argument(
         "--step",
@@ -437,6 +442,11 @@ async def _serve_replay(args: argparse.Namespace) -> int:
             f"replaying {export_dir.name} ({source.frame_count} frames, {mode}); "
             f"run {source.run_id} on http://{args.host}:{args.port}"
         )
+        if not args.step:
+            # Free-running replay finishes driving the recorded frames then keeps
+            # serving the terminal state — intentional for the screen-recording
+            # rig, but non-obvious (the process "hangs" rather than exits). Say so.
+            print("  (serves the final frame after the roast ends; Ctrl-C to stop)")
         config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
         server = uvicorn.Server(config)
         runner = asyncio.create_task(server.serve())

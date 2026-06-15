@@ -133,15 +133,20 @@ def test_replay_free_running_drives_the_roast(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """``--replay <dir> --speed 60`` (no --step) free-runs the recorded roast to
-    completion via run() — the banner reports the free-running mode. The fault
-    fixture is used (9 frames) so the inter-tick sleeps stay negligible."""
+    completion via run() — the banner reports the free-running mode and notes the
+    serve-final-frame-after-completion behaviour (#103). The fault fixture is used
+    (9 frames) so the inter-tick sleeps stay negligible."""
     fixture = Path(__file__).parent / "fixtures" / "replay" / "fault-pre-t0"
     monkeypatch.setattr(
         "sys.argv",
         ["roastpilot-agent", "--replay", str(fixture), "--speed", "60", "--port", "0"],
     )
     assert cli.main() == 0
-    assert "free-running at 60x" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "free-running at 60x" in out
+    # #103: the free-running banner flags the non-obvious "keeps serving after the
+    # roast ends" behaviour so an operator does not think the rig has hung.
+    assert "serves the final frame after the roast ends" in out
 
 
 def test_parser_serve_defaults() -> None:
