@@ -190,4 +190,62 @@ describe("useDashboardEvents (hook)", () => {
     // t=60 was replaced by the live frame (bean 200+60=260), not the seed (160).
     expect(result.current.points.find((p) => p.t === 60)?.bean).toBe(260);
   });
+
+  it("a failed /telemetry backfill degrades to live-only — no crash, live frames still render (#155)", async () => {
+    // The backfill catch path (#155): a rejected /telemetry must NOT throw out of the
+    // effect or wipe the curve — it degrades to the live stream. Assert the live frame
+    // already in the buffer is preserved and the failed fetch adds NO backfilled points.
+    const fetchTelemetry = vi.fn(() => Promise.reject(new Error("telemetry 503")));
+    const { result, rerender } = renderHook(
+      ({ frames, count, status }: { frames: readonly SseEvent[]; count: number; status: ConnectionStatus }) =>
+        useDashboardEvents(frames, count, "run-1", status, { fetchTelemetry }),
+      {
+        // A live frame is already folded in before the backfill resolves/rejects.
+        initialProps: {
+          frames: [telemetry(60)] as readonly SseEvent[],
+          count: 1,
+          status: "live" as ConnectionStatus,
+        },
+      },
+    );
+
+    // The live frame renders immediately (it does not depend on the backfill).
+    expect(result.current.points.map((p) => p.t)).toEqual([60]);
+
+    // The backfill was attempted and rejected; the hook swallows it (no throw).
+    await waitFor(() => expect(fetchTelemetry).toHaveBeenCalledTimes(1));
+    // The curve is unchanged by the failure: only the live frame, no seed points,
+    // bean from the LIVE frame (200+60=260) — not a stale/empty wipe.
+    expect(result.current.points.map((p) => p.t)).toEqual([60]);
+    expect(result.current.points.find((p) => p.t === 60)?.bean).toBe(260);
+
+    // And a later live frame still appends — the stream is unbroken after the failure.
+    rerender({ frames: [telemetry(60), telemetry(90)] as readonly SseEvent[], count: 2, status: "live" });
+    await waitFor(() => expect(result.current.points.map((p) => p.t)).toEqual([60, 90]));
+  });
+
+  it("re-arms after a failed backfill so a later reconnect RETRIES the fetch (#155)", async () => {
+    // The catch branch resets `wasLive` so the next live transition re-seeds. First
+    // attempt rejects (degrade to live-only); on reconnect the fetch succeeds and the
+    // missed window is finally backfilled — the failure is recoverable, not terminal.
+    const fetchTelemetry = vi
+      .fn<typeof import("@/lib/api").api.telemetry>()
+      .mockRejectedValueOnce(new Error("telemetry 503"))
+      .mockResolvedValueOnce(series([0, 30, 60]));
+    const { result, rerender } = renderHook(
+      ({ status }: { status: ConnectionStatus }) =>
+        useDashboardEvents([], 0, "run-1", status, { fetchTelemetry }),
+      { initialProps: { status: "live" as ConnectionStatus } },
+    );
+
+    // First live transition: fetch rejected, curve stays empty (no points seeded).
+    await waitFor(() => expect(fetchTelemetry).toHaveBeenCalledTimes(1));
+    expect(result.current.points).toHaveLength(0);
+
+    // Reconnect (reconnecting → live) re-arms and re-fetches; this time it resolves.
+    rerender({ status: "reconnecting" });
+    rerender({ status: "live" });
+    await waitFor(() => expect(fetchTelemetry).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(result.current.points.map((p) => p.t)).toEqual([0, 30, 60]));
+  });
 });
