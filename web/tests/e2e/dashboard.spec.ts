@@ -57,11 +57,16 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   const hook = await readChartData(page);
   expect(hook.columns[0].length).toBeGreaterThan(0);
   expect(hook.chargeBandVisible).toBe(true);
-  // The charge band (170–200 °C) must be ON-SCREEN in preheating (E10-spa.md): the
-  // °C scale folds it in, so its max reaches the band top even though the preheating
-  // data sits at ~38–43 °C. The flag-only chargeBandVisible check missed that the
-  // band could be ranged off-screen — assert the rendered scale actually covers it.
-  expect(hook.scales.c.max ?? 0).toBeGreaterThanOrEqual(200);
+  // The charge band (170–200 °C) must be ON-SCREEN in preheating (E10-spa.md). With
+  // the FIXED 0–210 °C axis (#217) the band is always in frame without the band
+  // having to stretch the domain (the old auto-fit folded it in); assert the rendered
+  // °C scale holds the pinned bounds and so spans the whole band even though the
+  // preheating data sits at ~38–43 °C.
+  expect(hook.scales.c.min).toBe(0);
+  expect(hook.scales.c.max).toBe(210);
+  // The RoR axis is fixed too — pinned even in preheating before any RoR develops.
+  expect(hook.scales.ror.min).toBe(-20);
+  expect(hook.scales.ror.max).toBe(30);
 
   // The live RoR readout is surfaced as an operator-facing metric (#165) and is
   // shown from the start incl. preheat (real probe data — not hidden pre-charge).
@@ -195,13 +200,20 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   expect(Math.max(...x) - Math.min(...x)).toBeGreaterThan(300);
   expect(hook.markers.map((m) => m.kind)).toContain("first_crack");
 
-  // Scale-COVERS-data guard (#131): the rendered uPlot scales must actually span the
-  // data, else the curve draws off-screen / collapsed (the bug where bean ramped to
-  // 178 °C but the °C axis stayed pinned at ~43 °C and x stayed null → a BLANK plot
-  // that still passes a byte-deterministic snapshot). Assert the °C scale max reaches
-  // the bean max and the x scale spans the elapsed range — so a blank plot fails HERE
-  // even though the pixels alone would be stable.
+  // FIXED value-axis ranges (#217): both Y-axes are pinned so the curve reads against
+  // an unchanging frame and never auto-zooms to the current sensor reading. Assert the
+  // rendered plot holds the operator-confirmed bounds against a REAL ramping curve —
+  // temp 0–210 °C, RoR −20..+30 °C/min — so a regression to auto-fit fails HERE, not
+  // only in the (regenerated-from-the-same-code) pixel baseline. The fixed °C range
+  // also still covers the bean max, preserving the scale-covers-data guarantee (#131):
+  // a BLANK/collapsed plot (bean ramped to 178 °C but the °C axis stuck at ~43 °C, x
+  // null) would still satisfy a byte-deterministic snapshot, so it must fail HERE.
+  expect(hook.scales.c.min).toBe(0);
+  expect(hook.scales.c.max).toBe(210);
   expect(hook.scales.c.max ?? 0).toBeGreaterThanOrEqual(beanMax);
+  expect(hook.scales.ror.min).toBe(-20);
+  expect(hook.scales.ror.max).toBe(30);
+  // x stays data-driven (#131): it must span the elapsed range, never collapse onto one x.
   expect((hook.scales.x.max ?? 0) - (hook.scales.x.min ?? 0)).toBeGreaterThan(300);
 
   await settle(page);

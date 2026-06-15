@@ -1,7 +1,9 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type uPlot from "uplot";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { LiveCurve } from "./LiveCurve";
+import { FIXED_SCALE_RANGES, makeAutoRange } from "./scales";
 import type { CurveMarker, CurvePoint } from "./types";
 
 // Canvas/matchMedia/ResizeObserver are stubbed in vitest.setup.ts so uPlot
@@ -116,5 +118,69 @@ describe("LiveCurve", () => {
     const labels = window.__chart?.markers.map((m) => m.label);
     expect(labels).toContain("T0");
     expect(labels).toContain("FIRST CRACK");
+  });
+});
+
+// The fixed value-axis ranges (#217) are the load-bearing contract: both Y-axes are
+// pinned so the curve never auto-zooms to the current sensor reading. The range
+// callback is pure (no canvas), so it is asserted directly — deterministic and
+// independent of the jsdom canvas stub (which leaves the live plot's scale min/max
+// null, as the scale-shape test above documents).
+describe("LiveCurve fixed value-axis ranges (#217)", () => {
+  // A minimal uPlot stand-in carrying only `data` — all the range callback reads.
+  function fakeSelf(data: (number | null)[][]): uPlot {
+    return { data } as unknown as uPlot;
+  }
+
+  // The fixed ranges encode the operator-confirmed bounds; pin them so an
+  // accidental edit to the constants is caught here, not only in the pixel gate.
+  it("pins the operator-confirmed bounds: temp 0–210 °C, RoR −20..+30 °C/min", () => {
+    expect(FIXED_SCALE_RANGES.c).toEqual([0, 210]);
+    expect(FIXED_SCALE_RANGES.ror).toEqual([-20, 30]);
+  });
+
+  it("returns the FIXED temperature range regardless of the data extent", () => {
+    const range = makeAutoRange(() => ({ visible: false, minC: 170, maxC: 200 }));
+    // Bean/env data that would otherwise auto-fit to ~38–186 °C…
+    const self = fakeSelf([[0, 30], [38, 186], [40, 190], [10, -90]]);
+    // …still yields the pinned 0–210, so the axis never zooms to the live reading.
+    expect(range(self, 38, 186, "c")).toEqual([0, 210]);
+  });
+
+  it("returns the FIXED RoR range regardless of the data extent (charge crash clipped)", () => {
+    const range = makeAutoRange(() => ({ visible: false, minC: 170, maxC: 200 }));
+    // RoR column dives to −90 on the charge crash and peaks at +25…
+    const self = fakeSelf([[0, 30], [38, 186], [40, 190], [-90, 25]]);
+    // …but the axis stays pinned −20..+30 (the trough dives off-screen by design).
+    expect(range(self, -90, 25, "ror")).toEqual([-20, 30]);
+  });
+
+  it("keeps the 170–200 charge band inside the fixed temperature range", () => {
+    // The whole point of 0–210: the band overlay is always in frame without the
+    // band having to stretch the domain.
+    const [lo, hi] = FIXED_SCALE_RANGES.c;
+    expect(lo).toBeLessThanOrEqual(170);
+    expect(hi).toBeGreaterThanOrEqual(200);
+  });
+
+  it("leaves the x (time) axis data-driven and ranged tight (no soft padding)", () => {
+    const range = makeAutoRange(() => ({ visible: false, minC: 170, maxC: 200 }));
+    const self = fakeSelf([[0, 30, 60, 1031]]);
+    // x covers the loaded elapsed-time range exactly — it must NOT be pinned.
+    expect(range(self, 0, 0, "x")).toEqual([0, 1031]);
+  });
+
+  it("falls back to uPlot's passed bounds for x on an empty mount (no finite data)", () => {
+    const range = makeAutoRange(() => ({ visible: false, minC: 170, maxC: 200 }));
+    const self = fakeSelf([[]]);
+    expect(range(self, 0, 100, "x")).toEqual([0, 100]);
+  });
+
+  it("exposes the fixed c/ror ranges on the test-hook scale shape", () => {
+    render(<LiveCurve points={POINTS} phase="development" />);
+    const scales = window.__chart?.scales;
+    // The hook now carries ror too (so the e2e suite can assert the fixed range
+    // against the real rendered plot). Shape under jsdom; values asserted in e2e.
+    expect(Object.keys(scales?.ror ?? {})).toEqual(["min", "max"]);
   });
 });
