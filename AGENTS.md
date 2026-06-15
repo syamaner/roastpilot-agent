@@ -197,8 +197,9 @@ clean.
   re-add it as required (it would deadlock workflow PRs). Green CI alone never
   means mergeable.
 - **Independent triage when work is delivered by an agent team (D23).** PR
-  review feedback (GitHub Claude Code Review, codecov, and a `/review-branch`
-  roster pass) is adjudicated by the lead/PM or the `pr-triage` subagent —
+  review feedback (the review roster below — **Claude Code Review** + **Augment
+  Code (auggie)** — plus codecov and a `/review-branch` roster pass) is
+  adjudicated by the lead/PM or the `pr-triage` subagent —
   *never* by the author teammate self-dismissing comments on its own PR. The
   author fixes; someone else decides what counts as resolved. (Each review is a
   fresh instance with no authoring context — independent of the author even when
@@ -206,8 +207,18 @@ clean.
 
 ## Code Review Rubric
 
-The automated **Claude Code Review** (`.github/workflows/claude-code-review.yml`,
-running `/code-review --comment`) and any reviewer follow this rubric.
+**The PR review roster (operator, 15 Jun 2026): `Claude Code Review` + `Augment
+Code (auggie)`.** The automated **Claude Code Review**
+(`.github/workflows/claude-code-review.yml`, running `/code-review --comment`),
+the **Augment Code** review (auggie, `augmentcode[bot]`), and any human reviewer
+follow this rubric. The ChatGPT/OpenAI **Codex connector is NOT part of the
+roster** — it was removed because its push-triggered re-reviews re-posted the
+same findings on every commit and churned the conversation-resolution merge gate
+(each `update-branch`/push re-opened threads, blocking auto-merge with no new
+signal). If the Codex bot still posts (until its GitHub App access is revoked in
+repo settings), its comments are **out-of-roster and non-authoritative**: triage
+may resolve them by pointing at the roster rule, and they never block a merge on
+their own.
 
 **Inline PR comments are MERGE-BLOCKING** — `main` requires every conversation
 resolved (branch protection). So calibrate where findings go:
