@@ -15,6 +15,7 @@ function summary(overrides: Partial<RoastSummary> = {}): RoastSummary {
     id: "r1",
     started_at_utc: "2026-06-07T14:00:00Z",
     completed_at_utc: "2026-06-07T14:12:00Z",
+    first_crack_at_utc: "2026-06-07T14:09:00Z",
     agent_phase: "complete",
     outcome: "completed",
     bean_origin: "Ethiopian Yirgacheffe",

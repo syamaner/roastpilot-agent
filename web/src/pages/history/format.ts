@@ -63,6 +63,24 @@ export function formatDevPercent(value: number | null): string {
 }
 
 /**
+ * Format the first-crack timestamp (#111) as a UTC time-of-day `HH:MM` for the
+ * FC-time column, or an em dash when no first crack was recorded for the run.
+ *
+ * Time-of-day rather than the full date (which the Date column already carries):
+ * the operator scans the FC column alongside the same-day Date, so the clock
+ * time is the useful, non-redundant signal. UTC + fixed numeric layout matches
+ * `formatStartedAt` so the snapshot suite stays byte-stable across runners.
+ * Returns the raw string unchanged if it cannot be parsed.
+ */
+export function formatFcTime(isoUtc: string | null): string {
+  if (isoUtc === null) return "—";
+  const date = new Date(isoUtc);
+  if (Number.isNaN(date.getTime())) return isoUtc;
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}`;
+}
+
+/**
  * Apply the active filters to the run list (pure, client-side over the small REST
  * list — no server round-trip). Order is preserved (the server returns newest
  * first). A run with no rating is excluded once a minimum rating is set.

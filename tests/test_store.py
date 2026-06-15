@@ -763,3 +763,52 @@ async def test_created_at_is_trigger_guarded_too(tmp_store: RoastStore) -> None:
             )
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_projects_first_crack_time(tmp_store: RoastStore) -> None:
+    """``list_runs`` projects the earliest ``first_crack`` event time (#111).
+
+    Both FC paths (MCP detection and the operator override) emit a
+    ``first_crack`` roast event, so the projection reads either crossing. The
+    earliest such event wins when more than one is present.
+    """
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc="2026-06-07T14:09:00+00:00",
+        )
+        # A later, duplicate FC event must not shadow the earliest one.
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.OPERATOR,
+            recorded_at_utc="2026-06-07T14:11:00+00:00",
+        )
+        runs = await tmp_store.list_runs()
+        assert len(runs) == 1
+        assert runs[0].first_crack_at_utc == "2026-06-07T14:09:00+00:00"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_first_crack_time_none_without_fc(tmp_store: RoastStore) -> None:
+    """A run that never reached first crack serializes ``first_crack_at_utc`` as
+    ``None`` (#111 back-compat: pre-FC runs and any run with no FC event)."""
+    await seeded_store(tmp_store)
+    try:
+        # A non-FC event exists, but no first_crack event for this run.
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.RUN_STARTED,
+            source=RoastEventSource.CONTROLLER,
+        )
+        runs = await tmp_store.list_runs()
+        assert len(runs) == 1
+        assert runs[0].first_crack_at_utc is None
+    finally:
+        await tmp_store.close()

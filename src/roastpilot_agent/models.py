@@ -435,6 +435,12 @@ class RoastSummary(BaseModel):
     id: str
     started_at_utc: str
     completed_at_utc: str | None = None
+    first_crack_at_utc: str | None = None
+    """UTC ISO-8601 wall-clock time of this run's first-crack event (#111),
+    projected from the earliest persisted ``first_crack`` roast event. ``None``
+    when no first crack was detected or operator-marked (back-compat: a pre-FC
+    run, or any run that never reached first crack). The history list renders it
+    as the FC-time column; the field is advisory display only, never control."""
     agent_phase: RoastPhase
     outcome: Literal["completed", "aborted", "faulted"] | None = None
     bean_origin: str

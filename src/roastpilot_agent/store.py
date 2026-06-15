@@ -700,13 +700,22 @@ class RoastStore:
 
         Development percent comes from the run's latest non-null telemetry
         snapshot via a correlated subquery — one statement, no N+1 — and is
-        ``None`` for a run that never recorded one."""
+        ``None`` for a run that never recorded one.
+
+        First-crack time (#111) comes from the earliest persisted ``first_crack``
+        roast event (the ``idx_roast_events_run_kind`` index covers the lookup)
+        and is ``None`` for a run that never reached first crack — both the MCP
+        detection and the operator-override FC paths emit that event, so either
+        crossing is projected."""
         async with self.connection.execute(
             "SELECT r.id, r.started_at_utc, r.completed_at_utc, r.agent_phase,"
             " r.outcome, r.profile_json, r.operator_rating,"
             " (SELECT t.development_percent FROM telemetry_snapshots t"
             "  WHERE t.run_id = r.id AND t.development_percent IS NOT NULL"
-            "  ORDER BY t.tick DESC LIMIT 1) AS dev_pct"
+            "  ORDER BY t.tick DESC LIMIT 1) AS dev_pct,"
+            " (SELECT e.recorded_at_utc FROM roast_events e"
+            "  WHERE e.run_id = r.id AND e.kind = 'first_crack'"
+            "  ORDER BY e.id ASC LIMIT 1) AS fc_at"
             " FROM roast_runs r ORDER BY r.started_at_utc DESC, r.rowid DESC"
         ) as cursor:
             rows = await cursor.fetchall()
@@ -718,6 +727,7 @@ class RoastStore:
                     id=str(row[0]),
                     started_at_utc=str(row[1]),
                     completed_at_utc=None if row[2] is None else str(row[2]),
+                    first_crack_at_utc=None if row[8] is None else str(row[8]),
                     agent_phase=RoastPhase(str(row[3])),
                     outcome=row[4],
                     bean_origin=profile.bean_origin,

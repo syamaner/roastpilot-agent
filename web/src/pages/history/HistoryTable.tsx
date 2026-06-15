@@ -2,10 +2,10 @@
  * Roast-history table (E10-S4).
  *
  * Columns are exactly what `GET /api/roasts` (`RoastSummary`) carries: Date,
- * Bean (origin + varietal, two-line), Outcome, Dev %, Rating. Profile name, FC
- * time, drop temp, and the sparkline curve from the prototype are intentionally
- * absent — they are not in the M1 contract (D7: no named profiles; FC time
- * deferred to #111). Rows are activated (click / Enter / Space) to open the
+ * Bean (origin + varietal, two-line), Outcome, Advisor, FC (first-crack time,
+ * #111), Dev %, Rating. Profile name, drop temp, and the sparkline curve from
+ * the prototype are intentionally absent — they are not in the M1 contract (D7:
+ * no named profiles). Rows are activated (click / Enter / Space) to open the
  * detail page; the row is the only navigation affordance.
  */
 
@@ -14,7 +14,7 @@ import { useNavigate } from "react-router-dom";
 import { cn } from "@/lib/cn";
 import type { RoastSummary } from "@/lib/types";
 
-import { beanLabel, formatDevPercent, formatStartedAt } from "./format";
+import { beanLabel, formatDevPercent, formatFcTime, formatStartedAt } from "./format";
 import { HistoryAdvisorCell } from "./HistoryAdvisorCell";
 import { OutcomeBadge } from "./OutcomeBadge";
 import { StarRating } from "./StarRating";
@@ -42,6 +42,7 @@ export function HistoryTable({ runs }: HistoryTableProps): React.JSX.Element {
               <th className={HEAD_CELL}>Bean</th>
               <th className={HEAD_CELL}>Outcome</th>
               <th className={HEAD_CELL}>Advisor</th>
+              <th className={HEAD_CELL}>FC</th>
               <th className={HEAD_CELL}>Dev %</th>
               <th className={HEAD_CELL}>Rating</th>
             </tr>
@@ -95,6 +96,16 @@ export function HistoryTable({ runs }: HistoryTableProps): React.JSX.Element {
                 </td>
                 <td className={BODY_CELL}>
                   <HistoryAdvisorCell runId={run.id} />
+                </td>
+                <td
+                  data-testid="history-fc"
+                  className={cn(
+                    BODY_CELL,
+                    "whitespace-nowrap font-mono text-sm",
+                    run.first_crack_at_utc === null ? "text-muted-foreground" : "text-foreground",
+                  )}
+                >
+                  {formatFcTime(run.first_crack_at_utc)}
                 </td>
                 <td className={cn(BODY_CELL, "font-mono text-sm text-foreground")}>
                   {formatDevPercent(run.development_percent)}

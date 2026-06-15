@@ -15,13 +15,15 @@
 import { expect, test, type Page } from "@playwright/test";
 
 // A fixed, hand-authored history payload: covers every outcome badge, a rated +
-// an unrated run, and a null dev %. Mirrors the real `RoastSummary` shape.
+// an unrated run, a null dev %, and (#111) both an FC time and a run that never
+// reached first crack (`first_crack_at_utc: null`). Mirrors `RoastSummary`.
 const HISTORY = {
   runs: [
     {
       id: "run-a",
       started_at_utc: "2026-06-07T14:00:00Z",
       completed_at_utc: "2026-06-07T14:12:00Z",
+      first_crack_at_utc: "2026-06-07T14:09:00Z",
       agent_phase: "complete",
       outcome: "completed",
       bean_origin: "Ethiopian Yirgacheffe",
@@ -33,6 +35,7 @@ const HISTORY = {
       id: "run-b",
       started_at_utc: "2026-06-06T15:07:00Z",
       completed_at_utc: "2026-06-06T15:18:00Z",
+      first_crack_at_utc: "2026-06-06T15:15:00Z",
       agent_phase: "complete",
       outcome: "aborted",
       bean_origin: "Colombian Supremo",
@@ -44,6 +47,7 @@ const HISTORY = {
       id: "run-c",
       started_at_utc: "2026-06-05T16:14:00Z",
       completed_at_utc: "2026-06-05T16:21:00Z",
+      first_crack_at_utc: null,
       agent_phase: "faulted",
       outcome: "faulted",
       bean_origin: "Kenyan AA",

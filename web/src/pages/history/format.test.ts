@@ -8,6 +8,7 @@ import {
   EMPTY_FILTERS,
   filterRuns,
   formatDevPercent,
+  formatFcTime,
   formatStartedAt,
 } from "./format";
 
@@ -16,6 +17,7 @@ function run(overrides: Partial<RoastSummary> = {}): RoastSummary {
     id: "r1",
     started_at_utc: "2026-06-07T14:00:00Z",
     completed_at_utc: "2026-06-07T14:12:00Z",
+    first_crack_at_utc: "2026-06-07T14:09:00Z",
     agent_phase: "complete",
     outcome: "completed",
     bean_origin: "Ethiopian Yirgacheffe",
@@ -64,6 +66,20 @@ describe("formatDevPercent", () => {
 
   it("renders an em dash for null", () => {
     expect(formatDevPercent(null)).toBe("—");
+  });
+});
+
+describe("formatFcTime", () => {
+  it("formats an ISO UTC timestamp as HH:MM in UTC", () => {
+    expect(formatFcTime("2026-06-07T14:09:30Z")).toBe("14:09");
+  });
+
+  it("renders an em dash when no first crack was recorded (null)", () => {
+    expect(formatFcTime(null)).toBe("—");
+  });
+
+  it("returns the raw string when unparseable", () => {
+    expect(formatFcTime("not-a-date")).toBe("not-a-date");
   });
 });
 

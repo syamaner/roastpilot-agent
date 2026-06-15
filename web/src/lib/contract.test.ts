@@ -419,6 +419,7 @@ describe("REST snapshot contract", () => {
       "id",
       "started_at_utc",
       "completed_at_utc",
+      "first_crack_at_utc",
       "agent_phase",
       "outcome",
       "bean_origin",

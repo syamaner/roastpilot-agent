@@ -153,9 +153,10 @@ def _normalize_sse_frame(raw: _JsonObj) -> _JsonObj:
 def _normalize_rest_snapshot(raw: _JsonObj) -> _JsonObj:
     """Pin a dumped REST snapshot's volatile fields to fixed sentinels (#121).
 
-    ``id`` is a random run id; ``started_at_utc`` / ``completed_at_utc`` are
-    wall-clock. All three are pinned so the snapshot regenerates deterministically
-    while still exercising the field shape (a present, non-null ISO string / id).
+    ``id`` is a random run id; ``started_at_utc`` / ``completed_at_utc`` /
+    ``first_crack_at_utc`` (#111) are wall-clock. All are pinned so the snapshot
+    regenerates deterministically while still exercising the field shape (a
+    present, non-null ISO string / id).
 
     As in :func:`_normalize_sse_frame`, every normalization guards on **non-null**
     so a value→``null`` server regression survives to fail the byte compare. ``id``
@@ -173,7 +174,7 @@ def _normalize_rest_snapshot(raw: _JsonObj) -> _JsonObj:
     """
     if raw.get("id") is not None:
         raw["id"] = _SENTINEL_RUN_ID
-    for key in ("started_at_utc", "completed_at_utc"):
+    for key in ("started_at_utc", "completed_at_utc", "first_crack_at_utc"):
         if raw.get(key) is not None:
             raw[key] = _SENTINEL_TIMESTAMP
     return raw

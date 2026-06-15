@@ -172,9 +172,12 @@ Owner: `dashboard` teammate. The demo centerpiece. Acceptance criteria:
 
 Owner: `history` teammate. Acceptance criteria:
 
-- [ ] History table per plan §7 (date, bean, profile, outcome, FC time,
-  dev %, rating) + filter + empty state. Sparklines optional (cut first if
-  time is tight).
+- [x] History table per plan §7 (date, bean, outcome, FC time, dev %, rating) +
+  filter + empty state. FC time deferred at S4 (the `RoastSummary` list payload
+  didn't carry it) and landed post-E10 via **#111** — `first_crack_at_utc`
+  projected from the earliest persisted `first_crack` roast event, rendered as
+  the history FC column (UTC `HH:MM`, em-dash when no FC). Profile name is out
+  (D7: minimal profiles, no named profiles); sparklines stay optional.
 
 ### E10-S5 — Roast detail page
 
