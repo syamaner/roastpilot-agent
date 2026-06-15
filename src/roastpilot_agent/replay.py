@@ -47,6 +47,7 @@ are **synthesized** here, clearly labelled:
 import asyncio
 import contextlib
 import json
+import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
@@ -70,6 +71,8 @@ from roastpilot_agent.models import (
 )
 from roastpilot_agent.safety import SafetyPolicy
 from roastpilot_agent.store import RoastStore
+
+_log = logging.getLogger(__name__)
 
 #: The replay speed bounds (kickoff §4): 1× is the E12 screen-recording rig,
 #: 60× the fast development pass. A requested speed is clamped into this band.
@@ -238,10 +241,23 @@ def load_export(export_dir: Path) -> ReplayScript:
         if not line:
             continue
         record = json.loads(line)
-        if record.get("type") == "event":
+        record_type = record.get("type")
+        if record_type == "event":
             event_records.append(record)
-        else:
+        elif record_type in (None, "telemetry"):
+            # A missing ``type`` is a legacy telemetry record (pre-typed export);
+            # an explicit ``"telemetry"`` is the current form.
             telemetry_records.append(record)
+        else:
+            # Guard the open ``else`` that previously coerced *every* non-event
+            # record into a telemetry frame (#103): an unrecognised body — e.g. a
+            # future ``type="summary"`` — would silently become a bogus telemetry
+            # frame and crash on the missing temperature keys (or worse, plot
+            # garbage). Skip it with a loud warning so a new record type is a
+            # visible no-op here, not a corrupt frame.
+            _log.warning(
+                "replay export %s: skipping unrecognised JSONL record type %r", jsonl, record_type
+            )
     if not telemetry_records:
         raise ValueError(f"replay export has no telemetry records: {jsonl}")
 
@@ -277,7 +293,16 @@ def load_export(export_dir: Path) -> ReplayScript:
             inject = ReplayActionKind.DROP_BEANS
             drop_injected = True
             markers.append(ReplayMarker.DROP)
-            markers.append(ReplayMarker.COOLING)  # drop engages cooling
+            # COOLING shares the DROP frame on the assumption that drop_beans
+            # engages cooling on the Hottop. Whether the real machine actually
+            # couples them is an OPEN hardware-verification story (component plan
+            # §3: "whether drop_beans engages cooling is to be verified"). Fine
+            # for replay — both markers should be reachable at the drop on the
+            # recorded roasts — but if the distinction ever matters (a separate
+            # recorded cooling_started event), split COOLING onto its own frame
+            # keyed off that event, the way STOP_COOLING is keyed off
+            # cooling_stopped below. (#103)
+            markers.append(ReplayMarker.COOLING)
             seen.update({ReplayMarker.DROP, ReplayMarker.COOLING})
         elif cool_stop_at is not None and mono >= cool_stop_at and not stop_injected:
             inject = ReplayActionKind.STOP_COOLING
@@ -710,8 +735,12 @@ class ReplaySource:
             "decision": decision,
             "evaluation": evaluation.model_dump(mode="json"),
         }
-        # SSE (live advisory panel) + store (detail-page trace table).
-        self._service.events.emit(RoastEventKind.ADVISORY, payload)
+        # Persist BEFORE the SSE flush, mirroring the live ``tick_once``
+        # persist-then-flush ordering: a store-write failure leaves both the
+        # store and the broadcaster clean, so a re-step retries with neither a
+        # half-persisted verdict nor a double-emitted advisory. (#103) The flag
+        # is set only after *both* the persistence and the SSE emit succeed, so
+        # the once-only guarantee never trips on a partial write.
         tick = self._current_tick()
         await self._store.record_safety_evaluation(run_id=run_id, tick=tick, evaluation=evaluation)
         await self._store.record_event(
@@ -720,6 +749,9 @@ class ReplaySource:
             source=RoastEventSource.ADVISOR,
             payload=payload,
         )
+        # SSE (live advisory panel); the store rows above back the detail-page
+        # trace table the SPA renders from.
+        self._service.events.emit(RoastEventKind.ADVISORY, payload)
         self._clamp_emitted = True
         self._reached.add(ReplayMarker.CLAMP)
 
@@ -758,6 +790,7 @@ def build_replay_service(
     store_path: Path,
     *,
     config: AppConfig | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> tuple[RoastService, ReplaySource, RoastStore]:
     """Wire a real :class:`RoastService` + :class:`ReplaySource` for an export.
 
@@ -765,6 +798,12 @@ def build_replay_service(
     loop disabled — ``run_loop=False`` so the source owns stepping). Returns the
     store too so the caller owns its lifecycle (``initialize`` before serving,
     ``close`` after). Shared by the CLI (``--replay``) and the tests.
+
+    ``sleep`` is the inter-tick delay coroutine the free-running :meth:`ReplaySource.run`
+    awaits; it defaults to :func:`asyncio.sleep`. Tests pass a no-op so the
+    free-running path drives the whole export instantly, with the same event
+    stream — exposed on the public factory so a test never reaches into the
+    source's private ``_sleep`` (#103).
     """
     app_config = config or AppConfig()
     control = ReplayRoasterControl()
@@ -791,6 +830,7 @@ def build_replay_service(
         safety=safety,
         store=store,
         sim_clock=sim_clock,
+        sleep=sleep,
         tick_interval_seconds=app_config.controller.tick_interval_seconds,
     )
     return service, source, store
@@ -856,6 +896,7 @@ async def create_replay_app(
     step_mode: bool = False,
     speed: float = 1.0,
     spa_dir: Path | None = None,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> tuple[FastAPI, RoastService, ReplaySource]:
     """Build a fully-wired replay FastAPI app over a recorded export.
 
@@ -874,11 +915,26 @@ async def create_replay_app(
     ``spa_dir`` (when set) serves the built SPA at ``/`` so the recorded roast
     renders in the real dashboard, mounted after the API routes exactly as the
     live serve path mounts it.
+
+    ``sleep`` is the free-running inter-tick delay coroutine (default
+    :func:`asyncio.sleep`); a test passes a no-op to drive the export instantly
+    without reaching into the source's private ``_sleep`` (#103).
     """
-    service, source, store = build_replay_service(export_dir, store_path, config=config)
+    service, source, store = build_replay_service(
+        export_dir, store_path, config=config, sleep=sleep
+    )
     source.set_speed(speed)
-    await store.initialize()
-    await source.start()
+    # Tear down the store (and its aiosqlite worker thread) + the service if
+    # bring-up fails after the store opens: a ``source.start()`` raising —
+    # e.g. a controller-start error — must not leak the worker thread past the
+    # event loop (no lifespan runs to clean it up, since the app is never
+    # returned). (#103)
+    try:
+        await store.initialize()
+        await source.start()
+    except BaseException:
+        await source.aclose()
+        raise
 
     @contextlib.asynccontextmanager
     async def _replay_lifespan(_app: FastAPI) -> AsyncGenerator[None]:
