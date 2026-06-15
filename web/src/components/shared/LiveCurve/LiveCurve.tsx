@@ -33,6 +33,12 @@ import {
   type SeriesKey,
 } from "./types";
 
+// Default charge band, hoisted to module scope so the prop default is a STABLE
+// reference. An inline `{ minC, maxC }` default would mint a new object every
+// parent render, firing the overlay-redraw effect (keyed on `chargeBand`) on
+// every 1 s telemetry tick. Performance-only.
+const DEFAULT_CHARGE_BAND: { minC: number; maxC: number } = { minC: 170, maxC: 200 };
+
 interface SeriesMeta {
   key: SeriesKey;
   label: string;
@@ -65,7 +71,7 @@ export function LiveCurve({
   points,
   markers = [],
   phase = null,
-  chargeBand = { minC: 170, maxC: 200 },
+  chargeBand = DEFAULT_CHARGE_BAND,
   highlightTime = null,
   initialHidden = [],
   className,
