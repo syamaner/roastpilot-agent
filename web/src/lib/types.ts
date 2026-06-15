@@ -319,6 +319,21 @@ export type CommandTraceSource =
   | "safety"
   | "recovery";
 
+// --- MCP write-command tool names (models.RoastCommand) — the `tool` field of a
+// timeline command. Mirrors the Python enum's wire values so the decision-trace
+// timeline carries a literal union, not a bare string.
+export type RoastCommandTool =
+  | "start_roast_session"
+  | "set_heat"
+  | "set_fan"
+  | "mark_beans_added"
+  | "mark_first_crack"
+  | "drop_beans"
+  | "start_cooling"
+  | "stop_cooling"
+  | "export_roast_log"
+  | "emergency_stop";
+
 export interface TimelineEvent {
   kind: RoastEventKind;
   source: RoastEventSource;
@@ -352,7 +367,7 @@ export interface TimelineAdvisorDecision {
 
 export interface TimelineCommand {
   tick: number;
-  tool: string;
+  tool: RoastCommandTool;
   source: CommandTraceSource;
   status: CommandTraceStatus;
   args: Record<string, unknown> | null;
