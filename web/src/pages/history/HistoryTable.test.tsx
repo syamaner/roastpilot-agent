@@ -20,6 +20,10 @@ function summary(overrides: Partial<RoastSummary> = {}): RoastSummary {
     bean_varietal: "Heirloom",
     rating: 4,
     development_percent: 19,
+    advisor_consults: 0,
+    advisor_clamped: 0,
+    advisor_rejected: 0,
+    advisor_failed: 0,
     ...overrides,
   };
 }
