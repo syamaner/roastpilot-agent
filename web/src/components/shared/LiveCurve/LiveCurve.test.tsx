@@ -36,17 +36,54 @@ describe("LiveCurve", () => {
   });
 
   it("exposes the rendered scale ranges on the test hook (#131 scale-covers-data guard)", () => {
-    // The hook carries the live uPlot x/°C scale ranges so an e2e test can assert
+    // The hook carries the live uPlot x/°C/RoR scale ranges so an e2e test can assert
     // the scale COVERS the data (catching the collapsed/unranged-scale bug a blank
     // snapshot can't). Under jsdom the canvas is stubbed, so we assert the SHAPE is
     // present (the real range values are asserted in the Playwright suite).
     render(<LiveCurve points={POINTS} phase="development" />);
     const scales = window.__chart?.scales;
     expect(scales).toBeDefined();
-    // Both scale entries exist with min/max keys (values are null under the stubbed
-    // jsdom canvas; the real covering ranges are asserted in the Playwright suite).
+    // ALL THREE scale entries exist with min/max keys — incl. ror (#133): autoRange
+    // ranges the ror scale, but until the hook reads it back a ror-scale collapse
+    // would only be caught by the pixel snapshot. Values are null under the stubbed
+    // jsdom canvas; the real covering ranges are asserted in the Playwright suite.
     expect(Object.keys(scales?.x ?? {})).toEqual(["min", "max"]);
     expect(Object.keys(scales?.c ?? {})).toEqual(["min", "max"]);
+    expect(Object.keys(scales?.ror ?? {})).toEqual(["min", "max"]);
+  });
+
+  it("re-publishes the hook when the data columns change (live append, not a stale read)", () => {
+    // The hook must track the LIVE plot, not a one-time mount snapshot: the dashboard
+    // appends a telemetry frame every tick, and a test reading window.__chart after a
+    // rerender must see the new data (#133 — assert hook BEHAVIOUR, not just shape).
+    const { rerender } = render(<LiveCurve points={POINTS.slice(0, 1)} />);
+    expect(window.__chart?.columns[0]).toEqual([0]);
+    expect(window.__chart?.columns[1]).toEqual([90]);
+
+    rerender(<LiveCurve points={POINTS} />);
+    expect(window.__chart?.columns[0]).toEqual([0, 30, 60]);
+    expect(window.__chart?.columns[1]).toEqual([90, 120, 150]);
+  });
+
+  it("re-publishes the hook when markers change (e.g. T0 → first-crack arrives)", () => {
+    const { rerender } = render(<LiveCurve points={POINTS} markers={[MARKERS[0]]} />);
+    expect(window.__chart?.markers.map((m) => m.label)).toEqual(["T0"]);
+
+    rerender(<LiveCurve points={POINTS} markers={MARKERS} />);
+    expect(window.__chart?.markers.map((m) => m.label)).toEqual(["T0", "FIRST CRACK"]);
+  });
+
+  it("destroys the uPlot instance on unmount (no leaked plot across remounts)", () => {
+    // The build effect's cleanup must call plot.destroy() so a remount (route change /
+    // strict-mode double-invoke) doesn't leak canvases or stack draw hooks. Assert via
+    // the public DOM contract: uPlot owns a `.uplot` element inside the host, gone after
+    // unmount (#133 cleanup item — verify teardown, don't just trust afterEach).
+    const { unmount } = render(<LiveCurve points={POINTS} />);
+    const host = screen.getByTestId("live-curve");
+    expect(host.querySelector(".uplot")).not.toBeNull();
+
+    unmount();
+    expect(host.querySelector(".uplot")).toBeNull();
   });
 
   it("shows the charge band in preheating only", () => {

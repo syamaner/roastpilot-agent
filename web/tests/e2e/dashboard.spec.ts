@@ -114,6 +114,21 @@ test("dashboard-fault — real env-ceiling fault renders the fault banner + trai
   const hook = await readChartData(page);
   expect(hook.columns[0].length).toBeGreaterThan(0);
 
+  // Scale-covers-data guard (#133): the c/ror axes are FIXED (#217), so assert
+  // they hold the pinned bounds, and x must SPAN the loaded telemetry — never
+  // collapse onto one point. A blank/collapsed plot (x null, c stuck) satisfies a
+  // byte-deterministic snapshot, so the regression must fail HERE. Closes the gap
+  // where this assertion lived only in dashboard-live/-developed.
+  const x = hook.columns[0].filter((v): v is number => v !== null);
+  expect(x.length).toBeGreaterThan(0);
+  expect(hook.scales.c.min).toBe(0);
+  expect(hook.scales.c.max).toBe(210);
+  expect(hook.scales.ror.min).toBe(-20);
+  expect(hook.scales.ror.max).toBe(30);
+  // x covers the data extent (degenerate single-point fixtures span 0, so use ≥).
+  expect(hook.scales.x.min).toBeLessThanOrEqual(Math.min(...x));
+  expect(hook.scales.x.max).toBeGreaterThanOrEqual(Math.max(...x));
+
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-fault.png");
 });
@@ -150,6 +165,17 @@ test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery mo
   // The curve drew the short pre-T0 track (data layer).
   const hook = await readChartData(page);
   expect(hook.columns[0].length).toBeGreaterThan(0);
+
+  // Scale-covers-data guard (#133): same regression class as the other curve
+  // states — FIXED c/ror bounds, x spanning the loaded track (never collapsed).
+  const x = hook.columns[0].filter((v): v is number => v !== null);
+  expect(x.length).toBeGreaterThan(0);
+  expect(hook.scales.c.min).toBe(0);
+  expect(hook.scales.c.max).toBe(210);
+  expect(hook.scales.ror.min).toBe(-20);
+  expect(hook.scales.ror.max).toBe(30);
+  expect(hook.scales.x.min).toBeLessThanOrEqual(Math.min(...x));
+  expect(hook.scales.x.max).toBeGreaterThanOrEqual(Math.max(...x));
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-recovery.png");
