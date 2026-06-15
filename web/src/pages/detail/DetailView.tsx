@@ -17,6 +17,10 @@ import { useMemo, useState } from "react";
 
 import { LiveCurve } from "@/components/shared";
 import type { RoastDetail, RoastTimeline, TelemetrySeries } from "@/lib/types";
+// #205: shared DISPLAY-ONLY RoR smoothing (dashboard owns the canonical module).
+// Raw `bean_ror_c_per_min` in the contract is untouched — this only smooths the
+// rendered line, identically on the live dashboard and this persisted detail curve.
+import { smoothRorForDisplay } from "@/pages/dashboard/rorSmoothing";
 import { AdvisorSummaryChips } from "./AdvisorSummaryChips";
 import { AdvisorTimeline } from "./AdvisorTimeline";
 import { advisorSummary, toAdvisorRows } from "./advisorModel";
@@ -45,7 +49,8 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
   // re-click). The page owns the toggle; the chart just renders `highlightTime`.
   const [selectedTick, setSelectedTick] = useState<number | null>(null);
 
-  const points = useMemo(() => toCurvePoints(telemetry), [telemetry]);
+  // #205: smooth RoR for display only; the persisted raw series is unchanged.
+  const points = useMemo(() => smoothRorForDisplay(toCurvePoints(telemetry)), [telemetry]);
   const markers = useMemo(() => toCurveMarkers(timeline, telemetry), [timeline, telemetry]);
   const rows = useMemo(() => toTraceRows(timeline, telemetry), [timeline, telemetry]);
   const advisorRows = useMemo(() => toAdvisorRows(timeline, telemetry), [timeline, telemetry]);
