@@ -5,7 +5,7 @@
         "advisory_paused": true
       },
       "event": "advisory",
-      "id": 1
+      "id": 0
     },
     {
       "data": {
@@ -13,7 +13,7 @@
         "trigger": "scheduled"
       },
       "event": "advisory",
-      "id": 2
+      "id": 0
     }
   ],
   "command_variants": [
@@ -23,7 +23,7 @@
         "source": "operator"
       },
       "event": "command_executed",
-      "id": 229
+      "id": 0
     }
   ],
   "frames": [
@@ -32,7 +32,7 @@
         "profile": "session-2"
       },
       "event": "run_started",
-      "id": 3
+      "id": 0
     },
     {
       "data": {
@@ -44,17 +44,17 @@
         "phase": "starting"
       },
       "event": "phase_changed",
-      "id": 1
+      "id": 0
     },
     {
       "data": {
-        "bean_temp_c": 145.0,
-        "env_temp_c": 171.0,
+        "bean_temp_c": 170.0,
+        "env_temp_c": 197.0,
         "guidance_max_c": 200.0,
         "guidance_min_c": 170.0
       },
       "event": "charge_guidance",
-      "id": 79
+      "id": 0
     },
     {
       "data": {
@@ -62,7 +62,7 @@
         "debounce_ticks": 3
       },
       "event": "t0_detected",
-      "id": 107
+      "id": 0
     },
     {
       "data": {
@@ -70,7 +70,7 @@
         "source": "mcp"
       },
       "event": "first_crack",
-      "id": 206
+      "id": 0
     },
     {
       "data": {
@@ -95,7 +95,7 @@
         "trigger": "replay_overlay"
       },
       "event": "advisory",
-      "id": 209
+      "id": 0
     },
     {
       "data": {
@@ -103,7 +103,7 @@
         "heat_percent": 80
       },
       "event": "command_executed",
-      "id": 4
+      "id": 0
     },
     {
       "data": {
@@ -111,7 +111,7 @@
         "reason": "already faulted"
       },
       "event": "command_failed",
-      "id": 3
+      "id": 0
     },
     {
       "data": {
@@ -124,7 +124,7 @@
         "verdict": "reject"
       },
       "event": "safety_alert",
-      "id": 1
+      "id": 0
     },
     {
       "data": {
@@ -137,7 +137,7 @@
         "verdict": "emergency_stop"
       },
       "event": "fault",
-      "id": 208
+      "id": 0
     },
     {
       "data": {
@@ -150,14 +150,14 @@
         "verdict": "recovery"
       },
       "event": "recovery_required",
-      "id": 14
+      "id": 0
     },
     {
       "data": {
         "acknowledged": "operator_recovery_required"
       },
       "event": "recovery_acknowledged",
-      "id": 2
+      "id": 0
     },
     {
       "data": {
@@ -169,12 +169,12 @@
         "summary_path": "/tmp/roast-export/summary.json"
       },
       "event": "logs_exported",
-      "id": 4
+      "id": 0
     },
     {
       "data": {},
       "event": "run_completed",
-      "id": 32
+      "id": 0
     },
     {
       "data": {
@@ -201,7 +201,7 @@
         "t0_detected": false
       },
       "event": "telemetry",
-      "id": 5
+      "id": 0
     },
     {
       "data": {},
