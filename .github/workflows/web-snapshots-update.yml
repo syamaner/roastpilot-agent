@@ -17,6 +17,10 @@ on:
 
 permissions:
   contents: write
+  # packages: read lets the container pull the GHCR-mirrored Playwright image
+  # with the built-in GITHUB_TOKEN (#262). contents: write stays for the
+  # baseline commit + push below — do not remove it.
+  packages: read
 
 concurrency:
   group: web-snapshots-update-${{ github.ref }}
@@ -26,10 +30,16 @@ jobs:
   update-baselines:
     name: Regenerate + commit Playwright baselines
     runs-on: ubuntu-latest
-    # The SAME pinned image as the ci.yml `web-snapshots` gate — bump both together
-    # with the @playwright/test / playwright-core versions in web/package.json.
+    # The SAME GHCR-mirrored image as the ci.yml `web-snapshots` gate (#262):
+    # MCR rate-limits anonymous pulls. The mirror-playwright.yml workflow keeps
+    # this ref in sync — bump the v1.55.1-noble pin together with
+    # mirror-playwright.yml, ci.yml, and the @playwright/test / playwright-core
+    # versions in web/package.json.
     container:
-      image: mcr.microsoft.com/playwright:v1.55.1-noble
+      image: ghcr.io/${{ github.repository }}/playwright:v1.55.1-noble
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Check out the dispatched branch
         uses: actions/checkout@v6.0.2
