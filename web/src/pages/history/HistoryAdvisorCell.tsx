@@ -1,48 +1,33 @@
 /**
- * Per-roast advisor summary cell for the history table (#170).
+ * Per-roast advisor summary cell for the history table (#170, #184).
  *
- * The `GET /api/roasts` summary contract carries no advisor stats, and the backend
- * is read-only for this story, so the summary is derived client-side from the same
- * `GET /api/roasts/{id}/timeline` the detail page reads — via the shared
- * `useTimeline` hook (TanStack Query caches per-run, shared with the detail page).
- * Server data only; nothing inferred. The count of consults + how many were
- * clamped/rejected/failed comes straight off the persisted timeline rows.
+ * Server data only; nothing inferred. The consult count and how many were
+ * clamped / rejected / failed are read straight off the `GET /api/roasts`
+ * summary's advisor-stat fields (#184), which the backend aggregates from the
+ * persisted `advisor_decisions` rows.
  *
- * Lazy-by-row: each visible history row issues its OWN `useTimeline(runId)` query,
- * so a freshly-loaded history page fires N parallel `/timeline` requests (one per
- * visible row). This is a DELIBERATE M1 trade-off, not an oversight: there is no
- * advisor-summary field on the `GET /api/roasts` list contract and the backend is
- * read-only for this story, so per-row derivation is the only server-data-only path
- * (the alternative — a backend summary column — is a future contract change). For
- * M1's handful of local roasts the cost is negligible, and TanStack Query caches
- * per-run so a revisit or cross-navigation to the detail page is free.
+ * Previously (#170) these counts were derived client-side per row from
+ * `GET /api/roasts/{id}/timeline` via `useTimeline` — a documented M1 trade-off
+ * that fired N parallel `/timeline` requests on a freshly-loaded history page
+ * (one per visible row). #184 added the aggregate fields to the list contract, so
+ * the cell now renders from the summary it is already handed: no per-row fetch,
+ * no N+1. The displayed text is byte-for-byte the same as before.
  *
- * The cell degrades gracefully — em dash while loading or on error (the list still
- * renders), a "no advice" hint for a roast with zero consults.
+ * The cell shows a "no advice" hint for a roast with zero consults; a run that
+ * predates the advisor (or simply never consulted) projects zeros and renders the
+ * same hint (back-compat).
  */
 
-import { useTimeline } from "@/hooks/queries";
-
-import { advisorSummary } from "@/pages/detail/advisorModel";
+import type { RoastSummary } from "@/lib/types";
 
 export interface HistoryAdvisorCellProps {
-  runId: string;
+  run: RoastSummary;
 }
 
-export function HistoryAdvisorCell({ runId }: HistoryAdvisorCellProps): React.JSX.Element {
-  const { data, isPending, isError } = useTimeline(runId);
+export function HistoryAdvisorCell({ run }: HistoryAdvisorCellProps): React.JSX.Element {
+  const consults = run.advisor_consults;
 
-  if (isPending || isError || data === undefined) {
-    return (
-      <span data-testid="history-advisor-pending" className="font-mono text-sm text-muted-foreground">
-        —
-      </span>
-    );
-  }
-
-  const summary = advisorSummary(data);
-
-  if (summary.consults === 0) {
+  if (consults === 0) {
     return (
       <span data-testid="history-advisor-none" className="font-mono text-xs text-muted-foreground">
         no advice
@@ -53,20 +38,18 @@ export function HistoryAdvisorCell({ runId }: HistoryAdvisorCellProps): React.JS
   return (
     <div data-testid="history-advisor" className="flex flex-col gap-0.5 font-mono text-xs">
       <span className="text-sm text-foreground">
-        {summary.consults} consult{summary.consults === 1 ? "" : "s"}
+        {consults} consult{consults === 1 ? "" : "s"}
       </span>
-      <span className="text-muted-foreground">
-        {parts(summary).join(" · ")}
-      </span>
+      <span className="text-muted-foreground">{parts(run).join(" · ")}</span>
     </div>
   );
 }
 
-function parts(summary: ReturnType<typeof advisorSummary>): string[] {
+function parts(run: RoastSummary): string[] {
   const out: string[] = [];
-  if (summary.clamped > 0) out.push(`${summary.clamped} clamped`);
-  if (summary.rejected > 0) out.push(`${summary.rejected} rejected`);
-  if (summary.failed > 0) out.push(`${summary.failed} failed`);
+  if (run.advisor_clamped > 0) out.push(`${run.advisor_clamped} clamped`);
+  if (run.advisor_rejected > 0) out.push(`${run.advisor_rejected} rejected`);
+  if (run.advisor_failed > 0) out.push(`${run.advisor_failed} failed`);
   if (out.length === 0) out.push("all allowed");
   return out;
 }

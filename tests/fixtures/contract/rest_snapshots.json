@@ -43,6 +43,10 @@
     "started_at_utc": "2026-01-01T00:00:00+00:00"
   },
   "roast_summary": {
+    "advisor_clamped": 0,
+    "advisor_consults": 0,
+    "advisor_failed": 0,
+    "advisor_rejected": 0,
     "agent_phase": "complete",
     "bean_origin": "Replay (recorded roast)",
     "bean_species": null,

@@ -5,6 +5,7 @@ this suite.
 """
 
 from pathlib import Path
+from typing import Literal
 
 import aiosqlite as aiosqlite_module
 import pytest
@@ -849,5 +850,149 @@ async def test_list_runs_first_crack_time_none_without_fc(tmp_store: RoastStore)
         runs = await tmp_store.list_runs()
         assert len(runs) == 1
         assert runs[0].first_crack_at_utc is None
+    finally:
+        await tmp_store.close()
+
+
+def _advisor_context() -> AdvisorContext:
+    """A minimal AdvisorContext for the advisor-stats projection tests (#184)."""
+    return AdvisorContext(
+        phase=RoastPhase.DEVELOPMENT,
+        roast_elapsed_seconds=500.0,
+        development_elapsed_seconds=30.0,
+        current_bean_temp_c=197.0,
+        current_env_temp_c=215.0,
+        bean_ror_c_per_min=8.0,
+        env_ror_c_per_min=6.0,
+        target_drop_temp_c=205.0,
+        profile_name="store-test",
+    )
+
+
+async def _record_consult(
+    store: RoastStore,
+    *,
+    tick: int,
+    status: Literal["ok", "timeout", "malformed", "provider_error"] = "ok",
+    verdict: SafetyVerdict | None = None,
+    run_id: str = "run-1",
+) -> None:
+    """Record one advisor consult and (optionally) the safety verdict it produced,
+    joined by tick the same way the controller path persists them (#184)."""
+    evaluation_id: int | None = None
+    if verdict is not None:
+        evaluation_id = await store.record_safety_evaluation(
+            run_id=run_id,
+            tick=tick,
+            evaluation=SafetyEvaluation(
+                rule="command_bounds",
+                verdict=verdict,
+                input_heat=120,
+                input_fan=40,
+                adjusted_heat=100,
+                adjusted_fan=40,
+                reason="test",
+            ),
+        )
+    await store.record_advisor_decision(
+        run_id=run_id,
+        tick=tick,
+        provider="openrouter",
+        model="test-model",
+        prompt_version="v0",
+        context=_advisor_context(),
+        latency_ms=100 if status == "ok" else None,
+        decision=RoastDecision(
+            target_heat=45, target_fan=60, should_drop=False, confidence=0.8, rationale="hold"
+        )
+        if status == "ok"
+        else None,
+        status=status,
+        safety_evaluation_id=evaluation_id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_list_runs_aggregates_advisor_stats(tmp_store: RoastStore) -> None:
+    """``list_runs`` projects per-run advisor consult/clamp/reject/fail counts (#184).
+
+    These reproduce the SPA's prior client-side ``advisorSummary`` so the history
+    advisor column renders identically without N+1ing ``/timeline``: ``consults``
+    is every persisted decision; ``failed`` is the non-``ok`` statuses; ``clamped``
+    / ``rejected`` count a consult against the safety verdict at its tick.
+    """
+    await seeded_store(tmp_store)
+    try:
+        await _record_consult(tmp_store, tick=4, status="ok", verdict=SafetyVerdict.ALLOW)
+        await _record_consult(tmp_store, tick=8, status="ok", verdict=SafetyVerdict.CLAMP)
+        await _record_consult(tmp_store, tick=12, status="ok", verdict=SafetyVerdict.REJECT)
+        await _record_consult(tmp_store, tick=16, status="provider_error", verdict=None)
+        runs = await tmp_store.list_runs()
+        assert len(runs) == 1
+        summary = runs[0]
+        assert summary.advisor_consults == 4
+        assert summary.advisor_clamped == 1
+        assert summary.advisor_rejected == 1
+        assert summary.advisor_failed == 1
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_advisor_stats_zero_without_consults(tmp_store: RoastStore) -> None:
+    """A run with no advisor decisions projects zeros (#184 back-compat).
+
+    The SPA renders a zero-consult run as "no advice"; a pre-advisor run must not
+    error or surface phantom counts.
+    """
+    await seeded_store(tmp_store)
+    try:
+        runs = await tmp_store.list_runs()
+        assert len(runs) == 1
+        summary = runs[0]
+        assert summary.advisor_consults == 0
+        assert summary.advisor_clamped == 0
+        assert summary.advisor_rejected == 0
+        assert summary.advisor_failed == 0
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_advisor_clamp_counts_latest_verdict_per_tick(
+    tmp_store: RoastStore,
+) -> None:
+    """Clamp/reject counts use the LATEST safety verdict at the consult's tick (#184).
+
+    The SPA's ``advisorSummary`` joined each consult to the *last* safety
+    evaluation at its tick (last-wins-by-tick). Recording two evaluations at one
+    tick — an earlier ``CLAMP`` then a later ``REJECT`` — and asserting the consult
+    counts as ``rejected`` (not ``clamped``) proves the projection mirrors that
+    join, the failure mode an id-blind aggregation would get wrong.
+    """
+    await seeded_store(tmp_store)
+    try:
+        # Earlier verdict at tick 8 (lower id): CLAMP.
+        await tmp_store.record_safety_evaluation(
+            run_id="run-1",
+            tick=8,
+            evaluation=SafetyEvaluation(
+                rule="r",
+                verdict=SafetyVerdict.CLAMP,
+                input_heat=120,
+                input_fan=40,
+                adjusted_heat=100,
+                adjusted_fan=40,
+                reason="earlier",
+            ),
+        )
+        # The consult and its later verdict (higher id) at the same tick: REJECT.
+        await _record_consult(tmp_store, tick=8, status="ok", verdict=SafetyVerdict.REJECT)
+        runs = await tmp_store.list_runs()
+        assert len(runs) == 1
+        summary = runs[0]
+        assert summary.advisor_consults == 1
+        assert summary.advisor_clamped == 0
+        assert summary.advisor_rejected == 1
     finally:
         await tmp_store.close()
