@@ -97,6 +97,7 @@ beforeEach(() => {
   healthState.data = undefined;
   healthState.isSuccess = false;
   viewState.fault = null;
+  streamState.enabledActions = null;
   operatorActionMock.mockClear();
 });
 
@@ -159,10 +160,13 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
     viewState.fault = { reason: "env ceiling exceeded" };
+    // #117: the affordance is driven by the server's enabled_actions mirror — the
+    // faulted-phase SSE frame carries acknowledge_fault.
+    streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
     renderPage();
     // The server finalises the run on acknowledgement → health reports no active run.
     healthState.data = { active_run_id: null };
-    fireEvent.click(screen.getByTestId("fault-start-new-roast"));
+    fireEvent.click(screen.getByTestId("fault-acknowledge"));
     // #206: the affordance dispatches the genuine acknowledge_fault control action.
     await waitFor(() =>
       expect(operatorActionMock).toHaveBeenCalledWith("run-fault", {
@@ -172,5 +176,18 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
     // Acknowledging clears the pin → no active run → idle Start form.
     expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
     expect(screen.queryByTestId("dashboard")).toBeNull();
+  });
+
+  it("hides the acknowledge affordance when the server does not enable acknowledge_fault (#117)", () => {
+    // A fault is shown, but the server's enabled_actions mirror does NOT include
+    // acknowledge_fault (e.g. a non-faulted phase). The banner must NOT render the
+    // affordance — render-from-server, no client-side fault-only gate (D25).
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
+    viewState.fault = { reason: "env ceiling exceeded" };
+    streamState.enabledActions = ["emergency_stop"]; // acknowledge_fault absent
+    renderPage();
+    expect(screen.getByTestId("fault-banner")).toBeInTheDocument();
+    expect(screen.queryByTestId("fault-acknowledge")).toBeNull();
   });
 });
