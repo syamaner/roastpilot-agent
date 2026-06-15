@@ -5,6 +5,7 @@ Hardware-free and server-free: the serve path is exercised with uvicorn's
 driven without binding a socket.
 """
 
+import asyncio
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
@@ -279,6 +280,132 @@ def test_serve_live_happy_path(
     assert captured["coffee_driver"] == "mock"
     # The finally teardown ran in order: service.shutdown → mcp.stop → store.close.
     assert order == ["service.shutdown", "mcp.stop", "store.close"]
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_serve_live_path_installs_recovery_lifespan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live ``serve`` path wires the recovery lifespan (issue #104).
+
+    Architecture invariant: a restart over a possibly-active run must enter
+    ``operator_recovery_required`` and NEVER auto-resume heat/fan. ``_serve_live``
+    builds the app with ``create_app(service, spa_dir=...)`` and deliberately
+    passes NO ``lifespan`` override, so it gets the default recovery ``_lifespan``
+    (``recover_on_start``) — replay's no-recovery lifespan must never reach this
+    path.
+
+    This pins the *observable guarantee* to the actual live serve path, not a
+    symbol reference: it pre-seeds a mid-roast (``preheating``) run into the live
+    store, drives the real ``cli.main() → _serve_live`` over a fake MCP child
+    (uvicorn ``serve`` is a no-op, so the app is built but its lifespan is not
+    yet entered), captures the app object ``_serve_live`` actually constructs by
+    wrapping ``create_app`` (the real factory still runs, default lifespan
+    intact), and then enters that captured app's lifespan. The recovery lifespan
+    must classify the run into ``operator_recovery_required`` with the roaster
+    untouched. If anyone swaps ``_serve_live`` to a bare/no-recovery lifespan,
+    the run would stay ``preheating`` and this test fails.
+    """
+    import roastpilot_agent.api as api
+    from roastpilot_agent import live
+    from roastpilot_agent.advisor import FakeAdvisor
+    from roastpilot_agent.api import RoastService, create_app
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.models import RoastPhase, RoastProfile, RoastTelemetry
+    from roastpilot_agent.store import RoastStore
+    from tests.conftest import FakeMCPClient
+
+    store_path = tmp_path / "trace" / "live.sqlite3"
+    profile = RoastProfile(
+        name="House Espresso",
+        bean_origin="Ethiopia",
+        bean_varietal="Heirloom",
+        bean_weight_grams=250.0,
+        initial_heat_percent=70,
+        initial_fan_percent=40,
+        target_drop_temp_c=205.0,
+        target_development_percent=20.0,
+    )
+
+    class _FakeMCP:
+        running = True
+        call_tool = staticmethod(_make_call_tool(_runtime_config_payload(roaster_driver="mock")))
+
+        async def stop(self) -> None:
+            return None
+
+    async def _seed_then_build(
+        config: AppConfig, *, store_path: Path
+    ) -> tuple[RoastService, _FakeMCP, RoastStore]:
+        # Pre-seed a possibly-active run mid-roast (no completed_at → recoverable)
+        # in the SAME store the wired service reads, then return a genuinely-wired
+        # service (real roaster + advisor) so recover_on_start actually classifies.
+        store = RoastStore(store_path)
+        await store.initialize()
+        await store.create_run(
+            run_id="run-104",
+            profile=profile,
+            config=config,
+            agent_phase=RoastPhase.PREHEATING,
+        )
+        roaster = FakeMCPClient([RoastTelemetry(bean_temp_c=150.0, env_temp_c=160.0)])
+        service = RoastService(
+            store,
+            config=config,
+            mcp=_FakeMCP(),  # type: ignore[arg-type]  # liveness-only handle
+            roaster=roaster,
+            advisor=FakeAdvisor(),
+            run_loop=False,  # don't auto-start a loop; assert the recovered phase
+        )
+        return service, _FakeMCP(), store
+
+    # Wrap create_app so we capture the app _serve_live actually builds, while the
+    # REAL factory (with its default recovery lifespan) runs unchanged.
+    built_apps: list[Any] = []
+    real_create_app = create_app
+
+    def _capturing_create_app(*args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        app = real_create_app(*args, **kwargs)
+        # A no-recovery lifespan would be an explicit kwarg — assert the live path
+        # never passes one, so it cannot opt out of recovery.
+        assert "lifespan" not in kwargs, "live serve path must not override the recovery lifespan"
+        built_apps.append(app)
+        return app
+
+    monkeypatch.setattr(api, "create_app", _capturing_create_app)
+    monkeypatch.setattr(live, "build_live_service", _seed_then_build)
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "serve", "--port", "0", "--db", str(store_path)],
+    )
+
+    assert cli.main() == 0
+    assert len(built_apps) == 1, "_serve_live should build exactly one app"
+    app = built_apps[0]
+
+    async def _assert_recovery() -> None:
+        # _serve_live's teardown closed the store; re-open it (initialize is
+        # idempotent and re-connects to the same on-disk DB, where the seeded
+        # mid-roast run still lives) before entering the lifespan.
+        store: RoastStore = app.state.service._store  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        await store.initialize()
+        try:
+            # Enter the captured app's lifespan — the one _serve_live built. The
+            # recovery _lifespan runs recover_on_start; the run must land in
+            # recovery, never auto-resumed to a hardware-active phase, with no
+            # roaster write.
+            async with app.router.lifespan_context(app):
+                recovered = await store.read_run("run-104")
+                assert recovered is not None
+                assert recovered.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+                roaster = app.state.service._roaster  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+                assert roaster.calls == [], (
+                    "recovery must not issue any roaster write (no auto-resume)"
+                )
+        finally:
+            await store.close()
+
+    asyncio.run(_assert_recovery())
 
 
 def test_resolve_live_store_path_precedence(
