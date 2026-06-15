@@ -21,10 +21,11 @@
 > after the next roast. **E11 (packaging) remains gated** behind D35 + the D28/D27 gates below.
 >
 > **D36 (14 Jun, operator) — refines D35 §7.1.** (a) The post-FC loop's context (#223) gains a
-> **windowed telemetry series** (5 s samples; recent full-res window + milestone summary) +
-> **derived features** (predicted-FC ETA off the *profile* FC band not a hardcoded 180, RoR
-> curvature/crash-flick, TP+recovery, distance-from-reference, control-signal entropy as the
-> anti-thrash signal) — **folded into #223, part of the first roast.** (b) **Deferred after the
+> **windowed telemetry series** (5 s samples; recent full-res window + milestone summary —
+> turning point / recovery / drying-end / FC) + **derived features** (predicted-FC ETA off the
+> *profile* FC band not a hardcoded 180, RoR curvature/crash-flick, TP+recovery,
+> distance-from-reference, control-signal entropy as the anti-thrash signal) — **folded into
+> #223, part of the first roast.** (b) **Deferred after the
 > first good roast:** **#228** an anticipatory pre-FC LLM **advisory layer** over the
 > deterministic floor (late-Maillard→FC; advisory-only, same safety box + deadband +
 > execute-or-not, fails closed to the deterministic trim; must clear the baked-roast negative

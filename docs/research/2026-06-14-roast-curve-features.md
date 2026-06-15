@@ -111,9 +111,11 @@ command samples.
 ## Artisan reference implementation (verified in source, 15 Jun)
 
 To recover the claims the harness's Artisan fetch dropped, the Artisan source was cloned
-(`github.com/artisan-roaster-scope/artisan`) and read directly. This is the canonical
-reference implementation and it **corrects two folk descriptions** above with concrete,
-liftable algorithms (citations are `file:line` in `src/artisanlib/`):
+(`github.com/artisan-roaster-scope/artisan`) and read directly. **Pinned at commit `137fa82`
+(2026-06-09)** — Artisan is actively developed, so the `file:line` citations below will drift;
+re-anchor against that SHA. This is the canonical reference implementation and it **corrects
+two folk descriptions** above with concrete, liftable algorithms (citations are `file:line` in
+`src/artisanlib/`):
 
 - **Live RoR is a least-squares slope, NOT a finite difference.** When `polyfitRoRcalc` is
   on, RoR is a **degree-1 `numpy.polyfit` over a configurable span** (default `deltaBTspan`
@@ -129,7 +131,10 @@ liftable algorithms (citations are `file:line` in `src/artisanlib/`):
   RoR *acceleration* (dRoR/dt)** thereafter. Crucially it projects off the **raw, unsmoothed
   RoR** (`unfiltereddelta2_pure`) to avoid the smoothing phase-lag. `canvas.py:6690-6712`
   (linear), `6738-6761` (quadratic accel), `6743` (raw-RoR note). → This is a directly
-  liftable FC-ETA algorithm; note the smooth-for-display / project-off-raw split.
+  liftable FC-ETA algorithm; note the smooth-for-display / project-off-raw split. **Caveat:
+  the 5-min linear→quadratic switch is an Artisan engineering choice, not a physics boundary —
+  treat it as a tunable, don't cargo-cult the constant** (it likely reflects Artisan's default
+  profile assumptions; validate the crossover on our own roasts).
 - **AUC (area under curve) is a live thermal-dose feature we missed** — trapezoidal
   integration each sample (`main.py:24370-24391`), with a **closed-form time-to-target-AUC**
   prediction by solving a quadratic on (RoR, accel). `main.py:24314-24317`. Worth adding to
@@ -197,6 +202,9 @@ if it meaningfully sharpens the audio mark, but not load-bearing for D36's antic
 
 Primary: Bandt & Pompe, *Permutation Entropy* (researchgate 11364831); Choudhury et al.,
 stiction detection (sciencedirect S0959152404001106); Hurst/DFA control-performance
-(sciencedirect S240589632200605X, springer s11071-017-3484-3); Birmingham roast-simulation
-(RMSE 2.7 °C). Practitioner: Cropster (FC prediction, flick); Scott Rao + artisan-roasterscope
-(RoR, smoothing, DTR); Mill47 (rise/crash/flick).
+(sciencedirect S240589632200605X, springer s11071-017-3484-3); Birmingham roast-simulation,
+RMSE 2.7 °C (`research.birmingham.ac.uk/en/publications/simulation-of-coffee-roasting-time-temperature-profiles/`).
+Practitioner: Cropster (FC prediction, flick); Scott Rao — FC ET-RoR trough
+(`scottrao.com/blog/2018/11/25/how-to-use-cropster-to-know-exactly-when-first-crack-began`)
++ artisan-roasterscope (RoR, smoothing, DTR); Mill47 (rise/crash/flick); Artisan source pinned
+at `137fa82`.
