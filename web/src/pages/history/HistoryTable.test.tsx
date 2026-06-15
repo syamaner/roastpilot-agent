@@ -13,6 +13,7 @@ function summary(overrides: Partial<RoastSummary> = {}): RoastSummary {
     id: "r1",
     started_at_utc: "2026-06-07T14:00:00Z",
     completed_at_utc: "2026-06-07T14:12:00Z",
+    first_crack_at_utc: "2026-06-07T14:09:00Z",
     agent_phase: "complete",
     outcome: "completed",
     bean_origin: "Ethiopian Yirgacheffe",
@@ -45,5 +46,22 @@ describe("HistoryTable bean identity (#164)", () => {
   it("omits the Blend badge for a single-origin run (and pre-#164 rows)", () => {
     renderTable([summary({ id: "single", is_blend: false, country: null })]);
     expect(screen.queryByTestId("history-blend-badge")).not.toBeInTheDocument();
+  });
+});
+
+describe("HistoryTable first-crack time (#111)", () => {
+  it("renders an FC column header", () => {
+    renderTable([summary()]);
+    expect(screen.getByRole("columnheader", { name: "FC" })).toBeInTheDocument();
+  });
+
+  it("shows the first-crack time as UTC HH:MM", () => {
+    renderTable([summary({ id: "fc", first_crack_at_utc: "2026-06-07T14:09:30Z" })]);
+    expect(screen.getByTestId("history-fc")).toHaveTextContent("14:09");
+  });
+
+  it("shows an em-dash empty state when the run never reached first crack", () => {
+    renderTable([summary({ id: "no-fc", first_crack_at_utc: null })]);
+    expect(screen.getByTestId("history-fc")).toHaveTextContent("—");
   });
 });

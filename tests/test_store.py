@@ -763,3 +763,91 @@ async def test_created_at_is_trigger_guarded_too(tmp_store: RoastStore) -> None:
             )
     finally:
         await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_projects_first_crack_time(tmp_store: RoastStore) -> None:
+    """``list_runs`` projects the earliest ``first_crack`` event time (#111).
+
+    Both FC paths (MCP detection and the operator override) emit a
+    ``first_crack`` roast event, so the projection reads either crossing. The
+    earliest such event wins when more than one is present.
+    """
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc="2026-06-07T14:09:00+00:00",
+        )
+        # A later, duplicate FC event must not shadow the earliest one.
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.OPERATOR,
+            recorded_at_utc="2026-06-07T14:11:00+00:00",
+        )
+        runs = await tmp_store.list_runs()
+        assert len(runs) == 1
+        assert runs[0].first_crack_at_utc == "2026-06-07T14:09:00+00:00"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_first_crack_time_orders_by_event_time_not_id(
+    tmp_store: RoastStore,
+) -> None:
+    """The FC projection orders by ``recorded_at_utc``, not insertion ``id`` (#111).
+
+    ``record_event`` accepts an explicit ``recorded_at_utc``, so a later-inserted
+    event (higher ``id``) can carry an *earlier* timestamp. Inserting two
+    ``first_crack`` events out of order — the LOWER-id one with the LATER time,
+    the HIGHER-id one with the EARLIER time — and asserting the EARLIER timestamp
+    is returned proves the query is time-ordered, the failure mode an id-ordered
+    subquery would silently get wrong.
+    """
+    earlier = "2026-06-07T14:09:00+00:00"
+    later = "2026-06-07T14:11:00+00:00"
+    await seeded_store(tmp_store)
+    try:
+        # Inserted FIRST (lower id) but the LATER event time.
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.OPERATOR,
+            recorded_at_utc=later,
+        )
+        # Inserted SECOND (higher id) but the EARLIER event time.
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            recorded_at_utc=earlier,
+        )
+        runs = await tmp_store.list_runs()
+        assert len(runs) == 1
+        # Earliest by time wins, even though it has the higher insertion id.
+        assert runs[0].first_crack_at_utc == earlier
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_runs_first_crack_time_none_without_fc(tmp_store: RoastStore) -> None:
+    """A run that never reached first crack serializes ``first_crack_at_utc`` as
+    ``None`` (#111 back-compat: pre-FC runs and any run with no FC event)."""
+    await seeded_store(tmp_store)
+    try:
+        # A non-FC event exists, but no first_crack event for this run.
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.RUN_STARTED,
+            source=RoastEventSource.CONTROLLER,
+        )
+        runs = await tmp_store.list_runs()
+        assert len(runs) == 1
+        assert runs[0].first_crack_at_utc is None
+    finally:
+        await tmp_store.close()

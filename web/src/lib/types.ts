@@ -211,6 +211,10 @@ export interface RoastSummary {
   id: string;
   started_at_utc: string;
   completed_at_utc: string | null;
+  // UTC ISO-8601 first-crack time (#111), projected server-side from the earliest
+  // persisted `first_crack` roast event; `null` when the run never reached first
+  // crack (back-compat). The history FC-time column renders from this.
+  first_crack_at_utc: string | null;
   agent_phase: RoastPhase;
   outcome: RoastOutcome | null;
   bean_origin: string;
