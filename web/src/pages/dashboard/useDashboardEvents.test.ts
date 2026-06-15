@@ -145,6 +145,37 @@ describe("dashboardReducer", () => {
     expect(s.points.map((p) => p.t)).toEqual([0, 30, 60]);
   });
 
+  it("interleaves a re-seed that FILLS gaps between live points, staying ascending (#155 merge)", () => {
+    // The mergeSeed rewrite (#155) is a two-pointer merge of two ascending sequences;
+    // this guards the interleave the old per-point insertion handled — a re-seed whose
+    // ticks fall BETWEEN existing live points, supplied out of order and with an
+    // internal duplicate, must still produce one ascending, deduped, existing-wins curve.
+    let s = dashboardReducer(initialDashboardViewModel, {
+      kind: "seed",
+      points: [
+        { t: 0, bean: 100, env: 120, ror: 12, heat: 70, fan: 40 },
+        { t: 60, bean: 999, env: 180, ror: 12, heat: 70, fan: 40 }, // a "live" value at t=60
+      ],
+    });
+    // A backfill that fills t=30 and t=90 (gaps), arrives unsorted, repeats t=60 (a dupe
+    // vs the existing point) and repeats t=30 within itself.
+    s = dashboardReducer(s, {
+      kind: "seed",
+      points: [
+        { t: 90, bean: 190, env: 210, ror: 12, heat: 70, fan: 40 },
+        { t: 30, bean: 130, env: 150, ror: 12, heat: 70, fan: 40 },
+        { t: 60, bean: 160, env: 180, ror: 12, heat: 70, fan: 40 }, // dupe of existing → skipped
+        { t: 30, bean: 131, env: 151, ror: 12, heat: 70, fan: 40 }, // dupe within seed → first wins
+      ],
+    });
+    // One ascending, deduped sequence covering both windows.
+    expect(s.points.map((p) => p.t)).toEqual([0, 30, 60, 90]);
+    // Existing point at t=60 won over the seed's duplicate (999, not 160).
+    expect(s.points.find((p) => p.t === 60)?.bean).toBe(999);
+    // The first seed entry for the within-seed duplicate t=30 won (130, not 131).
+    expect(s.points.find((p) => p.t === 30)?.bean).toBe(130);
+  });
+
   it("sets the latest advisory + verdict from an advisory frame with a decision", () => {
     const s = dashboardReducer(initialDashboardViewModel, ev("advisory", ADVISORY_DECISION));
     expect(s.latestAdvisory?.decision?.target_heat).toBe(60);

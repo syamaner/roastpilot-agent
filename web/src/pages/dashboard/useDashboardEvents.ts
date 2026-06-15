@@ -159,13 +159,40 @@ function upsertPoint(points: CurvePoint[], point: CurvePoint): CurvePoint[] {
 /** Merge a backfilled snapshot series into the live buffer, deduping on `t`. Existing
  *  points (already-seen live frames) win over a re-seed's duplicates, so a reconnect
  *  re-hydrate only FILLS the window the device missed and never double-plots or
- *  clobbers fresher live data. */
+ *  clobbers fresher live data.
+ *
+ *  Linear two-pointer merge of two ascending sequences (#155): `points` is kept
+ *  sorted by `upsertPoint`, and the additions are sorted here, so the merge is
+ *  O(M + N) rather than the old per-addition `upsertPoint` scan (O(M×N) when many
+ *  additions land mid-buffer). On a `t` collision the existing live point wins (the
+ *  addition is skipped). */
 function mergeSeed(points: CurvePoint[], seed: CurvePoint[]): CurvePoint[] {
   const present = new Set(points.map((p) => p.t));
-  const additions = seed.filter((p) => !present.has(p.t));
+  // Dedupe vs the live buffer, then dedupe within the seed itself and sort ascending
+  // so the two-pointer merge below sees a clean ascending sequence (a downsampled
+  // snapshot is chronological in practice, but don't depend on it).
+  const seenInSeed = new Set<number>();
+  const additions: CurvePoint[] = [];
+  for (const p of seed) {
+    if (present.has(p.t) || seenInSeed.has(p.t)) continue;
+    seenInSeed.add(p.t);
+    additions.push(p);
+  }
   if (additions.length === 0) return points;
-  let merged = points;
-  for (const p of additions) merged = upsertPoint(merged, p);
+  additions.sort((a, b) => a.t - b.t);
+
+  // Merge the two ascending, mutually-disjoint sequences. No `t` collisions remain
+  // between them (additions were filtered against `present`), so this is a plain
+  // ascending interleave.
+  const merged: CurvePoint[] = new Array<CurvePoint>(points.length + additions.length);
+  let i = 0;
+  let j = 0;
+  let k = 0;
+  while (i < points.length && j < additions.length) {
+    merged[k++] = points[i].t <= additions[j].t ? points[i++] : additions[j++];
+  }
+  while (i < points.length) merged[k++] = points[i++];
+  while (j < additions.length) merged[k++] = additions[j++];
   return merged;
 }
 
