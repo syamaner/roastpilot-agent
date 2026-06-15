@@ -60,7 +60,16 @@ jobs:
       # in-process; this is the belt-and-braces `git diff` form the issue asks
       # for, with an explicit diff + "regenerate with X" hint on failure. It
       # restores the tree on exit (never leaves the fixtures dirty).
+      #
+      # `if: always()` (#237): the in-sync pytest tests fail FIRST on a real
+      # drift, so under the default success() condition this dedicated gate — the
+      # one carrying the developer-facing diff + "regenerate with X" hint, its
+      # whole reason to exist over pytest alone — would be SKIPPED in exactly the
+      # scenario it is for. Running it always surfaces the hint on a real drift
+      # while leaving pytest's own in-process coverage of the in-sync tests intact
+      # (the smaller change than reordering the step).
       - name: Contract-drift gate (regenerate-and-compare)
+        if: always()
         run: python scripts/check_contract_drift.py
 
       - name: Upload coverage to Codecov
