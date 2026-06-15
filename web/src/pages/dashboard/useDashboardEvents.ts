@@ -174,6 +174,12 @@ function mergeSeed(points: CurvePoint[], seed: CurvePoint[]): CurvePoint[] {
   const seenInSeed = new Set<number>();
   const additions: CurvePoint[] = [];
   for (const p of seed) {
+    // Intra-seed duplicate `t` is FIRST-wins here (we keep the first, skip the rest) —
+    // a deliberate change from the old per-point `upsertPoint` loop, which replaced on
+    // `t` (LAST-wins). Moot for the real path: the /telemetry backfill series carries
+    // unique timestamps, so no within-seed `t` collision occurs. The load-bearing
+    // invariant is unaffected — an EXISTING live point still wins over ANY seed point
+    // (the `present.has(p.t)` guard), so a re-seed never clobbers fresher live data.
     if (present.has(p.t) || seenInSeed.has(p.t)) continue;
     seenInSeed.add(p.t);
     additions.push(p);
