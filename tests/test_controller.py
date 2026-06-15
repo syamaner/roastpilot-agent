@@ -1928,6 +1928,163 @@ async def test_development_clock_survives_recovery_resume() -> None:
     assert advisor.contexts[-1].development_elapsed_seconds == 100.0
 
 
+# --- #219: the advisor's DTR clock is charge-referenced (T0), server-side only.
+# The chart/readout clock (ControllerSnapshot.roast_elapsed_seconds) stays
+# run/preheat-referenced — re-origining the chart at charge is deferred to #220.
+
+
+@pytest.mark.asyncio
+async def test_advisor_roast_elapsed_zero_before_charge() -> None:
+    """The advisor context's ``roast_elapsed_seconds`` (the DTR denominator) is
+    0.0 before charge (#219): it zeros at charge by roasting convention, and
+    there is no DTR before there is a bean on the drum. Holds even after preheat
+    time has elapsed (a consult that runs pre-charge sees 0.0, not the preheat
+    duration)."""
+    advisor = FakeAdvisor([decision()])
+    harness = make_harness(readings=[reading()], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    harness.clock.advance(300.0)  # five minutes of preheat, no charge yet
+    # A bare transition_to does NOT stamp the charge clock — only the debounced-T0
+    # path in _apply_phase_rules does (see the next test). So the advisor's
+    # charge-referenced clock is still 0.0 even though the run clock is 300 s.
+    harness.controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert advisor.contexts[-1].roast_elapsed_seconds == 0.0
+
+
+@pytest.mark.asyncio
+async def test_advisor_roast_elapsed_counts_from_charge_not_run_start() -> None:
+    """Regression for the live 'test 6' defect (#219): the advisor's DTR clock was
+    referenced to run/preheat start, so a roast that charged late fed an inflated
+    roast duration → understated DTR → late drop past the bitter ceiling. The
+    advisor context must count from the debounced T0/charge instant. Here ~5 min
+    of preheat precedes charge; the advisor sees time-since-charge only, NOT
+    preheat + time-since-charge."""
+    crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
+    turned = reading(bean=95.0, t0_detected=True, bean_ror_c_per_min=5.0)
+    advisor = FakeAdvisor([decision(heat=40, fan=60)])
+    harness = make_harness(readings=[crashing], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    harness.clock.advance(300.0)  # the preheat the OLD advisor clock wrongly counted
+    # Debounce three T0 ticks → charge transition stamps the charge clock on the
+    # third (at clock=302.0: 300 + two 1.0 advances inside the loop).
+    for _ in range(3):
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    # The bean turns: the settle window releases and the advisor is consulted.
+    harness.reader.readings = [turned]
+    harness.clock.advance(1.0)  # clock → 304.0
+    await harness.controller.tick()
+    ctx = advisor.contexts[-1]
+    # Charge stamped at clock=302.0; this consult runs at clock=304.0 → 2.0 s,
+    # NOT ~304 s from run start (the old run-start bug).
+    assert ctx.roast_elapsed_seconds == pytest.approx(2.0)
+    assert ctx.roast_elapsed_seconds < 300.0
+    # It matches seconds_since_charge (same charge instant, the bake-off convention).
+    assert ctx.roast_elapsed_seconds == pytest.approx(ctx.seconds_since_charge)
+
+
+@pytest.mark.asyncio
+async def test_advisor_dtr_is_charge_referenced_post_fc() -> None:
+    """The DTR the advisor computes (development_elapsed / roast_elapsed) is now
+    charge-referenced end to end (#219), matching the v4-prompt definition the
+    bake-off validated. Charge → 100 s pre-FC → FC → 25 s development gives DTR =
+    25 / 125 = 0.20, not 25 / (preheat + 125)."""
+    crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
+    advisor = FakeAdvisor([decision()])
+    harness = make_harness(readings=[crashing], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    harness.clock.advance(600.0)  # long preheat — would dominate a run-start clock
+    for _ in range(3):  # debounce → charge stamp on the 3rd tick (clock=602.0)
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    harness.clock.advance(100.0 - 1.0)  # 100 s total since the charge stamp at FC
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)  # FC edge arms dev clock
+    harness.clock.advance(25.0)  # development time
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    ctx = advisor.contexts[-1]
+    assert ctx.development_elapsed_seconds is not None
+    assert ctx.development_elapsed_seconds == pytest.approx(25.0)
+    assert ctx.roast_elapsed_seconds == pytest.approx(125.0)  # NOT 600 + 125
+    dtr = ctx.development_elapsed_seconds / ctx.roast_elapsed_seconds
+    assert dtr == pytest.approx(0.20)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_clock_stays_run_referenced_not_charge() -> None:
+    """The chart/readout clock the SPA renders — ``ControllerSnapshot.
+    roast_elapsed_seconds`` — stays run/preheat-referenced (#219 re-scope). The
+    dashboard plots each point at ``t = elapsed_seconds`` and must keep showing
+    the pre-charge preheat/RoR curve (#165); a charge-referenced value would
+    collapse every pre-charge row onto x=0. Charge-referencing is confined to the
+    advisor context; re-origining the chart at charge is deferred to #220."""
+    crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
+    harness = make_harness(readings=[crashing])
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    harness.clock.advance(180.0)  # preheat
+    # Pre-charge the snapshot clock already counts the preheat (run-referenced),
+    # NOT a flat charge-referenced 0.0 — so pre-charge telemetry charts/persists.
+    assert harness.controller.snapshot().roast_elapsed_seconds == pytest.approx(180.0)
+    # Charge, then a tick: the snapshot clock keeps counting from run start
+    # (~181 s), it does NOT reset to ~0 at charge.
+    for _ in range(3):
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert harness.controller.snapshot().roast_elapsed_seconds == pytest.approx(183.0)
+
+
+@pytest.mark.asyncio
+async def test_advisor_charge_clock_resets_on_new_run() -> None:
+    """A new run/preheat clears the charge clock (#219), so a stale charge time
+    from a prior roast never inflates the next roast's advisor DTR clock — it
+    reads 0.0 again until the next charge stamps it."""
+    crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
+    turned = reading(bean=95.0, t0_detected=True, bean_ror_c_per_min=5.0)
+    advisor = FakeAdvisor([decision(), decision()])
+    harness = make_harness(readings=[crashing], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    for _ in range(3):  # charge the first roast
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    harness.reader.readings = [turned]
+    await harness.controller.tick()  # bean turned → advisor consulted, charged clock > 0
+    assert advisor.contexts[-1].roast_elapsed_seconds > 0.0
+    # Finish and start a fresh run along the legal path.
+    for step in [
+        RoastPhase.DEVELOPMENT,
+        RoastPhase.COOLING,
+        RoastPhase.COMPLETE,
+        RoastPhase.IDLE,
+        RoastPhase.STARTING,
+        RoastPhase.PREHEATING,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    ]:
+        harness.controller.transition_to(step)
+    harness.clock.advance(50.0)
+    harness.reader.readings = [reading()]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    # The fresh run never re-charged (bare transition), so the advisor clock is 0.0.
+    assert advisor.contexts[-1].roast_elapsed_seconds == 0.0
+
+
 @pytest.mark.asyncio
 async def test_advisor_drop_now_executes() -> None:
     advisor = FakeAdvisor([decision(drop=True)])
