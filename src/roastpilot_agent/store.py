@@ -702,11 +702,19 @@ class RoastStore:
         snapshot via a correlated subquery — one statement, no N+1 — and is
         ``None`` for a run that never recorded one.
 
-        First-crack time (#111) comes from the earliest persisted ``first_crack``
-        roast event (the ``idx_roast_events_run_kind`` index covers the lookup)
-        and is ``None`` for a run that never reached first crack — both the MCP
-        detection and the operator-override FC paths emit that event, so either
-        crossing is projected."""
+        First-crack time (#111) is the *chronologically earliest* persisted
+        ``first_crack`` roast event for the run (the ``idx_roast_events_run_kind``
+        index covers the lookup), and is ``None`` for a run that never reached
+        first crack — both the MCP detection and the operator-override FC paths
+        emit that event, so either crossing is projected.
+
+        The subquery orders by ``recorded_at_utc`` (the event time), NOT by the
+        insertion ``id``: ``record_event`` accepts an explicit ``recorded_at_utc``,
+        so a later-inserted event can carry an earlier timestamp, and ordering by
+        ``id`` would then return the wrong FC time. The stored value is always
+        ``datetime.now(UTC).isoformat()`` (see :func:`_utc_now`) — a fixed-width
+        ISO-8601 string with a constant ``+00:00`` offset — so a lexicographic
+        ``ORDER BY`` on the text column is also chronological."""
         async with self.connection.execute(
             "SELECT r.id, r.started_at_utc, r.completed_at_utc, r.agent_phase,"
             " r.outcome, r.profile_json, r.operator_rating,"
@@ -715,7 +723,7 @@ class RoastStore:
             "  ORDER BY t.tick DESC LIMIT 1) AS dev_pct,"
             " (SELECT e.recorded_at_utc FROM roast_events e"
             "  WHERE e.run_id = r.id AND e.kind = 'first_crack'"
-            "  ORDER BY e.id ASC LIMIT 1) AS fc_at"
+            "  ORDER BY e.recorded_at_utc ASC LIMIT 1) AS fc_at"
             " FROM roast_runs r ORDER BY r.started_at_utc DESC, r.rowid DESC"
         ) as cursor:
             rows = await cursor.fetchall()
