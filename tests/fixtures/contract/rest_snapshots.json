@@ -1,7 +1,7 @@
 {
   "roast_detail": {
     "agent_phase": "complete",
-    "completed_at_utc": "2026-06-14T10:55:51.088222+00:00",
+    "completed_at_utc": "2026-01-01T00:00:00+00:00",
     "enabled_actions": [
       "pause_advisory",
       "resume_advisory",
@@ -9,7 +9,7 @@
     ],
     "export_manifest": null,
     "fault_reason": null,
-    "id": "5087089bb6094c52a0a5d446b7c6309d",
+    "id": "00000000000000000000000000000000",
     "mic_status": {
       "audio_running": true,
       "dropped_window_count": 0,
@@ -36,24 +36,24 @@
       "initial_heat_percent": 80,
       "is_blend": false,
       "name": "cooling-complete",
-      "target_development_percent": 20.0,
-      "target_drop_temp_c": 205.0
+      "target_development_percent": 15.0,
+      "target_drop_temp_c": 195.0
     },
     "rating": null,
-    "started_at_utc": "2026-06-14T10:55:51.079503+00:00"
+    "started_at_utc": "2026-01-01T00:00:00+00:00"
   },
   "roast_summary": {
     "agent_phase": "complete",
     "bean_origin": "Replay (recorded roast)",
     "bean_species": null,
     "bean_varietal": null,
-    "completed_at_utc": "2026-06-14T10:55:51.088222+00:00",
+    "completed_at_utc": "2026-01-01T00:00:00+00:00",
     "country": null,
     "development_percent": null,
-    "id": "5087089bb6094c52a0a5d446b7c6309d",
+    "id": "00000000000000000000000000000000",
     "is_blend": false,
     "outcome": "completed",
     "rating": null,
-    "started_at_utc": "2026-06-14T10:55:51.079503+00:00"
+    "started_at_utc": "2026-01-01T00:00:00+00:00"
   }
 }

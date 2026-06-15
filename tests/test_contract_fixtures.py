@@ -24,13 +24,28 @@ The five the fixtures don't exercise (``safety_alert``, ``recovery_acknowledged`
 real ``model_dump()`` payloads through the **same** real ``EventBroadcaster`` so
 every ``SseEventType`` is pinned. A coverage assertion fails if a new event type
 is ever added and left unmapped.
+
+**Continuous server-drift auto-catch (#121).** PR #120 caught SPA-side drift
+continuously (the vitest runs against the committed fixture) and a *deliberate*
+server rename (the dev regenerates → vitest red), but it could NOT auto-catch an
+*accidental* server-side field rename where the dev forgot to regenerate: the
+committed fixture went stale and CI stayed green. #121 closes that gap. The
+volatile fields (the broadcaster ``id`` sequence, ``elapsed_seconds``, the run
+id, ``started_at_utc`` / ``completed_at_utc``) are normalized to fixed sentinels
+so a regeneration is byte-deterministic, then a default-on test
+(:func:`test_committed_sse_fixture_is_in_sync_with_server` /
+:func:`test_committed_rest_fixture_is_in_sync_with_server`) rebuilds the fixture
+in memory from the live server and asserts it equals the committed bytes. An
+accidental server reshape now fails a plain ``pytest`` run with a "regenerate
+with X" hint — no manual regen needed. ``scripts/check_contract_drift.py`` wires
+the same regenerate-and-compare into CI as a ``git diff``-style gate.
 """
 
 import asyncio
 import json
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import pytest_asyncio
@@ -77,6 +92,80 @@ _regen_only = pytest.mark.skipif(
     not os.environ.get("REGEN_CONTRACT_FIXTURES"),
     reason="fixture-write test: set REGEN_CONTRACT_FIXTURES=1 to regenerate on demand",
 )
+
+# Fixed sentinels for the volatile fields, so a regeneration is byte-deterministic
+# (#121). Without these, every regen rewrites the broadcaster `id` sequence, the
+# random run id, and the wall-clock timestamps — masking real server drift in the
+# `git diff`. The contract these fields *carry* is shape, not value (the SPA looks
+# frames up by `event`, never by `id`; it reads timestamps as opaque ISO strings),
+# so pinning the value loses no contract coverage while making drift detectable.
+_SENTINEL_SSE_ID = 0
+_SENTINEL_RUN_ID = "00000000000000000000000000000000"
+_SENTINEL_TIMESTAMP = "2026-01-01T00:00:00+00:00"
+_SENTINEL_ELAPSED = 0.0
+
+# The hint printed when the committed fixture is out of sync with the server.
+_REGEN_HINT = (
+    "committed contract fixture is out of sync with the server — a server model "
+    "reshaped without the fixture being regenerated (the #115 drift class). "
+    "Regenerate with: REGEN_CONTRACT_FIXTURES=1 python -m pytest "
+    "tests/test_contract_fixtures.py"
+)
+
+
+# A dumped frame/snapshot is JSON-shaped (model_dump(mode="json")); the fixture
+# payloads are JSON objects whose values are frames, frame-lists, or snapshots.
+_JsonObj = dict[str, Any]
+_FixturePayload = dict[str, Any]
+
+
+def _normalize_sse_frame(raw: _JsonObj) -> _JsonObj:
+    """Pin a dumped SSE frame's volatile fields to fixed sentinels (#121).
+
+    ``id`` is the broadcaster's monotonic sequence (varies with tick count); the
+    telemetry frame's ``elapsed_seconds`` is wall-clock-derived. Both are pinned
+    so a regeneration is deterministic. A ``null`` id (the API-built heartbeat)
+    stays ``null`` — that is a real contract distinction (``int | None``), not a
+    volatile value.
+
+    Args:
+        raw: One ``SseEvent.model_dump(mode="json")`` dict.
+
+    Returns:
+        The same dict, mutated in place, with volatile fields normalized.
+    """
+    if raw.get("id") is not None:
+        raw["id"] = _SENTINEL_SSE_ID
+    data = raw.get("data")
+    if isinstance(data, dict) and "elapsed_seconds" in data:
+        data["elapsed_seconds"] = _SENTINEL_ELAPSED
+    return raw
+
+
+def _normalize_rest_snapshot(raw: _JsonObj) -> _JsonObj:
+    """Pin a dumped REST snapshot's volatile fields to fixed sentinels (#121).
+
+    ``id`` is a random run id; ``started_at_utc`` / ``completed_at_utc`` are
+    wall-clock. All three are pinned so the snapshot regenerates deterministically
+    while still exercising the field shape (a present, non-null ISO string / id).
+
+    Args:
+        raw: A ``RoastDetail`` or ``RoastSummary`` ``model_dump(mode="json")`` dict.
+
+    Returns:
+        The same dict, mutated in place, with volatile fields normalized.
+    """
+    if "id" in raw:
+        raw["id"] = _SENTINEL_RUN_ID
+    for key in ("started_at_utc", "completed_at_utc"):
+        if raw.get(key) is not None:
+            raw[key] = _SENTINEL_TIMESTAMP
+    return raw
+
+
+def _serialize(payload: object) -> str:
+    """The canonical on-disk form for a contract fixture (stable + diffable)."""
+    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
 
 def _drain(queue: "asyncio.Queue[SseEvent]") -> list[SseEvent]:
@@ -279,25 +368,39 @@ async def test_every_sse_event_type_has_a_real_frame(all_sse_frames: list[SseEve
     assert not missing, f"no real frame captured for: {sorted(m.value for m in missing)}"
 
 
-@_regen_only
-@pytest.mark.asyncio
-async def test_write_sse_frame_fixture(all_sse_frames: list[SseEvent]) -> None:
-    """Write the committed SSE-frame fixture the vitest contract test loads.
+def _build_sse_payload(all_sse_frames: list[SseEvent]) -> _FixturePayload:
+    """The canonical SSE-fixture payload, built from real wire frames (#121).
 
-    One representative frame per type, plus the extra ``advisory`` variants
-    (the SPA parses several shapes off that one event). Each entry is the real
-    ``SseEvent.model_dump`` — ``{event, data, id}``. Writing in a test (not a
-    script) keeps the fixture re-derivable and re-validated on every run.
+    One representative frame per ``SseEventType`` (in declaration order), plus the
+    extra ``advisory`` shapes (pause toggle, skipped) and the ``drop_beans``
+    ``command_executed`` variant the SPA's drop-marker branch parses. Each entry
+    is the real ``SseEvent.model_dump`` with its volatile fields normalized
+    (:func:`_normalize_sse_frame`), so two regenerations are byte-identical.
+
+    This is the single source of truth for the committed fixture: the regenerate
+    test writes its serialization, and the default-on in-sync test compares the
+    committed bytes against its serialization. Building it once means the two can
+    never disagree about the shape.
+
+    Args:
+        all_sse_frames: Every real wire frame from the ``all_sse_frames`` fixture.
+
+    Returns:
+        The fixture dict (``frames`` / ``advisory_variants`` / ``command_variants``).
     """
     by_type = _select_one_per_type(all_sse_frames)
 
     # Frames keyed one-per-type, in the stable SseEventType declaration order.
-    primary = [by_type[t].model_dump(mode="json") for t in SseEventType if t in by_type]
+    primary: list[_JsonObj] = [
+        _normalize_sse_frame(by_type[t].model_dump(mode="json"))
+        for t in SseEventType
+        if t in by_type
+    ]
 
     # The advisory-shape variants the SPA also parses (pause toggle, skipped),
     # beyond the representative (the CLAMP overlay) already in `primary`.
-    advisory_variants = [
-        f.model_dump(mode="json")
+    advisory_variants: list[_JsonObj] = [
+        _normalize_sse_frame(f.model_dump(mode="json"))
         for f in all_sse_frames
         if f.event is SseEventType.ADVISORY and ("advisory_paused" in f.data or "skipped" in f.data)
     ]
@@ -305,37 +408,47 @@ async def test_write_sse_frame_fixture(all_sse_frames: list[SseEvent]) -> None:
     # The `command_executed` shape the SPA's drop-marker branch parses
     # (events.ts / useDashboardEvents reads `data.command === "drop_beans"`),
     # distinct from the heat/fan representative already in `primary`.
-    command_variants = [
-        f.model_dump(mode="json")
+    command_variants: list[_JsonObj] = [
+        _normalize_sse_frame(f.model_dump(mode="json"))
         for f in all_sse_frames
         if f.event is SseEventType.COMMAND_EXECUTED and f.data.get("command") == "drop_beans"
     ]
 
-    payload = {
+    assert command_variants, "no drop_beans command_executed frame captured"
+    # Re-validate: every frame still round-trips through the real SseEvent model
+    # after normalization (so the fixture can never go stale silently vs the model).
+    for raw in primary + advisory_variants + command_variants:
+        SseEvent.model_validate(raw)
+
+    return {
         "frames": primary,
         "advisory_variants": advisory_variants,
         "command_variants": command_variants,
     }
-    _CONTRACT_DIR.mkdir(parents=True, exist_ok=True)
-    _SSE_FRAMES_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-
-    # Re-validate: every written frame round-trips through the real SseEvent model
-    # (so the fixture can never go stale silently against the model).
-    for raw in primary + advisory_variants + command_variants:
-        SseEvent.model_validate(raw)
-
-    assert command_variants, "no drop_beans command_executed frame captured"
 
 
 @_regen_only
 @pytest.mark.asyncio
-async def test_write_rest_snapshot_fixture(tmp_path: Path) -> None:
-    """Write the committed REST-snapshot fixture (RoastDetail + RoastSummary).
+async def test_write_sse_frame_fixture(all_sse_frames: list[SseEvent]) -> None:
+    """Write the committed SSE-frame fixture the vitest contract test loads.
+
+    Regenerate-on-demand only (``REGEN_CONTRACT_FIXTURES=1``). Writes the exact
+    serialization of :func:`_build_sse_payload`; the default-on in-sync test
+    re-derives the same payload and asserts it equals these committed bytes.
+    """
+    _CONTRACT_DIR.mkdir(parents=True, exist_ok=True)
+    _SSE_FRAMES_PATH.write_text(_serialize(_build_sse_payload(all_sse_frames)))
+
+
+async def _collect_rest_snapshots(tmp_path: Path) -> tuple[RoastDetail, RoastSummary]:
+    """Drive a completed cooling replay and return its (detail, summary) snapshots.
 
     Sourced from the real ``RoastService``: a completed cooling run gives a
     ``RoastDetail`` with a real ``enabled_actions`` projection and a
-    ``RoastSummary`` history item. Both are real ``model_dump`` output and are
-    re-validated against their models here.
+    ``RoastSummary`` history item. The detail is enriched with a real, non-null
+    ``MicStatus`` projection (#197) — the same one ``detail()`` applies live to an
+    active run — so the committed snapshot exercises that field shape, not the
+    ``None`` branch the flat export would otherwise leave it on.
     """
     service, source, _queue = await _subscribed_replay(_COOLING_COMPLETE, tmp_path / "rest.sqlite3")
     try:
@@ -348,12 +461,6 @@ async def test_write_rest_snapshot_fixture(tmp_path: Path) -> None:
 
     assert history.runs, "completed replay produced no history row"
     summary = next((r for r in history.runs if r.id == detail.id), history.runs[0])
-
-    # The completed replay's detail carries mic_status=None (the run is no longer
-    # active and the flat export has no live MCP first-crack status). Pin the
-    # mic_status shape (#197) on the committed snapshot the SPA's TS mirror reads
-    # by enriching with a real projection — the same one detail() applies live to
-    # the active run. This keeps the contract field exercised, not null.
     detail = detail.model_copy(
         update={
             "mic_status": MicStatus.from_first_crack_status(
@@ -367,17 +474,44 @@ async def test_write_rest_snapshot_fixture(tmp_path: Path) -> None:
             )
         }
     )
+    return detail, summary
 
+
+def _build_rest_payload(detail: RoastDetail, summary: RoastSummary) -> _FixturePayload:
+    """The canonical REST-fixture payload, with volatile fields normalized (#121).
+
+    Single source of truth shared by the regenerate test and the default-on
+    in-sync test, mirroring :func:`_build_sse_payload`.
+
+    Args:
+        detail: The real ``RoastDetail`` snapshot (mic-status enriched).
+        summary: The matching ``RoastSummary`` history row.
+
+    Returns:
+        The fixture dict (``roast_detail`` / ``roast_summary``), normalized.
+    """
     payload = {
-        "roast_detail": detail.model_dump(mode="json"),
-        "roast_summary": summary.model_dump(mode="json"),
+        "roast_detail": _normalize_rest_snapshot(detail.model_dump(mode="json")),
+        "roast_summary": _normalize_rest_snapshot(summary.model_dump(mode="json")),
     }
-    _CONTRACT_DIR.mkdir(parents=True, exist_ok=True)
-    _REST_SNAPSHOTS_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-
     # Re-validate against the real models so the fixture can't drift from them.
     RoastDetail.model_validate(payload["roast_detail"])
     RoastSummary.model_validate(payload["roast_summary"])
+    return payload
+
+
+@_regen_only
+@pytest.mark.asyncio
+async def test_write_rest_snapshot_fixture(tmp_path: Path) -> None:
+    """Write the committed REST-snapshot fixture (RoastDetail + RoastSummary).
+
+    Regenerate-on-demand only. Writes the exact serialization of
+    :func:`_build_rest_payload`; the default-on in-sync test re-derives the same
+    payload and asserts it equals these committed bytes.
+    """
+    detail, summary = await _collect_rest_snapshots(tmp_path)
+    _CONTRACT_DIR.mkdir(parents=True, exist_ok=True)
+    _REST_SNAPSHOTS_PATH.write_text(_serialize(_build_rest_payload(detail, summary)))
 
 
 @pytest.mark.asyncio
@@ -461,3 +595,65 @@ def test_committed_rest_fixture_matches_models() -> None:
     raw = json.loads(_REST_SNAPSHOTS_PATH.read_text())
     RoastDetail.model_validate(raw["roast_detail"])
     RoastSummary.model_validate(raw["roast_summary"])
+
+
+# --- Continuous server-drift auto-catch (#121) -----------------------------
+#
+# These run on a plain `pytest` (NOT regen-gated). They rebuild the fixture in
+# memory from the live server through the same builders the regenerate tests use,
+# and assert it equals the committed bytes. An accidental server-side reshape that
+# nobody regenerated for now fails CI here — closing the gap PR #120 left open
+# (`test_committed_*_matches_models` only catches an edit that breaks model
+# validation, not a faithful-but-renamed field; the byte compare catches both).
+
+
+@pytest.mark.asyncio
+async def test_committed_sse_fixture_is_in_sync_with_server(all_sse_frames: list[SseEvent]) -> None:
+    """The committed SSE fixture equals a fresh regeneration from the server.
+
+    The continuous half of the #121 guard. Builds the canonical payload from the
+    real wire frames and compares it to the committed bytes; a server reshape that
+    drifted the fixture (without a regen) fails here with the regenerate hint.
+    """
+    fresh = _serialize(_build_sse_payload(all_sse_frames))
+    committed = _SSE_FRAMES_PATH.read_text()
+    assert fresh == committed, _REGEN_HINT
+
+
+@pytest.mark.asyncio
+async def test_committed_rest_fixture_is_in_sync_with_server(tmp_path: Path) -> None:
+    """The committed REST fixture equals a fresh regeneration from the server."""
+    detail, summary = await _collect_rest_snapshots(tmp_path)
+    fresh = _serialize(_build_rest_payload(detail, summary))
+    committed = _REST_SNAPSHOTS_PATH.read_text()
+    assert fresh == committed, _REGEN_HINT
+
+
+@pytest.mark.asyncio
+async def test_in_sync_guard_fails_on_injected_server_drift(
+    all_sse_frames: list[SseEvent],
+) -> None:
+    """Proof the in-sync guard FAILS on a server-side field rename (#121).
+
+    The #120 bar was "must fail on a deliberate rename, proven once." This proves
+    the *continuous* form: simulate an accidental server reshape by renaming a
+    field in the freshly-built payload (here ``phase`` → ``agent_phase`` on the
+    ``phase_changed`` frame, the literal #115 drift), then assert the in-sync
+    byte-compare against the committed fixture goes RED. If this test ever passes,
+    the guard has stopped catching drift and is worthless — so it is itself a
+    must-fail-on-rename sentinel.
+    """
+    payload = _build_sse_payload(all_sse_frames)
+    frames: list[_JsonObj] = payload["frames"]
+    phase_changed = next(f for f in frames if f["event"] == SseEventType.PHASE_CHANGED.value)
+    data: _JsonObj = phase_changed["data"]
+    assert "phase" in data, "expected a `phase` field to rename"
+    # The #115 drift: server renames `phase` → `agent_phase`.
+    data["agent_phase"] = data.pop("phase")
+
+    drifted = _serialize(payload)
+    committed = _SSE_FRAMES_PATH.read_text()
+    assert drifted != committed, (
+        "the in-sync guard did NOT detect an injected `phase`→`agent_phase` rename "
+        "— it has stopped catching server drift"
+    )
