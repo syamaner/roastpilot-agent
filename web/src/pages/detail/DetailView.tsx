@@ -16,11 +16,11 @@
 import { useMemo, useState } from "react";
 
 import { LiveCurve } from "@/components/shared";
-import type { RoastDetail, RoastTimeline, TelemetrySeries } from "@/lib/types";
-// #205: shared DISPLAY-ONLY RoR smoothing (dashboard owns the canonical module).
+// #205: shared DISPLAY-ONLY RoR smoothing (lib/ is the canonical home, #244).
 // Raw `bean_ror_c_per_min` in the contract is untouched — this only smooths the
 // rendered line, identically on the live dashboard and this persisted detail curve.
-import { smoothRorForDisplay } from "@/pages/dashboard/rorSmoothing";
+import { smoothRorForDisplay } from "@/lib/rorSmoothing";
+import type { RoastDetail, RoastTimeline, TelemetrySeries } from "@/lib/types";
 import { AdvisorSummaryChips } from "./AdvisorSummaryChips";
 import { AdvisorTimeline } from "./AdvisorTimeline";
 import { advisorSummary, toAdvisorRows } from "./advisorModel";
