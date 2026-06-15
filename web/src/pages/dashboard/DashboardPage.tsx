@@ -174,6 +174,12 @@ export function DashboardPage(): React.JSX.Element {
   // arrived, else the snapshot's set (so the bar is correct on first paint).
   const effectiveEnabled = enabledActions ?? detail.data?.enabled_actions ?? null;
 
+  // #117: the FaultBanner's acknowledge affordance mirrors server truth — shown
+  // iff the server enables `acknowledge_fault` (only in the `faulted` phase). This
+  // keeps the banner button render-from-server (no client-side command matrix,
+  // D25), consistent with the OperatorActionBar.
+  const canAcknowledgeFault = effectiveEnabled?.includes("acknowledge_fault") ?? false;
+
   // Persistent charge cue (#211): derive the cue's display state from the SERVER
   // phase (preheating), the live bean temperature, and the profile's charge band
   // from the REST snapshot. Tri-state so the cue never goes silent on an
@@ -256,23 +262,36 @@ export function DashboardPage(): React.JSX.Element {
         {/* Fault banner sits above the dashboard when faulted (Prompt B §2).
             Informational + persistent: the fault stays on screen until the
             operator acknowledges it; cooling/e-stop live in the action bar (the
-            faulted run stays operable, #206). The "Start New Roast" affordance
-            dispatches the genuine `acknowledge_fault` action — finalising the
-            operable-faulted run server-side — then clears the sticky-faulted pin
-            (#124) and re-fetches health, returning to the idle Start-roast form.
-            `acknowledge_fault` issues no roaster command (heat is already off). */}
+            faulted run stays operable, #206). The acknowledge affordance (#117) —
+            shown only when the server's enabled_actions mirror enables
+            acknowledge_fault — dispatches the genuine `acknowledge_fault` action,
+            finalising the operable-faulted run server-side, then clears the
+            sticky-faulted pin (#124) and re-fetches health, returning to the idle
+            Start-roast form. `acknowledge_fault` issues no roaster command (heat
+            is already off). */}
         <FaultBanner
           fault={view.fault}
           trail={view.safetyTrail}
+          // #117: the acknowledge affordance is driven by the server's
+          // `enabled_actions` mirror (acknowledge_fault is enabled iff the phase
+          // is `faulted`), NOT a client-side fault check — the no-client-matrix
+          // invariant (D25). When the server stops enabling it, the affordance is
+          // omitted. The genuine `acknowledge_fault` control action (#206)
+          // finalises the operable-faulted run server-side (no roaster command —
+          // heat is already off), then the page clears the sticky pin (#124) and
+          // re-fetches health → the idle Start form. The label is the operator's
+          // real next step.
           startNewRoast={
-            <button
-              type="button"
-              onClick={handleAcknowledgeFault}
-              data-testid="fault-start-new-roast"
-              className="inline-flex items-center rounded-md border border-roast-fault/60 bg-roast-fault/15 px-4 py-2 text-sm font-semibold uppercase tracking-wide text-roast-fault transition-colors hover:bg-roast-fault/25"
-            >
-              Start New Roast
-            </button>
+            canAcknowledgeFault ? (
+              <button
+                type="button"
+                onClick={handleAcknowledgeFault}
+                data-testid="fault-acknowledge"
+                className="inline-flex items-center rounded-md border border-roast-fault/60 bg-roast-fault/15 px-4 py-2 text-sm font-semibold uppercase tracking-wide text-roast-fault transition-colors hover:bg-roast-fault/25"
+              >
+                Acknowledge Fault &amp; Start New Roast
+              </button>
+            ) : undefined
           }
         />
 

@@ -2032,6 +2032,38 @@ async def test_206_estop_in_preheating_then_cool_then_acknowledge(store: RoastSt
 
 
 @pytest.mark.asyncio
+async def test_acknowledge_fault_is_audit_only_issues_no_mcp_write(store: RoastStore) -> None:
+    """#117: acknowledging a fault is audit-only — it records the operator
+    acknowledgement and finalises the run, but the ACK ITSELF issues NO roaster
+    command and never re-triggers emergency_stop. The only MCP write in the trace
+    is the e-stop that caused the fault; the ack tick adds nothing."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)  # preheating
+    # E-stop → fault (the one and only roaster write up to the ack).
+    await service.submit_operator_action(
+        run_id,
+        OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP, payload={"reason": "x"}),
+    )
+    assert not await _tick(service, clock)
+    assert (await store.read_run(run_id)).agent_phase is RoastPhase.FAULTED  # type: ignore[union-attr]
+    commands_before_ack = list(mcp.commands())
+    # The fault was caused by exactly one roaster write: the e-stop.
+    assert commands_before_ack.count("emergency_stop") == 1
+
+    # Acknowledge the fault → finalises, but issues no further MCP write.
+    ack = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    assert ack.result == "accepted"
+    assert await _tick(service, clock)  # finalises this tick
+    # The command trace is UNCHANGED by the ack — no roaster write, no second e-stop.
+    assert mcp.commands() == commands_before_ack
+    final = await store.read_run(run_id)
+    assert final is not None and final.outcome == "faulted"
+
+
+@pytest.mark.asyncio
 async def test_acknowledge_fault_outside_faulted_is_recorded_failed(store: RoastStore) -> None:
     """acknowledge_fault is meaningless outside FAULTED: from preheating the drain
     records a failed operator action and never finalises the run."""
