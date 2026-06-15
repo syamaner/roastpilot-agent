@@ -24,10 +24,15 @@ export interface ChartHookSnapshot {
   markers: { kind: string; t: number; label: string }[];
   highlightTime: number | null;
   chargeBandVisible: boolean;
-  /** Rendered uPlot scale ranges — a test asserts these COVER the data (#131). */
+  /**
+   * Rendered uPlot scale ranges. x is asserted to COVER the data (#131); c and ror
+   * are FIXED (#217), so a test asserts they hold their pinned bounds (0–210 °C,
+   * −20..+30 °C/min) regardless of the live data.
+   */
   scales: {
     x: { min: number | null; max: number | null };
     c: { min: number | null; max: number | null };
+    ror: { min: number | null; max: number | null };
   };
 }
 
