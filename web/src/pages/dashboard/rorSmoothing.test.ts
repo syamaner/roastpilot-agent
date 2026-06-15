@@ -45,8 +45,8 @@ describe("smoothRorForDisplay", () => {
   });
 
   it("computes a centered window average for an interior point", () => {
-    // 1 s spacing, window 5 s → ±2.5 s → indices i-2..i+2. For index 5:
-    // mean(2,3,4,5,6) RoR values.
+    // 1 s spacing, window 5 s → ±2.5 s → indices i-2..i+2. ror = index, so for
+    // index 5 the five samples are indices 3..7, carrying RoR 3,4,5,6,7.
     const points = curve([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
     const smoothed = rorOf(smoothRorForDisplay(points, 5)) as number[];
     expect(smoothed[5]).toBeCloseTo((3 + 4 + 5 + 6 + 7) / 5, 10);
