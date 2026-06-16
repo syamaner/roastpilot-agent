@@ -64,7 +64,7 @@ DEV = (RoastPhase.DEVELOPMENT,)
 # Two frontier models within the post-FC budget (sonnet-4.6, gpt-5.5) alongside
 # the opus-4.8 frontier — none carry latency-risk; recorded latency confirms.
 ROSTER_MAIN: tuple[Candidate, ...] = (
-    Candidate("openai/gpt-4o", Tier.SPEED_AND_POWER, DEV),
+    Candidate("openai/gpt-4o", Tier.PRIOR_FRONTIER, DEV),
     Candidate("openai/gpt-4o-mini", Tier.ULTRA_FLASH, DEV),
     Candidate("google/gemini-3.1-flash-lite", Tier.ULTRA_FLASH, DEV),
     Candidate("anthropic/claude-haiku-4.5", Tier.ULTRA_FLASH, DEV),
