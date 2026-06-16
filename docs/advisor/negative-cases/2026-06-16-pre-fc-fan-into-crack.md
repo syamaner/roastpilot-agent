@@ -68,6 +68,26 @@ not a temperature**. The output (75) and the rationale ("75%") are right, so it 
 but the mental model is muddled. **#274's teaching prompt must state the lever semantics
 explicitly** (heat / fan are 0–100 % duty, their effect + thermal lag — not °C setpoints).
 
+## Third instance — the most damning: ~35 °C below FC (`artisan-08`)
+
+Same model, pre-FC at **bean 137 °C** (RoR 12, human holding **100 / 20**) → **heat 100 → 70,
+fan 20 → 35.** Bean 137 is **early drying / Maillard, ~35 °C below the FC band** — RoR 12 there is
+*healthy*, not an overshoot risk. Cutting heat this early is the textbook setup for a **stall /
+long bake**, nowhere near FC. The model again flags the hole it is digging in its own rationale:
+*"if RoR collapses below ~3 C/min, recover heat by +10–15% to avoid long bake."*
+
+```json
+{"phase":"roasting_pre_first_crack","roast_elapsed_seconds":260.0,"current_bean_temp_c":137.0,"current_env_temp_c":198.0,"bean_ror_c_per_min":12.0,"target_drop_temp_c":193.0,"target_development_percent":16.6,"profile_name":".artisan-fixtures/artisan-08","first_crack_detected":false}
+```
+```json
+{"target_heat":70,"target_fan":35,"should_drop":false,"confidence":0.85,"rationale":"Pre-first-crack with a high bean RoR (~12 C/min) and max heat currently applied: act early to blunt the RoR ... Reduce element to 70% ... raise fan moderately (35%) ... if RoR collapses below ~3 C/min, recover heat by +10–15% to avoid long bake."}
+```
+
+**The three instances span 137 / 165 / 168 °C** — the whole pre-FC range. So this is **not**
+over-eager FC anticipation; it is a blanket **"high RoR → cut heat + open fan" reflex with no
+phase awareness** — exactly the v4 gap. (A complete tally across all models/roasts will come from
+the run's scorecard, via the heat-direction-disagreement metric on pre-FC ticks.)
+
 ## Use
 
 - **#274** — a worked negative example for designing/validating the control teaching system
