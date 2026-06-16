@@ -52,8 +52,26 @@ Exact operator run commands::
     python scripts/advisor_bakeoff.py --mode per-phase --iterations 3 \\
         --prompt-version v2 v3 --out /tmp/bakeoff-perphase.json
 
-The replay machinery (replay + metrics + report) is testable WITHOUT a key via a
-canned recommender; only the real-candidate run needs ``OPENROUTER_API_KEY``.
+**Long-run observability + recovery (replay mode, #280).** A replay run is
+expensive and slow (a model call per tick, per model, per prompt, per roast), so
+it prints a per-cell progress line as each ``(model, prompt, roast)`` cell
+completes plus a periodic cumulative-cost heartbeat, persists every completed
+cell to a ``<out>.cells.jsonl`` sidecar **immediately**, and on re-run RESUMES by
+skipping cells already on disk (``--no-resume`` to force a clean run). An optional
+``--max-spend`` budget stops the run GRACEFULLY before it would breach the cap —
+flushing partials, rendering the partial scorecard, and exiting cleanly. Spend is
+estimated as ``calls x --cost-per-call`` (pydantic_ai exposes token usage, not a
+billed dollar amount). A kill / cap / crash therefore loses at most the in-flight
+cell, and the final scorecard always renders from the accumulated cells::
+
+    OPENROUTER_API_KEY=sk-or-... \\
+    python scripts/advisor_bakeoff.py --out /tmp/bakeoff.json \\
+        --max-spend 20 --report-md /tmp/bakeoff.md
+    # killed / capped? just re-run the SAME command — it resumes.
+
+The replay machinery (replay + metrics + report + checkpoint + cost guard) is
+testable WITHOUT a key via a canned recommender; only the real-candidate run
+needs ``OPENROUTER_API_KEY``.
 """
 
 from __future__ import annotations
@@ -77,6 +95,7 @@ from advisor_smoke import DEFAULT_FIXTURE, build_context  # noqa: E402
 from bakeoff_replay import (  # noqa: E402
     GroundTruth,
     PhaseLatency,
+    ReplayTick,
     RoastScore,
     TickOutcome,
     build_ticks,
@@ -993,6 +1012,121 @@ async def run_replay_cell(
     return await score_candidate(cand, prompt_version, recommend, roasts, cadence_seconds)
 
 
+def roast_id_for(fixture: Path) -> str:
+    """Return the stable ``roast_id`` used to key a (model, prompt, roast) cell.
+
+    The id is the ``<session-parent>/<session>`` name the scorecard already uses
+    as the roast name, so the checkpoint key matches the reported roast.
+
+    Args:
+        fixture: A replay roast ``roast.jsonl`` fixture path.
+
+    Returns:
+        The roast id (e.g. ``live-roast-2026-06-07/session-1``).
+    """
+    return f"{fixture.parent.parent.name}/{fixture.parent.name}"
+
+
+@dataclasses.dataclass
+class RoastReplay:
+    """One scored ``(model_slug, prompt_version, roast_id)`` replay cell.
+
+    The atomic checkpoint unit (issue #280): the raw per-tick recommender
+    outcomes for a single roast plus the identity that keys them. Scores,
+    samples, and the trajectory view are derived from ``outcomes`` by the
+    existing pure scorers — never stored — so a reload recomputes them
+    identically and the scoring math is untouched.
+
+    Attributes:
+        slug: The model slug measured.
+        prompt_version: The prompt version under test.
+        roast_id: The roast the outcomes are for (see :func:`roast_id_for`).
+        outcomes: The per-tick recommender outcomes (decision + latency), in
+            tick order — the only model-call output worth persisting.
+        ground: The roast's ground truth (rebuilt from the fixture; not stored).
+        score: The derived :class:`RoastScore` for the cell.
+        samples: The advice samples at the key roast moments.
+        trajectory: The control-trajectory sanity scorecard (#277).
+        call_count: Number of recommender calls this cell consumed (= ticks);
+            the basis for the cost estimate when no provider cost is exposed.
+    """
+
+    slug: str
+    prompt_version: str
+    roast_id: str
+    outcomes: list[TickOutcome]
+    ground: GroundTruth
+    score: RoastScore
+    samples: list[tuple[str, TickOutcome]]
+    trajectory: TrajectorySanity
+    call_count: int
+
+
+def build_roast_replay(
+    slug: str,
+    prompt_version: str,
+    roast_id: str,
+    outcomes: list[TickOutcome],
+    ground: GroundTruth,
+) -> RoastReplay:
+    """Build a :class:`RoastReplay` by running the existing pure scorers.
+
+    The single place the scorers are invoked, so a fresh run and a checkpoint
+    reload produce identical derived metrics from the same outcomes.
+
+    Args:
+        slug: The model slug.
+        prompt_version: The prompt version under test.
+        roast_id: The roast id the outcomes are for.
+        outcomes: The per-tick recommender outcomes (fresh or reloaded).
+        ground: The roast's ground truth.
+
+    Returns:
+        The fully-derived :class:`RoastReplay`.
+    """
+    return RoastReplay(
+        slug=slug,
+        prompt_version=prompt_version,
+        roast_id=roast_id,
+        outcomes=outcomes,
+        ground=ground,
+        score=score_roast(outcomes, ground, roast_id),
+        samples=_sample_outcomes(outcomes, ground),
+        # Control-trajectory sanity (#277): orthogonal, agreement-free; scored
+        # from the SAME outcomes, so it adds no model calls and never touches the
+        # drop / heat metrics.
+        trajectory=score_trajectory(outcomes, roast_id),
+        # One recommender call per tick — the basis for the cost estimate.
+        call_count=len(outcomes),
+    )
+
+
+def _replays_to_cell(
+    cand: Candidate, prompt_version: str, replays: list[RoastReplay]
+) -> ReplayCell:
+    """Assemble the per-roast replays for one candidate into a :class:`ReplayCell`.
+
+    Pure: the report layer is unchanged — it still consumes :class:`ReplayCell`.
+
+    Args:
+        cand: The candidate model.
+        prompt_version: The prompt version under test.
+        replays: The per-roast replays for this (slug, prompt) cell, roast order.
+
+    Returns:
+        The assembled :class:`ReplayCell`.
+    """
+    return ReplayCell(
+        slug=cand.slug,
+        tier=cand.tier.value,
+        prompt_version=prompt_version,
+        latency_risk=cand.latency_risk,
+        scores=[r.score for r in replays],
+        samples={r.roast_id: r.samples for r in replays},
+        trajectories=[r.trajectory for r in replays],
+    )
+
+
 async def score_candidate(
     cand: Candidate,
     prompt_version: str,
@@ -1020,28 +1154,14 @@ async def score_candidate(
         The :class:`ReplayCell`.
     """
     tick_clock = clock if clock is not None else time.perf_counter
-    scores: list[RoastScore] = []
-    samples: dict[str, list[tuple[str, TickOutcome]]] = {}
-    trajectories: list[TrajectorySanity] = []
+    replays: list[RoastReplay] = []
     for fixture in roasts:
         ticks, ground = build_ticks(fixture, cadence_seconds=cadence_seconds)
         outcomes = await replay_roast(ticks, recommend, clock=tick_clock)
-        roast_name = f"{fixture.parent.parent.name}/{fixture.parent.name}"
-        scores.append(score_roast(outcomes, ground, roast_name))
-        samples[roast_name] = _sample_outcomes(outcomes, ground)
-        # Control-trajectory sanity (#277): orthogonal, agreement-free; scored
-        # from the SAME outcomes, so it adds no model calls and never touches the
-        # drop / heat metrics above.
-        trajectories.append(score_trajectory(outcomes, roast_name))
-    return ReplayCell(
-        slug=cand.slug,
-        tier=cand.tier.value,
-        prompt_version=prompt_version,
-        latency_risk=cand.latency_risk,
-        scores=scores,
-        samples=samples,
-        trajectories=trajectories,
-    )
+        replays.append(
+            build_roast_replay(cand.slug, prompt_version, roast_id_for(fixture), outcomes, ground)
+        )
+    return _replays_to_cell(cand, prompt_version, replays)
 
 
 _HONEST_FRAMING = (
@@ -1271,6 +1391,539 @@ async def run_replay_bakeoff(
     return availability, cells
 
 
+# --- Observability + incremental checkpoint + cost guard (#280) -------------
+
+# The default per-cell cost estimate (USD) used when no provider/usage dollar
+# cost is exposed. pydantic_ai surfaces *token* usage (``AdvisorUsage``) but not
+# a billed dollar amount, so the cost guard estimates spend as
+# ``call_count * PER_CALL_COST_USD``. This is a deliberately rough, documented
+# upper-ish guard rail — overrideable with ``--cost-per-call`` — not an invoice.
+# Anchored to the 16 Jun run: ~$32 across a full roster sweep, dominated by the
+# frontier models; per get_recommendation call this lands in the low-cents range.
+DEFAULT_COST_PER_CALL_USD = 0.02
+
+# How often the heartbeat line is emitted, in wall-clock seconds.
+DEFAULT_HEARTBEAT_SECONDS = 30.0
+
+
+def _decision_to_json(decision: RoastDecision | None) -> dict[str, Any] | None:
+    """Serialize a decision for the sidecar, or ``None`` for a failed tick."""
+    return decision.model_dump() if decision is not None else None
+
+
+def _decision_from_json(raw: dict[str, Any] | None) -> RoastDecision | None:
+    """Rebuild a decision from a sidecar row, or ``None`` for a failed tick."""
+    return RoastDecision.model_validate(raw) if raw is not None else None
+
+
+def roast_replay_to_record(replay: RoastReplay) -> dict[str, Any]:
+    """Serialize a :class:`RoastReplay` to a sidecar JSONL record.
+
+    Persists only the cell identity and the raw per-tick recommender outcomes
+    (decision + latency + error). The derived score / samples / trajectory are
+    NOT stored — they are recomputed by the pure scorers on reload, so the
+    scoring math is the single source of truth and never drifts.
+
+    Args:
+        replay: The completed per-roast replay to persist.
+
+    Returns:
+        A JSON-ready record keyed by ``(model_slug, prompt_version, roast_id)``.
+    """
+    return {
+        "model_slug": replay.slug,
+        "prompt_version": replay.prompt_version,
+        "roast_id": replay.roast_id,
+        "call_count": replay.call_count,
+        "outcomes": [
+            {
+                "decision": _decision_to_json(o.decision),
+                "latency_seconds": o.latency_seconds,
+                "error": o.error,
+            }
+            for o in replay.outcomes
+        ],
+    }
+
+
+def roast_replay_from_record(
+    record: dict[str, Any], ticks: list[ReplayTick], ground: GroundTruth
+) -> RoastReplay:
+    """Rebuild a :class:`RoastReplay` from a sidecar record + rebuilt ticks.
+
+    The ticks are reconstructed deterministically from the fixture (no model
+    calls); each saved per-tick recommender outcome is reattached to its tick in
+    order, then the existing pure scorers derive the metrics — identical to a
+    fresh run. The recorded outcome count must match the rebuilt tick count, or
+    the fixture/cadence changed since the checkpoint and the record is rejected.
+
+    Args:
+        record: A sidecar record from :func:`roast_replay_to_record`.
+        ticks: The ticks rebuilt from the fixture for this roast.
+        ground: The roast's ground truth.
+
+    Returns:
+        The reconstructed :class:`RoastReplay`.
+
+    Raises:
+        ValueError: If the recorded outcome count does not match ``ticks``.
+    """
+    raw_outcomes = cast("list[dict[str, Any]]", record["outcomes"])
+    if len(raw_outcomes) != len(ticks):
+        raise ValueError(
+            f"checkpoint for {record['model_slug']}/{record['prompt_version']}/"
+            f"{record['roast_id']} has {len(raw_outcomes)} outcomes but the fixture "
+            f"rebuilds {len(ticks)} ticks (fixture or cadence changed) — re-run from scratch"
+        )
+    outcomes = [
+        TickOutcome(
+            tick=tick,
+            decision=_decision_from_json(raw.get("decision")),
+            latency_seconds=raw.get("latency_seconds"),
+            error=raw.get("error"),
+        )
+        for tick, raw in zip(ticks, raw_outcomes, strict=True)
+    ]
+    return build_roast_replay(
+        str(record["model_slug"]),
+        str(record["prompt_version"]),
+        str(record["roast_id"]),
+        outcomes,
+        ground,
+    )
+
+
+def sidecar_path(out: Path) -> Path:
+    """Return the sidecar JSONL path next to the ``--out`` JSON path."""
+    return out.with_name(out.name + ".cells.jsonl")
+
+
+CellKey = tuple[str, str, str]
+
+
+def cell_key(slug: str, prompt_version: str, roast_id: str) -> CellKey:
+    """The ``(model_slug, prompt_version, roast_id)`` checkpoint key."""
+    return (slug, prompt_version, roast_id)
+
+
+class Checkpoint:
+    """Append-only sidecar of completed ``(slug, prompt, roast)`` cells (#280).
+
+    Each completed per-roast replay is appended to a JSONL sidecar immediately,
+    so a kill / cap-hit / crash leaves every finished cell on disk. On start the
+    sidecar is loaded and already-complete cells are skipped, so a re-run never
+    re-pays for finished work (resume); the in-flight cell is the most a kill can
+    lose. The final scorecard renders from the accumulated cells either way.
+
+    Attributes:
+        path: The sidecar JSONL path.
+        resume: When ``True`` (default), pre-existing records are loaded and
+            their cells skipped; when ``False``, the sidecar is truncated on open
+            so the run starts clean.
+    """
+
+    def __init__(self, path: Path, *, resume: bool = True) -> None:
+        """Open (and optionally load) the sidecar at ``path``.
+
+        Args:
+            path: The sidecar JSONL path.
+            resume: Load + skip existing cells when ``True``; truncate when
+                ``False``.
+        """
+        self.path = path
+        self.resume = resume
+        self._records: dict[CellKey, dict[str, Any]] = {}
+        if resume and path.exists():
+            self._load()
+        elif not resume and path.exists():
+            path.unlink()
+
+    def _load(self) -> None:
+        """Load existing sidecar records, keyed by the cell triple.
+
+        A later record for the same key wins (a resumed re-run that re-did a
+        cell), so loading is last-write-wins per key.
+        """
+        for line in self.path.read_text().splitlines():
+            if not line.strip():
+                continue
+            record = cast("dict[str, Any]", json.loads(line))
+            key = cell_key(
+                str(record["model_slug"]),
+                str(record["prompt_version"]),
+                str(record["roast_id"]),
+            )
+            self._records[key] = record
+
+    def has(self, key: CellKey) -> bool:
+        """Return whether ``key``'s cell is already complete on disk."""
+        return key in self._records
+
+    def record(self, key: CellKey) -> dict[str, Any]:
+        """Return the stored record for an already-complete ``key``."""
+        return self._records[key]
+
+    def append(self, replay: RoastReplay) -> None:
+        """Persist a completed replay to disk immediately and remember it.
+
+        Appends one JSONL line and flushes to the OS, so an abrupt kill right
+        after this call still leaves the cell recoverable.
+
+        Args:
+            replay: The completed per-roast replay to persist.
+        """
+        record = roast_replay_to_record(replay)
+        key = cell_key(replay.slug, replay.prompt_version, replay.roast_id)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+            handle.flush()
+        self._records[key] = record
+
+    def completed_count(self) -> int:
+        """How many cells are already complete on disk."""
+        return len(self._records)
+
+
+class CostGuard:
+    """Tracks cumulative spend and trips a graceful stop before a budget (#280).
+
+    Spend is estimated as ``calls * cost_per_call`` (pydantic_ai exposes token
+    usage, not a billed dollar amount — see :data:`DEFAULT_COST_PER_CALL_USD`).
+    ``would_exceed`` lets the orchestrator decide BEFORE paying for the next
+    cell, so a budget stop flushes partials and exits cleanly rather than raising
+    mid-call. The guard never makes a call itself — it only accounts.
+
+    Attributes:
+        cost_per_call: Estimated USD per recommender call.
+        max_spend: The budget ceiling in USD, or ``None`` for unlimited.
+    """
+
+    def __init__(self, cost_per_call: float, max_spend: float | None) -> None:
+        """Initialise the guard.
+
+        Args:
+            cost_per_call: Estimated USD per recommender call.
+            max_spend: The budget ceiling in USD, or ``None`` for no cap.
+        """
+        self.cost_per_call = cost_per_call
+        self.max_spend = max_spend
+        self._calls = 0
+
+    @property
+    def calls(self) -> int:
+        """Total recommender calls accounted so far."""
+        return self._calls
+
+    @property
+    def spend(self) -> float:
+        """Estimated cumulative spend in USD."""
+        return round(self._calls * self.cost_per_call, 4)
+
+    def add_calls(self, n: int) -> None:
+        """Account ``n`` completed recommender calls."""
+        self._calls += n
+
+    def would_exceed(self, upcoming_calls: int) -> bool:
+        """Whether running ``upcoming_calls`` more would breach the budget.
+
+        Args:
+            upcoming_calls: The number of calls the next cell would cost.
+
+        Returns:
+            ``True`` if a budget is set and the projected spend would exceed it.
+        """
+        if self.max_spend is None:
+            return False
+        projected = (self._calls + upcoming_calls) * self.cost_per_call
+        return projected > self.max_spend
+
+
+@dataclasses.dataclass
+class Heartbeat:
+    """Periodic liveness line for a long run (#280) — no silent multi-hour runs.
+
+    Attributes:
+        total_cells: Total cells the run will attempt.
+        interval_seconds: Minimum wall-clock seconds between heartbeats.
+        clock: Wall-clock source (injectable for tests).
+        emit: Sink for the heartbeat line (defaults to a flushed ``print``).
+    """
+
+    total_cells: int
+    interval_seconds: float = DEFAULT_HEARTBEAT_SECONDS
+    clock: Callable[[], float] = time.monotonic
+    emit: Callable[[str], None] = lambda line: print(line, flush=True)
+    _started: float = dataclasses.field(default=0.0, init=False)
+    _last: float = dataclasses.field(default=0.0, init=False)
+
+    def __post_init__(self) -> None:
+        """Stamp the start time so elapsed is measured from construction."""
+        self._started = self.clock()
+        self._last = self._started
+
+    def maybe_beat(self, done: int, guard: CostGuard, *, force: bool = False) -> None:
+        """Emit a heartbeat if the interval elapsed (or ``force``).
+
+        Args:
+            done: Cells completed so far (incl. resumed).
+            guard: The cost guard, for cumulative spend + call count.
+            force: Emit regardless of the interval (run start / end).
+        """
+        now = self.clock()
+        if not force and now - self._last < self.interval_seconds:
+            return
+        self._last = now
+        elapsed = now - self._started
+        self.emit(
+            f"[heartbeat] elapsed={elapsed:.0f}s cells={done}/{self.total_cells} "
+            f"calls={guard.calls} spend=${guard.spend:.2f}"
+            + (f"/{guard.max_spend:.2f}" if guard.max_spend is not None else "")
+        )
+
+
+def cell_progress_line(
+    cand: Candidate, replay: RoastReplay, n: int, total: int, cost_per_call: float
+) -> str:
+    """Render the per-cell progress line emitted as each cell completes.
+
+    Args:
+        cand: The candidate model.
+        replay: The completed per-roast replay.
+        n: This cell's 1-based position in the run.
+        total: Total cells the run will attempt.
+        cost_per_call: The run's configured USD-per-call rate — the SAME rate the
+            :class:`CostGuard` accounts spend with, so the displayed per-cell cost
+            never contradicts the budget math.
+
+    Returns:
+        The progress line.
+    """
+    score = replay.score
+    f1 = score.drop.f1
+    median = _phase_latency_str(score.phase_latency)
+    cell_cost = round(replay.call_count * cost_per_call, 4)
+    return (
+        f"  [cell] {cand.slug} | {replay.roast_id} {n}/{total} | "
+        f"drop F1={f1} | latency {median} | ~${cell_cost:.2f}"
+    )
+
+
+@dataclasses.dataclass
+class ObservableRunResult:
+    """Outcome of an observable, checkpointed replay run (#280).
+
+    Attributes:
+        availability: The availability-sweep results.
+        cells: The assembled :class:`ReplayCell` list (resumed + fresh).
+        stopped_for_budget: ``True`` if the run stopped early on ``--max-spend``;
+            the cells are then a valid PARTIAL scorecard.
+        resumed_cells: How many per-roast cells were skipped (loaded from disk).
+        fresh_cells: How many per-roast cells were computed this run.
+    """
+
+    availability: list[AvailabilityResult]
+    cells: list[ReplayCell]
+    stopped_for_budget: bool
+    resumed_cells: int
+    fresh_cells: int
+
+
+async def run_replay_bakeoff_observable(
+    roster: tuple[Candidate, ...],
+    roasts: tuple[Path, ...],
+    prompt_versions: list[str],
+    reasoning: ReasoningEffort | None,
+    cadence_seconds: float,
+    *,
+    out: Path,
+    resume: bool = True,
+    cost_per_call: float = DEFAULT_COST_PER_CALL_USD,
+    max_spend: float | None = None,
+    heartbeat_seconds: float = DEFAULT_HEARTBEAT_SECONDS,
+    recommender_factory: Callable[
+        [Candidate, str], Callable[[AdvisorContext], Awaitable[RoastDecision]]
+    ]
+    | None = None,
+    clock: Callable[[], float] | None = None,
+    heartbeat_clock: Callable[[], float] | None = None,
+) -> ObservableRunResult:
+    """Run the replay bake-off with observability, checkpointing, and a cost guard.
+
+    The observable counterpart to :func:`run_replay_bakeoff`. It runs each
+    ``(model_slug, prompt_version, roast_id)`` cell **serially** so progress,
+    incremental persistence, and a graceful budget stop are deterministic; each
+    completed cell is appended to the sidecar immediately and a progress line is
+    printed, with a periodic cumulative-cost heartbeat. On start it loads the
+    sidecar and SKIPS already-complete cells (resume). The scoring math is
+    unchanged — cells are derived by the same pure scorers, fresh or reloaded.
+
+    Args:
+        roster: The candidate roster.
+        roasts: The replay roast fixtures (the known-good test set).
+        prompt_versions: Prompt versions to compare (e.g. ``["v2", "v3"]``).
+        reasoning: Reasoning effort, or ``None`` for the provider default.
+        cadence_seconds: Roast-time spacing between scored ticks.
+        out: The ``--out`` JSON path; the sidecar is derived from it.
+        resume: Load + skip already-complete cells when ``True`` (default).
+        cost_per_call: Estimated USD per recommender call (cost guard basis).
+        max_spend: Optional USD budget; the run stops gracefully before breaching
+            it, flushing partials.
+        heartbeat_seconds: Minimum wall-clock seconds between heartbeats.
+        recommender_factory: Builds the async recommender for a (candidate,
+            prompt) cell. Defaults to the real :class:`PydanticAIAdvisor`; tests
+            inject a canned recommender (key-free seam).
+        clock: Monotonic clock for per-tick latency; defaults to
+            ``time.perf_counter``.
+        heartbeat_clock: Wall-clock for the heartbeat; defaults to
+            ``time.monotonic``.
+
+    Returns:
+        The :class:`ObservableRunResult` (availability + assembled cells + the
+        budget-stop / resume accounting).
+    """
+    survivors, availability = await availability_sweep(roster, prompt_versions[0], reasoning)
+    print(render_availability(availability), flush=True)
+    print("", flush=True)
+
+    factory = (
+        recommender_factory
+        if recommender_factory is not None
+        else _real_recommender_factory(reasoning)
+    )
+    checkpoint = Checkpoint(sidecar_path(out), resume=resume)
+    guard = CostGuard(cost_per_call, max_spend)
+    total_cells = len(prompt_versions) * len(survivors) * len(roasts)
+    hb_clock = heartbeat_clock if heartbeat_clock is not None else time.monotonic
+    heartbeat = Heartbeat(
+        total_cells=total_cells, interval_seconds=heartbeat_seconds, clock=hb_clock
+    )
+
+    # Pre-build ticks + ground once per roast (deterministic, no model calls);
+    # both fresh runs and reloads reuse them, so resume needs no model access.
+    built = {roast_id_for(f): build_ticks(f, cadence_seconds=cadence_seconds) for f in roasts}
+
+    # Resumed cells already on disk: count + account ONLY the cells that belong
+    # to THIS run's (survivors x prompts x roasts) grid. A sidecar carrying
+    # entries from a different roster / prompt set must not inflate the resumed
+    # count or the cost — only the current run's keys are skipped below, so the
+    # count must be scoped the same way to stay consistent with that skip logic.
+    resumed = 0
+    for pv in prompt_versions:
+        for c in survivors:
+            for f in roasts:
+                key = cell_key(c.slug, pv, roast_id_for(f))
+                if not checkpoint.has(key):
+                    continue
+                resumed += 1
+                guard.add_calls(int(checkpoint.record(key)["call_count"]))
+
+    if resumed:
+        print(f"resume: {resumed}/{total_cells} cells already on disk — skipping them", flush=True)
+
+    replays_by_cell: dict[tuple[str, str], list[RoastReplay]] = {}
+    done = 0
+    fresh = 0
+    stopped = False
+    heartbeat.maybe_beat(done=resumed, guard=guard, force=True)
+
+    for pv in prompt_versions:
+        for cand in survivors:
+            recommend = factory(cand, pv)
+            for fixture in roasts:
+                rid = roast_id_for(fixture)
+                key = cell_key(cand.slug, pv, rid)
+                ticks, ground = built[rid]
+
+                if checkpoint.has(key):
+                    replay = roast_replay_from_record(checkpoint.record(key), ticks, ground)
+                    replays_by_cell.setdefault((cand.slug, pv), []).append(replay)
+                    done += 1
+                    continue
+
+                # Cost guard: decide BEFORE paying for the cell so a stop flushes
+                # partials and exits cleanly (never mid-call).
+                if guard.would_exceed(len(ticks)):
+                    print(
+                        f"[budget] stopping gracefully before {cand.slug}/{pv}/{rid}: "
+                        f"running it (~{len(ticks)} calls) would exceed --max-spend "
+                        f"${max_spend:.2f} (spent ~${guard.spend:.2f} over {guard.calls} calls). "
+                        f"{done} cells complete and flushed to {checkpoint.path}.",
+                        flush=True,
+                    )
+                    stopped = True
+                    break
+
+                outcomes = await replay_roast(
+                    ticks, recommend, clock=clock if clock is not None else time.perf_counter
+                )
+                replay = build_roast_replay(cand.slug, pv, rid, outcomes, ground)
+                checkpoint.append(replay)  # persist immediately — kill-safe
+                guard.add_calls(replay.call_count)
+                replays_by_cell.setdefault((cand.slug, pv), []).append(replay)
+                done += 1
+                fresh += 1
+                print(
+                    cell_progress_line(cand, replay, done, total_cells, guard.cost_per_call),
+                    flush=True,
+                )
+                heartbeat.maybe_beat(done=done, guard=guard)
+            if stopped:
+                break
+        if stopped:
+            break
+
+    heartbeat.maybe_beat(done=done, guard=guard, force=True)
+
+    # Assemble cells in (prompt, survivor) order, including partial cells (a cell
+    # with only some roasts scored is still a valid, reportable partial).
+    cells: list[ReplayCell] = []
+    for pv in prompt_versions:
+        for cand in survivors:
+            replays = replays_by_cell.get((cand.slug, pv))
+            if replays:
+                cells.append(_replays_to_cell(cand, pv, replays))
+    return ObservableRunResult(
+        availability=availability,
+        cells=cells,
+        stopped_for_budget=stopped,
+        resumed_cells=resumed,
+        fresh_cells=fresh,
+    )
+
+
+def _real_recommender_factory(
+    reasoning: ReasoningEffort | None,
+) -> Callable[[Candidate, str], Callable[[AdvisorContext], Awaitable[RoastDecision]]]:
+    """Build the default real-OpenRouter recommender factory (spends credits).
+
+    The default ``recommender_factory`` for
+    :func:`run_replay_bakeoff_observable`. Tests inject a canned recommender
+    factory instead (the key-free seam), so this real path is never exercised by
+    the test suite.
+
+    Args:
+        reasoning: Reasoning effort, or ``None`` for the provider default.
+
+    Returns:
+        A factory mapping a (candidate, prompt) to a timeout-bounded recommender.
+    """
+
+    def factory(
+        cand: Candidate, prompt_version: str
+    ) -> Callable[[AdvisorContext], Awaitable[RoastDecision]]:
+        advisor = PydanticAIAdvisor(_make_config(cand.slug, prompt_version, reasoning))
+
+        async def recommend(context: AdvisorContext) -> RoastDecision:
+            return await asyncio.wait_for(
+                advisor.get_recommendation(context), timeout=MEASURE_TIMEOUT
+            )
+
+        return recommend
+
+    return factory
+
+
 # --- Run loop ---------------------------------------------------------------
 
 
@@ -1375,6 +2028,35 @@ async def main() -> int:
         "command-signal coherence (change/reversal counts, control-signal entropy, "
         "momentum cuts) over development. Agreement-free; the JSON always carries it.",
     )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="replay mode: ignore + truncate any existing checkpoint sidecar and "
+        "run every cell from scratch (default: resume — skip cells already on disk)",
+    )
+    parser.add_argument(
+        "--max-spend",
+        type=float,
+        default=None,
+        help="replay mode: optional USD budget; the run stops GRACEFULLY before a "
+        "cell would breach it, flushing partial results and rendering the partial "
+        "scorecard (no exception). Spend is estimated as calls x --cost-per-call.",
+    )
+    parser.add_argument(
+        "--cost-per-call",
+        type=float,
+        default=DEFAULT_COST_PER_CALL_USD,
+        help=f"replay mode: estimated USD per recommender call for the cost guard "
+        f"(default: {DEFAULT_COST_PER_CALL_USD}; pydantic_ai exposes tokens, not a "
+        f"billed dollar amount, so spend is an estimate)",
+    )
+    parser.add_argument(
+        "--heartbeat-seconds",
+        type=float,
+        default=DEFAULT_HEARTBEAT_SECONDS,
+        help=f"replay mode: minimum wall-clock seconds between cumulative-cost "
+        f"heartbeats (default: {DEFAULT_HEARTBEAT_SECONDS:g})",
+    )
     args = parser.parse_args()
 
     reasoning: ReasoningEffort | None = (
@@ -1400,15 +2082,28 @@ async def main() -> int:
         print(f"\nwrote artifact -> {args.out}", flush=True)
         return 0
 
-    availability, replay_cells = await run_replay_bakeoff(
-        ROSTER, REPLAY_ROASTS, prompt_versions, reasoning, args.cadence_seconds
+    result = await run_replay_bakeoff_observable(
+        ROSTER,
+        REPLAY_ROASTS,
+        prompt_versions,
+        reasoning,
+        args.cadence_seconds,
+        out=args.out,
+        resume=not bool(args.no_resume),
+        cost_per_call=float(args.cost_per_call),
+        max_spend=cast("float | None", args.max_spend),
+        heartbeat_seconds=float(args.heartbeat_seconds),
     )
+    availability, replay_cells = result.availability, result.cells
     report = render_replay_report(replay_cells, REPLAY_ROASTS, trajectory=bool(args.trajectory))
     print("\n" + report, flush=True)
     args.out.write_text(
         json.dumps(
             {
                 "mode": "replay",
+                "stopped_for_budget": result.stopped_for_budget,
+                "resumed_cells": result.resumed_cells,
+                "fresh_cells": result.fresh_cells,
                 "availability": [dataclasses.asdict(a) for a in availability],
                 "cells": replay_cells_to_json(replay_cells),
             },
@@ -1419,6 +2114,12 @@ async def main() -> int:
     if args.report_md is not None:
         args.report_md.write_text(report)
         print(f"wrote markdown report -> {args.report_md}", flush=True)
+    if result.stopped_for_budget:
+        print(
+            "NOTE: the run stopped early on --max-spend; the scorecard above is a "
+            "PARTIAL over the completed cells. Re-run (resume is on) to finish the rest.",
+            flush=True,
+        )
     return 0
 
 
