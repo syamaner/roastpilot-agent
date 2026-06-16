@@ -353,6 +353,55 @@ class MCPConfig(BaseModel):
     env: dict[str, str] = Field(default_factory=dict[str, str])
 
 
+# Access-log mode (issue #267): how the ``serve`` uvicorn access logger treats
+# SUCCESSFUL (status < 400) requests on the chatty paths.
+#   - ``quiet`` (default): drop 2xx/3xx on the quiet-path set (the SSE stream,
+#     the per-tick telemetry series, the health poll) so a live roast's console
+#     isn't buried; keep every 4xx/5xx (any path) and every other path.
+#   - ``full``: log all requests (today's behaviour) — no filter installed.
+#   - ``off``: disable the uvicorn access log entirely (``access_log=False``).
+HttpAccessLogMode = Literal["quiet", "full", "off"]
+
+# The default quiet-path set (issue #267). These MIRROR the route-path constants
+# in ``api.py`` (``HEALTH_PATH`` / ``TELEMETRY_PATH`` / ``EVENTS_PATH``) — the
+# real route templates, so a future route rename can't silently un-quiet them.
+# config.py must not import api.py (api.py imports config.py — an import cycle),
+# so the values are duplicated here and pinned equal to the api.py source of
+# truth by a drift test (``tests/test_logging_config.py``). The ``{run_id}``
+# segment is matched as a prefix+suffix pattern by the CLI filter, catching any
+# run id.
+DEFAULT_HTTP_ACCESS_LOG_QUIET_PATHS: tuple[str, ...] = (
+    "/api/roasts/{run_id}/events",
+    "/api/roasts/{run_id}/telemetry",
+    "/api/health",
+)
+
+
+class LoggingConfig(BaseModel):
+    """Serve-time HTTP access-log verbosity controls (issue #267).
+
+    Logging configuration only — it changes what the ``uvicorn.access`` logger
+    emits during ``serve``, never any API behaviour, the controller, the
+    advisor, or the SSE contract. The operator-facing #157 startup readout and
+    all app/domain logs are unaffected.
+
+    Resolution precedence (applied in ``cli.py``): a CLI flag wins over the
+    ``ROASTPILOT_*`` environment variable, which wins over these config
+    defaults — mirroring the ``--db`` > ``ROASTPILOT_DB`` > default pattern.
+    """
+
+    #: Master access-log mode: ``quiet`` (default), ``full``, or ``off``.
+    http_access_log_mode: HttpAccessLogMode = "quiet"
+    #: Route paths whose SUCCESSFUL (status < 400) requests are dropped in
+    #: ``quiet`` mode. Templates with ``{run_id}`` are matched as prefix+suffix
+    #: patterns so any run id is caught. Defaults to the three chatty paths.
+    http_access_log_quiet_paths: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_HTTP_ACCESS_LOG_QUIET_PATHS)
+    )
+    #: The uvicorn ``log_level`` for ``serve`` (default ``info``, today's value).
+    log_level: str = Field(default="info", min_length=1)
+
+
 class AppConfig(BaseSettings):
     """Top-level application settings, loadable from environment variables.
 
@@ -366,3 +415,4 @@ class AppConfig(BaseSettings):
     advisor: AdvisorConfig = Field(default_factory=AdvisorConfig)
     safety: SafetyLimits = Field(default_factory=SafetyLimits)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)

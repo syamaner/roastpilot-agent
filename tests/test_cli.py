@@ -166,6 +166,29 @@ def test_parser_serve_with_spa_dir(tmp_path: Path) -> None:
     assert args.spa_dir == tmp_path
 
 
+def test_parser_access_log_defaults_to_none() -> None:
+    """``--access-log`` / ``--log-level`` default to ``None`` (config wins)."""
+    args = cli._build_parser().parse_args(["serve"])  # pyright: ignore[reportPrivateUsage]
+    assert args.access_log is None
+    assert args.log_level is None
+
+
+def test_parser_access_log_accepts_modes() -> None:
+    """``--access-log`` accepts the three modes; ``--log-level`` is free text."""
+    parser = cli._build_parser()  # pyright: ignore[reportPrivateUsage]
+    for mode in ("quiet", "full", "off"):
+        args = parser.parse_args(["serve", "--access-log", mode, "--log-level", "debug"])
+        assert args.access_log == mode
+        assert args.log_level == "debug"
+
+
+def test_parser_access_log_rejects_bad_mode() -> None:
+    """``--access-log`` rejects an out-of-set mode (argparse ``choices``)."""
+    parser = cli._build_parser()  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(SystemExit):
+        parser.parse_args(["serve", "--access-log", "loud"])
+
+
 def test_resolve_spa_dir_prefers_explicit_when_valid(tmp_path: Path) -> None:
     """An explicit --spa-dir with index.html is used verbatim."""
     (tmp_path / "index.html").write_text("<title>x</title>", encoding="utf-8")
