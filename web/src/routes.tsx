@@ -35,6 +35,13 @@ const DetailHarnessFailedPage = lazy(() =>
     default: m.DetailHarnessFailedPage,
   })),
 );
+// #271 long-roast detail snapshot — the advisor-decisions list + decision-trace
+// table both exceed the inline cap, proving the last-5 cap + "View all" modal.
+const DetailHarnessLongPage = lazy(() =>
+  import("@/pages/detail/DetailHarnessLongPage").then((m) => ({
+    default: m.DetailHarnessLongPage,
+  })),
+);
 
 export const routes: RouteObject[] = [
   { path: "/", element: <DashboardPage /> },
@@ -49,4 +56,6 @@ export const routes: RouteObject[] = [
   { path: "/__detail-harness", element: <DetailHarnessPage /> },
   // __detail-harness-failed: advisor-failure detail state (#170 snapshot).
   { path: "/__detail-harness-failed", element: <DetailHarnessFailedPage /> },
+  // __detail-harness-long: long-roast detail — capped lists + "View all" (#271).
+  { path: "/__detail-harness-long", element: <DetailHarnessLongPage /> },
 ];

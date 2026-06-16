@@ -24,6 +24,7 @@ import type { RoastDetail, RoastTimeline, TelemetrySeries } from "@/lib/types";
 import { AdvisorSummaryChips } from "./AdvisorSummaryChips";
 import { AdvisorTimeline } from "./AdvisorTimeline";
 import { advisorSummary, toAdvisorRows } from "./advisorModel";
+import { CappedList } from "./CappedList";
 import { DecisionTraceTable } from "./DecisionTraceTable";
 import { EventTimeline } from "./EventTimeline";
 import { ExportOptions } from "./ExportOptions";
@@ -63,6 +64,17 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
   const onSelectRow = (tick: number) =>
     setSelectedTick((current) => (current === tick ? null : tick));
 
+  // Selecting a row that lives only in a "View all" modal would point the curve
+  // highlight off-screen behind the overlay (#126). When the selection happens
+  // inside the modal we close it first, so the highlighted curve (top of the page)
+  // is in frame; an inline selection toggles as before.
+  const selectFrom =
+    (close: () => void, inModal: boolean) =>
+    (tick: number) => {
+      if (inModal) close();
+      onSelectRow(tick);
+    };
+
   return (
     <div className="flex flex-col gap-6" data-testid="detail-view">
       <TitleBlock detail={detail} stats={stats} />
@@ -81,16 +93,38 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
           <h2 className="text-sm font-semibold tracking-tight">Advisor decisions</h2>
           <AdvisorSummaryChips summary={advisor} />
         </div>
-        <AdvisorTimeline
+        <CappedList
           rows={advisorRows}
-          selectedTick={selectedTick}
-          onSelect={onSelectRow}
+          modalTitle="Advisor decisions — full history"
+          testId="advisor"
+          modalTableTestId="advisor-timeline-modal"
+          renderRows={(slice, ctx) => (
+            <AdvisorTimeline
+              rows={slice}
+              selectedTick={selectedTick}
+              onSelect={selectFrom(ctx.close, ctx.inModal)}
+              tableTestId={ctx.tableTestId}
+            />
+          )}
         />
       </section>
 
       <section className="flex flex-col gap-2">
         <h2 className="text-sm font-semibold tracking-tight">Decision trace</h2>
-        <DecisionTraceTable rows={rows} selectedTick={selectedTick} onSelect={onSelectRow} />
+        <CappedList
+          rows={rows}
+          modalTitle="Decision trace — full history"
+          testId="trace"
+          modalTableTestId="decision-trace-table-modal"
+          renderRows={(slice, ctx) => (
+            <DecisionTraceTable
+              rows={slice}
+              selectedTick={selectedTick}
+              onSelect={selectFrom(ctx.close, ctx.inModal)}
+              tableTestId={ctx.tableTestId}
+            />
+          )}
+        />
       </section>
 
       <div className="grid gap-6 lg:grid-cols-2">

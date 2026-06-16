@@ -42,6 +42,13 @@ export interface DecisionTraceTableProps {
   selectedTick: number | null;
   /** Toggle selection for a row's tick (re-selecting the same tick clears it). */
   onSelect: (tick: number) => void;
+  /**
+   * The table container's `data-testid`. Defaults to `decision-trace-table` — the
+   * #253 column-header guard scopes to exactly that id, so the modal copy of this
+   * table (#271) passes a DISTINCT id to keep the guarded selector unambiguous when
+   * both the inline and the modal table are mounted.
+   */
+  tableTestId?: string;
   className?: string;
 }
 
@@ -49,6 +56,7 @@ export function DecisionTraceTable({
   rows,
   selectedTick,
   onSelect,
+  tableTestId = "decision-trace-table",
   className,
 }: DecisionTraceTableProps): React.JSX.Element {
   if (rows.length === 0) {
@@ -64,7 +72,7 @@ export function DecisionTraceTable({
 
   return (
     <div
-      data-testid="decision-trace-table"
+      data-testid={tableTestId}
       className={cn("overflow-x-auto rounded-lg border border-border bg-card", className)}
     >
       <table className="w-full border-collapse text-sm">
