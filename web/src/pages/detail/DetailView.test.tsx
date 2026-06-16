@@ -7,10 +7,13 @@ import { DetailView } from "./DetailView";
 import {
   FIXTURE_DETAIL,
   FIXTURE_DETAIL_FAILED,
+  FIXTURE_DETAIL_LONG,
   FIXTURE_TELEMETRY,
   FIXTURE_TELEMETRY_FAILED,
+  FIXTURE_TELEMETRY_LONG,
   FIXTURE_TIMELINE,
   FIXTURE_TIMELINE_FAILED,
+  FIXTURE_TIMELINE_LONG,
 } from "./fixture";
 
 function wrapper() {
@@ -112,6 +115,93 @@ describe("DetailView composition", () => {
       .closest("[data-testid='timeline-event']")!;
     expect(fc).toHaveTextContent("audio_model");
     expect(fc).toHaveTextContent("0.91");
+  });
+});
+
+function renderLongView() {
+  return render(
+    <DetailView
+      detail={FIXTURE_DETAIL_LONG}
+      telemetry={FIXTURE_TELEMETRY_LONG}
+      timeline={FIXTURE_TIMELINE_LONG}
+    />,
+    { wrapper: wrapper() },
+  );
+}
+
+describe("DetailView list caps (#271)", () => {
+  it("caps the inline decision-trace table to 5 rows and offers 'View all (N)'", () => {
+    renderLongView();
+    const inlineTable = screen.getByTestId("decision-trace-table");
+    expect(within(inlineTable).getAllByTestId("trace-row")).toHaveLength(5);
+    // N = 24 trace rows → the affordance appears with the full count.
+    expect(screen.getByTestId("trace-view-all")).toHaveTextContent(
+      `View all (${FIXTURE_TIMELINE_LONG.safety_evaluations.length})`,
+    );
+  });
+
+  it("caps the inline advisor timeline to 5 rows and offers 'View all (N)'", () => {
+    renderLongView();
+    const inlineTimeline = screen.getByTestId("advisor-timeline");
+    expect(within(inlineTimeline).getAllByTestId("advisor-row")).toHaveLength(5);
+    expect(screen.getByTestId("advisor-view-all")).toHaveTextContent(
+      `View all (${FIXTURE_TIMELINE_LONG.advisor_decisions.length})`,
+    );
+  });
+
+  it("does NOT show 'View all' when a list is at or below the cap", () => {
+    // The short fixture has 3 trace rows / 3 advisor rows.
+    renderView();
+    expect(screen.queryByTestId("trace-view-all")).toBeNull();
+    expect(screen.queryByTestId("advisor-view-all")).toBeNull();
+  });
+
+  it("keeps the #253 trace-table header selector unambiguous when the modal is open", () => {
+    renderLongView();
+    fireEvent.click(screen.getByTestId("trace-view-all"));
+    // The inline table keeps the guarded testid; the modal copy uses a distinct one.
+    expect(screen.getAllByTestId("decision-trace-table")).toHaveLength(1);
+    expect(screen.getByTestId("decision-trace-table-modal")).toBeInTheDocument();
+  });
+
+  it("opens the trace modal with the COMPLETE history and closes it", () => {
+    renderLongView();
+    fireEvent.click(screen.getByTestId("trace-view-all"));
+    const modal = screen.getByTestId("trace-modal");
+    expect(within(modal).getAllByTestId("trace-row")).toHaveLength(
+      FIXTURE_TIMELINE_LONG.safety_evaluations.length,
+    );
+    fireEvent.click(screen.getByTestId("trace-modal-close"));
+    expect(screen.queryByTestId("trace-modal")).toBeNull();
+  });
+
+  it("selecting a trace row that only lives in the modal sets the curve highlight and closes the modal (#126)", () => {
+    renderLongView();
+    expect(window.__chart?.highlightTime).toBeNull();
+    fireEvent.click(screen.getByTestId("trace-view-all"));
+
+    // Tick 0 is well outside the last-5 inline window — modal-only.
+    const modal = screen.getByTestId("trace-modal");
+    const firstRow = within(modal)
+      .getAllByTestId("trace-row")
+      .find((r) => r.getAttribute("data-tick") === "0")!;
+    fireEvent.click(firstRow);
+
+    // The highlight is set (tick 0 → 0 s in the telemetry) and the modal closed so
+    // the highlighted curve at the top of the page is back in frame.
+    expect(window.__chart?.highlightTime).toBe(0);
+    expect(screen.queryByTestId("trace-modal")).toBeNull();
+  });
+
+  it("selecting an inline trace row still highlights the curve (inline view works)", () => {
+    renderLongView();
+    const inlineTable = screen.getByTestId("decision-trace-table");
+    // The CLAMP row is engineered to fall in the last-5 inline window.
+    const clamp = within(inlineTable)
+      .getAllByTestId("trace-row")
+      .find((r) => r.getAttribute("data-verdict") === "clamp")!;
+    fireEvent.click(clamp);
+    expect(window.__chart?.highlightTime).not.toBeNull();
   });
 });
 

@@ -244,3 +244,115 @@ export const FIXTURE_TIMELINE_FAILED: RoastTimeline = {
   ],
   commands: [],
 };
+
+// --- Long-roast fixture (#271) -----------------------------------------------
+//
+// A long roast whose advisor-decisions list and decision-trace table both far
+// exceed the inline cap of 5 — the state the cap + "View all" modal exists for.
+// Reuses the same telemetry/detail (the curve is incidental here) and synthesizes
+// many ALLOW ticks with one CLAMP near the end, so the CLAMP row is among the last
+// 5 and stays inline (the `roast-detail-selected` highlight guard, #126, keeps
+// working). The full set lives in the modal.
+
+export const FIXTURE_LONG_RUN_ID = "detail-fixture-long-001";
+
+const LONG_TRACE_TICK_COUNT = 24; // > 5 so the cap engages.
+// The CLAMP sits at the second-to-last tick → inside the last-5 inline window.
+const LONG_CLAMP_TICK = LONG_TRACE_TICK_COUNT - 2;
+
+export const FIXTURE_DETAIL_LONG: RoastDetail = {
+  ...FIXTURE_DETAIL,
+  id: FIXTURE_LONG_RUN_ID,
+  notes: "Long roast — decision lists exceed the inline cap.",
+};
+
+// Telemetry long enough that every synthesized trace/advisor tick maps to an
+// `elapsed_seconds` (so a selected row — inline or modal — has a curve x-position).
+const LONG_TELEMETRY_POINTS: TelemetryPoint[] = Array.from(
+  { length: LONG_TRACE_TICK_COUNT + 2 },
+  (_, i) => {
+    const elapsed = i * 30;
+    const phase =
+      i < LONG_TRACE_TICK_COUNT - 4
+        ? "roasting_pre_first_crack"
+        : i < LONG_TRACE_TICK_COUNT
+          ? "development"
+          : "cooling";
+    return {
+      tick: i,
+      elapsed_seconds: elapsed,
+      agent_phase: phase,
+      bean_temp_c: 92 + i * 5.2,
+      env_temp_c: 120 + i * 4.0,
+      bean_ror_c_per_min: Math.max(3, 16 - i * 0.4),
+      env_ror_c_per_min: Math.max(2, 14 - i * 0.35),
+      heat_level_percent: 70,
+      fan_level_percent: 45,
+      cooling_on: i >= LONG_TRACE_TICK_COUNT,
+      development_percent: i >= LONG_TRACE_TICK_COUNT - 4 ? (i - (LONG_TRACE_TICK_COUNT - 4)) * 4 : null,
+    };
+  },
+);
+
+export const FIXTURE_TELEMETRY_LONG: TelemetrySeries = {
+  run_id: FIXTURE_LONG_RUN_ID,
+  downsample: 1,
+  point_count: LONG_TELEMETRY_POINTS.length,
+  points: LONG_TELEMETRY_POINTS,
+};
+
+export const FIXTURE_TIMELINE_LONG: RoastTimeline = {
+  run_id: FIXTURE_LONG_RUN_ID,
+  events: FIXTURE_TIMELINE.events,
+  safety_evaluations: Array.from({ length: LONG_TRACE_TICK_COUNT }, (_, i) => {
+    const isClamp = i === LONG_CLAMP_TICK;
+    const recordedAt = `2026-06-07T09:${String(12 + i).padStart(2, "0")}:00Z`;
+    return isClamp
+      ? {
+          tick: i,
+          rule: "bounds",
+          verdict: "clamp" as const,
+          input_heat: 105,
+          input_fan: 40,
+          adjusted_heat: 100,
+          adjusted_fan: 40,
+          reason:
+            "requested heat 105 % / fan 40 % outside 0–100: clamped to heat 100 % / fan 40 %",
+          recorded_at_utc: recordedAt,
+        }
+      : {
+          tick: i,
+          rule: "rate_limit",
+          verdict: "allow" as const,
+          input_heat: 70,
+          input_fan: 45,
+          adjusted_heat: 70,
+          adjusted_fan: 45,
+          reason: "within limits",
+          recorded_at_utc: recordedAt,
+        };
+  }),
+  advisor_decisions: Array.from({ length: LONG_TRACE_TICK_COUNT }, (_, i) => {
+    const isClamp = i === LONG_CLAMP_TICK;
+    const recordedAt = `2026-06-07T09:${String(12 + i).padStart(2, "0")}:00Z`;
+    return {
+      tick: i,
+      provider: "openrouter",
+      model: "anthropic/claude-opus-4.8",
+      prompt_version: "v1",
+      latency_ms: 800 + i,
+      status: "ok" as const,
+      decision: {
+        target_heat: isClamp ? 105 : 70,
+        target_fan: isClamp ? 40 : 45,
+        should_drop: false,
+        confidence: 0.8,
+        rationale: isClamp
+          ? "Pushing heat near first crack to hold momentum into development."
+          : `Holding heat; RoR tracking the profile (tick ${i}).`,
+      },
+      recorded_at_utc: recordedAt,
+    };
+  }),
+  commands: [],
+};

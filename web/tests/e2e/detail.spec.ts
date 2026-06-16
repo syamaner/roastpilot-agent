@@ -93,6 +93,53 @@ test("the detail curve carries the full persisted series + T0/FC/drop markers", 
   expect(hook.markers.map((m) => m.kind).sort()).toEqual(["drop", "first_crack", "t0"]);
 });
 
+test.describe("capped detail lists (#271)", () => {
+  // The long-roast harness: advisor-decisions + decision-trace both have 24 rows
+  // (> the inline cap of 5), so the page must show only the last 5 of each inline
+  // and offer a "View all (N)" affordance into the scrollable modal — proving the
+  // detail page stays a fixed-height layout instead of growing with roast length.
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/__detail-harness-long");
+    await settle(page);
+    await waitForChartPoints(page, 1);
+  });
+
+  test("roast-detail-capped — inline lists cap at 5 with a 'View all' affordance", async ({
+    page,
+  }) => {
+    // Inline cap: only the last 5 rows of each list render in the page body.
+    await expect(page.getByTestId("trace-row")).toHaveCount(5);
+    await expect(page.getByTestId("advisor-row")).toHaveCount(5);
+
+    // The affordance appears iff N > cap (24 > 5 here), one per list.
+    await expect(page.getByTestId("trace-view-all")).toHaveText("View all (24)");
+    await expect(page.getByTestId("advisor-view-all")).toHaveText("View all (24)");
+
+    // #253 still holds on the long page: the inline trace table keeps the guarded
+    // `decision-trace-table` testid (the modal copy uses a distinct `-modal` id), so
+    // the structural header guard resolves to exactly one table.
+    await expect(page.locator("[data-testid='decision-trace-table'] thead th")).toHaveText([
+      ...EXPECTED_TRACE_COLUMNS,
+    ]);
+
+    await expect(page).toHaveScreenshot("roast-detail-capped.png");
+  });
+
+  test("'View all' opens the full, scrollable history and Escape closes it", async ({ page }) => {
+    await page.getByTestId("trace-view-all").click();
+
+    // The modal shows the COMPLETE set (all 24 rows), in its own table copy so the
+    // inline guard above is never ambiguous.
+    const dialog = page.getByTestId("trace-modal");
+    await expect(dialog).toBeVisible();
+    await expect(dialog.locator("[data-testid='decision-trace-table-modal'] [data-testid='trace-row']")).toHaveCount(24);
+
+    // Escape closes and returns focus (a11y, mirroring RecoveryModal).
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+  });
+});
+
 test.describe("advisor-failure detail (#170)", () => {
   test.beforeEach(async ({ page }) => {
     await page.goto("/__detail-harness-failed");

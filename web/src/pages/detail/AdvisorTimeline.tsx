@@ -37,6 +37,12 @@ export interface AdvisorTimelineProps {
   selectedTick: number | null;
   /** Toggle selection for a row's tick (re-selecting the same tick clears it). */
   onSelect: (tick: number) => void;
+  /**
+   * The table container's `data-testid`. Defaults to `advisor-timeline`; the modal
+   * copy of this timeline (#271) passes a DISTINCT id so the inline and modal
+   * tables stay individually addressable when both are mounted.
+   */
+  tableTestId?: string;
   className?: string;
 }
 
@@ -44,6 +50,7 @@ export function AdvisorTimeline({
   rows,
   selectedTick,
   onSelect,
+  tableTestId = "advisor-timeline",
   className,
 }: AdvisorTimelineProps): React.JSX.Element {
   if (rows.length === 0) {
@@ -62,7 +69,7 @@ export function AdvisorTimeline({
 
   return (
     <div
-      data-testid="advisor-timeline"
+      data-testid={tableTestId}
       className={cn("overflow-x-auto rounded-lg border border-border bg-card", className)}
     >
       <table className="w-full border-collapse text-sm">
