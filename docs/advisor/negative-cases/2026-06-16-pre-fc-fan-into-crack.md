@@ -15,7 +15,7 @@ and likely would not, do this.
 ## Context sent to the model
 
 ```json
-{"phase":"roasting_pre_first_crack","roast_elapsed_seconds":534.0,"development_elapsed_seconds":null,"current_bean_temp_c":168.0,"current_env_temp_c":219.0,"bean_ror_c_per_min":10.7,"env_ror_c_per_min":7.0,"target_drop_temp_c":190.0,"target_development_percent":17.9,"charge_guidance_min_c":null,"charge_guidance_max_c":null,"profile_name":".artisan-fixtures/artisan-02","recent_telemetry_samples":[{"monotonic_seconds":537.698,"bean_temp_c":167.0,"env_temp_c":218.0,"heat_level_percent":100,"fan_level_percent":30},{"monotonic_seconds":538.698,"bean_temp_c":167.3,"env_temp_c":218.3,"heat_level_percent":100,"fan_level_percent":30},{"monotonic_seconds":539.698,"bean_temp_c":167.7,"env_temp_c":218.7,"heat_level_percent":100,"fan_level_percent":30},{"monotonic_seconds":540.698,"bean_temp_c":168.0,"env_temp_c":219.0,"heat_level_percent":100,"fan_level_percent":30},{"monotonic_seconds":541.698,"bean_temp_c":168.0,"env_temp_c":219.0,"heat_level_percent":100,"fan_level_percent":30},{"monotonic_seconds":542.698,"bean_temp_c":168.0,"env_temp_c":219.0,"heat_level_percent":100,"fan_level_percent":30}],"first_crack_detected":false,"first_crack_timestamp_seconds":null,"seconds_since_charge":null}
+{"phase":"roasting_pre_first_crack","roast_elapsed_seconds":534.0,"current_bean_temp_c":168.0,"current_env_temp_c":219.0,"bean_ror_c_per_min":10.7,"env_ror_c_per_min":7.0,"target_drop_temp_c":190.0,"target_development_percent":17.9,"profile_name":".artisan-fixtures/artisan-02","first_crack_detected":false}
 ```
 
 ## Model response
@@ -32,8 +32,9 @@ and likely would not, do this.
 - **Heat 100 → 60 at bean 168**, still climbing toward the ~170–180 °C FC band. "Prevent
   overshoot" sounds prudent, but cutting that hard *before* FC risks **stalling/delaying** the
   crack — the opposite of "drive to FC".
-- The human in `artisan-02` held **100 / 30** through here (see `recent_telemetry_samples`):
-  a clean directional **disagreement**, in the dangerous direction.
+- The human in `artisan-02` held **heat 100 / fan 30** through this window (in the input
+  telemetry, trimmed here per the no-raw-logs policy): a clean directional **disagreement**,
+  in the dangerous direction.
 - It correctly names the phase ("Pre-first-crack…") — **recognition is not the failure;
   *acting* pre-FC is.** Even the model's own hedge ("if RoR falls too quickly … avoid
   stalling") shows it sensed the risk it was creating.
