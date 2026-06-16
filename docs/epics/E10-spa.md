@@ -275,6 +275,44 @@ the dev-time + DTR readouts; no new snapshot state added — the developed state
 already reaches `development`), and its test gained data-level assertions on both
 readouts.
 
+### E10 follow-ups — closed (15–16 Jun 2026)
+
+The S1–S6 review-deferred follow-ups and contract/observability fast-follows are
+all merged to `main`. None re-open a story; they harden the shipped surface.
+
+| # | What | PR |
+|---|------|-----|
+| #102 | Pin `pyright` in the dev group so local == CI | #231 |
+| #103 | Replay-harness hardening (7 deferred PR #101 follow-ups) | #251 |
+| #104 | Live-serve path pinned to the recovery lifespan (test) | #233 |
+| #105 | E10-S2 deferred review nits (typed command tool + stable `chargeBand`) | #249 |
+| #111 | `first_crack_at_utc` on `RoastSummary` + history FC-time column | #240 |
+| #112 | Dashboard live-contract gaps — **closed**: GAP A (live dev time/DTR) shipped via #220/#238; GAP B (live FC-detector health) is M2/MCP scope, out of E10 | #238 |
+| #117 | `acknowledge_fault` operator action — FE-gating + audit-only guard (substance already shipped in #206) | #264 |
+| #121 | Continuous contract-drift auto-catch (regenerate-in-CI + compare) | #236 |
+| #126 | Detail CLAMP-highlight captured in-frame (element-scoped snapshot) | #256 |
+| #133 | `LiveCurve` test-hardening (ror scale hook, scale-covers-data, cleanup) | #250 |
+| #155 | Dashboard curve hydration — O(M+N) `mergeSeed` + backfill catch-path tests | #254 |
+| #205 | Display-only RoR smoothing — dissolve the curve staircase | #243 |
+| #217 | Live curve fixed Y-axis scales (temp + RoR) | #232 |
+| #219 | Charge-reference the advisor's DTR/drop clock (server-side) | #234 |
+| #220 | Live development time + DTR on the dashboard | #238 |
+| #235 | Persist & restore the charge clock (T0) across restart | #259 |
+| #237 | Run the contract-drift gate `if: always()` so the hint shows on real drift | #255 |
+| #239 | Freeze development time / DTR at the drop | #261 |
+| #241 | Un-blind the history snapshot — test the populated 7-column table | #252 |
+| #242 | Name-keyed row access in store read projections | #248 |
+| #244 | Relocate `rorSmoothing` helper to `web/src/lib/` (shared) | #247 |
+| #253 | Structural column-header assertion on the detail trace-table | #258 |
+| #184 | Advisor stats on `RoastSummary` — drop the history `/timeline` N+1 | #245 |
+| #257 | Dependabot: bump `form-data` | #257 |
+
+**Governance / CI (cross-epic, recorded here for board completeness):** PR review
+roster curated to Claude Code Review + Augment (auggie); Codex + CodeRabbit
+disabled (#246, plan **D37**). CI Playwright image mirrored to GHCR off MCR's
+anonymous-pull hot path; `mirror-playwright.yml` self-refreshes (#262/#263, plan
+**D38**).
+
 Epic status: **core + S6 deterministic work done** — the page fan-out is complete:
 S1–S5 are all merged to `main` (replay #101, foundation #100, E7 `enabled_actions`
 contract #107/D25, S2 foundation follow-up #115 = phase_changed fix + types audit

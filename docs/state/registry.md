@@ -19,8 +19,12 @@
 > charge-origin chart deferred to #220**). **§7 forward goals:**
 > parameterised plan interface (a future learning loop → anticipatory pre-FC) + outcome-
 > labelled roast logs as a fine-tune training corpus (learning brain → roastpilot-cloud, D29).
-> Forward-looking #209/#211 (charge cluster) are MERGED; #210/#212 (operability) deferred to
-> after the next roast. **E11 (packaging) remains gated** behind D35 + the D28/D27 gates below.
+> Forward-looking #209/#211 (charge cluster) are MERGED. **Observability slice DONE on `main`**
+> (#217/#219/#220 + #205, plus the #235/#239 DTR-correctness fixes — shipped ahead of the first
+> roast, NOT deferred; see the 15–16 Jun session note below and plan D35a). #210/#212 (operability)
+> remain deferred to after the next roast. **The D35 keystone #222/#223/#224 (epic #221) is still
+> OPEN — the critical path to the next #134 roast.** **E11 (packaging) remains gated** behind D35 +
+> the D28/D27 gates below.
 >
 > **D36 (14 Jun, operator) — refines D35 §7.1.** (a) The post-FC loop's context (#223) gains a
 > **windowed telemetry series** (5 s samples; recent full-res window + milestone summary —
@@ -75,6 +79,47 @@
   E9 (vertical slice) → E10 (SPA) → E11 (packaging) → E12 (validation/demo).
 
 ## Active Context
+
+**15–16 Jun 2026 — two autonomous batches + safety-operability + observability merged
+to `main`; D35 keystone still the critical path.** The latest session-cluster cleared a
+large pre-roast backlog without starting the D35 build. Honest state:
+
+- **Observability slice — DONE** (was D35a-listed "deferred", now shipped ahead of the
+  roast): live curve fixed Y-axis (#217 → #232), charge-referenced DTR/drop clock
+  (#219 → #234), live development time + DTR on the dashboard (#220 → #238), display-only
+  RoR smoothing (#205 → #243). The post-FC loop's DTR inputs and the operator's post-FC
+  readouts are now in place before #223.
+- **Safety-operability / DTR-correctness — DONE:** charge clock (T0) survives restart
+  (#235 → #259), development time / DTR freeze at the drop (#239 → #261), `acknowledge_fault`
+  FE-gating + audit-only guard (#117 → #264; substance shipped earlier in #206).
+- **E10 follow-up housekeeping — DONE** (all merged; see `docs/epics/E10-spa.md` "E10
+  follow-ups — closed"): #102 (pin pyright → #231), #104 (recovery-lifespan test → #233),
+  #121 (#236) + #237 (#255) contract-drift gate, #111 (FC-time on history → #240), #184
+  (advisor stats on summary, kills the history N+1 → #245), #244 (#247) + #105 (#249)
+  refactors, #133 (#250) + #126 (#256) + #241 (#252) + #253 (#258) test-hardening, #155
+  (#254) curve hydration, #242 (#248) name-keyed rows, #103 (#251) replay-harness
+  hardening, #257 Dependabot. **#112 closed** (GAP A shipped via #220; GAP B = live
+  FC-detector health is M2/MCP scope, out of E10).
+- **Governance / CI — DONE:** PR review roster curated to Claude Code Review + Augment
+  (auggie); Codex + CodeRabbit disabled (#246, **plan D37**) — a conversation-resolution
+  gate + a re-review-on-every-push bot was a non-terminating merge loop. CI Playwright
+  image mirrored to GHCR off MCR's anonymous-pull hot path; `mirror-playwright.yml`
+  self-refreshes weekly + on bump (#262/#263, **plan D38**).
+
+**Remaining backlog (nothing here is started):**
+- **D35 keystone (epic #221, PREP/Todo) — the critical path to the next #134 roast:**
+  **#222** pre-FC deterministic policy → **#223** post-FC LLM control loop (ROAST-CRITICAL)
+  → **#224** replay test-harness + outcome-labelled corpus + re-scoped LLM eval.
+- **D36 (post-first-roast):** #228 pre-FC anticipatory advisory layer, #229 curve-feature
+  spike. (Neither is on the project board yet.)
+- **Advisor behavior:** #218 (fan/heat over-adjust — the attempt-3 evidence for D35).
+- **Safety-operability follow-ups:** #210 (DROP unavailable after e-stop), #212 (Ctrl+C
+  hangs on a live roast), #177 (wedged-MCP-child shutdown timeout), #176 (cooling on
+  graceful shutdown). #159 (auto-merge-vs-review governance race; interim: don't `--auto`
+  substantive PRs).
+- **E11 (packaging, BLOCKED — D28 + D27):** #136/#137/#138, gated on #134 (supervised
+  hardware roast) + the torch-free chain.
+- **E12 (validation/demo):** #139/#140/#141, #134.
 
 E1–E6 are complete: safety policy, deterministic controller, typed MCP
 client, and SQLite persistence (schema v2 with trigger-enforced
