@@ -428,6 +428,15 @@ class RoastStore:
         programming error and raises, like :meth:`update_run_phase` — a silent
         no-op would lose the recovery breadcrumb.
 
+        Write-once guard (defence in depth, #260): the UPDATE is scoped to
+        ``WHERE t0_detected_at_utc IS NULL`` so the first persisted charge
+        instant wins at the storage layer regardless of caller discipline. The
+        controller's ``_t0_persisted`` flag and the recover-seed already prevent
+        any double-write in live paths, so this is behaviour-preserving for the
+        sole current caller (which always writes on the first charged tick, when
+        the column is still NULL); the guard protects a future second caller
+        from clobbering a recovered T0.
+
         Args:
             run_id: The active run whose charge instant is being stamped.
             t0_detected_at_utc: ISO-8601 UTC timestamp of the charge/T0 detection;
@@ -435,12 +444,22 @@ class RoastStore:
         """
         charged_at = t0_detected_at_utc or _utc_now()
         cursor = await self.connection.execute(
-            "UPDATE roast_runs SET t0_detected_at_utc = ?, updated_at_utc = ? WHERE id = ?",
+            "UPDATE roast_runs SET t0_detected_at_utc = ?, updated_at_utc = ?"
+            " WHERE id = ? AND t0_detected_at_utc IS NULL",
             (charged_at, _utc_now(), run_id),
         )
         await self.connection.commit()
         if cursor.rowcount == 0:
-            raise RuntimeError(f"no roast_run with id {run_id!r}")
+            # Either the run does not exist (a programming error) or T0 is
+            # already persisted (the write-once guard fired). Distinguish the
+            # two so a missing run still raises but a guarded second write is a
+            # silent no-op (first-write-wins).
+            exists_cursor = await self.connection.execute(
+                "SELECT 1 FROM roast_runs WHERE id = ?", (run_id,)
+            )
+            row = await exists_cursor.fetchone()
+            if row is None:
+                raise RuntimeError(f"no roast_run with id {run_id!r}")
 
     async def record_event(
         self,

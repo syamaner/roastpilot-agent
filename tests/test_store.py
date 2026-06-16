@@ -596,6 +596,32 @@ async def test_record_t0_detected_at_unknown_run_raises(tmp_store: RoastStore) -
 
 
 @pytest.mark.asyncio
+async def test_record_t0_detected_at_is_write_once(tmp_store: RoastStore) -> None:
+    """#260: the SQL-layer write-once guard makes the first persisted charge
+    instant win. The normal first write succeeds; a second call with a different
+    timestamp is a silent no-op (``WHERE t0_detected_at_utc IS NULL``) and does
+    not clobber the recovered value, regardless of caller discipline."""
+    store = await seeded_store(tmp_store)
+    try:
+        first = "2026-06-15T10:00:00+00:00"
+        second = "2026-06-15T10:05:00+00:00"
+
+        # First write succeeds (column was NULL).
+        await store.record_t0_detected_at("run-1", first)
+        persisted = await store.read_latest_run()
+        assert persisted is not None
+        assert persisted.t0_detected_at_utc == first
+
+        # Second write with a different timestamp does not overwrite.
+        await store.record_t0_detected_at("run-1", second)
+        persisted = await store.read_latest_run()
+        assert persisted is not None
+        assert persisted.t0_detected_at_utc == first
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
 async def test_recovery_read_feeds_the_controller(tmp_path: Path) -> None:
     """End to end across the E4/E6 seam: the persisted phase drives
     recover_from_restart into operator_recovery_required with zero writes."""
