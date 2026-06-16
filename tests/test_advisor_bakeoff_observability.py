@@ -327,6 +327,76 @@ async def test_resume_does_not_repay_for_finished_cells(
     assert calls["n"] == 0, "a fully-resumed run must not re-pay for any cell"
 
 
+@pytest.mark.asyncio
+async def test_resume_count_is_scoped_to_the_current_run_grid(
+    mock_healthcheck: None, tmp_path: Path
+) -> None:
+    """Unrelated sidecar entries don't inflate the resumed count or get skipped.
+
+    A sidecar from a DIFFERENT roster / prompt set sits alongside the current
+    run's cells. The resumed count must reflect only the current ``(survivors x
+    prompts x roasts)`` grid, and every current-run cell must run (none wrongly
+    skipped against a foreign key).
+    """
+    out = tmp_path / "bakeoff.json"
+    roster = _roster()
+    roasts = bakeoff.REPLAY_ROASTS
+    grid = len(roster) * len(roasts)
+
+    # Seed the sidecar with entries that are NOT in this run's grid: a foreign
+    # model slug and a foreign prompt version, both with the run's roast ids.
+    sidecar = bakeoff.sidecar_path(out)
+    foreign: list[dict[str, Any]] = [
+        {
+            "model_slug": "foreign/model-not-in-roster",
+            "prompt_version": "v2",
+            "roast_id": bakeoff.roast_id_for(roasts[0]),
+            "call_count": 7,
+            "outcomes": [],
+        },
+        {
+            "model_slug": _SLUG_A,  # a real survivor slug…
+            "prompt_version": "v9-not-run",  # …but a prompt this run never uses.
+            "roast_id": bakeoff.roast_id_for(roasts[0]),
+            "call_count": 11,
+            "outcomes": [],
+        },
+    ]
+    sidecar.write_text("".join(json.dumps(r) + "\n" for r in foreign))
+
+    calls = {"n": 0}
+
+    async def counting_recommend(context: AdvisorContext) -> RoastDecision:
+        calls["n"] += 1
+        return await _canned_recommend(context)
+
+    def counting_factory(_cand: Candidate, _pv: str) -> Any:
+        return counting_recommend
+
+    result = await bakeoff.run_replay_bakeoff_observable(
+        roster,
+        roasts,
+        ["v2"],
+        None,
+        60.0,
+        out=out,
+        recommender_factory=counting_factory,
+        clock=_fixed_clock(),
+        heartbeat_clock=_fixed_clock(),
+    )
+
+    # None of the foreign entries belong to this run's grid → nothing resumed,
+    # every current-run cell ran fresh (the foreign keys never mis-skipped one).
+    assert result.resumed_cells == 0
+    assert result.fresh_cells == grid
+    assert calls["n"] > 0, "current-run cells must actually run, not skip on foreign keys"
+
+    # The sidecar now also carries this run's real cells, on top of the foreign
+    # ones the harness left untouched.
+    written = [ln for ln in sidecar.read_text().splitlines() if ln.strip()]
+    assert len(written) == len(foreign) + grid
+
+
 # --- Partial-on-kill: a valid partial scorecard renders ----------------------
 
 
@@ -379,6 +449,31 @@ def test_cost_guard_unbounded_never_trips() -> None:
     guard = bakeoff.CostGuard(cost_per_call=99.0, max_spend=None)
     guard.add_calls(1000)
     assert guard.would_exceed(1000) is False
+
+
+def test_progress_line_cost_uses_configured_rate_not_the_default() -> None:
+    """The per-cell cost in the progress line uses the run's rate, not the default."""
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    rid = bakeoff.roast_id_for(fixture)
+    ticks, ground = bakeoff.build_ticks(fixture, cadence_seconds=60.0)
+    outcomes = [
+        bakeoff.TickOutcome(tick=t, decision=None, latency_seconds=0.1, error="x") for t in ticks
+    ]
+    replay = bakeoff.build_roast_replay(_SLUG_A, "v2", rid, outcomes, ground)
+    cand = Candidate(_SLUG_A, Tier.INCUMBENT, bakeoff.PHASE_ORDER)
+
+    # A configured rate deliberately different from DEFAULT_COST_PER_CALL_USD.
+    configured = 0.005
+    assert configured != bakeoff.DEFAULT_COST_PER_CALL_USD
+    guard = bakeoff.CostGuard(cost_per_call=configured, max_spend=None)
+    line = bakeoff.cell_progress_line(cand, replay, 1, 4, guard.cost_per_call)
+
+    # The line's cost equals call_count * the CONFIGURED rate (the CostGuard rate),
+    # and disagrees with the default-rate figure a contradicting display would show.
+    expected = round(replay.call_count * configured, 4)
+    default_figure = round(replay.call_count * bakeoff.DEFAULT_COST_PER_CALL_USD, 4)
+    assert f"~${expected:.2f}" in line
+    assert expected != default_figure
 
 
 @pytest.mark.asyncio

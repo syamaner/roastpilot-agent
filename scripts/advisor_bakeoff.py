@@ -1682,12 +1682,27 @@ class Heartbeat:
         )
 
 
-def _cell_progress_line(cand: Candidate, replay: RoastReplay, n: int, total: int) -> str:
-    """Render the per-cell progress line emitted as each cell completes."""
+def cell_progress_line(
+    cand: Candidate, replay: RoastReplay, n: int, total: int, cost_per_call: float
+) -> str:
+    """Render the per-cell progress line emitted as each cell completes.
+
+    Args:
+        cand: The candidate model.
+        replay: The completed per-roast replay.
+        n: This cell's 1-based position in the run.
+        total: Total cells the run will attempt.
+        cost_per_call: The run's configured USD-per-call rate — the SAME rate the
+            :class:`CostGuard` accounts spend with, so the displayed per-cell cost
+            never contradicts the budget math.
+
+    Returns:
+        The progress line.
+    """
     score = replay.score
     f1 = score.drop.f1
     median = _phase_latency_str(score.phase_latency)
-    cell_cost = round(replay.call_count * DEFAULT_COST_PER_CALL_USD, 4)
+    cell_cost = round(replay.call_count * cost_per_call, 4)
     return (
         f"  [cell] {cand.slug} | {replay.roast_id} {n}/{total} | "
         f"drop F1={f1} | latency {median} | ~${cell_cost:.2f}"
@@ -1788,18 +1803,21 @@ async def run_replay_bakeoff_observable(
     # both fresh runs and reloads reuse them, so resume needs no model access.
     built = {roast_id_for(f): build_ticks(f, cadence_seconds=cadence_seconds) for f in roasts}
 
-    # Resumed cells already on disk: count them toward cost + progress so the
-    # heartbeat's spend reflects the whole job, then a re-run never re-pays.
-    for record in (
-        checkpoint.record(cell_key(c.slug, pv, roast_id_for(f)))
-        for pv in prompt_versions
-        for c in survivors
-        for f in roasts
-        if checkpoint.has(cell_key(c.slug, pv, roast_id_for(f)))
-    ):
-        guard.add_calls(int(record["call_count"]))
+    # Resumed cells already on disk: count + account ONLY the cells that belong
+    # to THIS run's (survivors x prompts x roasts) grid. A sidecar carrying
+    # entries from a different roster / prompt set must not inflate the resumed
+    # count or the cost — only the current run's keys are skipped below, so the
+    # count must be scoped the same way to stay consistent with that skip logic.
+    resumed = 0
+    for pv in prompt_versions:
+        for c in survivors:
+            for f in roasts:
+                key = cell_key(c.slug, pv, roast_id_for(f))
+                if not checkpoint.has(key):
+                    continue
+                resumed += 1
+                guard.add_calls(int(checkpoint.record(key)["call_count"]))
 
-    resumed = checkpoint.completed_count()
     if resumed:
         print(f"resume: {resumed}/{total_cells} cells already on disk — skipping them", flush=True)
 
@@ -1845,7 +1863,10 @@ async def run_replay_bakeoff_observable(
                 replays_by_cell.setdefault((cand.slug, pv), []).append(replay)
                 done += 1
                 fresh += 1
-                print(_cell_progress_line(cand, replay, done, total_cells), flush=True)
+                print(
+                    cell_progress_line(cand, replay, done, total_cells, guard.cost_per_call),
+                    flush=True,
+                )
                 heartbeat.maybe_beat(done=done, guard=guard)
             if stopped:
                 break
