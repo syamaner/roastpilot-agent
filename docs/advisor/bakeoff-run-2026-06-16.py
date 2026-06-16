@@ -110,10 +110,14 @@ async def main() -> int:
         ROSTER_REASONING, ALL_ROASTS, [PROMPT_VERSION], "low", CADENCE_SECONDS
     )
 
+    # trajectory=True appends the control-trajectory sanity section (#277): the
+    # agreement-free command-signal coherence view (change/reversal counts,
+    # control-signal entropy, momentum cuts) the D40.4 control-loop eval needs.
+    # The JSON already always carries it.
     report = (
-        render_replay_report(cells_main, ALL_ROASTS)
+        render_replay_report(cells_main, ALL_ROASTS, trajectory=True)
         + "\n\n---\n\n## gpt-5-mini (reasoning=low)\n\n"
-        + render_replay_report(cells_reason, ALL_ROASTS)
+        + render_replay_report(cells_reason, ALL_ROASTS, trajectory=True)
     )
     print("\n" + report, flush=True)
 
