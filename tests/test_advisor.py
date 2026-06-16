@@ -925,12 +925,19 @@ def test_reasoning_from_run_returns_none_without_thinking_parts() -> None:
 
 
 def test_reasoning_from_run_extracts_and_joins_thinking_parts() -> None:
-    """Thinking-part contents across the run are concatenated into the trace."""
+    """Thinking-part contents across the run are concatenated into the trace.
+
+    An empty thinking part is skipped (the ``if content`` guard), so only the
+    non-empty parts join into the trace.
+    """
 
     class _Result:
         def all_messages(self) -> list[ModelResponse]:
             return [
                 ModelResponse(parts=[ThinkingPart(content="step one")]),
+                # An empty thinking part is skipped — exercises the falsy-content
+                # branch so it cannot smuggle a blank fragment into the trace.
+                ModelResponse(parts=[ThinkingPart(content="")]),
                 ModelResponse(parts=[ThinkingPart(content="step two"), TextPart("answer")]),
             ]
 
@@ -940,6 +947,16 @@ def test_reasoning_from_run_extracts_and_joins_thinking_parts() -> None:
 def test_reasoning_from_run_never_raises_on_bad_shape() -> None:
     """An unrecognised run shape degrades to ``None`` rather than erroring."""
     assert reasoning_from_run(object()) is None
+
+
+def test_reasoning_from_run_swallows_all_messages_error() -> None:
+    """An ``all_messages()`` that raises degrades to ``None`` (best-effort)."""
+
+    class _Result:
+        def all_messages(self) -> list[ModelResponse]:
+            raise RuntimeError("library shape changed")
+
+    assert reasoning_from_run(_Result()) is None
 
 
 @pytest.mark.asyncio
