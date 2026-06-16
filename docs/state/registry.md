@@ -80,9 +80,11 @@
 
 ## Active Context
 
-**15–16 Jun 2026 — two autonomous batches + safety-operability + observability merged
-to `main`; D35 keystone still the critical path.** The latest session-cluster cleared a
-large pre-roast backlog without starting the D35 build. Honest state:
+**15–16 Jun 2026 — two batches of autonomous agent-execution work (dev orchestration,
+NOT roast autonomy — the advisor stays advisory-only and never controls hardware) +
+safety-operability + observability merged to `main`; D35 keystone still the critical
+path.** The latest session-cluster cleared a large pre-roast backlog without starting the
+D35 build. Honest state:
 
 - **Observability slice — DONE** (was D35a-listed "deferred", now shipped ahead of the
   roast): live curve fixed Y-axis (#217 → #232), charge-referenced DTR/drop clock
