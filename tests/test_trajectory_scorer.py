@@ -142,6 +142,23 @@ def test_holds_between_trims_do_not_create_reversals() -> None:
     assert traj.direction_reversal_count == 0
 
 
+def test_reversal_rate_is_hold_invariant() -> None:
+    """Identical directional thrash scores the SAME rate, holds or not (fix #1).
+
+    The dense thrash ``[30,40,30,40]`` and the hold-interleaved
+    ``[30,40,40,30,30,40]`` have the SAME non-hold directional move sequence
+    (up, down, up → two reversals). Normalising by directional pairs (not raw
+    sample pairs) must make their reversal_rate identical — otherwise a model
+    that pads thrash with holds looks falsely more coherent.
+    """
+    dense = ts.score_lever_trajectory("fan", [30, 40, 30, 40])
+    interleaved = ts.score_lever_trajectory("fan", [30, 40, 40, 30, 30, 40])
+    assert dense.direction_reversal_count == interleaved.direction_reversal_count == 2
+    assert dense.reversal_rate == interleaved.reversal_rate
+    # Both are pure thrash on every directional pair → rate at its max of 1.0.
+    assert dense.reversal_rate == 1.0
+
+
 # --- control-signal entropy --------------------------------------------------
 
 
@@ -267,6 +284,53 @@ def test_empty_development_scores_zero() -> None:
     assert sanity.control_signal_entropy == 0.0
     assert sanity.trajectory_sanity == 0.0
     assert sanity.momentum_cut_flags == 0
+    # An empty window is below the threshold → flagged low-confidence.
+    assert sanity.low_confidence is True
+
+
+# --- short-window low-confidence (safety-reviewer fix #2) --------------------
+
+
+def test_short_dev_window_is_flagged_low_confidence() -> None:
+    """A <= 2-tick window reads reversal_rate=0 by construction → flagged (fix #2).
+
+    Two ticks can yield at most one directional move, so a reversal is impossible
+    and the rate is 0 — "smooth" by accident, not coherence. The card must flag
+    it so the operator does not rank such a model smooth, while STILL computing
+    the numbers (and still able to register momentum cuts).
+    """
+    short = ts.score_trajectory(
+        _series_outcomes([70, 40], [40, 40], ror_series=[3.0, 3.0]),
+        "short-window",
+    )
+    assert short.development_ok_count == 2
+    assert short.control_signal_entropy == 0.0
+    assert short.low_confidence is True
+    # The flag does not suppress momentum-cut detection: the 70->40 cut on low
+    # RoR is still penalised, so a short window cannot dodge the penalty by being
+    # ranked "smooth".
+    assert short.momentum_cut_flags == 1
+
+
+def test_full_dev_window_is_not_low_confidence() -> None:
+    """A window at/above the threshold is NOT flagged low-confidence."""
+    full = ts.score_trajectory(
+        _series_outcomes([60, 55, 50, 45], [40, 40, 40, 40], ror_series=[8.0] * 4),
+        "full-window",
+    )
+    assert full.development_ok_count == ts.MIN_CONFIDENT_DEV_TICKS
+    assert full.low_confidence is False
+
+
+def test_report_surfaces_low_confidence_flag() -> None:
+    """The markdown report annotates a low-confidence short window."""
+    short = ts.score_trajectory(
+        _series_outcomes([70, 40], [40, 40], ror_series=[8.0, 8.0]),
+        "short-window",
+    )
+    report = ts.render_trajectory_report([("model-x prompt=v4", [short])])
+    assert "LOW-CONFIDENCE" in report
+    assert "do NOT rank as 'smooth'" in report
 
 
 # --- reporting + JSON --------------------------------------------------------
@@ -306,6 +370,7 @@ def test_trajectory_to_json_round_trips_fields() -> None:
     }
     assert data["control_signal_entropy"] == sanity.control_signal_entropy
     assert data["trajectory_sanity"] == sanity.trajectory_sanity
+    assert data["low_confidence"] == sanity.low_confidence
 
 
 # --- real-data smoke (committed 7-Jun roasts) -------------------------------

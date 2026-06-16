@@ -85,6 +85,16 @@ LARGE_HEAT_CUT_PCT = 15.0
 # distribution (memory: "Operator Hottop roast profile").
 LOW_ROR_C_PER_MIN = 5.0
 
+# Below this many development-phase recommendations the reversal_rate / entropy
+# is LOW-CONFIDENCE: a reversal needs >= 2 directional moves (>= 3 setpoints), so a
+# window of <= 2 ticks yields reversal_rate=0 by construction — "smooth" by
+# accident, not coherence — while still eligible for momentum-cut penalties. Flag
+# (do NOT auto-exclude) any window below this so the operator does not rank a
+# short-window model "smooth" spuriously (safety-reviewer #2). Set to 4: the
+# smallest window where at least two reversals can occur, so the rate is
+# meaningfully populated rather than 0/near-0 by window length alone.
+MIN_CONFIDENT_DEV_TICKS = 4
+
 
 # --- Per-lever trajectory metrics -------------------------------------------
 
@@ -107,8 +117,11 @@ class LeverTrajectory:
             trim has zero reversals; the 30↔40↔50↔60↔70 twiddle reverses on
             almost every step.
         reversal_rate: ``direction_reversal_count`` normalised by the number of
-            consecutive delta-pairs that could reverse (``max(sample_count-2, 0)``)
-            — in ``[0, 1]``, comparable across series of different length.
+            adjacent *directional* (non-hold) move-pairs that could reverse
+            (``max(directional_moves - 1, 0)``) — in ``[0, 1]``, and
+            **hold-invariant**: interleaving holds between the same directional
+            moves does not change the rate, so it is comparable across models
+            regardless of how many sub-dead-band holds each emits.
         mean_abs_change: Mean magnitude (percentage points) of the moves that
             cleared the dead-band, or ``0.0`` if the lever never moved.
     """
@@ -175,11 +188,15 @@ def score_lever_trajectory(lever: str, series: list[int]) -> LeverTrajectory:
     directions = [c for c in (_classify_delta(d) for d in deltas) if c != 0]
     reversals = sum(1 for i in range(len(directions) - 1) if directions[i] != directions[i + 1])
 
-    # Normalise by the number of consecutive delta-pairs that *could* reverse, so
-    # the rate is comparable across roasts of different scored length. With N
-    # samples there are N-1 deltas and N-2 adjacent delta-pairs.
-    pair_slots = max(len(series) - 2, 0)
-    reversal_rate = round(reversals / pair_slots, 3) if pair_slots else 0.0
+    # Normalise by the number of *directional* (non-hold) move-pairs that could
+    # reverse — NOT the raw sample-pair count — so the rate is HOLD-INVARIANT and
+    # comparable across models. The numerator counts flips between non-hold moves,
+    # so the denominator must too: with D directional moves there are max(D-1, 0)
+    # adjacent directional pairs. Normalising by len(series)-2 instead would let a
+    # model that interleaves holds between thrashy moves look falsely more coherent
+    # than one thrashing back-to-back with the same reversals (safety-reviewer #1).
+    directional_pairs = max(len(directions) - 1, 0)
+    reversal_rate = round(reversals / directional_pairs, 3) if directional_pairs else 0.0
 
     return LeverTrajectory(
         lever=lever,
@@ -322,6 +339,11 @@ class TrajectorySanity:
         momentum_cuts: The detected cuts (for the report / diagnosis).
         trajectory_sanity: The composite thrash summary (lower = more roaster-
             like). See :func:`composite_sanity` for the exact combination.
+        low_confidence: ``True`` when the development window had fewer than
+            :data:`MIN_CONFIDENT_DEV_TICKS` recommendations — the reversal_rate /
+            entropy is then near-zero by window length, not by coherence, so the
+            "smooth" reading is not trustworthy. Surfaced in the report; the
+            numbers are still computed (not nulled), just flagged.
     """
 
     roast_name: str
@@ -333,6 +355,7 @@ class TrajectorySanity:
     momentum_cut_flags: int
     momentum_cuts: list[MomentumCut]
     trajectory_sanity: float
+    low_confidence: bool
 
 
 # Weight on each momentum-cut flag in the composite. A momentum-killing cut is a
@@ -411,6 +434,7 @@ def score_trajectory(outcomes: list[TickOutcome], roast_name: str) -> Trajectory
         momentum_cut_flags=len(cuts),
         momentum_cuts=cuts,
         trajectory_sanity=sanity,
+        low_confidence=len(ok) < MIN_CONFIDENT_DEV_TICKS,
     )
 
 
@@ -450,13 +474,19 @@ def render_trajectory_md(sanity: TrajectorySanity) -> list[str]:
     Returns:
         Markdown lines for the report (the caller indents under the cell).
     """
+    confidence = (
+        f" [LOW-CONFIDENCE: < {MIN_CONFIDENT_DEV_TICKS} dev ticks — reversal_rate/"
+        "entropy near-zero by window length, not coherence; do NOT rank as 'smooth']"
+        if sanity.low_confidence
+        else ""
+    )
     lines = [
         f"  - {sanity.roast_name} (dev ticks {sanity.development_ok_count}/"
         f"{sanity.development_tick_count}): "
         f"trajectory_sanity={sanity.trajectory_sanity} "
         f"(lower=less thrash) "
         f"entropy={sanity.control_signal_entropy} "
-        f"momentum_cuts={sanity.momentum_cut_flags}",
+        f"momentum_cuts={sanity.momentum_cut_flags}{confidence}",
         _render_lever_line(sanity.heat),
         _render_lever_line(sanity.fan),
     ]
@@ -525,4 +555,5 @@ def trajectory_to_json(sanity: TrajectorySanity) -> dict[str, Any]:
         "momentum_cut_flags": sanity.momentum_cut_flags,
         "momentum_cuts": [dataclasses.asdict(c) for c in sanity.momentum_cuts],
         "trajectory_sanity": sanity.trajectory_sanity,
+        "low_confidence": sanity.low_confidence,
     }
