@@ -86,6 +86,12 @@ from bakeoff_replay import (  # noqa: E402
     score_roast,
     score_to_json,
 )
+from trajectory_scorer import (  # noqa: E402
+    TrajectorySanity,
+    render_trajectory_report,
+    score_trajectory,
+    trajectory_to_json,
+)
 
 from roastpilot_agent.advisor import (  # noqa: E402
     AdvisorContext,
@@ -913,6 +919,11 @@ class ReplayCell:
         scores: Per-roast scorecards.
         samples: Per-roast advice samples at the key moments (for operator
             quality judgement, since the metrics are agreement-only).
+        trajectories: Per-roast control-trajectory sanity scorecards (#277) —
+            the agreement-FREE command-signal coherence view (change/reversal
+            counts, control-signal entropy, momentum cuts). Ordered to match
+            ``scores`` (one per replay roast). Computed alongside the agreement
+            metrics; reported behind ``--trajectory``.
     """
 
     slug: str
@@ -921,6 +932,12 @@ class ReplayCell:
     latency_risk: bool
     scores: list[RoastScore]
     samples: dict[str, list[tuple[str, TickOutcome]]]
+    # Defaulted so existing constructors (and the report-only tests that build a
+    # cell by hand) stay valid; the replay path always populates it. The typed
+    # factory keeps pyright strict from inferring ``list[Unknown]``.
+    trajectories: list[TrajectorySanity] = dataclasses.field(
+        default_factory=lambda: cast("list[TrajectorySanity]", [])
+    )
 
 
 def _sample_outcomes(
@@ -1005,12 +1022,17 @@ async def score_candidate(
     tick_clock = clock if clock is not None else time.perf_counter
     scores: list[RoastScore] = []
     samples: dict[str, list[tuple[str, TickOutcome]]] = {}
+    trajectories: list[TrajectorySanity] = []
     for fixture in roasts:
         ticks, ground = build_ticks(fixture, cadence_seconds=cadence_seconds)
         outcomes = await replay_roast(ticks, recommend, clock=tick_clock)
         roast_name = f"{fixture.parent.parent.name}/{fixture.parent.name}"
         scores.append(score_roast(outcomes, ground, roast_name))
         samples[roast_name] = _sample_outcomes(outcomes, ground)
+        # Control-trajectory sanity (#277): orthogonal, agreement-free; scored
+        # from the SAME outcomes, so it adds no model calls and never touches the
+        # drop / heat metrics above.
+        trajectories.append(score_trajectory(outcomes, roast_name))
     return ReplayCell(
         slug=cand.slug,
         tier=cand.tier.value,
@@ -1018,6 +1040,7 @@ async def score_candidate(
         latency_risk=cand.latency_risk,
         scores=scores,
         samples=samples,
+        trajectories=trajectories,
     )
 
 
@@ -1046,7 +1069,12 @@ def _phase_latency_str(phase_latency: list[PhaseLatency]) -> str:
     return " ".join(parts) if parts else "—"
 
 
-def render_replay_report(cells: list[ReplayCell], roasts: tuple[Path, ...]) -> str:
+def render_replay_report(
+    cells: list[ReplayCell],
+    roasts: tuple[Path, ...],
+    *,
+    trajectory: bool = False,
+) -> str:
     """Render the quantitative replay report (markdown) — agreement, NOT truth.
 
     Per (model, prompt): the drop F1 / precision / recall / timing, heat & fan
@@ -1057,6 +1085,10 @@ def render_replay_report(cells: list[ReplayCell], roasts: tuple[Path, ...]) -> s
     Args:
         cells: The scored replay cells.
         roasts: The replay roast fixtures (for the header).
+        trajectory: When ``True``, append the control-trajectory sanity section
+            (#277) — the agreement-FREE command-signal coherence view. Off by
+            default so the existing drop-decision report is byte-for-byte
+            unchanged unless the operator opts in.
 
     Returns:
         The markdown report.
@@ -1101,6 +1133,19 @@ def render_replay_report(cells: list[ReplayCell], roasts: tuple[Path, ...]) -> s
             for roast_name, picks in cell.samples.items():
                 for label, outcome in picks:
                     out.append(_render_sample_line(roast_name, label, outcome))
+
+    if trajectory:
+        out.append("")
+        out.append("---")
+        out.append("")
+        scored = [
+            (
+                f"{cell.slug} ({cell.tier}) prompt={cell.prompt_version}",
+                cell.trajectories,
+            )
+            for cell in cells
+        ]
+        out.append(render_trajectory_report(scored))
     return "\n".join(out)
 
 
@@ -1171,6 +1216,7 @@ def replay_cells_to_json(cells: list[ReplayCell]) -> list[dict[str, Any]]:
                 "latency_risk": cell.latency_risk,
                 "scores": [score_to_json(s) for s in cell.scores],
                 "samples": samples_json,
+                "trajectories": [trajectory_to_json(t) for t in cell.trajectories],
             }
         )
     return rows
@@ -1322,6 +1368,13 @@ async def main() -> int:
         default=None,
         help="replay mode: also write the markdown scorecard here",
     )
+    parser.add_argument(
+        "--trajectory",
+        action="store_true",
+        help="replay mode: append the control-trajectory sanity section (#277) — "
+        "command-signal coherence (change/reversal counts, control-signal entropy, "
+        "momentum cuts) over development. Agreement-free; the JSON always carries it.",
+    )
     args = parser.parse_args()
 
     reasoning: ReasoningEffort | None = (
@@ -1350,7 +1403,7 @@ async def main() -> int:
     availability, replay_cells = await run_replay_bakeoff(
         ROSTER, REPLAY_ROASTS, prompt_versions, reasoning, args.cadence_seconds
     )
-    report = render_replay_report(replay_cells, REPLAY_ROASTS)
+    report = render_replay_report(replay_cells, REPLAY_ROASTS, trajectory=bool(args.trajectory))
     print("\n" + report, flush=True)
     args.out.write_text(
         json.dumps(
