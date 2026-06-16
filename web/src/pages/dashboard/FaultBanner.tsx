@@ -50,14 +50,14 @@ export interface FaultBannerProps {
    *  no roaster command (heat is already off in faulted). The page passes it only
    *  when the server's `enabled_actions` mirror enables `acknowledge_fault`;
    *  omit/undefined renders no affordance. */
-  startNewRoast?: ReactNode;
+  acknowledgeAffordance?: ReactNode;
   className?: string;
 }
 
 export function FaultBanner({
   fault,
   trail,
-  startNewRoast,
+  acknowledgeAffordance,
   className,
 }: FaultBannerProps): React.JSX.Element | null {
   if (fault === null) return null;
@@ -79,7 +79,7 @@ export function FaultBanner({
             {fault.reason}
           </p>
         </div>
-        {startNewRoast && <div className="shrink-0">{startNewRoast}</div>}
+        {acknowledgeAffordance && <div className="shrink-0">{acknowledgeAffordance}</div>}
       </div>
 
       {/* Current forced-safe state — the fail-closed posture (heat 0, fan safe). */}
