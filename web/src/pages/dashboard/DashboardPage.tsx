@@ -281,7 +281,7 @@ export function DashboardPage(): React.JSX.Element {
           // heat is already off), then the page clears the sticky pin (#124) and
           // re-fetches health → the idle Start form. The label is the operator's
           // real next step.
-          startNewRoast={
+          acknowledgeAffordance={
             canAcknowledgeFault ? (
               <button
                 type="button"

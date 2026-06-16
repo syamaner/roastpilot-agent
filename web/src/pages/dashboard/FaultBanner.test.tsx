@@ -64,13 +64,13 @@ describe("FaultBanner", () => {
       <FaultBanner
         fault={FAULT}
         trail={[]}
-        startNewRoast={<a data-testid="start-new">Start New Roast</a>}
+        acknowledgeAffordance={<a data-testid="start-new">Start New Roast</a>}
       />,
     );
     expect(screen.getByTestId("start-new")).toBeInTheDocument();
   });
 
-  it("renders no action affordance when startNewRoast is omitted", () => {
+  it("renders no action affordance when acknowledgeAffordance is omitted", () => {
     render(<FaultBanner fault={FAULT} trail={[]} />);
     expect(screen.queryByTestId("start-new")).toBeNull();
   });
