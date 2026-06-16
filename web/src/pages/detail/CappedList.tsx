@@ -13,7 +13,7 @@
  * inside the modal. The affordance appears iff `rows.length > cap`.
  */
 
-import { useState } from "react";
+import { useCallback, useState } from "react";
 
 import { ListModal } from "./ListModal";
 
@@ -51,7 +51,11 @@ export function CappedList<Row>({
   modalTableTestId,
 }: CappedListProps<Row>): React.JSX.Element {
   const [open, setOpen] = useState(false);
-  const close = () => setOpen(false);
+  // Stable identity: `close` is passed to `ListModal` as `onClose`, which lists it
+  // in a `useEffect` dep array. An inline closure would change every render and
+  // re-fire the modal's focus-trap effect (premature focus restore) on any parent
+  // re-render while the modal is open — reviewer-confirmed correctness hazard.
+  const close = useCallback(() => setOpen(false), []);
 
   const total = rows.length;
   const overflows = total > cap;
@@ -83,7 +87,9 @@ export function CappedList<Row>({
           testId={`${testId}-modal`}
           onClose={close}
         >
-          {renderRows(rows, { inModal: true, close, tableTestId: modalTableTestId })}
+          {/* Build the full-history tree only while open — when closed the modal
+              renders nothing, so there is no point reconciling N rows every tick. */}
+          {open && renderRows(rows, { inModal: true, close, tableTestId: modalTableTestId })}
         </ListModal>
       )}
     </div>
