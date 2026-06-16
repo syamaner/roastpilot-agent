@@ -1342,6 +1342,292 @@ def replay_cells_to_json(cells: list[ReplayCell]) -> list[dict[str, Any]]:
     return rows
 
 
+# --- "Most-interesting cells" surfacing from the capture (#284) -------------
+
+# How many calls to surface per interest category by default.
+DEFAULT_INTEREST_TOP_N = 5
+# A heat move at/above this magnitude (percentage points) vs the previous real
+# setpoint counts as a deliberate direction; smaller wobble is "hold". Matches
+# the scorer's ``_DIRECTION_DEADBAND`` so the surfacing agrees with the metric.
+_INTEREST_DEADBAND = 1.0
+
+
+class InterestKind(enum.Enum):
+    """Why a captured call was surfaced as "interesting" (#284). Plain ``Enum``.
+
+    Drives the report grouping, not an auto-pick. A call may qualify under more
+    than one kind; each kind's top-N is selected independently.
+    """
+
+    HEAT_DIRECTION_DISAGREEMENT = "heat-direction-disagreement"
+    PRE_FC_INTERVENTION = "pre-fc-intervention"
+    FAILURE = "failure"
+
+
+@dataclasses.dataclass(frozen=True)
+class InterestingCall:
+    """A surfaced capture record plus why it is interesting (#284).
+
+    Attributes:
+        kind: The :class:`InterestKind` this call was surfaced under.
+        score: The interest magnitude (kind-specific; larger = more interesting),
+            used to rank within a kind.
+        reason: A short human-readable explanation for the report.
+        call: The underlying captured call (carries prompt + rationale +
+            reasoning for the inline lookup).
+    """
+
+    kind: InterestKind
+    score: float
+    reason: str
+    call: CapturedCall
+
+
+def _heat_direction(prev: int | None, now: int) -> int | None:
+    """Return -1 / 0 / +1 for a heat move, or ``None`` without a baseline."""
+    if prev is None:
+        return None
+    delta = now - prev
+    if delta >= _INTEREST_DEADBAND:
+        return 1
+    if delta <= -_INTEREST_DEADBAND:
+        return -1
+    return 0
+
+
+_PRE_FC_PHASES: frozenset[str] = frozenset(
+    {RoastPhase.PREHEATING.value, RoastPhase.ROASTING_PRE_FIRST_CRACK.value}
+)
+
+
+def select_interesting_calls(
+    calls: list[CapturedCall], *, top_n: int = DEFAULT_INTEREST_TOP_N
+) -> dict[InterestKind, list[InterestingCall]]:
+    """Pick the most-interesting captured calls per category (#284).
+
+    Surfaces, from the raw capture, the cells whose reasoning is worth reading
+    without a re-run:
+
+    - **heat-direction disagreement** — the model moved heat the OPPOSITE way the
+      known-good human did (e.g. cut while the human raised/held), ranked by the
+      magnitude of the swing. This is the lens that catches the 16 Jun pre-FC
+      heat-cut.
+    - **pre-FC intervention** — a pre-first-crack call that cuts heat or raises
+      fan while the human held, ranked by the combined move size. This is the
+      lens that catches the fan-into-the-crack case explicitly.
+    - **failure** — a call that produced no decision (provider/timeout/parse).
+
+    Ties break by larger latency then earlier tick so the order is deterministic.
+
+    Args:
+        calls: Every captured call to consider (a run's full capture).
+        top_n: How many to keep per category.
+
+    Returns:
+        A mapping of each :class:`InterestKind` to its ranked top-N (possibly
+        empty when nothing qualified).
+    """
+    heat_disagreements: list[InterestingCall] = []
+    pre_fc: list[InterestingCall] = []
+    failures: list[InterestingCall] = []
+
+    for call in calls:
+        if call.decision is None:
+            failures.append(
+                InterestingCall(
+                    kind=InterestKind.FAILURE,
+                    score=1.0,
+                    reason=f"no decision ({call.error or 'unknown error'})",
+                    call=call,
+                )
+            )
+            continue
+        dec = call.decision
+        real_dir = _heat_direction(call.prev_real_heat_percent, call.real_heat_percent)
+        model_dir = _heat_direction(call.prev_real_heat_percent, dec.target_heat)
+        if real_dir is not None and model_dir is not None and real_dir != model_dir:
+            swing = abs(dec.target_heat - call.real_heat_percent)
+            heat_disagreements.append(
+                InterestingCall(
+                    kind=InterestKind.HEAT_DIRECTION_DISAGREEMENT,
+                    score=float(swing),
+                    reason=(
+                        f"model moved heat {_dir_word(model_dir)} "
+                        f"(→{dec.target_heat}%) while the roast moved it "
+                        f"{_dir_word(real_dir)} (→{call.real_heat_percent}%)"
+                    ),
+                    call=call,
+                )
+            )
+        # Pre-FC intervention: a heat cut or fan raise vs the previous real
+        # setpoints, in a pre-first-crack phase — the #218 bake behaviour.
+        if call.phase in _PRE_FC_PHASES and call.prev_real_heat_percent is not None:
+            heat_cut = call.real_heat_percent - dec.target_heat
+            fan_raise = dec.target_fan - call.real_fan_percent
+            if heat_cut >= _INTEREST_DEADBAND or fan_raise >= _INTEREST_DEADBAND:
+                pre_fc.append(
+                    InterestingCall(
+                        kind=InterestKind.PRE_FC_INTERVENTION,
+                        score=float(max(heat_cut, 0) + max(fan_raise, 0)),
+                        reason=(
+                            f"pre-FC ({call.phase}): heat {call.real_heat_percent}→"
+                            f"{dec.target_heat}% fan {call.real_fan_percent}→"
+                            f"{dec.target_fan}% (human held — momentum/fan-into-crack risk)"
+                        ),
+                        call=call,
+                    )
+                )
+
+    return {
+        InterestKind.HEAT_DIRECTION_DISAGREEMENT: _rank(heat_disagreements, top_n),
+        InterestKind.PRE_FC_INTERVENTION: _rank(pre_fc, top_n),
+        InterestKind.FAILURE: _rank(failures, top_n),
+    }
+
+
+def _dir_word(direction: int) -> str:
+    """Render a -1 / 0 / +1 heat direction as cut / hold / raise."""
+    return {-1: "cut", 0: "hold", 1: "raise"}[direction]
+
+
+def _rank(items: list[InterestingCall], top_n: int) -> list[InterestingCall]:
+    """Rank interesting calls by score desc, then latency desc, then tick asc."""
+    return sorted(
+        items,
+        key=lambda i: (
+            -i.score,
+            -(i.call.latency_seconds or 0.0),
+            i.call.tick_index,
+        ),
+    )[:top_n]
+
+
+def render_interesting_calls(
+    selected: dict[InterestKind, list[InterestingCall]], *, top_n: int = DEFAULT_INTEREST_TOP_N
+) -> str:
+    """Render the "most-interesting cells" report section (#284).
+
+    Each surfaced call is shown WITH its prompt context, the structured advice +
+    rationale, and (when present) the reasoning trace — so "why did model X do Y"
+    is a lookup, not a re-run. The reasoning trace is truncated for readability;
+    the full text always lives in the (gitignored) capture file.
+
+    Args:
+        selected: The per-kind ranked calls from :func:`select_interesting_calls`.
+        top_n: The top-N the selection used (for the heading).
+
+    Returns:
+        The markdown section.
+    """
+    out: list[str] = []
+    out.append("# Most-interesting cells (auditable from the per-call capture, #284)")
+    out.append("")
+    out.append(
+        "Surfaced from the full per-call capture so the worst / most-divergent "
+        "advice is a lookup, not a re-run. Each entry carries its prompt context, "
+        "the structured advice + rationale, and the reasoning trace WHERE THE "
+        "PROVIDER EXPOSED IT (absent for non-reasoning models). The complete "
+        "prompt + reasoning live in the gitignored capture file."
+    )
+    headings = {
+        InterestKind.HEAT_DIRECTION_DISAGREEMENT: (
+            f"## Largest heat-direction disagreements (top {top_n})"
+        ),
+        InterestKind.PRE_FC_INTERVENTION: (
+            f"## Pre-first-crack interventions — heat cut / fan-into-crack (top {top_n})"
+        ),
+        InterestKind.FAILURE: f"## Failures — calls with no decision (top {top_n})",
+    }
+    for kind in (
+        InterestKind.PRE_FC_INTERVENTION,
+        InterestKind.HEAT_DIRECTION_DISAGREEMENT,
+        InterestKind.FAILURE,
+    ):
+        out.append("")
+        out.append(headings[kind])
+        items = selected.get(kind, [])
+        if not items:
+            out.append("")
+            out.append("  (none)")
+            continue
+        for item in items:
+            out.append("")
+            out.extend(_render_interesting_call(item))
+    return "\n".join(out)
+
+
+# How many characters of a reasoning trace to inline in the report (the full
+# trace is always in the gitignored capture file).
+_REASONING_PREVIEW_CHARS = 600
+
+
+def _render_interesting_call(item: InterestingCall) -> list[str]:
+    """Render one surfaced call with prompt + rationale + reasoning."""
+    call = item.call
+    ctx = call.context
+    lines = [
+        f"- {call.model_slug} | prompt={call.prompt_version} | {call.roast_id} "
+        f"tick={call.tick_index} @ {call.monotonic_seconds:.0f}s ({call.phase})",
+        f"    why: {item.reason}",
+        f"    prompt: bean={ctx.current_bean_temp_c}°C env={ctx.current_env_temp_c}°C "
+        f"bean_ror={ctx.bean_ror_c_per_min} dev_elapsed={ctx.development_elapsed_seconds} "
+        f"fc_detected={ctx.first_crack_detected} "
+        f"real(heat/fan)={call.real_heat_percent}/{call.real_fan_percent}",
+    ]
+    if call.decision is not None:
+        dec = call.decision
+        lines.append(
+            f"    advice: heat={dec.target_heat}% fan={dec.target_fan}% "
+            f"drop={dec.should_drop} conf={dec.confidence} rationale={dec.rationale!r}"
+        )
+    else:
+        lines.append(f"    advice: (none) error={call.error}")
+    if call.reasoning_available and call.reasoning is not None:
+        preview = call.reasoning.replace("\n", " ").strip()
+        if len(preview) > _REASONING_PREVIEW_CHARS:
+            preview = preview[:_REASONING_PREVIEW_CHARS] + " […]"
+        lines.append(f"    reasoning: {preview}")
+    else:
+        lines.append("    reasoning: (provider exposed none)")
+    return lines
+
+
+def interesting_cells_to_json(
+    selected: dict[InterestKind, list[InterestingCall]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Serialize the surfaced interesting calls for the ``--out`` JSON (#284).
+
+    Each entry carries its identity, the reason, the structured advice, and the
+    full reasoning trace + ``reasoning_available`` flag so the JSON artifact is a
+    self-contained derived summary (the raw capture stays gitignored).
+
+    Args:
+        selected: The per-kind ranked calls from :func:`select_interesting_calls`.
+
+    Returns:
+        A mapping of the kind value to its list of JSON-ready entries.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    for kind, items in selected.items():
+        out[kind.value] = [
+            {
+                "score": item.score,
+                "reason": item.reason,
+                "model_slug": item.call.model_slug,
+                "prompt_version": item.call.prompt_version,
+                "roast_id": item.call.roast_id,
+                "tick_index": item.call.tick_index,
+                "monotonic_seconds": item.call.monotonic_seconds,
+                "phase": item.call.phase,
+                "decision": _decision_to_json(item.call.decision),
+                "reasoning": item.call.reasoning,
+                "reasoning_available": item.call.reasoning_available,
+            }
+            for item in items
+        ]
+    return out
+
+
 async def run_replay_bakeoff(
     roster: tuple[Candidate, ...],
     roasts: tuple[Path, ...],
@@ -1585,6 +1871,343 @@ class Checkpoint:
         return len(self._records)
 
 
+# --- Full per-call capture (prompt + response + reasoning) (#284) ------------
+
+# A reasoning-aware recommender: given a tick context, return the recommendation
+# AND the provider's reasoning trace (``None`` when the provider exposed none).
+# The real advisor's ``get_recommendation_with_reasoning`` matches this; a canned
+# callable matches it too, which is how the capture is tested without a key.
+ReasoningRecommender = Callable[[AdvisorContext], Awaitable[tuple[RoastDecision, str | None]]]
+
+
+@dataclasses.dataclass
+class CapturedCall:
+    """The full audit record of one scored advisor call (#284).
+
+    Persisted so re-analysis (e.g. finding the pre-FC heat-cut / fan-into-crack
+    or the lever-unit confusion) needs **no re-run** — the prompt, the structured
+    response, and the reasoning trace are all on disk. The score-relevant fields
+    are duplicated alongside the raw response so a reader can rank "most
+    interesting" without re-deriving them.
+
+    Attributes:
+        model_slug: The model that produced the call.
+        prompt_version: The prompt version under test.
+        roast_id: The roast the tick belongs to (see :func:`roast_id_for`).
+        tick_index: The 0-based tick position within the roast.
+        monotonic_seconds: The tick's roast timestamp.
+        roast_elapsed_seconds: Elapsed roast time at the tick (from the context).
+        phase: The agent phase value at the tick.
+        context: The full :class:`AdvisorContext` sent (the prompt).
+        decision: The raw structured :class:`RoastDecision` (incl. ``rationale``),
+            or ``None`` when the call failed.
+        reasoning: The provider's reasoning / thinking trace when exposed, else
+            ``None``.
+        reasoning_available: Whether a reasoning trace was captured for the call.
+        latency_seconds: The measured call latency, or ``None`` on failure.
+        error: The failure message when the call produced no decision.
+        cost_estimate_usd: The per-call cost estimate (calls x cost-per-call).
+        real_heat_percent: The known-good roast's heat setpoint at the tick.
+        real_fan_percent: The known-good roast's fan setpoint at the tick.
+        prev_real_heat_percent: The previous real heat setpoint (direction base).
+        real_should_drop: Whether the real roast had dropped by the tick.
+    """
+
+    model_slug: str
+    prompt_version: str
+    roast_id: str
+    tick_index: int
+    monotonic_seconds: float
+    roast_elapsed_seconds: float
+    phase: str
+    context: AdvisorContext
+    decision: RoastDecision | None
+    reasoning: str | None
+    reasoning_available: bool
+    latency_seconds: float | None
+    error: str | None
+    cost_estimate_usd: float
+    real_heat_percent: int
+    real_fan_percent: int
+    prev_real_heat_percent: int | None
+    real_should_drop: bool
+
+
+def captured_call_to_json(call: CapturedCall) -> dict[str, Any]:
+    """Serialize a :class:`CapturedCall` to a JSON-ready record.
+
+    The context and decision are dumped via their Pydantic ``model_dump`` so the
+    full prompt + structured response round-trip; everything else is scalar.
+
+    Args:
+        call: The captured call.
+
+    Returns:
+        A JSON-ready dict keyed for lookup by the cell triple + tick index.
+    """
+    return {
+        "model_slug": call.model_slug,
+        "prompt_version": call.prompt_version,
+        "roast_id": call.roast_id,
+        "tick_index": call.tick_index,
+        "monotonic_seconds": call.monotonic_seconds,
+        "roast_elapsed_seconds": call.roast_elapsed_seconds,
+        "phase": call.phase,
+        "context": call.context.model_dump(mode="json"),
+        "decision": _decision_to_json(call.decision),
+        "reasoning": call.reasoning,
+        "reasoning_available": call.reasoning_available,
+        "latency_seconds": call.latency_seconds,
+        "error": call.error,
+        "cost_estimate_usd": call.cost_estimate_usd,
+        "real_heat_percent": call.real_heat_percent,
+        "real_fan_percent": call.real_fan_percent,
+        "prev_real_heat_percent": call.prev_real_heat_percent,
+        "real_should_drop": call.real_should_drop,
+    }
+
+
+def captured_call_from_json(record: dict[str, Any]) -> CapturedCall:
+    """Rebuild a :class:`CapturedCall` from a persisted capture record.
+
+    The inverse of :func:`captured_call_to_json` — the context and decision are
+    re-validated through their Pydantic models so the reload is field-for-field
+    identical to capture time.
+
+    Args:
+        record: A capture record from :func:`captured_call_to_json`.
+
+    Returns:
+        The reconstructed :class:`CapturedCall`.
+    """
+    return CapturedCall(
+        model_slug=str(record["model_slug"]),
+        prompt_version=str(record["prompt_version"]),
+        roast_id=str(record["roast_id"]),
+        tick_index=int(record["tick_index"]),
+        monotonic_seconds=float(record["monotonic_seconds"]),
+        roast_elapsed_seconds=float(record["roast_elapsed_seconds"]),
+        phase=str(record["phase"]),
+        context=AdvisorContext.model_validate(record["context"]),
+        decision=_decision_from_json(record.get("decision")),
+        reasoning=cast("str | None", record.get("reasoning")),
+        reasoning_available=bool(record.get("reasoning_available", False)),
+        latency_seconds=cast("float | None", record.get("latency_seconds")),
+        error=cast("str | None", record.get("error")),
+        cost_estimate_usd=float(record.get("cost_estimate_usd", 0.0)),
+        real_heat_percent=int(record["real_heat_percent"]),
+        real_fan_percent=int(record["real_fan_percent"]),
+        prev_real_heat_percent=cast("int | None", record.get("prev_real_heat_percent")),
+        real_should_drop=bool(record["real_should_drop"]),
+    )
+
+
+def build_captured_calls(
+    slug: str,
+    prompt_version: str,
+    roast_id: str,
+    ticks: list[ReplayTick],
+    outcomes: list[TickOutcome],
+    reasonings: list[str | None],
+    cost_per_call: float,
+) -> list[CapturedCall]:
+    """Assemble the per-tick capture records for one completed roast cell.
+
+    Pure: pairs each tick with its outcome (decision + latency + error) and the
+    reasoning trace captured for it. Used for both a fresh run and reconstruction
+    in tests; no model calls.
+
+    Args:
+        slug: The model slug.
+        prompt_version: The prompt version under test.
+        roast_id: The roast id.
+        ticks: The reconstructed ticks for the roast.
+        outcomes: The per-tick outcomes (same length / order as ``ticks``).
+        reasonings: The per-tick reasoning traces (same length / order).
+        cost_per_call: The run's per-call cost estimate.
+
+    Returns:
+        One :class:`CapturedCall` per tick, in tick order.
+    """
+    calls: list[CapturedCall] = []
+    for index, (tick, outcome, reasoning) in enumerate(
+        zip(ticks, outcomes, reasonings, strict=True)
+    ):
+        calls.append(
+            CapturedCall(
+                model_slug=slug,
+                prompt_version=prompt_version,
+                roast_id=roast_id,
+                tick_index=index,
+                monotonic_seconds=tick.monotonic_seconds,
+                roast_elapsed_seconds=tick.context.roast_elapsed_seconds,
+                phase=tick.context.phase.value,
+                context=tick.context,
+                decision=outcome.decision,
+                reasoning=reasoning,
+                reasoning_available=reasoning is not None,
+                latency_seconds=outcome.latency_seconds,
+                error=outcome.error,
+                cost_estimate_usd=round(cost_per_call, 6),
+                real_heat_percent=tick.real_heat_percent,
+                real_fan_percent=tick.real_fan_percent,
+                prev_real_heat_percent=tick.prev_real_heat_percent,
+                real_should_drop=tick.real_should_drop,
+            )
+        )
+    return calls
+
+
+async def replay_roast_with_capture(
+    ticks: list[ReplayTick],
+    recommender: ReasoningRecommender,
+    *,
+    clock: Callable[[], float],
+) -> tuple[list[TickOutcome], list[str | None]]:
+    """Run a reasoning-aware recommender over every tick, capturing reasoning.
+
+    The capture counterpart to :func:`replay_roast`: it produces the SAME
+    :class:`TickOutcome` list the scorers consume (so the scoring math is
+    untouched) plus a parallel per-tick reasoning list. A failed call yields a
+    ``None`` decision outcome and a ``None`` reasoning, exactly as the scoring
+    path expects — reasoning absence never errors.
+
+    Args:
+        ticks: The reconstructed ticks (from :func:`build_ticks`).
+        recommender: A reasoning-aware async recommender returning
+            ``(decision, reasoning)``.
+        clock: A monotonic clock returning seconds.
+
+    Returns:
+        ``(outcomes, reasonings)`` — aligned to ``ticks`` by index.
+    """
+    outcomes: list[TickOutcome] = []
+    reasonings: list[str | None] = []
+    for tick in ticks:
+        started = clock()
+        try:
+            decision, reasoning = await recommender(tick.context)
+        except Exception as exc:  # noqa: BLE001 — capture, score the rest of the roast
+            outcomes.append(
+                TickOutcome(
+                    tick=tick,
+                    decision=None,
+                    latency_seconds=round(clock() - started, 3),
+                    error=f"{type(exc).__name__}: {str(exc)[:200]}",
+                )
+            )
+            reasonings.append(None)
+            continue
+        outcomes.append(
+            TickOutcome(tick=tick, decision=decision, latency_seconds=round(clock() - started, 3))
+        )
+        reasonings.append(reasoning)
+    return outcomes, reasonings
+
+
+def capture_path(out: Path) -> Path:
+    """Return the per-call capture JSONL path next to the ``--out`` JSON path.
+
+    Distinct from the :func:`sidecar_path` checkpoint: the capture is large and
+    contains the full prompts / reasoning, so it lives at its own gitignored path
+    (``<out>.capture.jsonl``) and is never committed (#284).
+    """
+    return out.with_name(out.name + ".capture.jsonl")
+
+
+class CaptureWriter:
+    """Append-only, resumable sidecar of full per-call audit records (#284).
+
+    Mirrors :class:`Checkpoint`'s incremental-flush + resume discipline so the
+    capture is also kill-safe and resumable: each completed cell's per-tick
+    records are appended immediately and flushed, and on a resumed run cells
+    already present are NOT re-captured (the checkpoint already skips re-running
+    them). Records are keyed by ``(model_slug, prompt_version, roast_id)``; a
+    later write for a key supersedes an earlier one (last-write-wins), matching
+    the checkpoint.
+
+    The capture file is gitignored (large + contains full prompts / reasoning);
+    only the derived summary / report is committed.
+
+    Attributes:
+        path: The capture JSONL path.
+        resume: When ``True`` (default), pre-existing records are loaded and
+            their cells are not re-captured; when ``False``, the file is
+            truncated on open.
+    """
+
+    def __init__(self, path: Path, *, resume: bool = True) -> None:
+        """Open (and optionally load) the capture file at ``path``.
+
+        Args:
+            path: The capture JSONL path.
+            resume: Load existing records when ``True``; truncate when ``False``.
+        """
+        self.path = path
+        self.resume = resume
+        self._by_cell: dict[CellKey, list[CapturedCall]] = {}
+        if resume and path.exists():
+            self._load()
+        elif not resume and path.exists():
+            path.unlink()
+
+    def _load(self) -> None:
+        """Load existing capture records, grouped by the cell triple.
+
+        Records are grouped per ``(slug, prompt, roast)`` cell in file order; a
+        later cell's records replace an earlier same-key group (last-write-wins),
+        matching the checkpoint's resume semantics.
+        """
+        ordered: dict[CellKey, list[CapturedCall]] = {}
+        for line in self.path.read_text().splitlines():
+            if not line.strip():
+                continue
+            record = cast("dict[str, Any]", json.loads(line))
+            call = captured_call_from_json(record)
+            key = cell_key(call.model_slug, call.prompt_version, call.roast_id)
+            # A new group for a key supersedes a previously-loaded one — the
+            # records arrive cell-contiguous, so the first tick (index 0) of a
+            # key starts a fresh group.
+            if key not in ordered or call.tick_index == 0:
+                ordered[key] = []
+            ordered[key].append(call)
+        self._by_cell = ordered
+
+    def has(self, key: CellKey) -> bool:
+        """Whether a cell's capture is already on disk."""
+        return key in self._by_cell
+
+    def calls_for(self, key: CellKey) -> list[CapturedCall]:
+        """Return the captured calls for a cell (empty if absent)."""
+        return list(self._by_cell.get(key, []))
+
+    def append(self, calls: list[CapturedCall]) -> None:
+        """Persist one cell's per-tick capture records immediately.
+
+        Writes every tick's record as its own JSONL line and flushes, so an
+        abrupt kill after this call leaves the cell's capture recoverable.
+
+        Args:
+            calls: The per-tick capture records for one completed roast cell.
+        """
+        if not calls:
+            return
+        key = cell_key(calls[0].model_slug, calls[0].prompt_version, calls[0].roast_id)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as handle:
+            for call in calls:
+                handle.write(json.dumps(captured_call_to_json(call)) + "\n")
+            handle.flush()
+        self._by_cell[key] = list(calls)
+
+    def all_calls(self) -> list[CapturedCall]:
+        """Every captured call across all cells, in load / append order."""
+        flat: list[CapturedCall] = []
+        for calls in self._by_cell.values():
+            flat.extend(calls)
+        return flat
+
+
 class CostGuard:
     """Tracks cumulative spend and trips a graceful stop before a budget (#280).
 
@@ -1711,7 +2334,7 @@ def cell_progress_line(
 
 @dataclasses.dataclass
 class ObservableRunResult:
-    """Outcome of an observable, checkpointed replay run (#280).
+    """Outcome of an observable, checkpointed replay run (#280, #284).
 
     Attributes:
         availability: The availability-sweep results.
@@ -1720,6 +2343,9 @@ class ObservableRunResult:
             the cells are then a valid PARTIAL scorecard.
         resumed_cells: How many per-roast cells were skipped (loaded from disk).
         fresh_cells: How many per-roast cells were computed this run.
+        captured_calls: Every full per-call audit record from this run (#284) —
+            resumed cells' capture is reloaded from the capture file, fresh
+            cells' is captured live, so the set is complete across a resume.
     """
 
     availability: list[AvailabilityResult]
@@ -1727,6 +2353,9 @@ class ObservableRunResult:
     stopped_for_budget: bool
     resumed_cells: int
     fresh_cells: int
+    captured_calls: list[CapturedCall] = dataclasses.field(
+        default_factory=lambda: cast("list[CapturedCall]", [])
+    )
 
 
 async def run_replay_bakeoff_observable(
@@ -1745,6 +2374,7 @@ async def run_replay_bakeoff_observable(
         [Candidate, str], Callable[[AdvisorContext], Awaitable[RoastDecision]]
     ]
     | None = None,
+    reasoning_recommender_factory: Callable[[Candidate, str], ReasoningRecommender] | None = None,
     clock: Callable[[], float] | None = None,
     heartbeat_clock: Callable[[], float] | None = None,
 ) -> ObservableRunResult:
@@ -1758,21 +2388,33 @@ async def run_replay_bakeoff_observable(
     sidecar and SKIPS already-complete cells (resume). The scoring math is
     unchanged — cells are derived by the same pure scorers, fresh or reloaded.
 
+    Alongside the scoring checkpoint it ALSO persists a full per-call capture
+    (#284): the prompt (full :class:`AdvisorContext`), the structured response
+    (incl. ``rationale``), the provider's reasoning trace where exposed, and the
+    score-relevant fields — to its own gitignored capture file, with the same
+    incremental-flush + resume discipline. A resumed cell's capture is reloaded
+    from disk, so ``captured_calls`` is complete across a resume.
+
     Args:
         roster: The candidate roster.
         roasts: The replay roast fixtures (the known-good test set).
         prompt_versions: Prompt versions to compare (e.g. ``["v2", "v3"]``).
         reasoning: Reasoning effort, or ``None`` for the provider default.
         cadence_seconds: Roast-time spacing between scored ticks.
-        out: The ``--out`` JSON path; the sidecar is derived from it.
+        out: The ``--out`` JSON path; the sidecar + capture are derived from it.
         resume: Load + skip already-complete cells when ``True`` (default).
         cost_per_call: Estimated USD per recommender call (cost guard basis).
         max_spend: Optional USD budget; the run stops gracefully before breaching
             it, flushing partials.
         heartbeat_seconds: Minimum wall-clock seconds between heartbeats.
-        recommender_factory: Builds the async recommender for a (candidate,
-            prompt) cell. Defaults to the real :class:`PydanticAIAdvisor`; tests
-            inject a canned recommender (key-free seam).
+        recommender_factory: Builds a plain ``RoastDecision`` recommender for a
+            (candidate, prompt) cell. Back-compat seam: when given (and no
+            reasoning factory is), its decisions are captured with ``None``
+            reasoning. Tests inject a canned recommender (key-free seam).
+        reasoning_recommender_factory: Builds a reasoning-aware recommender
+            (returns ``(decision, reasoning)``) for a cell. Takes precedence over
+            ``recommender_factory``; defaults to the real
+            :class:`PydanticAIAdvisor` reasoning path when neither is given.
         clock: Monotonic clock for per-tick latency; defaults to
             ``time.perf_counter``.
         heartbeat_clock: Wall-clock for the heartbeat; defaults to
@@ -1780,18 +2422,17 @@ async def run_replay_bakeoff_observable(
 
     Returns:
         The :class:`ObservableRunResult` (availability + assembled cells + the
-        budget-stop / resume accounting).
+        budget-stop / resume accounting + the full per-call capture).
     """
     survivors, availability = await availability_sweep(roster, prompt_versions[0], reasoning)
     print(render_availability(availability), flush=True)
     print("", flush=True)
 
-    factory = (
-        recommender_factory
-        if recommender_factory is not None
-        else _real_recommender_factory(reasoning)
+    capture_factory = _resolve_capture_factory(
+        reasoning_recommender_factory, recommender_factory, reasoning
     )
     checkpoint = Checkpoint(sidecar_path(out), resume=resume)
+    capture = CaptureWriter(capture_path(out), resume=resume)
     guard = CostGuard(cost_per_call, max_spend)
     total_cells = len(prompt_versions) * len(survivors) * len(roasts)
     hb_clock = heartbeat_clock if heartbeat_clock is not None else time.monotonic
@@ -1829,7 +2470,7 @@ async def run_replay_bakeoff_observable(
 
     for pv in prompt_versions:
         for cand in survivors:
-            recommend = factory(cand, pv)
+            recommend = capture_factory(cand, pv)
             for fixture in roasts:
                 rid = roast_id_for(fixture)
                 key = cell_key(cand.slug, pv, rid)
@@ -1854,11 +2495,19 @@ async def run_replay_bakeoff_observable(
                     stopped = True
                     break
 
-                outcomes = await replay_roast(
+                outcomes, reasonings = await replay_roast_with_capture(
                     ticks, recommend, clock=clock if clock is not None else time.perf_counter
                 )
                 replay = build_roast_replay(cand.slug, pv, rid, outcomes, ground)
                 checkpoint.append(replay)  # persist immediately — kill-safe
+                # Capture the full per-call records alongside the score checkpoint
+                # (#284) — same incremental-flush discipline, separate gitignored
+                # file. Never blocks or alters the scoring path.
+                capture.append(
+                    build_captured_calls(
+                        cand.slug, pv, rid, ticks, outcomes, reasonings, cost_per_call
+                    )
+                )
                 guard.add_calls(replay.call_count)
                 replays_by_cell.setdefault((cand.slug, pv), []).append(replay)
                 done += 1
@@ -1876,29 +2525,78 @@ async def run_replay_bakeoff_observable(
     heartbeat.maybe_beat(done=done, guard=guard, force=True)
 
     # Assemble cells in (prompt, survivor) order, including partial cells (a cell
-    # with only some roasts scored is still a valid, reportable partial).
+    # with only some roasts scored is still a valid, reportable partial). The
+    # capture is assembled the same way so a resumed run's capture is complete.
     cells: list[ReplayCell] = []
+    captured_calls: list[CapturedCall] = []
     for pv in prompt_versions:
         for cand in survivors:
             replays = replays_by_cell.get((cand.slug, pv))
             if replays:
                 cells.append(_replays_to_cell(cand, pv, replays))
+            for fixture in roasts:
+                key = cell_key(cand.slug, pv, roast_id_for(fixture))
+                if capture.has(key):
+                    captured_calls.extend(capture.calls_for(key))
     return ObservableRunResult(
         availability=availability,
         cells=cells,
         stopped_for_budget=stopped,
         resumed_cells=resumed,
         fresh_cells=fresh,
+        captured_calls=captured_calls,
     )
 
 
-def _real_recommender_factory(
+def _resolve_capture_factory(
+    reasoning_recommender_factory: Callable[[Candidate, str], ReasoningRecommender] | None,
+    recommender_factory: Callable[
+        [Candidate, str], Callable[[AdvisorContext], Awaitable[RoastDecision]]
+    ]
+    | None,
     reasoning: ReasoningEffort | None,
-) -> Callable[[Candidate, str], Callable[[AdvisorContext], Awaitable[RoastDecision]]]:
-    """Build the default real-OpenRouter recommender factory (spends credits).
+) -> Callable[[Candidate, str], ReasoningRecommender]:
+    """Resolve which reasoning-aware recommender factory the run should use.
 
-    The default ``recommender_factory`` for
-    :func:`run_replay_bakeoff_observable`. Tests inject a canned recommender
+    Precedence: an explicit ``reasoning_recommender_factory`` wins; else a plain
+    ``recommender_factory`` is adapted to return ``None`` reasoning (back-compat
+    seam — its captures simply carry no reasoning); else the real
+    :class:`PydanticAIAdvisor` reasoning path (spends credits).
+
+    Args:
+        reasoning_recommender_factory: An explicit reasoning-aware factory, or
+            ``None``.
+        recommender_factory: A plain-decision factory to adapt, or ``None``.
+        reasoning: Reasoning effort for the real default factory.
+
+    Returns:
+        A factory mapping a (candidate, prompt) to a :data:`ReasoningRecommender`.
+    """
+    if reasoning_recommender_factory is not None:
+        return reasoning_recommender_factory
+    if recommender_factory is not None:
+        plain = recommender_factory
+
+        def adapted(cand: Candidate, pv: str) -> ReasoningRecommender:
+            recommend = plain(cand, pv)
+
+            async def with_reasoning(context: AdvisorContext) -> tuple[RoastDecision, str | None]:
+                return await recommend(context), None
+
+            return with_reasoning
+
+        return adapted
+    return _real_reasoning_recommender_factory(reasoning)
+
+
+def _real_reasoning_recommender_factory(
+    reasoning: ReasoningEffort | None,
+) -> Callable[[Candidate, str], ReasoningRecommender]:
+    """Build the default real-OpenRouter reasoning-aware factory (spends credits).
+
+    The default capture factory for :func:`run_replay_bakeoff_observable`. Calls
+    :meth:`PydanticAIAdvisor.get_recommendation_with_reasoning` so the capture
+    records the provider's reasoning trace where exposed. Tests inject a canned
     factory instead (the key-free seam), so this real path is never exercised by
     the test suite.
 
@@ -1906,17 +2604,16 @@ def _real_recommender_factory(
         reasoning: Reasoning effort, or ``None`` for the provider default.
 
     Returns:
-        A factory mapping a (candidate, prompt) to a timeout-bounded recommender.
+        A factory mapping a (candidate, prompt) to a timeout-bounded
+        reasoning-aware recommender.
     """
 
-    def factory(
-        cand: Candidate, prompt_version: str
-    ) -> Callable[[AdvisorContext], Awaitable[RoastDecision]]:
+    def factory(cand: Candidate, prompt_version: str) -> ReasoningRecommender:
         advisor = PydanticAIAdvisor(_make_config(cand.slug, prompt_version, reasoning))
 
-        async def recommend(context: AdvisorContext) -> RoastDecision:
+        async def recommend(context: AdvisorContext) -> tuple[RoastDecision, str | None]:
             return await asyncio.wait_for(
-                advisor.get_recommendation(context), timeout=MEASURE_TIMEOUT
+                advisor.get_recommendation_with_reasoning(context), timeout=MEASURE_TIMEOUT
             )
 
         return recommend
@@ -2057,6 +2754,13 @@ async def main() -> int:
         help=f"replay mode: minimum wall-clock seconds between cumulative-cost "
         f"heartbeats (default: {DEFAULT_HEARTBEAT_SECONDS:g})",
     )
+    parser.add_argument(
+        "--interest-top-n",
+        type=int,
+        default=DEFAULT_INTEREST_TOP_N,
+        help=f"replay mode: how many calls to surface per 'most-interesting cells' "
+        f"category from the per-call capture (#284) (default: {DEFAULT_INTEREST_TOP_N})",
+    )
     args = parser.parse_args()
 
     reasoning: ReasoningEffort | None = (
@@ -2095,7 +2799,12 @@ async def main() -> int:
         heartbeat_seconds=float(args.heartbeat_seconds),
     )
     availability, replay_cells = result.availability, result.cells
+    interest_top_n = int(args.interest_top_n)
+    selected = select_interesting_calls(result.captured_calls, top_n=interest_top_n)
     report = render_replay_report(replay_cells, REPLAY_ROASTS, trajectory=bool(args.trajectory))
+    # Append the #284 surfacing so "why did model X do Y" is a lookup, not a
+    # re-run. The full prompt + reasoning live in the gitignored capture file.
+    report = report + "\n\n---\n\n" + render_interesting_calls(selected, top_n=interest_top_n)
     print("\n" + report, flush=True)
     args.out.write_text(
         json.dumps(
@@ -2104,13 +2813,24 @@ async def main() -> int:
                 "stopped_for_budget": result.stopped_for_budget,
                 "resumed_cells": result.resumed_cells,
                 "fresh_cells": result.fresh_cells,
+                "captured_calls": len(result.captured_calls),
+                "capture_path": str(capture_path(args.out)),
+                "reasoning_available_calls": sum(
+                    1 for c in result.captured_calls if c.reasoning_available
+                ),
                 "availability": [dataclasses.asdict(a) for a in availability],
+                "interesting_cells": interesting_cells_to_json(selected),
                 "cells": replay_cells_to_json(replay_cells),
             },
             indent=2,
         )
     )
     print(f"\nwrote artifact -> {args.out}", flush=True)
+    print(
+        f"wrote per-call capture ({len(result.captured_calls)} calls, "
+        f"gitignored) -> {capture_path(args.out)}",
+        flush=True,
+    )
     if args.report_md is not None:
         args.report_md.write_text(report)
         print(f"wrote markdown report -> {args.report_md}", flush=True)
