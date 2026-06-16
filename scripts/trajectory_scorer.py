@@ -63,7 +63,7 @@ from roastpilot_agent.models import RoastPhase
 
 # A lever move at or above this magnitude (percentage points) between consecutive
 # development-phase recommendations counts as a deliberate "change". Mirrors the
-# replay layer's ``_DIRECTION_DEADBAND`` (1.0) so a 1-point wobble is "hold", not
+# replay layer's ``_DIRECTION_DEADBAND`` (1.0) so a sub-1-point wobble is "hold", not
 # a change — the same dead-band the direction-flip guard (#223/#228) uses, kept in
 # sync deliberately. OPEN QUESTION for the operator: should the trajectory
 # dead-band be WIDER than the agreement dead-band (e.g. 3-5 pts) so only roaster-
@@ -142,8 +142,9 @@ def _signed_deltas(series: list[int]) -> list[int]:
 def _classify_delta(delta: int) -> int:
     """Classify a delta as -1 / 0 / +1 using the change dead-band.
 
-    A move smaller than :data:`CHANGE_DEADBAND_PCT` in magnitude is "hold" (0);
-    this keeps a 1-point sensor-grade wobble from registering as thrash.
+    A move smaller than :data:`CHANGE_DEADBAND_PCT` in magnitude is "hold" (0)
+    (so an exact 1 pp change counts as a move; only a sub-1-point sensor-grade
+    wobble is held — this keeps noise from registering as thrash).
 
     Args:
         delta: The signed setpoint change in percentage points.
