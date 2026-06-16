@@ -19,19 +19,247 @@ import asyncio
 import logging
 import os
 import tempfile
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from roastpilot_agent import __version__
 
 if TYPE_CHECKING:
     from roastpilot_agent.api import RoastService
+    from roastpilot_agent.config import HttpAccessLogMode, LoggingConfig
     from roastpilot_agent.mcp_client import MCPServerProcess, RuntimeConfigSnapshot, ToolCaller
     from roastpilot_agent.models import AdvisorHealth
     from roastpilot_agent.store import RoastStore
 
 _log = logging.getLogger(__name__)
+
+#: Valid access-log modes for the ``--access-log`` CLI flag and the
+#: ``ROASTPILOT_HTTP_ACCESS_LOG`` env var (issue #267).
+_ACCESS_LOG_MODES = ("quiet", "full", "off")
+#: The uvicorn logger that emits the per-request ``GET /… 200 OK`` access lines.
+_UVICORN_ACCESS_LOGGER = "uvicorn.access"
+
+
+def _access_path_matches(request_path: str, pattern: str) -> bool:
+    """Return whether ``request_path`` matches a quiet-path ``pattern``.
+
+    The chatty paths are per-run (``/api/roasts/{run_id}/telemetry`` and the
+    SSE stream), so the run id is part of every real request line and an exact
+    literal match would never fire. A ``pattern`` containing the ``{run_id}``
+    template segment is therefore matched as **prefix + suffix**: the request
+    path must start with the text before ``{run_id}`` and end with the text
+    after it, with a non-empty id between (no ``/`` in the id segment, so a
+    deeper sub-path such as ``…/telemetry/extra`` does not match). A pattern
+    with no template segment is matched exactly. The query string (if any) is
+    stripped before matching.
+
+    Args:
+        request_path: The request path from the uvicorn access record (may
+            carry a ``?query`` suffix).
+        pattern: A quiet-path entry — an exact path or a ``{run_id}`` template.
+
+    Returns:
+        ``True`` when the request path is one of the quiet paths.
+    """
+    path = request_path.split("?", 1)[0]
+    if "{run_id}" not in pattern:
+        return path == pattern
+    prefix, suffix = pattern.split("{run_id}", 1)
+    if not (path.startswith(prefix) and path.endswith(suffix)):
+        return False
+    run_id = path[len(prefix) : len(path) - len(suffix)] if suffix else path[len(prefix) :]
+    return bool(run_id) and "/" not in run_id
+
+
+def _access_record_path_and_status(record: logging.LogRecord) -> tuple[str, int] | None:
+    """Extract the request path and HTTP status from a uvicorn access record.
+
+    uvicorn's access logger formats with a 5-tuple
+    ``(client_addr, method, full_path, http_version, status_code)`` in
+    ``record.args``. This reads ``full_path`` (index 2) and ``status_code``
+    (index 4). Any record that does not match that shape (a non-access log
+    routed through the same logger, a future uvicorn format change) returns
+    ``None`` so the filter fails OPEN — it keeps the record rather than risk
+    dropping something it cannot classify.
+
+    Args:
+        record: A log record emitted on the ``uvicorn.access`` logger.
+
+    Returns:
+        ``(path, status)`` when the record is a recognizable access line, else
+        ``None``.
+    """
+    args = record.args
+    if not isinstance(args, tuple) or len(args) < 5:
+        return None
+    path, status = args[2], args[4]
+    if not isinstance(path, str) or not isinstance(status, int):
+        return None
+    return path, status
+
+
+class _QuietAccessLogFilter(logging.Filter):
+    """Drop successful access lines on the chatty paths (issue #267).
+
+    Installed on the ``uvicorn.access`` logger in ``quiet`` mode. It suppresses
+    a record only when BOTH hold: the HTTP status is < 400 (success), AND the
+    request path is in the configured quiet-path set (the SSE stream, the
+    per-tick telemetry series, the health poll — matched per
+    :func:`_access_path_matches`, so any run id is caught). Everything else
+    passes: every 4xx/5xx (any path), every non-quiet path, and any record this
+    filter cannot classify (fails open). It is logging-only — it never touches
+    API behaviour, only what the access logger emits.
+    """
+
+    def __init__(self, quiet_paths: Sequence[str]) -> None:
+        """Initialize the filter with the quiet-path set.
+
+        Args:
+            quiet_paths: The route paths (exact or ``{run_id}`` templates)
+                whose successful requests are suppressed.
+        """
+        super().__init__()
+        self._quiet_paths = tuple(quiet_paths)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        """Return ``True`` to keep the record, ``False`` to drop it.
+
+        Args:
+            record: The candidate ``uvicorn.access`` log record.
+
+        Returns:
+            ``False`` only for a successful (status < 400) request on a quiet
+            path; ``True`` otherwise (kept).
+        """
+        parsed = _access_record_path_and_status(record)
+        if parsed is None:
+            return True  # unclassifiable — fail open, keep it
+        path, status = parsed
+        if status >= 400:
+            return True  # always keep client/server errors
+        return not any(_access_path_matches(path, p) for p in self._quiet_paths)
+
+
+def _resolve_access_log_mode(
+    cli_value: "str | None", config_default: "HttpAccessLogMode"
+) -> "HttpAccessLogMode":
+    """Resolve the access-log mode: CLI flag > env var > config default (#267).
+
+    Mirrors the ``--db`` > ``ROASTPILOT_DB`` > default precedence in
+    :func:`_resolve_live_store_path`.
+
+    Args:
+        cli_value: The ``--access-log`` flag value, or ``None`` when unset.
+        config_default: The ``AppConfig`` default to fall back to when neither
+            the flag nor the env var is set.
+
+    Returns:
+        The effective mode (``quiet`` / ``full`` / ``off``).
+    """
+    if cli_value is not None:
+        return cast_access_log_mode(cli_value)
+    env_value = os.environ.get("ROASTPILOT_HTTP_ACCESS_LOG")
+    if env_value:
+        normalized = env_value.strip().lower()
+        if normalized in _ACCESS_LOG_MODES:
+            return cast_access_log_mode(normalized)
+        _log.warning(
+            "ignoring invalid ROASTPILOT_HTTP_ACCESS_LOG=%r (expected one of %s)",
+            env_value,
+            ", ".join(_ACCESS_LOG_MODES),
+        )
+    return config_default
+
+
+def cast_access_log_mode(value: str) -> "HttpAccessLogMode":
+    """Narrow a validated string to the ``HttpAccessLogMode`` literal type.
+
+    The caller has already constrained ``value`` to one of the three modes
+    (argparse ``choices`` or an env-var membership check), so this is a typed
+    pass-through that satisfies pyright without a runtime cost.
+
+    Args:
+        value: One of ``"quiet"``, ``"full"``, ``"off"``.
+
+    Returns:
+        The same string, typed as :data:`HttpAccessLogMode`.
+    """
+    return cast("HttpAccessLogMode", value)
+
+
+def _resolve_log_level(cli_value: str | None, config_default: str) -> str:
+    """Resolve the uvicorn log level: CLI flag > env var > config default (#267).
+
+    Args:
+        cli_value: The ``--log-level`` flag value, or ``None`` when unset.
+        config_default: The ``AppConfig`` default to fall back to when neither
+            the flag nor the env var is set.
+
+    Returns:
+        The effective uvicorn log level string (e.g. ``"info"``).
+    """
+    if cli_value is not None:
+        return cli_value
+    env_value = os.environ.get("ROASTPILOT_LOG_LEVEL")
+    if env_value:
+        return env_value.strip().lower()
+    return config_default
+
+
+def _apply_access_log_mode(mode: "HttpAccessLogMode", quiet_paths: Sequence[str]) -> bool:
+    """Install/clear the quiet filter and return uvicorn's ``access_log`` flag.
+
+    Logging-only side effect: it manages the :class:`_QuietAccessLogFilter` on
+    the ``uvicorn.access`` logger so re-resolution is idempotent (any prior
+    instance is removed first), then:
+
+    - ``quiet`` → install the filter (drop 2xx/3xx on the quiet paths), return
+      ``True`` (access log stays on for everything it keeps);
+    - ``full`` → no filter, return ``True`` (today's behaviour);
+    - ``off`` → no filter, return ``False`` (``uvicorn.Config(access_log=False)``
+      disables the access log entirely).
+
+    Args:
+        mode: The resolved access-log mode.
+        quiet_paths: The quiet-path set for the filter (used in ``quiet`` mode).
+
+    Returns:
+        The value to pass as ``uvicorn.Config(access_log=...)``.
+    """
+    access_logger = logging.getLogger(_UVICORN_ACCESS_LOGGER)
+    for existing in [f for f in access_logger.filters if isinstance(f, _QuietAccessLogFilter)]:
+        access_logger.removeFilter(existing)
+    if mode == "quiet":
+        access_logger.addFilter(_QuietAccessLogFilter(quiet_paths))
+        return True
+    # ``full`` keeps the access log on with no filter; ``off`` disables it.
+    return mode != "off"
+
+
+def _configure_access_log(
+    args: argparse.Namespace, logging_config: "LoggingConfig"
+) -> tuple[str, bool]:
+    """Resolve + apply the access-log config for a serve entrypoint (#267).
+
+    Resolves the mode and log level with CLI > env > config precedence, installs
+    the quiet filter on ``uvicorn.access`` when appropriate, and returns the
+    ``(log_level, access_log)`` pair the caller passes to ``uvicorn.Config``.
+    Logging-only: it changes nothing but what the access logger emits.
+
+    Args:
+        args: The parsed CLI namespace (``access_log`` / ``log_level`` flags).
+        logging_config: The ``AppConfig.logging`` section (config defaults +
+            quiet-path set).
+
+    Returns:
+        ``(log_level, access_log)`` for ``uvicorn.Config(log_level=...,
+        access_log=...)``.
+    """
+    mode = _resolve_access_log_mode(args.access_log, logging_config.http_access_log_mode)
+    log_level = _resolve_log_level(args.log_level, logging_config.log_level)
+    access_log = _apply_access_log_mode(mode, logging_config.http_access_log_quiet_paths)
+    return log_level, access_log
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -98,6 +326,28 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--host", default="127.0.0.1", help="bind host (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="bind port (default 8000)")
+    parser.add_argument(
+        "--access-log",
+        dest="access_log",
+        choices=list(_ACCESS_LOG_MODES),
+        default=None,
+        help=(
+            "HTTP access-log verbosity for 'serve'/--replay: 'quiet' (default) "
+            "drops successful (2xx/3xx) logs on the chatty SSE/telemetry/health "
+            "paths while keeping all 4xx/5xx and every other path; 'full' logs "
+            "all requests; 'off' disables the access log. Precedence: this flag "
+            "> $ROASTPILOT_HTTP_ACCESS_LOG > config default (quiet)."
+        ),
+    )
+    parser.add_argument(
+        "--log-level",
+        dest="log_level",
+        default=None,
+        help=(
+            "uvicorn log level for 'serve'/--replay (default 'info'). "
+            "Precedence: this flag > $ROASTPILOT_LOG_LEVEL > config default."
+        ),
+    )
     return parser
 
 
@@ -354,7 +604,17 @@ async def _serve_live(args: argparse.Namespace) -> int:
         # (advisory-paused is valid); the result is exposed on /api/health.
         await _emit_advisor_readout(service)
 
-        uv = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
+        # Access-log verbosity (#267): resolve CLI > env > config and install the
+        # quiet filter on uvicorn.access. Logging-only — nothing about the API
+        # changes, only what its access logger emits.
+        log_level, access_log = _configure_access_log(args, config.logging)
+        uv = uvicorn.Config(
+            app,
+            host=args.host,
+            port=args.port,
+            log_level=log_level,
+            access_log=access_log,
+        )
         server = uvicorn.Server(uv)
         # _lifespan runs recover_on_start (restart → recovery) on startup and
         # service.shutdown() on teardown; we stop the MCP child after the
@@ -416,6 +676,7 @@ async def _serve_replay(args: argparse.Namespace) -> int:
     """Build and serve the replay app; free-run unless ``--step``."""
     import uvicorn
 
+    from roastpilot_agent.config import AppConfig
     from roastpilot_agent.replay import clamp_speed, create_replay_app
 
     export_dir: Path = args.replay
@@ -447,7 +708,16 @@ async def _serve_replay(args: argparse.Namespace) -> int:
             # serving the terminal state — intentional for the screen-recording
             # rig, but non-obvious (the process "hangs" rather than exits). Say so.
             print("  (serves the final frame after the roast ends; Ctrl-C to stop)")
-        config = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
+        # Access-log verbosity (#267): same CLI > env > config resolution as the
+        # live serve. Logging-only — the replay SSE pipeline is unchanged.
+        log_level, access_log = _configure_access_log(args, AppConfig().logging)
+        config = uvicorn.Config(
+            app,
+            host=args.host,
+            port=args.port,
+            log_level=log_level,
+            access_log=access_log,
+        )
         server = uvicorn.Server(config)
         runner = asyncio.create_task(server.serve())
         if not args.step:

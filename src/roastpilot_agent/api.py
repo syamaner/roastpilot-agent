@@ -86,6 +86,30 @@ from roastpilot_agent.store import RoastStore
 
 _log = logging.getLogger(__name__)
 
+#: The route paths the access-log quiet filter targets, as the single source of
+#: truth (issue #267). Both the FastAPI route registration in :func:`create_app`
+#: and the CLI's ``uvicorn.access`` quiet filter read these, so a future route
+#: rename can never silently un-quiet the chatty paths (a drift test pins it).
+#:
+#: ``TELEMETRY_PATH`` and ``EVENTS_PATH`` carry the ``{run_id}`` template
+#: segment. They are matched by the filter as **prefix + suffix** patterns (see
+#: ``cli._access_path_matches``) so ``/api/roasts/<any-run-id>/telemetry`` and
+#: the per-run SSE stream are caught regardless of the run id — the chatty paths
+#: are per-run, so an exact literal would never match a real request line.
+HEALTH_PATH = "/api/health"
+TELEMETRY_PATH = "/api/roasts/{run_id}/telemetry"
+EVENTS_PATH = "/api/roasts/{run_id}/events"
+
+#: The default access-log quiet-path set (issue #267): the SSE stream, the
+#: per-tick telemetry series, and the health poll — the three paths that flood
+#: the console during a live roast. Sourced from the route constants above so it
+#: cannot drift from the real routes.
+DEFAULT_HTTP_ACCESS_LOG_QUIET_PATHS: tuple[str, ...] = (
+    EVENTS_PATH,
+    TELEMETRY_PATH,
+    HEALTH_PATH,
+)
+
 
 #: A roaster control surface satisfies both controller protocols (read + write).
 #: The E9 live stack wires either the real ``RoasterControlAdapter`` (over the
@@ -1664,17 +1688,17 @@ def create_app(
         lifespan=lifespan or _lifespan,
     )
     app.state.service = service
-    app.get("/api/health")(health)
+    app.get(HEALTH_PATH)(health)
     app.post("/api/roasts", status_code=201)(start_roast)
     app.get("/api/roasts")(list_roasts)
     app.get("/api/roasts/{run_id}")(get_roast)
-    app.get("/api/roasts/{run_id}/telemetry")(get_telemetry)
+    app.get(TELEMETRY_PATH)(get_telemetry)
     app.get("/api/roasts/{run_id}/timeline")(get_timeline)
     app.get("/api/roasts/{run_id}/log")(get_log_manifest)
     app.get("/api/roasts/{run_id}/log/{artifact}")(download_log)
     app.post("/api/roasts/{run_id}/rating")(rate_roast)
     app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)
-    app.get("/api/roasts/{run_id}/events")(stream_events)
+    app.get(EVENTS_PATH)(stream_events)
     if spa_dir is not None and (spa_dir / "index.html").is_file():
         # Imported lazily so the API-only/scaffold path carries no static-mount
         # cost and there is no import cycle (live.py imports api.create_app).
