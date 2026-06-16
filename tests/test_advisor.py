@@ -24,7 +24,13 @@ from typing import Any
 
 import pytest
 from pydantic_ai import ModelHTTPError
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelResponse,
+    TextPart,
+    ThinkingPart,
+    ToolCallPart,
+)
 from pydantic_ai.models import Model
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -45,6 +51,7 @@ from roastpilot_agent.advisor import (
     build_model,
     instructions_for,
     reasoning_extra_body,
+    reasoning_from_run,
     usage_from_run,
 )
 from roastpilot_agent.config import AdvisorConfig, ControllerConfig, SafetyLimits
@@ -888,3 +895,93 @@ async def test_pydanticai_healthcheck_times_out_unreachable(
     assert health.status is AdvisorHealthStatus.UNREACHABLE
     assert health.error is not None
     assert "timed out" in health.error
+
+
+# --- Reasoning capture (#284) ---
+
+
+def _function_model_with_thinking(args: dict[str, Any], thinking: str) -> FunctionModel:
+    """A double that emits a ``ThinkingPart`` then calls its output tool.
+
+    Mirrors a reasoning model: the response carries the reasoning trace as a
+    thinking part alongside the structured output tool call.
+    """
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        tool_name = info.output_tools[0].name
+        return ModelResponse(parts=[ThinkingPart(content=thinking), ToolCallPart(tool_name, args)])
+
+    return FunctionModel(respond)
+
+
+def test_reasoning_from_run_returns_none_without_thinking_parts() -> None:
+    """A run with no thinking parts yields ``None`` (non-reasoning model)."""
+
+    class _Result:
+        def all_messages(self) -> list[ModelResponse]:
+            return [ModelResponse(parts=[TextPart("hello")])]
+
+    assert reasoning_from_run(_Result()) is None
+
+
+def test_reasoning_from_run_extracts_and_joins_thinking_parts() -> None:
+    """Thinking-part contents across the run are concatenated into the trace."""
+
+    class _Result:
+        def all_messages(self) -> list[ModelResponse]:
+            return [
+                ModelResponse(parts=[ThinkingPart(content="step one")]),
+                ModelResponse(parts=[ThinkingPart(content="step two"), TextPart("answer")]),
+            ]
+
+    assert reasoning_from_run(_Result()) == "step one\n\nstep two"
+
+
+def test_reasoning_from_run_never_raises_on_bad_shape() -> None:
+    """An unrecognised run shape degrades to ``None`` rather than erroring."""
+    assert reasoning_from_run(object()) is None
+
+
+@pytest.mark.asyncio
+async def test_get_recommendation_with_reasoning_captures_thinking() -> None:
+    """The reasoning-aware method returns the decision AND the thinking trace."""
+    advisor = _advisor_with(
+        _function_model_with_thinking(_VALID_OUTPUT, "bean temp climbing; hold heat")
+    )
+    decision, reasoning = await advisor.get_recommendation_with_reasoning(
+        _context_in_phase(RoastPhase.DEVELOPMENT)
+    )
+    assert decision.target_heat == _VALID_OUTPUT["target_heat"]
+    assert reasoning is not None
+    assert "hold heat" in reasoning
+
+
+@pytest.mark.asyncio
+async def test_get_recommendation_with_reasoning_none_when_absent() -> None:
+    """A non-reasoning model returns the decision with ``None`` reasoning."""
+    advisor = _advisor_with(_function_model_returning(_VALID_OUTPUT))
+    decision, reasoning = await advisor.get_recommendation_with_reasoning(
+        _context_in_phase(RoastPhase.DEVELOPMENT)
+    )
+    assert decision.should_drop == _VALID_OUTPUT["should_drop"]
+    assert reasoning is None
+
+
+@pytest.mark.asyncio
+async def test_get_recommendation_with_reasoning_maps_failures() -> None:
+    """The reasoning-aware method shares the typed-error mapping (malformed /
+    unsafe / provider) with the plain method."""
+    malformed = _advisor_with(_function_model_text("no tool here"))
+    with pytest.raises(AdvisorMalformedOutputError):
+        await malformed.get_recommendation_with_reasoning(_context_in_phase(RoastPhase.DEVELOPMENT))
+
+    unsafe = _advisor_with(_function_model_returning({**_VALID_OUTPUT, "target_heat": 150}))
+    with pytest.raises(AdvisorUnsafeOutputError):
+        await unsafe.get_recommendation_with_reasoning(_context_in_phase(RoastPhase.DEVELOPMENT))
+
+    def boom(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise ModelHTTPError(status_code=503, model_name="x", body="upstream down")
+
+    provider = _advisor_with(FunctionModel(boom))
+    with pytest.raises(AdvisorProviderError):
+        await provider.get_recommendation_with_reasoning(_context_in_phase(RoastPhase.DEVELOPMENT))

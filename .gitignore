@@ -53,3 +53,8 @@ web/dist/
 # Derived Artisan bake-off fixtures (personal roast logs — not committed, AGENTS.md)
 .artisan-fixtures/
 .artisan-holdout/
+
+# Bake-off per-call capture (#284): full prompts + responses + reasoning traces.
+# Large + contains raw advisor I/O — only the derived summary / report is
+# committed, never the raw capture (mirrors the .artisan-fixtures convention).
+*.capture.jsonl
