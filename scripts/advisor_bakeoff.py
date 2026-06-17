@@ -1109,11 +1109,16 @@ def _replays_to_cell(
     """Assemble the per-roast replays for one candidate into a :class:`ReplayCell`.
 
     Pure: the report layer is unchanged — it still consumes :class:`ReplayCell`.
+    ``scores`` and ``trajectories`` are emitted in the order of ``replays``, so
+    the caller MUST pass them in a deterministic roast order (not completion
+    order) — under ``--concurrency > 1`` cells complete out of order, so the
+    orchestrator slots them by roast index and sorts before calling this (#281).
 
     Args:
         cand: The candidate model.
         prompt_version: The prompt version under test.
-        replays: The per-roast replays for this (slug, prompt) cell, roast order.
+        replays: The per-roast replays for this (slug, prompt) cell, in roast
+            order (the caller's responsibility — see above).
 
     Returns:
         The assembled :class:`ReplayCell`.
@@ -1698,7 +1703,8 @@ DEFAULT_HEARTBEAT_SECONDS = 30.0
 
 # Default in-flight cell cap. Bounded so the harness never blasts the provider
 # (operator, 16 Jun): the independent ``(model, prompt, roast)`` cells run
-# concurrently behind an ``asyncio.Semaphore``, but the fan-out is always capped.
+# concurrently behind a bounded worker pool (a fixed set of workers pulling from
+# a shared queue — equivalent to a semaphore), so the fan-out is always capped.
 DEFAULT_CONCURRENCY = 8
 # Hard ceiling on the configurable cap — a sanity bound so a fat ``--concurrency``
 # typo cannot turn the bounded fan-out into a blast.
@@ -1830,6 +1836,7 @@ def with_retry(
     policy: RetryPolicy,
     *,
     sleep: Callable[[float], Awaitable[None]] | None = None,
+    on_attempt: Callable[[], None] | None = None,
 ) -> ReasoningRecommender:
     """Wrap a reasoning-aware recommender with bounded retry + backoff (#281).
 
@@ -1841,11 +1848,18 @@ def with_retry(
     the caller AROUND this wrapper, so a retried call's latency includes its
     backoff — which is the real cost the FC gate must see.
 
+    Every provider REQUEST (the first try and each retry) invokes ``on_attempt``
+    before it is issued, so the cost guard can account *actual* provider requests
+    — not one-per-tick — and keep the budget honest when calls are retried.
+
     Args:
         recommender: The reasoning-aware recommender to wrap.
         policy: The retry/backoff policy.
         sleep: Async sleep between attempts; defaults to :func:`asyncio.sleep`
             (injectable so tests stay instant).
+        on_attempt: Called once per provider request attempt (incl. retries),
+            just before the request is issued — the hook the cost guard uses to
+            count real requests. ``None`` to count nothing.
 
     Returns:
         A recommender with the same signature that retries transient failures.
@@ -1855,6 +1869,8 @@ def with_retry(
     async def retrying(context: AdvisorContext) -> tuple[RoastDecision, str | None]:
         last_exc: Exception | None = None
         for attempt in range(1, policy.attempts + 1):
+            if on_attempt is not None:
+                on_attempt()
             try:
                 return await recommender(context)
             except Exception as exc:  # noqa: BLE001 — classify, then retry or re-raise
@@ -1877,12 +1893,21 @@ class _ConcurrentBudget:
     race: two cells could each see headroom and both schedule, overshooting the
     cap. This guards the same accounting with an :class:`asyncio.Lock` and a
     single ``try_reserve`` that atomically checks AND commits the projected calls,
-    so once the budget is reached no further cell is scheduled — the running total
-    can never overshoot by more than the cells already in flight (which were
-    reserved while there was still headroom).
+    so once the budget is reached no further cell is scheduled.
 
-    The reservation is the basis for the cost estimate; the underlying
-    :class:`CostGuard` stays the single accounting source (calls + spend).
+    **Reservation vs actual requests.** ``try_reserve`` pre-pays a cell's
+    *minimum* cost — one provider request per tick. But ``with_retry`` may issue
+    several requests for a single tick (a retried 429 / 5xx), so the cost guard
+    counts ACTUAL provider requests, not one-per-tick: every attempt increments
+    the guard via :meth:`account_attempt`, and the pre-paid reservation is then
+    backed out via :meth:`release_reserved` so each request is counted exactly
+    once. The honest overshoot bound is therefore: the running total can exceed
+    ``--max-spend`` only by the (retry-inflated) request counts of the cells that
+    were already in flight when the cap was reached — those reserved while there
+    was still headroom.
+
+    The underlying :class:`CostGuard` stays the single accounting source (calls
+    + spend); this only makes its mutation concurrency-safe and retry-aware.
 
     Attributes:
         guard: The wrapped :class:`CostGuard` (the accounting source of truth).
@@ -1899,10 +1924,14 @@ class _ConcurrentBudget:
         self._stopped = False
 
     async def try_reserve(self, upcoming_calls: int) -> bool:
-        """Atomically reserve ``upcoming_calls`` if the budget allows it.
+        """Atomically reserve ``upcoming_calls`` (the cell's minimum cost).
+
+        The reservation is the per-tick floor; per-attempt accounting + the
+        matching release reconcile it to the actual request count afterwards.
 
         Args:
-            upcoming_calls: The number of calls the cell would cost.
+            upcoming_calls: The minimum number of requests the cell would cost
+                (one per tick, before any retries).
 
         Returns:
             ``True`` if the calls were reserved (the cell may run); ``False`` if
@@ -1915,6 +1944,29 @@ class _ConcurrentBudget:
                 return False
             self.guard.add_calls(upcoming_calls)
             return True
+
+    def account_attempt(self) -> None:
+        """Count one ACTUAL provider request (the first try or a retry).
+
+        Wired as ``with_retry``'s ``on_attempt`` hook so the guard's call count
+        — and thus the spend estimate — tracks real requests including retries,
+        not one-per-tick. Thread-safe without the lock: ``+= 1`` on the guard's
+        counter is atomic under the single-threaded event loop, and there is no
+        check-then-act here (unlike :meth:`try_reserve`).
+        """
+        self.guard.add_calls(1)
+
+    def release_reserved(self, reserved_calls: int) -> None:
+        """Back out a cell's pre-paid reservation after its attempts are counted.
+
+        Each tick's first request is counted twice otherwise — once by the
+        ``try_reserve`` floor, once by :meth:`account_attempt`. Releasing the
+        reservation leaves exactly the actual request count accounted.
+
+        Args:
+            reserved_calls: The per-tick floor previously reserved for the cell.
+        """
+        self.guard.add_calls(-reserved_calls)
 
     @property
     def stopped(self) -> bool:
@@ -2573,6 +2625,10 @@ class ObservableRunResult:
             the cells are then a valid PARTIAL scorecard.
         resumed_cells: How many per-roast cells were skipped (loaded from disk).
         fresh_cells: How many per-roast cells were computed this run.
+        accounted_calls: The cost guard's final ACTUAL provider-request count —
+            resumed cells' recorded calls plus every fresh request including
+            ``with_retry`` retries (not one-per-tick), the basis for the spend
+            estimate (#281).
         captured_calls: Every full per-call audit record from this run (#284) —
             resumed cells' capture is reloaded from the capture file, fresh
             cells' is captured live, so the set is complete across a resume.
@@ -2583,6 +2639,7 @@ class ObservableRunResult:
     stopped_for_budget: bool
     resumed_cells: int
     fresh_cells: int
+    accounted_calls: int = 0
     captured_calls: list[CapturedCall] = dataclasses.field(
         default_factory=lambda: cast("list[CapturedCall]", [])
     )
@@ -2684,12 +2741,16 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
     **Concurrency (#281).** With ``concurrency == 1`` (the default) the fresh
     cells run strictly serially, byte-identical to the original behaviour. With
     ``concurrency > 1`` the independent cells run concurrently behind a bounded
-    :class:`asyncio.Semaphore` (never an unbounded fan-out); the budget check is
-    made atomic via :class:`_ConcurrentBudget` so the running total can never
-    overshoot ``--max-spend`` by more than the cells already in flight. Within a
-    single cell the ticks stay serial, so per-call latency is still measured per
-    request; provider-side queueing under high concurrency can inflate that
-    latency, so the latency gate is authoritative at low concurrency (see #281).
+    worker pool (never an unbounded fan-out); the budget check is made atomic via
+    :class:`_ConcurrentBudget`, which counts ACTUAL provider requests (including
+    ``with_retry`` retries, not one-per-tick), so the running total overshoots
+    ``--max-spend`` only by the request counts of the cells already in flight
+    when the cap was hit. Each cell's per-roast replays are assembled in roast
+    order (slotted by roast index), so concurrent completion order never reorders
+    the scorecard. Within a single cell the ticks stay serial, so per-call
+    latency is still measured per request; provider-side queueing under high
+    concurrency can inflate that latency, so the latency gate is authoritative at
+    low concurrency (see #281).
 
     **Backoff (#281).** When ``retry_policy`` is given each recommender call is
     wrapped with :func:`with_retry`, retrying transient ``429`` / ``5xx`` /
@@ -2771,18 +2832,32 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
         if cached is not None:
             return cached
         base = capture_factory(cand, pv)
+        # When retrying, every provider request (incl. retries) is counted via the
+        # budget's per-attempt hook, and the cell's per-tick reservation is backed
+        # out after the run, so the cost guard tracks ACTUAL requests not ticks.
         wrapped = (
-            base if retry_policy is None else with_retry(base, retry_policy, sleep=retry_sleep)
+            base
+            if retry_policy is None
+            else with_retry(
+                base, retry_policy, sleep=retry_sleep, on_attempt=budget.account_attempt
+            )
         )
         recommenders[cache_key] = wrapped
         return wrapped
 
+    # The roast's stable grid index, so each cell's per-roast replays can be
+    # assembled in ROAST ORDER regardless of the order they COMPLETE in under
+    # concurrency (completions interleave; the scorecard must not).
+    roast_index = {roast_id_for(f): i for i, f in enumerate(roasts)}
+
     # Walk the grid once IN ORDER: resumed cells are reloaded + accounted here
     # (so the resume count + cost is scoped to this run's grid, unchanged), and
     # the remaining fresh cells are collected as a schedule the workers consume.
+    # Each cell's replays are stored in a roast-index-keyed slot map, never an
+    # append list, so concurrent completion order cannot reorder them (#281).
     resumed = 0
     pending: list[_PendingCell] = []
-    replays_by_cell: dict[tuple[str, str], list[RoastReplay]] = {}
+    replays_by_cell: dict[tuple[str, str], dict[int, RoastReplay]] = {}
     for pv in prompt_versions:
         for cand in survivors:
             for fixture in roasts:
@@ -2791,7 +2866,7 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
                 ticks, ground = built[rid]
                 if checkpoint.has(key):
                     replay = roast_replay_from_record(checkpoint.record(key), ticks, ground)
-                    replays_by_cell.setdefault((cand.slug, pv), []).append(replay)
+                    replays_by_cell.setdefault((cand.slug, pv), {})[roast_index[rid]] = replay
                     resumed += 1
                     guard.add_calls(replay.call_count)
                     continue
@@ -2813,9 +2888,11 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
         cand, pv, rid = pending_cell.cand, pending_cell.prompt_version, pending_cell.rid
         ticks, ground = pending_cell.ticks, pending_cell.ground
 
-        # Atomic budget reservation BEFORE paying for the cell: once the budget is
-        # reached no further cell is scheduled, and the running total can only
-        # overshoot by the cells already reserved while there was headroom.
+        # Atomic budget reservation BEFORE paying for the cell (the per-tick
+        # floor): once the budget is reached no further cell is scheduled. Actual
+        # provider requests — incl. retries — are counted per attempt during the
+        # run, so the running total overshoots only by the (retry-inflated)
+        # request counts of the cells already in flight when the cap was hit.
         if not await budget.try_reserve(len(ticks)):
             if not stopped:
                 stopped = True
@@ -2829,9 +2906,18 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
                     )
             return
 
-        outcomes, reasonings = await replay_roast_with_capture(
-            ticks, recommender_for(cand, pv), clock=tick_clock
-        )
+        try:
+            outcomes, reasonings = await replay_roast_with_capture(
+                ticks, recommender_for(cand, pv), clock=tick_clock
+            )
+        finally:
+            # With retry counting on, every request (incl. retries) was counted
+            # by ``account_attempt``; back out the per-tick reservation so each
+            # request is counted exactly once. Without a policy there is no
+            # per-attempt counting, so the reservation IS the accounting — leave
+            # it. In a ``finally`` so a mid-cell raise cannot leak the reservation.
+            if retry_policy is not None:
+                budget.release_reserved(len(ticks))
         replay = build_roast_replay(cand.slug, pv, rid, outcomes, ground)
         # Persist immediately — kill-safe. The shared sidecar + capture files are
         # written under one lock so concurrent cells never interleave a line.
@@ -2840,7 +2926,8 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
             capture.append(
                 build_captured_calls(cand.slug, pv, rid, ticks, outcomes, reasonings, cost_per_call)
             )
-            replays_by_cell.setdefault((cand.slug, pv), []).append(replay)
+            # Slot by roast index — completion order is irrelevant to assembly.
+            replays_by_cell.setdefault((cand.slug, pv), {})[roast_index[rid]] = replay
         async with progress_lock:
             done += 1
             fresh += 1
@@ -2863,14 +2950,17 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
     heartbeat.maybe_beat(done=done, guard=guard, force=True)
 
     # Assemble cells in (prompt, survivor) order, including partial cells (a cell
-    # with only some roasts scored is still a valid, reportable partial). The
-    # capture is assembled the same way so a resumed run's capture is complete.
+    # with only some roasts scored is still a valid, reportable partial). Each
+    # cell's per-roast replays are emitted in ROAST-INDEX order (the slot map is
+    # sorted by key), so concurrent completion order never reorders the scorecard.
+    # The capture is assembled the same way so a resumed run's capture is complete.
     cells: list[ReplayCell] = []
     captured_calls: list[CapturedCall] = []
     for pv in prompt_versions:
         for cand in survivors:
-            replays = replays_by_cell.get((cand.slug, pv))
-            if replays:
+            slots = replays_by_cell.get((cand.slug, pv))
+            if slots:
+                replays = [slots[i] for i in sorted(slots)]
                 cells.append(_replays_to_cell(cand, pv, replays))
             for fixture in roasts:
                 key = cell_key(cand.slug, pv, roast_id_for(fixture))
@@ -2882,6 +2972,7 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
         stopped_for_budget=stopped,
         resumed_cells=resumed,
         fresh_cells=fresh,
+        accounted_calls=guard.calls,
         captured_calls=captured_calls,
     )
 

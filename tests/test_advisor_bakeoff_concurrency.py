@@ -496,3 +496,181 @@ async def test_concurrent_run_applies_retry_under_fan_out(
     # Every tick produced a decision — the single transient 503 was retried away.
     assert all(c.decision is not None for c in result.captured_calls)
     assert result.fresh_cells == len(_roster()) * len(bakeoff.REPLAY_ROASTS)
+
+
+# --- Within-cell roast/tick ordering under concurrency (issue 1) ------------
+
+
+def _ordered_cell_signature(cells: list[bakeoff.ReplayCell]) -> list[tuple[str, str, list[str]]]:
+    """For each cell, the (slug, prompt, [roast_name in scores order]) signature.
+
+    Surfaces the WITHIN-CELL roast ordering specifically: a cell whose per-roast
+    scores were assembled in completion order rather than roast order would show
+    a reordered ``roast_name`` list here.
+    """
+    return [(c.slug, c.prompt_version, [s.roast_name for s in c.scores]) for c in cells]
+
+
+@pytest.mark.asyncio
+async def test_within_cell_roast_order_is_deterministic_under_concurrency(
+    mock_healthcheck: None, tmp_path: Path
+) -> None:
+    """A cell's per-roast scores stay in ROAST order even when roasts finish out of order.
+
+    The first roast is made the SLOWER one (its recommender yields the event loop
+    repeatedly) so that, under ``--concurrency > 1``, the second roast's cell
+    completes first. If assembly used completion order the scores would be
+    reordered; slotting by roast index keeps them in fixture order, byte-identical
+    to the serial run.
+    """
+    roster = _roster()
+    roasts = bakeoff.REPLAY_ROASTS
+    first_rid = bakeoff.roast_id_for(roasts[0])
+
+    def skewing_factory(_cand: Candidate, _pv: str) -> Any:
+        async def recommend(context: AdvisorContext) -> RoastDecision:
+            # The first roast's profile_name carries its id; slow it down so the
+            # SECOND roast completes first under concurrency (forces out-of-order
+            # completion — the exact condition that would corrupt append-order).
+            if context.profile_name == first_rid:
+                for _ in range(5):
+                    await asyncio.sleep(0)
+            return await _canned_recommend(context)
+
+        return recommend
+
+    serial = await bakeoff.run_replay_bakeoff_observable(
+        roster,
+        roasts,
+        ["v2"],
+        None,
+        60.0,
+        out=tmp_path / "serial.json",
+        concurrency=1,
+        recommender_factory=skewing_factory,
+        clock=_fixed_clock(),
+        heartbeat_clock=_fixed_clock(),
+    )
+    concurrent = await bakeoff.run_replay_bakeoff_observable(
+        roster,
+        roasts,
+        ["v2"],
+        None,
+        60.0,
+        out=tmp_path / "concurrent.json",
+        concurrency=8,
+        recommender_factory=skewing_factory,
+        clock=_fixed_clock(),
+        heartbeat_clock=_fixed_clock(),
+    )
+
+    serial_sig = _ordered_cell_signature(serial.cells)
+    concurrent_sig = _ordered_cell_signature(concurrent.cells)
+    # Every cell's scores are in fixture (roast 0, roast 1) order in BOTH runs.
+    expected_order = [bakeoff.roast_id_for(r) for r in roasts]
+    for _slug, _pv, names in concurrent_sig:
+        assert names == expected_order, "per-cell scores must stay in roast order"
+    # And the concurrent within-cell ordering is byte-identical to serial.
+    assert concurrent_sig == serial_sig
+
+
+# --- Budget counts ACTUAL provider requests, including retries (issue 2) ----
+
+
+@pytest.mark.asyncio
+async def test_budget_counts_each_retry_attempt(mock_healthcheck: None, tmp_path: Path) -> None:
+    """A run whose every call retries twice accounts 3 requests per tick, not 1 (#281).
+
+    The cost guard must account ACTUAL provider requests (every attempt), not
+    one-per-tick: ``with_retry``'s ``on_attempt`` hook increments the guard per
+    request and the cell's per-tick reservation is released, so each request is
+    counted exactly once. A single-roast, single-candidate run makes the count
+    exact — ``accounted_calls == 3 * ticks`` when every tick fails twice then
+    succeeds, versus ``ticks`` if retries were (wrongly) uncounted.
+    """
+    roster = (Candidate(_SLUG_A, Tier.INCUMBENT, bakeoff.PHASE_ORDER),)
+    roasts = (bakeoff.REPLAY_ROASTS[0],)
+    ticks, _ground = bakeoff.build_ticks(roasts[0], cadence_seconds=60.0)
+    n_ticks = len(ticks)
+
+    counter = {"n": 0}
+
+    async def two_429s_then_ok(context: AdvisorContext) -> tuple[RoastDecision, str | None]:
+        # Each tick fails twice then succeeds → exactly 3 provider requests/tick.
+        counter["n"] += 1
+        if counter["n"] % 3 != 0:
+            raise AdvisorProviderError("status_code: 429 rate limit")
+        return await _canned_recommend(context), None
+
+    def factory(_cand: Candidate, _pv: str) -> Any:
+        return two_429s_then_ok
+
+    result = await bakeoff.run_replay_bakeoff_observable(
+        roster,
+        roasts,
+        ["v2"],
+        None,
+        60.0,
+        out=tmp_path / "bakeoff.json",
+        concurrency=1,
+        cost_per_call=1.0,
+        retry_policy=RetryPolicy(attempts=4, rng=lambda: 0.0),
+        retry_sleep=_instant_sleep,
+        reasoning_recommender_factory=factory,
+        clock=_fixed_clock(),
+        heartbeat_clock=_fixed_clock(),
+    )
+
+    assert result.fresh_cells == 1
+    assert counter["n"] == 3 * n_ticks, "every tick issued three provider requests"
+    # The budget counted every request — NOT one-per-tick. This is the issue-2 fix.
+    assert result.accounted_calls == 3 * n_ticks
+    assert result.accounted_calls != n_ticks
+
+
+@pytest.mark.asyncio
+async def test_run_budget_stops_accounting_actual_retried_requests(
+    mock_healthcheck: None, tmp_path: Path
+) -> None:
+    """An always-retrying run under a budget stops, having counted actual requests.
+
+    Each tick costs the full retry attempt count, so spend climbs faster than
+    one-per-tick. The run must still stop gracefully on ``--max-spend`` (it never
+    silently keeps spending past the cap because retries were uncounted), and the
+    accounted requests reflect the retries.
+    """
+    fail_until = {"n": 0}
+
+    async def two_429s_then_ok(context: AdvisorContext) -> tuple[RoastDecision, str | None]:
+        # Each call fails twice then succeeds → 3 provider requests per tick.
+        fail_until["n"] += 1
+        if fail_until["n"] % 3 != 0:
+            raise AdvisorProviderError("status_code: 429 rate limit")
+        return await _canned_recommend(context), None
+
+    def factory(_cand: Candidate, _pv: str) -> Any:
+        return two_429s_then_ok
+
+    result = await bakeoff.run_replay_bakeoff_observable(
+        _roster(),
+        bakeoff.REPLAY_ROASTS,
+        ["v2"],
+        None,
+        60.0,
+        out=tmp_path / "bakeoff.json",
+        concurrency=4,
+        cost_per_call=1.0,
+        max_spend=30.0,
+        retry_policy=RetryPolicy(attempts=4, rng=lambda: 0.0),
+        retry_sleep=_instant_sleep,
+        reasoning_recommender_factory=factory,
+        clock=_fixed_clock(),
+        heartbeat_clock=_fixed_clock(),
+    )
+
+    assert result.stopped_for_budget is True
+    assert result.fresh_cells > 0
+    # Retried requests were counted (each completed tick cost ~3 requests), so the
+    # accounted total is well above the completed-tick count — the bound is honest.
+    completed_ticks = sum(1 for c in result.captured_calls if c.decision is not None)
+    assert result.accounted_calls >= 3 * completed_ticks
