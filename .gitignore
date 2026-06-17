@@ -53,3 +53,7 @@ web/dist/
 # Derived Artisan bake-off fixtures (personal roast logs — not committed, AGENTS.md)
 .artisan-fixtures/
 .artisan-holdout/
+
+# Large per-roast bake-off dumps (regenerable; commit the summary doc instead)
+docs/advisor/bakeoff-results-2026-06-16.json
+docs/advisor/bakeoff-results-2026-06-16.md

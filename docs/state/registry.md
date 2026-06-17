@@ -41,6 +41,23 @@
 > cases on #224 first) + **#229** a curve-insight feature spike. The deterministic pre-FC trim
 > (#222) stays the always-on floor, unchanged for the first roast. Cadence stays ~10 s pre-FC /
 > ~5 s post-FC (decoupled from the 5 s sample resolution). Plan: D36 in `roastpilot-plan/roastpilot-agent/plan.md` §1; research note `docs/research/2026-06-14-roast-curve-features.md`.
+>
+> **D40/D41 (16 Jun) — design-review round 2 + the model-roster screen.** D40 settled five
+> operator answers (validate on our data not shadow-mode; **#223 split into #273–#277**;
+> "reference curve" = the roast-so-far telemetry; full-roster bake-off; deadband = a short
+> dwell + history-in-every-prompt). The bake-off then RAN (8 models, 28 roasts, prompt v4):
+> **a SCREEN, not a pin** — the **FC latency gate is decisive** (only gpt-4o / gpt-4o-mini /
+> gemini-3.1-flash-lite clear ~5 s; sonnet-4.6 / gpt-5.5 / opus-4.8 / even gpt-5-mini@low all
+> bust), recall 1.0 across the roster, and the **pre-FC heat-cut/fan-into-crack pattern showed
+> systematically** (worst heat-dir: gpt-5-mini 0.26, frontier ~0.40; survivors 0.82–0.84) —
+> a **v4 prompt-gap, not a model fault**, captured as `docs/advisor/negative-cases/`. **No
+> model pinned** (incumbent `gemini-3.1-flash-lite` D33 stands; gpt-4o confirmed latency-viable);
+> the real pin comes from a **capture-enabled re-run with the #274 teaching prompt**, paired
+> before→after (**D41**). Summary: `docs/advisor/bakeoff-summary-2026-06-16.md`. **Harness
+> hardening from the run, all on `main`:** #280/#283 (observability + checkpoint/resume + cost
+> guard), #284/#285 (persist prompt+response+**reasoning** + most-interesting-cells surfacing) —
+> *the scores find the symptom, only the reasoning found the cause*; #281 (bounded-concurrency
+> replay) queued on top. Plan: D40/D41 in `plan.md` §1.
 
 - Epic file: `docs/epics/E11-packaging.md` — **BLOCKED, do not start (D28 + D27)**.
   E10 closed 11 Jun 2026. E11 is next in order but **gated**: do **not** begin E11
