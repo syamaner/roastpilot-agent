@@ -1701,11 +1701,6 @@ DEFAULT_HEARTBEAT_SECONDS = 30.0
 
 # --- Concurrency + retry/backoff (#281) -------------------------------------
 
-# Default in-flight cell cap. Bounded so the harness never blasts the provider
-# (operator, 16 Jun): the independent ``(model, prompt, roast)`` cells run
-# concurrently behind a bounded worker pool (a fixed set of workers pulling from
-# a shared queue — equivalent to a semaphore), so the fan-out is always capped.
-DEFAULT_CONCURRENCY = 8
 # Hard ceiling on the configurable cap — a sanity bound so a fat ``--concurrency``
 # typo cannot turn the bounded fan-out into a blast.
 MAX_CONCURRENCY = 32
@@ -2774,7 +2769,7 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
             it, flushing partials.
         heartbeat_seconds: Minimum wall-clock seconds between heartbeats.
         concurrency: Maximum cells in flight (>= 1). ``1`` is the serial default;
-            higher values fan out behind a bounded semaphore.
+            higher values fan out behind a bounded :class:`asyncio.Queue` worker pool.
         retry_policy: When given, wrap each recommender with bounded retry +
             backoff for transient failures; ``None`` disables retry (the
             historical default the existing tests rely on).
