@@ -57,3 +57,8 @@ web/dist/
 # Large per-roast bake-off dumps (regenerable; commit the summary doc instead)
 docs/advisor/bakeoff-results-2026-06-16.json
 docs/advisor/bakeoff-results-2026-06-16.md
+
+# Bake-off per-call capture (#284): full prompts + responses + reasoning traces.
+# Large + contains raw advisor I/O — only the derived summary / report is
+# committed, never the raw capture (mirrors the .artisan-fixtures convention).
+*.capture.jsonl

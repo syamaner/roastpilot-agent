@@ -726,6 +726,49 @@ def usage_from_run(usage: Any) -> AdvisorUsage:
     )
 
 
+def reasoning_from_run(result: Any) -> str | None:
+    """Extract the model's reasoning / thinking trace from a PydanticAI run.
+
+    Chain-of-thought is provider-dependent (#284): reasoning models
+    (gpt-5-mini, the o-series, deepseek-r1) expose it, and PydanticAI surfaces
+    it as ``ThinkingPart`` parts on the response messages; non-reasoning models
+    emit none beyond the structured ``rationale``. The thinking-part contents
+    across the run's messages are concatenated (blank-separated) into a single
+    trace. This NEVER raises and returns ``None`` when no reasoning is present —
+    callers record a ``reasoning_available`` flag from whether this is ``None``.
+
+    Args:
+        result: A PydanticAI ``AgentRunResult`` (or anything exposing
+            ``all_messages()`` yielding messages with ``parts``). Duck-typed and
+            defensive so a provider/library shape change degrades to "no
+            reasoning" rather than an error.
+
+    Returns:
+        The concatenated reasoning trace, or ``None`` when the provider returned
+        no thinking parts (or the run shape is unrecognised).
+    """
+    try:
+        from pydantic_ai.messages import ThinkingPart
+    except ImportError:  # pragma: no cover — pydantic_ai always ships messages
+        return None
+    all_messages = getattr(result, "all_messages", None)
+    if not callable(all_messages):
+        return None
+    try:
+        messages: Any = all_messages()
+    except Exception:  # noqa: BLE001 — capture is best-effort, never fatal
+        return None
+    fragments: list[str] = []
+    for message in messages:
+        for part in getattr(message, "parts", ()):
+            if isinstance(part, ThinkingPart):
+                content = getattr(part, "content", None)
+                if content:
+                    fragments.append(str(content))
+    trace = "\n\n".join(f.strip() for f in fragments if f.strip())
+    return trace or None
+
+
 def reasoning_extra_body(
     reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None,
 ) -> dict[str, Any] | None:
@@ -960,6 +1003,45 @@ class PydanticAIAdvisor(RoastAdvisor):
             return RoastDecision.model_validate(result.output.model_dump())
         except ValidationError as exc:
             raise AdvisorUnsafeOutputError(str(exc)) from exc
+
+    async def get_recommendation_with_reasoning(
+        self, context: AdvisorContext
+    ) -> tuple[RoastDecision, str | None]:
+        """Run the model and return the recommendation plus its reasoning trace.
+
+        Identical control path and failure mapping to
+        :meth:`get_recommendation`, but it ALSO returns the provider's reasoning
+        / thinking trace when present (#284) — the auditability seam the
+        bake-off capture uses. The trace is extracted from the run's
+        ``ThinkingPart`` parts via :func:`reasoning_from_run`; it is ``None`` for
+        non-reasoning models and extraction never raises. This is advisory-only:
+        no MCP write tools are ever passed, and the returned decision is the same
+        strictly re-validated :class:`RoastDecision` as the plain method.
+
+        Args:
+            context: The structured roast context to advise on.
+
+        Returns:
+            ``(decision, reasoning)`` — the validated recommendation and the
+            reasoning trace, or ``None`` reasoning when the provider exposed
+            none.
+        """
+        model_slug = self._config.model_for(context.phase)
+        agent = self._agent_for(model_slug)
+        context_json = context.model_dump_json()
+        try:
+            result = await agent.run(context_json)
+        except UnexpectedModelBehavior as exc:
+            raise AdvisorMalformedOutputError(str(exc)) from exc
+        except ModelAPIError as exc:
+            raise AdvisorProviderError(str(exc)) from exc
+        self.last_usage = usage_from_run(result.usage)
+        reasoning = reasoning_from_run(result)
+        try:
+            decision = RoastDecision.model_validate(result.output.model_dump())
+        except ValidationError as exc:
+            raise AdvisorUnsafeOutputError(str(exc)) from exc
+        return decision, reasoning
 
     async def healthcheck(self) -> AdvisorHealth:
         """Probe reachability with a cheap, bounded completion (issue #168).
