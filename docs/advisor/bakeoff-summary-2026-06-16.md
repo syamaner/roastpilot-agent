@@ -31,8 +31,9 @@ heat cuts on an already-declining RoR across the 28 roasts, development phase.)
    tight at 4.1 s). **sonnet-4.6, gpt-5.5, opus-4.8, and even gpt-5-mini at `reasoning=low`
    all bust it** — despite gpt-5-mini / gpt-5.5 topping the drop-F1 column. The reasoning
    and frontier models think their way past the wall; same lesson as the original bake-off.
-2. **Drop skill barely separates the survivors.** Recall is **1.0 across the whole roster**
-   (v4's recall fix holds), and F1 is a 0.87–0.90 near-tie among the latency survivors. Drop
+2. **Drop skill barely separates the survivors.** Recall is **1.0 for every model except
+   gpt-5-mini (0.96, one missed/errored roast)** — v4's recall fix holds across the roster —
+   and F1 is a 0.87–0.90 near-tie among the latency survivors. Drop
    F1 is not the discriminator here; latency and control-behaviour are.
 3. **Heat-direction agreement is the quantitative shadow of the pre-FC bake finding.**
    gpt-5-mini — the model caught cutting heat + opening fan pre-FC (see

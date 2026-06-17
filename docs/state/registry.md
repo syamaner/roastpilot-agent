@@ -48,7 +48,7 @@
 > dwell + history-in-every-prompt). The bake-off then RAN (8 models, 28 roasts, prompt v4):
 > **a SCREEN, not a pin** — the **FC latency gate is decisive** (only gpt-4o / gpt-4o-mini /
 > gemini-3.1-flash-lite clear ~5 s; sonnet-4.6 / gpt-5.5 / opus-4.8 / even gpt-5-mini@low all
-> bust), recall 1.0 across the roster, and the **pre-FC heat-cut/fan-into-crack pattern showed
+> bust), recall 1.0 for all but gpt-5-mini (0.96), and the **pre-FC heat-cut/fan-into-crack pattern showed
 > systematically** (worst heat-dir: gpt-5-mini 0.26, frontier ~0.40; survivors 0.82–0.84) —
 > a **v4 prompt-gap, not a model fault**, captured as `docs/advisor/negative-cases/`. **No
 > model pinned** (incumbent `gemini-3.1-flash-lite` D33 stands; gpt-4o confirmed latency-viable);
