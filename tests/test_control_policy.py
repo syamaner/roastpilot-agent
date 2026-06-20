@@ -225,3 +225,24 @@ def test_full_range_bounds_match_no_bounds_verdicts() -> None:
         assert with_box.verdict is without.verdict
         assert with_box.adjusted_heat == without.adjusted_heat
         assert with_box.adjusted_fan == without.adjusted_fan
+
+
+def test_rate_limit_reject_with_bounds() -> None:
+    """The rate-limit REJECT branch fires even when a real box is passed (#294).
+
+    Closes the "six verdicts unchanged with bounds" gap: ALLOW and CLAMP are
+    already proven with ``bounds=box``; this exercises REJECT (an in-bounds
+    request issued inside the ``min_seconds_between_commands`` window) WITH the
+    phase-resolved box, confirming the rate limit precedes the bounds clamp.
+    """
+    gate = SafetyPolicy(SafetyLimits())
+    box = RoastControlPolicy(SafetyLimits(), _PROFILE).limits_for(RoastPhase.DEVELOPMENT)
+    # 0.5 s < the 2.0 s default min_seconds_between_commands → rate-limit REJECT,
+    # even though 70/40 sits inside the (today full-range) box.
+    evaluation = gate.evaluate_command(
+        requested_heat=70,
+        requested_fan=40,
+        seconds_since_last_command=0.5,
+        bounds=box,
+    )
+    assert evaluation.verdict is SafetyVerdict.REJECT

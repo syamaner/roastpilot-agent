@@ -344,23 +344,41 @@ class SafetyLimits(BaseModel):
 
     @model_validator(mode="after")
     def _check_drop_ceiling_order(self) -> "SafetyLimits":
-        """The emergency-drop bound must sit above the bitter ceiling.
+        """The drop/bitter ceilings must order correctly under the hard ceiling.
 
-        Guards the D35 §3 invariant that ``emergency_drop_temp_c`` is the
-        last-resort bound *above* the ≤196 °C ``bitter_ceiling_temp_c`` target
-        ceiling — an inverted pair would make the emergency bound fire before
-        the bitter ceiling the model is told to respect.
+        Guards the D35 §3 invariants:
+
+        - ``emergency_drop_temp_c`` is the last-resort bound *above* the ≤196 °C
+          ``bitter_ceiling_temp_c`` target ceiling — an inverted pair would make
+          the emergency bound fire before the bitter ceiling the model is told to
+          respect.
+        - Both told ceilings sit *below* ``max_bean_temp_c``, the hard enforced
+          bean-temp ceiling. A told ceiling at or above the hard ceiling is a
+          misconfiguration the gate can never honour (the gate would fault on the
+          hard ceiling first), so the value the model is told would never be the
+          value enforced.
 
         Returns:
             The validated limits instance.
 
         Raises:
-            ValueError: If ``emergency_drop_temp_c <= bitter_ceiling_temp_c``.
+            ValueError: If ``emergency_drop_temp_c <= bitter_ceiling_temp_c`` or
+                if either told ceiling is ``>= max_bean_temp_c``.
         """
         if self.emergency_drop_temp_c <= self.bitter_ceiling_temp_c:
             raise ValueError(
                 "emergency_drop_temp_c must be above bitter_ceiling_temp_c "
                 f"({self.emergency_drop_temp_c} <= {self.bitter_ceiling_temp_c})"
+            )
+        if self.bitter_ceiling_temp_c >= self.max_bean_temp_c:
+            raise ValueError(
+                "bitter_ceiling_temp_c must be below max_bean_temp_c "
+                f"({self.bitter_ceiling_temp_c} >= {self.max_bean_temp_c})"
+            )
+        if self.emergency_drop_temp_c >= self.max_bean_temp_c:
+            raise ValueError(
+                "emergency_drop_temp_c must be below max_bean_temp_c "
+                f"({self.emergency_drop_temp_c} >= {self.max_bean_temp_c})"
             )
         return self
 
