@@ -178,6 +178,12 @@ def test_safety_limit_defaults_are_conservative() -> None:
     assert limits.overrun_safe_fan_percent == 100
     assert limits.pre_t0_overrun_severity == "recovery"
     assert limits.min_seconds_between_commands == 2.0
+    # D35 §3 drop/bitter ceilings (#273): the emergency-drop bound sits above the
+    # ≤196 °C bitter ceiling, and both stay below the hard bean-temp ceiling.
+    assert limits.bitter_ceiling_temp_c == 196.0
+    assert limits.emergency_drop_temp_c == 198.0
+    assert limits.bitter_ceiling_temp_c < limits.emergency_drop_temp_c
+    assert limits.emergency_drop_temp_c < limits.max_bean_temp_c
 
 
 @pytest.mark.parametrize(
@@ -208,6 +214,23 @@ def test_safety_limit_defaults_are_conservative() -> None:
         (SafetyLimits, {"overrun_safe_fan_percent": 101}),
         (SafetyLimits, {"pre_t0_overrun_severity": "explode"}),
         (SafetyLimits, {"min_seconds_between_commands": 0}),
+        # #294 (D35 §3): inverted drop ceilings — emergency-drop must sit above
+        # the bitter ceiling, so a 200/198 pair is rejected (mirrors the
+        # rejection proven in test_control_policy).
+        (
+            SafetyLimits,
+            {"bitter_ceiling_temp_c": 200.0, "emergency_drop_temp_c": 198.0},
+        ),
+        # #294 (D35 §3): a told ceiling at/above the hard enforced
+        # ``max_bean_temp_c`` is a misconfiguration the gate can never honour.
+        (
+            SafetyLimits,
+            {"max_bean_temp_c": 195.0, "bitter_ceiling_temp_c": 196.0},
+        ),
+        (
+            SafetyLimits,
+            {"max_bean_temp_c": 197.0, "emergency_drop_temp_c": 198.0},
+        ),
     ],
 )
 def test_config_rejects_nonsense(

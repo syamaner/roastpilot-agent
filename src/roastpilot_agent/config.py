@@ -9,7 +9,7 @@ validation at E12 (E12-S1).
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .models import RoastPhase
@@ -308,6 +308,21 @@ class SafetyLimits(BaseModel):
       failure mode). ``malformed`` / ``unsafe`` are provider-*reachable*
       (model misbehaving, a different class) and deliberately do NOT count
       toward this stop.
+    - ``bitter_ceiling_temp_c`` 196 °C (D35 §3, the operator's empirical drop
+      ceiling): the ≤196 °C *indicated* bean temperature past which a medium
+      roast turns bitter / ashy (irreversible). This is the **drop/bitter
+      ceiling** the D35 control box and the post-FC LLM (#223) reason inside —
+      surfaced through :class:`~roastpilot_agent.control_policy.RoastControlPolicy`
+      as a *told* limit. It is NOT a new hard-stop verdict in this story (the
+      enforced emergency ceiling stays ``max_bean_temp_c``); #223 owns wiring
+      the drop box. Recorded here as the single source so the value the model is
+      told equals the value the gate will enforce.
+    - ``emergency_drop_temp_c`` 198 °C (D35 §3): the emergency-drop bound — bean
+      temperature above which the roast must be dropped immediately regardless
+      of development. Above the ≤196 °C bitter ceiling by design (a 2 °C margin
+      that is the last-resort bound, not the target). Same single-source role as
+      ``bitter_ceiling_temp_c``: a *told* limit surfaced through the policy, not
+      a new verdict in this story.
     """
 
     max_bean_temp_c: float = Field(default=230.0, gt=0)
@@ -318,6 +333,54 @@ class SafetyLimits(BaseModel):
     min_seconds_between_commands: float = Field(default=2.0, gt=0)
     max_consecutive_mcp_failures: int = Field(default=3, ge=1)
     max_consecutive_advisor_failures: int = Field(default=3, ge=1)
+    # D35 §3 drop/bitter ceilings (Celsius), the single source the control
+    # policy surfaces into both the advisor context and the (future #223) gate.
+    # Conservative software values from the operator's empirical Hottop profile;
+    # validate at E12. ``emergency_drop_temp_c`` must sit above
+    # ``bitter_ceiling_temp_c`` (a model validator pins it) — the bitter ceiling
+    # is the *target* ceiling, the emergency-drop bound is the last-resort one.
+    bitter_ceiling_temp_c: float = Field(default=196.0, gt=0)
+    emergency_drop_temp_c: float = Field(default=198.0, gt=0)
+
+    @model_validator(mode="after")
+    def _check_drop_ceiling_order(self) -> "SafetyLimits":
+        """The drop/bitter ceilings must order correctly under the hard ceiling.
+
+        Guards the D35 §3 invariants:
+
+        - ``emergency_drop_temp_c`` is the last-resort bound *above* the ≤196 °C
+          ``bitter_ceiling_temp_c`` target ceiling — an inverted pair would make
+          the emergency bound fire before the bitter ceiling the model is told to
+          respect.
+        - Both told ceilings sit *below* ``max_bean_temp_c``, the hard enforced
+          bean-temp ceiling. A told ceiling at or above the hard ceiling is a
+          misconfiguration the gate can never honour (the gate would fault on the
+          hard ceiling first), so the value the model is told would never be the
+          value enforced.
+
+        Returns:
+            The validated limits instance.
+
+        Raises:
+            ValueError: If ``emergency_drop_temp_c <= bitter_ceiling_temp_c`` or
+                if either told ceiling is ``>= max_bean_temp_c``.
+        """
+        if self.emergency_drop_temp_c <= self.bitter_ceiling_temp_c:
+            raise ValueError(
+                "emergency_drop_temp_c must be above bitter_ceiling_temp_c "
+                f"({self.emergency_drop_temp_c} <= {self.bitter_ceiling_temp_c})"
+            )
+        if self.bitter_ceiling_temp_c >= self.max_bean_temp_c:
+            raise ValueError(
+                "bitter_ceiling_temp_c must be below max_bean_temp_c "
+                f"({self.bitter_ceiling_temp_c} >= {self.max_bean_temp_c})"
+            )
+        if self.emergency_drop_temp_c >= self.max_bean_temp_c:
+            raise ValueError(
+                "emergency_drop_temp_c must be below max_bean_temp_c "
+                f"({self.emergency_drop_temp_c} >= {self.max_bean_temp_c})"
+            )
+        return self
 
 
 class MCPConfig(BaseModel):

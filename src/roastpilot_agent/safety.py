@@ -13,6 +13,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from roastpilot_agent.config import SafetyLimits
+from roastpilot_agent.control_policy import PhaseControlLimits
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
     OperatorAction,
@@ -203,6 +204,17 @@ class SafetyPolicy:
     def __init__(self, limits: SafetyLimits) -> None:
         self._limits = limits
 
+    @property
+    def limits(self) -> SafetyLimits:
+        """The configured safety limits backing every rule (read-only).
+
+        Exposed so the controller can build the single
+        :class:`~roastpilot_agent.control_policy.RoastControlPolicy` from the
+        *same* limits the gate enforces (D35 §8.3, #273) — the told==enforced
+        single source — without a second copy of the configuration.
+        """
+        return self._limits
+
     def evaluate_telemetry(
         self,
         *,
@@ -369,17 +381,46 @@ class SafetyPolicy:
         requested_heat: int,
         requested_fan: int,
         seconds_since_last_command: float | None,
+        bounds: PhaseControlLimits | None = None,
     ) -> SafetyEvaluation:
         """Heat/fan command validation: rate limit, then bounds (E3-S3).
 
         Rate limiting first — a command inside ``min_seconds_between_commands``
         of the previous one is REJECTed outright (``None`` means no prior
-        command; exactly at the limit is allowed). Then bounds: requests
-        outside 0–100 % are CLAMPed, never rejected — the intent (more/less
-        heat or air) is honored at the nearest safe value. ALLOW and CLAMP
-        both carry the adjusted values to execute.
+        command; exactly at the limit is allowed). Then bounds: a request
+        outside the executable heat/fan box is CLAMPed, never rejected — the
+        intent (more/less heat or air) is honored at the nearest safe value.
+        ALLOW and CLAMP both carry the adjusted values to execute.
+
+        The box comes from the single :class:`RoastControlPolicy` source (D35
+        §8.3, #273): when ``bounds`` is supplied, the heat/fan floor + ceiling it
+        carries are the clamp range — the *same* limits placed in the advisor
+        context, so the value the model is told equals the value enforced here
+        (told == enforced). When ``bounds`` is ``None`` the range is the full
+        0–100 lever (the historical behaviour, preserved unchanged); the policy
+        resolves that same 0–100 box for every phase today, so wiring the gate to
+        the policy is a verdict no-op until #222 narrows a phase.
+
+        Args:
+            requested_heat: The requested heat level (deliberately unbounded —
+                an out-of-range request is recorded exactly as made).
+            requested_fan: The requested fan level (deliberately unbounded).
+            seconds_since_last_command: Seconds since the previous accepted
+                command, or ``None`` if there was none.
+            bounds: The phase-resolved control box from
+                :class:`RoastControlPolicy`, or ``None`` for the full 0–100
+                lever range.
+
+        Returns:
+            A :class:`SafetyEvaluation`: REJECT when rate-limited, CLAMP when the
+            request falls outside the box, ALLOW otherwise — the latter two
+            carrying the bounded values to execute.
         """
         limits = self._limits
+        heat_floor = bounds.heat_floor_percent if bounds is not None else 0
+        heat_ceiling = bounds.heat_ceiling_percent if bounds is not None else 100
+        fan_floor = bounds.fan_floor_percent if bounds is not None else 0
+        fan_ceiling = bounds.fan_ceiling_percent if bounds is not None else 100
         if (
             seconds_since_last_command is not None
             and seconds_since_last_command < limits.min_seconds_between_commands
@@ -395,8 +436,8 @@ class SafetyPolicy:
                     f"Hottop serial loop runs at ~1 Hz, faster writes have no effect"
                 ),
             )
-        clamped_heat = min(100, max(0, requested_heat))
-        clamped_fan = min(100, max(0, requested_fan))
+        clamped_heat = min(heat_ceiling, max(heat_floor, requested_heat))
+        clamped_fan = min(fan_ceiling, max(fan_floor, requested_fan))
         if clamped_heat != requested_heat or clamped_fan != requested_fan:
             return SafetyEvaluation(
                 rule="command_bounds",
@@ -406,8 +447,10 @@ class SafetyPolicy:
                 adjusted_heat=clamped_heat,
                 adjusted_fan=clamped_fan,
                 reason=(
-                    f"requested heat {requested_heat} % / fan {requested_fan} % outside 0–100: "
-                    f"clamped to heat {clamped_heat} % / fan {clamped_fan} %"
+                    f"requested heat {requested_heat} % / fan {requested_fan} % outside the "
+                    f"control box (heat {heat_floor}–{heat_ceiling} %, fan "
+                    f"{fan_floor}–{fan_ceiling} %): clamped to heat {clamped_heat} % / fan "
+                    f"{clamped_fan} %"
                 ),
             )
         return SafetyEvaluation(

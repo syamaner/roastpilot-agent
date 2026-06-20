@@ -22,6 +22,7 @@ from roastpilot_agent.advisor import (
     RoastDecision,
 )
 from roastpilot_agent.config import ControllerConfig, SafetyLimits
+from roastpilot_agent.control_policy import PhaseControlLimits
 from roastpilot_agent.controller import (
     TRANSITION_TABLE,
     UNIVERSAL_TARGETS,
@@ -354,6 +355,67 @@ async def test_tick_order_with_advisory() -> None:
         "emit:command_executed",
     ]
     assert harness.executor.targets == [(65, 50)]
+
+
+def _advisory_harness_in_phase(phase: RoastPhase, *, advisor: RoastAdvisor) -> Harness:
+    """A profile-loaded harness manoeuvred into an advisory ``phase``.
+
+    Walks the normal path to ``phase`` (one of the advisory phases) with
+    ``PROFILE`` loaded, clearing the log/event buffers so a single consult is
+    isolated — the generalisation of ``harness_in_development`` over the other
+    advisory phases (#294).
+    """
+    harness = make_harness(readings=[reading()], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH:
+        harness.controller.transition_to(step)
+        if step is phase:
+            break
+    harness.log.clear()
+    harness.events.events.clear()
+    return harness
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase",
+    [
+        RoastPhase.PREHEATING,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        RoastPhase.DEVELOPMENT,
+    ],
+)
+async def test_advisor_context_box_equals_gate_box_told_equals_enforced(
+    phase: RoastPhase,
+) -> None:
+    """#273/#294: the box the controller TELLS the model is the box it ENFORCES.
+
+    Drives a real consult in each advisory phase and asserts the control box on
+    the ``AdvisorContext`` the controller actually built (the told side) is the
+    same box ``_control_limits`` resolves for the gate (the enforced side) —
+    after #294 these share a single ``PhaseControlLimits`` instance per tick.
+    This pins the controller wiring across every advisory phase, not just the
+    policy unit.
+    """
+    advisor = FakeAdvisor([decision()])
+    harness = _advisory_harness_in_phase(phase, advisor=advisor)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert advisor.contexts, "the advisor should have been consulted"
+    context = advisor.contexts[-1]
+    enforced = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    assert context.phase is phase
+    assert context.heat_floor_percent == enforced.heat_floor_percent
+    assert context.heat_ceiling_percent == enforced.heat_ceiling_percent
+    assert context.fan_floor_percent == enforced.fan_floor_percent
+    assert context.fan_ceiling_percent == enforced.fan_ceiling_percent
+    assert context.bitter_ceiling_temp_c == enforced.bitter_ceiling_temp_c
+    assert context.emergency_drop_temp_c == enforced.emergency_drop_temp_c
+    # The profile-aware bitter ceiling: PROFILE drops at 205 °C, above the 196 °C
+    # hard ceiling, so the told ceiling stays the hard 196 (never loosened).
+    assert context.bitter_ceiling_temp_c == 196.0
+    assert context.emergency_drop_temp_c == 198.0
 
 
 @pytest.mark.asyncio
@@ -2083,7 +2145,8 @@ def test_advisor_context_development_clock_frozen_after_drop() -> None:
     harness.controller.transition_to(RoastPhase.COOLING)  # drop
     harness.clock.advance(90.0)  # cooling time that must not leak into the clocks
 
-    ctx = harness.controller._build_advisor_context(reading())  # pyright: ignore[reportPrivateUsage]
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
     assert ctx.development_elapsed_seconds == 60.0  # frozen at drop, not 150.0
     assert ctx.roast_elapsed_seconds == 180.0  # charge clock frozen at drop, not 270.0
 
@@ -2673,7 +2736,12 @@ async def test_drift_guards_block_writes_when_matrix_is_permissive() -> None:
 
 class RejectingCommandPolicy(SafetyPolicy):
     def evaluate_command(
-        self, *, requested_heat: int, requested_fan: int, seconds_since_last_command: float | None
+        self,
+        *,
+        requested_heat: int,
+        requested_fan: int,
+        seconds_since_last_command: float | None,
+        bounds: PhaseControlLimits | None = None,
     ) -> SafetyEvaluation:
         return SafetyEvaluation(
             rule="command_rate_limited",

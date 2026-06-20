@@ -29,6 +29,7 @@ from roastpilot_agent.advisor import (
     RoastDecision,
 )
 from roastpilot_agent.config import ControllerConfig
+from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
     RoastCommand,
@@ -1114,7 +1115,13 @@ class RoastController:
                 {"trigger": trigger.value, "evaluation": phase_validity.model_dump(mode="json")},
             )
             return
-        context = self._build_advisor_context(telemetry)
+        # Resolve the phase control box ONCE per advisory cycle (#273/#294):
+        # the SAME PhaseControlLimits instance is passed into the advisor
+        # context (told) and into evaluate_command (enforced) below, so told ==
+        # enforced by structural identity — not by two computations that happen
+        # to agree across the advisor await.
+        control_box = self._control_limits()
+        context = self._build_advisor_context(telemetry, control_box)
         # The trace identity persisted on every outcome path below (#167),
         # carrying the PHASE-RESOLVED model (#189): the row records the model
         # that actually answered this phase's call, not the base slug — so once
@@ -1152,6 +1159,12 @@ class RoastController:
             requested_heat=decision.target_heat,
             requested_fan=decision.target_fan,
             seconds_since_last_command=self._seconds_since_last_command(),
+            # The SAME phase-resolved box instance placed in the advisor context
+            # (#273): the model is told this range and the gate clamps to it —
+            # told == enforced by identity. Today this is the full 0–100 lever
+            # (verdict no-op); #222 narrows it per phase on the same single
+            # source.
+            bounds=control_box,
         )
         safety_evaluation_id = await self._snapshots.persist_evaluation(evaluation)
         # Persist the advisor decision and link it to the verdict it produced
@@ -1309,6 +1322,12 @@ class RoastController:
         self._events.emit(RoastEventKind.RUN_STARTED, {"profile": profile.name})
         # Initial heat/fan per profile, through safety policy (runtime
         # flow step 5) — never raw.
+        # NOTE (#222): this call deliberately does NOT pass bounds=, so it
+        # enforces the full 0–100 box today. That is correct only while the
+        # phase boxes are the full lever (#273 no-op). Once #222 narrows the
+        # per-phase boxes, wire this to _control_limits()/the policy too —
+        # otherwise run-start would enforce 0–100 while the model is told a
+        # narrowed box (a told≠enforced gap at the run-start command).
         evaluation = self._safety.evaluate_command(
             requested_heat=profile.initial_heat_percent,
             requested_fan=profile.initial_fan_percent,
@@ -1648,7 +1667,41 @@ class RoastController:
         self._advisory_paused = False
         self._events.emit(RoastEventKind.ADVISORY, {"advisory_paused": False})
 
-    def _build_advisor_context(self, telemetry: RoastTelemetry) -> AdvisorContext:
+    def _control_limits(self) -> PhaseControlLimits:
+        """Resolve the current phase's control box from the single source (#273).
+
+        Builds the :class:`RoastControlPolicy` from the safety policy's *own*
+        limits (``self._safety.limits`` — the same config the gate enforces) and
+        the frozen active profile, then resolves the box for the current phase.
+
+        The caller (:meth:`_consult_advisor`) resolves this box ONCE per
+        advisory cycle and passes that single :class:`PhaseControlLimits`
+        instance into both the advisor context (told) and the safety gate
+        (enforced), so within a tick the two read the same object and can never
+        carry different numbers (D35 §8.3).
+
+        Returns:
+            The phase-resolved control box for the controller's current phase.
+        """
+        policy = RoastControlPolicy(self._safety.limits, self._profile)
+        return policy.limits_for(self._phase)
+
+    def _build_advisor_context(
+        self, telemetry: RoastTelemetry, limits: PhaseControlLimits
+    ) -> AdvisorContext:
+        """Build the advisor context for the current tick.
+
+        Args:
+            telemetry: The latest roaster telemetry snapshot.
+            limits: The phase-resolved control box for this advisory cycle. The
+                caller passes the SAME instance into the safety gate's
+                ``evaluate_command(bounds=...)``, so the box the model is told
+                (the context limit fields) is the box the gate enforces — told
+                == enforced by identity (#273/#294).
+
+        Returns:
+            The populated :class:`AdvisorContext`.
+        """
         assert self._profile is not None  # guarded by caller
         return AdvisorContext(
             phase=self._phase,
@@ -1671,6 +1724,16 @@ class RoastController:
             seconds_since_charge=(
                 None if self._charge_monotonic is None else self._clock() - self._charge_monotonic
             ),
+            # D35 §8.2/8.3 (#273): the phase-resolved control box the model is
+            # told it must reason inside — the SAME limits instance the gate
+            # clamps the resulting command into (see the evaluate_command call
+            # in _consult_advisor), so told == enforced by identity.
+            heat_floor_percent=limits.heat_floor_percent,
+            heat_ceiling_percent=limits.heat_ceiling_percent,
+            fan_floor_percent=limits.fan_floor_percent,
+            fan_ceiling_percent=limits.fan_ceiling_percent,
+            bitter_ceiling_temp_c=limits.bitter_ceiling_temp_c,
+            emergency_drop_temp_c=limits.emergency_drop_temp_c,
         )
 
     def _seconds_since_last_command(self) -> float | None:
