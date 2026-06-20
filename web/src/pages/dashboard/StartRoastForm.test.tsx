@@ -52,6 +52,9 @@ describe("StartRoastForm", () => {
       bean_species: null,
       is_blend: false,
       description: null,
+      // #291 metadata fields take their unset defaults.
+      processing: null,
+      altitude_m: null,
       bean_weight_grams: 250,
       charge_guidance_min_c: 170,
       charge_guidance_max_c: 200,
@@ -106,6 +109,52 @@ describe("StartRoastForm", () => {
     fireEvent.submit(screen.getByTestId("start-roast-form"));
     await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
     expect((onStart.mock.calls[0][0] as RoastProfile).is_blend).toBe(true);
+  });
+
+  it("renders the processing + altitude metadata inputs (#291)", () => {
+    render(<StartRoastForm onStart={vi.fn()} />);
+    expect(screen.getByTestId("start-roast-processing")).toBeInTheDocument();
+    expect(screen.getByTestId("start-roast-altitude_m")).toBeInTheDocument();
+  });
+
+  it("passes processing + altitude through when provided (#291)", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    fireEvent.change(screen.getByTestId("start-roast-processing"), {
+      target: { value: "natural" },
+    });
+    fireEvent.change(screen.getByTestId("start-roast-altitude_m"), {
+      target: { value: "2100" },
+    });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
+    const profile = onStart.mock.calls[0][0] as RoastProfile;
+    expect(profile.processing).toBe("natural");
+    expect(profile.altitude_m).toBe(2100);
+  });
+
+  it("leaves processing + altitude null when blank (#291)", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
+    const profile = onStart.mock.calls[0][0] as RoastProfile;
+    expect(profile.processing).toBeNull();
+    expect(profile.altitude_m).toBeNull();
+  });
+
+  it("rejects an out-of-range altitude (#291)", () => {
+    const onStart = vi.fn();
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    fireEvent.change(screen.getByTestId("start-roast-altitude_m"), {
+      target: { value: "21000" },
+    });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    expect(screen.getByTestId("start-roast-altitude_m-error")).toBeInTheDocument();
+    expect(onStart).not.toHaveBeenCalled();
   });
 
   it("passes an optional varietal through when provided", async () => {

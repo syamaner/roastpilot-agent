@@ -24,7 +24,7 @@ import { useState } from "react";
 
 import { cn } from "@/lib/cn";
 import { ApiError } from "@/lib/api";
-import type { BeanSpecies, RoastProfile } from "@/lib/types";
+import type { BeanSpecies, ProcessingMethod, RoastProfile } from "@/lib/types";
 
 /**
  * The form's string-keyed draft (text/number inputs are strings; we parse on
@@ -41,6 +41,9 @@ interface Draft {
   bean_species: string;
   is_blend: boolean;
   description: string;
+  // Per-origin learning-loop axes (#291): a process dropdown + altitude number.
+  processing: string;
+  altitude_m: string;
   bean_weight_grams: string;
   charge_guidance_min_c: string;
   charge_guidance_max_c: string;
@@ -60,6 +63,23 @@ const SPECIES_OPTIONS: { value: BeanSpecies | ""; label: string }[] = [
   { value: "excelsa", label: "Excelsa" },
 ];
 
+/** The processing-method select options (#291); mirrors `ProcessingMethod`. The
+ *  empty value is "unset" → `null` on submit. */
+const PROCESSING_OPTIONS: { value: ProcessingMethod | ""; label: string }[] = [
+  { value: "", label: "—" },
+  { value: "washed", label: "Washed" },
+  { value: "natural", label: "Natural" },
+  { value: "honey", label: "Honey" },
+  { value: "anaerobic", label: "Anaerobic" },
+  { value: "wet_hulled", label: "Wet-hulled" },
+  { value: "other", label: "Other" },
+];
+
+/** Growing-altitude bounds (#291) — mirrors `models.RoastProfile.altitude_m`
+ *  (0–4000 m). A fat-finger like `21000` is rejected before the POST. */
+const ALTITUDE_MIN_M = 0;
+const ALTITUDE_MAX_M = 4000;
+
 /** Pre-filled defaults (mirror `models.RoastProfile` field defaults). The
  *  operator mainly fills name + bean_origin + weight; identity fields optional. */
 const DEFAULT_DRAFT: Draft = {
@@ -71,6 +91,8 @@ const DEFAULT_DRAFT: Draft = {
   bean_species: "",
   is_blend: false,
   description: "",
+  processing: "",
+  altitude_m: "",
   bean_weight_grams: "",
   charge_guidance_min_c: "170",
   charge_guidance_max_c: "200",
@@ -118,6 +140,25 @@ function validate(draft: Draft): { profile: RoastProfile } | { errors: Errors } 
   const farmRaw = draft.farm.trim();
   const descriptionRaw = draft.description.trim();
   const species = draft.bean_species === "" ? null : (draft.bean_species as BeanSpecies);
+  // #291 process is an optional select; blank → null (unset).
+  const processing = draft.processing === "" ? null : (draft.processing as ProcessingMethod);
+
+  // #291 altitude is an optional whole-metre number; blank → null (unset). When
+  // present it must be a whole number within the coffee-growing range.
+  const altitudeRaw = draft.altitude_m.trim();
+  let altitudeM: number | null = null;
+  if (altitudeRaw !== "") {
+    const altitude = Number(altitudeRaw);
+    if (
+      !Number.isInteger(altitude) ||
+      altitude < ALTITUDE_MIN_M ||
+      altitude > ALTITUDE_MAX_M
+    ) {
+      errors.altitude_m = `${ALTITUDE_MIN_M}–${ALTITUDE_MAX_M} m, whole number.`;
+    } else {
+      altitudeM = altitude;
+    }
+  }
 
   const weight = Number(draft.bean_weight_grams);
   if (draft.bean_weight_grams.trim() === "" || !Number.isFinite(weight) || weight <= 0)
@@ -164,6 +205,8 @@ function validate(draft: Draft): { profile: RoastProfile } | { errors: Errors } 
       bean_species: species,
       is_blend: draft.is_blend,
       description: descriptionRaw === "" ? null : descriptionRaw,
+      processing,
+      altitude_m: altitudeM,
       bean_weight_grams: weight,
       charge_guidance_min_c: minC,
       charge_guidance_max_c: maxC,
@@ -288,6 +331,20 @@ export function StartRoastForm({ onStart, className }: StartRoastFormProps): Rea
           error={errors.bean_varietal}
           placeholder="Heirloom"
           hint="Cultivar — distinct from species"
+        />
+        <ProcessingSelect value={draft.processing} onChange={set("processing")} />
+        <Field
+          id="altitude_m"
+          label="Altitude (m, optional)"
+          type="number"
+          min={ALTITUDE_MIN_M}
+          max={ALTITUDE_MAX_M}
+          step={1}
+          value={draft.altitude_m}
+          onChange={set("altitude_m")}
+          error={errors.altitude_m}
+          placeholder="2100"
+          hint={`Growing altitude, ${ALTITUDE_MIN_M}–${ALTITUDE_MAX_M} m`}
         />
         <BlendToggle checked={draft.is_blend} onChange={setBlend} />
         <DescriptionField
@@ -529,6 +586,47 @@ function SpeciesSelect({ value, onChange }: SpeciesSelectProps): React.JSX.Eleme
       </select>
       <span id={hintId} className="text-xs text-muted-foreground">
         Botanical species — distinct from cultivar
+      </span>
+    </div>
+  );
+}
+
+interface ProcessingSelectProps {
+  value: string;
+  onChange: (e: React.ChangeEvent<HTMLSelectElement>) => void;
+}
+
+/** Post-harvest processing-method select (#291) — a constrained vocabulary
+ *  (mirrors the `ProcessingMethod` Literal); the empty option means "unset".
+ *  Distinct from the free-text process notes in the description. One of the
+ *  per-origin axes the learning loop (D42) keys on. */
+function ProcessingSelect({ value, onChange }: ProcessingSelectProps): React.JSX.Element {
+  const hintId = "processing-hint";
+  return (
+    <div className="flex flex-col gap-1">
+      <label
+        htmlFor="processing"
+        className="text-xs font-semibold uppercase tracking-wide text-muted-foreground"
+      >
+        Processing (optional)
+      </label>
+      <select
+        id="processing"
+        name="processing"
+        value={value}
+        onChange={onChange}
+        aria-describedby={hintId}
+        data-testid="start-roast-processing"
+        className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus:ring-1 focus:ring-ring"
+      >
+        {PROCESSING_OPTIONS.map((opt) => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
+      <span id={hintId} className="text-xs text-muted-foreground">
+        Post-harvest process
       </span>
     </div>
   );
