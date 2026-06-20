@@ -722,18 +722,23 @@ def evaluate_turning_point(roasts: list[Roast]) -> TpResult:
     for r in roasts:
         tp_temp, time_to_tp = turning_point(r)
         slope = _recovery_slope(r, r.charge_seconds + time_to_tp)
+        # Store unrounded values so the correlation arrays use full precision.
+        # Rounding happens at the serialisation / display step (Correlation fields
+        # and _rng already round; TpRoast fields in JSON output are handled by
+        # _sanitise_for_json in main()).
         per_roast.append(
             TpRoast(
                 name=r.name,
-                tp_temp_c=round(tp_temp, 2),
-                time_to_tp_s=round(time_to_tp, 1),
-                recovery_slope_c_per_min=round(slope, 2),
-                time_to_fc_s=round(r.time_to_fc_seconds, 1),
-                total_roast_s=round(r.total_roast_seconds, 1),
-                drop_temp_c=round(r.drop_bean_c, 2),
+                tp_temp_c=tp_temp,
+                time_to_tp_s=time_to_tp,
+                recovery_slope_c_per_min=slope,
+                time_to_fc_s=r.time_to_fc_seconds,
+                total_roast_s=r.total_roast_seconds,
+                drop_temp_c=r.drop_bean_c,
             )
         )
 
+    # Build correlation arrays from unrounded per-roast values.
     predictors = {
         "tp_temp_c": np.array([p.tp_temp_c for p in per_roast], dtype=np.float64),
         "time_to_tp_s": np.array([p.time_to_tp_s for p in per_roast], dtype=np.float64),
@@ -868,6 +873,29 @@ def _print_report(report: Report) -> None:
         )
 
 
+def _sanitise_for_json(obj: Any) -> Any:
+    """Recursively replace non-finite floats with None for valid JSON output.
+
+    ``json.dumps`` raises ``ValueError`` on ``nan`` / ``inf`` / ``-inf`` unless
+    a custom encoder or ``allow_nan=True`` is used (the latter produces invalid
+    JSON). This helper walks the structure and substitutes ``None`` (JSON null)
+    so the output is always spec-compliant.
+
+    Args:
+        obj: A dict, list, float, or other JSON-compatible scalar.
+
+    Returns:
+        The sanitised object, safe to pass to ``json.dumps``.
+    """
+    if isinstance(obj, float):
+        return None if not math.isfinite(obj) else obj
+    if isinstance(obj, dict):
+        return {str(k): _sanitise_for_json(v) for k, v in obj.items()}  # type: ignore[return-value,unknown-variable-type]
+    if isinstance(obj, list):
+        return [_sanitise_for_json(v) for v in obj]  # type: ignore[return-value]
+    return obj
+
+
 def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint: run the evaluation and print a report.
 
@@ -904,7 +932,7 @@ def main(argv: list[str] | None = None) -> int:
     band = (float(args.fc_band[0]), float(args.fc_band[1])) if args.fc_band else None
     report = build_report(args.fixtures_dir, band)
     if args.json:
-        print(json.dumps(asdict(report), indent=2, default=str))
+        print(json.dumps(_sanitise_for_json(asdict(report)), indent=2))
     else:
         _print_report(report)
     return 0
