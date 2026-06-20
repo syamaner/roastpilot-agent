@@ -29,6 +29,7 @@ from roastpilot_agent.advisor import (
     RoastDecision,
 )
 from roastpilot_agent.config import ControllerConfig
+from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
     RoastCommand,
@@ -1152,6 +1153,11 @@ class RoastController:
             requested_heat=decision.target_heat,
             requested_fan=decision.target_fan,
             seconds_since_last_command=self._seconds_since_last_command(),
+            # The SAME phase-resolved box placed in the advisor context (#273):
+            # the model is told this range and the gate clamps to it — told ==
+            # enforced. Today this is the full 0–100 lever (verdict no-op);
+            # #222 narrows it per phase on the same single source.
+            bounds=self._control_limits(),
         )
         safety_evaluation_id = await self._snapshots.persist_evaluation(evaluation)
         # Persist the advisor decision and link it to the verdict it produced
@@ -1648,8 +1654,25 @@ class RoastController:
         self._advisory_paused = False
         self._events.emit(RoastEventKind.ADVISORY, {"advisory_paused": False})
 
+    def _control_limits(self) -> PhaseControlLimits:
+        """Resolve the current phase's control box from the single source (#273).
+
+        Builds the :class:`RoastControlPolicy` from the safety policy's *own*
+        limits (``self._safety.limits`` — the same config the gate enforces) and
+        the frozen active profile, then resolves the box for the current phase.
+        The returned :class:`PhaseControlLimits` is the ONE object both the
+        advisor context (told) and the safety gate (enforced) read, so the two
+        can never carry different numbers (D35 §8.3).
+
+        Returns:
+            The phase-resolved control box for the controller's current phase.
+        """
+        policy = RoastControlPolicy(self._safety.limits, self._profile)
+        return policy.limits_for(self._phase)
+
     def _build_advisor_context(self, telemetry: RoastTelemetry) -> AdvisorContext:
         assert self._profile is not None  # guarded by caller
+        limits = self._control_limits()
         return AdvisorContext(
             phase=self._phase,
             # Charge-referenced (#219): the DTR denominator the advisor reasons
@@ -1671,6 +1694,16 @@ class RoastController:
             seconds_since_charge=(
                 None if self._charge_monotonic is None else self._clock() - self._charge_monotonic
             ),
+            # D35 §8.2/8.3 (#273): the phase-resolved control box the model is
+            # told it must reason inside — the SAME limits object the gate clamps
+            # the resulting command into (see the evaluate_command call in
+            # _consult_advisor), so told == enforced with no second copy.
+            heat_floor_percent=limits.heat_floor_percent,
+            heat_ceiling_percent=limits.heat_ceiling_percent,
+            fan_floor_percent=limits.fan_floor_percent,
+            fan_ceiling_percent=limits.fan_ceiling_percent,
+            bitter_ceiling_temp_c=limits.bitter_ceiling_temp_c,
+            emergency_drop_temp_c=limits.emergency_drop_temp_c,
         )
 
     def _seconds_since_last_command(self) -> float | None:

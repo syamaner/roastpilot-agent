@@ -124,7 +124,7 @@ export const FIXTURE_TIMELINE: RoastTimeline = {
       input_fan: 40,
       adjusted_heat: 100,
       adjusted_fan: 40,
-      reason: "requested heat 105 % / fan 40 % outside 0–100: clamped to heat 100 % / fan 40 %",
+      reason: "requested heat 105 % / fan 40 % outside the control box (heat 0–100 %, fan 0–100 %): clamped to heat 100 % / fan 40 %",
       recorded_at_utc: "2026-06-07T09:16:00Z",
     },
     {
@@ -317,7 +317,7 @@ export const FIXTURE_TIMELINE_LONG: RoastTimeline = {
           adjusted_heat: 100,
           adjusted_fan: 40,
           reason:
-            "requested heat 105 % / fan 40 % outside 0–100: clamped to heat 100 % / fan 40 %",
+            "requested heat 105 % / fan 40 % outside the control box (heat 0–100 %, fan 0–100 %): clamped to heat 100 % / fan 40 %",
           recorded_at_utc: recordedAt,
         }
       : {

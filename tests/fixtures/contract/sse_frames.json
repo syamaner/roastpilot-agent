@@ -86,7 +86,7 @@
           "adjusted_heat": 100,
           "input_fan": 40,
           "input_heat": 105,
-          "reason": "requested heat 105 % / fan 40 % outside 0\u2013100: clamped to heat 100 % / fan 40 %",
+          "reason": "requested heat 105 % / fan 40 % outside the control box (heat 0\u2013100 %, fan 0\u2013100 %): clamped to heat 100 % / fan 40 %",
           "rule": "command_bounds",
           "verdict": "clamp"
         },

@@ -90,6 +90,18 @@ class AdvisorContext(BaseModel):
     back. It lets the model reason that a freshly-charged bean is in early
     drying, so its RoR will be negative and then turn, rather than mistaking
     the post-charge crash for a stall (#209).
+
+    The phase-resolved control LIMITS (``heat_floor_percent`` /
+    ``heat_ceiling_percent`` / ``fan_floor_percent`` / ``fan_ceiling_percent`` /
+    ``bitter_ceiling_temp_c`` / ``emergency_drop_temp_c``) are the explicit box
+    the model must reason inside (D35 §8.2, #273). They are NOT a second copy of
+    the numbers: the controller resolves them from the single
+    :class:`~roastpilot_agent.control_policy.RoastControlPolicy`, and the *same*
+    resolved heat/fan box is what the safety gate clamps a command into — so the
+    value the model is told equals the value enforced (told == enforced). They
+    default to ``None`` so a context built without the policy (or by an older
+    caller) stays valid; populated, they are read-only context, never a control
+    authority the advisor can widen.
     """
 
     phase: RoastPhase
@@ -120,6 +132,17 @@ class AdvisorContext(BaseModel):
     # drying, RoR will be negative then turn" rather than misreading the
     # post-charge crash as a stall (#209).
     seconds_since_charge: float | None = None
+    # D35 §8.2 (#273): the live, phase-resolved control box the model is told it
+    # must reason inside. Resolved by the controller from the single
+    # control_policy.RoastControlPolicy; the SAME heat/fan box is what
+    # safety.evaluate_command clamps into (told == enforced — no second copy).
+    # None when the context is built without the policy (older callers / tests).
+    heat_floor_percent: int | None = Field(default=None, ge=0, le=100)
+    heat_ceiling_percent: int | None = Field(default=None, ge=0, le=100)
+    fan_floor_percent: int | None = Field(default=None, ge=0, le=100)
+    fan_ceiling_percent: int | None = Field(default=None, ge=0, le=100)
+    bitter_ceiling_temp_c: float | None = None
+    emergency_drop_temp_c: float | None = None
 
 
 class RoastDecision(BaseModel):
