@@ -177,6 +177,17 @@ export type RoastOutcome = "completed" | "aborted" | "faulted";
  *  an enum). Distinct from `bean_varietal` (cultivar). */
 export type BeanSpecies = "arabica" | "robusta" | "liberica" | "excelsa";
 
+/** Post-harvest processing method (#291) — mirrors `models.ProcessingMethod` (a
+ *  Literal, not an enum). One of the per-origin axes the learning loop (D42)
+ *  keys on; distinct from any free-text process notes in `description`. */
+export type ProcessingMethod =
+  | "washed"
+  | "natural"
+  | "honey"
+  | "anaerobic"
+  | "wet_hulled"
+  | "other";
+
 export interface RoastProfile {
   name: string;
   bean_origin: string;
@@ -189,6 +200,10 @@ export interface RoastProfile {
   description?: string | null;
   bean_species?: BeanSpecies | null;
   is_blend?: boolean;
+  // Per-origin learning-loop axes (#291): post-harvest process + growing altitude.
+  // Optional / defaulted for back-compat with frozen pre-#291 profiles.
+  processing?: ProcessingMethod | null;
+  altitude_m?: number | null;
   bean_weight_grams: number;
   charge_guidance_min_c: number;
   charge_guidance_max_c: number;
@@ -226,6 +241,10 @@ export interface RoastSummary {
   country?: string | null;
   bean_species?: BeanSpecies | null;
   is_blend?: boolean;
+  // #291 per-origin axes projected from the frozen profile; optional for
+  // forward/back-compat (a pre-#291 build or fixture may omit them).
+  processing?: ProcessingMethod | null;
+  altitude_m?: number | null;
   rating: number | null;
   development_percent: number | null;
   // Advisor stats (#184) aggregated server-side from `advisor_decisions`, so the
