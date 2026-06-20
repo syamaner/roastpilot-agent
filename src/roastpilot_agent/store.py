@@ -865,6 +865,8 @@ class RoastStore:
                     country=profile.country,
                     bean_species=profile.bean_species,
                     is_blend=profile.is_blend,
+                    processing=profile.processing,
+                    altitude_m=profile.altitude_m,
                     rating=None if row["operator_rating"] is None else int(row["operator_rating"]),
                     development_percent=None if row["dev_pct"] is None else float(row["dev_pct"]),
                     advisor_consults=int(row["advisor_consults"]),

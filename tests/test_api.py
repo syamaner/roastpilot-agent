@@ -224,6 +224,8 @@ async def test_start_roast_carries_bean_identity_to_detail(client: AsyncClient) 
             "description": "Washed; 70% this + 30% Brazil natural.",
             "bean_species": "arabica",
             "is_blend": True,
+            "processing": "natural",
+            "altitude_m": 2100,
         }
     )
     created = await client.post("/api/roasts", json=profile)
@@ -238,6 +240,9 @@ async def test_start_roast_carries_bean_identity_to_detail(client: AsyncClient) 
     assert body_profile["description"] == "Washed; 70% this + 30% Brazil natural."
     assert body_profile["bean_species"] == "arabica"
     assert body_profile["is_blend"] is True
+    # #291: processing + altitude flow through to the detail projection too.
+    assert body_profile["processing"] == "natural"
+    assert body_profile["altitude_m"] == 2100
 
 
 @pytest.mark.asyncio
@@ -247,7 +252,15 @@ async def test_history_summary_projects_bean_identity(
     """#164: the history list projects country / species / blend marker from the
     frozen profile so the table can show them without opening each run."""
     profile = _profile().model_dump()
-    profile.update({"country": "Colombia", "bean_species": "arabica", "is_blend": True})
+    profile.update(
+        {
+            "country": "Colombia",
+            "bean_species": "arabica",
+            "is_blend": True,
+            "processing": "honey",
+            "altitude_m": 1600,
+        }
+    )
     created = await client.post("/api/roasts", json=profile)
     run_id = created.json()["id"]
     await store.complete_run(run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
@@ -258,6 +271,8 @@ async def test_history_summary_projects_bean_identity(
     assert row["country"] == "Colombia"
     assert row["bean_species"] == "arabica"
     assert row["is_blend"] is True
+    assert row["processing"] == "honey"
+    assert row["altitude_m"] == 1600
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,7 @@
     "notes": null,
     "outcome": "completed",
     "profile": {
+      "altitude_m": null,
       "bean_origin": "Replay (recorded roast)",
       "bean_species": null,
       "bean_varietal": null,
@@ -36,6 +37,7 @@
       "initial_heat_percent": 80,
       "is_blend": false,
       "name": "cooling-complete",
+      "processing": null,
       "target_development_percent": 15.0,
       "target_drop_temp_c": 195.0
     },
@@ -48,6 +50,7 @@
     "advisor_failed": 0,
     "advisor_rejected": 0,
     "agent_phase": "complete",
+    "altitude_m": null,
     "bean_origin": "Replay (recorded roast)",
     "bean_species": null,
     "bean_varietal": null,
@@ -58,6 +61,7 @@
     "id": "00000000000000000000000000000000",
     "is_blend": false,
     "outcome": "completed",
+    "processing": null,
     "rating": null,
     "started_at_utc": "2026-01-01T00:00:00+00:00"
   }
