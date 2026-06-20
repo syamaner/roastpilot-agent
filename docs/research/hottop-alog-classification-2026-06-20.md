@@ -7,18 +7,19 @@ Pure data analysis over the operator's personal Artisan `.alog` Hottop roast log
 ## TL;DR
 
 - **Corpus:** 47 usable roasts (every file had charge + first crack + drop).
-- **Roast-degree split:** 18 medium / 23 dark / 6 over-dark (drop display BT > 200 °C over-done proxy). Separately, 26/47 dropped past the ~196 °C bitter *ceiling*.
+- **Roast-degree split (operative > 197 °C over-done line):** 17 medium / 10 dark / 20 over-dark. Under the earlier > 200 °C proxy the over-dark count was 6; **14 roasts flip** into over-dark on the 197 line (drop in (197, 200] °C). Separately, 26/47 dropped past the ~196 °C bitter *ceiling*.
+- **Known-good medium reference set (§7.1 seed):** **17 roasts** — mediums under the 197 line, second crack not reached. Listed below.
 - **DTR:** median **15.3%** — below Rao's 20–25% band, in line with our 7-Jun ~15–16% prior.
 - **FC display BT:** median **178.0 °C**; **drop display BT** median **197.0 °C** — consistent with the ~20–30 °C probe offset.
 - **Crash verdict:** RoR went negative within 90 s of first crack in **0/47** roasts. The post-FC RoR *declines* in 28/47 but stays positive — a managed declining-RoR shape, **not** a crash. This **CONFIRMS #229** on the full set.
-- **Ground-truth check:** the `kona_3_dark` roast (filename explicitly says dark) is classified **dark** — **PASS** for the medium/dark split.
+- **Ground-truth check:** the `kona_3_dark` roast (filename explicitly says dark) is classified **over-dark** — **PASS** for the medium/dark split.
 - **Bean-metadata gap:** 0/47 files carry *in-file* origin / processing / measured density. Per-origin layer below is built from the **filename** shorthand (a guess) with **ASSUMED** processing defaults — caveats apply.
 
 ## Method
 
 Each `.alog` parses with `ast.literal_eval` (it is a Python dict literal, not JSON). Event marks come from `timeindex` (indices into `timex`): `[CHARGE, DRY_END, FCs, FCe, SCs, SCe, DROP, COOL]`, CHARGE unset = `-1`, the rest unset = `0`. Every event is guarded to be at or after charge. Temperatures are the Hottop **display** bean probe (`temp2`), in °C.
 
-Per roast we compute drop BT, FC BT, FC time, development time (drop − FCs), total time (drop − charge), **DTR = dev/total**, development temp rise (drop BT − FC BT), turning point, and a 30 s-window RoR (°C/min) track from FC to drop. Degree classification: any roast reaching second crack is `dark`; the rest are split by deterministic k=2 k-means over z-scored `(drop_bt, dev_time, dev_temp_rise)` (z-scoring cancels the constant probe offset), labelling the higher-drop / longer-development cluster `dark`; drop BT > 200 °C (the operator's over-done proxy) is promoted to `over-dark`.
+Per roast we compute drop BT, FC BT, FC time, development time (drop − FCs), total time (drop − charge), **DTR = dev/total**, development temp rise (drop BT − FC BT), turning point, and a 30 s-window RoR (°C/min) track from FC to drop. Degree classification: any roast reaching second crack is `dark`; the rest are split by deterministic k=2 k-means over z-scored `(drop_bt, dev_time, dev_temp_rise)` (z-scoring cancels the constant probe offset), labelling the higher-drop / longer-development cluster `dark`; drop BT > 197 °C (the operator's operative over-done line, set 20 Jun 2026) is promoted to `over-dark`. The earlier > 200 °C proxy is kept only as a secondary reference.
 
 ## Aggregate distributions
 
@@ -82,9 +83,56 @@ Each claim marked CONFIRMED / CONTRADICTED / CAN'T-TELL on our 47-roast data.
 | 4b | Flick (brief RoR rebound after FC) | **CAN'T-TELL** | A rebound clearing the 3 °C/min quantisation floor appears in **27/47** roasts, but at the probe's ~1/3 °C resolution over a 30 s window even these are hard to separate from sampling noise. Not reliably groundable here. |
 | 5 | Per-origin profiling | **CAN'T-TELL** | 0/47 files carry origin / processing / measured density (`beans` and `organization` empty; `density` is the Artisan `[0,'g',1,'l']` placeholder). See the gap note below. |
 
-Second crack was reached in **0/47** roasts, so the hard `sc_reached -> dark` rule did not fire; the medium/dark split rests on the k-means cut, with the > 200 °C over-done promotion on top.
+Second crack was reached in **0/47** roasts, so the hard `sc_reached -> dark` rule did not fire; the medium/dark split rests on the k-means cut, with the > 197 °C over-done promotion on top.
 
 Note the declining-RoR claim (4a) holds in 28/47, not all: in the remainder the 30 s-window RoR at drop sits at or above the at-FC value, typically the hotter/longer over-dark roasts where the operator carried heat late. The crash result (3) is unaffected — none go negative.
+
+## Over-done threshold and the roasts that flip
+
+The operator set the operative over-done line at **drop display BT > 197 °C** (20 Jun 2026). The earlier > 200 °C proxy is kept only as a secondary reference. Re-cutting on 197 °C moves the over-dark count from 6 (> 200 proxy) to **20** (> 197 operative); the **14 roasts below flip** from medium/dark into over-dark (drop in (197, 200] °C):
+
+| anon id | roast date | fixture | drop BT °C | DTR % | was (> 200 cut) |
+|---|---|---|---|---|---|
+| `2f6b741824` | 2024-09-07 | artisan-28 | 197.3 | 13.6 | medium |
+| `a1214c89d7` | 2025-07-17 | — | 198.0 | 14.1 | dark |
+| `f4d0b9b795` | 2025-04-06 | — | 198.0 | 16.5 | dark |
+| `db3f37e9f8` | 2024-12-06 | — | 198.0 | 14.9 | dark |
+| `5a44b9f9d0` | 2024-12-06 | — | 198.0 | 16.9 | dark |
+| `d69dfb2943` | 2025-07-16 | — | 198.3 | 18.3 | dark |
+| `51c1dcfe00` | 2024-11-09 | — | 198.7 | 20.9 | dark |
+| `c3b5731b8d` | 2025-03-16 | — | 198.7 | 13.7 | dark |
+| `2b20148be6` | 2025-03-15 | — | 198.7 | 17.6 | dark |
+| `335da8d705` | 2025-07-16 | — | 199.0 | 14.0 | dark |
+| `c0ed211d8c` | 2025-03-16 | — | 199.0 | 13.3 | dark |
+| `c53c9e1920` | 2024-09-07 | — | 200.0 | 12.4 | dark |
+| `4c2994e9fe` | 2025-03-30 | — | 200.0 | 14.2 | dark |
+| `204c38b465` | 2025-03-30 | — | 200.0 | 13.5 | dark |
+
+## Known-good medium reference set (§7.1 seed)
+
+The roasts that seed the §7.1 per-bean reference curves: **mediums under the 197 °C over-done line, second crack not reached** — **17 roasts**. This is the load-bearing output. Each is keyed by anonymised id and mapped to its `artisan-NN` fixture where one exists (the fixtures carry the replayable telemetry; the raw `.alog` is never committed).
+
+| anon id | roast date | fixture | drop BT °C | FC BT °C | DTR % | dev s |
+|---|---|---|---|---|---|---|
+| `7299dd0767` | 2024-10-06 | artisan-01 | 189.0 | 172.0 | 20.5 | 127 |
+| `0362587c18` | 2024-09-07 | artisan-02 | 190.0 | 173.3 | 17.9 | 124 |
+| `2291673149` | 2024-10-20 | artisan-03 | 190.0 | 172.0 | 19.0 | 127 |
+| `a327960220` | 2025-10-19 | artisan-04 | 191.3 | 177.0 | 15.7 | 84 |
+| `561748882c` | 2024-11-19 | artisan-05 | 191.7 | 172.7 | 19.5 | 149 |
+| `31d5e7eed4` | 2024-10-06 | artisan-06 | 192.7 | 174.0 | 20.7 | 133 |
+| `3def1cf392` | 2025-10-19 | artisan-07 | 193.0 | 177.0 | 17.2 | 97 |
+| `e6a542d113` | 2025-10-19 | artisan-08 | 193.0 | 176.7 | 16.6 | 96 |
+| `1722ef63e9` | 2025-10-19 | artisan-09 | 193.0 | 177.3 | 15.3 | 87 |
+| `62f2692d6c` | 2025-10-12 | artisan-11 | 193.7 | 180.0 | 14.0 | 83 |
+| `f7e5409cd5` | 2025-10-12 | artisan-12 | 194.0 | 181.0 | 14.4 | 80 |
+| `dcdd4994a7` | 2025-10-19 | artisan-13 | 194.0 | 177.0 | 19.9 | 123 |
+| `6cd91c9b71` | 2025-10-12 | artisan-14 | 194.3 | 177.7 | 17.7 | 106 |
+| `9fd9edec49` | 2024-06-23 | artisan-16 | 195.0 | 179.0 | 13.4 | 92 |
+| `9ec38751d5` | 2024-09-07 | artisan-18 | 195.3 | 181.0 | 13.6 | 98 |
+| `438a36546b` | 2024-09-07 | artisan-19 | 195.3 | 180.0 | 12.4 | 89 |
+| `977b744c39` | 2024-11-12 | artisan-22 | 196.3 | 179.0 | 14.6 | 106 |
+
+17/17 of the known-good mediums map to an `artisan-NN` fixture. DTR across this set: median 16.6%, range 12.4–20.7%.
 
 ## Bean-metadata gap (explicit)
 
@@ -96,19 +144,19 @@ Origin is parsed from the **filename** (in-file `beans` is empty). Processing / 
 
 | origin | N | DTR median % | FC BT median °C | drop BT median °C | degree mix | processing/altitude (ASSUMED) |
 |---|---|---|---|---|---|---|
-| Cuba | 10 | 14.0 | 179.3 | 198.8 | 0m/9d/1o | washed, low–mid (soft) [ASSUMED] |
+| Cuba | 10 | 14.0 | 179.3 | 198.8 | 0m/2d/8o | washed, low–mid (soft) [ASSUMED] |
 | Taiwan (Nantou/Alishan) | 7 | 20.5 | 172.7 | 191.7 | 5m/2d/0o | washed, high-grown (~1100–1400 m) [ASSUMED] |
 | Brazil | 5 | 15.7 | 177.0 | 193.0 | 4m/0d/1o | natural, low-grown [ASSUMED] |
 | Costa Rica (Hermosa) | 5 | 17.7 | 177.7 | 194.0 | 4m/1d/0o | washed SHB, high-grown [ASSUMED] |
-| Hawaii Kona | 4 | 14.1 | 180.0 | 196.8 | 3m/1d/0o | washed, low–mid altitude (soft) [ASSUMED] |
+| Hawaii Kona | 4 | 14.1 | 180.0 | 196.8 | 2m/0d/2o | washed, low–mid altitude (soft) [ASSUMED] |
 | Australia (AMBIGUOUS) | 3 | 13.4 | 179.0 | 197.0 | 1m/1d/1o | UNKNOWN — Australian-grown low-altitude or a blend [ASSUMED, FLAG] |
-| Brazil (fermented/anaerobic) | 3 | 12.8 | 183.0 | 201.0 | 0m/1d/2o | anaerobic/fermented [ASSUMED] |
-| Jamaica (Blue Mountain) | 3 | 16.5 | 177.3 | 197.0 | 0m/3d/0o | washed, high-grown [ASSUMED] |
-| Nicaragua | 3 | 12.4 | 180.0 | 198.7 | 1m/2d/0o | washed, mid–high [ASSUMED] |
-| Indonesia | 2 | 18.5 | 176.5 | 197.5 | 0m/2d/0o | wet-hulled, mid [ASSUMED] |
+| Brazil (fermented/anaerobic) | 3 | 12.8 | 183.0 | 201.0 | 0m/0d/3o | anaerobic/fermented [ASSUMED] |
+| Jamaica (Blue Mountain) | 3 | 16.5 | 177.3 | 197.0 | 0m/2d/1o | washed, high-grown [ASSUMED] |
+| Nicaragua | 3 | 12.4 | 180.0 | 198.7 | 1m/0d/2o | washed, mid–high [ASSUMED] |
+| Indonesia | 2 | 18.5 | 176.5 | 197.5 | 0m/1d/1o | wet-hulled, mid [ASSUMED] |
 | Vietnam | 2 | 12.5 | 179.0 | 198.7 | 0m/1d/1o | likely robusta, low-grown — roasts very differently [ASSUMED, FLAG] |
 
-Degree mix key: `m` medium / `d` dark / `o` over-dark (drop > 200 °C).
+Degree mix key: `m` medium / `d` dark / `o` over-dark (drop > 197 °C).
 
 ### Per-origin reconciliation
 
@@ -135,19 +183,6 @@ Keyed by anonymised id (stable hash of the roast UUID) + roast date. No bean-ide
 | `2a2c3d1055` | 2025-07-17 | dark | artisan-25 | 197.0 | 178.3 | 104 | 741 | 14.0 | 18.7 | 11.0 | 8.0 |
 | `1d3bec4235` | 2025-04-06 | dark | artisan-26 | 197.0 | 175.0 | 133 | 650 | 20.5 | 22.0 | 10.7 | 7.7 |
 | `940dff2f88` | 2024-12-06 | dark | artisan-27 | 197.0 | 177.0 | 121 | 678 | 17.8 | 20.0 | 10.0 | 7.7 |
-| `a1214c89d7` | 2025-07-17 | dark | — | 198.0 | 179.0 | 90 | 639 | 14.1 | 19.0 | 13.3 | 11.6 |
-| `f4d0b9b795` | 2025-04-06 | dark | — | 198.0 | 178.0 | 127 | 772 | 16.5 | 20.0 | 7.7 | 5.8 |
-| `db3f37e9f8` | 2024-12-06 | dark | — | 198.0 | 179.0 | 107 | 717 | 14.9 | 19.0 | 8.0 | 7.7 |
-| `5a44b9f9d0` | 2024-12-06 | dark | — | 198.0 | 179.0 | 118 | 700 | 16.9 | 19.0 | 11.6 | 6.5 |
-| `d69dfb2943` | 2025-07-16 | dark | — | 198.3 | 177.0 | 124 | 676 | 18.3 | 21.3 | 12.9 | 9.0 |
-| `51c1dcfe00` | 2024-11-09 | dark | — | 198.7 | 168.3 | 148 | 709 | 20.9 | 30.3 | 10.7 | 9.7 |
-| `c3b5731b8d` | 2025-03-16 | dark | — | 198.7 | 179.0 | 96 | 703 | 13.7 | 19.7 | 10.7 | 9.3 |
-| `2b20148be6` | 2025-03-15 | dark | — | 198.7 | 175.3 | 133 | 754 | 17.6 | 23.3 | 8.4 | 8.4 |
-| `335da8d705` | 2025-07-16 | dark | — | 199.0 | 179.7 | 86 | 616 | 14.0 | 19.3 | 12.7 | 10.0 |
-| `c0ed211d8c` | 2025-03-16 | dark | — | 199.0 | 181.0 | 97 | 728 | 13.3 | 18.0 | 11.3 | 8.0 |
-| `c53c9e1920` | 2024-09-07 | dark | — | 200.0 | 183.0 | 92 | 741 | 12.4 | 17.0 | 10.0 | 8.7 |
-| `4c2994e9fe` | 2025-03-30 | dark | — | 200.0 | 180.3 | 96 | 676 | 14.2 | 19.7 | 13.5 | 10.0 |
-| `204c38b465` | 2025-03-30 | dark | — | 200.0 | 180.0 | 94 | 695 | 13.5 | 20.0 | 12.0 | 10.7 |
 | `7299dd0767` | 2024-10-06 | medium | artisan-01 | 189.0 | 172.0 | 127 | 621 | 20.5 | 17.0 | 12.0 | 5.8 |
 | `0362587c18` | 2024-09-07 | medium | artisan-02 | 190.0 | 173.3 | 124 | 692 | 17.9 | 16.7 | 9.0 | 5.3 |
 | `2291673149` | 2024-10-20 | medium | artisan-03 | 190.0 | 172.0 | 127 | 669 | 19.0 | 18.0 | 10.3 | 6.0 |
@@ -165,7 +200,20 @@ Keyed by anonymised id (stable hash of the roast UUID) + roast date. No bean-ide
 | `9ec38751d5` | 2024-09-07 | medium | artisan-18 | 195.3 | 181.0 | 98 | 720 | 13.6 | 14.3 | 11.0 | 6.0 |
 | `438a36546b` | 2024-09-07 | medium | artisan-19 | 195.3 | 180.0 | 89 | 715 | 12.4 | 15.3 | 11.0 | 7.7 |
 | `977b744c39` | 2024-11-12 | medium | artisan-22 | 196.3 | 179.0 | 106 | 726 | 14.6 | 17.3 | 10.7 | 7.3 |
-| `2f6b741824` | 2024-09-07 | medium | artisan-28 | 197.3 | 181.0 | 100 | 738 | 13.6 | 16.3 | 9.7 | 7.7 |
+| `2f6b741824` | 2024-09-07 | over-dark | artisan-28 | 197.3 | 181.0 | 100 | 738 | 13.6 | 16.3 | 9.7 | 7.7 |
+| `a1214c89d7` | 2025-07-17 | over-dark | — | 198.0 | 179.0 | 90 | 639 | 14.1 | 19.0 | 13.3 | 11.6 |
+| `f4d0b9b795` | 2025-04-06 | over-dark | — | 198.0 | 178.0 | 127 | 772 | 16.5 | 20.0 | 7.7 | 5.8 |
+| `db3f37e9f8` | 2024-12-06 | over-dark | — | 198.0 | 179.0 | 107 | 717 | 14.9 | 19.0 | 8.0 | 7.7 |
+| `5a44b9f9d0` | 2024-12-06 | over-dark | — | 198.0 | 179.0 | 118 | 700 | 16.9 | 19.0 | 11.6 | 6.5 |
+| `d69dfb2943` | 2025-07-16 | over-dark | — | 198.3 | 177.0 | 124 | 676 | 18.3 | 21.3 | 12.9 | 9.0 |
+| `51c1dcfe00` | 2024-11-09 | over-dark | — | 198.7 | 168.3 | 148 | 709 | 20.9 | 30.3 | 10.7 | 9.7 |
+| `c3b5731b8d` | 2025-03-16 | over-dark | — | 198.7 | 179.0 | 96 | 703 | 13.7 | 19.7 | 10.7 | 9.3 |
+| `2b20148be6` | 2025-03-15 | over-dark | — | 198.7 | 175.3 | 133 | 754 | 17.6 | 23.3 | 8.4 | 8.4 |
+| `335da8d705` | 2025-07-16 | over-dark | — | 199.0 | 179.7 | 86 | 616 | 14.0 | 19.3 | 12.7 | 10.0 |
+| `c0ed211d8c` | 2025-03-16 | over-dark | — | 199.0 | 181.0 | 97 | 728 | 13.3 | 18.0 | 11.3 | 8.0 |
+| `c53c9e1920` | 2024-09-07 | over-dark | — | 200.0 | 183.0 | 92 | 741 | 12.4 | 17.0 | 10.0 | 8.7 |
+| `4c2994e9fe` | 2025-03-30 | over-dark | — | 200.0 | 180.3 | 96 | 676 | 14.2 | 19.7 | 13.5 | 10.0 |
+| `204c38b465` | 2025-03-30 | over-dark | — | 200.0 | 180.0 | 94 | 695 | 13.5 | 20.0 | 12.0 | 10.7 |
 | `75a42d27a7` | 2024-09-07 | over-dark | — | 200.3 | 183.0 | 94 | 738 | 12.7 | 17.3 | 10.0 | 9.0 |
 | `ac73c2f7a4` | 2024-11-09 | over-dark | — | 201.0 | 184.3 | 74 | 707 | 10.5 | 16.7 | 13.3 | 12.3 |
 | `8ab917f53e` | 2025-03-15 | over-dark | — | 201.0 | 184.0 | 92 | 699 | 13.2 | 17.0 | 13.5 | 9.7 |

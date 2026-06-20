@@ -160,22 +160,57 @@ def test_classify_degrees_second_crack_is_dark() -> None:
     assert labels[m.anon_id] == "dark"
 
 
-def test_classify_degrees_over_done_promotion() -> None:
-    """A drop past the over-done proxy (>200 C) is promoted to over-dark."""
-    metrics: list[ac.RoastMetrics] = []
-    # Two cool mediums and one very hot roast.
-    specs = [(190.0, "a"), (191.0, "b"), (202.0, "c")]
-    for drop_bt, uid in specs:
-        timex = _ramp(760, 0.0, 1.0)
-        bt = _ramp(601, 100.0, (175.0 - 100.0) / 600.0)
-        bt += [175.0 + (i + 1) * ((drop_bt - 175.0) / 159.0) for i in range(159)]
-        prof = _profile(charge_idx=0, fc_idx=600, drop_idx=759, timex=timex, bt=bt, uuid=uid)
-        m = ac.compute_metrics(prof, fallback_id=uid)
-        assert m is not None
-        metrics.append(m)
+def _metric_for(drop_bt: float, uid: str) -> ac.RoastMetrics:
+    """Build a single roast metric with a target drop bean temperature.
+
+    Args:
+        drop_bt: The desired drop bean temperature (°C).
+        uid: A unique seed for the anonymised id.
+
+    Returns:
+        The computed metrics.
+    """
+    timex = _ramp(760, 0.0, 1.0)
+    bt = _ramp(601, 100.0, (175.0 - 100.0) / 600.0)
+    bt += [175.0 + (i + 1) * ((drop_bt - 175.0) / 159.0) for i in range(159)]
+    prof = _profile(charge_idx=0, fc_idx=600, drop_idx=759, timex=timex, bt=bt, uuid=uid)
+    m = ac.compute_metrics(prof, fallback_id=uid)
+    assert m is not None
+    return m
+
+
+def test_classify_degrees_over_done_on_197_line() -> None:
+    """The operative cut is > 197 C: 198 promotes to over-dark, 197 does not."""
+    metrics = [_metric_for(190.0, "a"), _metric_for(197.0, "b"), _metric_for(198.0, "c")]
     labels = ac.classify_degrees(metrics)
-    hot = next(m for m in metrics if m.drop_bt > 200.0)
-    assert labels[hot.anon_id] == "over-dark"
+    at_line = next(m for m in metrics if m.drop_bt == 197.0)
+    over = next(m for m in metrics if m.drop_bt == 198.0)
+    assert labels[over.anon_id] == "over-dark"
+    assert labels[at_line.anon_id] != "over-dark"
+
+
+def test_roast_in_197_to_200_window_flips_under_operative_cut() -> None:
+    """A 199 C roast is over-dark on the 197 line but not on the > 200 proxy."""
+    metrics = [_metric_for(190.0, "a"), _metric_for(199.0, "b")]
+    operative = ac.classify_degrees(metrics)
+    base = ac.base_labels(metrics)
+    flip = next(m for m in metrics if m.drop_bt == 199.0)
+    # Operative (> 197) promotes it; the base label (pre-promotion, = what the
+    # > 200 proxy would leave it as, since 199 <= 200) does not.
+    assert operative[flip.anon_id] == "over-dark"
+    assert base[flip.anon_id] in {"medium", "dark"}
+
+
+def test_known_good_mediums_excludes_over_done_and_second_crack() -> None:
+    """The reference set is mediums under 197 C with no second crack."""
+    cool = _metric_for(190.0, "cool")
+    hot = _metric_for(199.0, "hot")
+    metrics = [cool, hot]
+    degrees = ac.classify_degrees(metrics)
+    kgm = ac.known_good_mediums(metrics, degrees)
+    ids = {m.anon_id for m in kgm}
+    assert cool.anon_id in ids
+    assert hot.anon_id not in ids
 
 
 def test_kmeans_two_separates_clusters_deterministically() -> None:

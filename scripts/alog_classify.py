@@ -61,10 +61,13 @@ _ROR_WINDOW_S = 30.0
 # Window after first crack within which a genuine RoR "crash" would appear.
 _CRASH_WINDOW_S = 90.0
 # Operator-empirical drop ceilings (display BT). 196 °C is the bitter ceiling
-# (memory: operator-hottop-roast-profile); >200 °C is the over-done proxy used
-# on the Artisan dataset (memory: artisan-roast-logs-dataset, "9 roasts >200").
+# (memory: operator-hottop-roast-profile). The OPERATIVE over-done line is the
+# operator-set > 197 °C (20 Jun 2026); the earlier > 200 °C proxy (memory:
+# artisan-roast-logs-dataset, "9 roasts >200") is retained only as a secondary
+# reference in the report.
 _BITTER_CEILING_C = 196.0
-_OVER_DONE_C = 200.0
+_OVER_DONE_C = 197.0
+_OVER_DONE_PROXY_C = 200.0
 # A flick must clear the probe quantisation floor to count as a real rebound.
 _FLICK_FLOOR_C_PER_MIN = 3.0
 
@@ -429,23 +432,19 @@ def kmeans_two(points: list[tuple[float, ...]], iterations: int = 100) -> list[i
     return labels
 
 
-def classify_degrees(metrics: list[RoastMetrics]) -> dict[str, str]:
-    """Label each roast medium / dark / over-dark.
+def base_labels(metrics: list[RoastMetrics]) -> dict[str, str]:
+    """Label each roast medium / dark *before* any over-done promotion.
 
     Hard rule: any roast that reached second crack is ``dark``. The remainder
     are split by k=2 k-means over z-scored ``(drop_bt, dev_time, dev_temp_rise)``
     — z-scoring cancels the constant ~20-30 °C probe offset. The higher-drop /
-    longer-development cluster is ``dark``; the other is ``medium``. Any roast
-    dropped past the operator's empirical over-done proxy (display BT
-    > 200 °C) is promoted to ``over-dark`` — the bitter *ceiling* is ~196 °C,
-    but dropping at or just past it is normal for this operator, so the
-    over-dark cut uses the > 200 °C over-done line rather than the ceiling.
+    longer-development cluster is ``dark``; the other is ``medium``.
 
     Args:
         metrics: All usable roast metrics.
 
     Returns:
-        A mapping of ``anon_id`` to degree label.
+        A mapping of ``anon_id`` to ``medium`` / ``dark``.
     """
     labels: dict[str, str] = {}
     soft = [m for m in metrics if not m.sc_reached]
@@ -468,12 +467,48 @@ def classify_degrees(metrics: list[RoastMetrics]) -> dict[str, str]:
         dark_cluster = 0 if mean_drop[0] >= mean_drop[1] else 1
         for i, m in enumerate(soft):
             labels[m.anon_id] = "dark" if clusters[i] == dark_cluster else "medium"
+    return labels
 
-    # Over-dark promotion: past the operator's empirical over-done proxy.
+
+def classify_degrees(metrics: list[RoastMetrics]) -> dict[str, str]:
+    """Label each roast medium / dark / over-dark.
+
+    Starts from :func:`base_labels` (second-crack hard rule + k-means cut), then
+    promotes any roast dropped past the operator's operative over-done line
+    (display BT > 197 °C, set 20 Jun 2026) to ``over-dark``. The earlier
+    > 200 °C proxy is retained only as a secondary reference in the report, not
+    used here.
+
+    Args:
+        metrics: All usable roast metrics.
+
+    Returns:
+        A mapping of ``anon_id`` to degree label.
+    """
+    labels = base_labels(metrics)
     for m in metrics:
         if m.drop_bt > _OVER_DONE_C:
             labels[m.anon_id] = "over-dark"
     return labels
+
+
+def known_good_mediums(metrics: list[RoastMetrics], degrees: dict[str, str]) -> list[RoastMetrics]:
+    """Select the known-good medium reference set for the §7.1 per-bean curves.
+
+    The reference set is the roasts labelled ``medium`` (so under the 197 °C
+    over-done line and not in the dark k-means cluster) that did **not** reach
+    second crack. These seed the per-bean reference curves, so this is the
+    load-bearing output of the analysis.
+
+    Args:
+        metrics: All usable roast metrics.
+        degrees: ``anon_id`` -> degree label.
+
+    Returns:
+        The qualifying roasts, ordered by drop bean temperature.
+    """
+    selected = [m for m in metrics if degrees.get(m.anon_id) == "medium" and not m.sc_reached]
+    return sorted(selected, key=lambda m: m.drop_bt)
 
 
 def match_fixtures(metrics: list[RoastMetrics], manifest_path: Path) -> dict[str, str]:
@@ -637,7 +672,7 @@ def _render_per_origin(
             f"{drop_med:.1f} | {mix_str} | {default} |"
         )
     lines.append("")
-    lines.append("Degree mix key: `m` medium / `d` dark / `o` over-dark (drop > 200 °C).")
+    lines.append("Degree mix key: `m` medium / `d` dark / `o` over-dark (drop > 197 °C).")
     lines.append("")
 
     # Literature check against the Roast Rebels per-origin DTR bands.
@@ -736,6 +771,14 @@ def render_markdown(
     gt_ids = [aid for aid, is_dark in dark_ground_truth.items() if is_dark]
     gt_pass = all(degrees.get(aid) in {"dark", "over-dark"} for aid in gt_ids) if gt_ids else None
 
+    # The roasts that flip into over-dark under the operative > 197 °C line but
+    # would not under the earlier > 200 °C proxy (the secondary reference).
+    flipped = sorted(
+        (m for m in metrics if _OVER_DONE_C < m.drop_bt <= _OVER_DONE_PROXY_C),
+        key=lambda m: m.drop_bt,
+    )
+    kgm = known_good_mediums(metrics, degrees)
+
     lines: list[str] = []
     lines.append("# Hottop .alog roast-degree classification + literature reconciliation")
     lines.append("")
@@ -753,9 +796,17 @@ def render_markdown(
     lines.append("")
     lines.append(f"- **Corpus:** {n} usable roasts (every file had charge + first crack + drop).")
     lines.append(
-        f"- **Roast-degree split:** {n_medium} medium / {n_dark} dark / "
-        f"{n_over} over-dark (drop display BT > 200 °C over-done proxy). "
-        f"Separately, {n_ceiling}/{n} dropped past the ~196 °C bitter *ceiling*."
+        f"- **Roast-degree split (operative > 197 °C over-done line):** "
+        f"{n_medium} medium / {n_dark} dark / {n_over} over-dark. Under the "
+        f"earlier > 200 °C proxy the over-dark count was "
+        f"{sum(1 for m in metrics if m.drop_bt > _OVER_DONE_PROXY_C)}; **"
+        f"{len(flipped)} roasts flip** into over-dark on the 197 line (drop in "
+        f"(197, 200] °C). Separately, {n_ceiling}/{n} dropped past the ~196 °C "
+        f"bitter *ceiling*."
+    )
+    lines.append(
+        f"- **Known-good medium reference set (§7.1 seed):** **{len(kgm)} roasts** "
+        f"— mediums under the 197 line, second crack not reached. Listed below."
     )
     lines.append(
         f"- **DTR:** median **{dtr_med:.1f}%** — below Rao's 20–25% band, in "
@@ -805,8 +856,9 @@ def render_markdown(
         "reaching second crack is `dark`; the rest are split by deterministic k=2 "
         "k-means over z-scored `(drop_bt, dev_time, dev_temp_rise)` (z-scoring "
         "cancels the constant probe offset), labelling the higher-drop / "
-        "longer-development cluster `dark`; drop BT > 200 °C (the operator's "
-        "over-done proxy) is promoted to `over-dark`."
+        "longer-development cluster `dark`; drop BT > 197 °C (the operator's "
+        "operative over-done line, set 20 Jun 2026) is promoted to `over-dark`. "
+        "The earlier > 200 °C proxy is kept only as a secondary reference."
     )
     lines.append("")
 
@@ -904,7 +956,7 @@ def render_markdown(
     lines.append(
         f"Second crack was reached in **{n_sc}/{n}** roasts, so the hard "
         f"`sc_reached -> dark` rule did not fire; the medium/dark split rests on "
-        f"the k-means cut, with the > 200 °C over-done promotion on top."
+        f"the k-means cut, with the > 197 °C over-done promotion on top."
     )
     lines.append("")
     lines.append(
@@ -912,6 +964,66 @@ def render_markdown(
         f"in the remainder the 30 s-window RoR at drop sits at or above the at-FC "
         f"value, typically the hotter/longer over-dark roasts where the operator "
         f"carried heat late. The crash result (3) is unaffected — none go negative."
+    )
+    lines.append("")
+
+    lines.append("## Over-done threshold and the roasts that flip")
+    lines.append("")
+    lines.append(
+        f"The operator set the operative over-done line at **drop display BT "
+        f"> 197 °C** (20 Jun 2026). The earlier > 200 °C proxy is kept only as a "
+        f"secondary reference. Re-cutting on 197 °C moves the over-dark count "
+        f"from {sum(1 for m in metrics if m.drop_bt > _OVER_DONE_PROXY_C)} (> 200 "
+        f"proxy) to **{n_over}** (> 197 operative); the **{len(flipped)} roasts "
+        f"below flip** from medium/dark into over-dark (drop in (197, 200] °C):"
+    )
+    lines.append("")
+    if flipped:
+        # Their label under the > 200 proxy: none of the flipped roasts exceed
+        # 200 °C, so the proxy over-done promotion never touches them — their
+        # prior label is the base (k-means + second-crack) label.
+        base = base_labels(metrics)
+        lines.append("| anon id | roast date | fixture | drop BT °C | DTR % | was (> 200 cut) |")
+        lines.append("|---|---|---|---|---|---|")
+        for m in flipped:
+            lines.append(
+                f"| `{m.anon_id}` | {m.roast_date} | "
+                f"{fixtures.get(m.anon_id, '—')} | {m.drop_bt:.1f} | "
+                f"{m.dtr_percent:.1f} | {base[m.anon_id]} |"
+            )
+    else:
+        lines.append("_No roasts fall in the (197, 200] °C window._")
+    lines.append("")
+
+    lines.append("## Known-good medium reference set (§7.1 seed)")
+    lines.append("")
+    lines.append(
+        f"The roasts that seed the §7.1 per-bean reference curves: **mediums "
+        f"under the 197 °C over-done line, second crack not reached** — "
+        f"**{len(kgm)} roasts**. This is the load-bearing output. Each is keyed "
+        f"by anonymised id and mapped to its `artisan-NN` fixture where one "
+        f"exists (the fixtures carry the replayable telemetry; the raw `.alog` "
+        f"is never committed)."
+    )
+    lines.append("")
+    lines.append("| anon id | roast date | fixture | drop BT °C | FC BT °C | DTR % | dev s |")
+    lines.append("|---|---|---|---|---|---|---|")
+    for m in kgm:
+        lines.append(
+            f"| `{m.anon_id}` | {m.roast_date} | {fixtures.get(m.anon_id, '—')} | "
+            f"{m.drop_bt:.1f} | {m.fc_bt:.1f} | {m.dtr_percent:.1f} | "
+            f"{m.dev_time_s:.0f} |"
+        )
+    lines.append("")
+    n_kgm_fixture = sum(1 for m in kgm if m.anon_id in fixtures)
+    lines.append(
+        f"{n_kgm_fixture}/{len(kgm)} of the known-good mediums map to an "
+        f"`artisan-NN` fixture. DTR across this set: "
+        f"median {statistics.median([m.dtr_percent for m in kgm]):.1f}%, "
+        f"range {min(m.dtr_percent for m in kgm):.1f}–"
+        f"{max(m.dtr_percent for m in kgm):.1f}%."
+        if kgm
+        else "No known-good mediums under the operative cut."
     )
     lines.append("")
 
