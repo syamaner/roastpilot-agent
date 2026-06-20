@@ -242,6 +242,77 @@ def test_roast_profile_old_shape_json_back_compat() -> None:
     assert profile.description is None
     assert profile.bean_species is None
     assert profile.is_blend is False
+    # The #291 additions take their back-compat defaults too.
+    assert profile.processing is None
+    assert profile.altitude_m is None
+
+
+def test_roast_profile_metadata_defaults() -> None:
+    """#291 processing / altitude default to unset so a minimal profile is valid
+    unchanged (the pre-#291 shape)."""
+    profile = RoastProfile.model_validate(_profile())
+    assert profile.processing is None
+    assert profile.altitude_m is None
+
+
+def test_roast_profile_metadata_populated() -> None:
+    """#291 processing / altitude round-trip a fully-specified value."""
+    profile = RoastProfile.model_validate(_profile(processing="natural", altitude_m=2100))
+    assert profile.processing == "natural"
+    assert profile.altitude_m == 2100
+
+
+@pytest.mark.parametrize(
+    "processing", ["washed", "natural", "honey", "anaerobic", "wet_hulled", "other"]
+)
+def test_roast_profile_processing_accepts_known_values(processing: str) -> None:
+    """All six processing-method literals are accepted."""
+    profile = RoastProfile.model_validate(_profile(processing=processing))
+    assert profile.processing == processing
+
+
+def test_roast_profile_rejects_unknown_processing() -> None:
+    """``processing`` is a constrained ``Literal`` — an unknown value is rejected
+    (proves it is not a free ``str``)."""
+    with pytest.raises(pydantic.ValidationError):
+        RoastProfile.model_validate(_profile(processing="carbonic"))
+
+
+@pytest.mark.parametrize("altitude_m", [-1, 4001])
+def test_roast_profile_rejects_out_of_range_altitude(altitude_m: int) -> None:
+    """``altitude_m`` is bounded to a sane coffee-growing range (0–4000 m)."""
+    with pytest.raises(pydantic.ValidationError):
+        RoastProfile.model_validate(_profile(altitude_m=altitude_m))
+
+
+def test_roast_profile_pre_291_json_back_compat() -> None:
+    """A frozen #164-era ``profile_json`` (full bean identity but no #291
+    processing / altitude) still deserializes — completed runs are immutable."""
+    pre_291_json = json.dumps(
+        {
+            "name": "Ethiopia light",
+            "bean_origin": "Ethiopia",
+            "bean_varietal": "Heirloom",
+            "country": "Ethiopia",
+            "farm": "Gedeb — Worka Sakaro",
+            "description": "Washed; jasmine, bergamot.",
+            "bean_species": "arabica",
+            "is_blend": False,
+            "bean_weight_grams": 250.0,
+            "charge_guidance_min_c": 170.0,
+            "charge_guidance_max_c": 200.0,
+            "initial_heat_percent": 70,
+            "initial_fan_percent": 40,
+            "target_drop_temp_c": 205.0,
+            "target_development_percent": 20.0,
+        }
+    )
+    profile = RoastProfile.model_validate_json(pre_291_json)
+    assert profile.country == "Ethiopia"
+    assert profile.bean_species == "arabica"
+    # The #291 additions take their back-compat defaults.
+    assert profile.processing is None
+    assert profile.altitude_m is None
 
 
 def test_roast_detail_enabled_actions_defaults_to_empty() -> None:
@@ -372,6 +443,8 @@ def test_roast_profile_json_round_trip() -> None:
             description="Washed; jasmine, bergamot.",
             bean_species="arabica",
             is_blend=False,
+            processing="washed",
+            altitude_m=2100,
         )
     )
     restored = RoastProfile.model_validate_json(profile.model_dump_json())
