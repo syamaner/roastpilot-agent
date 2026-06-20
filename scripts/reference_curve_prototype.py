@@ -190,7 +190,7 @@ def anon_id(profile: dict[str, Any], fallback: str) -> str:
         A short hex digest, stable per roast, revealing nothing about the bean.
     """
     seed = str(profile.get("roastUUID") or fallback)
-    return hashlib.sha1(seed.encode("utf-8")).hexdigest()[:10]  # noqa: S324
+    return hashlib.sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:10]
 
 
 def infer_origin(basename: str) -> str:
