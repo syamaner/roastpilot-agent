@@ -1105,6 +1105,8 @@ async def test_list_runs_maps_every_column_to_its_field(tmp_store: RoastStore) -
         country="Colombia",
         bean_species="arabica",
         is_blend=True,
+        processing="washed",
+        altitude_m=1750,
         bean_weight_grams=300.0,
         initial_heat_percent=65,
         initial_fan_percent=35,
@@ -1179,6 +1181,8 @@ async def test_list_runs_maps_every_column_to_its_field(tmp_store: RoastStore) -
         assert summary.country == "Colombia"
         assert summary.bean_species == "arabica"
         assert summary.is_blend is True
+        assert summary.processing == "washed"
+        assert summary.altitude_m == 1750
         assert summary.rating == 4
         assert summary.development_percent == 17.5
         assert summary.advisor_consults == 6

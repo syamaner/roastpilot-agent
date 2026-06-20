@@ -245,6 +245,16 @@ class RoastTelemetry(BaseModel):
 # by ``bean_varietal`` (Heirloom, Bourbon, SL28…).
 BeanSpecies = Literal["arabica", "robusta", "liberica", "excelsa"]
 
+# Post-harvest processing method (#291) — a constrained ``Literal``, deliberately
+# NOT a ``models.py`` ``Enum`` (an enum here would trip the safety-reviewer
+# escalation, which routes any ``models.py`` enum change through it, even though
+# processing is not safety-bearing). The learning loop (D42) keys per-origin
+# advisor levers on this axis, so it is structured rather than free text (and is
+# distinct from the free-text process notes an operator may also put in
+# ``description``). ``"other"`` is the explicit escape hatch for an uncommon
+# process so the value stays a closed set.
+ProcessingMethod = Literal["washed", "natural", "honey", "anaerobic", "wet_hulled", "other"]
+
 
 class RoastProfile(BaseModel):
     """Minimal static roast profile (decision D7) with richer bean identity (#164).
@@ -263,9 +273,14 @@ class RoastProfile(BaseModel):
     bean carries the structured fields and the secondaries live in
     ``description`` — a fully structured component list is out of scope (#164).
 
-    Backward compatibility: every #164 field is optional / defaulted so a frozen
-    ``roast_runs.profile_json`` from before #164 (which carried only
-    ``bean_origin`` + ``bean_varietal``) still deserializes unchanged.
+    The #291 additions extend that identity with the per-origin axes the learning
+    loop (D42) keys on: the post-harvest ``processing`` method and growing
+    ``altitude_m``.
+
+    Backward compatibility: every #164 and #291 field is optional / defaulted so a
+    frozen ``roast_runs.profile_json`` from before either change (the pre-#164
+    shape carried only ``bean_origin`` + ``bean_varietal``) still deserializes
+    unchanged.
     """
 
     name: str = Field(min_length=1)
@@ -287,6 +302,17 @@ class RoastProfile(BaseModel):
     is_blend: bool = False
     """Whether the drum held a blend. When true, the structured fields describe
     the primary bean and the secondaries are recorded in ``description``."""
+    processing: ProcessingMethod | None = None
+    """Post-harvest processing method (#291): washed / natural / honey /
+    anaerobic / wet_hulled / other. A constrained ``Literal``, not an ``Enum``
+    (see ``ProcessingMethod``). Optional for back-compat; one of the per-origin
+    axes the learning loop (D42) keys advisor levers on. Distinct from any
+    free-text process notes in ``description``."""
+    altitude_m: int | None = Field(default=None, ge=0, le=4000)
+    """Growing altitude in metres above sea level (#291). Optional for
+    back-compat; bounded to a sane coffee-growing range (0–4000 m). Another
+    per-origin learning-loop (D42) axis. For a blend this is the primary bean's
+    altitude."""
     bean_weight_grams: float = Field(gt=0)
     charge_guidance_min_c: float = 170.0
     # The guidance ceiling deliberately equals the pre-T0 safety bound
@@ -427,9 +453,10 @@ class RoastSummary(BaseModel):
     """History list item (plan §6: id, started, outcome, bean, rating, dev %).
 
     The richer bean-identity fields (#164: ``country``, ``bean_species``,
-    ``is_blend``) are projected from the frozen profile so the history list can
-    show producing country and a blend marker without opening each run. They are
-    optional / defaulted for back-compat with pre-#164 frozen profiles.
+    ``is_blend``; #291: ``processing``, ``altitude_m``) are projected from the
+    frozen profile so the history list can show producing country, processing,
+    altitude, and a blend marker without opening each run. They are optional /
+    defaulted for back-compat with pre-#164 / pre-#291 frozen profiles.
     """
 
     id: str
@@ -448,6 +475,8 @@ class RoastSummary(BaseModel):
     country: str | None = None
     bean_species: BeanSpecies | None = None
     is_blend: bool = False
+    processing: ProcessingMethod | None = None
+    altitude_m: int | None = None
     rating: int | None = None
     development_percent: float | None = None
     advisor_consults: int = 0
