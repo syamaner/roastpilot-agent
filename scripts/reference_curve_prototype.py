@@ -190,7 +190,7 @@ def anon_id(profile: dict[str, Any], fallback: str) -> str:
         A short hex digest, stable per roast, revealing nothing about the bean.
     """
     seed = str(profile.get("roastUUID") or fallback)
-    return hashlib.sha1(seed.encode("utf-8"), usedforsecurity=False).hexdigest()[:10]
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:10]
 
 
 def infer_origin(basename: str) -> str:
@@ -358,9 +358,19 @@ def register_roast(profile: dict[str, Any], fallback_id: str) -> RegisteredRoast
         (i for i in range(len(timex)) if timex[i] >= cast("float", drop_t_for_tp)),
         len(timex) - 1,
     )
-    turning_bt = bt[charge_idx]
-    turning_t = charge_t
-    for i in range(charge_idx, drop_idx + 1):
+    # Seed the turning-point search from the first valid (non-ARTISAN_NODATA)
+    # sample at or after charge_idx.  Seeding from bt[charge_idx] directly
+    # risks poisoning the search when Artisan recorded -1.0 at that index.
+    seed_idx = next(
+        (i for i in range(charge_idx, drop_idx + 1) if bt[i] != _ARTISAN_NODATA),
+        None,
+    )
+    if seed_idx is None:
+        # No valid BT in the range — cannot determine a turning point.
+        return None
+    turning_bt = bt[seed_idx]
+    turning_t = timex[seed_idx]
+    for i in range(seed_idx + 1, drop_idx + 1):
         if bt[i] == _ARTISAN_NODATA:
             continue
         if bt[i] < turning_bt:
@@ -487,25 +497,48 @@ def _weighted_sd(values: list[float], weights: list[float], mean: float) -> floa
     return math.sqrt(max(0.0, var))
 
 
-def _percentile(values: list[float], q: float) -> float:
-    """Linear-interpolated percentile of ``values`` (unweighted).
+def _weighted_percentile(values: list[float], weights: list[float], q: float) -> float:
+    """Weighted linear-interpolated percentile of ``values``.
+
+    Uses the cumulative-weight method: sort (value, weight) pairs by value,
+    compute the normalised cumulative weight after each point, then linearly
+    interpolate to quantile ``q``.  An unweighted call (all weights equal)
+    reproduces the ordinary sample percentile.
 
     Args:
         values: The values (any order).
+        weights: Parallel non-negative weights (must sum to > 0).
         q: Quantile in ``[0, 1]``.
 
     Returns:
-        The percentile value (NaN for an empty input).
+        The weighted percentile value (NaN for an empty input or zero
+        total weight).
     """
     if not values:  # pragma: no cover - defensive: a node always has >=1 pooled value
         return float("nan")
-    s = sorted(values)
-    pos = q * (len(s) - 1)
-    lo = math.floor(pos)
-    hi = math.ceil(pos)
-    if lo == hi:
-        return s[lo]
-    return s[lo] * (hi - pos) + s[hi] * (pos - lo)
+    total = sum(weights)
+    if total <= 0:  # pragma: no cover - defensive: pooled roasts always carry weight >0
+        return float("nan")
+    pairs = sorted(zip(values, weights, strict=True), key=lambda p: p[0])
+    # Midpoint cumulative weight (the "hazen" style, avoiding the boundary issue
+    # at q=0 / q=1 with pure upper-cumulative sums).
+    cum: list[float] = []
+    running = 0.0
+    for _, wi in pairs:
+        running += wi
+        cum.append((running - wi / 2.0) / total)
+    # Clamp: below the first midpoint → return first value; above last → return last.
+    if q <= cum[0]:
+        return pairs[0][0]
+    if q >= cum[-1]:
+        return pairs[-1][0]
+    # Linear interpolation between adjacent midpoints.
+    for i in range(len(cum) - 1):
+        if cum[i] <= q <= cum[i + 1]:
+            span = cum[i + 1] - cum[i]
+            frac = (q - cum[i]) / span if span > 0 else 0.0
+            return pairs[i][0] + frac * (pairs[i + 1][0] - pairs[i][0])
+    return pairs[-1][0]  # pragma: no cover - unreachable: loop covers all intervals
 
 
 def build_reference(
@@ -540,8 +573,8 @@ def build_reference(
         m_ror = _weighted_mean(ror_j, w)
         mean_bt.append(round(m_bt, 2))
         sd_bt.append(round(_weighted_sd(bt_j, w, m_bt), 2))
-        p10.append(round(_percentile(bt_j, 0.10), 2))
-        p90.append(round(_percentile(bt_j, 0.90), 2))
+        p10.append(round(_weighted_percentile(bt_j, w, 0.10), 2))
+        p90.append(round(_weighted_percentile(bt_j, w, 0.90), 2))
         mean_ror.append(round(m_ror, 2))
         sd_ror.append(round(_weighted_sd(ror_j, w, m_ror), 2))
     return ReferenceCurve(
