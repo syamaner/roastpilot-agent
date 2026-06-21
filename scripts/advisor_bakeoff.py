@@ -3712,8 +3712,11 @@ async def main() -> int:
         help=f"replay mode: optional USD budget; the run stops GRACEFULLY before a "
         f"cell would breach it, flushing partial results and rendering the partial "
         f"scorecard (no exception). Spend is estimated as calls x --cost-per-call. "
-        f"SUGGESTED for a #277 run: ${SUGGESTED_MAX_SPEND_USD:g} (covers the screen "
-        f"and the finalist full-set passes with headroom). Unset = no cap.",
+        f"NOTE: with --seeds N the cap is applied PER SEED (each seed is its own "
+        f"checkpointed pass), so total spend can reach up to N x this value — size "
+        f"it for one seed's pass. SUGGESTED for a #277 run: ${SUGGESTED_MAX_SPEND_USD:g} "
+        f"per seed (covers one screen or finalist full-set pass with headroom). "
+        f"Unset = no cap.",
     )
     parser.add_argument(
         "--cost-per-call",

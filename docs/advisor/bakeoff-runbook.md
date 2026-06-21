@@ -63,7 +63,7 @@ and runs only the new candidate.
 | `--seeds N` | repeat passes per cell. Finalists use 2 (variance), the screen uses 1. Each seed writes a seed-suffixed checkpoint so seeds stay independently resumable. |
 | `--prompt-version V [V ...]` | prompt(s) to compare. Default `c1` (the as-built #274 control teaching system prompt). Pass `c1 v4` for a c1-vs-v4 (drop-lens) A/B. |
 | `--trajectory` | append the command-signal coherence section (change / reversal counts, momentum cuts) over development. Agreement-free; the JSON always carries it. |
-| `--max-spend USD` | optional budget; the run stops GRACEFULLY before a cell would breach it, flushes partials, renders the partial scorecard. Suggested ~$25 covers the screen + finalist passes with headroom. |
+| `--max-spend USD` | optional budget; the run stops GRACEFULLY before a cell would breach it, flushes partials, renders the partial scorecard. **Applied PER SEED** — with `--seeds N` total spend can reach up to N× this value, so size it for one seed's pass (~$25 covers a single screen or finalist full-set pass with headroom). |
 | `--out PATH` | the JSON results file. |
 | `--report-md PATH` | also write the markdown scorecard here. |
 | `--include-pre-fc` | OPT-OUT of dev-only scope (see below). |
