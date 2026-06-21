@@ -476,9 +476,9 @@ def test_descriptor_for_defaults_to_base_descriptor() -> None:
 def test_advisor_default_pins_every_phase_to_one_agent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The pinned-model-everywhere default (gemini-3.1-flash-lite, D33) is a
-    clean behavioral no-op: every phase resolves to the same slug, so exactly
-    one agent is built (one cache entry)."""
+    """The pinned-model-everywhere default (gpt-4o, #277 PIN) is a clean
+    behavioral no-op: every phase resolves to the same slug, so exactly one agent
+    is built (one cache entry)."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
     advisor = PydanticAIAdvisor(AdvisorConfig())
     for phase in (
@@ -488,7 +488,7 @@ def test_advisor_default_pins_every_phase_to_one_agent(
     ):
         advisor._agent_for(advisor._config.model_for(phase))  # type: ignore[reportPrivateUsage]
     cache = advisor._agents  # type: ignore[reportPrivateUsage]
-    assert set(cache) == {"google/gemini-3.1-flash-lite"}
+    assert set(cache) == {"openai/gpt-4o"}
 
 
 @pytest.mark.asyncio
@@ -751,13 +751,62 @@ def test_v3_prompt_has_explicit_per_stage_sections() -> None:
     assert "never control hardware" in v3
 
 
-def test_v4_is_the_default_prompt_version() -> None:
-    """v4 is the shipped default (D34, the #194 prompt bake-off) — the
-    profile-anchored drop that closed v2's recall gap. v2/v3 remain selectable
-    and distinct."""
-    assert AdvisorConfig().prompt_version == "v4"
+def test_c1_is_the_default_prompt_version() -> None:
+    """c1 (the #274 control teaching SYSTEM frame) is the shipped default, wired
+    live for the post-FC control loop (#277). It resolves to the control teaching
+    prompt and is distinct from the v* per-tick lenses, which stay selectable."""
+    assert AdvisorConfig().prompt_version == "c1"
+    assert instructions_for("c1") == control_teaching_prompt("c1")
+    assert instructions_for("c1") != instructions_for("v4")
     assert instructions_for("v4") != instructions_for("v2")
     assert instructions_for("v3") != instructions_for("v2")
+
+
+def test_default_prompt_version_matches_control_teaching_version() -> None:
+    """The config default and advisor.CONTROL_TEACHING_PROMPT_VERSION never drift.
+
+    config.py uses the literal "c1" to avoid an advisor->config import cycle; this
+    pins it equal to the canonical constant so a future control-version bump
+    (c2, ...) cannot silently leave the live default behind.
+    """
+    assert AdvisorConfig().prompt_version == CONTROL_TEACHING_PROMPT_VERSION
+
+
+def test_live_post_fc_advisor_uses_the_c1_system_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production PydanticAIAdvisor sends c1 as its system instructions (#277).
+
+    Wires the deferred-from-#276 step: the live post-FC control loop's advisor is
+    constructed with the #274 control teaching frame (c1) as the agent's system
+    ``instructions``; the per-tick #275 context is the user message (sent via
+    ``agent.run(context_json)``, asserted elsewhere). Default config = gpt-4o + c1.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
+    advisor = PydanticAIAdvisor(AdvisorConfig())
+    instructions = advisor._instructions  # type: ignore[reportPrivateUsage]
+    assert instructions == control_teaching_prompt("c1")
+    # The pinned post-FC (DEVELOPMENT) model is gpt-4o.
+    assert advisor._config.model_for(RoastPhase.DEVELOPMENT) == "openai/gpt-4o"  # type: ignore[reportPrivateUsage]
+
+
+def test_live_advisor_passes_no_mcp_write_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The advisory-only invariant survives the c1 + gpt-4o pin (#277).
+
+    The agent the controller's post-FC loop runs is built with only a structured
+    ``output_type`` and the c1 instructions — never any roaster-write tool. The
+    advisor returns typed ``RoastDecision`` data; the controller owns the loop and
+    every write still passes safety policy.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
+    advisor = PydanticAIAdvisor(AdvisorConfig())
+    agent = advisor._agent_for("openai/gpt-4o")  # type: ignore[reportPrivateUsage]
+    # No tools registered on the agent's toolset (advisory-only): the agent is
+    # purely a structured-output recommender.
+    toolset = agent._function_toolset  # type: ignore[reportPrivateUsage]
+    assert not toolset.tools, "advisor agent must carry NO tools (advisory-only)"
 
 
 def test_drop_recall_variants_keep_heat_fan_and_invariants() -> None:

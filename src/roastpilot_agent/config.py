@@ -48,26 +48,31 @@ DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float | None] = {
     RoastPhase.DEVELOPMENT: 5.0,
 }
 
-# The advisor model — the Artisan-expanded bake-off winner (D33, 14 Jun 2026):
-# ``google/gemini-3.1-flash-lite`` via OpenRouter. On 28 real quality-filtered
-# Hottop roasts it was the ONLY model that reliably makes the flavor-critical
-# drop call (drop F1 0.63, called the drop on 18/28 with the best heat-direction
-# agreement 0.88 and the fastest latency ~1.2 s); every other candidate —
-# including the prior incumbent ``anthropic/claude-opus-4.8`` (D20/D21) and all
-# the frontier/slow models — essentially never calls the drop (over-holds past
-# the ≤196 °C bitter ceiling, the dangerous direction). See
-# ``docs/advisor/bakeoff-artisan-summary.md``. This is the base slug AND the
-# default for every phase; the per-phase mechanism (#173) is retained so a
-# future fast/slow split can flip a slot without a behavior change until then.
-DEFAULT_ADVISOR_MODEL = "google/gemini-3.1-flash-lite"
+# The advisor model — the #277 post-FC control bake-off PIN (21 Jun 2026):
+# ``openai/gpt-4o`` via OpenRouter. Under D35 the live advisor is consulted only
+# in the post-FC DEVELOPMENT phase (the controller drives pre-FC
+# deterministically), so the #277 eval scored that scope across 17 known-good
+# mediums. gpt-4o tracks the operator's real heat moves the closest (heat MAE
+# ~7.5 pp vs ~22 for gemini-3.1-flash-lite and ~31 for gemini-3-flash-preview),
+# has the best heat-direction agreement (~0.78), a reliable drop (F1 ~0.86), and
+# live-viable latency (~2.0 s, inside the 10 s gate). It is ALSO the proven
+# control model in the operator's working n8n autonomous roaster (D40.4), which
+# de-risks the first supervised hardware roast. Runner-up
+# ``google/gemini-3.1-flash-lite`` (faster + ~5x cheaper) lost on heat-magnitude
+# fidelity; ``google/gemini-3-flash-preview`` was rejected (best drop but steers
+# heat the wrong way). See ``docs/advisor/bakeoff-results-2026-06-21.md``. This is
+# the base slug AND the default for every phase; the per-phase mechanism (#173)
+# is retained so a future re-run can flip a slot without a behavior change.
+DEFAULT_ADVISOR_MODEL = "openai/gpt-4o"
 
 # Phase-keyed advisor MODEL selection (#173, operator 13 Jun): the model slug
-# the advisor uses, by agent phase. The MECHANISM only — every phase defaults
-# to ``DEFAULT_ADVISOR_MODEL`` (gemini-3.1-flash-lite everywhere, D33), which is
-# fast enough for every phase including the tight FC gate, so there is no
-# per-phase split today. The map is kept so a future re-run can flip a slot
-# (e.g. a more capable preheat/pre-FC model) and record it as a new D-number. A
-# phase absent from the map falls back to ``model_slug``.
+# the advisor uses, by agent phase. The MECHANISM only — every phase defaults to
+# ``DEFAULT_ADVISOR_MODEL`` (gpt-4o everywhere, #277 PIN). Under D35 the advisor
+# is consulted only in DEVELOPMENT (post-FC), so DEVELOPMENT is the phase the PIN
+# actually governs; preheat / pre-FC are deterministic and never consult. The map
+# is kept so a future re-run can flip a slot (e.g. a faster/cheaper development
+# model once the cloud feedback loop learns heat trims) and record it as a new
+# D-number. A phase absent from the map falls back to ``model_slug``.
 DEFAULT_ADVISOR_MODEL_BY_PHASE: dict[RoastPhase, str] = {
     RoastPhase.PREHEATING: DEFAULT_ADVISOR_MODEL,
     RoastPhase.ROASTING_PRE_FIRST_CRACK: DEFAULT_ADVISOR_MODEL,
@@ -277,17 +282,17 @@ class AdvisorConfig(BaseModel):
     provider — it never lives in config or the database.
 
     The default ``model_slug`` and ``prompt_version`` are the bake-off's
-    outcome. The Artisan-expanded re-run (D33, 14 Jun 2026 — 28 real
-    quality-filtered Hottop roasts, fixing the original N=2 sample) picked
-    ``google/gemini-3.1-flash-lite`` via OpenRouter: the only model that
-    reliably makes the flavor-critical drop call (drop F1 0.63, 18/28, best
-    heat-direction 0.88, fastest ~1.2 s), where the prior incumbent
-    ``anthropic/claude-opus-4.8`` (D20/D21) and every frontier/slow model
-    over-hold (never drop). The prompt is ``v4`` (D34, the #194 prompt bake-off):
-    the profile-anchored drop prompt that closes v2's drop-recall gap on the same
-    28 roasts (recall 0.68→1.0, F1 0.66→0.88) and generalizes 19/19 on the
-    held-out roasts. See ``docs/advisor/experiment.md``. To
-    run a model on its native provider (no OpenRouter hop/markup, per D18), set
+    outcome. The #277 post-FC control bake-off (21 Jun 2026 — gpt-4o vs the
+    prior winner and fast control candidates, scored on the post-FC DEVELOPMENT
+    scope across 17 known-good mediums, 2 seeds) pinned ``openai/gpt-4o`` via
+    OpenRouter: it tracks the operator's real heat moves the closest (heat MAE
+    ~7.5 pp vs ~22 for gemini-3.1-flash-lite and ~31 for gemini-3-flash-preview),
+    has the best heat-direction agreement (~0.78), a reliable drop (F1 ~0.86),
+    live-viable latency (~2.0 s), and is the proven n8n control model (D40.4).
+    The prompt is ``c1`` (#274 / D39.1): the AS-BUILT control teaching SYSTEM
+    frame, wired live for the post-FC loop (#277) — the per-tick #275 context is
+    the user message. See ``docs/advisor/bakeoff-results-2026-06-21.md``. To run a
+    model on its native provider (no OpenRouter hop/markup, per D18), set
     ``provider`` + the matching ``api_key_env``. ``OPENROUTER_API_KEY`` must be
     set in the environment at runtime; ``FakeAdvisor`` stays the test/CI default.
 
@@ -295,9 +300,10 @@ class AdvisorConfig(BaseModel):
     (the identity in the decision-trace descriptor and the reachability probe),
     and ``model_slug_by_phase`` is an optional per-phase override map resolved
     by :meth:`model_for`. By default every phase resolves to
-    ``DEFAULT_ADVISOR_MODEL`` — gemini-3.1-flash-lite everywhere (D33) — so the
-    map is retained additive plumbing with zero behavior change; a future re-run
-    could flip a phase slot to a different model. A phase absent from the
+    ``DEFAULT_ADVISOR_MODEL`` — gpt-4o everywhere (#277 PIN); under D35 only the
+    post-FC DEVELOPMENT phase actually consults the advisor — so the map is
+    retained additive plumbing with zero behavior change; a future re-run could
+    flip a phase slot to a different model. A phase absent from the
     override map falls back to ``model_slug``.
     """
 
@@ -328,13 +334,19 @@ class AdvisorConfig(BaseModel):
     # well inside an operator's pre-roast attention window.
     healthcheck_timeout_seconds: float = Field(default=5.0, gt=0)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    # v4 (D34, the #194 prompt bake-off): the profile-anchored drop prompt closes
-    # v2's drop-recall gap (recall 0.68→1.0, F1 0.66→0.88, precision up, heat
-    # direction held; generalizes 19/19 on held-out roasts). v2 told the model to
-    # "develop past the guide, don't rush the drop" — exactly what made the pinned
-    # gemini model over-hold; v4 anchors the drop on the profile target + a
-    # development floor, ≤196 °C bitter ceiling. See docs/advisor/experiment.md.
-    prompt_version: str = Field(default="v4", min_length=1)
+    # c1 (#274 / D39.1 + #277): the AS-BUILT control teaching SYSTEM frame for the
+    # post-FC control loop, wired live here (deferred from #276 to #277). It is the
+    # whole-machine teaching frame (told == enforced: every numeric limit comes
+    # from the live AdvisorContext / #273 policy, it names no thresholds, and it
+    # makes acting pre-FC wrong, not merely named). The per-tick #275 context is
+    # the user message. The #277 bake-off scored gpt-4o under exactly this c1 frame
+    # and pinned it (docs/advisor/bakeoff-results-2026-06-21.md). The older v*
+    # prompts (e.g. the v4 drop-lens) remain selectable for an A/B but are no
+    # longer the live default. See advisor.instructions_for / control_teaching_prompt.
+    # The literal "c1" (not an import) keeps config free of an advisor->config
+    # import cycle; a test pins it equal to advisor.CONTROL_TEACHING_PROMPT_VERSION
+    # so the two can never drift.
+    prompt_version: str = Field(default="c1", min_length=1)
     # Reasoning control for the OpenAI-compatible path (OpenRouter normalizes
     # the ``reasoning`` request param across providers). ``None`` leaves the
     # provider default; ``"off"`` disables reasoning; the effort levels set

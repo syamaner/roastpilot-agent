@@ -111,12 +111,13 @@ def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
     assert config.provider == "openai_compatible"
     assert config.provider_base_url == "https://openrouter.ai/api/v1"
     assert config.api_key_env == "OPENROUTER_API_KEY"
-    # Artisan-expanded bake-off winner (D33, 14 Jun): gemini-3.1-flash-lite via
-    # OpenRouter — the only model that reliably calls the drop on 28 real roasts
-    # (opus + the frontier/slow models over-hold). Prompt v4 (D34, #194) — the
-    # profile-anchored drop that closes v2's recall gap.
-    assert config.model_slug == "google/gemini-3.1-flash-lite"
-    assert config.prompt_version == "v4"
+    # #277 post-FC control bake-off PIN (21 Jun): gpt-4o via OpenRouter — closest
+    # to the operator's real heat moves (heat MAE ~7.5 pp) and the proven n8n
+    # baseline. Prompt c1 (#274 / D39.1) — the AS-BUILT control teaching SYSTEM
+    # frame, wired live for the post-FC loop. See
+    # docs/advisor/bakeoff-results-2026-06-21.md.
+    assert config.model_slug == "openai/gpt-4o"
+    assert config.prompt_version == "c1"
     assert config.timeout_seconds == 10.0
     assert config.temperature == 0.0
     assert config.reasoning_effort is None  # provider default until measured
@@ -124,10 +125,10 @@ def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
 
 def test_advisor_per_phase_model_default_is_pinned_model_everywhere() -> None:
     """#173 MECHANISM: per-phase model selection defaults to the single pinned
-    model (gemini-3.1-flash-lite, D33) for every phase — the map is retained so
-    a future re-run could flip a phase slot to a different model."""
+    model (gpt-4o, #277 PIN) for every phase — the map is retained so a future
+    re-run could flip a phase slot to a different model."""
     config = AdvisorConfig()
-    assert DEFAULT_ADVISOR_MODEL == "google/gemini-3.1-flash-lite"
+    assert DEFAULT_ADVISOR_MODEL == "openai/gpt-4o"
     # The base slug and every phase override are the same single model today.
     assert config.model_slug == DEFAULT_ADVISOR_MODEL
     assert config.model_slug_by_phase == {

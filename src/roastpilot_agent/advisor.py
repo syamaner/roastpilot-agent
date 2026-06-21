@@ -757,7 +757,28 @@ _PROMPTS: dict[str, str] = {
 
 
 def instructions_for(prompt_version: str) -> str:
-    """Return the versioned advisor instructions, or raise on an unknown version."""
+    """Return the versioned advisor instructions, or raise on an unknown version.
+
+    Resolves both prompt namespaces: the ``v``-prefixed per-tick advisory lenses
+    in :data:`_PROMPTS` and the ``c``-prefixed control teaching SYSTEM frames in
+    :data:`_CONTROL_TEACHING_PROMPTS` (e.g. ``c1``). The live post-FC advisor
+    runs with ``prompt_version="c1"`` (#277), so the control teaching frame is the
+    system ``instructions`` of the production agent; the per-tick #275 context is
+    the user message. The ``c``-namespace is checked first so a control version
+    can never be shadowed by a same-named user lens.
+
+    Args:
+        prompt_version: The advisor prompt version — a ``c`` control teaching
+            frame (``c1``) or a ``v`` per-tick lens (``v0``..``v8``).
+
+    Returns:
+        The instruction text for ``prompt_version``.
+
+    Raises:
+        ValueError: If ``prompt_version`` is in neither namespace.
+    """
+    if prompt_version in _CONTROL_TEACHING_PROMPTS:
+        return _CONTROL_TEACHING_PROMPTS[prompt_version]
     try:
         return _PROMPTS[prompt_version]
     except KeyError:
