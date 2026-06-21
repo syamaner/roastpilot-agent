@@ -273,7 +273,7 @@ def test_ethiopia_seed_values() -> None:
     assert s.charge_guidance_max_c == 200.0
     assert s.initial_heat_percent == 100
     assert s.initial_fan_percent == 30
-    assert s.target_drop_temp_c == 190.0
+    assert s.target_drop_temp_c == 195.0  # latest acceptable drop (roast 2 ran to 196 = dark)
     assert s.target_development_percent == 13.0
     assert s.default_bean_weight_grams == 250.0
     assert SEED_BEAN_PROFILES == (ETHIOPIA_KOKE_SEED,)

@@ -46,7 +46,11 @@ ETHIOPIA_KOKE_SEED = BeanProfile(
     charge_guidance_max_c=200.0,
     initial_heat_percent=100,
     initial_fan_percent=30,
-    target_drop_temp_c=190.0,
+    # Roast 2 (run c3b84625) ran past this to 196 °C and dropped slightly DARK
+    # (dev only 1:09, DTR 11.6 %, under the 13 % target). 195 °C is the LATEST
+    # acceptable drop for this delicate natural (operator guidance) — the advisor
+    # must STRETCH development toward the DTR target before the bean reaches it.
+    target_drop_temp_c=195.0,
     target_development_percent=13.0,
     default_bean_weight_grams=250.0,
     description=(
