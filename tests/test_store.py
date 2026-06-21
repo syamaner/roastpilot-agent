@@ -13,6 +13,8 @@ import pytest
 from roastpilot_agent import store as store_module
 from roastpilot_agent.store import MIGRATIONS, RoastStore
 
+# The full migrated table set: the nine v1 tables plus the additive
+# ``bean_profiles`` table from the v4 migration (#303).
 EXPECTED_TABLES = {
     "roast_runs",
     "roast_events",
@@ -23,6 +25,7 @@ EXPECTED_TABLES = {
     "operator_actions",
     "sync_jobs",
     "reference_roasts",
+    "bean_profiles",
 }
 
 EXPECTED_INDEXES = {
@@ -32,6 +35,7 @@ EXPECTED_INDEXES = {
     "idx_advisor_run_tick",
     "idx_command_run_tick",
     "idx_roast_runs_sync_status",
+    "idx_bean_profiles_archived",
 }
 
 
@@ -44,7 +48,8 @@ async def fetch_names(store: RoastStore, kind: str) -> set[str]:
 
 
 @pytest.mark.asyncio
-async def test_schema_v1_creates_all_nine_tables(tmp_store: RoastStore) -> None:
+async def test_migrations_create_all_expected_tables(tmp_store: RoastStore) -> None:
+    """The nine v1 tables plus the additive v4 ``bean_profiles`` table (#303)."""
     await tmp_store.initialize()
     try:
         assert await fetch_names(tmp_store, "table") == EXPECTED_TABLES

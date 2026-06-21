@@ -11,6 +11,8 @@ import pydantic
 import pytest
 
 from roastpilot_agent.models import (
+    BeanProfile,
+    BeanProfileInput,
     MicHealth,
     MicStatus,
     RoastCommand,
@@ -449,3 +451,111 @@ def test_roast_profile_json_round_trip() -> None:
     )
     restored = RoastProfile.model_validate_json(profile.model_dump_json())
     assert restored == profile
+
+
+# --- #303: BeanProfile template model ---
+
+
+def _bean_profile(**overrides: object) -> dict[str, object]:
+    """Valid BeanProfile kwargs; override per test case."""
+    base: dict[str, object] = {
+        "id": "abc123",
+        "created_at": "2026-06-21T00:00:00+00:00",
+        "updated_at": "2026-06-21T00:00:00+00:00",
+        "name": "Ethiopia light",
+        "bean_origin": "Ethiopia",
+        "default_bean_weight_grams": 250.0,
+        "initial_heat_percent": 70,
+        "initial_fan_percent": 40,
+        "target_drop_temp_c": 205.0,
+        "target_development_percent": 20.0,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_bean_profile_shares_every_roast_profile_field_except_weight() -> None:
+    """#303 DRY guarantee: the two models cannot drift — BeanProfile carries
+    every RoastProfile field except ``bean_weight_grams``, plus the library-only
+    id / timestamps / default weight."""
+    roast_fields = set(RoastProfile.model_fields)
+    bean_fields = set(BeanProfile.model_fields)
+    # RoastProfile's only non-shared field is the per-roast charge weight.
+    assert roast_fields - bean_fields == {"bean_weight_grams"}
+    # BeanProfile adds exactly the library bookkeeping + the default weight.
+    assert bean_fields - roast_fields == {
+        "id",
+        "created_at",
+        "updated_at",
+        "default_bean_weight_grams",
+    }
+
+
+def test_bean_profile_input_has_no_server_owned_fields() -> None:
+    """#303: the create/update body omits the store-owned id + timestamps."""
+    input_fields = set(BeanProfileInput.model_fields)
+    assert "id" not in input_fields
+    assert "created_at" not in input_fields
+    assert "updated_at" not in input_fields
+    assert "bean_weight_grams" not in input_fields
+    assert "default_bean_weight_grams" in input_fields
+
+
+def test_bean_profile_validates_and_strips_like_roast_profile() -> None:
+    """#303: the shared validators apply — whitespace-only name rejected,
+    optional identity blanks normalize to None."""
+    with pytest.raises(pydantic.ValidationError):
+        BeanProfile.model_validate(_bean_profile(name="   "))
+    profile = BeanProfile.model_validate(_bean_profile(farm="  ", description="  "))
+    assert profile.farm is None
+    assert profile.description is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"default_bean_weight_grams": 0},
+        {"default_bean_weight_grams": -10.0},
+        {"id": ""},
+        {"initial_heat_percent": 101},
+        {"charge_guidance_min_c": 210.0},  # min > max
+    ],
+)
+def test_bean_profile_rejects_nonsense(overrides: dict[str, object]) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        BeanProfile.model_validate(_bean_profile(**overrides))
+
+
+def test_bean_profile_to_roast_profile_copies_shared_fields() -> None:
+    """#303: to_roast_profile builds a RoastProfile from the template + the
+    per-roast charge weight, copying every shared field and dropping the
+    library bookkeeping."""
+    bean = BeanProfile.model_validate(
+        _bean_profile(
+            country="Ethiopia",
+            farm="Koke Washing Station",
+            bean_varietal="Dega",
+            bean_species="arabica",
+            processing="natural",
+            altitude_m=1885,
+            default_bean_weight_grams=250.0,
+        )
+    )
+    roast = bean.to_roast_profile(bean_weight_grams=200.0)
+    assert isinstance(roast, RoastProfile)
+    assert roast.bean_weight_grams == 200.0  # the entered per-roast weight wins
+    # Every shared field copied verbatim.
+    for field in set(RoastProfile.model_fields) - {"bean_weight_grams"}:
+        assert getattr(roast, field) == getattr(bean, field)
+
+
+def test_bean_profile_json_round_trip() -> None:
+    bean = BeanProfile.model_validate(
+        _bean_profile(
+            country="Ethiopia",
+            processing="natural",
+            altitude_m=1885,
+        )
+    )
+    restored = BeanProfile.model_validate_json(bean.model_dump_json())
+    assert restored == bean

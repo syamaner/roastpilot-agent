@@ -256,31 +256,22 @@ BeanSpecies = Literal["arabica", "robusta", "liberica", "excelsa"]
 ProcessingMethod = Literal["washed", "natural", "honey", "anaerobic", "wet_hulled", "other"]
 
 
-class RoastProfile(BaseModel):
-    """Minimal static roast profile (decision D7) with richer bean identity (#164).
+class _BeanProfileFieldsBase(BaseModel):
+    """Shared bean-identity + roast-target fields for the two profile models (#303).
 
-    No curve targets in M1: name, bean identity, charge guidance range,
-    initial heat/fan, target drop temperature, target development percent.
-    The profile is frozen into ``roast_runs.profile_json`` at run start
-    (plan §5); hardware safety limits live in config, not here.
+    The single source of truth for every field that a reusable :class:`BeanProfile`
+    template and an instantiated :class:`RoastProfile` have in common — bean
+    identity (name, origin, varietal, country, farm, description, species, blend
+    flag, #291 processing + altitude), the charge guidance band, the initial
+    heat/fan levers, and the drop/development targets — together with the
+    whitespace-normalizing validators and the guidance-range check.
 
-    Bean identity (#164) records what was actually in the drum. Beyond the
-    original flat ``bean_origin`` + optional ``bean_varietal`` (cultivar), it
-    captures the producing ``country``, the specific ``farm`` / co-op / washing
-    station / region, the botanical ``bean_species``, an ``is_blend`` flag, and a
-    free-text ``description`` (process, tasting notes, lot, and — for a blend —
-    the secondary beans). The blend model is deliberately simple: the *primary*
-    bean carries the structured fields and the secondaries live in
-    ``description`` — a fully structured component list is out of scope (#164).
-
-    The #291 additions extend that identity with the per-origin axes the learning
-    loop (D42) keys on: the post-harvest ``processing`` method and growing
-    ``altitude_m``.
-
-    Backward compatibility: every #164 and #291 field is optional / defaulted so a
-    frozen ``roast_runs.profile_json`` from before either change (the pre-#164
-    shape carried only ``bean_origin`` + ``bean_varietal``) still deserializes
-    unchanged.
+    Pulled out as a base so the two models cannot drift (#303): the only
+    difference between them is the per-roast ``bean_weight_grams`` (on
+    :class:`RoastProfile`) versus the template ``default_bean_weight_grams`` +
+    identity fields (on :class:`BeanProfile`). Not used directly — it carries no
+    weight field on its own — so it is an internal base, not part of the public
+    API. All temperatures are Celsius.
     """
 
     name: str = Field(min_length=1)
@@ -313,7 +304,6 @@ class RoastProfile(BaseModel):
     back-compat; bounded to a sane coffee-growing range (0–4000 m). Another
     per-origin learning-loop (D42) axis. For a blend this is the primary bean's
     altitude."""
-    bean_weight_grams: float = Field(gt=0)
     charge_guidance_min_c: float = 170.0
     # The guidance ceiling deliberately equals the pre-T0 safety bound
     # (config.SafetyLimits.pre_t0_max_bean_temp_c, default 200.0): operators
@@ -351,7 +341,7 @@ class RoastProfile(BaseModel):
         return stripped or None
 
     @model_validator(mode="after")
-    def _check_guidance_range(self) -> "RoastProfile":
+    def _check_guidance_range(self) -> "_BeanProfileFieldsBase":
         """The charge guidance band must be a non-empty range."""
         if self.charge_guidance_min_c >= self.charge_guidance_max_c:
             raise ValueError(
@@ -359,6 +349,123 @@ class RoastProfile(BaseModel):
                 f"({self.charge_guidance_min_c} >= {self.charge_guidance_max_c})"
             )
         return self
+
+
+class RoastProfile(_BeanProfileFieldsBase):
+    """Minimal static roast profile (decision D7) with richer bean identity (#164).
+
+    No curve targets in M1: name, bean identity, charge guidance range,
+    initial heat/fan, target drop temperature, target development percent.
+    The profile is frozen into ``roast_runs.profile_json`` at run start
+    (plan §5); hardware safety limits live in config, not here.
+
+    Bean identity (#164) records what was actually in the drum. Beyond the
+    original flat ``bean_origin`` + optional ``bean_varietal`` (cultivar), it
+    captures the producing ``country``, the specific ``farm`` / co-op / washing
+    station / region, the botanical ``bean_species``, an ``is_blend`` flag, and a
+    free-text ``description`` (process, tasting notes, lot, and — for a blend —
+    the secondary beans). The blend model is deliberately simple: the *primary*
+    bean carries the structured fields and the secondaries live in
+    ``description`` — a fully structured component list is out of scope (#164).
+
+    The #291 additions extend that identity with the per-origin axes the learning
+    loop (D42) keys on: the post-harvest ``processing`` method and growing
+    ``altitude_m``.
+
+    The bean-identity + target fields live on the shared :class:`_BeanProfileFieldsBase`
+    so this model and the reusable :class:`BeanProfile` template (#303) cannot
+    drift; the only field this model adds is the per-roast ``bean_weight_grams``.
+
+    Backward compatibility: every #164 and #291 field is optional / defaulted so a
+    frozen ``roast_runs.profile_json`` from before either change (the pre-#164
+    shape carried only ``bean_origin`` + ``bean_varietal``) still deserializes
+    unchanged.
+    """
+
+    bean_weight_grams: float = Field(gt=0)
+
+
+class BeanProfile(_BeanProfileFieldsBase):
+    """A reusable, saved bean-profile template the operator picks per roast (#303).
+
+    The saved library entry behind the Start-Roast dropdown (D45, amends D29/D7):
+    it carries every :class:`RoastProfile` bean-identity + roast-target field
+    EXCEPT the per-roast charge weight, and adds a stable ``id``, the
+    ``created_at`` / ``updated_at`` timestamps, and a ``default_bean_weight_grams``
+    that pre-fills (but does not fix) each roast's charge weight.
+
+    A roast does not start from a ``BeanProfile`` directly: :meth:`to_roast_profile`
+    instantiates a frozen :class:`RoastProfile` from the template + the entered
+    charge weight, and the start-roast path / ``roast_runs.profile_json`` snapshot
+    are unchanged — so editing a saved profile only affects FUTURE roasts; past
+    roasts keep their frozen snapshot (the #303 edit-is-safe-by-construction
+    guarantee). All temperatures are Celsius.
+    """
+
+    id: str = Field(min_length=1)
+    created_at: str
+    """ISO-8601 UTC instant the profile was first saved."""
+    updated_at: str
+    """ISO-8601 UTC instant of the most recent edit (equals ``created_at`` when
+    never edited)."""
+    default_bean_weight_grams: float = Field(gt=0)
+    """The charge weight (grams) that pre-fills a new roast's form; the operator
+    may adjust it per roast (you may roast 200 g or 250 g of the same bean)."""
+
+    def to_roast_profile(self, bean_weight_grams: float) -> RoastProfile:
+        """Instantiate a :class:`RoastProfile` from this template + a charge weight.
+
+        Builds the frozen-at-run-start profile a roast actually uses: every shared
+        bean-identity + target field copied verbatim, with the per-roast
+        ``bean_weight_grams`` supplied by the caller (defaulted from
+        ``default_bean_weight_grams`` at the UI, adjustable per roast). The
+        template's ``id`` / timestamps are deliberately dropped — they are library
+        bookkeeping, not part of the per-roast profile snapshot, so the
+        ``roast_runs.profile_json`` shape and corpus integrity are unchanged
+        (#303).
+
+        Args:
+            bean_weight_grams: The charge weight for this roast, in grams (> 0).
+
+        Returns:
+            A :class:`RoastProfile` ready for the start-roast path.
+        """
+        shared = self.model_dump(
+            exclude={"id", "created_at", "updated_at", "default_bean_weight_grams"}
+        )
+        return RoastProfile(**shared, bean_weight_grams=bean_weight_grams)
+
+
+# --- #303: bean-profile library CRUD wire models (D45) ---
+#
+# The Start-Roast dropdown's saved-profile contract. ``BeanProfileInput`` is the
+# create/update request body — every reusable field the operator fills, WITHOUT
+# the server-owned ``id`` / ``created_at`` / ``updated_at`` (the store stamps
+# those). ``BeanProfileList`` is the GET envelope. The full :class:`BeanProfile`
+# (with id + timestamps) is the create/update/get response. Celsius throughout,
+# consistent with the rest of the API.
+
+
+class BeanProfileInput(_BeanProfileFieldsBase):
+    """``POST``/``PUT /api/bean-profiles`` request body (#303).
+
+    Carries every saved bean-profile field the operator supplies — the shared
+    bean-identity + roast-target fields plus ``default_bean_weight_grams`` — but
+    NOT the server-owned ``id`` / ``created_at`` / ``updated_at``: the store mints
+    the id and stamps the timestamps (create stamps both; update bumps
+    ``updated_at`` only). The same body shape serves create and edit.
+    """
+
+    default_bean_weight_grams: float = Field(gt=0)
+    """The charge weight (grams) that pre-fills a new roast's form; adjustable
+    per roast."""
+
+
+class BeanProfileList(BaseModel):
+    """``GET /api/bean-profiles`` envelope (#303): the saved library, the
+    dropdown renders from."""
+
+    profiles: list[BeanProfile]
 
 
 # --- E7-S1: REST API response models (component plan §6) ---

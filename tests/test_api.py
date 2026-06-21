@@ -2153,3 +2153,159 @@ async def test_lifespan_runs_recovery_on_startup_and_shutdown(store: RoastStore)
         recovered = await store.read_run("run-life")
         assert recovered is not None
         assert recovered.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+
+
+# --- #303: bean-profile library CRUD API ---
+
+
+def _bean_input(**overrides: object) -> dict[str, object]:
+    """A valid POST/PUT /api/bean-profiles body; override per test case."""
+    base: dict[str, object] = {
+        "name": "Colombia washed",
+        "bean_origin": "Colombia",
+        "default_bean_weight_grams": 250.0,
+        "initial_heat_percent": 70,
+        "initial_fan_percent": 40,
+        "target_drop_temp_c": 205.0,
+        "target_development_percent": 20.0,
+    }
+    base.update(overrides)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_bean_profiles_empty_list(client: AsyncClient) -> None:
+    response = await client.get("/api/bean-profiles")
+    assert response.status_code == 200
+    assert response.json() == {"profiles": []}
+
+
+@pytest.mark.asyncio
+async def test_create_bean_profile_returns_201_with_id_and_timestamps(
+    client: AsyncClient,
+) -> None:
+    response = await client.post("/api/bean-profiles", json=_bean_input(name="Kenya AA"))
+    assert response.status_code == 201
+    body = response.json()
+    assert body["id"]
+    assert body["name"] == "Kenya AA"
+    assert body["created_at"] == body["updated_at"]
+    assert body["default_bean_weight_grams"] == 250.0
+    # And it now lists.
+    listed = await client.get("/api/bean-profiles")
+    assert [p["id"] for p in listed.json()["profiles"]] == [body["id"]]
+
+
+@pytest.mark.asyncio
+async def test_create_bean_profile_validation_error_is_422(client: AsyncClient) -> None:
+    response = await client.post(
+        "/api/bean-profiles", json=_bean_input(default_bean_weight_grams=0)
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_update_bean_profile_edits_in_place(client: AsyncClient) -> None:
+    created = (await client.post("/api/bean-profiles", json=_bean_input())).json()
+    response = await client.put(
+        f"/api/bean-profiles/{created['id']}",
+        json=_bean_input(name="Edited", target_drop_temp_c=190.0),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == created["id"]
+    assert body["created_at"] == created["created_at"]
+    # updated_at advances (monotonic over the real server clock); the strict
+    # bump-was-actually-written assertion is pinned at the store layer with a
+    # controlled clock (test_bean_profiles.test_update_bumps_updated_at_*).
+    assert body["updated_at"] >= created["updated_at"]
+    assert body["name"] == "Edited"
+    assert body["target_drop_temp_c"] == 190.0
+
+
+@pytest.mark.asyncio
+async def test_update_unknown_bean_profile_is_404(client: AsyncClient) -> None:
+    response = await client.put("/api/bean-profiles/nope", json=_bean_input())
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_update_archived_bean_profile_is_404(client: AsyncClient) -> None:
+    """#304 (augment): editing an archived profile is a 404, not a phantom 200 —
+    the store's rowcount guard surfaces as the not-found error."""
+    created = (await client.post("/api/bean-profiles", json=_bean_input())).json()
+    assert (await client.delete(f"/api/bean-profiles/{created['id']}")).status_code == 200
+    response = await client.put(
+        f"/api/bean-profiles/{created['id']}", json=_bean_input(name="Edited")
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_update_bean_profile_validation_error_is_422(client: AsyncClient) -> None:
+    created = (await client.post("/api/bean-profiles", json=_bean_input())).json()
+    response = await client.put(
+        f"/api/bean-profiles/{created['id']}",
+        json=_bean_input(initial_heat_percent=101),
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_delete_bean_profile_archives(client: AsyncClient) -> None:
+    created = (await client.post("/api/bean-profiles", json=_bean_input())).json()
+    response = await client.delete(f"/api/bean-profiles/{created['id']}")
+    assert response.status_code == 200
+    assert response.json() == {"id": created["id"], "result": "archived"}
+    # Gone from the dropdown.
+    listed = await client.get("/api/bean-profiles")
+    assert listed.json() == {"profiles": []}
+
+
+@pytest.mark.asyncio
+async def test_delete_unknown_bean_profile_is_404(client: AsyncClient) -> None:
+    response = await client.delete("/api/bean-profiles/never-existed")
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_lifespan_seeds_ethiopia_profile_idempotently(store: RoastStore) -> None:
+    """#303: the app lifespan seeds the Ethiopia Koke profile (present once after
+    two startups — idempotent)."""
+    from roastpilot_agent.seed import ETHIOPIA_KOKE_ID
+
+    service = RoastService(store)
+    app = create_app(service)
+    async with app.router.lifespan_context(app):
+        first = await store.list_bean_profiles()
+    async with app.router.lifespan_context(app):
+        second = await store.list_bean_profiles()
+    assert [p.id for p in first] == [ETHIOPIA_KOKE_ID]
+    assert [p.id for p in second] == [ETHIOPIA_KOKE_ID]  # not double-inserted
+
+
+@pytest.mark.asyncio
+async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) -> None:
+    """#303: end-to-end seam — lifespan seed → GET /api/bean-profiles returns the
+    Ethiopia Koke profile with its locked values over HTTP (the FE-visible path)."""
+    from roastpilot_agent.seed import ETHIOPIA_KOKE_ID
+
+    service = RoastService(store)
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(transport=transport, base_url="http://test") as http,
+    ):
+        response = await http.get("/api/bean-profiles")
+    assert response.status_code == 200
+    profiles = response.json()["profiles"]
+    assert len(profiles) == 1
+    koke = profiles[0]
+    assert koke["id"] == ETHIOPIA_KOKE_ID
+    assert koke["name"] == "Ethiopia Yirgacheffe Koke (Natural)"
+    assert koke["processing"] == "natural"
+    assert koke["altitude_m"] == 1885
+    assert koke["default_bean_weight_grams"] == 250.0
+    assert koke["target_drop_temp_c"] == 190.0
+    assert koke["target_development_percent"] == 13.0
