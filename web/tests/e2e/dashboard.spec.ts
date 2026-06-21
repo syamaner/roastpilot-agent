@@ -47,13 +47,15 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   // to the server's snapshot — never the lossy `__lastEventId`.
   await settleStepped(page, stepped);
 
-  // Charge-referenced curve (#308): the x-axis re-origins to charge/T0 (0:00 =
-  // charge, Artisan convention), so PRE-charge (preheating) telemetry — which the
-  // server stamps with a null charge clock — carries NO curve points yet. The
-  // roast curve begins at charge; in preheating only the fixed axes + the charge
-  // band render. (This intentionally supersedes the #220 serve-referenced plot.)
+  // Serve-keyed curve (#326): the curve buffer keys on serve elapsed, so PRE-charge
+  // (preheating) telemetry PLOTS LIVE (the #316 blank-preheat regression is fixed).
+  // After stepping 8 ticks into preheat the curve carries that lead-in — assert it is
+  // non-empty and ascending on the serve clock. The ROAST TIME label (0:00 = charge,
+  // negative in preheat) is a display transform, not a change to the buffered x.
   const hook = await readChartData(page);
-  expect(hook.columns[0].length).toBe(0); // no plotted history before charge
+  const xs = hook.columns[0].filter((v): v is number => v !== null);
+  expect(xs.length).toBeGreaterThan(0); // preheat history plots live (#326)
+  for (let i = 1; i < xs.length; i++) expect(xs[i]).toBeGreaterThan(xs[i - 1]); // ascending serve-elapsed
   expect(hook.chargeBandVisible).toBe(true);
   // The charge band (170–200 °C) must be ON-SCREEN in preheating (E10-spa.md). With
   // the FIXED 0–210 °C axis (#217) the band is always in frame; assert the rendered
@@ -159,12 +161,16 @@ test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery mo
   await expect(page.getByTestId("recovery-modal")).toBeVisible();
   await expect(page.getByTestId("recovery-no-auto-resume")).toBeVisible();
 
-  // Charge-referenced curve (#308): the pre-T0 overrun fires BEFORE charge, so the
-  // server's charge clock is still null and the curve carries NO plotted points yet
-  // (the roast curve begins at charge). The fixed axes still render against an
-  // unchanging frame — assert the pinned bounds (the scale-covers-data class, #133).
+  // Serve-keyed curve (#326): the pre-T0 overrun fires BEFORE charge, but the curve
+  // now keys on serve elapsed, so any preheat frames seen before the overrun PLOT
+  // (the curve no longer waits for charge). The count depends on the fixture's
+  // pre-overrun frames; assert the curve is well-formed (ascending serve-elapsed, no
+  // crash on a sparse/degenerate range — the #326 hardening) rather than a brittle
+  // exact count. The fixed axes still render against an unchanging frame (the
+  // scale-covers-data class, #133/#217).
   const hook = await readChartData(page);
-  expect(hook.columns[0].length).toBe(0); // no plotted history before charge
+  const xs = hook.columns[0].filter((v): v is number => v !== null);
+  for (let i = 1; i < xs.length; i++) expect(xs[i]).toBeGreaterThan(xs[i - 1]); // ascending serve-elapsed
   expect(hook.scales.c.min).toBe(0);
   expect(hook.scales.c.max).toBe(210);
   expect(hook.scales.ror.min).toBe(-20);
@@ -215,8 +221,9 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   const beanMax = Math.max(...bean);
   expect(beanMax).toBeGreaterThan(120); // a developed bean temperature
   expect(beanMax - Math.min(...bean)).toBeGreaterThan(40); // a real ramp
-  // The x-axis (elapsed seconds since T0) spreads across the roast — guards the #128
-  // regression where a stepped burst collapsed every point onto one x.
+  // The x-axis (serve-elapsed seconds, #326 — the buffer key; the ROAST TIME label
+  // is a display transform) spreads across the roast — guards the #128 regression
+  // where a stepped burst collapsed every point onto one x.
   expect(Math.max(...x) - Math.min(...x)).toBeGreaterThan(300);
   expect(hook.markers.map((m) => m.kind)).toContain("first_crack");
 
@@ -313,12 +320,16 @@ test("dashboard-charge-window — preheating + bean in the charge band shows the
   await expect(page.getByTestId("charge-banner")).toContainText(/charge window/i);
   await expect(page.getByTestId("charge-banner")).toContainText("°C");
 
-  // Charge-referenced curve (#308): this is still PRE-charge (preheating, beans not
-  // yet added → no T0), so the server's charge clock is null and the curve carries
-  // NO plotted points yet — the roast curve begins at charge. The fixed axes still
-  // render against an unchanging frame (the scale-covers-data class, #133/#217).
+  // Serve-keyed curve (#326): this is still PRE-charge (preheating, beans not yet
+  // added → no T0), but the curve buffer now keys on serve elapsed, so the preheat
+  // lead-in PLOTS LIVE (the #316 blank-preheat regression is fixed). After stepping
+  // 90 frames the curve carries the preheat history — assert it is non-empty and
+  // ascending on the serve clock. The fixed axes still render against an unchanging
+  // frame (the scale-covers-data class, #133/#217).
   const hook = await readChartData(page);
-  expect(hook.columns[0].length).toBe(0); // no plotted history before charge
+  const xs = hook.columns[0].filter((v): v is number => v !== null);
+  expect(xs.length).toBeGreaterThan(0); // preheat history plots live (#326)
+  for (let i = 1; i < xs.length; i++) expect(xs[i]).toBeGreaterThan(xs[i - 1]); // ascending serve-elapsed
   expect(hook.scales.c.min).toBe(0);
   expect(hook.scales.c.max).toBe(210);
   expect(hook.scales.ror.min).toBe(-20);

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { formatElapsed, formatSeriesValue, toColumns } from "./chartData";
+import { formatElapsed, formatRoastTime, formatSeriesValue, toColumns } from "./chartData";
 import type { CurvePoint } from "./types";
 
 const POINTS: CurvePoint[] = [
@@ -58,5 +58,36 @@ describe("formatElapsed (M:SS time axis, #153)", () => {
     expect(formatElapsed(null)).toBe("—");
     expect(formatElapsed(-5)).toBe("—");
     expect(formatElapsed(NaN)).toBe("—");
+  });
+});
+
+describe("formatRoastTime (charge-referenced roast time, #326)", () => {
+  it("reads 0:00 at the charge origin", () => {
+    expect(formatRoastTime(540, 540)).toBe("0:00");
+  });
+
+  it("reads positive M:SS after charge", () => {
+    expect(formatRoastTime(540 + 90, 540)).toBe("1:30");
+    expect(formatRoastTime(540 + 583, 540)).toBe("9:43"); // the roast-3 end clock
+  });
+
+  it("reads negative -M:SS before charge (preheat)", () => {
+    expect(formatRoastTime(540 - 2, 540)).toBe("-0:02");
+    expect(formatRoastTime(540 - 200, 540)).toBe("-3:20");
+  });
+
+  it("rounds both operands so the charge tick is exactly 0:00 (no -0:00)", () => {
+    expect(formatRoastTime(540.4, 540.1)).toBe("0:00");
+  });
+
+  it("falls back to serve-elapsed display when the origin is null (pre-T0)", () => {
+    expect(formatRoastTime(66, null)).toBe("1:06");
+    expect(formatRoastTime(0, null)).toBe("0:00");
+  });
+
+  it("renders an em dash for null/non-finite seconds (regardless of origin)", () => {
+    expect(formatRoastTime(null, 540)).toBe("—");
+    expect(formatRoastTime(NaN, 540)).toBe("—");
+    expect(formatRoastTime(null, null)).toBe("—");
   });
 });

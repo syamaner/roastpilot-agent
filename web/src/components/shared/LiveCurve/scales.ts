@@ -87,6 +87,15 @@ export function makeAutoRange(
     }
     // No finite data (empty mount): let uPlot keep whatever it passed.
     if (lo === Infinity || hi === -Infinity) return [_min, _max];
+    // Guard a DEGENERATE (zero-width) x-range: a single plotted point — or several
+    // points all at the same elapsed second — gives lo === hi, and uPlot's split
+    // calc (numAxisSplits) divides by the span, producing a non-finite increment →
+    // `new Array(NaN)` → "RangeError: Invalid array length", which throws out of the
+    // async commit and breaks the dashboard React tree (seen on short/sparse roasts:
+    // the preheat curve starts as one point now that pre-charge frames plot, #326).
+    // Widen to a small symmetric window so the axis always has a positive width; the
+    // single point sits centered. A 1 s half-window matches the 1 s tick cadence.
+    if (lo === hi) return [lo - 1, hi + 1];
     // The x (time) axis is ranged tight (no soft padding).
     return [lo, hi];
   };

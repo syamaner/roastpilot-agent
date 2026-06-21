@@ -340,8 +340,15 @@ describe("dashboard page parser — folds every event it consumes", () => {
     );
   });
 
-  it("t0_detected sets the T0 marker", () => {
-    const next = dashboardReducer(initialDashboardViewModel, {
+  it("t0_detected sets the T0 marker (anchored to the latest plotted point, #326)", () => {
+    // The T0 marker anchors to the latest plotted point's serve-elapsed (#326), so
+    // fold a telemetry frame first — t0_detected on an EMPTY buffer records the
+    // detection but places no marker (the telemetry-derive path sets it later).
+    let next = dashboardReducer(initialDashboardViewModel, {
+      kind: "event",
+      event: frame("telemetry"),
+    });
+    next = dashboardReducer(next, {
       kind: "event",
       event: frame("t0_detected"),
     });
