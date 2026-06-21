@@ -56,15 +56,17 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 python -m pip install -q -e . --group dev
-# Build the SPA if web/dist is missing OR stale vs the source — so a `git pull`
-# that changed web/ doesn't keep serving an old bundle (e.g. a pre-dashboard stub).
-if [ ! -f web/dist/index.html ] || \
-   [ -n "$(find web/src web/package.json -type f -newer web/dist/index.html -print -quit 2>/dev/null)" ]; then
-  echo "  building SPA (web/dist missing or stale)…"
-  ( cd web && { [ -d node_modules ] || npm install; }; npm run build )
-else
-  echo "  SPA up to date."
-fi
+# ALWAYS rebuild the SPA on start. The earlier mtime-staleness heuristic missed
+# the real roast-2 failure mode: the server was already running on an old bundle
+# when fresh FE was pulled, so it kept serving stale assets. A clean build is
+# ~1 s — simpler and bulletproof than guessing freshness. `npm install` stays
+# conditional on node_modules being absent (the slow step).
+echo "  building SPA…"
+(
+  cd web || exit 1                       # never build from the repo root if cd fails
+  [ -d node_modules ] || npm install     # slow step, only when missing
+  npm run build
+)
 
 IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
 [ -n "$IP" ] || IP="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127' | head -1 || true)"
