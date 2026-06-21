@@ -7,6 +7,7 @@ binary, hardware, or network is touched. The static-mount tests use FastAPI's
 synchronous ``TestClient`` over a temporary built-SPA tree.
 """
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
@@ -17,19 +18,30 @@ import pytest_asyncio
 from fastapi.testclient import TestClient
 
 from roastpilot_agent import live
-from roastpilot_agent.api import RoastService, create_app
-from roastpilot_agent.config import AdvisorConfig, AppConfig, MCPConfig
+from roastpilot_agent.api import (
+    BufferingEventEmitter,
+    EventBroadcaster,
+    QueuedOperatorAction,
+    RoastRunner,
+    RoastService,
+    _TickCounter,  # pyright: ignore[reportPrivateUsage]
+    create_app,
+)
+from roastpilot_agent.config import AdvisorConfig, AppConfig, ControllerConfig, MCPConfig
+from roastpilot_agent.controller import ControllerSnapshot, RoastController
 from roastpilot_agent.mcp_client import (
     MCPConnectionError,
     MCPServerProcess,
     RoasterControlAdapter,
+    RoastSessionState,
 )
-from roastpilot_agent.models import RoastPhase, RoastProfile
+from roastpilot_agent.models import RoastPhase, RoastProfile, RoastTelemetry
 from roastpilot_agent.store import RoastStore
 
 # Reuse the canned tool fixtures + fake-session doubles from the mcp_client tests.
 from tests.test_mcp_client import (
     CANNED,
+    SESSION_STATE_PAYLOAD,
     FakeInitializableSession,
     FakeResult,
 )
@@ -519,3 +531,89 @@ def test_default_spa_dir_none_when_build_absent(
     fake_pkg.mkdir(parents=True)
     monkeypatch.setattr(live, "__file__", str(fake_pkg / "live.py"))
     assert live.default_spa_dir() is None
+
+
+# --- #308 persistence seam: controller dev% wins over the MCP raw dev% ---------
+
+
+class _SnapshotOnlyController:
+    """A minimal controller stand-in exposing just ``snapshot()`` (the only method
+    ``RoastRunner._publish_and_persist_telemetry`` calls)."""
+
+    def __init__(self, snapshot: ControllerSnapshot) -> None:
+        self._snapshot = snapshot
+
+    def snapshot(self) -> ControllerSnapshot:
+        return self._snapshot
+
+
+class _RawStateStub:
+    """A ``RawStateSource`` whose ``last_state`` carries a chosen MCP raw dev%."""
+
+    def __init__(self, last_state: RoastSessionState) -> None:
+        self._last_state = last_state
+
+    @property
+    def last_state(self) -> RoastSessionState:
+        return self._last_state
+
+
+@pytest.mark.asyncio
+async def test_persisted_dev_percent_is_the_controller_value_not_mcp_raw(
+    tmp_path: Path,
+) -> None:
+    """#308 regression: the PERSISTED telemetry ``development_percent`` is the
+    CONTROLLER's charge/FC-referenced value (the single source the advisor reasons
+    on), NOT the MCP raw number — which can lag or disagree (the first supervised
+    roast persisted the MCP's value while the operator-facing dev% must match the
+    model's). Locks the api.py persistence-swap so it cannot be silently reverted.
+
+    The MCP raw state reports development_percent = 3.6 (the canned fixture); the
+    controller snapshot reports a deliberately DIFFERENT 12.5. The stored row must
+    carry 12.5.
+    """
+    store = RoastStore(tmp_path / "seam.sqlite3")
+    await store.initialize()
+    try:
+        run_id = "run-seam"
+        await store.create_run(
+            run_id=run_id,
+            profile=_profile(),
+            config=AppConfig(),
+            agent_phase=RoastPhase.DEVELOPMENT,
+        )
+        controller_dev_percent = 12.5
+        mcp_raw = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
+        assert mcp_raw.development_percent == 3.6  # the differing MCP raw value
+        snapshot = ControllerSnapshot(
+            phase=RoastPhase.DEVELOPMENT,
+            current_heat=50,
+            current_fan=60,
+            roast_elapsed_seconds=600.0,
+            development_elapsed_seconds=75.0,
+            development_percent=controller_dev_percent,
+            telemetry=RoastTelemetry.model_validate({"bean_temp_c": 196.0, "env_temp_c": 214.0}),
+            advisory_paused=False,
+            charge_detected=True,
+        )
+        queue: asyncio.Queue[QueuedOperatorAction] = asyncio.Queue()
+        runner = RoastRunner(
+            # Duck-typed: the persistence method calls only ``snapshot()``.
+            controller=cast(RoastController, _SnapshotOnlyController(snapshot)),
+            store=store,
+            emitter=BufferingEventEmitter(EventBroadcaster(), clock=lambda: 0.0),
+            operator_queue=queue,
+            counter=_TickCounter(),
+            config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+            run_id=run_id,
+            clock=lambda: 0.0,
+            raw_state=_RawStateStub(mcp_raw),
+        )
+
+        await runner._publish_and_persist_telemetry()  # pyright: ignore[reportPrivateUsage]
+
+        points = await store.read_telemetry_points(run_id)
+        assert len(points) == 1
+        assert points[0].development_percent == controller_dev_percent  # controller, not 3.6
+    finally:
+        await store.close()

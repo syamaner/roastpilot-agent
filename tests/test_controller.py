@@ -493,6 +493,17 @@ async def test_advisor_drop_blocked_when_system_development_below_target() -> No
     assert note["source"] == "advisor"
     assert note["target_development_percent"] == PROFILE.target_development_percent
     assert cast(float, note["system_development_percent"]) == pytest.approx(5.0)
+    assert note["drop_dev_margin_percent"] == ControllerConfig().drop_dev_margin_percent
+    # Trace parity (#312 review): the blocked drop persists a REJECT
+    # SafetyEvaluation, not just an event note, so it shows in the
+    # safety_evaluations trace like the low-confidence reject does.
+    drop_blocks = [e for e in harness.sink.evaluations if e.rule == "advisor_drop_coherence"]
+    assert len(drop_blocks) == 1
+    assert drop_blocks[0].verdict is SafetyVerdict.REJECT
+    # Held the current targets (no lever write from the reject itself).
+    assert drop_blocks[0].adjusted_heat is not None
+    assert drop_blocks[0].adjusted_fan is not None
+    assert "below the drop window floor" in drop_blocks[0].reason
 
 
 @pytest.mark.asyncio
@@ -508,8 +519,9 @@ async def test_advisor_drop_executes_when_system_development_within_margin() -> 
 
     assert harness.executor.commands.count("drop_beans") == 1
     assert harness.controller.phase is RoastPhase.COOLING
-    # No incoherence rejection was emitted.
+    # No incoherence rejection was emitted, and no drop-coherence REJECT persisted.
     assert not [p for p in _advisory_payloads(harness) if "drop_rejected" in p]
+    assert not [e for e in harness.sink.evaluations if e.rule == "advisor_drop_coherence"]
 
 
 @pytest.mark.asyncio
@@ -525,6 +537,39 @@ async def test_operator_manual_drop_overrides_low_development() -> None:
     assert harness.controller.phase is RoastPhase.COOLING
 
 
+@pytest.mark.asyncio
+async def test_advisor_drop_executes_exactly_at_the_window_floor() -> None:
+    """#312 boundary: the guard is ``system_percent >= floor`` (floor = target -
+    margin = 20 - 3 = 17). A drop with the system EXACTLY at the floor (17 %) is
+    HONOURED — pins ``>=`` (not ``>``), mirroring
+    ``test_confidence_exactly_at_floor_proceeds``."""
+    advisor = FakeAdvisor([decision(heat=50, fan=60, drop=True)])
+    harness = _development_harness_with_dev_percent(system_dev_percent=17.0, advisor=advisor)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert harness.executor.commands.count("drop_beans") == 1
+    assert harness.controller.phase is RoastPhase.COOLING
+    assert not [e for e in harness.sink.evaluations if e.rule == "advisor_drop_coherence"]
+
+
+@pytest.mark.asyncio
+async def test_advisor_drop_blocked_just_below_the_window_floor() -> None:
+    """#312 boundary: a drop with the system just BELOW the floor (16.99 %, floor
+    17 %) is BLOCKED — the strict ``>=`` test fails by a hundredth of a point, so
+    the guard withholds the drop and persists the REJECT."""
+    advisor = FakeAdvisor([decision(heat=50, fan=60, drop=True)])
+    harness = _development_harness_with_dev_percent(system_dev_percent=16.99, advisor=advisor)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert harness.executor.commands.count("drop_beans") == 0
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    drop_blocks = [e for e in harness.sink.evaluations if e.rule == "advisor_drop_coherence"]
+    assert len(drop_blocks) == 1
+    assert drop_blocks[0].verdict is SafetyVerdict.REJECT
+
+
 def test_drop_coherence_guard_fails_open_without_a_profile() -> None:
     """#312: the drop coherence guard fails OPEN when it cannot be evaluated — no
     loaded profile means no target to check against, so it does not block (the
@@ -532,6 +577,21 @@ def test_drop_coherence_guard_fails_open_without_a_profile() -> None:
     always carries a profile; this pins the defensive branch directly."""
     controller = make_harness().controller
     # No profile loaded.
+    assert controller._drop_development_is_coherent() is True  # pyright: ignore[reportPrivateUsage]
+
+
+def test_drop_coherence_guard_fails_open_before_first_crack() -> None:
+    """#312: the guard also fails OPEN with a profile loaded but development not yet
+    started (``_development_percent()`` is ``None`` pre-FC) — the second defensive
+    branch. The guard is only invoked from the DEVELOPMENT-gated advisor drop path,
+    so this branch never blocks a real drop; pinned directly for coverage."""
+    controller = make_harness().controller
+    controller.load_profile(PROFILE)
+    controller.transition_to(RoastPhase.STARTING)
+    controller.transition_to(RoastPhase.PREHEATING)
+    controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    # Pre-FC: development percent is None, so the guard fails open.
+    assert controller._development_percent() is None  # pyright: ignore[reportPrivateUsage]
     assert controller._drop_development_is_coherent() is True  # pyright: ignore[reportPrivateUsage]
 
 

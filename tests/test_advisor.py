@@ -775,7 +775,7 @@ def test_c1_grounds_development_numbers_to_context_no_invention() -> None:
     # Use the context values verbatim — do NOT estimate / infer / invent.
     assert "verbatim" in lowered
     assert "do not estimate" in lowered
-    assert "never invent" in lowered or "never invent" in lowered
+    assert "never invent" in lowered or "do not invent" in lowered
     # Must STATE the development percent / DTR value it used in the rationale.
     assert "must state the development percent" in lowered
     # Must not anchor the dev% to the target just because it "should" be near it.

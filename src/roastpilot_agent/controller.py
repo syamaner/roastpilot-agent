@@ -1356,16 +1356,35 @@ class RoastController:
             # referenced) — NOT the model's claimed number, which the first
             # supervised roast showed can be fabricated ("14 %" at a true ~5.4 %).
             # When the system's development is materially below the target window
-            # the advisor's drop is REJECTED like a safety verdict: recorded and
-            # surfaced as a note, while the same consult's heat/fan advice (applied
-            # above) still stands. The operator's manual DROP BEANS is a separate,
-            # un-gated operator path; e-stop and the safety box are unaffected.
+            # the advisor's drop is REJECTED like a safety verdict: a REJECT
+            # SafetyEvaluation is persisted (trace parity with the low-confidence
+            # reject, so the blocked drop shows in the safety_evaluations trace,
+            # not only the event stream) and the rejection is surfaced as a note,
+            # while the same consult's heat/fan advice (applied above) still
+            # stands. No roaster write happens, so no invariant is at risk. The
+            # operator's manual DROP BEANS is a separate, un-gated operator path;
+            # e-stop and the safety box are unaffected.
+            #
+            # Inside this branch _development_percent() is non-None by construction:
+            # _drop_development_is_coherent() returns True (fails open) when the
+            # profile is absent or the percent is None, so reaching here guarantees
+            # both a loaded profile and a computed development percent.
+            system_percent = self._development_percent()
+            assert system_percent is not None  # guaranteed by the guard above
+            drop_block = self._safety.evaluate_advisor_drop_coherence(
+                system_development_percent=system_percent,
+                target_development_percent=self._profile.target_development_percent,
+                margin_percent=self._config.drop_dev_margin_percent,
+                current_heat=self._current_heat,
+                current_fan=self._current_fan,
+            )
+            await self._snapshots.persist_evaluation(drop_block)
             self._events.emit(
                 RoastEventKind.ADVISORY,
                 {
                     "drop_rejected": "development_incoherent",
                     "source": "advisor",
-                    "system_development_percent": self._development_percent(),
+                    "system_development_percent": system_percent,
                     "target_development_percent": self._profile.target_development_percent,
                     "drop_dev_margin_percent": self._config.drop_dev_margin_percent,
                 },
