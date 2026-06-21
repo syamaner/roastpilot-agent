@@ -14,7 +14,7 @@ from typing import cast
 
 import pytest
 
-from roastpilot_agent.config import MCPConfig
+from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
 from roastpilot_agent.mcp_client import (
     ControlCommandResult,
     EventCommandResult,
@@ -34,6 +34,7 @@ from roastpilot_agent.mcp_client import (
     parse_tool_result,
     project_mic_status,
     project_session_state,
+    resolve_mcp_command,
 )
 from roastpilot_agent.models import MicHealth
 
@@ -384,11 +385,78 @@ class HangingSession:
 
 
 def test_spawn_argv_includes_serve_positional() -> None:
-    """server.json packageArguments fix: the spawn command is
-    `coffee-roaster-mcp serve` — pinned per the E5-S2 criterion."""
+    """server.json packageArguments fix: the spawn args are
+    `<resolved-command> serve` — pinned per the E5-S2 criterion. The command
+    itself is the default, resolved to the in-venv console script
+    (test_default_command_resolves_to_in_venv_script covers that resolution)."""
     params = MCPServerProcess().build_server_parameters()
-    assert params.command == "coffee-roaster-mcp"
+    assert params.command == resolve_mcp_command(DEFAULT_MCP_COMMAND)
     assert params.args == ["serve"]
+
+
+def test_default_command_resolves_to_in_venv_script(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Spawn-hardening (homebrew-stale-deps segfault): when the command is left
+    at the default and a console script exists beside ``sys.executable``, the
+    spawn uses that ABSOLUTE in-venv path — never a bare-PATH lookup that could
+    pick up a foreign install."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    interpreter = fake_bin / "python"
+    interpreter.write_text("")  # the running interpreter's location
+    script = fake_bin / DEFAULT_MCP_COMMAND
+    script.write_text("")  # the in-venv console script next to it
+    monkeypatch.setattr("roastpilot_agent.mcp_client.sys.executable", str(interpreter))
+    # A PATH entry holding a DIFFERENT (foreign) install that must NOT win.
+    foreign = tmp_path / "homebrew"
+    foreign.mkdir()
+    (foreign / DEFAULT_MCP_COMMAND).write_text("")
+    monkeypatch.setenv("PATH", str(foreign))
+
+    assert resolve_mcp_command(DEFAULT_MCP_COMMAND) == str(script)
+    assert MCPServerProcess().build_server_parameters().command == str(script)
+
+
+def test_explicit_command_is_used_verbatim(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """An explicit operator/config override always wins, unchanged — even when
+    an in-venv default script exists beside ``sys.executable``. The operator's
+    deliberate binary choice is never second-guessed."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    interpreter = fake_bin / "python"
+    interpreter.write_text("")
+    (fake_bin / DEFAULT_MCP_COMMAND).write_text("")  # default script present...
+    monkeypatch.setattr("roastpilot_agent.mcp_client.sys.executable", str(interpreter))
+
+    override = "/opt/homebrew/bin/coffee-roaster-mcp"
+    assert resolve_mcp_command(override) == override  # ...but the override wins
+    params = MCPServerProcess(MCPConfig(command=override)).build_server_parameters()
+    assert params.command == override
+
+
+def test_default_command_falls_back_to_path_then_bare(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no in-venv script beside the interpreter, the default resolves via a
+    PATH lookup; with nothing on PATH either, it falls back to the bare name and
+    lets the transport's own spawn report the failure."""
+    empty_bin = tmp_path / "bin"
+    empty_bin.mkdir()
+    interpreter = empty_bin / "python"
+    interpreter.write_text("")  # no console script beside it
+    monkeypatch.setattr("roastpilot_agent.mcp_client.sys.executable", str(interpreter))
+
+    path_dir = tmp_path / "onpath"
+    path_dir.mkdir()
+    on_path = path_dir / DEFAULT_MCP_COMMAND
+    on_path.write_text("")
+    on_path.chmod(0o755)
+    monkeypatch.setenv("PATH", str(path_dir))
+    assert resolve_mcp_command(DEFAULT_MCP_COMMAND) == str(on_path)
+
+    monkeypatch.setenv("PATH", str(tmp_path / "nothing-here"))
+    assert resolve_mcp_command(DEFAULT_MCP_COMMAND) == DEFAULT_MCP_COMMAND
 
 
 def test_spawn_env_is_none_without_overrides() -> None:
@@ -564,7 +632,10 @@ async def test_start_initializes_health_checks_and_stops_cleanly() -> None:
     assert session.initialized
     assert session.calls == [("get_server_info", {})]  # health check
     params = probe.params
-    assert getattr(params, "command", None) == "coffee-roaster-mcp"
+    # The default command is resolved to the in-venv console script before
+    # spawning (spawn-hardening); the bare-name case is covered by
+    # test_default_command_falls_back_to_path_then_bare.
+    assert getattr(params, "command", None) == resolve_mcp_command(DEFAULT_MCP_COMMAND)
     await process.stop()
     assert not process.running
     assert probe.exited  # child torn down cleanly
