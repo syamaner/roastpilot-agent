@@ -1212,21 +1212,22 @@ async def test_sustained_dead_mcp_emits_exactly_one_fault_and_holds() -> None:
     assert fail_safe_targets, "fail-safe must have written heat 0 / safe fan on entry"
     assert fail_safe_targets[-1][0] == 0  # heat 0 %
 
-    # The detector counts persisted evaluations + reader calls before the latch
-    # so a post-latch tick can be proven to add neither.
+    # Snapshot the persisted evaluations + applied targets at the latch boundary
+    # so a post-latch tick can be proven to add NEITHER (the anti-spam guarantee).
     evals_at_fault = len(harness.sink.evaluations)
-    reader_reads = harness.log.count("read")
     targets_at_fault = len(harness.executor.targets)
 
-    # Twenty more ticks against the still-dead MCP: the latch holds silently.
+    # Twenty more ticks against the still-dead MCP. The latch now attempts an
+    # upward-only escalation re-read each tick, but the dead read raises and is
+    # held SILENTLY — so the spam guarantee holds: still exactly one FAULT event,
+    # no new persisted evaluation, no re-write of the posture, no re-fire.
     for _ in range(20):
         await harness.controller.tick()
 
     assert harness.controller.phase is RoastPhase.FAULTED
     # EXACTLY ONE fault event across the whole dead-MCP stretch (the bug emitted N).
     assert harness.events.kinds().count(RoastEventKind.FAULT) == 1
-    # No re-read of the dead child, no re-evaluation, no re-write of the posture.
-    assert harness.log.count("read") == reader_reads
+    # A failed re-read produced NO new evaluation and NO re-write of the posture.
     assert len(harness.sink.evaluations) == evals_at_fault
     assert len(harness.executor.targets) == targets_at_fault
     # Operator recovery stays available throughout the latch (#206 operable-faulted):
@@ -1240,8 +1241,11 @@ async def test_sustained_dead_mcp_emits_exactly_one_fault_and_holds() -> None:
 
 @pytest.mark.asyncio
 async def test_recovery_phase_latches_and_holds() -> None:
-    """A controller latched into operator_recovery_required holds silently: no
-    re-read, no re-evaluation, no repeated recovery_required event."""
+    """A controller latched into operator_recovery_required holds: the upward-only
+    escalation re-read sees a below-ceiling reading (no escalation), so it never
+    re-emits recovery_required, persists no new evaluation, and never escalates."""
+    # 205 °C is the pre-T0 charge bound (→ recovery) but well below the 230 °C hard
+    # ceiling, so the latched escalation re-read returns ALLOW: nothing to escalate.
     harness = make_harness(readings=[reading(bean=205.0)])
     for step in NORMAL_PATH[:2]:  # …→ PREHEATING
         harness.controller.transition_to(step)
@@ -1250,7 +1254,6 @@ async def test_recovery_phase_latches_and_holds() -> None:
     await harness.controller.tick()  # pre-T0 overrun → operator_recovery_required
     assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
     assert harness.events.kinds().count(RoastEventKind.RECOVERY_REQUIRED) == 1
-    reads = harness.log.count("read")
     evals = len(harness.sink.evaluations)
 
     for _ in range(10):
@@ -1258,7 +1261,9 @@ async def test_recovery_phase_latches_and_holds() -> None:
 
     assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
     assert harness.events.kinds().count(RoastEventKind.RECOVERY_REQUIRED) == 1
-    assert harness.log.count("read") == reads  # the dead/idle MCP is not re-read
+    # No FAULT escalation (the reading is below the hard ceiling) and no new
+    # persisted evaluation while latched on a below-ceiling reading.
+    assert RoastEventKind.FAULT not in harness.events.kinds()
     assert len(harness.sink.evaluations) == evals
 
 
@@ -1312,7 +1317,6 @@ async def test_latch_retries_fail_safe_after_a_transient_write_failure() -> None
     # The entry write failed → posture not yet confirmed (no successful target).
     assert executor.targets == []
 
-    reads_before_retry = harness.log.count("read")
     evals_before_retry = len(harness.sink.evaluations)
 
     # Latched ticks retry the heat-off write: first retry fails, second succeeds.
@@ -1325,10 +1329,129 @@ async def test_latch_retries_fail_safe_after_a_transient_write_failure() -> None
 
     # Posture confirmed once; not re-applied every tick thereafter.
     assert len(executor.targets) == 1
-    # Still exactly one fault event, and the retries did not re-read or re-eval.
+    # Still exactly one fault event. The escalation re-read sees None (no session)
+    # and holds silently, so it persists no new evaluation and never escalates.
     assert harness.events.kinds().count(RoastEventKind.FAULT) == 1
-    assert harness.log.count("read") == reads_before_retry
     assert len(harness.sink.evaluations) == evals_before_retry
+
+
+@pytest.mark.asyncio
+async def test_latch_auto_escalates_fault_to_emergency_stop_once() -> None:
+    """Safety-reviewer carry-forward (#206): a controller latched in `faulted`
+    with a still-LIVE MCP must still AUTO-escalate to the hardware emergency stop
+    if the MCP then reports a hard-ceiling breach — exactly once, with no re-fire
+    or spam on subsequent identical ticks.
+
+    Entry: a STALE-telemetry reading (live MCP, bean below the ceiling) faults
+    closed → FAULTED latched on FAULT. Then a FRESH reading crosses the 230 °C
+    hard bean ceiling → the latched escalation re-read fires `emergency_stop` once
+    and emits one escalation FAULT; later identical ticks neither re-fire nor
+    re-emit (EMERGENCY_STOP is the max severity).
+    """
+    stale_low = reading(bean=180.0, env=200.0, age_seconds=10.0)  # stale → FAULT
+    over_ceiling = reading(bean=235.0, env=200.0, age_seconds=0.0)  # > 230 → e-stop
+    harness = harness_in_development(readings=[stale_low, over_ceiling])
+
+    await harness.controller.tick()  # entry: stale FAULT → FAULTED (latched FAULT)
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.events.kinds().count(RoastEventKind.FAULT) == 1
+    assert harness.executor.estop_reasons == []  # no hardware e-stop yet
+
+    await harness.controller.tick()  # escalation: hard-ceiling breach → e-stop
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert len(harness.executor.estop_reasons) == 1  # fired exactly ONCE
+    assert harness.events.kinds().count(RoastEventKind.FAULT) == 2  # +1 escalation
+
+    # Subsequent identical over-ceiling ticks: already at EMERGENCY_STOP (max
+    # severity) → no re-fire, no further escalation event.
+    for _ in range(10):
+        await harness.controller.tick()
+    assert len(harness.executor.estop_reasons) == 1  # still once
+    assert harness.events.kinds().count(RoastEventKind.FAULT) == 2  # still two
+    # Operator escalation stays available throughout.
+    assert OperatorAction.EMERGENCY_STOP in enabled_operator_actions(harness.controller.phase)
+
+
+@pytest.mark.asyncio
+async def test_latch_does_not_escalate_on_a_same_or_lesser_verdict() -> None:
+    """The escalation is upward-ONLY: a FAULT-latched controller whose live MCP
+    keeps reporting a below-ceiling (ALLOW) or same-severity reading must NOT
+    fire a hardware e-stop or emit any further event."""
+    stale_low = reading(bean=180.0, env=200.0, age_seconds=10.0)  # stale → FAULT
+    fresh_ok = reading(bean=190.0, env=200.0, age_seconds=0.0)  # below ceiling → ALLOW
+    harness = harness_in_development(readings=[stale_low, fresh_ok])
+
+    await harness.controller.tick()  # entry → FAULTED (latched FAULT)
+    assert harness.controller.phase is RoastPhase.FAULTED
+    faults_after_entry = harness.events.kinds().count(RoastEventKind.FAULT)
+
+    for _ in range(10):
+        await harness.controller.tick()  # fresh ALLOW reading: nothing to escalate
+
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.executor.estop_reasons == []  # no escalation fired
+    assert harness.events.kinds().count(RoastEventKind.FAULT) == faults_after_entry
+
+
+@pytest.mark.asyncio
+async def test_latch_escalates_recovery_to_emergency_stop_and_faults() -> None:
+    """A controller latched in operator_recovery_required (the lower-severity
+    RECOVERY latch) that then sees a hard-ceiling breach escalates upward to the
+    hardware emergency stop AND crosses into FAULTED — the universal `* → faulted`
+    edge — firing the e-stop once."""
+    pre_t0_overrun = reading(bean=205.0, env=200.0)  # > 200 pre-T0 bound → RECOVERY
+    over_ceiling = reading(bean=235.0, env=200.0)  # > 230 hard ceiling → e-stop
+    harness = make_harness(readings=[pre_t0_overrun, over_ceiling])
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING (no confirmed T0)
+        harness.controller.transition_to(step)
+    harness.events.events.clear()
+
+    await harness.controller.tick()  # pre-T0 overrun → operator_recovery_required
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert harness.executor.estop_reasons == []
+
+    await harness.controller.tick()  # hard-ceiling breach → escalate to e-stop
+    assert harness.controller.phase is RoastPhase.FAULTED  # crossed into faulted
+    assert len(harness.executor.estop_reasons) == 1
+    assert RoastEventKind.FAULT in harness.events.kinds()
+    # Max severity now: no re-fire on subsequent identical ticks.
+    for _ in range(5):
+        await harness.controller.tick()
+    assert len(harness.executor.estop_reasons) == 1
+
+
+@pytest.mark.asyncio
+async def test_latch_escalation_estop_failure_is_surfaced_and_latches_retry() -> None:
+    """A raising e-stop during the latched escalation must not crash the tick: it
+    surfaces COMMAND_FAILED, latches a heat-off retry, still emits the escalation
+    FAULT, and re-latches at EMERGENCY_STOP so it does not re-fire."""
+
+    class FailingEstopExecutor(RecordingExecutor):
+        async def emergency_stop(self, *, reason: str) -> None:
+            raise RuntimeError("serial port dead")
+
+    log: list[str] = []
+    stale_low = reading(bean=180.0, env=200.0, age_seconds=10.0)  # stale → FAULT
+    over_ceiling = reading(bean=235.0, env=200.0, age_seconds=0.0)  # > 230 → e-stop
+    harness = make_harness(readings=[stale_low, over_ceiling], executor=FailingEstopExecutor(log))
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:  # …→ DEVELOPMENT
+        harness.controller.transition_to(step)
+    harness.events.events.clear()
+
+    await harness.controller.tick()  # entry: stale FAULT → FAULTED
+    assert harness.controller.phase is RoastPhase.FAULTED
+
+    await harness.controller.tick()  # escalation: e-stop raises but is handled
+    assert harness.controller.phase is RoastPhase.FAULTED
+    kinds = harness.events.kinds()
+    assert RoastEventKind.COMMAND_FAILED in kinds  # surfaced the failed e-stop
+    assert kinds.count(RoastEventKind.FAULT) == 2  # entry + escalation
+    # A failed escalation e-stop latched a heat-off retry (fail-closed), and the
+    # latch is now at EMERGENCY_STOP so it does not re-fire.
+    for _ in range(5):
+        await harness.controller.tick()
+    assert harness.events.kinds().count(RoastEventKind.FAULT) == 2  # no re-fire
 
 
 @pytest.mark.asyncio

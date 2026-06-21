@@ -156,6 +156,20 @@ UNIVERSAL_TARGETS: frozenset[RoastPhase] = frozenset(
 #: one is ever extended. A test pins the equality so the coupling is intentional.
 TERMINAL_LATCH_PHASES: frozenset[RoastPhase] = UNIVERSAL_TARGETS
 
+#: Severity ranking of the terminal-stage verdicts, for the upward-only
+#: escalation a latched controller still performs (safety-reviewer carry-forward
+#: on #206). A latched controller re-reads + re-evaluates each tick and acts ONLY
+#: when the new verdict is STRICTLY MORE SEVERE than the one it latched on — so a
+#: ``faulted`` run whose (live) MCP then reports a hard-ceiling breach still
+#: auto-escalates to the hardware emergency stop, while a sustained same-or-lesser
+#: verdict (or a dead-MCP read) produces no re-emit and no re-fire. Only these
+#: three verdicts ever latch a terminal phase; ALLOW/CLAMP/REJECT never do.
+_TERMINAL_VERDICT_SEVERITY: dict[SafetyVerdict, int] = {
+    SafetyVerdict.RECOVERY: 1,
+    SafetyVerdict.FAULT: 2,
+    SafetyVerdict.EMERGENCY_STOP: 3,
+}
+
 
 class StateReader(Protocol):
     """Reads the current roast telemetry (E5 wraps get_roast_state)."""
@@ -601,6 +615,13 @@ class RoastController:
         # while still killing the re-read / re-eval / re-emit noise loop the latch
         # exists to fix. ``None`` = posture confirmed / nothing pending.
         self._pending_fail_safe: SafetyEvaluation | None = None
+        # The terminal verdict the controller is currently LATCHED on (None when
+        # not in a terminal phase). Drives the upward-only escalation in the
+        # terminal-phase tick branch: re-evaluation acts only on a STRICTLY more
+        # severe verdict (FAULT → EMERGENCY_STOP), so auto-escalation to the
+        # hardware e-stop survives the anti-spam latch while a same/lesser verdict
+        # never re-emits or re-fires (safety-reviewer carry-forward on #206).
+        self._latched_verdict: SafetyVerdict | None = None
         # D35 §4-A / D40.5 (#276): the direction of each lever's last EXECUTED
         # post-FC move, fed into the coherence/deadband gate so a sub-threshold
         # direction reversal (the #218 30<->40<->30 thrash) is damped to a hold.
@@ -832,8 +853,11 @@ class RoastController:
             # (acknowledge → idle, resume, start cooling): the operator now owns
             # the levers, so any unconfirmed fail-safe retry latch is dropped — it
             # must not keep forcing heat-off into a run the operator just resumed
-            # or a cooling cycle they just started (#206 / PR review).
+            # or a cooling cycle they just started (#206 / PR review). The latched
+            # verdict clears too, so a fresh terminal entry later starts its
+            # escalation tracking from scratch.
             self._pending_fail_safe = None
+            self._latched_verdict = None
         if target in (RoastPhase.STARTING, RoastPhase.PREHEATING):
             # Per-run latches reset (T0 confirmation, debounce streak,
             # add-beans guidance) on a new run AND on every preheating
@@ -918,24 +942,28 @@ class RoastController:
         """Run one controller tick in the documented order.
 
         A controller already latched into a terminal HOLD phase
-        (:data:`TERMINAL_LATCH_PHASES`) short-circuits before reading the MCP:
-        the fail-safe posture is already applied and the terminal event was
-        already emitted on entry, so re-reading a (possibly dead) child,
-        re-evaluating safety, and re-emitting the identical fault every tick is
-        pure noise — the post-#206 "infinite error loop". The only live work
-        left in a terminal phase is the once-only operator-timeout nag (it does
-        not actuate). Operator recovery actions (acknowledge / resume / cooling /
-        emergency-stop) are separate, always-available methods, so the latch
-        never reduces what the operator can do (#206 operable-faulted intact).
+        (:data:`TERMINAL_LATCH_PHASES`) runs a REDUCED tick: it re-attempts an
+        unconfirmed fail-safe write, then re-reads + re-evaluates ONLY to allow
+        an upward-only escalation (a ``faulted`` run whose still-live MCP reports
+        a hard-ceiling breach auto-escalates to the hardware emergency stop). It
+        NEVER re-emits the same-or-lesser verdict, and a failed re-read (dead MCP)
+        holds silently — so the post-#206 "infinite error loop" (the identical
+        FAULT re-emitted every tick) stays fixed while the automatic upward
+        escalation the controller had before the latch is preserved. Operator
+        recovery actions (acknowledge / resume / cooling / emergency-stop) are
+        separate, always-available methods, so the latch never reduces what the
+        operator can do (#206 operable-faulted intact).
         """
         if self._phase in TERMINAL_LATCH_PHASES:
             # If the fail-safe write did not confirm on entry (a transient MCP
             # write failure), re-attempt the heat-off write here — the latch must
-            # never strand the roaster hot. This is the ONLY actuation a latched
-            # tick performs; it re-reads nothing, re-evaluates nothing, and
-            # re-emits no terminal event, so it drives toward safety without
-            # re-opening the noise loop. Once it confirms, the latch is silent.
+            # never strand the roaster hot. Once it confirms, this is silent.
             await self._retry_pending_fail_safe()
+            # Upward-only re-evaluation: escalate to a STRICTLY more severe verdict
+            # (FAULT → EMERGENCY_STOP) if the live MCP now reports one; otherwise
+            # hold without re-emitting anything (and hold silently if the MCP is
+            # dead). This is the only place a latched tick may fire new hardware.
+            await self._maybe_escalate_while_latched()
             self._check_operator_timeout()
             # A stale advisory request must not survive the latch into a later
             # resumed/cooling tick (mirrors the fail-closed branch below).
@@ -1276,6 +1304,7 @@ class RoastController:
             if self._phase is not RoastPhase.FAULTED:
                 self.transition_to(RoastPhase.FAULTED)
                 self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
+            self._latched_verdict = SafetyVerdict.EMERGENCY_STOP
             return True
         if verdict is SafetyVerdict.FAULT:
             await self._apply_fail_safe(evaluation)
@@ -1283,6 +1312,7 @@ class RoastController:
             if self._phase is not RoastPhase.FAULTED:
                 self.transition_to(RoastPhase.FAULTED)
                 self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
+            self._latched_verdict = SafetyVerdict.FAULT
             return True
         if verdict is SafetyVerdict.RECOVERY:
             await self._apply_fail_safe(evaluation)
@@ -1292,6 +1322,7 @@ class RoastController:
                 self._events.emit(
                     RoastEventKind.RECOVERY_REQUIRED, evaluation.model_dump(mode="json")
                 )
+            self._latched_verdict = SafetyVerdict.RECOVERY
             return True
         # CLAMP/REJECT never arise from telemetry-stage rules.
         return False
@@ -1371,6 +1402,96 @@ class RoastController:
         if pending is None:
             return
         await self._apply_fail_safe(pending)
+
+    async def _maybe_escalate_while_latched(self) -> None:
+        """Upward-only safety escalation from inside a terminal HOLD phase (#206).
+
+        The latch stops the re-emit/re-read NOISE loop, but a ``faulted`` run is
+        also reachable with a still-LIVE MCP (e.g. a stale-telemetry FAULT). If
+        that MCP then reports a hard-ceiling breach, the controller must still
+        AUTO-escalate to the hardware emergency stop — the automatic upward
+        escalation it had before the latch (safety-reviewer carry-forward).
+
+        It re-reads + re-evaluates and acts ONLY when the new verdict is STRICTLY
+        MORE SEVERE than the latched one (per :data:`_TERMINAL_VERDICT_SEVERITY`):
+
+        * **Dead/empty read** — hold silently. A raised read or ``None`` is NOT
+          counted toward a new fault and emits nothing (the dead-MCP anti-spam
+          guarantee: still exactly one FAULT event ever).
+        * **Same or lesser verdict** — do nothing: no re-emit, no re-fire.
+        * **Strictly more severe** (the only actionable case today: FAULT or
+          RECOVERY → EMERGENCY_STOP) — fire the hardware emergency stop ONCE,
+          emit ONE escalation FAULT event, and re-latch at the higher verdict.
+          Already at EMERGENCY_STOP (max severity) ⇒ nothing can out-rank it, so
+          it never re-fires.
+        """
+        latched = self._latched_verdict
+        if latched is None:  # pragma: no cover — only entered while latched
+            return
+        if latched is SafetyVerdict.EMERGENCY_STOP:
+            # Already at the top of the severity order — nothing can escalate it,
+            # so it never re-reads or re-fires.
+            return
+        # A read that raises (dead MCP) or returns no session must hold SILENTLY:
+        # it must not count toward a new fault or re-emit (anti-spam). So this
+        # bypasses _read_telemetry's failure counter deliberately.
+        try:
+            telemetry = await self._reader.read_telemetry()
+        except Exception:
+            return
+        if telemetry is None:
+            return
+        evaluation = self._safety.evaluate_telemetry(
+            phase=self._phase,
+            bean_temp_c=telemetry.bean_temp_c,
+            env_temp_c=telemetry.env_temp_c,
+            t0_confirmed=self._t0_confirmed,
+        )
+        new_severity = _TERMINAL_VERDICT_SEVERITY.get(evaluation.verdict)
+        if new_severity is None or new_severity <= _TERMINAL_VERDICT_SEVERITY[latched]:
+            # ALLOW/CLAMP/REJECT, or a same/lesser terminal verdict: hold, no
+            # re-emit, no re-fire — the latch stays at its current level.
+            return
+        # Strictly more severe → escalate. The only path that reaches here is an
+        # EMERGENCY_STOP out-ranking a FAULT/RECOVERY latch.
+        await self._snapshots.persist_evaluation(evaluation)
+        await self._escalate_to_emergency_stop(evaluation)
+
+    async def _escalate_to_emergency_stop(self, evaluation: SafetyEvaluation) -> None:
+        """Fire the hardware emergency stop ONCE from a latched terminal phase.
+
+        The escalation actuation for :meth:`_maybe_escalate_while_latched`: it
+        executes the hardware ``emergency_stop`` (a real upward escalation beyond
+        the heat-off fail-safe posture), emits exactly ONE escalation FAULT event,
+        and re-latches at ``EMERGENCY_STOP`` so a sustained breach never re-fires.
+        A raising e-stop is surfaced and latches a heat-off retry (same fail-closed
+        handling as the entry path), never crashing the tick.
+
+        Args:
+            evaluation: The hard-ceiling EMERGENCY_STOP evaluation that triggered
+                the escalation (already persisted by the caller).
+        """
+        try:
+            await self._executor.emergency_stop(reason=evaluation.reason)
+        except Exception:
+            self._events.emit(
+                RoastEventKind.COMMAND_FAILED,
+                {"command": "emergency_stop", "reason": evaluation.reason},
+            )
+            self._pending_fail_safe = self._heat_off_evaluation(source_rule="emergency_stop_retry")
+        # An emergency stop lands in FAULTED: escalating from operator_recovery_
+        # required (the lower-severity RECOVERY latch) crosses the universal
+        # `* → faulted` edge; escalating from a FAULT latch is already there.
+        if self._phase is not RoastPhase.FAULTED:
+            self.transition_to(RoastPhase.FAULTED)
+        # Record the escalation as a single FAULT event and raise the latch to the
+        # max verdict so it cannot re-fire on the next identical tick. (Set after
+        # the transition: transition_to out of a terminal phase would otherwise
+        # clear the latched verdict — but FAULTED is itself terminal, so the
+        # leaving-terminal clear does not fire here; setting after is belt-and-
+        # braces against that ordering.)
+        self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
+        self._latched_verdict = SafetyVerdict.EMERGENCY_STOP
 
     async def _run_advisory(
         self, telemetry: RoastTelemetry | None, trigger: AdvisoryTrigger
