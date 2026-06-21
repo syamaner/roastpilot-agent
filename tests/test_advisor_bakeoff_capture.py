@@ -105,8 +105,8 @@ def mock_healthcheck(monkeypatch: pytest.MonkeyPatch) -> None:
 def _roster() -> tuple[Candidate, ...]:
     """A two-slug roster both measured in every phase."""
     return (
-        Candidate(_SLUG_A, Tier.INCUMBENT, bakeoff.PHASE_ORDER),
-        Candidate(_SLUG_B, Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
+        Candidate(_SLUG_A, Tier.BASELINE, bakeoff.PHASE_ORDER),
+        Candidate(_SLUG_B, Tier.CONTROL_CANDIDATE, (RoastPhase.DEVELOPMENT,)),
     )
 
 

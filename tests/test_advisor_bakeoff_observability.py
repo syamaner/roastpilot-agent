@@ -79,8 +79,8 @@ def mock_healthcheck(monkeypatch: pytest.MonkeyPatch) -> None:
 def _roster() -> tuple[Candidate, ...]:
     """A two-slug roster both measured in every phase."""
     return (
-        Candidate(_SLUG_A, Tier.INCUMBENT, bakeoff.PHASE_ORDER),
-        Candidate(_SLUG_B, Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
+        Candidate(_SLUG_A, Tier.BASELINE, bakeoff.PHASE_ORDER),
+        Candidate(_SLUG_B, Tier.CONTROL_CANDIDATE, (RoastPhase.DEVELOPMENT,)),
     )
 
 
@@ -460,7 +460,7 @@ def test_progress_line_cost_uses_configured_rate_not_the_default() -> None:
         bakeoff.TickOutcome(tick=t, decision=None, latency_seconds=0.1, error="x") for t in ticks
     ]
     replay = bakeoff.build_roast_replay(_SLUG_A, "v2", rid, outcomes, ground)
-    cand = Candidate(_SLUG_A, Tier.INCUMBENT, bakeoff.PHASE_ORDER)
+    cand = Candidate(_SLUG_A, Tier.BASELINE, bakeoff.PHASE_ORDER)
 
     # A configured rate deliberately different from DEFAULT_COST_PER_CALL_USD.
     configured = 0.005

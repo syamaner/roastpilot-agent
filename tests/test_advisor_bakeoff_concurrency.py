@@ -78,8 +78,8 @@ def mock_healthcheck(monkeypatch: pytest.MonkeyPatch) -> None:
 def _roster() -> tuple[Candidate, ...]:
     """A two-slug roster both measured in every phase."""
     return (
-        Candidate(_SLUG_A, Tier.INCUMBENT, bakeoff.PHASE_ORDER),
-        Candidate(_SLUG_B, Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
+        Candidate(_SLUG_A, Tier.BASELINE, bakeoff.PHASE_ORDER),
+        Candidate(_SLUG_B, Tier.CONTROL_CANDIDATE, (RoastPhase.DEVELOPMENT,)),
     )
 
 
@@ -588,7 +588,7 @@ async def test_budget_counts_each_retry_attempt(mock_healthcheck: None, tmp_path
     exact — ``accounted_calls == 3 * ticks`` when every tick fails twice then
     succeeds, versus ``ticks`` if retries were (wrongly) uncounted.
     """
-    roster = (Candidate(_SLUG_A, Tier.INCUMBENT, bakeoff.PHASE_ORDER),)
+    roster = (Candidate(_SLUG_A, Tier.BASELINE, bakeoff.PHASE_ORDER),)
     roasts = (bakeoff.REPLAY_ROASTS[0],)
     ticks, _ground = bakeoff.build_ticks(roasts[0], cadence_seconds=60.0)
     n_ticks = len(ticks)
