@@ -1,10 +1,14 @@
-# DRAFT — control teaching system prompt (#274 / D39.1)
+# Control teaching system prompt (#274 / D39.1) — design notes
 
-> **Status: DRAFT for operator review. Not wired in.** This is the *roasting craft*
-> half of #274, written for you to ratify/edit before it becomes the advisor's system
-> message. It is **not** the drop-narrow `v4` user prompt (D34) — `v4` stays the drop
-> lens; this is the stable `system` message that teaches the whole control model and
-> is shared by the post-FC loop (#223) and the pre-FC advisory layer (#228).
+> **Status: RATIFIED and shipped.** The operator resolved the four open questions
+> (issue #274, 20 Jun); the prompt now lives as a versioned artifact at
+> `roastpilot_agent.advisor.control_teaching_prompt()` /
+> `CONTROL_TEACHING_PROMPT_VERSION = "c1"`, with content tests in
+> `tests/test_advisor.py`. This file is kept as the design rationale; the live text
+> is the `c1` entry in `advisor._CONTROL_TEACHING_PROMPTS`. It is a standalone
+> artifact — wiring into the loops is #223 (post-FC) and #228 (pre-FC advisory). It
+> is **not** the drop-narrow `v4` user prompt (D34) — `v4` stays the drop lens; this
+> is the stable `system` message that teaches the whole control model.
 >
 > Two rules shape it: (1) **told == enforced** — every numeric limit comes from the
 > live `AdvisorContext` (sourced from the per-phase `RoastControlPolicy`, #273), so the
@@ -127,14 +131,16 @@ heat 100→60/75/70 + fan-up moves, and the units section forbids the °C/% conf
 remaining risk is post-FC behaviour, which the safety box + the coherence/deadband gate
 (#276) cover; this prompt is the *first* line, not the only one.
 
-## Open questions for the operator
+## Open questions — RESOLVED by the operator (20 Jun), built to these
 
-1. **How prescriptive pre-FC?** This draft says "hold; gentle shaping only if consulted."
-   Do you want it more prescriptive (e.g., name the n8n default "heat 100 / fan 30 to the
-   crack") or kept as principle so the policy/limits carry the numbers?
-2. **Drop wording** — should the drop guidance stay here in general terms (window + below
-   the bitter ceiling, from context) and leave the sharp drop-decision phrasing to the
-   tuned `v4` lens, or fold v4's drop anchor into this system prompt?
-3. **Fan ceiling near FC** — worth an explicit "do not exceed the pre-FC fan ceiling in
-   the approach," or does the per-phase fan ceiling from #273 already cover it cleanly?
-4. **Tone/length** — this is ~40 lines; trim for token cost, or keep the teaching detail?
+1. **Pre-FC prescriptiveness → PRINCIPLE.** The prompt teaches "hold; gentle shaping
+   only if consulted"; the numbers (heat 100 / fan 30) live in #273's
+   `RoastControlPolicy` only — naming them here would re-create the #218 two-copies
+   incoherence.
+2. **Drop wording → GENERAL here.** General terms (window + below the bitter ceiling,
+   from context); the sharp drop-decision phrasing stays in the tuned `v4` lens.
+   v4's drop anchor (and its `196` number) is **not** folded in.
+3. **Fan ceiling near FC → rely on #273.** No explicit number; the per-phase fan
+   ceiling from #273's policy in the context covers it.
+4. **Tone/length → FULL teaching detail kept.** The system message caches (separate
+   from the per-tick context), so the token cost is negligible.

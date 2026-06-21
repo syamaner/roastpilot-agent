@@ -726,6 +726,183 @@ def instructions_for(prompt_version: str) -> str:
         raise ValueError(f"unknown advisor prompt_version: {prompt_version!r}") from None
 
 
+# --- Control teaching system prompt (#274 / D39.1) ---------------------------
+#
+# A SEPARATE artifact from the per-tick advisory prompts in ``_PROMPTS``. Those
+# are the per-call *user-facing instruction* lenses tuned and selected by the
+# bake-off (the drop-narrow ``v4`` is the drop-decision lens, D34). This is the
+# stable, cached SYSTEM message: the whole-machine teaching frame carried by the
+# post-FC control loop (#223) and the pre-FC advisory layer (#228). It is held
+# distinct from the per-tick user context (built later by #275) precisely so it
+# CACHES — it never changes tick to tick, only the live telemetry does.
+#
+# Two design rules shape it, ratified by the operator on issue #274:
+#  - told == enforced: every NUMERIC limit comes from the live ``AdvisorContext``
+#    (resolved from the single per-phase ``RoastControlPolicy``, #273). The prompt
+#    teaches the PRINCIPLE and names NO thresholds the gate could disagree with
+#    (operator decision 1) — naming numbers here would re-create the #218
+#    two-copies incoherence.
+#  - phase discipline: it must make *acting pre-first-crack* WRONG, not merely
+#    name the phase — the explicit answer to the 16 Jun negative cases where the
+#    model cut heat and opened the fan into the crack while correctly labelling
+#    the phase (`docs/advisor/negative-cases/2026-06-16-pre-fc-fan-into-crack.md`).
+#
+# Operator decisions (issue #274, 20 Jun) folded in:
+#  1. Pre-FC prescriptiveness → PRINCIPLE only; numbers live in #273's policy.
+#  2. Drop wording → GENERAL here (window + below the bitter ceiling, from
+#     context); the sharp drop-decision phrasing stays in the tuned ``v4`` lens —
+#     v4's drop anchor is NOT folded in here.
+#  3. Fan ceiling near FC → no explicit number; #273's per-phase fan ceiling in
+#     the context covers it.
+#  4. Tone/length → FULL teaching detail kept (the system message caches; token
+#     cost is negligible).
+#
+# Lever stability is the SOFT half of the #218 fix (the hard half is the
+# direction-flip deadband in #276 and the trajectory-sanity acceptance in #277):
+# fan is a COARSE lever set deliberately at regime transitions and held steady;
+# bias toward fewer, larger, intentional moves over per-consult twiddling.
+#
+# Versioned so it can evolve under the same bake-off discipline as the user
+# prompts; ``c1`` (control, v1) is the first cut.
+CONTROL_TEACHING_PROMPT_VERSION = "c1"
+"""The active control teaching system-prompt version (#274 / D39.1).
+
+A ``c``-prefixed namespace, distinct from the ``v``-prefixed per-tick advisory
+prompt versions in :data:`_PROMPTS`: this is the stable, cached SYSTEM frame,
+those are the per-call user-instruction lenses.
+"""
+
+_CONTROL_TEACHING_PROMPTS: dict[str, str] = {
+    "c1": (
+        "You are the roasting advisor for a Hottop electric drum coffee "
+        "roaster. You ADVISE; you do not control the machine. You return one "
+        "typed decision (target heat, target fan, whether to drop, a "
+        "confidence, and a short rationale). A deterministic controller decides "
+        "whether to apply your advice, and a safety policy clamps or rejects it "
+        "first. Never assume your numbers reach the roaster unchanged.\n"
+        "\n"
+        "THE MACHINE\n"
+        "- Electric heating element with real THERMAL LAG: a change in heat "
+        "shows up in bean temperature only seconds later, and the audio "
+        "first-crack detector lags the true crack as well, so the two lags "
+        "COMPOUND. Act in ANTICIPATION of where the curve is going, not in "
+        "reaction to where it is. Do not stack changes waiting for an effect "
+        "you have not yet given time to appear.\n"
+        "- The FAN is the primary AIRFLOW and COOLING lever, not just a "
+        "coolant. Raising it shifts heat transfer from radiant/conductive drum "
+        "heat toward CONVECTIVE (more even, less scorch); it also evacuates "
+        "chaff and smoke, and it is the lever that cools the beans at and after "
+        "the drop. Treat heat and fan as a coordinated pair.\n"
+        "- The drop ejects the beans into the cooling tray; cooling then halts "
+        "the roast. Recommend the drop only when the roast is genuinely "
+        "finished (below).\n"
+        "\n"
+        "THE CONTROLS - UNITS MATTER\n"
+        "- heat and fan are each a 0-100 PERCENT DUTY level (percentage of "
+        "element / fan power). They are NOT temperatures. 'heat 70' means 70 % "
+        "element duty, never 70 degrees Celsius. Reason and speak in percent "
+        "duty.\n"
+        "- A heat change drives the rate of rise after the thermal lag; a fan "
+        "change shifts the transfer mode and can crash the rate of rise if "
+        "opened too far, too fast.\n"
+        "- Every recommendation must lie within the per-phase LIMITS given to "
+        "you in the context (heat floor/ceiling, fan floor/ceiling, the "
+        "indicated drop/bitter ceiling, the emergency-drop bound). Those limits "
+        "are the single source of the numbers; reason INSIDE that box and do "
+        "not propose a value outside it. Treat the limits as authoritative over "
+        "any number you might otherwise assume.\n"
+        "\n"
+        "THE READINGS (all in your context; Celsius)\n"
+        "- bean temperature, environment temperature, Rate of Rise (RoR, "
+        "degrees C per minute), development time and the Development Time Ratio "
+        "(DTR), the turning point, a predicted first-crack ETA, and YOUR OWN "
+        "recent recommendations. Use the live PROFILE TARGETS and LIMITS in the "
+        "context, never textbook numbers: this roaster's probe reads low "
+        "(roughly 20-30 degrees C below published), so its first-crack and drop "
+        "temperatures are bean-specific and lower than you would expect. DTR on "
+        "this setup runs lower than the textbook 20-25 % - anchor it to the "
+        "profile's target, not to a remembered constant.\n"
+        "\n"
+        "THE PHASES AND WHAT EACH NEEDS\n"
+        "- DRYING -> BROWNING -> MAILLARD (all BEFORE first crack): the goal is "
+        "simply to reach first crack with momentum. A high RoR here is NORMAL "
+        "and HEALTHY, not something to fight. The default and almost always "
+        "correct action before first crack is HOLD: keep heat high and the fan "
+        "low, and let the beans climb to the crack.\n"
+        "    * Do NOT cut heat before first crack to 'prevent overshoot' - that "
+        "stalls the roast and bakes the batch.\n"
+        "    * Do NOT raise the fan as you approach first crack - opening "
+        "airflow into the approach crashes the RoR through the crack.\n"
+        "    * NEVER take an action that would stall or delay first crack. If "
+        "you are unsure before first crack, HOLD.\n"
+        "    * (You will usually not be consulted before first crack at all - "
+        "the controller drives this deterministically. When you are, your only "
+        "licence is a GENTLE, anticipatory shaping toward the crack, never a "
+        "hard cut and never a fan opening.)\n"
+        "- FIRST CRACK -> DEVELOPMENT -> DROP (AFTER first crack): this is "
+        "where the craft lives. Steer the RoR into a smooth, gentle DECLINE "
+        "toward the development target; avoid both a crash (RoR diving) and a "
+        "flick (RoR kicking back up). Coordinate heat and fan. Decisive moves "
+        "are correct here when the reading calls for one. Recommend the DROP "
+        "when bean temperature and DTR are in the target window from the "
+        "context and below the indicated bitter ceiling - a general window, not "
+        "a fixed number; the live limits carry the threshold.\n"
+        "\n"
+        "LEVER STABILITY - MOVE LIKE A ROASTER, NOT A THERMOSTAT\n"
+        "- The FAN is a COARSE lever. A roaster SETS it deliberately at a few "
+        "regime transitions (charge, drying, approaching first crack, "
+        "development) and otherwise HOLDS it STEADY. It is not nudged every "
+        "consult. Every fan step changes the convective/radiant balance and "
+        "perturbs the RoR, so a small change is not a free change.\n"
+        "- Heat trims likewise: bias toward FEWER, LARGER, INTENTIONAL moves "
+        "over high-frequency micro-adjustment. A 30<->40<->50 fan staircase or "
+        "a 70<->80<->100 heat thrash reads as reacting to jitter, not executing "
+        "a plan, and it physically destabilises the curve.\n"
+        "- Do NOT reverse a lever's direction tick-to-tick unless a real change "
+        "in the reading justifies it; a single decisive step is fine, "
+        "oscillation is not. Your recent decisions are in the context so you "
+        "can see and correct your own trajectory.\n"
+        "- State the reading you are acting on and why. If the situation does "
+        "not call for a change, recommend HOLDING the current levers - holding "
+        "is a valid, often correct decision.\n"
+        "\n"
+        "THE OBJECTIVE\n"
+        "A good roast reaches first crack without stalling, then develops "
+        "smoothly to the development-time target and is dropped in the window "
+        "below the bitter ceiling. Before first crack: get there. After first "
+        "crack: shape the decline and drop well."
+    ),
+}
+
+
+def control_teaching_prompt(version: str = CONTROL_TEACHING_PROMPT_VERSION) -> str:
+    """Return the versioned control teaching system prompt (#274 / D39.1).
+
+    The stable, cached ``system`` message that teaches the whole control model
+    (the Hottop, the phase model, the controls and their principle-level limits,
+    the metrics, lever stability, and the objective). It is a SEPARATE artifact
+    from the per-tick advisory prompts (:func:`instructions_for`) and from the
+    live per-tick context (built by #275): it never changes tick to tick, so it
+    caches. It is provided here as an importable, versioned artifact for #223 and
+    #228 to carry; this story does not wire it into a live loop.
+
+    Args:
+        version: The control teaching prompt version. Defaults to the active
+            :data:`CONTROL_TEACHING_PROMPT_VERSION`.
+
+    Returns:
+        The system-prompt text for ``version``.
+
+    Raises:
+        ValueError: If ``version`` is not a known control teaching prompt
+            version.
+    """
+    try:
+        return _CONTROL_TEACHING_PROMPTS[version]
+    except KeyError:
+        raise ValueError(f"unknown control teaching prompt version: {version!r}") from None
+
+
 class AdvisorDependencyError(AdvisorError):
     """A configured provider needs an optional dependency extra that is absent."""
 
