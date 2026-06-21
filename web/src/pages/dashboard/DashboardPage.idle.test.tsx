@@ -35,12 +35,24 @@ const healthState = {
   isSuccess: false,
 };
 
+// Stub the bean-profile library hooks too (#303): un-stubbed they pass through to
+// the real impl and fire a real (failing) fetch in jsdom that only "passes" by
+// timing luck. The list returns the fixtures so the idle Start form's dropdown is
+// wired with real data; the mutations are no-op resolved mutateAsync stubs. The
+// stub is defined inside the (hoisted) factory so it isn't referenced before init.
 vi.mock("@/hooks/queries", async () => {
   const actual = await vi.importActual<typeof import("@/hooks/queries")>("@/hooks/queries");
+  const { FIXTURE_BEAN_PROFILES } =
+    await vi.importActual<typeof import("./beanProfileFixture")>("./beanProfileFixture");
+  const noopMutation = () => ({ mutateAsync: vi.fn(async () => undefined) });
   return {
     ...actual,
     useHealth: () => healthState,
     useRoast: () => ({ data: undefined }),
+    useBeanProfiles: () => ({ data: { profiles: FIXTURE_BEAN_PROFILES }, isLoading: false }),
+    useCreateBeanProfile: noopMutation,
+    useUpdateBeanProfile: noopMutation,
+    useDeleteBeanProfile: noopMutation,
   };
 });
 
@@ -120,6 +132,18 @@ describe("DashboardPage idle/active wiring (#158)", () => {
     // The idle header shows a neutral label, not the "connecting" stream indicator
     // (there is no run to connect to) — #160 review item 3.
     expect(screen.getByTestId("idle-indicator")).toHaveTextContent(/no active roast/i);
+  });
+
+  it("wires the bean-profile library into the idle Start form (#303)", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: null };
+    renderPage();
+    // The page passes useBeanProfiles' list (+ the CRUD mutations) to StartRoastForm,
+    // so the saved-profile dropdown renders with the library — incl. the Koke seed.
+    expect(screen.getByTestId("bean-profile-picker")).toBeInTheDocument();
+    expect(screen.getByTestId("bean-profile-select")).toHaveTextContent(
+      "Ethiopia Yirgacheffe Koke (Natural)",
+    );
   });
 
   it("shows the live dashboard (not the form) when a run is active", () => {

@@ -213,6 +213,63 @@ export interface RoastProfile {
   target_development_percent: number;
 }
 
+// --- Bean-profile library (#303, models.BeanProfile / BeanProfileInput /
+// BeanProfileList) — the Start-Roast dropdown's saved-profile contract (D45).
+//
+// A `BeanProfile` is every reusable `RoastProfile` field EXCEPT the per-roast
+// `bean_weight_grams`, PLUS a server-owned `id` + `created_at` / `updated_at`
+// timestamps and a `default_bean_weight_grams` that pre-fills (but does not fix)
+// each roast's charge weight. `BeanProfileInput` is the POST/PUT body (the same
+// reusable fields + `default_bean_weight_grams`, WITHOUT the server-owned id /
+// timestamps). All temperatures are Celsius. Editing a saved profile only affects
+// FUTURE roasts — a started roast freezes its own `RoastProfile` snapshot.
+
+/** The reusable saved-profile fields shared by `BeanProfile` and
+ *  `BeanProfileInput` — every `RoastProfile` field except the per-roast
+ *  `bean_weight_grams`, plus the template's `default_bean_weight_grams`. */
+export interface BeanProfileFields {
+  name: string;
+  bean_origin: string;
+  bean_varietal: string | null;
+  country?: string | null;
+  farm?: string | null;
+  description?: string | null;
+  bean_species?: BeanSpecies | null;
+  is_blend?: boolean;
+  processing?: ProcessingMethod | null;
+  altitude_m?: number | null;
+  charge_guidance_min_c: number;
+  charge_guidance_max_c: number;
+  initial_heat_percent: number;
+  initial_fan_percent: number;
+  target_drop_temp_c: number;
+  target_development_percent: number;
+  /** Pre-fills (but does not fix) each roast's charge weight; adjustable per roast. */
+  default_bean_weight_grams: number;
+}
+
+/** `POST` / `PUT /api/bean-profiles` request body (models.BeanProfileInput). */
+export type BeanProfileInput = BeanProfileFields;
+
+/** A saved bean-profile library entry (models.BeanProfile) — the create/update/get
+ *  response and the dropdown's row. Adds the server-owned id + timestamps. */
+export interface BeanProfile extends BeanProfileFields {
+  id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** `GET /api/bean-profiles` envelope (models.BeanProfileList). */
+export interface BeanProfileList {
+  profiles: BeanProfile[];
+}
+
+/** `DELETE /api/bean-profiles/{id}` response (api.delete_bean_profile). */
+export interface BeanProfileDeleteResult {
+  id: string;
+  result: "archived";
+}
+
 export interface LogManifest {
   log_dir: string;
   jsonl_path: string;
