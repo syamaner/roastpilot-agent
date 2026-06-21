@@ -527,11 +527,25 @@ class SafetyLimits(BaseModel):
         return self
 
 
+#: The bare console-script name of the coffee-roaster-mcp child (the default
+#: ``MCPConfig.command``). It is a *constant*, not just a Field default, so the
+#: spawn-hardening in ``mcp_client.build_server_parameters`` can recognise the
+#: "operator left it at the default" case and resolve the script to the agent's
+#: OWN environment (next to ``sys.executable``) rather than letting a bare-PATH
+#: lookup pick up a foreign install. See that method for the why (a homebrew
+#: coffee-roaster-mcp with stale, mismatched deps segfaulted a live roast).
+DEFAULT_MCP_COMMAND = "coffee-roaster-mcp"
+
+
 class MCPConfig(BaseModel):
     """coffee-roaster-mcp child-process settings (D6, E5-S2).
 
     - ``command`` + the fixed ``serve`` positional form the spawn argv
       (`coffee-roaster-mcp serve`, matching server.json packageArguments).
+      When left at the ``DEFAULT_MCP_COMMAND`` default, the client resolves it
+      to the in-venv console script before spawning (see
+      ``mcp_client.build_server_parameters``); an explicit override is spawned
+      verbatim.
     - ``call_timeout_seconds`` 5.0: every MCP call — including
       ``emergency_stop`` — must raise rather than stall the tick loop
       (safety-reviewer carry-forward, E4-S2). Five seconds ≈ five stalled
@@ -543,7 +557,7 @@ class MCPConfig(BaseModel):
       slowness without masking a wedged child.
     """
 
-    command: str = Field(default="coffee-roaster-mcp", min_length=1)
+    command: str = Field(default=DEFAULT_MCP_COMMAND, min_length=1)
     call_timeout_seconds: float = Field(default=5.0, gt=0)
     startup_timeout_seconds: float = Field(default=15.0, gt=0)
     #: Environment overrides for the spawned child, merged over the agent's own

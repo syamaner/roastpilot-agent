@@ -25,16 +25,19 @@ passed through from MCP, never recomputed.
 import asyncio
 import json
 import os
+import shutil
+import sys
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
+from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, ConfigDict
 
-from roastpilot_agent.config import MCPConfig
+from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
 from roastpilot_agent.models import MicStatus, RoastTelemetry
 
 # --- vocabulary mirrored from coffee_roaster_mcp (session.py / config.py) ---
@@ -495,6 +498,58 @@ SessionFactory = Callable[
 ]
 
 
+def resolve_mcp_command(command: str) -> str:
+    """Resolve the MCP child command, pinning the default to the agent's own env.
+
+    The advisor never controls hardware, but the *binary the controller spawns*
+    is itself a safety surface: it carries the pinned ``coffee-roaster-mcp``
+    (and its pinned pydantic / pydantic_core / mcp stack) that the safety and
+    telemetry paths are validated against. In production a bare-PATH spawn of
+    ``coffee-roaster-mcp`` (the agent was started outside its activated venv)
+    resolved to ``/opt/homebrew/bin/coffee-roaster-mcp`` — a *foreign* homebrew
+    Python carrying a STALE, mismatched dependency set (pydantic 2.12.3 /
+    pydantic_core 2.41.4, mcp 1.19.0 instead of the agent's 2.13.4 / 2.46.4),
+    and that stale native stack is exactly where the end-of-roast audio-teardown
+    segfault hit. So when the command is left at the default, we never trust a
+    bare-PATH lookup to find the right one: we resolve it to the console script
+    installed alongside the running interpreter (``sys.executable``), which is
+    guaranteed to be the in-venv, pinned install.
+
+    Resolution order for the default command:
+
+    1. The console script next to ``sys.executable`` (``<py-dir>/<name>`` plus
+       the platform's executable suffix on Windows), if it exists — the pinned
+       in-venv install.
+    2. A ``PATH`` lookup via :func:`shutil.which` — a best-effort fallback when
+       the script is not co-located with the interpreter (e.g. a pipx/uv shim
+       layout) but is still reachable.
+    3. The bare name unchanged — let the transport's own spawn report failure.
+
+    An explicit, non-default ``command`` (an operator/config override) is
+    ALWAYS returned verbatim: the operator has deliberately chosen a binary and
+    that choice must win, including an intentional homebrew or system path.
+
+    Args:
+        command: The configured ``MCPConfig.command``.
+
+    Returns:
+        The command to spawn — an absolute in-venv path when the default is
+        resolvable, otherwise an unchanged string.
+    """
+    if command != DEFAULT_MCP_COMMAND:
+        # Explicit operator/config override — never second-guess it.
+        return command
+    interpreter_dir = Path(sys.executable).parent
+    suffix = Path(sys.executable).suffix  # ".exe" on Windows, "" elsewhere
+    candidate = interpreter_dir / f"{DEFAULT_MCP_COMMAND}{suffix}"
+    if candidate.exists():
+        return str(candidate)
+    on_path = shutil.which(DEFAULT_MCP_COMMAND)
+    if on_path is not None:
+        return on_path
+    return DEFAULT_MCP_COMMAND
+
+
 @asynccontextmanager
 async def _spawn_stdio_session(
     params: StdioServerParameters,
@@ -574,12 +629,19 @@ class MCPServerProcess:
     def build_server_parameters(self) -> StdioServerParameters:
         """The spawn argv: ``<command> serve`` (server.json packageArguments).
 
+        The default command is resolved to the in-venv console script before
+        spawning (see :func:`resolve_mcp_command`) so a bare-PATH lookup can
+        never silently shadow the pinned install with a foreign one — the
+        homebrew-stale-deps segfault trap. An explicit operator override is
+        passed through verbatim.
+
         Config ``env`` overrides are merged over the agent's own environment so
         the child keeps ``PATH``/``HOME`` while gaining the requested selectors
         (E9-S2 sets the mock-driver vars). With no overrides, ``env`` stays
         ``None`` and the transport supplies its default safe environment."""
         env = {**os.environ, **self._config.env} if self._config.env else None
-        return StdioServerParameters(command=self._config.command, args=["serve"], env=env)
+        command = resolve_mcp_command(self._config.command)
+        return StdioServerParameters(command=command, args=["serve"], env=env)
 
     @property
     def running(self) -> bool:
