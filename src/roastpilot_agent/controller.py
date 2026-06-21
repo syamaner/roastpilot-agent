@@ -34,7 +34,7 @@ from roastpilot_agent.coherence import (
     evaluate_lever_coherence,
 )
 from roastpilot_agent.config import ControllerConfig
-from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy
+from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy, TrimSignal
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
     RoastCommand,
@@ -1078,22 +1078,27 @@ class RoastController:
           before a run is loaded.
         * **Idempotent**: it writes only when the current heat/fan differ from the
           target, so after the first pre-FC write each later tick is a no-op — no
-          rate-limit churn, no redundant serial writes. The constant target means
-          steady high heat / low fan; the heat floor == the target, so even a
-          spurious lower value would be clamped back up (the #218 70→40→20→0 crash
-          is structurally impossible pre-FC).
+          rate-limit churn, no redundant serial writes. The flat-floor target is
+          steady high heat / low fan; the heat floor == the active target, so even
+          a spurious lower value is clamped back up (the #218 70→40→20→0 crash is
+          structurally impossible pre-FC).
+        * **Anticipatory heat trim (#327)**: in the late-Maillard → FC window
+          (keyed on the live bean temperature + the #229 predicted-FC ETA via
+          :meth:`_trim_signal`) the policy lowers the deterministic heat target to
+          a moderate trim level so the env cools and RoR bends into FC before the
+          drop ceiling. The trim NEVER raises heat above the floor and fails closed
+          to the flat floor whenever the FC-ETA is unknown / the window is shut —
+          the floor stays the always-on guarantee FC still arrives (§8.4).
 
         Args:
-            telemetry: The reading this tick consumed. Unused for the lever value
-                (the target is deterministic, not telemetry-derived in M1 — the
-                telemetry-driven late-Maillard trim is deferred to D36/#228), but
-                taken so the signature matches the tick-pipeline steps and a future
-                telemetry-aware refinement needs no plumbing change.
+            telemetry: The reading this tick consumed. Its bean temperature keys
+                the trim window's bean-temp guard (the FC-ETA is derived from the
+                accumulated curve); ``None`` (a failed read) leaves the window
+                keyed on the last curve sample.
         """
-        del telemetry  # deterministic target is not telemetry-derived in M1 (#222)
         if self._profile is None:
             return
-        box = self._control_limits()
+        box = self._control_limits(trim_signal=self._trim_signal(telemetry))
         if not box.has_deterministic_target:
             return
         # Validated all-or-nothing on PhaseControlLimits: a deterministic target
@@ -2281,7 +2286,7 @@ class RoastController:
         self._advisory_paused = False
         self._events.emit(RoastEventKind.ADVISORY, {"advisory_paused": False})
 
-    def _control_limits(self) -> PhaseControlLimits:
+    def _control_limits(self, *, trim_signal: TrimSignal | None = None) -> PhaseControlLimits:
         """Resolve the current phase's control box from the single source (#273).
 
         Builds the :class:`RoastControlPolicy` from the safety policy's *own*
@@ -2294,12 +2299,22 @@ class RoastController:
         (enforced), so within a tick the two read the same object and can never
         carry different numbers (D35 §8.3).
 
+        Args:
+            trim_signal: The live bean-temp + FC-ETA for the deterministic
+                anticipatory heat trim (#327), or ``None`` to fail closed to the
+                flat #222 floor. Only the deterministic pre-FC lever path supplies
+                one; the advisor-consult and run-start callers pass ``None`` (the
+                trim governs the controller-actuated pre-FC heat, not the post-FC
+                advisor box).
+
         Returns:
             The phase-resolved control box for the controller's current phase.
         """
-        return self._policy_limits_for(self._phase)
+        return self._policy_limits_for(self._phase, trim_signal=trim_signal)
 
-    def _policy_limits_for(self, phase: RoastPhase) -> PhaseControlLimits:
+    def _policy_limits_for(
+        self, phase: RoastPhase, *, trim_signal: TrimSignal | None = None
+    ) -> PhaseControlLimits:
         """Resolve the single-source control box for an arbitrary ``phase``.
 
         Builds the :class:`RoastControlPolicy` from the safety policy's *own*
@@ -2311,6 +2326,8 @@ class RoastController:
 
         Args:
             phase: The agent phase to resolve the control box for.
+            trim_signal: The live bean-temp + FC-ETA for the anticipatory heat
+                trim (#327), or ``None`` to fail closed to the flat floor.
 
         Returns:
             The phase-resolved :class:`PhaseControlLimits` box.
@@ -2320,7 +2337,39 @@ class RoastController:
             self._profile,
             pre_fc_levers=self._config.pre_first_crack_levers,
         )
-        return policy.limits_for(phase)
+        return policy.limits_for(phase, trim_signal=trim_signal)
+
+    def _trim_signal(self, telemetry: RoastTelemetry | None) -> TrimSignal | None:
+        """Build the live anticipatory-trim signal for this tick, or ``None`` (#327).
+
+        Pairs the freshest bean temperature with the #229 predicted-FC ETA so
+        :meth:`RoastControlPolicy.limits_for` can decide whether the late-Maillard
+        trim window is open. The bean temperature is this tick's ``telemetry``
+        reading when present, else the last accumulated curve sample (the FC-ETA
+        is always derived from the curve window). Returns ``None`` — fail closed to
+        the flat floor — only when neither a live read nor any curve sample exists
+        (the very first ticks of a run). A present signal with an unknown (``None``)
+        FC-ETA is equally safe: the policy fails the trim closed on it.
+
+        Args:
+            telemetry: This tick's reading, or ``None`` on a failed/sessionless
+                read (the window then keys on the last curve sample).
+
+        Returns:
+            The :class:`TrimSignal` for this tick, or ``None`` when no bean
+            temperature is available at all.
+        """
+        if telemetry is not None:
+            bean_temp_c = telemetry.bean_temp_c
+        else:
+            window = self._history.curve_window()
+            if not window:
+                return None
+            bean_temp_c = window[-1].bean_temp_c
+        return TrimSignal(
+            bean_temp_c=bean_temp_c,
+            first_crack_eta_seconds=self._first_crack_eta_seconds(),
+        )
 
     def _record_curve_history(self, telemetry: RoastTelemetry | None) -> None:
         """Record this tick's curve sample and arm curve milestones (#275).

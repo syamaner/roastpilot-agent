@@ -9,13 +9,17 @@ that equality and pin that #273 introduces no second copy and changes none of th
 six safety verdicts.
 """
 
+import json
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
 from roastpilot_agent.advisor import AdvisorContext
-from roastpilot_agent.config import PreFirstCrackLevers, SafetyLimits
-from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy
+from roastpilot_agent.config import LateMaillardTrim, PreFirstCrackLevers, SafetyLimits
+from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy, TrimSignal
 from roastpilot_agent.models import RoastPhase, RoastProfile
+from roastpilot_agent.roast_history import RoastCurveSample, estimate_first_crack_eta_seconds
 from roastpilot_agent.safety import SafetyPolicy, SafetyVerdict
 
 _PROFILE = RoastProfile(
@@ -215,6 +219,114 @@ def test_safety_limits_rejects_inverted_drop_ceilings() -> None:
         SafetyLimits(bitter_ceiling_temp_c=200.0, emergency_drop_temp_c=198.0)
 
 
+# --- Anticipatory late-Maillard heat trim (#327) -----------------------------
+
+# A trim signal sized to OPEN the default window: bean above the 155 °C floor and
+# a positive FC-ETA (30 s) at/below the 60 s window.
+_TRIM_OPEN = TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=30.0)
+
+
+@pytest.mark.parametrize("phase", _PRE_FC_PHASES)
+def test_trim_lowers_heat_floor_and_target_in_window(phase: RoastPhase) -> None:
+    """With the late-Maillard window open the pre-FC heat floor AND target drop to
+    the configured trim level (#327) — a moderate reduction from the flat 100 floor,
+    not a crash. Fan is unchanged (the plan's "fan controlled", not raised)."""
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE)
+    box = policy.limits_for(phase, trim_signal=_TRIM_OPEN)
+    assert box.heat_target_percent == 65  # the default trim level (~60–70 %)
+    assert box.heat_floor_percent == 65  # floor pinned to the trim — no cut below
+    assert box.heat_ceiling_percent == 100
+    # Fan stays at the flat-floor target/box — the trim never raises fan.
+    assert box.fan_target_percent == 30
+    assert box.fan_floor_percent == 0
+    assert box.fan_ceiling_percent == 30
+
+
+def test_trim_never_exceeds_the_flat_floor_heat() -> None:
+    """The trim is a strict reduction: the trimmed heat target sits at or below the
+    flat-floor heat (#327), so the floor never rises and FC is never delayed."""
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE)
+    flat = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    trimmed = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=_TRIM_OPEN)
+    assert trimmed.heat_target_percent is not None
+    assert flat.heat_target_percent is not None
+    assert trimmed.heat_target_percent <= flat.heat_target_percent
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [
+        None,  # no signal at all → fail closed
+        TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=None),  # FC-ETA unknown
+        TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=120.0),  # FC too far out
+        TrimSignal(bean_temp_c=140.0, first_crack_eta_seconds=30.0),  # bean below floor
+        TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=0.0),  # non-positive ETA
+    ],
+)
+def test_trim_fails_closed_to_flat_floor(signal: TrimSignal | None) -> None:
+    """Outside the window — no signal, unknown/too-far/non-positive FC-ETA, or a
+    bean below the late-Maillard floor — the policy resolves the flat #222 floor
+    (heat 100 / fan 30), the always-on guarantee FC still arrives (§8.4)."""
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE)
+    box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=signal)
+    assert box.heat_target_percent == 100
+    assert box.heat_floor_percent == 100
+    assert box.fan_target_percent == 30
+
+
+def test_trim_disabled_in_config_keeps_flat_floor_even_in_window() -> None:
+    """``enabled=False`` reverts to the pure #222 flat floor with no trim window —
+    even a signal that would otherwise open the window resolves heat 100 (#327)."""
+    levers = PreFirstCrackLevers(late_maillard_trim=LateMaillardTrim(enabled=False))
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE, pre_fc_levers=levers)
+    box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=_TRIM_OPEN)
+    assert box.heat_target_percent == 100
+    assert box.heat_floor_percent == 100
+
+
+def test_trim_ignored_outside_pre_fc_phases() -> None:
+    """The trim signal only affects the pre-FC phases; a non-pre-FC phase resolves
+    the full 0–100 box with no deterministic target regardless of the signal."""
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE)
+    box = policy.limits_for(RoastPhase.DEVELOPMENT, trim_signal=_TRIM_OPEN)
+    assert not box.has_deterministic_target
+    assert box.heat_floor_percent == 0
+    assert box.heat_ceiling_percent == 100
+
+
+def test_trim_parameters_are_config_driven_not_hardcoded() -> None:
+    """The trim level + window are PARAMETERS (plan §8.3 single-source): a custom
+    LateMaillardTrim resolves into the box, not the roast-3-sized defaults."""
+    levers = PreFirstCrackLevers(
+        late_maillard_trim=LateMaillardTrim(
+            trim_heat_percent=70, window_fc_eta_seconds=45.0, min_bean_temp_c=150.0
+        )
+    )
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE, pre_fc_levers=levers)
+    # Bean 152 (above the custom 150 floor), ETA 40 s (inside the custom 45 s window).
+    signal = TrimSignal(bean_temp_c=152.0, first_crack_eta_seconds=40.0)
+    box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=signal)
+    assert box.heat_target_percent == 70
+    assert box.heat_floor_percent == 70
+
+
+def test_levers_reject_trim_heat_above_flat_floor() -> None:
+    """PreFirstCrackLevers pins trim_heat_percent <= heat_target_percent (#327):
+    a trim heat above the flat floor would let the trim RAISE heat, which could
+    delay FC — the trim must only ever reduce heat."""
+    with pytest.raises(ValidationError):
+        PreFirstCrackLevers(
+            heat_target_percent=80,
+            late_maillard_trim=LateMaillardTrim(trim_heat_percent=90),
+        )
+    # A trim heat ABOVE a learned-lower flat floor is rejected too.
+    with pytest.raises(ValidationError):
+        PreFirstCrackLevers(
+            heat_target_percent=60,
+            late_maillard_trim=LateMaillardTrim(trim_heat_percent=70),
+        )
+
+
 def test_safety_policy_exposes_its_own_limits() -> None:
     """The gate exposes the SAME limits object the policy must build from (#273)."""
     limits = SafetyLimits()
@@ -340,3 +452,63 @@ def test_rate_limit_reject_with_bounds() -> None:
         bounds=box,
     )
     assert evaluation.verdict is SafetyVerdict.REJECT
+
+
+# --- #327 replay validation against a REAL Hottop roast curve ----------------
+
+# The committed 7 Jun 2026 live-roast fixture (a real Hottop roast reaching the
+# FC band), used to validate the trim engages in late Maillard on real telemetry.
+# The roast-3 (21 Jun) trace lives only in the operator's local SQLite DB (DBs are
+# git-ignored, AGENTS.md §Rules), so live-trace replay against roast 3 itself is
+# pending the operator's export; this real-curve replay is the in-repo proxy.
+_LIVE_ROAST = (
+    Path(__file__).parent / "fixtures" / "live-roast-2026-06-07" / "session-2" / "roast.jsonl"
+)
+
+
+def _live_curve() -> list[RoastCurveSample]:
+    """Load the 7 Jun session-2 telemetry as a pre-FC curve (charge-referenced)."""
+    rows = [
+        json.loads(line)
+        for line in _LIVE_ROAST.read_text().splitlines()
+        if line.strip() and "bean_temp_c" in line
+    ]
+    t0 = rows[0]["monotonic_seconds"]
+    return [
+        RoastCurveSample(
+            elapsed_since_charge_seconds=r["monotonic_seconds"] - t0,
+            bean_temp_c=r["bean_temp_c"],
+            env_temp_c=r["env_temp_c"],
+            heat_percent=r.get("heat_level_percent") or 0,
+            fan_percent=r.get("fan_level_percent") or 0,
+            bean_ror_c_per_min=None,
+            env_ror_c_per_min=None,
+        )
+        for r in rows
+    ]
+
+
+def test_trim_engages_in_late_maillard_on_a_real_roast_curve() -> None:
+    """#327 replay validation: stepping the policy + #229 FC-ETA estimator over a
+    REAL Hottop roast curve, the anticipatory trim engages in the late-Maillard
+    band (bean ~155–176 °C, FC predicted within the window) and NEVER below the
+    155 °C late-Maillard floor — exactly the plan §3 window. This is the in-repo
+    proxy for the roast-3 trajectory the trim exists to fix (the flat-100 floor
+    drove the bean 8 °C over the ceiling); the trimmed heat there is 65 %, not the
+    flat 100, so the env runs cooler into FC."""
+    curve = _live_curve()
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE)
+    engaged_beans: list[float] = []
+    for i in range(5, len(curve)):
+        window = curve[max(0, i - 60) : i + 1]
+        eta = estimate_first_crack_eta_seconds(window, fc_target_bean_temp_c=176.0)
+        signal = TrimSignal(bean_temp_c=curve[i].bean_temp_c, first_crack_eta_seconds=eta)
+        box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=signal)
+        if box.heat_target_percent == 65:  # the trim level (not the flat 100 floor)
+            engaged_beans.append(curve[i].bean_temp_c)
+    # The trim DID engage on this real curve (the window opened in late Maillard).
+    assert engaged_beans, "trim never engaged on the real roast curve"
+    # It only ever engaged in the late-Maillard band — never below the 155 °C floor,
+    # never above the FC target the estimator stops projecting past.
+    assert min(engaged_beans) >= 155.0
+    assert max(engaged_beans) <= 176.0

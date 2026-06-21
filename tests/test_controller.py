@@ -22,7 +22,12 @@ from roastpilot_agent.advisor import (
     RoastDecision,
 )
 from roastpilot_agent.coherence import LeverDirection
-from roastpilot_agent.config import ControllerConfig, SafetyLimits
+from roastpilot_agent.config import (
+    ControllerConfig,
+    LateMaillardTrim,
+    PreFirstCrackLevers,
+    SafetyLimits,
+)
 from roastpilot_agent.control_policy import PhaseControlLimits
 from roastpilot_agent.controller import (
     TERMINAL_LATCH_PHASES,
@@ -827,6 +832,134 @@ async def test_operator_resume_into_pre_fc_re_engages_deterministic_levers(
     # The next tick re-engages the deterministic lever (the resumed run progresses).
     await harness.controller.tick()
     assert harness.executor.targets == [(100, 30)]
+
+
+# --- Anticipatory late-Maillard heat trim (#327) -----------------------------
+
+
+async def _charge_into_pre_fc(harness: Harness) -> None:
+    """Drive the harness from PREHEATING into ROASTING_PRE_FIRST_CRACK via a
+    debounced T0 so the charge clock is stamped (the curve only accumulates after
+    charge, and the FC-ETA the trim keys on needs that curve)."""
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING
+        harness.controller.transition_to(step)
+    t0 = reading(bean=150.0, t0_detected=True, bean_ror_c_per_min=20.0)
+    harness.reader.readings = [t0]
+    for _ in range(3):  # three consecutive T0 ticks debounce → pre-FC
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    harness.log.clear()
+    harness.events.events.clear()
+
+
+@pytest.mark.asyncio
+async def test_trim_engages_in_late_maillard_window_through_safety_path() -> None:
+    """#327: in the late-Maillard window (bean above the floor, FC-ETA inside the
+    window) the controller deterministically trims heat to 65 % — NOT the flat 100
+    floor — and the trimmed write passes the normal lever→safety path (an
+    evaluation is persisted before the set_targets). The advisor is never consulted
+    (pre-FC stays deterministic)."""
+    advisor = FakeAdvisor([decision(heat=40, fan=70)])
+    harness = make_harness(advisor=advisor)
+    await _charge_into_pre_fc(harness)
+    # A warming ramp: bean +0.5 °C/s, so from 165 °C the FC-ETA to the 176 °C FC
+    # target is ~22 s (inside the 60 s window) and the bean is above the 155 °C
+    # late-Maillard floor. Five samples build the slope the estimator needs.
+    bean = 162.0
+    for _ in range(6):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=30.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean += 0.5
+    # The last tick trimmed heat to 65 (not the flat 100 floor); fan held at 30.
+    assert harness.controller.snapshot().current_heat == 65
+    assert harness.controller.snapshot().current_fan == 30
+    assert harness.executor.targets[-1] == (65, 30)
+    # Through the safety gate (an evaluation persisted for the trimmed write).
+    assert "all_clear" in [e.rule for e in harness.sink.evaluations]
+    # Advisor never ran pre-FC — the trim is controller-owned, deterministic.
+    assert advisor.contexts == []
+
+
+@pytest.mark.asyncio
+async def test_early_maillard_holds_the_flat_floor_before_the_window() -> None:
+    """#327: before the window opens (early Maillard — the bean is still well below
+    the late-Maillard floor, even with a warming slope), heat holds at the flat 100
+    floor. The trim engages only once the bean climbs into the late-Maillard band."""
+    harness = make_harness()
+    await _charge_into_pre_fc(harness)
+    # A warming ramp that stays BELOW the 155 °C floor: FC-ETA may resolve but the
+    # bean-temp guard keeps the window shut → the flat floor holds.
+    bean = 140.0
+    for _ in range(6):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=30.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean += 0.5
+    assert harness.controller.snapshot().current_heat == 100  # flat floor, not trimmed
+    assert harness.controller.snapshot().current_fan == 30
+
+
+@pytest.mark.asyncio
+async def test_unknown_fc_eta_fails_closed_to_flat_floor() -> None:
+    """#327 fail-closed: with no warming slope the FC-ETA is unknown (the estimator
+    returns None), so even a hot bean (above the late-Maillard floor) holds the flat
+    100 floor — the always-on guarantee FC still arrives (§8.4)."""
+    harness = make_harness()
+    await _charge_into_pre_fc(harness)
+    # A FLAT bean above the floor: bean ≥ 155 but a zero slope ⇒ no FC-ETA. Enough
+    # ticks that the estimator's recent-sample window is entirely flat (the earlier
+    # charge ramp has aged out), so the slope is non-positive and the ETA is None.
+    for _ in range(10):
+        harness.reader.readings = [reading(bean=165.0, bean_ror_c_per_min=0.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.snapshot().current_heat == 100  # fail closed to the floor
+    assert harness.controller.snapshot().current_fan == 30
+
+
+@pytest.mark.asyncio
+async def test_trim_signal_keys_on_last_curve_sample_when_read_fails() -> None:
+    """#327: on a tolerated FAILED read (telemetry None) the trim signal keys the
+    bean-temp guard on the last accumulated curve sample (the FC-ETA is always
+    curve-derived), so a transient read miss does not collapse the signal — it is
+    ``None`` only when no curve sample exists at all."""
+    harness = make_harness()
+    await _charge_into_pre_fc(harness)
+    # Build a warming curve into the window, then read the signal with a failed read.
+    bean = 162.0
+    for _ in range(6):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=30.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean += 0.5
+    signal = harness.controller._trim_signal(None)  # pyright: ignore[reportPrivateUsage]
+    assert signal is not None
+    # Keyed on the last curve sample's bean temp (the prior tick's reading).
+    assert signal.bean_temp_c == pytest.approx(bean - 0.5)
+
+
+@pytest.mark.asyncio
+async def test_trim_disabled_holds_flat_floor_in_window() -> None:
+    """#327: with the trim disabled in config the controller holds the flat 100
+    floor even inside what would be the late-Maillard window — the pure #222
+    behaviour, the explicit off-switch."""
+    config = ControllerConfig(
+        pre_first_crack_levers=PreFirstCrackLevers(
+            late_maillard_trim=LateMaillardTrim(enabled=False)
+        )
+    )
+    harness = make_harness(config=config)
+    await _charge_into_pre_fc(harness)
+    bean = 162.0
+    for _ in range(6):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=30.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean += 0.5
+    assert harness.controller.snapshot().current_heat == 100  # trim off → flat floor
 
 
 @pytest.mark.asyncio
