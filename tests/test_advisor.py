@@ -751,15 +751,58 @@ def test_v3_prompt_has_explicit_per_stage_sections() -> None:
     assert "never control hardware" in v3
 
 
-def test_c1_is_the_default_prompt_version() -> None:
-    """c1 (the #274 control teaching SYSTEM frame) is the shipped default, wired
-    live for the post-FC control loop (#277). It resolves to the control teaching
-    prompt and is distinct from the v* per-tick lenses, which stay selectable."""
-    assert AdvisorConfig().prompt_version == "c1"
+def test_c2_is_the_default_prompt_version() -> None:
+    """c2 (the #274 control teaching SYSTEM frame + the roast-2 development-stretch
+    section) is the shipped default, wired live for the post-FC control loop. It
+    resolves to the control teaching prompt and is distinct from the v* per-tick
+    lenses; c1 stays selectable for an A/B."""
+    assert AdvisorConfig().prompt_version == "c2"
+    assert instructions_for("c2") == control_teaching_prompt("c2")
+    # c1 is kept intact and selectable (prompts are versioned, #274).
     assert instructions_for("c1") == control_teaching_prompt("c1")
-    assert instructions_for("c1") != instructions_for("v4")
+    assert instructions_for("c1") != instructions_for("c2")
+    assert instructions_for("c2") != instructions_for("v4")
     assert instructions_for("v4") != instructions_for("v2")
     assert instructions_for("v3") != instructions_for("v2")
+
+
+def test_c2_extends_c1_with_post_fc_development_stretch() -> None:
+    """c2 is c1 PLUS a post-FC stretch section, with all of c1's grounding kept.
+
+    Roast 2 (run c3b84625): the advisor rode a mid heat level post-FC so the bean
+    raced to the drop ceiling under-developed. c2 adds the teaching to cut heat
+    aggressively at/after first crack to stretch development toward target, never
+    ride a mid level, and never overshoot the drop target — while keeping c1's
+    told==enforced grounding (uses context dev% verbatim / never invent) and the
+    #218/#274 lever-stability framing. It names NO numbers (the live limits carry
+    every threshold).
+    """
+    c1 = control_teaching_prompt("c1")
+    c2 = control_teaching_prompt("c2")
+    # c2 is a strict superset of c1's grounding: every c1 line survives.
+    assert c1 in c2 or all(block in c2 for block in c1.split("\n\n")), (
+        "c2 must preserve c1's grounding verbatim"
+    )
+    lowered = c2.lower()
+    # The new post-FC stretch teaching.
+    assert "stretch development" in lowered
+    assert "development time ratio" in lowered or "dtr" in lowered
+    assert "cut heat" in lowered  # the aggressive heat cut is the lever
+    # Do NOT ride a mid heat level (the explicit roast-2 anti-pattern).
+    assert "mid heat level" in lowered
+    assert "50 %" in c2  # the concrete anti-pattern example
+    # Never overshoot the drop target.
+    assert "never overshoot the drop target" in lowered
+    # Still grounds dev numbers to context (c1's anti-hallucination language kept).
+    assert "verbatim" in lowered and "never invent" in lowered
+    # The new section names NO fixed drop/dev THRESHOLD numbers of its own
+    # (told==enforced; the live limits carry every threshold). It must not bake in
+    # the roast-2 figures (195 ceiling / 178 FC / 13 % DTR target).
+    start = c2.index("POST-FIRST-CRACK")
+    new_section = c2[start : c2.index("THE OBJECTIVE\n", start)]
+    assert "195" not in new_section
+    assert "178" not in new_section
+    assert "13 %" not in new_section
 
 
 def test_c1_grounds_development_numbers_to_context_no_invention() -> None:
@@ -795,21 +838,22 @@ def test_default_prompt_version_matches_control_teaching_version() -> None:
     assert AdvisorConfig().prompt_version == CONTROL_TEACHING_PROMPT_VERSION
 
 
-def test_live_post_fc_advisor_uses_the_c1_system_prompt(
+def test_live_post_fc_advisor_uses_the_c2_system_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The production PydanticAIAdvisor sends c1 as its system instructions (#277).
+    """The production PydanticAIAdvisor sends c2 as its system instructions.
 
-    Wires the deferred-from-#276 step: the live post-FC control loop's advisor is
-    constructed with the #274 control teaching frame (c1) as the agent's system
-    ``instructions``; the per-tick #275 context is the user message (sent via
-    ``agent.run(context_json)``, asserted elsewhere). Default config = gpt-4o + c1.
+    The live post-FC control loop's advisor is constructed with the #274 control
+    teaching frame (now c2, the roast-2 development-stretch tuning) as the agent's
+    system ``instructions``; the per-tick #275 context is the user message (sent
+    via ``agent.run(context_json)``, asserted elsewhere). Default config = gpt-4o
+    + c2 (the model is unchanged — this was a prompt-only change).
     """
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
     advisor = PydanticAIAdvisor(AdvisorConfig())
     instructions = advisor._instructions  # type: ignore[reportPrivateUsage]
-    assert instructions == control_teaching_prompt("c1")
-    # The pinned post-FC (DEVELOPMENT) model is gpt-4o.
+    assert instructions == control_teaching_prompt("c2")
+    # The pinned post-FC (DEVELOPMENT) model is gpt-4o (unchanged by the c2 prompt).
     assert advisor._config.model_for(RoastPhase.DEVELOPMENT) == "openai/gpt-4o"  # type: ignore[reportPrivateUsage]
 
 
@@ -881,7 +925,7 @@ def test_control_teaching_prompt_exists_and_is_stable() -> None:
     It is a SEPARATE artifact from the per-tick advisory prompts: it is NOT one
     of the ``v``-namespaced ``instructions_for`` versions, and it is not the
     drop-narrow ``v4`` drop lens. Two calls return the identical (stable) text."""
-    assert CONTROL_TEACHING_PROMPT_VERSION == "c1"
+    assert CONTROL_TEACHING_PROMPT_VERSION == "c2"
     prompt = control_teaching_prompt()
     assert prompt
     # Operator decision 4: the FULL teaching detail is retained (the system

@@ -822,13 +822,20 @@ def instructions_for(prompt_version: str) -> str:
 # bias toward fewer, larger, intentional moves over per-consult twiddling.
 #
 # Versioned so it can evolve under the same bake-off discipline as the user
-# prompts; ``c1`` (control, v1) is the first cut.
-CONTROL_TEACHING_PROMPT_VERSION = "c1"
-"""The active control teaching system-prompt version (#274 / D39.1).
+# prompts; ``c1`` (control, v1) is the first cut. ``c2`` (control, v2) adds the
+# post-FC development-stretch teaching after roast 2 (run c3b84625) showed the
+# advisor riding a mid heat level (80->60->50, then HELD 50 %) so the bean RACED
+# from first crack to the drop ceiling — development only 1:09, DTR 11.6 %, under
+# the 13 % target, dropped slightly DARK at 196. c1 is kept intact (prompts are
+# versioned, #274); c2 is the new live default.
+CONTROL_TEACHING_PROMPT_VERSION = "c2"
+"""The active control teaching system-prompt version (#274 / D39.1; ``c2``).
 
 A ``c``-prefixed namespace, distinct from the ``v``-prefixed per-tick advisory
 prompt versions in :data:`_PROMPTS`: this is the stable, cached SYSTEM frame,
-those are the per-call user-instruction lenses.
+those are the per-call user-instruction lenses. ``c2`` adds the post-FC
+development-stretch teaching (roast-2 evidence) on top of ``c1``; ``c1`` stays
+selectable for an A/B.
 """
 
 _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
@@ -948,6 +955,48 @@ _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
         "crack: shape the decline and drop well."
     ),
 }
+
+# --- c2 (#274; roast-2 development-stretch teaching) --------------------------
+#
+# c2 is c1 PLUS one new section, spliced in just before THE OBJECTIVE so all of
+# c1's grounding is preserved byte-for-byte (told == enforced; dev numbers from
+# context verbatim, never invented; #218/#274 lever stability). The new section
+# answers roast 2 (run c3b84625): post-FC the advisor cut heat 80->60->50 and
+# then HELD 50 %, so the bean raced from first crack (~178 C) to 196 C with
+# development only 1:09 (DTR 11.6 %, under the 13 % target) and dropped slightly
+# DARK. On a light/delicate NATURAL the priority post-FC is to STRETCH
+# development and raise DTR toward the target by cutting heat AGGRESSIVELY at /
+# just after first crack to hold a low, controlled RoR — not to settle onto a mid
+# heat level and let the bean sprint to the ceiling. It still names NO numbers
+# (the live limits / drop ceiling come from context, the #218 two-copies rule).
+_C2_DEVELOPMENT_STRETCH_SECTION = (
+    "POST-FIRST-CRACK: STRETCH DEVELOPMENT, DO NOT SPRINT TO THE CEILING\n"
+    "- On a LIGHT or DELICATE roast (and natural-process beans especially), the "
+    "priority the moment first crack arrives is to EXTEND development and raise "
+    "the Development Time Ratio (DTR) toward the profile target - NOT to coast. "
+    "The failure to avoid is the bean racing from first crack to the drop "
+    "ceiling in well under the target development time.\n"
+    "- The lever for this is HEAT, cut DECISIVELY and EARLY. At or just after "
+    "first crack, drop heat AGGRESSIVELY (a real step down, not a token trim) to "
+    "bend the rate of rise into a low, controlled DECLINE, then pace the climb so "
+    "the development target is reached as bean temperature APPROACHES the drop "
+    "ceiling from the context - the two should arrive together.\n"
+    "- Do NOT ride a MID heat level (for example settling at 50 % and holding it) "
+    "after first crack: a mid hold lets the rate of rise stay high, the bean "
+    "sprints up the last several degrees, and you reach the ceiling with the "
+    "development time and DTR still short of target. If development is behind the "
+    "target with bean temperature near the ceiling, you have cut heat too little, "
+    "too late - cut it further now rather than accept an under-developed drop.\n"
+    "- NEVER overshoot the drop target. The indicated drop / bitter ceiling in "
+    "the context is the LATEST acceptable drop, not a goal to push past; crossing "
+    "it tips the roast dark and bitter. If the bean is at the ceiling and "
+    "development is at target, recommend the DROP - do not hold for a few more "
+    "seconds of development at the cost of going over.\n"
+    "\n"
+)
+_CONTROL_TEACHING_PROMPTS["c2"] = _CONTROL_TEACHING_PROMPTS["c1"].replace(
+    "THE OBJECTIVE\n", _C2_DEVELOPMENT_STRETCH_SECTION + "THE OBJECTIVE\n", 1
+)
 
 
 def control_teaching_prompt(version: str = CONTROL_TEACHING_PROMPT_VERSION) -> str:

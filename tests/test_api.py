@@ -2307,5 +2307,5 @@ async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) ->
     assert koke["processing"] == "natural"
     assert koke["altitude_m"] == 1885
     assert koke["default_bean_weight_grams"] == 250.0
-    assert koke["target_drop_temp_c"] == 190.0
+    assert koke["target_drop_temp_c"] == 195.0  # roast-2 tuning: latest acceptable drop
     assert koke["target_development_percent"] == 13.0

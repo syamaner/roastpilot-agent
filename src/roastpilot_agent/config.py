@@ -370,19 +370,20 @@ class AdvisorConfig(BaseModel):
     # well inside an operator's pre-roast attention window.
     healthcheck_timeout_seconds: float = Field(default=5.0, gt=0)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
-    # c1 (#274 / D39.1 + #277): the AS-BUILT control teaching SYSTEM frame for the
-    # post-FC control loop, wired live here (deferred from #276 to #277). It is the
-    # whole-machine teaching frame (told == enforced: every numeric limit comes
-    # from the live AdvisorContext / #273 policy, it names no thresholds, and it
-    # makes acting pre-FC wrong, not merely named). The per-tick #275 context is
-    # the user message. The #277 bake-off scored gpt-4o under exactly this c1 frame
-    # and pinned it (docs/advisor/bakeoff-results-2026-06-21.md). The older v*
-    # prompts (e.g. the v4 drop-lens) remain selectable for an A/B but are no
-    # longer the live default. See advisor.instructions_for / control_teaching_prompt.
-    # The literal "c1" (not an import) keeps config free of an advisor->config
-    # import cycle; a test pins it equal to advisor.CONTROL_TEACHING_PROMPT_VERSION
-    # so the two can never drift.
-    prompt_version: str = Field(default="c1", min_length=1)
+    # c2 (#274 + roast-2 tuning): the control teaching SYSTEM frame for the
+    # post-FC control loop, wired live here. It is the whole-machine teaching
+    # frame (told == enforced: every numeric limit comes from the live
+    # AdvisorContext / #273 policy, it names no thresholds, and it makes acting
+    # pre-FC wrong, not merely named). c2 = c1 PLUS a post-FC development-stretch
+    # section after roast 2 (run c3b84625) showed the advisor riding a mid heat
+    # level so the bean raced from first crack to the ceiling (dev only 1:09, DTR
+    # 11.6 %, dropped slightly dark at 196). c1 stays selectable for an A/B; the
+    # #277 bake-off was scored under c1. The per-tick #275 context is the user
+    # message. The literal "c2" (not an import) keeps config free of an
+    # advisor->config import cycle; a test pins it equal to
+    # advisor.CONTROL_TEACHING_PROMPT_VERSION so the two can never drift. The model
+    # default stays gpt-4o (DEFAULT_ADVISOR_MODEL) — this is a prompt change only.
+    prompt_version: str = Field(default="c2", min_length=1)
     # Reasoning control for the OpenAI-compatible path (OpenRouter normalizes
     # the ``reasoning`` request param across providers). ``None`` leaves the
     # provider default; ``"off"`` disables reasoning; the effort levels set
