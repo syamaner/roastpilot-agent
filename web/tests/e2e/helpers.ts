@@ -99,13 +99,8 @@ export async function settleStepped(page: Page, reached: ReplayStepResult): Prom
     { timeout: 15_000 },
   );
   if (reached.persisted_point_count > 0) {
-    await page.waitForFunction(
-      (n) => {
-        const hook = (window as unknown as { __chart?: ChartHookSnapshot }).__chart;
-        return (hook?.columns?.[0]?.length ?? 0) >= n;
-      },
-      reached.persisted_point_count,
-      { timeout: 15_000 },
-    );
+    // Reuse the chart-points gate (same `window.__chart` curve length, same 15 s
+    // timeout) rather than re-inlining the `waitForFunction` body.
+    await waitForChartPoints(page, reached.persisted_point_count);
   }
 }

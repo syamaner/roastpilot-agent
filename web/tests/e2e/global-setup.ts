@@ -116,28 +116,6 @@ export async function stepTo(agent: string, tick: number): Promise<ReplayStepRes
   return (await res.json()) as ReplayStepResult;
 }
 
-/** The downsampled telemetry snapshot shape (the LOSSLESS REST settle source, #338). */
-interface TelemetrySnapshot {
-  point_count: number;
-  points: { charge_elapsed_seconds: number | null }[];
-}
-
-/**
- * Read the agent's CHARGED telemetry point count straight from the REST snapshot
- * (#338) — store-backed and lossless, independent of SSE delivery. This is the
- * server-side authority the stepped result's `persisted_point_count` mirrors; a
- * spec polls it (or the browser's rendered curve) rather than the lossy
- * `__lastEventId`. Returns 0 for a run with no charged points yet (pre-charge).
- */
-export async function serverChargedPointCount(agent: string, runId: string): Promise<number> {
-  const res = await fetch(`${agent}/api/roasts/${runId}/telemetry`);
-  if (!res.ok) {
-    throw new Error(`telemetry snapshot for ${runId} on ${agent} failed (${res.status})`);
-  }
-  const series = (await res.json()) as TelemetrySnapshot;
-  return series.points.filter((p) => p.charge_elapsed_seconds !== null).length;
-}
-
 /** Probe one agent's gated step surface (a 0-tick step is a no-op route probe). */
 async function probeStepSurface(agent: string): Promise<void> {
   const res = await fetch(`${agent}/api/replay/step`, {
