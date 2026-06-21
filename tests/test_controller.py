@@ -1203,6 +1203,29 @@ def test_policy_development_consults_at_the_post_fc_dwell_cadence() -> None:
     )
 
 
+def test_policy_post_fc_dwell_suppresses_delta_triggers_not_just_heartbeat() -> None:
+    """#276 Fix 2: the post-FC dwell suppresses BOTH the change-based delta triggers
+    AND the heartbeat — not the heartbeat alone.
+
+    A large +5 °C bean-temp jump INSIDE the 5 s dwell would fire BEAN_TEMP_DELTA if
+    only the heartbeat were gated; under the dwell it must stay silent (``None``).
+    The companion test (``..._consults_at_the_post_fc_dwell_cadence``) covers a flat
+    roast; this one proves the dwell beats a live delta too."""
+    policy = _policy()
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=185.0), now=0.0)
+    # +5 °C (well past the 1.0 °C delta threshold) but only 1 s in — inside the 5 s
+    # dwell: the delta trigger is suppressed, not just the heartbeat.
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.DEVELOPMENT,
+            telemetry=reading(bean=190.0),
+            now=1.0,
+            manual_request=False,
+        )
+        is None
+    )
+
+
 def test_policy_pre_first_crack_is_never_an_automatic_advice_phase() -> None:
     """D35 (#222): the advisor is NOT consulted pre-FC at all. Even a large
     bean-temp jump and a flat roast both stay silent in ROASTING_PRE_FIRST_CRACK
@@ -3409,6 +3432,82 @@ async def test_silent_advisor_does_not_actuate_post_fc() -> None:
     await harness.controller.tick()
     assert len(harness.executor.targets) == writes_before  # held, no actuation
     assert "drop_beans" not in harness.executor.commands
+    # Fail-closed = NO state change: an erroring consult must not advance the phase.
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+
+@pytest.mark.asyncio
+async def test_sustained_sub_threshold_cut_actuates_within_two_consults() -> None:
+    """#276 Fix 1 (controller-level): a SUSTAINED sub-threshold heat cut must NOT
+    latch the lever high forever — it actuates the cut by the second consult.
+
+    The over-roast failure mode: after a confident heat RAISE (UP), the advisor
+    keeps asking for the SAME small cut (a -10 DOWN, below the 15 deadband). The
+    first cut is damped (held), but the damp advances the recorded direction DOWN,
+    so the identical second request is a same-direction move and the cut executes.
+    """
+    advisor = FakeAdvisor(
+        [decision(heat=80, fan=50), decision(heat=70, fan=50), decision(heat=70, fan=50)]
+    )
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    # Consult 1: a decisive first move UP — executed (heat 80).
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (80, 50)
+    # Consult 2: 80 -> 70 is a -10 sub-threshold reversal — damped, held at 80.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=185.0)]
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (80, 50)  # still held — one damped cycle
+    # Consult 3: the SAME 70 request — now a same-direction (DOWN) move: the cut
+    # actuates. The sustained intent converged; the lever did not stay pinned high.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0)]
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (70, 50)
+
+
+@pytest.mark.asyncio
+async def test_mixed_partial_damp_executes_only_the_decisive_lever() -> None:
+    """#276 Fix 4: in one consult, a sub-threshold heat reversal (DAMP) alongside a
+    decisive fan move (ALLOW) executes ONLY the fan — the heat is held, only the
+    fan direction updates, and the COHERENCE_DAMPED note lists only the heat lever.
+    """
+    advisor = FakeAdvisor([decision(heat=70, fan=50), decision(heat=60, fan=80)])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    # Consult 1: first move (heat UP, fan UP) — executed at (70, 50).
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (70, 50)
+    # Consult 2: heat 70 -> 60 (-10, sub-threshold reversal of UP) DAMPED; fan
+    # 50 -> 80 (+30, decisive) ALLOWED. Only the fan moves: executed (70, 80).
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=185.0)]
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (70, 80)
+    # Only the heat lever is reported damped (not both).
+    damped = [p for p in _advisory_events(harness) if "coherence_damped" in p]
+    assert damped, "the damped heat reversal must surface a COHERENCE_DAMPED note"
+    assert set(cast(list[str], damped[-1]["coherence_damped"])) == {"heat"}
+    # The heat direction stayed (held value 70); the fan direction advanced UP.
+    assert harness.controller._fan_direction is LeverDirection.UP  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_confidence_exactly_at_floor_proceeds() -> None:
+    """#276 Fix 3: the low-confidence gate is ``confidence < floor`` (strict), so a
+    confidence EXACTLY at the floor PROCEEDS (a normal ALLOW lever write, not the
+    fail-closed REJECT). Pins the ``<`` vs ``<=`` boundary against a refactor."""
+    floor = ControllerConfig().post_fc_min_confidence
+    at_floor = RoastDecision(
+        target_heat=70, target_fan=50, should_drop=False, confidence=floor, rationale="boundary"
+    )
+    advisor = FakeAdvisor([at_floor])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    await harness.controller.tick()
+    # Proceeds: the levers actuate and the last evaluation is the command box, not
+    # the low-confidence REJECT.
+    assert harness.executor.targets[-1] == (70, 50)
+    assert harness.sink.evaluations[-1].rule != "advisor_low_confidence"
+    assert harness.sink.evaluations[-1].verdict in (SafetyVerdict.ALLOW, SafetyVerdict.CLAMP)
 
 
 @pytest.mark.asyncio

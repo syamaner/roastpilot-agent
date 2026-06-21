@@ -1317,7 +1317,13 @@ class RoastController:
         if decision.should_drop:
             drop = self._safety.evaluate_drop_recommendation(phase=self._phase)
             await self._snapshots.persist_evaluation(drop)
-            if drop.verdict is SafetyVerdict.ALLOW:
+            # The advisor advice path is reached only in DEVELOPMENT (the sole
+            # post-FC advice phase, _AUTO_ADVICE_PHASES), and
+            # evaluate_drop_recommendation ALLOWs unconditionally in DEVELOPMENT —
+            # so the REJECT/false branch here is unreachable today. Kept (not
+            # collapsed) because it is the safety boundary if a future phase becomes
+            # an advice phase; the un-taken branch is pragma'd, not the guard logic.
+            if drop.verdict is SafetyVerdict.ALLOW:  # pragma: no branch — see above
                 try:
                     await self._executor.drop_beans()
                 except Exception:
@@ -1389,13 +1395,22 @@ class RoastController:
                     "threshold_percent": threshold,
                 },
             )
+        # Persist the recorded directions for BOTH outcomes, before the hold check.
+        # A damped reversal holds the lever value but ADVANCES its direction toward
+        # the requested side (#276 Fix 1), so a sustained sub-threshold push
+        # converges on the next consult instead of latching the lever forever. The
+        # value-holds early-return below must not skip this, or a fully-damped
+        # consult would never record the advance. A plain hold (requested ==
+        # current) returns the unchanged direction, so this is a no-op there.
+        self._heat_direction = heat_result.direction
+        self._fan_direction = fan_result.direction
         if (
             heat_result.applied_value == self._current_heat
             and fan_result.applied_value == self._current_fan
         ):
             # Both levers hold (no requested change, or every change damped): a
-            # deterministic HOLD — no write, no rate-limit churn. The recorded
-            # directions are unchanged (a hold seeds no trajectory).
+            # deterministic HOLD — no write, no rate-limit churn. Directions were
+            # already recorded above so a sustained damped push still converges.
             return
         await self._executor.set_targets(
             heat_percent=heat_result.applied_value,
@@ -1403,8 +1418,6 @@ class RoastController:
         )
         self._current_heat = heat_result.applied_value
         self._current_fan = fan_result.applied_value
-        self._heat_direction = heat_result.direction
-        self._fan_direction = fan_result.direction
         self._last_command_monotonic = self._clock()
         self._events.emit(
             RoastEventKind.COMMAND_EXECUTED,

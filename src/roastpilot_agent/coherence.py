@@ -20,13 +20,23 @@ The rule, applied **independently to each lever** (heat and fan):
   is a *decisive* move and is **allowed** unchanged.
 * A request that **reverses** the lever's last executed direction and is **below**
   the magnitude threshold is *incoherent thrash* and is **damped** — that lever is
-  held at its current value (the reversal is suppressed).
+  held at its current value (the reversal is suppressed) **for that one consult**.
+  The damped reversal **advances the recorded direction toward the requested side**,
+  so a *sustained* sub-threshold push in one direction converges (executes) on the
+  next consult rather than latching the lever forever. An *isolated* reversal (true
+  jitter) is still suppressed on the consult it appears; only a request that
+  *persists* in the new direction breaks through, and only after one damped cycle.
+  A rapid alternating oscillation (the #218 ``30 <-> 40 <-> 30`` staircase) keeps
+  reversing the advanced direction every consult, so each step is a fresh reversal
+  and stays damped — it never breaks through unbounded.
 
 This is the D40.5 reconciliation of the operator's ~2-3 s coherence dwell against
-the ~5 s post-FC consult cadence: across consecutive consults, no small direction
-reversal, but any decisive move passes. The magnitude threshold is a single named
-configuration constant (``ControllerConfig.post_fc_deadband_threshold_percent``);
-its exact value is tuned on the replay harness (#277).
+the ~5 s post-FC consult cadence: across consecutive consults, no small one-off
+direction reversal, but any decisive move — and any sustained directional intent —
+passes. The magnitude threshold is a single named configuration constant
+(``ControllerConfig.post_fc_deadband_threshold_percent``); its exact value (and a
+possible near-bitter-ceiling exemption that always lets a heat *cut* through) is
+tuned on the replay harness (#277).
 
 The gate is **deterministic, pure, and typed** — it returns a typed
 :class:`CoherenceDecision`, never a string verdict, and it holds no state of its
@@ -85,9 +95,11 @@ class LeverGateResult:
         applied_value: The lever value to execute — the request when allowed, the
             unchanged current value when damped.
         direction: The lever's recorded direction *after* this decision: the new
-            move's direction when allowed, the prior direction unchanged when
-            damped (a suppressed move never rewrites the trajectory the next
-            consult is judged against).
+            move's direction both when allowed AND when damped. A damped reversal
+            still ADVANCES the recorded direction toward the requested side so a
+            sustained sub-threshold push converges on the next consult instead of
+            latching forever; an alternating oscillation re-reverses this advanced
+            direction each consult and so stays damped (#276 Fix 1).
     """
 
     decision: CoherenceDecision
@@ -127,7 +139,12 @@ def evaluate_lever_coherence(
     * A reversal whose magnitude is at or above ``threshold_percent``: ``ALLOW``
       — a decisive move is correct post-FC even when it reverses (D35 §1).
     * A reversal whose magnitude is below ``threshold_percent``: ``DAMP`` — hold
-      the lever; the suppressed move does not rewrite the recorded direction.
+      the lever for this consult, BUT advance the recorded direction toward the
+      requested side. A *sustained* sub-threshold push then reads as a
+      same-direction move on the next consult and executes (converges within two
+      consults); an *isolated* reversal is still suppressed on the consult it
+      appears, and an alternating oscillation re-reverses the advanced direction
+      each consult so it stays damped (#276 Fix 1).
 
     Args:
         requested: The recommended lever value (0-100 percent), already clamped
@@ -150,10 +167,17 @@ def evaluate_lever_coherence(
     move_direction = _direction_of(delta)
     reverses = last_direction is not LeverDirection.NONE and move_direction is not last_direction
     if reverses and abs(delta) < threshold_percent:
-        # Incoherent sub-threshold reversal (the #218 30<->40<->30 thrash): hold
-        # the lever and keep the prior direction so a suppressed move cannot seed
-        # a fake trajectory for the next consult.
-        return LeverGateResult(CoherenceDecision.DAMP, current, last_direction)
+        # Incoherent sub-threshold reversal: hold the lever for this consult, but
+        # ADVANCE the recorded direction toward the requested side (#276 Fix 1).
+        # A SUSTAINED sub-threshold push then becomes a same-direction (ALLOW) move
+        # on the next consult and converges, so the lever cannot latch forever
+        # (the over-roast failure mode); an ISOLATED reversal is still suppressed
+        # here, and a #218 30<->40<->30 oscillation re-reverses this advanced
+        # direction every consult, so each alternating step is a fresh reversal and
+        # stays damped — slowed, never broken through unbounded.
+        # NB: the threshold value (15) and a near-bitter-ceiling exemption (always
+        # let a heat CUT through) are #277 replay-tuning, deliberately not here.
+        return LeverGateResult(CoherenceDecision.DAMP, current, move_direction)
     # First move, same-direction move, or a decisive (>= threshold) reversal: a
     # deliberate step is correct post-FC — apply it and record its direction.
     return LeverGateResult(CoherenceDecision.ALLOW, requested, move_direction)
