@@ -64,18 +64,18 @@ DEV = (RoastPhase.DEVELOPMENT,)
 # Two frontier models within the post-FC budget (sonnet-4.6, gpt-5.5) alongside
 # the opus-4.8 frontier — none carry latency-risk; recorded latency confirms.
 ROSTER_MAIN: tuple[Candidate, ...] = (
-    Candidate("openai/gpt-4o", Tier.PRIOR_FRONTIER, DEV),
-    Candidate("openai/gpt-4o-mini", Tier.ULTRA_FLASH, DEV),
-    Candidate("google/gemini-3.1-flash-lite", Tier.ULTRA_FLASH, DEV),
-    Candidate("anthropic/claude-haiku-4.5", Tier.ULTRA_FLASH, DEV),
-    Candidate("anthropic/claude-opus-4.8", Tier.INCUMBENT, b.PHASE_ORDER),
-    Candidate("anthropic/claude-sonnet-4.6", Tier.PRIOR_FRONTIER, DEV),
-    Candidate("openai/gpt-5.5", Tier.PRIOR_FRONTIER, DEV),
+    Candidate("openai/gpt-4o", Tier.FRONTIER_CEILING, DEV),
+    Candidate("openai/gpt-4o-mini", Tier.CONTROL_CANDIDATE, DEV),
+    Candidate("google/gemini-3.1-flash-lite", Tier.CONTROL_CANDIDATE, DEV),
+    Candidate("anthropic/claude-haiku-4.5", Tier.CONTROL_CANDIDATE, DEV),
+    Candidate("anthropic/claude-opus-4.8", Tier.BASELINE, b.PHASE_ORDER),
+    Candidate("anthropic/claude-sonnet-4.6", Tier.FRONTIER_CEILING, DEV),
+    Candidate("openai/gpt-5.5", Tier.FRONTIER_CEILING, DEV),
 )
 
 # Pass 2 — reasoning model, run at reasoning=low to stay inside the FC budget.
 ROSTER_REASONING: tuple[Candidate, ...] = (
-    Candidate("openai/gpt-5-mini", Tier.FAST_REASONING, DEV, latency_risk=True),
+    Candidate("openai/gpt-5-mini", Tier.FRONTIER_CEILING, DEV, latency_risk=True),
 )
 
 PROMPT_VERSION = "v4"  # the current drop pin (D34); hold prompt, vary model.

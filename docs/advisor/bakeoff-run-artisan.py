@@ -49,14 +49,14 @@ PRE = (RoastPhase.ROASTING_PRE_FIRST_CRACK,)
 # Roster A: the ≤3 s FC-viable cheap set (operator's >3 s exclusion), verified
 # against OpenRouter's live catalog in the first run.
 ROSTER_CHEAP: tuple[Candidate, ...] = (
-    Candidate("google/gemini-3.1-flash-lite", Tier.ULTRA_FLASH, DEV),
-    Candidate("openai/gpt-5.4-nano", Tier.ULTRA_FLASH, DEV),
-    Candidate("openai/gpt-4.1-mini", Tier.ULTRA_FLASH, DEV),
-    Candidate("meta-llama/llama-3.3-70b-instruct", Tier.SPEED_AND_POWER, PRE),
+    Candidate("google/gemini-3.1-flash-lite", Tier.CONTROL_CANDIDATE, DEV),
+    Candidate("openai/gpt-5.4-nano", Tier.CONTROL_CANDIDATE, DEV),
+    Candidate("openai/gpt-4.1-mini", Tier.CONTROL_CANDIDATE, DEV),
+    Candidate("meta-llama/llama-3.3-70b-instruct", Tier.CONTROL_CANDIDATE, PRE),
 )
 # Incumbent frontier — spot-check only (over-hold re-confirmation on Artisan).
 ROSTER_OPUS: tuple[Candidate, ...] = (
-    Candidate("anthropic/claude-opus-4.8", Tier.INCUMBENT, b.PHASE_ORDER),
+    Candidate("anthropic/claude-opus-4.8", Tier.BASELINE, b.PHASE_ORDER),
 )
 
 FIXTURES = REPO_ROOT / ".artisan-fixtures"

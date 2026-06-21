@@ -201,13 +201,53 @@ def test_build_control_ticks_enriches_by_default_and_can_opt_out() -> None:
 def test_enriched_pre_fc_tick_has_an_fc_eta_and_narrowed_box() -> None:
     """A pre-FC tick gets an FC-ETA and the pre-FC narrowed heat floor (#273)."""
     fixture = bakeoff.REPLAY_ROASTS[0]
-    ticks, ground = bakeoff.build_control_ticks(fixture, cadence_seconds=20.0)
+    # include_pre_fc to inspect the (gated-out) pre-FC ticks the enrichment builds.
+    ticks, _ground = bakeoff.build_control_ticks(fixture, cadence_seconds=20.0, include_pre_fc=True)
     pre = [t for t in ticks if t.context.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK]
     # Mid-roast pre-FC tick (enough curve to project an ETA).
     mid = pre[len(pre) // 2]
     assert mid.context.first_crack_eta_seconds is not None
     # Pre-FC box pins the heat floor to the deterministic target (#222/#273).
     assert mid.context.heat_floor_percent == 100
+
+
+def test_build_control_ticks_is_development_only_by_default() -> None:
+    """The as-built D35 advisor scope: only post-FC development ticks are consulted."""
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    dev_only, _ = bakeoff.build_control_ticks(fixture, cadence_seconds=30.0)
+    assert dev_only, "there must be development ticks to consult"
+    # No preheating / pre-first-crack ticks survive the default scope.
+    assert all(t.context.phase is RoastPhase.DEVELOPMENT for t in dev_only)
+    assert all(t.context.first_crack_detected for t in dev_only)
+    # The drop decision lives at the end of development → the drop tick is kept,
+    # so drop timing is still scored.
+    assert any(t.real_should_drop for t in dev_only)
+
+
+def test_development_only_keeps_pre_fc_history_in_the_curve_window() -> None:
+    """A kept development tick still sees the pre-FC roast-so-far curve (#275)."""
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    dev_only, _ = bakeoff.build_control_ticks(fixture, cadence_seconds=30.0)
+    first_dev = dev_only[0]
+    window = first_dev.context.roast_curve_window
+    # The first development tick's curve window reaches back well before this
+    # tick's own time — enrichment runs over the whole roast (incl. the pre-FC
+    # samples), then the scope filter is applied, so the history is preserved.
+    assert len(window) > 1
+    earliest = min(s.elapsed_since_charge_seconds for s in window)
+    assert earliest < first_dev.context.roast_elapsed_seconds
+
+
+def test_include_pre_fc_restores_the_gated_out_ticks() -> None:
+    """--include-pre-fc keeps preheat + pre-FC ticks; the default drops them."""
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    dev_only, _ = bakeoff.build_control_ticks(fixture, cadence_seconds=30.0)
+    full, _ = bakeoff.build_control_ticks(fixture, cadence_seconds=30.0, include_pre_fc=True)
+    assert len(full) > len(dev_only)
+    phases = {t.context.phase for t in full}
+    assert RoastPhase.ROASTING_PRE_FIRST_CRACK in phases or RoastPhase.PREHEATING in phases
+    # development_only() is the pure filter behind the default.
+    assert bakeoff.development_only(full) == dev_only
 
 
 # --- Availability sweep -----------------------------------------------------

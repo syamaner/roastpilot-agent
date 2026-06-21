@@ -483,20 +483,60 @@ def enrich_ticks_with_control_context(
     return enriched
 
 
+# --- AS-BUILT advisor SCOPE: post-FC development only (D35) ------------------
+#
+# Under D35 the advisor is GATED OUT before first crack: the deterministic
+# controller drives preheat / drying / Maillard (heat 100, low fan, #222), and the
+# LLM is consulted ONLY in DEVELOPMENT (first crack → drop, #223). Scoring the
+# model on pre-FC ticks therefore (a) spends ~4x the budget on a path that never
+# runs in production and (b) pollutes the metrics — e.g. the model correctly
+# advises heat 100 in preheat while the Artisan fixture logged heat 0 there, so a
+# correct pre-FC answer reads as a large disagreement. So the bake-off consults +
+# scores ONLY development-phase ticks by default. The pre-FC curve still feeds the
+# #275 curve window of the first development tick (enrichment runs over the WHOLE
+# roast first; the filter is applied AFTER), so the model sees the full roast-so-far
+# history — it is just never *asked* before first crack. ``--include-pre-fc`` keeps
+# the pre-FC ticks for a one-off inspection of the gated-out path (default OFF).
+ADVISOR_SCOPE_PHASES: frozenset[RoastPhase] = frozenset({RoastPhase.DEVELOPMENT})
+
+
+def development_only(ticks: list[ReplayTick]) -> list[ReplayTick]:
+    """Keep only the post-FC development ticks — the as-built D35 advisor scope.
+
+    Drops preheating + ``roasting_pre_first_crack`` ticks (the deterministic,
+    advisor-gated-out path). The drop tick is always in development (it is at/after
+    first crack), so the drop-decision / drop-timing metric is preserved. Run this
+    AFTER enrichment so each kept tick's #275 curve window still carries the
+    pre-FC roast-so-far history.
+
+    Args:
+        ticks: The reconstructed (and enriched) ticks for a roast.
+
+    Returns:
+        The development-phase ticks, in order.
+    """
+    return [t for t in ticks if t.context.phase in ADVISOR_SCOPE_PHASES]
+
+
 def build_control_ticks(
     fixture: Path,
     *,
     cadence_seconds: float,
     enrich: bool = True,
     policy: RoastControlPolicy | None = None,
+    include_pre_fc: bool = False,
 ) -> tuple[list[ReplayTick], GroundTruth]:
-    """Build replay ticks and (by default) enrich them with the AS-BUILT context.
+    """Build replay ticks and (by default) enrich + scope them to the advisor box.
 
     The single seam the bake-off uses to reconstruct ticks: it calls
-    :func:`build_ticks` then, when ``enrich`` is set (the #277 default), augments
+    :func:`build_ticks`, then, when ``enrich`` is set (the #277 default), augments
     each tick's context with the #273 limits + #275 control context via
-    :func:`enrich_ticks_with_control_context`. ``enrich=False`` reproduces the
-    pre-#277 drop-only context (the historical bake-off) for a clean comparison.
+    :func:`enrich_ticks_with_control_context`, then (unless ``include_pre_fc``)
+    restricts the result to the post-FC DEVELOPMENT ticks — the as-built D35
+    advisor scope (the advisor is gated out pre-FC). Enrichment runs over the WHOLE
+    roast before the scope filter, so a kept development tick's #275 curve window
+    still carries the pre-FC history. ``enrich=False`` reproduces the pre-#277
+    drop-only context (the historical bake-off) for a clean comparison.
 
     Args:
         fixture: The live-roast ``roast.jsonl`` to replay.
@@ -504,13 +544,18 @@ def build_control_ticks(
         enrich: Add the #273/#275 AS-BUILT context fields (default ``True``).
         policy: The control policy to resolve #273 limits from; defaults to the
             configured hard box.
+        include_pre_fc: Keep the pre-first-crack ticks (preheat + drying/Maillard)
+            for a one-off inspection of the gated-out path. Default ``False`` — the
+            as-built D35 scope is development-only.
 
     Returns:
-        ``(ticks, ground_truth)``.
+        ``(ticks, ground_truth)`` — development-only unless ``include_pre_fc``.
     """
     ticks, ground = build_ticks(fixture, cadence_seconds=cadence_seconds)
     if enrich:
         ticks = enrich_ticks_with_control_context(ticks, ground, policy=policy)
+    if not include_pre_fc:
+        ticks = development_only(ticks)
     return ticks, ground
 
 
@@ -1568,6 +1613,7 @@ async def score_candidate(
     cadence_seconds: float,
     *,
     clock: Callable[[], float] | None = None,
+    include_pre_fc: bool = False,
 ) -> ReplayCell:
     """Score one candidate's recommender over the replay roasts (key-free seam).
 
@@ -1582,6 +1628,8 @@ async def score_candidate(
         roasts: The replay roast fixtures.
         cadence_seconds: Roast-time spacing between scored ticks.
         clock: Monotonic clock; defaults to ``time.perf_counter``.
+        include_pre_fc: Keep the gated-out pre-FC ticks (default ``False`` — the
+            as-built D35 advisor scope is development-only).
 
     Returns:
         The :class:`ReplayCell`.
@@ -1589,7 +1637,9 @@ async def score_candidate(
     tick_clock = clock if clock is not None else time.perf_counter
     replays: list[RoastReplay] = []
     for fixture in roasts:
-        ticks, ground = build_control_ticks(fixture, cadence_seconds=cadence_seconds)
+        ticks, ground = build_control_ticks(
+            fixture, cadence_seconds=cadence_seconds, include_pre_fc=include_pre_fc
+        )
         outcomes = await replay_roast(ticks, recommend, clock=tick_clock)
         replays.append(
             build_roast_replay(cand.slug, prompt_version, roast_id_for(fixture), outcomes, ground)
@@ -3155,6 +3205,7 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
     reasoning_recommender_factory: Callable[[Candidate, str], ReasoningRecommender] | None = None,
     clock: Callable[[], float] | None = None,
     heartbeat_clock: Callable[[], float] | None = None,
+    include_pre_fc: bool = False,
 ) -> ObservableRunResult:
     """Run the replay bake-off with observability, checkpointing, and a cost guard.
 
@@ -3219,6 +3270,10 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
             ``time.perf_counter``.
         heartbeat_clock: Wall-clock for the heartbeat; defaults to
             ``time.monotonic``.
+        include_pre_fc: Keep the gated-out pre-FC ticks (default ``False`` — the
+            as-built D35 advisor scope is post-FC development only). Each cell then
+            costs ~4x more and scores a path that never runs in production; use it
+            only for a one-off inspection of pre-FC behaviour.
 
     Returns:
         The :class:`ObservableRunResult` (availability + assembled cells + the
@@ -3248,9 +3303,14 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
     # Pre-build ticks + ground once per roast (deterministic, no model calls);
     # both fresh runs and reloads reuse them, so resume needs no model access. The
     # AS-BUILT context (#273 limits + #275 control context) is enriched here so
-    # every model under test gets the SAME context the live D35 loop would build.
+    # every model under test gets the SAME context the live D35 loop would build,
+    # and (unless --include-pre-fc) the ticks are scoped to the post-FC DEVELOPMENT
+    # phase — the as-built D35 advisor scope (gated out pre-FC).
     built = {
-        roast_id_for(f): build_control_ticks(f, cadence_seconds=cadence_seconds) for f in roasts
+        roast_id_for(f): build_control_ticks(
+            f, cadence_seconds=cadence_seconds, include_pre_fc=include_pre_fc
+        )
+        for f in roasts
     }
 
     # One recommender per (candidate, prompt), built once and reused across that
@@ -3674,6 +3734,15 @@ async def main() -> int:
         f"network failure, with exponential backoff honouring Retry-After (#281) "
         f"(default: {DEFAULT_RETRY_ATTEMPTS}; 1 disables retry)",
     )
+    parser.add_argument(
+        "--include-pre-fc",
+        action="store_true",
+        help="replay mode: ALSO consult + score the gated-out pre-first-crack ticks "
+        "(preheat + drying/Maillard). Default OFF — under D35 the advisor is "
+        "development-only (the controller drives pre-FC deterministically), so the "
+        "default eval is post-FC only. Enabling this costs ~4x and scores a path "
+        "that never runs in production; use it for a one-off inspection.",
+    )
     args = parser.parse_args()
 
     reasoning: ReasoningEffort | None = (
@@ -3736,6 +3805,7 @@ async def main() -> int:
                 heartbeat_seconds=float(args.heartbeat_seconds),
                 concurrency=concurrency,
                 retry_policy=retry_policy,
+                include_pre_fc=bool(args.include_pre_fc),
             )
         )
     result = seed_results[0]

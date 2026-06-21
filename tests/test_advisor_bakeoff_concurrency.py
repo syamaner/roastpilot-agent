@@ -361,6 +361,8 @@ async def test_concurrent_resume_matches_all_at_once(
     roasts = bakeoff.REPLAY_ROASTS
     out = tmp_path / "bakeoff.json"
 
+    # Pre-FC-inclusive so the budget trips mid-run (the denser tick set the budget
+    # math assumes); all three runs share the scope so resume stays consistent.
     reference = await bakeoff.run_replay_bakeoff_observable(
         roster,
         roasts,
@@ -371,6 +373,7 @@ async def test_concurrent_resume_matches_all_at_once(
         recommender_factory=_canned_factory,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
 
     # Partial run capped by budget, concurrent.
@@ -387,6 +390,7 @@ async def test_concurrent_resume_matches_all_at_once(
         recommender_factory=_canned_factory,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
     assert partial.stopped_for_budget is True
     assert 0 < partial.fresh_cells < len(roster) * len(roasts)
@@ -403,6 +407,7 @@ async def test_concurrent_resume_matches_all_at_once(
         recommender_factory=_canned_factory,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
     assert resumed.resumed_cells == partial.fresh_cells
     assert resumed.stopped_for_budget is False
@@ -428,6 +433,8 @@ async def test_budget_stop_is_concurrency_safe(mock_healthcheck: None, tmp_path:
     roasts = bakeoff.REPLAY_ROASTS
     out = tmp_path / "bakeoff.json"
 
+    # Pre-FC-inclusive so each cell is ~22 calls and the $30 budget trips mid-run
+    # (the development-only default is too cheap to exercise the overshoot bound).
     result = await bakeoff.run_replay_bakeoff_observable(
         roster,
         roasts,
@@ -441,6 +448,7 @@ async def test_budget_stop_is_concurrency_safe(mock_healthcheck: None, tmp_path:
         recommender_factory=_canned_factory,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
 
     assert result.stopped_for_budget is True
@@ -590,6 +598,8 @@ async def test_budget_counts_each_retry_attempt(mock_healthcheck: None, tmp_path
     """
     roster = (Candidate(_SLUG_A, Tier.BASELINE, bakeoff.PHASE_ORDER),)
     roasts = (bakeoff.REPLAY_ROASTS[0],)
+    # Count ALL ticks: this retry-accounting mechanics test runs pre-FC-inclusive
+    # so the per-tick request count is exact over the full tick set.
     ticks, _ground = bakeoff.build_ticks(roasts[0], cadence_seconds=60.0)
     n_ticks = len(ticks)
 
@@ -619,6 +629,7 @@ async def test_budget_counts_each_retry_attempt(mock_healthcheck: None, tmp_path
         reasoning_recommender_factory=factory,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
 
     assert result.fresh_cells == 1
@@ -651,6 +662,7 @@ async def test_run_budget_stops_accounting_actual_retried_requests(
     def factory(_cand: Candidate, _pv: str) -> Any:
         return two_429s_then_ok
 
+    # Pre-FC-inclusive so the retry-inflated spend trips the $30 budget mid-run.
     result = await bakeoff.run_replay_bakeoff_observable(
         _roster(),
         bakeoff.REPLAY_ROASTS,
@@ -666,6 +678,7 @@ async def test_run_budget_stops_accounting_actual_retried_requests(
         reasoning_recommender_factory=factory,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
 
     assert result.stopped_for_budget is True
