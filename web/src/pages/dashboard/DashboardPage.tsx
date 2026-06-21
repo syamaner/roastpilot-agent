@@ -20,7 +20,16 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { AppFrame, ConnectionIndicator, LiveCurve } from "@/components/shared";
-import { roastKeys, useHealth, useRoast } from "@/hooks/queries";
+import {
+  roastKeys,
+  useBeanProfiles,
+  useCreateBeanProfile,
+  useDeleteBeanProfile,
+  useHealth,
+  useRoast,
+  useUpdateBeanProfile,
+} from "@/hooks/queries";
+import type { BeanProfileInput } from "@/lib/types";
 import { useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
 import { smoothRorForDisplay } from "@/lib/rorSmoothing";
@@ -78,6 +87,28 @@ export function DashboardPage(): React.JSX.Element {
   const [lastResult, setLastResult] = useState<OperatorActionResultView | null>(null);
 
   const queryClient = useQueryClient();
+
+  // Bean-profile library (#303) — the idle Start form's saved-profile dropdown +
+  // add/edit modals. Read-only list + the typed CRUD mutations (each invalidates
+  // the list). The mutations resolve to the saved BeanProfile so the form selects it.
+  const beanProfiles = useBeanProfiles();
+  const createBeanProfile = useCreateBeanProfile();
+  const updateBeanProfile = useUpdateBeanProfile();
+  const deleteBeanProfile = useDeleteBeanProfile();
+
+  const handleCreateProfile = useCallback(
+    (input: BeanProfileInput) => createBeanProfile.mutateAsync(input),
+    [createBeanProfile],
+  );
+  const handleUpdateProfile = useCallback(
+    (id: string, input: BeanProfileInput) =>
+      updateBeanProfile.mutateAsync({ id, input }),
+    [updateBeanProfile],
+  );
+  const handleArchiveProfile = useCallback(
+    (id: string) => deleteBeanProfile.mutateAsync(id),
+    [deleteBeanProfile],
+  );
 
   // Start a roast from the idle form (#158). On 201 we refetch health so the new
   // `active_run_id` is discovered and the dashboard swaps to the live view — we do
@@ -250,7 +281,14 @@ export function DashboardPage(): React.JSX.Element {
         }
       >
         <div className="flex flex-col gap-4" data-testid="dashboard-idle">
-          <StartRoastForm onStart={handleStartRoast} />
+          <StartRoastForm
+            onStart={handleStartRoast}
+            profiles={beanProfiles.data?.profiles ?? []}
+            profilesLoading={beanProfiles.isLoading}
+            onCreateProfile={handleCreateProfile}
+            onUpdateProfile={handleUpdateProfile}
+            onArchiveProfile={handleArchiveProfile}
+          />
         </div>
       </AppFrame>
     );

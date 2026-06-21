@@ -5,9 +5,15 @@
  * (`useRoastStream`), not polling. Pages consume these read-only.
  */
 
-import { skipToken, useQuery } from "@tanstack/react-query";
+import {
+  skipToken,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 
 import { api } from "@/lib/api";
+import type { BeanProfileInput } from "@/lib/types";
 
 export const roastKeys = {
   health: ["health"] as const,
@@ -16,6 +22,11 @@ export const roastKeys = {
   timeline: (runId: string) => ["roasts", runId, "timeline"] as const,
   telemetry: (runId: string, downsample: number) =>
     ["roasts", runId, "telemetry", downsample] as const,
+};
+
+/** Query keys for the bean-profile library (#303). */
+export const beanProfileKeys = {
+  all: ["bean-profiles"] as const,
 };
 
 export function useHealth() {
@@ -47,5 +58,46 @@ export function useTelemetry(runId: string | null, downsample = 1) {
   return useQuery({
     queryKey: roastKeys.telemetry(runId ?? "", downsample),
     queryFn: runId === null ? skipToken : () => api.telemetry(runId, downsample),
+  });
+}
+
+// --- Bean-profile library (#303, D45) — the Start-Roast dropdown's CRUD. ---
+
+/** The saved bean-profile library for the Start-Roast dropdown (name-ordered
+ *  server-side). The list the dropdown renders from. */
+export function useBeanProfiles() {
+  return useQuery({ queryKey: beanProfileKeys.all, queryFn: api.beanProfiles });
+}
+
+/** Create a saved bean profile; invalidates the list so the new row appears in
+ *  the dropdown. The caller selects the returned profile (the mutation resolves
+ *  to the created `BeanProfile`). */
+export function useCreateBeanProfile() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (input: BeanProfileInput) => api.createBeanProfile(input),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: beanProfileKeys.all }),
+  });
+}
+
+/** Edit a saved bean profile (future roasts only); invalidates the list. */
+export function useUpdateBeanProfile() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, input }: { id: string; input: BeanProfileInput }) =>
+      api.updateBeanProfile(id, input),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: beanProfileKeys.all }),
+  });
+}
+
+/** Archive (soft-delete) a saved bean profile; invalidates the list. */
+export function useDeleteBeanProfile() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.deleteBeanProfile(id),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: beanProfileKeys.all }),
   });
 }

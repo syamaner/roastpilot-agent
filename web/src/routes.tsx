@@ -42,6 +42,14 @@ const DetailHarnessLongPage = lazy(() =>
     default: m.DetailHarnessLongPage,
   })),
 );
+// #303 bean-profile library snapshot — the idle Start-Roast form with the saved-
+// profile dropdown + add/edit modals over fixed fixture data (the idle page is not
+// reachable via the replay agents, which always carry an active run).
+const StartRoastHarnessPage = lazy(() =>
+  import("@/pages/harness/StartRoastHarnessPage").then((m) => ({
+    default: m.StartRoastHarnessPage,
+  })),
+);
 
 export const routes: RouteObject[] = [
   { path: "/", element: <DashboardPage /> },
@@ -58,4 +66,6 @@ export const routes: RouteObject[] = [
   { path: "/__detail-harness-failed", element: <DetailHarnessFailedPage /> },
   // __detail-harness-long: long-roast detail — capped lists + "View all" (#271).
   { path: "/__detail-harness-long", element: <DetailHarnessLongPage /> },
+  // __start-roast-harness: idle Start form + bean-profile library (#303 snapshot).
+  { path: "/__start-roast-harness", element: <StartRoastHarnessPage /> },
 ];

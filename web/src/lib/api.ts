@@ -7,6 +7,10 @@
  */
 
 import type {
+  BeanProfile,
+  BeanProfileDeleteResult,
+  BeanProfileInput,
+  BeanProfileList,
   HealthResponse,
   OperatorActionRequest,
   OperatorActionResult,
@@ -103,4 +107,31 @@ export const api = {
 
   /** SSE stream URL for a run (consumed by the EventSource hook). */
   eventsUrl: (runId: string) => `${API_BASE}/api/roasts/${runId}/events`,
+
+  // --- Bean-profile library (#303, D45) — the Start-Roast dropdown's CRUD. ---
+
+  /** `GET /api/bean-profiles` — the saved bean-profile library, name-ordered. */
+  beanProfiles: () => request<BeanProfileList>("/api/bean-profiles"),
+
+  /** `POST /api/bean-profiles` — create a saved profile (201; 422 invalid). */
+  createBeanProfile: (input: BeanProfileInput) =>
+    request<BeanProfile>("/api/bean-profiles", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  /** `PUT /api/bean-profiles/{id}` — edit a saved profile (200; 404/422). Edits
+   *  affect future roasts only — the backend never mutates a past roast's frozen
+   *  snapshot. */
+  updateBeanProfile: (id: string, input: BeanProfileInput) =>
+    request<BeanProfile>(`/api/bean-profiles/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(input),
+    }),
+
+  /** `DELETE /api/bean-profiles/{id}` — archive (soft-delete) a profile (200; 404). */
+  deleteBeanProfile: (id: string) =>
+    request<BeanProfileDeleteResult>(`/api/bean-profiles/${id}`, {
+      method: "DELETE",
+    }),
 };

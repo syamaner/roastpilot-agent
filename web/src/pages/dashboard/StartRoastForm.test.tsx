@@ -2,7 +2,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError } from "@/lib/api";
-import type { RoastProfile } from "@/lib/types";
+import type { BeanProfile, BeanProfileInput, RoastProfile } from "@/lib/types";
+import { FIXTURE_BEAN_PROFILES, FIXTURE_KOKE } from "./beanProfileFixture";
 import { StartRoastForm } from "./StartRoastForm";
 
 afterEach(cleanup);
@@ -175,6 +176,20 @@ describe("StartRoastForm", () => {
     fireEvent.submit(screen.getByTestId("start-roast-form"));
     expect(screen.getByTestId("start-roast-name-error")).toBeInTheDocument();
     expect(screen.getByTestId("start-roast-bean_origin-error")).toBeInTheDocument();
+    expect(onStart).not.toHaveBeenCalled();
+  });
+
+  it("pre-fills the per-roast charge weight (#303) and rejects clearing it", () => {
+    const onStart = vi.fn();
+    render(<StartRoastForm onStart={onStart} />);
+    // #303: the charge weight is pre-filled (default 250 g) — distinct from the
+    // saved profile's default_bean_weight_grams; adjustable per roast.
+    expect(screen.getByTestId("start-roast-bean_weight_grams")).toHaveValue(250);
+    fillMinimum();
+    fireEvent.change(screen.getByTestId("start-roast-bean_weight_grams"), {
+      target: { value: "" },
+    });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
     expect(screen.getByTestId("start-roast-bean_weight_grams-error")).toBeInTheDocument();
     expect(onStart).not.toHaveBeenCalled();
   });
@@ -324,5 +339,112 @@ describe("StartRoastForm", () => {
 
     resolve(undefined);
     await waitFor(() => expect(screen.getByTestId("start-roast-submit")).toBeEnabled());
+  });
+});
+
+/** Wire the bean-profile library so the dropdown + modals render. */
+function renderWithLibrary(overrides: Partial<Parameters<typeof StartRoastForm>[0]> = {}) {
+  const onStart = vi.fn().mockResolvedValue(undefined);
+  const onCreateProfile = vi.fn(
+    async (input: BeanProfileInput): Promise<BeanProfile> => ({
+      ...input,
+      id: "created-id",
+      created_at: "t",
+      updated_at: "t",
+    }),
+  );
+  const onUpdateProfile = vi.fn(
+    async (id: string, input: BeanProfileInput): Promise<BeanProfile> => ({
+      ...input,
+      id,
+      created_at: "t",
+      updated_at: "t",
+    }),
+  );
+  render(
+    <StartRoastForm
+      onStart={onStart}
+      profiles={FIXTURE_BEAN_PROFILES}
+      onCreateProfile={onCreateProfile}
+      onUpdateProfile={onUpdateProfile}
+      {...overrides}
+    />,
+  );
+  return { onStart, onCreateProfile, onUpdateProfile };
+}
+
+describe("StartRoastForm — bean-profile library (#303)", () => {
+  it("shows the dropdown only when the CRUD callbacks are wired", () => {
+    render(<StartRoastForm onStart={vi.fn()} />);
+    expect(screen.queryByTestId("bean-profile-picker")).toBeNull();
+    cleanup();
+    renderWithLibrary();
+    expect(screen.getByTestId("bean-profile-picker")).toBeInTheDocument();
+  });
+
+  it("selecting a profile FILLS the form fields + pre-fills the per-roast weight", () => {
+    renderWithLibrary();
+    fireEvent.change(screen.getByTestId("bean-profile-select"), {
+      target: { value: FIXTURE_KOKE.id },
+    });
+    // Identity + targets fill from the selected profile.
+    expect(screen.getByTestId("start-roast-name")).toHaveValue(FIXTURE_KOKE.name);
+    expect(screen.getByTestId("start-roast-bean_origin")).toHaveValue(FIXTURE_KOKE.bean_origin);
+    expect(screen.getByTestId("start-roast-processing")).toHaveValue("natural");
+    expect(screen.getByTestId("start-roast-initial_heat_percent")).toHaveValue(100);
+    expect(screen.getByTestId("start-roast-target_drop_temp_c")).toHaveValue(190);
+    // The per-roast charge weight pre-fills from default_bean_weight_grams.
+    expect(screen.getByTestId("start-roast-bean_weight_grams")).toHaveValue(250);
+  });
+
+  it("starts a roast with the selected profile + an adjusted per-roast weight", async () => {
+    const { onStart } = renderWithLibrary();
+    fireEvent.change(screen.getByTestId("bean-profile-select"), {
+      target: { value: FIXTURE_KOKE.id },
+    });
+    // Operator adjusts the per-roast weight (200 g of the same bean).
+    fireEvent.change(screen.getByTestId("start-roast-bean_weight_grams"), {
+      target: { value: "200" },
+    });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
+    const profile = onStart.mock.calls[0][0] as RoastProfile;
+    expect(profile.bean_origin).toBe("Ethiopia");
+    expect(profile.bean_weight_grams).toBe(200);
+    // The start contract is the RoastProfile shape — no default_bean_weight_grams.
+    expect("default_bean_weight_grams" in profile).toBe(false);
+  });
+
+  it("opens the add modal and creates a profile, then selects it", async () => {
+    const { onCreateProfile } = renderWithLibrary();
+    fireEvent.click(screen.getByTestId("bean-profile-add-button"));
+    expect(screen.getByTestId("bean-profile-modal")).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("bean-profile-name"), {
+      target: { value: "New roast profile" },
+    });
+    fireEvent.change(screen.getByTestId("bean-profile-bean_origin"), {
+      target: { value: "Kenya" },
+    });
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onCreateProfile).toHaveBeenCalledTimes(1));
+    // The modal closes and the new profile fills the form.
+    await waitFor(() => expect(screen.queryByTestId("bean-profile-modal")).toBeNull());
+    expect(screen.getByTestId("start-roast-name")).toHaveValue("New roast profile");
+  });
+
+  it("opens the edit modal for the selected profile and updates it (future roasts only)", async () => {
+    const { onUpdateProfile } = renderWithLibrary();
+    fireEvent.change(screen.getByTestId("bean-profile-select"), {
+      target: { value: FIXTURE_KOKE.id },
+    });
+    fireEvent.click(screen.getByTestId("bean-profile-edit-button"));
+    expect(screen.getByTestId("bean-profile-modal")).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId("bean-profile-target_development_percent"), {
+      target: { value: "16" },
+    });
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onUpdateProfile).toHaveBeenCalledTimes(1));
+    expect(onUpdateProfile.mock.calls[0][0]).toBe(FIXTURE_KOKE.id);
+    expect(onUpdateProfile.mock.calls[0][1].target_development_percent).toBe(16);
   });
 });
