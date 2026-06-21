@@ -24,7 +24,7 @@ import uPlot from "uplot";
 import "uplot/dist/uPlot.min.css";
 
 import { cn } from "@/lib/cn";
-import { formatElapsed, formatSeriesValue, toColumns } from "./chartData";
+import { formatRoastTime, formatSeriesValue, toColumns } from "./chartData";
 import { makeAutoRange } from "./scales";
 import {
   type ChartTestHook,
@@ -73,6 +73,7 @@ export function LiveCurve({
   phase = null,
   chargeBand = DEFAULT_CHARGE_BAND,
   highlightTime = null,
+  originSeconds = null,
   initialHidden = [],
   className,
   height = 420,
@@ -106,6 +107,15 @@ export function LiveCurve({
   // that every render keeps current instead.
   const overlayRef = useRef({ markers, highlightTime, chargeBandVisible, chargeBand });
   overlayRef.current = { markers, highlightTime, chargeBandVisible, chargeBand };
+
+  // The x-axis `values` formatter is created once in the plot-build effect (keyed
+  // on [height, meta]) but must label ticks against the LIVE charge origin (#326):
+  // origin starts null (preheat, serve-elapsed labels) and becomes the T0 serve-
+  // elapsed once charge lands. Read it through a ref so the formatter re-labels to
+  // roast time on the next redraw without rebuilding the plot; the effect below
+  // forces that redraw when `originSeconds` changes.
+  const originRef = useRef<number | null>(originSeconds);
+  originRef.current = originSeconds;
 
   // (Re)build the plot when structural inputs change. Data-only updates go
   // through setData below to avoid tearing down the canvas every tick.
@@ -156,11 +166,14 @@ export function LiveCurve({
         {
           stroke: token("--muted-foreground", "#a1a1aa"),
           grid: { show: true, stroke: token("--border", "#3f3f46") },
-          // The x is roast-elapsed SECONDS; render the tick labels as M:SS
-          // (720 → 12:00) like roasting tools — display-only, the data stays
-          // seconds (#153). `time:false` on the x scale, so uPlot passes raw
+          // The x is SERVE-elapsed SECONDS; render the tick labels as CHARGE-
+          // referenced ROAST TIME (#326) — 0:00 = charge, negative in preheat —
+          // via `formatRoastTime(v, origin)`. Before T0 lands (origin null) this
+          // falls back to serve-elapsed M:SS (#153). Display-only; the data stays
+          // serve seconds. `time:false` on the x scale, so uPlot passes raw
           // numeric splits here.
-          values: (_self, splits) => splits.map((v) => formatElapsed(v)),
+          values: (_self, splits) =>
+            splits.map((v) => formatRoastTime(v, originRef.current)),
         },
         { scale: "c", stroke: token("--muted-foreground", "#a1a1aa"), grid: { show: false } },
         { scale: "ror", side: 1, stroke: token("--roast-nominal", "#34d399"), grid: { show: false } },
@@ -226,6 +239,14 @@ export function LiveCurve({
     plotRef.current?.redraw();
   }, [markers, highlightTime]);
 
+  // When the charge origin lands (or changes), the x-axis tick formatter must
+  // re-label preheat negative and 0:00 at charge (#326). The formatter reads
+  // `originRef` live, so a plain redraw re-runs the axis `values` callback — no
+  // rebuild or setData needed (point positions don't move, only their labels).
+  useEffect(() => {
+    plotRef.current?.redraw();
+  }, [originSeconds]);
+
   // The °C range is fixed (#217), so the band overlay no longer re-ranges the scale —
   // but when it appears/disappears or moves, the canvas overlay (drawn in the `draw`
   // hook) must repaint. A plain `redraw()` fires that draw hook (same mechanism as the
@@ -278,6 +299,7 @@ export function LiveCurve({
         visible={visible}
         readout={readoutPoint}
         readoutTime={readoutPoint?.t ?? null}
+        originSeconds={originSeconds}
         onToggle={toggle}
       />
       <div
@@ -297,18 +319,22 @@ interface LegendProps {
   meta: SeriesMeta[];
   visible: Record<SeriesKey, boolean>;
   readout: { bean: number | null; env: number | null; ror: number | null; heat: number | null; fan: number | null } | null;
-  /** Elapsed seconds at the readout index (cursor, else latest point); rendered M:SS. */
+  /** Serve-elapsed seconds at the readout index (cursor, else latest point);
+   *  rendered as roast time via `formatRoastTime` against `originSeconds`. */
   readoutTime: number | null;
+  /** Serve-elapsed at the T0/charge moment (#326); null → serve-elapsed display. */
+  originSeconds: number | null;
   onToggle: (key: SeriesKey) => void;
 }
 
 /** Color-keyed legend that doubles as the cursor value readout + toggle control. */
-function Legend({ meta, visible, readout, readoutTime, onToggle }: LegendProps): React.JSX.Element {
+function Legend({ meta, visible, readout, readoutTime, originSeconds, onToggle }: LegendProps): React.JSX.Element {
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs" data-testid="live-curve-legend">
-      {/* The cursor/latest-point time, M:SS (#153) — same format as the x-axis ticks. */}
+      {/* The cursor/latest-point time as CHARGE-referenced roast time (#326) —
+          same transform as the x-axis ticks (0:00 = charge, negative in preheat). */}
       <span className="numeric font-medium text-muted-foreground" data-testid="legend-time">
-        {formatElapsed(readoutTime)}
+        {formatRoastTime(readoutTime, originSeconds)}
       </span>
       {meta.map((m) => {
         const value = readout ? readout[m.key] : null;

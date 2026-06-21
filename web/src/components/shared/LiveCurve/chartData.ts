@@ -42,6 +42,34 @@ export function formatElapsed(seconds: number | null): string {
   return `${mins}:${secs.toString().padStart(2, "0")}`;
 }
 
+/**
+ * Format a point's serve-elapsed `seconds` as CHARGE-referenced ROAST TIME for
+ * the time axis + cursor readout (#326), given the serve-elapsed `origin` at the
+ * T0/charge moment.
+ *
+ * The point buffer is keyed on SERVE elapsed (so preheat plots live, before T0 is
+ * known); this is a pure DISPLAY transform that re-labels those positions to roast
+ * time (0:00 = charge) without moving any point:
+ *   - `origin == null` (T0 not detected yet — live preheat): fall back to the
+ *     serve-elapsed display (`formatElapsed`), so the axis still reads a sensible
+ *     clock before charge lands.
+ *   - `origin != null`: `d = round(seconds) − round(origin)` →
+ *     `0` → `0:00` (charge), positive → `M:SS`, negative (preheat) → `-M:SS`.
+ *   - `null`/non-finite `seconds` → `—` (the existing stray-tick guard).
+ *
+ * Rounding both operands before subtracting keeps 0:00 exact at the charge tick
+ * (the marker sits there) and avoids a sub-second `-0:00`.
+ */
+export function formatRoastTime(seconds: number | null, origin: number | null): string {
+  if (seconds === null || !Number.isFinite(seconds)) return "—";
+  if (origin === null || !Number.isFinite(origin)) return formatElapsed(seconds);
+  const d = Math.round(seconds) - Math.round(origin);
+  const mins = Math.floor(Math.abs(d) / 60);
+  const secs = Math.abs(d) % 60;
+  const body = `${mins}:${secs.toString().padStart(2, "0")}`;
+  return d < 0 ? `-${body}` : body;
+}
+
 /** Format a series value for the legend readout. `null` → an em dash. */
 export function formatSeriesValue(key: SeriesKey, value: number | null): string {
   if (value === null || Number.isNaN(value)) return "—";

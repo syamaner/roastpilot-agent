@@ -26,23 +26,33 @@ const ADVISORY_DECISION = {
 };
 
 describe("dashboardReducer", () => {
-  it("appends a curve point per telemetry frame (x = CHARGE-referenced seconds, #308)", () => {
+  it("appends a curve point per telemetry frame (x = SERVE-elapsed seconds, #326)", () => {
     let s = initialDashboardViewModel;
-    // The curve x is charge-referenced (#308): `t` keys on charge_elapsed_seconds,
-    // NOT serve elapsed_seconds. The differing serve value is ignored for the x.
+    // The curve buffer keys `t` on serve elapsed_seconds (#326), NOT
+    // charge_elapsed_seconds — so preheat plots live; the charge re-origin is a
+    // downstream display transform. The differing charge value is ignored for the x.
     s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 510, charge_elapsed_seconds: 10, bean_temp_c: 120, env_temp_c: 140, bean_ror_c_per_min: 16, heat_percent: 70, fan_percent: 40 }));
     s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 511, charge_elapsed_seconds: 11, bean_temp_c: 121, env_temp_c: 141, bean_ror_c_per_min: 15, heat_percent: 70, fan_percent: 40 }));
     expect(s.points).toHaveLength(2);
-    expect(s.points[0]).toMatchObject({ t: 10, bean: 120, heat: 70 });
+    expect(s.points[0]).toMatchObject({ t: 510, bean: 120, heat: 70 });
   });
 
-  it("drops PRE-charge telemetry (null charge clock — the curve starts at charge, #308)", () => {
-    // Pre-charge the server sends charge_elapsed_seconds: null even though serve
-    // elapsed_seconds is set; those ticks carry no charge-clock x, so they're
-    // dropped and the curve begins at the charge origin (0:00 = charge).
+  it("plots PRE-charge telemetry so the preheat curve is visible (#326 regression guard for #316)", () => {
+    // Pre-charge the server sends charge_elapsed_seconds: null but serve
+    // elapsed_seconds is set; the buffer keys on serve elapsed so the preheat frame
+    // PLOTS (the #316 fix dropped these and left the chart blank during preheat).
     const s = dashboardReducer(
       initialDashboardViewModel,
       ev("telemetry", { elapsed_seconds: 90, charge_elapsed_seconds: null, bean_temp_c: 120, env_temp_c: 140 }),
+    );
+    expect(s.points).toHaveLength(1);
+    expect(s.points[0]).toMatchObject({ t: 90, bean: 120 });
+  });
+
+  it("drops a telemetry frame only when the serve clock is null (no x to place, #326)", () => {
+    const s = dashboardReducer(
+      initialDashboardViewModel,
+      ev("telemetry", { elapsed_seconds: null, charge_elapsed_seconds: null, bean_temp_c: 120, env_temp_c: 140 }),
     );
     expect(s.points).toHaveLength(0);
   });
@@ -104,9 +114,10 @@ describe("dashboardReducer", () => {
         { t: 30, bean: 130, env: 150, ror: 12, heat: 70, fan: 40 },
       ],
     });
+    // Live frames key on serve elapsed_seconds (#326); the seam tick is serve t=30.
     s = dashboardReducer(
       s,
-      ev("telemetry", { elapsed_seconds: 530, charge_elapsed_seconds: 30, bean_temp_c: 999, env_temp_c: 150, bean_ror_c_per_min: 12, heat_percent: 70, fan_percent: 40 }),
+      ev("telemetry", { elapsed_seconds: 30, charge_elapsed_seconds: 0, bean_temp_c: 999, env_temp_c: 150, bean_ror_c_per_min: 12, heat_percent: 70, fan_percent: 40 }),
     );
     s = dashboardReducer(s, {
       kind: "seed",
@@ -124,15 +135,15 @@ describe("dashboardReducer", () => {
         { t: 30, bean: 130, env: 150, ror: 12, heat: 70, fan: 40 },
       ],
     });
-    // Live frame at the last seeded tick (t=30) with a fresher value, then a new tick.
-    // Live frames key on charge_elapsed_seconds (#308); serve elapsed is offset.
+    // Live frame at the last seeded tick (serve t=30) with a fresher value, then a
+    // new tick. Live frames key on serve elapsed_seconds (#326).
     s = dashboardReducer(
       s,
-      ev("telemetry", { elapsed_seconds: 530, charge_elapsed_seconds: 30, bean_temp_c: 200, env_temp_c: 150, bean_ror_c_per_min: 12, heat_percent: 70, fan_percent: 40 }),
+      ev("telemetry", { elapsed_seconds: 30, charge_elapsed_seconds: 0, bean_temp_c: 200, env_temp_c: 150, bean_ror_c_per_min: 12, heat_percent: 70, fan_percent: 40 }),
     );
     s = dashboardReducer(
       s,
-      ev("telemetry", { elapsed_seconds: 560, charge_elapsed_seconds: 60, bean_temp_c: 260, env_temp_c: 180, bean_ror_c_per_min: 12, heat_percent: 70, fan_percent: 40 }),
+      ev("telemetry", { elapsed_seconds: 60, charge_elapsed_seconds: 30, bean_temp_c: 260, env_temp_c: 180, bean_ror_c_per_min: 12, heat_percent: 70, fan_percent: 40 }),
     );
     expect(s.points.map((p) => p.t)).toEqual([0, 30, 60]); // t=30 not duplicated
     expect(s.points.find((p) => p.t === 30)?.bean).toBe(200); // live value won
@@ -143,10 +154,10 @@ describe("dashboardReducer", () => {
       { t: 0, bean: 100, env: 120, ror: 12, heat: 70, fan: 40 },
       { t: 60, bean: 160, env: 180, ror: 12, heat: 70, fan: 40 },
     ] });
-    // A late frame for charge-t=30 (out of order) inserts between 0 and 60.
+    // A late frame for serve-t=30 (out of order) inserts between 0 and 60.
     s = dashboardReducer(
       s,
-      ev("telemetry", { elapsed_seconds: 530, charge_elapsed_seconds: 30, bean_temp_c: 130, env_temp_c: 150, bean_ror_c_per_min: 12, heat_percent: 70, fan_percent: 40 }),
+      ev("telemetry", { elapsed_seconds: 30, charge_elapsed_seconds: 0, bean_temp_c: 130, env_temp_c: 150, bean_ror_c_per_min: 12, heat_percent: 70, fan_percent: 40 }),
     );
     expect(s.points.map((p) => p.t)).toEqual([0, 30, 60]);
   });
@@ -264,65 +275,61 @@ describe("dashboardReducer", () => {
     expect(s.safetyTrail.map((e) => e.kind)).toEqual(["safety_alert", "fault"]);
   });
 
-  it("adds T0 and first-crack markers (once each)", () => {
-    let s = dashboardReducer(initialDashboardViewModel, ev("t0_detected", { bean_temp_c: 175 }));
-    // charge_elapsed_seconds drives the curve x (#308): the FC marker lands at the
-    // latest point's charge-referenced t (500), not the serve elapsed (1021).
-    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 1021, charge_elapsed_seconds: 500, bean_temp_c: 200, env_temp_c: 210 }));
+  it("adds T0 and first-crack markers at the serve-elapsed of detection (once each, #326)", () => {
+    // Markers key on serve elapsed (#326): plot a preheat frame, then the charge
+    // tick (serve 510) at which T0 fires, then a post-charge tick before FC.
+    let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 480, charge_elapsed_seconds: null, bean_temp_c: 90, env_temp_c: 180 }));
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 510, charge_elapsed_seconds: 0, bean_temp_c: 160, env_temp_c: 200 }));
+    s = dashboardReducer(s, ev("t0_detected", { bean_temp_c: 160 }));
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 1010, charge_elapsed_seconds: 500, bean_temp_c: 200, env_temp_c: 210 }));
     s = dashboardReducer(s, ev("first_crack", { source: "mcp", bean_temp_c: 201 }));
     // Re-deliver first_crack — must not duplicate the marker.
     s = dashboardReducer(s, ev("first_crack", { source: "mcp", bean_temp_c: 201 }));
     expect(s.t0).not.toBeNull();
     expect(s.firstCrack?.source).toBe("mcp");
     expect(s.markers.filter((m) => m.kind === "first_crack")).toHaveLength(1);
-    expect(s.markers.find((m) => m.kind === "first_crack")?.t).toBe(500);
+    // FC marker sits at the latest point's serve-elapsed (1010), not the charge clock.
+    expect(s.markers.find((m) => m.kind === "first_crack")?.t).toBe(1010);
   });
 
-  it("marks the charge (T0) turning point at x=0 labeled 'T0' (#165/#308)", () => {
-    // The T0 marker anchors the curve origin (0:00 = charge, Artisan convention) —
-    // and with the charge-referenced x (#308) the first post-charge point lands at
-    // t=0 right under it.
-    const s = dashboardReducer(initialDashboardViewModel, ev("t0_detected", { bean_temp_c: 175 }));
-    const t0 = s.markers.find((m) => m.kind === "t0");
-    expect(t0).toEqual({ kind: "t0", t: 0, label: "T0" });
+  it("sets t0ElapsedSeconds + the T0 marker to the serve-elapsed at charge (#326)", () => {
+    // t0ElapsedSeconds is null before T0 fires; on t0_detected it (and the T0
+    // marker) take the latest plotted point's serve-elapsed — the charge moment —
+    // so LiveCurve can re-label the axis to roast time (0:00 = charge, preheat
+    // negative) without moving any point.
+    let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 480, charge_elapsed_seconds: null, bean_temp_c: 90, env_temp_c: 180 }));
+    expect(s.t0ElapsedSeconds).toBeNull();
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 540, charge_elapsed_seconds: 0, bean_temp_c: 160, env_temp_c: 200 }));
+    s = dashboardReducer(s, ev("t0_detected", { bean_temp_c: 160 }));
+    expect(s.t0ElapsedSeconds).toBe(540);
+    expect(s.markers.find((m) => m.kind === "t0")).toEqual({ kind: "t0", t: 540, label: "T0" });
   });
 
-  it("plots the curve in CHARGE-referenced time, origin at charge (#308)", () => {
-    // With the charge re-origin (#308), the first post-charge tick lands at t=0 and
-    // the curve advances in since-charge seconds — RoR is real probe data and stays
-    // plotted (the operator still steers by it).
+  it("plots the curve in SERVE-elapsed time, preheat included (#326)", () => {
+    // The buffer keys on serve elapsed: a preheat frame (null charge clock) AND the
+    // post-charge frames all plot, continuous through preheat → charge → roast. RoR
+    // is real probe data and stays plotted (the operator still steers by it).
     let s = dashboardReducer(
       initialDashboardViewModel,
+      ev("telemetry", { elapsed_seconds: 300, charge_elapsed_seconds: null, bean_temp_c: 60, env_temp_c: 190, bean_ror_c_per_min: 30 }),
+    );
+    s = dashboardReducer(
+      s,
       ev("telemetry", { elapsed_seconds: 510, charge_elapsed_seconds: 0, bean_temp_c: 148, env_temp_c: 200, bean_ror_c_per_min: 22 }),
     );
     s = dashboardReducer(
       s,
       ev("telemetry", { elapsed_seconds: 540, charge_elapsed_seconds: 30, bean_temp_c: 165, env_temp_c: 205, bean_ror_c_per_min: 18 }),
     );
-    expect(s.points.map((p) => p.t)).toEqual([0, 30]);
+    expect(s.points.map((p) => p.t)).toEqual([300, 510, 540]);
     expect(s.points.every((p) => p.ror !== null)).toBe(true);
-    expect(s.points[0]).toMatchObject({ t: 0, ror: 22 });
+    expect(s.points[1]).toMatchObject({ t: 510, ror: 22 });
   });
 
-  it("drops PRE-charge ticks so the curve starts at charge, not preheat (#308)", () => {
-    // Pre-charge ticks carry a null charge clock even with serve elapsed set; they
-    // are NOT plotted — the curve no longer shows the preheat lead-in (#220 hold
-    // superseded per the operator). Only the post-charge tick survives.
-    let s = dashboardReducer(
-      initialDashboardViewModel,
-      ev("telemetry", { elapsed_seconds: 120, charge_elapsed_seconds: null, bean_temp_c: 60, env_temp_c: 180, bean_ror_c_per_min: 22 }),
-    );
-    s = dashboardReducer(
-      s,
-      ev("telemetry", { elapsed_seconds: 510, charge_elapsed_seconds: 0, bean_temp_c: 148, env_temp_c: 200, bean_ror_c_per_min: 18 }),
-    );
-    expect(s.points.map((p) => p.t)).toEqual([0]);
-  });
-
-  it("adds a drop marker on a drop_beans command_executed", () => {
+  it("adds a drop marker at the latest point's serve-elapsed on drop_beans (#326)", () => {
     let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 1100, charge_elapsed_seconds: 600, bean_temp_c: 215, env_temp_c: 220 }));
     s = dashboardReducer(s, ev("command_executed", { command: "drop_beans", source: "operator" }));
-    expect(s.markers.find((m) => m.kind === "drop")?.t).toBe(600);
+    expect(s.markers.find((m) => m.kind === "drop")?.t).toBe(1100);
   });
 
   it("ignores a non-drop command_executed (no marker)", () => {

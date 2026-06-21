@@ -369,6 +369,7 @@ export function DashboardPage(): React.JSX.Element {
           markers={curve.markers}
           phase={phase}
           chargeBand={chargeBand ?? undefined}
+          originSeconds={view.t0ElapsedSeconds}
         />
 
         <ControlRow

@@ -99,9 +99,9 @@ describe("useDashboardEvents (hook)", () => {
 
   // --- #153: curve backfill from /telemetry on (re)connect ---
 
-  /** A persisted telemetry series for the backfill stub. `t` is the CHARGE-
-   *  referenced clock (#308) the curve x re-origins on; serve elapsed is offset so
-   *  the two are never confused. */
+  /** A persisted telemetry series for the backfill stub. `t` is the SERVE-elapsed
+   *  clock (#326) the curve buffer keys on; the charge clock is offset (t − 510) so
+   *  the two are never confused — these ticks are post-charge. */
   function series(ticks: number[]): TelemetrySeries {
     return {
       run_id: "run-1",
@@ -109,8 +109,8 @@ describe("useDashboardEvents (hook)", () => {
       point_count: ticks.length,
       points: ticks.map((t, i) => ({
         tick: i,
-        elapsed_seconds: 500 + t,
-        charge_elapsed_seconds: t,
+        elapsed_seconds: t,
+        charge_elapsed_seconds: t - 510,
         agent_phase: "development",
         bean_temp_c: 100 + t,
         env_temp_c: 120 + t,
@@ -124,13 +124,13 @@ describe("useDashboardEvents (hook)", () => {
     };
   }
 
-  /** A live telemetry SSE frame at CHARGE-referenced elapsed `t` (#308). */
+  /** A live telemetry SSE frame at SERVE-elapsed `t` (#326; the buffer key). */
   function telemetry(t: number): SseEvent {
     return {
       event: "telemetry",
       data: {
-        elapsed_seconds: 500 + t,
-        charge_elapsed_seconds: t,
+        elapsed_seconds: t,
+        charge_elapsed_seconds: t - 510,
         bean_temp_c: 200 + t,
         env_temp_c: 220 + t,
         bean_ror_c_per_min: 10,

@@ -55,6 +55,15 @@ export interface LiveCurveProps {
    * consumer toggles by passing `null`). Owned by the consumer, not the chart.
    */
   highlightTime?: number | null;
+  /**
+   * Serve-elapsed seconds at the T0/charge moment, for the CHARGE-referenced ROAST
+   * TIME display (#326). The point buffer is keyed on serve elapsed (so preheat
+   * plots live); passing the charge origin re-labels the x-axis ticks + cursor
+   * readout to roast time (0:00 = charge, negative before T0) WITHOUT moving any
+   * point. `null` (default, or before T0 lands) → the axis shows serve-elapsed.
+   * The dashboard passes `vm.t0ElapsedSeconds`; the detail page omits it.
+   */
+  originSeconds?: number | null;
   /** Series hidden by default (e.g. detail view may start with heat/fan off). */
   initialHidden?: SeriesKey[];
   className?: string;

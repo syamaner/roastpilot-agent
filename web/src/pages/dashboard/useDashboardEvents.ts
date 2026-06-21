@@ -69,13 +69,22 @@ export interface DashboardViewModel {
   firstCrack: FirstCrackData | null;
   /** T0 detection; null until detected. */
   t0: T0DetectedData | null;
-  /** Event markers for the curve (T0 / first crack / drop), x in CHARGE-referenced
-   *  seconds (#308): T0 sits at 0, FC/drop at their since-charge elapsed. */
+  /** SERVE-elapsed seconds at the T0/charge moment (#326), null until T0 fires.
+   *  Passed to LiveCurve as the charge origin so the x-axis + cursor read CHARGE-
+   *  referenced ROAST TIME (0:00 = charge, negative in preheat) while the point
+   *  buffer stays serve-keyed (so preheat plots live). Null before T0 → the chart
+   *  shows serve-elapsed. */
+  t0ElapsedSeconds: number | null;
+  /** Event markers for the curve (T0 / first crack / drop), x in SERVE-elapsed
+   *  seconds (#326) — the same axis the points are keyed on. The T0 marker sits at
+   *  the serve-elapsed of the charge moment, so it lands at the charge tick on the
+   *  serve-referenced curve (and reads 0:00 once the origin transform applies). */
   markers: CurveMarker[];
-  /** Curve points, x = CHARGE-referenced elapsed seconds (#308: 0:00 = charge),
-   *  ascending and deduped on `t`. Seeded from the `/telemetry` snapshot on
-   *  (re)connect (#153), then appended/merged per live telemetry frame. Pre-charge
-   *  ticks (null charge clock) are dropped — the curve starts at the charge origin. */
+  /** Curve points, x = SERVE-elapsed seconds (#326), ascending and deduped on `t`.
+   *  Seeded from the `/telemetry` snapshot on (re)connect (#153), then appended/
+   *  merged per live telemetry frame. PRE-charge frames ARE plotted (only a null
+   *  serve clock is dropped), so the curve is continuous through preheat → charge →
+   *  roast → drop; the charge origin is applied as a display transform downstream. */
   points: CurvePoint[];
   /** Monotonic counter assigning each advisory record a stable key (per run). */
   advisorySeq: number;
@@ -90,6 +99,7 @@ export const initialDashboardViewModel: DashboardViewModel = {
   safetyTrail: [],
   firstCrack: null,
   t0: null,
+  t0ElapsedSeconds: null,
   markers: [],
   points: [],
   advisorySeq: 0,
@@ -104,20 +114,20 @@ type Action =
   | { kind: "reset" };
 
 /**
- * Pull the CHARGE-referenced elapsed-seconds x for a telemetry frame (#308); null
- * frames don't plot.
+ * Pull the SERVE-elapsed x for a telemetry frame (#326); null frames don't plot.
  *
- * The curve x-axis is re-origined to charge/T0 (0:00 = charge, Artisan convention),
- * so we key `t` on `charge_elapsed_seconds`, NOT the serve-referenced
- * `elapsed_seconds`. The server sends `charge_elapsed_seconds: null` for PRE-charge
- * (preheat) ticks; those carry no x on the charge clock, so they're dropped — the
- * curve begins at the charge origin and the T0 marker (already at t=0) sits there.
- * This intentionally supersedes the #220 serve-referenced plot per the operator.
+ * The point buffer keys `t` on serve `elapsed_seconds`, NOT `charge_elapsed_seconds`
+ * — so PRE-charge (preheat) frames plot LIVE, before T0/charge is known, and the
+ * curve stays continuous through preheat → charge → roast → drop (the #316 fix that
+ * dropped preheat frames left the chart blank during preheat). Only a null serve
+ * clock is dropped (no x to place). The charge-referenced ROAST TIME display
+ * (0:00 = charge, negative in preheat) is a downstream label transform in LiveCurve
+ * keyed on `t0ElapsedSeconds`, not a change to the buffered x.
  */
 function pointFromTelemetry(t: TelemetryEventData): CurvePoint | null {
-  if (t.charge_elapsed_seconds == null) return null;
+  if (t.elapsed_seconds == null) return null;
   return {
-    t: t.charge_elapsed_seconds,
+    t: t.elapsed_seconds,
     bean: t.bean_temp_c,
     env: t.env_temp_c,
     ror: t.bean_ror_c_per_min,
@@ -127,13 +137,12 @@ function pointFromTelemetry(t: TelemetryEventData): CurvePoint | null {
 }
 
 /** Project a persisted `/telemetry` snapshot point into the curve form, x =
- *  CHARGE-referenced elapsed seconds (#308). Pre-charge snapshots carry a null
- *  `charge_elapsed_seconds` (the lead-in) and can't be placed on the charge clock,
- *  so they're dropped — same rule as the live frame path (`pointFromTelemetry`). */
+ *  SERVE-elapsed seconds (#326). Only a null serve clock is dropped — pre-charge
+ *  snapshots plot, same rule as the live frame path (`pointFromTelemetry`). */
 function pointFromSnapshot(p: TelemetryPoint): CurvePoint | null {
-  if (p.charge_elapsed_seconds == null) return null;
+  if (p.elapsed_seconds == null) return null;
   return {
-    t: p.charge_elapsed_seconds,
+    t: p.elapsed_seconds,
     bean: p.bean_temp_c,
     env: p.env_temp_c,
     ror: p.bean_ror_c_per_min,
@@ -294,16 +303,24 @@ export function dashboardReducer(
     }
     case "t0_detected": {
       const data = event.data as unknown as T0DetectedData;
+      // The charge moment's SERVE-elapsed is the latest plotted point's t (#326) —
+      // the same value the FC/drop markers use, and the origin the LiveCurve display
+      // subtracts to read roast time (0:00 here, preheat negative). The T0 marker
+      // sits at this serve-elapsed t so it lands on the charge tick of the serve-
+      // referenced curve.
+      const at = state.points.length > 0 ? state.points[state.points.length - 1].t : 0;
       return {
         ...state,
         t0: data,
-        markers: withMarker(state.markers, { kind: "t0", t: 0, label: "T0" }),
+        t0ElapsedSeconds: at,
+        markers: withMarker(state.markers, { kind: "t0", t: at, label: "T0" }),
       };
     }
     case "first_crack": {
       const data = event.data as unknown as FirstCrackData;
-      // The FC marker's x is the elapsed time at detection — the latest plotted
-      // point's t (the curve x-axis is CHARGE-referenced seconds since T0, #308).
+      // The FC marker's x is the serve-elapsed at detection — the latest plotted
+      // point's t (the buffer x-axis is serve-elapsed seconds, #326; the roast-time
+      // re-label is a display transform in LiveCurve).
       const at = state.points.length > 0 ? state.points[state.points.length - 1].t : 0;
       return {
         ...state,
