@@ -893,6 +893,7 @@ class RoastRunner:
                     fan_percent=snapshot.current_fan,
                     cooling_on=telemetry.cooling_on,
                     elapsed_seconds=snapshot.roast_elapsed_seconds,
+                    charge_elapsed_seconds=snapshot.charge_elapsed_seconds,
                     development_elapsed_seconds=snapshot.development_elapsed_seconds,
                     development_percent=snapshot.development_percent,
                     t0_detected=telemetry.t0_detected,
@@ -919,6 +920,11 @@ class RoastRunner:
             # must equal what the model sees. The MCP raw figure stays in
             # raw_state_json for diagnosis.
             development_percent=snapshot.development_percent,
+            # #308: persist the charge-referenced roast clock alongside the
+            # serve-referenced elapsed_seconds so the REST telemetry series can
+            # re-origin the chart x-axis at charge on a history/reload read. None
+            # before charge; frozen at the drop value in cooling. Display-only.
+            charge_elapsed_seconds=snapshot.charge_elapsed_seconds,
             raw_state_json=None if raw is None else raw.model_dump_json(),
         )
 

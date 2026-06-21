@@ -251,6 +251,18 @@ CREATE TABLE bean_profiles (
 CREATE INDEX idx_bean_profiles_archived ON bean_profiles(archived, name);
 """
 
+SCHEMA_V5_CHARGE_ELAPSED = """
+-- #308: persist the charge-referenced roast clock (seconds since charge/T0) on
+-- each telemetry snapshot so the REST telemetry series re-origins the chart
+-- x-axis at charge (Artisan 0:00) on a history/reload read, not only live over
+-- SSE. Nullable and advisory/display-only — no safety gate reads it (the safety
+-- box keys on temperature, never the clock). NULL before charge (and for
+-- pre-existing rows), which the SPA renders as no roast-time / pre-charge
+-- lead-in. Distinct from the existing serve-referenced elapsed_seconds column,
+-- which is retained as the chart's raw x lead-in.
+ALTER TABLE telemetry_snapshots ADD COLUMN charge_elapsed_seconds REAL;
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
@@ -259,6 +271,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V2_IMMUTABILITY,
     SCHEMA_V3_T0_DETECTED_AT,
     SCHEMA_V4_BEAN_PROFILES,
+    SCHEMA_V5_CHARGE_ELAPSED,
 )
 
 
@@ -535,6 +548,7 @@ class RoastStore:
         heat_level_percent: int | None = None,
         fan_level_percent: int | None = None,
         development_percent: float | None = None,
+        charge_elapsed_seconds: float | None = None,
         raw_state_json: str | None = None,
     ) -> bool:
         """Persist a telemetry row, throttled to ``interval_seconds``.
@@ -551,8 +565,8 @@ class RoastStore:
             " (run_id, tick, recorded_at_utc, elapsed_seconds, agent_phase, mcp_phase,"
             "  bean_temp_c, env_temp_c, bean_ror_c_per_min, env_ror_c_per_min,"
             "  heat_level_percent, fan_level_percent, cooling_on, development_percent,"
-            "  raw_state_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  charge_elapsed_seconds, raw_state_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 run_id,
                 tick,
@@ -568,6 +582,7 @@ class RoastStore:
                 fan_level_percent,
                 None if telemetry is None else int(telemetry.cooling_on),
                 development_percent,
+                charge_elapsed_seconds,
                 raw_state_json,
             ),
         )
@@ -961,7 +976,7 @@ class RoastStore:
         async with self.connection.execute(
             "SELECT tick, elapsed_seconds, agent_phase, bean_temp_c, env_temp_c,"
             " bean_ror_c_per_min, env_ror_c_per_min, heat_level_percent,"
-            " fan_level_percent, cooling_on, development_percent"
+            " fan_level_percent, cooling_on, development_percent, charge_elapsed_seconds"
             " FROM telemetry_snapshots WHERE run_id = ? ORDER BY tick ASC, id ASC",
             (run_id,),
         ) as cursor:
@@ -992,6 +1007,9 @@ class RoastStore:
                 development_percent=None
                 if row["development_percent"] is None
                 else float(row["development_percent"]),
+                charge_elapsed_seconds=None
+                if row["charge_elapsed_seconds"] is None
+                else float(row["charge_elapsed_seconds"]),
             )
             for row in sampled
         ]

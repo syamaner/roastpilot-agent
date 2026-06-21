@@ -590,6 +590,7 @@ async def test_persisted_dev_percent_is_the_controller_value_not_mcp_raw(
             current_heat=50,
             current_fan=60,
             roast_elapsed_seconds=600.0,
+            charge_elapsed_seconds=480.0,
             development_elapsed_seconds=75.0,
             development_percent=controller_dev_percent,
             telemetry=RoastTelemetry.model_validate({"bean_temp_c": 196.0, "env_temp_c": 214.0}),
@@ -615,5 +616,8 @@ async def test_persisted_dev_percent_is_the_controller_value_not_mcp_raw(
         points = await store.read_telemetry_points(run_id)
         assert len(points) == 1
         assert points[0].development_percent == controller_dev_percent  # controller, not 3.6
+        # #308: the charge-referenced roast clock is persisted from the snapshot
+        # (the REST telemetry series re-origins the chart x-axis at charge).
+        assert points[0].charge_elapsed_seconds == 480.0
     finally:
         await store.close()

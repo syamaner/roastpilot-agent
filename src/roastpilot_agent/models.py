@@ -686,6 +686,12 @@ class TelemetryPoint(BaseModel):
 
     tick: int
     elapsed_seconds: float | None = None
+    charge_elapsed_seconds: float | None = None
+    """Seconds since charge (T0) at this snapshot — the operator-facing roast
+    clock (#308), persisted so the REST telemetry series re-origins the chart
+    x-axis at charge (0:00) on a history/reload read, not only live over SSE.
+    ``None`` before charge (and for pre-#308 rows). Distinct from
+    ``elapsed_seconds`` (serve/run-referenced — the chart's raw x lead-in)."""
     agent_phase: RoastPhase
     bean_temp_c: float | None = None
     env_temp_c: float | None = None
@@ -874,6 +880,15 @@ class TelemetryEventData(BaseModel):
     fan_percent: int | None = None
     cooling_on: bool = False
     elapsed_seconds: float | None = None
+    charge_elapsed_seconds: float | None = None
+    """Seconds since charge (T0) — the operator-facing roast clock (#308). ``None``
+    before charge (the SPA shows '—' / no roast time during preheat), and frozen
+    at the drop value in cooling. Server-authoritative (the controller's
+    ``_charge_elapsed_seconds``, the same charge/T0 instant the advisor's DTR uses).
+    The SPA renders ROAST TIME from this with 0:00 = charge and re-origins the
+    chart x-axis to charge. **Distinct from** ``elapsed_seconds``
+    (serve/run-referenced — the chart's raw x lead-in, kept so the SPA can still
+    draw the pre-charge preheat curve)."""
     development_elapsed_seconds: float | None = None
     """Seconds since first crack — the live development clock (#220). ``None``
     before first crack. Server-authoritative (the controller's

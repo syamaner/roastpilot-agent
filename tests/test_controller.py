@@ -2292,6 +2292,62 @@ def test_development_and_dtr_freeze_at_drop_on_snapshot() -> None:
     assert frozen.development_percent == at_drop.development_percent
 
 
+def test_snapshot_charge_elapsed_is_none_before_charge() -> None:
+    """#308: the snapshot's ``charge_elapsed_seconds`` is ``None`` before charge.
+
+    The operator-facing ROAST TIME source: ``None`` during preheat (the SPA shows
+    '—', not a misleading ``0:00``), so the header reads no roast time until the
+    bean is on the drum. Distinct from ``roast_elapsed_seconds`` (serve-referenced)
+    which keeps climbing through preheat for the chart's raw x lead-in."""
+    harness = make_harness(readings=[reading()])
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    harness.clock.advance(45.0)  # preheat time elapses
+
+    snap = harness.controller.snapshot()
+    assert snap.charge_elapsed_seconds is None  # no charge yet
+    # The serve-referenced chart clock still advanced through preheat.
+    assert snap.roast_elapsed_seconds == pytest.approx(45.0)
+
+
+def test_snapshot_charge_elapsed_is_since_charge_after_t0() -> None:
+    """#308: after charge (T0) the snapshot's ``charge_elapsed_seconds`` counts
+    since charge, NOT since serve/run start (the #308 header re-origin).
+
+    Charge is stamped, then 90 s elapse: the charge clock reads 90 s while the
+    serve clock includes the prior preheat lead-in."""
+    harness = _charged_developed_harness()  # preheat → charge stamped → pre-FC
+    harness.clock.advance(90.0)
+
+    snap = harness.controller.snapshot()
+    charge_elapsed = snap.charge_elapsed_seconds
+    assert charge_elapsed is not None
+    assert charge_elapsed == pytest.approx(90.0)  # since charge
+    # Distinct from the serve clock, which is >= the charge clock (includes preheat).
+    assert snap.roast_elapsed_seconds >= charge_elapsed
+
+
+def test_snapshot_charge_elapsed_freezes_at_drop() -> None:
+    """#308: once the beans are dropped (COOLING), ``charge_elapsed_seconds`` freezes
+    at its drop value instead of climbing into cooling (via ``_effective_now``,
+    mirroring the development clock freeze of #239). Display-only."""
+    harness = _charged_developed_harness()
+    harness.clock.advance(120.0)  # charge → FC
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    harness.clock.advance(60.0)  # 60 s development before the drop
+
+    at_drop = harness.controller.snapshot()
+    assert at_drop.charge_elapsed_seconds == pytest.approx(180.0)  # 120 + 60
+
+    harness.controller.transition_to(RoastPhase.COOLING)  # drop stamps the instant
+    harness.clock.advance(120.0)  # cooling runs on — the clock must NOT move
+
+    frozen = harness.controller.snapshot()
+    assert frozen.charge_elapsed_seconds == pytest.approx(180.0)  # frozen, not 300.0
+    assert frozen.charge_elapsed_seconds == at_drop.charge_elapsed_seconds
+
+
 def test_advisor_context_development_clock_frozen_after_drop() -> None:
     """#239: the advisor context's development_elapsed_seconds AND
     roast_elapsed_seconds (the DTR numerator + denominator) freeze at their drop

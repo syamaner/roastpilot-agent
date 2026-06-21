@@ -181,6 +181,7 @@
         "agent_phase": "preheating",
         "bean_ror_c_per_min": null,
         "bean_temp_c": 38.0,
+        "charge_elapsed_seconds": null,
         "cooling_on": false,
         "development_elapsed_seconds": null,
         "development_percent": null,

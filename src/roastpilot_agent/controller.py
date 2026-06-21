@@ -484,12 +484,22 @@ class ControllerSnapshot:
     charge-referenced roast clock, #220) are read-only projections of the
     already-computed clocks the advisor reasons on; both ``None`` before first
     crack. The runner copies them onto the per-tick telemetry SSE frame so the
-    operator sees the live development time + DTR (no client-side derivation)."""
+    operator sees the live development time + DTR (no client-side derivation).
+
+    ``charge_elapsed_seconds`` is the operator-facing roast clock: seconds since
+    charge (T0), ``None`` before charge, frozen at the drop value in cooling
+    (#308). It is the charge-referenced projection of
+    :meth:`RoastController._charge_elapsed_seconds`, surfaced so the SPA can
+    render ROAST TIME with 0:00 = charge and re-origin the chart x-axis to charge
+    (the header re-origin, part 1 = backend). It is **distinct** from
+    ``roast_elapsed_seconds`` (serve/run-referenced — the chart's raw x lead-in,
+    kept so the SPA can still draw the pre-charge preheat curve)."""
 
     phase: RoastPhase
     current_heat: int
     current_fan: int
     roast_elapsed_seconds: float
+    charge_elapsed_seconds: float | None
     development_elapsed_seconds: float | None
     development_percent: float | None
     telemetry: RoastTelemetry | None
@@ -611,6 +621,7 @@ class RoastController:
             current_heat=self._current_heat,
             current_fan=self._current_fan,
             roast_elapsed_seconds=self._roast_elapsed_seconds(),
+            charge_elapsed_seconds=self._charge_elapsed_seconds_or_none(),
             development_elapsed_seconds=self._development_elapsed_seconds(),
             development_percent=self._development_percent(),
             telemetry=self._last_telemetry,
@@ -652,6 +663,26 @@ class RoastController:
         if self._charge_monotonic is None:
             return 0.0
         return self._effective_now() - self._charge_monotonic
+
+    def _charge_elapsed_seconds_or_none(self) -> float | None:
+        """The charge-referenced roast clock for the SPA, ``None`` before charge.
+
+        The operator-facing ROAST TIME source surfaced on
+        :class:`ControllerSnapshot` (#308): seconds since charge (T0), ``None``
+        before charge so the SPA can show '—' until the bean is on the drum
+        (rather than a misleading ``0:00`` during preheat), and frozen at the
+        drop value in cooling (via :meth:`_effective_now`). It is the same clock
+        as :meth:`_charge_elapsed_seconds` (which returns ``0.0`` pre-charge for
+        the advisor's DTR denominator), differing only in the pre-charge sentinel
+        the display contract wants.
+
+        Distinct from :meth:`_roast_elapsed_seconds` (serve/run-referenced — the
+        chart's raw x lead-in). Advisory/display-only: it bounds no control,
+        transition, verdict, executor, or drop gate.
+        """
+        if self._charge_monotonic is None:
+            return None
+        return self._charge_elapsed_seconds()
 
     def _effective_now(self) -> float:
         """The clock instant the elapsed-time readouts reference, frozen at drop.

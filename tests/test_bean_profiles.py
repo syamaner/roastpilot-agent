@@ -45,8 +45,13 @@ async def store(tmp_path: Path) -> AsyncIterator[RoastStore]:
 
 @pytest.mark.asyncio
 async def test_v4_migration_creates_bean_profiles_table(store: RoastStore) -> None:
-    """#303: the additive bump lands the new table + index and reaches v4."""
-    assert await store.schema_version() == 4
+    """#303: the additive bump lands the new table + index from v4 onward.
+
+    The V4 migration introduced ``bean_profiles``; later additive migrations
+    (e.g. #308's V5 ``charge_elapsed_seconds`` column) bump the version further,
+    so the assertion is ``>= 4`` (the table is present at the current schema)
+    rather than pinning the now-intermediate v4."""
+    assert await store.schema_version() >= 4
     async with store.connection.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table'"
     ) as cursor:
