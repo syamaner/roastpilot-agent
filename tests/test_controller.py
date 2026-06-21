@@ -21,6 +21,7 @@ from roastpilot_agent.advisor import (
     RoastAdvisor,
     RoastDecision,
 )
+from roastpilot_agent.coherence import LeverDirection
 from roastpilot_agent.config import ControllerConfig, SafetyLimits
 from roastpilot_agent.control_policy import PhaseControlLimits
 from roastpilot_agent.controller import (
@@ -1080,21 +1081,30 @@ async def test_failed_emergency_stop_still_faults() -> None:
 def _policy() -> AdvisoryCallPolicy:
     """A policy with the default ControllerConfig thresholds (temp 1.0 °C,
     RoR 2.0 °C/min, phase-keyed floors: pre-FC NOT an advice phase (D35/#222) /
-    development 0 = unthrottled)."""
+    development heartbeat 5 s, post-FC consult dwell 5 s, #276).
+
+    The default post-FC dwell (``post_fc_min_consult_interval_seconds`` 5 s, #276)
+    gates EVERY automatic development trigger — including the change-based ones —
+    so a test that wants a change trigger to fire on the next tick must advance
+    ``now`` past the dwell (use :func:`_no_dwell_development_policy` for the
+    isolated delta-logic tests)."""
     return AdvisoryCallPolicy(ControllerConfig())
 
 
-def _throttled_development_policy() -> AdvisoryCallPolicy:
-    """A policy whose DEVELOPMENT floor is a long fixed heartbeat (1000 s).
+def _no_dwell_development_policy(*, heartbeat_seconds: float = 1000.0) -> AdvisoryCallPolicy:
+    """A development policy with the post-FC dwell effectively off (#276).
 
-    Development is unthrottled by default (0 floor → MIN_INTERVAL fires every
-    eligible tick), which makes the change-based triggers impossible to isolate
-    in a unit test. A long floor suppresses the heartbeat so a test can assert
-    that a sub-threshold delta is genuinely silent and an at-threshold delta
-    fires the change-based trigger (the post-FC analogue of the retired pre-FC
-    no-heartbeat tests)."""
+    The default post-FC dwell (5 s, #276) gates the change-based triggers too, so
+    isolating the delta logic on consecutive 1 s ticks needs the dwell out of the
+    way: a near-zero dwell (``gt=0`` forbids exactly 0) lets a change trigger fire
+    on the next tick, while a long heartbeat floor suppresses MIN_INTERVAL so the
+    test can assert a sub-threshold delta is genuinely silent and an at-threshold
+    one fires the change-based trigger."""
     return AdvisoryCallPolicy(
-        ControllerConfig(advisory_min_interval_seconds={RoastPhase.DEVELOPMENT: 1000.0})
+        ControllerConfig(
+            advisory_min_interval_seconds={RoastPhase.DEVELOPMENT: heartbeat_seconds},
+            post_fc_min_consult_interval_seconds=0.001,
+        )
     )
 
 
@@ -1127,7 +1137,7 @@ def test_policy_phase_transition_triggers() -> None:
 def test_policy_bean_temp_delta_triggers_at_threshold_not_below() -> None:
     # Development with a long heartbeat floor (#222): isolate the change-based
     # bean-temp trigger from the per-tick (0 floor) heartbeat.
-    policy = _throttled_development_policy()
+    policy = _no_dwell_development_policy()
     policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=150.0), now=0.0)
     # +0.5 °C, below the delta threshold, well inside the heartbeat floor: silent.
     assert (
@@ -1154,7 +1164,7 @@ def test_policy_bean_temp_delta_triggers_at_threshold_not_below() -> None:
 def test_policy_ror_delta_triggers_at_threshold() -> None:
     # Development with a long heartbeat floor (#222): the RoR delta is the only
     # reason to fire (the heartbeat is suppressed).
-    policy = _throttled_development_policy()
+    policy = _no_dwell_development_policy()
     policy.note_call(
         phase=RoastPhase.DEVELOPMENT,
         telemetry=reading(bean=150.0, bean_ror_c_per_min=5.0),
@@ -1170,23 +1180,49 @@ def test_policy_ror_delta_triggers_at_threshold() -> None:
     assert trigger is AdvisoryTrigger.ROR_DELTA
 
 
-def test_policy_development_is_unthrottled_back_to_back() -> None:
-    """#171: development (first crack onward) has a 0 floor — the heartbeat
-    fires on the very next tick after a consult returns, so consults run
-    back-to-back, bounded only by advisor latency (calls are serial)."""
+def test_policy_development_consults_at_the_post_fc_dwell_cadence() -> None:
+    """#276 (supersedes the #171 back-to-back behaviour): development consults run
+    at the deliberate post-FC dwell (~5 s, D40.5), not every tick.
+
+    A flat roast within the 5 s dwell is silent — the every-tick heartbeat is
+    gated by the post-FC dwell — and the heartbeat (MIN_INTERVAL) fires once the
+    dwell has elapsed. This deliberate cadence is the floor the deadband judges
+    the model's trajectory across (the #218 anti-thrash fix)."""
     policy = _policy()
     flat = reading(bean=200.0, bean_ror_c_per_min=5.0)
     policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=0.0)
-    # 1 s later (one tick), with no temp/RoR change, the consult fires again.
+    # 1 s later (one tick), inside the 5 s dwell: silent (no every-tick spam).
     assert (
         policy.evaluate(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=1.0, manual_request=False)
+        is None
+    )
+    # At the 5 s dwell the heartbeat fires.
+    assert (
+        policy.evaluate(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=5.0, manual_request=False)
         is AdvisoryTrigger.MIN_INTERVAL
     )
-    # And again the next tick after recording the prior call.
-    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=1.0)
+
+
+def test_policy_post_fc_dwell_suppresses_delta_triggers_not_just_heartbeat() -> None:
+    """#276 Fix 2: the post-FC dwell suppresses BOTH the change-based delta triggers
+    AND the heartbeat — not the heartbeat alone.
+
+    A large +5 °C bean-temp jump INSIDE the 5 s dwell would fire BEAN_TEMP_DELTA if
+    only the heartbeat were gated; under the dwell it must stay silent (``None``).
+    The companion test (``..._consults_at_the_post_fc_dwell_cadence``) covers a flat
+    roast; this one proves the dwell beats a live delta too."""
+    policy = _policy()
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=185.0), now=0.0)
+    # +5 °C (well past the 1.0 °C delta threshold) but only 1 s in — inside the 5 s
+    # dwell: the delta trigger is suppressed, not just the heartbeat.
     assert (
-        policy.evaluate(phase=RoastPhase.DEVELOPMENT, telemetry=flat, now=2.0, manual_request=False)
-        is AdvisoryTrigger.MIN_INTERVAL
+        policy.evaluate(
+            phase=RoastPhase.DEVELOPMENT,
+            telemetry=reading(bean=190.0),
+            now=1.0,
+            manual_request=False,
+        )
+        is None
     )
 
 
@@ -1222,18 +1258,36 @@ def test_policy_pre_first_crack_is_never_an_automatic_advice_phase() -> None:
     )
 
 
-def test_policy_change_trigger_fires_early_within_phase_interval() -> None:
-    """The change-based triggers are evaluated before the heartbeat floor — a
-    large bean-temp jump reports BEAN_TEMP_DELTA (not MIN_INTERVAL) on the same
-    tick as the prior call, so the trace records the *reason* it fired."""
+def test_policy_post_fc_dwell_only_applies_to_development() -> None:
+    """#276: the post-FC consult dwell gates DEVELOPMENT only. Every other phase
+    returns no dwell (the pre-FC phases are deterministic and never consulted; the
+    lifecycle states are not advice phases)."""
     policy = _policy()
+    assert (
+        policy._phase_min_consult_interval(RoastPhase.DEVELOPMENT)  # pyright: ignore[reportPrivateUsage]
+        == ControllerConfig().post_fc_min_consult_interval_seconds
+    )
+    for phase in RoastPhase:
+        if phase is RoastPhase.DEVELOPMENT:
+            continue
+        assert (
+            policy._phase_min_consult_interval(phase) is None  # pyright: ignore[reportPrivateUsage]
+        )
+
+
+def test_policy_change_trigger_fires_early_within_phase_interval() -> None:
+    """Once the post-FC dwell has elapsed, the change-based triggers are evaluated
+    before the heartbeat floor — a large bean-temp jump reports BEAN_TEMP_DELTA
+    (not MIN_INTERVAL), so the trace records the *reason* it fired (#276 keeps the
+    delta reason once the dwell clears; the dwell itself is tested separately)."""
+    policy = _no_dwell_development_policy()
     policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=150.0), now=0.0)
-    # Same tick (0-floor heartbeat not yet elapsed), a +5 °C jump: the
-    # change-based trigger is reported.
+    # Dwell out of the way (near-zero), heartbeat floor long: just past the dwell a
+    # +5 °C jump reports the change-based trigger rather than the heartbeat.
     trigger = policy.evaluate(
         phase=RoastPhase.DEVELOPMENT,
         telemetry=reading(bean=155.0),
-        now=0.0,
+        now=0.01,
         manual_request=False,
     )
     assert trigger is AdvisoryTrigger.BEAN_TEMP_DELTA
@@ -1304,7 +1358,7 @@ def test_policy_baseline_advances_on_each_call() -> None:
     a further +0.5 °C is below threshold again. A long development heartbeat floor
     suppresses MIN_INTERVAL so the sub-threshold tick is silent — isolating the
     baseline advance (#222)."""
-    policy = _throttled_development_policy()
+    policy = _no_dwell_development_policy()
     policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=200.0), now=0.0)
     assert (
         policy.evaluate(
@@ -1329,8 +1383,9 @@ def test_policy_baseline_advances_on_each_call() -> None:
 
 def test_policy_manual_consult_with_no_telemetry_keeps_delta_baseline() -> None:
     """A manual consult mid-roast with a dropped reading must not blank the
-    temp baseline — the next real delta still measures from the prior call."""
-    policy = _policy()
+    temp baseline — the next real delta still measures from the prior call. The
+    post-FC dwell is out of the way (#276) so the delta logic is isolated."""
+    policy = _no_dwell_development_policy()
     policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=200.0), now=0.0)
     policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=None, now=1.0)
     trigger = policy.evaluate(
@@ -2121,15 +2176,13 @@ async def test_advisor_roast_elapsed_counts_from_charge_not_run_start() -> None:
         reading(bean=185.0, bean_ror_c_per_min=5.0, first_crack_detected=True)
     ]
     harness.clock.advance(1.0)  # clock → 304.0
-    await harness.controller.tick()  # → DEVELOPMENT
+    await harness.controller.tick()  # → DEVELOPMENT, first (PHASE_CHANGE) consult
     assert harness.controller.phase is RoastPhase.DEVELOPMENT
-    harness.reader.readings = [reading(bean=186.0, bean_ror_c_per_min=4.0)]
-    harness.clock.advance(1.0)  # clock → 305.0
-    await harness.controller.tick()  # first development consult
     ctx = advisor.contexts[-1]
-    # Charge stamped at clock=302.0; this consult runs at clock=305.0 → 3.0 s,
-    # NOT ~305 s from run start (the old run-start bug).
-    assert ctx.roast_elapsed_seconds == pytest.approx(3.0)
+    # Charge stamped at clock=302.0; the first development consult fires on the FC
+    # tick at clock=304.0 → 2.0 s (the ~5 s post-FC dwell, #276, means the very
+    # next tick does NOT re-consult), NOT ~304 s from run start (the old bug).
+    assert ctx.roast_elapsed_seconds == pytest.approx(2.0)
     assert ctx.roast_elapsed_seconds < 300.0
     # It matches seconds_since_charge (same charge instant, the bake-off convention).
     assert ctx.roast_elapsed_seconds == pytest.approx(ctx.seconds_since_charge)
@@ -3100,7 +3153,7 @@ async def test_context_carries_roast_so_far_curve_after_charge() -> None:
     ]
     await harness.controller.tick()
     assert harness.controller.phase is RoastPhase.DEVELOPMENT
-    harness.clock.advance(1.0)
+    harness.clock.advance(5.0)  # clear the post-FC dwell (#276) so the next consult fires
     harness.reader.readings = [reading(bean=180.0, bean_ror_c_per_min=5.0)]
     await harness.controller.tick()
     assert advisor.contexts
@@ -3175,13 +3228,15 @@ async def test_decision_trace_records_requested_not_gate_adjusted() -> None:
     own move history the next tick reasons from. A trace that recorded the
     applied/clamped value (or skipped the rejected consult) would fail here."""
     advisor = FakeAdvisor([decision(heat=80, fan=35), decision(heat=20, fan=70)])
-    # min_seconds_between_commands=2.0 (default); advance only 1.0 s between the
-    # two consults so the second is rate-limited (REJECT, nothing executes).
+    # min_seconds_between_commands=2.0 (default); the second consult is a MANUAL
+    # request 1.0 s later — manual bypasses the post-FC consult dwell (#276) so it
+    # fires inside the rate-limit window and the gate REJECTs it (nothing executes).
     harness = harness_in_development(readings=[reading()], advisor=advisor)
     await harness.controller.tick()  # consult 1: heat=80/fan=35 ALLOWed + executed
     assert harness.executor.targets[-1] == (80, 35)
     harness.clock.advance(1.0)  # < 2.0 s → next command is rate-limited
     harness.reader.readings = [reading(bean=188.0)]
+    harness.controller.request_advisory()  # manual: bypasses the dwell, still rate-limited
     await harness.controller.tick()  # consult 2: heat=20/fan=70 REJECTed (no exec)
     # No second command executed (still the consult-1 levers).
     assert harness.executor.targets[-1] == (80, 35)
@@ -3258,3 +3313,248 @@ async def test_history_resets_on_new_run() -> None:
     assert history.curve_window() == []
     assert history.milestones() == []
     assert history.decision_trace() == []
+
+
+# --- #276: post-FC coherence/deadband gate + drop + fail-closed ---
+
+
+def _advisory_events(harness: Harness) -> list[dict[str, object]]:
+    """Every ADVISORY event payload, in order (the decision-trace stream)."""
+    return [
+        cast(dict[str, object], p) for k, p in harness.events.events if k is RoastEventKind.ADVISORY
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deadband_damps_a_flip_flop_but_allows_a_decisive_move() -> None:
+    """#276: a sub-threshold direction reversal across consecutive post-FC consults
+    is damped to a HOLD (the #218 30<->40<->30 thrash), while a decisive move
+    (>= the deadband threshold) is applied.
+
+    Three consults, each past the 5 s post-FC dwell so they fire on their own:
+      1. heat 70 / fan 50 from 0/0 — first move (UP/UP), executed.
+      2. heat 60 / fan 45 — both a -10 reversal (< 15 threshold) — DAMPED: no
+         write, levers held at (70, 50), and a COHERENCE_DAMPED note emitted.
+      3. heat 50 / fan 50 — heat -20 (>= 15, decisive reversal) — applied; fan
+         unchanged from the held 50, so the executed pair is (50, 50).
+    """
+    advisor = FakeAdvisor(
+        [decision(heat=70, fan=50), decision(heat=60, fan=45), decision(heat=50, fan=50)]
+    )
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    # Consult 1: first move, executed.
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (70, 50)
+    # Consult 2: sub-threshold reversal on both levers — damped, no new write.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=185.0)]
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (70, 50)  # still the consult-1 levers
+    damped = [p for p in _advisory_events(harness) if "coherence_damped" in p]
+    assert damped, "the damped reversal must surface a COHERENCE_DAMPED note"
+    assert set(cast(list[str], damped[-1]["coherence_damped"])) == {"heat", "fan"}
+    # Consult 3: a decisive heat cut (>= threshold) IS applied.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0)]
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (50, 50)
+
+
+@pytest.mark.asyncio
+async def test_deadband_allows_a_single_decisive_first_move() -> None:
+    """#276: the deadband never damps a first or same-direction move — a single
+    decisive step on entry to development is applied unchanged (it only damps an
+    incoherent reversal)."""
+    advisor = FakeAdvisor([decision(heat=80, fan=60)])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (80, 60)
+
+
+@pytest.mark.asyncio
+async def test_every_post_fc_lever_write_traces_to_a_safety_evaluation() -> None:
+    """#276 invariant: an executed post-FC lever pair is preceded by an ALLOW/CLAMP
+    command evaluation — the coherence gate sits AFTER safety and can only hold,
+    never bypass it."""
+    advisor = FakeAdvisor([decision(heat=65, fan=50)])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (65, 50)
+    command_evals = [
+        e for e in harness.sink.evaluations if e.rule in ("all_clear", "command_bounds")
+    ]
+    assert command_evals, "the executed lever write must trace to a command evaluation"
+    assert command_evals[-1].verdict in (SafetyVerdict.ALLOW, SafetyVerdict.CLAMP)
+
+
+@pytest.mark.asyncio
+async def test_low_confidence_recommendation_fails_closed_to_hold() -> None:
+    """#276 fail-closed: a below-floor-confidence recommendation does NOT actuate —
+    it holds the current levers, records a REJECT (advisor_low_confidence) verdict,
+    and still traces the decision for diagnosis. The drop is not evaluated."""
+    # First consult (confident) sets a baseline; second is low-confidence + drop.
+    confident = RoastDecision(
+        target_heat=70, target_fan=50, should_drop=False, confidence=0.9, rationale="ok"
+    )
+    unsure = RoastDecision(
+        target_heat=20, target_fan=90, should_drop=True, confidence=0.05, rationale="unsure"
+    )
+    advisor = FakeAdvisor([confident, unsure])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (70, 50)
+    writes_before = len(harness.executor.targets)
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0)]
+    await harness.controller.tick()
+    # No new lever write and NO drop on the unsure recommendation.
+    assert len(harness.executor.targets) == writes_before
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.sink.evaluations[-1].rule == "advisor_low_confidence"
+    assert harness.sink.evaluations[-1].verdict is SafetyVerdict.REJECT
+    # The unsure decision is still traced (honest diagnosis).
+    assert harness.sink.advisor_decisions[-1].decision is not None
+    assert harness.sink.advisor_decisions[-1].decision.confidence == pytest.approx(0.05)
+
+
+@pytest.mark.asyncio
+async def test_silent_advisor_does_not_actuate_post_fc() -> None:
+    """#276 fail-closed: an erroring advisor never moves the levers — after a
+    confident first move, a provider error holds (no new write, no drop)."""
+    advisor = FakeAdvisor([decision(heat=70, fan=50), AdvisorFailureMode.PROVIDER_ERROR])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (70, 50)
+    writes_before = len(harness.executor.targets)
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0)]
+    await harness.controller.tick()
+    assert len(harness.executor.targets) == writes_before  # held, no actuation
+    assert "drop_beans" not in harness.executor.commands
+    # Fail-closed = NO state change: an erroring consult must not advance the phase.
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+
+@pytest.mark.asyncio
+async def test_sustained_sub_threshold_cut_actuates_within_two_consults() -> None:
+    """#276 Fix 1 (controller-level): a SUSTAINED sub-threshold heat cut must NOT
+    latch the lever high forever — it actuates the cut by the second consult.
+
+    The over-roast failure mode: after a confident heat RAISE (UP), the advisor
+    keeps asking for the SAME small cut (a -10 DOWN, below the 15 deadband). The
+    first cut is damped (held), but the damp advances the recorded direction DOWN,
+    so the identical second request is a same-direction move and the cut executes.
+    """
+    advisor = FakeAdvisor(
+        [decision(heat=80, fan=50), decision(heat=70, fan=50), decision(heat=70, fan=50)]
+    )
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    # Consult 1: a decisive first move UP — executed (heat 80).
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (80, 50)
+    # Consult 2: 80 -> 70 is a -10 sub-threshold reversal — damped, held at 80.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=185.0)]
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (80, 50)  # still held — one damped cycle
+    # Consult 3: the SAME 70 request — now a same-direction (DOWN) move: the cut
+    # actuates. The sustained intent converged; the lever did not stay pinned high.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0)]
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (70, 50)
+
+
+@pytest.mark.asyncio
+async def test_mixed_partial_damp_executes_only_the_decisive_lever() -> None:
+    """#276 Fix 4: in one consult, a sub-threshold heat reversal (DAMP) alongside a
+    decisive fan move (ALLOW) executes ONLY the fan — the heat is held, only the
+    fan direction updates, and the COHERENCE_DAMPED note lists only the heat lever.
+    """
+    advisor = FakeAdvisor([decision(heat=70, fan=50), decision(heat=60, fan=80)])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    # Consult 1: first move (heat UP, fan UP) — executed at (70, 50).
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (70, 50)
+    # Consult 2: heat 70 -> 60 (-10, sub-threshold reversal of UP) DAMPED; fan
+    # 50 -> 80 (+30, decisive) ALLOWED. Only the fan moves: executed (70, 80).
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=185.0)]
+    await harness.controller.tick()
+    assert harness.executor.targets[-1] == (70, 80)
+    # Only the heat lever is reported damped (not both).
+    damped = [p for p in _advisory_events(harness) if "coherence_damped" in p]
+    assert damped, "the damped heat reversal must surface a COHERENCE_DAMPED note"
+    assert set(cast(list[str], damped[-1]["coherence_damped"])) == {"heat"}
+    # The heat direction stayed (held value 70); the fan direction advanced UP.
+    assert harness.controller._fan_direction is LeverDirection.UP  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_confidence_exactly_at_floor_proceeds() -> None:
+    """#276 Fix 3: the low-confidence gate is ``confidence < floor`` (strict), so a
+    confidence EXACTLY at the floor PROCEEDS (a normal ALLOW lever write, not the
+    fail-closed REJECT). Pins the ``<`` vs ``<=`` boundary against a refactor."""
+    floor = ControllerConfig().post_fc_min_confidence
+    at_floor = RoastDecision(
+        target_heat=70, target_fan=50, should_drop=False, confidence=floor, rationale="boundary"
+    )
+    advisor = FakeAdvisor([at_floor])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    await harness.controller.tick()
+    # Proceeds: the levers actuate and the last evaluation is the command box, not
+    # the low-confidence REJECT.
+    assert harness.executor.targets[-1] == (70, 50)
+    assert harness.sink.evaluations[-1].rule != "advisor_low_confidence"
+    assert harness.sink.evaluations[-1].verdict in (SafetyVerdict.ALLOW, SafetyVerdict.CLAMP)
+
+
+@pytest.mark.asyncio
+async def test_advisor_drop_executes_only_on_allow_in_development() -> None:
+    """#276: a should_drop recommendation drops the beans only through the ALLOW
+    drop-eligibility gate (development). The executed drop traces to that ALLOW
+    evaluation, then the controller transitions to COOLING."""
+    advisor = FakeAdvisor(
+        [
+            RoastDecision(
+                target_heat=60, target_fan=50, should_drop=True, confidence=0.9, rationale="drop"
+            )
+        ]
+    )
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    await harness.controller.tick()
+    assert "drop_beans" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.COOLING
+    drop_evals = [e for e in harness.sink.evaluations if e.rule == "drop_eligibility"]
+    assert drop_evals and drop_evals[-1].verdict is SafetyVerdict.ALLOW
+
+
+def test_advisor_drop_outside_development_is_rejected() -> None:
+    """#276: the drop-eligibility gate REJECTs a should_drop anywhere but
+    development — the safety rule the post-FC drop path passes through."""
+    policy = SafetyPolicy(SafetyLimits())
+    for phase in RoastPhase:
+        evaluation = policy.evaluate_drop_recommendation(phase=phase)
+        if phase is RoastPhase.DEVELOPMENT:
+            assert evaluation.verdict is SafetyVerdict.ALLOW
+        else:
+            assert evaluation.verdict is SafetyVerdict.REJECT
+
+
+@pytest.mark.asyncio
+async def test_post_fc_lever_direction_resets_on_a_new_run() -> None:
+    """#276: the coherence trajectory is per-roast — a new run clears the recorded
+    lever directions, so the first post-FC move of the next roast is judged as a
+    first move (never damped against the previous roast's direction)."""
+    advisor = FakeAdvisor([decision(heat=70, fan=50)], default_decision=decision(heat=70, fan=50))
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    await harness.controller.tick()
+    assert harness.controller._heat_direction is LeverDirection.UP  # pyright: ignore[reportPrivateUsage]
+    # End this roast and start a fresh one.
+    harness.controller.transition_to(RoastPhase.COOLING)
+    harness.controller.transition_to(RoastPhase.COMPLETE)
+    harness.controller.transition_to(RoastPhase.IDLE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    assert harness.controller._heat_direction is LeverDirection.NONE  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._fan_direction is LeverDirection.NONE  # pyright: ignore[reportPrivateUsage]

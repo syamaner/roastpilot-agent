@@ -37,7 +37,15 @@ from .models import RoastPhase
 # + the controller (PR #201 / Codex).
 DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS: dict[RoastPhase, float | None] = {
     RoastPhase.ROASTING_PRE_FIRST_CRACK: None,
-    RoastPhase.DEVELOPMENT: 0.0,
+    # Post-FC the loop is consulted at a deliberate ~5 s cadence (D35 §4-A,
+    # D40.5, #276), not every tick: a steady dwell between consults is what lets
+    # the deadband judge the model's trajectory across consecutive moves rather
+    # than chase per-tick jitter (the #218 thrash). The change-based triggers
+    # additionally respect this floor in development (see
+    # ``ControllerConfig.post_fc_min_consult_interval_seconds`` and
+    # ``AdvisoryCallPolicy.evaluate``), so the development cadence is the floor,
+    # not back-to-back at advisor latency.
+    RoastPhase.DEVELOPMENT: 5.0,
 }
 
 # The advisor model — the Artisan-expanded bake-off winner (D33, 14 Jun 2026):
@@ -202,6 +210,31 @@ class ControllerConfig(BaseModel):
     # ETA. Default 176.0 °C = the #229-validated FC band midpoint (171-180 °C) on
     # this roaster's indicated probe. Anticipation context only; never a lever.
     first_crack_target_bean_temp_c: float = Field(default=176.0, gt=0)
+    # D35 §4-A / D40.5 (#276): the post-FC control-loop cadence + coherence gate.
+    #
+    # ``post_fc_min_consult_interval_seconds`` — the minimum seconds between
+    # AUTOMATIC post-FC consults, applied to the change-based triggers too (not
+    # just the MIN_INTERVAL heartbeat), so development consults run at a deliberate
+    # ~5 s dwell rather than back-to-back at advisor latency (the steady cadence
+    # the deadband judges the model's trajectory across, #218). A manual operator
+    # request still bypasses it. Default 5.0 = the D40.5 post-FC cadence.
+    post_fc_min_consult_interval_seconds: float = Field(default=5.0, gt=0)
+    # ``post_fc_deadband_threshold_percent`` — the reversal magnitude (percentage
+    # points) at or above which a lever direction-reversal is DECISIVE and allowed;
+    # a reversal BELOW it is incoherent thrash and is damped to a hold
+    # (roastpilot_agent.coherence.evaluate_lever_coherence). Damps the #218
+    # 30<->40<->30 twiddle (steps of ~10) while letting a real cut/raise through.
+    # Default 15 — above the observed twiddle step, below a decisive move; the
+    # exact value is tuned on the replay harness (#277), so it is a named config
+    # constant, not a literal in the gate.
+    post_fc_deadband_threshold_percent: int = Field(default=15, ge=1, le=100)
+    # ``post_fc_min_confidence`` — the advisor confidence floor below which a
+    # post-FC recommendation is treated as "I don't know" and fails closed to a
+    # deterministic HOLD (no actuation), alongside the silent/slow/error/rejected
+    # paths (#276). Default 0.2 — a near-zero-confidence move holds; legitimate
+    # advice (the FakeAdvisor scripts at 0.9) passes. Tuned on the replay harness
+    # (#277). Set 0.0 to disable the floor.
+    post_fc_min_confidence: float = Field(default=0.2, ge=0.0, le=1.0)
 
     def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.

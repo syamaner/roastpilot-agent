@@ -25,14 +25,19 @@ def test_controller_defaults_match_orchestration_plan() -> None:
     assert config.tick_interval_seconds == 1.0
     assert config.advisory_min_temp_delta_c == 1.0
     assert config.advisory_min_ror_delta_c_per_min == 2.0
-    # D32 (#191): cadence by FC-proximity. Preheat is OFF (not in the map +
-    # excluded from auto-advice phases); pre-first-crack has NO fixed heartbeat
-    # (None — change-based + the near-FC boost only); development unthrottled.
-    # None (not inf) so the frozen-config JSON stays valid (PR #201 / Codex).
+    # D32 (#191) + D40.5 (#276): cadence by FC-proximity. Preheat is OFF (not in
+    # the map + excluded from auto-advice phases); pre-first-crack has NO fixed
+    # heartbeat (None — change-based only); development consults at the deliberate
+    # ~5 s post-FC cadence (#276), not every tick. None (not inf) so the frozen
+    # config JSON stays valid (PR #201 / Codex).
     assert config.advisory_min_interval_seconds == {
         RoastPhase.ROASTING_PRE_FIRST_CRACK: None,
-        RoastPhase.DEVELOPMENT: 0.0,
+        RoastPhase.DEVELOPMENT: 5.0,
     }
+    # D35 §4-A / D40.5 (#276): the post-FC loop knobs.
+    assert config.post_fc_min_consult_interval_seconds == 5.0
+    assert config.post_fc_deadband_threshold_percent == 15
+    assert config.post_fc_min_confidence == 0.2
     assert config.advisory_near_fc_bean_temp_c == 170.0
     assert config.advisory_near_fc_interval_seconds == 10.0
     # #209: post-charge settle window — fallback timeout 90 s, turning-point RoR
@@ -62,9 +67,9 @@ def test_advisory_interval_for_resolves_per_phase_and_defaults_unthrottled() -> 
     config = ControllerConfig()
     # Pre-first-crack has NO fixed heartbeat (None — change-based + near-FC only).
     assert config.advisory_interval_for(RoastPhase.ROASTING_PRE_FIRST_CRACK) is None
-    # Development is unthrottled (0); phases absent from the map are too —
-    # preheat (not an auto-advice phase) and cooling.
-    assert config.advisory_interval_for(RoastPhase.DEVELOPMENT) == 0.0
+    # Development has the ~5 s post-FC heartbeat (#276); phases absent from the
+    # map are unthrottled (0) — preheat (not an auto-advice phase) and cooling.
+    assert config.advisory_interval_for(RoastPhase.DEVELOPMENT) == 5.0
     assert config.advisory_interval_for(RoastPhase.PREHEATING) == 0.0
     assert config.advisory_interval_for(RoastPhase.COOLING) == 0.0
 
@@ -97,7 +102,7 @@ def test_frozen_controller_config_is_strict_json_valid() -> None:
     round_tripped = json.loads(json.dumps(dumped), parse_constant=_reject_constant)
     assert round_tripped["advisory_min_interval_seconds"] == {
         RoastPhase.ROASTING_PRE_FIRST_CRACK.value: None,
-        RoastPhase.DEVELOPMENT.value: 0.0,
+        RoastPhase.DEVELOPMENT.value: 5.0,
     }
 
 

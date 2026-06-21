@@ -488,6 +488,52 @@ class SafetyPolicy:
             ),
         )
 
+    def evaluate_advisor_low_confidence(
+        self,
+        *,
+        confidence: float,
+        min_confidence: float,
+        current_heat: int,
+        current_fan: int,
+    ) -> SafetyEvaluation:
+        """Low-confidence advisor recommendation ⇒ rejected ⇒ deterministic hold (#276).
+
+        A post-FC recommendation whose ``confidence`` is below the configured
+        ``min_confidence`` floor is treated as "I don't know" and fails closed:
+        the recommendation is REJECTed and the deterministic fallback holds the
+        current targets (the adjusted values echo the heat/fan already in effect),
+        exactly like the reachable-but-misbehaving failures
+        (:meth:`evaluate_advisor_failure`). It never blocks the tick and it never
+        actuates — a model that is unsure must not move the levers. The
+        recommendation is still persisted in the decision trace; this verdict is
+        the no-write outcome attached to it.
+
+        A confidence at or above the floor is the caller's signal to proceed to
+        the command-bounds evaluation; this method is only consulted on the
+        below-floor path, so it always returns REJECT.
+
+        Args:
+            confidence: The advisor's self-reported confidence (0-1).
+            min_confidence: The configured post-FC confidence floor (0-1).
+            current_heat: The heat level currently in effect (held).
+            current_fan: The fan level currently in effect (held).
+
+        Returns:
+            A REJECT :class:`SafetyEvaluation` whose adjusted values hold the
+            current targets.
+        """
+        return SafetyEvaluation(
+            rule="advisor_low_confidence",
+            verdict=SafetyVerdict.REJECT,
+            adjusted_heat=current_heat,
+            adjusted_fan=current_fan,
+            reason=(
+                f"advisor confidence {confidence:.2f} below the post-FC floor "
+                f"{min_confidence:.2f}: recommendation rejected, deterministic fallback holds "
+                f"current targets (heat {current_heat} %, fan {current_fan} %)"
+            ),
+        )
+
     def evaluate_advisor_failure(
         self,
         *,

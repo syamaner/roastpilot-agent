@@ -28,6 +28,11 @@ from roastpilot_agent.advisor import (
     RoastAdvisor,
     RoastDecision,
 )
+from roastpilot_agent.coherence import (
+    CoherenceDecision,
+    LeverDirection,
+    evaluate_lever_coherence,
+)
 from roastpilot_agent.config import ControllerConfig
 from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy
 from roastpilot_agent.models import (
@@ -381,6 +386,18 @@ class AdvisoryCallPolicy:
         # below and documents the invariant.
         if self._last_call_monotonic is None:
             return AdvisoryTrigger.PHASE_CHANGE
+        # D35 §4-A / D40.5 (#276): a deliberate post-FC consult cadence. The
+        # change-based triggers (temp/RoR delta) below would otherwise fire every
+        # eligible tick on a fast-moving development curve, re-creating the
+        # change-based-every-tick cadence (D32) that drove the #218 twiddling. A
+        # minimum post-FC dwell suppresses BOTH the delta triggers and the
+        # heartbeat until it elapses, so development consults run at the ~5 s
+        # cadence the deadband judges the model's trajectory across. The first
+        # consult in the phase (the PHASE_CHANGE above) is unaffected; a manual
+        # request bypassed this whole method. Pre-FC phases never reach here.
+        min_dwell = self._phase_min_consult_interval(phase)
+        if min_dwell is not None and now - self._last_call_monotonic < min_dwell:
+            return None
         if (
             telemetry is not None
             and self._last_bean_temp_c is not None
@@ -405,6 +422,28 @@ class AdvisoryCallPolicy:
         floor = self._config.advisory_interval_for(phase)
         if floor is not None and now - self._last_call_monotonic >= floor:
             return AdvisoryTrigger.MIN_INTERVAL
+        return None
+
+    def _phase_min_consult_interval(self, phase: RoastPhase) -> float | None:
+        """The minimum-dwell floor that gates EVERY automatic trigger in ``phase``.
+
+        Distinct from :meth:`ControllerConfig.advisory_interval_for` (the
+        MIN_INTERVAL heartbeat floor): this floor additionally suppresses the
+        change-based triggers, so the post-FC cadence is a deliberate dwell rather
+        than every-tick on a fast curve (D35 §4-A / D40.5, #276). Only DEVELOPMENT
+        (the single post-FC advice phase under D35) carries a dwell; every other
+        phase returns ``None`` (no extra gate — pre-FC is deterministic and not
+        consulted, the lifecycle states are not advice phases).
+
+        Args:
+            phase: The agent phase being evaluated.
+
+        Returns:
+            The post-FC minimum-dwell seconds for ``phase``, or ``None`` when the
+            phase has no extra cadence gate.
+        """
+        if phase is RoastPhase.DEVELOPMENT:
+            return self._config.post_fc_min_consult_interval_seconds
         return None
 
     def note_call(
@@ -524,6 +563,13 @@ class RoastController:
         self._advisory_policy = AdvisoryCallPolicy(config)
         self._current_heat = 0
         self._current_fan = 0
+        # D35 §4-A / D40.5 (#276): the direction of each lever's last EXECUTED
+        # post-FC move, fed into the coherence/deadband gate so a sub-threshold
+        # direction reversal (the #218 30<->40<->30 thrash) is damped to a hold.
+        # Reset on each new run/preheat (a fresh roast has no prior trajectory).
+        # Context for the deterministic gate only — it never bypasses safety.
+        self._heat_direction = LeverDirection.NONE
+        self._fan_direction = LeverDirection.NONE
         self._last_command_monotonic: float | None = None
         self._t0_streak = 0
         self._t0_confirmed = False
@@ -702,6 +748,11 @@ class RoastController:
             # the roast-so-far curve, milestones, and decision trace are
             # per-roast. Context only; clears no control state.
             self._history.reset()
+            # A new run/preheat clears the post-FC lever trajectory (#276): the
+            # coherence gate has no prior direction to reverse on the first
+            # post-FC move of the new roast.
+            self._heat_direction = LeverDirection.NONE
+            self._fan_direction = LeverDirection.NONE
         if target is RoastPhase.COOLING and self._drop_monotonic is None:
             # The drop instant (#239): every drop path lands in COOLING (the
             # advisor drop, the operator drop, and the pre-FC early-abort drop),
@@ -1216,6 +1267,15 @@ class RoastController:
                 confidence=decision.confidence,
             )
         )
+        if decision.confidence < self._config.post_fc_min_confidence:
+            # Fail-closed on low confidence (#276): a model that is unsure must
+            # not move the levers — and must not drop. The recommendation is still
+            # traced (above) for diagnosis; the no-write REJECT is the outcome
+            # attached to it. This is one of the four fail-closed paths (silent /
+            # slow / error already returned above; rejected/clamped handled by the
+            # gate below). The drop is deliberately NOT evaluated on this path.
+            await self._reject_low_confidence(decision, trigger, context, latency_ms, descriptor)
+            return
         evaluation = self._safety.evaluate_command(
             requested_heat=decision.target_heat,
             requested_fan=decision.target_fan,
@@ -1251,21 +1311,19 @@ class RoastController:
             and evaluation.adjusted_heat is not None
             and evaluation.adjusted_fan is not None
         ):
-            await self._executor.set_targets(
-                heat_percent=evaluation.adjusted_heat,
-                fan_percent=evaluation.adjusted_fan,
-            )
-            self._current_heat = evaluation.adjusted_heat
-            self._current_fan = evaluation.adjusted_fan
-            self._last_command_monotonic = self._clock()
-            self._events.emit(
-                RoastEventKind.COMMAND_EXECUTED,
-                {"heat_percent": evaluation.adjusted_heat, "fan_percent": evaluation.adjusted_fan},
+            await self._execute_advisor_levers(
+                heat=evaluation.adjusted_heat, fan=evaluation.adjusted_fan
             )
         if decision.should_drop:
             drop = self._safety.evaluate_drop_recommendation(phase=self._phase)
             await self._snapshots.persist_evaluation(drop)
-            if drop.verdict is SafetyVerdict.ALLOW:
+            # The advisor advice path is reached only in DEVELOPMENT (the sole
+            # post-FC advice phase, _AUTO_ADVICE_PHASES), and
+            # evaluate_drop_recommendation ALLOWs unconditionally in DEVELOPMENT —
+            # so the REJECT/false branch here is unreachable today. Kept (not
+            # collapsed) because it is the safety boundary if a future phase becomes
+            # an advice phase; the un-taken branch is pragma'd, not the guard logic.
+            if drop.verdict is SafetyVerdict.ALLOW:  # pragma: no branch — see above
                 try:
                     await self._executor.drop_beans()
                 except Exception:
@@ -1279,6 +1337,143 @@ class RoastController:
                     {"command": "drop_beans", "source": "advisor"},
                 )
                 self.transition_to(RoastPhase.COOLING)
+
+    async def _execute_advisor_levers(self, *, heat: int, fan: int) -> None:
+        """Apply a safety-approved advisor heat/fan through the coherence gate (#276).
+
+        The SECOND post-FC gate, after the safety box: the values here have
+        already passed :meth:`SafetyPolicy.evaluate_command` (ALLOW/CLAMP), so the
+        coherence gate can only ever turn an approved move into a HOLD — it never
+        produces a larger or out-of-box value, so it cannot weaken the safety
+        verdict. Each lever is judged independently
+        (:func:`coherence.evaluate_lever_coherence`): a sub-threshold direction
+        REVERSAL versus that lever's last executed move is damped (the #218
+        thrash), while a first move, a same-direction move, or a decisive
+        (>= threshold) reversal is applied. The damped value holds the current
+        lever; the executed direction is recorded for the next consult.
+
+        When BOTH levers are damped to their current values the result is a HOLD —
+        no MCP write is issued and no COMMAND_EXECUTED is emitted, so an incoherent
+        flip-flop produces no actuation at all. Any executed change emits a
+        COHERENCE_DAMPED note for the levers held, for the decision trace.
+
+        Args:
+            heat: The safety-approved heat percent (the gate may hold it).
+            fan: The safety-approved fan percent (the gate may hold it).
+        """
+        threshold = self._config.post_fc_deadband_threshold_percent
+        heat_result = evaluate_lever_coherence(
+            requested=heat,
+            current=self._current_heat,
+            last_direction=self._heat_direction,
+            threshold_percent=threshold,
+        )
+        fan_result = evaluate_lever_coherence(
+            requested=fan,
+            current=self._current_fan,
+            last_direction=self._fan_direction,
+            threshold_percent=threshold,
+        )
+        damped_levers = [
+            lever
+            for lever, result in (("heat", heat_result), ("fan", fan_result))
+            if result.decision is CoherenceDecision.DAMP
+        ]
+        if damped_levers:
+            # Surface every sub-threshold reversal that was suppressed, so the
+            # decision trace shows the gate acted (talk/diagnosis material) — even
+            # when the other lever still moves.
+            self._events.emit(
+                RoastEventKind.ADVISORY,
+                {
+                    "coherence_damped": damped_levers,
+                    "requested": {"heat_percent": heat, "fan_percent": fan},
+                    "held": {
+                        "heat_percent": self._current_heat,
+                        "fan_percent": self._current_fan,
+                    },
+                    "threshold_percent": threshold,
+                },
+            )
+        # Persist the recorded directions for BOTH outcomes, before the hold check.
+        # A damped reversal holds the lever value but ADVANCES its direction toward
+        # the requested side (#276 Fix 1), so a sustained sub-threshold push
+        # converges on the next consult instead of latching the lever forever. The
+        # value-holds early-return below must not skip this, or a fully-damped
+        # consult would never record the advance. A plain hold (requested ==
+        # current) returns the unchanged direction, so this is a no-op there.
+        self._heat_direction = heat_result.direction
+        self._fan_direction = fan_result.direction
+        if (
+            heat_result.applied_value == self._current_heat
+            and fan_result.applied_value == self._current_fan
+        ):
+            # Both levers hold (no requested change, or every change damped): a
+            # deterministic HOLD — no write, no rate-limit churn. Directions were
+            # already recorded above so a sustained damped push still converges.
+            return
+        await self._executor.set_targets(
+            heat_percent=heat_result.applied_value,
+            fan_percent=fan_result.applied_value,
+        )
+        self._current_heat = heat_result.applied_value
+        self._current_fan = fan_result.applied_value
+        self._last_command_monotonic = self._clock()
+        self._events.emit(
+            RoastEventKind.COMMAND_EXECUTED,
+            {
+                "heat_percent": heat_result.applied_value,
+                "fan_percent": fan_result.applied_value,
+            },
+        )
+
+    async def _reject_low_confidence(
+        self,
+        decision: RoastDecision,
+        trigger: AdvisoryTrigger,
+        context: AdvisorContext,
+        latency_ms: int | None,
+        descriptor: AdvisorDescriptor,
+    ) -> None:
+        """Fail closed on a below-floor-confidence post-FC recommendation (#276).
+
+        Produces the no-write REJECT verdict
+        (:meth:`SafetyPolicy.evaluate_advisor_low_confidence`) holding the current
+        targets, persists it and the (already-traced) decision linked to it, and
+        emits the advisory outcome. No lever write, no drop — a model that is
+        unsure holds. The drop is deliberately not evaluated: a low-confidence
+        drop is the most dangerous self-contradiction the gate exists to stop.
+
+        Args:
+            decision: The advisor recommendation (persisted for diagnosis).
+            trigger: Why the advisor was consulted this tick.
+            context: The context the advisor answered.
+            latency_ms: The call latency.
+            descriptor: The advisor trace identity.
+        """
+        evaluation = self._safety.evaluate_advisor_low_confidence(
+            confidence=decision.confidence,
+            min_confidence=self._config.post_fc_min_confidence,
+            current_heat=self._current_heat,
+            current_fan=self._current_fan,
+        )
+        safety_evaluation_id = await self._snapshots.persist_evaluation(evaluation)
+        await self._snapshots.persist_advisor_decision(
+            descriptor=descriptor,
+            context=context,
+            latency_ms=latency_ms,
+            decision=decision,
+            status="ok",
+            safety_evaluation_id=safety_evaluation_id,
+        )
+        self._events.emit(
+            RoastEventKind.ADVISORY,
+            {
+                "trigger": trigger.value,
+                "decision": decision.model_dump(mode="json"),
+                "evaluation": evaluation.model_dump(mode="json"),
+            },
+        )
 
     async def _record_advisor_failure(
         self,
