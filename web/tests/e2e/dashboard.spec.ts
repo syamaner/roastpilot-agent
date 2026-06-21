@@ -249,6 +249,29 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   // must fail HERE, not only in the regenerated baseline.
   await expect(page.getByTestId("dtr-readout")).toHaveText(/^\d+\.\d+ %$/);
 
+  // ROAST TIME is CHARGE-referenced (#308): in this post-charge state the server
+  // emits a non-null `charge_elapsed_seconds`, so the big clock reads since-charge,
+  // NOT since-serve. This is the ONLY e2e guard on the DashboardPage wiring — a
+  // revert to `elapsed_seconds` (the old serve clock) renders the SAME mm:ss shape
+  // and would slip past every other assertion + the regenerated pixel baseline.
+  // The charged state must hold: ROAST TIME is mm:ss and the pre-charge Preheat
+  // read-out is GONE (it only shows while charge_elapsed_seconds is null).
+  await expect(page.getByTestId("roast-timer")).toHaveText(/^\d{2}:\d{2}$/);
+  await expect(page.getByTestId("preheat-timer")).not.toBeVisible();
+  // Value check that pins the CLOCK SOURCE, not just its format. The session-2
+  // fixture reaches first crack at ~535 s since charge but ~1029 s since serve (a
+  // ~493 s preheat lead-in); the replay stops at that FC tick. So the charge-
+  // referenced clock is ~08:55 while a serve-referenced revert would read ~17:0x.
+  // Assert the rendered timer is well under the serve figure (< 15:00 = 900 s):
+  // charge (~535 s) passes with wide margin, a revert to elapsed_seconds (~1029 s)
+  // FAILS. Parse mm:ss → seconds rather than matching a brittle exact string.
+  const roastTimerText = await page.getByTestId("roast-timer").textContent();
+  expect(roastTimerText).toMatch(/^\d{2}:\d{2}$/);
+  const [mm, ss] = (roastTimerText ?? "00:00").split(":").map((n) => Number(n));
+  const roastTimerSeconds = mm * 60 + ss;
+  expect(roastTimerSeconds).toBeGreaterThan(0); // a real post-charge clock, ticking
+  expect(roastTimerSeconds).toBeLessThan(900); // charge-referenced, not the ~1029 s serve clock
+
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-developed.png");
 });

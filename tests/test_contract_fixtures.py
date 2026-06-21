@@ -58,6 +58,7 @@ from roastpilot_agent.models import (
     SseEvent,
     SseEventType,
     TelemetryEventData,
+    TelemetrySeries,
 )
 from roastpilot_agent.replay import (
     ReplayMarker,
@@ -183,6 +184,35 @@ def _normalize_rest_snapshot(raw: _JsonObj) -> _JsonObj:
     for key in ("started_at_utc", "completed_at_utc", "first_crack_at_utc"):
         if raw.get(key) is not None:
             raw[key] = _SENTINEL_TIMESTAMP
+    return raw
+
+
+def _normalize_telemetry_series(raw: _JsonObj) -> _JsonObj:
+    """Pin a dumped ``TelemetrySeries``'s volatile fields to fixed sentinels (#121).
+
+    The ``run_id`` is random and each ``TelemetryPoint``'s ``elapsed_seconds`` /
+    ``charge_elapsed_seconds`` are wall-clock-derived (volatile, exactly like the
+    SSE-frame clocks). Pin all of them so a regeneration is byte-deterministic while
+    the field SHAPE — the ``TelemetryPoint`` keys the SPA's TS mirror reads — is
+    still exercised. As elsewhere, every value normalization guards on **non-null**
+    so a value→``null`` server regression survives to fail the byte compare
+    (``charge_elapsed_seconds`` is legitimately ``null`` for pre-charge points — a
+    real contract state the SPA treats specially, dropping the point from the curve).
+
+    Args:
+        raw: One ``TelemetrySeries.model_dump(mode="json")`` dict.
+
+    Returns:
+        The same dict, mutated in place, with volatile fields normalized.
+    """
+    if raw.get("run_id") is not None:
+        raw["run_id"] = _SENTINEL_RUN_ID
+    points: list[_JsonObj] = raw.get("points") or []
+    for point in points:
+        if point.get("elapsed_seconds") is not None:
+            point["elapsed_seconds"] = _SENTINEL_ELAPSED
+        if point.get("charge_elapsed_seconds") is not None:
+            point["charge_elapsed_seconds"] = _SENTINEL_ELAPSED
     return raw
 
 
@@ -463,15 +493,20 @@ async def test_write_sse_frame_fixture(all_sse_frames: list[SseEvent]) -> None:
     _SSE_FRAMES_PATH.write_text(_serialize(_build_sse_payload(all_sse_frames)))
 
 
-async def _collect_rest_snapshots(tmp_path: Path) -> tuple[RoastDetail, RoastSummary]:
-    """Drive a completed cooling replay and return its (detail, summary) snapshots.
+async def _collect_rest_snapshots(
+    tmp_path: Path,
+) -> tuple[RoastDetail, RoastSummary, TelemetrySeries]:
+    """Drive a completed cooling replay and return its REST snapshots + series.
 
     Sourced from the real ``RoastService``: a completed cooling run gives a
-    ``RoastDetail`` with a real ``enabled_actions`` projection and a
-    ``RoastSummary`` history item. The detail is enriched with a real, non-null
+    ``RoastDetail`` with a real ``enabled_actions`` projection, a ``RoastSummary``
+    history item, and the persisted ``/telemetry`` ``TelemetrySeries`` the detail
+    page's curve renders. The detail is enriched with a real, non-null
     ``MicStatus`` projection (#197) — the same one ``detail()`` applies live to an
     active run — so the committed snapshot exercises that field shape, not the
-    ``None`` branch the flat export would otherwise leave it on.
+    ``None`` branch the flat export would otherwise leave it on. The series is the
+    real ``read_telemetry_points`` projection (#308: each ``TelemetryPoint`` carries
+    the charge-referenced clock the SPA re-origins the curve x-axis on).
     """
     service, source, _queue = await _subscribed_replay(_COOLING_COMPLETE, tmp_path / "rest.sqlite3")
     try:
@@ -479,6 +514,7 @@ async def _collect_rest_snapshots(tmp_path: Path) -> tuple[RoastDetail, RoastSum
         assert source.run_id is not None
         detail = await service.detail(source.run_id)
         history = await service.history()
+        series = await service.telemetry(source.run_id, downsample=1)
     finally:
         await source.aclose()
 
@@ -497,10 +533,12 @@ async def _collect_rest_snapshots(tmp_path: Path) -> tuple[RoastDetail, RoastSum
             )
         }
     )
-    return detail, summary
+    return detail, summary, series
 
 
-def _build_rest_payload(detail: RoastDetail, summary: RoastSummary) -> _FixturePayload:
+def _build_rest_payload(
+    detail: RoastDetail, summary: RoastSummary, series: TelemetrySeries
+) -> _FixturePayload:
     """The canonical REST-fixture payload, with volatile fields normalized (#121).
 
     Single source of truth shared by the regenerate test and the default-on
@@ -509,17 +547,23 @@ def _build_rest_payload(detail: RoastDetail, summary: RoastSummary) -> _FixtureP
     Args:
         detail: The real ``RoastDetail`` snapshot (mic-status enriched).
         summary: The matching ``RoastSummary`` history row.
+        series: The matching ``/telemetry`` ``TelemetrySeries`` (the detail-page
+            curve's source; pins the ``TelemetryPoint`` shape, incl. #308's
+            ``charge_elapsed_seconds``).
 
     Returns:
-        The fixture dict (``roast_detail`` / ``roast_summary``), normalized.
+        The fixture dict (``roast_detail`` / ``roast_summary`` /
+        ``telemetry_series``), normalized.
     """
     payload = {
         "roast_detail": _normalize_rest_snapshot(detail.model_dump(mode="json")),
         "roast_summary": _normalize_rest_snapshot(summary.model_dump(mode="json")),
+        "telemetry_series": _normalize_telemetry_series(series.model_dump(mode="json")),
     }
     # Re-validate against the real models so the fixture can't drift from them.
     RoastDetail.model_validate(payload["roast_detail"])
     RoastSummary.model_validate(payload["roast_summary"])
+    TelemetrySeries.model_validate(payload["telemetry_series"])
     return payload
 
 
@@ -532,9 +576,9 @@ async def test_write_rest_snapshot_fixture(tmp_path: Path) -> None:
     :func:`_build_rest_payload`; the default-on in-sync test re-derives the same
     payload and asserts it equals these committed bytes.
     """
-    detail, summary = await _collect_rest_snapshots(tmp_path)
+    detail, summary, series = await _collect_rest_snapshots(tmp_path)
     _CONTRACT_DIR.mkdir(parents=True, exist_ok=True)
-    _REST_SNAPSHOTS_PATH.write_text(_serialize(_build_rest_payload(detail, summary)))
+    _REST_SNAPSHOTS_PATH.write_text(_serialize(_build_rest_payload(detail, summary, series)))
 
 
 @pytest.mark.asyncio
@@ -661,6 +705,30 @@ def test_committed_rest_fixture_matches_models() -> None:
     raw = json.loads(_REST_SNAPSHOTS_PATH.read_text())
     RoastDetail.model_validate(raw["roast_detail"])
     RoastSummary.model_validate(raw["roast_summary"])
+    TelemetrySeries.model_validate(raw["telemetry_series"])
+
+
+def test_committed_rest_fixture_carries_telemetry_charge_elapsed_seconds() -> None:
+    """The committed ``/telemetry`` series pins the charge-clock key on each point (#308).
+
+    The SPA re-origins the live curve x-axis on ``TelemetryPoint.charge_elapsed_seconds``
+    (the detail-page backfill + the dashboard seed both read it); a server that
+    stopped projecting it onto the persisted series would silently break the
+    re-origin on a reconnect/late-join. Pin the KEY on every committed point (the
+    cooling-complete run is post-charge, so real values are present), with the
+    serve-referenced ``elapsed_seconds`` coexisting (#308)."""
+    raw = json.loads(_REST_SNAPSHOTS_PATH.read_text())
+    points = raw["telemetry_series"]["points"]
+    assert points, "committed telemetry_series has no points — regenerate it"
+    for point in points:
+        assert "charge_elapsed_seconds" in point, (
+            "committed telemetry_series point is missing charge_elapsed_seconds — regenerate it"
+        )
+        assert "elapsed_seconds" in point, (
+            "committed telemetry_series point is missing the serve-referenced "
+            "elapsed_seconds — regenerate it (it must coexist with "
+            "charge_elapsed_seconds, #308)"
+        )
 
 
 # --- Continuous server-drift auto-catch (#121) -----------------------------
@@ -689,8 +757,8 @@ async def test_committed_sse_fixture_is_in_sync_with_server(all_sse_frames: list
 @pytest.mark.asyncio
 async def test_committed_rest_fixture_is_in_sync_with_server(tmp_path: Path) -> None:
     """The committed REST fixture equals a fresh regeneration from the server."""
-    detail, summary = await _collect_rest_snapshots(tmp_path)
-    fresh = _serialize(_build_rest_payload(detail, summary))
+    detail, summary, series = await _collect_rest_snapshots(tmp_path)
+    fresh = _serialize(_build_rest_payload(detail, summary, series))
     committed = _REST_SNAPSHOTS_PATH.read_text()
     assert fresh == committed, _REGEN_HINT
 
