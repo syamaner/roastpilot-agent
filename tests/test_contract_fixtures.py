@@ -147,6 +147,12 @@ def _normalize_sse_frame(raw: _JsonObj) -> _JsonObj:
     data: _JsonObj | None = raw.get("data")
     if data is not None and data.get("elapsed_seconds") is not None:
         data["elapsed_seconds"] = _SENTINEL_ELAPSED
+    # #308: the charge-referenced roast clock is wall-clock-derived (volatile)
+    # exactly like elapsed_seconds, so pin it to the same sentinel when present.
+    # Guarded on non-null so a server regression that nulls it survives to fail
+    # the byte compare (it is None before charge — a real contract state).
+    if data is not None and data.get("charge_elapsed_seconds") is not None:
+        data["charge_elapsed_seconds"] = _SENTINEL_ELAPSED
     return raw
 
 
@@ -610,6 +616,28 @@ def test_committed_sse_fixture_carries_development_time_and_dtr() -> None:
     )
     assert "development_percent" in data, (
         "committed telemetry frame is missing development_percent — regenerate it"
+    )
+
+
+def test_committed_sse_fixture_carries_charge_elapsed_seconds() -> None:
+    """The committed SSE telemetry frame pins the charge-referenced clock key (#308).
+
+    The dashboard renders ROAST TIME (0:00 = charge) from
+    ``telemetry.charge_elapsed_seconds`` and re-origins the chart x-axis to charge;
+    a server that stopped projecting it would silently break the header re-origin.
+    The representative frame is pre-charge, so the value is ``null`` (the header
+    shows '—' until the bean is on the drum), but the KEY must be present on the
+    wire shape the SPA's TS mirror reads. Distinct from ``elapsed_seconds`` (the
+    serve-referenced raw x lead-in), which must also remain present."""
+    raw = json.loads(_SSE_FRAMES_PATH.read_text())
+    telemetry = next(f for f in raw["frames"] if f["event"] == SseEventType.TELEMETRY.value)
+    data = telemetry["data"]
+    assert "charge_elapsed_seconds" in data, (
+        "committed telemetry frame is missing charge_elapsed_seconds — regenerate it"
+    )
+    assert "elapsed_seconds" in data, (
+        "committed telemetry frame is missing the serve-referenced elapsed_seconds — "
+        "regenerate it (it must coexist with charge_elapsed_seconds, #308)"
     )
 
 

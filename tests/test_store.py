@@ -424,6 +424,46 @@ async def test_telemetry_rows_are_interval_throttled(tmp_store: RoastStore) -> N
 
 
 @pytest.mark.asyncio
+async def test_telemetry_round_trips_charge_elapsed_seconds(tmp_store: RoastStore) -> None:
+    """#308 (V5): the charge-referenced roast clock is persisted and read back.
+
+    The REST telemetry series re-origins the chart x-axis at charge on a
+    history/reload read, so the per-snapshot ``charge_elapsed_seconds`` must
+    survive the round-trip. ``None`` before charge (the pre-charge lead-in),
+    a since-charge value after T0 — both persisted exactly and reconstructed
+    on :meth:`read_telemetry_points`."""
+    await seeded_store(tmp_store)
+    try:
+        reading = RoastTelemetry(bean_temp_c=150.0, env_temp_c=170.0)
+        # Tick 1: pre-charge → charge_elapsed_seconds is None (the chart lead-in).
+        await tmp_store.record_telemetry(
+            run_id="run-1",
+            tick=1,
+            agent_phase=RoastPhase.PREHEATING,
+            elapsed_seconds=0.0,
+            interval_seconds=5.0,
+            telemetry=reading,
+            charge_elapsed_seconds=None,
+        )
+        # Tick 2: post-charge → the operator-facing roast clock since T0.
+        await tmp_store.record_telemetry(
+            run_id="run-1",
+            tick=2,
+            agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            elapsed_seconds=30.0,
+            interval_seconds=5.0,
+            telemetry=reading,
+            charge_elapsed_seconds=12.0,
+        )
+        points = await tmp_store.read_telemetry_points("run-1")
+        assert [p.charge_elapsed_seconds for p in points] == [None, 12.0]
+        # The serve-referenced clock is retained and distinct (the chart's raw x).
+        assert [p.elapsed_seconds for p in points] == [0.0, 30.0]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_writes_commit_per_tick(tmp_store: RoastStore) -> None:
     """Another connection sees every write immediately — proof that each
     writer commits (power loss never costs a committed tick)."""
