@@ -123,7 +123,7 @@ class LateMaillardTrim(BaseModel):
     #: bend RoR into FC, NOT a momentum-killing cut (the #218 pre-FC crash). Must
     #: stay <= the flat-floor ``PreFirstCrackLevers.heat_target_percent`` (the
     #: trim only ever lowers heat — a validator on the parent pins this).
-    trim_heat_percent: int = Field(default=65, ge=0, le=100)
+    trim_heat_percent: int = Field(default=65, ge=10, le=100)
     #: Seconds-before-predicted-FC at which the window OPENS. Default 60 — the
     #: trim engages in late Maillard, ~1 min ahead of the projected crack, so the
     #: env cools before FC rather than at it. Well inside the #229-validated

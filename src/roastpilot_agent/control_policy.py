@@ -362,7 +362,10 @@ class RoastControlPolicy:
         if not trim.enabled or trim_signal is None:
             return False
         eta = trim_signal.first_crack_eta_seconds
-        if eta is None or eta <= 0.0 or eta > trim.window_fc_eta_seconds:
+        # `not (0.0 < eta <= window)` is True for None, NaN, ≤0, and >window.
+        # NaN comparisons all return False in Python, so NaN passes the old
+        # `eta <= 0.0 or eta > window` guards — this form fails closed for NaN too.
+        if eta is None or not (0.0 < eta <= trim.window_fc_eta_seconds):
             return False
         return trim_signal.bean_temp_c >= trim.min_bean_temp_c
 

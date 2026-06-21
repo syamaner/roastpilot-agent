@@ -221,6 +221,11 @@ def test_safety_limits_rejects_inverted_drop_ceilings() -> None:
 
 # --- Anticipatory late-Maillard heat trim (#327) -----------------------------
 
+# Default trim heat level (LateMaillardTrim.trim_heat_percent default).
+# Using a named constant rather than a bare 65 literal prevents silent
+# zero-engagement when the default changes.
+_DEFAULT_TRIM_LEVEL: int = 65
+
 # A trim signal sized to OPEN the default window: bean above the 155 °C floor and
 # a positive FC-ETA (30 s) at/below the 60 s window.
 _TRIM_OPEN = TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=30.0)
@@ -233,8 +238,8 @@ def test_trim_lowers_heat_floor_and_target_in_window(phase: RoastPhase) -> None:
     not a crash. Fan is unchanged (the plan's "fan controlled", not raised)."""
     policy = RoastControlPolicy(SafetyLimits(), _PROFILE)
     box = policy.limits_for(phase, trim_signal=_TRIM_OPEN)
-    assert box.heat_target_percent == 65  # the default trim level (~60–70 %)
-    assert box.heat_floor_percent == 65  # floor pinned to the trim — no cut below
+    assert box.heat_target_percent == _DEFAULT_TRIM_LEVEL  # the default trim level (~60–70 %)
+    assert box.heat_floor_percent == _DEFAULT_TRIM_LEVEL  # floor pinned to the trim — no cut below
     assert box.heat_ceiling_percent == 100
     # Fan stays at the flat-floor target/box — the trim never raises fan.
     assert box.fan_target_percent == 30
@@ -261,6 +266,7 @@ def test_trim_never_exceeds_the_flat_floor_heat() -> None:
         TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=120.0),  # FC too far out
         TrimSignal(bean_temp_c=140.0, first_crack_eta_seconds=30.0),  # bean below floor
         TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=0.0),  # non-positive ETA
+        TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=float("nan")),  # NaN ETA
     ],
 )
 def test_trim_fails_closed_to_flat_floor(signal: TrimSignal | None) -> None:
@@ -287,7 +293,7 @@ def test_latched_signal_keeps_trim_engaged_through_eta_bounce() -> None:
     # …but the SAME bounce with the latch set holds the trim at 65.
     latched = TrimSignal(bean_temp_c=170.0, first_crack_eta_seconds=80.0, latched=True)
     latched_box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=latched)
-    assert latched_box.heat_target_percent == 65
+    assert latched_box.heat_target_percent == _DEFAULT_TRIM_LEVEL
 
 
 def test_trim_window_open_ignores_the_latch() -> None:
@@ -349,6 +355,18 @@ def test_trim_parameters_are_config_driven_not_hardcoded() -> None:
     box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=signal)
     assert box.heat_target_percent == 70
     assert box.heat_floor_percent == 70
+
+
+def test_trim_heat_percent_below_safe_minimum_is_rejected() -> None:
+    """LateMaillardTrim rejects trim_heat_percent < 10 at construction time (#327).
+    Values that low would stall the roast (heat=0 in late Maillard); the ge=10
+    bound guards against misconfiguration before it reaches hardware."""
+    with pytest.raises(ValidationError):
+        LateMaillardTrim(trim_heat_percent=9)
+    with pytest.raises(ValidationError):
+        LateMaillardTrim(trim_heat_percent=0)
+    # The boundary value is valid.
+    assert LateMaillardTrim(trim_heat_percent=10).trim_heat_percent == 10
 
 
 def test_levers_reject_trim_heat_above_flat_floor() -> None:
@@ -545,7 +563,7 @@ def test_trim_engages_in_late_maillard_on_a_real_roast_curve() -> None:
         eta = estimate_first_crack_eta_seconds(window, fc_target_bean_temp_c=176.0)
         signal = TrimSignal(bean_temp_c=curve[i].bean_temp_c, first_crack_eta_seconds=eta)
         box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=signal)
-        if box.heat_target_percent == 65:  # the trim level (not the flat 100 floor)
+        if box.heat_target_percent == _DEFAULT_TRIM_LEVEL:  # the trim level (not the flat 100 floor)
             engaged_beans.append(curve[i].bean_temp_c)
     # The trim DID engage on this real curve (the window opened in late Maillard).
     assert engaged_beans, "trim never engaged on the real roast curve"
