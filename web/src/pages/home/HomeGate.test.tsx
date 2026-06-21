@@ -7,14 +7,15 @@
  */
 
 import { cleanup, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { HomeGate } from "./HomeGate";
 
 const healthState: {
   data: { active_run_id: string | null } | undefined;
   isSuccess: boolean;
-} = { data: undefined, isSuccess: false };
+  isError: boolean;
+} = { data: undefined, isSuccess: false, isError: false };
 
 vi.mock("@/hooks/queries", () => ({
   useHealth: () => healthState,
@@ -29,6 +30,10 @@ vi.mock("./HomePage", () => ({
 }));
 
 afterEach(cleanup);
+// Reset error flag between tests so the error-state case doesn't bleed into others.
+beforeEach(() => {
+  healthState.isError = false;
+});
 
 describe("HomeGate state-aware `/` (#324)", () => {
   it("renders neither destination until health resolves", () => {
@@ -54,5 +59,17 @@ describe("HomeGate state-aware `/` (#324)", () => {
     render(<HomeGate />);
     expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
     expect(screen.queryByTestId("home-stub")).toBeNull();
+  });
+
+  it("falls back to the home hub when the health fetch errors", () => {
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    healthState.data = undefined;
+    render(<HomeGate />);
+    // The hub is shown (active run is unknown — treat as idle); the blank loading
+    // div must not persist so the operator is never stuck on an empty screen.
+    expect(screen.getByTestId("home-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("home-gate-loading")).toBeNull();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
   });
 });
