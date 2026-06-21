@@ -149,9 +149,12 @@ UNIVERSAL_TARGETS: frozenset[RoastPhase] = frozenset(
 #: (#206): emergency-stop, cooling, and acknowledge stay available throughout.
 #: This kills the post-#206 "infinite error loop" where a sustained dead-MCP read
 #: re-emitted the identical FAULT event every tick (roast 2, attempt 2).
-TERMINAL_LATCH_PHASES: frozenset[RoastPhase] = frozenset(
-    {RoastPhase.FAULTED, RoastPhase.OPERATOR_RECOVERY_REQUIRED}
-)
+#:
+#: Bound to :data:`UNIVERSAL_TARGETS` by IDENTITY, not duplicated (PR review): the
+#: phases the tick latches in ARE exactly the universal fall-into-from-anywhere
+#: terminal phases, so a single source of truth keeps them from drifting apart if
+#: one is ever extended. A test pins the equality so the coupling is intentional.
+TERMINAL_LATCH_PHASES: frozenset[RoastPhase] = UNIVERSAL_TARGETS
 
 
 class StateReader(Protocol):
@@ -588,6 +591,16 @@ class RoastController:
         self._advisory_policy = AdvisoryCallPolicy(config)
         self._current_heat = 0
         self._current_fan = 0
+        # Fail-closed retry latch (#206 / PR review, blocker finding). The
+        # heat-off / safe-fan write is applied ONCE on entry into a terminal HOLD
+        # phase. If that write (or an e-stop) fails TRANSIENTLY, the roaster may
+        # still be hot — so the pending safe target is held here and re-attempted
+        # on EACH subsequent latched tick (heat-off is monotonically toward
+        # safety) until it confirms, at which point this clears and the latch goes
+        # fully silent. This preserves the fail-closed guarantee under a flaky MCP
+        # while still killing the re-read / re-eval / re-emit noise loop the latch
+        # exists to fix. ``None`` = posture confirmed / nothing pending.
+        self._pending_fail_safe: SafetyEvaluation | None = None
         # D35 §4-A / D40.5 (#276): the direction of each lever's last EXECUTED
         # post-FC move, fed into the coherence/deadband gate so a sub-threshold
         # direction reversal (the #218 30<->40<->30 thrash) is damped to a hold.
@@ -814,6 +827,13 @@ class RoastController:
             raise InvalidTransitionError(self._phase, target)
         previous = self._phase
         self._phase = target
+        if previous in TERMINAL_LATCH_PHASES and target not in TERMINAL_LATCH_PHASES:
+            # Leaving a terminal HOLD phase is an EXPLICIT operator action
+            # (acknowledge → idle, resume, start cooling): the operator now owns
+            # the levers, so any unconfirmed fail-safe retry latch is dropped — it
+            # must not keep forcing heat-off into a run the operator just resumed
+            # or a cooling cycle they just started (#206 / PR review).
+            self._pending_fail_safe = None
         if target in (RoastPhase.STARTING, RoastPhase.PREHEATING):
             # Per-run latches reset (T0 confirmation, debounce streak,
             # add-beans guidance) on a new run AND on every preheating
@@ -909,6 +929,13 @@ class RoastController:
         never reduces what the operator can do (#206 operable-faulted intact).
         """
         if self._phase in TERMINAL_LATCH_PHASES:
+            # If the fail-safe write did not confirm on entry (a transient MCP
+            # write failure), re-attempt the heat-off write here — the latch must
+            # never strand the roaster hot. This is the ONLY actuation a latched
+            # tick performs; it re-reads nothing, re-evaluates nothing, and
+            # re-emits no terminal event, so it drives toward safety without
+            # re-opening the noise loop. Once it confirms, the latch is silent.
+            await self._retry_pending_fail_safe()
             self._check_operator_timeout()
             # A stale advisory request must not survive the latch into a later
             # resumed/cooling tick (mirrors the fail-closed branch below).
@@ -1236,6 +1263,12 @@ class RoastController:
                     RoastEventKind.COMMAND_FAILED,
                     {"command": "emergency_stop", "reason": evaluation.reason},
                 )
+                # The e-stop did not confirm; latch a heat-off retry so the
+                # terminal-phase tick keeps driving toward safety rather than
+                # leaving the roaster potentially hot (#206 / PR review blocker).
+                self._pending_fail_safe = self._heat_off_evaluation(
+                    source_rule="emergency_stop_retry"
+                )
             # Emit ONCE, only on entry into FAULTED — never while already
             # latched there (the tick loop short-circuits before reaching here
             # in a terminal phase, but the guard keeps the emit transition-bound
@@ -1273,6 +1306,11 @@ class RoastController:
         phase; the matrix forbids SET_HEAT in e.g. cooling to prevent
         re-heating, not heat-off). A failed write is surfaced
         (COMMAND_FAILED) but never blocks the fail-closed transition.
+
+        On a write FAILURE the evaluation is LATCHED in ``_pending_fail_safe``
+        so the terminal-phase tick re-attempts the heat-off write until it
+        confirms — the latch must not strand the roaster hot after one transient
+        failure (#206 / PR review blocker). A successful write clears the latch.
         """
         if evaluation.adjusted_heat is None or evaluation.adjusted_fan is None:
             return
@@ -1286,9 +1324,53 @@ class RoastController:
                 RoastEventKind.COMMAND_FAILED,
                 {"command": "set_targets", "context": "fail_safe", "rule": evaluation.rule},
             )
+            # Posture NOT confirmed: hold it for retry on the next latched tick.
+            self._pending_fail_safe = evaluation
             return
         self._current_heat = evaluation.adjusted_heat
         self._current_fan = evaluation.adjusted_fan
+        # Posture confirmed on hardware: nothing left to retry.
+        self._pending_fail_safe = None
+
+    def _heat_off_evaluation(self, *, source_rule: str) -> SafetyEvaluation:
+        """A synthetic heat-off / overrun-safe-fan fail-safe target (#206).
+
+        The unconditional fail-closed posture (heat 0 %, the configured
+        overrun-safe fan) used as the RETRY target after a failed e-stop and as
+        the fallback any time a fail-safe write could not be confirmed. Heat-off
+        is monotonically toward safety in every phase, so retrying it can never
+        make the roaster less safe.
+
+        Args:
+            source_rule: The rule name to stamp on the synthetic evaluation for
+                the decision trace (e.g. the e-stop reason source).
+
+        Returns:
+            A ``FAULT`` :class:`SafetyEvaluation` carrying heat 0 / safe fan.
+        """
+        return SafetyEvaluation(
+            rule=source_rule,
+            verdict=SafetyVerdict.FAULT,
+            adjusted_heat=0,
+            adjusted_fan=self._safety.limits.overrun_safe_fan_percent,
+            reason="fail-closed retry: heat 0 %, overrun-safe fan",
+        )
+
+    async def _retry_pending_fail_safe(self) -> None:
+        """Re-attempt the latched heat-off write on a terminal-phase tick (#206).
+
+        Called only from the terminal-phase short-circuit in :meth:`tick`. It
+        re-issues the held fail-safe write (heat 0 %, safe fan); on success the
+        latch clears and later latched ticks are fully silent, on failure it
+        stays latched and is retried again next tick. It NEVER re-emits the
+        terminal event, never re-reads the MCP, and never re-evaluates safety —
+        so it preserves the fail-closed guarantee without re-opening the noise
+        loop the latch closed.
+        """
+        pending = self._pending_fail_safe
+        if pending is None:
+            return
+        await self._apply_fail_safe(pending)
 
     async def _run_advisory(
         self, telemetry: RoastTelemetry | None, trigger: AdvisoryTrigger

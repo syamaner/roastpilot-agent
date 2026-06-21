@@ -25,6 +25,7 @@ from roastpilot_agent.coherence import LeverDirection
 from roastpilot_agent.config import ControllerConfig, SafetyLimits
 from roastpilot_agent.control_policy import PhaseControlLimits
 from roastpilot_agent.controller import (
+    TERMINAL_LATCH_PHASES,
     TRANSITION_TABLE,
     UNIVERSAL_TARGETS,
     AdvisoryCallPolicy,
@@ -1259,6 +1260,75 @@ async def test_recovery_phase_latches_and_holds() -> None:
     assert harness.events.kinds().count(RoastEventKind.RECOVERY_REQUIRED) == 1
     assert harness.log.count("read") == reads  # the dead/idle MCP is not re-read
     assert len(harness.sink.evaluations) == evals
+
+
+def test_terminal_latch_phases_is_the_universal_targets_set() -> None:
+    """The latch set is bound to UNIVERSAL_TARGETS by identity, not duplicated
+    (PR review): the phases the tick latches in ARE the universal terminal HOLD
+    phases. Pinning this keeps them from drifting apart if one is ever extended."""
+    assert TERMINAL_LATCH_PHASES is UNIVERSAL_TARGETS
+    expected = frozenset({RoastPhase.FAULTED, RoastPhase.OPERATOR_RECOVERY_REQUIRED})
+    assert expected == TERMINAL_LATCH_PHASES
+
+
+@pytest.mark.asyncio
+async def test_latch_retries_fail_safe_after_a_transient_write_failure() -> None:
+    """PR-review blocker: the latch must NOT strand the roaster hot if the
+    fail-safe heat-off write fails transiently on the entry tick.
+
+    A flaky executor fails the first N set_targets writes (the entry write + the
+    first latched retry), then succeeds. The fail-closed posture must be RETRIED
+    on subsequent latched ticks until it confirms (heat 0), without re-emitting
+    the fault, re-reading the dead MCP, or re-evaluating safety.
+    """
+
+    class FlakyExecutor(RecordingExecutor):
+        def __init__(self, log: list[str], fail_first: int) -> None:
+            super().__init__(log)
+            self._remaining_failures = fail_first
+
+        async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+            if self._remaining_failures > 0:
+                self._remaining_failures -= 1
+                raise RuntimeError("serial write dropped")
+            await super().set_targets(heat_percent=heat_percent, fan_percent=fan_percent)
+
+    log: list[str] = []
+    # The entry write fails AND the first retry fails; the second retry succeeds.
+    executor = FlakyExecutor(log, fail_first=2)
+    # Missing telemetry during an active roast faults closed via _apply_fail_safe
+    # (the FAULT verdict carries adjusted heat 0 / safe fan — the set_targets path
+    # the flaky executor disrupts).
+    harness = make_harness(readings=[None], executor=executor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:  # …→ DEVELOPMENT
+        harness.controller.transition_to(step)
+    harness.events.events.clear()
+
+    await harness.controller.tick()  # entry: FAULT; fail-safe write fails → latched
+    assert harness.controller.phase is RoastPhase.FAULTED
+    fault_count = harness.events.kinds().count(RoastEventKind.FAULT)
+    assert fault_count == 1
+    # The entry write failed → posture not yet confirmed (no successful target).
+    assert executor.targets == []
+
+    reads_before_retry = harness.log.count("read")
+    evals_before_retry = len(harness.sink.evaluations)
+
+    # Latched ticks retry the heat-off write: first retry fails, second succeeds.
+    await harness.controller.tick()  # retry 1 fails, still latched
+    assert executor.targets == []
+    await harness.controller.tick()  # retry 2 succeeds → heat 0 applied
+    assert executor.targets, "fail-safe heat-off must eventually be applied"
+    assert executor.targets[-1][0] == 0  # heat 0 %
+    await harness.controller.tick()  # confirmed → no further writes
+
+    # Posture confirmed once; not re-applied every tick thereafter.
+    assert len(executor.targets) == 1
+    # Still exactly one fault event, and the retries did not re-read or re-eval.
+    assert harness.events.kinds().count(RoastEventKind.FAULT) == 1
+    assert harness.log.count("read") == reads_before_retry
+    assert len(harness.sink.evaluations) == evals_before_retry
 
 
 @pytest.mark.asyncio
