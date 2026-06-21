@@ -62,7 +62,11 @@ python -m pip install -q -e . --group dev
 # ~1 s — simpler and bulletproof than guessing freshness. `npm install` stays
 # conditional on node_modules being absent (the slow step).
 echo "  building SPA…"
-( cd web && { [ -d node_modules ] || npm install; }; npm run build )
+(
+  cd web || exit 1                       # never build from the repo root if cd fails
+  [ -d node_modules ] || npm install     # slow step, only when missing
+  npm run build
+)
 
 IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true)"
 [ -n "$IP" ] || IP="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -v '^127' | head -1 || true)"
