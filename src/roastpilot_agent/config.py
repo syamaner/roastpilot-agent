@@ -188,6 +188,20 @@ class ControllerConfig(BaseModel):
     # plan (D42 §7.1) can supply a different ramp. (Parameterized factory, not a
     # bare model default, per the repo's pyright-strict typed-default idiom.)
     pre_first_crack_levers: PreFirstCrackLevers = Field(default_factory=PreFirstCrackLevers)
+    # D40.3 / D40.5 (#275): per-tick control-loop CONTEXT payload bounds. The
+    # context builder (roast_history.RoastHistory) keeps the roast-so-far curve
+    # as a bounded recent FULL-RESOLUTION window plus a milestone summary, and the
+    # model's own recommendations as a bounded decision trace — never a raw
+    # whole-roast dump. These set the bounds; defaults mirror the module's named
+    # constants (~60 s of 1 s curve, ~1 min of 5 s consults). Context-only — they
+    # never touch the safety path.
+    curve_window_samples: int = Field(default=60, ge=1)
+    decision_trace_entries: int = Field(default=12, ge=1)
+    # FC-ETA projection target (#229 KEEP): the FC-band bean temperature the
+    # builder extrapolates the recent bean RoR toward to estimate the first-crack
+    # ETA. Default 176.0 °C = the #229-validated FC band midpoint (171-180 °C) on
+    # this roaster's indicated probe. Anticipation context only; never a lever.
+    first_crack_target_bean_temp_c: float = Field(default=176.0, gt=0)
 
     def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.

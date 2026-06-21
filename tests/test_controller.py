@@ -42,6 +42,7 @@ from roastpilot_agent.models import (
     RoastProfile,
     RoastTelemetry,
 )
+from roastpilot_agent.roast_history import RoastMilestoneKind
 from roastpilot_agent.safety import (
     OPERATOR_ACTION_COMMAND,
     SafetyEvaluation,
@@ -3058,3 +3059,144 @@ def test_emergency_stop_enabled_in_every_phase() -> None:
     """E-stop is always available — its matrix row is the full phase set."""
     for phase in RoastPhase:
         assert OperatorAction.EMERGENCY_STOP in enabled_operator_actions(phase)
+
+
+# --- #275: per-tick control-loop context (roast-so-far curve + DTR + trace) ---
+
+
+@pytest.mark.asyncio
+async def test_context_carries_roast_so_far_curve_after_charge() -> None:
+    """#275 (D40.3): once charged, the per-tick context curve window accumulates
+    the roast-so-far telemetry (bean/env/heat/fan + RoR) and the model's own
+    decision trace — and the advisor context surfaces both post-FC."""
+    advisor = FakeAdvisor([], default_decision=decision(heat=70, fan=40))
+    t0 = reading(bean=120.0, t0_detected=True, bean_ror_c_per_min=-40.0)
+    harness = make_harness(readings=[t0], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING
+        harness.controller.transition_to(step)
+    # Debounce T0 → ROASTING_PRE_FIRST_CRACK (charge clock stamped on tick 3).
+    for _ in range(3):
+        harness.reader.readings = [t0]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    # A few pre-FC ticks: the bean turns and warms (TP then recovery), the
+    # advisor stays silent (deterministic pre-FC), but the curve accumulates.
+    pre_fc = [
+        reading(bean=118.0, bean_ror_c_per_min=-5.0),  # still crashing
+        reading(bean=119.0, bean_ror_c_per_min=2.0),  # turning point (RoR >= 0)
+        reading(bean=125.0, bean_ror_c_per_min=10.0),  # recovery
+        reading(bean=140.0, bean_ror_c_per_min=12.0),
+    ]
+    for r in pre_fc:
+        harness.reader.readings = [r]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert advisor.contexts == []  # advisor silent pre-FC
+    # First crack → DEVELOPMENT, then a development consult.
+    harness.reader.readings = [
+        reading(bean=176.0, bean_ror_c_per_min=8.0, first_crack_detected=True)
+    ]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=180.0, bean_ror_c_per_min=5.0)]
+    await harness.controller.tick()
+    assert advisor.contexts
+    ctx = advisor.contexts[-1]
+    # The roast-so-far curve is present and paired (action + response).
+    assert len(ctx.roast_curve_window) > 3
+    last = ctx.roast_curve_window[-1]
+    assert last.bean_temp_c == 180.0
+    assert last.heat_percent >= 0 and last.fan_percent >= 0
+    # Milestones: turning point + recovery (pre-FC) and first crack.
+    kinds = {m.kind for m in ctx.roast_milestones}
+    assert RoastMilestoneKind.TURNING_POINT in kinds
+    assert RoastMilestoneKind.RECOVERY in kinds
+    assert RoastMilestoneKind.FIRST_CRACK in kinds
+    fc = next(m for m in ctx.roast_milestones if m.kind is RoastMilestoneKind.FIRST_CRACK)
+    assert fc.bean_temp_c == 176.0  # bean temp at the crack
+    # DTR is a distinct value from the development duration.
+    assert ctx.development_elapsed_seconds is not None
+    assert ctx.development_time_ratio is not None
+    # FC-ETA is None post-FC (the detector owns FC now).
+    assert ctx.first_crack_eta_seconds is None
+
+
+@pytest.mark.asyncio
+async def test_context_decision_trace_records_model_own_recommendations() -> None:
+    """#275 (D40.5 / #218): the model's own prior recommendations are encoded in
+    the decision trace, so the NEXT consult sees its trajectory."""
+    advisor = FakeAdvisor(
+        [decision(heat=70, fan=40), decision(heat=55, fan=45)],
+        default_decision=decision(heat=50, fan=50),
+    )
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    # First development consult: no prior trace yet.
+    await harness.controller.tick()
+    assert advisor.contexts[-1].decision_trace == []
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=185.0)]
+    # Second consult: the first recommendation is now in the trace.
+    await harness.controller.tick()
+    trace = advisor.contexts[-1].decision_trace
+    assert len(trace) == 1
+    assert trace[0].target_heat == 70
+    assert trace[0].target_fan == 40
+    assert trace[0].should_drop is False
+
+
+@pytest.mark.asyncio
+async def test_fc_eta_present_pre_fc_when_advisor_context_built() -> None:
+    """#275 / #229: the FC-ETA is a pre-FC anticipation scalar. Built directly
+    on a charged, warming curve it projects a positive ETA; post-FC it is None.
+    (Pre-FC the advisor is not consulted, so this exercises the builder via a
+    manual context build to assert the scalar without a live consult.)"""
+    advisor = FakeAdvisor([], default_decision=decision())
+    t0 = reading(bean=150.0, t0_detected=True, bean_ror_c_per_min=2.0)
+    harness = make_harness(readings=[t0], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:
+        harness.controller.transition_to(step)
+    for _ in range(3):  # debounce charge
+        harness.reader.readings = [t0]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    # Warm steadily toward the FC target so the extrapolation has a slope.
+    for bean in (155.0, 160.0, 165.0, 170.0):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=10.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    # Build the context directly (pre-FC the advisor is gated out by design).
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
+        reading(bean=171.0, bean_ror_c_per_min=10.0), limits
+    )
+    assert ctx.first_crack_eta_seconds is not None
+    assert ctx.first_crack_eta_seconds > 0.0
+
+
+@pytest.mark.asyncio
+async def test_history_resets_on_new_run() -> None:
+    """#275: a new run/preheat clears the per-tick context history (per-roast)."""
+    advisor = FakeAdvisor([], default_decision=decision())
+    t0 = reading(bean=120.0, t0_detected=True, bean_ror_c_per_min=2.0)
+    harness = make_harness(readings=[t0], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:
+        harness.controller.transition_to(step)
+    for _ in range(3):
+        harness.reader.readings = [t0]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    history = harness.controller._history  # pyright: ignore[reportPrivateUsage]
+    assert history.curve_window()  # accumulated something
+    # A fresh preheat (a new run) resets the history.
+    harness.controller.transition_to(RoastPhase.COOLING)
+    harness.controller.transition_to(RoastPhase.COMPLETE)
+    harness.controller.transition_to(RoastPhase.IDLE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    assert history.curve_window() == []
+    assert history.milestones() == []

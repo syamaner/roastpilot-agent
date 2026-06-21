@@ -36,6 +36,11 @@ from pydantic_ai.models import Model
 
 from roastpilot_agent.config import AdvisorConfig
 from roastpilot_agent.models import AdvisorHealth, AdvisorHealthStatus, RoastPhase
+from roastpilot_agent.roast_history import (
+    DecisionTraceEntry,
+    RoastCurveSample,
+    RoastMilestone,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -102,6 +107,17 @@ class AdvisorContext(BaseModel):
     default to ``None`` so a context built without the policy (or by an older
     caller) stays valid; populated, they are read-only context, never a control
     authority the advisor can widen.
+
+    The per-tick control-loop context (D40.3 / D40.5, #275) carries the
+    roast-so-far telemetry curve (``roast_curve_window`` — a bounded recent
+    full-resolution window — plus ``roast_milestones``, the turning-point /
+    recovery / drying-end / first-crack summary), the model's own prior
+    recommendations (``decision_trace``, the #218 anti-thrash history), the DTR
+    (``development_time_ratio``, distinct from the ``development_elapsed_seconds``
+    duration), and the validation-supported FC-ETA (``first_crack_eta_seconds``,
+    #229 KEEP). All are read-only context with no control authority, default
+    empty / ``None`` for callers that build no history, and are assembled by the
+    controller from :class:`~roastpilot_agent.roast_history.RoastHistory`.
     """
 
     phase: RoastPhase
@@ -143,6 +159,28 @@ class AdvisorContext(BaseModel):
     fan_ceiling_percent: int | None = Field(default=None, ge=0, le=100)
     bitter_ceiling_temp_c: float | None = None
     emergency_drop_temp_c: float | None = None
+    # D40.3 / D40.5 (#275): the per-tick control-loop context the model reasons
+    # on — the roast-so-far telemetry curve (a bounded recent full-res window +
+    # a milestone summary), the model's OWN prior recommendations (the #218
+    # anti-thrash decision trace), the DTR, and the validation-supported FC-ETA
+    # (#229 KEEP). Built by the controller from roast_history.RoastHistory. Like
+    # every AdvisorContext field this is read-only context with no control
+    # authority — the controller and safety policy never read it back. All
+    # default empty / None so a context built without history (older callers,
+    # the drop-only bake-off) stays valid. Wiring these into the live post-FC
+    # consult is #276; this story populates them.
+    roast_curve_window: list[RoastCurveSample] = Field(default_factory=list[RoastCurveSample])
+    roast_milestones: list[RoastMilestone] = Field(default_factory=list[RoastMilestone])
+    decision_trace: list[DecisionTraceEntry] = Field(default_factory=list[DecisionTraceEntry])
+    # DTR (development time as a SHARE of the charge-referenced roast clock) — a
+    # value DISTINCT from development_elapsed_seconds (the duration). Both come
+    # from the existing #219/#220/#235/#239 clocks (reused, not reinvented);
+    # None before first crack.
+    development_time_ratio: float | None = None
+    # FC-ETA: predicted seconds until first crack from RoR extrapolation (#229
+    # KEEP). A pre-FC anticipation trigger only, never a lever move on its own;
+    # None once FC is detected or before there is enough curve to project.
+    first_crack_eta_seconds: float | None = None
 
 
 class RoastDecision(BaseModel):
