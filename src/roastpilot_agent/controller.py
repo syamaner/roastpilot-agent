@@ -39,6 +39,14 @@ from roastpilot_agent.models import (
     RoastProfile,
     RoastTelemetry,
 )
+from roastpilot_agent.roast_history import (
+    DecisionTraceEntry,
+    RoastCurveSample,
+    RoastHistory,
+    RoastMilestone,
+    RoastMilestoneKind,
+    estimate_first_crack_eta_seconds,
+)
 from roastpilot_agent.safety import (
     COMMAND_PHASE_MATRIX,
     SafetyEvaluation,
@@ -527,6 +535,16 @@ class RoastController:
         # operator advisory pause latch (pause/resume_advisory, D19).
         self._last_telemetry: RoastTelemetry | None = None
         self._advisory_paused = False
+        # D40.3 / D40.5 (#275): the per-tick control-loop CONTEXT accumulator —
+        # the roast-so-far curve (bounded recent full-res window + milestone
+        # summary) and the model's own recommendation trace (#218). Context
+        # assembly only: it never actuates hardware, never evaluates safety, and
+        # holds no control authority. Reset on each new run/preheat. Wiring its
+        # payload into the live post-FC consult is #276; this story builds it.
+        self._history = RoastHistory(
+            curve_window_samples=config.curve_window_samples,
+            decision_trace_entries=config.decision_trace_entries,
+        )
 
     # --- E4-S1: transitions ---
 
@@ -680,6 +698,10 @@ class RoastController:
             # drop instant so the next roast's development time and DTR run live
             # again rather than staying frozen at the prior roast's drop value.
             self._drop_monotonic = None
+            # A new run/preheat starts a fresh per-tick context history (#275):
+            # the roast-so-far curve, milestones, and decision trace are
+            # per-roast. Context only; clears no control state.
+            self._history.reset()
         if target is RoastPhase.COOLING and self._drop_monotonic is None:
             # The drop instant (#239): every drop path lands in COOLING (the
             # advisor drop, the operator drop, and the pre-FC early-abort drop),
@@ -698,6 +720,18 @@ class RoastController:
             # resume the in-memory FC time is preserved (same process) or stays
             # None (after a restart) — advisory-only either way (safety review).
             self._first_crack_monotonic = self._clock()
+            # Record the first-crack milestone for the per-tick context summary
+            # (#275): the development clock's origin and a curve landmark the
+            # post-FC loop reasons from. Context only; the last reading the tick
+            # consumed supplies the bean temperature at the crack.
+            if self._last_telemetry is not None:
+                self._history.record_milestone(
+                    RoastMilestone(
+                        kind=RoastMilestoneKind.FIRST_CRACK,
+                        elapsed_since_charge_seconds=self._charge_elapsed_seconds(),
+                        bean_temp_c=self._last_telemetry.bean_temp_c,
+                    )
+                )
         if target in UNIVERSAL_TARGETS:
             # D16 operator-timeout tracking starts on entering a true
             # operator-required state — never in normal phases.
@@ -742,6 +776,15 @@ class RoastController:
         # lever, and a tick that just hit FC does NOT (it falls to the advisor).
         # The advisory step below is a no-op in these phases (gated out).
         await self._apply_deterministic_pre_fc_levers(telemetry)
+        # D40.3 (#275): accumulate the roast-so-far curve + milestones for the
+        # per-tick control-loop context AFTER the phase rules + deterministic
+        # pre-FC levers have run, so the sample captures the charge tick itself
+        # and pairs the reading with the heat/fan the controller actually
+        # commanded this tick (the (action, response) history the model reads).
+        # Context assembly only — it actuates nothing and evaluates no safety; a
+        # fail-closed tick returns above and records no sample (a faulting roast
+        # is not building context for an advisor that will not be consulted).
+        self._record_curve_history(telemetry)
         await self._maybe_run_advisory(telemetry)
 
     async def _maybe_run_advisory(self, telemetry: RoastTelemetry | None) -> None:
@@ -1159,6 +1202,20 @@ class RoastController:
         # whether its advice was then allowed/clamped.
         self._consecutive_advisor_failures = 0
         latency_ms = self._elapsed_ms(started)
+        # D40.5 (#275): record the model's OWN recommendation in the decision
+        # trace so the NEXT tick's context shows it its trajectory (the #218
+        # anti-thrash fix). The trace carries the RECOMMENDED levers (what the
+        # model asked for), not the clamped value the gate applies — it is the
+        # model's own move history. Context only; no control authority.
+        self._history.record_decision(
+            DecisionTraceEntry(
+                elapsed_since_charge_seconds=self._charge_elapsed_seconds(),
+                target_heat=decision.target_heat,
+                target_fan=decision.target_fan,
+                should_drop=decision.should_drop,
+                confidence=decision.confidence,
+            )
+        )
         evaluation = self._safety.evaluate_command(
             requested_heat=decision.target_heat,
             requested_fan=decision.target_fan,
@@ -1706,6 +1763,121 @@ class RoastController:
         )
         return policy.limits_for(phase)
 
+    def _record_curve_history(self, telemetry: RoastTelemetry | None) -> None:
+        """Record this tick's curve sample and arm curve milestones (#275).
+
+        Appends the (action, response) curve point — the bean/env temperature
+        and RoR the tick read, paired with the heat/fan the controller has
+        commanded this tick — to the bounded roast-so-far window, then arms the
+        charge-referenced milestones the per-tick context summarises (turning
+        point, recovery, drying end). Called late in the tick (after the phase
+        rules and deterministic pre-FC levers) so it captures the charge tick and
+        the freshly-commanded levers. Pure context assembly: it actuates nothing,
+        evaluates no safety, and holds no control authority.
+
+        No-ops before charge (no roast curve yet) and on an empty read (nothing
+        to record). First crack is armed on its transition edge (the authoritative
+        FC source), not here. Temperatures are Celsius.
+
+        Args:
+            telemetry: The reading this tick consumed, or ``None`` on a failed /
+                sessionless read.
+        """
+        if telemetry is None or self._charge_monotonic is None:
+            return
+        elapsed = self._charge_elapsed_seconds()
+        sample = RoastCurveSample(
+            elapsed_since_charge_seconds=elapsed,
+            bean_temp_c=telemetry.bean_temp_c,
+            env_temp_c=telemetry.env_temp_c,
+            heat_percent=self._current_heat,
+            fan_percent=self._current_fan,
+            bean_ror_c_per_min=telemetry.bean_ror_c_per_min,
+            env_ror_c_per_min=telemetry.env_ror_c_per_min,
+        )
+        self._history.record_sample(sample)
+        self._arm_pre_fc_milestones(telemetry, elapsed)
+
+    def _arm_pre_fc_milestones(self, telemetry: RoastTelemetry, elapsed: float) -> None:
+        """Arm the pre-FC curve milestones from the live reading (#275).
+
+        - TURNING POINT: the post-charge bean-temperature minimum — armed once
+          the bean RoR turns from falling to rising (the curve has bottomed out).
+          Carried as a DISPLAY-ONLY landmark: #229 found it is a charge-temperature
+          proxy (corr 0.979), so it is shown, never used as a control predictor.
+        - RECOVERY: the bean RoR at the first reading after the turning point — the
+          one turning-point-family metric that survived the #229 confound check
+          (a charge-independent early-pace signal), kept cautiously.
+        - DRYING END: the drying→browning boundary the phase model would cross; in
+          M1 the agent has no separate drying phase, so this is left to a future
+          phase signal and not armed from RoR alone (#229 gives it no predictive
+          weight). Recorded only when an explicit signal exists.
+
+        Args:
+            telemetry: The reading this tick consumed.
+            elapsed: The charge-referenced seconds for this reading.
+        """
+        if self._first_crack_monotonic is not None:
+            # Post-FC: the pre-FC landmarks are already behind us.
+            return
+        ror = telemetry.bean_ror_c_per_min
+        if ror is None:
+            return
+        if not self._history.has_milestone(RoastMilestoneKind.TURNING_POINT):
+            # The turning point is the bean-temp minimum: RoR crosses from
+            # negative (post-charge crash) up through zero. Arm on the first
+            # non-negative RoR after charge.
+            if ror >= 0.0:
+                self._history.record_milestone(
+                    RoastMilestone(
+                        kind=RoastMilestoneKind.TURNING_POINT,
+                        elapsed_since_charge_seconds=elapsed,
+                        bean_temp_c=telemetry.bean_temp_c,
+                    )
+                )
+            return
+        if not self._history.has_milestone(RoastMilestoneKind.RECOVERY):
+            # The recovery RoR: the bean RoR at the first reading after the
+            # turning point (a charge-independent early-pace scalar, #229 KEEP).
+            self._history.record_milestone(
+                RoastMilestone(
+                    kind=RoastMilestoneKind.RECOVERY,
+                    elapsed_since_charge_seconds=elapsed,
+                    bean_temp_c=telemetry.bean_temp_c,
+                    value=ror,
+                )
+            )
+
+    def _first_crack_eta_seconds(self) -> float | None:
+        """The FC-ETA for the current pre-FC curve, or ``None`` (#275 / #229).
+
+        Extrapolates the recent bean RoR toward the configured FC-band target
+        (:attr:`ControllerConfig.first_crack_target_bean_temp_c`) — the
+        #229-validated anticipation trigger. ``None`` once first crack is detected
+        (the development clock is armed) or before there is enough curve to
+        project. Context only; never a lever move on its own.
+        """
+        if self._first_crack_monotonic is not None:
+            return None
+        return estimate_first_crack_eta_seconds(
+            self._history.curve_window(),
+            fc_target_bean_temp_c=self._config.first_crack_target_bean_temp_c,
+        )
+
+    def _development_time_ratio(self) -> float | None:
+        """DTR as a fraction (0-1) for the advisor context (#275).
+
+        The same charge-referenced ratio the operator readout shows as a percent
+        (:meth:`_development_percent`), expressed as a fraction for the
+        :attr:`AdvisorContext.development_time_ratio` field — a value DISTINCT
+        from the development *duration*. ``None`` before first crack. Reuses the
+        existing #219/#220 clocks; does not reinvent them.
+        """
+        percent = self._development_percent()
+        if percent is None:
+            return None
+        return percent / 100.0
+
     def _build_advisor_context(
         self, telemetry: RoastTelemetry, limits: PhaseControlLimits
     ) -> AdvisorContext:
@@ -1754,6 +1926,17 @@ class RoastController:
             fan_ceiling_percent=limits.fan_ceiling_percent,
             bitter_ceiling_temp_c=limits.bitter_ceiling_temp_c,
             emergency_drop_temp_c=limits.emergency_drop_temp_c,
+            # D40.3 / D40.5 (#275): the per-tick control-loop context — the
+            # bounded roast-so-far curve window + milestone summary, the model's
+            # own decision trace (#218), the DTR (distinct from the development
+            # duration above), and the validation-supported FC-ETA (#229 KEEP).
+            # Read-only context; the controller and safety policy never read it
+            # back. Wiring this into the live post-FC consult is #276.
+            roast_curve_window=self._history.curve_window(),
+            roast_milestones=self._history.milestones(),
+            decision_trace=self._history.decision_trace(),
+            development_time_ratio=self._development_time_ratio(),
+            first_crack_eta_seconds=self._first_crack_eta_seconds(),
         )
 
     def _seconds_since_last_command(self) -> float | None:
