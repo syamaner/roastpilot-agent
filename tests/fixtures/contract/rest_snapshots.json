@@ -56,7 +56,7 @@
     "bean_varietal": null,
     "completed_at_utc": "2026-01-01T00:00:00+00:00",
     "country": null,
-    "development_percent": null,
+    "development_percent": 50.0,
     "first_crack_at_utc": "2026-01-01T00:00:00+00:00",
     "id": "00000000000000000000000000000000",
     "is_blend": false,

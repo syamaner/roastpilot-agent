@@ -414,6 +414,156 @@ async def test_advisor_context_box_equals_gate_box_told_equals_enforced() -> Non
     assert context.emergency_drop_temp_c == 198.0
 
 
+# --- #312: trustworthy drop — dev% computation + drop coherence guard ---
+
+
+def _development_harness_with_dev_percent(
+    *,
+    system_dev_percent: float,
+    advisor: RoastAdvisor | None = None,
+    config: ControllerConfig | None = None,
+) -> Harness:
+    """A DEVELOPMENT harness whose SYSTEM development percent is a known value.
+
+    Stamps the controller's charge (T0) clock and walks the first-crack edge with
+    the :class:`FakeClock` advanced so that ``_development_percent`` returns
+    ``system_dev_percent`` exactly: development time / charge-referenced roast
+    time = the requested fraction. Used to drive the deterministic drop coherence
+    guard (#312) from a precisely-known ground-truth development figure.
+    """
+    harness = make_harness(readings=[reading()], advisor=advisor, config=config)
+    controller = harness.controller
+    controller.load_profile(PROFILE)
+    controller.transition_to(RoastPhase.STARTING)
+    controller.transition_to(RoastPhase.PREHEATING)
+    controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    # Stamp the charge/T0 clock at t=0 (the DTR denominator origin), then advance
+    # to first crack so a known development window can follow.
+    controller._charge_monotonic = harness.clock.now  # pyright: ignore[reportPrivateUsage]
+    fc_offset_seconds = 300.0
+    harness.clock.advance(fc_offset_seconds)
+    controller.transition_to(RoastPhase.DEVELOPMENT)  # stamps the FC clock at now
+    # Choose a development window so dev% == system_dev_percent exactly:
+    #   dev% = dev_time / (fc_offset + dev_time) * 100
+    #   => dev_time = fc_offset * f / (1 - f),  f = system_dev_percent / 100
+    fraction = system_dev_percent / 100.0
+    dev_time_seconds = fc_offset_seconds * fraction / (1.0 - fraction)
+    harness.clock.advance(dev_time_seconds)
+    snapshot_percent = controller.snapshot().development_percent
+    assert snapshot_percent is not None
+    assert snapshot_percent == pytest.approx(system_dev_percent)
+    harness.log.clear()
+    harness.events.events.clear()
+    return harness
+
+
+def _advisory_payloads(harness: Harness) -> list[dict[str, object]]:
+    """All ADVISORY event payloads emitted on ``harness``, in order."""
+    return [
+        cast(dict[str, object], p) for k, p in harness.events.events if k is RoastEventKind.ADVISORY
+    ]
+
+
+@pytest.mark.asyncio
+async def test_advisor_drop_blocked_when_system_development_below_target() -> None:
+    """#312 (the first-roast failure): an advisor ``should_drop=true`` is BLOCKED
+    when the SYSTEM's real development percent is materially below the target
+    window — the drop is irreversible and the model's claimed number is not
+    trusted. The drop is not executed, no COOLING transition happens, a rejection
+    note is surfaced, and the same consult's heat/fan advice still applies.
+
+    PROFILE targets 20 % development; the system is at 5 % (well below the 3 pp
+    margin), reproducing the fabricated-"we're done" early drop.
+    """
+    advisor = FakeAdvisor([decision(heat=60, fan=55, drop=True)])
+    harness = _development_harness_with_dev_percent(system_dev_percent=5.0, advisor=advisor)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    # The drop was NOT executed and the phase stayed in DEVELOPMENT.
+    assert harness.executor.commands.count("drop_beans") == 0
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    # The heat/fan advice from the SAME consult still applied.
+    assert harness.executor.targets == [(60, 55)]
+    # A rejection note was surfaced with the system (not claimed) development.
+    rejections = [p for p in _advisory_payloads(harness) if "drop_rejected" in p]
+    assert rejections, "expected a drop_rejected advisory note"
+    note = rejections[-1]
+    assert note["drop_rejected"] == "development_incoherent"
+    assert note["source"] == "advisor"
+    assert note["target_development_percent"] == PROFILE.target_development_percent
+    assert cast(float, note["system_development_percent"]) == pytest.approx(5.0)
+
+
+@pytest.mark.asyncio
+async def test_advisor_drop_executes_when_system_development_within_margin() -> None:
+    """#312: a legitimate advisor drop — ``should_drop=true`` AND the system's real
+    development is within the margin of the target — is HONOURED: the drop executes
+    and the controller transitions to COOLING. PROFILE targets 20 %; the system is
+    at 18 % (within the default 3 pp margin)."""
+    advisor = FakeAdvisor([decision(heat=50, fan=60, drop=True)])
+    harness = _development_harness_with_dev_percent(system_dev_percent=18.0, advisor=advisor)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert harness.executor.commands.count("drop_beans") == 1
+    assert harness.controller.phase is RoastPhase.COOLING
+    # No incoherence rejection was emitted.
+    assert not [p for p in _advisory_payloads(harness) if "drop_rejected" in p]
+
+
+@pytest.mark.asyncio
+async def test_operator_manual_drop_overrides_low_development() -> None:
+    """#312: the operator's MANUAL drop is a separate, un-gated operator path — it
+    drops regardless of the system development percent. The coherence guard gates
+    the ADVISOR drop only; an operator who decides to drop at 5 % development is
+    obeyed."""
+    harness = _development_harness_with_dev_percent(system_dev_percent=5.0)
+    await harness.controller.operator_drop_beans()
+
+    assert harness.executor.commands.count("drop_beans") == 1
+    assert harness.controller.phase is RoastPhase.COOLING
+
+
+def test_drop_coherence_guard_fails_open_without_a_profile() -> None:
+    """#312: the drop coherence guard fails OPEN when it cannot be evaluated — no
+    loaded profile means no target to check against, so it does not block (the
+    safety drop evaluation still owns the phase boundary). The live advisory path
+    always carries a profile; this pins the defensive branch directly."""
+    controller = make_harness().controller
+    # No profile loaded.
+    assert controller._drop_development_is_coherent() is True  # pyright: ignore[reportPrivateUsage]
+
+
+def test_development_percent_is_zero_at_first_crack_and_charge_referenced() -> None:
+    """#308: the development percent is FC-referenced (0 % at first crack) and the
+    DTR denominator is the CHARGE/T0 clock, not serve start.
+
+    Charge at t=0, first crack 300 s later, then 60 s of development: development
+    time = 60 s, roast time (since charge) = 360 s, so dev% = 60/360 = 16.67 %.
+    At the first-crack instant itself dev% is exactly 0 %.
+    """
+    harness = make_harness(readings=[reading()])
+    controller = harness.controller
+    controller.load_profile(PROFILE)
+    controller.transition_to(RoastPhase.STARTING)
+    controller.transition_to(RoastPhase.PREHEATING)
+    controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    controller._charge_monotonic = harness.clock.now  # pyright: ignore[reportPrivateUsage]
+    harness.clock.advance(300.0)  # 300 s charge → first crack
+    controller.transition_to(RoastPhase.DEVELOPMENT)  # FC edge
+
+    # 0 % at the first-crack instant (development time is zero).
+    assert controller.snapshot().development_percent == pytest.approx(0.0)
+    assert controller.snapshot().development_elapsed_seconds == pytest.approx(0.0)
+
+    harness.clock.advance(60.0)  # 60 s of development
+    snapshot = controller.snapshot()
+    # Development time is since-FC; DTR denominator is since-CHARGE (360 s total).
+    assert snapshot.development_elapsed_seconds == pytest.approx(60.0)
+    assert snapshot.development_percent == pytest.approx(60.0 / 360.0 * 100.0)
+
+
 # --- #222: deterministic pre-FC control policy ---
 
 
@@ -2382,18 +2532,22 @@ async def test_full_mock_roast_with_fake_mcp() -> None:
 
     The advisor advises ``drop=True`` throughout, but the change-based
     call-frequency policy consults it automatically (no manual trigger), and
-    drop-eligibility honours the recommendation only once development begins
-    — so the drop fires on entering development, and every earlier
-    ``drop=True`` in preheating/pre-FC is safely rejected. This is the
-    architecture invariant in motion: the advisor keeps advising, the
-    controller decides when it is safe to obey."""
+    drop-eligibility honours the recommendation only once development begins.
+    Under the #312 drop coherence guard the drop fires not the instant
+    development opens (dev% ≈ 0) but once the SYSTEM's real development reaches
+    the target window — every earlier ``drop=True`` (preheating, pre-FC, and the
+    too-early development ticks) is safely withheld. This is the architecture
+    invariant in motion: the advisor keeps advising, the controller decides when
+    it is safe to obey."""
     warm = reading(bean=120.0, env=140.0)
     charge = reading(bean=178.0, env=185.0)
     t0 = reading(bean=95.0, t0_detected=True)  # charge drop, T0 reported
     fc = reading(bean=196.0, t0_detected=True, first_crack_detected=True)
     dev = reading(bean=200.0, t0_detected=True, first_crack_detected=True)
     log: list[str] = []
-    mcp = FakeMCPClient([warm, charge, t0, t0, t0, fc, dev], log)
+    # Extra development frames so the roast can DEVELOP into the target window
+    # before the coherence guard lets the advisor drop fire (#312).
+    mcp = FakeMCPClient([warm, charge, t0, t0, t0, fc, dev, dev, dev, dev, dev], log)
     events = EventSink(log)
     sink = RecordingSnapshotSink(log)
     # Constant advice via default_decision: consulted automatically on every
@@ -2420,10 +2574,21 @@ async def test_full_mock_roast_with_fake_mcp() -> None:
         await controller.tick()
         clock.advance(2.5)
     assert controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-    # The FC frame enters development and, in the same tick, the automatic
-    # advisory consult drops the beans (drop now eligible) → cooling.
+    # The FC frame enters development; the drop is NOT honoured yet (#312) —
+    # development just opened, so the system's real development is ~0 %, far below
+    # the profile's 20 % target window, and the coherence guard withholds it.
     await controller.tick()
     clock.advance(2.5)
+    assert controller.phase is RoastPhase.DEVELOPMENT
+    # Develop into the target window: advance the development clock so the system
+    # dev% climbs to within the margin of target, then the standing drop=True is
+    # honoured and the roast drops → cooling.
+    clock.advance(60.0)
+    for _ in range(4):
+        await controller.tick()
+        clock.advance(2.5)
+        if controller.phase is RoastPhase.COOLING:
+            break
     assert controller.phase is RoastPhase.COOLING
     await controller.operator_stop_cooling()
     assert controller.phase is RoastPhase.COMPLETE

@@ -710,6 +710,41 @@ class RoastController:
             return None
         return development_elapsed / charge_elapsed * 100.0
 
+    def _drop_development_is_coherent(self) -> bool:
+        """Whether the SYSTEM's development supports honouring an advisor drop (#312).
+
+        The deterministic half of the trustworthy-drop fix: a drop is irreversible,
+        so the controller will only honour an advisor ``should_drop=true`` when the
+        *system's own* development percent (:meth:`_development_percent`,
+        charge/FC-referenced — never the model's claimed number) has reached the
+        target window. Coherent when
+
+            ``development_percent >= target_development_percent - drop_dev_margin_percent``
+
+        with ``drop_dev_margin_percent`` the small named tolerance from
+        :class:`~roastpilot_agent.config.ControllerConfig` (default 3 pp), so a drop
+        a percentage point or two short of target still goes through while a drop
+        materially short (the fabricated-"we're done" failure) is blocked.
+
+        Fails OPEN (returns ``True``) only when the guard cannot be evaluated —
+        there is no profile target, or development has not started so
+        ``_development_percent`` is ``None`` (the safety drop evaluation still owns
+        the phase boundary in that case). It reads already-computed clocks and the
+        config; it commands nothing, gates only the advisor drop path, and never
+        touches the operator manual-drop path, the safety box, or e-stop.
+
+        Returns:
+            ``True`` to allow the advisor drop to proceed to safety evaluation,
+            ``False`` to block it (the system's development is below the window).
+        """
+        if self._profile is None:
+            return True
+        system_percent = self._development_percent()
+        if system_percent is None:
+            return True
+        floor = self._profile.target_development_percent - self._config.drop_dev_margin_percent
+        return system_percent >= floor
+
     def can_transition(self, target: RoastPhase) -> bool:
         """Whether ``target`` is a legal next phase from the current one."""
         if target is self._phase:
@@ -1314,6 +1349,28 @@ class RoastController:
             await self._execute_advisor_levers(
                 heat=evaluation.adjusted_heat, fan=evaluation.adjusted_fan
             )
+        if decision.should_drop and not self._drop_development_is_coherent():
+            # Deterministic DROP COHERENCE GUARD (#312). The drop is irreversible,
+            # so an advisor ``should_drop=true`` is cross-checked against the
+            # SYSTEM's real development percent (_development_percent, charge/FC-
+            # referenced) — NOT the model's claimed number, which the first
+            # supervised roast showed can be fabricated ("14 %" at a true ~5.4 %).
+            # When the system's development is materially below the target window
+            # the advisor's drop is REJECTED like a safety verdict: recorded and
+            # surfaced as a note, while the same consult's heat/fan advice (applied
+            # above) still stands. The operator's manual DROP BEANS is a separate,
+            # un-gated operator path; e-stop and the safety box are unaffected.
+            self._events.emit(
+                RoastEventKind.ADVISORY,
+                {
+                    "drop_rejected": "development_incoherent",
+                    "source": "advisor",
+                    "system_development_percent": self._development_percent(),
+                    "target_development_percent": self._profile.target_development_percent,
+                    "drop_dev_margin_percent": self._config.drop_dev_margin_percent,
+                },
+            )
+            return
         if decision.should_drop:
             drop = self._safety.evaluate_drop_recommendation(phase=self._phase)
             await self._snapshots.persist_evaluation(drop)
