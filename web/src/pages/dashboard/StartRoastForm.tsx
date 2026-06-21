@@ -156,6 +156,21 @@ export function StartRoastForm({
     setWeightError(undefined);
   };
 
+  // Archive: delete via the parent, then CLEAR the selection so the picker no
+  // longer points at the archived id (it has dropped out of `profiles`, so the
+  // <select> would otherwise hold a stale value and the Edit button would stay
+  // enabled but be a no-op). The already-filled form values are deliberately KEPT
+  // — the operator may still start this roast — but the saved-profile SELECTION
+  // resets to "manual entry". The modal closes itself on archive success (onClose).
+  const handleArchive =
+    onArchiveProfile === undefined
+      ? undefined
+      : async (id: string) => {
+          const result = await onArchiveProfile(id);
+          setSelectedId("");
+          return result;
+        };
+
   const canManageProfiles = onCreateProfile !== undefined && onUpdateProfile !== undefined;
 
   return (
@@ -264,7 +279,7 @@ export function StartRoastForm({
           }
           onSaved={handleSaved}
           onClose={() => setModal(null)}
-          onArchive={modal.mode === "edit" ? onArchiveProfile : undefined}
+          onArchive={modal.mode === "edit" ? handleArchive : undefined}
         />
       )}
     </>

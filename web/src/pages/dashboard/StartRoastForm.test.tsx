@@ -462,19 +462,29 @@ describe("StartRoastForm — bean-profile library (#303)", () => {
     expect(onUpdateProfile.mock.calls[0][1].target_development_percent).toBe(16);
   });
 
-  it("archives the selected profile from the edit modal, then closes it", async () => {
-    // Covers the StartRoastForm wiring (onArchive={mode==="edit" ? onArchiveProfile :
+  it("archives the selected profile, then clears the selection + disables Edit", async () => {
+    // Covers the StartRoastForm wiring (onArchive={mode==="edit" ? handleArchive :
     // undefined}) — only the isolated BeanProfileModal test exercised archive before.
     const { onArchiveProfile } = renderWithLibrary();
     fireEvent.change(screen.getByTestId("bean-profile-select"), {
       target: { value: FIXTURE_KOKE.id },
     });
+    // Pre-condition: the selection points at the profile and Edit is enabled.
+    expect(screen.getByTestId("bean-profile-select")).toHaveValue(FIXTURE_KOKE.id);
+    expect(screen.getByTestId("bean-profile-edit-button")).toBeEnabled();
+
     fireEvent.click(screen.getByTestId("bean-profile-edit-button"));
     expect(screen.getByTestId("bean-profile-modal")).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("bean-profile-archive"));
     await waitFor(() => expect(onArchiveProfile).toHaveBeenCalledWith(FIXTURE_KOKE.id));
     // The modal closes after a successful archive.
     await waitFor(() => expect(screen.queryByTestId("bean-profile-modal")).toBeNull());
+
+    // The selection must no longer point at the archived id (the <select> resets to
+    // "" / manual entry) and the Edit button is disabled — picker + Edit stay
+    // consistent with the now-shorter list, never a stale no-op selection.
+    await waitFor(() => expect(screen.getByTestId("bean-profile-select")).toHaveValue(""));
+    expect(screen.getByTestId("bean-profile-edit-button")).toBeDisabled();
   });
 
   it("does not offer Archive in the add modal (no profile to archive)", () => {
