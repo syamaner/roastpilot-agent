@@ -377,45 +377,240 @@ def _advisory_harness_in_phase(phase: RoastPhase, *, advisor: RoastAdvisor) -> H
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "phase",
-    [
-        RoastPhase.PREHEATING,
-        RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        RoastPhase.DEVELOPMENT,
-    ],
-)
-async def test_advisor_context_box_equals_gate_box_told_equals_enforced(
-    phase: RoastPhase,
-) -> None:
+async def test_advisor_context_box_equals_gate_box_told_equals_enforced() -> None:
     """#273/#294: the box the controller TELLS the model is the box it ENFORCES.
 
-    Drives a real consult in each advisory phase and asserts the control box on
+    Drives a real consult in DEVELOPMENT (the only advisory phase under D35/#222 —
+    pre-FC is deterministic, the advisor gated out) and asserts the control box on
     the ``AdvisorContext`` the controller actually built (the told side) is the
-    same box ``_control_limits`` resolves for the gate (the enforced side) —
-    after #294 these share a single ``PhaseControlLimits`` instance per tick.
-    This pins the controller wiring across every advisory phase, not just the
-    policy unit.
+    same box ``_control_limits`` resolves for the gate (the enforced side) — after
+    #294 these share a single ``PhaseControlLimits`` instance per tick. The pre-FC
+    told==enforced proof is the deterministic-path test below
+    (``test_pre_fc_deterministic_box_told_equals_enforced``).
     """
     advisor = FakeAdvisor([decision()])
-    harness = _advisory_harness_in_phase(phase, advisor=advisor)
+    harness = _advisory_harness_in_phase(RoastPhase.DEVELOPMENT, advisor=advisor)
     harness.controller.request_advisory()
     await harness.controller.tick()
 
     assert advisor.contexts, "the advisor should have been consulted"
     context = advisor.contexts[-1]
     enforced = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
-    assert context.phase is phase
+    assert context.phase is RoastPhase.DEVELOPMENT
     assert context.heat_floor_percent == enforced.heat_floor_percent
     assert context.heat_ceiling_percent == enforced.heat_ceiling_percent
     assert context.fan_floor_percent == enforced.fan_floor_percent
     assert context.fan_ceiling_percent == enforced.fan_ceiling_percent
     assert context.bitter_ceiling_temp_c == enforced.bitter_ceiling_temp_c
     assert context.emergency_drop_temp_c == enforced.emergency_drop_temp_c
-    # The profile-aware bitter ceiling: PROFILE drops at 205 °C, above the 196 °C
-    # hard ceiling, so the told ceiling stays the hard 196 (never loosened).
+    # DEVELOPMENT keeps the full 0–100 box (the post-FC LLM's box, #223); the
+    # profile-aware bitter ceiling: PROFILE drops at 205 °C, above 196, so the
+    # told ceiling stays the hard 196.
+    assert (context.heat_floor_percent, context.heat_ceiling_percent) == (0, 100)
+    assert (context.fan_floor_percent, context.fan_ceiling_percent) == (0, 100)
     assert context.bitter_ceiling_temp_c == 196.0
     assert context.emergency_drop_temp_c == 198.0
+
+
+# --- #222: deterministic pre-FC control policy ---
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK],
+)
+def test_pre_fc_box_is_narrowed_with_deterministic_target(phase: RoastPhase) -> None:
+    """D35 §3 (#222): the two pre-FC phases resolve a NARROWED box with a
+    deterministic lever target — heat pinned high (floor == the n8n heat 100
+    target, so a momentum-killing cut is impossible) and fan capped low (≤ the
+    n8n fan 30). The development phase by contrast keeps the full 0–100 box."""
+    harness = make_harness()
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH:
+        harness.controller.transition_to(step)
+        if step is phase:
+            break
+    box = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    assert box.has_deterministic_target
+    # Defaults: heat 100 / fan 30 (the operator's proven n8n pre-FC values).
+    assert box.heat_target_percent == 100
+    assert box.fan_target_percent == 30
+    # Heat floor pinned to the target → no cut below 100 is executable pre-FC.
+    assert box.heat_floor_percent == 100
+    assert box.heat_ceiling_percent == 100
+    # Fan capped low.
+    assert box.fan_floor_percent == 0
+    assert box.fan_ceiling_percent == 30
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK],
+)
+def test_pre_fc_deterministic_box_told_equals_enforced(phase: RoastPhase) -> None:
+    """Carry-forward B (#222 / #273 review): with the pre-FC box genuinely
+    narrower than 0–100, the told==enforced proof is load-bearing. The narrowed
+    box is the SAME one the gate clamps an out-of-box request into — a request
+    below the heat floor (a would-be momentum-killing cut) clamps back up to the
+    floor, and a fan request above the low ceiling clamps down to it."""
+    harness = make_harness()
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH:
+        harness.controller.transition_to(step)
+        if step is phase:
+            break
+    box = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    gate = harness.controller._safety  # pyright: ignore[reportPrivateUsage]
+    # A would-be heat crash (20 %) clamps UP to the pinned floor (100), and a
+    # high fan (80 %) clamps DOWN to the low ceiling (30) — told == enforced.
+    evaluation = gate.evaluate_command(
+        requested_heat=20,
+        requested_fan=80,
+        seconds_since_last_command=None,
+        bounds=box,
+    )
+    assert evaluation.verdict is SafetyVerdict.CLAMP
+    assert evaluation.adjusted_heat == box.heat_floor_percent == 100
+    assert evaluation.adjusted_fan == box.fan_ceiling_percent == 30
+
+
+def _pre_fc_harness(phase: RoastPhase, *, advisor: RoastAdvisor | None = None) -> Harness:
+    """A profile-loaded harness in a deterministic pre-FC phase, ready to tick."""
+    harness = make_harness(readings=[reading(bean=150.0)], advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH:
+        harness.controller.transition_to(step)
+        if step is phase:
+            break
+    harness.log.clear()
+    harness.events.events.clear()
+    return harness
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase",
+    [RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK],
+)
+async def test_deterministic_pre_fc_levers_actuate_through_safety_path(
+    phase: RoastPhase,
+) -> None:
+    """D35 §3 (#222): pre-FC the controller deterministically sets heat 100 / fan
+    30 each tick, and the write passes the existing safety path (a command_bounds
+    or all_clear evaluation is persisted before the set_targets). The target is
+    the operator's proven n8n value; the heat floor is pinned to it."""
+    harness = _pre_fc_harness(phase)
+    await harness.controller.tick()
+    # The deterministic lever was actuated: heat 100 / fan 30.
+    assert harness.executor.targets == [(100, 30)]
+    assert harness.controller.snapshot().current_heat == 100
+    assert harness.controller.snapshot().current_fan == 30
+    # It went through the safety gate (an evaluation persisted for the write).
+    rules = [e.rule for e in harness.sink.evaluations]
+    assert "all_clear" in rules  # the command evaluation (target sits inside its box)
+
+
+@pytest.mark.asyncio
+async def test_deterministic_pre_fc_lever_is_idempotent_after_first_write() -> None:
+    """Once at the deterministic target the controller does not re-write each tick
+    (#222): no rate-limit churn, no redundant serial writes — the target is
+    constant pre-FC, so only the first tick (or a divergence) writes."""
+    harness = _pre_fc_harness(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    await harness.controller.tick()
+    assert harness.executor.targets == [(100, 30)]
+    harness.clock.advance(5.0)  # well past the rate-limit window
+    await harness.controller.tick()
+    # No second write — already at the target.
+    assert harness.executor.targets == [(100, 30)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase",
+    [RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK],
+)
+async def test_advisor_not_consulted_pre_fc_even_on_manual_request(
+    phase: RoastPhase,
+) -> None:
+    """D35 §3 (#222): the free-form advisor is gated out of pre-FC entirely — not
+    even a manual operator request reaches it before first crack. The
+    deterministic lever still actuates; the advisor sees nothing."""
+    advisor = FakeAdvisor([decision(heat=40, fan=70)])
+    harness = _pre_fc_harness(phase, advisor=advisor)
+    harness.controller.request_advisory()  # manual request pre-FC
+    await harness.controller.tick()
+    assert advisor.contexts == []  # advisor NOT consulted pre-FC
+    # The deterministic lever drove the roast, not the advisor's 40/70.
+    assert harness.executor.targets == [(100, 30)]
+
+
+@pytest.mark.asyncio
+async def test_pre_fc_heat_crash_is_structurally_impossible() -> None:
+    """The #218 failure mode (heat 70→40→20→0 pre-FC) cannot recur (#222): even if
+    something requested a heat cut, the pinned heat floor (100) clamps it back up.
+    Here the advisor — which would have advised a cut — is never consulted pre-FC,
+    AND the box floor would clamp any cut, so heat holds at 100 across the roast."""
+    advisor = FakeAdvisor([decision(heat=20, fan=40)])  # a would-be crash
+    harness = _pre_fc_harness(RoastPhase.ROASTING_PRE_FIRST_CRACK, advisor=advisor)
+    heats: list[int] = []
+    for bean in (150.0, 160.0, 170.0):
+        harness.reader.readings = [reading(bean=bean)]
+        harness.clock.advance(3.0)
+        await harness.controller.tick()
+        heats.append(harness.controller.snapshot().current_heat)
+    # Heat held high the whole pre-FC window — never crashed below the floor.
+    assert all(h == 100 for h in heats), heats
+    assert advisor.contexts == []  # advisor never ran pre-FC
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase",
+    [RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK],
+)
+async def test_restart_into_pre_fc_never_auto_resumes_heat(phase: RoastPhase) -> None:
+    """Restart safety (#222 / the architecture invariant): a restart with a
+    possibly-active pre-FC run — in EITHER deterministic pre-FC phase (mid-preheat
+    or mid-pre-first-crack) — enters operator_recovery_required and the
+    deterministic lever policy does NOT auto-resume heat/fan — no MCP write is
+    issued. The policy only actuates during a normally-progressing run, never as a
+    side effect of restart/recovery."""
+    harness = make_harness(readings=[reading(bean=150.0)])
+    harness.controller.load_profile(PROFILE)
+    await harness.controller.recover_from_restart(phase)
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert harness.executor.targets == []  # no auto-resume
+    # A tick in recovery still issues NO deterministic lever write (the recovery
+    # phase carries no deterministic target and the tick fails closed before it).
+    await harness.controller.tick()
+    assert harness.executor.targets == []
+    assert harness.controller.snapshot().current_heat == 0  # heat stays off
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase",
+    [RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK],
+)
+async def test_operator_resume_into_pre_fc_re_engages_deterministic_levers(
+    phase: RoastPhase,
+) -> None:
+    """After a restart→operator_recovery_required, the EXPLICIT operator resume
+    into EITHER deterministic pre-FC phase re-engages the deterministic lever
+    policy on the next tick (#222). This is the operator's choice (operator_resume
+    is the explicit action), not an auto-resume — heat is 0 until the resumed tick
+    actuates it."""
+    harness = make_harness(readings=[reading(bean=150.0)])
+    harness.controller.load_profile(PROFILE)
+    await harness.controller.recover_from_restart(phase)
+    assert harness.controller.snapshot().current_heat == 0
+    harness.controller.operator_resume(phase)
+    # Heat still 0 immediately after resume — operator_resume never writes hardware.
+    assert harness.executor.targets == []
+    assert harness.controller.snapshot().current_heat == 0
+    # The next tick re-engages the deterministic lever (the resumed run progresses).
+    await harness.controller.tick()
+    assert harness.executor.targets == [(100, 30)]
 
 
 @pytest.mark.asyncio
@@ -883,17 +1078,31 @@ async def test_failed_emergency_stop_still_faults() -> None:
 
 def _policy() -> AdvisoryCallPolicy:
     """A policy with the default ControllerConfig thresholds (temp 1.0 °C,
-    RoR 2.0 °C/min, phase-keyed floors: preheat OFF / pre-FC None (no fixed
-    heartbeat) / development 0 = unthrottled, near-FC boost at 170 °C / 10 s,
-    D32 #191)."""
+    RoR 2.0 °C/min, phase-keyed floors: pre-FC NOT an advice phase (D35/#222) /
+    development 0 = unthrottled)."""
     return AdvisoryCallPolicy(ControllerConfig())
+
+
+def _throttled_development_policy() -> AdvisoryCallPolicy:
+    """A policy whose DEVELOPMENT floor is a long fixed heartbeat (1000 s).
+
+    Development is unthrottled by default (0 floor → MIN_INTERVAL fires every
+    eligible tick), which makes the change-based triggers impossible to isolate
+    in a unit test. A long floor suppresses the heartbeat so a test can assert
+    that a sub-threshold delta is genuinely silent and an at-threshold delta
+    fires the change-based trigger (the post-FC analogue of the retired pre-FC
+    no-heartbeat tests)."""
+    return AdvisoryCallPolicy(
+        ControllerConfig(advisory_min_interval_seconds={RoastPhase.DEVELOPMENT: 1000.0})
+    )
 
 
 def test_policy_first_consult_in_advice_phase_is_phase_change() -> None:
     policy = _policy()
-    # Pre-first-crack is an auto-advice phase (preheat is not, post-D32).
+    # Development is the only auto-advice phase under D35 (#222): pre-FC is
+    # deterministic, the advisor is not consulted there.
     trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        phase=RoastPhase.DEVELOPMENT,
         telemetry=reading(),
         now=0.0,
         manual_request=False,
@@ -903,9 +1112,10 @@ def test_policy_first_consult_in_advice_phase_is_phase_change() -> None:
 
 def test_policy_phase_transition_triggers() -> None:
     policy = _policy()
+    # A transition INTO development (the post-FC advice phase) fires PHASE_CHANGE.
     policy.note_call(phase=RoastPhase.PREHEATING, telemetry=reading(), now=0.0)
     trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        phase=RoastPhase.DEVELOPMENT,
         telemetry=reading(),
         now=1.0,
         manual_request=False,
@@ -914,27 +1124,24 @@ def test_policy_phase_transition_triggers() -> None:
 
 
 def test_policy_bean_temp_delta_triggers_at_threshold_not_below() -> None:
-    # Pre-first-crack DRYING (bean 150 °C, below the near-FC band) has no fixed
-    # heartbeat and no near-FC boost, so the sub-threshold case is genuinely
-    # silent — isolating the change-based trigger.
-    policy = _policy()
-    policy.note_call(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=reading(bean=150.0), now=0.0
-    )
-    # +0.5 °C, below the delta threshold: no trigger.
+    # Development with a long heartbeat floor (#222): isolate the change-based
+    # bean-temp trigger from the per-tick (0 floor) heartbeat.
+    policy = _throttled_development_policy()
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=150.0), now=0.0)
+    # +0.5 °C, below the delta threshold, well inside the heartbeat floor: silent.
     assert (
         policy.evaluate(
-            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            phase=RoastPhase.DEVELOPMENT,
             telemetry=reading(bean=150.5),
             now=1.0,
             manual_request=False,
         )
         is None
     )
-    # +1.0 °C reaches the threshold.
+    # +1.0 °C reaches the threshold (the change-based trigger fires).
     assert (
         policy.evaluate(
-            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            phase=RoastPhase.DEVELOPMENT,
             telemetry=reading(bean=151.0),
             now=1.0,
             manual_request=False,
@@ -944,50 +1151,22 @@ def test_policy_bean_temp_delta_triggers_at_threshold_not_below() -> None:
 
 
 def test_policy_ror_delta_triggers_at_threshold() -> None:
-    # Pre-first-crack drying (no fixed heartbeat, below the near-FC band): the
-    # RoR delta is the *only* reason to fire at 1 s.
-    policy = _policy()
+    # Development with a long heartbeat floor (#222): the RoR delta is the only
+    # reason to fire (the heartbeat is suppressed).
+    policy = _throttled_development_policy()
     policy.note_call(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        phase=RoastPhase.DEVELOPMENT,
         telemetry=reading(bean=150.0, bean_ror_c_per_min=5.0),
         now=0.0,
     )
     # Same bean temp, RoR jumps +2.0 °C/min: RoR is the live trigger.
     trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        phase=RoastPhase.DEVELOPMENT,
         telemetry=reading(bean=150.0, bean_ror_c_per_min=7.0),
         now=1.0,
         manual_request=False,
     )
     assert trigger is AdvisoryTrigger.ROR_DELTA
-
-
-def test_policy_near_fc_boost_fires_when_approaching_fc() -> None:
-    """D32 (#191): once the bean nears the FC band (>= advisory_near_fc_bean_temp_c,
-    170 °C default) a heartbeat is GUARANTEED — the near-FC boost — so the
-    anticipatory cut isn't missed if RoR flattens into the crack. Silent just
-    shy of the boost interval, fires at it, even with flat telemetry."""
-    policy = _policy()
-    flat = reading(bean=172.0, bean_ror_c_per_min=5.0)  # at/above the near-FC band
-    policy.note_call(phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=flat, now=0.0)
-    assert (
-        policy.evaluate(
-            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-            telemetry=flat,
-            now=9.9,
-            manual_request=False,
-        )
-        is None
-    )
-    assert (
-        policy.evaluate(
-            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-            telemetry=flat,
-            now=10.0,
-            manual_request=False,
-        )
-        is AdvisoryTrigger.NEAR_FC
-    )
 
 
 def test_policy_development_is_unthrottled_back_to_back() -> None:
@@ -1010,38 +1189,50 @@ def test_policy_development_is_unthrottled_back_to_back() -> None:
     )
 
 
-def test_policy_drying_has_no_heartbeat_stays_silent_when_flat() -> None:
-    """D32 (#191): pre-first-crack DRYING (below the near-FC band) has NO fixed
-    heartbeat — a flat roast stays silent however long it sits, so stable drying
-    is quiet (only change-based triggers + the near-FC boost ever fire here)."""
+def test_policy_pre_first_crack_is_never_an_automatic_advice_phase() -> None:
+    """D35 (#222): the advisor is NOT consulted pre-FC at all. Even a large
+    bean-temp jump and a flat roast both stay silent in ROASTING_PRE_FIRST_CRACK
+    — the deterministic controller owns the pre-FC levers, so no automatic
+    trigger ever fires there (the former drying/near-FC cadence is retired)."""
     policy = _policy()
-    flat = reading(bean=150.0, bean_ror_c_per_min=5.0)  # drying, below the FC band
+    flat = reading(bean=150.0, bean_ror_c_per_min=5.0)
     policy.note_call(phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=flat, now=0.0)
-    fired = [
+    # A flat roast over a long span: silent.
+    flat_fired = [
         policy.evaluate(
             phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
             telemetry=flat,
             now=t,
             manual_request=False,
         )
-        for t in (1.0, 10.0, 30.0, 120.0, 600.0)  # well past any old heartbeat floor
+        for t in (1.0, 10.0, 30.0, 120.0, 600.0)
     ]
-    assert fired == [None, None, None, None, None]
+    assert flat_fired == [None, None, None, None, None]
+    # A large bean-temp jump (would have fired BEAN_TEMP_DELTA pre-#222): also
+    # silent now — pre-FC is gated out of automatic advice entirely.
+    assert (
+        policy.evaluate(
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            telemetry=reading(bean=200.0, bean_ror_c_per_min=5.0),
+            now=601.0,
+            manual_request=False,
+        )
+        is None
+    )
 
 
 def test_policy_change_trigger_fires_early_within_phase_interval() -> None:
-    """The change-based triggers are never gated by the floor — a large bean-temp
-    jump consults immediately even in pre-first-crack (which has no fixed
-    heartbeat), preserving responsive behavior."""
+    """The change-based triggers are evaluated before the heartbeat floor — a
+    large bean-temp jump reports BEAN_TEMP_DELTA (not MIN_INTERVAL) on the same
+    tick as the prior call, so the trace records the *reason* it fired."""
     policy = _policy()
-    policy.note_call(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=reading(bean=150.0), now=0.0
-    )
-    # 1 s in, a +5 °C jump fires immediately (drying, below the near-FC band).
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=150.0), now=0.0)
+    # Same tick (0-floor heartbeat not yet elapsed), a +5 °C jump: the
+    # change-based trigger is reported.
     trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        phase=RoastPhase.DEVELOPMENT,
         telemetry=reading(bean=155.0),
-        now=1.0,
+        now=0.0,
         manual_request=False,
     )
     assert trigger is AdvisoryTrigger.BEAN_TEMP_DELTA
@@ -1056,9 +1247,16 @@ def test_policy_manual_bypasses_phase_scoping_and_interval() -> None:
     assert trigger is AdvisoryTrigger.MANUAL
 
 
-def test_policy_manual_request_reaches_preheat_despite_auto_off() -> None:
-    """D32 (#191): preheat is OFF for AUTOMATIC consults, but a manual operator
-    request still reaches it — manual bypasses the auto-advice-phase scope."""
+def test_policy_manual_in_preheat_returns_manual_in_isolation() -> None:
+    """Isolated AdvisoryCallPolicy logic ONLY — NOT the controller's runtime path.
+
+    D32 (#191): in isolation the policy treats a manual operator request in preheat
+    as MANUAL (manual bypasses the auto-advice-phase scope). But under D35 (#222)
+    the controller short-circuits in `_maybe_run_advisory` and never calls
+    `policy.evaluate()` for the pre-FC phases, so this branch is unreachable at
+    runtime — the advisor is gated out of pre-FC entirely. The system-level
+    invariant is `test_advisor_not_consulted_pre_fc_even_on_manual_request`. The
+    policy itself is retained (and exercised) for POST-FC cadence."""
     policy = _policy()
     trigger = policy.evaluate(
         phase=RoastPhase.PREHEATING, telemetry=reading(), now=0.0, manual_request=True
@@ -1082,7 +1280,8 @@ def test_policy_manual_takes_precedence_over_automatic_trigger() -> None:
 @pytest.mark.parametrize(
     "phase",
     [
-        RoastPhase.PREHEATING,  # D32 (#191): preheat is NOT an automatic-advice phase
+        RoastPhase.PREHEATING,  # D35 (#222): pre-FC is deterministic, advisor gated out
+        RoastPhase.ROASTING_PRE_FIRST_CRACK,  # D35 (#222): pre-FC, advisor gated out
         RoastPhase.IDLE,
         RoastPhase.STARTING,
         RoastPhase.COOLING,
@@ -1100,29 +1299,25 @@ def test_policy_no_automatic_call_outside_advice_phases(phase: RoastPhase) -> No
 
 
 def test_policy_baseline_advances_on_each_call() -> None:
-    """Deltas measure from the last call, not the start: after a call at
-    201 °C, a further +0.5 °C is below threshold again. Pre-first-crack has
-    no MIN_INTERVAL floor (None); the near-FC boost (10 s) has not elapsed
-    (only 1 s since the last call), so the sub-threshold tick is silent."""
-    policy = _policy()
-    policy.note_call(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=reading(bean=200.0), now=0.0
-    )
+    """Deltas measure from the last call, not the start: after a call at 201 °C,
+    a further +0.5 °C is below threshold again. A long development heartbeat floor
+    suppresses MIN_INTERVAL so the sub-threshold tick is silent — isolating the
+    baseline advance (#222)."""
+    policy = _throttled_development_policy()
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=200.0), now=0.0)
     assert (
         policy.evaluate(
-            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            phase=RoastPhase.DEVELOPMENT,
             telemetry=reading(bean=201.0),
             now=1.0,
             manual_request=False,
         )
         is AdvisoryTrigger.BEAN_TEMP_DELTA
     )
-    policy.note_call(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=reading(bean=201.0), now=1.0
-    )
+    policy.note_call(phase=RoastPhase.DEVELOPMENT, telemetry=reading(bean=201.0), now=1.0)
     assert (
         policy.evaluate(
-            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            phase=RoastPhase.DEVELOPMENT,
             telemetry=reading(bean=201.5),
             now=2.0,
             manual_request=False,
@@ -1144,240 +1339,6 @@ def test_policy_manual_consult_with_no_telemetry_keeps_delta_baseline() -> None:
         manual_request=False,
     )
     assert trigger is AdvisoryTrigger.BEAN_TEMP_DELTA
-
-
-# --- #209: post-charge SETTLE window (AdvisoryCallPolicy) ---
-
-
-def test_policy_post_charge_settle_suppresses_first_consult_on_crash() -> None:
-    """Regression (#209): the consult that previously floored heat. Right after
-    charge, the post-charge bean is still crashing (bean RoR << 0). The settle
-    window suppresses the first automatic PHASE_CHANGE consult so the advisor
-    never sees, and misreads, the not-yet-turned bean."""
-    policy = _policy()
-    policy.note_charge(now=0.0)
-    trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=160.0, bean_ror_c_per_min=-80.0),
-        now=1.0,
-        manual_request=False,
-    )
-    assert trigger is None
-
-
-def test_policy_post_charge_settle_releases_on_turning_point() -> None:
-    """Once the bean turns (bean RoR >= the turning-point threshold, default 0),
-    the settle window releases and the first real consult fires as a
-    PHASE_CHANGE on the settled, turned bean."""
-    policy = _policy()
-    policy.note_charge(now=0.0)
-    # Still crashing: suppressed.
-    assert (
-        policy.evaluate(
-            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-            telemetry=reading(bean=160.0, bean_ror_c_per_min=-80.0),
-            now=1.0,
-            manual_request=False,
-        )
-        is None
-    )
-    # Turned (RoR crossed zero): released, first real consult.
-    trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
-        now=5.0,
-        manual_request=False,
-    )
-    assert trigger is AdvisoryTrigger.PHASE_CHANGE
-
-
-def test_policy_post_charge_settle_releases_on_timeout() -> None:
-    """The fallback timeout bounds suppression: a stuck/negative RoR that never
-    crosses the turning point cannot suppress automatic advice forever — past
-    ``advisory_post_charge_settle_max_seconds`` (90 s) the window releases."""
-    policy = _policy()
-    policy.note_charge(now=0.0)
-    # Bean RoR stays deeply negative throughout: only the timeout can release.
-    assert (
-        policy.evaluate(
-            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-            telemetry=reading(bean=120.0, bean_ror_c_per_min=-80.0),
-            now=45.0,
-            manual_request=False,
-        )
-        is None
-    )
-    trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=120.0, bean_ror_c_per_min=-80.0),
-        now=91.0,
-        manual_request=False,
-    )
-    assert trigger is AdvisoryTrigger.PHASE_CHANGE
-
-
-def test_policy_post_charge_settle_release_preserves_first_consult_after_no_telemetry_skip() -> (
-    None
-):
-    """#213 (Codex P2): a MANUAL request during the settle window on a
-    no-telemetry tick bypasses the gate and lands in _run_advisory as a
-    no_telemetry skip; _maybe_run_advisory then calls note_call(telemetry=None),
-    which advances _last_phase to pre-first-crack WITHOUT setting the temp/RoR
-    delta baselines. Pre-first-crack has no MIN_INTERVAL floor, so if the settle
-    release merely fell through it would find phase==_last_phase, no delta
-    baseline, and return None — starving the advisor for the whole drying phase.
-    The release must itself fire the first consult as a PHASE_CHANGE."""
-    policy = _policy()
-    policy.note_charge(now=0.0)
-    # A manual no-telemetry consult mid-window advances _last_phase but leaves
-    # the delta baselines unset (the exact note_call the controller makes after
-    # a no_telemetry skip).
-    policy.note_call(phase=RoastPhase.ROASTING_PRE_FIRST_CRACK, telemetry=None, now=1.0)
-    # The bean turns on a real reading: the release IS the first real consult,
-    # preserved as PHASE_CHANGE rather than swallowed to None by the fallthrough.
-    trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
-        now=5.0,
-        manual_request=False,
-    )
-    assert trigger is AdvisoryTrigger.PHASE_CHANGE
-
-
-def test_policy_post_charge_settle_latches_released() -> None:
-    """The release is a one-way latch (#209): once the bean has turned, a later
-    RoR dip back below the turning point must NOT re-suppress. After release the
-    policy behaves per its normal cadence — here the change-based RoR delta
-    fires; crucially it is not None-by-settle."""
-    policy = _policy()
-    policy.note_charge(now=0.0)
-    # Release on the turning point, recording the call so the baselines advance.
-    released = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
-        now=5.0,
-        manual_request=False,
-    )
-    assert released is AdvisoryTrigger.PHASE_CHANGE
-    policy.note_call(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
-        now=5.0,
-    )
-    # RoR dips back well below the turning point (a normal post-turn wobble),
-    # bean temp held flat so the bean-temp delta cannot fire — the >= 2 °C/min
-    # RoR move is the only live trigger. The settle gate is latched released, so
-    # the result is that real trigger, unambiguously NOT a settle-suppressed None.
-    trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=95.0, bean_ror_c_per_min=-30.0),
-        now=8.0,
-        manual_request=False,
-    )
-    assert trigger is AdvisoryTrigger.ROR_DELTA
-
-
-def test_policy_manual_wins_during_post_charge_settle() -> None:
-    """A manual operator request bypasses the settle gate (it is evaluated
-    before phase scoping and the settle window): the operator always gets a
-    response even on the crashing post-charge bean (#209)."""
-    policy = _policy()
-    policy.note_charge(now=0.0)
-    trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=160.0, bean_ror_c_per_min=-80.0),
-        now=1.0,
-        manual_request=True,
-    )
-    assert trigger is AdvisoryTrigger.MANUAL
-
-
-def test_policy_post_charge_settle_inert_without_note_charge() -> None:
-    """Back-compat (#209): the settle gate is inert until ``note_charge`` is
-    called. Without it, ``_charge_monotonic`` is None and the first pre-FC
-    consult is the unchanged PHASE_CHANGE — even on a crashing bean."""
-    policy = _policy()
-    trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=160.0, bean_ror_c_per_min=-80.0),
-        now=1.0,
-        manual_request=False,
-    )
-    assert trigger is AdvisoryTrigger.PHASE_CHANGE
-
-
-def test_policy_post_charge_settle_does_not_apply_in_development() -> None:
-    """The settle gate is scoped to ROASTING_PRE_FIRST_CRACK only (#209). A
-    development-phase consult after ``note_charge`` is not suppressed — it fires
-    its normal PHASE_CHANGE even with a momentarily negative RoR."""
-    policy = _policy()
-    policy.note_charge(now=0.0)
-    trigger = policy.evaluate(
-        phase=RoastPhase.DEVELOPMENT,
-        telemetry=reading(bean=200.0, bean_ror_c_per_min=-30.0),
-        now=1.0,
-        manual_request=False,
-    )
-    assert trigger is AdvisoryTrigger.PHASE_CHANGE
-
-
-def test_policy_post_charge_settle_no_telemetry_tick_does_not_release() -> None:
-    """#213 (augmentcode): the settle window must never release on a
-    no-telemetry tick. A tolerated read-fail tick that the safety layer lets
-    through reaches the gate with telemetry=None; releasing there would fall to
-    PHASE_CHANGE, whose _run_advisory emits a no_telemetry skip while note_call
-    still advances the baseline — consuming the first real post-charge consult.
-    So even past the fallback timeout, a None-telemetry tick stays suppressed;
-    release happens only on the next tick that carries a real reading."""
-    policy = _policy()
-    policy.note_charge(now=0.0)
-    # Past the 90 s timeout, but no reading this tick: still suppressed.
-    assert (
-        policy.evaluate(
-            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-            telemetry=None,
-            now=91.0,
-            manual_request=False,
-        )
-        is None
-    )
-    # The next tick carries a reading: the timeout releases it (PHASE_CHANGE),
-    # so the no-telemetry tick merely deferred release rather than consuming it.
-    trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=120.0, bean_ror_c_per_min=-80.0),
-        now=92.0,
-        manual_request=False,
-    )
-    assert trigger is AdvisoryTrigger.PHASE_CHANGE
-
-
-def test_policy_post_charge_settle_rearms_on_second_charge() -> None:
-    """#213 (claude): ``note_charge`` re-arms the latch. After a first roast
-    releases on its turning point, a second charge resets ``_settle_released``
-    to False, so the crashing post-charge bean of the new roast is suppressed
-    again — the gate is not a one-shot for the policy's lifetime."""
-    policy = _policy()
-    policy.note_charge(now=0.0)
-    # First roast: release on the turning point.
-    assert (
-        policy.evaluate(
-            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-            telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
-            now=5.0,
-            manual_request=False,
-        )
-        is AdvisoryTrigger.PHASE_CHANGE
-    )
-    # Second charge re-arms the window.
-    policy.note_charge(now=100.0)
-    trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=160.0, bean_ror_c_per_min=-80.0),
-        now=101.0,
-        manual_request=False,
-    )
-    assert trigger is None
 
 
 @pytest.mark.asyncio
@@ -1524,17 +1485,15 @@ async def test_t0_debounce_confirms_after_three_consecutive_ticks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_debounced_t0_charges_policy_and_populates_seconds_since_charge() -> None:
-    """Controller wiring (#209): the debounced T0 transition stamps the charge
-    clock and opens the settle window on the SAME tick, before the advisory
-    consult runs (the tick pipeline runs _apply_phase_rules before
-    _maybe_run_advisory). So (a) the first pre-first-crack consult is suppressed
-    while the post-charge bean is still crashing (bean RoR < 0), and (b) once it
-    fires, the advisor context carries seconds_since_charge ≈ elapsed."""
-    # Charge: bean crashes (RoR << 0) for the T0 ticks and one tick after, then
-    # turns (RoR > 0) so the settle window releases and the advisor is reached.
+async def test_debounced_t0_stamps_charge_clock_and_advisor_silent_pre_fc() -> None:
+    """Controller wiring (D35 / #222 + #219): the debounced T0 transition stamps
+    the charge clock, and the advisor is NOT consulted anywhere pre-FC (the
+    deterministic controller owns the levers). (a) Through the whole post-charge,
+    pre-FC window the advisor stays silent. (b) Once first crack fires and the
+    roast reaches DEVELOPMENT, the advisor IS consulted and the context carries
+    seconds_since_charge ≈ elapsed since the T0 stamp (the #219 charge clock,
+    stamped pre-FC, survives into the post-FC consult)."""
     crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
-    turned = reading(bean=95.0, t0_detected=True, bean_ror_c_per_min=5.0)
     advisor = FakeAdvisor([decision(heat=40, fan=60)])
     harness = make_harness(readings=[crashing], advisor=advisor)
     harness.controller.load_profile(PROFILE)
@@ -1543,28 +1502,34 @@ async def test_debounced_t0_charges_policy_and_populates_seconds_since_charge() 
     harness.log.clear()
     harness.events.events.clear()
     # Three consecutive T0 ticks debounce → transition into pre-first-crack on
-    # the third; that tick stamps the charge clock and opens the settle window.
+    # the third; that tick stamps the charge clock (at clock=2.0).
     for _ in range(3):
         await harness.controller.tick()
         harness.clock.advance(1.0)
     assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-    # (a) The advisor was NOT consulted: the first pre-FC consult landed inside
-    # the settle window on the crashing bean and was suppressed.
+    # (a) The advisor is NOT consulted pre-FC — deterministic control, even on a
+    # crashing post-charge bean, and even after several more pre-FC ticks.
     assert advisor.contexts == []
-    # A further crashing tick stays suppressed (bean still has not turned).
     await harness.controller.tick()
     harness.clock.advance(1.0)
     assert advisor.contexts == []
-    # (b) The bean turns: the settle window releases, the advisor is consulted,
-    # and the context carries seconds_since_charge ≈ elapsed since the T0 stamp.
-    harness.reader.readings = [turned]
-    await harness.controller.tick()
-    assert advisor.contexts  # consulted now that the bean has turned
+    # (b) First crack → DEVELOPMENT; the advisor is now consulted, and the
+    # charge clock stamped pre-FC populates seconds_since_charge. FC fires here
+    # via the MCP first_crack_detected path so the charge clock is untouched.
+    harness.reader.readings = [
+        reading(bean=185.0, bean_ror_c_per_min=5.0, first_crack_detected=True)
+    ]
+    await harness.controller.tick()  # transitions to DEVELOPMENT (no consult this tick yet)
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=186.0, bean_ror_c_per_min=4.0)]
+    await harness.controller.tick()  # first development consult
+    assert advisor.contexts  # consulted post-FC
     ctx = advisor.contexts[-1]
     assert ctx.seconds_since_charge is not None
-    # T0 stamped on the 3rd tick at clock=2.0; the turned consult runs at
-    # clock=4.0 (3 loop ticks advance 0→3.0, the crashing tick advances to 4.0).
-    assert ctx.seconds_since_charge == pytest.approx(2.0)
+    # Charge stamped at clock=2.0; this consult runs after further ticks, so the
+    # charge clock has kept counting from the pre-FC stamp (it is > 0).
+    assert ctx.seconds_since_charge > 0.0
 
 
 @pytest.mark.asyncio
@@ -1664,12 +1629,19 @@ async def test_start_run_is_serialized() -> None:
 
 
 @pytest.mark.asyncio
-async def test_start_run_applies_validated_initial_targets() -> None:
+async def test_start_run_clamps_initial_targets_to_pre_fc_box() -> None:
+    """Carry-forward A (#222 / #273 review): run-start lands in PREHEATING and
+    passes the PREHEATING control box as bounds, so the profile's initial heat/fan
+    (70/40) are clamped to the narrowed pre-FC box (heat floor 100, fan ceiling
+    30) — told == enforced at the very first roast command, not enforcing 0–100
+    while the policy says the narrowed box."""
     harness = make_harness(readings=[reading()])
     await harness.controller.start_run(PROFILE)
-    assert harness.executor.targets == [(70, 40)]  # profile initials via safety policy
+    # 70 → 100 (clamped UP to the pinned heat floor), 40 → 30 (clamped DOWN to the
+    # low fan ceiling): the deterministic pre-FC levers, applied at run start.
+    assert harness.executor.targets == [(100, 30)]
     rules = [e.rule for e in harness.sink.evaluations]
-    assert "all_clear" in rules
+    assert "command_bounds" in rules  # the clamp verdict was recorded
 
 
 @pytest.mark.asyncio
@@ -1739,47 +1711,6 @@ async def test_resume_requires_recovery_and_never_writes_heat() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resume_into_pre_first_crack_rearms_post_charge_settle_after_restart() -> None:
-    """#213 FIX 6 — the RESTART case: a process restart leaves a fresh policy
-    with NO charge on record (``_charge_monotonic is None``), and the recovery
-    resume into pre-first-crack transitions WITHOUT a fresh T0/note_charge — so
-    the gate would be inert and the first resumed consult could fire PHASE_CHANGE
-    on a still-crashing bean (re-exposing #209). Because the policy holds no
-    charge, the resume re-arms the settle window referenced to the resume
-    instant: a crashing bean (RoR < 0) is suppressed, a turned bean (RoR >= 0)
-    releases at once. (The in-process recovery case — where re-arming would be
-    wrong — is covered by the policy-level test below.)"""
-    harness = make_harness(readings=[reading()])
-    # Fresh policy after a restart: no prior charge on record.
-    policy = harness.controller._advisory_policy  # pyright: ignore[reportPrivateUsage]
-    assert policy._charge_monotonic is None  # pyright: ignore[reportPrivateUsage]
-    await harness.controller.recover_from_restart(RoastPhase.ROASTING_PRE_FIRST_CRACK)
-    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
-    harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
-    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-    now = harness.clock.now
-    policy = harness.controller._advisory_policy  # pyright: ignore[reportPrivateUsage]
-    # Still crashing at the resume instant: suppressed (no first-consult flood).
-    assert (
-        policy.evaluate(
-            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-            telemetry=reading(bean=140.0, bean_ror_c_per_min=-40.0),
-            now=now + 1.0,
-            manual_request=False,
-        )
-        is None
-    )
-    # Already turned (e.g. the restart landed after the turning point): releases.
-    trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=150.0, bean_ror_c_per_min=3.0),
-        now=now + 2.0,
-        manual_request=False,
-    )
-    assert trigger is AdvisoryTrigger.PHASE_CHANGE
-
-
-@pytest.mark.asyncio
 async def test_restore_charge_clock_survives_restart_into_resumed_advice() -> None:
     """#235: a restart→operator-resume restores the advisory DTR clock.
 
@@ -1790,18 +1721,16 @@ async def test_restore_charge_clock_survives_restart_into_resumed_advice() -> No
     charge instant; ``restore_charge_clock`` reconstructs the monotonic anchor
     from it so the seconds-since-charge denominator survives.
 
-    Drives the real advisory path: after restore + resume into pre-first-crack,
-    a turned-bean tick consults the advisor, and the captured context carries the
-    restored elapsed (≈120 s), NOT 0.0. Advisory/display-only — heat/fan are
-    never auto-resumed and the resume gate is unchanged.
+    Under D35 (#222) the advisor is not consulted pre-FC, so the restored clock is
+    asserted post-FC: after restore + resume into pre-first-crack, first crack
+    advances to DEVELOPMENT and the advisor consult there carries the restored
+    elapsed (≈120 s + the pre-FC dwell), NOT 0.0. Advisory/display-only — heat/fan
+    are never auto-resumed and the resume gate is unchanged.
     """
     # The persisted absolute charge instant: 120 s before "now".
     charged_at = datetime.now(UTC) - timedelta(seconds=120.0)
-    # Turned bean (RoR >= 0) so the post-charge settle window releases at once and
-    # the resumed pre-first-crack consult actually reaches the advisor.
-    turned = reading(bean=150.0, bean_ror_c_per_min=4.0)
     advisor = FakeAdvisor([decision(heat=50, fan=55)])
-    harness = make_harness(readings=[turned], advisor=advisor)
+    harness = make_harness(readings=[reading()], advisor=advisor)
     harness.controller.load_profile(PROFILE)
 
     # Restart recovery: restore the charge clock from the persisted instant, then
@@ -1811,13 +1740,16 @@ async def test_restore_charge_clock_survives_restart_into_resumed_advice() -> No
     assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
     assert harness.executor.targets == []  # restart never auto-resumes heat/fan
 
-    # Operator resumes into pre-first-crack, then a tick consults the advisor.
+    # Operator resumes into pre-first-crack (deterministic control, no consult),
+    # then first crack advances to DEVELOPMENT where the advisor IS consulted.
     harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
     assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
     harness.controller.request_advisory()
     await harness.controller.tick()
 
-    assert advisor.contexts, "advisor should have been consulted after resume"
+    assert advisor.contexts, "advisor should have been consulted after resume + FC"
     ctx = advisor.contexts[-1]
     # The DTR denominator is the restored charge clock — non-zero and ≈120 s
     # (the wall-clock gap between the persisted instant and now), NOT 0.0.
@@ -1864,48 +1796,6 @@ def test_restore_charge_clock_clamps_future_instant() -> None:
     assert harness.controller._charge_elapsed_seconds() == pytest.approx(  # pyright: ignore[reportPrivateUsage]
         0.0, abs=1.0
     )
-
-
-def test_rearm_on_resume_preserves_released_latch_in_process() -> None:
-    """#213 FIX 6 — the IN-PROCESS case: when the policy still carries the prior
-    roast's charge state (an in-process recovery — e.g. a D30 fail-closed
-    mid-drying — long past the turning point), a recovery resume must NOT re-arm
-    the settle window. Unconditional re-arming (FIX 2's first cut) would treat a
-    normal post-turn RoR dip as a fresh charge crash and suppress advice for up
-    to the 90 s fallback, defeating the one-way latch. ``_charge_monotonic`` is
-    set and ``_settle_released`` is True, so the guard skips the re-arm and the
-    latch is preserved."""
-    policy = _policy()
-    # Charge, then turn → the settle latch releases (one real roast, in-process).
-    policy.note_charge(now=0.0)
-    assert (
-        policy.evaluate(
-            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-            telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
-            now=5.0,
-            manual_request=False,
-        )
-        is AdvisoryTrigger.PHASE_CHANGE
-    )
-    policy.note_call(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=95.0, bean_ror_c_per_min=0.5),
-        now=5.0,
-    )
-    assert policy._settle_released is True  # pyright: ignore[reportPrivateUsage]
-    # An in-process recovery resume: the policy still holds the charge, so the
-    # guard preserves the released latch rather than re-arming.
-    policy.rearm_post_charge_settle_on_resume(now=10.0)
-    assert policy._settle_released is True  # pyright: ignore[reportPrivateUsage]
-    # A normal post-turn RoR dip (bean temp flat so only the RoR delta can fire)
-    # is NOT re-suppressed — it returns its real trigger, not None-by-settle.
-    trigger = policy.evaluate(
-        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
-        telemetry=reading(bean=95.0, bean_ror_c_per_min=-30.0),
-        now=11.0,
-        manual_request=False,
-    )
-    assert trigger is AdvisoryTrigger.ROR_DELTA
 
 
 @pytest.mark.asyncio
@@ -1996,18 +1886,20 @@ async def test_operator_first_crack_override_stamped_and_gated() -> None:
     assert harness2.executor.commands == []
 
 
-@pytest.mark.asyncio
-async def test_development_elapsed_none_before_first_crack() -> None:
+def test_development_elapsed_none_before_first_crack() -> None:
     """The advisor context carries ``development_elapsed_seconds=None`` until
-    first crack arms the development clock."""
-    advisor = FakeAdvisor([decision()])
-    harness = make_harness(readings=[reading()], advisor=advisor)
+    first crack arms the development clock.
+
+    The advisor is not consulted pre-FC (#222), so the context *mapping* is
+    asserted directly via ``_build_advisor_context`` (the field a pre-FC build
+    would carry), rather than via a pre-FC consult that no longer happens."""
+    harness = make_harness(readings=[reading()])
     harness.controller.load_profile(PROFILE)
     for step in NORMAL_PATH[:3]:  # …→ ROASTING_PRE_FIRST_CRACK
         harness.controller.transition_to(step)
-    harness.controller.request_advisory()
-    await harness.controller.tick()
-    assert advisor.contexts[-1].development_elapsed_seconds is None
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+    assert ctx.development_elapsed_seconds is None
 
 
 @pytest.mark.asyncio
@@ -2029,12 +1921,12 @@ async def test_development_elapsed_tracks_seconds_since_first_crack() -> None:
     assert advisor.contexts[-1].development_elapsed_seconds == 45.0
 
 
-@pytest.mark.asyncio
-async def test_development_clock_resets_on_new_run() -> None:
+def test_development_clock_resets_on_new_run() -> None:
     """A new run/preheat clears the development clock, so a stale FC time from
-    a prior run never leaks into the next run's advisor context."""
-    advisor = FakeAdvisor([decision(), decision()])
-    harness = make_harness(readings=[reading(), reading()], advisor=advisor)
+    a prior run never leaks into the next run's advisor context. The advisor is
+    not consulted pre-FC (#222), so the reset is asserted on the context mapping
+    (``_build_advisor_context``) once the fresh run is back in pre-first-crack."""
+    harness = make_harness(readings=[reading()])
     harness.controller.load_profile(PROFILE)
     for step in NORMAL_PATH[:4]:  # …→ DEVELOPMENT (arms the clock)
         harness.controller.transition_to(step)
@@ -2049,9 +1941,9 @@ async def test_development_clock_resets_on_new_run() -> None:
         RoastPhase.ROASTING_PRE_FIRST_CRACK,
     ]:
         harness.controller.transition_to(step)
-    harness.controller.request_advisory()
-    await harness.controller.tick()
-    assert advisor.contexts[-1].development_elapsed_seconds is None
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+    assert ctx.development_elapsed_seconds is None
 
 
 @pytest.mark.asyncio
@@ -2179,26 +2071,25 @@ def test_drop_clock_resets_on_new_run_so_next_roast_runs_live() -> None:
 # run/preheat-referenced — re-origining the chart at charge is deferred to #220.
 
 
-@pytest.mark.asyncio
-async def test_advisor_roast_elapsed_zero_before_charge() -> None:
+def test_advisor_roast_elapsed_zero_before_charge() -> None:
     """The advisor context's ``roast_elapsed_seconds`` (the DTR denominator) is
     0.0 before charge (#219): it zeros at charge by roasting convention, and
     there is no DTR before there is a bean on the drum. Holds even after preheat
-    time has elapsed (a consult that runs pre-charge sees 0.0, not the preheat
-    duration)."""
-    advisor = FakeAdvisor([decision()])
-    harness = make_harness(readings=[reading()], advisor=advisor)
+    time has elapsed (the context mapping pre-charge sees 0.0, not the preheat
+    duration). Asserted on the mapping (``_build_advisor_context``) — the advisor
+    is not consulted pre-FC (#222)."""
+    harness = make_harness(readings=[reading()])
     harness.controller.load_profile(PROFILE)
     harness.controller.transition_to(RoastPhase.STARTING)
     harness.controller.transition_to(RoastPhase.PREHEATING)
     harness.clock.advance(300.0)  # five minutes of preheat, no charge yet
     # A bare transition_to does NOT stamp the charge clock — only the debounced-T0
-    # path in _apply_phase_rules does (see the next test). So the advisor's
-    # charge-referenced clock is still 0.0 even though the run clock is 300 s.
+    # path in _apply_phase_rules does. So the advisor's charge-referenced clock is
+    # still 0.0 even though the run clock is 300 s.
     harness.controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
-    harness.controller.request_advisory()
-    await harness.controller.tick()
-    assert advisor.contexts[-1].roast_elapsed_seconds == 0.0
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+    assert ctx.roast_elapsed_seconds == 0.0
 
 
 @pytest.mark.asyncio
@@ -2207,10 +2098,9 @@ async def test_advisor_roast_elapsed_counts_from_charge_not_run_start() -> None:
     referenced to run/preheat start, so a roast that charged late fed an inflated
     roast duration → understated DTR → late drop past the bitter ceiling. The
     advisor context must count from the debounced T0/charge instant. Here ~5 min
-    of preheat precedes charge; the advisor sees time-since-charge only, NOT
-    preheat + time-since-charge."""
+    of preheat precedes charge; the advisor (consulted post-FC under #222) sees
+    time-since-charge only, NOT preheat + time-since-charge."""
     crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
-    turned = reading(bean=95.0, t0_detected=True, bean_ror_c_per_min=5.0)
     advisor = FakeAdvisor([decision(heat=40, fan=60)])
     harness = make_harness(readings=[crashing], advisor=advisor)
     harness.controller.load_profile(PROFILE)
@@ -2223,14 +2113,22 @@ async def test_advisor_roast_elapsed_counts_from_charge_not_run_start() -> None:
         await harness.controller.tick()
         harness.clock.advance(1.0)
     assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-    # The bean turns: the settle window releases and the advisor is consulted.
-    harness.reader.readings = [turned]
+    # First crack → DEVELOPMENT (advisor consulted post-FC). The pre-FC advisor is
+    # gated out (#222), so the charge-referenced clock is asserted at the first
+    # development consult, two ticks after the charge stamp at clock=302.0.
+    harness.reader.readings = [
+        reading(bean=185.0, bean_ror_c_per_min=5.0, first_crack_detected=True)
+    ]
     harness.clock.advance(1.0)  # clock → 304.0
-    await harness.controller.tick()
+    await harness.controller.tick()  # → DEVELOPMENT
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    harness.reader.readings = [reading(bean=186.0, bean_ror_c_per_min=4.0)]
+    harness.clock.advance(1.0)  # clock → 305.0
+    await harness.controller.tick()  # first development consult
     ctx = advisor.contexts[-1]
-    # Charge stamped at clock=302.0; this consult runs at clock=304.0 → 2.0 s,
-    # NOT ~304 s from run start (the old run-start bug).
-    assert ctx.roast_elapsed_seconds == pytest.approx(2.0)
+    # Charge stamped at clock=302.0; this consult runs at clock=305.0 → 3.0 s,
+    # NOT ~305 s from run start (the old run-start bug).
+    assert ctx.roast_elapsed_seconds == pytest.approx(3.0)
     assert ctx.roast_elapsed_seconds < 300.0
     # It matches seconds_since_charge (same charge instant, the bake-off convention).
     assert ctx.roast_elapsed_seconds == pytest.approx(ctx.seconds_since_charge)
@@ -2297,10 +2195,11 @@ async def test_snapshot_clock_stays_run_referenced_not_charge() -> None:
 async def test_advisor_charge_clock_resets_on_new_run() -> None:
     """A new run/preheat clears the charge clock (#219), so a stale charge time
     from a prior roast never inflates the next roast's advisor DTR clock — it
-    reads 0.0 again until the next charge stamps it."""
+    reads 0.0 again until the next charge stamps it. The advisor is consulted
+    post-FC (#222); the fresh-run reset is asserted on the context mapping
+    (``_build_advisor_context``) back in pre-first-crack."""
     crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
-    turned = reading(bean=95.0, t0_detected=True, bean_ror_c_per_min=5.0)
-    advisor = FakeAdvisor([decision(), decision()])
+    advisor = FakeAdvisor([decision()])
     harness = make_harness(readings=[crashing], advisor=advisor)
     harness.controller.load_profile(PROFILE)
     harness.controller.transition_to(RoastPhase.STARTING)
@@ -2309,9 +2208,12 @@ async def test_advisor_charge_clock_resets_on_new_run() -> None:
         await harness.controller.tick()
         harness.clock.advance(1.0)
     assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-    harness.reader.readings = [turned]
-    await harness.controller.tick()  # bean turned → advisor consulted, charged clock > 0
-    assert advisor.contexts[-1].roast_elapsed_seconds > 0.0
+    # The charge clock is stamped (> 0 since charge) — read via the context mapping.
+    first_limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    first_ctx = harness.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
+        reading(), first_limits
+    )
+    assert first_ctx.roast_elapsed_seconds > 0.0
     # Finish and start a fresh run along the legal path.
     for step in [
         RoastPhase.DEVELOPMENT,
@@ -2324,11 +2226,10 @@ async def test_advisor_charge_clock_resets_on_new_run() -> None:
     ]:
         harness.controller.transition_to(step)
     harness.clock.advance(50.0)
-    harness.reader.readings = [reading()]
-    harness.controller.request_advisory()
-    await harness.controller.tick()
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
     # The fresh run never re-charged (bare transition), so the advisor clock is 0.0.
-    assert advisor.contexts[-1].roast_elapsed_seconds == 0.0
+    assert ctx.roast_elapsed_seconds == 0.0
 
 
 # --- #220: the snapshot surfaces development time + DTR for the live readouts.
@@ -2627,13 +2528,14 @@ async def test_back_to_back_runs_are_not_rate_limited() -> None:
     initial profile targets are never silently rejected."""
     harness = make_harness(readings=[reading()])
     await harness.controller.start_run(PROFILE)
-    assert harness.executor.targets == [(70, 40)]
+    # Clamped to the pre-FC box at run start (carry-forward A, #222): 70/40 → 100/30.
+    assert harness.executor.targets == [(100, 30)]
     # Finish the run instantly (no clock advance) and start the next.
     for step in NORMAL_PATH[2:6]:
         harness.controller.transition_to(step)
     harness.controller.operator_acknowledge_fault()  # complete → idle
     await harness.controller.start_run(PROFILE)
-    assert harness.executor.targets == [(70, 40), (70, 40)]  # second write happened
+    assert harness.executor.targets == [(100, 30), (100, 30)]  # second write happened
 
 
 @pytest.mark.asyncio

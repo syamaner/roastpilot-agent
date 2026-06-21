@@ -13,7 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from roastpilot_agent.advisor import AdvisorContext
-from roastpilot_agent.config import SafetyLimits
+from roastpilot_agent.config import PreFirstCrackLevers, SafetyLimits
 from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy
 from roastpilot_agent.models import RoastPhase, RoastProfile
 from roastpilot_agent.safety import SafetyPolicy, SafetyVerdict
@@ -31,20 +31,59 @@ _PROFILE = RoastProfile(
 _ALL_PHASES = tuple(RoastPhase)
 
 
-def test_limits_for_resolves_full_lever_range_today() -> None:
-    """Every phase resolves the full 0–100 heat/fan box (the #273 verdict no-op).
+_PRE_FC_PHASES = (RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK)
+_NON_PRE_FC_PHASES = tuple(p for p in _ALL_PHASES if p not in _PRE_FC_PHASES)
 
-    #222 narrows this per phase on the same object; until then the box equals the
-    safety gate's historical 0–100 clamp, so wiring the gate to the policy cannot
-    change any verdict.
+
+def test_limits_for_resolves_full_lever_range_outside_pre_fc() -> None:
+    """Non-pre-FC phases resolve the full 0–100 heat/fan box with no deterministic
+    target (#222): development → drop is the post-FC LLM's box (#223), and the
+    lifecycle states do not actuate. Only the two pre-FC phases are narrowed.
     """
     policy = RoastControlPolicy(SafetyLimits(), _PROFILE)
-    for phase in _ALL_PHASES:
+    for phase in _NON_PRE_FC_PHASES:
         limits = policy.limits_for(phase)
         assert limits.heat_floor_percent == 0
         assert limits.heat_ceiling_percent == 100
         assert limits.fan_floor_percent == 0
         assert limits.fan_ceiling_percent == 100
+        assert not limits.has_deterministic_target
+        assert limits.heat_target_percent is None
+        assert limits.fan_target_percent is None
+
+
+@pytest.mark.parametrize("phase", _PRE_FC_PHASES)
+def test_pre_fc_phases_resolve_narrowed_box_with_deterministic_target(
+    phase: RoastPhase,
+) -> None:
+    """D35 §3 (#222): the two pre-FC phases resolve a NARROWED box carrying the
+    deterministic n8n lever target — heat pinned high (floor == the heat 100
+    target, so a momentum-killing cut cannot execute) and fan capped low (≤ 30).
+    """
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE)
+    box = policy.limits_for(phase)
+    assert box.has_deterministic_target
+    assert box.heat_target_percent == 100
+    assert box.fan_target_percent == 30
+    assert box.heat_floor_percent == 100  # pinned to the target — no cut below
+    assert box.heat_ceiling_percent == 100
+    assert box.fan_floor_percent == 0
+    assert box.fan_ceiling_percent == 30
+
+
+def test_pre_fc_levers_are_parameterised_not_hardcoded() -> None:
+    """The pre-FC levers are PARAMETERS (plan §4-A.3 / §7.1): a custom
+    PreFirstCrackLevers resolves into the box and target, not the n8n defaults —
+    the interface a learned per-bean plan (D42) supplies."""
+    levers = PreFirstCrackLevers(
+        heat_target_percent=90, fan_target_percent=25, fan_ceiling_percent=40
+    )
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE, pre_fc_levers=levers)
+    box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert box.heat_target_percent == 90
+    assert box.heat_floor_percent == 90
+    assert box.fan_target_percent == 25
+    assert box.fan_ceiling_percent == 40
 
 
 def test_bitter_and_emergency_ceilings_come_from_config() -> None:
@@ -113,6 +152,61 @@ def test_phase_control_limits_rejects_inverted_drop_ceilings() -> None:
             bitter_ceiling_temp_c=198.0,
             emergency_drop_temp_c=196.0,
         )
+
+
+def test_phase_control_limits_rejects_half_set_targets() -> None:
+    """The deterministic lever targets are all-or-nothing (#222): heat set without
+    fan (or vice versa) is an invalid box."""
+    with pytest.raises(ValidationError):
+        PhaseControlLimits(
+            heat_floor_percent=100,
+            heat_ceiling_percent=100,
+            fan_floor_percent=0,
+            fan_ceiling_percent=30,
+            bitter_ceiling_temp_c=196.0,
+            emergency_drop_temp_c=198.0,
+            heat_target_percent=100,  # fan target omitted → invalid
+        )
+
+
+def test_phase_control_limits_rejects_heat_target_outside_box() -> None:
+    """A heat target outside its own box (#222) would be silently clamped by the
+    gate — told != enforced for the deterministic path — so it is rejected."""
+    with pytest.raises(ValidationError):
+        PhaseControlLimits(
+            heat_floor_percent=100,
+            heat_ceiling_percent=100,
+            fan_floor_percent=0,
+            fan_ceiling_percent=30,
+            bitter_ceiling_temp_c=196.0,
+            emergency_drop_temp_c=198.0,
+            heat_target_percent=50,  # below the pinned floor of 100
+            fan_target_percent=30,
+        )
+
+
+def test_phase_control_limits_rejects_fan_target_outside_box() -> None:
+    """A fan target outside its own box (#222) is rejected (same told==enforced
+    invariant as the heat target)."""
+    with pytest.raises(ValidationError):
+        PhaseControlLimits(
+            heat_floor_percent=100,
+            heat_ceiling_percent=100,
+            fan_floor_percent=0,
+            fan_ceiling_percent=30,
+            bitter_ceiling_temp_c=196.0,
+            emergency_drop_temp_c=198.0,
+            heat_target_percent=100,
+            fan_target_percent=50,  # above the fan ceiling of 30
+        )
+
+
+def test_pre_first_crack_levers_rejects_fan_ceiling_below_target() -> None:
+    """PreFirstCrackLevers pins fan_ceiling_percent >= fan_target_percent (#222):
+    a ceiling below the target would make the policy's own deterministic write
+    fall outside the box it resolves."""
+    with pytest.raises(ValidationError):
+        PreFirstCrackLevers(fan_target_percent=30, fan_ceiling_percent=20)
 
 
 def test_safety_limits_rejects_inverted_drop_ceilings() -> None:

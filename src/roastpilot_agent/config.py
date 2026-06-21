@@ -67,6 +67,65 @@ DEFAULT_ADVISOR_MODEL_BY_PHASE: dict[RoastPhase, str] = {
 }
 
 
+class PreFirstCrackLevers(BaseModel):
+    """Deterministic pre-first-crack heat/fan lever parameters (D35 §3/§4-A, #222).
+
+    D35 splits control at first crack: before FC the controller deterministically
+    drives the levers (the free-form advisor is NOT consulted), porting the
+    operator's proven n8n decision-tree values — **heat 100 / fan low to FC**
+    (max heat, low fan until browning; no momentum-killing cuts). These are
+    PARAMETERS, not constants in code (plan §4-A.3 / §7.1): the defaults are the
+    operator's proven values, and the shape lets a learned per-bean plan (D42
+    §7.1) later supply different ramps without a code change.
+
+    The values feed :class:`~roastpilot_agent.control_policy.RoastControlPolicy`,
+    which resolves them into the narrowed pre-FC box (heat floor pinned to the
+    target so a cut is impossible; fan capped at the low ceiling) AND the
+    deterministic target the controller actuates each tick — told == enforced
+    from one source (D35 §8.3).
+
+    All values are percentages (0–100); temperatures are out of scope here (the
+    box ceilings live in :class:`SafetyLimits`).
+    """
+
+    #: The deterministic heat the controller holds through preheat → FC. Default
+    #: 100 — the operator's proven n8n pre-FC heat (steady high heat to drive the
+    #: roast to first crack; do not extend roast time). The policy pins the heat
+    #: *floor* to this same value so a momentum-killing cut (#218's 70→40→20→0)
+    #: is structurally impossible pre-FC.
+    heat_target_percent: int = Field(default=100, ge=0, le=100)
+    #: The deterministic fan the controller holds through preheat → FC. Default
+    #: 30 — the operator's proven n8n pre-FC fan (low airflow until browning).
+    fan_target_percent: int = Field(default=30, ge=0, le=100)
+    #: The pre-FC fan box ceiling. Default 30 — equal to the fan target (the
+    #: operator's low-fan method admits no higher pre-FC airflow). Must be >= the
+    #: fan target so the deterministic write sits inside its own box (a validator
+    #: pins it); raise it to leave the policy room above the target if a profile
+    #: later wants a small browning-entry fan opening (plan §3).
+    fan_ceiling_percent: int = Field(default=30, ge=0, le=100)
+
+    @model_validator(mode="after")
+    def _check_fan_ceiling(self) -> "PreFirstCrackLevers":
+        """The fan ceiling must not sit below the fan target.
+
+        A ceiling below the target would make the deterministic fan write fall
+        outside its own box (the gate would clamp the policy's own target),
+        breaking told == enforced for the deterministic path.
+
+        Returns:
+            The validated levers instance.
+
+        Raises:
+            ValueError: If ``fan_ceiling_percent`` is below ``fan_target_percent``.
+        """
+        if self.fan_ceiling_percent < self.fan_target_percent:
+            raise ValueError(
+                "fan_ceiling_percent must not be below fan_target_percent "
+                f"({self.fan_ceiling_percent} < {self.fan_target_percent})"
+            )
+        return self
+
+
 class ControllerConfig(BaseModel):
     """Controller timing and advisory-call thresholds.
 
@@ -95,38 +154,22 @@ class ControllerConfig(BaseModel):
     advisory_min_interval_seconds: dict[RoastPhase, Annotated[float, Field(ge=0)] | None] = Field(
         default_factory=lambda: dict(DEFAULT_ADVISORY_MIN_INTERVAL_SECONDS)
     )
-    # Near-FC cadence boost (D32 / #191): the Maillard-approach is the advisor's
-    # highest-value window (the anticipatory heat cut that must precede FC, where
-    # thermal + ~12–21 s detector lag compound). Since pre-first-crack has no
-    # fixed heartbeat (change-based only), guarantee a heartbeat once the bean is
-    # near the FC band so the pre-emptive cut isn't missed if RoR flattens into
-    # the crack. ``advisory_near_fc_bean_temp_c`` is the approach threshold
-    # (default 170 °C — within a few °C of the operator's empirical ~178 °C FC on
-    # this probe; roaster/probe-specific, hence tunable); above it, in
-    # pre-first-crack, the consult floor becomes ``advisory_near_fc_interval_seconds``.
+    # RETIRED under D35 (#222) — these shaped *pre-FC* advisory cadence, and the
+    # advisor is no longer consulted before first crack (the deterministic
+    # controller owns the pre-FC levers). Kept as inert, defaulted fields so a
+    # frozen ``roast_runs`` config from before #222 still deserializes unchanged;
+    # nothing reads them now. Remove once no persisted config references them.
+    #
+    # Near-FC cadence boost (D32 / #191, retired): once boosted the advisory
+    # heartbeat as the bean neared the FC band so the anticipatory cut wasn't
+    # missed if RoR flattened into the crack.
     advisory_near_fc_bean_temp_c: float = Field(default=170.0, gt=0)
     advisory_near_fc_interval_seconds: float = Field(default=10.0, gt=0)
-    # Post-charge SETTLE window (#209), the inverse of the near-FC boost above.
-    # T0 is the transition into pre-first-crack, and the charge dunks the cold
-    # beans into the hot drum — bean temp falls fast (RoR << 0) for tens of
-    # seconds until the *turning point*, where it stops falling and starts
-    # rising. The very first automatic consult (PHASE_CHANGE) would otherwise
-    # land on this crash and misread the not-yet-turned bean as a stall,
-    # flooring heat (the 2nd-hardware-roast advisor-flood failure). These two
-    # fields bound a deterministic suppression of AUTOMATIC advice after charge
-    # until the bean turns; a manual operator request always bypasses it.
-    #
-    # ``advisory_post_charge_settle_max_seconds``: the fallback timeout — the
-    # max seconds after charge to suppress automatic advice if the turning
-    # point is never detected (a stuck/None RoR must never suppress forever).
-    # ~90 s comfortably exceeds a normal Hottop turning point (~30–60 s) while
-    # bounding the suppression so advice is never withheld indefinitely.
+    # Post-charge SETTLE window (#209, retired): suppressed the first automatic
+    # post-charge consult on the crashing not-yet-turned bean until the turning
+    # point (RoR >= threshold) or a fallback timeout. Now a no-op (D35 §2): with
+    # no pre-FC advice at all there is nothing to suppress.
     advisory_post_charge_settle_max_seconds: float = Field(default=90.0, gt=0)
-    # ``advisory_post_charge_turning_point_ror_c_per_min``: the bean-RoR
-    # threshold (°C/min) that marks the turning point — once bean RoR is at or
-    # above it the bean has stopped falling and the settle window releases.
-    # Default 0.0 (RoR crosses zero). No ``gt``/``ge`` bound — a threshold of
-    # exactly 0 must be valid (it is the natural zero-crossing default).
     advisory_post_charge_turning_point_ror_c_per_min: float = Field(default=0.0)
     advisory_timeout_seconds: float = Field(default=10.0, gt=0)
     t0_debounce_ticks: int = Field(default=3, ge=1)
@@ -138,6 +181,13 @@ class ControllerConfig(BaseModel):
     # raises a safety alert (a nag, not an actuation); 600 s gives an
     # operator a realistic window to return before the system complains.
     operator_timeout_seconds: float = Field(default=600.0, gt=0)
+    # Deterministic pre-first-crack heat/fan levers (D35 §3/§4-A, #222): the
+    # operator's proven n8n pre-FC values (heat 100 / fan low), resolved by
+    # RoastControlPolicy into the narrowed pre-FC box + the deterministic target
+    # the controller actuates each tick. Parameterised, not hardcoded — a learned
+    # plan (D42 §7.1) can supply a different ramp. (Parameterized factory, not a
+    # bare model default, per the repo's pyright-strict typed-default idiom.)
+    pre_first_crack_levers: PreFirstCrackLevers = Field(default_factory=PreFirstCrackLevers)
 
     def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.

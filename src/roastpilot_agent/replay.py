@@ -160,12 +160,17 @@ def _profile_for(name: str) -> RoastProfile:
 
     The recorded exports carry no agent profile, so replay supplies a generic
     one. The charge guidance band (170–200 °C) is the default; the dashboard's
-    charge band renders from it during preheating."""
+    charge band renders from it during preheating.
+
+    The initial heat/fan match the deterministic pre-FC levers (D35/#222: heat
+    100 / fan low) so the run-start command sits inside the narrowed PREHEATING
+    box (carry-forward A) and replays as an ALLOW, not a CLAMP — the synthesized
+    CLAMP overlay stays the only CLAMP in a replayed timeline."""
     return RoastProfile(
         name=name,
         bean_origin="Replay (recorded roast)",
         bean_weight_grams=250.0,
-        initial_heat_percent=80,
+        initial_heat_percent=100,
         initial_fan_percent=10,
         # Default target aligned with prompt v4 + the operator's empirical median
         # across the 28 good roasts (drop 195 °C / 15 % DTR): 205 °C anchored v4

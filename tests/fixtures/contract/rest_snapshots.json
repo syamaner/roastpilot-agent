@@ -34,7 +34,7 @@
       "description": null,
       "farm": null,
       "initial_fan_percent": 10,
-      "initial_heat_percent": 80,
+      "initial_heat_percent": 100,
       "is_blend": false,
       "name": "cooling-complete",
       "processing": null,

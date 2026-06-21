@@ -276,39 +276,58 @@ class AdvisoryTrigger(Enum):
     BEAN_TEMP_DELTA = "bean_temp_delta"
     ROR_DELTA = "ror_delta"
     MIN_INTERVAL = "min_interval"
-    NEAR_FC = "near_fc"
+    # NOTE: the ``near_fc`` trigger (D32/#191) is retired under D35 (#222) — it
+    # only boosted *pre-FC* advisory cadence, and the advisor is no longer
+    # consulted pre-FC. Kept out of the enum so a stale value cannot be emitted.
 
 
+# The pre-first-crack phases the deterministic lever policy owns (D35 §3, #222):
+# preheat and charge→FC. Before FC the controller drives heat/fan from the
+# policy every tick and the free-form advisor is NOT consulted at all — neither
+# automatically nor on a manual request (the LLM thrashed and baked the roast
+# here, #218; there is no craft to add — max heat, low fan to FC). The advisor's
+# first consult is at/after first crack (the post-FC loop is #223). Gating the
+# advisor out of these phases makes #209's post-charge settle window a no-op
+# pre-FC, as D35 requires (the window only ever suppressed *automatic* pre-FC
+# advice; with no pre-FC advice at all it is inert).
+_DETERMINISTIC_PRE_FC_PHASES: frozenset[RoastPhase] = frozenset(
+    {RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK}
+)
 # Advice is only worth requesting in phases where its output (a heat/fan
 # target) could legally execute — the SET_HEAT row of the command×phase
 # matrix is the single source of truth, so this never drifts from safety.
 _ADVICE_PHASES: frozenset[RoastPhase] = COMMAND_PHASE_MATRIX[RoastCommand.SET_HEAT]
-# Phases the advisor is consulted in AUTOMATICALLY (D32 / #191): preheat is
-# excluded — the LLM adds no judgment over the deterministic warm-up ramp, and
-# its preheat calls were the #134 error-spam surface. A manual operator request
-# still reaches every advice phase (it bypasses this scope); the command×phase
-# matrix then decides whether the resulting advice can apply.
-_AUTO_ADVICE_PHASES: frozenset[RoastPhase] = _ADVICE_PHASES - {RoastPhase.PREHEATING}
+# Phases the advisor is consulted in AUTOMATICALLY (D32 / #191 + D35 / #222): the
+# deterministic pre-FC phases (preheat AND charge→FC) are excluded — pre-FC is
+# deterministic and the advisor is not consulted there. With only DEVELOPMENT
+# left, post-FC is where the LLM advises (#223).
+_AUTO_ADVICE_PHASES: frozenset[RoastPhase] = _ADVICE_PHASES - _DETERMINISTIC_PRE_FC_PHASES
 
 
 class AdvisoryCallPolicy:
     """Decides when the advisor is consulted (orchestration plan § Advisory
     Call Frequency).
 
-    Cadence scales with first-crack proximity (D32 / #191): an automatic call
-    fires only on a meaningful change since the last call — a phase transition,
-    a bean-temp move of ``advisory_min_temp_delta_c``, a RoR move of
-    ``advisory_min_ror_delta_c_per_min`` — plus, by phase:
-    **preheat → OFF** (not an automatic-advice phase); **pre-first-crack → no
-    fixed heartbeat** (``advisory_min_interval_seconds`` mapped to ``None`` —
-    change-based only) **plus a near-FC boost** (a short heartbeat once bean temp
-    reaches
-    ``advisory_near_fc_bean_temp_c``, so the anticipatory cut isn't missed if RoR
-    flattens); **development → unthrottled** (floor 0). The interval is a floor
-    only — the change-based triggers fire sooner. A manual operator request
-    bypasses every gate, including phase scoping, so the operator always gets a
-    response (the command×phase matrix then decides whether that advice can
-    apply).
+    Under D35 (#222) the advisor is consulted ONLY post-first-crack — the
+    deterministic controller owns the levers before FC and the free-form advisor
+    is gated out of every pre-FC phase. So this policy now governs the post-FC
+    cadence only:
+
+    - **preheat / charge→FC**: not automatic-advice phases (the deterministic
+      pre-FC policy owns them; the advisor is not consulted there at all). The
+      former post-charge settle window (#209) and near-FC boost (D32/#191) are
+      retired here — they only ever shaped *pre-FC* advisory cadence, which no
+      longer exists; #209 is now a no-op as D35 §2 mandates.
+    - **development (post-FC)**: unthrottled (floor 0) — an automatic call fires
+      on a meaningful change since the last call (a phase transition, a bean-temp
+      move of ``advisory_min_temp_delta_c``, a RoR move of
+      ``advisory_min_ror_delta_c_per_min``) or, failing those, the phase's
+      consult floor.
+
+    A manual operator request bypasses every gate, including phase scoping —
+    however the controller does not route a manual pre-FC request here either
+    (it is short-circuited before this policy is consulted, #222), so a manual
+    request only reaches this policy post-FC.
 
     Pure and deterministic: :meth:`evaluate` only reads state, and the
     controller calls :meth:`note_call` after an actual consult to advance
@@ -322,13 +341,6 @@ class AdvisoryCallPolicy:
         self._last_bean_temp_c: float | None = None
         self._last_bean_ror_c_per_min: float | None = None
         self._last_phase: RoastPhase | None = None
-        # Post-charge SETTLE window (#209): the monotonic instant charge (T0)
-        # opened the window, and a one-way latch that releases it once the bean
-        # turns (or the fallback timeout elapses). ``_charge_monotonic`` stays
-        # None until ``note_charge`` records the debounced T0, so the gate is
-        # inert for a never-charged run.
-        self._charge_monotonic: float | None = None
-        self._settle_released: bool = False
 
     def evaluate(
         self,
@@ -341,54 +353,14 @@ class AdvisoryCallPolicy:
         """Return the trigger to consult the advisor this tick, or ``None``.
 
         Manual wins unconditionally. Otherwise automatic triggers apply only
-        in advice-applicable phases, evaluated most-meaningful first: a phase
-        change (including the first consult in an advice phase), then the
-        bean-temp and RoR deltas, then the minimum-interval heartbeat.
+        in advice-applicable phases (post-FC only under D35, #222), evaluated
+        most-meaningful first: a phase change (including the first consult in an
+        advice phase), then the bean-temp and RoR deltas, then the
+        minimum-interval heartbeat.
         """
         if manual_request:
             return AdvisoryTrigger.MANUAL
         if phase not in _AUTO_ADVICE_PHASES:
-            return None
-        # Post-charge SETTLE window (#209): T0 is the transition into
-        # pre-first-crack, and the charge dunks the bean — temp falls fast
-        # (RoR << 0) for tens of seconds until the turning point. The first
-        # automatic consult (PHASE_CHANGE, below) would otherwise land on this
-        # crash and misread it as a stall, flooring heat. Suppress AUTOMATIC
-        # advice until the bean turns (bean RoR >= the turning-point threshold)
-        # or a fallback timeout elapses, then latch released so a later RoR dip
-        # never re-suppresses. Manual requests bypassed this above.
-        if (
-            phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-            and self._charge_monotonic is not None
-            and not self._settle_released
-        ):
-            # Only judge the turning point / release on a tick with a real
-            # reading: a no-telemetry tick would produce a no_telemetry skip in
-            # _run_advisory that still advances note_call's baseline, consuming
-            # the first real post-charge consult (augmentcode review, #213).
-            # Persistent missing telemetry is the safety layer's concern (it
-            # faults), not this gate's.
-            if telemetry is None:
-                return None
-            turned = (
-                telemetry.bean_ror_c_per_min is not None
-                and telemetry.bean_ror_c_per_min
-                >= self._config.advisory_post_charge_turning_point_ror_c_per_min
-            )
-            timed_out = (
-                now - self._charge_monotonic >= self._config.advisory_post_charge_settle_max_seconds
-            )
-            if turned or timed_out:
-                self._settle_released = True
-                # The release tick IS the first real post-charge consult, so
-                # fire it as a PHASE_CHANGE rather than falling through to the
-                # delta/interval checks. A manual no-telemetry skip earlier in
-                # the window can have advanced _last_phase without setting a
-                # delta baseline; with no MIN_INTERVAL floor in pre-first-crack
-                # the fallthrough would then return None and starve the advisor
-                # until near-FC (Codex review #213). The telemetry-None guard
-                # above guarantees this release tick carries a reading.
-                return AdvisoryTrigger.PHASE_CHANGE
             return None
         # First consult in an advice phase, or any phase transition since the
         # last call: ``_last_phase`` starts None, so the first eligible tick
@@ -416,62 +388,16 @@ class AdvisoryCallPolicy:
             >= self._config.advisory_min_ror_delta_c_per_min
         ):
             return AdvisoryTrigger.ROR_DELTA
-        # Near-FC cadence boost (D32 / #191): the Maillard-approach is the
-        # advisor's highest-value window — the anticipatory heat cut that must
-        # precede FC (thermal + ~12–21 s detector lag compound). Pre-first-crack
-        # has no fixed heartbeat, so once the bean nears the FC band guarantee a
-        # heartbeat here, so the pre-emptive cut isn't missed if RoR flattens
-        # into the crack and the change-based triggers above go quiet.
-        if (
-            phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-            and telemetry is not None
-            and telemetry.bean_temp_c >= self._config.advisory_near_fc_bean_temp_c
-            and now - self._last_call_monotonic >= self._config.advisory_near_fc_interval_seconds
-        ):
-            return AdvisoryTrigger.NEAR_FC
         # Phase-keyed consult floor (D32 / #171), resolved from the *current*
         # phase so it follows the roast forward: development 0 = unthrottled (a
         # 0 floor fires every eligible tick once the prior serial call returns,
-        # so FC/development consults run back-to-back at advisor latency);
-        # pre-first-crack ``None`` = NO fixed heartbeat (change-based + the near-FC
-        # boost above are its only automatic triggers); preheat is not an
-        # automatic-advice phase at all. The change-based triggers above still
-        # short-circuit sooner in any phase.
+        # so development consults run back-to-back at advisor latency). Only
+        # post-FC phases reach here under D35 (#222). The change-based triggers
+        # above still short-circuit sooner.
         floor = self._config.advisory_interval_for(phase)
         if floor is not None and now - self._last_call_monotonic >= floor:
             return AdvisoryTrigger.MIN_INTERVAL
         return None
-
-    def note_charge(self, *, now: float) -> None:
-        """Record that charge (T0) just happened: open the post-charge settle
-        window (#209).
-
-        The controller calls this once, at the debounced T0 transition into
-        ``ROASTING_PRE_FIRST_CRACK``, before the advisory consult runs on the
-        same tick — so the policy suppresses automatic advice on the crashing
-        post-charge bean until it passes its turning point.
-
-        Args:
-            now: The controller-clock instant of the debounced T0 transition.
-        """
-        self._charge_monotonic = now
-        self._settle_released = False
-
-    def rearm_post_charge_settle_on_resume(self, *, now: float) -> None:
-        """Re-arm the post-charge settle window on a recovery-resume into
-        pre-first-crack (#209/#213), but ONLY if the policy holds no charge on
-        record — i.e. a fresh policy after a process restart, where a resume can
-        land mid-crash and the gate would otherwise be inert. When the policy
-        still carries the prior roast's charge state (in-process recovery, e.g.
-        a D30 fail-closed mid-drying), preserve it — including an already-released
-        latch — so a normal post-turn RoR dip after the resume is not
-        re-suppressed.
-
-        Args:
-            now: The controller-clock instant of the recovery resume.
-        """
-        if self._charge_monotonic is None:
-            self.note_charge(now=now)
 
     def note_call(
         self,
@@ -568,10 +494,9 @@ class RoastController:
         # the advisor reasons about near the drop.
         self._first_crack_monotonic: float | None = None
         # Monotonic instant of the debounced T0/charge transition into
-        # ROASTING_PRE_FIRST_CRACK (#209), set in ``_apply_phase_rules`` and
-        # cleared on a new run/preheat. Stamps the charge clock for both the
-        # advisor's ``seconds_since_charge`` context and the post-charge settle
-        # window (notified to ``_advisory_policy.note_charge`` on the same tick).
+        # ROASTING_PRE_FIRST_CRACK (#219), set in ``_apply_phase_rules`` and
+        # cleared on a new run/preheat. Stamps the charge clock for the advisor's
+        # ``seconds_since_charge`` context and the charge-referenced DTR clock.
         self._charge_monotonic: float | None = None
         # Monotonic instant of the drop (the transition into COOLING), set in
         # ``transition_to`` and cleared on a new run/preheat (#239). Freezes the
@@ -748,12 +673,8 @@ class RoastController:
             # only on the first-crack transition below.
             self._first_crack_monotonic = None
             # A new run/preheat is "back before charge": clear the charge clock
-            # so ``seconds_since_charge`` is None and the settle window is
-            # re-armed (#209). It is restamped at the debounced T0 transition.
-            # The ``_advisory_policy`` needs no corresponding reset here: its
-            # ``_settle_released`` (left True by a prior roast's release) makes
-            # the gate harmlessly inert until ``note_charge`` re-arms it on the
-            # next T0 or recovery-resume (claude review, #213).
+            # so ``seconds_since_charge`` is None (#219). It is restamped at the
+            # debounced T0 transition.
             self._charge_monotonic = None
             # A new run/preheat un-freezes the elapsed clocks (#239): clear the
             # drop instant so the next roast's development time and DTR run live
@@ -815,6 +736,12 @@ class RoastController:
             return
         await self._apply_phase_rules(telemetry)
         self._check_operator_timeout()
+        # D35 §3 (#222): pre-FC the controller deterministically sets heat/fan
+        # from the policy — runs AFTER _apply_phase_rules so a tick that just
+        # charged (PREHEATING → ROASTING_PRE_FIRST_CRACK) actuates the pre-FC
+        # lever, and a tick that just hit FC does NOT (it falls to the advisor).
+        # The advisory step below is a no-op in these phases (gated out).
+        await self._apply_deterministic_pre_fc_levers(telemetry)
         await self._maybe_run_advisory(telemetry)
 
     async def _maybe_run_advisory(self, telemetry: RoastTelemetry | None) -> None:
@@ -827,6 +754,12 @@ class RoastController:
         manual_request = self._advisory_requested
         self._advisory_requested = False
         if self._advisor is None or self._profile is None:
+            return
+        if self._phase in _DETERMINISTIC_PRE_FC_PHASES:
+            # D35 §3 (#222): pre-FC is deterministic — the advisor is NOT
+            # consulted before first crack, not even on a manual request (cleared
+            # above). The controller already actuated the deterministic lever this
+            # tick (_apply_deterministic_pre_fc_levers); there is no advice to add.
             return
         if self._advisory_paused:
             # Operator paused advice (D19). The controller keeps running every
@@ -865,6 +798,79 @@ class RoastController:
                     "waited_seconds": waited,
                 },
             )
+
+    async def _apply_deterministic_pre_fc_levers(self, telemetry: RoastTelemetry | None) -> None:
+        """Deterministically drive heat/fan from the policy before FC (D35 §3, #222).
+
+        The highest-stakes path in the D35 chain: it actuates real heat/fan on the
+        roaster before first crack. Every write still passes the existing safety
+        path — the command×phase matrix gate (``evaluate_command_phase``) then
+        ``evaluate_command`` with the phase's single-source control box — so the
+        deterministic levers are safety-gated exactly like advisor output (no new
+        verdict, no invariant change).
+
+        Behaviour:
+
+        * **Only the two deterministic pre-FC phases** (preheat, charge→FC) carry
+          a lever target (``PhaseControlLimits.has_deterministic_target``); every
+          other phase returns immediately. A restart/recovery NEVER lands in these
+          phases without explicit operator action (``recover_from_restart`` enters
+          ``operator_recovery_required``), so this never auto-resumes heat/fan — it
+          actuates only during a normally-progressing run.
+        * **No active run** (no profile) ⇒ no-op: the policy/box is meaningless
+          before a run is loaded.
+        * **Idempotent**: it writes only when the current heat/fan differ from the
+          target, so after the first pre-FC write each later tick is a no-op — no
+          rate-limit churn, no redundant serial writes. The constant target means
+          steady high heat / low fan; the heat floor == the target, so even a
+          spurious lower value would be clamped back up (the #218 70→40→20→0 crash
+          is structurally impossible pre-FC).
+
+        Args:
+            telemetry: The reading this tick consumed. Unused for the lever value
+                (the target is deterministic, not telemetry-derived in M1 — the
+                telemetry-driven late-Maillard trim is deferred to D36/#228), but
+                taken so the signature matches the tick-pipeline steps and a future
+                telemetry-aware refinement needs no plumbing change.
+        """
+        del telemetry  # deterministic target is not telemetry-derived in M1 (#222)
+        if self._profile is None:
+            return
+        box = self._control_limits()
+        if not box.has_deterministic_target:
+            return
+        # Validated all-or-nothing on PhaseControlLimits: a deterministic target
+        # implies both lever values are present.
+        assert box.heat_target_percent is not None  # noqa: S101 (validator invariant)
+        assert box.fan_target_percent is not None  # noqa: S101 (validator invariant)
+        target_heat = box.heat_target_percent
+        target_fan = box.fan_target_percent
+        if self._current_heat == target_heat and self._current_fan == target_fan:
+            # Already at the deterministic target — no write (avoids rate-limit
+            # churn and redundant serial writes; the target is constant pre-FC).
+            return
+        # Matrix gate first (SET_HEAT must be valid in this phase — it is, for both
+        # pre-FC phases — but the gate stays the single source so this never drifts
+        # from safety), then the bounds/rate-limit clamp.
+        phase_validity = self._safety.evaluate_command_phase(
+            command=RoastCommand.SET_HEAT, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(phase_validity)
+        if phase_validity.verdict is not SafetyVerdict.ALLOW:  # pragma: no cover — both
+            # pre-FC phases are in the SET_HEAT matrix row; unreachable defensive guard.
+            return
+        evaluation = self._safety.evaluate_command(
+            requested_heat=target_heat,
+            requested_fan=target_fan,
+            seconds_since_last_command=self._seconds_since_last_command(),
+            # The SAME single-source box (#273/#222): the gate clamps to exactly
+            # the phase box the target was resolved from — told == enforced for the
+            # deterministic path too. The target sits inside the box by construction
+            # (PhaseControlLimits validates it), so a clean run yields ALLOW.
+            bounds=box,
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        await self._execute_targets(evaluation)
 
     async def _apply_phase_rules(self, telemetry: RoastTelemetry | None) -> None:
         """MCP-driven phase rules: preheating (E4-S3) and roasting (E4-S4).
@@ -910,15 +916,13 @@ class RoastController:
                 )
                 self._t0_streak = 0  # unambiguous post-confirmation state
                 self.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
-                # Stamp the charge clock and open the post-charge settle window
-                # on the SAME tick, BEFORE the advisory consult runs later in
-                # this tick (#209): the tick pipeline runs _apply_phase_rules
-                # before _maybe_run_advisory, so the first pre-first-crack
-                # consult is suppressed on the crashing post-charge bean until
-                # it turns, and ``seconds_since_charge`` reads from this instant.
-                now = self._clock()
-                self._charge_monotonic = now
-                self._advisory_policy.note_charge(now=now)
+                # Stamp the charge clock at the debounced T0 transition: the
+                # advisor's ``seconds_since_charge`` context and the
+                # charge-referenced DTR clock (#219) read from this instant. The
+                # post-charge settle window (#209) is retired under D35 (#222) —
+                # the advisor is no longer consulted pre-FC, so there is no
+                # automatic post-charge consult left to suppress.
+                self._charge_monotonic = self._clock()
             return
         if (
             self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
@@ -1322,16 +1326,19 @@ class RoastController:
         self._events.emit(RoastEventKind.RUN_STARTED, {"profile": profile.name})
         # Initial heat/fan per profile, through safety policy (runtime
         # flow step 5) — never raw.
-        # NOTE (#222): this call deliberately does NOT pass bounds=, so it
-        # enforces the full 0–100 box today. That is correct only while the
-        # phase boxes are the full lever (#273 no-op). Once #222 narrows the
-        # per-phase boxes, wire this to _control_limits()/the policy too —
-        # otherwise run-start would enforce 0–100 while the model is told a
-        # narrowed box (a told≠enforced gap at the run-start command).
+        # Carry-forward A (#222, #273 PR #294 review): pass the single-source
+        # PREHEATING control box as bounds=. With #222 narrowing the pre-FC phases
+        # (heat floor 100, fan ceiling ~30) the run-start command must be clamped
+        # to the SAME box the policy resolves and the deterministic lever step
+        # uses — otherwise run-start would enforce the full 0–100 box while the
+        # policy/told side is the narrowed one (a told≠enforced gap at the very
+        # first roast command). ``transition_to(PREHEATING)`` ran above, so the
+        # current phase is PREHEATING and ``_control_limits`` resolves its box.
         evaluation = self._safety.evaluate_command(
             requested_heat=profile.initial_heat_percent,
             requested_fan=profile.initial_fan_percent,
             seconds_since_last_command=self._seconds_since_last_command(),
+            bounds=self._control_limits(),
         )
         await self._snapshots.persist_evaluation(evaluation)
         await self._execute_targets(evaluation)
@@ -1473,21 +1480,12 @@ class RoastController:
         # single failure.
         self._consecutive_advisor_failures = 0
         self.transition_to(target)  # table gates targets; starting is never legal
-        if target is RoastPhase.ROASTING_PRE_FIRST_CRACK:
-            # Re-arm the post-charge settle window on a resume into early
-            # roasting (#209, Codex review #213), but CONDITIONALLY (#213 FIX 6):
-            #   - process RESTART → fresh policy with no charge on record
-            #     (_charge_monotonic is None): re-arm, so a resume that lands
-            #     mid-crash is protected (RoR-driven release frees it at once if
-            #     the bean has already turned);
-            #   - IN-PROCESS recovery (e.g. a D30 fail-closed mid-drying) → the
-            #     policy still carries the prior roast's charge state, long past
-            #     the turning point: preserve it (including an already-released
-            #     latch) so a normal post-turn RoR dip is not re-suppressed for
-            #     up to the fallback window.
-            # The guard lives in the policy method; reference the settle to the
-            # resume instant when it does re-arm.
-            self._advisory_policy.rearm_post_charge_settle_on_resume(now=self._clock())
+        # No post-charge settle re-arm under D35 (#222): the advisor is not
+        # consulted pre-FC, so a resume into ROASTING_PRE_FIRST_CRACK has no
+        # automatic pre-FC consult to suppress (#209 retired). A resume into a
+        # pre-FC phase re-engages the DETERMINISTIC lever policy on the next
+        # tick — that is the operator's explicit choice (this method IS the
+        # explicit operator action), never an auto-resume of heat/fan.
         self._events.emit(RoastEventKind.RECOVERY_ACKNOWLEDGED, {"resumed_to": target.value})
 
     def operator_acknowledge_fault(self) -> None:
@@ -1683,8 +1681,30 @@ class RoastController:
         Returns:
             The phase-resolved control box for the controller's current phase.
         """
-        policy = RoastControlPolicy(self._safety.limits, self._profile)
-        return policy.limits_for(self._phase)
+        return self._policy_limits_for(self._phase)
+
+    def _policy_limits_for(self, phase: RoastPhase) -> PhaseControlLimits:
+        """Resolve the single-source control box for an arbitrary ``phase``.
+
+        Builds the :class:`RoastControlPolicy` from the safety policy's *own*
+        limits (``self._safety.limits``), the frozen active profile, and the
+        configured deterministic pre-FC levers (#222), then resolves ``phase``.
+        :meth:`_control_limits` wraps it for the current phase; ``start_run``
+        passes the run-start phase explicitly so the run-start command is told ==
+        enforced against the narrowed pre-FC box (carry-forward A, #273 review).
+
+        Args:
+            phase: The agent phase to resolve the control box for.
+
+        Returns:
+            The phase-resolved :class:`PhaseControlLimits` box.
+        """
+        policy = RoastControlPolicy(
+            self._safety.limits,
+            self._profile,
+            pre_fc_levers=self._config.pre_first_crack_levers,
+        )
+        return policy.limits_for(phase)
 
     def _build_advisor_context(
         self, telemetry: RoastTelemetry, limits: PhaseControlLimits
