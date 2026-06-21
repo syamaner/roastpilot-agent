@@ -97,7 +97,13 @@ export function FaultBanner({
           <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Safety System Event Trail
           </h3>
-          <ul data-testid="safety-trail" className="flex flex-col gap-1">
+          {/* Bounded height + internal scroll: a long trail (e.g. a fault re-emitted
+              every tick) must not grow unbounded and push the rest of the page out
+              of view. pr-1 keeps the scrollbar from crowding the row text. */}
+          <ul
+            data-testid="safety-trail"
+            className="flex max-h-64 flex-col gap-1 overflow-y-auto pr-1"
+          >
             {trail.map((entry, i) => (
               <li
                 key={i}

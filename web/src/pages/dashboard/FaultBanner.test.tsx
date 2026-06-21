@@ -51,6 +51,22 @@ describe("FaultBanner", () => {
     expect(rows[1]).toHaveTextContent("FAULT");
   });
 
+  it("bounds the trail height + scrolls so a long trail can't push the page away", () => {
+    // Roast-2 post-mortem: a re-emitted-every-tick fault spammed the trail with
+    // dozens of identical rows, growing it unbounded and scrolling the rest of
+    // the page out of view. The container must be height-capped + scrollable.
+    const longTrail: SafetyTrailEntry[] = Array.from({ length: 60 }, () => ({
+      kind: "fault" as const,
+      evaluation: FAULT,
+    }));
+    render(<FaultBanner fault={FAULT} trail={longTrail} />);
+    const list = screen.getByTestId("safety-trail");
+    expect(list.className).toMatch(/max-h-/);
+    expect(list.className).toContain("overflow-y-auto");
+    // Every row still renders (reachable via scroll, none dropped).
+    expect(screen.getAllByTestId("safety-trail-row")).toHaveLength(60);
+  });
+
   it("is informational + persistent — NO server-dispatching button on the banner", () => {
     // A fault must not be hidden by the operator, and the banner must not re-issue
     // a roaster command under a misleading 'acknowledge' label (button honesty).
