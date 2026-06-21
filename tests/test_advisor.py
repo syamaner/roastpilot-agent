@@ -18,6 +18,7 @@ Three layers:
 """
 
 import asyncio
+import re
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any
@@ -811,7 +812,11 @@ def test_control_teaching_prompt_exists_and_is_stable() -> None:
     assert CONTROL_TEACHING_PROMPT_VERSION == "c1"
     prompt = control_teaching_prompt()
     assert prompt
-    assert len(prompt) > 500
+    # Operator decision 4: the FULL teaching detail is retained (the system
+    # message caches, so token cost is negligible). The current text is ~5.4k
+    # chars; a > 4000 floor catches a major trim while leaving room to edit. The
+    # substantive content tests below do the real "what is taught" guarding.
+    assert len(prompt) > 4000
     # Default arg resolves to the active version, and it is stable across calls.
     assert prompt == control_teaching_prompt(CONTROL_TEACHING_PROMPT_VERSION)
     assert control_teaching_prompt() == control_teaching_prompt()
@@ -827,8 +832,9 @@ def test_control_teaching_prompt_unknown_version_raises() -> None:
 
 def test_control_teaching_prompt_teaches_the_machine_and_phases() -> None:
     """The prompt carries the load-bearing teaching content: the Hottop machine
-    (electric drum, thermal lag, fan as the primary airflow/cooling lever) and
-    the full phase model (drying -> browning -> Maillard -> first crack ->
+    (electric drum, thermal lag, fan as the primary airflow/cooling lever), the
+    metrics (bean/env temp, RoR, DTR, dev-time, turning point, FC-ETA), and the
+    full phase model (drying -> browning -> Maillard -> first crack ->
     development -> drop) with what each phase needs."""
     lower = control_teaching_prompt().lower()
     # The machine.
@@ -839,6 +845,15 @@ def test_control_teaching_prompt_teaches_the_machine_and_phases() -> None:
     assert "convective" in lower
     assert "airflow" in lower
     assert "cooling" in lower
+    # The metrics (issue goal): bean/env temp, RoR, DTR, dev-time, turning
+    # point, FC-ETA — the readings the model reasons over.
+    assert "bean temperature" in lower
+    assert "environment temperature" in lower
+    assert "rate of rise" in lower or "ror" in lower
+    assert "development time ratio" in lower or "dtr" in lower
+    assert "development time" in lower
+    assert "turning point" in lower
+    assert "first-crack eta" in lower
     # The full phase model.
     for phase_word in ("drying", "browning", "maillard", "first crack", "development", "drop"):
         assert phase_word in lower, phase_word
@@ -887,6 +902,13 @@ def test_control_teaching_prompt_is_principle_not_numbers() -> None:
     assert "196" not in prompt  # the v4 drop anchor's bitter ceiling is NOT folded in
     assert "heat 100" not in lower  # the #273 pre-FC default is NOT named here
     assert "fan 30" not in lower
+    # Decision 3: no explicit fan-ceiling NUMBER near FC — rely on #273's
+    # per-phase fan ceiling from the context. The abstract "fan floor/ceiling"
+    # limits reference is fine; a literal "fan <number>" duty value is not. The
+    # only digit-bearing 'heat 70' is the percent-duty *unit* illustration, so
+    # match the lever followed by a number, excluding the 0-100 range itself.
+    assert re.search(r"\bfan\s+\d+\b", lower) is None
+    assert re.search(r"\bheat\s+(?!70\b)\d+\b", lower) is None
 
 
 def test_control_teaching_prompt_encodes_pre_fc_discipline() -> None:
