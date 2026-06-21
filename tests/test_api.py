@@ -1980,7 +1980,20 @@ async def test_background_loop_stays_alive_on_fault_until_acknowledged(
         run_loop=True,
     )
     detail = await service.start_roast(_profile())
-    await asyncio.sleep(0.03)
+
+    # Poll for the fault rather than a fixed sleep. The background loop's
+    # wall-clock pace varies under CI load, so a tight `asyncio.sleep(0.03)` was a
+    # timing flake (the loop had not yet reached the fault tick when asserted).
+    # This asserts the SAME state — bounded so a genuine never-faults regression
+    # still fails the test promptly.
+    async def _agent_phase() -> RoastPhase | None:
+        run = await store.read_run(detail.id)
+        return None if run is None else run.agent_phase
+
+    for _ in range(400):
+        if await _agent_phase() is RoastPhase.FAULTED:
+            break
+        await asyncio.sleep(0.005)
     # The run has faulted but the loop is still alive (not finalised) — operable.
     faulting = await store.read_run(detail.id)
     assert faulting is not None
@@ -1991,7 +2004,12 @@ async def test_background_loop_stays_alive_on_fault_until_acknowledged(
     await service.submit_operator_action(
         detail.id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
     )
-    await asyncio.sleep(0.03)
+    # Poll for finalisation (loop stop) instead of a fixed sleep. ``runner`` is
+    # already narrowed non-None by the assert above.
+    for _ in range(400):
+        if service.runner.finalized:
+            break
+        await asyncio.sleep(0.005)
     await service.shutdown()
     finished = await store.read_run(detail.id)
     assert finished is not None
