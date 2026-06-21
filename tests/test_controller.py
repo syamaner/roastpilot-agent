@@ -3337,11 +3337,19 @@ async def test_deadband_damps_a_flip_flop_but_allows_a_decisive_move() -> None:
          write, levers held at (70, 50), and a COHERENCE_DAMPED note emitted.
       3. heat 50 / fan 50 — heat -20 (>= 15, decisive reversal) — applied; fan
          unchanged from the held 50, so the executed pair is (50, 50).
+
+    Pins an explicit threshold of 15 (not the tuned default 10, #277) so the -10
+    moves are genuinely sub-threshold — this exercises the damping MECHANISM,
+    decoupled from the data-tuned production default.
     """
     advisor = FakeAdvisor(
         [decision(heat=70, fan=50), decision(heat=60, fan=45), decision(heat=50, fan=50)]
     )
-    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    harness = harness_in_development(
+        readings=[reading()],
+        advisor=advisor,
+        config=ControllerConfig(post_fc_deadband_threshold_percent=15),
+    )
     # Consult 1: first move, executed.
     await harness.controller.tick()
     assert harness.executor.targets[-1] == (70, 50)
@@ -3445,11 +3453,19 @@ async def test_sustained_sub_threshold_cut_actuates_within_two_consults() -> Non
     keeps asking for the SAME small cut (a -10 DOWN, below the 15 deadband). The
     first cut is damped (held), but the damp advances the recorded direction DOWN,
     so the identical second request is a same-direction move and the cut executes.
+
+    Pins an explicit threshold of 15 (not the tuned default 10, #277) so the -10
+    cut is genuinely sub-threshold — this exercises the convergence MECHANISM,
+    decoupled from the data-tuned production default.
     """
     advisor = FakeAdvisor(
         [decision(heat=80, fan=50), decision(heat=70, fan=50), decision(heat=70, fan=50)]
     )
-    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    harness = harness_in_development(
+        readings=[reading()],
+        advisor=advisor,
+        config=ControllerConfig(post_fc_deadband_threshold_percent=15),
+    )
     # Consult 1: a decisive first move UP — executed (heat 80).
     await harness.controller.tick()
     assert harness.executor.targets[-1] == (80, 50)
@@ -3471,9 +3487,17 @@ async def test_mixed_partial_damp_executes_only_the_decisive_lever() -> None:
     """#276 Fix 4: in one consult, a sub-threshold heat reversal (DAMP) alongside a
     decisive fan move (ALLOW) executes ONLY the fan — the heat is held, only the
     fan direction updates, and the COHERENCE_DAMPED note lists only the heat lever.
+
+    Pins an explicit threshold of 15 (not the tuned default 10, #277) so the -10
+    heat reversal is genuinely sub-threshold — this exercises the per-lever
+    partial-damp MECHANISM, decoupled from the data-tuned production default.
     """
     advisor = FakeAdvisor([decision(heat=70, fan=50), decision(heat=60, fan=80)])
-    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    harness = harness_in_development(
+        readings=[reading()],
+        advisor=advisor,
+        config=ControllerConfig(post_fc_deadband_threshold_percent=15),
+    )
     # Consult 1: first move (heat UP, fan UP) — executed at (70, 50).
     await harness.controller.tick()
     assert harness.executor.targets[-1] == (70, 50)

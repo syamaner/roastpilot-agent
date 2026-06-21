@@ -36,7 +36,11 @@ def test_controller_defaults_match_orchestration_plan() -> None:
     }
     # D35 §4-A / D40.5 (#276): the post-FC loop knobs.
     assert config.post_fc_min_consult_interval_seconds == 5.0
-    assert config.post_fc_deadband_threshold_percent == 15
+    # Tuned from the operator's recorded post-FC behaviour (#277): 10 is the
+    # largest threshold that damps ZERO of the operator's real >=10 pp reversals
+    # (every Hottop lever move is quantised to 10 pp). See
+    # tests/test_coherence.py::test_operator_recorded_reversals_pass_at_default_threshold.
+    assert config.post_fc_deadband_threshold_percent == 10
     assert config.post_fc_min_confidence == 0.2
     assert config.advisory_near_fc_bean_temp_c == 170.0
     assert config.advisory_near_fc_interval_seconds == 10.0
