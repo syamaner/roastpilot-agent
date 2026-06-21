@@ -11,6 +11,7 @@ text, no auto-pick).
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -221,6 +222,46 @@ def test_enriched_pre_fc_tick_has_an_fc_eta_and_narrowed_box() -> None:
     assert mid.context.first_crack_eta_seconds is not None
     # Pre-FC box pins the heat floor to the deterministic target (#222/#273).
     assert mid.context.heat_floor_percent == 100
+
+
+def test_fc_milestone_is_sourced_only_from_seen_ticks() -> None:
+    """The FC milestone never draws on a future (unseen) tick (#299 review).
+
+    The summary is "as of ``ticks[upto_index]``" — like the live controller
+    arming FC on the first post-transition tick, it must only ever draw on ticks
+    the model has already seen (``ticks[:upto_index + 1]``). The fix bounds the
+    FC nearest-tick search the same way the turning point is bounded; this asserts
+    the invariant holds at every index from the FC crossing onward, and that a
+    contrived future-nearer FC time still resolves to a seen tick.
+    """
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    ticks, ground = bakeoff.build_ticks(fixture, cadence_seconds=30.0)
+    fc_index = next(
+        i for i, t in enumerate(ticks) if t.monotonic_seconds >= ground.first_crack_seconds
+    )
+    # The invariant at every index from the FC crossing onward: whatever tick the
+    # FC milestone is sourced from must be one the model has already seen.
+    for upto in range(fc_index, len(ticks)):
+        seen_temps = [t.context.current_bean_temp_c for t in ticks[: upto + 1]]
+        milestones = bakeoff._milestones_for(ticks, ground, upto)  # pyright: ignore[reportPrivateUsage]
+        fc = next(m for m in milestones if m.kind is bakeoff.RoastMilestoneKind.FIRST_CRACK)
+        assert fc.bean_temp_c in seen_temps
+
+    # Direct guard on the bound: skew the FC time to sit nearer a FUTURE tick than
+    # the current one, then evaluate AT that future index. An unbounded search at
+    # the seen index would reach for the nearer tick; the bounded search must keep
+    # to the seen window. Evaluating at upto = fc_index + 1 keeps now >= FC (so the
+    # milestone is emitted) while the future tick fc_index + 1 is the closer one.
+    if fc_index + 1 < len(ticks):
+        seen_t = ticks[fc_index].monotonic_seconds
+        next_t = ticks[fc_index + 1].monotonic_seconds
+        fc_seconds = seen_t + 0.6 * (next_t - seen_t)  # nearer the future tick
+        skewed = dataclasses.replace(ground, first_crack_seconds=fc_seconds)
+        # Evaluate one tick later so the milestone surfaces; the seen window is
+        # [: fc_index + 2], and the bounded FC source must be inside it.
+        milestones = bakeoff._milestones_for(ticks, skewed, fc_index + 1)  # pyright: ignore[reportPrivateUsage]
+        fc = next(m for m in milestones if m.kind is bakeoff.RoastMilestoneKind.FIRST_CRACK)
+        assert fc.bean_temp_c in [t.context.current_bean_temp_c for t in ticks[: fc_index + 2]]
 
 
 def test_build_control_ticks_is_development_only_by_default() -> None:

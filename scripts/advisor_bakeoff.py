@@ -381,9 +381,17 @@ def _milestones_for(
                 bean_temp_c=tp.context.current_bean_temp_c,
             )
         )
-    # First crack: surfaced once the roast has crossed the FC event time.
+    # First crack: surfaced once the roast has crossed the FC event time. Bound
+    # the search to ticks at/before the current index (same as the turning point):
+    # an unbounded ``min(ticks, ...)`` over a coarse cadence can pick the *next*
+    # (future) tick as nearest to the FC time, injecting telemetry the model has
+    # not "seen" yet — the live controller arms FC on the first post-transition
+    # tick, never a future one.
     if now >= ground.first_crack_seconds:
-        fc_tick = min(ticks, key=lambda t: abs(t.monotonic_seconds - ground.first_crack_seconds))
+        fc_tick = min(
+            ticks[: upto_index + 1],
+            key=lambda t: abs(t.monotonic_seconds - ground.first_crack_seconds),
+        )
         milestones.append(
             RoastMilestone(
                 kind=RoastMilestoneKind.FIRST_CRACK,
@@ -719,7 +727,13 @@ ROSTER: tuple[Candidate, ...] = (
 
 
 def screen_roster(roster: tuple[Candidate, ...] = ROSTER) -> tuple[Candidate, ...]:
-    """Return the SCREEN roster (all 9 candidates) for the screen pass (#277)."""
+    """Return the SCREEN roster (every candidate) for the screen pass (#277).
+
+    Intentionally a no-op pass-through: the full roster *is* the screen by
+    construction (the screen runs everyone once; the finalists are the carried
+    subset). It exists as the named counterpart to :func:`finalist_roster` so the
+    two passes read symmetrically at the call site, not because it filters.
+    """
     return roster
 
 
@@ -3821,6 +3835,15 @@ async def main() -> int:
     availability = result.availability
     replay_cells = [cell for r in seed_results for cell in r.cells]
     captured_calls = [call for r in seed_results for call in r.captured_calls]
+    # Multi-seed runs capture per-seed (``<out>.seedN.json.capture.jsonl``). The
+    # combined artifact below advertises ``capture_path(args.out)`` as THE capture
+    # file, so materialise the merged capture there too — otherwise the path in
+    # the JSON / the print points at a file that was never written. Single-seed
+    # already wrote it (seed_out == args.out), so only the merge case needs this.
+    if seeds > 1:
+        capture_path(args.out).write_text(
+            "".join(json.dumps(captured_call_to_json(c)) + "\n" for c in captured_calls)
+        )
     interest_top_n = int(args.interest_top_n)
     selected = select_interesting_calls(captured_calls, top_n=interest_top_n)
     report = render_replay_report(replay_cells, roasts, trajectory=bool(args.trajectory))
