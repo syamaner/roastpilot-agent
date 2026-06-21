@@ -488,6 +488,62 @@ class SafetyPolicy:
             ),
         )
 
+    def evaluate_advisor_drop_coherence(
+        self,
+        *,
+        system_development_percent: float,
+        target_development_percent: float,
+        margin_percent: float,
+        current_heat: int,
+        current_fan: int,
+    ) -> SafetyEvaluation:
+        """Drop coherence guard ⇒ rejected drop when development is below target (#312).
+
+        The deterministic cross-check the controller applies before honouring an
+        advisor ``should_drop=true``: the drop is irreversible, so it is gated on
+        the SYSTEM's real development percent (never the model's claimed number,
+        which the first supervised roast showed can be fabricated). When
+
+            ``system_development_percent < target_development_percent - margin_percent``
+
+        the drop is REJECTed; the adjusted values hold the current targets (no
+        lever write, no drop), mirroring the low-confidence-reject hold pattern so
+        the blocked drop is observable in the safety_evaluations trace, not only
+        the event stream. This method is consulted only on the below-window path,
+        so it always returns REJECT; coherence (the at/above-window case) is the
+        caller's signal to proceed to the drop-eligibility evaluation.
+
+        No invariant is at risk: no roaster write happens on a REJECT, and the
+        operator's manual drop is a separate, un-gated path. All percents are the
+        charge/FC-referenced development ratio in percentage points (not Celsius).
+
+        Args:
+            system_development_percent: The controller's real development percent
+                (``Controller._development_percent``), charge/FC-referenced.
+            target_development_percent: The profile's development-ratio target.
+            margin_percent: The tolerance below target within which a drop is still
+                honoured (``ControllerConfig.drop_dev_margin_percent``).
+            current_heat: The heat level currently in effect (held).
+            current_fan: The fan level currently in effect (held).
+
+        Returns:
+            A REJECT :class:`SafetyEvaluation` whose adjusted values hold the
+            current targets.
+        """
+        floor = target_development_percent - margin_percent
+        return SafetyEvaluation(
+            rule="advisor_drop_coherence",
+            verdict=SafetyVerdict.REJECT,
+            adjusted_heat=current_heat,
+            adjusted_fan=current_fan,
+            reason=(
+                f"advisor drop blocked: system development {system_development_percent:.2f} % "
+                f"below the drop window floor {floor:.2f} % "
+                f"(target {target_development_percent:.2f} % - margin {margin_percent:.2f} pp); "
+                f"drop withheld, current targets held (heat {current_heat} %, fan {current_fan} %)"
+            ),
+        )
+
     def evaluate_advisor_low_confidence(
         self,
         *,

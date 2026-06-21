@@ -255,6 +255,27 @@ class ControllerConfig(BaseModel):
     # advice (the FakeAdvisor scripts at 0.9) passes. Tuned on the replay harness
     # (#277). Set 0.0 to disable the floor.
     post_fc_min_confidence: float = Field(default=0.2, ge=0.0, le=1.0)
+    # ``drop_dev_margin_percent`` — the deterministic DROP COHERENCE GUARD (#312).
+    # The advisor may FABRICATE a development number to justify an irreversible
+    # drop (the first supervised roast: the model asserted "14 %" when the system's
+    # true development was ~5.4 %, and dropped the beans early on that invented
+    # figure). The drop is irreversible, so the controller cross-checks the model's
+    # ``should_drop=true`` against the SYSTEM's real, computed development percent
+    # (``_development_percent``, charge/FC-referenced) — never the model's claimed
+    # number. A drop is HONOURED only when
+    #   development_percent >= target_development_percent - drop_dev_margin_percent.
+    # Below that the advisor's drop is REJECTED (recorded, surfaced as a note);
+    # the same consult's heat/fan advice still applies. This gates the ADVISOR
+    # drop only — the operator's manual DROP BEANS is an operator action through a
+    # separate path and is never gated; e-stop and the safety box are unaffected.
+    #
+    # Default 3.0 percentage points — a small tolerance below the profile target
+    # so a drop that is genuinely "within the window" (a percentage point or two
+    # short of target, the normal operator judgement) still goes through, while a
+    # drop materially short of target (the fabricated-"we're done" failure, which
+    # was ~7-8 pp below the ~13 % target) is blocked. Config-overridable; a
+    # literal-free named constant the controller's drop guard reads.
+    drop_dev_margin_percent: float = Field(default=3.0, ge=0.0, le=100.0)
 
     def advisory_interval_for(self, phase: RoastPhase) -> float | None:
         """Return the minimum-interval consult floor for ``phase`` in seconds.

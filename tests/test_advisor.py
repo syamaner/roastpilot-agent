@@ -762,6 +762,29 @@ def test_c1_is_the_default_prompt_version() -> None:
     assert instructions_for("v3") != instructions_for("v2")
 
 
+def test_c1_grounds_development_numbers_to_context_no_invention() -> None:
+    """#312: the c1 frame must instruct the model to use the development numbers
+    FROM CONTEXT verbatim, never to estimate/invent them, and to STATE the dev%
+    value it used in its rationale — the anti-hallucination fix after the first
+    supervised roast (the model fabricated "14 %" at a true ~5.4 % to justify an
+    irreversible early drop). A prompt-content assertion: this is the load-bearing
+    grounding language the fix turns on.
+    """
+    prompt = control_teaching_prompt("c1")
+    lowered = prompt.lower()
+    # Use the context values verbatim — do NOT estimate / infer / invent.
+    assert "verbatim" in lowered
+    assert "do not estimate" in lowered
+    assert "never invent" in lowered or "do not invent" in lowered
+    # Must STATE the development percent / DTR value it used in the rationale.
+    assert "must state the development percent" in lowered
+    # Must not anchor the dev% to the target just because it "should" be near it.
+    assert "anchor the development percent to the target" in lowered
+    # The irreversible-drop framing is present so a fabricated number cannot drive
+    # the drop.
+    assert "irreversible" in lowered
+
+
 def test_default_prompt_version_matches_control_teaching_version() -> None:
     """The config default and advisor.CONTROL_TEACHING_PROMPT_VERSION never drift.
 

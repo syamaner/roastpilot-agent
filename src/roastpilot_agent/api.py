@@ -910,7 +910,15 @@ class RoastRunner:
             mcp_phase=None if raw is None else raw.phase,
             heat_level_percent=snapshot.current_heat,
             fan_level_percent=snapshot.current_fan,
-            development_percent=None if raw is None else raw.development_percent,
+            # Persist the CONTROLLER's development percent (#308), the single
+            # charge/FC-referenced source the advisor also reasons on
+            # (snapshot.development_percent ⇐ Controller._development_percent),
+            # NOT the MCP raw value. The raw value used the MCP's own FC instant
+            # and so disagreed with the advisor's number — the first supervised
+            # roast persisted the MCP's ~2 %/5.4 % while the operator-facing dev%
+            # must equal what the model sees. The MCP raw figure stays in
+            # raw_state_json for diagnosis.
+            development_percent=snapshot.development_percent,
             raw_state_json=None if raw is None else raw.model_dump_json(),
         )
 
