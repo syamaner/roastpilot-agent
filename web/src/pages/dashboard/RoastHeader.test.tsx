@@ -7,6 +7,10 @@ afterEach(cleanup);
 
 const BASE = {
   phase: "development" as const,
+  // #308: ROAST TIME is charge-referenced. Here serve-elapsed (582) is well past
+  // the charge clock (402) — they are deliberately distinct so a test that asserts
+  // the wrong source fails loud.
+  chargeElapsedSeconds: 402,
   elapsedSeconds: 582,
   developmentSeconds: 72,
   developmentPercent: 18.5,
@@ -26,8 +30,49 @@ describe("RoastHeader", () => {
 
   it("formats the roast + development timers as mm:ss (tabular)", () => {
     render(<RoastHeader {...BASE} />);
-    expect(screen.getByTestId("roast-timer")).toHaveTextContent("09:42");
+    // ROAST TIME is the CHARGE-referenced clock (#308): 402 s → 06:42, NOT the
+    // serve-referenced 582 s (09:42) — proving the big clock reads since-charge.
+    expect(screen.getByTestId("roast-timer")).toHaveTextContent("06:42");
     expect(screen.getByTestId("development-timer")).toHaveTextContent("01:12");
+  });
+
+  it("shows ROAST TIME as since-charge after charge, not since-serve (#308)", () => {
+    render(<RoastHeader {...BASE} chargeElapsedSeconds={300} elapsedSeconds={900} />);
+    // 300 s since charge → 05:00 (NOT 900 s / 15:00 since serve). No Preheat
+    // read-out once charged.
+    expect(screen.getByTestId("roast-timer")).toHaveTextContent("05:00");
+    expect(screen.queryByTestId("preheat-timer")).toBeNull();
+  });
+
+  it("freezes ROAST TIME at the charge clock value (drop holds it, #308)", () => {
+    // After drop the server stops advancing charge_elapsed_seconds; the header
+    // renders whatever the frozen value is — no client-side ticking.
+    const { rerender } = render(<RoastHeader {...BASE} chargeElapsedSeconds={530} />);
+    expect(screen.getByTestId("roast-timer")).toHaveTextContent("08:50");
+    rerender(<RoastHeader {...BASE} chargeElapsedSeconds={530} elapsedSeconds={999} />);
+    expect(screen.getByTestId("roast-timer")).toHaveTextContent("08:50");
+  });
+
+  it("pre-charge shows 00:00 ROAST TIME + a distinct Preheat read-out (#308)", () => {
+    // charge_elapsed_seconds null = pre-charge: the big clock reads 00:00 and the
+    // serve-referenced preheat duration is surfaced SEPARATELY (not as roast time).
+    render(
+      <RoastHeader
+        {...BASE}
+        phase="preheating"
+        chargeElapsedSeconds={null}
+        elapsedSeconds={95}
+        developmentSeconds={null}
+        developmentPercent={null}
+      />,
+    );
+    expect(screen.getByTestId("roast-timer")).toHaveTextContent("00:00");
+    expect(screen.getByTestId("preheat-timer")).toHaveTextContent("01:35");
+  });
+
+  it("omits the Preheat read-out once charged (#308)", () => {
+    render(<RoastHeader {...BASE} chargeElapsedSeconds={120} />);
+    expect(screen.queryByTestId("preheat-timer")).toBeNull();
   });
 
   it("shows the live bean RoR readout in °C/min (#165)", () => {

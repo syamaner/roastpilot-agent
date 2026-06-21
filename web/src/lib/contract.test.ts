@@ -178,6 +178,9 @@ describe("telemetry — every field the SPA renders is present", () => {
       "fan_percent",
       "cooling_on",
       "elapsed_seconds",
+      // #308: the charge-referenced roast clock (0:00 = charge) rides the frame;
+      // null pre-charge, since-charge after, frozen at drop.
+      "charge_elapsed_seconds",
       // #220: live development time + DTR ride the telemetry frame (null pre-FC).
       "development_elapsed_seconds",
       "development_percent",

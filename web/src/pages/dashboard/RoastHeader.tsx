@@ -5,6 +5,12 @@
  * timer, the profile name, the first-crack pipeline status, the roaster-link
  * status, and a diagnostics drawer.
  *
+ * ROAST TIME is CHARGE-referenced (#308): 0:00 = charge/T0 (Artisan convention),
+ * frozen at drop — driven by the server's `charge_elapsed_seconds`, never derived
+ * here. Pre-charge it shows 00:00 and a distinct "Preheat" read-out carries the
+ * serve-referenced lead-in (`elapsed_seconds`). This intentionally supersedes the
+ * earlier serve-referenced clock (the #220 hold) per the operator.
+ *
  * Renders only REAL contract state (kickoff §8 — surface gaps, never invent):
  *  - Development time + DTR (#220, closes the #112 gap): the live `telemetry`
  *    frame now carries BOTH `development_elapsed_seconds` (time since first crack)
@@ -37,7 +43,21 @@ import { MicStatusIcon } from "./MicStatusIcon";
 
 export interface RoastHeaderProps {
   phase: RoastPhase | null;
-  /** Seconds since the run started (the roast timer); from telemetry.elapsed. */
+  /**
+   * Charge-referenced roast clock (#308): seconds since charge/T0 — the
+   * operator-facing ROAST TIME (0:00 = charge, Artisan convention; frozen at
+   * drop). Server-authoritative (telemetry.charge_elapsed_seconds). `null`
+   * PRE-charge: the big clock then shows "0:00" and the distinct Preheat
+   * read-out (below) carries the serve-referenced lead-in.
+   */
+  chargeElapsedSeconds: number | null;
+  /**
+   * Serve-referenced elapsed (seconds since the run STARTED), from
+   * telemetry.elapsed_seconds. Used ONLY for the pre-charge "Preheat" read-out
+   * (and the diagnostics drawer) — the operator-facing ROAST TIME is the
+   * charge-referenced clock above (#308). Kept distinct so preheat duration is
+   * visible without inflating the roast clock.
+   */
   elapsedSeconds: number | null;
   /** Seconds since the first-crack event (the development timer); null pre-FC.
    *  Server-authoritative (telemetry.development_elapsed_seconds, #220). */
@@ -71,6 +91,7 @@ export interface RoastHeaderProps {
 
 export function RoastHeader({
   phase,
+  chargeElapsedSeconds,
   elapsedSeconds,
   developmentSeconds,
   developmentPercent,
@@ -81,6 +102,13 @@ export function RoastHeader({
   micStatus,
 }: RoastHeaderProps): React.JSX.Element {
   const accent = phaseAccentVar(phase);
+  // #308: ROAST TIME is charge-referenced (0:00 = charge). Pre-charge the server
+  // sends `charge_elapsed_seconds: null`; we render the big clock as "00:00" then,
+  // and surface the serve-referenced preheat duration as a SEPARATE, clearly-
+  // labelled read-out so it never masquerades as roast time. `charged` is purely a
+  // PRESENTATION test on the server-authoritative clock — NOT phase inference.
+  const charged = chargeElapsedSeconds !== null;
+  const roastTimeText = charged ? formatClock(chargeElapsedSeconds) : "00:00";
   return (
     <header
       data-testid="roast-header"
@@ -104,7 +132,16 @@ export function RoastHeader({
           {phase ? PHASE_LABEL[phase] : "—"}
         </span>
 
-        <Metric label="Roast Time" value={formatClock(elapsedSeconds)} testid="roast-timer" />
+        {/* ROAST TIME is the charge-referenced clock (#308): 0:00 = charge, frozen
+            at drop — the Artisan convention the operator reads. Pre-charge it shows
+            00:00. */}
+        <Metric label="Roast Time" value={roastTimeText} testid="roast-timer" />
+        {/* Pre-charge ONLY: the serve-referenced preheat duration, a DISTINCT
+            read-out so the lead-in is visible without inflating the roast clock.
+            Drops away the moment charge fires (charge_elapsed_seconds non-null). */}
+        {!charged && (
+          <Metric label="Preheat" value={formatClock(elapsedSeconds)} testid="preheat-timer" />
+        )}
         {/* Live Rate of Rise — the signal roasters steer by, and the same signal
             the advisor reasons on (operator parity, #165). Bean °C/min, Celsius. */}
         <Metric

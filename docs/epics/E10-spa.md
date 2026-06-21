@@ -267,13 +267,31 @@ them onto `TelemetryEventData`, and the dashboard `RoastHeader` renders the
 `Development` timer + a new `DTR` readout (both hidden pre-FC). This CLOSES the
 #112 gap (the dashboard previously showed a client-derived dev timer and omitted
 the %; it is now server-authoritative, no client-side derivation). The chart
-x-origin is UNCHANGED — re-referencing the curve to charge (Artisan-style 0:00) is
-a separate operator UX decision still held. SPA contract mirror (`lib/types.ts`)
+x-origin was held serve-referenced here — re-referencing the curve to charge
+(Artisan-style 0:00) was a separate operator UX decision, **now actioned in #308**
+(see the follow-up note below). SPA contract mirror (`lib/types.ts`)
 and the #236/#121 contract fixtures regenerated for the new fields. The existing
 `dashboard-developed` Playwright baseline was EXTENDED (its post-FC state now shows
 the dev-time + DTR readouts; no new snapshot state added — the developed state
 already reaches `development`), and its test gained data-level assertions on both
 readouts.
+
+Post-E10 timing follow-up (not an E10 story): **#308 — re-origin ROAST TIME + the
+chart x-axis to charge/T0** (operator, 21 Jun; the remaining half of the first-roast
+timing fix after #312/#313 corrected the dev%/DTR formula). The controller already
+stamps a charge-referenced clock (`_charge_elapsed_seconds`, the advisor's DTR
+instant); the backend (#314) surfaces it as `charge_elapsed_seconds` on the
+`telemetry` SSE frame + the `/telemetry` series (None pre-charge, since-charge after,
+frozen at drop). The frontend (this PR) reads THAT: the `RoastHeader` ROAST TIME is
+now charge-referenced (0:00 = charge, Artisan convention; 00:00 + a distinct
+"Preheat" read-out pre-charge so the serve lead-in never masquerades as roast time),
+and the dashboard curve x-axis re-origins to charge — the page-local
+`useDashboardEvents` keys each curve point's `t` on `charge_elapsed_seconds`, so the
+T0 marker sits at 0 and PRE-charge ticks (null charge clock) are dropped (the curve
+begins at charge; preheat is not plotted). dev-time + DTR stay prominent (unchanged).
+This intentionally supersedes the #220 serve-referenced x-origin hold. Five dashboard
+Playwright baselines (`dashboard-live`, `-charge-window`, `-recovery`, `-fault`,
+`-developed`) regenerate via `web-snapshots-update.yml` at merge.
 
 ### E10 follow-ups — closed (15–16 Jun 2026)
 

@@ -69,11 +69,13 @@ export interface DashboardViewModel {
   firstCrack: FirstCrackData | null;
   /** T0 detection; null until detected. */
   t0: T0DetectedData | null;
-  /** Event markers for the curve (T0 / first crack / drop), x in seconds. */
+  /** Event markers for the curve (T0 / first crack / drop), x in CHARGE-referenced
+   *  seconds (#308): T0 sits at 0, FC/drop at their since-charge elapsed. */
   markers: CurveMarker[];
-  /** Curve points, x = elapsed seconds, ascending and deduped on `t`. Seeded from
-   *  the `/telemetry` snapshot on (re)connect (#153), then appended/merged per live
-   *  telemetry frame. */
+  /** Curve points, x = CHARGE-referenced elapsed seconds (#308: 0:00 = charge),
+   *  ascending and deduped on `t`. Seeded from the `/telemetry` snapshot on
+   *  (re)connect (#153), then appended/merged per live telemetry frame. Pre-charge
+   *  ticks (null charge clock) are dropped — the curve starts at the charge origin. */
   points: CurvePoint[];
   /** Monotonic counter assigning each advisory record a stable key (per run). */
   advisorySeq: number;
@@ -101,11 +103,21 @@ type Action =
   | { kind: "seed"; points: CurvePoint[] }
   | { kind: "reset" };
 
-/** Pull the elapsed-seconds x for a telemetry frame; null frames don't plot. */
+/**
+ * Pull the CHARGE-referenced elapsed-seconds x for a telemetry frame (#308); null
+ * frames don't plot.
+ *
+ * The curve x-axis is re-origined to charge/T0 (0:00 = charge, Artisan convention),
+ * so we key `t` on `charge_elapsed_seconds`, NOT the serve-referenced
+ * `elapsed_seconds`. The server sends `charge_elapsed_seconds: null` for PRE-charge
+ * (preheat) ticks; those carry no x on the charge clock, so they're dropped — the
+ * curve begins at the charge origin and the T0 marker (already at t=0) sits there.
+ * This intentionally supersedes the #220 serve-referenced plot per the operator.
+ */
 function pointFromTelemetry(t: TelemetryEventData): CurvePoint | null {
-  if (t.elapsed_seconds == null) return null;
+  if (t.charge_elapsed_seconds == null) return null;
   return {
-    t: t.elapsed_seconds,
+    t: t.charge_elapsed_seconds,
     bean: t.bean_temp_c,
     env: t.env_temp_c,
     ror: t.bean_ror_c_per_min,
@@ -114,13 +126,14 @@ function pointFromTelemetry(t: TelemetryEventData): CurvePoint | null {
   };
 }
 
-/** Project a persisted `/telemetry` snapshot point into the curve form (x = elapsed
- *  seconds). Null-elapsed points can't be placed on the x-axis, so they're dropped —
- *  same rule as the live frame path (`pointFromTelemetry`). */
+/** Project a persisted `/telemetry` snapshot point into the curve form, x =
+ *  CHARGE-referenced elapsed seconds (#308). Pre-charge snapshots carry a null
+ *  `charge_elapsed_seconds` (the lead-in) and can't be placed on the charge clock,
+ *  so they're dropped — same rule as the live frame path (`pointFromTelemetry`). */
 function pointFromSnapshot(p: TelemetryPoint): CurvePoint | null {
-  if (p.elapsed_seconds == null) return null;
+  if (p.charge_elapsed_seconds == null) return null;
   return {
-    t: p.elapsed_seconds,
+    t: p.charge_elapsed_seconds,
     bean: p.bean_temp_c,
     env: p.env_temp_c,
     ror: p.bean_ror_c_per_min,
@@ -290,7 +303,7 @@ export function dashboardReducer(
     case "first_crack": {
       const data = event.data as unknown as FirstCrackData;
       // The FC marker's x is the elapsed time at detection — the latest plotted
-      // point's t (the curve x-axis is elapsed seconds since T0).
+      // point's t (the curve x-axis is CHARGE-referenced seconds since T0, #308).
       const at = state.points.length > 0 ? state.points[state.points.length - 1].t : 0;
       return {
         ...state,
