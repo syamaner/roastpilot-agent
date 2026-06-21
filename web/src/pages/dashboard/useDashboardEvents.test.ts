@@ -305,6 +305,81 @@ describe("dashboardReducer", () => {
     expect(s.markers.find((m) => m.kind === "t0")).toEqual({ kind: "t0", t: 540, label: "T0" });
   });
 
+  it("recovers the T0 origin from a live post-charge telemetry frame on reload (no t0_detected, #326)", () => {
+    // SSE doesn't replay t0_detected: a reload mid-roast folds telemetry without ever
+    // seeing the live T0 event. The first post-charge frame (charge_elapsed_seconds
+    // non-null) recovers the origin from the server's own clocks —
+    // elapsed − charge_elapsed — and places the T0 marker, so the axis reads roast
+    // time. A pre-charge frame (null charge clock) leaves the origin unknown.
+    let s = dashboardReducer(
+      initialDashboardViewModel,
+      ev("telemetry", { elapsed_seconds: 400, charge_elapsed_seconds: null, bean_temp_c: 90, env_temp_c: 180 }),
+    );
+    expect(s.t0ElapsedSeconds).toBeNull();
+    // First post-charge frame: serve 600, charge 60 → origin = 540.
+    s = dashboardReducer(
+      s,
+      ev("telemetry", { elapsed_seconds: 600, charge_elapsed_seconds: 60, bean_temp_c: 165, env_temp_c: 205 }),
+    );
+    expect(s.t0ElapsedSeconds).toBe(540);
+    expect(s.markers.find((m) => m.kind === "t0")).toEqual({ kind: "t0", t: 540, label: "T0" });
+    // A later post-charge frame must NOT move the established origin/marker.
+    s = dashboardReducer(
+      s,
+      ev("telemetry", { elapsed_seconds: 630, charge_elapsed_seconds: 90, bean_temp_c: 170, env_temp_c: 206 }),
+    );
+    expect(s.t0ElapsedSeconds).toBe(540);
+    expect(s.markers.filter((m) => m.kind === "t0")).toHaveLength(1);
+  });
+
+  it("recovers the T0 origin from a seeded /telemetry snapshot on cold reload (#326)", () => {
+    // The cold-reload/late-join path: the backfill seed carries post-charge snapshot
+    // points, and the seed action passes the origin recovered from their server clocks
+    // (first post-charge point: serve 510 − charge 0 = 510). No t0_detected fires.
+    const s = dashboardReducer(initialDashboardViewModel, {
+      kind: "seed",
+      origin: 510,
+      points: [
+        { t: 510, bean: 160, env: 200, ror: 18, heat: 70, fan: 40 },
+        { t: 540, bean: 165, env: 205, ror: 16, heat: 70, fan: 40 },
+      ],
+    });
+    expect(s.t0ElapsedSeconds).toBe(510);
+    expect(s.markers.find((m) => m.kind === "t0")).toEqual({ kind: "t0", t: 510, label: "T0" });
+    expect(s.points.map((p) => p.t)).toEqual([510, 540]);
+  });
+
+  it("a seed with a null origin (pre-charge-only snapshot) leaves t0ElapsedSeconds null (#326)", () => {
+    const s = dashboardReducer(initialDashboardViewModel, {
+      kind: "seed",
+      origin: null,
+      points: [{ t: 90, bean: 60, env: 180, ror: 30, heat: 100, fan: 30 }],
+    });
+    expect(s.t0ElapsedSeconds).toBeNull();
+    expect(s.markers.some((m) => m.kind === "t0")).toBe(false);
+  });
+
+  it("a recovered origin already set is not overwritten by a later seed/frame (#326)", () => {
+    // Live t0_detected established the origin; a later reconnect re-seed with a
+    // different recovered origin must NOT move it (existing origin wins).
+    let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 540, charge_elapsed_seconds: 0, bean_temp_c: 160, env_temp_c: 200 }));
+    s = dashboardReducer(s, ev("t0_detected", { bean_temp_c: 160 }));
+    expect(s.t0ElapsedSeconds).toBe(540);
+    s = dashboardReducer(s, { kind: "seed", origin: 999, points: [{ t: 600, bean: 170, env: 205, ror: 16, heat: 70, fan: 40 }] });
+    expect(s.t0ElapsedSeconds).toBe(540); // unchanged
+  });
+
+  it("t0_detected with an EMPTY buffer leaves t0ElapsedSeconds null (no point to anchor, #326)", () => {
+    // With no plotted point there's no serve-elapsed for charge; defaulting to 0
+    // would mislabel preheat as large positive roast-time. Leave the origin null
+    // (and place no marker) — the telemetry-derive path sets it once a post-charge
+    // frame lands. The detection itself is still recorded.
+    const s = dashboardReducer(initialDashboardViewModel, ev("t0_detected", { bean_temp_c: 175 }));
+    expect(s.t0).not.toBeNull();
+    expect(s.t0ElapsedSeconds).toBeNull();
+    expect(s.markers.some((m) => m.kind === "t0")).toBe(false);
+  });
+
   it("plots the curve in SERVE-elapsed time, preheat included (#326)", () => {
     // The buffer keys on serve elapsed: a preheat frame (null charge clock) AND the
     // post-charge frames all plot, continuous through preheat → charge → roast. RoR

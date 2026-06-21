@@ -110,7 +110,15 @@ export const ADVISORY_HISTORY_LIMIT = 4;
 
 type Action =
   | { kind: "event"; event: SseEvent }
-  | { kind: "seed"; points: CurvePoint[] }
+  | {
+      kind: "seed";
+      points: CurvePoint[];
+      /** Recovered T0 origin (serve-elapsed at charge) from the snapshot's server
+       *  clocks, for the cold-reload/late-join case (#326) — applied only if the
+       *  origin isn't already known. Null/omitted when the snapshot has no post-charge
+       *  point. */
+      origin?: number | null;
+    }
   | { kind: "reset" };
 
 /**
@@ -148,6 +156,42 @@ function pointFromSnapshot(p: TelemetryPoint): CurvePoint | null {
     ror: p.bean_ror_c_per_min,
     heat: p.heat_level_percent,
     fan: p.fan_level_percent,
+  };
+}
+
+/**
+ * Recover the SERVE-elapsed at the T0/charge moment from a frame that carries BOTH
+ * server clocks (#326 reload/late-join fix).
+ *
+ * SSE does not replay the one-shot `t0_detected` event, so an operator who reloads
+ * (or reconnects) mid-roast would fold telemetry/snapshot frames but never the live
+ * T0 event — leaving the chart axis stuck on serve-elapsed while the ROAST TIME
+ * header reads charge time (seen repeatedly in roast 3). When the server reports a
+ * non-null `charge_elapsed_seconds` (post-charge), the serve-elapsed at charge is
+ * `elapsed_seconds − charge_elapsed_seconds`. This is NOT client-side clock
+ * derivation: both operands are SERVER fields (the controller's own clocks), and we
+ * round each before subtracting so the recovered origin matches the live path's
+ * integer serve-elapsed. Returns null when either clock is missing (pre-charge, or a
+ * partial frame) — the origin stays unknown until a post-charge frame arrives.
+ */
+function originFromClocks(
+  elapsedSeconds: number | null | undefined,
+  chargeElapsedSeconds: number | null | undefined,
+): number | null {
+  if (elapsedSeconds == null || chargeElapsedSeconds == null) return null;
+  return Math.round(elapsedSeconds) - Math.round(chargeElapsedSeconds);
+}
+
+/** Fold a recovered T0 origin into the view-model iff it isn't already known —
+ *  setting `t0ElapsedSeconds` and placing the T0 marker at that serve-elapsed (the
+ *  reload path; the live `t0_detected` handler owns the streamed case). A no-op once
+ *  the origin is set, so a later frame never moves an established origin/marker. */
+function withRecoveredOrigin(state: DashboardViewModel, origin: number | null): DashboardViewModel {
+  if (origin === null || state.t0ElapsedSeconds !== null) return state;
+  return {
+    ...state,
+    t0ElapsedSeconds: origin,
+    markers: withMarker(state.markers, { kind: "t0", t: origin, label: "T0" }),
   };
 }
 
@@ -237,17 +281,29 @@ export function dashboardReducer(
   if (action.kind === "reset") return initialDashboardViewModel;
 
   if (action.kind === "seed") {
-    const merged = mergeSeed(state.points, action.points);
-    if (merged === state.points) return state;
-    return { ...state, points: merged };
+    // Recover the T0 origin from the snapshot's server clocks on a cold reload/
+    // late-join (#326), then merge the points. Origin recovery runs even when the
+    // points themselves dedupe to a no-op (a reconnect re-seed of an already-present
+    // window), so a reload still hydrates the axis origin.
+    const withOrigin = withRecoveredOrigin(state, action.origin ?? null);
+    const merged = mergeSeed(withOrigin.points, action.points);
+    if (merged === withOrigin.points) return withOrigin;
+    return { ...withOrigin, points: merged };
   }
 
   const event = action.event;
   switch (event.event) {
     case "telemetry": {
-      const point = pointFromTelemetry(event.data as unknown as TelemetryEventData);
+      const data = event.data as unknown as TelemetryEventData;
+      const point = pointFromTelemetry(data);
       if (point === null) return state;
-      return { ...state, points: upsertPoint(state.points, point) };
+      // Recover the T0 origin from the live frame's server clocks if it isn't yet
+      // known (#326): SSE doesn't replay `t0_detected`, so a reload/reconnect mid-
+      // roast recovers the charge origin from the first post-charge telemetry frame
+      // (charge_elapsed_seconds non-null) rather than waiting on an event that
+      // already fired. A no-op once the origin is set (the live `t0_detected` path).
+      const recovered = withRecoveredOrigin(state, originFromClocks(data.elapsed_seconds, data.charge_elapsed_seconds));
+      return { ...recovered, points: upsertPoint(recovered.points, point) };
     }
     case "advisory": {
       const data = event.data as unknown as AdvisoryEventData;
@@ -308,7 +364,16 @@ export function dashboardReducer(
       // subtracts to read roast time (0:00 here, preheat negative). The T0 marker
       // sits at this serve-elapsed t so it lands on the charge tick of the serve-
       // referenced curve.
-      const at = state.points.length > 0 ? state.points[state.points.length - 1].t : 0;
+      //
+      // Guard an EMPTY buffer: with no plotted point we have no serve-elapsed for
+      // charge, so leave `t0ElapsedSeconds` null (and place no marker) — the
+      // telemetry-derive path sets it correctly once the first post-charge frame
+      // lands. Defaulting to 0 here would mislabel every preheat tick as a large
+      // positive roast-time. Always record the T0 detection itself.
+      if (state.points.length === 0) {
+        return { ...state, t0: data };
+      }
+      const at = state.points[state.points.length - 1].t;
       return {
         ...state,
         t0: data,
@@ -426,11 +491,20 @@ export function useDashboardEvents(
       .then((series) => {
         if (cancelled) return;
         const seeded: CurvePoint[] = [];
+        // Recover the T0 origin from the FIRST post-charge snapshot point's server
+        // clocks (#326 cold-reload): SSE didn't replay `t0_detected`, so the snapshot
+        // is the only place the origin can be recovered on a fresh page load. Earliest
+        // post-charge point keeps the recovery deterministic regardless of order.
+        let origin: number | null = null;
         for (const p of series.points) {
           const point = pointFromSnapshot(p);
           if (point !== null) seeded.push(point);
+          if (origin === null) {
+            const o = originFromClocks(p.elapsed_seconds, p.charge_elapsed_seconds);
+            if (o !== null) origin = o;
+          }
         }
-        dispatch({ kind: "seed", points: seeded });
+        dispatch({ kind: "seed", points: seeded, origin });
       })
       .catch(() => {
         // A failed backfill leaves the live frames as-is and re-arms so a later
