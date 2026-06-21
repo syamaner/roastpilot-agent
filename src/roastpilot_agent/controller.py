@@ -899,6 +899,22 @@ class RoastController:
             # re-arm from the flat floor and only re-engage on this roast's own
             # clean FC-ETA signal — never inherit a prior roast's latch.
             self._trim_latched = False
+        if target is RoastPhase.ROASTING_PRE_FIRST_CRACK:
+            # Clear the trim latch on EVERY entry into pre-FC, not just the
+            # new-run/preheat path above (#327, safety-reviewer low on the latch
+            # PR). The transition table allows a same-process
+            # ``operator_recovery_required -> roasting_pre_first_crack`` resume that
+            # BYPASSES preheating, so a fault/recovery mid-pre-FC then resume would
+            # otherwise carry a STALE latch — the next tick would trim a now-cooler
+            # bean (below the 155 °C floor) where a fresh window would never open,
+            # weakening the §8.4 "FC still arrives" floor guarantee. Resetting on
+            # entry is harmless on the normal preheating->pre-FC path (the latch is
+            # already False there) and the latch re-arms correctly the moment the
+            # window next opens. (Cross-process restart is already safe: a fresh
+            # controller defaults the flag False; this is only the in-process resume
+            # edge. The restart-never-auto-resumes invariant is untouched — this
+            # clears a flag, it does not actuate heat/fan.)
+            self._trim_latched = False
         if target is RoastPhase.COOLING and self._drop_monotonic is None:
             # The drop instant (#239): every drop path lands in COOLING (the
             # advisor drop, the operator drop, and the pre-FC early-abort drop),

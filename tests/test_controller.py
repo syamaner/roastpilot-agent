@@ -1022,6 +1022,39 @@ async def test_trim_latch_resets_on_new_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_trim_latch_clears_on_recovery_resume_straight_into_pre_fc() -> None:
+    """#327 (safety-reviewer low): the latch also clears on the same-process
+    ``operator_recovery_required -> roasting_pre_first_crack`` resume that BYPASSES
+    preheating. Without the entry reset a fault/recovery mid-pre-FC then resume would
+    carry a STALE latch and trim a now-cooler bean (below the 155 °C floor) where a
+    fresh window never opens — weakening the §8.4 FC-arrival floor. The latch must be
+    clear after the resume, and a cold-bean tick must hold the flat 100 floor."""
+    harness = make_harness()
+    await _charge_into_pre_fc(harness)
+    # Engage + latch the trim in the late-Maillard window.
+    bean = 162.0
+    for _ in range(6):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=30.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean += 0.5
+    assert harness.controller._trim_latched is True  # pyright: ignore[reportPrivateUsage]
+    # Fault/recovery mid-pre-FC, then the operator resumes STRAIGHT back into pre-FC
+    # (the legal recovery→pre-FC edge that bypasses preheating).
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    # The latch is clear (reset on entry to pre-FC), NOT inherited from before the fault.
+    assert harness.controller._trim_latched is False  # pyright: ignore[reportPrivateUsage]
+    # A now-COLD bean (140 °C, below the 155 °C floor) must NOT trim — a fresh window
+    # can't open below the floor, and the stale latch is gone, so heat holds at 100.
+    harness.reader.readings = [reading(bean=140.0, bean_ror_c_per_min=30.0)]
+    await harness.controller.tick()
+    assert harness.controller.snapshot().current_heat == 100  # flat floor — no stale trim
+    assert harness.controller._trim_latched is False  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_safety_evaluated_before_advisory_and_blocks_it() -> None:
     """A hard-ceiling breach e-stops and faults before the advisor is ever
     consulted — safety always precedes advisory calls and execution."""
