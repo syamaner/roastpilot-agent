@@ -42,7 +42,7 @@ from roastpilot_agent.models import (
     RoastProfile,
     RoastTelemetry,
 )
-from roastpilot_agent.roast_history import RoastMilestoneKind
+from roastpilot_agent.roast_history import DecisionTraceEntry, RoastMilestoneKind
 from roastpilot_agent.safety import (
     OPERATOR_ACTION_COMMAND,
     SafetyEvaluation,
@@ -3105,11 +3105,20 @@ async def test_context_carries_roast_so_far_curve_after_charge() -> None:
     await harness.controller.tick()
     assert advisor.contexts
     ctx = advisor.contexts[-1]
-    # The roast-so-far curve is present and paired (action + response).
+    # The roast-so-far curve is present and carries the FULL reading per sample
+    # (bean/env/RoR), not just bean temp — the model reads the whole curve.
     assert len(ctx.roast_curve_window) > 3
     last = ctx.roast_curve_window[-1]
     assert last.bean_temp_c == 180.0
-    assert last.heat_percent >= 0 and last.fan_percent >= 0
+    assert last.env_temp_c == 200.0  # reading()'s default env
+    assert last.bean_ror_c_per_min == 5.0  # the RoR this tick read
+    # Paired action+response: the sample carries the levers the controller
+    # ACTUALLY commanded this tick (the default-decision advice heat=70/fan=40,
+    # applied by the ALLOW path), not a placeholder zero. A regression that
+    # stored 0 or a stale lever would fail here.
+    assert last.heat_percent == 70
+    assert last.fan_percent == 40
+    assert (last.heat_percent, last.fan_percent) == harness.executor.targets[-1]
     # Milestones: turning point + recovery (pre-FC) and first crack.
     kinds = {m.kind for m in ctx.roast_milestones}
     assert RoastMilestoneKind.TURNING_POINT in kinds
@@ -3117,9 +3126,18 @@ async def test_context_carries_roast_so_far_curve_after_charge() -> None:
     assert RoastMilestoneKind.FIRST_CRACK in kinds
     fc = next(m for m in ctx.roast_milestones if m.kind is RoastMilestoneKind.FIRST_CRACK)
     assert fc.bean_temp_c == 176.0  # bean temp at the crack
-    # DTR is a distinct value from the development duration.
+    # The RECOVERY milestone carries the post-turning-point bean RoR as its
+    # scalar value (#229 KEEP) — the recovery reading was the bean_ror=10.0 tick.
+    recovery = next(m for m in ctx.roast_milestones if m.kind is RoastMilestoneKind.RECOVERY)
+    assert recovery.value == 10.0
+    # Development time AND DTR are two DISTINCT, correctly-computed values: the
+    # DTR is dev_elapsed / charge_elapsed (a fraction), NOT the duration and NOT
+    # the percent. A dropped /100 (leaving a percent) would fail this.
     assert ctx.development_elapsed_seconds is not None
     assert ctx.development_time_ratio is not None
+    expected_dtr = ctx.development_elapsed_seconds / ctx.roast_elapsed_seconds
+    assert abs(ctx.development_time_ratio - expected_dtr) < 1e-9
+    assert ctx.development_time_ratio < 1.0  # a fraction, not a percent
     # FC-ETA is None post-FC (the detector owns FC now).
     assert ctx.first_crack_eta_seconds is None
 
@@ -3145,6 +3163,33 @@ async def test_context_decision_trace_records_model_own_recommendations() -> Non
     assert trace[0].target_heat == 70
     assert trace[0].target_fan == 40
     assert trace[0].should_drop is False
+
+
+@pytest.mark.asyncio
+async def test_decision_trace_records_requested_not_gate_adjusted() -> None:
+    """#275 / #218: the trace must carry what the MODEL asked for, NOT what the
+    safety gate then applied. Exercised via a rate-limit REJECT: the second
+    consult fires before min_seconds_between_commands so the gate REJECTs it (no
+    command executes, the levers do not change), yet the rejected recommendation
+    must still land in the trace with its REQUESTED values — that is the model's
+    own move history the next tick reasons from. A trace that recorded the
+    applied/clamped value (or skipped the rejected consult) would fail here."""
+    advisor = FakeAdvisor([decision(heat=80, fan=35), decision(heat=20, fan=70)])
+    # min_seconds_between_commands=2.0 (default); advance only 1.0 s between the
+    # two consults so the second is rate-limited (REJECT, nothing executes).
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    await harness.controller.tick()  # consult 1: heat=80/fan=35 ALLOWed + executed
+    assert harness.executor.targets[-1] == (80, 35)
+    harness.clock.advance(1.0)  # < 2.0 s → next command is rate-limited
+    harness.reader.readings = [reading(bean=188.0)]
+    await harness.controller.tick()  # consult 2: heat=20/fan=70 REJECTed (no exec)
+    # No second command executed (still the consult-1 levers).
+    assert harness.executor.targets[-1] == (80, 35)
+    # …but the REJECTed recommendation is recorded with its REQUESTED values.
+    trace = harness.controller._history.decision_trace()  # pyright: ignore[reportPrivateUsage]
+    assert len(trace) == 2
+    assert (trace[1].target_heat, trace[1].target_fan) == (20, 70)  # requested, not applied
+    assert (trace[1].target_heat, trace[1].target_fan) != harness.executor.targets[-1]
 
 
 @pytest.mark.asyncio
@@ -3192,7 +3237,19 @@ async def test_history_resets_on_new_run() -> None:
         harness.clock.advance(1.0)
     history = harness.controller._history  # pyright: ignore[reportPrivateUsage]
     assert history.curve_window()  # accumulated something
-    # A fresh preheat (a new run) resets the history.
+    # Seed a decision so the reset's clearing of the trace is a real trap (the
+    # pre-FC harness never consults, so the trace would be empty by default).
+    history.record_decision(
+        DecisionTraceEntry(
+            elapsed_since_charge_seconds=1.0,
+            target_heat=60,
+            target_fan=40,
+            should_drop=False,
+            confidence=0.5,
+        )
+    )
+    assert history.decision_trace()  # seeded
+    # A fresh preheat (a new run) resets ALL history (curve, milestones, trace).
     harness.controller.transition_to(RoastPhase.COOLING)
     harness.controller.transition_to(RoastPhase.COMPLETE)
     harness.controller.transition_to(RoastPhase.IDLE)
@@ -3200,3 +3257,4 @@ async def test_history_resets_on_new_run() -> None:
     harness.controller.transition_to(RoastPhase.PREHEATING)
     assert history.curve_window() == []
     assert history.milestones() == []
+    assert history.decision_trace() == []

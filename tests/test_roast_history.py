@@ -90,7 +90,7 @@ def test_default_bounds_match_named_constants() -> None:
 
 @pytest.mark.parametrize(
     ("curve", "trace"),
-    [(0, 5), (5, 0), (-1, 5)],
+    [(0, 5), (5, 0), (-1, 5), (5, -1)],
 )
 def test_non_positive_bounds_rejected(curve: int, trace: int) -> None:
     """A bound below 1 is a configuration error (an empty/negative window is
