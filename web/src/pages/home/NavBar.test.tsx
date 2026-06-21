@@ -34,24 +34,24 @@ function renderNav(initialPath = "/") {
 afterEach(cleanup);
 
 describe("NavBar (#324)", () => {
-  it("always shows Home and History", () => {
+  it("shows Home (not Live roast) + History when the server reports no active run", () => {
     healthState.data = { active_run_id: null };
     renderNav();
     expect(screen.getByTestId("nav-home")).toHaveAttribute("href", "/");
     expect(screen.getByTestId("nav-history")).toHaveAttribute("href", "/roasts");
-  });
-
-  it("hides the Live roast link when the server reports no active run", () => {
-    healthState.data = { active_run_id: null };
-    renderNav();
+    // The first slot is Home when idle — the Live-roast label is not shown.
     expect(screen.queryByTestId("nav-live-roast")).toBeNull();
   });
 
-  it("shows the Live roast link (→ /) when the server reports an active run", () => {
+  it("swaps the first slot to Live roast (→ /, not Home) when a run is active", () => {
     healthState.data = { active_run_id: "run-42" };
     renderNav("/roasts");
     const live = screen.getByTestId("nav-live-roast");
     expect(live).toHaveAttribute("href", "/");
+    // The first slot's label tracks server state, so `/` is never claimed by two
+    // active links at once — Home is not also rendered while a run is active.
+    expect(screen.queryByTestId("nav-home")).toBeNull();
+    expect(screen.getByTestId("nav-history")).toHaveAttribute("href", "/roasts");
   });
 
   it("navigates when a link is clicked", async () => {

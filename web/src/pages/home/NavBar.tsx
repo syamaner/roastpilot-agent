@@ -6,10 +6,12 @@
  * shared `AppFrame` header (brand + connection indicator) stays below it; this bar
  * owns cross-page navigation only.
  *
- * The "Live roast" link is shown ONLY when the server reports an active run
- * (`useHealth().active_run_id`). Active-run presence is SERVER state — we never
- * infer roast phase locally (architecture invariant); the link merely routes to
- * `/`, where `HomeGate` shows the live dashboard while a run is active.
+ * `/` is state-aware (`HomeGate`): idle → the home hub, active run → the live
+ * dashboard. The first nav slot mirrors that — it shows "Home" when idle and
+ * "Live roast" when the server reports an active run — so the two never both
+ * target `/` at once (which would light up two active links and hide which page
+ * the operator is on). Active-run presence is SERVER state (`useHealth().
+ * active_run_id`); we never infer roast phase locally (architecture invariant).
  */
 
 import { NavLink } from "react-router-dom";
@@ -38,19 +40,20 @@ export function NavBar(): React.JSX.Element {
       data-testid="app-nav"
       className="flex items-center gap-1 border-b border-border bg-card px-6 py-2"
     >
-      <NavLink to="/" end className={navLinkClass} data-testid="nav-home">
-        Home
-      </NavLink>
-      <NavLink to="/roasts" className={navLinkClass} data-testid="nav-history">
-        History
-      </NavLink>
+      {/* First slot routes to `/` either way; its LABEL tracks server state so the
+          live dashboard and the home hub never both claim the active `/` link. */}
       {hasActiveRun ? (
-        // `/` resolves to the live dashboard while a run is active (HomeGate), so
-        // the live-roast entry routes there. `end` keeps it from matching `/roasts`.
         <NavLink to="/" end className={navLinkClass} data-testid="nav-live-roast">
           Live roast
         </NavLink>
-      ) : null}
+      ) : (
+        <NavLink to="/" end className={navLinkClass} data-testid="nav-home">
+          Home
+        </NavLink>
+      )}
+      <NavLink to="/roasts" className={navLinkClass} data-testid="nav-history">
+        History
+      </NavLink>
     </nav>
   );
 }

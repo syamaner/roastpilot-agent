@@ -10,6 +10,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { roastKeys } from "@/hooks/queries";
 import { StartRoastView } from "./StartRoastView";
 
 const startRoastMock = vi.hoisted(() => vi.fn(async () => ({ id: "run-new" })));
@@ -37,6 +38,9 @@ vi.mock("@/hooks/queries", async () => {
 
 function renderView() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  // Spy on the awaited health refetch — the render-from-server enforcement point:
+  // start must refresh the active-run snapshot before routing to `/`.
+  const refetchSpy = vi.spyOn(client, "refetchQueries");
   const wrapper = (children: ReactNode) => (
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={["/start"]}>
@@ -47,7 +51,8 @@ function renderView() {
       </MemoryRouter>
     </QueryClientProvider>
   );
-  return render(wrapper(<StartRoastView />));
+  render(wrapper(<StartRoastView />));
+  return { refetchSpy };
 }
 
 afterEach(cleanup);
@@ -76,11 +81,16 @@ describe("StartRoastView (#324)", () => {
     expect(screen.getByTestId("bean-profile-picker")).toBeInTheDocument();
   });
 
-  it("POSTs the roast and navigates to `/` on success", async () => {
-    renderView();
+  it("POSTs, refetches health, then navigates to `/` on success", async () => {
+    const { refetchSpy } = renderView();
     fillMinimum();
     fireEvent.submit(screen.getByTestId("start-roast-form"));
     await waitFor(() => expect(startRoastMock).toHaveBeenCalledTimes(1));
+    // Render-from-server: start AWAITS a health refetch (the active-run snapshot)
+    // before routing, so `/` resolves to the dashboard with no idle-hub flash.
+    await waitFor(() =>
+      expect(refetchSpy).toHaveBeenCalledWith({ queryKey: roastKeys.health }),
+    );
     // On success we route to `/` (HomeGate → live dashboard once health refetches).
     await waitFor(() =>
       expect(screen.getByTestId("home-or-dashboard")).toBeInTheDocument(),
