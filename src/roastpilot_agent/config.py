@@ -227,12 +227,27 @@ class ControllerConfig(BaseModel):
     # ``post_fc_deadband_threshold_percent`` — the reversal magnitude (percentage
     # points) at or above which a lever direction-reversal is DECISIVE and allowed;
     # a reversal BELOW it is incoherent thrash and is damped to a hold
-    # (roastpilot_agent.coherence.evaluate_lever_coherence). Damps the #218
-    # 30<->40<->30 twiddle (steps of ~10) while letting a real cut/raise through.
-    # Default 15 — above the observed twiddle step, below a decisive move; the
-    # exact value is tuned on the replay harness (#277), so it is a named config
-    # constant, not a literal in the gate.
-    post_fc_deadband_threshold_percent: int = Field(default=15, ge=1, le=100)
+    # (roastpilot_agent.coherence.evaluate_lever_coherence).
+    #
+    # Default 10 — TUNED from the operator's own post-FC behaviour on the 17
+    # known-good medium Artisan roasts (#277, scripts/deadband_tune.py;
+    # docs/advisor/deadband-tuning-2026-06-21.md). The Hottop's levers are
+    # quantised to 10 pp, so EVERY one of the operator's real post-FC reversals is
+    # >= 10 pp (heat reversals span 10-50 pp, fan 10-50 pp; the smallest observed
+    # is 10). With the gate's strict ``abs(delta) < threshold`` test, a 10 pp
+    # reversal passes at threshold 10 (10 < 10 is false) but is damped at 11+; so
+    # 10 is the LARGEST value that damps ZERO of the operator's real intentional
+    # moves while still catching any sub-10-pp (sub-granularity) jitter. The prior
+    # placeholder 15 would have damped 13 heat + 4 fan real operator reversals —
+    # exactly the intentional decisive moves the gate must let through (D35 §1).
+    # NB: because the operator's intentional reversals and the #218
+    # 30<->40<->30 twiddle are BOTH 10 pp on this roaster, a pure-magnitude
+    # deadband at 10 pp granularity cannot separate them; the gate's #276
+    # direction-advancing oscillation damping (a repeated alternation keeps
+    # re-reversing and stays damped) is what bounds the #218 staircase, not this
+    # magnitude floor. Config-overridable; a literal-free named constant the gate
+    # reads.
+    post_fc_deadband_threshold_percent: int = Field(default=10, ge=1, le=100)
     # ``post_fc_min_confidence`` — the advisor confidence floor below which a
     # post-FC recommendation is treated as "I don't know" and fails closed to a
     # deterministic HOLD (no actuation), alongside the silent/slow/error/rejected

@@ -205,3 +205,50 @@ def test_decision_matrix(
         _gate(requested=requested, current=current, last_direction=last_direction).decision
         is expected
     )
+
+
+# --- Data-grounded default regression (#277) --------------------------------
+#
+# The default threshold was TUNED from the operator's own post-FC behaviour on
+# the 17 known-good medium Artisan roasts (scripts/deadband_tune.py;
+# docs/advisor/deadband-tuning-2026-06-21.md). Every Hottop lever move is
+# quantised to 10 pp, so the operator's smallest real reversal is 10 pp; the gate
+# damps ``abs(delta) < threshold``, so the default (10) is the largest value that
+# damps ZERO of the operator's real intentional reversals. This pins that:
+# replaying the operator's recorded development sequences through the production
+# gate at the configured default DAMPS NONE of them. The fixtures are local-only
+# (gitignored), so the test SKIPS cleanly on a checkout without them (CI) and
+# asserts the substantive behaviour wherever they are present.
+
+
+def test_default_threshold_does_not_damp_recorded_operator_reversals() -> None:
+    """The configured default damps none of the operator's recorded reversals (#277)."""
+    import sys
+    from pathlib import Path
+
+    from roastpilot_agent.config import ControllerConfig
+
+    repo_root = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(repo_root / "scripts"))
+    deadband_tune = pytest.importorskip("deadband_tune")
+    advisor_bakeoff = pytest.importorskip("advisor_bakeoff")
+
+    try:
+        fixtures = advisor_bakeoff.resolve_test_set(advisor_bakeoff.FULL_MEDIUM_FIXTURE_NAMES)
+    except FileNotFoundError:
+        pytest.skip("local-only Artisan fixtures absent (gitignored)")
+
+    default_threshold = ControllerConfig().post_fc_deadband_threshold_percent
+    total_reversals = 0
+    for lever, field in deadband_tune.LEVERS:
+        per_roast = [deadband_tune.development_setpoints(f, field) for f in fixtures]
+        # Every real reversal must survive the gate at the default threshold.
+        result = deadband_tune.replay_threshold(per_roast, default_threshold)
+        assert result.reversals_damped == 0, (
+            f"{lever}: default threshold {default_threshold} damped "
+            f"{result.reversals_damped} of the operator's recorded reversals"
+        )
+        total_reversals += result.reversals_allowed
+    # Sanity: the operator did make reversals (the test is exercising real moves,
+    # not a degenerate empty set).
+    assert total_reversals > 0, "expected the recorded roasts to contain real reversals"
