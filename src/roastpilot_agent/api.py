@@ -54,6 +54,9 @@ from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
     AdvisorHealth,
     AdvisorTraceStatus,
+    BeanProfile,
+    BeanProfileInput,
+    BeanProfileList,
     HealthResponse,
     LogManifest,
     MCPChildStatus,
@@ -82,7 +85,8 @@ from roastpilot_agent.safety import (
     SafetyVerdict,
     enabled_operator_actions,
 )
-from roastpilot_agent.store import RoastStore
+from roastpilot_agent.seed import SEED_BEAN_PROFILES
+from roastpilot_agent.store import BeanProfileNotFoundError, RoastStore
 
 _log = logging.getLogger(__name__)
 
@@ -1443,6 +1447,48 @@ class RoastService:
             action=request.action, result=result, reason=reason, queued=queued
         )
 
+    # --- #303: bean-profile library CRUD (D45) ---
+    #
+    # The saved-profile library behind the Start-Roast dropdown. Plain REST over
+    # the store's CRUD: no MCP, no phase coupling, no SSE — the SPA-renders-from-
+    # server invariant holds (profiles come from the API). A roast still starts
+    # from a RoastProfile; these endpoints never touch the start-roast path or a
+    # frozen roast snapshot.
+
+    async def seed_bean_profiles(self) -> None:
+        """Idempotently seed the built-in bean profiles at startup (#303).
+
+        Inserts each :data:`~roastpilot_agent.seed.SEED_BEAN_PROFILES` entry by
+        its stable id (``INSERT OR IGNORE``) so the Ethiopia Koke profile is
+        selectable for the first roast and a restart never double-inserts.
+        """
+        for seed in SEED_BEAN_PROFILES:
+            await self._store.seed_bean_profile(seed)
+
+    async def list_bean_profiles(self) -> BeanProfileList:
+        """The active saved bean profiles for the dropdown, name-ordered (#303)."""
+        return BeanProfileList(profiles=await self._store.list_bean_profiles())
+
+    async def create_bean_profile(self, profile_input: BeanProfileInput) -> BeanProfile:
+        """Create a saved bean profile (#303)."""
+        return await self._store.create_bean_profile(profile_input)
+
+    async def update_bean_profile(
+        self, profile_id: str, profile_input: BeanProfileInput
+    ) -> BeanProfile:
+        """Edit a saved bean profile (future roasts only), or 404 (#303)."""
+        try:
+            return await self._store.update_bean_profile(profile_id, profile_input)
+        except BeanProfileNotFoundError as exc:
+            raise RoastRunNotFoundError(str(exc)) from exc
+
+    async def delete_bean_profile(self, profile_id: str) -> None:
+        """Archive (soft-delete) a saved bean profile, or 404 (#303)."""
+        try:
+            await self._store.delete_bean_profile(profile_id)
+        except BeanProfileNotFoundError as exc:
+            raise RoastRunNotFoundError(str(exc)) from exc
+
 
 def _get_service(request: Request) -> RoastService:
     """Dependency: the app's :class:`RoastService`, or 503 if unconfigured.
@@ -1578,6 +1624,42 @@ async def submit_operator_action(
         raise HTTPException(status_code=410, detail=str(exc)) from exc
 
 
+async def list_bean_profiles(service: ServiceDep) -> BeanProfileList:
+    """``GET /api/bean-profiles`` — the saved bean-profile library (#303)."""
+    return await service.list_bean_profiles()
+
+
+async def create_bean_profile(profile: BeanProfileInput, service: ServiceDep) -> BeanProfile:
+    """``POST /api/bean-profiles`` — create a saved bean profile (#303)."""
+    return await service.create_bean_profile(profile)
+
+
+async def update_bean_profile(
+    profile_id: str, profile: BeanProfileInput, service: ServiceDep
+) -> BeanProfile:
+    """``PUT /api/bean-profiles/{profile_id}`` — edit a saved profile, 404 if
+    unknown (#303). Future-roasts-only: a past roast's frozen snapshot is
+    unaffected."""
+    try:
+        return await service.update_bean_profile(profile_id, profile)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+async def delete_bean_profile(profile_id: str, service: ServiceDep) -> dict[str, str]:
+    """``DELETE /api/bean-profiles/{profile_id}`` — archive a saved profile, 404
+    if unknown (#303).
+
+    A soft archive, not a hard delete: the profile drops out of the dropdown but
+    its row survives so a past roast that referenced it never dangles.
+    """
+    try:
+        await service.delete_bean_profile(profile_id)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"id": profile_id, "result": "archived"}
+
+
 async def stream_events(
     run_id: str,
     request: Request,
@@ -1640,6 +1722,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
     for the API-only/scaffold app (no service, or no roaster wired)."""
     service = getattr(app.state, "service", None)
     if isinstance(service, RoastService):
+        await service.seed_bean_profiles()
         await service.recover_on_start()
     yield
     if isinstance(service, RoastService):
@@ -1698,6 +1781,10 @@ def create_app(
     app.get("/api/roasts/{run_id}/log/{artifact}")(download_log)
     app.post("/api/roasts/{run_id}/rating")(rate_roast)
     app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)
+    app.get("/api/bean-profiles")(list_bean_profiles)
+    app.post("/api/bean-profiles", status_code=201)(create_bean_profile)
+    app.put("/api/bean-profiles/{profile_id}")(update_bean_profile)
+    app.delete("/api/bean-profiles/{profile_id}")(delete_bean_profile)
     app.get(EVENTS_PATH)(stream_events)
     if spa_dir is not None and (spa_dir / "index.html").is_file():
         # Imported lazily so the API-only/scaffold path carries no static-mount

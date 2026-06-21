@@ -9,6 +9,7 @@ migration mechanism. Write paths land in E6-S2, recovery reads in E6-S3.
 import hashlib
 import json
 import re
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -20,6 +21,8 @@ from roastpilot_agent.advisor import AdvisorContext, RoastDecision
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
+    BeanProfile,
+    BeanProfileInput,
     CommandTraceSource,
     CommandTraceStatus,
     LogManifest,
@@ -225,6 +228,29 @@ SCHEMA_V3_T0_DETECTED_AT = """
 ALTER TABLE roast_runs ADD COLUMN t0_detected_at_utc TEXT;
 """
 
+SCHEMA_V4_BEAN_PROFILES = """
+-- #303 (D45): the saved bean-profile library behind the Start-Roast dropdown.
+-- Additive — a NEW table only; no existing table or row is touched, so the
+-- frozen roast_runs.profile_json snapshots and corpus integrity are unchanged
+-- (a roast still instantiates a RoastProfile and freezes that, never a row here).
+-- Stores the reusable BeanProfile template as one JSON column (the same
+-- model_dump_json shape RoastProfile uses for profile_json) plus the columns the
+-- list query filters/orders on. ``archived`` is a soft-delete flag, not a hard
+-- DELETE: a profile may be referenced by a past roast's notes, so deleting only
+-- hides it from the dropdown (archived = 1) and never dangles a reference.
+CREATE TABLE bean_profiles (
+  id TEXT PRIMARY KEY,                       -- uuid4 hex (BeanProfile.id)
+  name TEXT NOT NULL,
+  profile_json TEXT NOT NULL,                -- full BeanProfile model_dump_json
+  archived INTEGER NOT NULL DEFAULT 0
+    CHECK (archived IN (0, 1)),
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL
+);
+
+CREATE INDEX idx_bean_profiles_archived ON bean_profiles(archived, name);
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
@@ -232,7 +258,16 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V1,
     SCHEMA_V2_IMMUTABILITY,
     SCHEMA_V3_T0_DETECTED_AT,
+    SCHEMA_V4_BEAN_PROFILES,
 )
+
+
+class BeanProfileNotFoundError(Exception):
+    """No active bean profile matches the id (#303).
+
+    Raised by :meth:`RoastStore.update_bean_profile` /
+    :meth:`RoastStore.delete_bean_profile` for an unknown or already-archived id;
+    the API maps it to HTTP 404."""
 
 
 class PersistedRun(BaseModel):
@@ -1056,6 +1091,151 @@ class RoastStore:
             advisor_decisions=advisor_decisions,
             commands=commands,
         )
+
+    # --- #303: bean-profile library CRUD (D45) ---
+    #
+    # The saved-profile library behind the Start-Roast dropdown. Purely additive
+    # over the v4 ``bean_profiles`` table — none of these paths touch
+    # ``roast_runs``, so a saved profile and a frozen roast snapshot are wholly
+    # independent (editing a profile cannot mutate a past roast). Delete is a soft
+    # archive (``archived = 1``), never a hard DELETE, so a profile referenced by
+    # a past roast's notes is never dangling.
+
+    async def create_bean_profile(self, profile_input: BeanProfileInput) -> BeanProfile:
+        """Persist a new saved bean profile and return it with its id + timestamps.
+
+        Mints a fresh uuid4 id and stamps ``created_at`` == ``updated_at`` at the
+        same instant; the full :class:`BeanProfile` is stored as one JSON column
+        (the same dump shape ``roast_runs.profile_json`` uses).
+
+        Args:
+            profile_input: The operator-supplied bean-profile fields (no id /
+                timestamps — the store owns those).
+
+        Returns:
+            The saved :class:`BeanProfile`, with id and timestamps populated.
+        """
+        now = _utc_now()
+        profile = BeanProfile(
+            id=uuid.uuid4().hex,
+            created_at=now,
+            updated_at=now,
+            **profile_input.model_dump(),
+        )
+        await self.connection.execute(
+            "INSERT INTO bean_profiles (id, name, profile_json, archived,"
+            " created_at_utc, updated_at_utc) VALUES (?, ?, ?, 0, ?, ?)",
+            (profile.id, profile.name, profile.model_dump_json(), now, now),
+        )
+        await self.connection.commit()
+        return profile
+
+    async def list_bean_profiles(self) -> list[BeanProfile]:
+        """The active (non-archived) saved profiles, name-ordered (#303).
+
+        Backs the Start-Roast dropdown. Archived profiles are excluded so a
+        soft-deleted bean never reappears as selectable, while its row survives so
+        any past roast that referenced it stays intact.
+        """
+        async with self.connection.execute(
+            "SELECT profile_json FROM bean_profiles WHERE archived = 0"
+            " ORDER BY name COLLATE NOCASE ASC, id ASC"
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [BeanProfile.model_validate_json(str(row["profile_json"])) for row in rows]
+
+    async def get_bean_profile(self, profile_id: str) -> BeanProfile | None:
+        """One active saved profile by id, or ``None`` (unknown or archived)."""
+        async with self.connection.execute(
+            "SELECT profile_json FROM bean_profiles WHERE id = ? AND archived = 0",
+            (profile_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return BeanProfile.model_validate_json(str(row["profile_json"]))
+
+    async def update_bean_profile(
+        self, profile_id: str, profile_input: BeanProfileInput
+    ) -> BeanProfile:
+        """Edit a saved profile in place; bumps ``updated_at`` only (#303).
+
+        Future-roasts-only by construction: this touches no ``roast_runs`` row, so
+        a past roast's frozen ``profile_json`` snapshot is unaffected (the
+        edit-is-safe guarantee). ``created_at`` and the id are preserved.
+
+        Args:
+            profile_id: The active profile to edit.
+            profile_input: The replacement bean-profile fields.
+
+        Returns:
+            The updated :class:`BeanProfile`.
+
+        Raises:
+            BeanProfileNotFoundError: No active profile has that id.
+        """
+        existing = await self.get_bean_profile(profile_id)
+        if existing is None:
+            raise BeanProfileNotFoundError(profile_id)
+        now = _utc_now()
+        updated = BeanProfile(
+            id=existing.id,
+            created_at=existing.created_at,
+            updated_at=now,
+            **profile_input.model_dump(),
+        )
+        await self.connection.execute(
+            "UPDATE bean_profiles SET name = ?, profile_json = ?, updated_at_utc = ?"
+            " WHERE id = ? AND archived = 0",
+            (updated.name, updated.model_dump_json(), now, profile_id),
+        )
+        await self.connection.commit()
+        return updated
+
+    async def delete_bean_profile(self, profile_id: str) -> None:
+        """Soft-delete (archive) a saved profile (#303).
+
+        Sets ``archived = 1`` so the bean drops out of the dropdown while its row
+        survives — a profile referenced by a past roast's notes is never dangling,
+        and ``roast_runs`` is untouched. Idempotent at the storage layer only via
+        the not-found guard: a second delete of an already-archived id raises (it
+        is no longer an *active* profile).
+
+        Raises:
+            BeanProfileNotFoundError: No active profile has that id.
+        """
+        cursor = await self.connection.execute(
+            "UPDATE bean_profiles SET archived = 1, updated_at_utc = ?"
+            " WHERE id = ? AND archived = 0",
+            (_utc_now(), profile_id),
+        )
+        await self.connection.commit()
+        if cursor.rowcount == 0:
+            raise BeanProfileNotFoundError(profile_id)
+
+    async def seed_bean_profile(self, seed: BeanProfile) -> bool:
+        """Idempotently insert a built-in seed profile by its fixed id (#303).
+
+        Used at startup to seed the Ethiopia Koke profile for the first roast.
+        Keyed on the seed's stable ``id`` with ``INSERT OR IGNORE`` so a restart
+        never double-inserts (and never clobbers an operator's later edit to the
+        seeded row). The full :class:`BeanProfile` is passed in (id + timestamps
+        already set) so the seed values are the single source of truth.
+
+        Args:
+            seed: The fully-formed seed profile (stable id + timestamps).
+
+        Returns:
+            ``True`` if the row was inserted this call; ``False`` if it already
+            existed (the idempotent no-op).
+        """
+        cursor = await self.connection.execute(
+            "INSERT OR IGNORE INTO bean_profiles (id, name, profile_json, archived,"
+            " created_at_utc, updated_at_utc) VALUES (?, ?, ?, 0, ?, ?)",
+            (seed.id, seed.name, seed.model_dump_json(), seed.created_at, seed.updated_at),
+        )
+        await self.connection.commit()
+        return cursor.rowcount > 0
 
 
 def _loads(value: Any) -> dict[str, Any] | None:
