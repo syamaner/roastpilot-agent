@@ -105,8 +105,8 @@ def mock_healthcheck(monkeypatch: pytest.MonkeyPatch) -> None:
 def _roster() -> tuple[Candidate, ...]:
     """A two-slug roster both measured in every phase."""
     return (
-        Candidate(_SLUG_A, Tier.INCUMBENT, bakeoff.PHASE_ORDER),
-        Candidate(_SLUG_B, Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
+        Candidate(_SLUG_A, Tier.BASELINE, bakeoff.PHASE_ORDER),
+        Candidate(_SLUG_B, Tier.CONTROL_CANDIDATE, (RoastPhase.DEVELOPMENT,)),
     )
 
 
@@ -256,6 +256,9 @@ async def test_capture_is_complete_across_resume(mock_healthcheck: None, tmp_pat
     # Reference: a clean all-at-once capture. Same cost_per_call as the killed
     # run below so the captured ``cost_estimate_usd`` (a per-run config value)
     # matches and the assertion isolates resume-completeness.
+    # Pre-FC-inclusive: this resume-completeness mechanics test needs the denser
+    # tick set so the $30 budget trips mid-run (the development-only default is too
+    # cheap to stop). All three runs use the same scope so resume stays consistent.
     ref_out = tmp_path / "ref.json"
     reference = await bakeoff.run_replay_bakeoff_observable(
         roster,
@@ -268,6 +271,7 @@ async def test_capture_is_complete_across_resume(mock_healthcheck: None, tmp_pat
         cost_per_call=1.0,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
 
     # Kill after K cells via a budget that only affords some of them.
@@ -284,6 +288,7 @@ async def test_capture_is_complete_across_resume(mock_healthcheck: None, tmp_pat
         max_spend=30.0,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
     assert killed.stopped_for_budget is True
     assert 0 < killed.fresh_cells < len(roster) * len(roasts)
@@ -301,6 +306,7 @@ async def test_capture_is_complete_across_resume(mock_healthcheck: None, tmp_pat
         cost_per_call=1.0,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
     assert resumed.resumed_cells == killed.fresh_cells
 

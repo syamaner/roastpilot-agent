@@ -40,17 +40,30 @@ or the repo. Nothing here changes production config defaults: pinning the
 winning prompt / per-phase model into ``config.py`` is a *separate* post-bake-off
 PR with its own D-number.
 
-Exact operator run commands::
+Exact operator run commands (#277 post-FC control bake-off)::
 
-    # Quantitative scorecard vs the two known-good roasts (default mode):
+    # 1) SCREEN — all 9 models, single seed, ~6 representative known-good mediums,
+    #    the AS-BUILT c1 control prompt (default):
     OPENROUTER_API_KEY=sk-or-... \\
-    python scripts/advisor_bakeoff.py --prompt-version v2 v3 \\
-        --out /tmp/bakeoff.json --report-md /tmp/bakeoff.md
+    python scripts/advisor_bakeoff.py --roster screen --test-set screen --seeds 1 \\
+        --trajectory --max-spend 25 \\
+        --out /tmp/bakeoff-screen.json --report-md /tmp/bakeoff-screen.md
 
-    # Lighter per-phase latency/advice table:
+    # 2) FINALISTS — the 5 carried models, 2 seeds, the FULL 17 known-good mediums:
+    OPENROUTER_API_KEY=sk-or-... \\
+    python scripts/advisor_bakeoff.py --roster finalists --test-set full --seeds 2 \\
+        --trajectory --max-spend 25 \\
+        --out /tmp/bakeoff-finalists.json --report-md /tmp/bakeoff-finalists.md
+
+    # Optional c1-vs-v4 (drop-lens) A/B on the screen set:
+    OPENROUTER_API_KEY=sk-or-... \\
+    python scripts/advisor_bakeoff.py --roster screen --test-set screen \\
+        --prompt-version c1 v4 --max-spend 25 --out /tmp/bakeoff-ab.json
+
+    # Lighter per-phase latency/advice table (synthetic moments):
     OPENROUTER_API_KEY=sk-or-... \\
     python scripts/advisor_bakeoff.py --mode per-phase --iterations 3 \\
-        --prompt-version v2 v3 --out /tmp/bakeoff-perphase.json
+        --prompt-version c1 v4 --out /tmp/bakeoff-perphase.json
 
 **Long-run observability + recovery (replay mode, #280).** A replay run is
 expensive and slow (a model call per tick, per model, per prompt, per roast), so
@@ -115,15 +128,65 @@ from trajectory_scorer import (  # noqa: E402
 )
 
 from roastpilot_agent.advisor import (  # noqa: E402
+    CONTROL_TEACHING_PROMPT_VERSION,
     AdvisorContext,
     AdvisorError,
     PydanticAIAdvisor,
     RoastDecision,
+    control_teaching_prompt,
 )
-from roastpilot_agent.config import AdvisorConfig  # noqa: E402
+from roastpilot_agent.config import AdvisorConfig, SafetyLimits  # noqa: E402
+from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy  # noqa: E402
 from roastpilot_agent.models import AdvisorHealthStatus, RoastPhase  # noqa: E402
+from roastpilot_agent.roast_history import (  # noqa: E402
+    DEFAULT_CURVE_WINDOW_SAMPLES,
+    DEFAULT_DECISION_TRACE_ENTRIES,
+    RoastCurveSample,
+    RoastMilestone,
+    RoastMilestoneKind,
+    estimate_first_crack_eta_seconds,
+)
 
 OPENROUTER = "https://openrouter.ai/api/v1"
+
+# --- AS-BUILT prompt wiring (#274 c1 + #275 context) -------------------------
+#
+# The #277 bake-off must test the AS-BUILT D35 control system, not the older
+# v4-era drop lens. The live post-FC loop (#276) carries the #274 ``c1`` control
+# TEACHING prompt as its cached SYSTEM message and the #275 per-tick control
+# context in the user message. The advisor builds its agent ``instructions`` from
+# ``instructions_for(config.prompt_version)``; the c1 system frame lives in a
+# SEPARATE dict (``_CONTROL_TEACHING_PROMPTS``), so to make the advisor send c1
+# as its system prompt we register c1 into the instructions table under its own
+# version key. This makes ``prompt_version="c1"`` resolve to the c1 teaching text
+# (the value live #276 sends), so the model under test gets the SAME system frame
+# the live loop gives it — with no change to production advisor behaviour (the
+# registration is idempotent and additive; the controller still selects its own
+# prompt version from config). ``v4`` stays a selectable prompt so a c1-vs-v4
+# (drop-lens) A/B is still possible; ``c1`` is the bake-off DEFAULT.
+CONTROL_PROMPT_VERSION = CONTROL_TEACHING_PROMPT_VERSION  # "c1"
+DEFAULT_DROP_LENS_PROMPT_VERSION = "v4"
+
+
+def _register_control_teaching_prompt() -> None:
+    """Register the c1 control teaching prompt into the advisor instructions table.
+
+    Idempotent and additive: makes ``instructions_for("c1")`` (and thus a
+    ``PydanticAIAdvisor`` built with ``prompt_version="c1"``) resolve to the #274
+    ``control_teaching_prompt()`` text, so the bake-off sends the AS-BUILT system
+    frame. Never overwrites an existing ``c1`` instruction entry.
+    """
+    from roastpilot_agent import advisor as _advisor_module
+
+    # Register the AS-BUILT c1 system frame into the advisor's instruction table so
+    # ``prompt_version="c1"`` resolves to it. The instruction table is module-level
+    # state (the same dict ``instructions_for`` reads); writing to it here is the
+    # bake-off opting the live system prompt into a selectable version, additively.
+    prompts: dict[str, str] = _advisor_module._PROMPTS  # pyright: ignore[reportPrivateUsage]
+    prompts.setdefault(CONTROL_PROMPT_VERSION, control_teaching_prompt(CONTROL_PROMPT_VERSION))
+
+
+_register_control_teaching_prompt()
 
 # The two known-good 7-Jun Hottop roasts used as the replay test set. Both are
 # GOOD roasts (operator ground truth), NOT provably optimal — the scoring
@@ -133,6 +196,92 @@ REPLAY_ROASTS: tuple[Path, ...] = (
     REPO_ROOT / "tests" / "fixtures" / "live-roast-2026-06-07" / "session-1" / "roast.jsonl",
     REPO_ROOT / "tests" / "fixtures" / "live-roast-2026-06-07" / "session-2" / "roast.jsonl",
 )
+
+# --- #277 test sets: the known-good medium Artisan roasts ---------------------
+#
+# The eval set is the 17 KNOWN-GOOD MEDIUMS from the offline .alog classification
+# (docs/research/hottop-alog-classification-2026-06-20.md §7.1: mediums under the
+# 197 °C over-done line, second crack not reached). Each maps 1:1 to an
+# ``.artisan-fixtures/artisan-NN`` dir holding a replay-ready ``roast.jsonl`` +
+# ``summary.json``. The fixtures are operator-personal roast data and are
+# LOCAL-ONLY (gitignored) — never committed; the names are the load-bearing,
+# committable artifact. A run resolves the dirs at run time and errors clearly if
+# a fixture dir is absent (see :func:`resolve_test_set`).
+ARTISAN_FIXTURES_DIR = REPO_ROOT / ".artisan-fixtures"
+
+# The 17 known-good mediums (classification doc §7.1), in drop-temperature order.
+# anon id → fixture mapping is from the doc's §7.1 table; artisan-10/15/17/20/21/
+# 23..27 are DARK and artisan-28 is OVER-DARK, so they are deliberately excluded.
+FULL_MEDIUM_FIXTURE_NAMES: tuple[str, ...] = (
+    "artisan-01",  # drop 189.0 °C  DTR 20.5%
+    "artisan-02",  # drop 190.0 °C  DTR 17.9%
+    "artisan-03",  # drop 190.0 °C  DTR 19.0%
+    "artisan-04",  # drop 191.3 °C  DTR 15.7%
+    "artisan-05",  # drop 191.7 °C  DTR 19.5%
+    "artisan-06",  # drop 192.7 °C  DTR 20.7%
+    "artisan-07",  # drop 193.0 °C  DTR 17.2%
+    "artisan-08",  # drop 193.0 °C  DTR 16.6%
+    "artisan-09",  # drop 193.0 °C  DTR 15.3%
+    "artisan-11",  # drop 193.7 °C  DTR 14.0%
+    "artisan-12",  # drop 194.0 °C  DTR 14.4%
+    "artisan-13",  # drop 194.0 °C  DTR 19.9%
+    "artisan-14",  # drop 194.3 °C  DTR 17.7%
+    "artisan-16",  # drop 195.0 °C  DTR 13.4%
+    "artisan-18",  # drop 195.3 °C  DTR 13.6%
+    "artisan-19",  # drop 195.3 °C  DTR 12.4%
+    "artisan-22",  # drop 196.3 °C  DTR 14.6%
+)
+
+# The ~6-roast SCREEN subset: a representative spread across the medium set's
+# drop-temperature and DTR range (a low-drop / high-DTR end, the mid band, and a
+# high-drop / low-DTR end), so the cheap single-seed screen still exercises the
+# breadth the full set covers without paying for all 17.
+SCREEN_MEDIUM_FIXTURE_NAMES: tuple[str, ...] = (
+    "artisan-01",  # 189.0 °C, DTR 20.5% — lightest drop, longest development
+    "artisan-06",  # 192.7 °C, DTR 20.7% — mid drop, high DTR
+    "artisan-09",  # 193.0 °C, DTR 15.3% — mid drop, mid DTR
+    "artisan-12",  # 194.0 °C, DTR 14.4% — upper-mid drop, low DTR
+    "artisan-16",  # 195.0 °C, DTR 13.4% — high drop, low DTR
+    "artisan-22",  # 196.3 °C, DTR 14.6% — highest drop (near the bitter ceiling)
+)
+
+
+def fixture_path_for(name: str) -> Path:
+    """Return the ``roast.jsonl`` path for an ``artisan-NN`` fixture dir name."""
+    return ARTISAN_FIXTURES_DIR / name / "roast.jsonl"
+
+
+def resolve_test_set(names: tuple[str, ...]) -> tuple[Path, ...]:
+    """Resolve fixture dir names to ``roast.jsonl`` paths, erroring on any absent.
+
+    The ``.artisan-fixtures`` data is local-only (gitignored), so a run on a
+    checkout without it fails loudly here — listing the missing fixtures — rather
+    than silently scoring a partial set.
+
+    Args:
+        names: The ``artisan-NN`` dir names to resolve.
+
+    Returns:
+        The resolved ``roast.jsonl`` paths, in ``names`` order.
+
+    Raises:
+        FileNotFoundError: If any named fixture's ``roast.jsonl`` is absent.
+    """
+    paths = tuple(fixture_path_for(n) for n in names)
+    missing = [str(p) for p in paths if not p.exists()]
+    if missing:
+        raise FileNotFoundError(
+            "missing local-only Artisan fixtures (gitignored — regenerate with "
+            "scripts/alog_to_fixture.py): " + ", ".join(missing)
+        )
+    return paths
+
+
+# The named test sets selectable on the CLI (#277).
+TEST_SETS: dict[str, tuple[str, ...]] = {
+    "screen": SCREEN_MEDIUM_FIXTURE_NAMES,
+    "full": FULL_MEDIUM_FIXTURE_NAMES,
+}
 # Roast-time spacing between scored decision ticks in a replay (a real run
 # spends a model call per tick per model per prompt per roast).
 DEFAULT_CADENCE_SECONDS = 30.0
@@ -153,19 +302,294 @@ MEASURE_TIMEOUT = 90.0
 ReasoningEffort = Literal["off", "minimal", "low", "medium", "high"]
 
 
-class Tier(enum.Enum):
-    """Candidate tier (#173 roster). Plain ``Enum`` per the repo's D15 idiom.
+# --- AS-BUILT per-tick control context (#273 limits + #275 history) ----------
+#
+# ``bakeoff_replay.build_ticks`` reconstructs the per-tick ``AdvisorContext`` from
+# the fixture, but it predates #273/#275: it does not carry the phase-resolved
+# control LIMITS (#273) or the per-tick control-loop context (#275 — the
+# roast-so-far curve window, the milestone summary, the model's decision trace,
+# the DTR, the FC-ETA). The #277 bake-off must give the model the SAME context the
+# live D35 loop gives it, so the enrichment below derives those fields from the
+# real roast fixture and re-stamps each tick's context — mirroring the controller's
+# ``_build_advisor_context`` (controller.py) field-for-field, from the same single
+# ``RoastControlPolicy`` source the live gate uses (told == enforced, #273/#294).
+# The FC-ETA reuses the validated ``estimate_first_crack_eta_seconds`` (#229 KEEP);
+# the curve/decision-trace bounds mirror the controller's config defaults.
 
-    The tier records *which phase* a candidate is primarily a candidate for and
-    its latency profile — it informs the report layout, not an auto-pick. Every
-    surviving candidate is still measured in every phase.
+# The FC-band bean-temperature the FC-ETA projects to — the controller's
+# ``first_crack_target_bean_temp_c`` default (config.py). Used only to ground the
+# pre-FC FC-ETA in the bake-off context, identical to the live loop.
+FC_ETA_TARGET_BEAN_TEMP_C = 176.0
+
+
+def _control_policy() -> RoastControlPolicy:
+    """Build the default :class:`RoastControlPolicy` for the bake-off context.
+
+    The single source the live gate resolves the per-phase control box from
+    (#273): the bake-off feeds the SAME resolved box into the model's context, so
+    the limits the model is told match what the live harness would enforce. Built
+    from the default :class:`SafetyLimits` with no active profile (the replay
+    fixtures carry no frozen profile), so the box is the configured hard box.
+    """
+    return RoastControlPolicy(SafetyLimits())
+
+
+def _curve_sample_from_context(context: AdvisorContext, heat: int, fan: int) -> RoastCurveSample:
+    """Build one roast-so-far curve sample from a tick's context + real levers."""
+    return RoastCurveSample(
+        elapsed_since_charge_seconds=context.roast_elapsed_seconds,
+        bean_temp_c=context.current_bean_temp_c,
+        env_temp_c=context.current_env_temp_c,
+        # The real (commanded) levers at this tick — the paired (action, response)
+        # history the model reasons on (#275). Clamped to the 0-100 model bound.
+        heat_percent=max(0, min(100, heat)),
+        fan_percent=max(0, min(100, fan)),
+        bean_ror_c_per_min=context.bean_ror_c_per_min,
+        env_ror_c_per_min=context.env_ror_c_per_min,
+    )
+
+
+def _milestones_for(
+    ticks: list[ReplayTick], ground: GroundTruth, upto_index: int
+) -> list[RoastMilestone]:
+    """Resolve the roast milestones known by ``ticks[upto_index]`` (#275 summary).
+
+    Mirrors the controller's milestone arming: the turning point (post-charge bean
+    minimum) and first crack are surfaced once the roast has passed them. Derived
+    from the fixture so the bake-off context carries the same milestone summary
+    the live loop would have built by that tick. Charge-referenced seconds.
+
+    Args:
+        ticks: All reconstructed ticks (ascending roast time).
+        ground: The roast's ground truth (FC time + temps).
+        upto_index: The current tick index — only milestones at/before this tick's
+            time are included (the model never sees a future landmark).
+
+    Returns:
+        The milestone summary as of ``ticks[upto_index]``.
+    """
+    now = ticks[upto_index].monotonic_seconds
+    milestones: list[RoastMilestone] = []
+    # Turning point: the post-charge bean-temperature minimum seen so far.
+    charged = [t for t in ticks[: upto_index + 1] if t.context.roast_elapsed_seconds >= 0.0]
+    if charged:
+        tp = min(charged, key=lambda t: t.context.current_bean_temp_c)
+        milestones.append(
+            RoastMilestone(
+                kind=RoastMilestoneKind.TURNING_POINT,
+                elapsed_since_charge_seconds=tp.context.roast_elapsed_seconds,
+                bean_temp_c=tp.context.current_bean_temp_c,
+            )
+        )
+    # First crack: surfaced once the roast has crossed the FC event time. Bound
+    # the search to ticks at/before the current index (same as the turning point):
+    # an unbounded ``min(ticks, ...)`` over a coarse cadence can pick the *next*
+    # (future) tick as nearest to the FC time, injecting telemetry the model has
+    # not "seen" yet — the live controller arms FC on the first post-transition
+    # tick, never a future one.
+    if now >= ground.first_crack_seconds:
+        fc_tick = min(
+            ticks[: upto_index + 1],
+            key=lambda t: abs(t.monotonic_seconds - ground.first_crack_seconds),
+        )
+        milestones.append(
+            RoastMilestone(
+                kind=RoastMilestoneKind.FIRST_CRACK,
+                elapsed_since_charge_seconds=fc_tick.context.roast_elapsed_seconds,
+                bean_temp_c=fc_tick.context.current_bean_temp_c,
+            )
+        )
+    return milestones
+
+
+def enrich_ticks_with_control_context(
+    ticks: list[ReplayTick],
+    ground: GroundTruth,
+    *,
+    policy: RoastControlPolicy | None = None,
+    curve_window_samples: int = DEFAULT_CURVE_WINDOW_SAMPLES,
+    decision_trace_entries: int = DEFAULT_DECISION_TRACE_ENTRIES,
+) -> list[ReplayTick]:
+    """Re-stamp each tick's context with the #273 limits + #275 control context.
+
+    The AS-BUILT enrichment (#277): each reconstructed tick's :class:`AdvisorContext`
+    is augmented with the phase-resolved control box (#273, from the single
+    :class:`RoastControlPolicy`) and the per-tick control-loop context (#275) —
+    the bounded roast-so-far curve window, the milestone summary, the model's own
+    decision trace, the DTR, and the FC-ETA — derived from the real roast so the
+    model gets the same context the live loop builds (controller.py
+    ``_build_advisor_context``). The decision trace is left EMPTY: the bake-off
+    replays the human roast tick-by-tick (each tick is an independent consult on
+    the real curve), so there is no model self-history to thread — matching the
+    first consult of a live roast. The ticks' real-lever / drop labels and
+    timestamps are untouched, so the scorers are unaffected.
+
+    Args:
+        ticks: The reconstructed ticks from :func:`build_ticks` (ascending time).
+        ground: The roast's ground truth.
+        policy: The control policy to resolve limits from; defaults to
+            :func:`_control_policy` (the configured hard box, no profile).
+        curve_window_samples: The bounded curve-window size (controller default).
+        decision_trace_entries: The decision-trace bound (carried for parity;
+            the trace stays empty here).
+
+    Returns:
+        New ticks whose contexts carry the #273 + #275 fields; same order/length.
+    """
+    _ = decision_trace_entries  # parity with the controller signature; trace empty
+    resolved_policy = policy if policy is not None else _control_policy()
+    limits_by_phase: dict[RoastPhase, PhaseControlLimits] = {
+        phase: resolved_policy.limits_for(phase) for phase in RoastPhase
+    }
+    enriched: list[ReplayTick] = []
+    for index, tick in enumerate(ticks):
+        context = tick.context
+        limits = limits_by_phase[context.phase]
+        # Roast-so-far curve window: the bounded full-resolution paired history
+        # up to and including this tick (newest last), like RoastHistory's deque.
+        window_start = max(0, index - curve_window_samples + 1)
+        curve_window = [
+            _curve_sample_from_context(
+                ticks[i].context, ticks[i].real_heat_percent, ticks[i].real_fan_percent
+            )
+            for i in range(window_start, index + 1)
+        ]
+        development_time_ratio: float | None = None
+        if context.development_elapsed_seconds is not None and context.roast_elapsed_seconds > 0.0:
+            development_time_ratio = round(
+                context.development_elapsed_seconds / context.roast_elapsed_seconds, 4
+            )
+        first_crack_eta_seconds = (
+            None
+            if context.first_crack_detected
+            else estimate_first_crack_eta_seconds(
+                curve_window, fc_target_bean_temp_c=FC_ETA_TARGET_BEAN_TEMP_C
+            )
+        )
+        new_context = context.model_copy(
+            update={
+                # #273 phase-resolved control box (told == enforced).
+                "heat_floor_percent": limits.heat_floor_percent,
+                "heat_ceiling_percent": limits.heat_ceiling_percent,
+                "fan_floor_percent": limits.fan_floor_percent,
+                "fan_ceiling_percent": limits.fan_ceiling_percent,
+                "bitter_ceiling_temp_c": limits.bitter_ceiling_temp_c,
+                "emergency_drop_temp_c": limits.emergency_drop_temp_c,
+                # #275 per-tick control-loop context.
+                "roast_curve_window": curve_window,
+                "roast_milestones": _milestones_for(ticks, ground, index),
+                "decision_trace": [],
+                "development_time_ratio": development_time_ratio,
+                "first_crack_eta_seconds": first_crack_eta_seconds,
+                # seconds_since_charge mirrors roast_elapsed once charged (#209).
+                "seconds_since_charge": (
+                    context.roast_elapsed_seconds if context.roast_elapsed_seconds >= 0.0 else None
+                ),
+            }
+        )
+        enriched.append(dataclasses.replace(tick, context=new_context))
+    return enriched
+
+
+# --- AS-BUILT advisor SCOPE: post-FC development only (D35) ------------------
+#
+# Under D35 the advisor is GATED OUT before first crack: the deterministic
+# controller drives preheat / drying / Maillard (heat 100, low fan, #222), and the
+# LLM is consulted ONLY in DEVELOPMENT (first crack → drop, #223). Scoring the
+# model on pre-FC ticks therefore (a) spends ~4x the budget on a path that never
+# runs in production and (b) pollutes the metrics — e.g. the model correctly
+# advises heat 100 in preheat while the Artisan fixture logged heat 0 there, so a
+# correct pre-FC answer reads as a large disagreement. So the bake-off consults +
+# scores ONLY development-phase ticks by default. The pre-FC curve still feeds the
+# #275 curve window of the first development tick (enrichment runs over the WHOLE
+# roast first; the filter is applied AFTER), so the model sees the full roast-so-far
+# history — it is just never *asked* before first crack. ``--include-pre-fc`` keeps
+# the pre-FC ticks for a one-off inspection of the gated-out path (default OFF).
+ADVISOR_SCOPE_PHASES: frozenset[RoastPhase] = frozenset({RoastPhase.DEVELOPMENT})
+
+
+def development_only(ticks: list[ReplayTick]) -> list[ReplayTick]:
+    """Keep only the post-FC development ticks — the as-built D35 advisor scope.
+
+    Drops preheating + ``roasting_pre_first_crack`` ticks (the deterministic,
+    advisor-gated-out path). The drop tick is always in development (it is at/after
+    first crack), so the drop-decision / drop-timing metric is preserved. Run this
+    AFTER enrichment so each kept tick's #275 curve window still carries the
+    pre-FC roast-so-far history.
+
+    Args:
+        ticks: The reconstructed (and enriched) ticks for a roast.
+
+    Returns:
+        The development-phase ticks, in order.
+    """
+    return [t for t in ticks if t.context.phase in ADVISOR_SCOPE_PHASES]
+
+
+def build_control_ticks(
+    fixture: Path,
+    *,
+    cadence_seconds: float,
+    enrich: bool = True,
+    policy: RoastControlPolicy | None = None,
+    include_pre_fc: bool = False,
+) -> tuple[list[ReplayTick], GroundTruth]:
+    """Build replay ticks and (by default) enrich + scope them to the advisor box.
+
+    The single seam the bake-off uses to reconstruct ticks: it calls
+    :func:`build_ticks`, then, when ``enrich`` is set (the #277 default), augments
+    each tick's context with the #273 limits + #275 control context via
+    :func:`enrich_ticks_with_control_context`, then (unless ``include_pre_fc``)
+    restricts the result to the post-FC DEVELOPMENT ticks — the as-built D35
+    advisor scope (the advisor is gated out pre-FC). Enrichment runs over the WHOLE
+    roast before the scope filter, so a kept development tick's #275 curve window
+    still carries the pre-FC history. ``enrich=False`` reproduces the pre-#277
+    drop-only context (the historical bake-off) for a clean comparison.
+
+    Args:
+        fixture: The live-roast ``roast.jsonl`` to replay.
+        cadence_seconds: Roast-time spacing between scored ticks.
+        enrich: Add the #273/#275 AS-BUILT context fields (default ``True``).
+        policy: The control policy to resolve #273 limits from; defaults to the
+            configured hard box.
+        include_pre_fc: Keep the pre-first-crack ticks (preheat + drying/Maillard)
+            for a one-off inspection of the gated-out path. Default ``False`` — the
+            as-built D35 scope is development-only.
+
+    Returns:
+        ``(ticks, ground_truth)`` — development-only unless ``include_pre_fc``.
+    """
+    ticks, ground = build_ticks(fixture, cadence_seconds=cadence_seconds)
+    if enrich:
+        ticks = enrich_ticks_with_control_context(ticks, ground, policy=policy)
+    if not include_pre_fc:
+        ticks = development_only(ticks)
+    return ticks, ground
+
+
+class Tier(enum.Enum):
+    """Candidate tier (#277 post-FC control roster). Plain ``Enum`` (D15 idiom).
+
+    The tier records each candidate's *role* in the #277 bake-off — it informs
+    the report layout and the screen→finalist carry, not an auto-pick. Every
+    surviving candidate is still measured in every phase / roast.
+
+    - ``BASELINE`` — ``openai/gpt-4o``, the PROVEN n8n autonomous-roaster baseline
+      (D40.4): the bar a post-FC control advisor must MATCH or beat.
+    - ``PRIOR_WINNER`` — ``google/gemini-3.1-flash-lite``, the prior D20/bake-off
+      standout (fast + cheap), carried as the speed/cost bar.
+    - ``CONTROL_CANDIDATE`` — the fast/cheap control models screened for the
+      post-FC loop (gpt-5-nano, grok-4-fast, deepseek-v4-flash,
+      gemini-3-flash-preview, claude-haiku-4.5).
+    - ``FRONTIER_CEILING`` — the strongest models in the screen (gpt-5-mini,
+      gemini-3.5-flash): the quality ceiling a fast candidate must approach to be
+      worth the speed.
     """
 
-    ULTRA_FLASH = "ultra-flash"
-    SPEED_AND_POWER = "speed-and-power"
-    FAST_REASONING = "fast-reasoning"
-    INCUMBENT = "incumbent"
-    PRIOR_FRONTIER = "prior-frontier"
+    BASELINE = "baseline-n8n"
+    PRIOR_WINNER = "prior-winner"
+    CONTROL_CANDIDATE = "control-candidate"
+    FRONTIER_CEILING = "frontier-ceiling"
 
 
 # Agent phases sampled, in roast order. The first-crack slot is the one #171
@@ -179,109 +603,143 @@ PHASE_ORDER: tuple[RoastPhase, ...] = (
 
 @dataclasses.dataclass(frozen=True)
 class Candidate:
-    """One bake-off candidate model (#173 roster encoded as data).
+    """One bake-off candidate model (#277 roster encoded as data).
 
     Attributes:
         slug: The OpenRouter model slug probed and run.
         tier: Which :class:`Tier` the candidate belongs to (informs the report
-            and the phase it is primarily a candidate for).
+            and the screen→finalist carry).
         primary_phases: The roast phase(s) the candidate is primarily a
             candidate for. All survivors are measured in every phase regardless;
-            this only flags the operator's main interest.
-        latency_risk: ``True`` for the fast-reasoning tier — a brief ``<think>``
-            before output adds latency, a poor fit for the FC slot's hard gate.
+            this only flags the operator's main interest. The #277 control loop
+            is post-FC (``DEVELOPMENT``), so most candidates name it.
+        latency_risk: ``True`` for a model that reasons / "thinks" before output
+            — a brief trace adds latency, a poor fit for the FC-slot hard gate.
+            The mitigation is the per-candidate ``reasoning`` cap below.
+        finalist: ``True`` for the 5 finalists carried to the FULL 17-medium
+            set with 2 seeds (#277). Screen-only candidates are ``False`` — they
+            run the single-seed SCREEN subset only.
+        reasoning: A per-candidate reasoning/thinking-effort cap (overrides the
+            run-wide ``--reasoning``). The #277 brief pins Gemini / GPT reasoning
+            to minimal / low so the live-latency band stays ~<=4 s; a reasoning
+            model is never run at ``high`` here. ``None`` falls back to the
+            run-wide reasoning effort.
     """
 
     slug: str
     tier: Tier
     primary_phases: tuple[RoastPhase, ...]
     latency_risk: bool = False
+    finalist: bool = False
+    reasoning: ReasoningEffort | None = None
 
 
-# The #173 candidate roster (operator, 13 Jun), encoded as data. Ultra-Flash →
-# FC/development; Speed & Power → charge/pre-FC; Fast-Reasoning → pre-FC, flagged
-# latency-risk; plus the incumbent D20 winner as the comparison anchor. The
-# availability sweep drops any slug that does not resolve on OpenRouter.
+# The #277 post-FC control-advisor roster (operator brief, 21 Jun), encoded as
+# data. The SCREEN is 9 models run once over the ~6-roast subset; the 5 FINALISTS
+# (``finalist=True``) carry to the FULL 17-medium set with 2 seeds. Gemini / GPT
+# reasoning is pinned minimal / low per the brief (live-latency band ~<=4 s) — no
+# reasoning model runs at ``high`` here. The control loop is post-FC, so the
+# primary phase is DEVELOPMENT throughout. The availability sweep drops any slug
+# that does not resolve on OpenRouter, so a phantom next-gen slug is caught.
 ROSTER: tuple[Candidate, ...] = (
-    # Ultra-Flash tier (sub-500 ms TTFT focus → FC/development slot).
-    Candidate("google/gemini-3.1-flash-lite", Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
-    Candidate("google/gemini-3.5-flash", Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
-    Candidate("deepseek/deepseek-v4-flash", Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
-    Candidate("openai/gpt-4.1-mini", Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
-    Candidate("openai/gpt-5.4-nano", Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
-    # Frontier-fast option: frontier quality at flash-ish speed — a prime FC-slot
-    # candidate (operator-approved bonus).
-    Candidate("anthropic/claude-opus-4.8-fast", Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
-    # Speed & Power tier (high logic, 500 ms-1 s → charge / pre-FC slot).
+    # --- FINALISTS (carry to the full 17-medium set, 2 seeds) ----------------
+    # gpt-4o — the PROVEN n8n autonomous-roaster baseline (D40.4): the co-baseline
+    # the control advisor must match or beat. Not a reasoning model.
     Candidate(
-        "meta-llama/llama-3.3-70b-instruct",
-        Tier.SPEED_AND_POWER,
-        (RoastPhase.ROASTING_PRE_FIRST_CRACK,),
+        "openai/gpt-4o",
+        Tier.BASELINE,
+        (RoastPhase.DEVELOPMENT,),
+        finalist=True,
     ),
+    # gemini-3.1-flash-lite — the prior bake-off winner (fast + cheap). Reasoning
+    # pinned minimal to hold the live-latency band.
     Candidate(
-        "qwen/qwen3.5-35b-a3b",
-        Tier.SPEED_AND_POWER,
-        (RoastPhase.ROASTING_PRE_FIRST_CRACK,),
+        "google/gemini-3.1-flash-lite",
+        Tier.PRIOR_WINNER,
+        (RoastPhase.DEVELOPMENT,),
+        finalist=True,
+        reasoning="minimal",
     ),
+    # gpt-5-nano — fast/cheap OpenAI control candidate. Reasoning pinned low.
     Candidate(
-        "qwen/qwen3-coder",
-        Tier.SPEED_AND_POWER,
-        (RoastPhase.ROASTING_PRE_FIRST_CRACK,),
+        "openai/gpt-5-nano",
+        Tier.CONTROL_CANDIDATE,
+        (RoastPhase.DEVELOPMENT,),
+        finalist=True,
+        reasoning="low",
     ),
+    # grok-4-fast — xAI's fast tier; a fresh control candidate.
     Candidate(
-        "nvidia/nemotron-3-ultra-550b-a55b",
-        Tier.SPEED_AND_POWER,
-        (RoastPhase.ROASTING_PRE_FIRST_CRACK,),
+        "x-ai/grok-4-fast",
+        Tier.CONTROL_CANDIDATE,
+        (RoastPhase.DEVELOPMENT,),
     ),
-    # Fast-Reasoning tier (brief <think> before output → pre-FC, latency-risk).
-    Candidate(
-        "deepseek/deepseek-r1",
-        Tier.FAST_REASONING,
-        (RoastPhase.ROASTING_PRE_FIRST_CRACK,),
-        latency_risk=True,
-    ),
-    Candidate(
-        "openai/o4-mini",
-        Tier.FAST_REASONING,
-        (RoastPhase.ROASTING_PRE_FIRST_CRACK,),
-        latency_risk=True,
-    ),
-    # Incumbent baseline (D20 winner, current default in the #173 slot).
-    Candidate(
-        "anthropic/claude-opus-4.8",
-        Tier.INCUMBENT,
-        PHASE_ORDER,
-    ),
-    # Prior-frontier baselines — the rest of the D20 slate, measured in every
-    # phase (``PHASE_ORDER``) like the incumbent. These are the quality floor a
-    # new ultra-flash candidate must match or beat: if a sub-500 ms model cannot
-    # roast at least as well as these established frontier models did, the speed
-    # is not worth the quality regression.
-    Candidate(
-        "anthropic/claude-sonnet-4.6",
-        Tier.PRIOR_FRONTIER,
-        PHASE_ORDER,
-    ),
-    Candidate(
-        "openai/gpt-5.5",
-        Tier.PRIOR_FRONTIER,
-        PHASE_ORDER,
-    ),
+    # claude-haiku-4.5 — Anthropic's fast tier; the non-reasoning frontier-fast
+    # quality bar carried to the full set.
     Candidate(
         "anthropic/claude-haiku-4.5",
-        Tier.PRIOR_FRONTIER,
-        PHASE_ORDER,
+        Tier.CONTROL_CANDIDATE,
+        (RoastPhase.DEVELOPMENT,),
     ),
-    # gpt-5-mini reasons before answering (~12-16 s) — included deliberately as
-    # the "quality competes but the latency fails the FC gate" case, so the
-    # operator can see a strong-advice / over-gate trade-off explicitly.
+    # --- SCREEN-ONLY (single seed on the ~6-roast subset) --------------------
+    # deepseek-v4-flash — cheap flash control candidate.
+    Candidate(
+        "deepseek/deepseek-v4-flash",
+        Tier.CONTROL_CANDIDATE,
+        (RoastPhase.DEVELOPMENT,),
+    ),
+    # gemini-3-flash-preview — Google's mid flash tier. Reasoning pinned low.
+    Candidate(
+        "google/gemini-3-flash-preview",
+        Tier.CONTROL_CANDIDATE,
+        (RoastPhase.DEVELOPMENT,),
+        finalist=True,
+        reasoning="low",
+    ),
+    # gpt-5-mini — a strong OpenAI model that reasons before answering; included
+    # as the quality-ceiling / latency-risk case. Reasoning capped low (never
+    # high) so the FC-gate read is a fair "fast-as-it-gets" measurement.
     Candidate(
         "openai/gpt-5-mini",
-        Tier.PRIOR_FRONTIER,
-        PHASE_ORDER,
+        Tier.FRONTIER_CEILING,
+        (RoastPhase.DEVELOPMENT,),
+        finalist=True,
         latency_risk=True,
+        reasoning="low",
+    ),
+    # gemini-3.5-flash — the frontier ceiling of the screen. Reasoning pinned low.
+    Candidate(
+        "google/gemini-3.5-flash",
+        Tier.FRONTIER_CEILING,
+        (RoastPhase.DEVELOPMENT,),
+        reasoning="low",
+    ),
+    # grok-4.3 — recovery slug for the deprecated grok-4-fast (the only
+    # non-Google/non-OpenAI control datapoint). Reasoning pinned low.
+    Candidate(
+        "x-ai/grok-4.3",
+        Tier.CONTROL_CANDIDATE,
+        (RoastPhase.DEVELOPMENT,),
+        finalist=True,
+        reasoning="low",
     ),
 )
+
+
+def screen_roster(roster: tuple[Candidate, ...] = ROSTER) -> tuple[Candidate, ...]:
+    """Return the SCREEN roster (every candidate) for the screen pass (#277).
+
+    Intentionally a no-op pass-through: the full roster *is* the screen by
+    construction (the screen runs everyone once; the finalists are the carried
+    subset). It exists as the named counterpart to :func:`finalist_roster` so the
+    two passes read symmetrically at the call site, not because it filters.
+    """
+    return roster
+
+
+def finalist_roster(roster: tuple[Candidate, ...] = ROSTER) -> tuple[Candidate, ...]:
+    """Return only the FINALIST candidates carried to the full set (#277)."""
+    return tuple(c for c in roster if c.finalist)
 
 
 def _make_config(
@@ -312,6 +770,26 @@ def _make_config(
         prompt_version=prompt_version,
         reasoning_effort=reasoning,
     )
+
+
+def resolve_reasoning(
+    cand: Candidate, run_reasoning: ReasoningEffort | None
+) -> ReasoningEffort | None:
+    """Resolve the reasoning effort for a candidate (#277 per-candidate cap).
+
+    A candidate's own ``reasoning`` cap (the #277 minimal / low pin for Gemini /
+    GPT, so the live-latency band holds) takes precedence over the run-wide
+    ``--reasoning``; ``None`` on the candidate falls back to the run-wide value.
+
+    Args:
+        cand: The candidate whose reasoning cap is consulted.
+        run_reasoning: The run-wide reasoning effort (``--reasoning``), or
+            ``None`` for the provider default.
+
+    Returns:
+        The reasoning effort to use for this candidate's cells.
+    """
+    return cand.reasoning if cand.reasoning is not None else run_reasoning
 
 
 # --- Per-phase grounded contexts -------------------------------------------
@@ -702,7 +1180,9 @@ async def run_cell(
     Returns:
         The :class:`CellResult` summary.
     """
-    advisor = PydanticAIAdvisor(_make_config(cand.slug, prompt_version, reasoning))
+    advisor = PydanticAIAdvisor(
+        _make_config(cand.slug, prompt_version, resolve_reasoning(cand, reasoning))
+    )
     latencies: list[float] = []
     decision: RoastDecision | None = None
     error: str | None = None
@@ -1006,7 +1486,9 @@ async def run_replay_cell(
     Returns:
         The :class:`ReplayCell`.
     """
-    advisor = PydanticAIAdvisor(_make_config(cand.slug, prompt_version, reasoning))
+    advisor = PydanticAIAdvisor(
+        _make_config(cand.slug, prompt_version, resolve_reasoning(cand, reasoning))
+    )
 
     async def recommend(context: AdvisorContext) -> RoastDecision:
         return await asyncio.wait_for(advisor.get_recommendation(context), timeout=MEASURE_TIMEOUT)
@@ -1027,6 +1509,18 @@ def roast_id_for(fixture: Path) -> str:
         The roast id (e.g. ``live-roast-2026-06-07/session-1``).
     """
     return f"{fixture.parent.parent.name}/{fixture.parent.name}"
+
+
+def _roast_label(fixture: Path) -> str:
+    """Return a compact roast label for the report header.
+
+    An ``.artisan-fixtures/artisan-NN`` fixture renders as just ``artisan-NN``;
+    every other fixture keeps the ``<parent>/<name>`` :func:`roast_id_for` form
+    (e.g. ``live-roast-2026-06-07/session-1``).
+    """
+    if fixture.parent.parent.name == ARTISAN_FIXTURES_DIR.name:
+        return fixture.parent.name
+    return roast_id_for(fixture)
 
 
 @dataclasses.dataclass
@@ -1142,6 +1636,7 @@ async def score_candidate(
     cadence_seconds: float,
     *,
     clock: Callable[[], float] | None = None,
+    include_pre_fc: bool = False,
 ) -> ReplayCell:
     """Score one candidate's recommender over the replay roasts (key-free seam).
 
@@ -1156,6 +1651,8 @@ async def score_candidate(
         roasts: The replay roast fixtures.
         cadence_seconds: Roast-time spacing between scored ticks.
         clock: Monotonic clock; defaults to ``time.perf_counter``.
+        include_pre_fc: Keep the gated-out pre-FC ticks (default ``False`` — the
+            as-built D35 advisor scope is development-only).
 
     Returns:
         The :class:`ReplayCell`.
@@ -1163,7 +1660,9 @@ async def score_candidate(
     tick_clock = clock if clock is not None else time.perf_counter
     replays: list[RoastReplay] = []
     for fixture in roasts:
-        ticks, ground = build_ticks(fixture, cadence_seconds=cadence_seconds)
+        ticks, ground = build_control_ticks(
+            fixture, cadence_seconds=cadence_seconds, include_pre_fc=include_pre_fc
+        )
         outcomes = await replay_roast(ticks, recommend, clock=tick_clock)
         replays.append(
             build_roast_replay(cand.slug, prompt_version, roast_id_for(fixture), outcomes, ground)
@@ -1221,12 +1720,12 @@ def render_replay_report(
         The markdown report.
     """
     out: list[str] = []
-    out.append("# Advisor bake-off — real-roast replay scorecard (#172/#173, D20)")
+    out.append("# Advisor bake-off — real-roast replay scorecard (#277 / D20)")
     out.append("")
     out.append(_HONEST_FRAMING)
     out.append("")
-    roast_names = ", ".join(f"{p.parent.parent.name}/{p.parent.name}" for p in roasts)
-    out.append(f"Test set (known-good 7-Jun Hottop roasts): {roast_names}")
+    roast_names = ", ".join(_roast_label(p) for p in roasts)
+    out.append(f"Test set (known-good Hottop roasts): {roast_names}")
     out.append(
         "Drop = should_drop agreement over ticks (F1/precision/recall) + first-drop "
         "timing error (s and °C vs the real drop). Heat/Fan = MAE (percentage "
@@ -1694,6 +2193,12 @@ async def run_replay_bakeoff(
 # Anchored to the 16 Jun run: ~$32 across a full roster sweep, dominated by the
 # frontier models; per get_recommendation call this lands in the low-cents range.
 DEFAULT_COST_PER_CALL_USD = 0.02
+
+# The operator-suggested #277 budget cap (USD). Sized to cover the screen pass
+# (9 models x ~6 roasts) plus the finalist full-set passes (5 models x 17 roasts
+# x 2 seeds) with headroom at the rough per-call estimate; surfaced in the
+# --max-spend help and the report so a run is never silently uncapped by accident.
+SUGGESTED_MAX_SPEND_USD = 25.0
 
 # How often the heartbeat line is emitted, in wall-clock seconds.
 DEFAULT_HEARTBEAT_SECONDS = 30.0
@@ -2723,6 +3228,7 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
     reasoning_recommender_factory: Callable[[Candidate, str], ReasoningRecommender] | None = None,
     clock: Callable[[], float] | None = None,
     heartbeat_clock: Callable[[], float] | None = None,
+    include_pre_fc: bool = False,
 ) -> ObservableRunResult:
     """Run the replay bake-off with observability, checkpointing, and a cost guard.
 
@@ -2787,6 +3293,10 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
             ``time.perf_counter``.
         heartbeat_clock: Wall-clock for the heartbeat; defaults to
             ``time.monotonic``.
+        include_pre_fc: Keep the gated-out pre-FC ticks (default ``False`` — the
+            as-built D35 advisor scope is post-FC development only). Each cell then
+            costs ~4x more and scores a path that never runs in production; use it
+            only for a one-off inspection of pre-FC behaviour.
 
     Returns:
         The :class:`ObservableRunResult` (availability + assembled cells + the
@@ -2814,8 +3324,17 @@ async def run_replay_bakeoff_observable(  # noqa: PLR0915 — one orchestration 
     tick_clock = clock if clock is not None else time.perf_counter
 
     # Pre-build ticks + ground once per roast (deterministic, no model calls);
-    # both fresh runs and reloads reuse them, so resume needs no model access.
-    built = {roast_id_for(f): build_ticks(f, cadence_seconds=cadence_seconds) for f in roasts}
+    # both fresh runs and reloads reuse them, so resume needs no model access. The
+    # AS-BUILT context (#273 limits + #275 control context) is enriched here so
+    # every model under test gets the SAME context the live D35 loop would build,
+    # and (unless --include-pre-fc) the ticks are scoped to the post-FC DEVELOPMENT
+    # phase — the as-built D35 advisor scope (gated out pre-FC).
+    built = {
+        roast_id_for(f): build_control_ticks(
+            f, cadence_seconds=cadence_seconds, include_pre_fc=include_pre_fc
+        )
+        for f in roasts
+    }
 
     # One recommender per (candidate, prompt), built once and reused across that
     # cell's roasts — and wrapped with retry/backoff when a policy is configured.
@@ -3033,7 +3552,9 @@ def _real_reasoning_recommender_factory(
     """
 
     def factory(cand: Candidate, prompt_version: str) -> ReasoningRecommender:
-        advisor = PydanticAIAdvisor(_make_config(cand.slug, prompt_version, reasoning))
+        advisor = PydanticAIAdvisor(
+            _make_config(cand.slug, prompt_version, resolve_reasoning(cand, reasoning))
+        )
 
         async def recommend(context: AdvisorContext) -> tuple[RoastDecision, str | None]:
             return await asyncio.wait_for(
@@ -3114,14 +3635,43 @@ async def main() -> int:
     parser.add_argument(
         "--prompt-version",
         nargs="+",
-        default=["v2", "v3"],
-        help="prompt version(s) to compare (default: v2 v3 — #172)",
+        default=[CONTROL_PROMPT_VERSION],
+        help=f"prompt version(s) to compare. Default: {CONTROL_PROMPT_VERSION} (the "
+        f"#274 control teaching system prompt, the AS-BUILT D35 system frame). Pass "
+        f"'{CONTROL_PROMPT_VERSION} {DEFAULT_DROP_LENS_PROMPT_VERSION}' for a "
+        f"c1-vs-v4 (drop-lens) A/B.",
+    )
+    parser.add_argument(
+        "--roster",
+        choices=["screen", "finalists"],
+        default="screen",
+        help="replay mode: which #277 roster to run — 'screen' (all 9, default) or "
+        "'finalists' (the 5 carried to the full set).",
+    )
+    parser.add_argument(
+        "--test-set",
+        choices=sorted(TEST_SETS),
+        default=None,
+        help="replay mode: the known-good-medium fixture set (#277) — 'screen' (~6 "
+        "representative mediums) or 'full' (all 17). Overrides --roasts when set; "
+        "if unset, the two known-good 7-Jun roasts are used (legacy default).",
+    )
+    parser.add_argument(
+        "--seeds",
+        type=int,
+        default=1,
+        help="replay mode: how many seeds (repeat passes) to run per cell (#277). "
+        "The finalists run 2 on the full set; the screen runs 1. Each extra seed "
+        "writes to a seed-suffixed checkpoint so the runs stay independently "
+        "resumable.",
     )
     parser.add_argument(
         "--reasoning",
         default="default",
         choices=["default", "off", "minimal", "low", "medium", "high"],
-        help="reasoning effort for the OpenAI-compatible path (default: provider default)",
+        help="run-wide reasoning effort for the OpenAI-compatible path (default: "
+        "provider default). A candidate's own reasoning cap (#277 minimal/low pin "
+        "for Gemini/GPT) overrides this.",
     )
     parser.add_argument(
         "--cadence-seconds",
@@ -3159,9 +3709,14 @@ async def main() -> int:
         "--max-spend",
         type=float,
         default=None,
-        help="replay mode: optional USD budget; the run stops GRACEFULLY before a "
-        "cell would breach it, flushing partial results and rendering the partial "
-        "scorecard (no exception). Spend is estimated as calls x --cost-per-call.",
+        help=f"replay mode: optional USD budget; the run stops GRACEFULLY before a "
+        f"cell would breach it, flushing partial results and rendering the partial "
+        f"scorecard (no exception). Spend is estimated as calls x --cost-per-call. "
+        f"NOTE: with --seeds N the cap is applied PER SEED (each seed is its own "
+        f"checkpointed pass), so total spend can reach up to N x this value — size "
+        f"it for one seed's pass. SUGGESTED for a #277 run: ${SUGGESTED_MAX_SPEND_USD:g} "
+        f"per seed (covers one screen or finalist full-set pass with headroom). "
+        f"Unset = no cap.",
     )
     parser.add_argument(
         "--cost-per-call",
@@ -3205,6 +3760,15 @@ async def main() -> int:
         f"network failure, with exponential backoff honouring Retry-After (#281) "
         f"(default: {DEFAULT_RETRY_ATTEMPTS}; 1 disables retry)",
     )
+    parser.add_argument(
+        "--include-pre-fc",
+        action="store_true",
+        help="replay mode: ALSO consult + score the gated-out pre-first-crack ticks "
+        "(preheat + drying/Maillard). Default OFF — under D35 the advisor is "
+        "development-only (the controller drives pre-FC deterministically), so the "
+        "default eval is post-FC only. Enabling this costs ~4x and scores a path "
+        "that never runs in production; use it for a one-off inspection.",
+    )
     args = parser.parse_args()
 
     reasoning: ReasoningEffort | None = (
@@ -3234,39 +3798,78 @@ async def main() -> int:
     retry_attempts = max(1, int(args.retry_attempts))
     # A real run always uses backoff; retry is a no-op when attempts == 1.
     retry_policy = RetryPolicy(attempts=retry_attempts)
-    result = await run_replay_bakeoff_observable(
-        ROSTER,
-        REPLAY_ROASTS,
-        prompt_versions,
-        reasoning,
-        args.cadence_seconds,
-        out=args.out,
-        resume=not bool(args.no_resume),
-        cost_per_call=float(args.cost_per_call),
-        max_spend=cast("float | None", args.max_spend),
-        heartbeat_seconds=float(args.heartbeat_seconds),
-        concurrency=concurrency,
-        retry_policy=retry_policy,
-    )
-    availability, replay_cells = result.availability, result.cells
+
+    # #277 roster + test-set selection. The roster is the full screen (9) or the
+    # finalists (5); the test set is the known-good-medium fixtures (screen ~6 /
+    # full 17) when --test-set is given, else the legacy two 7-Jun roasts.
+    roster = finalist_roster() if args.roster == "finalists" else screen_roster()
+    test_set_name = cast("str | None", args.test_set)
+    roasts = resolve_test_set(TEST_SETS[test_set_name]) if test_set_name else REPLAY_ROASTS
+    seeds = max(1, int(args.seeds))
+
+    # Run each seed as its own checkpointed pass (seed-suffixed out path so each
+    # seed stays independently resumable), then merge the cells + capture for one
+    # combined scorecard. A single seed is the common case and writes to --out.
+    seed_results: list[ObservableRunResult] = []
+    for seed in range(1, seeds + 1):
+        seed_out = (
+            args.out if seeds == 1 else args.out.with_name(f"{args.out.stem}.seed{seed}.json")
+        )
+        if seeds > 1:
+            print(f"\n=== seed {seed}/{seeds} (checkpoint {seed_out}) ===", flush=True)
+        seed_results.append(
+            await run_replay_bakeoff_observable(
+                roster,
+                roasts,
+                prompt_versions,
+                reasoning,
+                args.cadence_seconds,
+                out=seed_out,
+                resume=not bool(args.no_resume),
+                cost_per_call=float(args.cost_per_call),
+                max_spend=cast("float | None", args.max_spend),
+                heartbeat_seconds=float(args.heartbeat_seconds),
+                concurrency=concurrency,
+                retry_policy=retry_policy,
+                include_pre_fc=bool(args.include_pre_fc),
+            )
+        )
+    result = seed_results[0]
+    availability = result.availability
+    replay_cells = [cell for r in seed_results for cell in r.cells]
+    captured_calls = [call for r in seed_results for call in r.captured_calls]
+    # Multi-seed runs capture per-seed (``<out>.seedN.json.capture.jsonl``). The
+    # combined artifact below advertises ``capture_path(args.out)`` as THE capture
+    # file, so materialise the merged capture there too — otherwise the path in
+    # the JSON / the print points at a file that was never written. Single-seed
+    # already wrote it (seed_out == args.out), so only the merge case needs this.
+    if seeds > 1:
+        capture_path(args.out).write_text(
+            "".join(json.dumps(captured_call_to_json(c)) + "\n" for c in captured_calls)
+        )
     interest_top_n = int(args.interest_top_n)
-    selected = select_interesting_calls(result.captured_calls, top_n=interest_top_n)
-    report = render_replay_report(replay_cells, REPLAY_ROASTS, trajectory=bool(args.trajectory))
+    selected = select_interesting_calls(captured_calls, top_n=interest_top_n)
+    report = render_replay_report(replay_cells, roasts, trajectory=bool(args.trajectory))
     # Append the #284 surfacing so "why did model X do Y" is a lookup, not a
     # re-run. The full prompt + reasoning live in the gitignored capture file.
     report = report + "\n\n---\n\n" + render_interesting_calls(selected, top_n=interest_top_n)
     print("\n" + report, flush=True)
+    stopped_for_budget = any(r.stopped_for_budget for r in seed_results)
     args.out.write_text(
         json.dumps(
             {
                 "mode": "replay",
-                "stopped_for_budget": result.stopped_for_budget,
-                "resumed_cells": result.resumed_cells,
-                "fresh_cells": result.fresh_cells,
-                "captured_calls": len(result.captured_calls),
+                "roster": args.roster,
+                "test_set": test_set_name or "live-roast-2026-06-07",
+                "seeds": seeds,
+                "prompt_versions": prompt_versions,
+                "stopped_for_budget": stopped_for_budget,
+                "resumed_cells": sum(r.resumed_cells for r in seed_results),
+                "fresh_cells": sum(r.fresh_cells for r in seed_results),
+                "captured_calls": len(captured_calls),
                 "capture_path": str(capture_path(args.out)),
                 "reasoning_available_calls": sum(
-                    1 for c in result.captured_calls if c.reasoning_available
+                    1 for c in captured_calls if c.reasoning_available
                 ),
                 "availability": [dataclasses.asdict(a) for a in availability],
                 "interesting_cells": interesting_cells_to_json(selected),
@@ -3277,14 +3880,14 @@ async def main() -> int:
     )
     print(f"\nwrote artifact -> {args.out}", flush=True)
     print(
-        f"wrote per-call capture ({len(result.captured_calls)} calls, "
+        f"wrote per-call capture ({len(captured_calls)} calls, "
         f"gitignored) -> {capture_path(args.out)}",
         flush=True,
     )
     if args.report_md is not None:
         args.report_md.write_text(report)
         print(f"wrote markdown report -> {args.report_md}", flush=True)
-    if result.stopped_for_budget:
+    if stopped_for_budget:
         print(
             "NOTE: the run stopped early on --max-spend; the scorecard above is a "
             "PARTIAL over the completed cells. Re-run (resume is on) to finish the rest.",

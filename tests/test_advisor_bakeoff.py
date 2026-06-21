@@ -11,6 +11,7 @@ text, no auto-pick).
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -72,21 +73,234 @@ def test_roster_is_well_formed() -> None:
             assert isinstance(phase, RoastPhase)
 
 
-def test_roster_covers_all_tiers_and_keeps_incumbent() -> None:
-    """The roster has every tier (incl. prior-frontier), the incumbent, no dupes."""
-    tiers = {c.tier for c in bakeoff.ROSTER}
-    assert tiers == set(bakeoff.Tier)
+def test_roster_is_the_277_screen_with_baseline_and_prior_winner() -> None:
+    """The as-run #277 roster has 10 unique models incl. baseline + prior winner.
+
+    The 10th slug is ``x-ai/grok-4.3``, the recovery candidate added when the
+    original ``x-ai/grok-4-fast`` slug 404'd as deprecated (see the
+    21 Jun results doc disposition).
+    """
     slugs = [c.slug for c in bakeoff.ROSTER]
+    assert len(slugs) == 10
     assert len(slugs) == len(set(slugs)), "roster slugs must be unique"
-    incumbents = [c for c in bakeoff.ROSTER if c.tier is bakeoff.Tier.INCUMBENT]
-    assert [c.slug for c in incumbents] == ["anthropic/claude-opus-4.8"]
+    # The gpt-4o n8n baseline (D40.4) and the prior winner are both present.
+    baselines = [c.slug for c in bakeoff.ROSTER if c.tier is bakeoff.Tier.BASELINE]
+    assert baselines == ["openai/gpt-4o"]
+    prior = [c.slug for c in bakeoff.ROSTER if c.tier is bakeoff.Tier.PRIOR_WINNER]
+    assert prior == ["google/gemini-3.1-flash-lite"]
 
 
-def test_fast_reasoning_tier_is_flagged_latency_risk() -> None:
-    """Fast-reasoning candidates are flagged as latency-risk (issue caution)."""
+def test_finalists_are_the_ones_carried_to_the_full_set() -> None:
+    """The as-run #277 finalists are flagged + returned by finalist_roster.
+
+    These are the candidates carried to the FULL 17-medium set with 2 seeds.
+    Of these, gpt-4o / gemini-3.1-flash-lite / gemini-3-flash-preview produced
+    usable full data; gpt-5-nano / gpt-5-mini / grok-4.3 were attempted but
+    proved unreachable on this OpenRouter access (see the 21 Jun results doc).
+    """
+    expected = {
+        "openai/gpt-4o",
+        "google/gemini-3.1-flash-lite",
+        "google/gemini-3-flash-preview",
+        "openai/gpt-5-nano",
+        "openai/gpt-5-mini",
+        "x-ai/grok-4.3",
+    }
+    assert {c.slug for c in bakeoff.ROSTER if c.finalist} == expected
+    assert {c.slug for c in bakeoff.finalist_roster()} == expected
+    assert {c.slug for c in bakeoff.screen_roster()} == {c.slug for c in bakeoff.ROSTER}
+
+
+def test_reasoning_models_are_capped_not_run_at_high() -> None:
+    """Gemini/GPT reasoning is pinned minimal/low; no candidate is pinned high."""
     for cand in bakeoff.ROSTER:
-        if cand.tier is bakeoff.Tier.FAST_REASONING:
-            assert cand.latency_risk, f"{cand.slug} (fast-reasoning) must be latency-risk"
+        if cand.reasoning is not None:
+            assert cand.reasoning in ("minimal", "low"), (
+                f"{cand.slug} reasoning must be minimal/low, never high"
+            )
+    # The known reasoning-capped models carry an explicit cap.
+    capped = {c.slug: c.reasoning for c in bakeoff.ROSTER if c.reasoning is not None}
+    assert capped["google/gemini-3.1-flash-lite"] == "minimal"
+    assert capped["openai/gpt-5-nano"] == "low"
+
+
+def test_latency_risk_candidate_is_flagged() -> None:
+    """gpt-5-mini (reasons before answering) is flagged latency-risk."""
+    by_slug = {c.slug: c for c in bakeoff.ROSTER}
+    assert by_slug["openai/gpt-5-mini"].latency_risk is True
+
+
+def test_resolve_reasoning_prefers_candidate_cap() -> None:
+    """A candidate's own reasoning cap overrides the run-wide reasoning."""
+    capped = bakeoff.Candidate(
+        "x/y", bakeoff.Tier.CONTROL_CANDIDATE, (RoastPhase.DEVELOPMENT,), reasoning="low"
+    )
+    uncapped = bakeoff.Candidate("a/b", bakeoff.Tier.BASELINE, (RoastPhase.DEVELOPMENT,))
+    assert bakeoff.resolve_reasoning(capped, "high") == "low"
+    assert bakeoff.resolve_reasoning(uncapped, "high") == "high"
+    assert bakeoff.resolve_reasoning(uncapped, None) is None
+
+
+# --- #277 test sets + AS-BUILT prompt/context wiring ------------------------
+
+
+def test_full_medium_set_is_the_seventeen_known_good_fixtures() -> None:
+    """The full set is exactly the 17 classification-doc known-good mediums."""
+    assert len(bakeoff.FULL_MEDIUM_FIXTURE_NAMES) == 17
+    assert len(set(bakeoff.FULL_MEDIUM_FIXTURE_NAMES)) == 17
+    # The dark/over-dark fixtures are deliberately excluded.
+    excluded = {"artisan-10", "artisan-15", "artisan-17", "artisan-20", "artisan-28"}
+    assert not (set(bakeoff.FULL_MEDIUM_FIXTURE_NAMES) & excluded)
+
+
+def test_screen_subset_is_a_subset_of_the_full_set() -> None:
+    """The ~6-roast screen subset is drawn from the full medium set."""
+    assert 1 <= len(bakeoff.SCREEN_MEDIUM_FIXTURE_NAMES) <= 8
+    assert set(bakeoff.SCREEN_MEDIUM_FIXTURE_NAMES) <= set(bakeoff.FULL_MEDIUM_FIXTURE_NAMES)
+    assert set(bakeoff.TEST_SETS) == {"screen", "full"}
+
+
+def test_resolve_test_set_errors_clearly_on_missing_fixture(tmp_path: Path) -> None:
+    """A missing local-only fixture yields a clear FileNotFoundError naming it."""
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(bakeoff, "ARTISAN_FIXTURES_DIR", tmp_path)
+        with pytest.raises(FileNotFoundError, match="missing local-only Artisan fixtures"):
+            bakeoff.resolve_test_set(("artisan-99",))
+
+
+def test_c1_is_registered_as_a_selectable_prompt() -> None:
+    """The AS-BUILT c1 control teaching prompt resolves as a prompt version."""
+    from roastpilot_agent.advisor import control_teaching_prompt, instructions_for
+
+    assert bakeoff.CONTROL_PROMPT_VERSION == "c1"
+    assert instructions_for("c1") == control_teaching_prompt("c1")
+
+
+def test_enrich_ticks_adds_the_273_limits_and_275_context() -> None:
+    """Enriched ticks carry the phase-resolved box + the per-tick control context."""
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    plain, ground = bakeoff.build_ticks(fixture, cadence_seconds=30.0)
+    enriched = bakeoff.enrich_ticks_with_control_context(plain, ground)
+    assert len(enriched) == len(plain)
+    # A post-FC (development) tick carries the full box + the #275 fields.
+    dev = next(t for t in enriched if t.context.first_crack_detected)
+    ctx = dev.context
+    assert ctx.heat_ceiling_percent == 100
+    assert ctx.bitter_ceiling_temp_c is not None
+    assert ctx.emergency_drop_temp_c is not None
+    assert ctx.roast_curve_window, "post-FC tick must carry a curve window"
+    assert ctx.development_time_ratio is not None
+    assert ctx.first_crack_eta_seconds is None  # post-FC: the detector owns it
+    # The real-lever / drop labels and timestamps are untouched by enrichment.
+    for a, e in zip(plain, enriched, strict=True):
+        assert e.real_heat_percent == a.real_heat_percent
+        assert e.real_should_drop == a.real_should_drop
+        assert e.monotonic_seconds == a.monotonic_seconds
+
+
+def test_build_control_ticks_enriches_by_default_and_can_opt_out() -> None:
+    """build_control_ticks enriches by default; enrich=False keeps the drop-only ctx."""
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    enriched, _ = bakeoff.build_control_ticks(fixture, cadence_seconds=30.0)
+    plain, _ = bakeoff.build_control_ticks(fixture, cadence_seconds=30.0, enrich=False)
+    dev_e = next(t for t in enriched if t.context.first_crack_detected)
+    dev_p = next(t for t in plain if t.context.first_crack_detected)
+    assert dev_e.context.bitter_ceiling_temp_c is not None
+    assert dev_p.context.bitter_ceiling_temp_c is None
+    assert dev_e.context.roast_curve_window
+    assert not dev_p.context.roast_curve_window
+
+
+def test_enriched_pre_fc_tick_has_an_fc_eta_and_narrowed_box() -> None:
+    """A pre-FC tick gets an FC-ETA and the pre-FC narrowed heat floor (#273)."""
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    # include_pre_fc to inspect the (gated-out) pre-FC ticks the enrichment builds.
+    ticks, _ground = bakeoff.build_control_ticks(fixture, cadence_seconds=20.0, include_pre_fc=True)
+    pre = [t for t in ticks if t.context.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK]
+    # Mid-roast pre-FC tick (enough curve to project an ETA).
+    mid = pre[len(pre) // 2]
+    assert mid.context.first_crack_eta_seconds is not None
+    # Pre-FC box pins the heat floor to the deterministic target (#222/#273).
+    assert mid.context.heat_floor_percent == 100
+
+
+def test_fc_milestone_is_sourced_only_from_seen_ticks() -> None:
+    """The FC milestone never draws on a future (unseen) tick (#299 review).
+
+    The summary is "as of ``ticks[upto_index]``" — like the live controller
+    arming FC on the first post-transition tick, it must only ever draw on ticks
+    the model has already seen (``ticks[:upto_index + 1]``). The fix bounds the
+    FC nearest-tick search the same way the turning point is bounded; this asserts
+    the invariant holds at every index from the FC crossing onward, and that a
+    contrived future-nearer FC time still resolves to a seen tick.
+    """
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    ticks, ground = bakeoff.build_ticks(fixture, cadence_seconds=30.0)
+    fc_index = next(
+        i for i, t in enumerate(ticks) if t.monotonic_seconds >= ground.first_crack_seconds
+    )
+    # The invariant at every index from the FC crossing onward: whatever tick the
+    # FC milestone is sourced from must be one the model has already seen.
+    for upto in range(fc_index, len(ticks)):
+        seen_temps = [t.context.current_bean_temp_c for t in ticks[: upto + 1]]
+        milestones = bakeoff._milestones_for(ticks, ground, upto)  # pyright: ignore[reportPrivateUsage]
+        fc = next(m for m in milestones if m.kind is bakeoff.RoastMilestoneKind.FIRST_CRACK)
+        assert fc.bean_temp_c in seen_temps
+
+    # Direct guard on the bound: skew the FC time to sit nearer a FUTURE tick than
+    # the current one, then evaluate AT that future index. An unbounded search at
+    # the seen index would reach for the nearer tick; the bounded search must keep
+    # to the seen window. Evaluating at upto = fc_index + 1 keeps now >= FC (so the
+    # milestone is emitted) while the future tick fc_index + 1 is the closer one.
+    if fc_index + 1 < len(ticks):
+        seen_t = ticks[fc_index].monotonic_seconds
+        next_t = ticks[fc_index + 1].monotonic_seconds
+        fc_seconds = seen_t + 0.6 * (next_t - seen_t)  # nearer the future tick
+        skewed = dataclasses.replace(ground, first_crack_seconds=fc_seconds)
+        # Evaluate one tick later so the milestone surfaces; the seen window is
+        # [: fc_index + 2], and the bounded FC source must be inside it.
+        milestones = bakeoff._milestones_for(ticks, skewed, fc_index + 1)  # pyright: ignore[reportPrivateUsage]
+        fc = next(m for m in milestones if m.kind is bakeoff.RoastMilestoneKind.FIRST_CRACK)
+        assert fc.bean_temp_c in [t.context.current_bean_temp_c for t in ticks[: fc_index + 2]]
+
+
+def test_build_control_ticks_is_development_only_by_default() -> None:
+    """The as-built D35 advisor scope: only post-FC development ticks are consulted."""
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    dev_only, _ = bakeoff.build_control_ticks(fixture, cadence_seconds=30.0)
+    assert dev_only, "there must be development ticks to consult"
+    # No preheating / pre-first-crack ticks survive the default scope.
+    assert all(t.context.phase is RoastPhase.DEVELOPMENT for t in dev_only)
+    assert all(t.context.first_crack_detected for t in dev_only)
+    # The drop decision lives at the end of development → the drop tick is kept,
+    # so drop timing is still scored.
+    assert any(t.real_should_drop for t in dev_only)
+
+
+def test_development_only_keeps_pre_fc_history_in_the_curve_window() -> None:
+    """A kept development tick still sees the pre-FC roast-so-far curve (#275)."""
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    dev_only, _ = bakeoff.build_control_ticks(fixture, cadence_seconds=30.0)
+    first_dev = dev_only[0]
+    window = first_dev.context.roast_curve_window
+    # The first development tick's curve window reaches back well before this
+    # tick's own time — enrichment runs over the whole roast (incl. the pre-FC
+    # samples), then the scope filter is applied, so the history is preserved.
+    assert len(window) > 1
+    earliest = min(s.elapsed_since_charge_seconds for s in window)
+    assert earliest < first_dev.context.roast_elapsed_seconds
+
+
+def test_include_pre_fc_restores_the_gated_out_ticks() -> None:
+    """--include-pre-fc keeps preheat + pre-FC ticks; the default drops them."""
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    dev_only, _ = bakeoff.build_control_ticks(fixture, cadence_seconds=30.0)
+    full, _ = bakeoff.build_control_ticks(fixture, cadence_seconds=30.0, include_pre_fc=True)
+    assert len(full) > len(dev_only)
+    phases = {t.context.phase for t in full}
+    assert RoastPhase.ROASTING_PRE_FIRST_CRACK in phases or RoastPhase.PREHEATING in phases
+    # development_only() is the pure filter behind the default.
+    assert bakeoff.development_only(full) == dev_only
 
 
 # --- Availability sweep -----------------------------------------------------
@@ -123,8 +337,8 @@ async def test_availability_sweep_drops_and_reports_unavailable(
 ) -> None:
     """A simulated-404 slug is dropped; a simulated-OK slug is kept."""
     roster = (
-        bakeoff.Candidate(_DEAD_SLUG, bakeoff.Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
-        bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.INCUMBENT, bakeoff.PHASE_ORDER),
+        bakeoff.Candidate(_DEAD_SLUG, bakeoff.Tier.CONTROL_CANDIDATE, (RoastPhase.DEVELOPMENT,)),
+        bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.BASELINE, bakeoff.PHASE_ORDER),
     )
     survivors, results = await bakeoff.availability_sweep(roster, "v2", None)
 
@@ -144,8 +358,8 @@ async def test_availability_sweep_report_lists_dropped_with_error(
 ) -> None:
     """The rendered availability section names the dropped slug and its error."""
     roster = (
-        bakeoff.Candidate(_DEAD_SLUG, bakeoff.Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
-        bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.INCUMBENT, bakeoff.PHASE_ORDER),
+        bakeoff.Candidate(_DEAD_SLUG, bakeoff.Tier.CONTROL_CANDIDATE, (RoastPhase.DEVELOPMENT,)),
+        bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.BASELINE, bakeoff.PHASE_ORDER),
     )
     _, results = await bakeoff.availability_sweep(roster, "v2", None)
     report = bakeoff.render_availability(results)
@@ -366,7 +580,7 @@ def _cell(
     phase: RoastPhase,
     median: float | None,
     *,
-    tier: bakeoff.Tier = bakeoff.Tier.ULTRA_FLASH,
+    tier: bakeoff.Tier = bakeoff.Tier.CONTROL_CANDIDATE,
     prompt_version: str = "v2",
     decision: RoastDecision | None = None,
     latency_risk: bool = False,
@@ -447,7 +661,7 @@ def test_decision_table_flags_latency_risk() -> None:
             "deepseek/r1",
             RoastPhase.ROASTING_PRE_FIRST_CRACK,
             5.0,
-            tier=bakeoff.Tier.FAST_REASONING,
+            tier=bakeoff.Tier.FRONTIER_CEILING,
             latency_risk=True,
         )
     ]
@@ -471,7 +685,7 @@ async def test_run_cell_uses_mocked_recommendation(
 
     monkeypatch.setattr(PydanticAIAdvisor, "get_recommendation", fake_reco)
     context, _ = bakeoff.build_phase_context(bakeoff.DEFAULT_FIXTURE, RoastPhase.DEVELOPMENT)
-    cand = bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.INCUMBENT, bakeoff.PHASE_ORDER)
+    cand = bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.BASELINE, bakeoff.PHASE_ORDER)
 
     cell = await bakeoff.run_cell(cand, RoastPhase.DEVELOPMENT, context, 3, "v3", None)
 
@@ -492,7 +706,7 @@ async def test_run_cell_records_failure(monkeypatch: pytest.MonkeyPatch) -> None
 
     monkeypatch.setattr(PydanticAIAdvisor, "get_recommendation", fake_reco)
     context, _ = bakeoff.build_phase_context(bakeoff.DEFAULT_FIXTURE, RoastPhase.DEVELOPMENT)
-    cand = bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.INCUMBENT, bakeoff.PHASE_ORDER)
+    cand = bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.BASELINE, bakeoff.PHASE_ORDER)
 
     cell = await bakeoff.run_cell(cand, RoastPhase.DEVELOPMENT, context, 2, "v2", None)
 
@@ -513,8 +727,8 @@ async def test_run_bakeoff_end_to_end_mocked(
 
     monkeypatch.setattr(PydanticAIAdvisor, "get_recommendation", fake_reco)
     roster = (
-        bakeoff.Candidate(_DEAD_SLUG, bakeoff.Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
-        bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.INCUMBENT, bakeoff.PHASE_ORDER),
+        bakeoff.Candidate(_DEAD_SLUG, bakeoff.Tier.CONTROL_CANDIDATE, (RoastPhase.DEVELOPMENT,)),
+        bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.BASELINE, bakeoff.PHASE_ORDER),
     )
     availability, cells = await bakeoff.run_bakeoff(
         roster, bakeoff.DEFAULT_FIXTURE, 1, ["v2"], None
@@ -562,7 +776,7 @@ async def test_score_candidate_over_both_roasts() -> None:
         clock_state["t"] += 0.7
         return clock_state["t"]
 
-    cand = bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.INCUMBENT, bakeoff.PHASE_ORDER)
+    cand = bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.BASELINE, bakeoff.PHASE_ORDER)
     cell = await bakeoff.score_candidate(
         cand, "v3", _canned_recommend, bakeoff.REPLAY_ROASTS, 30.0, clock=clock
     )
@@ -612,7 +826,7 @@ def test_render_replay_report_carries_honest_framing_and_no_autopick() -> None:
     )
     cell = bakeoff.ReplayCell(
         slug=_OK_SLUG,
-        tier="incumbent",
+        tier="baseline-n8n",
         prompt_version="v3",
         latency_risk=False,
         scores=[score],
@@ -638,8 +852,8 @@ async def test_run_replay_bakeoff_drops_unavailable_then_scores(
 
     monkeypatch.setattr(PydanticAIAdvisor, "get_recommendation", fake_reco)
     roster = (
-        bakeoff.Candidate(_DEAD_SLUG, bakeoff.Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
-        bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.INCUMBENT, bakeoff.PHASE_ORDER),
+        bakeoff.Candidate(_DEAD_SLUG, bakeoff.Tier.CONTROL_CANDIDATE, (RoastPhase.DEVELOPMENT,)),
+        bakeoff.Candidate(_OK_SLUG, bakeoff.Tier.BASELINE, bakeoff.PHASE_ORDER),
     )
     availability, cells = await bakeoff.run_replay_bakeoff(
         roster, bakeoff.REPLAY_ROASTS, ["v2"], None, 60.0

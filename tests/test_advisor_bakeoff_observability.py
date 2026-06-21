@@ -79,8 +79,8 @@ def mock_healthcheck(monkeypatch: pytest.MonkeyPatch) -> None:
 def _roster() -> tuple[Candidate, ...]:
     """A two-slug roster both measured in every phase."""
     return (
-        Candidate(_SLUG_A, Tier.INCUMBENT, bakeoff.PHASE_ORDER),
-        Candidate(_SLUG_B, Tier.ULTRA_FLASH, (RoastPhase.DEVELOPMENT,)),
+        Candidate(_SLUG_A, Tier.BASELINE, bakeoff.PHASE_ORDER),
+        Candidate(_SLUG_B, Tier.CONTROL_CANDIDATE, (RoastPhase.DEVELOPMENT,)),
     )
 
 
@@ -219,6 +219,9 @@ async def test_checkpoint_resume_skips_completed_and_matches_all_at_once(
     roasts = bakeoff.REPLAY_ROASTS
 
     # 1) A clean all-at-once run for the reference scorecard.
+    # These budget/resume MECHANICS tests need the denser pre-FC-inclusive tick
+    # set so the budget math (the first cell is ~22 calls) trips deterministically;
+    # the development-only default (~3 dev ticks/roast) is exercised separately.
     ref_out = tmp_path / "ref.json"
     reference = await bakeoff.run_replay_bakeoff_observable(
         roster,
@@ -230,6 +233,7 @@ async def test_checkpoint_resume_skips_completed_and_matches_all_at_once(
         recommender_factory=_canned_factory,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
     assert reference.fresh_cells == len(roster) * len(roasts)
     assert reference.resumed_cells == 0
@@ -250,6 +254,7 @@ async def test_checkpoint_resume_skips_completed_and_matches_all_at_once(
         max_spend=30.0,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
     assert k_budget.stopped_for_budget is True
     completed_after_kill = k_budget.fresh_cells
@@ -270,6 +275,7 @@ async def test_checkpoint_resume_skips_completed_and_matches_all_at_once(
         recommender_factory=_canned_factory,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
     assert resumed.resumed_cells == completed_after_kill
     assert resumed.fresh_cells == len(roster) * len(roasts) - completed_after_kill
@@ -406,6 +412,8 @@ async def test_partial_scorecard_renders_after_simulated_kill(
 ) -> None:
     """A mid-run stop leaves cells that render a valid (partial) markdown report."""
     out = tmp_path / "bakeoff.json"
+    # Pre-FC-inclusive so the budget trips mid-run (the denser tick set the budget
+    # math assumes; the development-only default is too cheap to stop at $30).
     result = await bakeoff.run_replay_bakeoff_observable(
         _roster(),
         bakeoff.REPLAY_ROASTS,
@@ -418,6 +426,7 @@ async def test_partial_scorecard_renders_after_simulated_kill(
         max_spend=30.0,
         clock=_fixed_clock(),
         heartbeat_clock=_fixed_clock(),
+        include_pre_fc=True,
     )
     assert result.stopped_for_budget is True
     assert result.cells, "a partial run still yields reportable cells"
@@ -460,7 +469,7 @@ def test_progress_line_cost_uses_configured_rate_not_the_default() -> None:
         bakeoff.TickOutcome(tick=t, decision=None, latency_seconds=0.1, error="x") for t in ticks
     ]
     replay = bakeoff.build_roast_replay(_SLUG_A, "v2", rid, outcomes, ground)
-    cand = Candidate(_SLUG_A, Tier.INCUMBENT, bakeoff.PHASE_ORDER)
+    cand = Candidate(_SLUG_A, Tier.BASELINE, bakeoff.PHASE_ORDER)
 
     # A configured rate deliberately different from DEFAULT_COST_PER_CALL_USD.
     configured = 0.005

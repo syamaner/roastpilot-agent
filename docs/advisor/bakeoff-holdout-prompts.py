@@ -43,7 +43,9 @@ from advisor_bakeoff import (  # noqa: E402
 from roastpilot_agent.models import RoastPhase  # noqa: E402
 
 DEV = (RoastPhase.DEVELOPMENT,)
-ROSTER: tuple[Candidate, ...] = (Candidate("google/gemini-3.1-flash-lite", Tier.ULTRA_FLASH, DEV),)
+ROSTER: tuple[Candidate, ...] = (
+    Candidate("google/gemini-3.1-flash-lite", Tier.CONTROL_CANDIDATE, DEV),
+)
 PROMPT_VERSIONS = ["v2", "v4", "v5"]  # baseline + winner + runner-up
 CADENCE_SECONDS = 30.0
 HELD_OUT_MIN_DROP_C = 198.0  # the operator's excluded over-dark roasts = unseen

@@ -57,7 +57,9 @@ from roastpilot_agent.models import RoastPhase  # noqa: E402
 DEV = (RoastPhase.DEVELOPMENT,)
 
 # The single PINNED candidate — this run tunes its PROMPT, not the model.
-ROSTER: tuple[Candidate, ...] = (Candidate("google/gemini-3.1-flash-lite", Tier.ULTRA_FLASH, DEV),)
+ROSTER: tuple[Candidate, ...] = (
+    Candidate("google/gemini-3.1-flash-lite", Tier.CONTROL_CANDIDATE, DEV),
+)
 
 PROMPT_VERSIONS = ["v2", "v4", "v5", "v6", "v7", "v8"]
 CADENCE_SECONDS = 30.0
