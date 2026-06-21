@@ -210,11 +210,15 @@ class RoastControlPolicy:
         """Resolve the control box for ``phase`` from the single source.
 
         The two pre-FC phases (preheat, charge→FC) resolve a NARROWED box with a
-        deterministic lever target (D35 §3/§4-A, #222): heat is pinned high
-        (floor = the heat target, so a momentum-killing cut is structurally
-        impossible — the gate clamps any lower value back up) and fan is capped
-        low (the operator's max-heat / low-fan-to-FC method). Every other phase
-        resolves the full 0–100 range with no deterministic target — development
+        deterministic lever target (D35 §3/§4-A, #222): heat resolves the range
+        ``[heat_target, 100]`` — the FLOOR is pinned to the deterministic target
+        (so a momentum-killing cut is structurally impossible — the gate clamps
+        any lower value back up) while the ceiling stays at 100. At the default
+        target 100 that range collapses to the point ``[100, 100]``, but a future
+        learned target below 100 (D42 §7.1) yields a genuine range; it is the
+        FLOOR, not a single pinned value, that prevents the #218 cut. Fan is
+        capped low (the operator's max-heat / low-fan-to-FC method). Every other
+        phase resolves the full 0–100 range with no deterministic target — development
         → drop is the post-FC LLM's box (#223); the lifecycle states do not
         actuate. The bitter ceiling is the configured hard ceiling, capped at the
         active profile's drop target when that is lower; the emergency-drop bound

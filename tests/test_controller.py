@@ -564,15 +564,20 @@ async def test_pre_fc_heat_crash_is_structurally_impossible() -> None:
 
 
 @pytest.mark.asyncio
-async def test_restart_into_pre_fc_never_auto_resumes_heat() -> None:
+@pytest.mark.parametrize(
+    "phase",
+    [RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK],
+)
+async def test_restart_into_pre_fc_never_auto_resumes_heat(phase: RoastPhase) -> None:
     """Restart safety (#222 / the architecture invariant): a restart with a
-    possibly-active pre-FC run enters operator_recovery_required and the
+    possibly-active pre-FC run — in EITHER deterministic pre-FC phase (mid-preheat
+    or mid-pre-first-crack) — enters operator_recovery_required and the
     deterministic lever policy does NOT auto-resume heat/fan — no MCP write is
     issued. The policy only actuates during a normally-progressing run, never as a
     side effect of restart/recovery."""
     harness = make_harness(readings=[reading(bean=150.0)])
     harness.controller.load_profile(PROFILE)
-    await harness.controller.recover_from_restart(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    await harness.controller.recover_from_restart(phase)
     assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
     assert harness.executor.targets == []  # no auto-resume
     # A tick in recovery still issues NO deterministic lever write (the recovery
@@ -583,16 +588,23 @@ async def test_restart_into_pre_fc_never_auto_resumes_heat() -> None:
 
 
 @pytest.mark.asyncio
-async def test_operator_resume_into_pre_fc_re_engages_deterministic_levers() -> None:
+@pytest.mark.parametrize(
+    "phase",
+    [RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK],
+)
+async def test_operator_resume_into_pre_fc_re_engages_deterministic_levers(
+    phase: RoastPhase,
+) -> None:
     """After a restart→operator_recovery_required, the EXPLICIT operator resume
-    into pre-FC re-engages the deterministic lever policy on the next tick (#222).
-    This is the operator's choice (operator_resume is the explicit action), not an
-    auto-resume — heat is 0 until the resumed tick actuates it."""
+    into EITHER deterministic pre-FC phase re-engages the deterministic lever
+    policy on the next tick (#222). This is the operator's choice (operator_resume
+    is the explicit action), not an auto-resume — heat is 0 until the resumed tick
+    actuates it."""
     harness = make_harness(readings=[reading(bean=150.0)])
     harness.controller.load_profile(PROFILE)
-    await harness.controller.recover_from_restart(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    await harness.controller.recover_from_restart(phase)
     assert harness.controller.snapshot().current_heat == 0
-    harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    harness.controller.operator_resume(phase)
     # Heat still 0 immediately after resume — operator_resume never writes hardware.
     assert harness.executor.targets == []
     assert harness.controller.snapshot().current_heat == 0
@@ -1235,9 +1247,16 @@ def test_policy_manual_bypasses_phase_scoping_and_interval() -> None:
     assert trigger is AdvisoryTrigger.MANUAL
 
 
-def test_policy_manual_request_reaches_preheat_despite_auto_off() -> None:
-    """D32 (#191): preheat is OFF for AUTOMATIC consults, but a manual operator
-    request still reaches it — manual bypasses the auto-advice-phase scope."""
+def test_policy_manual_in_preheat_returns_manual_in_isolation() -> None:
+    """Isolated AdvisoryCallPolicy logic ONLY — NOT the controller's runtime path.
+
+    D32 (#191): in isolation the policy treats a manual operator request in preheat
+    as MANUAL (manual bypasses the auto-advice-phase scope). But under D35 (#222)
+    the controller short-circuits in `_maybe_run_advisory` and never calls
+    `policy.evaluate()` for the pre-FC phases, so this branch is unreachable at
+    runtime — the advisor is gated out of pre-FC entirely. The system-level
+    invariant is `test_advisor_not_consulted_pre_fc_even_on_manual_request`. The
+    policy itself is retained (and exercised) for POST-FC cadence."""
     policy = _policy()
     trigger = policy.evaluate(
         phase=RoastPhase.PREHEATING, telemetry=reading(), now=0.0, manual_request=True
