@@ -629,6 +629,13 @@ class RoastController:
         # Context for the deterministic gate only — it never bypasses safety.
         self._heat_direction = LeverDirection.NONE
         self._fan_direction = LeverDirection.NONE
+        # D35 §3 (#327): the anticipatory late-Maillard heat-trim LATCH. Set once
+        # the trim window first opens this pre-FC phase (a clean FC-ETA + bean
+        # floor), then held so the trim stays engaged through a noisy-ETA bounce —
+        # the hysteresis that stops the deterministic heat oscillating
+        # 100↔trim↔100 (the #218 lever-thrash). Reset on each new run/preheat; the
+        # trim ends naturally when FC moves the phase out of pre-FC.
+        self._trim_latched = False
         self._last_command_monotonic: float | None = None
         self._t0_streak = 0
         self._t0_confirmed = False
@@ -887,6 +894,11 @@ class RoastController:
             # post-FC move of the new roast.
             self._heat_direction = LeverDirection.NONE
             self._fan_direction = LeverDirection.NONE
+            # A new run/preheat clears the anticipatory trim latch (#327): a fresh
+            # roast has not yet opened the late-Maillard window, so the trim must
+            # re-arm from the flat floor and only re-engage on this roast's own
+            # clean FC-ETA signal — never inherit a prior roast's latch.
+            self._trim_latched = False
         if target is RoastPhase.COOLING and self._drop_monotonic is None:
             # The drop instant (#239): every drop path lands in COOLING (the
             # advisor drop, the operator drop, and the pre-FC early-abort drop),
@@ -1098,7 +1110,16 @@ class RoastController:
         """
         if self._profile is None:
             return
-        box = self._control_limits(trim_signal=self._trim_signal(telemetry))
+        # Build the live trim signal (bean-temp + FC-ETA + the per-run latch), arm
+        # the latch the moment THIS tick's fresh-engage window first opens, then
+        # resolve the box from the (possibly freshly-latched) signal. The latch is
+        # the hysteresis: once the window has opened it stays engaged through a
+        # noisy-ETA bounce, so the deterministic heat does not oscillate
+        # 100↔trim↔100 (the #218 lever-thrash). ``trim_window_open`` ignores the
+        # carried latch, so a garbage ETA never arms it; the latch resets per
+        # run/preheat in ``transition_to``.
+        trim_signal = self._arm_trim_latch(self._trim_signal(telemetry))
+        box = self._control_limits(trim_signal=trim_signal)
         if not box.has_deterministic_target:
             return
         # Validated all-or-nothing on PhaseControlLimits: a deterministic target
@@ -2332,24 +2353,43 @@ class RoastController:
         Returns:
             The phase-resolved :class:`PhaseControlLimits` box.
         """
-        policy = RoastControlPolicy(
+        return self._policy().limits_for(phase, trim_signal=trim_signal)
+
+    def _policy(self) -> RoastControlPolicy:
+        """Build the single-source :class:`RoastControlPolicy` for this tick (#273).
+
+        From the safety policy's *own* limits (``self._safety.limits`` — the same
+        config the gate enforces), the frozen active profile, and the configured
+        deterministic pre-FC levers (#222). Constructed fresh and side-effect free
+        each call; shared by :meth:`_policy_limits_for` (box resolution) and
+        :meth:`_trim_signal` (the #327 trim-window latch arming) so neither keeps a
+        second copy of the limit source.
+
+        Returns:
+            A :class:`RoastControlPolicy` over the current safety limits + profile.
+        """
+        return RoastControlPolicy(
             self._safety.limits,
             self._profile,
             pre_fc_levers=self._config.pre_first_crack_levers,
         )
-        return policy.limits_for(phase, trim_signal=trim_signal)
 
     def _trim_signal(self, telemetry: RoastTelemetry | None) -> TrimSignal | None:
         """Build the live anticipatory-trim signal for this tick, or ``None`` (#327).
 
-        Pairs the freshest bean temperature with the #229 predicted-FC ETA so
+        Pairs the freshest bean temperature with the #229 predicted-FC ETA and the
+        controller's current per-run latch state so
         :meth:`RoastControlPolicy.limits_for` can decide whether the late-Maillard
-        trim window is open. The bean temperature is this tick's ``telemetry``
-        reading when present, else the last accumulated curve sample (the FC-ETA
-        is always derived from the curve window). Returns ``None`` — fail closed to
-        the flat floor — only when neither a live read nor any curve sample exists
-        (the very first ticks of a run). A present signal with an unknown (``None``)
-        FC-ETA is equally safe: the policy fails the trim closed on it.
+        trim is engaged. The bean temperature is this tick's ``telemetry`` reading
+        when present, else the last accumulated curve sample (the FC-ETA is always
+        derived from the curve window). Returns ``None`` — fail closed to the flat
+        floor — only when neither a live read nor any curve sample exists (the very
+        first ticks of a run). A present signal with an unknown (``None``) FC-ETA
+        is equally safe: the policy fails a *fresh* engage closed on it.
+
+        Pure builder: it reads ``self._trim_latched`` but never arms it — the latch
+        is armed in :meth:`_apply_deterministic_pre_fc_levers` (the actuation path),
+        so probing the signal never mutates control state.
 
         Args:
             telemetry: This tick's reading, or ``None`` on a failed/sessionless
@@ -2369,6 +2409,41 @@ class RoastController:
         return TrimSignal(
             bean_temp_c=bean_temp_c,
             first_crack_eta_seconds=self._first_crack_eta_seconds(),
+            latched=self._trim_latched,
+        )
+
+    def _arm_trim_latch(self, trim_signal: TrimSignal | None) -> TrimSignal | None:
+        """Arm the per-run trim latch when the fresh-engage window first opens (#327).
+
+        The single mutation point for ``self._trim_latched``: once
+        :meth:`RoastControlPolicy.trim_window_open` returns ``True`` (a clean
+        FC-ETA inside the window AND bean ≥ the late-Maillard floor) the latch
+        flips ``False`` → ``True`` and stays set for the rest of the pre-FC phase
+        (reset per run/preheat in :meth:`transition_to`). This is the hysteresis
+        that stops the trim oscillating: a later noisy ETA bouncing back above the
+        window keeps the trim engaged rather than snapping heat back to 100.
+
+        Returns a signal carrying the freshly-armed latch so the SAME tick already
+        trims (no one-tick lag). An already-latched or ``None`` signal is returned
+        unchanged. ``trim_window_open`` ignores the carried latch, so this never
+        arms on a degenerate signal.
+
+        Args:
+            trim_signal: This tick's signal (current latch carried), or ``None``.
+
+        Returns:
+            The signal to resolve the box from — re-stamped ``latched=True`` on the
+            tick the window first opens, otherwise unchanged.
+        """
+        if trim_signal is None or self._trim_latched:
+            return trim_signal
+        if not self._policy().trim_window_open(trim_signal):
+            return trim_signal
+        self._trim_latched = True
+        return TrimSignal(
+            bean_temp_c=trim_signal.bean_temp_c,
+            first_crack_eta_seconds=trim_signal.first_crack_eta_seconds,
+            latched=True,
         )
 
     def _record_curve_history(self, telemetry: RoastTelemetry | None) -> None:

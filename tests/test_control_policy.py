@@ -274,6 +274,47 @@ def test_trim_fails_closed_to_flat_floor(signal: TrimSignal | None) -> None:
     assert box.fan_target_percent == 30
 
 
+def test_latched_signal_keeps_trim_engaged_through_eta_bounce() -> None:
+    """#327 hysteresis: a LATCHED signal keeps the trim engaged even when the FC-ETA
+    bounces back ABOVE the window (the noisy-estimator case) — the trimmed heat is
+    held, not snapped back to 100. Without the latch the same out-of-window ETA
+    fails closed to the flat floor (the flip-flop the latch removes)."""
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE)
+    # ETA 80 s is OUTSIDE the 60 s window — a fresh signal would NOT engage…
+    fresh = TrimSignal(bean_temp_c=170.0, first_crack_eta_seconds=80.0, latched=False)
+    fresh_box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=fresh)
+    assert fresh_box.heat_target_percent == 100
+    # …but the SAME bounce with the latch set holds the trim at 65.
+    latched = TrimSignal(bean_temp_c=170.0, first_crack_eta_seconds=80.0, latched=True)
+    latched_box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=latched)
+    assert latched_box.heat_target_percent == 65
+
+
+def test_trim_window_open_ignores_the_latch() -> None:
+    """#327: ``trim_window_open`` is the FRESH-engage precondition — it ignores the
+    carried latch, so the controller only ever latches on a clean in-window signal
+    (a garbage ETA never arms the latch even if the signal claims latched)."""
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE)
+    # A degenerate signal (no ETA) that falsely claims latched: window stays shut.
+    assert not policy.trim_window_open(
+        TrimSignal(bean_temp_c=170.0, first_crack_eta_seconds=None, latched=True)
+    )
+    # A clean in-window signal opens regardless of the latch value.
+    assert policy.trim_window_open(
+        TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=30.0, latched=False)
+    )
+
+
+def test_disabled_trim_ignores_the_latch() -> None:
+    """#327: a config-disabled trim is never engaged, even by a latched signal —
+    ``enabled=False`` is the hard off-switch the latch cannot override."""
+    levers = PreFirstCrackLevers(late_maillard_trim=LateMaillardTrim(enabled=False))
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE, pre_fc_levers=levers)
+    latched = TrimSignal(bean_temp_c=170.0, first_crack_eta_seconds=30.0, latched=True)
+    box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=latched)
+    assert box.heat_target_percent == 100
+
+
 def test_trim_disabled_in_config_keeps_flat_floor_even_in_window() -> None:
     """``enabled=False`` reverts to the pure #222 flat floor with no trim window —
     even a signal that would otherwise open the window resolves heat 100 (#327)."""

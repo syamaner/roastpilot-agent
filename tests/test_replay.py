@@ -891,3 +891,38 @@ async def test_fault_severity_override_reaches_faulted(tmp_path: Path) -> None:
     timeline = await service.timeline(source.run_id)
     assert any(e.verdict == "fault" for e in timeline.safety_evaluations)
     await source.aclose()
+
+
+@pytest.mark.asyncio
+async def test_trim_engages_once_no_flip_flop_on_session2_replay(tmp_path: Path) -> None:
+    """#327 hysteresis: the anticipatory heat trim engages EXACTLY ONCE on the real
+    session-2 roast and holds through to the FC hand-off — no 100↔65 oscillation.
+
+    Pre-latch, the naive FC-ETA wobbled across the window boundary so the
+    deterministic heat thrashed 100→65→100→65→100 (an extra ``set_targets`` per
+    flip — the #218 lever-thrash and the source of the ``dashboard-developed``
+    replay event-stream churn). With the per-run latch the lever sequence to first
+    crack is the flat-floor write then a single trim step, after which the trim is
+    held; FC then hands control to the post-FC loop (phase development)."""
+    _app, _service, source = await create_replay_app(
+        _SESSION_2, tmp_path / "trim_latch.sqlite3", step_mode=True, speed=60
+    )
+    try:
+        result = await source.advance_to(ReplayMarker.FIRST_CRACK)
+        assert result.agent_phase == "development"  # FC handed off to the post-FC loop
+        # The source owns the recording control; read the executed lever writes.
+        set_targets = [args for name, args in source._control.commands if name == "set_targets"]  # pyright: ignore[reportPrivateUsage]
+        # The run-start command (the replay profile's heat 100 / fan 10), then the
+        # deterministic pre-FC floor (fan opens to 30), then a SINGLE trim step to
+        # 65 — held to FC. The key assertion is no 100↔65 oscillation: heat 65
+        # appears exactly once and never reverts to 100 before the FC hand-off.
+        assert set_targets == [
+            {"heat": 100, "fan": 10},
+            {"heat": 100, "fan": 30},
+            {"heat": 65, "fan": 30},
+        ], set_targets
+        heats = [t["heat"] for t in set_targets]
+        assert heats.count(65) == 1  # one engage
+        assert heats[-1] == 65  # held trimmed into the FC hand-off (no snap-back)
+    finally:
+        await source.aclose()

@@ -904,14 +904,23 @@ async def test_early_maillard_holds_the_flat_floor_before_the_window() -> None:
 
 @pytest.mark.asyncio
 async def test_unknown_fc_eta_fails_closed_to_flat_floor() -> None:
-    """#327 fail-closed: with no warming slope the FC-ETA is unknown (the estimator
-    returns None), so even a hot bean (above the late-Maillard floor) holds the flat
-    100 floor — the always-on guarantee FC still arrives (§8.4)."""
+    """#327 fail-closed: with NO warming slope from the start the FC-ETA is unknown
+    (the estimator returns None) and the window never opens, so the trim never
+    engages or latches — even a hot bean (above the late-Maillard floor) holds the
+    flat 100 floor (the always-on guarantee FC still arrives, §8.4)."""
     harness = make_harness()
-    await _charge_into_pre_fc(harness)
-    # A FLAT bean above the floor: bean ≥ 155 but a zero slope ⇒ no FC-ETA. Enough
-    # ticks that the estimator's recent-sample window is entirely flat (the earlier
-    # charge ramp has aged out), so the slope is non-positive and the ETA is None.
+    # Charge with the bean ALREADY flat at 165 °C (above the 155 floor) so there is
+    # never a warming slope to project an FC-ETA from — the fail-closed case with no
+    # prior in-window engage that could have latched the trim (hysteresis untouched).
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING
+        harness.controller.transition_to(step)
+    t0 = reading(bean=165.0, t0_detected=True, bean_ror_c_per_min=0.0)
+    harness.reader.readings = [t0]
+    for _ in range(3):  # debounce → pre-FC, all at a flat 165
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
     for _ in range(10):
         harness.reader.readings = [reading(bean=165.0, bean_ror_c_per_min=0.0)]
         await harness.controller.tick()
@@ -960,6 +969,56 @@ async def test_trim_disabled_holds_flat_floor_in_window() -> None:
         harness.clock.advance(1.0)
         bean += 0.5
     assert harness.controller.snapshot().current_heat == 100  # trim off → flat floor
+
+
+@pytest.mark.asyncio
+async def test_trim_latch_holds_through_eta_bounce_no_flip_flop() -> None:
+    """#327 hysteresis: once the window opens, a momentary FC-ETA bounce back above
+    the window does NOT snap heat back to 100 — the latch holds the trim at 65 and
+    NO extra set_targets fires (no 100↔65 thrash). This is the controller-level
+    proof of the fix for the replay event-stream churn."""
+    harness = make_harness()
+    await _charge_into_pre_fc(harness)
+    # Warm into the window to ENGAGE + latch the trim (bean ≥155, FC-ETA ≤60 s).
+    bean = 162.0
+    for _ in range(6):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=30.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean += 0.5
+    assert harness.controller.snapshot().current_heat == 65  # engaged
+    writes_after_engage = len(harness.executor.targets)
+    # Now FLATTEN the bean: the FC-ETA goes unknown (the boundary "bounce"). Pre-latch
+    # this snapped heat back to 100; with the latch it stays trimmed and re-writes
+    # nothing.
+    for _ in range(5):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=0.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.snapshot().current_heat == 65  # held — no snap-back
+    assert len(harness.executor.targets) == writes_after_engage  # no extra writes
+
+
+@pytest.mark.asyncio
+async def test_trim_latch_resets_on_new_run() -> None:
+    """#327: the trim latch is per-run — a fresh run/preheat clears it, so the next
+    roast re-arms from the flat floor and only re-engages on its OWN clean FC-ETA
+    (never inherits the prior roast's latch)."""
+    harness = make_harness()
+    await _charge_into_pre_fc(harness)
+    bean = 162.0
+    for _ in range(6):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=30.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean += 0.5
+    assert harness.controller._trim_latched is True  # pyright: ignore[reportPrivateUsage]
+    # A new run/preheat clears the latch (same reset block as the other per-run
+    # state). Reach PREHEATING via the legal recovery edge (the "back before charge"
+    # resume): pre-FC →(universal) operator_recovery_required → preheating.
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    assert harness.controller._trim_latched is False  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
