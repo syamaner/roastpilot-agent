@@ -124,6 +124,32 @@ describe("useDashboardEvents (hook)", () => {
     };
   }
 
+  /** A persisted series with EXPLICIT serve/charge clocks per row — used for the
+   *  reload/late-join backfill (#326): a real pre-charge row (charge_elapsed_seconds
+   *  null) plus post-charge rows whose clocks let the hook recover the T0 origin.
+   *  `[serve, charge]` pairs; charge null = pre-charge (preheat). */
+  function mixedSeries(rows: [number, number | null][]): TelemetrySeries {
+    return {
+      run_id: "run-1",
+      downsample: 1,
+      point_count: rows.length,
+      points: rows.map(([serve, charge], i) => ({
+        tick: i,
+        elapsed_seconds: serve,
+        charge_elapsed_seconds: charge,
+        agent_phase: charge == null ? "preheating" : "development",
+        bean_temp_c: 50 + serve / 10,
+        env_temp_c: 180 + serve / 100,
+        bean_ror_c_per_min: 12,
+        env_ror_c_per_min: 14,
+        heat_level_percent: 100,
+        fan_level_percent: 30,
+        cooling_on: false,
+        development_percent: null,
+      })),
+    };
+  }
+
   /** A live telemetry SSE frame at SERVE-elapsed `t` (#326; the buffer key). */
   function telemetry(t: number): SseEvent {
     return {
@@ -157,6 +183,40 @@ describe("useDashboardEvents (hook)", () => {
     expect(fetchTelemetry).toHaveBeenCalledTimes(1);
     expect(result.current.points.map((p) => p.t)).toEqual([0, 30, 60, 90]);
     expect(result.current.points[0]).toMatchObject({ t: 0, bean: 100, env: 120, heat: 70, fan: 40 });
+  });
+
+  it("backfills a PRE-charge snapshot row AND recovers the T0 origin on cold reload (#326)", async () => {
+    // End-to-end through the real hook → pointFromSnapshot → seed path (the seed
+    // action takes already-projected points, so this is the only test of the
+    // pointFromSnapshot null-guard change). A reload mid-roast fetches a series with
+    // a genuine PRE-charge row (charge null) plus post-charge rows; assert:
+    //  - the pre-charge row IS seeded, keyed on serve elapsed (the new guard drops
+    //    only on null serve clock — the #316 blank-preheat regression fix), and
+    //  - the hook recovers the T0 origin from the first post-charge row's clocks
+    //    (serve 540 − charge 0 = 540), with no t0_detected event (Augment medium).
+    const fetchTelemetry = vi.fn(() =>
+      Promise.resolve(
+        mixedSeries([
+          [300, null], // pre-charge (preheat) — must still seed
+          [480, null], // pre-charge
+          [540, 0], // charge moment → origin 540
+          [600, 60], // post-charge
+        ]),
+      ),
+    );
+    const { result, rerender } = renderHook(
+      ({ status }: { status: ConnectionStatus }) =>
+        useDashboardEvents([], 0, "run-1", status, { fetchTelemetry }),
+      { initialProps: { status: "connecting" as ConnectionStatus } },
+    );
+
+    rerender({ status: "live" });
+    await waitFor(() => expect(result.current.points).toHaveLength(4));
+    // All four rows seeded, keyed on serve elapsed — INCLUDING the two pre-charge rows.
+    expect(result.current.points.map((p) => p.t)).toEqual([300, 480, 540, 600]);
+    // Origin recovered from the server clocks (no t0_detected fired), T0 marker placed.
+    expect(result.current.t0ElapsedSeconds).toBe(540);
+    expect(result.current.markers.find((m) => m.kind === "t0")).toEqual({ kind: "t0", t: 540, label: "T0" });
   });
 
   it("re-seeds on reconnect WITHOUT duplicating points (reconnect catches up, #135)", async () => {

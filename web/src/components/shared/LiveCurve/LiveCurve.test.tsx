@@ -129,6 +129,43 @@ describe("LiveCurve", () => {
     expect(screen.getByTestId("legend-time")).toHaveTextContent("—");
   });
 
+  it("renders the legend time as CHARGE-referenced roast time when originSeconds is set (#326)", () => {
+    // The core acceptance contract: with the charge origin threaded through
+    // LiveCurve → Legend, the cursor/latest readout reads SIGNED roast time
+    // (point − origin), NOT serve-elapsed. Latest point serve t=600 with origin 540
+    // → "1:00" (60 s into the roast), never "10:00" (the un-transformed serve value).
+    render(
+      <LiveCurve
+        points={[
+          { t: 480, bean: 90, env: 180, ror: 30, heat: 100, fan: 30 },
+          { t: 540, bean: 160, env: 200, ror: 22, heat: 100, fan: 30 },
+          { t: 600, bean: 175, env: 205, ror: 18, heat: 80, fan: 40 },
+        ]}
+        originSeconds={540}
+      />,
+    );
+    expect(screen.getByTestId("legend-time")).toHaveTextContent("1:00");
+    expect(screen.getByTestId("legend-time")).not.toHaveTextContent("10:00");
+  });
+
+  it("renders a NEGATIVE legend time for a pre-charge latest point when origin is set (#326)", () => {
+    // A latest point before the charge origin reads negative roast time (preheat).
+    // Several pre-charge points so uPlot has a non-degenerate x-range; the latest
+    // (t=340) drives the readout.
+    render(
+      <LiveCurve
+        points={[
+          { t: 300, bean: 70, env: 172, ror: 30, heat: 100, fan: 30 },
+          { t: 320, bean: 75, env: 174, ror: 30, heat: 100, fan: 30 },
+          { t: 340, bean: 80, env: 175, ror: 30, heat: 100, fan: 30 },
+        ]}
+        originSeconds={540}
+      />,
+    );
+    // 340 − 540 = −200 s → "-3:20".
+    expect(screen.getByTestId("legend-time")).toHaveTextContent("-3:20");
+  });
+
   it("reflects the controlled highlightTime on the data hook", () => {
     const { rerender } = render(<LiveCurve points={POINTS} highlightTime={null} />);
     expect(window.__chart?.highlightTime).toBeNull();
