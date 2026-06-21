@@ -761,15 +761,16 @@ def instructions_for(prompt_version: str) -> str:
 
     Resolves both prompt namespaces: the ``v``-prefixed per-tick advisory lenses
     in :data:`_PROMPTS` and the ``c``-prefixed control teaching SYSTEM frames in
-    :data:`_CONTROL_TEACHING_PROMPTS` (e.g. ``c1``). The live post-FC advisor
-    runs with ``prompt_version="c1"`` (#277), so the control teaching frame is the
-    system ``instructions`` of the production agent; the per-tick #275 context is
-    the user message. The ``c``-namespace is checked first so a control version
-    can never be shadowed by a same-named user lens.
+    :data:`_CONTROL_TEACHING_PROMPTS` (``c1``, ``c2``). The live post-FC advisor
+    runs with ``prompt_version="c2"`` (the active default after the roast-2
+    development-stretch tuning; ``c1`` stays selectable for an A/B), so the control
+    teaching frame is the system ``instructions`` of the production agent; the
+    per-tick #275 context is the user message. The ``c``-namespace is checked first
+    so a control version can never be shadowed by a same-named user lens.
 
     Args:
         prompt_version: The advisor prompt version — a ``c`` control teaching
-            frame (``c1``) or a ``v`` per-tick lens (``v0``..``v8``).
+            frame (``c1`` / ``c2``) or a ``v`` per-tick lens (``v0``..``v8``).
 
     Returns:
         The instruction text for ``prompt_version``.
@@ -1007,10 +1008,11 @@ def control_teaching_prompt(version: str = CONTROL_TEACHING_PROMPT_VERSION) -> s
     the metrics, lever stability, and the objective). It is a SEPARATE artifact
     from the per-tick advisory prompts (the ``v`` lenses) and from the live
     per-tick context (built by #275): it never changes tick to tick, so it
-    caches. It is wired live (#277): :func:`instructions_for` resolves the ``c``
-    versions, so a :class:`PydanticAIAdvisor` built with ``prompt_version="c1"``
-    (the shipped default) sends this text as the agent's system ``instructions``
-    for the post-FC control loop.
+    caches. It is wired live: :func:`instructions_for` resolves the ``c``
+    versions, so a :class:`PydanticAIAdvisor` built with ``prompt_version="c2"``
+    (the shipped default — c1 plus the roast-2 development-stretch teaching; ``c1``
+    stays selectable for an A/B) sends this text as the agent's system
+    ``instructions`` for the post-FC control loop.
 
     Args:
         version: The control teaching prompt version. Defaults to the active
