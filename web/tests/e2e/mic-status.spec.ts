@@ -27,7 +27,7 @@
 import { expect, test } from "@playwright/test";
 
 import { advanceTo, AGENTS, step } from "./global-setup";
-import { settle } from "./helpers";
+import { settle, settleStepped } from "./helpers";
 import { WEB_URLS } from "./urls";
 
 test("mic-green — capture-alive OK mic renders the green icon (real replay, server-derived)", async ({
@@ -39,13 +39,15 @@ test("mic-green — capture-alive OK mic renders the green icon (real replay, se
   });
 
   // Step a few ticks into preheating so telemetry frames (each carrying the
-  // synthesized `mic_health: "ok"`) flow to the live browser.
-  const reached = await advanceTo(AGENTS.session2, "preheating");
-  expect(reached.agent_phase).toBe("preheating");
+  // synthesized `mic_health: "ok"`) flow to the live browser. A small additive `step`
+  // (4, or 8 on a retry — both well below T0 at ~frame 99) stays retry-safe and keeps
+  // the shared session-2 agent independent of the other preheating specs. The lossless
+  // `settleStepped` replaces the flaky `__lastEventId` wait (#338); the mic
+  // `data-health` assertion below is the real check (it retries).
+  await advanceTo(AGENTS.session2, "preheating");
   const stepped = await step(AGENTS.session2, 4);
-  await page.waitForFunction((id) => (window.__lastEventId ?? -1) >= id, stepped.last_event_id, {
-    timeout: 15_000,
-  });
+  expect(stepped.agent_phase).toBe("preheating");
+  await settleStepped(page, stepped);
 
   // The icon is tinted by the server-derived health — assert the DATA (the
   // authoritative layer alongside the pixels): a capture-alive mic reads OK/green.
