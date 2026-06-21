@@ -576,8 +576,9 @@ def test_drop_coherence_guard_fails_open_without_a_profile() -> None:
     safety drop evaluation still owns the phase boundary). The live advisory path
     always carries a profile; this pins the defensive branch directly."""
     controller = make_harness().controller
-    # No profile loaded.
-    assert controller._drop_development_is_coherent() is True  # pyright: ignore[reportPrivateUsage]
+    # No profile loaded: fails open even for a real (would-block) development value
+    # — the guard takes the percent the caller computed once (#294 compute-once).
+    assert controller._drop_development_is_coherent(5.0) is True  # pyright: ignore[reportPrivateUsage]
 
 
 def test_drop_coherence_guard_fails_open_before_first_crack() -> None:
@@ -590,9 +591,11 @@ def test_drop_coherence_guard_fails_open_before_first_crack() -> None:
     controller.transition_to(RoastPhase.STARTING)
     controller.transition_to(RoastPhase.PREHEATING)
     controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
-    # Pre-FC: development percent is None, so the guard fails open.
-    assert controller._development_percent() is None  # pyright: ignore[reportPrivateUsage]
-    assert controller._drop_development_is_coherent() is True  # pyright: ignore[reportPrivateUsage]
+    # Pre-FC: development percent is None, so the guard fails open. The caller
+    # computes it once and passes it in (#294 compute-once).
+    system_percent = controller._development_percent()  # pyright: ignore[reportPrivateUsage]
+    assert system_percent is None
+    assert controller._drop_development_is_coherent(system_percent) is True  # pyright: ignore[reportPrivateUsage]
 
 
 def test_development_percent_is_zero_at_first_crack_and_charge_referenced() -> None:

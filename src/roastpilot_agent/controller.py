@@ -710,7 +710,7 @@ class RoastController:
             return None
         return development_elapsed / charge_elapsed * 100.0
 
-    def _drop_development_is_coherent(self) -> bool:
+    def _drop_development_is_coherent(self, system_percent: float | None) -> bool:
         """Whether the SYSTEM's development supports honouring an advisor drop (#312).
 
         The deterministic half of the trustworthy-drop fix: a drop is irreversible,
@@ -728,10 +728,20 @@ class RoastController:
 
         Fails OPEN (returns ``True``) only when the guard cannot be evaluated —
         there is no profile target, or development has not started so
-        ``_development_percent`` is ``None`` (the safety drop evaluation still owns
-        the phase boundary in that case). It reads already-computed clocks and the
-        config; it commands nothing, gates only the advisor drop path, and never
-        touches the operator manual-drop path, the safety box, or e-stop.
+        ``system_percent`` is ``None`` (the safety drop evaluation still owns the
+        phase boundary in that case). It commands nothing, gates only the advisor
+        drop path, and never touches the operator manual-drop path, the safety box,
+        or e-stop.
+
+        The development percent is **passed in** (computed once by the caller, the
+        #294 compute-once pattern) so the value that decides the block is exactly
+        the value the rejection note and the persisted :class:`SafetyEvaluation`
+        report — no sub-tick recompute can let them drift apart.
+
+        Args:
+            system_percent: The SYSTEM's development percent from a single
+                :meth:`_development_percent` read this tick, or ``None`` (no
+                profile / pre-FC) — both fail open.
 
         Returns:
             ``True`` to allow the advisor drop to proceed to safety evaluation,
@@ -739,7 +749,6 @@ class RoastController:
         """
         if self._profile is None:
             return True
-        system_percent = self._development_percent()
         if system_percent is None:
             return True
         floor = self._profile.target_development_percent - self._config.drop_dev_margin_percent
@@ -1349,7 +1358,12 @@ class RoastController:
             await self._execute_advisor_levers(
                 heat=evaluation.adjusted_heat, fan=evaluation.adjusted_fan
             )
-        if decision.should_drop and not self._drop_development_is_coherent():
+        # Compute the SYSTEM development percent ONCE (the #294 compute-once
+        # pattern): the same value decides the block, fills the rejection note,
+        # and feeds the persisted SafetyEvaluation, so the reported number is
+        # exactly the one that blocked — no sub-tick recompute drift.
+        system_percent = self._development_percent()
+        if decision.should_drop and not self._drop_development_is_coherent(system_percent):
             # Deterministic DROP COHERENCE GUARD (#312). The drop is irreversible,
             # so an advisor ``should_drop=true`` is cross-checked against the
             # SYSTEM's real development percent (_development_percent, charge/FC-
@@ -1365,11 +1379,10 @@ class RoastController:
             # operator's manual DROP BEANS is a separate, un-gated operator path;
             # e-stop and the safety box are unaffected.
             #
-            # Inside this branch _development_percent() is non-None by construction:
-            # _drop_development_is_coherent() returns True (fails open) when the
+            # Inside this branch system_percent is non-None by construction:
+            # _drop_development_is_coherent returns True (fails open) when the
             # profile is absent or the percent is None, so reaching here guarantees
             # both a loaded profile and a computed development percent.
-            system_percent = self._development_percent()
             assert system_percent is not None  # guaranteed by the guard above
             drop_block = self._safety.evaluate_advisor_drop_coherence(
                 system_development_percent=system_percent,
