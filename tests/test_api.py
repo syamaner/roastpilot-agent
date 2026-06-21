@@ -1517,13 +1517,19 @@ async def test_restart_restores_charge_clock_so_resumed_dtr_survives(store: Roas
         ),
     )
     assert service.runner is not None
-    # The resume tick re-arms the settle window; a turned bean (RoR >= 0) releases
-    # it at once, so the pre-first-crack PHASE_CHANGE advisory fires automatically.
+    # The resume tick re-engages the deterministic pre-FC policy (no advisor
+    # consult — D35/#222). The advisor is consulted post-FC, so drive first crack
+    # to DEVELOPMENT, then the development consult carries the restored DTR clock.
     mcp.frames = [_reading(bean=150.0, env=185.0, bean_ror_c_per_min=4.0)]
     await _tick(service, clock)  # drains the resume action
-    await _tick(service, clock)  # turned-bean consult
+    mcp.frames = [
+        _reading(bean=185.0, env=200.0, bean_ror_c_per_min=4.0, first_crack_detected=True)
+    ]
+    await _tick(service, clock)  # first crack → DEVELOPMENT
+    mcp.frames = [_reading(bean=186.0, env=201.0, bean_ror_c_per_min=4.0)]
+    await _tick(service, clock)  # development consult
 
-    assert advisor.contexts, "advisor should be consulted after resume"
+    assert advisor.contexts, "advisor should be consulted after resume + FC"
     ctx = advisor.contexts[-1]
     # The DTR denominator is the restored charge clock — non-zero, ≈120 s, NOT 0.0.
     assert ctx.roast_elapsed_seconds > 0.0

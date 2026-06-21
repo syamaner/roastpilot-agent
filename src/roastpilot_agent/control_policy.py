@@ -28,14 +28,24 @@ no-op (#273's invariant), and #222 narrows the range per phase.
 
 from pydantic import BaseModel, Field, model_validator
 
-from roastpilot_agent.config import SafetyLimits
+from roastpilot_agent.config import PreFirstCrackLevers, SafetyLimits
 from roastpilot_agent.models import RoastPhase, RoastProfile
 
-# The full lever range. Today every phase resolves to this, reproducing the
-# gate's current 0–100 clamp exactly (the #273 "no verdict change" invariant);
-# #222 narrows it per phase (e.g. pre-FC fan ceiling ~30) on this same object.
+# The full lever range. Phases the deterministic pre-FC policy does not own
+# (development → drop, cooling, the lifecycle states) resolve to this full
+# 0–100 box, reproducing the gate's pre-#222 clamp exactly. #222 narrows the
+# two pre-FC phases (PREHEATING / ROASTING_PRE_FIRST_CRACK) on this same object.
 _LEVER_MIN_PERCENT = 0
 _LEVER_MAX_PERCENT = 100
+
+# The pre-first-crack phases the deterministic lever policy owns (D35 §3/§4-A):
+# preheat and charge→FC. In both the controller sets heat/fan from the policy
+# every tick and the free-form advisor is NOT consulted (#222). Every other
+# phase resolves the full 0–100 box and carries no deterministic target (the
+# post-FC LLM owns development → drop; #223).
+_PRE_FIRST_CRACK_PHASES: frozenset[RoastPhase] = frozenset(
+    {RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK}
+)
 
 
 class PhaseControlLimits(BaseModel):
@@ -62,21 +72,35 @@ class PhaseControlLimits(BaseModel):
     fan_ceiling_percent: int = Field(ge=0, le=100)
     bitter_ceiling_temp_c: float = Field(gt=0)
     emergency_drop_temp_c: float = Field(gt=0)
+    #: The deterministic heat/fan target the controller actuates every tick in
+    #: this phase (D35 §3/§4-A, #222), or ``None`` when the phase carries no
+    #: deterministic lever (post-FC: the LLM decides; lifecycle states: no
+    #: actuation). Set together — both present (a pre-FC phase) or both ``None``.
+    #: When present each target sits *inside* its own heat/fan box (a model
+    #: validator pins this), so the deterministic write is never itself clamped.
+    heat_target_percent: int | None = Field(default=None, ge=0, le=100)
+    fan_target_percent: int | None = Field(default=None, ge=0, le=100)
 
     @model_validator(mode="after")
     def _check_ranges(self) -> "PhaseControlLimits":
-        """Floors must not exceed ceilings, and the drop bound the bitter one.
+        """Floors must not exceed ceilings, the drop bound the bitter one, and
+        any deterministic target must sit inside its own box.
 
         A floor above its ceiling would be an empty box (no executable lever
         value); the emergency-drop bound must stay above the bitter ceiling
-        (D35 §3, mirrored from :class:`SafetyLimits`).
+        (D35 §3, mirrored from :class:`SafetyLimits`). The deterministic lever
+        targets (#222) are all-or-nothing — both set or both ``None`` — and each
+        must lie within its own heat/fan box so the controller's deterministic
+        write passes the gate as ALLOW, never silently clamped (told == enforced
+        for the deterministic path too).
 
         Returns:
             The validated limits instance.
 
         Raises:
-            ValueError: If any floor exceeds its ceiling, or the emergency-drop
-                bound is not above the bitter ceiling.
+            ValueError: If any floor exceeds its ceiling, the emergency-drop
+                bound is not above the bitter ceiling, the targets are set
+                inconsistently, or a target falls outside its box.
         """
         if self.heat_floor_percent > self.heat_ceiling_percent:
             raise ValueError(
@@ -93,7 +117,41 @@ class PhaseControlLimits(BaseModel):
                 "emergency_drop_temp_c must be above bitter_ceiling_temp_c "
                 f"({self.emergency_drop_temp_c} <= {self.bitter_ceiling_temp_c})"
             )
+        if (self.heat_target_percent is None) != (self.fan_target_percent is None):
+            raise ValueError(
+                "heat_target_percent and fan_target_percent must be set together "
+                "(both a deterministic pre-FC phase or both None)"
+            )
+        if self.heat_target_percent is not None and not (
+            self.heat_floor_percent <= self.heat_target_percent <= self.heat_ceiling_percent
+        ):
+            raise ValueError(
+                "heat_target_percent must lie within the heat box "
+                f"({self.heat_floor_percent}–{self.heat_ceiling_percent}): "
+                f"{self.heat_target_percent}"
+            )
+        if self.fan_target_percent is not None and not (
+            self.fan_floor_percent <= self.fan_target_percent <= self.fan_ceiling_percent
+        ):
+            raise ValueError(
+                "fan_target_percent must lie within the fan box "
+                f"({self.fan_floor_percent}–{self.fan_ceiling_percent}): "
+                f"{self.fan_target_percent}"
+            )
         return self
+
+    @property
+    def has_deterministic_target(self) -> bool:
+        """Whether this phase carries a deterministic heat/fan lever target.
+
+        ``True`` only for the pre-FC phases the controller actuates from the
+        policy (#222). The two target fields are validated all-or-nothing, so
+        ``heat_target_percent`` alone is a sufficient discriminator.
+
+        Returns:
+            ``True`` when both lever targets are set, ``False`` otherwise.
+        """
+        return self.heat_target_percent is not None
 
 
 class RoastControlPolicy:
@@ -118,12 +176,19 @@ class RoastControlPolicy:
     consulted every tick.
 
     #222 extends this same object with the pre-FC deterministic *lever* targets
-    (heat 100 / fan low to FC); #223 reads these *limits* for the post-FC drop
-    box. Both build on this single source rather than duplicating the numbers.
+    (heat 100 / fan low to FC) and the narrowed pre-FC box that contains them;
+    #223 reads these *limits* for the post-FC drop box. Both build on this single
+    source rather than duplicating the numbers.
     """
 
-    def __init__(self, limits: SafetyLimits, profile: RoastProfile | None = None) -> None:
-        """Construct the policy from the safety limits and the active profile.
+    def __init__(
+        self,
+        limits: SafetyLimits,
+        profile: RoastProfile | None = None,
+        *,
+        pre_fc_levers: PreFirstCrackLevers | None = None,
+    ) -> None:
+        """Construct the policy from the safety limits, profile, and pre-FC levers.
 
         Args:
             limits: The hard safety limits (the single config source for the
@@ -131,17 +196,27 @@ class RoastControlPolicy:
             profile: The frozen active roast profile, or ``None`` when no run is
                 in progress (the limits then resolve from ``limits`` alone). The
                 profile only ever *tightens* a told ceiling, never loosens it.
+            pre_fc_levers: The deterministic pre-FC heat/fan lever parameters
+                (#222) — the operator's proven n8n defaults (heat 100 / fan low)
+                unless overridden. ``None`` uses :class:`PreFirstCrackLevers`
+                defaults; the parameters are profile/config-driven so a learned
+                plan (D42 §7.1) can later supply them without a code change.
         """
         self._limits = limits
         self._profile = profile
+        self._pre_fc_levers = pre_fc_levers if pre_fc_levers is not None else PreFirstCrackLevers()
 
     def limits_for(self, phase: RoastPhase) -> PhaseControlLimits:
         """Resolve the control box for ``phase`` from the single source.
 
-        Today every phase resolves the full 0–100 heat/fan range, reproducing
-        the safety gate's current clamp behaviour exactly (the #273 "no verdict
-        change" invariant). #222 narrows this range per phase on this same
-        object. The bitter ceiling is the configured hard ceiling, capped at the
+        The two pre-FC phases (preheat, charge→FC) resolve a NARROWED box with a
+        deterministic lever target (D35 §3/§4-A, #222): heat is pinned high
+        (floor = the heat target, so a momentum-killing cut is structurally
+        impossible — the gate clamps any lower value back up) and fan is capped
+        low (the operator's max-heat / low-fan-to-FC method). Every other phase
+        resolves the full 0–100 range with no deterministic target — development
+        → drop is the post-FC LLM's box (#223); the lifecycle states do not
+        actuate. The bitter ceiling is the configured hard ceiling, capped at the
         active profile's drop target when that is lower; the emergency-drop bound
         is the configured hard bound.
 
@@ -150,15 +225,38 @@ class RoastControlPolicy:
 
         Returns:
             The :class:`PhaseControlLimits` box for ``phase`` — the *same*
-            object the gate clamps into and the model is told about.
+            object the gate clamps into, the model is told about, and (pre-FC)
+            the controller deterministically actuates.
         """
+        bitter = self._bitter_ceiling_temp_c()
+        emergency = self._limits.emergency_drop_temp_c
+        if phase in _PRE_FIRST_CRACK_PHASES:
+            levers = self._pre_fc_levers
+            return PhaseControlLimits(
+                # Heat pinned high: floor == the deterministic target, so the
+                # gate clamps any lower request (or a stale/odd value) back up to
+                # the target — the heat 70→40→20→0 pre-FC crash (#218) cannot
+                # recur. Ceiling stays full 100 (steady high heat, operator
+                # method; the deferred late-Maillard trim, D36/#228, would lower
+                # the floor here when FC-ETA exists).
+                heat_floor_percent=levers.heat_target_percent,
+                heat_ceiling_percent=_LEVER_MAX_PERCENT,
+                # Fan capped low: floor 0, ceiling the configured low value (~30)
+                # — the operator's low-fan-to-browning method.
+                fan_floor_percent=_LEVER_MIN_PERCENT,
+                fan_ceiling_percent=levers.fan_ceiling_percent,
+                bitter_ceiling_temp_c=bitter,
+                emergency_drop_temp_c=emergency,
+                heat_target_percent=levers.heat_target_percent,
+                fan_target_percent=levers.fan_target_percent,
+            )
         return PhaseControlLimits(
             heat_floor_percent=_LEVER_MIN_PERCENT,
             heat_ceiling_percent=_LEVER_MAX_PERCENT,
             fan_floor_percent=_LEVER_MIN_PERCENT,
             fan_ceiling_percent=_LEVER_MAX_PERCENT,
-            bitter_ceiling_temp_c=self._bitter_ceiling_temp_c(),
-            emergency_drop_temp_c=self._limits.emergency_drop_temp_c,
+            bitter_ceiling_temp_c=bitter,
+            emergency_drop_temp_c=emergency,
         )
 
     def _bitter_ceiling_temp_c(self) -> float:

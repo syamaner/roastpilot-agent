@@ -100,7 +100,7 @@
     {
       "data": {
         "fan_percent": 10,
-        "heat_percent": 80
+        "heat_percent": 100
       },
       "event": "command_executed",
       "id": 0
@@ -189,7 +189,7 @@
         "env_temp_c": 43.0,
         "fan_percent": 10,
         "first_crack_detected": false,
-        "heat_percent": 80,
+        "heat_percent": 100,
         "mic_status": {
           "audio_running": true,
           "dropped_window_count": 0,
