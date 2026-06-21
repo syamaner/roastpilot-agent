@@ -44,6 +44,8 @@ import type {
   SseEvent,
   SseEventType,
   TelemetryEventData,
+  TelemetryPoint,
+  TelemetrySeries,
 } from "@/lib/types";
 
 // --- Fixture loading -------------------------------------------------------
@@ -65,6 +67,9 @@ interface SseFixture {
 interface RestFixture {
   roast_detail: RoastDetail;
   roast_summary: RoastSummary;
+  // The real `/telemetry` series the detail-page curve renders (#308 adds the
+  // charge-referenced clock to each point); server-dumped, never hand-authored.
+  telemetry_series: TelemetrySeries;
 }
 
 const sse = JSON.parse(
@@ -178,6 +183,9 @@ describe("telemetry — every field the SPA renders is present", () => {
       "fan_percent",
       "cooling_on",
       "elapsed_seconds",
+      // #308: the charge-referenced roast clock (0:00 = charge) rides the frame;
+      // null pre-charge, since-charge after, frozen at drop.
+      "charge_elapsed_seconds",
       // #220: live development time + DTR ride the telemetry frame (null pre-FC).
       "development_elapsed_seconds",
       "development_percent",
@@ -431,5 +439,41 @@ describe("REST snapshot contract", () => {
       "advisor_rejected",
       "advisor_failed",
     ]);
+  });
+
+  it("TelemetrySeries point carries every field the curve reads, incl. charge_elapsed_seconds (#308)", () => {
+    // The REST `/telemetry` series is the detail-page curve's source AND the
+    // dashboard's reconnect/late-join backfill seed. Both re-origin the curve x on
+    // `TelemetryPoint.charge_elapsed_seconds` (#308); a server that dropped it from
+    // the PERSISTED series — even with the live SSE frame still carrying it — would
+    // silently break the re-origin on a reconnect. This is the REST-side guard the
+    // SSE-frame assertion above does not cover (distinct shape: `heat_level_percent`
+    // / `tick`, no `mic_status`). Asserted off a real server-dumped fixture point.
+    const series = rest.telemetry_series;
+    expect(series.points.length).toBeGreaterThan(0);
+    const point = series.points[0] as unknown as Record<string, unknown>;
+    expectKeys(point, [
+      "tick",
+      "elapsed_seconds",
+      // #308: the charge-referenced clock the curve x-axis re-origins on. Coexists
+      // with the serve-referenced `elapsed_seconds` (the raw lead-in).
+      "charge_elapsed_seconds",
+      "agent_phase",
+      "bean_temp_c",
+      "env_temp_c",
+      "bean_ror_c_per_min",
+      "env_ror_c_per_min",
+      "heat_level_percent",
+      "fan_level_percent",
+      "cooling_on",
+      "development_percent",
+    ]);
+    // Every point in the real series carries the key (pre-charge points hold null —
+    // a real contract state the SPA drops from the curve — but the KEY is present).
+    for (const p of series.points as TelemetryPoint[]) {
+      expect(p, "a series point is missing charge_elapsed_seconds").toHaveProperty(
+        "charge_elapsed_seconds",
+      );
+    }
   });
 });

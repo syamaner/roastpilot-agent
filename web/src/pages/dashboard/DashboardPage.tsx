@@ -335,6 +335,9 @@ export function DashboardPage(): React.JSX.Element {
 
         <RoastHeader
           phase={phase}
+          // ROAST TIME is charge-referenced (#308): 0:00 = charge, frozen at drop.
+          chargeElapsedSeconds={telemetry?.charge_elapsed_seconds ?? null}
+          // Serve-referenced elapsed backs the pre-charge "Preheat" read-out only.
           elapsedSeconds={telemetry?.elapsed_seconds ?? null}
           developmentSeconds={developmentSeconds}
           developmentPercent={developmentPercent}

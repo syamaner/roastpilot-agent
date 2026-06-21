@@ -47,35 +47,31 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   // The phase badge reflects the server's preheating phase.
   await expect(page.getByTestId("phase-badge")).toHaveAttribute("data-phase", "preheating");
 
-  // Gate the canvas shot on an INDEPENDENT minimum point-count (the stepped frames
-  // mean the curve must carry ≥1 point) BEFORE reading the hook — so the barrier
-  // can actually block on the async chart render, not a count it just read (D26 kit).
-  await waitForChartPoints(page, 1);
-
-  // The curve built from the stepped telemetry, and the charge band shows in
-  // preheating (asserted via DATA — the authoritative layer alongside the pixels).
+  // Charge-referenced curve (#308): the x-axis re-origins to charge/T0 (0:00 =
+  // charge, Artisan convention), so PRE-charge (preheating) telemetry — which the
+  // server stamps with a null charge clock — carries NO curve points yet. The
+  // roast curve begins at charge; in preheating only the fixed axes + the charge
+  // band render. (This intentionally supersedes the #220 serve-referenced plot.)
   const hook = await readChartData(page);
-  expect(hook.columns[0].length).toBeGreaterThan(0);
+  expect(hook.columns[0].length).toBe(0); // no plotted history before charge
   expect(hook.chargeBandVisible).toBe(true);
   // The charge band (170–200 °C) must be ON-SCREEN in preheating (E10-spa.md). With
-  // the FIXED 0–210 °C axis (#217) the band is always in frame without the band
-  // having to stretch the domain (the old auto-fit folded it in); assert the rendered
-  // °C scale holds the pinned bounds and so spans the whole band even though the
-  // preheating data sits at ~38–43 °C.
+  // the FIXED 0–210 °C axis (#217) the band is always in frame; assert the rendered
+  // °C scale holds the pinned bounds and so spans the whole band.
   expect(hook.scales.c.min).toBe(0);
   expect(hook.scales.c.max).toBe(210);
   // The RoR axis is fixed too — pinned even in preheating before any RoR develops.
   expect(hook.scales.ror.min).toBe(-20);
   expect(hook.scales.ror.max).toBe(30);
-  // x spans the loaded telemetry, never collapses onto one x (#133 item 2, #131).
-  // Use the `(max ?? 0) - (min ?? 0) > N` form so a NULL bound (unranged/collapsed
-  // scale) yields 0 and FAILS — `x.min <= dataMin` passes spuriously when x.min is
-  // null (`null <= n` === true in JS). The 8 stepped preheat frames span > 0 s.
-  expect((hook.scales.x.max ?? 0) - (hook.scales.x.min ?? 0)).toBeGreaterThan(0);
 
   // The live RoR readout is surfaced as an operator-facing metric (#165) and is
   // shown from the start incl. preheat (real probe data — not hidden pre-charge).
   await expect(page.getByTestId("ror-readout")).toContainText("°C/min");
+  // Pre-charge, ROAST TIME reads 00:00 and the distinct Preheat read-out carries the
+  // serve-referenced lead-in (#308). The big clock is charge-referenced (0:00 =
+  // charge); preheat duration is shown separately, never as roast time.
+  await expect(page.getByTestId("roast-timer")).toHaveText("00:00");
+  await expect(page.getByTestId("preheat-timer")).toBeVisible();
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-live.png");
@@ -164,24 +160,16 @@ test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery mo
   await expect(page.getByTestId("recovery-modal")).toBeVisible();
   await expect(page.getByTestId("recovery-no-auto-resume")).toBeVisible();
 
-  // Gate the canvas shot on an INDEPENDENT minimum point-count before reading the
-  // hook, so the barrier blocks on the async render (D26 kit).
-  await waitForChartPoints(page, 1);
-
-  // The curve drew the short pre-T0 track (data layer).
+  // Charge-referenced curve (#308): the pre-T0 overrun fires BEFORE charge, so the
+  // server's charge clock is still null and the curve carries NO plotted points yet
+  // (the roast curve begins at charge). The fixed axes still render against an
+  // unchanging frame — assert the pinned bounds (the scale-covers-data class, #133).
   const hook = await readChartData(page);
-  expect(hook.columns[0].length).toBeGreaterThan(0);
-
-  // Scale-covers-data guard (#133): same regression class as the other curve
-  // states — FIXED c/ror bounds, x spanning the loaded track (never collapsed).
-  const x = hook.columns[0].filter((v): v is number => v !== null);
-  expect(x.length).toBeGreaterThan(1);
+  expect(hook.columns[0].length).toBe(0); // no plotted history before charge
   expect(hook.scales.c.min).toBe(0);
   expect(hook.scales.c.max).toBe(210);
   expect(hook.scales.ror.min).toBe(-20);
   expect(hook.scales.ror.max).toBe(30);
-  // x spans the loaded track, never collapses (#131) — null-safe form (see fault).
-  expect((hook.scales.x.max ?? 0) - (hook.scales.x.min ?? 0)).toBeGreaterThan(0);
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-recovery.png");
@@ -261,6 +249,29 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   // must fail HERE, not only in the regenerated baseline.
   await expect(page.getByTestId("dtr-readout")).toHaveText(/^\d+\.\d+ %$/);
 
+  // ROAST TIME is CHARGE-referenced (#308): in this post-charge state the server
+  // emits a non-null `charge_elapsed_seconds`, so the big clock reads since-charge,
+  // NOT since-serve. This is the ONLY e2e guard on the DashboardPage wiring — a
+  // revert to `elapsed_seconds` (the old serve clock) renders the SAME mm:ss shape
+  // and would slip past every other assertion + the regenerated pixel baseline.
+  // The charged state must hold: ROAST TIME is mm:ss and the pre-charge Preheat
+  // read-out is GONE (it only shows while charge_elapsed_seconds is null).
+  await expect(page.getByTestId("roast-timer")).toHaveText(/^\d{2}:\d{2}$/);
+  await expect(page.getByTestId("preheat-timer")).not.toBeVisible();
+  // Value check that pins the CLOCK SOURCE, not just its format. The session-2
+  // fixture reaches first crack at ~535 s since charge but ~1029 s since serve (a
+  // ~493 s preheat lead-in); the replay stops at that FC tick. So the charge-
+  // referenced clock is ~08:55 while a serve-referenced revert would read ~17:0x.
+  // Assert the rendered timer is well under the serve figure (< 15:00 = 900 s):
+  // charge (~535 s) passes with wide margin, a revert to elapsed_seconds (~1029 s)
+  // FAILS. Parse mm:ss → seconds rather than matching a brittle exact string.
+  const roastTimerText = await page.getByTestId("roast-timer").textContent();
+  expect(roastTimerText).toMatch(/^\d{2}:\d{2}$/);
+  const [mm, ss] = (roastTimerText ?? "00:00").split(":").map((n) => Number(n));
+  const roastTimerSeconds = mm * 60 + ss;
+  expect(roastTimerSeconds).toBeGreaterThan(0); // a real post-charge clock, ticking
+  expect(roastTimerSeconds).toBeLessThan(900); // charge-referenced, not the ~1029 s serve clock
+
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-developed.png");
 });
@@ -301,22 +312,16 @@ test("dashboard-charge-window — preheating + bean in the charge band shows the
   await expect(page.getByTestId("charge-banner")).toContainText(/charge window/i);
   await expect(page.getByTestId("charge-banner")).toContainText("°C");
 
-  // The curve built from the stepped preheat telemetry (data layer). 90 stepped
-  // frames → a multi-point curve, so gate on a real minimum, not just ≥1.
-  await waitForChartPoints(page, 2);
+  // Charge-referenced curve (#308): this is still PRE-charge (preheating, beans not
+  // yet added → no T0), so the server's charge clock is null and the curve carries
+  // NO plotted points yet — the roast curve begins at charge. The fixed axes still
+  // render against an unchanging frame (the scale-covers-data class, #133/#217).
   const hook = await readChartData(page);
-  const x = hook.columns[0].filter((v): v is number => v !== null);
-  expect(x.length).toBeGreaterThan(1);
-
-  // Scale-covers-data guard (#133 item 2): this state loads real telemetry (90
-  // stepped frames), so assert the FIXED c/ror bounds (#217) AND that x spans the
-  // loaded preheat track. Null-safe span form (see fault) so a collapsed/unranged
-  // scale FAILS rather than slipping through `x.min <= dataMin`.
+  expect(hook.columns[0].length).toBe(0); // no plotted history before charge
   expect(hook.scales.c.min).toBe(0);
   expect(hook.scales.c.max).toBe(210);
   expect(hook.scales.ror.min).toBe(-20);
   expect(hook.scales.ror.max).toBe(30);
-  expect((hook.scales.x.max ?? 0) - (hook.scales.x.min ?? 0)).toBeGreaterThan(0);
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-charge-window.png");

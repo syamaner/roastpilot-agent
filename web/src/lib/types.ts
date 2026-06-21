@@ -102,6 +102,14 @@ export interface TelemetryEventData {
   fan_percent: number | null;
   cooling_on: boolean;
   elapsed_seconds: number | null;
+  // Charge-referenced roast clock (#308): seconds since charge/T0 — the
+  // operator-facing ROAST TIME and the chart x-axis origin (Artisan convention,
+  // 0:00 = charge). `null` PRE-charge (preheat), since-charge after, FROZEN at
+  // drop. Distinct from `elapsed_seconds`, which stays serve-referenced (seconds
+  // since the run started) and now backs only the preheat display. Server-
+  // authoritative (controller `_charge_elapsed_seconds`, the same charge/T0
+  // instant the advisor's DTR uses); never derived client-side.
+  charge_elapsed_seconds: number | null;
   // Development time + DTR (#220), server-authoritative. Both null before first
   // crack (the readouts show "—"). `development_elapsed_seconds` is the duration
   // since FC; `development_percent` is DTR — that duration as a share of the
@@ -343,6 +351,10 @@ export interface RoastDetail {
 export interface TelemetryPoint {
   tick: number;
   elapsed_seconds: number | null;
+  // Charge-referenced roast clock (#308), persisted per snapshot: seconds since
+  // charge/T0. `null` for pre-charge ticks (the chart lead-in). The curve x-axis
+  // re-origins on THIS (0:00 = charge); `elapsed_seconds` stays serve-referenced.
+  charge_elapsed_seconds: number | null;
   agent_phase: RoastPhase;
   bean_temp_c: number | null;
   env_temp_c: number | null;

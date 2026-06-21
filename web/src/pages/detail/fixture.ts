@@ -33,6 +33,10 @@ const TELEMETRY_POINTS: TelemetryPoint[] = Array.from({ length: 16 }, (_, i) => 
   return {
     tick: i,
     elapsed_seconds: elapsed,
+    // #308: charge-referenced clock. This fixture's roast is already past charge
+    // (it opens in roasting_pre_first_crack), so mirror the elapsed value — the
+    // detail page plots on its own x and does not read this yet.
+    charge_elapsed_seconds: elapsed,
     agent_phase: phase,
     bean_temp_c: 92 + i * 8.2,
     env_temp_c: 120 + i * 6.5,
@@ -281,6 +285,8 @@ const LONG_TELEMETRY_POINTS: TelemetryPoint[] = Array.from(
     return {
       tick: i,
       elapsed_seconds: elapsed,
+      // #308: charge-referenced clock; mirror elapsed (this fixture is post-charge).
+      charge_elapsed_seconds: elapsed,
       agent_phase: phase,
       bean_temp_c: 92 + i * 5.2,
       env_temp_c: 120 + i * 4.0,
