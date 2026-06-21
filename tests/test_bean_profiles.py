@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
+from roastpilot_agent import store as store_module
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.models import BeanProfileInput, RoastPhase, RoastProfile
 from roastpilot_agent.seed import ETHIOPIA_KOKE_ID, ETHIOPIA_KOKE_SEED, SEED_BEAN_PROFILES
@@ -116,19 +117,28 @@ async def test_get_unknown_returns_none(store: RoastStore) -> None:
 
 
 @pytest.mark.asyncio
-async def test_update_bumps_updated_at_preserves_created_and_id(store: RoastStore) -> None:
+async def test_update_bumps_updated_at_preserves_created_and_id(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Pin distinct create / update instants so the bump is strictly verifiable —
+    # without this, sub-microsecond execution can make the two timestamps coincide
+    # and an UPDATE that silently dropped ``updated_at_utc = ?`` would still pass.
+    stamps = iter(["2026-06-21T00:00:00+00:00", "2026-06-21T00:00:05+00:00"])
+    monkeypatch.setattr(store_module, "_utc_now", lambda: next(stamps))
     created = await store.create_bean_profile(_input(name="Original"))
     updated = await store.update_bean_profile(
         created.id, _input(name="Edited", target_drop_temp_c=190.0)
     )
     assert updated.id == created.id
     assert updated.created_at == created.created_at
-    assert updated.updated_at >= created.updated_at
+    assert updated.updated_at > created.updated_at  # strictly bumped
     assert updated.name == "Edited"
     assert updated.target_drop_temp_c == 190.0
-    # The persisted row reflects the edit.
+    # The persisted row reflects both the edit and the bumped timestamp.
     fetched = await store.get_bean_profile(created.id)
-    assert fetched is not None and fetched.name == "Edited"
+    assert fetched is not None
+    assert fetched.name == "Edited"
+    assert fetched.updated_at == updated.updated_at
 
 
 @pytest.mark.asyncio

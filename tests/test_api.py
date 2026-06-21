@@ -2215,6 +2215,10 @@ async def test_update_bean_profile_edits_in_place(client: AsyncClient) -> None:
     body = response.json()
     assert body["id"] == created["id"]
     assert body["created_at"] == created["created_at"]
+    # updated_at advances (monotonic over the real server clock); the strict
+    # bump-was-actually-written assertion is pinned at the store layer with a
+    # controlled clock (test_bean_profiles.test_update_bumps_updated_at_*).
+    assert body["updated_at"] >= created["updated_at"]
     assert body["name"] == "Edited"
     assert body["target_drop_temp_c"] == 190.0
 
@@ -2266,3 +2270,30 @@ async def test_lifespan_seeds_ethiopia_profile_idempotently(store: RoastStore) -
         second = await store.list_bean_profiles()
     assert [p.id for p in first] == [ETHIOPIA_KOKE_ID]
     assert [p.id for p in second] == [ETHIOPIA_KOKE_ID]  # not double-inserted
+
+
+@pytest.mark.asyncio
+async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) -> None:
+    """#303: end-to-end seam — lifespan seed → GET /api/bean-profiles returns the
+    Ethiopia Koke profile with its locked values over HTTP (the FE-visible path)."""
+    from roastpilot_agent.seed import ETHIOPIA_KOKE_ID
+
+    service = RoastService(store)
+    app = create_app(service)
+    transport = ASGITransport(app=app)
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(transport=transport, base_url="http://test") as http,
+    ):
+        response = await http.get("/api/bean-profiles")
+    assert response.status_code == 200
+    profiles = response.json()["profiles"]
+    assert len(profiles) == 1
+    koke = profiles[0]
+    assert koke["id"] == ETHIOPIA_KOKE_ID
+    assert koke["name"] == "Ethiopia Yirgacheffe Koke (Natural)"
+    assert koke["processing"] == "natural"
+    assert koke["altitude_m"] == 1885
+    assert koke["default_bean_weight_grams"] == 250.0
+    assert koke["target_drop_temp_c"] == 190.0
+    assert koke["target_development_percent"] == 13.0
