@@ -410,6 +410,23 @@ def test_advisor_failure_rejects_and_holds_current_targets(
     assert evaluation.adjusted_fan == 55
 
 
+def test_advisor_low_confidence_rejects_and_holds_current_targets(
+    policy: SafetyPolicy,
+) -> None:
+    """#276: a below-floor-confidence recommendation is REJECTed and the
+    deterministic fallback holds the current targets (no actuation)."""
+    evaluation = policy.evaluate_advisor_low_confidence(
+        confidence=0.1,
+        min_confidence=0.2,
+        current_heat=70,
+        current_fan=45,
+    )
+    assert evaluation.verdict is SafetyVerdict.REJECT
+    assert evaluation.rule == "advisor_low_confidence"
+    assert evaluation.adjusted_heat == 70
+    assert evaluation.adjusted_fan == 45
+
+
 @pytest.mark.parametrize("failures", [1, 2])
 def test_advisor_availability_below_threshold_holds_current_targets(
     policy: SafetyPolicy, failures: int
