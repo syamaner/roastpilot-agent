@@ -38,6 +38,7 @@ from pydantic_ai.models.google import GoogleModel
 from pydantic_ai.models.openai import OpenAIChatModel
 
 from roastpilot_agent.advisor import (
+    CONTROL_TEACHING_PROMPT_VERSION,
     AdvisorContext,
     AdvisorDescriptor,
     AdvisorFailureMode,
@@ -49,6 +50,7 @@ from roastpilot_agent.advisor import (
     RoastAdvisor,
     RoastDecision,
     build_model,
+    control_teaching_prompt,
     instructions_for,
     reasoning_extra_body,
     reasoning_from_run,
@@ -794,6 +796,113 @@ def test_drop_recall_variants_encode_distinct_strategies() -> None:
     assert "floor" in v6 and "ceiling" in v6 and "flick guard" in v6
     assert "12-21 s" in instructions_for("v7") and "lower bound" in instructions_for("v7").lower()
     assert "drop rule" in instructions_for("v8").lower()
+
+
+# --- control teaching system prompt (#274 / D39.1) ---
+
+
+def test_control_teaching_prompt_exists_and_is_stable() -> None:
+    """The control teaching prompt is an importable, non-empty, versioned
+    artifact, and the default-version call returns the active version's text.
+
+    It is a SEPARATE artifact from the per-tick advisory prompts: it is NOT one
+    of the ``v``-namespaced ``instructions_for`` versions, and it is not the
+    drop-narrow ``v4`` drop lens. Two calls return the identical (stable) text."""
+    assert CONTROL_TEACHING_PROMPT_VERSION == "c1"
+    prompt = control_teaching_prompt()
+    assert prompt
+    assert len(prompt) > 500
+    # Default arg resolves to the active version, and it is stable across calls.
+    assert prompt == control_teaching_prompt(CONTROL_TEACHING_PROMPT_VERSION)
+    assert control_teaching_prompt() == control_teaching_prompt()
+    # Distinct from the per-tick advisory lenses (including the v4 drop lens).
+    assert prompt != instructions_for("v4")
+
+
+def test_control_teaching_prompt_unknown_version_raises() -> None:
+    """An unknown control teaching version raises, like ``instructions_for``."""
+    with pytest.raises(ValueError, match="control teaching prompt version"):
+        control_teaching_prompt("does-not-exist")
+
+
+def test_control_teaching_prompt_teaches_the_machine_and_phases() -> None:
+    """The prompt carries the load-bearing teaching content: the Hottop machine
+    (electric drum, thermal lag, fan as the primary airflow/cooling lever) and
+    the full phase model (drying -> browning -> Maillard -> first crack ->
+    development -> drop) with what each phase needs."""
+    lower = control_teaching_prompt().lower()
+    # The machine.
+    assert "hottop" in lower
+    assert "electric" in lower
+    assert "thermal lag" in lower
+    # Fan as the PRIMARY airflow/cooling lever, not just a coolant.
+    assert "convective" in lower
+    assert "airflow" in lower
+    assert "cooling" in lower
+    # The full phase model.
+    for phase_word in ("drying", "browning", "maillard", "first crack", "development", "drop"):
+        assert phase_word in lower, phase_word
+
+
+def test_control_teaching_prompt_states_lever_units_as_percent_duty() -> None:
+    """Lever-unit fix (the 16 Jun gpt-5-mini '70-80 degrees C' slip): heat/fan
+    are 0-100 percent duty, explicitly NOT temperatures/setpoints."""
+    prompt = control_teaching_prompt()
+    lower = prompt.lower()
+    assert "0-100" in prompt
+    assert "percent duty" in lower
+    assert "not temperatures" in lower
+
+
+def test_control_teaching_prompt_carries_lever_stability_content() -> None:
+    """Lever stability (the soft half of the #218 fix, folded into #274): fan is
+    a COARSE lever set deliberately at regime transitions and held steady; bias
+    toward fewer, larger, intentional moves over per-consult twiddling."""
+    lower = control_teaching_prompt().lower()
+    assert "coarse" in lower
+    assert "hold" in lower and "steady" in lower
+    assert "fewer, larger, intentional" in lower
+    # The named anti-thrash patterns from the issue (staircase / thrash).
+    assert "staircase" in lower or "thrash" in lower
+    # Do not reverse a lever direction tick-to-tick without a real change.
+    assert "tick-to-tick" in lower
+    assert "oscillation" in lower
+
+
+def test_control_teaching_prompt_is_principle_not_numbers() -> None:
+    """Operator decision 1/3: numbers live in #273's policy (the live context
+    limits), NOT in the prompt. The prompt teaches the model to reason inside the
+    per-phase limits from the context and names no hardcoded thresholds.
+
+    Guards against re-creating the #218 two-copies incoherence: it must NOT carry
+    the pre-FC default numbers (heat 100 / fan 30) and must NOT carry the v4 drop
+    anchor's '196' bitter-ceiling number (decision 2)."""
+    prompt = control_teaching_prompt()
+    lower = prompt.lower()
+    # Teaches reasoning inside the context-provided limits.
+    assert "limits" in lower
+    assert "floor" in lower and "ceiling" in lower
+    assert "context" in lower
+    # No hardcoded control numbers (principle, not numbers).
+    assert "196" not in prompt  # the v4 drop anchor's bitter ceiling is NOT folded in
+    assert "heat 100" not in lower  # the #273 pre-FC default is NOT named here
+    assert "fan 30" not in lower
+
+
+def test_control_teaching_prompt_encodes_pre_fc_discipline() -> None:
+    """Binding acceptance from the 16 Jun negative cases: the prompt must make
+    *acting* pre-first-crack WRONG (drive to FC, never stall, do not cut heat to
+    prevent overshoot, do not open the fan into the crack), not merely name the
+    phase."""
+    lower = control_teaching_prompt().lower()
+    # Drive to the crack; do not stall/delay it.
+    assert "stall" in lower
+    assert "never" in lower
+    # The two banned pre-FC moves named.
+    assert "do not cut heat" in lower
+    assert "do not raise the fan" in lower
+    # Hold is the pre-FC default; hold if unsure.
+    assert "hold" in lower
 
 
 # --- healthcheck reachability probe (issue #168) ---
