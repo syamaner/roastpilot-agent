@@ -325,6 +325,52 @@ async def test_step_advances_exact_ticks(
 
 
 @pytest.mark.asyncio
+async def test_step_to_is_idempotent_absolute_cursor(
+    session2: tuple[RoastService, ReplaySource],
+) -> None:
+    """#338: step_to(n) advances to an ABSOLUTE cursor and is idempotent — the
+    retry-safe sibling of the additive step(). Re-issuing the same (or a lower)
+    target after reaching it is a no-op, so a Playwright retry can't over-step."""
+    _service, source = session2
+    r1 = await source.step_to(8)
+    assert r1.tick == 8
+    # Re-targeting the same absolute cursor steps NOTHING (idempotent under retry).
+    r2 = await source.step_to(8)
+    assert r2.tick == 8
+    # A target BELOW the current cursor is forward-only — also a no-op (never rewinds).
+    r3 = await source.step_to(3)
+    assert r3.tick == 8
+    # A higher target advances only the delta.
+    r4 = await source.step_to(12)
+    assert r4.tick == 12
+    # A target past the end stops cleanly at the last frame (clamped, never hangs).
+    end = await source.step_to(10_000)
+    assert end.tick == source.frame_count
+
+
+@pytest.mark.asyncio
+async def test_step_result_carries_run_id_and_charged_point_count(
+    session2: tuple[RoastService, ReplaySource],
+) -> None:
+    """#338 lossless settle fields: the step result carries the run id and the
+    store-backed CHARGED telemetry point count (== the rendered curve length).
+    Pre-charge (preheating) the charged count is 0 — the curve is empty until T0;
+    post-FC it is positive and matches the persisted charged rows."""
+    _service, source = session2
+    pre = await source.step_to(8)  # still preheating, pre-charge
+    assert pre.run_id == source.run_id
+    assert pre.agent_phase == "preheating"
+    assert pre.persisted_point_count == 0  # no charged points before T0
+    post = await source.advance_to(ReplayMarker.FIRST_CRACK)
+    assert post.persisted_point_count > 0  # the developed curve carries points
+    # The reported count equals the charged rows in the REST snapshot the SPA hydrates.
+    assert source.run_id is not None
+    series = await _service.telemetry(source.run_id, downsample=1)
+    charged = sum(1 for p in series.points if p.charge_elapsed_seconds is not None)
+    assert post.persisted_point_count == charged
+
+
+@pytest.mark.asyncio
 async def test_step_past_end_stops_at_finalize(
     session2: tuple[RoastService, ReplaySource],
 ) -> None:
@@ -449,12 +495,15 @@ async def test_step_routes_mounted_only_in_step_mode(tmp_path: Path) -> None:
             step_routes = {r.path for r in step_app.routes}  # type: ignore[attr-defined]
             free_routes = {r.path for r in free_app.routes}  # type: ignore[attr-defined]
             assert "/api/replay/step" in step_routes
+            assert "/api/replay/step-to" in step_routes  # #338 idempotent variant
             assert "/api/replay/advance-to" in step_routes
             assert "/api/replay/step" not in free_routes
+            assert "/api/replay/step-to" not in free_routes
             assert "/api/replay/advance-to" not in free_routes
             # The LIVE app (real roast) never exposes the replay control routes.
             live_routes = {r.path for r in create_app(service=None).routes}  # type: ignore[attr-defined]
             assert "/api/replay/step" not in live_routes
+            assert "/api/replay/step-to" not in live_routes
             assert "/api/replay/advance-to" not in live_routes
         finally:
             await free_src.aclose()
@@ -593,7 +642,7 @@ async def test_cooling_complete_fixture_stops_cooling_and_completes(tmp_path: Pa
 
 @pytest.mark.asyncio
 async def test_http_step_routes_drive_the_replay(tmp_path: Path) -> None:
-    """The gated POST /api/replay/{step,advance-to} routes advance the real
+    """The gated POST /api/replay/{step,step-to,advance-to} routes advance the real
     controller and return the settled body shape the Playwright setup reads."""
     from fastapi.testclient import TestClient
 
@@ -611,14 +660,26 @@ async def test_http_step_routes_drive_the_replay(tmp_path: Path) -> None:
             "finalized",
             "settled",
             "last_event_id",
+            "run_id",  # #338 lossless settle fields
+            "persisted_point_count",
             "requested_marker",
             "marker_reached",
         }
+        # #338: the run id + charged point count are in the body for the REST settle.
+        assert body["run_id"] == source.run_id
+        assert body["persisted_point_count"] == 0  # pre-charge: empty curve
+        # #338: the idempotent absolute-cursor route lands the target and re-targets
+        # are no-ops (retry-safe).
+        stepped_to = client.post("/api/replay/step-to", json={"tick": 6}).json()
+        assert stepped_to["tick"] == 6
+        again = client.post("/api/replay/step-to", json={"tick": 6}).json()
+        assert again["tick"] == 6  # idempotent
         advanced = client.post("/api/replay/advance-to", json={"marker": "first_crack"}).json()
         assert advanced["agent_phase"] == "development"
         assert advanced["marker_reached"] is True
         assert advanced["requested_marker"] == "first_crack"
         assert advanced["last_event_id"] >= body["last_event_id"]
+        assert advanced["persisted_point_count"] > 0  # developed curve has points
     assert source.run_id is not None
 
 

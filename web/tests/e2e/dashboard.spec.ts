@@ -20,8 +20,8 @@
 
 import { expect, test } from "@playwright/test";
 
-import { advanceTo, AGENTS, step } from "./global-setup";
-import { readChartData, settle, waitForChartPoints } from "./helpers";
+import { advanceTo, AGENTS, step, stepTo } from "./global-setup";
+import { readChartData, settle, settleStepped, waitForChartPoints } from "./helpers";
 import { WEB_URLS } from "./urls";
 
 test("dashboard-live — preheating with the charge band, full-page snapshot (canvas un-masked)", async ({
@@ -36,16 +36,16 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
 
   // `preheating` is the tick-0 marker (emits no new frames); step a few ticks INTO
   // preheating so telemetry frames flow to the live browser and the curve builds.
-  const reached = await advanceTo(AGENTS.session2, "preheating");
-  expect(reached.agent_phase).toBe("preheating");
+  // A small additive `step` is retry-safe HERE (8, or 16 on a retry, both stay well
+  // below T0 at ~frame 99 — only the charge-window spec's step(90) needs the
+  // absolute `stepTo`, #338), and additive stepping keeps the shared session-2 agent
+  // independent of the other preheating specs' cursors.
+  await advanceTo(AGENTS.session2, "preheating");
   const stepped = await step(AGENTS.session2, 8);
   expect(stepped.agent_phase).toBe("preheating");
-  await page.waitForFunction((id) => (window.__lastEventId ?? -1) >= id, stepped.last_event_id, {
-    timeout: 15_000,
-  });
-
-  // The phase badge reflects the server's preheating phase.
-  await expect(page.getByTestId("phase-badge")).toHaveAttribute("data-phase", "preheating");
+  // Lossless settle (#338): the rendered phase (+ curve where charged) catches up
+  // to the server's snapshot — never the lossy `__lastEventId`.
+  await settleStepped(page, stepped);
 
   // Charge-referenced curve (#308): the x-axis re-origins to charge/T0 (0:00 =
   // charge, Artisan convention), so PRE-charge (preheating) telemetry — which the
@@ -91,9 +91,8 @@ test("dashboard-fault — real env-ceiling fault renders the fault banner + trai
   // Advance to the fault marker; 404 here means the export never faulted (fail loud).
   const reached = await advanceTo(AGENTS.session1, "fault");
   expect(reached.agent_phase).toBe("faulted");
-  await page.waitForFunction((id) => (window.__lastEventId ?? -1) >= id, reached.last_event_id, {
-    timeout: 15_000,
-  });
+  // Lossless settle (#338): rendered phase + curve catch up to the server snapshot.
+  await settleStepped(page, reached);
 
   // Phase reached the SPA from the server, and the fault banner is shown.
   await expect(page.getByTestId("phase-badge")).toHaveAttribute("data-phase", "faulted");
@@ -148,9 +147,9 @@ test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery mo
 
   const reached = await advanceTo(AGENTS.faultPreT0, "recovery");
   expect(reached.agent_phase).toBe("operator_recovery_required");
-  await page.waitForFunction((id) => (window.__lastEventId ?? -1) >= id, reached.last_event_id, {
-    timeout: 15_000,
-  });
+  // Lossless settle (#338): pre-charge state — no curve yet, so the phase gate
+  // alone settles (the curve is intentionally empty before charge).
+  await settleStepped(page, reached);
 
   // Server-derived recovery phase opens the modal with the "no auto-resume" copy.
   await expect(page.getByTestId("phase-badge")).toHaveAttribute(
@@ -191,9 +190,10 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
 
   const reached = await advanceTo(AGENTS.session2Developed, "first_crack");
   expect(reached.agent_phase).toBe("development");
-  await page.waitForFunction((id) => (window.__lastEventId ?? -1) >= id, reached.last_event_id, {
-    timeout: 15_000,
-  });
+  // Lossless settle (#338): rendered phase + the full charged curve catch up to the
+  // server snapshot (re-hydrated from REST on (re)connect, #153), not the lossy
+  // `__lastEventId` whose single dropped frame timed this spec out on #336.
+  await settleStepped(page, reached);
 
   await expect(page.getByTestId("phase-badge")).toHaveAttribute("data-phase", "development");
 
@@ -291,14 +291,15 @@ test("dashboard-charge-window — preheating + bean in the charge band shows the
 
   // start() leaves the cursor at frame 0 (preheating, bean ~38 °C). Step forward —
   // still PRE-T0 — until the bean is in the band: in the session-2 fixture frame ~90
-  // reads bean ~177 °C while phase is still preheating (T0/charge is frame 99). Step
-  // 90 to land comfortably mid-band with margin before T0; assert phase to fail loud
-  // if the fixture shifts (we never want a baseline of the wrong state).
-  const stepped = await step(AGENTS.session2ChargeWindow, 90);
+  // reads bean ~177 °C while phase is still preheating (T0/charge is frame 99).
+  // `stepTo` (absolute cursor) lands frame 90 comfortably mid-band with margin before
+  // T0 AND is retry-safe — a Playwright retry re-targets frame 90 instead of
+  // over-stepping past T0 into the wrong phase (the #338 `toBe` mismatch). Assert phase
+  // to fail loud if the fixture shifts (we never want a baseline of the wrong state).
+  const stepped = await stepTo(AGENTS.session2ChargeWindow, 90);
   expect(stepped.agent_phase).toBe("preheating");
-  await page.waitForFunction((id) => (window.__lastEventId ?? -1) >= id, stepped.last_event_id, {
-    timeout: 15_000,
-  });
+  // Lossless settle (#338): pre-charge state — phase gate only (no curve before T0).
+  await settleStepped(page, stepped);
 
   // Phase reached the SPA from the server (still preheating — beans not yet added).
   await expect(page.getByTestId("phase-badge")).toHaveAttribute("data-phase", "preheating");

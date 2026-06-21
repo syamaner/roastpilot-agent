@@ -17,6 +17,8 @@
 
 import { expect, type Page } from "@playwright/test";
 
+import type { ReplayStepResult } from "./global-setup";
+
 /** Shape of the chart test hook exposed by LiveCurve (mirror of ChartTestHook). */
 export interface ChartHookSnapshot {
   columns: (number | null)[][];
@@ -66,4 +68,39 @@ export async function waitForChartPoints(page: Page, min: number): Promise<void>
 export async function settle(page: Page): Promise<void> {
   await page.evaluate(() => document.fonts.ready);
   await expect(page.locator("[data-chart-ready='true']")).toBeVisible();
+}
+
+/**
+ * Settle the browser onto a deterministic replay-step result — the LOSSLESS
+ * barrier (#338) that replaces `waitForFunction(window.__lastEventId >= id)`.
+ *
+ * The old barrier waited for the browser's `__lastEventId` to reach the stepped
+ * result's `last_event_id`. That assumes lossless SSE delivery, but the broadcaster
+ * drops on `QueueFull` and offers no Last-Event-ID resume, so a single missed frame
+ * (CI load, an EventSource reconnect) left `__lastEventId` permanently short → a
+ * deterministic 15 s timeout. This barrier instead settles on signals the system
+ * actually GUARANTEES, both store-backed and lossless:
+ *
+ *   1. the rendered `phase-badge` reaches the server's `agent_phase` (phase is
+ *      re-hydrated from the REST snapshot on every (re)connect — never lost);
+ *   2. the rendered curve (`window.__chart`) reaches the server's CHARGED point
+ *      count (`persisted_point_count`), which the SPA re-hydrates from the REST
+ *      `/telemetry` snapshot on (re)connect (#153) — so a dropped telemetry frame
+ *      self-heals rather than wedging the barrier.
+ *
+ * A pre-charge state (`persisted_point_count === 0`, e.g. recovery / preheating
+ * before the charge clock) carries no plotted curve, so only the phase gate
+ * applies — correct, because the curve is intentionally empty there.
+ */
+export async function settleStepped(page: Page, reached: ReplayStepResult): Promise<void> {
+  await expect(page.getByTestId("phase-badge")).toHaveAttribute(
+    "data-phase",
+    reached.agent_phase,
+    { timeout: 15_000 },
+  );
+  if (reached.persisted_point_count > 0) {
+    // Reuse the chart-points gate (same `window.__chart` curve length, same 15 s
+    // timeout) rather than re-inlining the `waitForFunction` body.
+    await waitForChartPoints(page, reached.persisted_point_count);
+  }
 }

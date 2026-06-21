@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from roastpilot_agent.api import QueuedOperatorAction, RoastService, create_app
 from roastpilot_agent.config import AppConfig
@@ -447,11 +447,19 @@ class ReplayRoasterControl:
 class ReplayStepResult:
     """The settled state after a deterministic step/advance (HTTP body shape).
 
-    ``last_event_id`` is the broadcaster's sequence after the stepped ticks
-    drain — the **same** id the SSE frames carry — so a Playwright caller can
-    wait until the browser's ``lastEventId >= last_event_id`` before
-    screenshotting, with no arbitrary sleep. ``settled`` is always true on
-    return (the step ran synchronously to completion).
+    ``run_id`` + ``persisted_point_count`` are the **lossless** settle signal
+    (#338): the run id and the number of charged telemetry rows the store holds
+    after this step. A Playwright caller polls ``GET /api/roasts/{run_id}/telemetry``
+    (REST, store-backed, lossless) and waits for the browser's rendered curve to
+    reach this count — a settle barrier that does NOT depend on every SSE frame
+    arriving. The browser re-hydrates the full series from the same REST snapshot
+    on (re)connect (#153), so a dropped/queued SSE frame self-heals.
+
+    ``last_event_id`` is the broadcaster's sequence after the stepped ticks drain
+    — the same id the SSE frames carry. It is retained for diagnostics, but is the
+    LOSSY signal (a dropped frame leaves a browser's ``__lastEventId`` permanently
+    short, #338), so it is no longer the settle barrier. ``settled`` is always true
+    on return (the step ran synchronously to completion).
 
     ``requested_marker`` / ``marker_reached`` are populated only by
     :meth:`ReplaySource.advance_to`: ``marker_reached`` is ``False`` when the
@@ -466,6 +474,8 @@ class ReplayStepResult:
     finalized: bool
     settled: bool
     last_event_id: int
+    run_id: str | None = None
+    persisted_point_count: int = 0
     requested_marker: str | None = None
     marker_reached: bool = True
 
@@ -478,6 +488,8 @@ class ReplayStepResult:
             "finalized": self.finalized,
             "settled": self.settled,
             "last_event_id": self.last_event_id,
+            "run_id": self.run_id,
+            "persisted_point_count": self.persisted_point_count,
             "requested_marker": self.requested_marker,
             "marker_reached": self.marker_reached,
         }
@@ -600,7 +612,33 @@ class ReplaySource:
             finalized = await self._advance_one()
             if finalized:
                 break
-        return self._result(finalized)
+        return await self._result(finalized)
+
+    async def step_to(self, target_tick: int) -> ReplayStepResult:
+        """Advance forward until the cursor reaches an ABSOLUTE ``target_tick`` (#338).
+
+        The idempotent sibling of :meth:`step`. ``step`` is count-based and
+        additive, so under Playwright ``retries`` a re-run that calls ``step(N)``
+        again advances N MORE frames from wherever the failed attempt left the
+        stateful (monotonic-forward) replay agent — landing the wrong phase
+        (the #338 ``toBe`` mismatch). ``step_to`` instead advances only the delta
+        to an absolute cursor, so a retry on an agent already at/past the target
+        is a no-op and lands the SAME state every attempt. Forward-only (the
+        cursor cannot rewind); a target at/below the current cursor steps nothing.
+
+        Args:
+            target_tick: The absolute cursor index to advance the replay to.
+
+        Returns:
+            The settled state once the cursor reaches ``target_tick`` (or the run
+            finalizes / the frames exhaust first).
+        """
+        finalized = False
+        while self._cursor < target_tick and not finalized:
+            if self._cursor >= len(self._script.frames):
+                break
+            finalized = await self._advance_one()
+        return await self._result(finalized)
 
     async def advance_to(self, marker: ReplayMarker) -> ReplayStepResult:
         """Advance until ``marker`` fires (or the run finalizes / frames exhaust).
@@ -612,13 +650,13 @@ class ReplaySource:
         control route turns that into a 404 so a caller fails loud rather than
         screenshotting the wrong state."""
         if marker in self._reached:
-            return self._result(self._is_finalized(), marker=marker)
+            return await self._result(self._is_finalized(), marker=marker)
         finalized = False
         while marker not in self._reached and not finalized:
             if self._cursor >= len(self._script.frames):
                 break
             finalized = await self._advance_one()
-        return self._result(finalized, marker=marker)
+        return await self._result(finalized, marker=marker)
 
     async def run(self) -> None:
         """Free-running replay: advance every frame at ``tick_interval / speed``.
@@ -768,7 +806,9 @@ class ReplaySource:
         runner = self._service.runner
         return runner is not None and runner.finalized
 
-    def _result(self, finalized: bool, *, marker: ReplayMarker | None = None) -> ReplayStepResult:
+    async def _result(
+        self, finalized: bool, *, marker: ReplayMarker | None = None
+    ) -> ReplayStepResult:
         phase, elapsed, tick = self._snapshot_fields()
         return ReplayStepResult(
             agent_phase=phase,
@@ -777,9 +817,29 @@ class ReplaySource:
             finalized=finalized or self._is_finalized(),
             settled=True,
             last_event_id=self._service.events.last_event_id,
+            run_id=self._run_id,
+            persisted_point_count=await self._persisted_point_count(),
             requested_marker=None if marker is None else marker.value,
             marker_reached=marker is None or marker in self._reached,
         )
+
+    async def _persisted_point_count(self) -> int:
+        """The store-backed CHARGED-telemetry row count for the run (#338).
+
+        The LOSSLESS settle target: the number of curve points the SPA renders
+        once it has caught up, read from the same ``GET /telemetry`` snapshot the
+        browser re-hydrates from (#153) — so it never depends on every SSE frame
+        arriving. Counts only rows with a non-null ``charge_elapsed_seconds``:
+        pre-charge preheat rows carry a null charge clock and are NOT plotted
+        (``pointFromSnapshot`` drops them), so the charged count matches the
+        rendered curve exactly — a settle on the full ``point_count`` would
+        overshoot by the preheat lead-in and never be reached in a pre-charge
+        state. ``0`` before the run starts (no run id yet).
+        """
+        if self._run_id is None:  # pragma: no cover — start() precedes stepping
+            return 0
+        series = await self._service.telemetry(self._run_id, downsample=1)
+        return sum(1 for p in series.points if p.charge_elapsed_seconds is not None)
 
     def _snapshot_fields(self) -> tuple[str, float | None, int]:
         """Read phase/elapsed/tick from the live controller snapshot."""
@@ -863,18 +923,33 @@ class ReplayAdvanceRequest(BaseModel):
     marker: ReplayMarker
 
 
+class ReplayStepToRequest(BaseModel):
+    """``POST /api/replay/step-to`` body: advance to an ABSOLUTE cursor tick (#338).
+
+    The idempotent sibling of ``step`` (count-based): a retry that re-issues the
+    same absolute target lands the SAME state rather than over-stepping the
+    stateful replay agent."""
+
+    tick: int = Field(ge=0)
+
+
 def mount_replay_controls(app: FastAPI, source: ReplaySource) -> None:
-    """Mount the gated ``/api/replay/{step,advance-to}`` control routes.
+    """Mount the gated ``/api/replay/{step,step-to,advance-to}`` control routes.
 
     Only the ``--step`` replay app calls this. Each route advances the real
     controller synchronously and returns the settled :class:`ReplayStepResult`
-    (phase, tick, ``last_event_id`` for the deterministic wait). ``advance-to``
-    returns **404** when the requested marker never fires in the export, so a
-    Playwright caller fails loud on a wrong fixture/marker instead of
-    screenshotting the wrong (terminal) state."""
+    (phase, tick, ``run_id`` + ``persisted_point_count`` for the lossless settle,
+    #338). ``advance-to`` returns **404** when the requested marker never fires in
+    the export, so a Playwright caller fails loud on a wrong fixture/marker instead
+    of screenshotting the wrong (terminal) state. ``step-to`` is the idempotent
+    absolute-cursor variant of ``step`` (retry-safe under Playwright ``retries``,
+    #338)."""
 
     async def step(request: ReplayStepRequest) -> dict[str, Any]:
         return (await source.step(request.ticks)).to_json()
+
+    async def step_to(request: ReplayStepToRequest) -> dict[str, Any]:
+        return (await source.step_to(request.tick)).to_json()
 
     async def advance_to(request: ReplayAdvanceRequest) -> dict[str, Any]:
         result = await source.advance_to(request.marker)
@@ -890,6 +965,7 @@ def mount_replay_controls(app: FastAPI, source: ReplaySource) -> None:
         return result.to_json()
 
     app.post("/api/replay/step")(step)
+    app.post("/api/replay/step-to")(step_to)
     app.post("/api/replay/advance-to")(advance_to)
 
 
