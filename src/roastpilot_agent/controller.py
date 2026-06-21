@@ -138,6 +138,21 @@ UNIVERSAL_TARGETS: frozenset[RoastPhase] = frozenset(
     {RoastPhase.FAULTED, RoastPhase.OPERATOR_RECOVERY_REQUIRED}
 )
 
+#: Terminal HOLD phases the controller latches into. Once the tick loop has
+#: failed closed into one of these (fail-safe already applied, fault/recovery
+#: event already emitted on entry), every later tick is a no-op: it does NOT
+#: re-read the (possibly dead) MCP, re-evaluate safety, or re-emit the terminal
+#: event. Leaving these phases is an EXPLICIT operator action only
+#: (``operator_acknowledge_fault`` → idle, ``operator_resume`` out of recovery,
+#: ``operator_start_cooling`` from faulted/recovery, ``operator_emergency_stop``),
+#: never a tick transition — so the latch never strands an operable-faulted run
+#: (#206): emergency-stop, cooling, and acknowledge stay available throughout.
+#: This kills the post-#206 "infinite error loop" where a sustained dead-MCP read
+#: re-emitted the identical FAULT event every tick (roast 2, attempt 2).
+TERMINAL_LATCH_PHASES: frozenset[RoastPhase] = frozenset(
+    {RoastPhase.FAULTED, RoastPhase.OPERATOR_RECOVERY_REQUIRED}
+)
+
 
 class StateReader(Protocol):
     """Reads the current roast telemetry (E5 wraps get_roast_state)."""
@@ -880,7 +895,25 @@ class RoastController:
         self._advisory_requested = True
 
     async def tick(self) -> None:
-        """Run one controller tick in the documented order."""
+        """Run one controller tick in the documented order.
+
+        A controller already latched into a terminal HOLD phase
+        (:data:`TERMINAL_LATCH_PHASES`) short-circuits before reading the MCP:
+        the fail-safe posture is already applied and the terminal event was
+        already emitted on entry, so re-reading a (possibly dead) child,
+        re-evaluating safety, and re-emitting the identical fault every tick is
+        pure noise — the post-#206 "infinite error loop". The only live work
+        left in a terminal phase is the once-only operator-timeout nag (it does
+        not actuate). Operator recovery actions (acknowledge / resume / cooling /
+        emergency-stop) are separate, always-available methods, so the latch
+        never reduces what the operator can do (#206 operable-faulted intact).
+        """
+        if self._phase in TERMINAL_LATCH_PHASES:
+            self._check_operator_timeout()
+            # A stale advisory request must not survive the latch into a later
+            # resumed/cooling tick (mirrors the fail-closed branch below).
+            self._advisory_requested = False
+            return
         telemetry, read_failed = await self._read_telemetry()
         # Remember the reading this tick consumed so the runner's post-tick
         # snapshot publishes the same telemetry it acted on (E9).
@@ -1203,21 +1236,29 @@ class RoastController:
                     RoastEventKind.COMMAND_FAILED,
                     {"command": "emergency_stop", "reason": evaluation.reason},
                 )
+            # Emit ONCE, only on entry into FAULTED — never while already
+            # latched there (the tick loop short-circuits before reaching here
+            # in a terminal phase, but the guard keeps the emit transition-bound
+            # regardless of caller; #206 infinite-loop fix).
             if self._phase is not RoastPhase.FAULTED:
                 self.transition_to(RoastPhase.FAULTED)
-            self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
+                self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
             return True
         if verdict is SafetyVerdict.FAULT:
             await self._apply_fail_safe(evaluation)
+            # Emit ONCE, only on entry into FAULTED (see EMERGENCY_STOP above).
             if self._phase is not RoastPhase.FAULTED:
                 self.transition_to(RoastPhase.FAULTED)
-            self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
+                self._events.emit(RoastEventKind.FAULT, evaluation.model_dump(mode="json"))
             return True
         if verdict is SafetyVerdict.RECOVERY:
             await self._apply_fail_safe(evaluation)
+            # Emit ONCE, only on entry into OPERATOR_RECOVERY_REQUIRED.
             if self._phase is not RoastPhase.OPERATOR_RECOVERY_REQUIRED:
                 self.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
-            self._events.emit(RoastEventKind.RECOVERY_REQUIRED, evaluation.model_dump(mode="json"))
+                self._events.emit(
+                    RoastEventKind.RECOVERY_REQUIRED, evaluation.model_dump(mode="json")
+                )
             return True
         # CLAMP/REJECT never arise from telemetry-stage rules.
         return False

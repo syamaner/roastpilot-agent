@@ -1189,6 +1189,79 @@ async def test_read_failures_tolerated_then_fault_closed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_sustained_dead_mcp_emits_exactly_one_fault_and_holds() -> None:
+    """The #206 infinite-error-loop fix (roast 2, attempt 2).
+
+    A sustained dead-MCP read (the child segfaulted) must fault closed ONCE and
+    then LATCH: subsequent ticks emit no further FAULT events, do not re-read the
+    dead child, and do not re-evaluate safety — while the fail-closed posture
+    (heat 0 %) stays enforced and operator recovery actions stay available.
+    """
+    harness = harness_in_development(
+        readings=[RuntimeError("segfault")],  # repeats every tick
+    )
+    # Tolerate-then-fault: default threshold is 3 consecutive read failures.
+    await harness.controller.tick()
+    await harness.controller.tick()
+    await harness.controller.tick()  # third failure → FAULTED
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.events.kinds().count(RoastEventKind.FAULT) == 1
+    # The safe posture applied on entry: heat 0, overrun-safe fan.
+    fail_safe_targets = list(harness.executor.targets)
+    assert fail_safe_targets, "fail-safe must have written heat 0 / safe fan on entry"
+    assert fail_safe_targets[-1][0] == 0  # heat 0 %
+
+    # The detector counts persisted evaluations + reader calls before the latch
+    # so a post-latch tick can be proven to add neither.
+    evals_at_fault = len(harness.sink.evaluations)
+    reader_reads = harness.log.count("read")
+    targets_at_fault = len(harness.executor.targets)
+
+    # Twenty more ticks against the still-dead MCP: the latch holds silently.
+    for _ in range(20):
+        await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.FAULTED
+    # EXACTLY ONE fault event across the whole dead-MCP stretch (the bug emitted N).
+    assert harness.events.kinds().count(RoastEventKind.FAULT) == 1
+    # No re-read of the dead child, no re-evaluation, no re-write of the posture.
+    assert harness.log.count("read") == reader_reads
+    assert len(harness.sink.evaluations) == evals_at_fault
+    assert len(harness.executor.targets) == targets_at_fault
+    # Operator recovery stays available throughout the latch (#206 operable-faulted):
+    # emergency-stop, start/stop cooling, and acknowledge are enabled in faulted.
+    enabled = enabled_operator_actions(harness.controller.phase)
+    assert OperatorAction.EMERGENCY_STOP in enabled
+    assert OperatorAction.START_COOLING in enabled
+    assert OperatorAction.STOP_COOLING in enabled
+    assert OperatorAction.ACKNOWLEDGE_FAULT in enabled
+
+
+@pytest.mark.asyncio
+async def test_recovery_phase_latches_and_holds() -> None:
+    """A controller latched into operator_recovery_required holds silently: no
+    re-read, no re-evaluation, no repeated recovery_required event."""
+    harness = make_harness(readings=[reading(bean=205.0)])
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING
+        harness.controller.transition_to(step)
+    harness.events.events.clear()
+    harness.log.clear()
+    await harness.controller.tick()  # pre-T0 overrun → operator_recovery_required
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert harness.events.kinds().count(RoastEventKind.RECOVERY_REQUIRED) == 1
+    reads = harness.log.count("read")
+    evals = len(harness.sink.evaluations)
+
+    for _ in range(10):
+        await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    assert harness.events.kinds().count(RoastEventKind.RECOVERY_REQUIRED) == 1
+    assert harness.log.count("read") == reads  # the dead/idle MCP is not re-read
+    assert len(harness.sink.evaluations) == evals
+
+
+@pytest.mark.asyncio
 async def test_recovery_verdict_enters_recovery_phase() -> None:
     """Pre-T0 overrun (default severity) lands in operator_recovery_required
     and emits recovery_required."""
