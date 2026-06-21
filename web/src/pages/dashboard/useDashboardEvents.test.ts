@@ -369,6 +369,23 @@ describe("dashboardReducer", () => {
     expect(s.t0ElapsedSeconds).toBe(540); // unchanged
   });
 
+  it("t0_detected does NOT overwrite an already-derived t0ElapsedSeconds (first-wins, #326)", () => {
+    // A reconnect/late-join derived the canonical origin from the server's clocks
+    // (elapsed − charge_elapsed). A subsequent t0_detected must KEEP that value, not
+    // clobber it with the latest-point heuristic — consistent first-wins with the
+    // recovery path. Here the recovered origin (520) differs from the latest plotted
+    // point's t (600) to prove the derived value wins.
+    let s = dashboardReducer(
+      initialDashboardViewModel,
+      ev("telemetry", { elapsed_seconds: 580, charge_elapsed_seconds: 60, bean_temp_c: 165, env_temp_c: 205 }),
+    );
+    expect(s.t0ElapsedSeconds).toBe(520); // derived: 580 − 60
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 600, charge_elapsed_seconds: 80, bean_temp_c: 170, env_temp_c: 206 }));
+    s = dashboardReducer(s, ev("t0_detected", { bean_temp_c: 165 }));
+    expect(s.t0ElapsedSeconds).toBe(520); // unchanged — the derived origin wins over 600
+    expect(s.t0).not.toBeNull();
+  });
+
   it("t0_detected with an EMPTY buffer leaves t0ElapsedSeconds null (no point to anchor, #326)", () => {
     // With no plotted point there's no serve-elapsed for charge; defaulting to 0
     // would mislabel preheat as large positive roast-time. Leave the origin null

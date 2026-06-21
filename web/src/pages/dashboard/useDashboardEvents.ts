@@ -377,7 +377,13 @@ export function dashboardReducer(
       return {
         ...state,
         t0: data,
-        t0ElapsedSeconds: at,
+        // FIRST-WINS, consistent with the telemetry/seed recovery path: if a
+        // reconnect/late-join already DERIVED the origin from the server's own clocks
+        // (elapsed − charge_elapsed, the canonical value), keep it — a re-fired
+        // t0_detected must not clobber it with the latest-point heuristic. They agree
+        // in practice (both reference the T0-detection tick), so this only set it when
+        // still null. The marker dedupes via withMarker.
+        t0ElapsedSeconds: state.t0ElapsedSeconds ?? at,
         markers: withMarker(state.markers, { kind: "t0", t: at, label: "T0" }),
       };
     }
