@@ -361,10 +361,9 @@ class AdvisorConfig(BaseModel):
 
         Looks ``phase`` up in :attr:`model_slug_by_phase`, falling back to the
         base :attr:`model_slug` when the phase carries no override. With the
-        default map (gemini-3.1-flash-lite for every phase, D33) this always
-        resolves to :attr:`model_slug`, so per-phase selection is a behavioral
-        no-op until a future re-run populates the map with a different per-phase
-        model.
+        default map (gpt-4o for every phase, #277 PIN) this always resolves to
+        :attr:`model_slug`, so per-phase selection is a behavioral no-op until a
+        future re-run populates the map with a different per-phase model.
 
         Args:
             phase: The agent phase the controller is currently in.
