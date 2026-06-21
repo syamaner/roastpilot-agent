@@ -43,12 +43,16 @@ const SAVED: BeanProfile = { ...INPUT, id: "p1", created_at: "t", updated_at: "t
 afterEach(() => vi.restoreAllMocks());
 
 describe("useBeanProfiles", () => {
-  it("fetches the saved bean-profile library", async () => {
+  it("fetches the saved bean-profile library and passes the data through", async () => {
     const spy = vi
       .spyOn(api, "beanProfiles")
       .mockResolvedValue({ profiles: [SAVED] });
-    renderHook(() => useBeanProfiles(), { wrapper: wrapperFor(makeClient()) });
+    const { result } = renderHook(() => useBeanProfiles(), {
+      wrapper: wrapperFor(makeClient()),
+    });
     await waitFor(() => expect(spy).toHaveBeenCalled());
+    // Real data pass-through: the dropdown renders from result.current.data.
+    await waitFor(() => expect(result.current.data?.profiles).toEqual([SAVED]));
   });
 });
 

@@ -361,16 +361,18 @@ function renderWithLibrary(overrides: Partial<Parameters<typeof StartRoastForm>[
       updated_at: "t",
     }),
   );
+  const onArchiveProfile = vi.fn(async (id: string) => ({ id, result: "archived" as const }));
   render(
     <StartRoastForm
       onStart={onStart}
       profiles={FIXTURE_BEAN_PROFILES}
       onCreateProfile={onCreateProfile}
       onUpdateProfile={onUpdateProfile}
+      onArchiveProfile={onArchiveProfile}
       {...overrides}
     />,
   );
-  return { onStart, onCreateProfile, onUpdateProfile };
+  return { onStart, onCreateProfile, onUpdateProfile, onArchiveProfile };
 }
 
 describe("StartRoastForm — bean-profile library (#303)", () => {
@@ -387,12 +389,24 @@ describe("StartRoastForm — bean-profile library (#303)", () => {
     fireEvent.change(screen.getByTestId("bean-profile-select"), {
       target: { value: FIXTURE_KOKE.id },
     });
-    // Identity + targets fill from the selected profile.
+    // Identity fills from the selected profile — assert EVERY mapped field so
+    // dropping one from draftFromBeanProfile regresses (not just a representative few).
     expect(screen.getByTestId("start-roast-name")).toHaveValue(FIXTURE_KOKE.name);
     expect(screen.getByTestId("start-roast-bean_origin")).toHaveValue(FIXTURE_KOKE.bean_origin);
+    expect(screen.getByTestId("start-roast-country")).toHaveValue("Ethiopia");
+    expect(screen.getByTestId("start-roast-farm")).toHaveValue("Koke Washing Station");
+    expect(screen.getByTestId("start-roast-bean_species")).toHaveValue("arabica");
+    expect(screen.getByTestId("start-roast-bean_varietal")).toHaveValue("Dega, Kudhume, Wolisho");
     expect(screen.getByTestId("start-roast-processing")).toHaveValue("natural");
+    expect(screen.getByTestId("start-roast-altitude_m")).toHaveValue(1885);
+    expect(screen.getByTestId("start-roast-description")).toHaveValue(FIXTURE_KOKE.description);
+    // Roast targets fill too.
+    expect(screen.getByTestId("start-roast-charge_guidance_min_c")).toHaveValue(170);
+    expect(screen.getByTestId("start-roast-charge_guidance_max_c")).toHaveValue(200);
     expect(screen.getByTestId("start-roast-initial_heat_percent")).toHaveValue(100);
+    expect(screen.getByTestId("start-roast-initial_fan_percent")).toHaveValue(30);
     expect(screen.getByTestId("start-roast-target_drop_temp_c")).toHaveValue(190);
+    expect(screen.getByTestId("start-roast-target_development_percent")).toHaveValue(13);
     // The per-roast charge weight pre-fills from default_bean_weight_grams.
     expect(screen.getByTestId("start-roast-bean_weight_grams")).toHaveValue(250);
   });
@@ -446,5 +460,29 @@ describe("StartRoastForm — bean-profile library (#303)", () => {
     await waitFor(() => expect(onUpdateProfile).toHaveBeenCalledTimes(1));
     expect(onUpdateProfile.mock.calls[0][0]).toBe(FIXTURE_KOKE.id);
     expect(onUpdateProfile.mock.calls[0][1].target_development_percent).toBe(16);
+  });
+
+  it("archives the selected profile from the edit modal, then closes it", async () => {
+    // Covers the StartRoastForm wiring (onArchive={mode==="edit" ? onArchiveProfile :
+    // undefined}) — only the isolated BeanProfileModal test exercised archive before.
+    const { onArchiveProfile } = renderWithLibrary();
+    fireEvent.change(screen.getByTestId("bean-profile-select"), {
+      target: { value: FIXTURE_KOKE.id },
+    });
+    fireEvent.click(screen.getByTestId("bean-profile-edit-button"));
+    expect(screen.getByTestId("bean-profile-modal")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("bean-profile-archive"));
+    await waitFor(() => expect(onArchiveProfile).toHaveBeenCalledWith(FIXTURE_KOKE.id));
+    // The modal closes after a successful archive.
+    await waitFor(() => expect(screen.queryByTestId("bean-profile-modal")).toBeNull());
+  });
+
+  it("does not offer Archive in the add modal (no profile to archive)", () => {
+    renderWithLibrary();
+    fireEvent.click(screen.getByTestId("bean-profile-add-button"));
+    expect(screen.getByTestId("bean-profile-modal")).toBeInTheDocument();
+    // The add modal never renders the archive affordance (onArchive is undefined
+    // for mode==="add" even though onArchiveProfile is wired).
+    expect(screen.queryByTestId("bean-profile-archive")).toBeNull();
   });
 });
