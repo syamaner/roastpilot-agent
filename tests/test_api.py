@@ -2230,6 +2230,18 @@ async def test_update_unknown_bean_profile_is_404(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
+async def test_update_archived_bean_profile_is_404(client: AsyncClient) -> None:
+    """#304 (augment): editing an archived profile is a 404, not a phantom 200 —
+    the store's rowcount guard surfaces as the not-found error."""
+    created = (await client.post("/api/bean-profiles", json=_bean_input())).json()
+    assert (await client.delete(f"/api/bean-profiles/{created['id']}")).status_code == 200
+    response = await client.put(
+        f"/api/bean-profiles/{created['id']}", json=_bean_input(name="Edited")
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_update_bean_profile_validation_error_is_422(client: AsyncClient) -> None:
     created = (await client.post("/api/bean-profiles", json=_bean_input())).json()
     response = await client.put(

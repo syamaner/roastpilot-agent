@@ -1184,12 +1184,19 @@ class RoastStore:
             updated_at=now,
             **profile_input.model_dump(),
         )
-        await self.connection.execute(
+        cursor = await self.connection.execute(
             "UPDATE bean_profiles SET name = ?, profile_json = ?, updated_at_utc = ?"
             " WHERE id = ? AND archived = 0",
             (updated.name, updated.model_dump_json(), now, profile_id),
         )
         await self.connection.commit()
+        if cursor.rowcount == 0:
+            # TOCTOU: the profile was archived (or deleted) between the
+            # get_bean_profile() read above and this UPDATE, so the
+            # ``archived = 0`` guard matched no row. Fail closed with the
+            # not-found error rather than return the fabricated ``updated`` model
+            # — never report a phantom success for a row that was not written.
+            raise BeanProfileNotFoundError(profile_id)
         return updated
 
     async def delete_bean_profile(self, profile_id: str) -> None:
@@ -1201,13 +1208,21 @@ class RoastStore:
         the not-found guard: a second delete of an already-archived id raises (it
         is no longer an *active* profile).
 
+        Archiving deliberately does NOT bump ``updated_at_utc``: ``updated_at`` is
+        a *profile-edit* timestamp (the embedded ``profile_json.updated_at`` is its
+        source of truth), and a soft-delete edits no profile content. Bumping only
+        the column would leave it disagreeing with the stale ``updated_at`` inside
+        ``profile_json``; leaving both untouched keeps the row's two timestamps
+        consistent without re-serializing the blob. (The archive instant is not
+        separately recorded — it is not part of the BeanProfile contract; add an
+        ``archived_at`` column if an audit trail is ever needed.)
+
         Raises:
             BeanProfileNotFoundError: No active profile has that id.
         """
         cursor = await self.connection.execute(
-            "UPDATE bean_profiles SET archived = 1, updated_at_utc = ?"
-            " WHERE id = ? AND archived = 0",
-            (_utc_now(), profile_id),
+            "UPDATE bean_profiles SET archived = 1 WHERE id = ? AND archived = 0",
+            (profile_id,),
         )
         await self.connection.commit()
         if cursor.rowcount == 0:

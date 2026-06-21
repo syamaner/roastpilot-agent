@@ -13,7 +13,7 @@ import pytest_asyncio
 
 from roastpilot_agent import store as store_module
 from roastpilot_agent.config import AppConfig
-from roastpilot_agent.models import BeanProfileInput, RoastPhase, RoastProfile
+from roastpilot_agent.models import BeanProfile, BeanProfileInput, RoastPhase, RoastProfile
 from roastpilot_agent.seed import ETHIOPIA_KOKE_ID, ETHIOPIA_KOKE_SEED, SEED_BEAN_PROFILES
 from roastpilot_agent.store import BeanProfileNotFoundError, RoastStore
 
@@ -169,6 +169,68 @@ async def test_delete_unknown_or_twice_raises(store: RoastStore) -> None:
         await store.delete_bean_profile(created.id)  # already archived
     with pytest.raises(BeanProfileNotFoundError):
         await store.delete_bean_profile("never-existed")
+
+
+@pytest.mark.asyncio
+async def test_update_archived_profile_raises_not_phantom_success(store: RoastStore) -> None:
+    """#304 (augment): an update racing an archive must NOT report a phantom
+    success. The ``archived = 0`` UPDATE guard matches no row once the profile is
+    archived, and the rowcount check raises BeanProfileNotFoundError rather than
+    returning a fabricated model.
+
+    The normal path (get_bean_profile returns None for an archived id) already
+    raises via the existence guard; this pins the TOCTOU rowcount guard directly
+    by faking a stale get_bean_profile read of an already-archived row.
+    """
+    created = await store.create_bean_profile(_input(name="Racey"))
+    await store.delete_bean_profile(created.id)  # now archived
+
+    # Simulate the TOCTOU window: the read sees the row active, but it was
+    # archived before the UPDATE lands (here it is already archived, so the
+    # ``archived = 0`` UPDATE matches no row).
+    async def _stale_read(_profile_id: str) -> BeanProfile | None:
+        return created
+
+    monkeypatch_get = pytest.MonkeyPatch()
+    monkeypatch_get.setattr(store, "get_bean_profile", _stale_read)
+    try:
+        with pytest.raises(BeanProfileNotFoundError):
+            await store.update_bean_profile(created.id, _input(name="Edited"))
+    finally:
+        monkeypatch_get.undo()
+
+    # The archived row was not mutated by the failed update.
+    async with store.connection.execute(
+        "SELECT profile_json FROM bean_profiles WHERE id = ?", (created.id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    assert BeanProfile.model_validate_json(str(row["profile_json"])).name == "Racey"
+
+
+@pytest.mark.asyncio
+async def test_archive_keeps_column_and_json_timestamps_consistent(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#304 (augment): archiving does not bump updated_at_utc, so the row's column
+    timestamp and the timestamp embedded in profile_json stay in agreement (both
+    are the create instant — a soft-delete edits no profile content)."""
+    stamps = iter(["2026-06-21T00:00:00+00:00", "2026-06-21T00:00:05+00:00"])
+    monkeypatch.setattr(store_module, "_utc_now", lambda: next(stamps))
+    created = await store.create_bean_profile(_input(name="Archived"))
+    # Next _utc_now() would be the 00:00:05 stamp; archiving must NOT consume it
+    # (it must not write a timestamp), so it stays available for any later call.
+    await store.delete_bean_profile(created.id)
+    async with store.connection.execute(
+        "SELECT updated_at_utc, profile_json FROM bean_profiles WHERE id = ?",
+        (created.id,),
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    embedded = BeanProfile.model_validate_json(str(row["profile_json"]))
+    column_ts = str(row["updated_at_utc"])
+    assert column_ts == embedded.updated_at  # the two timestamps agree
+    assert column_ts == created.updated_at  # neither moved on archive
 
 
 @pytest.mark.asyncio
