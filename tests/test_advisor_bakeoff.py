@@ -73,9 +73,14 @@ def test_roster_is_well_formed() -> None:
 
 
 def test_roster_is_the_277_screen_with_baseline_and_prior_winner() -> None:
-    """The #277 screen has 9 unique models incl. the n8n baseline + prior winner."""
+    """The as-run #277 roster has 10 unique models incl. baseline + prior winner.
+
+    The 10th slug is ``x-ai/grok-4.3``, the recovery candidate added when the
+    original ``x-ai/grok-4-fast`` slug 404'd as deprecated (see the
+    21 Jun results doc disposition).
+    """
     slugs = [c.slug for c in bakeoff.ROSTER]
-    assert len(slugs) == 9
+    assert len(slugs) == 10
     assert len(slugs) == len(set(slugs)), "roster slugs must be unique"
     # The gpt-4o n8n baseline (D40.4) and the prior winner are both present.
     baselines = [c.slug for c in bakeoff.ROSTER if c.tier is bakeoff.Tier.BASELINE]
@@ -84,14 +89,21 @@ def test_roster_is_the_277_screen_with_baseline_and_prior_winner() -> None:
     assert prior == ["google/gemini-3.1-flash-lite"]
 
 
-def test_finalists_are_the_five_carried_to_the_full_set() -> None:
-    """Exactly the 5 named finalists are flagged + returned by finalist_roster."""
+def test_finalists_are_the_ones_carried_to_the_full_set() -> None:
+    """The as-run #277 finalists are flagged + returned by finalist_roster.
+
+    These are the candidates carried to the FULL 17-medium set with 2 seeds.
+    Of these, gpt-4o / gemini-3.1-flash-lite / gemini-3-flash-preview produced
+    usable full data; gpt-5-nano / gpt-5-mini / grok-4.3 were attempted but
+    proved unreachable on this OpenRouter access (see the 21 Jun results doc).
+    """
     expected = {
         "openai/gpt-4o",
         "google/gemini-3.1-flash-lite",
+        "google/gemini-3-flash-preview",
         "openai/gpt-5-nano",
-        "x-ai/grok-4-fast",
-        "anthropic/claude-haiku-4.5",
+        "openai/gpt-5-mini",
+        "x-ai/grok-4.3",
     }
     assert {c.slug for c in bakeoff.ROSTER if c.finalist} == expected
     assert {c.slug for c in bakeoff.finalist_roster()} == expected

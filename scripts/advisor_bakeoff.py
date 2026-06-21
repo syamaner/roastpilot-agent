@@ -665,7 +665,6 @@ ROSTER: tuple[Candidate, ...] = (
         "x-ai/grok-4-fast",
         Tier.CONTROL_CANDIDATE,
         (RoastPhase.DEVELOPMENT,),
-        finalist=True,
     ),
     # claude-haiku-4.5 — Anthropic's fast tier; the non-reasoning frontier-fast
     # quality bar carried to the full set.
@@ -673,7 +672,6 @@ ROSTER: tuple[Candidate, ...] = (
         "anthropic/claude-haiku-4.5",
         Tier.CONTROL_CANDIDATE,
         (RoastPhase.DEVELOPMENT,),
-        finalist=True,
     ),
     # --- SCREEN-ONLY (single seed on the ~6-roast subset) --------------------
     # deepseek-v4-flash — cheap flash control candidate.
@@ -687,6 +685,7 @@ ROSTER: tuple[Candidate, ...] = (
         "google/gemini-3-flash-preview",
         Tier.CONTROL_CANDIDATE,
         (RoastPhase.DEVELOPMENT,),
+        finalist=True,
         reasoning="low",
     ),
     # gpt-5-mini — a strong OpenAI model that reasons before answering; included
@@ -696,6 +695,7 @@ ROSTER: tuple[Candidate, ...] = (
         "openai/gpt-5-mini",
         Tier.FRONTIER_CEILING,
         (RoastPhase.DEVELOPMENT,),
+        finalist=True,
         latency_risk=True,
         reasoning="low",
     ),
@@ -704,6 +704,15 @@ ROSTER: tuple[Candidate, ...] = (
         "google/gemini-3.5-flash",
         Tier.FRONTIER_CEILING,
         (RoastPhase.DEVELOPMENT,),
+        reasoning="low",
+    ),
+    # grok-4.3 — recovery slug for the deprecated grok-4-fast (the only
+    # non-Google/non-OpenAI control datapoint). Reasoning pinned low.
+    Candidate(
+        "x-ai/grok-4.3",
+        Tier.CONTROL_CANDIDATE,
+        (RoastPhase.DEVELOPMENT,),
+        finalist=True,
         reasoning="low",
     ),
 )
