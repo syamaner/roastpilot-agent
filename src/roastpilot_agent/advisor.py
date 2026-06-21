@@ -757,7 +757,28 @@ _PROMPTS: dict[str, str] = {
 
 
 def instructions_for(prompt_version: str) -> str:
-    """Return the versioned advisor instructions, or raise on an unknown version."""
+    """Return the versioned advisor instructions, or raise on an unknown version.
+
+    Resolves both prompt namespaces: the ``v``-prefixed per-tick advisory lenses
+    in :data:`_PROMPTS` and the ``c``-prefixed control teaching SYSTEM frames in
+    :data:`_CONTROL_TEACHING_PROMPTS` (e.g. ``c1``). The live post-FC advisor
+    runs with ``prompt_version="c1"`` (#277), so the control teaching frame is the
+    system ``instructions`` of the production agent; the per-tick #275 context is
+    the user message. The ``c``-namespace is checked first so a control version
+    can never be shadowed by a same-named user lens.
+
+    Args:
+        prompt_version: The advisor prompt version — a ``c`` control teaching
+            frame (``c1``) or a ``v`` per-tick lens (``v0``..``v8``).
+
+    Returns:
+        The instruction text for ``prompt_version``.
+
+    Raises:
+        ValueError: If ``prompt_version`` is in neither namespace.
+    """
+    if prompt_version in _CONTROL_TEACHING_PROMPTS:
+        return _CONTROL_TEACHING_PROMPTS[prompt_version]
     try:
         return _PROMPTS[prompt_version]
     except KeyError:
@@ -919,10 +940,12 @@ def control_teaching_prompt(version: str = CONTROL_TEACHING_PROMPT_VERSION) -> s
     The stable, cached ``system`` message that teaches the whole control model
     (the Hottop, the phase model, the controls and their principle-level limits,
     the metrics, lever stability, and the objective). It is a SEPARATE artifact
-    from the per-tick advisory prompts (:func:`instructions_for`) and from the
-    live per-tick context (built by #275): it never changes tick to tick, so it
-    caches. It is provided here as an importable, versioned artifact for #223 and
-    #228 to carry; this story does not wire it into a live loop.
+    from the per-tick advisory prompts (the ``v`` lenses) and from the live
+    per-tick context (built by #275): it never changes tick to tick, so it
+    caches. It is wired live (#277): :func:`instructions_for` resolves the ``c``
+    versions, so a :class:`PydanticAIAdvisor` built with ``prompt_version="c1"``
+    (the shipped default) sends this text as the agent's system ``instructions``
+    for the post-FC control loop.
 
     Args:
         version: The control teaching prompt version. Defaults to the active
@@ -1134,10 +1157,11 @@ class PydanticAIAdvisor(RoastAdvisor):
         self._instructions = instructions_for(config.prompt_version)
         #: Per-slug agent cache (#173). One agent per distinct model slug —
         #: instructions and settings are slug-independent, only the underlying
-        #: ``Model`` varies. With the Opus-everywhere default every phase
-        #: resolves to the same slug, so exactly one agent is built: a clean
-        #: behavioral no-op. Keyed by slug; ``_injected_model`` short-circuits
-        #: the cache for the test seam. ``descriptor``/``healthcheck`` warm the
+        #: ``Model`` varies. With the single-model default (gpt-4o everywhere,
+        #: #277) every phase resolves to the same slug, so exactly one agent is
+        #: built: a clean behavioral no-op. Keyed by slug; ``_injected_model``
+        #: short-circuits the cache for the test seam.
+        #: ``descriptor``/``healthcheck`` warm the
         #: base ``model_slug`` entry eagerly so the prior single-agent eager
         #: construction (and its import-error surface) is preserved.
         self._agents: dict[str, Agent[None, _RawRoastDecision]] = {}
