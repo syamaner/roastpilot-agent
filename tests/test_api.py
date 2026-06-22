@@ -1440,21 +1440,33 @@ async def test_restart_into_active_phase_enters_recovery_without_resuming(
 
 
 @pytest.mark.asyncio
-async def test_recover_on_start_faulted_run_re_enters_operable_faulted(
+async def test_recover_on_start_auto_finalizes_a_stale_faulted_run(
     store: RoastStore,
 ) -> None:
-    """#206 (fail-closed restart): a persisted FAULTED run with no ``completed_at``
-    (the post-#206 common case) re-enters the operable-FAULTED state — NOT
-    operator_recovery_required (whose row would permit resume-into-roasting). The
-    loop is alive, no heat/fan/session write is issued, and the operator can still
-    cool / e-stop / acknowledge. This is distinct from the active-roast →
-    recovery path (tested separately)."""
+    """#331: a prior session's unfinalised FAULTED run is AUTO-FINALISED on restart
+    — NOT restored as the active run. A restart is a new session; restoring the
+    stale fault as active stranded the operator on it and blocked a fresh roast
+    (the roast-3 boot-onto-"test 6" bug). It is moved terminal (outcome ``faulted``,
+    fault_reason preserved) so it lands in history, the boot is clean (no active
+    run), and no heat/fan/MCP write is issued (restart-never-auto-resumes intact).
+    Supersedes the prior #206 "re-enter operable-faulted on restart" behaviour: the
+    in-SESSION operable-faulted path is unchanged; this is only the cross-restart
+    stale-fault case."""
     await store.create_run(
         run_id="run-faulted-crash",
         profile=_profile(),
         config=AppConfig(),
         agent_phase=RoastPhase.FAULTED,
     )
+    # The real bug shape: a fault that was NEVER finalised (completed_at stays NULL
+    # — a crash / unacknowledged fault from a prior session). The fault_reason was
+    # persisted when it first faulted. Set it directly (no completion, so the
+    # immutability trigger — which guards only ALREADY-completed rows — does not fire).
+    await store.connection.execute(
+        "UPDATE roast_runs SET fault_reason = ? WHERE id = ?",
+        ("env 242 C exceeds the hard ceiling 240 C", "run-faulted-crash"),
+    )
+    await store.connection.commit()
     mcp = FakeMCPClient()
     service = RoastService(
         store,
@@ -1466,19 +1478,49 @@ async def test_recover_on_start_faulted_run_re_enters_operable_faulted(
     await service.recover_on_start()
     recovered = await store.read_run("run-faulted-crash")
     assert recovered is not None
-    assert recovered.agent_phase is RoastPhase.FAULTED  # NOT operator_recovery_required
-    assert recovered.completed_at_utc is None  # operable, awaiting acknowledgement
-    assert service.active_run_id == "run-faulted-crash"
-    assert service.runner is not None
-    assert service.runner.controller_snapshot().phase is RoastPhase.FAULTED
-    # No resume-into-roast: heat/fan are not auto-resumed, no MCP write on recovery.
+    # Auto-finalised: terminal, outcome faulted, in history — NOT the active run.
+    assert recovered.completed_at_utc is not None
+    assert recovered.outcome == "faulted"
+    assert recovered.agent_phase is RoastPhase.FAULTED
+    # fault_reason PRESERVED for diagnosis (finalize_stale_faulted_run never touches it).
+    assert recovered.fault_reason == "env 242 C exceeds the hard ceiling 240 C"
+    # Boot is clean: no active run, no runner/loop started, no MCP write, no resume.
+    assert service.active_run_id is None
+    assert service.runner is None
     assert mcp.commands() == []
+    # The store agrees there is no active run, so a fresh roast is not blocked.
+    assert await store.active_run() is None
+
+
+@pytest.mark.asyncio
+async def test_recover_on_start_active_roast_still_recovers_to_recovery_required(
+    store: RoastStore,
+) -> None:
+    """#331 regression guard: the NORMAL recovery path is unchanged — a persisted
+    ACTIVE-ROAST phase (not faulted) still enters operator_recovery_required on
+    restart, with no heat/fan/MCP write (restart-never-auto-resumes). Only the
+    stale-faulted case changed."""
+    await store.create_run(
+        run_id="run-mid-roast",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+    mcp = FakeMCPClient()
+    service = RoastService(
+        store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False, clock=FakeClock()
+    )
+    await service.recover_on_start()
+    assert service.active_run_id == "run-mid-roast"
+    assert service.runner is not None
+    assert service.runner.controller_snapshot().phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
     snapshot = service.runner.controller_snapshot()
-    assert (snapshot.current_heat, snapshot.current_fan) == (0, 0)
-    # The operable-faulted state surfaces cooling/e-stop/ack, never resume-to-roast.
-    enabled = enabled_operator_actions(RoastPhase.FAULTED)
-    assert OperatorAction.STOP_COOLING in enabled
-    assert OperatorAction.ACKNOWLEDGE_FAULT in enabled
+    assert (snapshot.current_heat, snapshot.current_fan) == (0, 0)  # no auto-resume
+    assert mcp.commands() == []  # no MCP write on recovery
+    # Emergency stop stays available from recovery.
+    assert OperatorAction.EMERGENCY_STOP in enabled_operator_actions(
+        RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    )
 
 
 @pytest.mark.asyncio
@@ -1571,10 +1613,17 @@ async def test_restart_restores_charge_clock_so_resumed_dtr_survives(store: Roas
 async def test_recover_faulted_then_acknowledge_preserves_fault_reason(
     store: RoastStore,
 ) -> None:
-    """#206 regression: recover_faulted() must latch _captured_fault_reason BEFORE
-    _flush_events() drains the FAULT event from the emitter buffer. Without the
-    latch, the fault_reason column is None after restart→acknowledge because the
-    buffer is empty when _handle_completion fires on the first tick after ack."""
+    """#206 regression: ``RoastRunner.recover_faulted()`` must latch
+    ``_captured_fault_reason`` BEFORE ``_flush_events()`` drains the FAULT event
+    from the emitter buffer. Without the latch, the fault_reason column is None
+    after recover→acknowledge because the buffer is empty when ``_handle_completion``
+    fires on the first tick after ack.
+
+    NB (#331): this exercises ``recover_faulted`` DIRECTLY rather than via
+    ``recover_on_start`` — restart recovery now AUTO-FINALISES a stale faulted run
+    (#331) instead of re-entering it operable, but ``recover_faulted`` itself (the
+    in-session operable-faulted path) is unchanged and still owns the #206 latch, so
+    its regression coverage lives here on the method directly."""
     await store.create_run(
         run_id="run-fault-reason",
         profile=_profile(),
@@ -1590,7 +1639,11 @@ async def test_recover_faulted_then_acknowledge_preserves_fault_reason(
         run_loop=False,
         clock=clock,
     )
-    await service.recover_on_start()
+    # Build the runner + re-enter operable-faulted directly (the in-session path).
+    runner = service._build_runner("run-fault-reason")  # pyright: ignore[reportPrivateUsage]
+    assert runner is not None
+    service.active_run_id = "run-fault-reason"
+    await runner.recover_faulted(_profile())
     assert service.runner is not None
 
     # Acknowledge the fault → finalises on the next tick.

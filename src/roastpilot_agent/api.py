@@ -522,7 +522,17 @@ class RoastRunner:
         and fan are NOT auto-resumed (``faulted`` is heat-off), emergency stop and
         engage/stop-cooling remain available, and the run finalises only when the
         operator acknowledges the fault. Issues no MCP write — same
-        restart-never-auto-resumes invariant as :meth:`recover`."""
+        restart-never-auto-resumes invariant as :meth:`recover`.
+
+        NB (#331): ``recover_on_start`` no longer calls this — it now AUTO-FINALISES
+        a stale faulted run instead (see :meth:`recover_on_start`). This method is
+        retained DELIBERATELY: it carries the #206 ``_captured_fault_reason`` latch
+        (latch BEFORE ``_flush_events`` drains the FAULT event), pinned by
+        ``test_recover_faulted_then_acknowledge_preserves_fault_reason`` which now
+        exercises it directly. Do NOT delete it as "dead code" — that would drop the
+        latch regression coverage. It is also the obvious hook if the operator ever
+        decides a restored fault should stay operable-for-cooling rather than
+        auto-finalise (the #331 trade)."""
         self._controller.load_profile(profile)
         await self._controller.recover_into_faulted(RoastPhase.FAULTED)
         # Latch before flush — the FAULT event is about to be drained from the
@@ -1173,17 +1183,24 @@ class RoastService:
 
         Two non-terminal restart cases, fail-closed both ways:
 
-        * **A persisted ``faulted`` run (#206)** re-enters the *operable-faulted*
-          state via :meth:`RoastRunner.recover_faulted` — NOT
-          ``operator_recovery_required``. A hard fault (or e-stop) must never
-          offer resume-into-roasting (which the recovery transition row permits),
-          because that would re-apply heat into an aborted run (operator decision,
-          14 Jun). The loop stays alive, heat is off, and the operator may still
-          engage/stop cooling or e-stop, then acknowledge the fault to finalise it.
+        * **A persisted ``faulted`` run (#331)** is AUTO-FINALISED to a terminal
+          ``faulted`` outcome (``finalize_stale_faulted_run``) rather than restored
+          as the active run. A restart is a new session: the fault was already
+          handled-or-abandoned last session, the machine was re-initialised, and the
+          only in-app action on a restored fault is acknowledge (which just
+          finalises it) — so restoring it as active served no operator action and
+          stranded the operator on a stale run, blocking a fresh roast (the roast-3
+          boot-onto-"test 6" bug). Finalising it lands it in HISTORY (fault_reason
+          preserved for diagnosis) and the boot is clean/idle. This resumes nothing
+          and issues no MCP write — the restart-never-auto-resumes invariant (about
+          actuation) is untouched. (The in-SESSION operable-faulted path, #206 —
+          ``recover_faulted`` / ``recover_into_faulted`` — is unchanged; it keeps a
+          LIVE fault operable for cooling within a session, distinct from this
+          cross-restart stale-fault case.)
         * **An active-roast phase** (preheating / pre-FC / development / cooling)
           enters ``operator_recovery_required`` via :meth:`RoastRunner.recover`,
           where explicit operator action (resume/drop/cool/end) is required and
-          emergency stop stays available.
+          emergency stop stays available. UNCHANGED by #331.
         """
         if self._roaster is None:
             return
@@ -1192,21 +1209,33 @@ class RoastService:
             return  # fresh database, or a terminal run — nothing possibly active
         if persisted.agent_phase in (RoastPhase.IDLE, RoastPhase.COMPLETE):
             return
+        if persisted.agent_phase is RoastPhase.FAULTED:
+            # #331: a prior session's UNFINALISED faulted run must NOT be restored
+            # as the active run — that strands the operator on a stale fault (e.g.
+            # roast 3 booting onto the 14-Jun "test 6" fault) and blocks a fresh
+            # roast. A restart is a NEW session: the machine was re-initialised, the
+            # fault was already handled-or-abandoned last session, and the only
+            # in-app action on a restored fault is acknowledge (which just finalises
+            # it) — so re-entering it as active serves no operator action. Finalise
+            # it terminally (outcome ``faulted``, fault_reason PRESERVED for
+            # diagnosis) so it lands in HISTORY and the boot is clean/idle, ready for
+            # a new roast. This is a store write only — it resumes nothing, issues no
+            # MCP write, and never touches heat/fan, so the restart-never-auto-resumes
+            # invariant (about actuation) is untouched. NB: the in-SESSION
+            # operable-faulted path (#206) is unchanged — that keeps a LIVE fault
+            # operable for cooling within the session; this only handles the
+            # cross-restart STALE fault.
+            await self._store.finalize_stale_faulted_run(persisted.run_id)
+            return
         runner = self._build_runner(persisted.run_id)
         if runner is None:  # pragma: no cover — guarded above
             return
         self.active_run_id = persisted.run_id
-        if persisted.agent_phase is RoastPhase.FAULTED:
-            # Fail-closed: a persisted hard fault with no completed_at (the now
-            # common case — a fault no longer auto-finalises, #206) re-enters the
-            # operable-faulted state, never resume-into-roast recovery.
-            await runner.recover_faulted(persisted.profile)
-        else:
-            await runner.recover(
-                persisted.profile,
-                persisted.agent_phase,
-                t0_detected_at_utc=persisted.t0_detected_at_utc,
-            )
+        await runner.recover(
+            persisted.profile,
+            persisted.agent_phase,
+            t0_detected_at_utc=persisted.t0_detected_at_utc,
+        )
         if self._run_loop:
             self._loop_task = asyncio.create_task(runner.run())
 
