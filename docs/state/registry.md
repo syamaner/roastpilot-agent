@@ -2,6 +2,14 @@
 
 ## Active Epic
 
+> **STATUS UPDATE — 21 Jun 2026 (supersedes the PREP framing below):** the D35 control work
+> is BUILT and **hardware-validated by roast 3** (first clean end-to-end roast). Pre-FC
+> deterministic floor (#222) + post-FC LLM loop (#223/#226/#276) + model pin (gpt-4o + c1, D43)
+> all SHIPPED. The floor shipped FLAT (heat 100 → FC); the §3 anticipatory **trim** was never
+> built and the floor overshoots (D46) → **#327 deterministic anticipatory trim is the P1
+> control priority, ahead of #228.** Full roast-3 detail + decisions D46–D50 in the Active
+> Context section below. The historical PREP-phase note (14 Jun) is kept for the record:
+>
 > **ACTIVE DIRECTION — D35 (14 Jun 2026): the deterministic-control-loop advisor
 > redesign is the priority, in a PREP phase (NO build until engineers are brought in;
 > operator decision).** The supervised hardware roasts (#134 attempts 2–4) surfaced that
@@ -97,6 +105,54 @@
 
 ## Active Context
 
+**21 Jun 2026 — FIRST CLEAN END-TO-END HARDWARE ROAST (roast 3). #134 substantively
+cleared on the harness; the deterministic control floor is hardware-validated; the
+anticipatory trim is now the P1 control priority.** Roast 3 (Ethiopia Yirgacheffe Koke
+natural, ceiling 195 °C) completed: charged, roasted, dropped, cooled, **NO end-of-roast
+segfault** (the thing that aborted roasts 1 & 2). Beans over-developed (drop 203 °C);
+taste pending. Plan decisions **D46–D50** (plan repo, commit 7e45402). What this session
+recorded:
+
+- **Deterministic floor VALIDATED but OVERSHOOTS (D46).** The D35 floor (heat 100 / fan 30
+  → FC) is safe and works, but **#222 shipped it FLAT** — the plan's §3 phase table specs a
+  late-Maillard anticipatory heat **trim** that was never built (plan ↔ impl drift). Roast 3:
+  flat 100 → late FC → env 239 °C → at FC the post-FC loop (c2) cut heat correctly (10→0 by
+  bean ~193) but drum/bean momentum **coasted the bean 193 → 203 even at heat 0**; the #313
+  drop-coherence guard then held the drop for dev% (5.9 % < 10 % floor) until bean 203 — **8 °C
+  over the 195 ceiling** (the guard-vs-ceiling conflict, #323). **→ the deterministic
+  anticipatory heat trim (#327) is the P1 control priority, AHEAD of #228.**
+- **Merged this session:** #319 (advisory trail cap + always-build), #320 (fault-latch +
+  escalation — tamed the roast-2 fault-event tick-spam), #321 (c2 prompt + Koke drop 195),
+  #322 (pin `coffee-roaster-mcp==0.1.6` + in-venv spawn, closes the homebrew trap).
+- **coffee-roaster-mcp v0.1.6 shipped (D47):** the audio-teardown UAF (#165) was the
+  roast-1/2 end-of-roast SIGSEGV (NOT a pydantic ABI mismatch); + drum (#163) + mic (#160).
+  Roast 3 completing clean validates #165 on hardware. The agent's fail-closed caught the
+  segfault on both prior roasts — invariant validated on hardware.
+- **Chart/UX decided (D48):** #307 (temp axis auto-range/no-clip; RoR axis fixed/may-clip;
+  heat/fan as a 0–100 % step-line overlay; smoothing still open), #326 (chart x = roast-time
+  charge-referenced, preheat negative), #324 (home/menu landing page), #325 (advisory-history
+  rows show roast-time + bean-temp). **A local chart-regression fix (#316 blank-preheat-chart)
+  is uncommitted in `web/src/pages/dashboard/useDashboardEvents.ts` — needs its own engineer
+  PR (9 guard tests must flip to serve-referenced); NOT part of this docs sync.**
+- **Detection backdating (D49):** T0 + FC should backdate to onset, not confirmation —
+  coffee-roaster-mcp #167 (T0) + #168 (FC sibling, filed this session).
+- **#228 sequenced LAST (D50):** the pre-FC anticipatory LLM advisory layer ships only after
+  the deterministic floor + trim are hardware-validated; it refines the trim and fails closed
+  to it.
+
+**Issues filed this session:** agent **#327** (P1 deterministic anticipatory trim), **#329**
+(restored/reloaded fault doesn't render ACKNOWLEDGE), **#330** (preheat clock keeps ticking
+after e-stop), **#331** (prior-session faulted run restored as ACTIVE, blocks UI), **#332**
+(investigate: acknowledge_fault slow while latched — #320 starving the action queue?); mcp
+**#168** (FC backdating). Earlier today: agent **#323/#324/#325/#326** + #307 decision
+comments; mcp **#167**.
+
+**Next-roast priority order (operator):** **P1 #327 deterministic anticipatory trim** (roast
+quality) + **#324 home page** (FE/BE parallelizable); then the P2 UI bugs (#329/#330/#331/#332
++ the #316 chart-fix PR first); **#228 LAST** (post-trim, hardware-validated).
+
+---
+
 **15–16 Jun 2026 — two batches of autonomous agent-execution work (dev orchestration,
 NOT roast autonomy — the advisor stays advisory-only and never controls hardware) +
 safety-operability + observability merged to `main`; D35 keystone still the critical
@@ -125,12 +181,17 @@ D35 build. Honest state:
   image mirrored to GHCR off MCR's anonymous-pull hot path; `mirror-playwright.yml`
   self-refreshes weekly + on bump (#262/#263, **plan D38**).
 
-**Remaining backlog (nothing here is started):**
-- **D35 keystone (epic #221, PREP/Todo) — the critical path to the next #134 roast:**
-  **#222** pre-FC deterministic policy → **#223** post-FC LLM control loop (ROAST-CRITICAL)
-  → **#224** replay test-harness + outcome-labelled corpus + re-scoped LLM eval.
-- **D36 (post-first-roast):** #228 pre-FC anticipatory advisory layer, #229 curve-feature
-  spike. (Neither is on the project board yet.)
+**Remaining backlog:**
+- **D35 keystone (epic #221) — pre-FC floor + post-FC loop SHIPPED + hardware-validated
+  (roast 3, 21 Jun):** **#222** pre-FC deterministic policy (DONE, but shipped FLAT — the
+  §3 anticipatory trim is missing, see below) → **#223/#226/#276** post-FC LLM control loop
+  (DONE; c2 cut heat correctly at FC) → **#224/#277** replay harness + corpus + LLM eval
+  (#277 ran, model PINNED gpt-4o + c1, D43; #224 consolidation open). **The roast-3 overshoot
+  was a pre-FC floor problem, not a post-FC loop problem.**
+- **P1 (the control priority): #327 deterministic anticipatory heat trim** (late Maillard →
+  FC; D46) — fixes the roast-3 overshoot; deterministic, ahead of #228.
+- **D36/D50 (post-trim, LAST):** #228 pre-FC anticipatory LLM advisory layer (refines the
+  #327 trim, fails closed to it); #229 curve-feature spike (DONE).
 - **Advisor behavior:** #218 (fan/heat over-adjust — the attempt-3 evidence for D35).
 - **Safety-operability follow-ups:** #210 (DROP unavailable after e-stop), #212 (Ctrl+C
   hangs on a live roast), #177 (wedged-MCP-child shutdown timeout), #176 (cooling on
@@ -331,8 +392,16 @@ library / dropdown / clone / post-start edit. Profile *selection / reuse / ratin
 recommendation* is deferred to **roastpilot-cloud** (feedback-learning), not yet fully
 planned. Keeps the appliance UX minimal; the cloud owns the profile/feedback brain.
 
-**Gate status:** E11 still blocked. Of the two D28 operator manual tests, **#135** (device
-SSE) is **DONE/CLOSED**; **#134** (supervised hardware roast) is the **sole remaining
+**Gate status (21 Jun update):** **#134 (supervised hardware roast) substantively CLEARED on
+the harness** — roast 3 ran end-to-end (charge → roast → drop → cool, no segfault) on the
+agent harness; the harness, safety fail-closed, deterministic floor, post-FC loop, and
+persistent trace all worked. Residual on #134 is roast *quality* (the #327 trim, not a harness
+gate) — operator to confirm whether to mark #134 Done now or after a clean ≤195 drop. **#135**
+(device SSE) is DONE/CLOSED. **E11 still blocked on the independent D27 torch-free chain**
+regardless. Historical context below.
+
+**Gate status (13 Jun):** E11 still blocked. Of the two D28 operator manual tests, **#135**
+(device SSE) is **DONE/CLOSED**; **#134** (supervised hardware roast) was the **sole remaining
 operator gate** — operator running it 13 Jun, now with a persistent trace (#161). The
 torch-free chain (D27: `coffee-first-crack-detection#54` → `coffee-roaster-mcp#157`,
 cross-repo) is the other, independent gate. Bridge follow-ups still
