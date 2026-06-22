@@ -522,7 +522,17 @@ class RoastRunner:
         and fan are NOT auto-resumed (``faulted`` is heat-off), emergency stop and
         engage/stop-cooling remain available, and the run finalises only when the
         operator acknowledges the fault. Issues no MCP write — same
-        restart-never-auto-resumes invariant as :meth:`recover`."""
+        restart-never-auto-resumes invariant as :meth:`recover`.
+
+        NB (#331): ``recover_on_start`` no longer calls this — it now AUTO-FINALISES
+        a stale faulted run instead (see :meth:`recover_on_start`). This method is
+        retained DELIBERATELY: it carries the #206 ``_captured_fault_reason`` latch
+        (latch BEFORE ``_flush_events`` drains the FAULT event), pinned by
+        ``test_recover_faulted_then_acknowledge_preserves_fault_reason`` which now
+        exercises it directly. Do NOT delete it as "dead code" — that would drop the
+        latch regression coverage. It is also the obvious hook if the operator ever
+        decides a restored fault should stay operable-for-cooling rather than
+        auto-finalise (the #331 trade)."""
         self._controller.load_profile(profile)
         await self._controller.recover_into_faulted(RoastPhase.FAULTED)
         # Latch before flush — the FAULT event is about to be drained from the

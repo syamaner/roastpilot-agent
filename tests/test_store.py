@@ -770,7 +770,8 @@ async def test_finalize_stale_faulted_run_terminal_and_preserves_reason(
 
         row = await fetch_one(
             tmp_store,
-            "SELECT outcome, agent_phase, completed_at_utc, fault_reason FROM roast_runs",
+            "SELECT outcome, agent_phase, completed_at_utc, fault_reason FROM roast_runs"
+            " WHERE id = 'run-1'",
         )
         assert row[0] == "faulted"  # terminal outcome
         assert row[1] == "faulted"  # phase unchanged
@@ -794,10 +795,43 @@ async def test_finalize_stale_faulted_run_raises_on_already_finalized(
         await tmp_store.complete_run(
             run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
         )
-        with pytest.raises(RuntimeError, match="no unfinalized roast_run"):
+        with pytest.raises(RuntimeError, match="no unfinalized FAULTED roast_run"):
             await tmp_store.finalize_stale_faulted_run("run-1")
-        with pytest.raises(RuntimeError, match="no unfinalized roast_run"):
+        with pytest.raises(RuntimeError, match="no unfinalized FAULTED roast_run"):
             await tmp_store.finalize_stale_faulted_run("does-not-exist")
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_finalize_stale_faulted_run_never_terminalizes_a_non_faulted_run(
+    tmp_store: RoastStore,
+) -> None:
+    """#331 defensive guard (Augment): the method is GUARDED to ``agent_phase =
+    'faulted'`` so it can never terminalise an ACTIVE non-faulted run — accidental
+    misuse on a live roast raises and leaves the run untouched (still active),
+    rather than silently corrupting it. (run-1 is seeded in ``starting``.)"""
+    await seeded_store(tmp_store)
+    try:
+        # An ACTIVE, unfinalised, NON-faulted run (e.g. mid-roast).
+        await tmp_store.connection.execute(
+            "UPDATE roast_runs SET agent_phase = ? WHERE id = 'run-1'",
+            (RoastPhase.ROASTING_PRE_FIRST_CRACK.value,),
+        )
+        await tmp_store.connection.commit()
+
+        with pytest.raises(RuntimeError, match="no unfinalized FAULTED roast_run"):
+            await tmp_store.finalize_stale_faulted_run("run-1")
+
+        # Untouched: still active (completed_at NULL), phase + outcome unchanged.
+        row = await fetch_one(
+            tmp_store,
+            "SELECT outcome, agent_phase, completed_at_utc FROM roast_runs WHERE id = 'run-1'",
+        )
+        assert row[0] is None  # no outcome stamped
+        assert row[1] == "roasting_pre_first_crack"  # phase unchanged
+        assert row[2] is None  # still active — NOT terminalized
+        assert await tmp_store.active_run() is not None  # the live run survives
     finally:
         await tmp_store.close()
 

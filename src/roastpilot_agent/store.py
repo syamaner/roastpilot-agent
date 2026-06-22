@@ -792,21 +792,28 @@ class RoastStore:
         Distinct from :meth:`complete_run`: it deliberately does NOT touch
         ``fault_reason`` (or any diagnostic field) — the reason persisted when the
         run first faulted last session is PRESERVED for diagnosis. It only flips
-        the run terminal; ``agent_phase`` stays ``faulted``. No-op-safe is the
-        caller's concern (it only calls this for a non-terminal faulted run).
+        the run terminal; ``agent_phase`` stays ``faulted``.
+
+        The UPDATE is GUARDED to a genuinely-faulted, unfinalised run
+        (``agent_phase = 'faulted' AND completed_at_utc IS NULL``) so the method
+        can never terminalise an ACTIVE non-faulted run — it matches its name /
+        contract, and accidental misuse raises rather than silently corrupting a
+        live roast. A non-matching id/phase touches no row and raises.
 
         This is a STORE write only — it resumes nothing, issues no MCP write, and
         does not touch heat/fan (the restart-never-auto-resumes invariant is about
         actuation, untouched here).
         """
+        now = _utc_now()  # one instant: completed_at == updated_at at finalisation
         cursor = await self.connection.execute(
             "UPDATE roast_runs SET completed_at_utc = ?, outcome = 'faulted',"
-            " updated_at_utc = ? WHERE id = ? AND completed_at_utc IS NULL",
-            (_utc_now(), _utc_now(), run_id),
+            " updated_at_utc = ? WHERE id = ? AND completed_at_utc IS NULL"
+            " AND agent_phase = ?",
+            (now, now, run_id, RoastPhase.FAULTED.value),
         )
         await self.connection.commit()
         if cursor.rowcount == 0:
-            raise RuntimeError(f"no unfinalized roast_run with id {run_id!r}")
+            raise RuntimeError(f"no unfinalized FAULTED roast_run with id {run_id!r}")
 
     async def set_operator_rating(
         self, run_id: str, *, rating: Literal[1, 2, 3, 4, 5], notes: str | None = None
