@@ -41,6 +41,26 @@ describe("toAdvisorRows", () => {
     expect(rows.every((r) => r.beanTempC === null)).toBe(true);
   });
 
+  it("latest-wins INCLUDING null on a duplicate tick — a later null clears the temp (#325)", () => {
+    // Augment medium: skipping null readings would latch the older non-null temp,
+    // rendering a STALE temp instead of the null placeholder. The latest point for a
+    // tick must win even when its reading is null. Two points at tick 4: first 178,
+    // then null → the tick-4 row reads null (placeholder), not 178.
+    const base = FIXTURE_TELEMETRY.points[0];
+    const series: TelemetrySeries = {
+      run_id: "dup",
+      downsample: 1,
+      point_count: 2,
+      points: [
+        { ...base, tick: 4, elapsed_seconds: 120, bean_temp_c: 178 },
+        { ...base, tick: 4, elapsed_seconds: 120, bean_temp_c: null },
+      ],
+    };
+    const rows = toAdvisorRows(FIXTURE_TIMELINE, series);
+    const tick4 = rows.find((r) => r.tick === 4)!;
+    expect(tick4.beanTempC).toBeNull();
+  });
+
   it("emits failure rows (no verdict, no recommendation) for failed consults", () => {
     const rows = toAdvisorRows(FIXTURE_TIMELINE_FAILED, FIXTURE_TELEMETRY);
     expect(rows).toHaveLength(3);

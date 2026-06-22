@@ -166,12 +166,22 @@ function tickElapsedIndex(series: TelemetrySeries | undefined): Map<number, numb
   return index;
 }
 
-/** Build a tick → `bean_temp_c` lookup (#325); latest value wins on duplicate ticks. */
-function tickBeanTempIndex(series: TelemetrySeries | undefined): Map<number, number> {
-  const index = new Map<number, number>();
+/**
+ * Build a tick → `bean_temp_c` lookup (#325); LATEST value wins on duplicate
+ * ticks, INCLUDING a later null reading.
+ *
+ * Every point sets its tick (we do NOT skip nulls), so a later duplicate point
+ * with a null bean reading OVERWRITES an earlier non-null one — the row then
+ * renders the null placeholder, not a stale temp. (Skipping nulls would leave the
+ * older value latched, contradicting latest-wins.) The map value is therefore
+ * `number | null`; the caller `?? null`-coalesces a missing tick (`undefined`) and
+ * an explicit null alike, so both read as "no temp".
+ */
+function tickBeanTempIndex(series: TelemetrySeries | undefined): Map<number, number | null> {
+  const index = new Map<number, number | null>();
   if (!series) return index;
   for (const p of series.points) {
-    if (p.bean_temp_c !== null) index.set(p.tick, p.bean_temp_c);
+    index.set(p.tick, p.bean_temp_c);
   }
   return index;
 }
