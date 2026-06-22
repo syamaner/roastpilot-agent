@@ -30,7 +30,7 @@ interface FieldProps {
   value: string;
   onChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   error?: string;
-  type?: "text" | "number";
+  type?: "text" | "number" | "url";
   placeholder?: string;
   min?: number;
   max?: number;
@@ -286,6 +286,18 @@ export function BeanProfileFields({
           onChange={set("description")}
           isBlend={draft.is_blend}
           testIdPrefix={testIdPrefix}
+        />
+        <Field
+          id="source_url"
+          label="Product URL (optional)"
+          type="url"
+          value={draft.source_url}
+          onChange={set("source_url")}
+          error={errors.source_url}
+          placeholder="https://roaster.example.com/the-bean"
+          hint="Where the bean was bought — shown as a link on the roast"
+          testIdPrefix={testIdPrefix}
+          wide
         />
       </fieldset>
 

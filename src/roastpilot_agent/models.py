@@ -12,6 +12,7 @@ invariant. Use ``.value`` at serialization boundaries.
 import json
 from enum import Enum
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -262,7 +263,7 @@ class _BeanProfileFieldsBase(BaseModel):
     The single source of truth for every field that a reusable :class:`BeanProfile`
     template and an instantiated :class:`RoastProfile` have in common — bean
     identity (name, origin, varietal, country, farm, description, species, blend
-    flag, #291 processing + altitude), the charge guidance band, the initial
+    flag, #291 processing + altitude, #315 source URL), the charge guidance band, the initial
     heat/fan levers, and the drop/development targets — together with the
     whitespace-normalizing validators and the guidance-range check.
 
@@ -304,6 +305,14 @@ class _BeanProfileFieldsBase(BaseModel):
     back-compat; bounded to a sane coffee-growing range (0–4000 m). Another
     per-origin learning-loop (D42) axis. For a blend this is the primary bean's
     altitude."""
+    source_url: str | None = None
+    """Product / source URL for the bean (#315): the page it was bought from
+    (e.g. the roaster's product listing). Optional for back-compat; a blank /
+    whitespace-only value normalizes to ``None`` like the other optional
+    identity fields. Validated as a well-formed ``http(s)`` URL — lenient
+    operator metadata, but a non-empty value must at least be a parseable
+    http(s) link so the UI never renders a broken anchor. Carried into the
+    corpus for provenance / re-ordering (D42)."""
     charge_guidance_min_c: float = 170.0
     # The guidance ceiling deliberately equals the pre-T0 safety bound
     # (config.SafetyLimits.pre_t0_max_bean_temp_c, default 200.0): operators
@@ -339,6 +348,42 @@ class _BeanProfileFieldsBase(BaseModel):
             return None
         stripped = value.strip()
         return stripped or None
+
+    @field_validator("source_url")
+    @classmethod
+    def _strip_and_check_source_url(cls, value: str | None) -> str | None:
+        """Normalize blank to ``None``; require a well-formed http(s) URL otherwise.
+
+        Lenient operator metadata: an empty / whitespace-only value is "unset"
+        (``None``), not an error. A non-empty value must parse as an absolute
+        ``http``/``https`` URL with a host — so the UI never renders a broken
+        anchor and the corpus link is dereferenceable. Validated with the
+        stdlib ``urlsplit`` (no extra dependency, no ``HttpUrl`` object that
+        would change the serialized JSON shape and complicate the frozen
+        ``profile_json`` round-trip).
+
+        Beyond scheme + host, the value is rejected if it carries userinfo
+        (``user:pass@host`` — a credential that must never be persisted in the
+        corpus or rendered into an anchor) or a malformed port (which would make
+        the anchor broken). ``urlsplit`` parses a bad port lazily, so a port is
+        validated by accessing :attr:`~urllib.parse.SplitResult.port` (it raises
+        ``ValueError`` on a non-numeric / out-of-range port).
+        """
+        if value is None:
+            return None
+        stripped = value.strip()
+        if not stripped:
+            return None
+        parsed = urlsplit(stripped)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("must be a well-formed http(s) URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("must not embed credentials (userinfo)")
+        try:
+            parsed.port  # noqa: B018 — accessing .port validates it (raises on a bad port)
+        except ValueError as exc:
+            raise ValueError("must not have a malformed port") from exc
+        return stripped
 
     @model_validator(mode="after")
     def _check_guidance_range(self) -> "_BeanProfileFieldsBase":

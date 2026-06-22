@@ -212,6 +212,9 @@ export interface RoastProfile {
   // Optional / defaulted for back-compat with frozen pre-#291 profiles.
   processing?: ProcessingMethod | null;
   altitude_m?: number | null;
+  // Product / source URL (#315): where the bean was bought. Optional / defaulted
+  // for back-compat with frozen pre-#315 profiles. A validated http(s) URL or null.
+  source_url?: string | null;
   bean_weight_grams: number;
   charge_guidance_min_c: number;
   charge_guidance_max_c: number;
@@ -246,6 +249,8 @@ export interface BeanProfileFields {
   is_blend?: boolean;
   processing?: ProcessingMethod | null;
   altitude_m?: number | null;
+  /** Product / source URL (#315) — where the bean was bought; a validated http(s) URL or null. */
+  source_url?: string | null;
   charge_guidance_min_c: number;
   charge_guidance_max_c: number;
   initial_heat_percent: number;
