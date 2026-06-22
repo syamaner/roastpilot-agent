@@ -42,6 +42,7 @@ ETHIOPIA_KOKE_SEED = BeanProfile(
     is_blend=False,
     processing="natural",
     altitude_m=1885,
+    source_url="https://redber.co.uk/products/ethiopia-yirgacheffe-koke",
     charge_guidance_min_c=170.0,
     charge_guidance_max_c=200.0,
     initial_heat_percent=100,
