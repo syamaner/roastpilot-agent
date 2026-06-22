@@ -15,8 +15,9 @@
  *
  * The legend doubles as a live cursor readout (value at the hovered time) AND a
  * click-to-toggle control (hide/show a series). Vertical markers label T0 /
- * first crack / drop; a shaded charge band shows in `preheating` only; a
- * controlled `highlightTime` draws the trace-row → curve highlight.
+ * first crack / drop / cooling (a light per-kind colour keeps clustered markers
+ * legible, #309); a shaded charge band shows in `preheating` only; a controlled
+ * `highlightTime` draws the trace-row → curve highlight.
  *
  * Tests assert the chart's DATA via `window.__chart` + `data-chart-*`, never the
  * canvas pixels (D24).
@@ -33,9 +34,30 @@ import {
   type ChartColumns,
   type ChartTestHook,
   type CurveMarker,
+  type CurveMarkerKind,
   type LiveCurveProps,
   type SeriesKey,
 } from "./types";
+
+/**
+ * Per-kind marker RGB (#309). A LIGHT, subordinate tint per event kind keeps
+ * clustered markers (FC / drop / cooling land close together at the end of a
+ * roast) legible without redesigning the grey-line treatment — the line + label
+ * stay the same weight, only the hue shifts. `t0` keeps the original neutral grey
+ * (the line/label pair predates this map). Indexed by `CurveMarkerKind` so a new
+ * kind must add an entry (exhaustive — a missing key is a type error).
+ */
+const MARKER_RGB: Record<CurveMarkerKind, string> = {
+  t0: "212, 212, 216", // neutral grey (unchanged from pre-#309)
+  first_crack: "251, 191, 36", // amber — the crack landmark
+  drop: "248, 113, 113", // red — beans out
+  cooling: "96, 165, 250", // blue — cooling air
+};
+
+/** The marker line/label colour at the given alpha (line 0.6, label 0.9). */
+function markerColor(kind: CurveMarkerKind, alpha: number): string {
+  return `rgba(${MARKER_RGB[kind]}, ${alpha})`;
+}
 
 // Default charge band, hoisted to module scope so the prop default is a STABLE
 // reference. An inline `{ minC, maxC }` default would mint a new object every
@@ -480,18 +502,34 @@ function drawOverlays(
     ctx.fillRect(u.bbox.left, yTop, u.bbox.width, yBot - yTop);
   }
 
-  for (const marker of markers) {
+  // Stagger labels vertically when markers cluster (FC / drop / cooling land
+  // close together at roast end, #309) so the labels don't overprint each other.
+  // Draw left-to-right; a label within LABEL_CLUSTER_PX of the previous one's x
+  // drops a row. Lines are unaffected (they span the full height).
+  const LABEL_CLUSTER_PX = 48;
+  const LABEL_ROW_PX = 12;
+  const ordered = [...markers].sort((a, b) => a.t - b.t);
+  ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+  ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+  let prevLabelX: number | null = null;
+  let labelRow = 0;
+  for (const marker of ordered) {
     const x = u.valToPos(marker.t, "x", true);
-    ctx.strokeStyle = "rgba(212, 212, 216, 0.6)";
+    ctx.strokeStyle = markerColor(marker.kind, 0.6);
     ctx.lineWidth = 1;
     line(ctx, x, u.bbox.top, x, u.bbox.top + u.bbox.height);
-    // Label the marker (T0 / FIRST CRACK / DROP) at the top of its line —
-    // ui-prompts.md Prompt A requires labeled event markers, not bare lines.
-    ctx.fillStyle = "rgba(212, 212, 216, 0.9)";
-    ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
-    ctx.textBaseline = "top";
-    ctx.textAlign = "left";
-    ctx.fillText(marker.label, x + 3, u.bbox.top + 2);
+    // Label the marker (T0 / FIRST CRACK / DROP / COOLING) near the top of its
+    // line — ui-prompts.md Prompt A requires labeled event markers, not bare
+    // lines. Per-kind colour (#309) keeps clustered labels distinguishable.
+    if (prevLabelX !== null && x - prevLabelX < LABEL_CLUSTER_PX) {
+      labelRow += 1;
+    } else {
+      labelRow = 0;
+    }
+    prevLabelX = x;
+    ctx.fillStyle = markerColor(marker.kind, 0.9);
+    ctx.fillText(marker.label, x + 3, u.bbox.top + 2 + labelRow * LABEL_ROW_PX);
   }
 
   if (highlightTime !== null) {
