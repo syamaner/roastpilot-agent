@@ -24,8 +24,8 @@ export interface CurvePoint {
   fan: number | null;
 }
 
-/** A vertical event marker on the curve (T0 / first crack / drop). */
-export type CurveMarkerKind = "t0" | "first_crack" | "drop";
+/** A vertical event marker on the curve (T0 / first crack / drop / cooling). */
+export type CurveMarkerKind = "t0" | "first_crack" | "drop" | "cooling";
 
 export interface CurveMarker {
   kind: CurveMarkerKind;

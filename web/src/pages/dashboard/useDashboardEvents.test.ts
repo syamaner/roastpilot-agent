@@ -432,6 +432,56 @@ describe("dashboardReducer", () => {
     expect(s.markers).toHaveLength(0);
   });
 
+  it("adds a cooling marker at the latest point's serve-elapsed on phase_changed→cooling (#309)", () => {
+    // Cooling is sourced from the server phase value, NOT inferred: the reducer
+    // reads phase_changed.phase === "cooling" and places the marker at the latest
+    // plotted point's serve-elapsed (the T0/FC/drop axis, #326). It never sets phase.
+    let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 1130, charge_elapsed_seconds: 630, bean_temp_c: 205, env_temp_c: 215 }));
+    s = dashboardReducer(s, ev("phase_changed", { phase: "cooling", enabled_actions: ["stop_cooling"] }));
+    expect(s.markers.find((m) => m.kind === "cooling")).toEqual({ kind: "cooling", t: 1130, label: "COOLING" });
+  });
+
+  it("places the cooling marker once — a re-fired cooling phase does not duplicate it (#309)", () => {
+    let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 1130, charge_elapsed_seconds: 630, bean_temp_c: 205, env_temp_c: 215 }));
+    s = dashboardReducer(s, ev("phase_changed", { phase: "cooling" }));
+    // A later telemetry frame then a re-delivered cooling phase_changed must not
+    // move/duplicate the marker (withMarker dedupe; FIRST-wins on t).
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 1160, charge_elapsed_seconds: 660, bean_temp_c: 200, env_temp_c: 90 }));
+    s = dashboardReducer(s, ev("phase_changed", { phase: "cooling" }));
+    expect(s.markers.filter((m) => m.kind === "cooling")).toHaveLength(1);
+    expect(s.markers.find((m) => m.kind === "cooling")?.t).toBe(1130);
+  });
+
+  it("does NOT place a cooling marker for a non-cooling phase_changed (no client phase inference, #309)", () => {
+    // Every other phase transition (e.g. development) is the shared reducer's
+    // concern — the dashboard reducer never sets phase and places no cooling marker.
+    // (A pre-charge telemetry frame is used so no T0 origin/marker is auto-recovered
+    // from the server clocks; we are isolating the phase_changed handler here.)
+    let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 300, charge_elapsed_seconds: null, bean_temp_c: 80, env_temp_c: 190 }));
+    s = dashboardReducer(s, ev("phase_changed", { phase: "development" }));
+    s = dashboardReducer(s, ev("phase_changed", { phase: "roasting_pre_first_crack" }));
+    expect(s.markers.some((m) => m.kind === "cooling")).toBe(false);
+    expect(s.markers).toHaveLength(0);
+  });
+
+  it("renders the full server-sourced marker set: charge/T0, FC, drop, cooling (#309)", () => {
+    // The four markers #309 surfaces, each from its server signal, all riding the
+    // same serve-elapsed axis (#326). Dry-end is intentionally absent — no server
+    // signal exists in M1 (deferred to a server-DRYING_END follow-up).
+    let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 510, charge_elapsed_seconds: 0, bean_temp_c: 160, env_temp_c: 200 }));
+    s = dashboardReducer(s, ev("t0_detected", { bean_temp_c: 160 }));
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 1010, charge_elapsed_seconds: 500, bean_temp_c: 201, env_temp_c: 215 }));
+    s = dashboardReducer(s, ev("first_crack", { source: "mcp", bean_temp_c: 201 }));
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 1100, charge_elapsed_seconds: 590, bean_temp_c: 213, env_temp_c: 218 }));
+    s = dashboardReducer(s, ev("command_executed", { command: "drop_beans", source: "operator" }));
+    s = dashboardReducer(s, ev("phase_changed", { phase: "cooling" }));
+    const byKind = Object.fromEntries(s.markers.map((m) => [m.kind, m.t]));
+    expect(byKind).toEqual({ t0: 510, first_crack: 1010, drop: 1100, cooling: 1100 });
+    // Dry-end is NOT a marker kind in M1 (no server signal; deferred). Guard that
+    // nothing slipped a drying-end kind in (string compare — not in the union).
+    expect(s.markers.map((m) => String(m.kind))).not.toContain("drying_end");
+  });
+
   it("resets to the initial view-model", () => {
     let s = dashboardReducer(initialDashboardViewModel, ev("advisory", ADVISORY_DECISION));
     s = dashboardReducer(s, { kind: "reset" });
@@ -503,5 +553,16 @@ describe("dashboardReducer — payload field-name contract", () => {
       ev("command_executed", { command: "drop_beans", source: "advisor" }),
     );
     expect(s.markers.some((m) => m.kind === "drop")).toBe(true);
+  });
+
+  it("phase_changed: reads `phase` (the cooling marker key — `phase`, NOT agent_phase; api.py _phase_changed_with_actions)", () => {
+    // The wire field is `phase` (the controller's emit) enriched with
+    // enabled_actions — guard the exact name the cooling-marker handler reads, the
+    // same contract-drift class that previously bit phase_changed.
+    const s = dashboardReducer(
+      dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 1130, charge_elapsed_seconds: 630, bean_temp_c: 205, env_temp_c: 215 })),
+      ev("phase_changed", { phase: "cooling", enabled_actions: ["stop_cooling"] }),
+    );
+    expect(s.markers.some((m) => m.kind === "cooling")).toBe(true);
   });
 });

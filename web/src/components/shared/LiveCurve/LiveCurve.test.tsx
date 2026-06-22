@@ -248,6 +248,21 @@ describe("LiveCurve", () => {
     expect(labels).toContain("T0");
     expect(labels).toContain("FIRST CRACK");
   });
+
+  it("surfaces the full server-sourced marker set incl. cooling on the data hook (#309)", () => {
+    // The four #309 markers (T0 / FC / drop / cooling) all flow through the chart's
+    // data hook (D24 asserts data, not the per-kind canvas colour). The clustered
+    // drop+cooling pair at the roast end both appear — neither is dropped.
+    const fullMarkers: CurveMarker[] = [
+      { kind: "t0", t: 0, label: "T0" },
+      { kind: "first_crack", t: 60, label: "FIRST CRACK" },
+      { kind: "drop", t: 60, label: "DROP" },
+      { kind: "cooling", t: 60, label: "COOLING" },
+    ];
+    render(<LiveCurve points={POINTS} markers={fullMarkers} />);
+    expect(window.__chart?.markers.map((m) => m.kind)).toEqual(["t0", "first_crack", "drop", "cooling"]);
+    expect(window.__chart?.markers.map((m) => m.label)).toContain("COOLING");
+  });
 });
 
 // Axis-scaling policy (#307): the temperature axis is controlled-dynamic auto-range
