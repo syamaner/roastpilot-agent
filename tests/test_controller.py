@@ -1619,6 +1619,39 @@ async def test_latch_does_not_escalate_on_a_same_or_lesser_verdict() -> None:
 
 
 @pytest.mark.asyncio
+async def test_latch_skips_escalation_read_after_fault_acknowledged() -> None:
+    """#332: once the operator acknowledges the fault (``note_fault_acknowledged``),
+    the latched tick SKIPS the upward-escalation re-read — the run is finalising and
+    heat is already off, so the re-read is pointless and (on a wedged child) is the
+    "slow to clear" latency. Crucially the SKIP is gated on the acknowledge, NOT a
+    general weakening: a hard-ceiling breach that WOULD have escalated does not, only
+    because the operator has acknowledged. The heat-off retry still runs (unchanged).
+
+    Mirror of ``test_latch_auto_escalates_fault_to_emergency_stop_once`` but with an
+    acknowledge before the breach tick: the e-stop must NOT fire."""
+    stale_low = reading(bean=180.0, env=200.0, age_seconds=10.0)  # stale → FAULT
+    over_ceiling = reading(bean=235.0, env=200.0, age_seconds=0.0)  # > 230 → would e-stop
+    harness = harness_in_development(readings=[stale_low, over_ceiling])
+
+    await harness.controller.tick()  # entry: stale FAULT → FAULTED (latched FAULT)
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.executor.estop_reasons == []
+    # The operator acknowledges (the runner calls this on the ack drain).
+    harness.controller.note_fault_acknowledged()
+    # A breach tick that WOULD escalate (see the auto-escalate test) now does NOT —
+    # the acknowledge gates the escalation re-read off.
+    for _ in range(10):
+        await harness.controller.tick()
+    assert harness.executor.estop_reasons == []  # escalation skipped post-acknowledge
+    assert harness.controller.phase is RoastPhase.FAULTED  # controller stays faulted
+    # New-run reset re-arms the flag so the next roast escalates normally.
+    harness.controller.transition_to(RoastPhase.IDLE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    assert harness.controller._fault_acknowledged is False  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_latch_escalates_recovery_to_emergency_stop_and_faults() -> None:
     """A controller latched in operator_recovery_required (the lower-severity
     RECOVERY latch) that then sees a hard-ceiling breach escalates upward to the
