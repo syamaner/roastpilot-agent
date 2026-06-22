@@ -69,9 +69,13 @@ export function useFrozenElapsed(
   const frozen = isClockFrozen(phase);
 
   useEffect(() => {
-    // Only capture while live. Once frozen we stop updating, so the held value is
-    // the last live tick. A new run re-mounts the dashboard live view (runId-keyed
-    // reset upstream), so the ref starts fresh — no stale carry-over across runs.
+    // Capture only the last NON-NULL live value. Once frozen we stop updating, so
+    // the held value is the last live tick. The `!== null` guard matters because
+    // `telemetry.elapsed_seconds` is nullable: a transient null frame (around
+    // hydrate / reconnect) must NOT overwrite the last good reading, else the
+    // freeze would land on null and display "--:--" instead of the real elapsed.
+    // A new run re-mounts the dashboard live view (runId-keyed reset upstream), so
+    // the ref starts fresh — no stale carry-over across runs.
     if (!frozen && elapsedSeconds !== null) {
       lastLiveRef.current = elapsedSeconds;
     }
