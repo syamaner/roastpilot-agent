@@ -221,7 +221,7 @@ function dataExtent(columns: ChartColumns, indices: number[]): { lo: number; hi:
  * overlay reads the band live); neither value axis is driven by it.
  */
 export function makeAutoRange(
-  _getChargeBand: () => ChargeBandRange,
+  getChargeBand: () => ChargeBandRange,
   state: AutoRangeState,
   getLogicalColumns: () => ChartColumns,
 ): (self: uPlot, min: number, max: number, scaleKey: string) => uPlot.Range.MinMax {
@@ -237,7 +237,21 @@ export function makeAutoRange(
 
     // Temperature axis (#307): controlled-dynamic with hysteresis.
     if (scaleKey === "c") {
-      const next = computeTempRange(hasData ? lo : null, hasData ? hi : null, state.tempRange);
+      // While the charge band is shown (preheating), the band MUST stay on-screen — it
+      // is the charge-readiness target (E10-spa.md). Preheat data is cool (~30–60 °C),
+      // so a pure data-fit would push the 170–200 band off the top; fold the band into
+      // the extent so the auto-range always covers BOTH the curve and the band. Once
+      // the band is hidden (post-charge) the range fits the curve alone, free to climb.
+      let lo2 = lo;
+      let hi2 = hi;
+      let has = hasData;
+      const band = getChargeBand();
+      if (band.visible) {
+        lo2 = has ? Math.min(lo2, band.minC) : band.minC;
+        hi2 = has ? Math.max(hi2, band.maxC) : band.maxC;
+        has = true;
+      }
+      const next = computeTempRange(has ? lo2 : null, has ? hi2 : null, state.tempRange);
       state.tempRange = next;
       return next;
     }

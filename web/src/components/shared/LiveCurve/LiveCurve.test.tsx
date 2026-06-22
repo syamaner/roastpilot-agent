@@ -42,17 +42,16 @@ describe("LiveCurve", () => {
   });
 
   it("exposes the rendered scale ranges on the test hook (#131 scale-covers-data guard)", () => {
-    // The hook carries the live uPlot x/°C/RoR scale ranges so an e2e test can assert
-    // the scale COVERS the data (catching the collapsed/unranged-scale bug a blank
-    // snapshot can't). Under jsdom the canvas is stubbed, so we assert the SHAPE is
-    // present (the real range values are asserted in the Playwright suite).
+    // The hook carries the live scale ranges so an e2e test can assert the scale COVERS
+    // the data (catching the collapsed/unranged-scale bug a blank snapshot can't).
     render(<LiveCurve points={POINTS} phase="development" />);
     const scales = window.__chart?.scales;
     expect(scales).toBeDefined();
-    // ALL FOUR scale entries exist with min/max keys — incl. ror + pct (#133/#307): a
-    // ror- or pct-scale collapse would only be caught by the pixel snapshot otherwise.
-    // Values are null under the stubbed jsdom canvas; the real covering ranges are
-    // asserted in the Playwright suite.
+    // ALL FOUR scale entries exist with min/max keys (#133/#307). Values are null under
+    // jsdom: the canvas is stubbed, so uPlot never invokes the `range` callback (no
+    // layout), leaving both the stubbed `plot.scales` AND the auto-range
+    // `tempRange` source the hook now reads (#341) unset. The real covering values are
+    // asserted in the Playwright suite (dashboard-developed: c.max >= beanMax).
     expect(Object.keys(scales?.x ?? {})).toEqual(["min", "max"]);
     expect(Object.keys(scales?.c ?? {})).toEqual(["min", "max"]);
     expect(Object.keys(scales?.ror ?? {})).toEqual(["min", "max"]);
@@ -334,6 +333,22 @@ describe("LiveCurve axis scaling (#307)", () => {
     const range = mkRange([[]]);
     const [lo, hi] = range(inertSelf, 0, 0, "c") as [number, number];
     expect(hi - lo).toBeGreaterThanOrEqual(TEMP_RANGE.MIN_SPAN);
+  });
+
+  it("keeps the charge band on-screen in preheating even when the curve is cool (#307)", () => {
+    // While preheating, the 170–200 °C charge band is the readiness target and MUST
+    // stay in frame (E10-spa.md). Preheat data is cool (~30–55 °C), so a pure data-fit
+    // would push the band off the top; the auto-range must fold the visible band into
+    // its extent. Build a range with the band VISIBLE and only cool preheat data.
+    const range = makeAutoRange(
+      () => ({ visible: true, minC: 170, maxC: 200 }),
+      freshState(),
+      () => [[0, 60], [30, 55], [40, 52], [18, 17]] as unknown as ChartColumns,
+    );
+    const [lo, hi] = range(inertSelf, 0, 0, "c") as [number, number];
+    expect(lo).toBeLessThanOrEqual(170); // band bottom in frame
+    expect(hi).toBeGreaterThanOrEqual(200); // band top in frame
+    expect(lo).toBeLessThanOrEqual(30); // AND the cool curve is still covered
   });
 
   it("covers a FULL developed-curve mount immediately, even after a narrow earlier range (#341)", () => {

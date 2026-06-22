@@ -344,21 +344,29 @@ export function LiveCurve({
   }, [chargeBandVisible, chargeBand]);
 
   // Expose the test hook — assert DATA + the rendered scale ranges (D24 / #131).
-  // For `plotRef.scales` here to reflect the just-drawn ranges, two things must
-  // hold: (1) React runs the `setData` effect above before this one (effects fire
-  // in declaration order, so a column change is applied first), AND (2) uPlot's
-  // `setData` re-ranges the scales SYNCHRONOUSLY (a uPlot 1.6.x behaviour — it
-  // recomputes ranges and redraws within the call, NOT a React guarantee). Both
-  // together let a test assert the scale COVERS the data (catching the
-  // collapsed/unranged-scale bug a blank snapshot can't). If a future uPlot defers
-  // the re-range, this hook would read stale ranges and the assertion must move
-  // behind an explicit redraw.
+  //
+  // x/ror/pct are read off `plotRef.scales` (x re-ranges to data each setData; ror/pct
+  // are fixed, so they're never stale). The °C (`c`) scale, though, is the
+  // controlled-dynamic auto-range (#307), and reading `plotRef.scales.c` here proved
+  // RACY in CI (#341): it assumes uPlot has SYNCHRONOUSLY committed the new c-range to
+  // `scales.c` by the time this effect runs after `setData`. On slower CI render
+  // timing that commit lagged, so the hook published a STALE preheat range
+  // (c.max ≈ 60) even with the full developed curve loaded — failing the
+  // `c.max >= beanMax` assertion deterministically in CI but never locally.
+  //
+  // The fix: publish `c` from `autoRangeRef.current.tempRange` — the range the
+  // auto-range CALLBACK authoritatively computed on the last setData. uPlot is
+  // guaranteed to invoke the range callback during `setData` (that's how a `range`
+  // function works), and the setData effect above runs before this one (declaration
+  // order), so `tempRange` always reflects the current data here — no dependence on
+  // when uPlot mirrors it into `scales.c`. This keeps the #131 scale-covers-data
+  // guarantee while removing the timing assumption that broke in CI.
   useEffect(() => {
     const plot = plotRef.current;
     const sx = plot?.scales.x;
-    const sc = plot?.scales.c;
     const sror = plot?.scales.ror;
     const spct = plot?.scales.pct;
+    const tc = autoRangeRef.current.tempRange;
     const hook: ChartTestHook = {
       columns,
       visible,
@@ -367,7 +375,8 @@ export function LiveCurve({
       chargeBandVisible,
       scales: {
         x: { min: sx?.min ?? null, max: sx?.max ?? null },
-        c: { min: sc?.min ?? null, max: sc?.max ?? null },
+        // °C from the auto-range source of truth, not the possibly-stale uPlot scale.
+        c: { min: tc?.[0] ?? null, max: tc?.[1] ?? null },
         ror: { min: sror?.min ?? null, max: sror?.max ?? null },
         pct: { min: spct?.min ?? null, max: spct?.max ?? null },
       },
