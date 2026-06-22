@@ -151,7 +151,9 @@ export function LiveCurve({
 
   // Hysteresis state for the controlled-dynamic temperature axis (#307). One per
   // mounted plot, carried in a ref so it survives data-only setData re-ranges (the
-  // range callback reads + updates it across frames). Rebuilt with the plot.
+  // range callback reads + updates it across frames). The settled range deliberately
+  // carries over if the plot is rebuilt on a height change — the data hasn't changed,
+  // so the carried-over range is the right starting point for the new plot.
   const autoRangeRef = useRef<AutoRangeState>({ tempRange: null });
 
   // The uPlot `draw` hook is created once in the plot-build effect (keyed on
@@ -334,11 +336,9 @@ export function LiveCurve({
     plotRef.current?.redraw();
   }, [originSeconds]);
 
-  // The °C range is fixed (#217), so the band overlay no longer re-ranges the scale —
-  // but when it appears/disappears or moves, the canvas overlay (drawn in the `draw`
-  // hook) must repaint. A plain `redraw()` fires that draw hook (same mechanism as the
-  // markers/highlight effect above); no `setData` round-trip is needed now the range
-  // is fixed.
+  // The band is a canvas overlay drawn in the `draw` hook, not a data series — so
+  // `setData` is never needed. When the band appears/disappears or moves, `redraw()`
+  // re-fires the `draw` hook (same mechanism as the markers/highlight effect above).
   useEffect(() => {
     plotRef.current?.redraw();
   }, [chargeBandVisible, chargeBand]);
