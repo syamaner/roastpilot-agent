@@ -20,7 +20,7 @@ import { useCallback, useEffect, useReducer, useRef } from "react";
 import type { CurveMarker, CurvePoint } from "@/components/shared/LiveCurve/types";
 import { useFrameDrain, type ConnectionStatus } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
-import type { SseEvent, TelemetryEventData, TelemetryPoint } from "@/lib/types";
+import type { RoastPhase, SseEvent, TelemetryEventData, TelemetryPoint } from "@/lib/types";
 import type {
   AdvisoryEventData,
   FirstCrackData,
@@ -121,6 +121,47 @@ export const initialDashboardViewModel: DashboardViewModel = {
 
 /** Decision-history depth shown in the advisory panel (ui-prompts Prompt A: "last 4"). */
 export const ADVISORY_HISTORY_LIMIT = 4;
+
+/**
+ * Synthesize the fault handshake for the FaultBanner from the HYDRATED SERVER
+ * SNAPSHOT (#329), for the boot-onto-faulted / reload-while-faulted case.
+ *
+ * The live `fault` SSE frame is one-shot — SSE does not replay it — so an operator
+ * who boots the app onto an already-faulted run, or reloads while faulted, folds no
+ * `fault` event and `vm.fault` stays null, stranding them with a faulted run and no
+ * ACKNOWLEDGE affordance (the banner that hosts the button renders only when the
+ * fault is non-null). This recovers the banner from the SERVER's own hydrated state:
+ *   - `phase` is the snapshot's `agent_phase` (hydrated by `useRoastStream`) — the
+ *     server's truth, NOT inferred here; we only branch on it.
+ *   - `faultReason` is the snapshot's `fault_reason` (the persisted fault detail the
+ *     `RoastDetail` snapshot carries; the full SafetyEvaluation is not persisted on
+ *     the snapshot, so the structured fields below mirror the fail-closed posture the
+ *     server guarantees in `faulted`: heat forced to 0, fan held).
+ *
+ * Returns null when the server phase is not `faulted` (no banner) — so a non-faulted
+ * hydrate shows nothing, and once a LIVE fault frame has been folded the caller
+ * prefers `vm.fault` (the real evaluation) over this snapshot stand-in.
+ */
+export function snapshotFault(
+  phase: RoastPhase | null,
+  faultReason: string | null | undefined,
+): SafetyEvaluationData | null {
+  if (phase !== "faulted") return null;
+  return {
+    // `safety` rule name as a stand-in: the snapshot doesn't persist the firing
+    // rule, only the reason. The banner shows `rule` as a label; "safety" is honest
+    // (the safety layer faulted) without fabricating a specific rule id.
+    rule: "safety",
+    verdict: "fault",
+    input_heat: null,
+    input_fan: null,
+    // The fail-closed posture the server GUARANTEES in `faulted` (heat off, fan
+    // held) — not a client guess about this run's numbers, but the invariant state.
+    adjusted_heat: 0,
+    adjusted_fan: null,
+    reason: faultReason ?? "Run faulted — heat forced off.",
+  };
+}
 
 type Action =
   | { kind: "event"; event: SseEvent }

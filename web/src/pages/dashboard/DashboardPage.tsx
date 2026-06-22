@@ -44,7 +44,7 @@ import { OperatorActionBar, type OperatorActionResultView } from "./OperatorActi
 import { RecoveryModal } from "./RecoveryModal";
 import { RoastHeader } from "./RoastHeader";
 import { StartRoastForm } from "./StartRoastForm";
-import { useDashboardEvents } from "./useDashboardEvents";
+import { snapshotFault, useDashboardEvents } from "./useDashboardEvents";
 
 export function DashboardPage(): React.JSX.Element {
   const health = useHealth();
@@ -186,16 +186,29 @@ export function DashboardPage(): React.JSX.Element {
     setLastResult(null);
   }, [runId]);
 
-  // #124: pin the run as soon as it faults, so a later `active_run_id`→null from
-  // a health refetch resolves `runId` back to this faulted run (via the `??`
-  // above) instead of collapsing to idle and dropping the fault banner. Pinning
-  // the id of the run we are already watching is not phase inference — the fault
-  // came from the server's SSE frame; cleared by `handleAcknowledgeFault`.
+  // #329: the fault that drives the FaultBanner — the LIVE evaluation (`view.fault`,
+  // the real SafetyEvaluation off the one-shot `fault` SSE frame) when we witnessed
+  // the fault, ELSE one synthesized from the HYDRATED SERVER SNAPSHOT (the faulted
+  // `agent_phase` + persisted `fault_reason`). Without the snapshot fallback, an
+  // operator who boots onto an already-faulted run or reloads while faulted folds no
+  // live `fault` frame, so the banner — and the ACKNOWLEDGE affordance it hosts —
+  // never render, stranding them (hit twice in roast 3). `view.fault` wins when
+  // present so the real evaluation's numbers show; the snapshot stand-in only fills
+  // the restore/reload gap. Phase is the server's hydrated truth — never inferred.
+  const effectiveFault = view.fault ?? snapshotFault(phase, detail.data?.fault_reason);
+
+  // #124/#329: pin the run as soon as it faults, so a later `active_run_id`→null
+  // from a health refetch resolves `runId` back to this faulted run (via the `??`
+  // above) instead of collapsing to idle and dropping the fault banner. Keyed on
+  // `effectiveFault` so the RELOAD-while-faulted case (no live frame; the fault came
+  // from the hydrated snapshot) is pinned too. Pinning the id of the run we are
+  // already watching is not phase inference — the fault is server-delivered (live
+  // frame or snapshot phase); cleared by `handleAcknowledgeFault`.
   useEffect(() => {
-    if (view.fault !== null && runId !== null) {
+    if (effectiveFault !== null && runId !== null) {
       setStickyFaultedRunId(runId);
     }
-  }, [view.fault, runId]);
+  }, [effectiveFault, runId]);
 
   // Advisor targets for the control-row ghost markers (latest decision).
   const targetHeat = view.latestAdvisory?.decision?.target_heat ?? null;
@@ -308,7 +321,7 @@ export function DashboardPage(): React.JSX.Element {
             Start-roast form. `acknowledge_fault` issues no roaster command (heat
             is already off). */}
         <FaultBanner
-          fault={view.fault}
+          fault={effectiveFault}
           trail={view.safetyTrail}
           // #117: the acknowledge affordance is driven by the server's
           // `enabled_actions` mirror (acknowledge_fault is enabled iff the phase

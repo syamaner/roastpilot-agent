@@ -5,6 +5,7 @@ import {
   ADVISORY_HISTORY_LIMIT,
   dashboardReducer,
   initialDashboardViewModel,
+  snapshotFault,
 } from "./useDashboardEvents";
 
 function ev<T>(event: SseEvent["event"], data: T, id?: number): { kind: "event"; event: SseEvent } {
@@ -596,5 +597,32 @@ describe("dashboardReducer — payload field-name contract", () => {
       ev("phase_changed", { phase: "cooling", enabled_actions: ["stop_cooling"] }),
     );
     expect(s.markers.some((m) => m.kind === "cooling")).toBe(true);
+  });
+});
+
+describe("snapshotFault (#329 — restore/reload fault from the hydrated snapshot)", () => {
+  it("synthesizes a fault evaluation when the server phase is faulted", () => {
+    const f = snapshotFault("faulted", "env ceiling exceeded");
+    expect(f).not.toBeNull();
+    expect(f?.verdict).toBe("fault");
+    expect(f?.reason).toBe("env ceiling exceeded");
+    // Mirrors the server-guaranteed fail-closed posture in faulted (heat off, fan held).
+    expect(f?.adjusted_heat).toBe(0);
+    expect(f?.adjusted_fan).toBeNull();
+  });
+
+  it("falls back to a generic reason when the snapshot carries no fault_reason", () => {
+    // The snapshot persists the phase but may not carry a reason — still render the
+    // banner (the operator needs the ACKNOWLEDGE button), with an honest placeholder.
+    expect(snapshotFault("faulted", null)?.reason).toBe("Run faulted — heat forced off.");
+    expect(snapshotFault("faulted", undefined)?.reason).toBe("Run faulted — heat forced off.");
+  });
+
+  it("returns null for any non-faulted phase (faulted-only; no false banner)", () => {
+    // The fallback is strictly faulted-gated — a normal hydrate must NOT synthesize a
+    // fault. Phase is the server's truth; we only branch on it, never infer it.
+    for (const phase of ["preheating", "roasting_pre_first_crack", "development", "cooling", "complete", "idle", null] as const) {
+      expect(snapshotFault(phase, "anything")).toBeNull();
+    }
   });
 });
