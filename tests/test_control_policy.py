@@ -563,7 +563,8 @@ def test_trim_engages_in_late_maillard_on_a_real_roast_curve() -> None:
         eta = estimate_first_crack_eta_seconds(window, fc_target_bean_temp_c=176.0)
         signal = TrimSignal(bean_temp_c=curve[i].bean_temp_c, first_crack_eta_seconds=eta)
         box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=signal)
-        if box.heat_target_percent == _DEFAULT_TRIM_LEVEL:  # the trim level (not the flat 100 floor)
+        # Engaged when heat resolves to the trim level (not the flat 100 floor).
+        if box.heat_target_percent == _DEFAULT_TRIM_LEVEL:
             engaged_beans.append(curve[i].bean_temp_c)
     # The trim DID engage on this real curve (the window opened in late Maillard).
     assert engaged_beans, "trim never engaged on the real roast curve"
