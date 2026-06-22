@@ -63,6 +63,19 @@ describe("useFrozenElapsed", () => {
     expect(result.current).toBe(180);
   });
 
+  it("does not overwrite the captured live value with a transient null frame (#330)", () => {
+    // A null elapsed during a live phase (e.g. reconnect gap / first hydrate frame)
+    // must not erase the last non-null live value, otherwise the freeze would show
+    // "--:--" instead of the last known clock reading.
+    const { result, rerender } = renderHook(
+      ({ s, p }: { s: number | null; p: RoastPhase | null }) => useFrozenElapsed(s, p),
+      { initialProps: { s: 95, p: "preheating" as RoastPhase | null } },
+    );
+    act(() => rerender({ s: null, p: "preheating" })); // transient null while still live
+    act(() => rerender({ s: 200, p: "faulted" })); // terminal: must hold 95, not null/200
+    expect(result.current).toBe(95);
+  });
+
   it("captures within an act() commit so the held value is the last live frame", () => {
     const { result, rerender } = renderHook(
       ({ s, p }: { s: number | null; p: RoastPhase | null }) => useFrozenElapsed(s, p),

@@ -72,7 +72,7 @@ export function useFrozenElapsed(
     // Only capture while live. Once frozen we stop updating, so the held value is
     // the last live tick. A new run re-mounts the dashboard live view (runId-keyed
     // reset upstream), so the ref starts fresh — no stale carry-over across runs.
-    if (!frozen) {
+    if (!frozen && elapsedSeconds !== null) {
       lastLiveRef.current = elapsedSeconds;
     }
   }, [frozen, elapsedSeconds]);
