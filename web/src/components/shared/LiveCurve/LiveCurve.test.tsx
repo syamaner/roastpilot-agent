@@ -10,7 +10,7 @@ import {
   makeAutoRange,
   TEMP_RANGE,
 } from "./scales";
-import type { CurveMarker, CurvePoint } from "./types";
+import type { ChartColumns, CurveMarker, CurvePoint } from "./types";
 
 // Canvas/matchMedia/ResizeObserver are stubbed in vitest.setup.ts so uPlot
 // mounts under jsdom. We assert the DATA test hook (window.__chart) and the
@@ -257,13 +257,22 @@ describe("LiveCurve", () => {
 // canvas), so they are asserted directly — deterministic and independent of the
 // jsdom canvas stub (which leaves the live plot's scale min/max null).
 describe("LiveCurve axis scaling (#307)", () => {
-  // A minimal uPlot stand-in carrying only `data` — all the range callback reads.
-  function fakeSelf(data: (number | null)[][]): uPlot {
-    return { data } as unknown as uPlot;
-  }
+  // The range callback no longer reads `self.data` (#341): it reads the LOGICAL
+  // columns via the provider, so the permuted plot data can't mis-range the axes.
+  // `self` is therefore an inert stand-in; the data lives in the columns provider.
+  const inertSelf = {} as unknown as uPlot;
   // A fresh hysteresis state per range callback under test.
   function freshState(): AutoRangeState {
     return { tempRange: null };
+  }
+  // Build a range callback over a fixed set of LOGICAL columns ([x, bean, env, ror,
+  // heat, fan]). This is the canonical pre-permutation layout the auto-range indexes.
+  function mkRange(columns: (number | null)[][]) {
+    return makeAutoRange(
+      () => ({ visible: false, minC: 170, maxC: 200 }),
+      freshState(),
+      () => columns as unknown as ChartColumns,
+    );
   }
 
   // --- RoR stays FIXED (comparable across roasts; charge crash clipped). ---
@@ -275,38 +284,55 @@ describe("LiveCurve axis scaling (#307)", () => {
   });
 
   it("returns the FIXED RoR range regardless of the data extent (charge crash clipped)", () => {
-    const range = makeAutoRange(() => ({ visible: false, minC: 170, maxC: 200 }), freshState());
     // RoR column dives to −90 on the charge crash and peaks at +25…
-    const self = fakeSelf([[0, 30], [38, 186], [40, 190], [-90, 25]]);
+    const range = mkRange([[0, 30], [38, 186], [40, 190], [-90, 25]]);
     // …but the axis stays pinned −20..+30 (the trough dives off-screen by design).
-    expect(range(self, -90, 25, "ror")).toEqual([-20, 30]);
+    expect(range(inertSelf, -90, 25, "ror")).toEqual([-20, 30]);
   });
 
   // --- Temperature axis: controlled-dynamic auto-range with hysteresis (#307). ---
 
   it("covers the bean+env data with padding (never clips a hot Env)", () => {
-    const range = makeAutoRange(() => ({ visible: false, minC: 170, maxC: 200 }), freshState());
     // bean tops out ~178, env runs hotter to ~205 — the #217 fixed 210 nearly clipped
     // env; the auto-range must keep it comfortably inside the frame.
-    const self = fakeSelf([[0, 60], [40, 178], [60, 205], [-10, 20]]);
-    const [lo, hi] = range(self, 0, 0, "c") as [number, number];
+    const range = mkRange([[0, 60], [40, 178], [60, 205], [-10, 20]]);
+    const [lo, hi] = range(inertSelf, 0, 0, "c") as [number, number];
     expect(lo).toBeLessThanOrEqual(40 - 0); // covers the min with floor/padding
     expect(hi).toBeGreaterThanOrEqual(205 + TEMP_RANGE.PAD); // covers env + its padding
   });
 
+  it("ranges the TEMP axis over bean/env, NOT heat/fan, regardless of draw order (#341)", () => {
+    // The bug Augment caught: the temp range scanned `self.data` at logical indices
+    // [1,2], but LiveCurve permutes the plot columns so heat/fan draw behind — so
+    // [1,2] became heat/fan (0–100 %) and the temp axis ranged over the control lines.
+    // The fix reads the LOGICAL columns: even though heat/fan (cols 4,5) span 0–100,
+    // the temp range must cover bean (col 1, ~40–178) and env (col 2, ~60–205), and
+    // its lower bound must NOT be dragged down to 0 by the control percentages.
+    const range = mkRange([
+      [0, 60, 120], // x
+      [40, 90, 178], // bean
+      [60, 140, 205], // env
+      [18, 16, 12], // ror
+      [0, 0, 0], // heat — 0 % would drag a buggy temp-min to 0
+      [100, 100, 100], // fan — 100 % is well below env's 205
+    ]);
+    const [lo, hi] = range(inertSelf, 0, 0, "c") as [number, number];
+    expect(hi).toBeGreaterThanOrEqual(205 + TEMP_RANGE.PAD); // covers env, not capped at 100
+    expect(lo).toBeGreaterThan(0); // NOT dragged to 0 by the 0 % heat line
+    expect(lo).toBeLessThanOrEqual(40); // still covers the bean min
+  });
+
   it("does NOT collapse to a zero-width range on a single point (the #128 guard)", () => {
-    const range = makeAutoRange(() => ({ visible: false, minC: 170, maxC: 200 }), freshState());
-    const self = fakeSelf([[540], [90], [180], [18]]);
-    const [lo, hi] = range(self, 0, 0, "c") as [number, number];
+    const range = mkRange([[540], [90], [180], [18]]);
+    const [lo, hi] = range(inertSelf, 0, 0, "c") as [number, number];
     expect(hi - lo).toBeGreaterThanOrEqual(TEMP_RANGE.MIN_SPAN); // a usable height, never 0
     expect(lo).toBeLessThanOrEqual(90);
     expect(hi).toBeGreaterThanOrEqual(180);
   });
 
   it("does NOT collapse on an empty mount (holds a sane default band)", () => {
-    const range = makeAutoRange(() => ({ visible: false, minC: 170, maxC: 200 }), freshState());
-    const self = fakeSelf([[]]);
-    const [lo, hi] = range(self, 0, 0, "c") as [number, number];
+    const range = mkRange([[]]);
+    const [lo, hi] = range(inertSelf, 0, 0, "c") as [number, number];
     expect(hi - lo).toBeGreaterThanOrEqual(TEMP_RANGE.MIN_SPAN);
   });
 
@@ -351,22 +377,19 @@ describe("LiveCurve axis scaling (#307)", () => {
   // --- x (time) axis: data-driven, ranged tight, with the degenerate-x guard. ---
 
   it("leaves the x (time) axis data-driven and ranged tight (no soft padding)", () => {
-    const range = makeAutoRange(() => ({ visible: false, minC: 170, maxC: 200 }), freshState());
-    const self = fakeSelf([[0, 30, 60, 1031]]);
+    const range = mkRange([[0, 30, 60, 1031]]);
     // x covers the loaded elapsed-time range exactly — it must NOT be pinned.
-    expect(range(self, 0, 0, "x")).toEqual([0, 1031]);
+    expect(range(inertSelf, 0, 0, "x")).toEqual([0, 1031]);
   });
 
   it("widens a zero-width x-range so uPlot's split calc never divides by zero (#326/#334)", () => {
-    const range = makeAutoRange(() => ({ visible: false, minC: 170, maxC: 200 }), freshState());
-    const self = fakeSelf([[540, 540]]); // several points at the same elapsed second
-    expect(range(self, 0, 0, "x")).toEqual([539, 541]);
+    const range = mkRange([[540, 540]]); // several points at the same elapsed second
+    expect(range(inertSelf, 0, 0, "x")).toEqual([539, 541]);
   });
 
   it("falls back to uPlot's passed bounds for x on an empty mount (no finite data)", () => {
-    const range = makeAutoRange(() => ({ visible: false, minC: 170, maxC: 200 }), freshState());
-    const self = fakeSelf([[]]);
-    expect(range(self, 0, 100, "x")).toEqual([0, 100]);
+    const range = mkRange([[]]);
+    expect(range(inertSelf, 0, 100, "x")).toEqual([0, 100]);
   });
 
   it("exposes the c/ror/pct ranges on the test-hook scale shape", () => {

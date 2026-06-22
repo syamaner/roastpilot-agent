@@ -171,6 +171,14 @@ export function LiveCurve({
   const originRef = useRef<number | null>(originSeconds);
   originRef.current = originSeconds;
 
+  // The auto-range callback (built once with the plot) must derive the temp/x extent
+  // from the LOGICAL columns (canonical [x, bean, env, ror, heat, fan]), NOT the
+  // permuted `self.data` it would otherwise scan (#341 — post-permutation, plot
+  // columns 1,2 are heat/fan, so the temp axis would range over the 0–100 % control
+  // lines). Read the live logical columns through this ref each frame.
+  const columnsRef = useRef(columns);
+  columnsRef.current = columns;
+
   // (Re)build the plot when structural inputs change. Data-only updates go
   // through setData below to avoid tearing down the canvas every tick.
   useEffect(() => {
@@ -188,6 +196,7 @@ export function LiveCurve({
         maxC: overlayRef.current.chargeBand.maxC,
       }),
       autoRangeRef.current,
+      () => columnsRef.current,
     );
 
     const opts: uPlot.Options = {

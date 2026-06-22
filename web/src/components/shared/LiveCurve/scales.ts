@@ -22,12 +22,18 @@
 
 import type uPlot from "uplot";
 
-// Column indices per scale (x, bean, env, ror, heat, fan). `c` is consulted at
-// runtime now (#307 auto-range reads bean+env); `ror` is fixed so its entry is
-// documentation-only.
+import type { ChartColumns } from "./types";
+
+// LOGICAL column indices per scale, in the canonical [x, bean, env, ror, heat, fan]
+// layout (the order `toColumns` produces, BEFORE LiveCurve's draw-order permutation).
+// The auto-range reads these against the LOGICAL columns — never `self.data`, whose
+// columns LiveCurve reorders to draw heat/fan behind bean/env (#307). Indexing
+// `self.data` here would scan the wrong series after the permutation (Augment, #341):
+// post-permutation, plot columns 1,2 are heat/fan (0–100 %), not bean/env, which would
+// range the temperature axis over the control percentages.
 export const SCALE_COLUMNS: Record<string, number[]> = {
   x: [0],
-  c: [1, 2], // bean + env feed the °C axis (auto-ranged, #307)
+  c: [1, 2], // bean + env feed the °C axis (auto-ranged, #307) — LOGICAL indices
   ror: [3], // doc-only: RoR column feeds the RoR axis (FIXED range — not data-driven)
 };
 
@@ -161,44 +167,55 @@ export function computeTempRange(
   return [nextLo, nextHi];
 }
 
+/** Scan the finite extent of `columns` at the given LOGICAL indices. */
+function dataExtent(columns: ChartColumns, indices: number[]): { lo: number; hi: number; hasData: boolean } {
+  let lo = Infinity;
+  let hi = -Infinity;
+  for (const ci of indices) {
+    const series = columns[ci];
+    if (!series) continue;
+    for (const v of series) {
+      if (v == null || !Number.isFinite(v)) continue;
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+  }
+  return { lo, hi, hasData: lo !== Infinity && hi !== -Infinity };
+}
+
 /**
  * Build a uPlot `scales.<key>.range` callback.
  *
  *   - "c" (temperature): controlled-dynamic auto-range with hysteresis (#307), via
- *     {@link computeTempRange}, reading bean + env off the live plot data. The
- *     settled range is stashed on `state.tempRange` so the next call applies
- *     hysteresis against it.
+ *     {@link computeTempRange}, reading bean + env from the LOGICAL columns (#341 —
+ *     NOT `self.data`, whose columns LiveCurve permutes to draw heat/fan behind, which
+ *     would otherwise range the temp axis over the control percentages). The settled
+ *     range is stashed on `state.tempRange` so the next call applies hysteresis.
  *   - "ror": FIXED −20..+30 (#217) — a fixed band, comparable across roasts.
  *   - "x" (time): data-driven, ranged tight, with a zero-width guard (the #326 /
  *     #334 degenerate-x hardening — a single point or several at the same second
  *     widened to a small symmetric window so uPlot's split calc never divides by a
  *     zero span and throws "Invalid array length").
  *
- * `getChargeBand` is retained for API symmetry (the overlay reads the band live);
- * neither value axis is driven by it.
+ * `getLogicalColumns` returns the canonical [x, bean, env, ror, heat, fan] columns
+ * (pre-permutation) so the range is derived from each series' LOGICAL identity,
+ * independent of draw order. `getChargeBand` is retained for API symmetry (the
+ * overlay reads the band live); neither value axis is driven by it.
  */
 export function makeAutoRange(
   _getChargeBand: () => ChargeBandRange,
   state: AutoRangeState,
+  getLogicalColumns: () => ChartColumns,
 ): (self: uPlot, min: number, max: number, scaleKey: string) => uPlot.Range.MinMax {
-  return (self: uPlot, _min: number, _max: number, scaleKey: string): uPlot.Range.MinMax => {
+  return (_self: uPlot, _min: number, _max: number, scaleKey: string): uPlot.Range.MinMax => {
     // RoR is FIXED (#217) — a fixed band stays comparable across roasts.
     const fixed = FIXED_SCALE_RANGES[scaleKey];
     if (fixed) return fixed;
 
+    // Read the data extent from the LOGICAL columns by this scale's logical indices —
+    // NOT `self.data` (which LiveCurve has permuted into draw order, #341).
     const cols = SCALE_COLUMNS[scaleKey] ?? [];
-    let lo = Infinity;
-    let hi = -Infinity;
-    for (const ci of cols) {
-      const series = self.data[ci];
-      if (!series) continue;
-      for (const v of series) {
-        if (v == null || !Number.isFinite(v)) continue;
-        if (v < lo) lo = v;
-        if (v > hi) hi = v;
-      }
-    }
-    const hasData = lo !== Infinity && hi !== -Infinity;
+    const { lo, hi, hasData } = dataExtent(getLogicalColumns(), cols);
 
     // Temperature axis (#307): controlled-dynamic with hysteresis.
     if (scaleKey === "c") {
