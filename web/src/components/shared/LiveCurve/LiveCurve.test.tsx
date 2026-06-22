@@ -336,6 +336,29 @@ describe("LiveCurve axis scaling (#307)", () => {
     expect(hi - lo).toBeGreaterThanOrEqual(TEMP_RANGE.MIN_SPAN);
   });
 
+  it("covers a FULL developed-curve mount immediately, even after a narrow earlier range (#341)", () => {
+    // The second #341 bug: a full-data (re)mount — the detail page, or the dashboard
+    // re-hydrating the whole curve from REST in one setData — must jump straight to
+    // covering the whole span, NEVER stay pinned at a narrow earlier range. The
+    // regen's dashboard-developed replay left c.max ≈ 60 because coverage deferred to
+    // incremental expansion. Drive the SAME state ref through: empty mount → a narrow
+    // preheat frame (~30–52 °C, establishes a low range) → the full developed curve
+    // (bean→178, env→205) in one call. The final range MUST cover 205.
+    const state = freshState();
+    let current = [[]] as unknown as ChartColumns; // empty mount
+    const range = makeAutoRange(
+      () => ({ visible: false, minC: 170, maxC: 200 }),
+      state,
+      () => current, // provider returns whatever `current` points at this call
+    );
+    range(inertSelf, 0, 0, "c");
+    current = [[0, 15], [30, 40], [50, 52], [18, 17]] as unknown as ChartColumns; // narrow preheat
+    range(inertSelf, 0, 0, "c");
+    current = [[0, 1031], [30, 178], [40, 205], [18, 12]] as unknown as ChartColumns; // full dev curve
+    const [, hi] = range(inertSelf, 0, 0, "c") as [number, number];
+    expect(hi).toBeGreaterThanOrEqual(205); // covers the developed env, not stuck low
+  });
+
   // --- computeTempRange hysteresis (the jitter guard), asserted directly. ---
 
   it("hysteresis: a small data wobble INSIDE the frame does NOT re-range (no jitter)", () => {

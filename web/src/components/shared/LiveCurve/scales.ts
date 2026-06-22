@@ -98,8 +98,14 @@ function ceilTo(v: number, q: number): number {
 }
 
 /**
- * Compute the controlled-dynamic temperature range for the current data extent,
- * applying hysteresis against `prev` (the last range we settled on).
+ * Compute the controlled-dynamic temperature range for the current data extent.
+ *
+ * Coverage is the invariant: the returned range ALWAYS covers the currently-loaded
+ * bean+env data with padding, so a full-data (re)mount jumps straight to the whole
+ * span (#341 — never stuck at a narrow earlier range). Hysteresis is applied ON TOP
+ * only to resist jitter: it lets the frame stay put on a sub-quantum wobble and
+ * resists contracting after a transient peak — it can never make the range
+ * under-cover the data.
  *
  * Exported for direct unit testing (the range callback wires it to live plot data).
  *
@@ -141,14 +147,17 @@ export function computeTempRange(
   const prevLo: number = prev[0];
   const prevHi: number = prev[1];
 
-  // HYSTERESIS. Only move a bound when the data has clearly left the current frame:
-  //   - the data (with padding) pokes OUTSIDE the current bound → expand to the
-  //     padded target (re-range so we don't clip);
-  //   - the data has shrunk so far INSIDE a bound that a full quantum of slack has
-  //     opened up → contract to the padded target (so the axis doesn't stay
-  //     permanently zoomed out after a transient peak).
-  // A small wobble that stays within [prevLo + slack, prevHi − slack] leaves the
-  // range untouched — that is what stops the every-frame jitter.
+  // COVERAGE FIRST, then hysteresis (the #131 / #341 lesson). The returned range MUST
+  // always cover the currently-loaded data with padding — a full-data (re)mount (the
+  // detail page, or the dashboard re-hydrating the whole curve from REST in one
+  // setData) must jump straight to covering the whole ~0–205 °C span, never stay
+  // pinned at a narrow earlier range (the bug where a developed curve left c.max ≈ 60).
+  // Hysteresis only DAMPS jitter: it lets the frame stay PUT on a small wobble, and
+  // resists CONTRACTING after a transient peak — it must never UNDER-cover the data.
+  //
+  // So each bound expands to the padded target whenever the data pokes outside the
+  // current frame (unconditional coverage), and otherwise holds unless enough slack
+  // has opened to justify contracting.
   const slack = QUANTUM;
   const paddedLo = dataLo - PAD;
   const paddedHi = dataHi + PAD;
@@ -156,13 +165,22 @@ export function computeTempRange(
   let nextLo = prevLo;
   let nextHi = prevHi;
 
-  if (paddedLo < prevLo) nextLo = targetLo; // data dropped below the frame → expand down
-  else if (paddedLo > prevLo + slack) nextLo = targetLo; // lots of slack opened → contract up
+  // Lower bound: expand DOWN to cover data below the frame; else contract up only
+  // once a full quantum of slack has opened (damped), never tighter than the target.
+  if (paddedLo < prevLo) nextLo = Math.min(prevLo, targetLo); // cover data below → expand down
+  else if (paddedLo > prevLo + slack) nextLo = targetLo; // slack opened → contract up
 
-  if (paddedHi > prevHi) nextHi = targetHi; // data rose above the frame → expand up
-  else if (paddedHi < prevHi - slack) nextHi = targetHi; // lots of slack opened → contract down
+  // Upper bound: expand UP to cover data above the frame (this is the coverage
+  // guarantee that fixes the c.max-stuck-at-60 bug); else contract down only once a
+  // full quantum of slack has opened (damped).
+  if (paddedHi > prevHi) nextHi = Math.max(prevHi, targetHi); // cover data above → expand up
+  else if (paddedHi < prevHi - slack) nextHi = targetHi; // slack opened → contract down
 
-  // Never let hysteresis produce a degenerate or inverted range.
+  // Final coverage clamp + degeneracy guard: whatever hysteresis decided, the range
+  // must still cover the padded data and never be narrower than MIN_SPAN. This is the
+  // belt-and-braces guarantee that a kept-prev bound can never leave the data clipped.
+  nextLo = Math.min(nextLo, targetLo);
+  nextHi = Math.max(nextHi, targetHi);
   if (nextHi - nextLo < MIN_SPAN) return [targetLo, targetHi];
   return [nextLo, nextHi];
 }
