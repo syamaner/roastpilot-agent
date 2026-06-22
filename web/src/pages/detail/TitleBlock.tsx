@@ -97,6 +97,21 @@ export function TitleBlock({ detail, stats, className }: TitleBlockProps): React
         </p>
       )}
 
+      {/* Product / source URL (#315): a clickable provenance link, read from the
+          frozen profile. Opens in a new tab; renders nothing when absent (no
+          broken anchor). The server validates it as a http(s) URL. */}
+      {profile.source_url && (
+        <a
+          href={profile.source_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          data-testid="bean-source-url"
+          className="text-sm text-roast-coffee underline underline-offset-2 hover:text-roast-coffee/80"
+        >
+          Product page
+        </a>
+      )}
+
       {detail.fault_reason ? (
         <p
           data-testid="fault-reason"

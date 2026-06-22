@@ -38,6 +38,7 @@
       "is_blend": false,
       "name": "cooling-complete",
       "processing": null,
+      "source_url": null,
       "target_development_percent": 15.0,
       "target_drop_temp_c": 195.0
     },

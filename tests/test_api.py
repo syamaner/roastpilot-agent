@@ -246,6 +246,34 @@ async def test_start_roast_carries_bean_identity_to_detail(client: AsyncClient) 
 
 
 @pytest.mark.asyncio
+async def test_start_roast_carries_source_url_to_detail(client: AsyncClient) -> None:
+    """#315: the bean's product/source URL flows through ``POST /api/roasts`` and
+    back out on the detail projection so the SPA can render it as a link."""
+    profile = _profile().model_dump()
+    profile["source_url"] = "https://redber.co.uk/products/ethiopia-yirgacheffe-koke"
+    created = await client.post("/api/roasts", json=profile)
+    assert created.status_code == 201
+    run_id = created.json()["id"]
+
+    detail = await client.get(f"/api/roasts/{run_id}")
+    assert detail.status_code == 200
+    assert (
+        detail.json()["profile"]["source_url"]
+        == "https://redber.co.uk/products/ethiopia-yirgacheffe-koke"
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_roast_rejects_malformed_source_url(client: AsyncClient) -> None:
+    """#315: a non-http(s) source_url is rejected at the API boundary (422), so a
+    broken link can never reach the corpus or the UI."""
+    profile = _profile().model_dump()
+    profile["source_url"] = "javascript:alert(1)"
+    created = await client.post("/api/roasts", json=profile)
+    assert created.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_history_summary_projects_bean_identity(
     client: AsyncClient, store: RoastStore
 ) -> None:

@@ -75,6 +75,68 @@ describe("RoastHeader", () => {
     expect(screen.queryByTestId("preheat-timer")).toBeNull();
   });
 
+  it("advances the Preheat read-out while preheating (live) (#330)", () => {
+    // Pre-charge, live phase: the read-out tracks the server's run clock frame by
+    // frame (it is server-authoritative, not a client wall-clock timer).
+    const { rerender } = render(
+      <RoastHeader {...BASE} phase="preheating" chargeElapsedSeconds={null} elapsedSeconds={40} />,
+    );
+    expect(screen.getByTestId("preheat-timer")).toHaveTextContent("00:40");
+    rerender(
+      <RoastHeader {...BASE} phase="preheating" chargeElapsedSeconds={null} elapsedSeconds={95} />,
+    );
+    expect(screen.getByTestId("preheat-timer")).toHaveTextContent("01:35");
+  });
+
+  it("FREEZES the Preheat read-out at the last live value on a fault during preheat (#330)", () => {
+    // Live preheat reaches 01:35, then the server reports `faulted` (e.g. an
+    // emergency stop during preheat). The controller keeps emitting frames with an
+    // advancing run clock, but the read-out must HOLD the last live value (01:35),
+    // not climb to the post-fault server value (03:20) — the run is stopped.
+    const { rerender } = render(
+      <RoastHeader {...BASE} phase="preheating" chargeElapsedSeconds={null} elapsedSeconds={95} />,
+    );
+    expect(screen.getByTestId("preheat-timer")).toHaveTextContent("01:35");
+    rerender(
+      <RoastHeader {...BASE} phase="faulted" chargeElapsedSeconds={null} elapsedSeconds={200} />,
+    );
+    expect(screen.getByTestId("preheat-timer")).toHaveTextContent("01:35");
+    // A further advancing frame after the fault must still be ignored (frozen).
+    rerender(
+      <RoastHeader {...BASE} phase="faulted" chargeElapsedSeconds={null} elapsedSeconds={260} />,
+    );
+    expect(screen.getByTestId("preheat-timer")).toHaveTextContent("01:35");
+  });
+
+  it("FREEZES the Preheat read-out on operator-recovery during preheat (#330)", () => {
+    // A restart-with-active-run lands a preheat run in recovery; the read-out holds.
+    const { rerender } = render(
+      <RoastHeader {...BASE} phase="preheating" chargeElapsedSeconds={null} elapsedSeconds={50} />,
+    );
+    expect(screen.getByTestId("preheat-timer")).toHaveTextContent("00:50");
+    rerender(
+      <RoastHeader
+        {...BASE}
+        phase="operator_recovery_required"
+        chargeElapsedSeconds={null}
+        elapsedSeconds={130}
+      />,
+    );
+    expect(screen.getByTestId("preheat-timer")).toHaveTextContent("00:50");
+  });
+
+  it("freezes the diagnostics Elapsed row on a terminal phase too (#330)", () => {
+    const { rerender } = render(
+      <RoastHeader {...BASE} phase="preheating" chargeElapsedSeconds={null} elapsedSeconds={70} />,
+    );
+    rerender(
+      <RoastHeader {...BASE} phase="faulted" chargeElapsedSeconds={null} elapsedSeconds={500} />,
+    );
+    fireEvent.click(screen.getByTestId("diagnostics-toggle"));
+    // 70 s → 01:10, held; not the post-fault 500 s (08:20).
+    expect(screen.getByTestId("diagnostics-drawer")).toHaveTextContent("01:10");
+  });
+
   it("shows the live bean RoR readout in °C/min (#165)", () => {
     render(<RoastHeader {...BASE} beanRorCPerMin={8.4} />);
     const ror = screen.getByTestId("ror-readout");
