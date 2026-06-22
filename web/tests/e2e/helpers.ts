@@ -27,14 +27,15 @@ export interface ChartHookSnapshot {
   highlightTime: number | null;
   chargeBandVisible: boolean;
   /**
-   * Rendered uPlot scale ranges. x is asserted to COVER the data (#131); c and ror
-   * are FIXED (#217), so a test asserts they hold their pinned bounds (0–210 °C,
-   * −20..+30 °C/min) regardless of the live data.
+   * Rendered uPlot scale ranges. x is asserted to COVER the data (#131); c (°C) is
+   * CONTROLLED-DYNAMIC auto-range (#307) — asserted to COVER bean+env without
+   * collapsing; ror is FIXED −20..+30 °C/min; pct is the FIXED 0–100 % control axis.
    */
   scales: {
     x: { min: number | null; max: number | null };
     c: { min: number | null; max: number | null };
     ror: { min: number | null; max: number | null };
+    pct: { min: number | null; max: number | null };
   };
 }
 

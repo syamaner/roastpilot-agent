@@ -57,14 +57,20 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   expect(xs.length).toBeGreaterThan(0); // preheat history plots live (#326)
   for (let i = 1; i < xs.length; i++) expect(xs[i]).toBeGreaterThan(xs[i - 1]); // ascending serve-elapsed
   expect(hook.chargeBandVisible).toBe(true);
-  // The charge band (170–200 °C) must be ON-SCREEN in preheating (E10-spa.md). With
-  // the FIXED 0–210 °C axis (#217) the band is always in frame; assert the rendered
-  // °C scale holds the pinned bounds and so spans the whole band.
-  expect(hook.scales.c.min).toBe(0);
-  expect(hook.scales.c.max).toBe(210);
-  // The RoR axis is fixed too — pinned even in preheating before any RoR develops.
+  // The charge band (170–200 °C) must be ON-SCREEN in preheating (E10-spa.md). The °C
+  // axis is now controlled-dynamic (#307): assert the rendered range COVERS the band
+  // and has a real, non-collapsed width (the #131 guard) rather than a pinned 0–210.
+  expect(hook.scales.c.min).not.toBeNull();
+  expect(hook.scales.c.max).not.toBeNull();
+  expect(hook.scales.c.min ?? 0).toBeLessThanOrEqual(170);
+  expect(hook.scales.c.max ?? 0).toBeGreaterThanOrEqual(200);
+  expect((hook.scales.c.max ?? 0) - (hook.scales.c.min ?? 0)).toBeGreaterThan(0);
+  // The RoR axis stays FIXED — pinned even in preheating before any RoR develops.
   expect(hook.scales.ror.min).toBe(-20);
   expect(hook.scales.ror.max).toBe(30);
+  // The dedicated control-line axis (heat/fan, #307) is fixed 0–100 %.
+  expect(hook.scales.pct.min).toBe(0);
+  expect(hook.scales.pct.max).toBe(100);
 
   // The live RoR readout is surfaced as an operator-facing metric (#165) and is
   // shown from the start incl. preheat (real probe data — not hidden pre-charge).
@@ -116,17 +122,22 @@ test("dashboard-fault — real env-ceiling fault renders the fault banner + trai
   const hook = await readChartData(page);
   expect(hook.columns[0].length).toBeGreaterThan(0);
 
-  // Scale-covers-data guard (#133): the c/ror axes are FIXED (#217), so assert
-  // they hold the pinned bounds, and x must SPAN the loaded telemetry — never
-  // collapse onto one point. A blank/collapsed plot (x null, c stuck) satisfies a
-  // byte-deterministic snapshot, so the regression must fail HERE. Closes the gap
-  // where this assertion lived only in dashboard-live/-developed.
+  // Scale-covers-data guard (#133/#307): the °C axis is controlled-dynamic, so assert
+  // it COVERS the data with a real width (never collapses), the RoR axis holds its
+  // FIXED band, and x must SPAN the loaded telemetry — never collapse onto one point.
+  // A blank/collapsed plot (x null, c stuck) satisfies a byte-deterministic snapshot,
+  // so the regression must fail HERE. session-1 carries a 241 °C env reading — the old
+  // fixed 0–210 (#217) would have CLIPPED it; the auto-range must keep it in frame.
   const x = hook.columns[0].filter((v): v is number => v !== null);
   expect(x.length).toBeGreaterThan(1);
-  expect(hook.scales.c.min).toBe(0);
-  expect(hook.scales.c.max).toBe(210);
+  const env = hook.columns[2].filter((v): v is number => v !== null);
+  const envMax = Math.max(...env);
+  expect((hook.scales.c.max ?? 0) - (hook.scales.c.min ?? 0)).toBeGreaterThan(0);
+  expect(hook.scales.c.max ?? 0).toBeGreaterThanOrEqual(envMax); // no clip (the #307 no-clip contract)
   expect(hook.scales.ror.min).toBe(-20);
   expect(hook.scales.ror.max).toBe(30);
+  expect(hook.scales.pct.min).toBe(0);
+  expect(hook.scales.pct.max).toBe(100);
   // x spans the loaded telemetry, never collapses (#131). The `(max ?? 0) - (min ??
   // 0) > 0` form FAILS on a null bound (a collapsed/unranged scale) — `x.min <=
   // dataMin` passes spuriously when x.min is null (`null <= n` === true in JS).
@@ -171,10 +182,12 @@ test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery mo
   const hook = await readChartData(page);
   const xs = hook.columns[0].filter((v): v is number => v !== null);
   for (let i = 1; i < xs.length; i++) expect(xs[i]).toBeGreaterThan(xs[i - 1]); // ascending serve-elapsed
-  expect(hook.scales.c.min).toBe(0);
-  expect(hook.scales.c.max).toBe(210);
+  // °C axis controlled-dynamic (#307): a real, non-collapsed width; RoR + pct fixed.
+  expect((hook.scales.c.max ?? 0) - (hook.scales.c.min ?? 0)).toBeGreaterThan(0);
   expect(hook.scales.ror.min).toBe(-20);
   expect(hook.scales.ror.max).toBe(30);
+  expect(hook.scales.pct.min).toBe(0);
+  expect(hook.scales.pct.max).toBe(100);
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-recovery.png");
@@ -227,19 +240,19 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   expect(Math.max(...x) - Math.min(...x)).toBeGreaterThan(300);
   expect(hook.markers.map((m) => m.kind)).toContain("first_crack");
 
-  // FIXED value-axis ranges (#217): both Y-axes are pinned so the curve reads against
-  // an unchanging frame and never auto-zooms to the current sensor reading. Assert the
-  // rendered plot holds the operator-confirmed bounds against a REAL ramping curve —
-  // temp 0–210 °C, RoR −20..+30 °C/min — so a regression to auto-fit fails HERE, not
-  // only in the (regenerated-from-the-same-code) pixel baseline. The fixed °C range
-  // also still covers the bean max, preserving the scale-covers-data guarantee (#131):
-  // a BLANK/collapsed plot (bean ramped to 178 °C but the °C axis stuck at ~43 °C, x
+  // Axis-scaling policy (#307): the °C axis is CONTROLLED-DYNAMIC (auto-range with
+  // hysteresis, no clip), the RoR axis stays FIXED, and the control lines get their own
+  // FIXED 0–100 % axis. Assert against a REAL ramping curve so a regression fails HERE,
+  // not only in the (regenerated-from-the-same-code) pixel baseline.
+  // Scale-covers-data (#131): the °C range must COVER the bean max with a real width —
+  // a BLANK/collapsed plot (bean ramped to 178 °C but the °C axis stuck/collapsed, x
   // null) would still satisfy a byte-deterministic snapshot, so it must fail HERE.
-  expect(hook.scales.c.min).toBe(0);
-  expect(hook.scales.c.max).toBe(210);
-  expect(hook.scales.c.max ?? 0).toBeGreaterThanOrEqual(beanMax);
+  expect((hook.scales.c.max ?? 0) - (hook.scales.c.min ?? 0)).toBeGreaterThan(0);
+  expect(hook.scales.c.max ?? 0).toBeGreaterThanOrEqual(beanMax); // no clip (#307)
   expect(hook.scales.ror.min).toBe(-20);
   expect(hook.scales.ror.max).toBe(30);
+  expect(hook.scales.pct.min).toBe(0);
+  expect(hook.scales.pct.max).toBe(100);
   // x stays data-driven (#131): it must span the elapsed range, never collapse onto one x.
   expect((hook.scales.x.max ?? 0) - (hook.scales.x.min ?? 0)).toBeGreaterThan(300);
 
@@ -330,10 +343,12 @@ test("dashboard-charge-window — preheating + bean in the charge band shows the
   const xs = hook.columns[0].filter((v): v is number => v !== null);
   expect(xs.length).toBeGreaterThan(0); // preheat history plots live (#326)
   for (let i = 1; i < xs.length; i++) expect(xs[i]).toBeGreaterThan(xs[i - 1]); // ascending serve-elapsed
-  expect(hook.scales.c.min).toBe(0);
-  expect(hook.scales.c.max).toBe(210);
+  // °C axis controlled-dynamic (#307): a real, non-collapsed width; RoR + pct fixed.
+  expect((hook.scales.c.max ?? 0) - (hook.scales.c.min ?? 0)).toBeGreaterThan(0);
   expect(hook.scales.ror.min).toBe(-20);
   expect(hook.scales.ror.max).toBe(30);
+  expect(hook.scales.pct.min).toBe(0);
+  expect(hook.scales.pct.max).toBe(100);
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-charge-window.png");
