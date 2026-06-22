@@ -2185,17 +2185,38 @@ class RoastController:
         self.transition_to(RoastPhase.DEVELOPMENT)
 
     async def operator_drop_beans(self) -> None:
-        """Operator drop: matrix-validated, executed, then cooling."""
+        """Operator drop: matrix-validated, executed, then cooling — EXCEPT from
+        ``faulted`` (#210).
+
+        From ``roasting_pre_first_crack`` / ``development`` this is the normal (or
+        early-abort) drop: it issues the drop and transitions to ``cooling``.
+        From ``faulted`` (#210) it is a SAFE-ING action — an e-stop/fault leaves the
+        drum hot (heat off but still hot), so the operator must be able to dump the
+        beans before they scorch. It issues the drop WITHOUT a phase transition
+        (mirroring the #206 ``operator_start_cooling`` / ``operator_stop_cooling``
+        faulted pattern): the run stays ``faulted`` until the operator acknowledges
+        it, heat stays off (``set_heat`` is never extended to faulted), and nothing
+        is auto-resumed (the restart-never-auto-resumes invariant is untouched —
+        this writes a single drop, not heat/fan). Whether ``drop_beans`` itself
+        engages cooling on the Hottop is the open §3 verification; either way DROP
+        adds no cooling here — START COOLING is a separate operator action already
+        available from faulted (#206).
+
+        Hardware is never written unless the resulting state is reachable: the
+        transition (when one applies) is guarded first, so a write-then-raise can't
+        diverge the FSM from the machine (E4-S4 safety rule)."""
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.DROP_BEANS, phase=self._phase
         )
         await self._snapshots.persist_evaluation(phase_validity)
         if phase_validity.verdict is not SafetyVerdict.ALLOW:
             return
-        # Never write hardware unless the resulting state is reachable —
-        # a write-then-raise would diverge the FSM from the machine
-        # (safety review blocker, E4-S4).
-        if not self.can_transition(RoastPhase.COOLING):
+        # Transition to cooling ONLY on the non-faulted drop. From `faulted` (#210
+        # safe-ing) the drop issues with no phase change — the run stays faulted
+        # until acknowledged. Guard the transition BEFORE writing hardware so a
+        # write-then-raise never diverges the FSM (E4-S4 blocker).
+        will_transition = self._phase is not RoastPhase.FAULTED
+        if will_transition and not self.can_transition(RoastPhase.COOLING):
             raise InvalidTransitionError(self._phase, RoastPhase.COOLING)
         try:
             await self._executor.drop_beans()
@@ -2205,7 +2226,8 @@ class RoastController:
         self._events.emit(
             RoastEventKind.COMMAND_EXECUTED, {"command": "drop_beans", "source": "operator"}
         )
-        self.transition_to(RoastPhase.COOLING)
+        if will_transition:
+            self.transition_to(RoastPhase.COOLING)
 
     async def operator_stop_cooling(self) -> None:
         """Operator stop-cooling: matrix-validated.
