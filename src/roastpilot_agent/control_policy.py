@@ -26,6 +26,8 @@ gate's current behaviour — so wiring the gate to read the box here is a verdic
 no-op (#273's invariant), and #222 narrows the range per phase.
 """
 
+from dataclasses import dataclass
+
 from pydantic import BaseModel, Field, model_validator
 
 from roastpilot_agent.config import PreFirstCrackLevers, SafetyLimits
@@ -46,6 +48,46 @@ _LEVER_MAX_PERCENT = 100
 _PRE_FIRST_CRACK_PHASES: frozenset[RoastPhase] = frozenset(
     {RoastPhase.PREHEATING, RoastPhase.ROASTING_PRE_FIRST_CRACK}
 )
+
+
+@dataclass(frozen=True)
+class TrimSignal:
+    """The live anticipatory-trim inputs the controller feeds the policy (#327).
+
+    Carries the values the deterministic late-Maillard heat trim is keyed on: the
+    current bean temperature, the #229 predicted-FC ETA, and the controller's
+    per-run **latch** state. Bean-temp + ETA are read at the tick; the policy
+    decides whether the trim window is open (see
+    :meth:`RoastControlPolicy.trim_window_open` /
+    :meth:`RoastControlPolicy.limits_for`). When the controller cannot resolve a
+    signal (no curve yet, post-FC, no warming slope) it passes ``None`` for
+    ``first_crack_eta_seconds`` (or no signal at all) and the policy FAILS CLOSED
+    to the flat #222 floor.
+
+    The **latch** (#327, hysteresis) makes the trim monotonic within a pre-FC
+    run: the controller sets ``latched`` once the window has *first* opened (on a
+    clean ETA + bean-floor signal) and keeps it set for the rest of the pre-FC
+    phase. A latched signal keeps the trim engaged even if the noisy linear FC-ETA
+    momentarily bounces back above the window, so the deterministic heat does not
+    oscillate 100↔trim↔100 (the #218 lever-thrash anti-pattern). The latch resets
+    per run/preheat and the trim ends naturally when FC moves the phase out of
+    pre-FC. The latch NEVER engages the trim on its own — the *first* engagement
+    still requires the full window precondition (valid ETA + bean ≥ floor), so a
+    garbage ETA never latches.
+
+    Side-effect free and immutable. All temperatures are Celsius.
+    """
+
+    #: The current bean temperature (°C) for the bean-temp window guard.
+    bean_temp_c: float
+    #: The #229 predicted seconds until first crack, or ``None`` when no estimate
+    #: is warranted (too little curve, not warming, already in the FC band). A
+    #: ``None`` ETA fails a *fresh* trim engagement closed to the flat floor.
+    first_crack_eta_seconds: float | None
+    #: The controller's per-run latch: ``True`` once the trim window has already
+    #: opened this pre-FC phase. Keeps the trim engaged through an ETA bounce
+    #: (hysteresis); reset per run/preheat. Defaults ``False`` (no prior engage).
+    latched: bool = False
 
 
 class PhaseControlLimits(BaseModel):
@@ -206,7 +248,9 @@ class RoastControlPolicy:
         self._profile = profile
         self._pre_fc_levers = pre_fc_levers if pre_fc_levers is not None else PreFirstCrackLevers()
 
-    def limits_for(self, phase: RoastPhase) -> PhaseControlLimits:
+    def limits_for(
+        self, phase: RoastPhase, *, trim_signal: TrimSignal | None = None
+    ) -> PhaseControlLimits:
         """Resolve the control box for ``phase`` from the single source.
 
         The two pre-FC phases (preheat, charge→FC) resolve a NARROWED box with a
@@ -217,15 +261,34 @@ class RoastControlPolicy:
         target 100 that range collapses to the point ``[100, 100]``, but a future
         learned target below 100 (D42 §7.1) yields a genuine range; it is the
         FLOOR, not a single pinned value, that prevents the #218 cut. Fan is
-        capped low (the operator's max-heat / low-fan-to-FC method). Every other
-        phase resolves the full 0–100 range with no deterministic target — development
-        → drop is the post-FC LLM's box (#223); the lifecycle states do not
-        actuate. The bitter ceiling is the configured hard ceiling, capped at the
-        active profile's drop target when that is lower; the emergency-drop bound
-        is the configured hard bound.
+        capped low (the operator's max-heat / low-fan-to-FC method).
+
+        **Anticipatory heat trim (#327).** When ``trim_signal`` opens the
+        late-Maillard → FC window (see :meth:`_trim_engaged`) the pre-FC heat
+        floor AND target are lowered to the configured trim level (a moderate
+        ~60–70 % reduction, not a crash) so the env cools and the RoR bends into
+        FC before the drop ceiling — roast 3 proved the flat 100 floor overshoots.
+        The trim is a strict reduction (a config validator pins
+        ``trim_heat_percent <= heat_target_percent``), so the floor never rises
+        and FC is never delayed by added heat. Outside the window — and whenever
+        the FC-ETA is unknown / no signal is supplied — it FAILS CLOSED to the
+        flat #222 floor (the always-on guarantee FC still arrives, §8.4). The fan
+        box and target are unchanged by the trim (fan stays at the floor; the
+        plan's "fan controlled", not raised — raising fan pre-FC crashes RoR into
+        the crack, the #218 anti-pattern).
+
+        Every other phase resolves the full 0–100 range with no deterministic
+        target — development → drop is the post-FC LLM's box (#223); the lifecycle
+        states do not actuate. The bitter ceiling is the configured hard ceiling,
+        capped at the active profile's drop target when that is lower; the
+        emergency-drop bound is the configured hard bound.
 
         Args:
             phase: The agent phase the controller is currently in.
+            trim_signal: The live bean-temp + FC-ETA the late-Maillard trim is
+                keyed on, or ``None`` (the controller cannot resolve one, or the
+                caller does not want the trim — both fail closed to the flat
+                floor). Ignored outside the pre-FC phases.
 
         Returns:
             The :class:`PhaseControlLimits` box for ``phase`` — the *same*
@@ -236,22 +299,28 @@ class RoastControlPolicy:
         emergency = self._limits.emergency_drop_temp_c
         if phase in _PRE_FIRST_CRACK_PHASES:
             levers = self._pre_fc_levers
+            # The deterministic heat the controller holds this tick: the trim
+            # level while the late-Maillard window is open (#327), else the flat
+            # #222 floor target. The floor is pinned to whichever heat is active
+            # so the gate clamps any lower value back up to it (no cut below the
+            # active level), and the trim is a strict reduction so the floor never
+            # rises above the #222 target.
+            heat = (
+                levers.late_maillard_trim.trim_heat_percent
+                if self._trim_engaged(trim_signal)
+                else levers.heat_target_percent
+            )
             return PhaseControlLimits(
-                # Heat pinned high: floor == the deterministic target, so the
-                # gate clamps any lower request (or a stale/odd value) back up to
-                # the target — the heat 70→40→20→0 pre-FC crash (#218) cannot
-                # recur. Ceiling stays full 100 (steady high heat, operator
-                # method; the deferred late-Maillard trim, D36/#228, would lower
-                # the floor here when FC-ETA exists).
-                heat_floor_percent=levers.heat_target_percent,
+                heat_floor_percent=heat,
                 heat_ceiling_percent=_LEVER_MAX_PERCENT,
                 # Fan capped low: floor 0, ceiling the configured low value (~30)
-                # — the operator's low-fan-to-browning method.
+                # — the operator's low-fan-to-browning method. The trim leaves fan
+                # at the floor (plan §3 "fan controlled", not raised).
                 fan_floor_percent=_LEVER_MIN_PERCENT,
                 fan_ceiling_percent=levers.fan_ceiling_percent,
                 bitter_ceiling_temp_c=bitter,
                 emergency_drop_temp_c=emergency,
-                heat_target_percent=levers.heat_target_percent,
+                heat_target_percent=heat,
                 fan_target_percent=levers.fan_target_percent,
             )
         return PhaseControlLimits(
@@ -262,6 +331,66 @@ class RoastControlPolicy:
             bitter_ceiling_temp_c=bitter,
             emergency_drop_temp_c=emergency,
         )
+
+    def trim_window_open(self, trim_signal: TrimSignal | None) -> bool:
+        """Whether a *fresh* late-Maillard trim engagement's window is open (#327).
+
+        The full engage PRECONDITION — the gate the controller's per-run latch is
+        set from. ``True`` only when ALL hold:
+
+        * the trim is enabled in config;
+        * a ``trim_signal`` is supplied with a *known* FC-ETA (a ``None`` ETA is
+          the fail-closed case: no curve yet, post-FC, or no warming slope);
+        * the FC-ETA is positive and at or below the configured window
+          (``window_fc_eta_seconds``) — i.e. FC is predicted within the window,
+          so we are in late Maillard;
+        * the bean is at or above ``min_bean_temp_c`` — a guard against a noisy
+          RoR projecting a spurious near-term FC early in the roast.
+
+        Latch-independent (it ignores ``trim_signal.latched``): this is what makes
+        the FIRST engagement require a clean signal, so a garbage ETA never
+        latches. Any missing/unknown input ⇒ ``False`` ⇒ the flat #222 floor (fail
+        closed, §8.4).
+
+        Args:
+            trim_signal: The live bean-temp + FC-ETA, or ``None``.
+
+        Returns:
+            ``True`` when the fresh-engage window is open, ``False`` otherwise.
+        """
+        trim = self._pre_fc_levers.late_maillard_trim
+        if not trim.enabled or trim_signal is None:
+            return False
+        eta = trim_signal.first_crack_eta_seconds
+        # `not (0.0 < eta <= window)` is True for None, NaN, ≤0, and >window.
+        # NaN comparisons all return False in Python, so NaN passes the old
+        # `eta <= 0.0 or eta > window` guards — this form fails closed for NaN too.
+        if eta is None or not (0.0 < eta <= trim.window_fc_eta_seconds):
+            return False
+        return trim_signal.bean_temp_c >= trim.min_bean_temp_c
+
+    def _trim_engaged(self, trim_signal: TrimSignal | None) -> bool:
+        """Whether the deterministic late-Maillard heat trim is active (#327).
+
+        Engaged when the trim is enabled AND either the fresh-engage window is
+        open (:meth:`trim_window_open`) OR the controller's per-run latch is set
+        (``trim_signal.latched``). The latch is the HYSTERESIS: once the window
+        has opened this pre-FC phase the trim stays engaged through a momentary
+        ETA bounce above the window, so the deterministic heat does not oscillate
+        100↔trim↔100 (the #218 lever-thrash). The latch alone never engages the
+        trim on a degenerate signal — a latched signal is only produced by the
+        controller AFTER a clean :meth:`trim_window_open`, and the ``enabled``
+        check here still gates it (a config-disabled trim is never engaged).
+
+        Args:
+            trim_signal: The live bean-temp + FC-ETA + latch, or ``None``.
+
+        Returns:
+            ``True`` when the trim is engaged this tick, ``False`` otherwise.
+        """
+        if trim_signal is None or not self._pre_fc_levers.late_maillard_trim.enabled:
+            return False
+        return trim_signal.latched or self.trim_window_open(trim_signal)
 
     def _bitter_ceiling_temp_c(self) -> float:
         """The told ≤196 °C bitter / drop ceiling, capped at the profile target.

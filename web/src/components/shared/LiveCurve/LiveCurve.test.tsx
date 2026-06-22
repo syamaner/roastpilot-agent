@@ -129,6 +129,67 @@ describe("LiveCurve", () => {
     expect(screen.getByTestId("legend-time")).toHaveTextContent("—");
   });
 
+  it("renders the legend time as CHARGE-referenced roast time when originSeconds is set (#326)", () => {
+    // The core acceptance contract: with the charge origin threaded through
+    // LiveCurve → Legend, the cursor/latest readout reads SIGNED roast time
+    // (point − origin), NOT serve-elapsed. Latest point serve t=600 with origin 540
+    // → "1:00" (60 s into the roast), never "10:00" (the un-transformed serve value).
+    render(
+      <LiveCurve
+        points={[
+          { t: 480, bean: 90, env: 180, ror: 30, heat: 100, fan: 30 },
+          { t: 540, bean: 160, env: 200, ror: 22, heat: 100, fan: 30 },
+          { t: 600, bean: 175, env: 205, ror: 18, heat: 80, fan: 40 },
+        ]}
+        originSeconds={540}
+      />,
+    );
+    expect(screen.getByTestId("legend-time")).toHaveTextContent("1:00");
+    expect(screen.getByTestId("legend-time")).not.toHaveTextContent("10:00");
+  });
+
+  it("renders a NEGATIVE legend time for a pre-charge latest point when origin is set (#326)", () => {
+    // A latest point before the charge origin reads negative roast time (preheat).
+    // Several pre-charge points so uPlot has a non-degenerate x-range; the latest
+    // (t=340) drives the readout.
+    render(
+      <LiveCurve
+        points={[
+          { t: 300, bean: 70, env: 172, ror: 30, heat: 100, fan: 30 },
+          { t: 320, bean: 75, env: 174, ror: 30, heat: 100, fan: 30 },
+          { t: 340, bean: 80, env: 175, ror: 30, heat: 100, fan: 30 },
+        ]}
+        originSeconds={540}
+      />,
+    );
+    // 340 − 540 = −200 s → "-3:20".
+    expect(screen.getByTestId("legend-time")).toHaveTextContent("-3:20");
+  });
+
+  // --- #326 regression: a DEGENERATE (single-point / zero-width) x-range must not
+  // throw. uPlot's split calc divides by the x span; a single plotted point (or
+  // several all at the same elapsed second) gives a zero-width range → a non-finite
+  // increment → `new Array(NaN)` → "RangeError: Invalid array length", which threw
+  // out of the async commit and broke the dashboard React tree (the SSE consumer
+  // stopped updating, stalling the phase readout). This surfaced once #326 made
+  // pre-charge frames plot: the preheat curve now STARTS as one point. The
+  // scales.makeAutoRange guard widens a zero-width x-range so the chart is robust on
+  // short/sparse roasts. These render without an unhandled error (vitest fails the
+  // file on an uncaught RangeError from the deferred uPlot commit).
+  it.each([
+    ["a single point at a non-zero elapsed second, null origin", [{ t: 540, bean: 90, env: 180, ror: 18, heat: 80, fan: 40 }], null as number | null],
+    ["a single point with the charge origin set", [{ t: 540, bean: 90, env: 180, ror: 18, heat: 80, fan: 40 }], 540],
+    ["several points all at the same elapsed second", [
+      { t: 540, bean: 90, env: 180, ror: 18, heat: 80, fan: 40 },
+      { t: 540, bean: 91, env: 181, ror: 18, heat: 80, fan: 40 },
+    ], 540],
+  ])("renders a degenerate x-range without throwing: %s (#326)", (_label, points, originSeconds) => {
+    render(<LiveCurve points={points as CurvePoint[]} originSeconds={originSeconds} />);
+    // The chart mounted; the data hook is populated (no throw tore the tree down).
+    expect(screen.getByTestId("live-curve")).toBeInTheDocument();
+    expect(window.__chart).toBeDefined();
+  });
+
   it("reflects the controlled highlightTime on the data hook", () => {
     const { rerender } = render(<LiveCurve points={POINTS} highlightTime={null} />);
     expect(window.__chart?.highlightTime).toBeNull();

@@ -80,6 +80,64 @@ DEFAULT_ADVISOR_MODEL_BY_PHASE: dict[RoastPhase, str] = {
 }
 
 
+class LateMaillardTrim(BaseModel):
+    """Deterministic anticipatory heat-trim parameters, late Maillard → FC (D35 §3, #327).
+
+    The §3 phase table specs a deterministic anticipatory heat **trim** in the
+    late-Maillard → FC window (still pre-FC): a *moderate* heat reduction (the
+    issue's "~60–70 %, not a crash"), fan held at the floor, to bend the RoR
+    smoothly into first crack. #222 shipped only the flat ``heat 100 / fan 30 →
+    FC`` floor; roast 3 (21 Jun 2026) proved the flat floor OVERSHOOTS — flat
+    100 % drove a late FC, env reached 239 °C, and the bean coasted 193 → 203 °C
+    even after the post-FC loop cut heat to 0, dropping 8 °C over the 195 °C
+    ceiling (#327 evidence). Trimming heat in late Maillard cools the env so
+    development accrues *before* the ceiling, and the drop lands ≤ ceiling.
+
+    These are PARAMETERS, not constants in code (plan §8.3 single-source):
+    :class:`~roastpilot_agent.control_policy.RoastControlPolicy` resolves them,
+    keyed on the live bean temperature + the #229 predicted-FC ETA, into the
+    pre-FC box (heat floor + target lowered to the trim level while the window is
+    open; fan unchanged) AND the deterministic target the controller actuates.
+    No LLM is consulted — D35 keeps pre-FC fully deterministic.
+
+    **Fails closed to the flat floor.** The trim engages ONLY while the window is
+    resolvable (bean ≥ ``min_bean_temp_c`` AND a positive FC-ETA at or below
+    ``window_fc_eta_seconds``). Whenever the FC-ETA is unknown, any input is
+    missing, or the bean is not yet in the window, the policy resolves the
+    existing flat ``heat 100 / fan 30`` floor — the floor stays the always-on
+    guarantee that FC still arrives (plan §8.4). The trim is a BOUNDED reduction:
+    it never raises heat above the floor and is sized not to stall or delay FC.
+
+    The window can be disabled wholesale with ``enabled=False`` (reverts to the
+    pure #222 flat floor). All values are percentages, Celsius, or seconds.
+    """
+
+    #: Whether the anticipatory trim is active. ``False`` reverts to the pure
+    #: #222 flat floor (heat 100 / fan 30 → FC) with no trim window — the
+    #: fail-closed baseline, also the explicit off-switch for a profile/operator
+    #: that wants the flat floor.
+    enabled: bool = Field(default=True)
+    #: The trimmed heat the controller holds once the window opens. Default 65 —
+    #: the midpoint of the plan's "~60–70 %, not a crash" band (#327 / plan §3).
+    #: A moderate reduction from the flat-floor 100 %: enough to cool the env and
+    #: bend RoR into FC, NOT a momentum-killing cut (the #218 pre-FC crash). Must
+    #: stay <= the flat-floor ``PreFirstCrackLevers.heat_target_percent`` (the
+    #: trim only ever lowers heat — a validator on the parent pins this).
+    trim_heat_percent: int = Field(default=65, ge=10, le=100)
+    #: Seconds-before-predicted-FC at which the window OPENS. Default 60 — the
+    #: trim engages in late Maillard, ~1 min ahead of the projected crack, so the
+    #: env cools before FC rather than at it. Well inside the #229-validated
+    #: FC-ETA accuracy horizon (the naive projection lands within ~half the
+    #: detector-lag window by ~90 s out), so the trigger is on a trustworthy ETA.
+    window_fc_eta_seconds: float = Field(default=60.0, gt=0)
+    #: The bean-temperature floor below which the trim NEVER engages, even if a
+    #: noisy RoR projects a spurious near-term FC. Default 155 °C — genuinely
+    #: late Maillard on this roaster's indicated probe (FC band 171–180 °C,
+    #: ``ControllerConfig.first_crack_target_bean_temp_c`` 176 °C), ~20 °C below
+    #: the FC target. Guards the FC-ETA trigger against an early false positive.
+    min_bean_temp_c: float = Field(default=155.0, gt=0)
+
+
 class PreFirstCrackLevers(BaseModel):
     """Deterministic pre-first-crack heat/fan lever parameters (D35 §3/§4-A, #222).
 
@@ -116,25 +174,44 @@ class PreFirstCrackLevers(BaseModel):
     #: pins it); raise it to leave the policy room above the target if a profile
     #: later wants a small browning-entry fan opening (plan §3).
     fan_ceiling_percent: int = Field(default=30, ge=0, le=100)
+    #: The deterministic anticipatory heat-trim (late Maillard → FC, D35 §3, #327).
+    #: When its window is open the policy lowers the pre-FC heat floor + target to
+    #: the trim level; outside the window (or when FC-ETA is unknown) it falls
+    #: closed to the flat ``heat_target_percent`` / ``fan_target_percent`` floor.
+    #: The trim's ``trim_heat_percent`` must not exceed ``heat_target_percent``
+    #: (the trim only ever lowers heat — a validator pins this).
+    late_maillard_trim: LateMaillardTrim = Field(default_factory=LateMaillardTrim)
 
     @model_validator(mode="after")
     def _check_fan_ceiling(self) -> "PreFirstCrackLevers":
-        """The fan ceiling must not sit below the fan target.
+        """The fan ceiling must not sit below the fan target, and the trim must
+        not raise heat above the flat-floor target.
 
-        A ceiling below the target would make the deterministic fan write fall
-        outside its own box (the gate would clamp the policy's own target),
-        breaking told == enforced for the deterministic path.
+        A fan ceiling below the target would make the deterministic fan write
+        fall outside its own box (the gate would clamp the policy's own target),
+        breaking told == enforced for the deterministic path. The
+        ``late_maillard_trim`` heat must stay <= the flat-floor
+        ``heat_target_percent`` so the trim is a strict REDUCTION (#327): it
+        never raises heat above the floor and so can never delay FC by adding
+        heat — the floor stays the always-on guarantee that FC arrives (§8.4).
 
         Returns:
             The validated levers instance.
 
         Raises:
-            ValueError: If ``fan_ceiling_percent`` is below ``fan_target_percent``.
+            ValueError: If ``fan_ceiling_percent`` is below ``fan_target_percent``
+                or the trim heat exceeds ``heat_target_percent``.
         """
         if self.fan_ceiling_percent < self.fan_target_percent:
             raise ValueError(
                 "fan_ceiling_percent must not be below fan_target_percent "
                 f"({self.fan_ceiling_percent} < {self.fan_target_percent})"
+            )
+        if self.late_maillard_trim.trim_heat_percent > self.heat_target_percent:
+            raise ValueError(
+                "late_maillard_trim.trim_heat_percent must not exceed "
+                "heat_target_percent (the trim only lowers heat) "
+                f"({self.late_maillard_trim.trim_heat_percent} > {self.heat_target_percent})"
             )
         return self
 

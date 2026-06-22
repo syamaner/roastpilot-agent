@@ -293,6 +293,21 @@ This intentionally supersedes the #220 serve-referenced x-origin hold. Five dash
 Playwright baselines (`dashboard-live`, `-charge-window`, `-recovery`, `-fault`,
 `-developed`) regenerate via `web-snapshots-update.yml` at merge.
 
+Post-E10 UI/UX follow-up (not an E10 story): **#324 — home / landing hub + persistent
+nav** (operator, 21 Jun; first step of the post-first-roast UI/UX pass). Before this
+the SPA had no landing page and no visible navigation — after acknowledging a fault the
+operator landed on the Start form with no way to history or to rate a finished roast.
+This PR adds a `RootLayout` that mounts a persistent `NavBar` (Home / History / a
+Live-roast link shown only when the server reports an active run) above every
+operator-facing page, a `HomePage` hub with two entry points (Start a new roast → the
+reused `StartRoastForm` at `/start`; View & rate roasts → `/roasts` → detail), and a
+state-aware `/` (`HomeGate`): active run → the live dashboard, idle → the home hub. The
+active-run decision reads the server's `/health` snapshot (`active_run_id`) — phase is
+never inferred client-side (invariant). Navigating away from a running roast and back
+does not disrupt it (the dashboard re-hydrates from `/telemetry` + SSE). A new
+`/__home-harness` snapshot route + `home.spec.ts` add the `home` baseline (CI-Docker
+owned via `web-snapshots-update.yml`).
+
 ### E10 follow-ups — closed (15–16 Jun 2026)
 
 The S1–S6 review-deferred follow-ups and contract/observability fast-follows are

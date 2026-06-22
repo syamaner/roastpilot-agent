@@ -3,13 +3,25 @@
  *
  * S2 owns the route table; the page bodies are filled by S3 (dashboard), S4
  * (history), and S5 (detail). The harness route is foundation-only.
+ *
+ * #324 adds the home / landing hub + a persistent nav: the operator-facing routes
+ * nest under `RootLayout` (which mounts the nav above every page), and `/` is
+ * state-aware via `HomeGate` (active run → dashboard, idle → home). The dev/test
+ * snapshot harnesses stay OUTSIDE the layout so their baselines remain nav-free
+ * and deterministic.
  */
 
 import { lazy } from "react";
 import type { RouteObject } from "react-router-dom";
 
-const DashboardPage = lazy(() =>
-  import("@/pages/dashboard/DashboardPage").then((m) => ({ default: m.DashboardPage })),
+const RootLayout = lazy(() =>
+  import("@/pages/home/RootLayout").then((m) => ({ default: m.RootLayout })),
+);
+const HomeGate = lazy(() =>
+  import("@/pages/home/HomeGate").then((m) => ({ default: m.HomeGate })),
+);
+const StartRoastView = lazy(() =>
+  import("@/pages/home/StartRoastView").then((m) => ({ default: m.StartRoastView })),
 );
 const HistoryPage = lazy(() =>
   import("@/pages/history/HistoryPage").then((m) => ({ default: m.HistoryPage })),
@@ -50,11 +62,27 @@ const StartRoastHarnessPage = lazy(() =>
     default: m.StartRoastHarnessPage,
   })),
 );
+// #324 home snapshot — the persistent nav + the landing hub over a seeded idle
+// `/health` snapshot (no active run), the deterministic `home` baseline target.
+const HomeHarnessPage = lazy(() =>
+  import("@/pages/home/HomeHarnessPage").then((m) => ({ default: m.HomeHarnessPage })),
+);
 
 export const routes: RouteObject[] = [
-  { path: "/", element: <DashboardPage /> },
-  { path: "/roasts", element: <HistoryPage /> },
-  { path: "/roasts/:runId", element: <DetailPage /> },
+  // Operator-facing routes nest under RootLayout → the persistent nav (#324) is
+  // mounted above each page. `/` is state-aware (HomeGate): active run → live
+  // dashboard, idle → home hub. `/start` is the Start-Roast form (reached from the
+  // home hub or the idle redirect). Phase is never inferred client-side — the
+  // active-run decision reads the server's `/health` snapshot.
+  {
+    element: <RootLayout />,
+    children: [
+      { path: "/", element: <HomeGate /> },
+      { path: "/start", element: <StartRoastView /> },
+      { path: "/roasts", element: <HistoryPage /> },
+      { path: "/roasts/:runId", element: <DetailPage /> },
+    ],
+  },
   // Foundation harnesses — dev/test only, the snapshot suite's stable targets (D24).
   // __chart-harness: fixed-data LiveCurve/badge/indicator gallery.
   // __stream-smoke: the live SSE path wired to the real replay harness (S1).
@@ -68,4 +96,6 @@ export const routes: RouteObject[] = [
   { path: "/__detail-harness-long", element: <DetailHarnessLongPage /> },
   // __start-roast-harness: idle Start form + bean-profile library (#303 snapshot).
   { path: "/__start-roast-harness", element: <StartRoastHarnessPage /> },
+  // __home-harness: persistent nav + landing hub over a seeded idle health snapshot.
+  { path: "/__home-harness", element: <HomeHarnessPage /> },
 ];

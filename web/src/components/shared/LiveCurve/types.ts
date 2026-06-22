@@ -13,7 +13,9 @@ export const SERIES_KEYS: readonly SeriesKey[] = ["bean", "env", "ror", "heat", 
 
 /** One curve point. Temps in °C, RoR in °C/min, heat/fan in %. `null` = gap. */
 export interface CurvePoint {
-  /** Seconds since charge (T0) — the chart x-axis. */
+  /** SERVE-elapsed seconds (the server clock since run start) — the chart x-axis
+   *  (#326). NOT charge-referenced: the ROAST TIME display (0:00 = charge, negative
+   *  in preheat) is a label transform in LiveCurve, keyed on `originSeconds`. */
   t: number;
   bean: number | null;
   env: number | null;
@@ -27,7 +29,8 @@ export type CurveMarkerKind = "t0" | "first_crack" | "drop";
 
 export interface CurveMarker {
   kind: CurveMarkerKind;
-  /** x position in seconds (same axis as CurvePoint.t). */
+  /** x position in SERVE-elapsed seconds (same axis as CurvePoint.t, #326) — the
+   *  ROAST TIME re-label is applied at display time, not here. */
   t: number;
   label: string;
 }
@@ -55,6 +58,15 @@ export interface LiveCurveProps {
    * consumer toggles by passing `null`). Owned by the consumer, not the chart.
    */
   highlightTime?: number | null;
+  /**
+   * Serve-elapsed seconds at the T0/charge moment, for the CHARGE-referenced ROAST
+   * TIME display (#326). The point buffer is keyed on serve elapsed (so preheat
+   * plots live); passing the charge origin re-labels the x-axis ticks + cursor
+   * readout to roast time (0:00 = charge, negative before T0) WITHOUT moving any
+   * point. `null` (default, or before T0 lands) → the axis shows serve-elapsed.
+   * The dashboard passes `vm.t0ElapsedSeconds`; the detail page omits it.
+   */
+  originSeconds?: number | null;
   /** Series hidden by default (e.g. detail view may start with heat/fan off). */
   initialHidden?: SeriesKey[];
   className?: string;
