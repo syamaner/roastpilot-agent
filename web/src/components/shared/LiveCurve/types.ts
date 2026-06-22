@@ -84,18 +84,24 @@ export interface ChartTestHook {
   highlightTime: number | null;
   chargeBandVisible: boolean;
   /**
-   * The RENDERED uPlot scale ranges (min/max) for the x (elapsed), c (°C) and ror
-   * (°C/min) scales, read off the live plot after each draw. The x scale is asserted
-   * to COVER the data — a collapsed/unranged scale (the bug where the curve drew
-   * off-screen / onto one point) leaves a scale that does NOT span the data, which a
-   * blank-but-byte-deterministic snapshot can't catch on its own (D26 / #131). The c
-   * and ror scales are FIXED (#217), so a test asserts they hold their pinned bounds
-   * (0–210 °C, −20..+30 °C/min) regardless of the data.
+   * The RENDERED uPlot scale ranges (min/max) for the x (elapsed), c (°C), ror
+   * (°C/min) and pct (heat/fan %) scales, read off the live plot after each draw.
+   *
+   *   - x: asserted to COVER the data — a collapsed/unranged scale (the bug where the
+   *     curve drew off-screen / onto one point) leaves a scale that does NOT span the
+   *     data, which a blank-but-byte-deterministic snapshot can't catch (D26 / #131).
+   *   - c (°C): CONTROLLED-DYNAMIC auto-range with hysteresis (#307) — a test asserts
+   *     it COVERS the bean+env data (with padding) and does NOT collapse to a
+   *     zero-width range; it is no longer the fixed 0–210 of #217.
+   *   - ror (°C/min): FIXED −20..+30 (a band comparable across roasts) — asserted to
+   *     hold its pinned bounds regardless of the data.
+   *   - pct (%): FIXED 0–100 (the dedicated control-line axis, #307).
    */
   scales: {
     x: { min: number | null; max: number | null };
     c: { min: number | null; max: number | null };
     ror: { min: number | null; max: number | null };
+    pct: { min: number | null; max: number | null };
   };
 }
 
