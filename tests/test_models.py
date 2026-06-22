@@ -359,13 +359,35 @@ def test_roast_profile_source_url_blank_normalizes_to_none(blank: str | None) ->
         "javascript:alert(1)",
         "example.com",
         "https://",
+        # Embedded userinfo — a credential that must never persist / render (#347).
+        "https://user:pass@example.com/bean",
+        "https://user@example.com/bean",
+        # Malformed port — would yield a broken anchor (#347).
+        "https://example.com:abc/bean",
+        "https://example.com:99999/bean",
     ],
 )
 def test_roast_profile_rejects_malformed_source_url(bad_url: str) -> None:
-    """#315 source_url rejects a non-http(s) / hostless / unparseable value so the
-    UI never renders a broken anchor (and a ``javascript:`` URL can't slip in)."""
+    """#315/#347 source_url rejects a non-http(s) / hostless / unparseable value,
+    a URL carrying userinfo (credential leak), or a malformed port — so the UI
+    never renders a broken anchor and no credential reaches the corpus."""
     with pytest.raises(pydantic.ValidationError):
         RoastProfile.model_validate(_profile(source_url=bad_url))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/path",
+        "https://example.com:8443/bean?lot=42",
+        "http://shop.example.com",
+    ],
+)
+def test_roast_profile_accepts_clean_source_url_with_valid_port(url: str) -> None:
+    """#347: a normal http(s) URL — including one with a valid explicit port —
+    round-trips unchanged once the userinfo / bad-port guards are in place."""
+    profile = RoastProfile.model_validate(_profile(source_url=url))
+    assert profile.source_url == url
 
 
 def test_roast_profile_pre_315_json_back_compat() -> None:

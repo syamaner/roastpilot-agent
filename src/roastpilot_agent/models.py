@@ -361,6 +361,13 @@ class _BeanProfileFieldsBase(BaseModel):
         stdlib ``urlsplit`` (no extra dependency, no ``HttpUrl`` object that
         would change the serialized JSON shape and complicate the frozen
         ``profile_json`` round-trip).
+
+        Beyond scheme + host, the value is rejected if it carries userinfo
+        (``user:pass@host`` — a credential that must never be persisted in the
+        corpus or rendered into an anchor) or a malformed port (which would make
+        the anchor broken). ``urlsplit`` parses a bad port lazily, so a port is
+        validated by accessing :attr:`~urllib.parse.SplitResult.port` (it raises
+        ``ValueError`` on a non-numeric / out-of-range port).
         """
         if value is None:
             return None
@@ -368,8 +375,14 @@ class _BeanProfileFieldsBase(BaseModel):
         if not stripped:
             return None
         parsed = urlsplit(stripped)
-        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError("must be a well-formed http(s) URL")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("must not embed credentials (userinfo)")
+        try:
+            parsed.port  # noqa: B018 — accessing .port validates it (raises on a bad port)
+        except ValueError as exc:
+            raise ValueError("must not have a malformed port") from exc
         return stripped
 
     @model_validator(mode="after")

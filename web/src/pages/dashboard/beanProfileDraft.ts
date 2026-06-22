@@ -135,8 +135,11 @@ export function draftFromBeanProfile(profile: BeanProfileInput): BeanProfileDraf
 /**
  * Whether a string parses as an absolute http(s) URL with a host (#315). Mirrors
  * the server's `source_url` validator: a non-http(s) scheme (e.g. `javascript:`,
- * `ftp:`), a missing host, or an unparseable value is rejected, so the UI never
- * renders a broken anchor. Uses the platform `URL` parser (no extra dependency).
+ * `ftp:`), a missing host, embedded userinfo (`user:pass@host` — a credential
+ * that must never persist or render into an anchor), or an unparseable value
+ * (incl. a malformed port, which the platform `URL` parser rejects) is rejected,
+ * so the UI never renders a broken anchor. Uses the platform `URL` parser (no
+ * extra dependency).
  */
 function isWellFormedHttpUrl(value: string): boolean {
   let parsed: URL;
@@ -145,7 +148,11 @@ function isWellFormedHttpUrl(value: string): boolean {
   } catch {
     return false;
   }
-  return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.hostname !== "";
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return false;
+  if (parsed.hostname === "") return false;
+  // Reject embedded credentials (userinfo).
+  if (parsed.username !== "" || parsed.password !== "") return false;
+  return true;
 }
 
 /**

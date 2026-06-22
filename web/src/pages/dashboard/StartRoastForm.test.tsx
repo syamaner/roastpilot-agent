@@ -183,12 +183,15 @@ describe("StartRoastForm", () => {
     expect((onStart.mock.calls[0][0] as RoastProfile).source_url).toBeNull();
   });
 
-  it("rejects a malformed product URL and does not start (#315)", () => {
+  it.each([
+    ["plain non-URL", "not-a-url"],
+    ["embedded userinfo (credential)", "https://user:pass@example.com/bean"],
+  ])("rejects a malformed product URL (%s) and does not start (#315/#347)", (_label, value) => {
     const onStart = vi.fn();
     render(<StartRoastForm onStart={onStart} />);
     fillMinimum();
     fireEvent.change(screen.getByTestId("start-roast-source_url"), {
-      target: { value: "not-a-url" },
+      target: { value },
     });
     fireEvent.submit(screen.getByTestId("start-roast-form"));
     expect(screen.getByTestId("start-roast-source_url-error")).toBeInTheDocument();
