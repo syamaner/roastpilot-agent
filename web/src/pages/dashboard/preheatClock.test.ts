@@ -69,7 +69,11 @@ describe("useFrozenElapsed", () => {
     // "--:--" instead of the last known clock reading.
     const { result, rerender } = renderHook(
       ({ s, p }: { s: number | null; p: RoastPhase | null }) => useFrozenElapsed(s, p),
-      { initialProps: { s: 95, p: "preheating" as RoastPhase | null } },
+      {
+        // Type the props explicitly so `s` is `number | null` — inferring from
+        // `{ s: 95 }` would narrow to `number` and reject the transient-null rerender.
+        initialProps: { s: 95, p: "preheating" } as { s: number | null; p: RoastPhase | null },
+      },
     );
     act(() => rerender({ s: null, p: "preheating" })); // transient null while still live
     act(() => rerender({ s: 200, p: "faulted" })); // terminal: must hold 95, not null/200
