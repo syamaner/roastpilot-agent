@@ -3642,6 +3642,69 @@ async def test_operator_stop_cooling_in_faulted_does_not_transition() -> None:
 
 
 @pytest.mark.asyncio
+async def test_operator_drop_beans_in_faulted_does_not_transition() -> None:
+    """#210: from faulted, DROP BEANS dumps the beans out of the hot drum and
+    issues the MCP write WITHOUT a phase transition — the run stays faulted (heat
+    off) until acknowledged. The operator must be able to safe the beans after an
+    e-stop/fault so they stop scorching, without re-enabling heat or auto-resuming
+    anything."""
+    harness = make_harness()
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    harness.events.events.clear()
+    targets_before = list(harness.executor.targets)
+    await harness.controller.operator_drop_beans()
+    # The drop was issued, and the run STAYS faulted (no cooling transition).
+    assert "drop_beans" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert RoastEventKind.RUN_COMPLETED not in harness.events.kinds()
+    # Heat stays off: the drop issued NO set_targets write at all (no re-enable).
+    assert harness.executor.targets == targets_before
+    # It went through the safety path (a command_phase_validity ALLOW was persisted).
+    assert any(
+        e.rule == "command_phase_validity" and e.verdict is SafetyVerdict.ALLOW
+        for e in harness.sink.evaluations
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_drop_beans_in_development_still_transitions_to_cooling() -> None:
+    """#210 regression: the NORMAL drop is unchanged — from development it issues
+    the drop AND transitions to cooling (only the faulted case is no-transition)."""
+    harness = make_harness()
+    _to(harness, 4)  # → DEVELOPMENT
+    await harness.controller.operator_drop_beans()
+    assert "drop_beans" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.COOLING
+
+
+@pytest.mark.asyncio
+async def test_operator_drop_beans_rejected_in_preheating() -> None:
+    """#210: DROP is still rejected where there are no beans (preheating) — the
+    faulted addition does not loosen the no-beans guard."""
+    harness = make_harness()
+    _to(harness, 2)  # → PREHEATING
+    await harness.controller.operator_drop_beans()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.PREHEATING
+    assert any(
+        e.rule == "command_phase_validity" and e.verdict is SafetyVerdict.REJECT
+        for e in harness.sink.evaluations
+    )
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_still_available_from_faulted_after_drop() -> None:
+    """#210: e-stop stays available from faulted even after a drop — the safe-ing
+    additions never reduce the always-available e-stop (the E3-S4 invariant)."""
+    harness = make_harness()
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    await harness.controller.operator_drop_beans()
+    harness.events.events.clear()
+    await harness.controller.operator_emergency_stop(reason="manual after drop")
+    assert harness.executor.estop_reasons  # e-stop executed from faulted
+
+
+@pytest.mark.asyncio
 async def test_recover_into_faulted_re_enters_faulted_heat_off_no_write() -> None:
     """#206: a restart finding a persisted FAULTED run re-enters the operable-
     faulted state — no MCP write, heat/fan not auto-resumed — distinct from the

@@ -87,9 +87,15 @@ COMMAND_PHASE_MATRIX: dict[RoastCommand, frozenset[RoastPhase]] = {
     # Operator FC override only makes sense before development begins.
     RoastCommand.MARK_FIRST_CRACK: frozenset({RoastPhase.ROASTING_PRE_FIRST_CRACK}),
     # Drop with beans in the drum: the normal development drop, or an early
-    # operator abort during roasting. Never while preheating (no beans yet).
+    # operator abort during roasting. Never while preheating (no beans yet). Also
+    # valid in `faulted` (#210): an e-stop/fault leaves the drum hot (heat off but
+    # still hot), and the operator must be able to dump the beans so they stop
+    # scorching — a safe-ing action, not a resume. Like the #206 cooling
+    # additions, DROP from faulted issues the command WITHOUT a phase transition
+    # (the run stays faulted until acknowledged); `set_heat` is deliberately NOT
+    # extended to faulted, so heat stays off throughout.
     RoastCommand.DROP_BEANS: frozenset(
-        {RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT}
+        {RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT, RoastPhase.FAULTED}
     ),
     # start_cooling is recovery-only (plan §6) plus the controller's
     # post-drop fallback when cooling_on is not observed (plan §3). Also valid
