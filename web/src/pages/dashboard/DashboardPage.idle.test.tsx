@@ -35,6 +35,26 @@ const healthState = {
   isSuccess: false,
 };
 
+// The run snapshot (`useRoast`) — mutable so the #329 hydrate-onto-faulted case can
+// supply a faulted `agent_phase` + `fault_reason` + `enabled_actions` (the restore /
+// reload path that has NO live `fault` SSE frame).
+const roastState: { data: unknown } = { data: undefined };
+
+// A minimal RoastProfile for the snapshot fixtures — the page reads the charge band
+// off `detail.data.profile`, so the snapshot must carry a profile to render.
+const SNAPSHOT_PROFILE = {
+  name: "Test",
+  bean_origin: "Test",
+  bean_varietal: null,
+  bean_weight_grams: 250,
+  charge_guidance_min_c: 170,
+  charge_guidance_max_c: 200,
+  initial_heat_percent: 80,
+  initial_fan_percent: 30,
+  target_drop_temp_c: 195,
+  target_development_percent: 20,
+};
+
 // Stub the bean-profile library hooks too (#303): un-stubbed they pass through to
 // the real impl and fire a real (failing) fetch in jsdom that only "passes" by
 // timing luck. The list returns the fixtures so the idle Start form's dropdown is
@@ -48,7 +68,7 @@ vi.mock("@/hooks/queries", async () => {
   return {
     ...actual,
     useHealth: () => healthState,
-    useRoast: () => ({ data: undefined }),
+    useRoast: () => roastState,
     useBeanProfiles: () => ({ data: { profiles: FIXTURE_BEAN_PROFILES }, isLoading: false }),
     useCreateBeanProfile: noopMutation,
     useUpdateBeanProfile: noopMutation,
@@ -78,20 +98,27 @@ vi.mock("@/hooks/useRoastStream", () => ({
 
 // The view-model folds frames; for this wiring test an empty view is enough.
 // `fault` is mutable so the #124 sticky-faulted-pin behavior can be exercised.
+// `snapshotFault` is the REAL helper (the page uses it for the #329 restore/reload
+// banner) — only `useDashboardEvents` is stubbed; the pure synthesizer is genuine.
 const viewState: { fault: unknown } = { fault: null };
-vi.mock("./useDashboardEvents", () => ({
-  useDashboardEvents: () => ({
-    points: [],
-    markers: [],
-    fault: viewState.fault,
-    firstCrack: null,
-    recovery: null,
-    latestAdvisory: null,
-    advisoryHistory: [],
-    advisoryPaused: false,
-    safetyTrail: [],
-  }),
-}));
+vi.mock("./useDashboardEvents", async () => {
+  const actual =
+    await vi.importActual<typeof import("./useDashboardEvents")>("./useDashboardEvents");
+  return {
+    ...actual,
+    useDashboardEvents: () => ({
+      points: [],
+      markers: [],
+      fault: viewState.fault,
+      firstCrack: null,
+      recovery: null,
+      latestAdvisory: null,
+      advisoryHistory: [],
+      advisoryPaused: false,
+      safetyTrail: [],
+    }),
+  };
+});
 
 function renderPage() {
   const client = new QueryClient();
@@ -108,8 +135,10 @@ afterEach(cleanup);
 beforeEach(() => {
   healthState.data = undefined;
   healthState.isSuccess = false;
+  roastState.data = undefined;
   viewState.fault = null;
   streamState.enabledActions = null;
+  streamState.phase = null;
   operatorActionMock.mockClear();
 });
 
@@ -213,5 +242,79 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
     renderPage();
     expect(screen.getByTestId("fault-banner")).toBeInTheDocument();
     expect(screen.queryByTestId("fault-acknowledge")).toBeNull();
+  });
+});
+
+describe("DashboardPage restored/reloaded fault (#329)", () => {
+  it("renders the FaultBanner + ACKNOWLEDGE from the hydrated snapshot, with NO live fault frame", () => {
+    // The boot-onto-faulted / reload-while-faulted case: SSE never replays the
+    // one-shot `fault` frame, so `view.fault` is null — but the snapshot hydrates
+    // the faulted phase + reason + enabled_actions. The banner (and the ACKNOWLEDGE
+    // affordance it hosts) must render from that server snapshot, not be stranded.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
+    viewState.fault = null; // NO live fault frame (the bug condition)
+    streamState.phase = "faulted"; // hydrated from the snapshot's agent_phase
+    streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
+    roastState.data = {
+      id: "run-fault",
+      agent_phase: "faulted",
+      fault_reason: "env ceiling exceeded",
+      enabled_actions: ["acknowledge_fault", "emergency_stop"],
+      profile: SNAPSHOT_PROFILE,
+    };
+    renderPage();
+    const banner = screen.getByTestId("fault-banner");
+    expect(banner).toBeInTheDocument();
+    // The reason comes from the snapshot's fault_reason (server-provided).
+    expect(screen.getByTestId("fault-reason")).toHaveTextContent("env ceiling exceeded");
+    // The operator is NOT stranded — the acknowledge affordance renders.
+    expect(screen.getByTestId("fault-acknowledge")).toBeInTheDocument();
+  });
+
+  it("acknowledges a snapshot-restored fault (no live frame) via the real acknowledge_fault action", async () => {
+    // The whole point of #329: the restored-fault ACKNOWLEDGE must dispatch the same
+    // genuine control action as the live path, clearing the run.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
+    viewState.fault = null;
+    streamState.phase = "faulted";
+    streamState.enabledActions = ["acknowledge_fault", "emergency_stop"];
+    roastState.data = {
+      id: "run-fault",
+      agent_phase: "faulted",
+      fault_reason: "env ceiling exceeded",
+      enabled_actions: ["acknowledge_fault", "emergency_stop"],
+      profile: SNAPSHOT_PROFILE,
+    };
+    renderPage();
+    healthState.data = { active_run_id: null }; // server finalises on ack
+    fireEvent.click(screen.getByTestId("fault-acknowledge"));
+    await waitFor(() =>
+      expect(operatorActionMock).toHaveBeenCalledWith("run-fault", {
+        action: "acknowledge_fault",
+      }),
+    );
+    expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
+  });
+
+  it("shows NO fault banner on a non-faulted hydrate (snapshot fallback is faulted-only)", () => {
+    // A normal active run hydrates a non-faulted phase → the snapshot fallback must
+    // NOT synthesize a fault (no false banner). Render-from-server: phase gates it.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-ok", mcp_child: "running" };
+    viewState.fault = null;
+    streamState.phase = "development";
+    streamState.enabledActions = ["drop_beans", "emergency_stop"];
+    roastState.data = {
+      id: "run-ok",
+      agent_phase: "development",
+      fault_reason: null,
+      enabled_actions: ["drop_beans", "emergency_stop"],
+      profile: SNAPSHOT_PROFILE,
+    };
+    renderPage();
+    expect(screen.getByTestId("dashboard")).toBeInTheDocument();
+    expect(screen.queryByTestId("fault-banner")).toBeNull();
   });
 });
