@@ -105,6 +105,65 @@
 
 ## Active Context
 
+**22 Jun 2026 — POST-ROAST-3 BACKLOG CLEARED (15 PRs merged; agent-team session). The
+P0 deterministic trim, the full control+safety serial, the chart sub-track, and the
+independent FE are all DONE. Roast 4 (supervised validation of the trim + c3) is the
+next operator gate.** A large autonomous agent-team session cleared the operator's
+pre-triaged post-roast-3 backlog. State recorded:
+
+- **P0 deterministic anticipatory heat trim SHIPPED + ENABLED (#336/#327).** Late-Maillard
+  → FC trim, **65 % / 60 s / 155 °C** defaults (operator-approved), hysteresis latch, fails
+  closed to the flat deterministic floor; a NaN-latch bug was caught pre-merge.
+  **safety-reviewer PASS ×4.** Shipped **enabled** for roast-4 supervised validation — this
+  is the fix for the roast-3 overshoot (D46). #327 is now CLOSED.
+- **Control + safety serial — DONE:** #343/#210 (DROP BEANS allowed from faulted — dump beans
+  off a hot drum), #348/#332 (acknowledge_fault latency — FAULT-latched wedged-child re-read
+  no longer starves the action queue), #350/#331 (auto-finalize a stale prior-session faulted
+  run on restart, no longer strands boot; safety-reviewer endorsed #331 auto-finalize-over-surface),
+  #349/#328 (**c3 control prompt** — fan as an active post-FC brake; **c3 is now the live
+  default for roast 4**, advisory-only).
+- **Chart sub-track — DONE:** #334/#326 (chart x-axis + cursor = charge-referenced ROAST TIME,
+  preheat negative), #341/#307 (live-chart UX: temp auto-range + hysteresis so no clip/collapse,
+  RoR fixed, heat/fan as a subordinate overlay, charge-band in frame), #352/#309 (chart event
+  markers — charge/T0, FC, drop, cooling; all server-sourced), #353/#325 (advisory-history rows
+  show roast-time + bean-temp).
+- **Independent FE — DONE:** #335/#324 (home/menu landing hub + persistent nav + state-aware `/`),
+  #347/#315 (bean-profile product/source URL + hardened validation), #345/#330 (preheat clock
+  freezes on a terminal/fault phase), #354/#329 (restored/reloaded fault renders ACKNOWLEDGE from
+  the hydrated snapshot).
+- **e2e reliability — DONE:** #340/#338 (lossless e2e settle barrier + idempotent replay stepping —
+  the flaky-gate fix that unblocked the merge pipeline).
+
+**Operator decisions captured this session:** trim defaults 65 %/60 s/155 °C shipped ENABLED for
+roast-4 supervised validation (operator-approved); **c3 prompt is the live default** (operator
+flagged); **centred Savitzky-Golay chosen for chart smoothing** (#344 — approved, not yet built);
+#331 auto-finalize-over-surface (safety-reviewer endorsed). Two operator-facing semantics notes,
+both safety-PASS'd: (a) **#348** — acknowledging a fault while the bean is still above the hard
+ceiling FINALISES that tick rather than auto-e-stopping (heat is already off; e-stop stays
+reachable); (b) **#350/#329** — a hot fault surviving a restart no longer auto-offers in-app
+cooling for that run (a future "cool from idle / history" button is the enhancement). **Plan-repo
+D-numbers still want the operator's plan commit:** the #327 trim (plan §3 / §8.4) and the c3 default.
+
+**Follow-ups filed this session (open, NOT in the original backlog):**
+- **#344** — chart smoothing (centred Savitzky-Golay; approved, build pending).
+- **#346** — server-side `_roast_elapsed_seconds` freeze on terminal phases (makes the #330 client
+  hold redundant).
+- **#351** — server DRYING_END signal → then the chart dry-end marker (deferred from #309).
+- **#337** — the agent must HONOR MCP's backdated T0/FC timestamp (gated on the MCP release;
+  auggie-verified the agent currently uses `self._clock()`, not the MCP timestamp).
+- Unfiled control idea: the deterministic floor should step fan up toward ~50 at FC.
+
+**Operator-gated / untouched (leave as-is):** coffee-roaster-mcp **#169/#170** (T0/FC backdating —
+CI-green + review-clean, awaiting the operator's gated merge + v0.1.7 release); **#323** (drop-ceiling
+override — the guard-vs-ceiling conflict from roast 3); **#318** (pre-FC manual heat/fan silently
+reverts — read-out vs operator-override decision); **#134/#135** (supervised hardware roast + device
+SSE); **#228** (pre-FC anticipatory LLM advisory layer — deferred LAST, D50).
+
+**Next gate:** roast 4 — supervised validation of the deterministic trim (#336, enabled) + the c3
+prompt (live default), targeting a clean ≤195 °C drop. Then the operator's call on marking #134 Done.
+
+---
+
 **21 Jun 2026 — FIRST CLEAN END-TO-END HARDWARE ROAST (roast 3). #134 substantively
 cleared on the harness; the deterministic control floor is hardware-validated; the
 anticipatory trim is now the P1 control priority.** Roast 3 (Ethiopia Yirgacheffe Koke
@@ -188,15 +247,22 @@ D35 build. Honest state:
   (DONE; c2 cut heat correctly at FC) → **#224/#277** replay harness + corpus + LLM eval
   (#277 ran, model PINNED gpt-4o + c1, D43; #224 consolidation open). **The roast-3 overshoot
   was a pre-FC floor problem, not a post-FC loop problem.**
-- **P1 (the control priority): #327 deterministic anticipatory heat trim** (late Maillard →
-  FC; D46) — fixes the roast-3 overshoot; deterministic, ahead of #228.
+- **P0 control priority: #327 deterministic anticipatory heat trim — DONE (22 Jun, #336,
+  enabled, safety-reviewer PASS ×4).** Fixes the roast-3 overshoot; awaiting roast-4
+  validation. See the 22 Jun block at the top for the full session.
 - **D36/D50 (post-trim, LAST):** #228 pre-FC anticipatory LLM advisory layer (refines the
   #327 trim, fails closed to it); #229 curve-feature spike (DONE).
 - **Advisor behavior:** #218 (fan/heat over-adjust — the attempt-3 evidence for D35).
-- **Safety-operability follow-ups:** #210 (DROP unavailable after e-stop), #212 (Ctrl+C
-  hangs on a live roast), #177 (wedged-MCP-child shutdown timeout), #176 (cooling on
-  graceful shutdown). #159 (auto-merge-vs-review governance race; interim: don't `--auto`
-  substantive PRs).
+  Post-FC fan-as-brake addressed by the c3 prompt (#328/#349, DONE 22 Jun).
+- **Safety-operability follow-ups:** #210 (DROP from faulted — **DONE 22 Jun, #343**),
+  #212 (Ctrl+C hangs on a live roast), #177 (wedged-MCP-child shutdown timeout), #176
+  (cooling on graceful shutdown). #159 (auto-merge-vs-review governance race; interim:
+  don't `--auto` substantive PRs).
+- **22 Jun follow-ups (open):** #344 (Savitzky-Golay chart smoothing, approved), #346
+  (server-side roast-elapsed freeze), #351 (server DRYING_END + chart marker), #337
+  (agent honors MCP backdated T0/FC timestamp, gated on the MCP release).
+- **Operator-gated:** #323 (drop-ceiling override), #318 (pre-FC manual revert), mcp
+  #169/#170 (T0/FC backdating, awaiting operator merge + v0.1.7).
 - **E11 (packaging, BLOCKED — D28 + D27):** #136/#137/#138, gated on #134 (supervised
   hardware roast) + the torch-free chain.
 - **E12 (validation/demo):** #139/#140/#141, #134.
