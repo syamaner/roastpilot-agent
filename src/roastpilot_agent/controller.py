@@ -642,6 +642,13 @@ class RoastController:
         self._guidance_emitted = False
         self._operator_state_entered: float | None = None
         self._operator_timeout_alerted = False
+        # #332: set once the operator has acknowledged the fault (the runner's
+        # teardown signal, mirrored here). While set, the latched-fault tick skips
+        # the upward-escalation re-read — the run is finalising this tick, heat is
+        # already off, and a wedged-child read there would only delay the
+        # acknowledge from clearing (the roast-3 "slow to clear" latency). Cleared
+        # on a new run/preheat. Never re-enables heat or weakens the heat-off retry.
+        self._fault_acknowledged = False
         # E9: the telemetry the most recent tick consumed (for the runner's
         # post-tick snapshot — SSE telemetry frame + persisted row), and the
         # operator advisory pause latch (pause/resume_advisory, D19).
@@ -874,6 +881,10 @@ class RoastController:
             self._t0_streak = 0
             self._t0_confirmed = False
             self._guidance_emitted = False
+            # A new run/preheat clears the fault-acknowledged teardown flag (#332):
+            # a fresh roast has no acknowledged fault, so the escalation re-read is
+            # fully armed again.
+            self._fault_acknowledged = False
             # A new run/preheat resets the development clock; it is (re)armed
             # only on the first-crack transition below.
             self._first_crack_monotonic = None
@@ -1469,6 +1480,13 @@ class RoastController:
         """
         latched = self._latched_verdict
         if latched is None:  # pragma: no cover — only entered while latched
+            return
+        if self._fault_acknowledged:
+            # #332: the operator has acknowledged — the run finalises this tick and
+            # the loop stops. Heat is already off (the fault forced it, and the
+            # heat-off retry above still runs), so there is nothing left to escalate
+            # INTO. Skip the re-read so a wedged-child read can't sit between the
+            # acknowledge and the finalise (the roast-3 "slow to clear" latency).
             return
         if latched is SafetyVerdict.EMERGENCY_STOP:
             # Already at the top of the severity order — nothing can escalate it,
@@ -2159,6 +2177,21 @@ class RoastController:
         # without inspecting event history (review observation, E4-S4 PR).
         self._events.emit(RoastEventKind.RECOVERY_ACKNOWLEDGED, {"acknowledged": prior.value})
 
+    def note_fault_acknowledged(self) -> None:
+        """Record that the operator has acknowledged the current fault (#332).
+
+        The runner's ``_dispatch_acknowledge_fault`` calls this on the drain that
+        flips its own ``_fault_acknowledged`` flag, so the SAME tick's latched
+        ``tick()`` (which runs after the drain) skips the upward-escalation re-read
+        (:meth:`_maybe_escalate_while_latched`): the run is finalising this tick and
+        heat is already off, so a wedged-child read there would only delay the
+        acknowledge from clearing. Pure flag set — issues no hardware write and does
+        NOT transition (the runner finalises via ``_handle_completion``, the #206
+        operable-faulted design). Cleared on a new run/preheat. The heat-off retry
+        latch is untouched, so the fail-closed posture is unchanged.
+        """
+        self._fault_acknowledged = True
+
     async def operator_mark_first_crack(self) -> None:
         """Operator FC override: matrix- and source-validated, then relayed
         to MCP with the true OPERATOR source (E3-S5/D16)."""
@@ -2185,17 +2218,38 @@ class RoastController:
         self.transition_to(RoastPhase.DEVELOPMENT)
 
     async def operator_drop_beans(self) -> None:
-        """Operator drop: matrix-validated, executed, then cooling."""
+        """Operator drop: matrix-validated, executed, then cooling — EXCEPT from
+        ``faulted`` (#210).
+
+        From ``roasting_pre_first_crack`` / ``development`` this is the normal (or
+        early-abort) drop: it issues the drop and transitions to ``cooling``.
+        From ``faulted`` (#210) it is a SAFE-ING action — an e-stop/fault leaves the
+        drum hot (heat off but still hot), so the operator must be able to dump the
+        beans before they scorch. It issues the drop WITHOUT a phase transition
+        (mirroring the #206 ``operator_start_cooling`` / ``operator_stop_cooling``
+        faulted pattern): the run stays ``faulted`` until the operator acknowledges
+        it, heat stays off (``set_heat`` is never extended to faulted), and nothing
+        is auto-resumed (the restart-never-auto-resumes invariant is untouched —
+        this writes a single drop, not heat/fan). Whether ``drop_beans`` itself
+        engages cooling on the Hottop is the open §3 verification; either way DROP
+        adds no cooling here — START COOLING is a separate operator action already
+        available from faulted (#206).
+
+        Hardware is never written unless the resulting state is reachable: the
+        transition (when one applies) is guarded first, so a write-then-raise can't
+        diverge the FSM from the machine (E4-S4 safety rule)."""
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.DROP_BEANS, phase=self._phase
         )
         await self._snapshots.persist_evaluation(phase_validity)
         if phase_validity.verdict is not SafetyVerdict.ALLOW:
             return
-        # Never write hardware unless the resulting state is reachable —
-        # a write-then-raise would diverge the FSM from the machine
-        # (safety review blocker, E4-S4).
-        if not self.can_transition(RoastPhase.COOLING):
+        # Transition to cooling ONLY on the non-faulted drop. From `faulted` (#210
+        # safe-ing) the drop issues with no phase change — the run stays faulted
+        # until acknowledged. Guard the transition BEFORE writing hardware so a
+        # write-then-raise never diverges the FSM (E4-S4 blocker).
+        will_transition = self._phase is not RoastPhase.FAULTED
+        if will_transition and not self.can_transition(RoastPhase.COOLING):
             raise InvalidTransitionError(self._phase, RoastPhase.COOLING)
         try:
             await self._executor.drop_beans()
@@ -2205,7 +2259,8 @@ class RoastController:
         self._events.emit(
             RoastEventKind.COMMAND_EXECUTED, {"command": "drop_beans", "source": "operator"}
         )
-        self.transition_to(RoastPhase.COOLING)
+        if will_transition:
+            self.transition_to(RoastPhase.COOLING)
 
     async def operator_stop_cooling(self) -> None:
         """Operator stop-cooling: matrix-validated.

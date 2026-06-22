@@ -722,6 +722,11 @@ class RoastRunner:
         pre-check, mirroring :meth:`_dispatch_acknowledge`."""
         if self._controller.phase is RoastPhase.FAULTED:
             self._fault_acknowledged = True
+            # #332: tell the controller too, so THIS tick's latched tick() skips the
+            # upward-escalation re-read (a wedged-child read there would otherwise
+            # sit between this drain and the same-tick finalise, delaying the
+            # acknowledge from clearing — the roast-3 "slow to clear" latency).
+            self._controller.note_fault_acknowledged()
             await self._store.record_operator_action(
                 action=OperatorAction.ACKNOWLEDGE_FAULT.value,
                 result="accepted",
