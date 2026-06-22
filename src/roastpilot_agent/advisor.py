@@ -761,16 +761,17 @@ def instructions_for(prompt_version: str) -> str:
 
     Resolves both prompt namespaces: the ``v``-prefixed per-tick advisory lenses
     in :data:`_PROMPTS` and the ``c``-prefixed control teaching SYSTEM frames in
-    :data:`_CONTROL_TEACHING_PROMPTS` (``c1``, ``c2``). The live post-FC advisor
-    runs with ``prompt_version="c2"`` (the active default after the roast-2
-    development-stretch tuning; ``c1`` stays selectable for an A/B), so the control
-    teaching frame is the system ``instructions`` of the production agent; the
-    per-tick #275 context is the user message. The ``c``-namespace is checked first
-    so a control version can never be shadowed by a same-named user lens.
+    :data:`_CONTROL_TEACHING_PROMPTS` (``c1``, ``c2``, ``c3``). The live post-FC
+    advisor runs with ``prompt_version="c3"`` (the active default after the roast-3
+    fan-as-active-brake tuning; ``c1`` / ``c2`` stay selectable for an A/B), so the
+    control teaching frame is the system ``instructions`` of the production agent;
+    the per-tick #275 context is the user message. The ``c``-namespace is checked
+    first so a control version can never be shadowed by a same-named user lens.
 
     Args:
         prompt_version: The advisor prompt version — a ``c`` control teaching
-            frame (``c1`` / ``c2``) or a ``v`` per-tick lens (``v0``..``v8``).
+            frame (``c1`` / ``c2`` / ``c3``) or a ``v`` per-tick lens
+            (``v0``..``v8``).
 
     Returns:
         The instruction text for ``prompt_version``.
@@ -829,14 +830,16 @@ def instructions_for(prompt_version: str) -> str:
 # from first crack to the drop ceiling — development only 1:09, DTR 11.6 %, under
 # the 13 % target, dropped slightly DARK at 196. c1 is kept intact (prompts are
 # versioned, #274); c2 is the new live default.
-CONTROL_TEACHING_PROMPT_VERSION = "c2"
-"""The active control teaching system-prompt version (#274 / D39.1; ``c2``).
+CONTROL_TEACHING_PROMPT_VERSION = "c3"
+"""The active control teaching system-prompt version (#274 / #328; ``c3``).
 
 A ``c``-prefixed namespace, distinct from the ``v``-prefixed per-tick advisory
 prompt versions in :data:`_PROMPTS`: this is the stable, cached SYSTEM frame,
 those are the per-call user-instruction lenses. ``c2`` adds the post-FC
-development-stretch teaching (roast-2 evidence) on top of ``c1``; ``c1`` stays
-selectable for an A/B.
+development-stretch teaching (roast-2 evidence) on top of ``c1``; ``c3`` adds the
+post-FC fan-as-active-brake teaching (roast-3 evidence) on top of ``c2``. ``c1``
+and ``c2`` stay selectable for an A/B; prompt-efficacy of ``c3`` is validated on
+the next roast / bake-off (operator-gated).
 """
 
 _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
@@ -999,6 +1002,50 @@ _CONTROL_TEACHING_PROMPTS["c2"] = _CONTROL_TEACHING_PROMPTS["c1"].replace(
     "THE OBJECTIVE\n", _C2_DEVELOPMENT_STRETCH_SECTION + "THE OBJECTIVE\n", 1
 )
 
+# --- c3 (#328; roast-3 fan-as-active-post-FC-brake teaching) ------------------
+#
+# c3 is c2 PLUS one new section, spliced in just before THE OBJECTIVE so all of
+# c1+c2's grounding is preserved byte-for-byte (told == enforced; dev numbers from
+# context verbatim; #218/#274 lever stability; the c2 stretch-development teaching).
+# It answers roast 3 (Ethiopia Koke natural): post-FC the advisor cut heat 50->0
+# but HELD fan at 30-40 the whole way, so once heat hit 0 the bean coasted from
+# ~193 to 203 C (8 C past the 195 ceiling) with no brake left and env at 239 C.
+# The cause was the advisor's CHOICE, not a clamp (the box allowed fan > 40): c2
+# names HEAT as *the* post-FC lever and the lever-stability section frames fan as
+# coarse/hold-steady, so the model under-used fan. This section makes a deliberate
+# post-FC fan increase one of the few INTENTIONAL moves — explicitly the remaining
+# brake once heat is already 0 — WITHOUT licensing the 30<->40<->50 twiddle the
+# lever-stability section still forbids. It names NO numbers (the live fan box +
+# drop ceiling come from context, the #218 two-copies rule); the plan's "FC ->
+# heat 80 / fan 50" reference shape is taught as a direction, not a literal.
+_C3_FAN_BRAKE_SECTION = (
+    "POST-FIRST-CRACK: FAN IS AN ACTIVE BRAKE, NOT A FIXED SETTING\n"
+    "- After first crack the fan is a PRIMARY control lever alongside heat, not a "
+    "level you set once and leave. Raising airflow bends the rate of rise DOWN "
+    "(more convective, less stored drum heat reaching the beans), evacuates heat "
+    "from the drum so the environment temperature falls, and clears smoke. Plan "
+    "the post-first-crack approach as heat DOWN and fan UP together - a higher "
+    "airflow regime than the low pre-first-crack fan, stepped up deliberately "
+    "at/after the crack (the reference shape is heat eased back with fan opened to "
+    "a mid airflow), then held at that higher regime.\n"
+    "- CRITICAL once heat is already at 0: if you have cut heat to its floor and "
+    "the bean is STILL climbing toward the drop ceiling, FAN IS THE ONLY BRAKE "
+    "LEFT. Cutting heat again does nothing (it is already at the floor); the lever "
+    "that still bites is AIRFLOW. RAISE the fan (within the fan ceiling from the "
+    "context) to arrest the climb and pull the environment temperature down - do "
+    "NOT sit at the low pre-first-crack fan and watch the bean coast past the "
+    "ceiling. Holding fan low here is the failure to avoid.\n"
+    "- This is NOT a licence to twiddle: a post-first-crack fan increase is ONE "
+    "deliberate, intentional move (or a small number of them) to a higher regime - "
+    "exactly the kind of decisive regime change the lever-stability rule above "
+    "ALLOWS - then HOLD there. It is the 30<->40<->50 oscillation that is "
+    "forbidden, never a single committed step up to brake the roast.\n"
+    "\n"
+)
+_CONTROL_TEACHING_PROMPTS["c3"] = _CONTROL_TEACHING_PROMPTS["c2"].replace(
+    "THE OBJECTIVE\n", _C3_FAN_BRAKE_SECTION + "THE OBJECTIVE\n", 1
+)
+
 
 def control_teaching_prompt(version: str = CONTROL_TEACHING_PROMPT_VERSION) -> str:
     """Return the versioned control teaching system prompt (#274 / D39.1).
@@ -1009,9 +1056,9 @@ def control_teaching_prompt(version: str = CONTROL_TEACHING_PROMPT_VERSION) -> s
     from the per-tick advisory prompts (the ``v`` lenses) and from the live
     per-tick context (built by #275): it never changes tick to tick, so it
     caches. It is wired live: :func:`instructions_for` resolves the ``c``
-    versions, so a :class:`PydanticAIAdvisor` built with ``prompt_version="c2"``
-    (the shipped default — c1 plus the roast-2 development-stretch teaching; ``c1``
-    stays selectable for an A/B) sends this text as the agent's system
+    versions, so a :class:`PydanticAIAdvisor` built with ``prompt_version="c3"``
+    (the shipped default — c2 plus the roast-3 fan-as-active-brake teaching; ``c1``
+    and ``c2`` stay selectable for an A/B) sends this text as the agent's system
     ``instructions`` for the post-FC control loop.
 
     Args:

@@ -117,11 +117,12 @@ def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
     assert config.api_key_env == "OPENROUTER_API_KEY"
     # #277 post-FC control bake-off PIN (21 Jun): gpt-4o via OpenRouter — closest
     # to the operator's real heat moves (heat MAE ~7.5 pp) and the proven n8n
-    # baseline (model UNCHANGED by the c2 prompt tuning). Prompt c2 (#274 +
-    # roast-2 development-stretch tuning) — the control teaching SYSTEM frame
-    # wired live for the post-FC loop; c1 stays selectable.
+    # baseline (model UNCHANGED by the c2/c3 prompt tuning). Prompt c3 (#274 +
+    # roast-2 development-stretch + roast-3 fan-as-active-brake tuning) — the
+    # control teaching SYSTEM frame wired live for the post-FC loop; c1/c2 stay
+    # selectable.
     assert config.model_slug == "openai/gpt-4o"
-    assert config.prompt_version == "c2"
+    assert config.prompt_version == "c3"
     assert config.timeout_seconds == 10.0
     assert config.temperature == 0.0
     assert config.reasoning_effort is None  # provider default until measured
