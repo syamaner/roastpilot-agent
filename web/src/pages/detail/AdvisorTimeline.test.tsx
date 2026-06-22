@@ -8,6 +8,7 @@ function row(overrides: Partial<AdvisorRow> = {}): AdvisorRow {
   return {
     tick: 4,
     elapsedSeconds: 120,
+    beanTempC: 178,
     recordedAtUtc: "2026-06-07T09:14:00Z",
     provider: "openrouter",
     model: "anthropic/claude-opus-4.8",
@@ -43,6 +44,31 @@ describe("AdvisorTimeline", () => {
     expect(badge).toHaveTextContent("CLAMP");
     // Status chip reads OK.
     expect(within(tr).getByTestId("advisor-status")).toHaveTextContent("OK");
+  });
+
+  it("renders the consult's bean-temp alongside its time (#325)", () => {
+    render(
+      <AdvisorTimeline
+        rows={[row({ elapsedSeconds: 240, beanTempC: 178 })]}
+        selectedTick={null}
+        onSelect={() => {}}
+      />,
+    );
+    const tr = screen.getByTestId("advisor-row");
+    expect(within(tr).getByText("04:00")).toBeInTheDocument(); // 240 s
+    expect(within(tr).getByTestId("advisor-row-temp")).toHaveTextContent("178.0 °C");
+  });
+
+  it("shows a placeholder temp when the consult has no bean-temp join (#325)", () => {
+    render(
+      <AdvisorTimeline
+        rows={[row({ beanTempC: null })]}
+        selectedTick={null}
+        onSelect={() => {}}
+      />,
+    );
+    // formatTemp(null) → em dash; never a fabricated 0 °C.
+    expect(screen.getByTestId("advisor-row-temp")).not.toHaveTextContent("°C");
   });
 
   it("renders a failed consult's status and no fabricated recommendation/verdict", () => {

@@ -36,6 +36,9 @@ export interface AdvisorRow {
   tick: number;
   /** Seconds since T0 for this tick (from telemetry), or `null` if unknown. */
   elapsedSeconds: number | null;
+  /** Bean temperature (°C) at this tick, joined from telemetry by tick (#325) —
+   *  the roast-moment temp the advisor reasoned at; `null` when unknown. */
+  beanTempC: number | null;
   recordedAtUtc: string;
   provider: string;
   model: string;
@@ -79,6 +82,7 @@ export function toAdvisorRows(
 ): AdvisorRow[] {
   if (!timeline) return [];
   const elapsed = tickElapsedIndex(series);
+  const beanByTick = tickBeanTempIndex(series);
   const verdictByTick = lastByTick(timeline.safety_evaluations);
 
   return timeline.advisor_decisions.map((advisor) => {
@@ -87,6 +91,7 @@ export function toAdvisorRows(
     return {
       tick: advisor.tick,
       elapsedSeconds: elapsed.get(advisor.tick) ?? null,
+      beanTempC: beanByTick.get(advisor.tick) ?? null,
       recordedAtUtc: advisor.recorded_at_utc,
       provider: advisor.provider,
       model: advisor.model,
@@ -157,6 +162,16 @@ function tickElapsedIndex(series: TelemetrySeries | undefined): Map<number, numb
   if (!series) return index;
   for (const p of series.points) {
     if (p.elapsed_seconds !== null) index.set(p.tick, p.elapsed_seconds);
+  }
+  return index;
+}
+
+/** Build a tick → `bean_temp_c` lookup (#325); latest value wins on duplicate ticks. */
+function tickBeanTempIndex(series: TelemetrySeries | undefined): Map<number, number> {
+  const index = new Map<number, number>();
+  if (!series) return index;
+  for (const p of series.points) {
+    if (p.bean_temp_c !== null) index.set(p.tick, p.bean_temp_c);
   }
   return index;
 }

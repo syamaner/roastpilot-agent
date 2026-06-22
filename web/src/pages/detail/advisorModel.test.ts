@@ -30,6 +30,15 @@ describe("toAdvisorRows", () => {
     expect(clamp.rationale).toContain("RoR stalling");
     // Time is placed on the curve's seconds axis from telemetry (tick 8 → 240 s).
     expect(clamp.elapsedSeconds).toBe(240);
+    // Bean-temp (#325) is joined from the same telemetry tick (92 + 8*8.2 = 157.6 °C).
+    expect(clamp.beanTempC).toBeCloseTo(157.6, 5);
+  });
+
+  it("leaves beanTempC null when the tick has no telemetry join (#325)", () => {
+    // A consult whose tick isn't in the telemetry series (or no series) → null
+    // bean-temp, never a fabricated value (same rule as elapsedSeconds).
+    const rows = toAdvisorRows(FIXTURE_TIMELINE, EMPTY_SERIES);
+    expect(rows.every((r) => r.beanTempC === null)).toBe(true);
   });
 
   it("emits failure rows (no verdict, no recommendation) for failed consults", () => {

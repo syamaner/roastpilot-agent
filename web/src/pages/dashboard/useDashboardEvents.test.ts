@@ -200,6 +200,38 @@ describe("dashboardReducer", () => {
     expect(s.advisoryHistory).toHaveLength(1);
   });
 
+  it("stamps the advisory with the latest telemetry's serve-time + bean-temp (#325)", () => {
+    // The advisory SSE frame carries no clock/telemetry, so the record is stamped
+    // from the latest plotted telemetry point the reducer holds — server-derived.
+    let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 1010, charge_elapsed_seconds: 480, bean_temp_c: 203, env_temp_c: 215 }));
+    s = dashboardReducer(s, ev("advisory", ADVISORY_DECISION));
+    expect(s.latestAdvisory?.atServeSeconds).toBe(1010);
+    expect(s.latestAdvisory?.beanTempC).toBe(203);
+  });
+
+  it("each advisory captures the serve-time/bean-temp at ITS tick (distinguishable rows, #325)", () => {
+    // The #325 motivation: successive advisories at different roast-moments must
+    // carry different context. Stamp at each fold from the then-latest point.
+    let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 950, charge_elapsed_seconds: 420, bean_temp_c: 195, env_temp_c: 210 }));
+    s = dashboardReducer(s, ev("advisory", ADVISORY_DECISION));
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 1010, charge_elapsed_seconds: 480, bean_temp_c: 203, env_temp_c: 215 }));
+    s = dashboardReducer(s, ev("advisory", ADVISORY_DECISION));
+    // History is newest-first: the later advisory (1010/203) leads, the earlier
+    // (950/195) follows — distinct stamps, so the rows are no longer identical.
+    expect(s.advisoryHistory.map((r) => [r.atServeSeconds, r.beanTempC])).toEqual([
+      [1010, 203],
+      [950, 195],
+    ]);
+  });
+
+  it("stamps null time/temp for an advisory folded before any telemetry (#325)", () => {
+    // No plotted point yet → null stamps (never a fabricated 0). The panel renders
+    // the formatter placeholders for these.
+    const s = dashboardReducer(initialDashboardViewModel, ev("advisory", ADVISORY_DECISION));
+    expect(s.latestAdvisory?.atServeSeconds).toBeNull();
+    expect(s.latestAdvisory?.beanTempC).toBeNull();
+  });
+
   it("marks the synthesized replay CLAMP key frame", () => {
     const s = dashboardReducer(
       initialDashboardViewModel,

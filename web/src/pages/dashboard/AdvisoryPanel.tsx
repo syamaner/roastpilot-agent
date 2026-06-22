@@ -14,8 +14,9 @@
  */
 
 import { VerdictBadge } from "@/components/shared";
+import { formatRoastTime } from "@/components/shared/LiveCurve/chartData";
 import { cn } from "@/lib/cn";
-import { formatConfidence, formatPercent } from "./format";
+import { formatConfidence, formatPercent, formatTempC } from "./format";
 import type { AdvisoryRecord } from "./useDashboardEvents";
 
 export interface AdvisoryPanelProps {
@@ -23,6 +24,11 @@ export interface AdvisoryPanelProps {
   history: AdvisoryRecord[];
   /** Whether the advisor is currently paused (shown as a status note). */
   paused: boolean;
+  /** Serve-elapsed seconds at the T0/charge moment (#326), so each advisory row's
+   *  roast-time renders CHARGE-referenced (M:SS, preheat negative) — the SAME
+   *  display transform the chart x-axis uses. `null` before T0 → the row falls
+   *  back to serve-elapsed (formatRoastTime's null-origin behavior). */
+  originSeconds?: number | null;
   className?: string;
 }
 
@@ -30,6 +36,7 @@ export function AdvisoryPanel({
   latest,
   history,
   paused,
+  originSeconds = null,
   className,
 }: AdvisoryPanelProps): React.JSX.Element {
   return (
@@ -56,7 +63,7 @@ export function AdvisoryPanel({
           Awaiting first recommendation…
         </p>
       ) : (
-        <LatestRecommendation record={latest} />
+        <LatestRecommendation record={latest} originSeconds={originSeconds} />
       )}
 
       {history.length > 0 && (
@@ -71,8 +78,20 @@ export function AdvisoryPanel({
                 data-testid="advisory-history-row"
                 className="flex items-center justify-between gap-3 rounded border border-border/60 px-3 py-1.5 text-sm"
               >
-                <span className="truncate text-muted-foreground">
-                  {summarize(record)}
+                <span className="flex min-w-0 items-baseline gap-2">
+                  {/* Roast-moment context (#325): charge-referenced roast-time +
+                      bean-temp, so the rows are distinguishable. tabular figures
+                      keep the columns aligned as values tick. */}
+                  <span
+                    data-testid="advisory-history-context"
+                    className="numeric shrink-0 text-xs text-muted-foreground/80"
+                  >
+                    {formatRoastTime(record.atServeSeconds, originSeconds)} ·{" "}
+                    {formatTempC(record.beanTempC)}
+                  </span>
+                  <span className="truncate text-muted-foreground">
+                    {summarize(record)}
+                  </span>
                 </span>
                 {record.evaluation && <VerdictBadge verdict={record.evaluation.verdict} />}
               </li>
@@ -84,14 +103,30 @@ export function AdvisoryPanel({
   );
 }
 
-function LatestRecommendation({ record }: { record: AdvisoryRecord }): React.JSX.Element {
+function LatestRecommendation({
+  record,
+  originSeconds,
+}: {
+  record: AdvisoryRecord;
+  originSeconds: number | null;
+}): React.JSX.Element {
   const { decision, evaluation } = record;
   return (
     <div className="flex flex-col gap-3" data-testid="advisory-latest">
       <div className="flex items-start justify-between gap-3">
         <div className="flex flex-col gap-1">
-          <span className="text-xs uppercase tracking-wide text-muted-foreground">
-            Latest Recommendation
+          <span className="flex items-baseline gap-2">
+            <span className="text-xs uppercase tracking-wide text-muted-foreground">
+              Latest Recommendation
+            </span>
+            {/* Roast-moment context (#325) — charge-referenced roast-time + bean-temp. */}
+            <span
+              data-testid="advisory-latest-context"
+              className="numeric text-xs text-muted-foreground/80"
+            >
+              {formatRoastTime(record.atServeSeconds, originSeconds)} ·{" "}
+              {formatTempC(record.beanTempC)}
+            </span>
           </span>
           <p className="text-sm leading-snug">
             {decision?.rationale ?? evaluation?.reason ?? "—"}
