@@ -68,7 +68,7 @@ describe("AdvisorTimeline", () => {
       />,
     );
     // formatTemp(null) → em dash; never a fabricated 0 °C.
-    expect(screen.getByTestId("advisor-row-temp")).not.toHaveTextContent("°C");
+    expect(screen.getByTestId("advisor-row-temp")).toHaveTextContent("—");
   });
 
   it("renders a failed consult's status and no fabricated recommendation/verdict", () => {

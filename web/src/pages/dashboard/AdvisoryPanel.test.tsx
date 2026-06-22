@@ -64,6 +64,16 @@ describe("AdvisoryPanel", () => {
     expect(screen.getAllByTestId("advisory-history-row")).toHaveLength(3);
   });
 
+  it("renders charge-referenced roast-time + bean-temp on the latest card (#325)", () => {
+    // The LatestRecommendation sub-component renders advisory-latest-context with the
+    // same formatRoastTime / formatTempC calls — serve 1010 − origin 530 = 480 s = 8:00.
+    const rec = record("allow", 0, 1010, 203);
+    render(<AdvisoryPanel latest={rec} history={[rec]} paused={false} originSeconds={530} />);
+    const ctx = screen.getByTestId("advisory-latest-context");
+    expect(ctx).toHaveTextContent("8:00");
+    expect(ctx).toHaveTextContent("203.0 °C");
+  });
+
   it("renders charge-referenced roast-time + bean-temp per history row (#325)", () => {
     // Each row stamps its serve-elapsed + bean-temp; with the charge origin
     // (originSeconds) the time renders CHARGE-referenced (same M:SS as the chart):
