@@ -24,7 +24,7 @@ import {
   isFailureStatus,
   type AdvisorRow,
 } from "./advisorModel";
-import { formatClock, formatConfidence, formatPercent } from "./format";
+import { formatClock, formatConfidence, formatPercent, formatTemp } from "./format";
 
 const STATUS_TONE_CLASS: Record<"ok" | "fail", string> = {
   ok: "border-roast-nominal/40 bg-roast-nominal/15 text-roast-nominal",
@@ -75,7 +75,7 @@ export function AdvisorTimeline({
       <table className="w-full border-collapse text-sm">
         <thead>
           <tr className="border-b border-border text-left text-xs uppercase tracking-wide text-muted-foreground">
-            <th scope="col" className="px-3 py-2 font-medium">Time</th>
+            <th scope="col" className="px-3 py-2 font-medium">Time · Temp</th>
             <th scope="col" className="px-3 py-2 font-medium">Advisor</th>
             <th scope="col" className="px-3 py-2 font-medium">Status</th>
             <th scope="col" className="px-3 py-2 font-medium">Recommended</th>
@@ -126,7 +126,12 @@ function AdvisorTimelineRow({
       )}
     >
       <td className="numeric whitespace-nowrap px-3 py-2 align-top text-muted-foreground">
-        {formatClock(row.elapsedSeconds)}
+        <div>{formatClock(row.elapsedSeconds)}</div>
+        {/* Bean-temp at this consult (#325) — the roast-moment temp the advisor
+            reasoned at, mirroring the dashboard panel's time · temp context. */}
+        <div data-testid="advisor-row-temp" className="text-xs text-muted-foreground/80">
+          {formatTemp(row.beanTempC)}
+        </div>
       </td>
       <td className="px-3 py-2 align-top">
         <div className="whitespace-nowrap text-xs">{row.model}</div>

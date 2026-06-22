@@ -383,6 +383,7 @@ export function DashboardPage(): React.JSX.Element {
           latest={view.latestAdvisory}
           history={view.advisoryHistory}
           paused={view.advisoryPaused}
+          originSeconds={view.t0ElapsedSeconds}
         />
       </div>
 

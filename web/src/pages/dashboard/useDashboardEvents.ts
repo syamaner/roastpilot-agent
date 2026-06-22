@@ -39,6 +39,18 @@ export interface AdvisoryRecord {
   evaluation: SafetyEvaluationData | undefined;
   /** True for the synthesized replay CLAMP key frame (never live-evaluated). */
   synthesized: boolean;
+  /** SERVE-elapsed seconds at the advisory's tick (#325), stamped from the latest
+   *  plotted telemetry point when the advisory is folded — null before any
+   *  telemetry has arrived. Stored serve-keyed (NOT pre-formatted) so the row's
+   *  CHARGE-referenced ROAST TIME is the same display transform the chart uses
+   *  (`formatRoastTime(atServeSeconds, t0ElapsedSeconds)`), correct even if the T0
+   *  origin is recovered AFTER this advisory was folded. The advisory SSE frame
+   *  carries no clock, so this is reducer-stamped from the server telemetry the
+   *  reducer already holds — server-derived, never inferred. */
+  atServeSeconds: number | null;
+  /** Bean temperature (°C) at the advisory's tick (#325), stamped from the latest
+   *  plotted telemetry point — null before any telemetry, or a null bean reading. */
+  beanTempC: number | null;
 }
 
 /** One row in the safety event trail (FaultBanner). */
@@ -319,11 +331,25 @@ export function dashboardReducer(
       if (data.decision === undefined && data.evaluation === undefined) {
         return state;
       }
+      // Stamp the advisory with the roast-moment context (#325) so the history
+      // rows are distinguishable (roast-time + bean-temp, not four identical
+      // lines). The advisory SSE frame carries NO clock/telemetry, so we take the
+      // latest plotted telemetry point the reducer already holds — server-derived,
+      // never inferred. Serve-keyed `t` + bean are stored raw; the CHARGE-
+      // referenced ROAST TIME is the chart's display transform applied at render.
+      // NOTE the controller emits the advisory frame BEFORE this tick's telemetry
+      // frame (telemetry is the runner's post-tick snapshot), so the latest point
+      // here is the PRIOR tick's reading — a ≤1 s (one-tick) skew from the
+      // advisory's own moment, which is within the advisor's own reading window
+      // and acceptable for a display label. Null before any telemetry has landed.
+      const latestPoint = state.points.length > 0 ? state.points[state.points.length - 1] : null;
       const record: AdvisoryRecord = {
         seq: state.advisorySeq,
         decision: data.decision,
         evaluation: data.evaluation,
         synthesized: data.synthesized === true,
+        atServeSeconds: latestPoint?.t ?? null,
+        beanTempC: latestPoint?.bean ?? null,
       };
       return {
         ...state,
