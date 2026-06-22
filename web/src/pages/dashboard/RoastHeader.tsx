@@ -40,6 +40,7 @@ import {
 } from "./format";
 import type { FirstCrackData } from "./events";
 import { MicStatusIcon } from "./MicStatusIcon";
+import { useFrozenElapsed } from "./preheatClock";
 
 export interface RoastHeaderProps {
   phase: RoastPhase | null;
@@ -57,6 +58,12 @@ export interface RoastHeaderProps {
    * (and the diagnostics drawer) — the operator-facing ROAST TIME is the
    * charge-referenced clock above (#308). Kept distinct so preheat duration is
    * visible without inflating the roast clock.
+   *
+   * FROZEN on a terminal/faulted/e-stopped phase (#330): the server keeps emitting
+   * frames with an advancing run clock after the run latches terminal, so the
+   * header holds this read-out at its last LIVE value once the server phase is
+   * terminal — the client-side analogue of the server's drop-freeze (#239/#261).
+   * Driven by the server `phase`, never inferred. See `useFrozenElapsed`.
    */
   elapsedSeconds: number | null;
   /** Seconds since the first-crack event (the development timer); null pre-FC.
@@ -102,6 +109,14 @@ export function RoastHeader({
   micStatus,
 }: RoastHeaderProps): React.JSX.Element {
   const accent = phaseAccentVar(phase);
+  // #330: freeze the serve-referenced clock at its last LIVE value once the server
+  // reports a terminal/faulted/e-stopped phase. The controller keeps emitting
+  // frames with an advancing run clock after the run latches terminal, so without
+  // this hold the pre-charge "Preheat" read-out (and the diagnostics Elapsed row)
+  // would keep climbing on a stopped run. This mirrors the server's drop-freeze of
+  // the charge clock / development time (#239/#261); it is a presentation hold
+  // driven by the server phase, NOT phase inference.
+  const displayedElapsedSeconds = useFrozenElapsed(elapsedSeconds, phase);
   // #308: ROAST TIME is charge-referenced (0:00 = charge). Pre-charge the server
   // sends `charge_elapsed_seconds: null`; we render the big clock as "00:00" then,
   // and surface the serve-referenced preheat duration as a SEPARATE, clearly-
@@ -140,7 +155,11 @@ export function RoastHeader({
             read-out so the lead-in is visible without inflating the roast clock.
             Drops away the moment charge fires (charge_elapsed_seconds non-null). */}
         {!charged && (
-          <Metric label="Preheat" value={formatClock(elapsedSeconds)} testid="preheat-timer" />
+          <Metric
+            label="Preheat"
+            value={formatClock(displayedElapsedSeconds)}
+            testid="preheat-timer"
+          />
         )}
         {/* Live Rate of Rise — the signal roasters steer by, and the same signal
             the advisor reasons on (operator parity, #165). Bean °C/min, Celsius. */}
@@ -179,7 +198,7 @@ export function RoastHeader({
           phase={phase}
           mcpChild={mcpChild}
           firstCrack={firstCrack}
-          elapsedSeconds={elapsedSeconds}
+          elapsedSeconds={displayedElapsedSeconds}
         />
       </div>
     </header>

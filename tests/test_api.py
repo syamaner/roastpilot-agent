@@ -246,6 +246,34 @@ async def test_start_roast_carries_bean_identity_to_detail(client: AsyncClient) 
 
 
 @pytest.mark.asyncio
+async def test_start_roast_carries_source_url_to_detail(client: AsyncClient) -> None:
+    """#315: the bean's product/source URL flows through ``POST /api/roasts`` and
+    back out on the detail projection so the SPA can render it as a link."""
+    profile = _profile().model_dump()
+    profile["source_url"] = "https://redber.co.uk/products/ethiopia-yirgacheffe-koke"
+    created = await client.post("/api/roasts", json=profile)
+    assert created.status_code == 201
+    run_id = created.json()["id"]
+
+    detail = await client.get(f"/api/roasts/{run_id}")
+    assert detail.status_code == 200
+    assert (
+        detail.json()["profile"]["source_url"]
+        == "https://redber.co.uk/products/ethiopia-yirgacheffe-koke"
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_roast_rejects_malformed_source_url(client: AsyncClient) -> None:
+    """#315: a non-http(s) source_url is rejected at the API boundary (422), so a
+    broken link can never reach the corpus or the UI."""
+    profile = _profile().model_dump()
+    profile["source_url"] = "javascript:alert(1)"
+    created = await client.post("/api/roasts", json=profile)
+    assert created.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_history_summary_projects_bean_identity(
     client: AsyncClient, store: RoastStore
 ) -> None:
@@ -2101,6 +2129,57 @@ async def test_acknowledge_fault_is_audit_only_issues_no_mcp_write(store: RoastS
     assert await _tick(service, clock)  # finalises this tick
     # The command trace is UNCHANGED by the ack — no roaster write, no second e-stop.
     assert mcp.commands() == commands_before_ack
+    final = await store.read_run(run_id)
+    assert final is not None and final.outcome == "faulted"
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_clears_promptly_under_wedged_mcp(store: RoastStore) -> None:
+    """#332: ``acknowledge_fault`` must finalise the run on the SAME tick it is
+    drained, without blocking on a fresh escalation read, even when the MCP child
+    is wedged (slow/failed reads).
+
+    Repro of the roast-3 "slow to clear" report: a FAULT-latched run (not e-stop —
+    consecutive MCP read failures, so ``_latched_verdict`` is FAULT) re-reads the
+    child every latched tick in ``_maybe_escalate_while_latched`` looking for an
+    upward escalation. That re-read runs BETWEEN the drain and the completion check
+    in the same ``tick_once``, so on a wedged child it blocks ~``call_timeout_seconds``
+    and delays finalisation AFTER the operator has already acknowledged. The fix
+    (``note_fault_acknowledged``) skips the escalation re-read once the fault is
+    acknowledged — the run is being torn down and heat is already off, so there is
+    nothing to escalate into.
+
+    Hardware-free + deterministic: a read-counting fake whose reads RAISE (a
+    dead/failed child). The assertion is on the READ COUNT, not wall-clock — the
+    acknowledge tick must NOT issue a fresh escalation read."""
+    clock = FakeClock()
+    log: list[str] = []
+    # Every read raises → after max_consecutive_mcp_failures (3) the run FAULTs,
+    # latched at the FAULT verdict (the escalation-re-read case, not e-stop). The
+    # explicit log records every ``read`` so the assertion is on the read count.
+    mcp = FakeMCPClient([RuntimeError("wedged child")], log=log)
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    # Tick to the fault: 3 consecutive failing reads cross the threshold.
+    for _ in range(3):
+        await _tick(service, clock)
+    faulted = await store.read_run(run_id)
+    assert faulted is not None and faulted.agent_phase is RoastPhase.FAULTED
+    # A latched tick with NO operator action DOES re-read (the escalation probe) —
+    # confirm the mechanism is real, so the test pins the path the fix narrows.
+    reads_before = log.count("read")
+    await _tick(service, clock)
+    assert log.count("read") > reads_before, "latched tick should probe for escalation"
+    # Now acknowledge + tick: the ack tick must FINALISE and must NOT issue another
+    # escalation read (that read is the wedged-child latency the operator hit).
+    ack = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    assert ack.result == "accepted"
+    reads_at_ack = log.count("read")
+    assert await _tick(service, clock)  # finalises on the ack tick
+    assert log.count("read") == reads_at_ack, (
+        "acknowledge tick must not block on a fresh escalation read"
+    )
     final = await store.read_run(run_id)
     assert final is not None and final.outcome == "faulted"
 

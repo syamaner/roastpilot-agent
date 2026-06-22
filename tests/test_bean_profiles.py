@@ -257,6 +257,18 @@ async def test_seed_idempotent_does_not_clobber_an_edit(store: RoastStore) -> No
     assert kept is not None and kept.name == "My edited Koke"
 
 
+@pytest.mark.asyncio
+async def test_source_url_round_trips_through_store(store: RoastStore) -> None:
+    """#315: a bean profile's source_url survives a create → get round-trip
+    (it rides along in the persisted ``profile_json``, no separate column)."""
+    created = await store.create_bean_profile(
+        _input(source_url="https://example.com/beans/kenya-aa")
+    )
+    fetched = await store.get_bean_profile(created.id)
+    assert fetched is not None
+    assert fetched.source_url == "https://example.com/beans/kenya-aa"
+
+
 def test_ethiopia_seed_values() -> None:
     """#303: the locked seed values (design review, 21 Jun)."""
     s = ETHIOPIA_KOKE_SEED
@@ -269,6 +281,8 @@ def test_ethiopia_seed_values() -> None:
     assert s.is_blend is False
     assert s.processing == "natural"
     assert s.altitude_m == 1885
+    # #315: the Koke product page (provenance for the corpus).
+    assert s.source_url == "https://redber.co.uk/products/ethiopia-yirgacheffe-koke"
     assert s.charge_guidance_min_c == 170.0
     assert s.charge_guidance_max_c == 200.0
     assert s.initial_heat_percent == 100

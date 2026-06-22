@@ -317,6 +317,110 @@ def test_roast_profile_pre_291_json_back_compat() -> None:
     assert profile.altitude_m is None
 
 
+def test_roast_profile_source_url_defaults_to_none() -> None:
+    """#315 source_url defaults to unset so a minimal profile is valid unchanged."""
+    profile = RoastProfile.model_validate(_profile())
+    assert profile.source_url is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://redber.co.uk/products/ethiopia-yirgacheffe-koke",
+        "http://example.com/bean?lot=42",
+        "https://shop.example.com",
+    ],
+)
+def test_roast_profile_source_url_accepts_well_formed_http(url: str) -> None:
+    """#315 source_url round-trips a well-formed http(s) URL unchanged."""
+    profile = RoastProfile.model_validate(_profile(source_url=url))
+    assert profile.source_url == url
+
+
+def test_roast_profile_source_url_strips_whitespace() -> None:
+    """Surrounding whitespace is stripped from a valid source_url."""
+    profile = RoastProfile.model_validate(_profile(source_url="  https://example.com  "))
+    assert profile.source_url == "https://example.com"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None])
+def test_roast_profile_source_url_blank_normalizes_to_none(blank: str | None) -> None:
+    """A blank / whitespace-only / absent source_url normalizes to ``None`` (unset),
+    not a validation error — lenient operator metadata, like the other optionals."""
+    profile = RoastProfile.model_validate(_profile(source_url=blank))
+    assert profile.source_url is None
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "not-a-url",
+        "ftp://example.com/bean",
+        "javascript:alert(1)",
+        "example.com",
+        "https://",
+        # Embedded userinfo — a credential that must never persist / render (#347).
+        "https://user:pass@example.com/bean",
+        "https://user@example.com/bean",
+        # Malformed port — would yield a broken anchor (#347).
+        "https://example.com:abc/bean",
+        "https://example.com:99999/bean",
+    ],
+)
+def test_roast_profile_rejects_malformed_source_url(bad_url: str) -> None:
+    """#315/#347 source_url rejects a non-http(s) / hostless / unparseable value,
+    a URL carrying userinfo (credential leak), or a malformed port — so the UI
+    never renders a broken anchor and no credential reaches the corpus."""
+    with pytest.raises(pydantic.ValidationError):
+        RoastProfile.model_validate(_profile(source_url=bad_url))
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/path",
+        "https://example.com:8443/bean?lot=42",
+        "http://shop.example.com",
+    ],
+)
+def test_roast_profile_accepts_clean_source_url_with_valid_port(url: str) -> None:
+    """#347: a normal http(s) URL — including one with a valid explicit port —
+    round-trips unchanged once the userinfo / bad-port guards are in place."""
+    profile = RoastProfile.model_validate(_profile(source_url=url))
+    assert profile.source_url == url
+
+
+def test_roast_profile_pre_315_json_back_compat() -> None:
+    """A frozen #291-era ``profile_json`` (no #315 source_url) still deserializes —
+    completed runs are immutable, so this must never break."""
+    pre_315_json = json.dumps(
+        {
+            "name": "Ethiopia light",
+            "bean_origin": "Ethiopia",
+            "bean_varietal": "Heirloom",
+            "country": "Ethiopia",
+            "farm": "Gedeb — Worka Sakaro",
+            "description": "Washed; jasmine, bergamot.",
+            "bean_species": "arabica",
+            "is_blend": False,
+            "processing": "washed",
+            "altitude_m": 2100,
+            "bean_weight_grams": 250.0,
+            "charge_guidance_min_c": 170.0,
+            "charge_guidance_max_c": 200.0,
+            "initial_heat_percent": 70,
+            "initial_fan_percent": 40,
+            "target_drop_temp_c": 205.0,
+            "target_development_percent": 20.0,
+        }
+    )
+    profile = RoastProfile.model_validate_json(pre_315_json)
+    assert profile.country == "Ethiopia"
+    assert profile.processing == "washed"
+    # The #315 addition takes its back-compat default.
+    assert profile.source_url is None
+
+
 def test_roast_detail_enabled_actions_defaults_to_empty() -> None:
     """``enabled_actions`` (E10 option (a), D25) defaults to an empty list when a
     detail is built without it — the API always populates it from the phase, but
