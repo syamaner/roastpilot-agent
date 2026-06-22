@@ -749,6 +749,60 @@ async def test_complete_run_finalizes_fields(tmp_store: RoastStore) -> None:
 
 
 @pytest.mark.asyncio
+async def test_finalize_stale_faulted_run_terminal_and_preserves_reason(
+    tmp_store: RoastStore,
+) -> None:
+    """#331: ``finalize_stale_faulted_run`` flips an unfinalised faulted run terminal
+    (outcome ``faulted``, ``completed_at`` stamped) so it leaves the active set, and
+    PRESERVES the existing ``fault_reason`` (does not overwrite it with NULL like a
+    bare ``complete_run(fault_reason=None)`` would) for diagnosis. ``agent_phase``
+    stays ``faulted``."""
+    await seeded_store(tmp_store)
+    try:
+        # An unfinalised faulted run with a fault reason already on the row.
+        await tmp_store.connection.execute(
+            "UPDATE roast_runs SET agent_phase = 'faulted', fault_reason = ? WHERE id = 'run-1'",
+            ("env 242 C exceeds the hard ceiling 240 C",),
+        )
+        await tmp_store.connection.commit()
+
+        await tmp_store.finalize_stale_faulted_run("run-1")
+
+        row = await fetch_one(
+            tmp_store,
+            "SELECT outcome, agent_phase, completed_at_utc, fault_reason FROM roast_runs",
+        )
+        assert row[0] == "faulted"  # terminal outcome
+        assert row[1] == "faulted"  # phase unchanged
+        assert row[2] is not None  # completed_at stamped → no longer active
+        assert row[3] == "env 242 C exceeds the hard ceiling 240 C"  # reason PRESERVED
+        # No longer the active run.
+        assert await tmp_store.active_run() is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_finalize_stale_faulted_run_raises_on_already_finalized(
+    tmp_store: RoastStore,
+) -> None:
+    """#331: it targets only an unfinalised run (``completed_at IS NULL``); an
+    already-terminal run matches no row and raises rather than silently re-stamping
+    (and the immutability trigger would block touching a completed run anyway)."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        with pytest.raises(RuntimeError, match="no unfinalized roast_run"):
+            await tmp_store.finalize_stale_faulted_run("run-1")
+        with pytest.raises(RuntimeError, match="no unfinalized roast_run"):
+            await tmp_store.finalize_stale_faulted_run("does-not-exist")
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_completed_runs_are_immutable(tmp_store: RoastStore) -> None:
     """Plan §8: completed-run immutability — enforced by the v2 triggers,
     not by application discipline."""
