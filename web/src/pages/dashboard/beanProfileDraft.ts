@@ -38,6 +38,7 @@ export interface BeanProfileDraft {
   description: string;
   processing: string;
   altitude_m: string;
+  source_url: string;
   charge_guidance_min_c: string;
   charge_guidance_max_c: string;
   initial_heat_percent: string;
@@ -96,6 +97,7 @@ export const DEFAULT_BEAN_PROFILE_DRAFT: BeanProfileDraft = {
   description: "",
   processing: "",
   altitude_m: "",
+  source_url: "",
   charge_guidance_min_c: "170",
   charge_guidance_max_c: "200",
   initial_heat_percent: "70",
@@ -119,6 +121,7 @@ export function draftFromBeanProfile(profile: BeanProfileInput): BeanProfileDraf
     description: profile.description ?? "",
     processing: profile.processing ?? "",
     altitude_m: profile.altitude_m == null ? "" : String(profile.altitude_m),
+    source_url: profile.source_url ?? "",
     charge_guidance_min_c: String(profile.charge_guidance_min_c),
     charge_guidance_max_c: String(profile.charge_guidance_max_c),
     initial_heat_percent: String(profile.initial_heat_percent),
@@ -127,6 +130,22 @@ export function draftFromBeanProfile(profile: BeanProfileInput): BeanProfileDraf
     target_development_percent: String(profile.target_development_percent),
     default_bean_weight_grams: String(profile.default_bean_weight_grams),
   };
+}
+
+/**
+ * Whether a string parses as an absolute http(s) URL with a host (#315). Mirrors
+ * the server's `source_url` validator: a non-http(s) scheme (e.g. `javascript:`,
+ * `ftp:`), a missing host, or an unparseable value is rejected, so the UI never
+ * renders a broken anchor. Uses the platform `URL` parser (no extra dependency).
+ */
+function isWellFormedHttpUrl(value: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
+  return (parsed.protocol === "http:" || parsed.protocol === "https:") && parsed.hostname !== "";
 }
 
 /**
@@ -148,6 +167,20 @@ export function validateBeanProfile(
   const farmRaw = draft.farm.trim();
   const descriptionRaw = draft.description.trim();
   const species = draft.bean_species === "" ? null : (draft.bean_species as BeanSpecies);
+
+  // #315: optional product URL. Blank → null; otherwise it must parse as an
+  // absolute http(s) URL with a host (mirrors the server's `source_url` validator
+  // so a broken anchor never reaches the corpus or the UI). Defense-in-depth + UX
+  // — the server's pydantic validator remains the authority.
+  const sourceUrlRaw = draft.source_url.trim();
+  let sourceUrl: string | null = null;
+  if (sourceUrlRaw !== "") {
+    if (isWellFormedHttpUrl(sourceUrlRaw)) {
+      sourceUrl = sourceUrlRaw;
+    } else {
+      errors.source_url = "Must be a http(s):// URL.";
+    }
+  }
   const processing =
     draft.processing === "" ? null : (draft.processing as ProcessingMethod);
 
@@ -215,6 +248,7 @@ export function validateBeanProfile(
       description: descriptionRaw === "" ? null : descriptionRaw,
       processing,
       altitude_m: altitudeM,
+      source_url: sourceUrl,
       charge_guidance_min_c: minC,
       charge_guidance_max_c: maxC,
       initial_heat_percent: heat,

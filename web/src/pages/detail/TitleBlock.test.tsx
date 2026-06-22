@@ -49,6 +49,29 @@ describe("TitleBlock bean identity (#164)", () => {
     expect(screen.getByTestId("bean-tag-blend")).toHaveTextContent(/blend/i);
   });
 
+  it("renders the source URL as a new-tab link with the right href (#315)", () => {
+    render(
+      <TitleBlock
+        detail={detailWith({
+          source_url: "https://redber.co.uk/products/ethiopia-yirgacheffe-koke",
+        })}
+        stats={STATS}
+      />,
+    );
+    const link = screen.getByTestId("bean-source-url");
+    expect(link).toHaveAttribute(
+      "href",
+      "https://redber.co.uk/products/ethiopia-yirgacheffe-koke",
+    );
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAttribute("rel", "noopener noreferrer");
+  });
+
+  it("renders no source-URL link when absent (#315 back-compat, no broken anchor)", () => {
+    render(<TitleBlock detail={detailWith({ source_url: null })} stats={STATS} />);
+    expect(screen.queryByTestId("bean-source-url")).not.toBeInTheDocument();
+  });
+
   it("omits the identity rows for a pre-#164 profile (back-compat)", () => {
     render(
       <TitleBlock
