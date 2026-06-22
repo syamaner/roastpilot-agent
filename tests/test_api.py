@@ -1333,10 +1333,12 @@ async def test_submit_operator_action_410_on_terminal_run(store: RoastStore) -> 
 
 @pytest.mark.asyncio
 async def test_faulted_unacknowledged_run_does_not_410(store: RoastStore) -> None:
-    """#206: a FAULTED run with no ``completed_at`` (the post-#206 common case —
-    a fault no longer auto-finalises) is NOT terminal, so an operator action is
-    NOT 410'd: stop_cooling / start_cooling / emergency_stop / acknowledge_fault
-    are all accepted, so a fault never strands a physically-running machine."""
+    """#206 + #210: a FAULTED run with no ``completed_at`` (the post-#206 common
+    case — a fault no longer auto-finalises) is NOT terminal, so an operator action
+    is NOT 410'd: stop_cooling / start_cooling / DROP_BEANS (#210 — dump beans from
+    the hot drum) / emergency_stop / acknowledge_fault are all accepted end-to-end
+    (the matrix pre-check passes), so a fault never strands a physically-running
+    machine or scorching beans."""
     await store.create_run(
         run_id="run-faulted",
         profile=_profile(),
@@ -1347,6 +1349,7 @@ async def test_faulted_unacknowledged_run_does_not_410(store: RoastStore) -> Non
     for action in (
         OperatorAction.STOP_COOLING,
         OperatorAction.START_COOLING,
+        OperatorAction.DROP_BEANS,
         OperatorAction.EMERGENCY_STOP,
         OperatorAction.ACKNOWLEDGE_FAULT,
     ):

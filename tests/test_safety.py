@@ -628,6 +628,22 @@ def test_d16_canonical_invalid_combinations(policy: SafetyPolicy) -> None:
     assert stop_cooling_during_development.verdict is SafetyVerdict.REJECT
 
 
+def test_drop_beans_allowed_from_faulted(policy: SafetyPolicy) -> None:
+    """#210: DROP BEANS is ALLOWED from FAULTED — the operator must be able to
+    dump beans from a hot drum after an e-stop/fault so they stop scorching. The
+    matrix row gains FAULTED alongside the normal roasting/development drop; the
+    controller issues it without leaving faulted (heat stays off)."""
+    evaluation = policy.evaluate_command_phase(
+        command=RoastCommand.DROP_BEANS, phase=RoastPhase.FAULTED
+    )
+    assert evaluation.verdict is SafetyVerdict.ALLOW
+    # DROP is still rejected where there are no beans / no abort case (preheating).
+    preheating = policy.evaluate_command_phase(
+        command=RoastCommand.DROP_BEANS, phase=RoastPhase.PREHEATING
+    )
+    assert preheating.verdict is SafetyVerdict.REJECT
+
+
 # --- E10 option (a) / D25: enabled_actions derivation over the matrix ---
 
 
@@ -661,16 +677,18 @@ def test_enabled_actions_empty_of_writes_in_complete() -> None:
     }
 
 
-def test_enabled_actions_in_faulted_allow_cooling_and_acknowledge() -> None:
-    """FAULTED (#206): the operable-faulted state must surface the cooling
-    controls (start/stop), e-stop (always), and acknowledge_fault — so a fault
-    never strands a physically-running machine — plus the ungated advisory
-    toggles. SET_HEAT is NOT here (heat stays off); acknowledge_recovery is
-    excluded (not the recovery phase)."""
+def test_enabled_actions_in_faulted_allow_cooling_drop_and_acknowledge() -> None:
+    """FAULTED (#206 + #210): the operable-faulted state must surface the cooling
+    controls (start/stop), DROP BEANS (#210 — dump the beans out of a hot drum so
+    they stop scorching after an abort), e-stop (always), and acknowledge_fault —
+    so a fault never strands a physically-running machine or scorching beans —
+    plus the ungated advisory toggles. SET_HEAT is NOT here (heat stays off);
+    acknowledge_recovery is excluded (not the recovery phase)."""
     enabled = set(enabled_operator_actions(RoastPhase.FAULTED))
     assert enabled == {
         OperatorAction.START_COOLING,
         OperatorAction.STOP_COOLING,
+        OperatorAction.DROP_BEANS,
         OperatorAction.EMERGENCY_STOP,
         OperatorAction.ACKNOWLEDGE_FAULT,
         OperatorAction.PAUSE_ADVISORY,
