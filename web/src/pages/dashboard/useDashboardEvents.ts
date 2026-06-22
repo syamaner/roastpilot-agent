@@ -75,10 +75,12 @@ export interface DashboardViewModel {
    *  buffer stays serve-keyed (so preheat plots live). Null before T0 → the chart
    *  shows serve-elapsed. */
   t0ElapsedSeconds: number | null;
-  /** Event markers for the curve (T0 / first crack / drop), x in SERVE-elapsed
-   *  seconds (#326) — the same axis the points are keyed on. The T0 marker sits at
-   *  the serve-elapsed of the charge moment, so it lands at the charge tick on the
-   *  serve-referenced curve (and reads 0:00 once the origin transform applies). */
+  /** Event markers for the curve (T0 / first crack / drop / cooling), x in
+   *  SERVE-elapsed seconds (#326) — the same axis the points are keyed on. The T0
+   *  marker sits at the serve-elapsed of the charge moment, so it lands at the
+   *  charge tick on the serve-referenced curve (and reads 0:00 once the origin
+   *  transform applies). Cooling is placed from the server `phase_changed`→cooling
+   *  frame (#309) — the server's phase value, never inferred locally. */
   markers: CurveMarker[];
   /** Curve points, x = SERVE-elapsed seconds (#326), ascending and deduped on `t`.
    *  Seeded from the `/telemetry` snapshot on (re)connect (#153), then appended/
@@ -410,11 +412,30 @@ export function dashboardReducer(
         markers: withMarker(state.markers, { kind: "drop", t: at, label: "DROP" }),
       };
     }
+    case "phase_changed": {
+      // The COOLING marker (#309). Phase is the SERVER's truth — owned by the
+      // shared reducer; we do NOT set it here and never infer it. We only READ the
+      // server-emitted phase value to place a display marker at the cooling
+      // transition (every drop lands in COOLING — controller.py — and explicit
+      // recovery cooling also transitions to COOLING, so phase_changed→cooling is
+      // the one signal that covers both paths). The marker sits at the latest
+      // plotted point's serve-elapsed (the same axis as T0/FC/drop, #326; the
+      // roast-time re-label is a display transform in LiveCurve), and dedupes via
+      // withMarker. Any other phase transition places no marker.
+      const data = event.data as { phase?: string };
+      if (data.phase !== "cooling") return state;
+      const at = state.points.length > 0 ? state.points[state.points.length - 1].t : 0;
+      return {
+        ...state,
+        markers: withMarker(state.markers, { kind: "cooling", t: at, label: "COOLING" }),
+      };
+    }
     default:
       // run_started / command_failed / logs_exported / run_completed / heartbeat
-      // / phase_changed / charge_guidance — not folded here (phase is the shared
-      // reducer's; charge_guidance is now consumed via the derived ChargeBanner,
-      // #211; the rest aren't dashboard view-model state).
+      // / charge_guidance — not folded here (charge_guidance is now consumed via
+      // the derived ChargeBanner, #211; the rest aren't dashboard view-model
+      // state). NOTE phase_changed is now matched above for the COOLING marker
+      // ONLY — phase itself remains the shared reducer's truth (we never set it).
       return state;
   }
 }

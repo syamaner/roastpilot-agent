@@ -24,6 +24,7 @@ export const FIXTURE_KOKE: BeanProfile = {
   is_blend: false,
   processing: "natural",
   altitude_m: 1885,
+  source_url: "https://redber.co.uk/products/ethiopia-yirgacheffe-koke",
   charge_guidance_min_c: 170,
   charge_guidance_max_c: 200,
   initial_heat_percent: 100,

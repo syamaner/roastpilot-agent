@@ -4,16 +4,20 @@
  * append) and the detail page (full persisted curve). uPlot, not Recharts.
  *
  * Five series:
- *   - bean °C, env °C   → left temperature axis
- *   - RoR °C/min        → right axis
- *   - heat %, fan %      → a HIDDEN 0–100 % scale, drawn as step-after lines
- *                          (amber `--roast-heat` / teal `--roast-fan`), so control
- *                          changes correlate with the temperature response.
+ *   - bean °C, env °C   → left temperature axis (controlled-dynamic auto-range, #307)
+ *   - RoR °C/min        → right axis (FIXED band, comparable across roasts)
+ *   - heat %, fan %      → a dedicated, fixed 0–100 % axis (#307), drawn as
+ *                          SUBORDINATE step-after lines (thin / dashed / muted, amber
+ *                          `--roast-heat` / teal `--roast-fan`) BEHIND the temperature
+ *                          and RoR curves, so the operator reads the control HISTORY
+ *                          (when heat was cut, fan moved) without it competing with the
+ *                          measurement curves.
  *
  * The legend doubles as a live cursor readout (value at the hovered time) AND a
  * click-to-toggle control (hide/show a series). Vertical markers label T0 /
- * first crack / drop; a shaded charge band shows in `preheating` only; a
- * controlled `highlightTime` draws the trace-row → curve highlight.
+ * first crack / drop / cooling (a light per-kind colour keeps clustered markers
+ * legible, #309); a shaded charge band shows in `preheating` only; a controlled
+ * `highlightTime` draws the trace-row → curve highlight.
  *
  * Tests assert the chart's DATA via `window.__chart` + `data-chart-*`, never the
  * canvas pixels (D24).
@@ -25,13 +29,35 @@ import "uplot/dist/uPlot.min.css";
 
 import { cn } from "@/lib/cn";
 import { formatRoastTime, formatSeriesValue, toColumns } from "./chartData";
-import { makeAutoRange } from "./scales";
+import { type AutoRangeState, makeAutoRange } from "./scales";
 import {
+  type ChartColumns,
   type ChartTestHook,
   type CurveMarker,
+  type CurveMarkerKind,
   type LiveCurveProps,
   type SeriesKey,
 } from "./types";
+
+/**
+ * Per-kind marker RGB (#309). A LIGHT, subordinate tint per event kind keeps
+ * clustered markers (FC / drop / cooling land close together at the end of a
+ * roast) legible without redesigning the grey-line treatment — the line + label
+ * stay the same weight, only the hue shifts. `t0` keeps the original neutral grey
+ * (the line/label pair predates this map). Indexed by `CurveMarkerKind` so a new
+ * kind must add an entry (exhaustive — a missing key is a type error).
+ */
+const MARKER_RGB: Record<CurveMarkerKind, string> = {
+  t0: "212, 212, 216", // neutral grey (unchanged from pre-#309)
+  first_crack: "251, 191, 36", // amber — the crack landmark
+  drop: "248, 113, 113", // red — beans out
+  cooling: "96, 165, 250", // blue — cooling air
+};
+
+/** The marker line/label colour at the given alpha (line 0.6, label 0.9). */
+function markerColor(kind: CurveMarkerKind, alpha: number): string {
+  return `rgba(${MARKER_RGB[kind]}, ${alpha})`;
+}
 
 // Default charge band, hoisted to module scope so the prop default is a STABLE
 // reference. An inline `{ minC, maxC }` default would mint a new object every
@@ -47,6 +73,17 @@ interface SeriesMeta {
   stroke: string;
   /** Step-after rendering for the control lines (heat/fan). */
   step: boolean;
+  /** Line width (px). The control lines (#307) are thinner than the measurements. */
+  width: number;
+  /** Dash pattern for subordinate control lines (heat/fan, #307); solid otherwise. */
+  dash?: number[];
+  /**
+   * Draw order — LOWER draws FIRST (further back). The control lines (#307) sit
+   * BEHIND bean/env/RoR so they don't compete with the measurement curves. uPlot
+   * paints series in index order, so the plot's series/data arrays are permuted to
+   * this order (see {@link PLOT_DRAW_ORDER}); the public column order is unchanged.
+   */
+  z: number;
 }
 
 // CSS custom properties resolve to the roast palette; uPlot needs concrete
@@ -58,13 +95,42 @@ function token(name: string, fallback: string): string {
 }
 
 function seriesMeta(): SeriesMeta[] {
+  // The measurement curves (bean/env/RoR) draw on top (higher z); the control lines
+  // (heat/fan, #307) draw behind (lower z), thinner + dashed, on the dedicated pct axis.
   return [
-    { key: "bean", label: "Bean", scale: "c", stroke: token("--roast-coffee", "#d97706"), step: false },
-    { key: "env", label: "Env", scale: "c", stroke: token("--muted-foreground", "#d4d4d8"), step: false },
-    { key: "ror", label: "RoR", scale: "ror", stroke: token("--roast-nominal", "#34d399"), step: false },
-    { key: "heat", label: "Heat", scale: "pct", stroke: token("--roast-heat", "#fbbf24"), step: true },
-    { key: "fan", label: "Fan", scale: "pct", stroke: token("--roast-fan", "#22d3ee"), step: true },
+    { key: "bean", label: "Bean", scale: "c", stroke: token("--roast-coffee", "#d97706"), step: false, width: 2, z: 4 },
+    { key: "env", label: "Env", scale: "c", stroke: token("--muted-foreground", "#d4d4d8"), step: false, width: 2, z: 3 },
+    { key: "ror", label: "RoR", scale: "ror", stroke: token("--roast-nominal", "#34d399"), step: false, width: 2, z: 2 },
+    { key: "heat", label: "Heat", scale: "pct", stroke: token("--roast-heat", "#fbbf24"), step: true, width: 1.25, dash: [4, 3], z: 0 },
+    { key: "fan", label: "Fan", scale: "pct", stroke: token("--roast-fan", "#22d3ee"), step: true, width: 1.25, dash: [4, 3], z: 1 },
   ];
+}
+
+/**
+ * Permutation from PLOT (draw) order → LOGICAL (column / `SERIES_KEYS`) order, #307.
+ *
+ * uPlot paints series in their array index order (later = on top) and ties each
+ * series to the SAME-index data column. To draw the control lines behind the
+ * measurements WITHOUT disturbing the public column order (the test hook, markers,
+ * and every `columns[1]===bean` assertion key off the logical order), we permute the
+ * series-options AND data arrays handed to uPlot by ascending `z`, then translate the
+ * plot-slot index back to the logical series index for visibility toggles.
+ *
+ * @param meta - series metadata in LOGICAL order.
+ * @returns logical series indices, ordered by ascending `z` (plot slot → logical idx).
+ */
+function plotDrawOrder(meta: SeriesMeta[]): number[] {
+  return meta.map((_, i) => i).sort((a, b) => meta[a].z - meta[b].z);
+}
+
+/**
+ * Permute LOGICAL columns ([x, …series in SERIES_KEYS order]) into PLOT order so the
+ * series at plot slot `k` reads data column `order[k]` (#307). Column 0 (x) is shared
+ * by all series and stays first; the five series columns follow in `order`.
+ */
+function toPlotData(columns: ChartColumns, order: number[]): uPlot.AlignedData {
+  const [x, ...seriesCols] = columns;
+  return [x, ...order.map((logicalIdx) => seriesCols[logicalIdx])] as unknown as uPlot.AlignedData;
 }
 
 export function LiveCurve({
@@ -100,6 +166,18 @@ export function LiveCurve({
   const columns = useMemo(() => toColumns(points), [points]);
   const chargeBandVisible = phase === "preheating";
 
+  // Plot draw order (#307): heat/fan draw BEHIND bean/env/RoR. This permutes the
+  // series + data arrays handed to uPlot (later-index = on top) while the public
+  // `columns` stay in logical order. Stable for the plot's lifetime (meta is stable).
+  const drawOrder = useMemo(() => plotDrawOrder(meta), [meta]);
+
+  // Hysteresis state for the controlled-dynamic temperature axis (#307). One per
+  // mounted plot, carried in a ref so it survives data-only setData re-ranges (the
+  // range callback reads + updates it across frames). The settled range deliberately
+  // carries over if the plot is rebuilt on a height change — the data hasn't changed,
+  // so the carried-over range is the right starting point for the new plot.
+  const autoRangeRef = useRef<AutoRangeState>({ tempRange: null });
+
   // The uPlot `draw` hook is created once in the plot-build effect (keyed on
   // [height, meta]); if it closed over markers/highlightTime/chargeBand directly
   // it would repaint STALE values when those props change without a rebuild (the
@@ -117,21 +195,33 @@ export function LiveCurve({
   const originRef = useRef<number | null>(originSeconds);
   originRef.current = originSeconds;
 
+  // The auto-range callback (built once with the plot) must derive the temp/x extent
+  // from the LOGICAL columns (canonical [x, bean, env, ror, heat, fan]), NOT the
+  // permuted `self.data` it would otherwise scan (#341 — post-permutation, plot
+  // columns 1,2 are heat/fan, so the temp axis would range over the 0–100 % control
+  // lines). Read the live logical columns through this ref each frame.
+  const columnsRef = useRef(columns);
+  columnsRef.current = columns;
+
   // (Re)build the plot when structural inputs change. Data-only updates go
   // through setData below to avoid tearing down the canvas every tick.
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
 
-    // The value axes are FIXED (#217), so the °C range no longer depends on the live
-    // charge band (the 0–210 range always contains the 170–200 band). The charge-band
-    // getter is passed only for API symmetry — `makeAutoRange` ignores it — and the
-    // band is still read live off `overlayRef` by the `draw` overlay, not the range.
-    const rangeFn = makeAutoRange(() => ({
-      visible: overlayRef.current.chargeBandVisible,
-      minC: overlayRef.current.chargeBand.minC,
-      maxC: overlayRef.current.chargeBand.maxC,
-    }));
+    // The temperature axis is controlled-dynamic with hysteresis (#307) and the RoR
+    // axis is fixed; the charge-band getter is passed only for API symmetry (the band
+    // overlay reads it live off `overlayRef`, not the range). The hysteresis state ref
+    // is threaded in so the temp range only moves when the data leaves the frame.
+    const rangeFn = makeAutoRange(
+      () => ({
+        visible: overlayRef.current.chargeBandVisible,
+        minC: overlayRef.current.chargeBand.minC,
+        maxC: overlayRef.current.chargeBand.maxC,
+      }),
+      autoRangeRef.current,
+      () => columnsRef.current,
+    );
 
     const opts: uPlot.Options = {
       width: host.clientWidth || 800,
@@ -143,23 +233,22 @@ export function LiveCurve({
       },
       legend: { show: false }, // we render our own legend (readout + toggle)
       scales: {
-        // `rangeFn` (#217) pins the two VALUE scales to fixed ranges (c → 0–210 °C,
-        // ror → −20..+30 °C/min) so they never auto-zoom to the current sensor reading,
-        // and re-ranges only the x (time) scale to the loaded data on each setData.
+        // `rangeFn` policy per scale: x (time) re-ranges to the loaded data; c
+        // (temperature) is controlled-dynamic auto-range with hysteresis (#307); ror
+        // is FIXED (−20..+30, comparable across roasts).
         // The plot is built once (on [height, meta]) while the dashboard's live series
         // is still EMPTY (it mounts before SSE frames arrive), so uPlot leaves x
         // unranged — {min:null,max:null}, which collapsed the series to a single point
         // at index 0 (invisible). `setData` was not re-ranging it; the explicit `range`
         // callback recomputes x's min/max from the data uPlot is about to draw, so x
-        // always covers the loaded elapsed-time range (the fixed c/ror always cover the
-        // roast).
+        // always covers the loaded elapsed-time range.
         // A `range` callback fires unconditionally, so `auto` has no effect and is
-        // omitted (#133): `rangeFn` pins c/ror to FIXED_SCALE_RANGES and re-ranges x
-        // to the data on every setData.
+        // omitted (#133).
         x: { time: false, range: rangeFn },
         c: { range: rangeFn },
         ror: { range: rangeFn },
-        // Hidden 0–100 % scale for the control lines — fixed range, no axis.
+        // Dedicated FIXED 0–100 % scale for the control lines (#307) — its own axis
+        // (below), so heat/fan read as percentages and never ride the temp/RoR scale.
         pct: { range: [0, 100] },
       },
       axes: [
@@ -177,19 +266,38 @@ export function LiveCurve({
         },
         { scale: "c", stroke: token("--muted-foreground", "#a1a1aa"), grid: { show: false } },
         { scale: "ror", side: 1, stroke: token("--roast-nominal", "#34d399"), grid: { show: false } },
-        // No axis for the hidden pct scale.
+        // Dedicated 0–100 % axis for the control lines (#307), drawn SUBTLY on the
+        // right (below the RoR axis) so heat/fan read as their own % scale without
+        // competing with the measurement axes: muted stroke, ticks every 25 %, no grid.
+        {
+          scale: "pct",
+          side: 1,
+          stroke: token("--muted-foreground", "#71717a"),
+          grid: { show: false },
+          ticks: { show: false },
+          size: 34,
+          splits: [0, 25, 50, 75, 100],
+          values: (_self, splits) => splits.map((v) => `${v}%`),
+          font: "10px ui-sans-serif, system-ui, sans-serif",
+        },
       ],
+      // Series + data are handed to uPlot in PLOT (draw) order (#307) so the control
+      // lines paint BEHIND bean/env/RoR; the public `columns`/test-hook stay logical.
       series: [
         {},
-        ...meta.map((m) => ({
-          label: m.label,
-          scale: m.scale,
-          stroke: m.stroke,
-          width: m.step ? 1.5 : 2,
-          paths: m.step ? uPlot.paths.stepped?.({ align: 1 }) : undefined,
-          show: visible[m.key],
-          points: { show: false },
-        })),
+        ...drawOrder.map((logicalIdx) => {
+          const m = meta[logicalIdx];
+          return {
+            label: m.label,
+            scale: m.scale,
+            stroke: m.stroke,
+            width: m.width,
+            dash: m.dash,
+            paths: m.step ? uPlot.paths.stepped?.({ align: 1 }) : undefined,
+            show: visible[m.key],
+            points: { show: false },
+          };
+        }),
       ],
       hooks: {
         setCursor: [
@@ -206,7 +314,7 @@ export function LiveCurve({
       },
     };
 
-    const plot = new uPlot(opts, columns as unknown as uPlot.AlignedData, host);
+    const plot = new uPlot(opts, toPlotData(columns, drawOrder), host);
     plotRef.current = plot;
 
     const onResize = () => plot.setSize({ width: host.clientWidth || 800, height });
@@ -222,17 +330,20 @@ export function LiveCurve({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [height, meta]);
 
-  // Data updates without tearing down the plot.
+  // Data updates without tearing down the plot — permuted into plot/draw order (#307).
   useEffect(() => {
-    plotRef.current?.setData(columns as unknown as uPlot.AlignedData);
-  }, [columns]);
+    plotRef.current?.setData(toPlotData(columns, drawOrder));
+  }, [columns, drawOrder]);
 
-  // Toggle series visibility on the live plot.
+  // Toggle series visibility on the live plot. The series live in PLOT order (#307),
+  // so plot slot `k+1` is the logical series `drawOrder[k]`.
   useEffect(() => {
     const plot = plotRef.current;
     if (!plot) return;
-    meta.forEach((m, i) => plot.setSeries(i + 1, { show: visible[m.key] }));
-  }, [visible, meta]);
+    drawOrder.forEach((logicalIdx, k) =>
+      plot.setSeries(k + 1, { show: visible[meta[logicalIdx].key] }),
+    );
+  }, [visible, meta, drawOrder]);
 
   // Redraw overlays (markers / highlight) when they change — a plain repaint.
   useEffect(() => {
@@ -247,30 +358,37 @@ export function LiveCurve({
     plotRef.current?.redraw();
   }, [originSeconds]);
 
-  // The °C range is fixed (#217), so the band overlay no longer re-ranges the scale —
-  // but when it appears/disappears or moves, the canvas overlay (drawn in the `draw`
-  // hook) must repaint. A plain `redraw()` fires that draw hook (same mechanism as the
-  // markers/highlight effect above); no `setData` round-trip is needed now the range
-  // is fixed.
+  // The band is a canvas overlay drawn in the `draw` hook, not a data series — so
+  // `setData` is never needed. When the band appears/disappears or moves, `redraw()`
+  // re-fires the `draw` hook (same mechanism as the markers/highlight effect above).
   useEffect(() => {
     plotRef.current?.redraw();
   }, [chargeBandVisible, chargeBand]);
 
   // Expose the test hook — assert DATA + the rendered scale ranges (D24 / #131).
-  // For `plotRef.scales` here to reflect the just-drawn ranges, two things must
-  // hold: (1) React runs the `setData` effect above before this one (effects fire
-  // in declaration order, so a column change is applied first), AND (2) uPlot's
-  // `setData` re-ranges the scales SYNCHRONOUSLY (a uPlot 1.6.x behaviour — it
-  // recomputes ranges and redraws within the call, NOT a React guarantee). Both
-  // together let a test assert the scale COVERS the data (catching the
-  // collapsed/unranged-scale bug a blank snapshot can't). If a future uPlot defers
-  // the re-range, this hook would read stale ranges and the assertion must move
-  // behind an explicit redraw.
+  //
+  // x/ror/pct are read off `plotRef.scales` (x re-ranges to data each setData; ror/pct
+  // are fixed, so they're never stale). The °C (`c`) scale, though, is the
+  // controlled-dynamic auto-range (#307), and reading `plotRef.scales.c` here proved
+  // RACY in CI (#341): it assumes uPlot has SYNCHRONOUSLY committed the new c-range to
+  // `scales.c` by the time this effect runs after `setData`. On slower CI render
+  // timing that commit lagged, so the hook published a STALE preheat range
+  // (c.max ≈ 60) even with the full developed curve loaded — failing the
+  // `c.max >= beanMax` assertion deterministically in CI but never locally.
+  //
+  // The fix: publish `c` from `autoRangeRef.current.tempRange` — the range the
+  // auto-range CALLBACK authoritatively computed on the last setData. uPlot is
+  // guaranteed to invoke the range callback during `setData` (that's how a `range`
+  // function works), and the setData effect above runs before this one (declaration
+  // order), so `tempRange` always reflects the current data here — no dependence on
+  // when uPlot mirrors it into `scales.c`. This keeps the #131 scale-covers-data
+  // guarantee while removing the timing assumption that broke in CI.
   useEffect(() => {
     const plot = plotRef.current;
     const sx = plot?.scales.x;
-    const sc = plot?.scales.c;
     const sror = plot?.scales.ror;
+    const spct = plot?.scales.pct;
+    const tc = autoRangeRef.current.tempRange;
     const hook: ChartTestHook = {
       columns,
       visible,
@@ -279,8 +397,10 @@ export function LiveCurve({
       chargeBandVisible,
       scales: {
         x: { min: sx?.min ?? null, max: sx?.max ?? null },
-        c: { min: sc?.min ?? null, max: sc?.max ?? null },
+        // °C from the auto-range source of truth, not the possibly-stale uPlot scale.
+        c: { min: tc?.[0] ?? null, max: tc?.[1] ?? null },
         ror: { min: sror?.min ?? null, max: sror?.max ?? null },
+        pct: { min: spct?.min ?? null, max: spct?.max ?? null },
       },
     };
     if (typeof window !== "undefined") window.__chart = hook;
@@ -382,18 +502,34 @@ function drawOverlays(
     ctx.fillRect(u.bbox.left, yTop, u.bbox.width, yBot - yTop);
   }
 
-  for (const marker of markers) {
+  // Stagger labels vertically when markers cluster (FC / drop / cooling land
+  // close together at roast end, #309) so the labels don't overprint each other.
+  // Draw left-to-right; a label within LABEL_CLUSTER_PX of the previous one's x
+  // drops a row. Lines are unaffected (they span the full height).
+  const LABEL_CLUSTER_PX = 48;
+  const LABEL_ROW_PX = 12;
+  const ordered = [...markers].sort((a, b) => a.t - b.t);
+  ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+  ctx.textBaseline = "top";
+  ctx.textAlign = "left";
+  let prevLabelX: number | null = null;
+  let labelRow = 0;
+  for (const marker of ordered) {
     const x = u.valToPos(marker.t, "x", true);
-    ctx.strokeStyle = "rgba(212, 212, 216, 0.6)";
+    ctx.strokeStyle = markerColor(marker.kind, 0.6);
     ctx.lineWidth = 1;
     line(ctx, x, u.bbox.top, x, u.bbox.top + u.bbox.height);
-    // Label the marker (T0 / FIRST CRACK / DROP) at the top of its line —
-    // ui-prompts.md Prompt A requires labeled event markers, not bare lines.
-    ctx.fillStyle = "rgba(212, 212, 216, 0.9)";
-    ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
-    ctx.textBaseline = "top";
-    ctx.textAlign = "left";
-    ctx.fillText(marker.label, x + 3, u.bbox.top + 2);
+    // Label the marker (T0 / FIRST CRACK / DROP / COOLING) near the top of its
+    // line — ui-prompts.md Prompt A requires labeled event markers, not bare
+    // lines. Per-kind colour (#309) keeps clustered labels distinguishable.
+    if (prevLabelX !== null && x - prevLabelX < LABEL_CLUSTER_PX) {
+      labelRow += 1;
+    } else {
+      labelRow = 0;
+    }
+    prevLabelX = x;
+    ctx.fillStyle = markerColor(marker.kind, 0.9);
+    ctx.fillText(marker.label, x + 3, u.bbox.top + 2 + labelRow * LABEL_ROW_PX);
   }
 
   if (highlightTime !== null) {

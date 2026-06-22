@@ -1619,6 +1619,39 @@ async def test_latch_does_not_escalate_on_a_same_or_lesser_verdict() -> None:
 
 
 @pytest.mark.asyncio
+async def test_latch_skips_escalation_read_after_fault_acknowledged() -> None:
+    """#332: once the operator acknowledges the fault (``note_fault_acknowledged``),
+    the latched tick SKIPS the upward-escalation re-read — the run is finalising and
+    heat is already off, so the re-read is pointless and (on a wedged child) is the
+    "slow to clear" latency. Crucially the SKIP is gated on the acknowledge, NOT a
+    general weakening: a hard-ceiling breach that WOULD have escalated does not, only
+    because the operator has acknowledged. The heat-off retry still runs (unchanged).
+
+    Mirror of ``test_latch_auto_escalates_fault_to_emergency_stop_once`` but with an
+    acknowledge before the breach tick: the e-stop must NOT fire."""
+    stale_low = reading(bean=180.0, env=200.0, age_seconds=10.0)  # stale → FAULT
+    over_ceiling = reading(bean=235.0, env=200.0, age_seconds=0.0)  # > 230 → would e-stop
+    harness = harness_in_development(readings=[stale_low, over_ceiling])
+
+    await harness.controller.tick()  # entry: stale FAULT → FAULTED (latched FAULT)
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.executor.estop_reasons == []
+    # The operator acknowledges (the runner calls this on the ack drain).
+    harness.controller.note_fault_acknowledged()
+    # A breach tick that WOULD escalate (see the auto-escalate test) now does NOT —
+    # the acknowledge gates the escalation re-read off.
+    for _ in range(10):
+        await harness.controller.tick()
+    assert harness.executor.estop_reasons == []  # escalation skipped post-acknowledge
+    assert harness.controller.phase is RoastPhase.FAULTED  # controller stays faulted
+    # New-run reset re-arms the flag so the next roast escalates normally.
+    harness.controller.transition_to(RoastPhase.IDLE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    assert harness.controller._fault_acknowledged is False  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_latch_escalates_recovery_to_emergency_stop_and_faults() -> None:
     """A controller latched in operator_recovery_required (the lower-severity
     RECOVERY latch) that then sees a hard-ceiling breach escalates upward to the
@@ -3639,6 +3672,69 @@ async def test_operator_stop_cooling_in_faulted_does_not_transition() -> None:
     assert "stop_cooling" in harness.executor.commands
     assert harness.controller.phase is RoastPhase.FAULTED
     assert RoastEventKind.RUN_COMPLETED not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_operator_drop_beans_in_faulted_does_not_transition() -> None:
+    """#210: from faulted, DROP BEANS dumps the beans out of the hot drum and
+    issues the MCP write WITHOUT a phase transition — the run stays faulted (heat
+    off) until acknowledged. The operator must be able to safe the beans after an
+    e-stop/fault so they stop scorching, without re-enabling heat or auto-resuming
+    anything."""
+    harness = make_harness()
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    harness.events.events.clear()
+    targets_before = list(harness.executor.targets)
+    await harness.controller.operator_drop_beans()
+    # The drop was issued, and the run STAYS faulted (no cooling transition).
+    assert "drop_beans" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert RoastEventKind.RUN_COMPLETED not in harness.events.kinds()
+    # Heat stays off: the drop issued NO set_targets write at all (no re-enable).
+    assert harness.executor.targets == targets_before
+    # It went through the safety path (a command_phase_validity ALLOW was persisted).
+    assert any(
+        e.rule == "command_phase_validity" and e.verdict is SafetyVerdict.ALLOW
+        for e in harness.sink.evaluations
+    )
+
+
+@pytest.mark.asyncio
+async def test_operator_drop_beans_in_development_still_transitions_to_cooling() -> None:
+    """#210 regression: the NORMAL drop is unchanged — from development it issues
+    the drop AND transitions to cooling (only the faulted case is no-transition)."""
+    harness = make_harness()
+    _to(harness, 4)  # → DEVELOPMENT
+    await harness.controller.operator_drop_beans()
+    assert "drop_beans" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.COOLING
+
+
+@pytest.mark.asyncio
+async def test_operator_drop_beans_rejected_in_preheating() -> None:
+    """#210: DROP is still rejected where there are no beans (preheating) — the
+    faulted addition does not loosen the no-beans guard."""
+    harness = make_harness()
+    _to(harness, 2)  # → PREHEATING
+    await harness.controller.operator_drop_beans()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.PREHEATING
+    assert any(
+        e.rule == "command_phase_validity" and e.verdict is SafetyVerdict.REJECT
+        for e in harness.sink.evaluations
+    )
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_still_available_from_faulted_after_drop() -> None:
+    """#210: e-stop stays available from faulted even after a drop — the safe-ing
+    additions never reduce the always-available e-stop (the E3-S4 invariant)."""
+    harness = make_harness()
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    await harness.controller.operator_drop_beans()
+    harness.events.events.clear()
+    await harness.controller.operator_emergency_stop(reason="manual after drop")
+    assert harness.executor.estop_reasons  # e-stop executed from faulted
 
 
 @pytest.mark.asyncio

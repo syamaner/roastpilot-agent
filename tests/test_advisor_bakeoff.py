@@ -169,11 +169,12 @@ def test_resolve_test_set_errors_clearly_on_missing_fixture(tmp_path: Path) -> N
 
 
 def test_control_prompts_are_registered_as_selectable() -> None:
-    """The active control teaching prompt (c2) is the bake-off default, and c1
-    stays resolvable as a prompt version for an A/B comparison."""
+    """The active control teaching prompt (c3) is the bake-off default, and c1/c2
+    stay resolvable as prompt versions for an A/B comparison."""
     from roastpilot_agent.advisor import control_teaching_prompt, instructions_for
 
-    assert bakeoff.CONTROL_PROMPT_VERSION == "c2"
+    assert bakeoff.CONTROL_PROMPT_VERSION == "c3"
+    assert instructions_for("c3") == control_teaching_prompt("c3")
     assert instructions_for("c2") == control_teaching_prompt("c2")
     assert instructions_for("c1") == control_teaching_prompt("c1")
 

@@ -37,6 +37,23 @@ describe("BeanProfileModal add mode (#303)", () => {
     await waitFor(() => expect(onSaved).toHaveBeenCalledTimes(1));
   });
 
+  it("captures the product URL on the saved profile (#315)", async () => {
+    const onSave = vi.fn(async (input: BeanProfileInput) => savedFrom(input));
+    render(
+      <BeanProfileModal mode="add" onSave={onSave} onSaved={vi.fn()} onClose={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-name"), { target: { value: "Kenya" } });
+    fireEvent.change(screen.getByTestId("bean-profile-bean_origin"), {
+      target: { value: "Kenya" },
+    });
+    fireEvent.change(screen.getByTestId("bean-profile-source_url"), {
+      target: { value: "https://roaster.example.com/kenya-aa" },
+    });
+    fireEvent.submit(screen.getByTestId("bean-profile-form"));
+    await waitFor(() => expect(onSave).toHaveBeenCalledTimes(1));
+    expect(onSave.mock.calls[0][0].source_url).toBe("https://roaster.example.com/kenya-aa");
+  });
+
   it("blocks save and shows field errors when required fields are blank", () => {
     const onSave = vi.fn();
     render(

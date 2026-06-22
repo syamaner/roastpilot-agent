@@ -56,6 +56,8 @@ describe("StartRoastForm", () => {
       // #291 metadata fields take their unset defaults.
       processing: null,
       altitude_m: null,
+      // #315 product URL takes its unset default.
+      source_url: null,
       bean_weight_grams: 250,
       charge_guidance_min_c: 170,
       charge_guidance_max_c: 200,
@@ -155,6 +157,44 @@ describe("StartRoastForm", () => {
     });
     fireEvent.submit(screen.getByTestId("start-roast-form"));
     expect(screen.getByTestId("start-roast-altitude_m-error")).toBeInTheDocument();
+    expect(onStart).not.toHaveBeenCalled();
+  });
+
+  it("passes a well-formed product URL through when provided (#315)", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    fireEvent.change(screen.getByTestId("start-roast-source_url"), {
+      target: { value: "https://redber.co.uk/products/ethiopia-yirgacheffe-koke" },
+    });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
+    expect((onStart.mock.calls[0][0] as RoastProfile).source_url).toBe(
+      "https://redber.co.uk/products/ethiopia-yirgacheffe-koke",
+    );
+  });
+
+  it("leaves source_url null when blank (#315)", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
+    expect((onStart.mock.calls[0][0] as RoastProfile).source_url).toBeNull();
+  });
+
+  it.each([
+    ["plain non-URL", "not-a-url"],
+    ["embedded userinfo (credential)", "https://user:pass@example.com/bean"],
+  ])("rejects a malformed product URL (%s) and does not start (#315/#347)", (_label, value) => {
+    const onStart = vi.fn();
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    fireEvent.change(screen.getByTestId("start-roast-source_url"), {
+      target: { value },
+    });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    expect(screen.getByTestId("start-roast-source_url-error")).toBeInTheDocument();
     expect(onStart).not.toHaveBeenCalled();
   });
 
@@ -399,6 +439,7 @@ describe("StartRoastForm — bean-profile library (#303)", () => {
     expect(screen.getByTestId("start-roast-bean_varietal")).toHaveValue("Dega, Kudhume, Wolisho");
     expect(screen.getByTestId("start-roast-processing")).toHaveValue("natural");
     expect(screen.getByTestId("start-roast-altitude_m")).toHaveValue(1885);
+    expect(screen.getByTestId("start-roast-source_url")).toHaveValue(FIXTURE_KOKE.source_url);
     expect(screen.getByTestId("start-roast-description")).toHaveValue(FIXTURE_KOKE.description);
     // Roast targets fill too.
     expect(screen.getByTestId("start-roast-charge_guidance_min_c")).toHaveValue(170);

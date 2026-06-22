@@ -246,6 +246,34 @@ async def test_start_roast_carries_bean_identity_to_detail(client: AsyncClient) 
 
 
 @pytest.mark.asyncio
+async def test_start_roast_carries_source_url_to_detail(client: AsyncClient) -> None:
+    """#315: the bean's product/source URL flows through ``POST /api/roasts`` and
+    back out on the detail projection so the SPA can render it as a link."""
+    profile = _profile().model_dump()
+    profile["source_url"] = "https://redber.co.uk/products/ethiopia-yirgacheffe-koke"
+    created = await client.post("/api/roasts", json=profile)
+    assert created.status_code == 201
+    run_id = created.json()["id"]
+
+    detail = await client.get(f"/api/roasts/{run_id}")
+    assert detail.status_code == 200
+    assert (
+        detail.json()["profile"]["source_url"]
+        == "https://redber.co.uk/products/ethiopia-yirgacheffe-koke"
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_roast_rejects_malformed_source_url(client: AsyncClient) -> None:
+    """#315: a non-http(s) source_url is rejected at the API boundary (422), so a
+    broken link can never reach the corpus or the UI."""
+    profile = _profile().model_dump()
+    profile["source_url"] = "javascript:alert(1)"
+    created = await client.post("/api/roasts", json=profile)
+    assert created.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_history_summary_projects_bean_identity(
     client: AsyncClient, store: RoastStore
 ) -> None:
@@ -1333,10 +1361,12 @@ async def test_submit_operator_action_410_on_terminal_run(store: RoastStore) -> 
 
 @pytest.mark.asyncio
 async def test_faulted_unacknowledged_run_does_not_410(store: RoastStore) -> None:
-    """#206: a FAULTED run with no ``completed_at`` (the post-#206 common case —
-    a fault no longer auto-finalises) is NOT terminal, so an operator action is
-    NOT 410'd: stop_cooling / start_cooling / emergency_stop / acknowledge_fault
-    are all accepted, so a fault never strands a physically-running machine."""
+    """#206 + #210: a FAULTED run with no ``completed_at`` (the post-#206 common
+    case — a fault no longer auto-finalises) is NOT terminal, so an operator action
+    is NOT 410'd: stop_cooling / start_cooling / DROP_BEANS (#210 — dump beans from
+    the hot drum) / emergency_stop / acknowledge_fault are all accepted end-to-end
+    (the matrix pre-check passes), so a fault never strands a physically-running
+    machine or scorching beans."""
     await store.create_run(
         run_id="run-faulted",
         profile=_profile(),
@@ -1347,6 +1377,7 @@ async def test_faulted_unacknowledged_run_does_not_410(store: RoastStore) -> Non
     for action in (
         OperatorAction.STOP_COOLING,
         OperatorAction.START_COOLING,
+        OperatorAction.DROP_BEANS,
         OperatorAction.EMERGENCY_STOP,
         OperatorAction.ACKNOWLEDGE_FAULT,
     ):
@@ -1409,21 +1440,33 @@ async def test_restart_into_active_phase_enters_recovery_without_resuming(
 
 
 @pytest.mark.asyncio
-async def test_recover_on_start_faulted_run_re_enters_operable_faulted(
+async def test_recover_on_start_auto_finalizes_a_stale_faulted_run(
     store: RoastStore,
 ) -> None:
-    """#206 (fail-closed restart): a persisted FAULTED run with no ``completed_at``
-    (the post-#206 common case) re-enters the operable-FAULTED state — NOT
-    operator_recovery_required (whose row would permit resume-into-roasting). The
-    loop is alive, no heat/fan/session write is issued, and the operator can still
-    cool / e-stop / acknowledge. This is distinct from the active-roast →
-    recovery path (tested separately)."""
+    """#331: a prior session's unfinalised FAULTED run is AUTO-FINALISED on restart
+    — NOT restored as the active run. A restart is a new session; restoring the
+    stale fault as active stranded the operator on it and blocked a fresh roast
+    (the roast-3 boot-onto-"test 6" bug). It is moved terminal (outcome ``faulted``,
+    fault_reason preserved) so it lands in history, the boot is clean (no active
+    run), and no heat/fan/MCP write is issued (restart-never-auto-resumes intact).
+    Supersedes the prior #206 "re-enter operable-faulted on restart" behaviour: the
+    in-SESSION operable-faulted path is unchanged; this is only the cross-restart
+    stale-fault case."""
     await store.create_run(
         run_id="run-faulted-crash",
         profile=_profile(),
         config=AppConfig(),
         agent_phase=RoastPhase.FAULTED,
     )
+    # The real bug shape: a fault that was NEVER finalised (completed_at stays NULL
+    # — a crash / unacknowledged fault from a prior session). The fault_reason was
+    # persisted when it first faulted. Set it directly (no completion, so the
+    # immutability trigger — which guards only ALREADY-completed rows — does not fire).
+    await store.connection.execute(
+        "UPDATE roast_runs SET fault_reason = ? WHERE id = ?",
+        ("env 242 C exceeds the hard ceiling 240 C", "run-faulted-crash"),
+    )
+    await store.connection.commit()
     mcp = FakeMCPClient()
     service = RoastService(
         store,
@@ -1435,19 +1478,49 @@ async def test_recover_on_start_faulted_run_re_enters_operable_faulted(
     await service.recover_on_start()
     recovered = await store.read_run("run-faulted-crash")
     assert recovered is not None
-    assert recovered.agent_phase is RoastPhase.FAULTED  # NOT operator_recovery_required
-    assert recovered.completed_at_utc is None  # operable, awaiting acknowledgement
-    assert service.active_run_id == "run-faulted-crash"
-    assert service.runner is not None
-    assert service.runner.controller_snapshot().phase is RoastPhase.FAULTED
-    # No resume-into-roast: heat/fan are not auto-resumed, no MCP write on recovery.
+    # Auto-finalised: terminal, outcome faulted, in history — NOT the active run.
+    assert recovered.completed_at_utc is not None
+    assert recovered.outcome == "faulted"
+    assert recovered.agent_phase is RoastPhase.FAULTED
+    # fault_reason PRESERVED for diagnosis (finalize_stale_faulted_run never touches it).
+    assert recovered.fault_reason == "env 242 C exceeds the hard ceiling 240 C"
+    # Boot is clean: no active run, no runner/loop started, no MCP write, no resume.
+    assert service.active_run_id is None
+    assert service.runner is None
     assert mcp.commands() == []
+    # The store agrees there is no active run, so a fresh roast is not blocked.
+    assert await store.active_run() is None
+
+
+@pytest.mark.asyncio
+async def test_recover_on_start_active_roast_still_recovers_to_recovery_required(
+    store: RoastStore,
+) -> None:
+    """#331 regression guard: the NORMAL recovery path is unchanged — a persisted
+    ACTIVE-ROAST phase (not faulted) still enters operator_recovery_required on
+    restart, with no heat/fan/MCP write (restart-never-auto-resumes). Only the
+    stale-faulted case changed."""
+    await store.create_run(
+        run_id="run-mid-roast",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+    mcp = FakeMCPClient()
+    service = RoastService(
+        store, roaster=mcp, advisor=FakeAdvisor(), run_loop=False, clock=FakeClock()
+    )
+    await service.recover_on_start()
+    assert service.active_run_id == "run-mid-roast"
+    assert service.runner is not None
+    assert service.runner.controller_snapshot().phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
     snapshot = service.runner.controller_snapshot()
-    assert (snapshot.current_heat, snapshot.current_fan) == (0, 0)
-    # The operable-faulted state surfaces cooling/e-stop/ack, never resume-to-roast.
-    enabled = enabled_operator_actions(RoastPhase.FAULTED)
-    assert OperatorAction.STOP_COOLING in enabled
-    assert OperatorAction.ACKNOWLEDGE_FAULT in enabled
+    assert (snapshot.current_heat, snapshot.current_fan) == (0, 0)  # no auto-resume
+    assert mcp.commands() == []  # no MCP write on recovery
+    # Emergency stop stays available from recovery.
+    assert OperatorAction.EMERGENCY_STOP in enabled_operator_actions(
+        RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    )
 
 
 @pytest.mark.asyncio
@@ -1540,10 +1613,17 @@ async def test_restart_restores_charge_clock_so_resumed_dtr_survives(store: Roas
 async def test_recover_faulted_then_acknowledge_preserves_fault_reason(
     store: RoastStore,
 ) -> None:
-    """#206 regression: recover_faulted() must latch _captured_fault_reason BEFORE
-    _flush_events() drains the FAULT event from the emitter buffer. Without the
-    latch, the fault_reason column is None after restart→acknowledge because the
-    buffer is empty when _handle_completion fires on the first tick after ack."""
+    """#206 regression: ``RoastRunner.recover_faulted()`` must latch
+    ``_captured_fault_reason`` BEFORE ``_flush_events()`` drains the FAULT event
+    from the emitter buffer. Without the latch, the fault_reason column is None
+    after recover→acknowledge because the buffer is empty when ``_handle_completion``
+    fires on the first tick after ack.
+
+    NB (#331): this exercises ``recover_faulted`` DIRECTLY rather than via
+    ``recover_on_start`` — restart recovery now AUTO-FINALISES a stale faulted run
+    (#331) instead of re-entering it operable, but ``recover_faulted`` itself (the
+    in-session operable-faulted path) is unchanged and still owns the #206 latch, so
+    its regression coverage lives here on the method directly."""
     await store.create_run(
         run_id="run-fault-reason",
         profile=_profile(),
@@ -1559,7 +1639,11 @@ async def test_recover_faulted_then_acknowledge_preserves_fault_reason(
         run_loop=False,
         clock=clock,
     )
-    await service.recover_on_start()
+    # Build the runner + re-enter operable-faulted directly (the in-session path).
+    runner = service._build_runner("run-fault-reason")  # pyright: ignore[reportPrivateUsage]
+    assert runner is not None
+    service.active_run_id = "run-fault-reason"
+    await runner.recover_faulted(_profile())
     assert service.runner is not None
 
     # Acknowledge the fault → finalises on the next tick.
@@ -2098,6 +2182,57 @@ async def test_acknowledge_fault_is_audit_only_issues_no_mcp_write(store: RoastS
     assert await _tick(service, clock)  # finalises this tick
     # The command trace is UNCHANGED by the ack — no roaster write, no second e-stop.
     assert mcp.commands() == commands_before_ack
+    final = await store.read_run(run_id)
+    assert final is not None and final.outcome == "faulted"
+
+
+@pytest.mark.asyncio
+async def test_acknowledge_fault_clears_promptly_under_wedged_mcp(store: RoastStore) -> None:
+    """#332: ``acknowledge_fault`` must finalise the run on the SAME tick it is
+    drained, without blocking on a fresh escalation read, even when the MCP child
+    is wedged (slow/failed reads).
+
+    Repro of the roast-3 "slow to clear" report: a FAULT-latched run (not e-stop —
+    consecutive MCP read failures, so ``_latched_verdict`` is FAULT) re-reads the
+    child every latched tick in ``_maybe_escalate_while_latched`` looking for an
+    upward escalation. That re-read runs BETWEEN the drain and the completion check
+    in the same ``tick_once``, so on a wedged child it blocks ~``call_timeout_seconds``
+    and delays finalisation AFTER the operator has already acknowledged. The fix
+    (``note_fault_acknowledged``) skips the escalation re-read once the fault is
+    acknowledged — the run is being torn down and heat is already off, so there is
+    nothing to escalate into.
+
+    Hardware-free + deterministic: a read-counting fake whose reads RAISE (a
+    dead/failed child). The assertion is on the READ COUNT, not wall-clock — the
+    acknowledge tick must NOT issue a fresh escalation read."""
+    clock = FakeClock()
+    log: list[str] = []
+    # Every read raises → after max_consecutive_mcp_failures (3) the run FAULTs,
+    # latched at the FAULT verdict (the escalation-re-read case, not e-stop). The
+    # explicit log records every ``read`` so the assertion is on the read count.
+    mcp = FakeMCPClient([RuntimeError("wedged child")], log=log)
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock)
+    # Tick to the fault: 3 consecutive failing reads cross the threshold.
+    for _ in range(3):
+        await _tick(service, clock)
+    faulted = await store.read_run(run_id)
+    assert faulted is not None and faulted.agent_phase is RoastPhase.FAULTED
+    # A latched tick with NO operator action DOES re-read (the escalation probe) —
+    # confirm the mechanism is real, so the test pins the path the fix narrows.
+    reads_before = log.count("read")
+    await _tick(service, clock)
+    assert log.count("read") > reads_before, "latched tick should probe for escalation"
+    # Now acknowledge + tick: the ack tick must FINALISE and must NOT issue another
+    # escalation read (that read is the wedged-child latency the operator hit).
+    ack = await service.submit_operator_action(
+        run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+    )
+    assert ack.result == "accepted"
+    reads_at_ack = log.count("read")
+    assert await _tick(service, clock)  # finalises on the ack tick
+    assert log.count("read") == reads_at_ack, (
+        "acknowledge tick must not block on a fresh escalation read"
+    )
     final = await store.read_run(run_id)
     assert final is not None and final.outcome == "faulted"
 

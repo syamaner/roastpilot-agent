@@ -751,17 +751,20 @@ def test_v3_prompt_has_explicit_per_stage_sections() -> None:
     assert "never control hardware" in v3
 
 
-def test_c2_is_the_default_prompt_version() -> None:
-    """c2 (the #274 control teaching SYSTEM frame + the roast-2 development-stretch
-    section) is the shipped default, wired live for the post-FC control loop. It
-    resolves to the control teaching prompt and is distinct from the v* per-tick
-    lenses; c1 stays selectable for an A/B."""
-    assert AdvisorConfig().prompt_version == "c2"
-    assert instructions_for("c2") == control_teaching_prompt("c2")
-    # c1 is kept intact and selectable (prompts are versioned, #274).
+def test_c3_is_the_default_prompt_version() -> None:
+    """c3 (the #274 control teaching SYSTEM frame + the roast-2 development-stretch
+    section + the roast-3 fan-as-active-brake section) is the shipped default, wired
+    live for the post-FC control loop. It resolves to the control teaching prompt
+    and is distinct from the v* per-tick lenses; c1 and c2 stay selectable for an
+    A/B."""
+    assert AdvisorConfig().prompt_version == "c3"
+    assert instructions_for("c3") == control_teaching_prompt("c3")
+    # c1 and c2 are kept intact and selectable (prompts are versioned, #274/#328).
     assert instructions_for("c1") == control_teaching_prompt("c1")
+    assert instructions_for("c2") == control_teaching_prompt("c2")
     assert instructions_for("c1") != instructions_for("c2")
-    assert instructions_for("c2") != instructions_for("v4")
+    assert instructions_for("c2") != instructions_for("c3")
+    assert instructions_for("c3") != instructions_for("v4")
     assert instructions_for("v4") != instructions_for("v2")
     assert instructions_for("v3") != instructions_for("v2")
 
@@ -805,6 +808,49 @@ def test_c2_extends_c1_with_post_fc_development_stretch() -> None:
     assert "13 %" not in new_section
 
 
+def test_c3_extends_c2_with_post_fc_fan_brake() -> None:
+    """c3 is c2 PLUS a post-FC fan-as-active-brake section, with all of c1+c2's
+    grounding kept.
+
+    Roast 3 (Ethiopia Koke): the advisor held fan at 30-40 while it cut heat to 0,
+    so the bean coasted 193->203 (8 C past the 195 ceiling) with no brake left. c3
+    teaches fan as an active post-FC lever — raise airflow at/after FC, and
+    ESPECIALLY when heat is already 0 and the bean is still climbing (fan is then
+    the only remaining brake) — while keeping the #218/#274 lever-stability
+    discipline (a deliberate step up, NOT the 30<->40<->50 twiddle) and c2's
+    stretch-development teaching. It names NO numbers (the live fan box / drop
+    ceiling carry every threshold)."""
+    c2 = control_teaching_prompt("c2")
+    c3 = control_teaching_prompt("c3")
+    # c3 is a strict superset of c2's grounding: every c2 line survives.
+    assert c2 in c3 or all(block in c3 for block in c2.split("\n\n")), (
+        "c3 must preserve c2's grounding verbatim"
+    )
+    lowered = c3.lower()
+    # The new post-FC fan-brake teaching.
+    assert "fan is an active brake" in lowered or "fan is the only brake left" in lowered
+    assert "raise the fan" in lowered or "raise airflow" in lowered
+    # The critical "heat already at 0 → fan is the only brake" teaching.
+    assert "only brake left" in lowered
+    assert "heat" in lowered and ("at 0" in lowered or "0:" in lowered or "floor" in lowered)
+    # Keeps the lever-stability discipline: a deliberate step, NOT a twiddle.
+    assert "twiddle" in lowered
+    assert "deliberate" in lowered or "intentional" in lowered
+    # The c2 stretch teaching is still present (strict superset).
+    assert "stretch development" in lowered
+    # The new section names NO fixed temperature/limit THRESHOLD numbers of its own
+    # (told==enforced; the live fan box / drop ceiling carry every threshold). It
+    # must not bake in the roast-3 figures (195 ceiling, 203 overshoot, 239 env) nor
+    # a literal fan target. (The "30<->40<->50" oscillation example is the SAME
+    # anti-pattern illustration c1 already carries — an anti-pattern to avoid, not a
+    # threshold to enforce — so those digits are allowed; the test below forbids only
+    # the figures that would actually drift from the live limits.)
+    start = c3.index("POST-FIRST-CRACK: FAN")
+    new_section = c3[start : c3.index("THE OBJECTIVE\n", start)]
+    for literal in ("195", "203", "239"):
+        assert literal not in new_section, f"c3 fan section must not bake in {literal!r}"
+
+
 def test_c1_grounds_development_numbers_to_context_no_invention() -> None:
     """#312: the c1 frame must instruct the model to use the development numbers
     FROM CONTEXT verbatim, never to estimate/invent them, and to STATE the dev%
@@ -838,22 +884,23 @@ def test_default_prompt_version_matches_control_teaching_version() -> None:
     assert AdvisorConfig().prompt_version == CONTROL_TEACHING_PROMPT_VERSION
 
 
-def test_live_post_fc_advisor_uses_the_c2_system_prompt(
+def test_live_post_fc_advisor_uses_the_c3_system_prompt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The production PydanticAIAdvisor sends c2 as its system instructions.
+    """The production PydanticAIAdvisor sends c3 as its system instructions.
 
     The live post-FC control loop's advisor is constructed with the #274 control
-    teaching frame (now c2, the roast-2 development-stretch tuning) as the agent's
-    system ``instructions``; the per-tick #275 context is the user message (sent
-    via ``agent.run(context_json)``, asserted elsewhere). Default config = gpt-4o
-    + c2 (the model is unchanged — this was a prompt-only change).
+    teaching frame (now c3, the roast-3 fan-as-active-brake tuning on top of c2's
+    development-stretch) as the agent's system ``instructions``; the per-tick #275
+    context is the user message (sent via ``agent.run(context_json)``, asserted
+    elsewhere). Default config = gpt-4o + c3 (the model is unchanged — this was a
+    prompt-only change).
     """
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
     advisor = PydanticAIAdvisor(AdvisorConfig())
     instructions = advisor._instructions  # type: ignore[reportPrivateUsage]
-    assert instructions == control_teaching_prompt("c2")
-    # The pinned post-FC (DEVELOPMENT) model is gpt-4o (unchanged by the c2 prompt).
+    assert instructions == control_teaching_prompt("c3")
+    # The pinned post-FC (DEVELOPMENT) model is gpt-4o (unchanged by the c3 prompt).
     assert advisor._config.model_for(RoastPhase.DEVELOPMENT) == "openai/gpt-4o"  # type: ignore[reportPrivateUsage]
 
 
@@ -925,7 +972,7 @@ def test_control_teaching_prompt_exists_and_is_stable() -> None:
     It is a SEPARATE artifact from the per-tick advisory prompts: it is NOT one
     of the ``v``-namespaced ``instructions_for`` versions, and it is not the
     drop-narrow ``v4`` drop lens. Two calls return the identical (stable) text."""
-    assert CONTROL_TEACHING_PROMPT_VERSION == "c2"
+    assert CONTROL_TEACHING_PROMPT_VERSION == "c3"
     prompt = control_teaching_prompt()
     assert prompt
     # Operator decision 4: the FULL teaching detail is retained (the system
