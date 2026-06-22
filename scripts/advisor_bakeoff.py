@@ -162,10 +162,10 @@ OPENROUTER = "https://openrouter.ai/api/v1"
 # (the value live #276 sends), so the model under test gets the SAME system frame
 # the live loop gives it — with no change to production advisor behaviour (the
 # registration is idempotent and additive; the controller still selects its own
-# prompt version from config). ``v4`` stays a selectable prompt so a c2-vs-v4
-# (drop-lens) A/B is still possible; the active control prompt (now ``c2``) is the
-# bake-off DEFAULT, and ``c1`` stays selectable for a c1-vs-c2 A/B.
-CONTROL_PROMPT_VERSION = CONTROL_TEACHING_PROMPT_VERSION  # "c2"
+# prompt version from config). ``v4`` stays a selectable prompt so a c3-vs-v4
+# (drop-lens) A/B is still possible; the active control prompt (now ``c3``) is the
+# bake-off DEFAULT, and ``c1`` / ``c2`` stay selectable for a c1-vs-c2-vs-c3 A/B.
+CONTROL_PROMPT_VERSION = CONTROL_TEACHING_PROMPT_VERSION  # "c3"
 DEFAULT_DROP_LENS_PROMPT_VERSION = "v4"
 
 
