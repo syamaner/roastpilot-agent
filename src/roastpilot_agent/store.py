@@ -779,6 +779,42 @@ class RoastStore:
         if cursor.rowcount == 0:
             raise RuntimeError(f"no roast_run with id {run_id!r}")
 
+    async def finalize_stale_faulted_run(self, run_id: str) -> None:
+        """Terminally finalise a prior-session unfinalised FAULTED run (#331).
+
+        On restart, a previous session's faulted run that the operator never
+        acknowledged is still ``completed_at_utc IS NULL`` — which ``active_run``
+        treats as live, so it is restored as the ACTIVE run and blocks the UI from
+        starting a fresh roast. This stamps ``completed_at`` with outcome
+        ``faulted`` so the stale run lands in HISTORY (terminal) instead of being
+        recovered as active — a fresh boot is then clean/idle.
+
+        Distinct from :meth:`complete_run`: it deliberately does NOT touch
+        ``fault_reason`` (or any diagnostic field) — the reason persisted when the
+        run first faulted last session is PRESERVED for diagnosis. It only flips
+        the run terminal; ``agent_phase`` stays ``faulted``.
+
+        The UPDATE is GUARDED to a genuinely-faulted, unfinalised run
+        (``agent_phase = 'faulted' AND completed_at_utc IS NULL``) so the method
+        can never terminalise an ACTIVE non-faulted run — it matches its name /
+        contract, and accidental misuse raises rather than silently corrupting a
+        live roast. A non-matching id/phase touches no row and raises.
+
+        This is a STORE write only — it resumes nothing, issues no MCP write, and
+        does not touch heat/fan (the restart-never-auto-resumes invariant is about
+        actuation, untouched here).
+        """
+        now = _utc_now()  # one instant: completed_at == updated_at at finalisation
+        cursor = await self.connection.execute(
+            "UPDATE roast_runs SET completed_at_utc = ?, outcome = 'faulted',"
+            " updated_at_utc = ? WHERE id = ? AND completed_at_utc IS NULL"
+            " AND agent_phase = ?",
+            (now, now, run_id, RoastPhase.FAULTED.value),
+        )
+        await self.connection.commit()
+        if cursor.rowcount == 0:
+            raise RuntimeError(f"no unfinalized FAULTED roast_run with id {run_id!r}")
+
     async def set_operator_rating(
         self, run_id: str, *, rating: Literal[1, 2, 3, 4, 5], notes: str | None = None
     ) -> None:
