@@ -32,7 +32,7 @@ import {
 import type { BeanProfileInput } from "@/lib/types";
 import { useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
-import { smoothRorForDisplay } from "@/lib/rorSmoothing";
+import { smoothCurveForDisplay } from "@/lib/rorSmoothing";
 import type { OperatorAction } from "@/lib/types";
 import { AdvisoryPanel } from "./AdvisoryPanel";
 import { ChargeBanner } from "./ChargeBanner";
@@ -268,11 +268,12 @@ export function DashboardPage(): React.JSX.Element {
 
   const inRecovery = phase === "operator_recovery_required";
 
-  // #205: smooth the RoR series for DISPLAY ONLY (raw `bean_ror_c_per_min` still
-  // feeds the advisor/safety server-side, untouched). The staircase comes from the
-  // 1 Hz quantised RoR; a centered moving average dissolves it without lag.
+  // #205/#344: smooth the bean + RoR series for DISPLAY ONLY (raw `bean_temp_c` /
+  // `bean_ror_c_per_min` still feed the advisor/safety server-side, untouched). The
+  // staircase comes from the 1 Hz quantised channels; a centered quadratic
+  // Savitzky-Golay fit dissolves it without net lag (the live tail shows raw).
   const curve = useMemo(
-    () => ({ points: smoothRorForDisplay(view.points), markers: view.markers }),
+    () => ({ points: smoothCurveForDisplay(view.points), markers: view.markers }),
     [view.points, view.markers],
   );
 
