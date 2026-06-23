@@ -15,9 +15,12 @@ class FakeEventSource implements EventSourceLike {
   onerror: ((this: EventSourceLike, ev: Event) => unknown) | null = null;
   listeners = new Map<string, (ev: MessageEvent) => void>();
   closed = false;
+  /** The URL the hook constructed this stream with (carries the resume id, #339). */
+  readonly url: string;
   static last: FakeEventSource | null = null;
 
-  constructor() {
+  constructor(url = "") {
+    this.url = url;
     FakeEventSource.last = this;
   }
 
@@ -54,7 +57,7 @@ function Probe({
 }) {
   const result = useRoastStream(runId, {
     heartbeatSeconds: 1,
-    createEventSource: () => new FakeEventSource(),
+    createEventSource: (url) => new FakeEventSource(url),
     fetchSnapshot: fetchSnapshot ?? (async () => ({ agent_phase: snapshotPhase ?? "preheating" })),
   });
   onResult(result);
@@ -167,6 +170,74 @@ describe("useRoastStream", () => {
     expect(second).not.toBe(first);
     act(() => second.open());
     expect(latest!.status).toBe("live");
+  });
+
+  it("carries the last applied event id on the explicit reconnect (#339)", async () => {
+    vi.useFakeTimers();
+    let latest: UseRoastStreamResult | null = null;
+    render(<Probe runId="r1" snapshotPhase="preheating" onResult={(r) => (latest = r)} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const first = FakeEventSource.last!;
+    // First connect carries no resume id.
+    expect(first.url).not.toContain("last_event_id");
+    act(() => first.open());
+
+    // Apply a few frames; the hook tracks the highest applied id (3).
+    act(() => first.emit("phase_changed", { phase: "preheating" }, 1));
+    act(() => first.emit("advisory", { note: "ok" }, 2));
+    act(() => first.emit("phase_changed", { phase: "roasting_pre_first_crack" }, 3));
+    expect(latest!.frameCount).toBe(3);
+
+    // Drop → backoff → reopen. The new stream must request the resume from id 3
+    // (a freshly constructed EventSource sends no Last-Event-ID header, so the
+    // hook carries the id explicitly on the URL — the server replays the gap).
+    act(() => first.error());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    const second = FakeEventSource.last!;
+    expect(second).not.toBe(first);
+    expect(second.url).toContain("last_event_id=3");
+
+    // A further frame on the resumed stream advances the resume id for any later
+    // reconnect — proving the id keeps tracking across the reconnect boundary.
+    act(() => second.open());
+    act(() => second.emit("first_crack", { detected: true }, 4));
+    act(() => second.error());
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(5000);
+    });
+    expect(FakeEventSource.last!.url).toContain("last_event_id=4");
+  });
+
+  it("resumes without dropping or double-applying frames across a reconnect (#339)", async () => {
+    // The reducer dedupes a re-delivered (already-applied) frame by id, so a
+    // server replay of the gap never double-applies; a genuinely-new gap frame
+    // applies exactly once. (Phase itself re-bases from the reconnect snapshot —
+    // that's the snapshot-first contract — so this asserts on the dedupe channel.)
+    let latest: UseRoastStreamResult | null = null;
+    await act(async () => {
+      render(<Probe runId="r1" snapshotPhase="roasting_pre_first_crack" onResult={(r) => (latest = r)} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const first = FakeEventSource.last!;
+    await act(async () => first.open());
+    await act(async () => first.emit("phase_changed", { phase: "development" }, 5));
+    expect(latest!.phase).toBe("development");
+    expect(latest!.frameCount).toBe(1);
+
+    // A re-delivered id-5 frame (the server replayed the gap boundary) is deduped
+    // by the reducer: phase does not double-apply or rewind.
+    await act(async () => first.emit("phase_changed", { phase: "development" }, 5));
+    expect(latest!.phase).toBe("development");
+
+    // The genuinely-new id-6 frame applies once and moves state.
+    await act(async () => first.emit("phase_changed", { phase: "cooling" }, 6));
+    expect(latest!.phase).toBe("cooling");
   });
 
   it("does nothing when runId is null (no stream, status connecting)", () => {
