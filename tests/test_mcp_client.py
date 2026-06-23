@@ -920,10 +920,39 @@ def test_event_backdate_seconds_none_for_negative_delta() -> None:
 
 
 def test_event_backdate_seconds_none_for_non_numeric_confirmation() -> None:
-    """A bool / non-finite confirmation value is rejected (a delta must be a real
+    """A bool / non-numeric confirmation value is rejected (a delta must be a real
     duration)."""
     event = EventSnapshot.model_validate(
         _beans_added_event({"confirmed_at_monotonic_seconds": True})
+    )
+    assert event_backdate_seconds(event, onset_key="turning_point_monotonic_seconds") is None
+
+
+def test_event_backdate_seconds_none_for_non_finite_confirmation() -> None:
+    """A non-finite confirmation value (inf/NaN) collapses to no delta — the
+    ``_payload_float`` finiteness guard, so a garbage timestamp never poisons the
+    clock origin."""
+    event = EventSnapshot.model_validate(
+        _beans_added_event(
+            {
+                "turning_point_monotonic_seconds": 638.88,
+                "confirmed_at_monotonic_seconds": float("inf"),
+            }
+        )
+    )
+    assert event_backdate_seconds(event, onset_key="turning_point_monotonic_seconds") is None
+
+
+def test_event_backdate_seconds_none_for_non_finite_event_monotonic_fallback() -> None:
+    """When the onset key is absent AND the event's own ``monotonic_seconds`` is
+    non-finite, the fallback collapses to no delta rather than subtracting inf."""
+    event = EventSnapshot.model_validate(
+        {
+            "kind": "beans_added",
+            "recorded_at_utc": "2026-06-07T12:09:10.189739+00:00",
+            "monotonic_seconds": float("inf"),
+            "payload": {"confirmed_at_monotonic_seconds": 650.0},
+        }
     )
     assert event_backdate_seconds(event, onset_key="turning_point_monotonic_seconds") is None
 

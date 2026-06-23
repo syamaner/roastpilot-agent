@@ -990,12 +990,30 @@ class RoastRunner:
             charge_elapsed_seconds: Seconds since the (backdated) charge from the
                 controller snapshot, or ``None`` before charge.
 
+        Timing assumption (advisory-only, accepted): ``charge_elapsed_seconds``
+        is read from the *current* snapshot while the reference here is live
+        ``datetime.now(UTC)``. On the normal first-charged tick the two are
+        same-tick, so the persisted instant is exact. The one drift case — the
+        store write fails on the first charged tick and only succeeds on a retry
+        AFTER drop (``charge_elapsed_seconds`` freezes at drop via
+        ``_effective_now`` while ``now`` keeps advancing) — would persist a charge
+        instant later than the true one. That path is itself ``# pragma: no
+        cover``-rare (a store failure spanning the drop) and the persisted value
+        is ADVISORY-ONLY: no safety or control gate reads it; the only effect is a
+        resumed run's DTR *readout* reading slightly short. Accepted rather than
+        threading a per-tick wall-clock through the snapshot for a degraded
+        readout on a doubly-rare path (claude-review / Augment adjudication, #337).
+
         Returns:
             The backdated charge instant as an ISO-8601 UTC string, or ``None``.
         """
         if charge_elapsed_seconds is None or not math.isfinite(charge_elapsed_seconds):
             return None
-        elapsed = max(0.0, charge_elapsed_seconds)
+        # `max(0.0, …)` is defensive narrowing: the snapshot's charge-elapsed is
+        # `_effective_now() - _charge_monotonic`, and `_effective_now() >=
+        # _charge_monotonic` always (charge precedes the current/drop instant, and
+        # `_backdated_now` keeps the anchor <= now), so this never clamps.
+        elapsed = max(0.0, charge_elapsed_seconds)  # pragma: no cover - unreachable narrowing
         return (datetime.now(UTC) - timedelta(seconds=elapsed)).isoformat()
 
     async def _publish_and_persist_telemetry(self) -> None:
