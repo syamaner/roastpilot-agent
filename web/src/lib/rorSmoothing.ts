@@ -79,14 +79,6 @@ import type { CurvePoint } from "@/components/shared/LiveCurve/types";
  */
 export const CURVE_SMOOTHING_WINDOW_SECONDS = 21;
 
-/**
- * Back-compat alias for the #205 RoR window constant. The single pinned width now
- * covers both channels (#344); kept so older imports/tests resolve.
- *
- * @deprecated Use {@link CURVE_SMOOTHING_WINDOW_SECONDS}.
- */
-export const ROR_SMOOTHING_WINDOW_SECONDS = CURVE_SMOOTHING_WINDOW_SECONDS;
-
 /** The display channels SG-smoothed for rendering (#344): the bean line and RoR. */
 type SmoothChannel = "bean" | "ror";
 const SMOOTH_CHANNELS: readonly SmoothChannel[] = ["bean", "ror"];
@@ -105,9 +97,12 @@ const SMOOTH_CHANNELS: readonly SmoothChannel[] = ["bean", "ror"];
  *     the raw value (this function signals that by returning the raw value when it
  *     cannot bracket, see {@link bracketed}).
  *   - Least-squares-fits y = a + b·x + c·x² (x measured from the centre's t) and
- *     returns `a`, the fitted value AT the centre. On uniform 1 Hz spacing this is
- *     exactly the closed-form centered SG convolution; the local fit generalises it
- *     to sparse/irregular cadence and degenerate windows.
+ *     returns `a`, the fitted value AT the centre, CLAMPED to the raw [min, max] of
+ *     the values used in the window (so a quadratic overshoot at a sharp edge cannot
+ *     produce a spurious display spike — a genuine extremum is inside that range). On
+ *     uniform 1 Hz spacing the unclamped fit is exactly the closed-form centered SG
+ *     convolution; the local fit generalises it to sparse/irregular cadence and
+ *     degenerate windows.
  *   - Falls back to the raw value if fewer than 3 points (a parabola is
  *     under-determined) — preserving the #205 "a lone sample is unchanged" contract.
  *
@@ -193,14 +188,33 @@ function savitzkyGolayCentre(
 
   // a = det(matrix with column 0 replaced by [t0,t1,t2]) / det.
   const a = (t0 * m00 - s1 * (t1 * s4 - t2 * s3) + s2 * (t1 * s3 - t2 * s2)) / det;
-  return { value: a, bracketed };
+
+  // Clamp the fitted centre to the raw [min, max] of the values actually used in
+  // this window's fit. A quadratic centre fit can OVERSHOOT past the local raw
+  // extremes around a sharp edge or sparse cadence (a spurious display spike); the
+  // true peak/trough is always inside the window's raw range, so clamping removes
+  // the overshoot WITHOUT blunting a genuine extremum.
+  let lo = vs[0];
+  let hi = vs[0];
+  for (let k = 1; k < vs.length; k += 1) {
+    if (vs[k] < lo) lo = vs[k];
+    if (vs[k] > hi) hi = vs[k];
+  }
+  const clamped = a < lo ? lo : a > hi ? hi : a;
+  return { value: clamped, bracketed };
 }
 
 /**
- * Return a copy of `points` with the bean and RoR channels replaced by their
- * centered quadratic Savitzky-Golay fit over a ±half-window time band (#344); every
- * other field is passed through unchanged. A new array of new objects is returned
- * (object identity is not preserved), suitable as a memoised render input.
+ * Return the `points` with the bean and RoR channels replaced by their centered
+ * quadratic Savitzky-Golay fit over a ±half-window time band (#344); every other
+ * field is passed through unchanged.
+ *
+ * Object identity is REUSED for memoisation, not freshly allocated: an unchanged
+ * point (neither bean nor ror moved) is returned as the SAME object, and the
+ * original array itself is returned unchanged when there is nothing to smooth
+ * (empty input or `windowSeconds <= 0`). A new object is allocated only for a point
+ * whose bean or ror value actually changed. The input array and its points are
+ * never mutated.
  *
  * Behaviour (per channel, independently):
  *   - A point whose own value is `null` stays `null` (a gap never becomes a
@@ -211,6 +225,10 @@ function savitzkyGolayCentre(
  *     newest points, with no future neighbours yet) — falls back to its RAW value,
  *     because a one-sided parabola there wobbles. As later ticks arrive the point
  *     becomes bracketed and the fitted value fills in symmetrically.
+ *   - The fitted centre is CLAMPED to the raw [min, max] of the values used in that
+ *     point's window, so a quadratic overshoot past the local extremes (a spurious
+ *     spike at a sharp edge / sparse cadence) cannot appear; a genuine peak/trough
+ *     is inside the window's raw range and so survives the clamp.
  *   - Points are assumed ascending in `t` (the curve invariant).
  *
  * @param points  The curve points (ascending `t`, seconds).
@@ -250,21 +268,4 @@ export function smoothCurveForDisplay(
     if (bean === point.bean && ror === point.ror) return point;
     return { ...point, bean, ror };
   });
-}
-
-/**
- * Back-compat wrapper for the #205 call sites: smooth the curve and return it.
- *
- * #344 promoted smoothing from RoR-only to bean+RoR; this delegates to
- * {@link smoothCurveForDisplay} so existing `smoothRorForDisplay(...)` imports keep
- * working while the new behaviour applies. Prefer importing
- * {@link smoothCurveForDisplay} directly in new code.
- *
- * @deprecated Use {@link smoothCurveForDisplay}.
- */
-export function smoothRorForDisplay(
-  points: CurvePoint[],
-  windowSeconds: number = CURVE_SMOOTHING_WINDOW_SECONDS,
-): CurvePoint[] {
-  return smoothCurveForDisplay(points, windowSeconds);
 }

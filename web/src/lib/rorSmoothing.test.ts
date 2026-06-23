@@ -1,12 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { CurvePoint } from "@/components/shared/LiveCurve/types";
-import {
-  CURVE_SMOOTHING_WINDOW_SECONDS,
-  ROR_SMOOTHING_WINDOW_SECONDS,
-  smoothCurveForDisplay,
-  smoothRorForDisplay,
-} from "./rorSmoothing";
+import { CURVE_SMOOTHING_WINDOW_SECONDS, smoothCurveForDisplay } from "./rorSmoothing";
 
 /**
  * Build a curve of evenly-spaced points. `rors` drives the RoR channel; `beans`
@@ -221,15 +216,24 @@ describe("smoothCurveForDisplay — Savitzky-Golay kernel (#344)", () => {
     expect(CURVE_SMOOTHING_WINDOW_SECONDS).toBeGreaterThanOrEqual(15);
     expect(CURVE_SMOOTHING_WINDOW_SECONDS).toBeLessThanOrEqual(25);
   });
-});
 
-describe("back-compat shims", () => {
-  it("smoothRorForDisplay delegates to smoothCurveForDisplay", () => {
-    const points = curve([10, 12, 14, 16, 18], 1, [70, 71, 72, 73, 74]);
-    expect(smoothRorForDisplay(points, 7)).toEqual(smoothCurveForDisplay(points, 7));
-  });
-
-  it("ROR_SMOOTHING_WINDOW_SECONDS aliases the curve window constant", () => {
-    expect(ROR_SMOOTHING_WINDOW_SECONDS).toBe(CURVE_SMOOTHING_WINDOW_SECONDS);
+  it("clamps an overshooting fit to the window's raw [min, max] (no spurious spike)", () => {
+    // A sharp step edge: a quadratic fit at the corner OVERSHOOTS past the raw step
+    // (Gibbs-like ringing) — the fitted centre would land below the local min / above
+    // the local max. The clamp pins every smoothed value inside the window's raw range
+    // so no spurious spike appears, while the genuine step extremes survive.
+    const ror = [0, 0, 0, 0, 0, 20, 20, 20, 20, 20];
+    const points = curve(ror);
+    const smoothed = rorOf(smoothCurveForDisplay(points, 11)) as number[];
+    for (let i = 0; i < smoothed.length; i += 1) {
+      // each point's window is a sub-range of [0, 20], so every smoothed value must
+      // stay within the global raw [min, max] (a tighter per-window bound is implied).
+      expect(smoothed[i]).toBeGreaterThanOrEqual(0);
+      expect(smoothed[i]).toBeLessThanOrEqual(20);
+    }
+    // and the step is still resolved (not flattened to a constant): low end near 0,
+    // high end near 20.
+    expect(Math.min(...smoothed)).toBeLessThan(5);
+    expect(Math.max(...smoothed)).toBeGreaterThan(15);
   });
 });
