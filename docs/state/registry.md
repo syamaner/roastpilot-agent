@@ -105,6 +105,47 @@
 
 ## Active Context
 
+**23 Jun 2026 — ROAST-4 PREP CYCLE COMPLETE (first run under the new PR-hygiene discipline,
+#356). Before-roast-4 reliability/readability shipped; one cleanup closed as superseded; the
+DRYING_END landmark added end-to-end. The next gate is the operator running roast 4.** Worked the
+post-roast-3 follow-up order as lead/PM with engineer teammates; every PR through `pr-preflight`
+(gates + self-critique + domain reviewer on the branch) and independent triage (D23, the author
+never self-triages):
+
+- **#339 SSE Last-Event-ID resume — MERGED (#357, `b1155fd`).** Broadcaster ring buffer +
+  replay-on-subscribe + endpoint Last-Event-ID header/query + a consumer-layer drain id-guard. The
+  live SPA no longer drops fault/recovery/CLAMP events on reconnect. Memory `sse-resume-needs-consumer-id-guard`.
+- **#344 centred Savitzky–Golay smoothing — MERGED (#358, `cc690e7`).** SG on bean + RoR,
+  display-only, centred (no net lag), live-tail-to-raw fallback, fitted centre clamped to the
+  window's raw range. Window pinned **21 s**, validated vs a roast-3 replay.
+- **#346 freeze `_roast_elapsed_seconds` server-side — CLOSED as superseded by #330 (plan D56).**
+  `elapsed_seconds` is one multi-purpose field (curve x-axis + persistence throttle + readout); a
+  blanket server freeze regresses the cooling curve and stops cooling rows persisting (caught
+  18→14 points pre-push). The readout-freeze belongs at the presentation layer, already shipped by
+  #330. No code change. (Engineer caught the regression before opening a PR.)
+- **#351 server DRYING_END signal + dry-end chart marker — COMPLETE (BE #359 `1d40733`, FE #360
+  `ac0fcb3`).** Bean-temp threshold approach, validated against the operator's 47 .alog roasts (all
+  47 carry a computed Dry-End temp, ~150 °C, median 149 / mean 150.5 / σ 4.9), pinned **150.0 °C**.
+  BE: turning-point-gated first-cross latch pre-FC, `drying_end` SSE event + persisted timeline,
+  deliberately NOT a RoastMilestone so it never reaches the advisor (observability-only). FE: the
+  `dry_end` marker on both the live dashboard and the reload/detail path (placed from the server's
+  own threshold cross against persisted telemetry). Independent qa caught a test-oracle coincidence
+  + two coverage gaps before merge. Memories `artisan-roast-logs-dataset` (the DRY_BT validation),
+  `event-kind-be-fe-contract-parity` (a backend event-kind change reds the FE contract gate).
+
+**PR-hygiene "after" sample (this cycle = the measured after for the #356 experiment):** 3 logic
+PRs, churn median 735→504, PRs >800 → 0 %, but >400 and the ~42 % review-fix share stayed flat —
+the win is size *composition* + zero avoidable churn, plus the metric-blind catch (#346 closed
+before any PR opened). Written up in blog post 17 + the `pr-flow-improvement-experiment` memory.
+
+**Still open / next:** everything remaining is OPERATOR-GATED — roast 4 (#134) + device SSE (#135);
+the `coffee-roaster-mcp` #169/#170 v0.1.7 backdating release (CI-green/review-clean, MERGEABLE) with
+the agent **#337** (honour the backdated T0/FC timestamp) + the MCP pin bump **in lockstep**; then
+the post-roast-4 sequence (#323 ceiling-override → #228 LAST → M2/D42). Untouched: #318. Nothing
+else agent-startable until roast 4.
+
+---
+
 **22 Jun 2026 — POST-ROAST-3 BACKLOG CLEARED (15 PRs merged; agent-team session). The
 P0 deterministic trim, the full control+safety serial, the chart sub-track, and the
 independent FE are all DONE. Roast 4 (supervised validation of the trim + c3) is the
