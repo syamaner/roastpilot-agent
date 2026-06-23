@@ -93,6 +93,35 @@ test("the detail curve carries the full persisted series + T0/FC/drop markers", 
   expect(hook.markers.map((m) => m.kind).sort()).toEqual(["drop", "first_crack", "t0"]);
 });
 
+test.describe("dry-end marker on the persisted reload path (#351)", () => {
+  // A SEPARATE harness route (FIXTURE_TIMELINE_DRY_END = the base detail data + a
+  // persisted drying_end event) so this positive case runs end-to-end WITHOUT
+  // disturbing the base /__detail-harness `roast-detail` snapshot. Data-only (D24):
+  // no toHaveScreenshot, so no pixel baseline shifts.
+  test.beforeEach(async ({ page }) => {
+    await page.goto("/__detail-harness-dry-end");
+    await settle(page);
+    await waitForChartPoints(page, 1);
+  });
+
+  test("dry_end reaches the chart, placed at the server threshold cross (240 s)", async ({
+    page,
+  }) => {
+    const hook = await readChartData(page);
+    // The reload path hydrates dry-end FROM the persisted timeline event alongside
+    // T0/FC/drop — the positive case the base detail fixture never exercises.
+    expect(hook.markers.map((m) => m.kind).sort()).toEqual([
+      "drop",
+      "dry_end",
+      "first_crack",
+      "t0",
+    ]);
+    // Placed at the first telemetry point reaching the event's server threshold_c
+    // (150 °C → fixture bean crosses at elapsed 240 s), NOT the event's monotonic.
+    expect(hook.markers.find((m) => m.kind === "dry_end")?.t).toBe(240);
+  });
+});
+
 test.describe("capped detail lists (#271)", () => {
   // The long-roast harness: advisor-decisions + decision-trace both have 24 rows
   // (> the inline cap of 5), so the page must show only the last 5 of each inline
