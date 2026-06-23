@@ -31,6 +31,7 @@ from roastpilot_agent.mcp_client import (
     RuntimeConfigSnapshot,
     ServerInfo,
     StartRoastSessionResult,
+    event_backdate_seconds,
     parse_tool_result,
     project_mic_status,
     project_session_state,
@@ -831,6 +832,138 @@ def _state_with_fc(**fc_overrides: object) -> RoastSessionState:
         },
     )
     return RoastSessionState.model_validate(payload)
+
+
+# --- #337: backdating-delta projection (coffee-roaster-mcp v0.1.7) ---
+
+
+def _beans_added_event(payload: dict[str, object]) -> dict[str, object]:
+    """A backdated ``beans_added`` event snapshot dict with ``monotonic_seconds``
+    at the turning point (the v0.1.7 server sets the event time to the onset)."""
+    return {
+        "kind": "beans_added",
+        "recorded_at_utc": "2026-06-07T12:09:10.189739+00:00",
+        "monotonic_seconds": 638.88,
+        "payload": payload,
+    }
+
+
+def _first_crack_event(payload: dict[str, object]) -> dict[str, object]:
+    return {
+        "kind": "first_crack_detected",
+        "recorded_at_utc": "2026-06-07T12:18:11.708550+00:00",
+        "monotonic_seconds": 1180.4,
+        "payload": payload,
+    }
+
+
+def test_event_backdate_seconds_t0_from_payload_pair() -> None:
+    """The T0 delta is ``confirmed_at − turning_point``, both MCP-domain — a
+    duration, never an absolute timestamp."""
+    event = EventSnapshot.model_validate(
+        _beans_added_event(
+            {
+                "turning_point_monotonic_seconds": 638.88,
+                "confirmed_at_monotonic_seconds": 655.88,
+            }
+        )
+    )
+    assert event_backdate_seconds(
+        event, onset_key="turning_point_monotonic_seconds"
+    ) == pytest.approx(17.0)
+
+
+def test_event_backdate_seconds_fc_from_payload_pair() -> None:
+    event = EventSnapshot.model_validate(
+        _first_crack_event(
+            {
+                "detected_at_monotonic_seconds": 1180.4,
+                "confirmed_at_monotonic_seconds": 1195.4,
+            }
+        )
+    )
+    assert event_backdate_seconds(
+        event, onset_key="detected_at_monotonic_seconds"
+    ) == pytest.approx(15.0)
+
+
+def test_event_backdate_seconds_falls_back_to_event_monotonic_for_onset() -> None:
+    """With no onset key in the payload the event's own (backdated)
+    ``monotonic_seconds`` supplies the onset."""
+    event = EventSnapshot.model_validate(
+        _beans_added_event({"confirmed_at_monotonic_seconds": 650.88})
+    )
+    assert event_backdate_seconds(
+        event, onset_key="turning_point_monotonic_seconds"
+    ) == pytest.approx(12.0)
+
+
+def test_event_backdate_seconds_none_without_confirmation_field() -> None:
+    """A manual mark / pre-0.1.7 payload has no ``confirmed_at_monotonic_seconds``
+    ⇒ no delta (the controller stamps at receive-tick)."""
+    event = EventSnapshot.model_validate(_beans_added_event({}))
+    assert event_backdate_seconds(event, onset_key="turning_point_monotonic_seconds") is None
+
+
+def test_event_backdate_seconds_none_for_negative_delta() -> None:
+    """A confirmation EARLIER than the onset is malformed ⇒ no delta (never
+    fabricate a future-referenced anchor)."""
+    event = EventSnapshot.model_validate(
+        _beans_added_event(
+            {
+                "turning_point_monotonic_seconds": 700.0,
+                "confirmed_at_monotonic_seconds": 650.0,
+            }
+        )
+    )
+    assert event_backdate_seconds(event, onset_key="turning_point_monotonic_seconds") is None
+
+
+def test_event_backdate_seconds_none_for_non_numeric_confirmation() -> None:
+    """A bool / non-finite confirmation value is rejected (a delta must be a real
+    duration)."""
+    event = EventSnapshot.model_validate(
+        _beans_added_event({"confirmed_at_monotonic_seconds": True})
+    )
+    assert event_backdate_seconds(event, onset_key="turning_point_monotonic_seconds") is None
+
+
+def test_project_session_state_surfaces_backdate_deltas() -> None:
+    """The projection surfaces both deltas from the matching events so the
+    controller can read them typed off ``RoastTelemetry``."""
+    state = RoastSessionState.model_validate(
+        _state_payload(
+            1200.5,
+            events=[
+                _beans_added_event(
+                    {
+                        "turning_point_monotonic_seconds": 638.88,
+                        "confirmed_at_monotonic_seconds": 655.88,
+                    }
+                ),
+                _first_crack_event(
+                    {
+                        "detected_at_monotonic_seconds": 1180.4,
+                        "confirmed_at_monotonic_seconds": 1195.4,
+                    }
+                ),
+            ],
+        )
+    )
+    telemetry = project_session_state(state, age_seconds=0.0)
+    assert telemetry is not None
+    assert telemetry.t0_backdate_seconds == pytest.approx(17.0)
+    assert telemetry.first_crack_backdate_seconds == pytest.approx(15.0)
+
+
+def test_project_session_state_backdate_none_for_legacy_empty_payload() -> None:
+    """The default fixture's ``beans_added`` event carries an empty payload (the
+    pre-0.1.7 / manual shape) ⇒ both deltas project as None."""
+    state = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
+    telemetry = project_session_state(state, age_seconds=0.0)
+    assert telemetry is not None
+    assert telemetry.t0_backdate_seconds is None
+    assert telemetry.first_crack_backdate_seconds is None
 
 
 def test_project_mic_status_running_and_detecting_is_ok() -> None:

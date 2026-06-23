@@ -24,6 +24,7 @@ passed through from MCP, never recomputed.
 
 import asyncio
 import json
+import math
 import os
 import shutil
 import sys
@@ -74,6 +75,23 @@ class EventSnapshot(MCPMirror):
     ``payload`` is deliberately permissive: a manual ``beans_added`` event
     carries an empty payload while auto-T0 carries source/charge/drop
     metadata (verified against both 7 Jun live-roast sessions).
+
+    With coffee-roaster-mcp v0.1.7 (#169/#170) the event ``monotonic_seconds``
+    is **backdated** to the turning-point (``beans_added``) / crack-onset
+    (``first_crack_detected``) instant, and the ``payload`` carries the raw
+    confirmation moment so a consumer can recover the lag the server corrected:
+
+    - ``beans_added``: ``turning_point_monotonic_seconds`` (== the backdated
+      ``monotonic_seconds``) + ``confirmed_at_monotonic_seconds`` +
+      ``confirmed_at_utc``.
+    - ``first_crack_detected``: ``detected_at_monotonic_seconds`` (== the
+      backdated ``monotonic_seconds``) + ``confirmed_at_monotonic_seconds``.
+
+    All three monotonic values live in the **MCP** ``time.monotonic`` domain,
+    which is a *different* domain to the agent's clock (the MCP is a separate
+    child process, D6). Only the in-domain *difference*
+    (``confirmed_at − onset``) is meaningful agent-side — see
+    :func:`event_backdate_seconds`.
     """
 
     kind: str
@@ -333,6 +351,78 @@ def project_mic_status(status: FirstCrackStatus) -> MicStatus:
     )
 
 
+def _payload_float(payload: dict[str, EventPayloadValue], key: str) -> float | None:
+    """Read a finite numeric payload field as a float, or ``None``.
+
+    Booleans are rejected (``bool`` is an ``int`` subclass but never a valid
+    timestamp), as are non-finite values — the result feeds a clock delta, so a
+    garbage value must collapse to "absent" rather than poison the origin.
+    """
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    if not math.isfinite(numeric):
+        return None
+    return numeric
+
+
+def event_backdate_seconds(event: EventSnapshot, *, onset_key: str) -> float | None:
+    """Return the MCP-domain backdating delta for a backdated milestone event.
+
+    coffee-roaster-mcp v0.1.7 (#169/#170) backdates the ``beans_added`` /
+    ``first_crack_detected`` event ``monotonic_seconds`` to the turning-point /
+    crack-onset instant and preserves the confirmation tick in the payload. This
+    returns ``confirmed_at_monotonic_seconds − onset`` — a duration computed
+    **entirely within the MCP monotonic domain**, so it is safe to subtract from
+    the agent's own ``time.monotonic`` receive-tick (the agent receives the event
+    at ≈ the confirmation moment). It is *never* an absolute MCP timestamp:
+    cross-process monotonic clocks are not comparable, so this only ever returns a
+    domain-free delta.
+
+    The onset is read from ``payload[onset_key]`` when present (the in-domain pair
+    keeps the subtraction self-consistent) and falls back to the event's own
+    backdated ``monotonic_seconds`` (which the server sets equal to that field).
+
+    Args:
+        event: The backdated milestone event snapshot.
+        onset_key: The payload key holding the backdated onset in the MCP domain
+            (``"turning_point_monotonic_seconds"`` for T0,
+            ``"detected_at_monotonic_seconds"`` for FC).
+
+    Returns:
+        The non-negative backdate delta in seconds, or ``None`` when the v0.1.7
+        ``confirmed_at_monotonic_seconds`` field is absent (a manual mark or a
+        pre-0.1.7 payload), the onset is unreadable, or the delta is negative /
+        non-finite (a malformed payload). ``None`` means "stamp at receive-tick",
+        the conservative pre-backdating behaviour.
+    """
+    confirmed = _payload_float(event.payload, "confirmed_at_monotonic_seconds")
+    if confirmed is None:
+        return None
+    onset = _payload_float(event.payload, onset_key)
+    if onset is None:
+        onset = event.monotonic_seconds
+    delta = confirmed - onset
+    if not math.isfinite(delta) or delta < 0.0:
+        return None
+    return delta
+
+
+def _latest_backdate_seconds(
+    events: Sequence[EventSnapshot], *, kind: str, onset_key: str
+) -> float | None:
+    """Return the backdate delta of the most recent event of ``kind``.
+
+    Both milestones are singletons in a session, but iterating in reverse keeps
+    the helper correct (and cheap) regardless of how many events precede them.
+    """
+    for event in reversed(events):
+        if event.kind == kind:
+            return event_backdate_seconds(event, onset_key=onset_key)
+    return None
+
+
 def project_session_state(state: RoastSessionState, *, age_seconds: float) -> RoastTelemetry | None:
     """Project an MCP ``RoastSessionState`` into the controller's ``RoastTelemetry``.
 
@@ -343,9 +433,12 @@ def project_session_state(state: RoastSessionState, *, age_seconds: float) -> Ro
 
     Detection booleans come from the contract-checked Literal status fields
     (``t0_status.status`` / ``first_crack_status.status``), not the latched
-    ``*_at_utc`` timestamps. Derived metrics (RoR) are passed through from MCP,
-    never recomputed (plan §2). ``age_seconds`` is supplied by the caller — the
-    session state carries no per-reading wall-clock age."""
+    ``*_at_utc`` timestamps. The backdating deltas (#337) come from the matching
+    ``beans_added`` / ``first_crack_detected`` event payloads (v0.1.7), surfaced
+    as in-domain durations the controller subtracts from its receive-tick clock.
+    Derived metrics (RoR) are passed through from MCP, never recomputed (plan §2).
+    ``age_seconds`` is supplied by the caller — the session state carries no
+    per-reading wall-clock age."""
     device = state.device_state
     if device is None or device.bean_temp_c is None or device.env_temp_c is None:
         return None
@@ -359,6 +452,16 @@ def project_session_state(state: RoastSessionState, *, age_seconds: float) -> Ro
         first_crack_detected=state.first_crack_status.status == "detected",
         cooling_on=state.cooling_on,
         mic_status=project_mic_status(state.first_crack_status),
+        t0_backdate_seconds=_latest_backdate_seconds(
+            state.events,
+            kind="beans_added",
+            onset_key="turning_point_monotonic_seconds",
+        ),
+        first_crack_backdate_seconds=_latest_backdate_seconds(
+            state.events,
+            kind="first_crack_detected",
+            onset_key="detected_at_monotonic_seconds",
+        ),
     )
 
 

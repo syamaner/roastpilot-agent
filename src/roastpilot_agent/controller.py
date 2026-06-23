@@ -13,6 +13,7 @@ fan (``operator_recovery_required``).
 """
 
 import asyncio
+import math
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -593,6 +594,16 @@ class RoastController:
         # drop values: post-drop the readout must hold the drop figure, not keep
         # climbing into cooling. Advisory/display-only; clamps no control path.
         self._drop_monotonic: float | None = None
+        # Pending FC backdating delta (#337), in seconds, handed to the
+        # ROASTING_PRE_FIRST_CRACK -> DEVELOPMENT stamp by ``_apply_phase_rules``
+        # the tick the MCP-detected first crack fires. ``transition_to`` is a
+        # generic method with no telemetry in scope, so the delta is staged here
+        # and consumed-then-cleared at the stamp. v0.1.7 backdates the FC event to
+        # the crack onset; subtracting this MCP-domain delta from the agent's
+        # receive-tick clock anchors the development origin ~17 s earlier (the lag
+        # the server corrected), shifting dev%/DTR/curve and the trim FC-ETA. None
+        # for a manual/override FC or a pre-0.1.7 payload (stamp at receive-tick).
+        self._pending_first_crack_backdate: float | None = None
         self._consecutive_read_failures = 0
         # D30 (#166): consecutive advisor *availability* failures
         # (provider_error / timeout). Incremented in _record_advisor_failure on
@@ -772,6 +783,42 @@ class RoastController:
             return now
         return min(now, self._drop_monotonic)
 
+    def _backdated_now(self, backdate_seconds: float | None) -> float:
+        """Anchor a milestone clock at the MCP-reported backdated instant (#337).
+
+        The MCP (a separate child process, D6) reports the T0 turning-point / FC
+        crack-onset by backdating its event timestamp, and carries the *delta* to
+        the confirmation tick in the event payload (``confirmed_at − onset``,
+        surfaced on ``RoastTelemetry``). Because cross-process ``time.monotonic``
+        clocks are **not** comparable, the agent never assigns the MCP's absolute
+        timestamp; instead it subtracts that in-domain delta from its own
+        receive-tick clock. The agent receives the event at ≈ the confirmation
+        moment, so ``self._clock() - delta`` reconstructs the onset in the agent's
+        own clock domain.
+
+        Fail-safe: a missing delta (manual mark / pre-0.1.7 payload — ``None``) or
+        a non-finite / negative one falls back to ``self._clock()`` (stamp at
+        receive-tick, the pre-backdating behaviour). The result is therefore never
+        in the future and never garbage — it is ``<= self._clock()`` by
+        construction (the future-rejection contract holds: a backdated milestone
+        is in the past). Advisory/display-only: this anchors the charge /
+        development clocks the advisor + SPA read, never a transition, verdict,
+        executor, or drop gate.
+
+        Args:
+            backdate_seconds: The MCP-domain backdating delta in seconds, or
+                ``None`` to stamp at the current receive-tick.
+
+        Returns:
+            The backdated monotonic instant in the agent's clock domain.
+        """
+        now = self._clock()
+        if backdate_seconds is None or not math.isfinite(backdate_seconds):
+            return now
+        if backdate_seconds < 0.0:
+            return now  # never fabricate a future-referenced milestone clock
+        return now - backdate_seconds
+
     def _development_elapsed_seconds(self) -> float | None:
         """Seconds since first crack, frozen at drop, or ``None`` before FC.
 
@@ -896,6 +943,10 @@ class RoastController:
             # A new run/preheat resets the development clock; it is (re)armed
             # only on the first-crack transition below.
             self._first_crack_monotonic = None
+            # A new run/preheat clears any staged FC backdating delta (#337):
+            # belt-and-braces with the consume-on-stamp clear, so a delta from a
+            # prior roast can never anchor a fresh roast's development clock.
+            self._pending_first_crack_backdate = None
             # A new run/preheat is "back before charge": clear the charge clock
             # so ``seconds_since_charge`` is None (#219). It is restamped at the
             # debounced T0 transition.
@@ -951,7 +1002,15 @@ class RoastController:
             # now, or an already-developed run would read elapsed≈0. On such a
             # resume the in-memory FC time is preserved (same process) or stays
             # None (after a restart) — advisory-only either way (safety review).
-            self._first_crack_monotonic = self._clock()
+            #
+            # #337: when the MCP backdated the FC event (v0.1.7), origin the
+            # development clock on the crack ONSET, not this receive-tick — apply
+            # the staged MCP-domain delta to the agent's own clock. The stage is
+            # consumed (set to None) so it never leaks into a later, unrelated
+            # FC-edge transition (e.g. a recovery resume). A manual/override FC or
+            # a pre-0.1.7 payload leaves the stage None ⇒ stamp at receive-tick.
+            self._first_crack_monotonic = self._backdated_now(self._pending_first_crack_backdate)
+            self._pending_first_crack_backdate = None
             # Record the first-crack milestone for the per-tick context summary
             # (#275): the development clock's origin and a curve landmark the
             # post-FC loop reasons from. Context only; the last reading the tick
@@ -1240,7 +1299,16 @@ class RoastController:
                 # post-charge settle window (#209) is retired under D35 (#222) —
                 # the advisor is no longer consulted pre-FC, so there is no
                 # automatic post-charge consult left to suppress.
-                self._charge_monotonic = self._clock()
+                #
+                # #337: origin the charge clock on the MCP-reported TURNING POINT
+                # (the local-max bean temp before the decline), not this debounced
+                # receive-tick — apply the backdating delta the v0.1.7 server
+                # carries on the ``beans_added`` event. The delta is an MCP-domain
+                # duration (confirmed − turning point), subtracted from the agent's
+                # own clock; a manual mark or pre-0.1.7 payload carries no delta
+                # (None) ⇒ stamp at receive-tick, the prior behaviour. This shifts
+                # dev%/DTR/curve x-origin ~17 s earlier (the lag corrected at T0).
+                self._charge_monotonic = self._backdated_now(telemetry.t0_backdate_seconds)
             return
         if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK and telemetry is not None:
             # Drying-end signal (#351) BEFORE the FC check: a pre-FC observability
@@ -1258,6 +1326,14 @@ class RoastController:
                     RoastEventKind.FIRST_CRACK,
                     {"source": RoastEventSource.MCP.value, "bean_temp_c": telemetry.bean_temp_c},
                 )
+                # #337: stage the MCP-reported FC backdating delta so the
+                # development-clock stamp in ``transition_to`` origins on the crack
+                # ONSET, not this receive-tick. Staged because ``transition_to`` is
+                # generic (no telemetry in scope); it is consumed-and-cleared at the
+                # stamp. Only this MCP-detection FC path stages a delta — the
+                # operator override (``operator_mark_first_crack``) leaves it None
+                # ⇒ stamp at receive-tick.
+                self._pending_first_crack_backdate = telemetry.first_crack_backdate_seconds
                 self.transition_to(RoastPhase.DEVELOPMENT)
 
     def _maybe_emit_charge_guidance(self, telemetry: RoastTelemetry) -> None:
