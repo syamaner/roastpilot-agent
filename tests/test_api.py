@@ -30,6 +30,7 @@ from roastpilot_agent.api import (
     EventBroadcaster,
     QueuedOperatorAction,
     RoastRunGoneError,
+    RoastRunner,
     RoastService,
     _parse_last_event_id,  # pyright: ignore[reportPrivateUsage]
     create_app,
@@ -1163,6 +1164,25 @@ def test_parse_last_event_id_ignores_malformed(raw: str | None) -> None:
 @pytest.mark.parametrize(("raw", "expected"), [("0", 0), ("7", 7), (" 42 ", 42), ("-1", -1)])
 def test_parse_last_event_id_parses_clean_int(raw: str, expected: int) -> None:
     assert _parse_last_event_id(raw) == expected
+
+
+@pytest.mark.parametrize("elapsed", [None, float("nan"), float("inf")])
+def test_backdated_charge_utc_returns_none_for_invalid_elapsed(elapsed: float | None) -> None:
+    """#337: a missing / non-finite charge-elapsed defers to the store's own
+    ``now`` (None) rather than fabricating a garbage backdated instant."""
+    assert RoastRunner._backdated_charge_utc(elapsed) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_backdated_charge_utc_backdates_by_elapsed() -> None:
+    """#337: a finite charge-elapsed yields ``now - elapsed`` as an ISO-8601 UTC
+    string in the PAST (the recovery breadcrumb matches the live backdated clock)."""
+    before = datetime.now(UTC)
+    result = RoastRunner._backdated_charge_utc(120.0)  # pyright: ignore[reportPrivateUsage]
+    assert result is not None
+    charged_at = datetime.fromisoformat(result)
+    # ~120 s before now (allow a little slack for test execution time).
+    delta = (before - charged_at).total_seconds()
+    assert 119.0 <= delta <= 122.0
 
 
 @pytest.mark.asyncio

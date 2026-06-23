@@ -525,7 +525,11 @@ class SafetyPolicy:
 
         Args:
             system_development_percent: The controller's real development percent
-                (``Controller._development_percent``), charge/FC-referenced.
+                (``Controller._development_percent``), charge/FC-referenced. Its
+                charge/FC clock origins honour MCP v0.1.7's backdated T0/FC instant
+                (#337), so this dev% reads ~+1.8 pp higher than a receive-tick
+                origin would — releasing this guard ~1-2 pp earlier, on a truer
+                dev%. It still fails safe: a below-window read only HOLDS the drop.
             target_development_percent: The profile's development-ratio target.
             margin_percent: The tolerance below target within which a drop is still
                 honoured (``ControllerConfig.drop_dev_margin_percent``).

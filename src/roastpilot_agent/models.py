@@ -225,6 +225,18 @@ class RoastTelemetry(BaseModel):
     rides the same live/replay telemetry path as ``first_crack_detected``;
     ``None`` when the source state exposes no first-crack status (e.g. a flat
     replay export, whose ``last_state`` is ``None``).
+
+    ``t0_backdate_seconds`` / ``first_crack_backdate_seconds`` carry the
+    MCP-reported backdating *delta* (#337): the seconds between the MCP's
+    confirmation tick and the backdated turning-point / crack-onset instant the
+    v0.1.7 server reports (coffee-roaster-mcp#169/#170). Both deltas are computed
+    *inside* the MCP monotonic domain (``confirmed_at_* − onset``), so they are
+    deltas — never absolute MCP timestamps, which are not comparable to the
+    agent's own ``time.monotonic`` clock. The controller subtracts the delta from
+    its receive-tick clock to anchor the charge / development origin at the true
+    onset. ``None`` when the source carries no backdated event (a manual mark, an
+    older payload, or no such event yet) — the controller then stamps at
+    receive-tick, the pre-0.1.7 behaviour.
     """
 
     bean_temp_c: float
@@ -236,6 +248,8 @@ class RoastTelemetry(BaseModel):
     first_crack_detected: bool = False
     cooling_on: bool = False
     mic_status: MicStatus | None = None
+    t0_backdate_seconds: float | None = None
+    first_crack_backdate_seconds: float | None = None
 
 
 # Bean species (botanical) — a constrained ``Literal`` deliberately, NOT a

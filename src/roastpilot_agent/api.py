@@ -17,11 +17,13 @@ and the SSE stream (S3) extend :class:`RoastService` in place.
 import asyncio
 import contextlib
 import logging
+import math
 import time
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, cast
 
@@ -955,16 +957,64 @@ class RoastRunner:
         to ``0.0``. Advisory/display-only — nothing safety-gating reads it. A
         store failure is swallowed (like the event flush): a missing recovery
         breadcrumb only degrades a later resumed run's DTR to the pre-#235
-        behaviour, it never affects the live safety tick."""
+        behaviour, it never affects the live safety tick.
+
+        #337: the controller now backdates its charge clock to the MCP-reported
+        turning point, so the persisted instant is derived as
+        ``now - charge_elapsed_seconds`` (the snapshot's charge-referenced clock,
+        already backdated) rather than the bare persist-tick wall-clock. This
+        keeps a resumed run's restored DTR clock consistent with the live one
+        instead of re-introducing the ~17 s T0 lag on recovery. A missing /
+        non-finite elapsed falls back to "now" (the pre-#337 behaviour)."""
         if self._t0_persisted or not snapshot.charge_detected:
             return
+        charged_at_utc = self._backdated_charge_utc(snapshot.charge_elapsed_seconds)
         try:
-            await self._store.record_t0_detected_at(self._run_id)
+            await self._store.record_t0_detected_at(self._run_id, t0_detected_at_utc=charged_at_utc)
         except Exception:  # pragma: no cover — fail-safe: a store error on this
             # advisory-only breadcrumb must never crash the safety tick; the only
             # cost is a resumed run's DTR degrading to the pre-#235 behaviour.
             return
         self._t0_persisted = True
+
+    @staticmethod
+    def _backdated_charge_utc(charge_elapsed_seconds: float | None) -> str | None:
+        """Reconstruct the backdated charge UTC from the charge-referenced clock.
+
+        Returns ``now - charge_elapsed_seconds`` as an ISO-8601 UTC string so the
+        persisted recovery breadcrumb matches the controller's backdated charge
+        clock (#337). ``None`` (defer to the store's own ``now``) when the elapsed
+        is absent or non-finite — never fabricate a future or garbage instant.
+
+        Args:
+            charge_elapsed_seconds: Seconds since the (backdated) charge from the
+                controller snapshot, or ``None`` before charge.
+
+        Timing assumption (advisory-only, accepted): ``charge_elapsed_seconds``
+        is read from the *current* snapshot while the reference here is live
+        ``datetime.now(UTC)``. On the normal first-charged tick the two are
+        same-tick, so the persisted instant is exact. The one drift case — the
+        store write fails on the first charged tick and only succeeds on a retry
+        AFTER drop (``charge_elapsed_seconds`` freezes at drop via
+        ``_effective_now`` while ``now`` keeps advancing) — would persist a charge
+        instant later than the true one. That path is itself ``# pragma: no
+        cover``-rare (a store failure spanning the drop) and the persisted value
+        is ADVISORY-ONLY: no safety or control gate reads it; the only effect is a
+        resumed run's DTR *readout* reading slightly short. Accepted rather than
+        threading a per-tick wall-clock through the snapshot for a degraded
+        readout on a doubly-rare path (claude-review / Augment adjudication, #337).
+
+        Returns:
+            The backdated charge instant as an ISO-8601 UTC string, or ``None``.
+        """
+        if charge_elapsed_seconds is None or not math.isfinite(charge_elapsed_seconds):
+            return None
+        # `max(0.0, …)` is defensive narrowing: the snapshot's charge-elapsed is
+        # `_effective_now() - _charge_monotonic`, and `_effective_now() >=
+        # _charge_monotonic` always (charge precedes the current/drop instant, and
+        # `_backdated_now` keeps the anchor <= now), so this never clamps.
+        elapsed = max(0.0, charge_elapsed_seconds)  # pragma: no cover - unreachable narrowing
+        return (datetime.now(UTC) - timedelta(seconds=elapsed)).isoformat()
 
     async def _publish_and_persist_telemetry(self) -> None:
         snapshot = self._controller.snapshot()
