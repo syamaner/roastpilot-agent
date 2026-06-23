@@ -133,14 +133,14 @@ describe("smoothCurveForDisplay — Savitzky-Golay kernel (#344)", () => {
   });
 
   it("falls back to the RAW point at the live tail (no one-sided wobble)", () => {
-    // The final points have no right-side neighbours, so the window cannot bracket
-    // the centre → they render RAW (not a wobbly one-sided fit). Build a curve whose
-    // last few raw values are deliberately spiky so a fit would visibly differ.
+    // Only the LAST point (index 10) has zero right-side neighbours and is unbracketed
+    // → renders RAW. Indices 8 and 9 each have at least one right neighbour within
+    // ±3.5 s (window 7 → half 3.5 s) and are bracketed/smoothed normally. Build a
+    // curve whose last raw value is deliberately spiky so a fit would visibly differ.
     const ror = [10, 10, 10, 10, 10, 10, 10, 10, 30, 5, 25];
     const points = curve(ror);
     const smoothed = rorOf(smoothCurveForDisplay(points, 7)) as number[];
-    // window 7 s → ±3 s; the last 3 points (8,9,10) lack a full right side: the very
-    // last point has zero right neighbours → definitely raw.
+    // index 10: zero right neighbours → not bracketed → raw 25.
     expect(smoothed[smoothed.length - 1]).toBe(25);
     // an early interior point IS bracketed and therefore smoothed (≈10, not spiky).
     expect(smoothed[4]).toBeCloseTo(10, 6);
