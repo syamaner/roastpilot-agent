@@ -292,6 +292,19 @@ class ControllerConfig(BaseModel):
     # ETA. Default 176.0 °C = the #229-validated FC band midpoint (171-180 °C) on
     # this roaster's indicated probe. Anticipation context only; never a lever.
     first_crack_target_bean_temp_c: float = Field(default=176.0, gt=0)
+    # Drying-end landmark (#351): the bean temperature at the drying→browning
+    # boundary, recorded once pre-FC as a DISPLAY/observability signal (the chart
+    # dry-end marker + the persisted timeline). Default 150.0 °C is .alog-validated
+    # against the operator's 47 annotated Artisan Hottop roasts — every one carries
+    # a computed Dry-End bean temp (``computed.DRY_BT``) tightly clustered: median
+    # 149.0, mean 150.5, min 144.7, max 169.0 (lone outlier), σ≈4.9. The agent's own
+    # probe is on the SAME scale: the 7 Jun live roasts cross 150 °C at +352 s /
+    # +366 s post-charge (cleanly pre-FC, ~170-190 s before FC), with FC at bean
+    # 178-181 °C and drop at 197 °C — matching the operator's empirical profile and
+    # the .alog FC/drop distribution. Observability only: it is NEVER fed to the
+    # advisor or any safety/control path (it is emitted as an SSE event + persisted
+    # to the timeline, NOT recorded as an advisor-facing ``RoastMilestone``).
+    drying_end_bean_temp_c: float = Field(default=150.0, gt=0)
     # D35 §4-A / D40.5 (#276): the post-FC control-loop cadence + coherence gate.
     #
     # ``post_fc_min_consult_interval_seconds`` — the minimum seconds between

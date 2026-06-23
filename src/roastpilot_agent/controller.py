@@ -640,6 +640,11 @@ class RoastController:
         self._t0_streak = 0
         self._t0_confirmed = False
         self._guidance_emitted = False
+        # One-way latch for the pre-FC drying-end signal (#351): set the tick the
+        # bean probe first crosses ``drying_end_bean_temp_c`` after the turning
+        # point, so the DRYING_END event/marker fires exactly once and never
+        # re-arms within a run. Reset on each new run/preheat. Observability only.
+        self._drying_end_emitted = False
         self._operator_state_entered: float | None = None
         self._operator_timeout_alerted = False
         # #332: set once the operator has acknowledged the fault (the runner's
@@ -881,6 +886,9 @@ class RoastController:
             self._t0_streak = 0
             self._t0_confirmed = False
             self._guidance_emitted = False
+            # A new run/preheat re-arms the one-way drying-end latch (#351) so the
+            # next roast can emit its own DRYING_END signal. Observability only.
+            self._drying_end_emitted = False
             # A new run/preheat clears the fault-acknowledged teardown flag (#332):
             # a fresh roast has no acknowledged fault, so the escalation re-read is
             # fully armed again.
@@ -1234,6 +1242,11 @@ class RoastController:
                 # automatic post-charge consult left to suppress.
                 self._charge_monotonic = self._clock()
             return
+        if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK and telemetry is not None:
+            # Drying-end signal (#351) before the FC check: a pre-FC observability
+            # landmark, so it can only fire while still pre-FC (the FC transition
+            # below moves the phase out of pre-FC and ends the window).
+            self._maybe_emit_drying_end(telemetry)
         if (
             self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
             and telemetry is not None
@@ -1278,6 +1291,47 @@ class RoastController:
                     "env_temp_c": telemetry.env_temp_c,
                     "guidance_min_c": low,
                     "guidance_max_c": high,
+                },
+            )
+
+    def _maybe_emit_drying_end(self, telemetry: RoastTelemetry) -> None:
+        """Emit the one-shot pre-FC drying-end signal on the first threshold cross.
+
+        Fires once, the tick the bean probe first reaches
+        :attr:`ControllerConfig.drying_end_bean_temp_c` (default 150 °C, the
+        .alog-validated drying→browning landmark — see the config docstring). A
+        one-way latch (``_drying_end_emitted``) so it never re-fires within a run,
+        and it is gated behind the TURNING POINT having already been recorded:
+        post-charge the bean crashes well below 150 and climbs back through it, so
+        requiring the curve to have bottomed out first makes the cross noise-robust
+        — a single jittery sample during the crash (or a hot charge reading) cannot
+        fire it, only the genuine rising cross of a bean that has turned. The caller
+        only invokes this pre-FC, so the window closes at first crack.
+
+        Emitted as a :class:`RoastEventKind.DRYING_END` event → the SSE stream (the
+        live chart marker) and the persisted timeline (detail page). Observability
+        ONLY: it is NOT recorded as a :class:`RoastMilestone`, so it never enters
+        :attr:`AdvisorContext.roast_milestones` — the advisor and every safety/
+        control path are untouched by it (lead constraint, #351). Temperatures
+        Celsius.
+
+        Args:
+            telemetry: The latest validated pre-FC reading for this tick.
+        """
+        if self._drying_end_emitted:
+            return
+        # Noise-robust gate: only after the bean has turned (post-charge minimum
+        # passed). Without it a transient high sample during the post-charge crash
+        # could trip the threshold spuriously.
+        if not self._history.has_milestone(RoastMilestoneKind.TURNING_POINT):
+            return
+        if telemetry.bean_temp_c >= self._config.drying_end_bean_temp_c:
+            self._drying_end_emitted = True
+            self._events.emit(
+                RoastEventKind.DRYING_END,
+                {
+                    "bean_temp_c": telemetry.bean_temp_c,
+                    "threshold_c": self._config.drying_end_bean_temp_c,
                 },
             )
 

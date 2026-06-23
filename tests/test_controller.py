@@ -929,6 +929,146 @@ async def test_unknown_fc_eta_fails_closed_to_flat_floor() -> None:
     assert harness.controller.snapshot().current_fan == 30
 
 
+# --- #351: pre-FC drying-end signal (observability) ---
+
+
+def _drying_end_payloads(harness: Harness) -> list[dict[str, object]]:
+    """Every DRYING_END event payload emitted on ``harness``, in order."""
+    return [
+        cast(dict[str, object], p)
+        for k, p in harness.events.events
+        if k is RoastEventKind.DRYING_END
+    ]
+
+
+async def _charge_into_pre_fc_below_drying_end(harness: Harness) -> None:
+    """Charge into pre-FC with the turning point recorded and the bean BELOW the
+    drying-end threshold, so a later rising cross is a clean first crossing (#351).
+
+    Charges via a debounced T0 at a sub-threshold bean with a non-negative RoR, so
+    ``_charge_monotonic`` is stamped and the turning point arms — the noise-robust
+    gate the drying-end signal sits behind — while the bean is still well under
+    150 °C.
+    """
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING
+        harness.controller.transition_to(step)
+    t0 = reading(bean=120.0, t0_detected=True, bean_ror_c_per_min=15.0)
+    harness.reader.readings = [t0]
+    for _ in range(3):  # debounce → pre-FC; arms the turning point post-charge
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    harness.log.clear()
+    harness.events.events.clear()
+
+
+@pytest.mark.asyncio
+async def test_drying_end_emits_once_on_first_threshold_cross() -> None:
+    """#351: the DRYING_END event fires exactly once, the tick the bean probe first
+    reaches the configured threshold (default 150 °C), carrying the bean temp at the
+    cross + the threshold. A one-way latch: further above-threshold ticks emit no
+    second event."""
+    harness = make_harness()
+    await _charge_into_pre_fc_below_drying_end(harness)
+    # Below threshold: no signal yet.
+    harness.reader.readings = [reading(bean=148.0, bean_ror_c_per_min=15.0)]
+    await harness.controller.tick()
+    assert _drying_end_payloads(harness) == []
+    # First cross (rising through 150): one event with the real payload.
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=151.0, bean_ror_c_per_min=15.0)]
+    await harness.controller.tick()
+    payloads = _drying_end_payloads(harness)
+    assert payloads == [{"bean_temp_c": 151.0, "threshold_c": 150.0}]
+    # Latched: subsequent above-threshold ticks emit no second event.
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=158.0, bean_ror_c_per_min=15.0)]
+    await harness.controller.tick()
+    assert _drying_end_payloads(harness) == payloads  # unchanged — exactly one
+
+
+@pytest.mark.asyncio
+async def test_drying_end_is_noise_robust_before_the_turning_point() -> None:
+    """#351: the signal is gated behind the turning point (bean minimum). A
+    transient above-threshold sample before the curve has turned — e.g. a hot
+    charge/probe reading during the post-charge crash — does NOT fire it; only the
+    genuine rising cross of a turned bean does."""
+    harness = make_harness()
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING
+        harness.controller.transition_to(step)
+    # Charge with a FALLING bean (negative RoR): the turning point never arms while
+    # the bean is still crashing, even though the bean reading is above threshold.
+    t0 = reading(bean=155.0, t0_detected=True, bean_ror_c_per_min=-20.0)
+    harness.reader.readings = [t0]
+    for _ in range(3):
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    harness.events.events.clear()
+    # A still-crashing above-threshold sample: turning point not yet armed → no fire.
+    harness.reader.readings = [reading(bean=152.0, bean_ror_c_per_min=-5.0)]
+    await harness.controller.tick()
+    assert _drying_end_payloads(harness) == []
+
+
+@pytest.mark.asyncio
+async def test_drying_end_is_not_recorded_as_an_advisor_milestone() -> None:
+    """#351 invariant: the drying-end signal is observability-only — it is emitted as
+    an event but NEVER recorded as a ``RoastMilestone``, so it never enters the
+    advisor context (``AdvisorContext.roast_milestones``). The advisor/safety path is
+    untouched by it."""
+    harness = make_harness()
+    await _charge_into_pre_fc_below_drying_end(harness)
+    harness.reader.readings = [reading(bean=151.0, bean_ror_c_per_min=15.0)]
+    await harness.controller.tick()
+    # The event fired…
+    assert _drying_end_payloads(harness)
+    # …but no DRYING_END milestone was recorded (it stays out of the advisor curve
+    # summary). Reach into the in-memory history the advisor context reads.
+    history = harness.controller._history  # pyright: ignore[reportPrivateUsage]
+    assert not history.has_milestone(RoastMilestoneKind.DRYING_END)
+    assert RoastMilestoneKind.DRYING_END not in {m.kind for m in history.milestones()}
+
+
+@pytest.mark.asyncio
+async def test_drying_end_does_not_fire_after_first_crack() -> None:
+    """#351: the signal is pre-FC only. Once the run is in development (post-FC) the
+    drying-end check is not reached, so a bean above threshold there emits nothing."""
+    harness = make_harness()
+    await _charge_into_pre_fc_below_drying_end(harness)
+    # Cross FC into development (the drying-end window closes at FC).
+    harness.reader.readings = [reading(bean=178.0, first_crack_detected=True)]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    harness.events.events.clear()
+    # A post-FC above-threshold reading: no drying-end event.
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=10.0)]
+    await harness.controller.tick()
+    assert _drying_end_payloads(harness) == []
+
+
+@pytest.mark.asyncio
+async def test_drying_end_re_arms_on_a_new_run() -> None:
+    """#351: the one-way latch resets on a new run/preheat, so the next roast emits
+    its own drying-end signal rather than staying latched from the prior run."""
+    harness = make_harness()
+    await _charge_into_pre_fc_below_drying_end(harness)
+    harness.reader.readings = [reading(bean=151.0, bean_ror_c_per_min=15.0)]
+    await harness.controller.tick()
+    assert len(_drying_end_payloads(harness)) == 1
+    # A new run/preheat re-arms the latch (enter PREHEATING clears _drying_end_emitted).
+    harness.controller.transition_to(RoastPhase.COOLING)
+    harness.controller.transition_to(RoastPhase.COMPLETE)
+    harness.controller.transition_to(RoastPhase.IDLE)
+    harness.events.events.clear()
+    await _charge_into_pre_fc_below_drying_end(harness)
+    harness.reader.readings = [reading(bean=151.0, bean_ror_c_per_min=15.0)]
+    await harness.controller.tick()
+    assert len(_drying_end_payloads(harness)) == 1  # the new run's own signal
+
+
 @pytest.mark.asyncio
 async def test_trim_signal_keys_on_last_curve_sample_when_read_fails() -> None:
     """#327: on a tolerated FAILED read (telemetry None) the trim signal keys the

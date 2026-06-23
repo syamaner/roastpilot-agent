@@ -129,6 +129,55 @@ async def test_migration_mechanism_applies_new_versions(
 
 
 @pytest.mark.asyncio
+async def test_v6_rebuild_preserves_existing_roast_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#351: the v6 roast_events rebuild (to widen the kind CHECK) must COPY every
+    existing row, not just recreate an empty table — the risky part of a
+    CHECK-altering table swap. Stop a store at v5, write an event, then upgrade to
+    the real (v6-including) MIGRATIONS and assert the old row survived AND the new
+    ``drying_end`` kind is now accepted."""
+    pre_v6 = MIGRATIONS[:5]  # V1..V5 (before the drying_end CHECK widening)
+    assert len(pre_v6) == 5
+    db_path = tmp_path / "v6upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", pre_v6)
+    old = RoastStore(db_path=db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 5
+        await seeded_store(old)
+        await old.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.FIRST_CRACK,
+            source=RoastEventSource.MCP,
+            payload={"bean_temp_c": 178.0},
+        )
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path=db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == len(MIGRATIONS)
+        timeline = await upgraded.read_timeline("run-1")
+        kinds = [e.kind for e in timeline.events]
+        # The pre-v6 event survived the rebuild's INSERT...SELECT copy.
+        assert RoastEventKind.FIRST_CRACK in kinds
+        # And the widened CHECK now accepts the new observability kind.
+        await upgraded.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.DRYING_END,
+            source=RoastEventSource.CONTROLLER,
+            payload={"bean_temp_c": 150.0, "threshold_c": 150.0},
+        )
+        after = await upgraded.read_timeline("run-1")
+        assert RoastEventKind.DRYING_END in [e.kind for e in after.events]
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
 async def test_foreign_keys_are_enforced(tmp_store: RoastStore) -> None:
     await tmp_store.initialize()
     try:
@@ -459,6 +508,29 @@ async def test_telemetry_round_trips_charge_elapsed_seconds(tmp_store: RoastStor
         assert [p.charge_elapsed_seconds for p in points] == [None, 12.0]
         # The serve-referenced clock is retained and distinct (the chart's raw x).
         assert [p.elapsed_seconds for p in points] == [0.0, 30.0]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_drying_end_event_round_trips_through_timeline(tmp_store: RoastStore) -> None:
+    """#351: the v6 ``drying_end`` event kind is accepted by the rebuilt
+    roast_events CHECK and surfaces on the persisted timeline (the detail page),
+    proving the new observability event reaches the store and back."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.DRYING_END,
+            source=RoastEventSource.CONTROLLER,
+            monotonic_seconds=210.0,
+            payload={"bean_temp_c": 150.0, "threshold_c": 150.0},
+        )
+        timeline = await tmp_store.read_timeline("run-1")
+        drying = [e for e in timeline.events if e.kind is RoastEventKind.DRYING_END]
+        assert len(drying) == 1
+        assert drying[0].source is RoastEventSource.CONTROLLER
+        assert drying[0].payload == {"bean_temp_c": 150.0, "threshold_c": 150.0}
     finally:
         await tmp_store.close()
 

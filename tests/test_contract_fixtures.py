@@ -286,13 +286,15 @@ async def _collect_first(
 
 
 def _gap_fill_frames() -> list[SseEvent]:
-    """The five SseEventTypes the recorded fixtures don't naturally drive.
+    """The SseEventTypes the recorded fixtures don't naturally drive.
 
     Emitted through the real :class:`EventBroadcaster` so the frame shape (id +
     envelope) is real, with payloads taken from real ``model_dump()`` /the exact
     controller emit-site dicts — never hand-authored. Each payload mirrors a real
     controller emit site:
 
+    * ``drying_end`` — controller.py ``_maybe_emit_drying_end`` dict
+      (``{"bean_temp_c": ..., "threshold_c": ...}``, the #351 pre-FC marker).
     * ``safety_alert`` — controller.py operator-timeout alert dict.
     * ``recovery_acknowledged`` — controller.py ``{"acknowledged": <phase>}``.
     * ``command_failed`` — controller.py ``{"command": ..., "reason": ...}``.
@@ -316,6 +318,14 @@ def _gap_fill_frames() -> list[SseEvent]:
         adjusted_fan=None,
         reason="operator did not confirm charge within the allowed window",
     )
+    # controller.py _maybe_emit_drying_end emit site shape (#351): the pre-FC
+    # drying-end marker carries the bean temp at the cross + the configured
+    # threshold. 150.0 is the .alog-validated default (config.drying_end_bean_temp_c).
+    broadcaster.emit(
+        RoastEventKind.DRYING_END,
+        {"bean_temp_c": 150.0, "threshold_c": 150.0},
+    )
+
     broadcaster.emit(RoastEventKind.SAFETY_ALERT, alert_eval.model_dump(mode="json"))
 
     # controller.py operator-acknowledge emit site shape.
