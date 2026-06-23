@@ -73,8 +73,12 @@ class RoastMilestoneKind(Enum):
     - ``RECOVERY`` — the bean RoR over the window just after the turning point;
       the one turning-point-family metric that survived the #229 confound check
       (a charge-independent early-pace signal), kept cautiously.
-    - ``DRYING_END`` — the drying-phase boundary the controller's phase model
-      crosses on the way to first crack (shown as roast structure).
+    - ``DRYING_END`` — the drying-phase boundary the controller crosses on the way
+      to first crack. NOTE (#351): the live drying-end signal is emitted as a
+      ``RoastEventKind.DRYING_END`` SSE event + persisted timeline landmark, NOT
+      recorded as a milestone of this kind — keeping it out of the advisor curve
+      summary (observability-only). This member is retained for the vocabulary; the
+      controller does not currently ``record_milestone`` it.
     - ``FIRST_CRACK`` — the detected first crack; the development clock's origin.
     """
 

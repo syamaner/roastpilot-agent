@@ -129,6 +129,7 @@ describe("SSE contract — every event type has a real frame", () => {
     "phase_changed",
     "charge_guidance",
     "t0_detected",
+    "drying_end",
     "first_crack",
     "advisory",
     "command_executed",

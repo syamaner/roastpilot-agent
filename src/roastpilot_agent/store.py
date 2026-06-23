@@ -263,6 +263,38 @@ SCHEMA_V5_CHARGE_ELAPSED = """
 ALTER TABLE telemetry_snapshots ADD COLUMN charge_elapsed_seconds REAL;
 """
 
+SCHEMA_V6_DRYING_END_EVENT = """
+-- #351: add the pre-FC 'drying_end' event kind (the .alog-validated ~150 °C
+-- drying→browning landmark) to the roast_events.kind CHECK. SQLite cannot ALTER a
+-- CHECK constraint in place, so rebuild the table (create-with-new-CHECK → copy →
+-- drop → rename → recreate the index). roast_events has no triggers and nothing
+-- references it by FK, so the swap is safe; column order/types are preserved
+-- exactly. Observability-only event (SSE marker + persisted timeline); it is never
+-- fed to the advisor or any safety/control path.
+CREATE TABLE roast_events_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES roast_runs(id),
+  kind TEXT NOT NULL CHECK (kind IN (
+    'run_started', 'phase_changed', 'charge_guidance', 't0_detected',
+    'drying_end', 'first_crack', 'advisory', 'command_executed', 'command_failed',
+    'safety_alert', 'fault', 'recovery_required', 'recovery_acknowledged',
+    'logs_exported', 'run_completed')),     -- models.RoastEventKind.value
+  source TEXT NOT NULL CHECK (source IN (
+    'controller', 'mcp', 'operator', 'advisor', 'safety')),
+                                            -- models.RoastEventSource.value
+  monotonic_seconds REAL,
+  recorded_at_utc TEXT NOT NULL,
+  payload_json TEXT
+);
+INSERT INTO roast_events_new
+  (id, run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json)
+  SELECT id, run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json
+  FROM roast_events;
+DROP TABLE roast_events;
+ALTER TABLE roast_events_new RENAME TO roast_events;
+CREATE INDEX idx_roast_events_run_kind ON roast_events(run_id, kind);
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
@@ -272,6 +304,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V3_T0_DETECTED_AT,
     SCHEMA_V4_BEAN_PROFILES,
     SCHEMA_V5_CHARGE_ELAPSED,
+    SCHEMA_V6_DRYING_END_EVENT,
 )
 
 

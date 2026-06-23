@@ -66,6 +66,14 @@
     },
     {
       "data": {
+        "bean_temp_c": 151.0,
+        "threshold_c": 150.0
+      },
+      "event": "drying_end",
+      "id": 0
+    },
+    {
+      "data": {
         "bean_temp_c": 178.0,
         "source": "mcp"
       },

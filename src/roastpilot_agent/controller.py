@@ -640,6 +640,11 @@ class RoastController:
         self._t0_streak = 0
         self._t0_confirmed = False
         self._guidance_emitted = False
+        # One-way latch for the pre-FC drying-end signal (#351): set the tick the
+        # bean probe first crosses ``drying_end_bean_temp_c`` after the turning
+        # point, so the DRYING_END event/marker fires exactly once and never
+        # re-arms within a run. Reset on each new run/preheat. Observability only.
+        self._drying_end_emitted = False
         self._operator_state_entered: float | None = None
         self._operator_timeout_alerted = False
         # #332: set once the operator has acknowledged the fault (the runner's
@@ -881,6 +886,9 @@ class RoastController:
             self._t0_streak = 0
             self._t0_confirmed = False
             self._guidance_emitted = False
+            # A new run/preheat re-arms the one-way drying-end latch (#351) so the
+            # next roast can emit its own DRYING_END signal. Observability only.
+            self._drying_end_emitted = False
             # A new run/preheat clears the fault-acknowledged teardown flag (#332):
             # a fresh roast has no acknowledged fault, so the escalation re-read is
             # fully armed again.
@@ -1234,22 +1242,23 @@ class RoastController:
                 # automatic post-charge consult left to suppress.
                 self._charge_monotonic = self._clock()
             return
-        if (
-            self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-            and telemetry is not None
-            and telemetry.first_crack_detected
-        ):
-            source = self._safety.evaluate_event_source(
-                transition="first_crack", source=RoastEventSource.MCP
-            )
-            await self._snapshots.persist_evaluation(source)
-            if source.verdict is not SafetyVerdict.ALLOW:
-                return
-            self._events.emit(
-                RoastEventKind.FIRST_CRACK,
-                {"source": RoastEventSource.MCP.value, "bean_temp_c": telemetry.bean_temp_c},
-            )
-            self.transition_to(RoastPhase.DEVELOPMENT)
+        if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK and telemetry is not None:
+            # Drying-end signal (#351) BEFORE the FC check: a pre-FC observability
+            # landmark, so it can only fire while still pre-FC — the FC transition
+            # below moves the phase out of pre-FC and ends the window.
+            self._maybe_emit_drying_end(telemetry)
+            if telemetry.first_crack_detected:
+                source = self._safety.evaluate_event_source(
+                    transition="first_crack", source=RoastEventSource.MCP
+                )
+                await self._snapshots.persist_evaluation(source)
+                if source.verdict is not SafetyVerdict.ALLOW:
+                    return
+                self._events.emit(
+                    RoastEventKind.FIRST_CRACK,
+                    {"source": RoastEventSource.MCP.value, "bean_temp_c": telemetry.bean_temp_c},
+                )
+                self.transition_to(RoastPhase.DEVELOPMENT)
 
     def _maybe_emit_charge_guidance(self, telemetry: RoastTelemetry) -> None:
         """Emit the one-shot add-beans cue when the BEAN probe enters the band.
@@ -1278,6 +1287,47 @@ class RoastController:
                     "env_temp_c": telemetry.env_temp_c,
                     "guidance_min_c": low,
                     "guidance_max_c": high,
+                },
+            )
+
+    def _maybe_emit_drying_end(self, telemetry: RoastTelemetry) -> None:
+        """Emit the one-shot pre-FC drying-end signal on the first threshold cross.
+
+        Fires once, the tick the bean probe first reaches
+        :attr:`ControllerConfig.drying_end_bean_temp_c` (default 150 °C, the
+        .alog-validated drying→browning landmark — see the config docstring). A
+        one-way latch (``_drying_end_emitted``) so it never re-fires within a run,
+        and it is gated behind the TURNING POINT having already been recorded:
+        post-charge the bean crashes well below 150 and climbs back through it, so
+        requiring the curve to have bottomed out first makes the cross noise-robust
+        — a single jittery sample during the crash (or a hot charge reading) cannot
+        fire it, only the genuine rising cross of a bean that has turned. The caller
+        only invokes this pre-FC, so the window closes at first crack.
+
+        Emitted as a :class:`RoastEventKind.DRYING_END` event → the SSE stream (the
+        live chart marker) and the persisted timeline (detail page). Observability
+        ONLY: it is NOT recorded as a :class:`RoastMilestone`, so it never enters
+        :attr:`AdvisorContext.roast_milestones` — the advisor and every safety/
+        control path are untouched by it (lead constraint, #351). Temperatures
+        Celsius.
+
+        Args:
+            telemetry: The latest validated pre-FC reading for this tick.
+        """
+        if self._drying_end_emitted:
+            return
+        # Noise-robust gate: only after the bean has turned (post-charge minimum
+        # passed). Without it a transient high sample during the post-charge crash
+        # could trip the threshold spuriously.
+        if not self._history.has_milestone(RoastMilestoneKind.TURNING_POINT):
+            return
+        if telemetry.bean_temp_c >= self._config.drying_end_bean_temp_c:
+            self._drying_end_emitted = True
+            self._events.emit(
+                RoastEventKind.DRYING_END,
+                {
+                    "bean_temp_c": telemetry.bean_temp_c,
+                    "threshold_c": self._config.drying_end_bean_temp_c,
                 },
             )
 
@@ -2562,10 +2612,14 @@ class RoastController:
         - RECOVERY: the bean RoR at the first reading after the turning point — the
           one turning-point-family metric that survived the #229 confound check
           (a charge-independent early-pace signal), kept cautiously.
-        - DRYING END: the drying→browning boundary the phase model would cross; in
-          M1 the agent has no separate drying phase, so this is left to a future
-          phase signal and not armed from RoR alone (#229 gives it no predictive
-          weight). Recorded only when an explicit signal exists.
+        - DRYING END: the drying→browning boundary. NOT armed here as a milestone
+          (#229 gives RoR no predictive weight for it, and #351 keeps it out of the
+          advisor curve summary by design). It now has an explicit server signal —
+          :meth:`_maybe_emit_drying_end` (#351) — which emits it as an SSE event +
+          persisted timeline landmark ONLY; deliberately not a ``record_milestone``
+          call, so it never enters :attr:`AdvisorContext.roast_milestones`. Do NOT
+          add a ``record_milestone(DRYING_END)`` here: that would leak the
+          observability signal into the advisor/control path (lead constraint).
 
         Args:
             telemetry: The reading this tick consumed.
