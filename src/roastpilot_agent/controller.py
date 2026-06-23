@@ -2612,10 +2612,14 @@ class RoastController:
         - RECOVERY: the bean RoR at the first reading after the turning point — the
           one turning-point-family metric that survived the #229 confound check
           (a charge-independent early-pace signal), kept cautiously.
-        - DRYING END: the drying→browning boundary the phase model would cross; in
-          M1 the agent has no separate drying phase, so this is left to a future
-          phase signal and not armed from RoR alone (#229 gives it no predictive
-          weight). Recorded only when an explicit signal exists.
+        - DRYING END: the drying→browning boundary. NOT armed here as a milestone
+          (#229 gives RoR no predictive weight for it, and #351 keeps it out of the
+          advisor curve summary by design). It now has an explicit server signal —
+          :meth:`_maybe_emit_drying_end` (#351) — which emits it as an SSE event +
+          persisted timeline landmark ONLY; deliberately not a ``record_milestone``
+          call, so it never enters :attr:`AdvisorContext.roast_milestones`. Do NOT
+          add a ``record_milestone(DRYING_END)`` here: that would leak the
+          observability signal into the advisor/control path (lead constraint).
 
         Args:
             telemetry: The reading this tick consumed.
