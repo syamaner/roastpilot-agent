@@ -249,19 +249,26 @@ describe("LiveCurve", () => {
     expect(labels).toContain("FIRST CRACK");
   });
 
-  it("surfaces the full server-sourced marker set incl. cooling on the data hook (#309)", () => {
-    // The four #309 markers (T0 / FC / drop / cooling) all flow through the chart's
-    // data hook (D24 asserts data, not the per-kind canvas colour). The clustered
-    // drop+cooling pair at the roast end both appear — neither is dropped.
+  it("surfaces the full server-sourced marker set incl. dry-end + cooling on the data hook (#309/#351)", () => {
+    // All five markers (T0 / dry-end / FC / drop / cooling) flow through the chart's
+    // data hook (D24 asserts data, not the per-kind canvas colour/subordinate style).
+    // The clustered drop+cooling pair at the roast end both appear — neither is dropped.
     const fullMarkers: CurveMarker[] = [
       { kind: "t0", t: 0, label: "T0" },
+      { kind: "dry_end", t: 30, label: "DRY END" },
       { kind: "first_crack", t: 60, label: "FIRST CRACK" },
       { kind: "drop", t: 60, label: "DROP" },
       { kind: "cooling", t: 60, label: "COOLING" },
     ];
     render(<LiveCurve points={POINTS} markers={fullMarkers} />);
-    expect(window.__chart?.markers.map((m) => m.kind)).toEqual(["t0", "first_crack", "drop", "cooling"]);
-    expect(window.__chart?.markers.map((m) => m.label)).toContain("COOLING");
+    expect(window.__chart?.markers.map((m) => m.kind)).toEqual([
+      "t0",
+      "dry_end",
+      "first_crack",
+      "drop",
+      "cooling",
+    ]);
+    expect(window.__chart?.markers.map((m) => m.label)).toContain("DRY END");
   });
 });
 

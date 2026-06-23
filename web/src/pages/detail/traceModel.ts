@@ -12,7 +12,9 @@
  *   - `toCurveMarkers` : T0 (from the `t0_detected` event) + first-crack / drop
  *                        from the telemetry's `development` / `cooling` phase
  *                        transitions (the controller's FC/drop events carry no
- *                        tick or time — server-derived phase is the reliable axis).
+ *                        tick or time — server-derived phase is the reliable axis);
+ *                        plus dry-end (#351) placed from the persisted `drying_end`
+ *                        timeline event's server threshold (see `dryEndSeconds`).
  *   - `toTraceRows`    : safety evaluations joined by `tick` to their advisor
  *                        decision + executed command → the decision-trace table.
  *   - `headlineStats`  : title-block stats derived from the same telemetry phases.
@@ -131,6 +133,9 @@ export function toCurveMarkers(
   const hasT0 = (timeline?.events ?? []).some((e) => e.kind === "t0_detected");
   if (hasT0) markers.push({ kind: "t0", t: 0, label: "T0" });
 
+  const dryEnd = dryEndSeconds(timeline, series);
+  if (dryEnd !== null) markers.push({ kind: "dry_end", t: dryEnd, label: "DRY END" });
+
   const fc = firstPhaseSeconds(series, "development");
   if (fc !== null) markers.push({ kind: "first_crack", t: fc, label: "FIRST CRACK" });
 
@@ -138,6 +143,36 @@ export function toCurveMarkers(
   if (drop !== null) markers.push({ kind: "drop", t: drop, label: "DROP" });
 
   return markers;
+}
+
+/**
+ * `elapsed_seconds` of the dry-end landmark for the persisted detail curve (#351),
+ * or null when the roast never recorded one.
+ *
+ * The pre-FC `drying_end` timeline event carries the server's `bean_temp_c` +
+ * `threshold_c` but NO tick or time (it is not a tick-keyed trace record), so —
+ * unlike FC/drop, which read a server PHASE transition — its x is placed from the
+ * SERVER'S OWN threshold against the persisted telemetry: the first telemetry point
+ * whose `bean_temp_c` reaches the event's `threshold_c`. That is the exact rising
+ * cross the controller latched on (`_maybe_emit_drying_end`), replayed against the
+ * server's persisted readings — the threshold is the server's, the temps are the
+ * server's, and the event's presence is the gate; nothing is inferred client-side.
+ * Gated on the event existing so a roast with no drying_end never paints a marker.
+ */
+function dryEndSeconds(
+  timeline: RoastTimeline | undefined,
+  series: TelemetrySeries | undefined,
+): number | null {
+  const event = (timeline?.events ?? []).find((e) => e.kind === "drying_end");
+  if (!event || !series) return null;
+  const threshold = event.payload?.threshold_c;
+  if (typeof threshold !== "number") return null;
+  for (const p of series.points) {
+    if (p.bean_temp_c !== null && p.bean_temp_c >= threshold && p.elapsed_seconds !== null) {
+      return p.elapsed_seconds;
+    }
+  }
+  return null;
 }
 
 /** `elapsed_seconds` of the first telemetry point that entered `phase`, or null. */

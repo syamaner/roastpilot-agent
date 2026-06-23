@@ -67,6 +67,84 @@ describe("toCurveMarkers", () => {
     const markers = toCurveMarkers(FIXTURE_TIMELINE, series);
     expect(markers.map((m) => m.kind)).toEqual(["t0"]);
   });
+
+  it("places dry-end (#351) at the first telemetry point reaching the event's server threshold", () => {
+    // The persisted drying_end timeline event carries the server's threshold but no
+    // tick — so its x is the first telemetry point whose bean_temp_c reaches that
+    // threshold (the server's own rising cross, replayed against persisted readings).
+    // Fixture bean_temp_c = 92 + i*8.2 → tick 7 = 149.4 (below), tick 8 = 157.6 (≥150),
+    // elapsed 240 s.
+    //
+    // monotonic_seconds is a DISTINCT, arbitrary server wall-clock (999) — NOT 240 —
+    // so this oracle falsifies the shortcut of returning event.monotonic_seconds
+    // directly: only a real telemetry scan for the threshold cross yields t === 240.
+    const timeline: RoastTimeline = {
+      ...FIXTURE_TIMELINE,
+      events: [
+        ...FIXTURE_TIMELINE.events,
+        {
+          kind: "drying_end",
+          source: "controller",
+          monotonic_seconds: 999,
+          recorded_at_utc: "2026-06-07T09:16:00Z",
+          payload: { bean_temp_c: 157.6, threshold_c: 150 },
+        },
+      ],
+    };
+    const markers = toCurveMarkers(timeline, FIXTURE_TELEMETRY);
+    expect(markers.find((m) => m.kind === "dry_end")).toEqual({
+      kind: "dry_end",
+      t: 240, // the threshold-cross elapsed_seconds, NOT the event's monotonic 999
+      label: "DRY END",
+    });
+  });
+
+  it("omits dry-end when no drying_end event is on the timeline", () => {
+    // FIXTURE_TIMELINE has no drying_end event → no marker, even though the bean
+    // curve crosses 150 °C (the event's presence is the gate, never a client threshold).
+    const markers = toCurveMarkers(FIXTURE_TIMELINE, FIXTURE_TELEMETRY);
+    expect(markers.some((m) => m.kind === "dry_end")).toBe(false);
+  });
+
+  it("omits dry-end when the drying_end event carries no numeric threshold", () => {
+    const timeline: RoastTimeline = {
+      ...FIXTURE_TIMELINE,
+      events: [
+        ...FIXTURE_TIMELINE.events,
+        {
+          kind: "drying_end",
+          source: "controller",
+          monotonic_seconds: 240,
+          recorded_at_utc: "2026-06-07T09:16:00Z",
+          payload: { bean_temp_c: 157.6 },
+        },
+      ],
+    };
+    const markers = toCurveMarkers(timeline, FIXTURE_TELEMETRY);
+    expect(markers.some((m) => m.kind === "dry_end")).toBe(false);
+  });
+
+  it("omits dry-end when no telemetry point reaches the event's threshold (gap between windows)", () => {
+    // Realistic when the server fires drying_end between downsampled telemetry
+    // windows: the event is present with a numeric threshold, but no persisted point
+    // reaches it (here threshold 999 °C, well above the fixture's ~215 °C peak), so
+    // there is no cross to anchor on → null → no marker (the scan exhausts cleanly).
+    const timeline: RoastTimeline = {
+      ...FIXTURE_TIMELINE,
+      events: [
+        ...FIXTURE_TIMELINE.events,
+        {
+          kind: "drying_end",
+          source: "controller",
+          monotonic_seconds: 240,
+          recorded_at_utc: "2026-06-07T09:16:00Z",
+          payload: { bean_temp_c: 157.6, threshold_c: 999 },
+        },
+      ],
+    };
+    const markers = toCurveMarkers(timeline, FIXTURE_TELEMETRY);
+    expect(markers.some((m) => m.kind === "dry_end")).toBe(false);
+  });
 });
 
 describe("toTraceRows", () => {

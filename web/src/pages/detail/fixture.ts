@@ -181,6 +181,31 @@ export const FIXTURE_TIMELINE: RoastTimeline = {
   ],
 };
 
+// --- Dry-end fixture (#351) ---------------------------------------------------
+//
+// FIXTURE_TIMELINE plus a persisted `drying_end` timeline event (the pre-FC
+// drying→browning landmark), so the detail-page reload path can be exercised
+// END-TO-END (a positive D24 assertion that `dry_end` reaches the chart's
+// `window.__chart` data). Kept as a SEPARATE export — the base FIXTURE_TIMELINE
+// (and its committed `roast-detail` snapshot) stay untouched. The event carries
+// the server's threshold (150 °C); the marker's x is derived from the first shared
+// TELEMETRY_POINTS bean reading reaching it (92 + i*8.2 → tick 8 = 157.6 °C at
+// elapsed 240 s). monotonic_seconds is an arbitrary server wall-clock, NOT the
+// curve x (it is not the placement source — the threshold cross is).
+export const FIXTURE_TIMELINE_DRY_END: RoastTimeline = {
+  ...FIXTURE_TIMELINE,
+  events: [
+    ...FIXTURE_TIMELINE.events,
+    {
+      kind: "drying_end",
+      source: "controller",
+      monotonic_seconds: 999,
+      recorded_at_utc: "2026-06-07T09:16:00Z",
+      payload: { bean_temp_c: 157.6, threshold_c: 150 },
+    },
+  ],
+};
+
 // --- Advisor-failure fixture (#170) ------------------------------------------
 //
 // A roast where the advisor NEVER returned a usable decision — every consult is a

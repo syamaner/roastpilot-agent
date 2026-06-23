@@ -54,6 +54,14 @@ const DetailHarnessLongPage = lazy(() =>
     default: m.DetailHarnessLongPage,
   })),
 );
+// #351 dry-end detail snapshot — the base detail data PLUS a persisted drying_end
+// timeline event, so the reload/persisted path places the dry-end chart marker
+// (asserted via the window.__chart DATA hook, not a new pixel baseline).
+const DetailHarnessDryEndPage = lazy(() =>
+  import("@/pages/detail/DetailHarnessDryEndPage").then((m) => ({
+    default: m.DetailHarnessDryEndPage,
+  })),
+);
 // #303 bean-profile library snapshot — the idle Start-Roast form with the saved-
 // profile dropdown + add/edit modals over fixed fixture data (the idle page is not
 // reachable via the replay agents, which always carry an active run).
@@ -94,6 +102,9 @@ export const routes: RouteObject[] = [
   { path: "/__detail-harness-failed", element: <DetailHarnessFailedPage /> },
   // __detail-harness-long: long-roast detail — capped lists + "View all" (#271).
   { path: "/__detail-harness-long", element: <DetailHarnessLongPage /> },
+  // __detail-harness-dry-end: detail data + a persisted drying_end event, so the
+  // reload path places the dry-end chart marker (#351 D24 data assertion).
+  { path: "/__detail-harness-dry-end", element: <DetailHarnessDryEndPage /> },
   // __start-roast-harness: idle Start form + bean-profile library (#303 snapshot).
   { path: "/__start-roast-harness", element: <StartRoastHarnessPage /> },
   // __home-harness: persistent nav + landing hub over a seeded idle health snapshot.
