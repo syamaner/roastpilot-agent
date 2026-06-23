@@ -38,7 +38,13 @@ class FakeEventSource implements EventSourceLike {
     this.onerror?.call(this, new Event("error"));
   }
   emit(type: string, data: unknown, id?: number): void {
-    const ev = { data: JSON.stringify(data), lastEventId: id ? String(id) : "" } as MessageEvent;
+    // `id !== undefined` (not a truthy check) so a deliberate id=0 frame is not
+    // silently treated as "no id" — the server's `last_event_id=0` resume path is
+    // a real case (#339), even though emitted server ids start at 1.
+    const ev = {
+      data: JSON.stringify(data),
+      lastEventId: id !== undefined ? String(id) : "",
+    } as MessageEvent;
     this.listeners.get(type)?.(ev);
   }
 }
