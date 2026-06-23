@@ -775,8 +775,16 @@ class RoastController:
         rather than climbing into cooling. ``min`` clamps post-drop reads to the
         drop instant — it never reports a time after the drop.
 
-        Advisory/display-only: it bounds nothing on the control path — no
-        transition, verdict, executor, or drop gate reads these clocks.
+        Mostly advisory/display, with ONE control coupling to be honest about
+        (#337): the DTR these clocks produce flows through
+        :meth:`_development_percent` into the #313 advisor-drop-coherence guard
+        (:meth:`_drop_development_is_coherent` →
+        :meth:`SafetyPolicy.evaluate_advisor_drop_coherence`), which REJECTs vs
+        allows an advisor ``should_drop``. So these clocks do bound that one gate —
+        but it fails safe: a guard REJECT is a HELD drop (no roaster write), and the
+        guard owns only the advisor drop path, never the operator manual drop, the
+        safety box, e-stop, or any phase transition. No verdict/executor/transition
+        is otherwise driven by these clocks.
         """
         now = self._clock()
         if self._drop_monotonic is None:
@@ -801,9 +809,17 @@ class RoastController:
         receive-tick, the pre-backdating behaviour). The result is therefore never
         in the future and never garbage — it is ``<= self._clock()`` by
         construction (the future-rejection contract holds: a backdated milestone
-        is in the past). Advisory/display-only: this anchors the charge /
-        development clocks the advisor + SPA read, never a transition, verdict,
-        executor, or drop gate.
+        is in the past).
+
+        This anchors the charge / development clocks the advisor + SPA read, and
+        through :meth:`_development_percent` the DTR these clocks produce feeds the
+        #313 advisor-drop-coherence guard (#337) — so honouring the backdate raises
+        the system dev% (~+1.8 pp) and releases the advisor drop ~1-2 pp earlier
+        (on a truer dev%). That coupling fails safe: the guard only ever HOLDS a
+        drop (no roaster write), gates only the advisor drop path, and drives no
+        phase transition, verdict, executor, operator drop, safety box, or e-stop.
+        The #327 deterministic trim is unaffected — its FC-ETA is charge-clock
+        independent (bean-temp/RoR projection).
 
         Args:
             backdate_seconds: The MCP-domain backdating delta in seconds, or
@@ -2181,10 +2197,15 @@ class RoastController:
         reads the true seconds-since-charge again instead of resetting to ``0.0``
         for the rest of the resumed run.
 
-        Advisory/display-only: ``_charge_monotonic`` feeds the advisor context
-        and the operator DTR readout, never a transition, verdict, or hardware
-        write — the worst case of a bad restore is a conservative advisory miss,
-        never an unsafe drop. It does **not** re-stamp the charge guidance or the
+        Mostly advisory/display: ``_charge_monotonic`` feeds the advisor context
+        and the operator DTR readout, and through :meth:`_development_percent` it
+        is the denominator of the #313 advisor-drop-coherence guard (#337) — so a
+        bad restore could shift that guard's release point, but it fails safe: the
+        guard only ever HOLDS a drop (no roaster write), never forces one, and it
+        gates only the advisor drop path — never a phase transition, the operator
+        manual drop, the safety box, e-stop, or any hardware write. The worst case
+        of a bad restore is therefore a conservative advisory/guard miss, never an
+        unsafe drop. It does **not** re-stamp the charge guidance or the
         post-charge settle window; those are handled by ``operator_resume``.
 
         A clock skew that would place charge in the future (a negative elapsed)

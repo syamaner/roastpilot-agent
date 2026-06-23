@@ -190,12 +190,15 @@ D-numbers still want the operator's plan commit:** the #327 trim (plan §3 / §8
 - **#346** — server-side `_roast_elapsed_seconds` freeze on terminal phases (makes the #330 client
   hold redundant).
 - **#351** — server DRYING_END signal → then the chart dry-end marker (deferred from #309).
-- **#337** — the agent must HONOR MCP's backdated T0/FC timestamp. **IN PR (lockstep with the
-  v0.1.7 release):** pin bumped `0.1.6 → 0.1.7`; the controller now origins the charge /
-  development / DTR / curve clocks on the MCP-reported backdated event timestamp by subtracting the
-  MCP-domain backdating *delta* (`confirmed_at − onset`, surfaced on `RoastTelemetry`) from its own
-  receive-tick clock — never assigning the cross-process absolute MCP `monotonic_seconds`. Manual
-  marks / pre-0.1.7 payloads / negative deltas fall back to receive-tick (future-rejection holds).
+- **#337** — honours MCP v0.1.7 backdated T0/FC (IN PR #362). NOT display-only: the backdated
+  clocks raise `_development_percent` (~+1.8 pp), which the #313 drop-coherence guard reads →
+  advisor-drop-release ~1-2 pp earlier (truer dev%, fails safe — a guard REJECT is still a held
+  drop, no roaster write). PM-relayed decision (to confirm with the operator): keep
+  `drop_dev_margin_percent` unchanged at the 3 pp default, RE-CHECK on roast 4 and tune only if
+  needed. Mechanism: the controller subtracts the MCP-domain backdating *delta* (`confirmed_at −
+  onset`, surfaced on `RoastTelemetry`) from its own receive-tick clock — never the cross-process
+  absolute MCP `monotonic_seconds`; manual marks / pre-0.1.7 payloads / negative deltas fall back to
+  receive-tick (future-rejection holds).
 - Unfiled control idea: the deterministic floor should step fan up toward ~50 at FC.
 
 **Operator-gated / untouched (leave as-is):** coffee-roaster-mcp **#169/#170** (T0/FC backdating —

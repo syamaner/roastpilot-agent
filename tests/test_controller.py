@@ -2606,6 +2606,72 @@ def test_backdated_now_subtracts_valid_delta() -> None:
     assert anchored < harness.clock.now
 
 
+async def _development_harness_via_fc_backdate(
+    *, charge_offset: float, fc_offset: float, dev_seconds: float, fc_backdate: float
+) -> Harness:
+    """A DEVELOPMENT harness whose FC clock is anchored via the real #337 backdate
+    path. Charge at t=0, first crack ``fc_offset`` s later through the genuine
+    MCP-detected FC tick (carrying ``fc_backdate``), then ``dev_seconds`` of
+    development. ``_development_percent`` then reflects the backdated FC origin."""
+    # Several identical drop decisions: the FC-edge tick may run a development
+    # consult, so the queue must not run dry before the asserted drop consult.
+    advisor = FakeAdvisor([decision(heat=50, fan=60, drop=True) for _ in range(4)])
+    harness = make_harness(readings=[reading()], advisor=advisor)
+    controller = harness.controller
+    controller.load_profile(PROFILE)
+    controller.transition_to(RoastPhase.STARTING)
+    controller.transition_to(RoastPhase.PREHEATING)
+    controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    controller._charge_monotonic = harness.clock.now  # pyright: ignore[reportPrivateUsage]
+    harness.clock.advance(charge_offset + fc_offset)
+    # Genuine MCP-detected FC tick: stages + applies the backdate delta at the
+    # development stamp (the real path, not a hand-set clock).
+    harness.reader.readings = [
+        reading(bean=185.0, first_crack_detected=True, first_crack_backdate_seconds=fc_backdate)
+    ]
+    await controller.tick()
+    assert controller.phase is RoastPhase.DEVELOPMENT
+    harness.clock.advance(dev_seconds)
+    harness.log.clear()
+    harness.events.events.clear()
+    harness.sink.evaluations.clear()  # drop the FC-edge tick's setup evaluations
+    return harness
+
+
+@pytest.mark.asyncio
+async def test_fc_backdate_moves_drop_coherence_guard_release() -> None:
+    """#337 control coupling (the safety-review correction): the backdated FC clock
+    flows through ``_development_percent`` into the #313 drop-coherence guard, so
+    honouring the backdate releases an advisor drop the receive-tick origin would
+    REJECT — a genuine (fail-safe) control effect, NOT display-only.
+
+    Same roast twice. Charge at 0, FC at 300 s, 53 s of development. Without
+    backdating dev% = 53/353 ≈ 15.0 % — below the 17 % floor (target 20 − margin
+    3) ⇒ the advisor drop is BLOCKED. A 17 s FC backdate moves the FC origin 17 s
+    earlier ⇒ development 70 s, dev% = 70/353 ≈ 19.8 % — above the floor ⇒ the SAME
+    advisor drop is HONOURED. The guard's release point genuinely moved with the
+    backdate."""
+    blocked = await _development_harness_via_fc_backdate(
+        charge_offset=0.0, fc_offset=300.0, dev_seconds=53.0, fc_backdate=0.0
+    )
+    blocked.controller.request_advisory()
+    await blocked.controller.tick()
+    # Receive-tick origin: dev% below the floor ⇒ drop REJECTed, stays DEVELOPMENT.
+    assert blocked.controller.phase is RoastPhase.DEVELOPMENT
+    assert blocked.executor.commands.count("drop_beans") == 0
+    assert [e for e in blocked.sink.evaluations if e.rule == "advisor_drop_coherence"]
+
+    released = await _development_harness_via_fc_backdate(
+        charge_offset=0.0, fc_offset=300.0, dev_seconds=53.0, fc_backdate=17.0
+    )
+    released.controller.request_advisory()
+    await released.controller.tick()
+    # Backdated FC origin lifts dev% over the floor ⇒ the SAME drop is HONOURED.
+    assert released.controller.phase is RoastPhase.COOLING
+    assert released.executor.commands.count("drop_beans") == 1
+    assert not [e for e in released.sink.evaluations if e.rule == "advisor_drop_coherence"]
+
+
 @pytest.mark.asyncio
 async def test_t0_debounce_resets_when_t0_absent() -> None:
     t0 = reading(bean=160.0, t0_detected=True)
