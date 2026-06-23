@@ -106,7 +106,15 @@ export const api = {
     `${API_BASE}/api/roasts/${runId}/log/${artifact}`,
 
   /** SSE stream URL for a run (consumed by the EventSource hook). */
-  eventsUrl: (runId: string) => `${API_BASE}/api/roasts/${runId}/events`,
+  eventsUrl: (runId: string, lastEventId?: number | null) =>
+    // `last_event_id` query param mirrors the SSE `Last-Event-ID` header for the
+    // hook's EXPLICIT reconnect (#339): a freshly-constructed EventSource sends no
+    // header, so on our own backoff path we carry the last applied id here and the
+    // server replays the buffered gap. Native EventSource auto-reconnect still
+    // uses the header; the server honors either.
+    typeof lastEventId === "number"
+      ? `${API_BASE}/api/roasts/${runId}/events?last_event_id=${lastEventId}`
+      : `${API_BASE}/api/roasts/${runId}/events`,
 
   // --- Bean-profile library (#303, D45) — the Start-Roast dropdown's CRUD. ---
 

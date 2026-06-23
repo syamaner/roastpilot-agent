@@ -31,6 +31,7 @@ from roastpilot_agent.api import (
     QueuedOperatorAction,
     RoastRunGoneError,
     RoastService,
+    _parse_last_event_id,  # pyright: ignore[reportPrivateUsage]
     create_app,
     stream_events,
 )
@@ -937,11 +938,25 @@ def _parse_frame(text: str) -> dict[str, object]:
 
 
 class _FakeRequest:
-    """Stands in for a Starlette Request — the SSE generator only calls
-    ``is_disconnected()``."""
+    """Stands in for a Starlette Request — the SSE endpoint calls
+    ``is_disconnected()`` plus ``headers.get(...)``/``query_params.get(...)`` for
+    the Last-Event-ID resume (#339). ``headers`` is keyed lower-case to mirror
+    Starlette's case-insensitive header access."""
 
-    def __init__(self, *, disconnected: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        disconnected: bool = False,
+        last_event_id_header: str | None = None,
+        last_event_id_query: str | None = None,
+    ) -> None:
         self._disconnected = disconnected
+        self.headers: dict[str, str] = (
+            {"last-event-id": last_event_id_header} if last_event_id_header is not None else {}
+        )
+        self.query_params: dict[str, str] = (
+            {"last_event_id": last_event_id_query} if last_event_id_query is not None else {}
+        )
 
     async def is_disconnected(self) -> bool:
         return self._disconnected
@@ -1053,6 +1068,173 @@ def test_event_broadcaster_drops_for_a_slow_consumer() -> None:
     assert data["enabled_actions"] == [
         a.value for a in enabled_operator_actions(RoastPhase.PREHEATING)
     ]
+
+
+def test_subscribe_replays_only_the_gap_after_last_event_id() -> None:
+    """A reconnect with a Last-Event-ID pre-loads exactly the frames newer than
+    that id, in order, before live frames resume (#339)."""
+    broadcaster = EventBroadcaster()
+    broadcaster.emit(RoastEventKind.RUN_STARTED, {"n": 1})  # id 1
+    broadcaster.emit(RoastEventKind.PHASE_CHANGED, {"phase": "preheating"})  # id 2
+    broadcaster.emit(RoastEventKind.FAULT, {"n": 3})  # id 3
+
+    # Client last applied id 1 → it should receive 2 and 3 only, in order.
+    queue = broadcaster.subscribe(last_event_id=1)
+    first = queue.get_nowait()
+    second = queue.get_nowait()
+    assert (first.id, second.id) == (2, 3)
+    assert queue.empty()
+    # And it keeps receiving live frames after the replayed gap.
+    broadcaster.emit(RoastEventKind.RUN_COMPLETED, {})  # id 4
+    assert queue.get_nowait().id == 4
+
+
+def test_subscribe_without_last_event_id_replays_nothing() -> None:
+    """A fresh connection (no Last-Event-ID) gets an empty queue — no backfill."""
+    broadcaster = EventBroadcaster()
+    broadcaster.emit(RoastEventKind.RUN_STARTED, {"n": 1})
+    broadcaster.emit(RoastEventKind.PHASE_CHANGED, {"phase": "preheating"})
+    queue = broadcaster.subscribe()
+    assert queue.empty()
+
+
+def test_subscribe_with_caught_up_last_event_id_replays_nothing() -> None:
+    """Last-Event-ID == the latest id: nothing newer to replay, empty queue."""
+    broadcaster = EventBroadcaster()
+    broadcaster.emit(RoastEventKind.RUN_STARTED, {"n": 1})  # id 1
+    queue = broadcaster.subscribe(last_event_id=1)
+    assert queue.empty()
+
+
+def test_broadcaster_rejects_replay_buffer_larger_than_queue() -> None:
+    """A replay buffer bigger than the queue is rejected at construction (#339):
+    pre-seeding iterates oldest-first under QueueFull-suppress, so a larger buffer
+    would silently drop the NEWEST gap frames — fail loudly instead."""
+    with pytest.raises(ValueError, match="must not exceed max_queue"):
+        EventBroadcaster(max_queue=10, replay_buffer=11)
+    # Equal is allowed (the default config); strictly larger is the only failure.
+    EventBroadcaster(max_queue=10, replay_buffer=10)
+
+
+def test_subscribe_id_beyond_buffer_replays_only_what_remains() -> None:
+    """When the client's id is older than the oldest buffered frame, the gap
+    before the buffer is unrecoverable — only the buffered frames replay (#339).
+    The client re-bases current state from the REST snapshot."""
+    broadcaster = EventBroadcaster(replay_buffer=2)
+    broadcaster.emit(RoastEventKind.RUN_STARTED, {"n": 1})  # id 1, evicted
+    broadcaster.emit(RoastEventKind.PHASE_CHANGED, {"phase": "preheating"})  # id 2
+    broadcaster.emit(RoastEventKind.FAULT, {"n": 3})  # id 3
+    # Buffer now holds only ids {2, 3}; a client at id 0 cannot get id 1 back.
+    queue = broadcaster.subscribe(last_event_id=0)
+    replayed = [queue.get_nowait().id, queue.get_nowait().id]
+    assert replayed == [2, 3]
+    assert queue.empty()
+
+
+def test_replay_buffer_evicts_oldest_past_capacity() -> None:
+    """The ring buffer is bounded: past capacity the oldest frame is evicted, so
+    a resume can never replay an id older than the retained window."""
+    broadcaster = EventBroadcaster(replay_buffer=3)
+    for _ in range(5):  # ids 1..5; buffer keeps only the last 3 (3, 4, 5)
+        broadcaster.emit(RoastEventKind.PHASE_CHANGED, {"phase": "preheating"})
+    queue = broadcaster.subscribe(last_event_id=0)
+    assert [queue.get_nowait().id for _ in range(3)] == [3, 4, 5]
+    assert queue.empty()
+
+
+def test_last_event_id_property_unchanged_by_resume() -> None:
+    """``last_event_id`` stays the monotonic published sequence regardless of any
+    resume — the settle signal (E10-S1) is unaffected by the ring buffer (#339)."""
+    broadcaster = EventBroadcaster()
+    broadcaster.emit(RoastEventKind.RUN_STARTED, {"n": 1})
+    broadcaster.emit(RoastEventKind.PHASE_CHANGED, {"phase": "preheating"})
+    assert broadcaster.last_event_id == 2
+    broadcaster.subscribe(last_event_id=1)  # no publish → no sequence change
+    assert broadcaster.last_event_id == 2
+
+
+@pytest.mark.parametrize("raw", ["", "  ", "abc", "1.5", "12x", None])
+def test_parse_last_event_id_ignores_malformed(raw: str | None) -> None:
+    """A missing/malformed Last-Event-ID parses to None (fresh connection),
+    never raising on the SSE entry path (#339)."""
+    assert _parse_last_event_id(raw) is None
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("0", 0), ("7", 7), (" 42 ", 42), ("-1", -1)])
+def test_parse_last_event_id_parses_clean_int(raw: str, expected: int) -> None:
+    assert _parse_last_event_id(raw) == expected
+
+
+@pytest.mark.asyncio
+async def test_sse_endpoint_resumes_from_last_event_id_header(
+    service: RoastService, store: RoastStore
+) -> None:
+    """The SSE endpoint reads the Last-Event-ID header and replays the gap (#339)."""
+    await _make_run(store, "run-resume", RoastPhase.PREHEATING)
+    service.events.emit(RoastEventKind.RUN_STARTED, {"n": 1})  # id 1
+    service.events.emit(RoastEventKind.PHASE_CHANGED, {"phase": "development"})  # id 2
+    request = cast(Request, _FakeRequest(last_event_id_header="1"))
+    response = await stream_events("run-resume", request, service)
+    # First the opening comment, then the replayed id-2 frame.
+    frames = await _collect_frames(response, 2)
+    assert frames[0] == ": connected\n\n"
+    assert "id: 2" in frames[1]
+    assert "event: phase_changed" in frames[1]
+
+
+@pytest.mark.asyncio
+async def test_sse_endpoint_resumes_from_last_event_id_query_param(
+    service: RoastService, store: RoastStore
+) -> None:
+    """Falls back to the ``last_event_id`` query param when the header is absent
+    (the hook's explicit-reconnect path, #339)."""
+    await _make_run(store, "run-resume-q", RoastPhase.PREHEATING)
+    service.events.emit(RoastEventKind.RUN_STARTED, {"n": 1})  # id 1
+    service.events.emit(RoastEventKind.FAULT, {"n": 2})  # id 2
+    request = cast(Request, _FakeRequest(last_event_id_query="1"))
+    response = await stream_events("run-resume-q", request, service)
+    frames = await _collect_frames(response, 2)
+    assert frames[0] == ": connected\n\n"
+    assert "id: 2" in frames[1]
+    assert "event: fault" in frames[1]
+
+
+@pytest.mark.asyncio
+async def test_sse_endpoint_ignores_malformed_last_event_id_header(
+    service: RoastService, store: RoastStore
+) -> None:
+    """A malformed Last-Event-ID is ignored: a fresh stream, no replay (#339)."""
+    await _make_run(store, "run-bad-id", RoastPhase.PREHEATING)
+    service.events.emit(RoastEventKind.RUN_STARTED, {"n": 1})  # id 1 (not replayed)
+    request = cast(Request, _FakeRequest(last_event_id_header="not-a-number"))
+    response = await stream_events("run-bad-id", request, service)
+    # Only the opening comment is immediately available; no buffered frame replays.
+    # A subsequent live emit still flows through.
+    service.events.emit(RoastEventKind.RUN_COMPLETED, {})  # id 2 (live)
+    frames = await _collect_frames(response, 2)
+    assert frames[0] == ": connected\n\n"
+    assert "id: 2" in frames[1]
+    assert "id: 1" not in frames[1]
+
+
+@pytest.mark.asyncio
+async def test_sse_endpoint_header_takes_precedence_over_query_param(
+    service: RoastService, store: RoastStore
+) -> None:
+    """When both are present the header wins; the query param is only a fallback
+    for the header-less explicit-reconnect path (#339)."""
+    await _make_run(store, "run-prec", RoastPhase.PREHEATING)
+    service.events.emit(RoastEventKind.RUN_STARTED, {"n": 1})  # id 1
+    service.events.emit(RoastEventKind.PHASE_CHANGED, {"phase": "development"})  # id 2
+    service.events.emit(RoastEventKind.FAULT, {"n": 3})  # id 3
+    # Header says "resume from 2" (replay only id 3); query param "0" would replay
+    # everything — proving the header, not the query param, drove the resume.
+    request = cast(Request, _FakeRequest(last_event_id_header="2", last_event_id_query="0"))
+    response = await stream_events("run-prec", request, service)
+    frames = await _collect_frames(response, 2)
+    assert frames[0] == ": connected\n\n"
+    assert "id: 3" in frames[1]
+    assert "id: 1" not in frames[1] and "id: 2" not in frames[1]
 
 
 @pytest.mark.asyncio

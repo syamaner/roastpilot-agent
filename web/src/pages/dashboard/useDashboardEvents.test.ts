@@ -1,3 +1,4 @@
+import { renderHook } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 
 import type { SseEvent } from "@/lib/types";
@@ -6,6 +7,7 @@ import {
   dashboardReducer,
   initialDashboardViewModel,
   snapshotFault,
+  useDashboardEvents,
 } from "./useDashboardEvents";
 
 function ev<T>(event: SseEvent["event"], data: T, id?: number): { kind: "event"; event: SseEvent } {
@@ -624,5 +626,62 @@ describe("snapshotFault (#329 — restore/reload fault from the hydrated snapsho
     for (const phase of ["preheating", "roasting_pre_first_crack", "development", "cooling", "complete", "idle", null] as const) {
       expect(snapshotFault(phase, "anything")).toBeNull();
     }
+  });
+});
+
+describe("useDashboardEvents drain dedup (#339 resume re-delivery)", () => {
+  const FAULT = {
+    rule: "env_ceiling",
+    verdict: "fault",
+    input_heat: null,
+    input_fan: null,
+    adjusted_heat: 0,
+    adjusted_fan: 100,
+    reason: "faulted",
+  };
+  const frame = (id: number): SseEvent => ({ event: "fault", data: { ...FAULT }, id });
+
+  it("does not double-append a re-delivered (resume-replayed) frame to the safety trail", () => {
+    // The raw `frames` drain channel is deliberately NOT id-deduped (#122), so a
+    // resume/reconnect that re-delivers a fault frame would otherwise append it to
+    // safetyTrail twice. The hook guards on event.id; the trail stays length 1.
+    const buffer: SseEvent[] = [frame(1)];
+    const { result, rerender } = renderHook(
+      ({ count }: { count: number }) =>
+        useDashboardEvents(buffer, count, "run-1", "connecting"),
+      { initialProps: { count: 1 } },
+    );
+    expect(result.current.safetyTrail).toHaveLength(1);
+
+    // Resume re-delivers the SAME id (1) as a new buffer entry — frameCount advances
+    // (the raw channel appends), but the hook must skip it.
+    buffer.push(frame(1));
+    rerender({ count: 2 });
+    expect(result.current.safetyTrail).toHaveLength(1);
+
+    // A genuinely-new id (2) still folds — the guard only skips already-seen ids.
+    buffer.push(frame(2));
+    rerender({ count: 3 });
+    expect(result.current.safetyTrail).toHaveLength(2);
+  });
+
+  it("re-applies frames after a run change resets the dedup cursor", () => {
+    // The per-run reset clears lastDispatchedId so a new run's id 1 is not mistaken
+    // for the previous run's already-seen id 1.
+    const buffer: SseEvent[] = [frame(1)];
+    const { result, rerender } = renderHook(
+      ({ count, runId }: { count: number; runId: string }) =>
+        useDashboardEvents(buffer, count, runId, "connecting"),
+      { initialProps: { count: 1, runId: "run-1" } },
+    );
+    expect(result.current.safetyTrail).toHaveLength(1);
+
+    // New run: the hook clears the stream buffer and frameCount drops to 0 (mirrors
+    // useRoastStream's per-run reset), then the new run's first frame bumps it to 1.
+    buffer.length = 0;
+    rerender({ count: 0, runId: "run-2" });
+    buffer.push(frame(1));
+    rerender({ count: 1, runId: "run-2" });
+    expect(result.current.safetyTrail).toHaveLength(1);
   });
 });

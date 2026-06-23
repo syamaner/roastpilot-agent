@@ -545,14 +545,33 @@ export function useDashboardEvents(
 ): DashboardViewModel {
   const [state, dispatch] = useReducer(dashboardReducer, initialDashboardViewModel);
 
+  // Highest event id already dispatched into the reducer. The raw `frames` drain
+  // channel is deliberately NOT id-deduped (it's the non-lossy #122 buffer), so a
+  // consumer that folds APPEND-style events (advisory feed, safety trail) must
+  // guard against a re-delivered id itself — otherwise an SSE resume/reconnect
+  // that re-delivers a frame would append a duplicate advisory row or fault marker
+  // (#339). Idempotent paths (telemetry upsert, first-wins t0) wouldn't care, but
+  // the trails would. Reset per run alongside the view-model.
+  const lastDispatchedId = useRef<number | null>(null);
+
   // Reset when the run changes (or clears) — the accumulated view-model is
   // per-run. Runs BEFORE the drain effect so a reset can't drop a frame: changing
   // runId re-subscribes the stream (clearing its buffer), whose frames arrive later.
   useEffect(() => {
     dispatch({ kind: "reset" });
+    lastDispatchedId.current = null;
   }, [runId]);
 
   const onFrame = useCallback((frame: SseEvent) => {
+    // Skip an already-dispatched id (a resume/reconnect re-delivery): the append
+    // paths in the reducer are not idempotent, so a duplicate would double-fold.
+    // Frames without an id (shouldn't occur on this stream) always dispatch.
+    if (typeof frame.id === "number") {
+      if (lastDispatchedId.current !== null && frame.id <= lastDispatchedId.current) {
+        return;
+      }
+      lastDispatchedId.current = frame.id;
+    }
     dispatch({ kind: "event", event: frame });
   }, []);
   useFrameDrain(frames, frameCount, onFrame);

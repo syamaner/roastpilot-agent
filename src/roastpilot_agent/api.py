@@ -19,6 +19,7 @@ import contextlib
 import logging
 import time
 import uuid
+from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -207,12 +208,50 @@ class EventBroadcaster:
     calls :meth:`unsubscribe`); it triggers no cooling and no state change,
     structurally — the broadcaster holds no controller, executor, or MCP
     reference, so backend safety continues with no client attached.
+
+    A bounded ring buffer of recent frames (each carrying its monotonic id) backs
+    ``Last-Event-ID`` resume (#339): a reconnecting client passes the id of its last applied frame
+    to :meth:`subscribe`, and every buffered frame newer than that is pre-loaded
+    into its queue before live frames resume, so a backgrounding/network hiccup
+    self-heals without losing the discrete fault/recovery/CLAMP/advisory frames in
+    the gap. Beyond the buffer's depth the gap is too old to replay losslessly —
+    the client still re-bases from the REST snapshot, but events older than the
+    oldest buffered id are gone (documented in :meth:`subscribe`).
     """
 
-    def __init__(self, *, max_queue: int = 1000) -> None:
+    #: Ring-buffer depth: recent frames retained for Last-Event-ID
+    #: resume. Sized to the same order as ``max_queue`` (1000) — at the 1 s
+    #: controller tick that is ~16 min of telemetry plus interleaved events, far
+    #: longer than any realistic backgrounding/network hiccup, while staying a
+    #: small, fixed-size buffer (one shared frame object per id, O(1) append).
+    DEFAULT_REPLAY_BUFFER: int = 1000
+
+    def __init__(self, *, max_queue: int = 1000, replay_buffer: int | None = None) -> None:
         self._subscribers: set[asyncio.Queue[SseEvent]] = set()
         self._max_queue = max_queue
         self._sequence = 0
+        # Enforce replay_buffer <= max_queue: subscribe() pre-seeds oldest-first and
+        # suppresses QueueFull, so a resumable slice larger than the queue would
+        # silently drop the NEWEST gap frames (delivering stale ones and missing the
+        # most recent). Keeping the buffer no larger than the queue makes that
+        # overflow impossible, so the suppress is only a defensive no-op. An
+        # EXPLICIT oversized replay_buffer is a caller error → fail loudly; the
+        # default just clamps to max_queue (so a small max_queue still constructs).
+        if replay_buffer is not None and replay_buffer > max_queue:
+            raise ValueError(
+                f"replay_buffer ({replay_buffer}) must not exceed max_queue "
+                f"({max_queue}): pre-seeding iterates oldest-first and would drop the "
+                "newest gap frames if the resumable slice overflowed the queue."
+            )
+        effective_replay = (
+            replay_buffer
+            if replay_buffer is not None
+            else min(self.DEFAULT_REPLAY_BUFFER, max_queue)
+        )
+        # Bounded recent-frame history for Last-Event-ID resume. ``deque`` with a
+        # ``maxlen`` evicts the oldest in O(1) on append, so the buffer never grows
+        # and the append never stalls the controller tick.
+        self._replay_buffer: deque[SseEvent] = deque(maxlen=effective_replay)
 
     @property
     def subscriber_count(self) -> int:
@@ -229,9 +268,40 @@ class EventBroadcaster:
         deterministic settle signal with no arbitrary sleep."""
         return self._sequence
 
-    def subscribe(self) -> asyncio.Queue[SseEvent]:
-        """Register a new subscriber queue for one SSE connection."""
+    def subscribe(self, last_event_id: int | None = None) -> asyncio.Queue[SseEvent]:
+        """Register a new subscriber queue for one SSE connection.
+
+        Args:
+            last_event_id: The id of the last frame the client already applied
+                (its ``Last-Event-ID``), or ``None`` for a fresh connection. When
+                given, every buffered frame with a strictly greater id is
+                pre-loaded into the new queue in order, so a reconnecting client
+                replays exactly the gap before live frames resume (#339).
+
+        Returns:
+            The subscriber's queue, pre-seeded with the resumable gap when a
+            ``last_event_id`` is supplied.
+
+        Note:
+            Resume is lossless only within the ring buffer's depth
+            (:data:`DEFAULT_REPLAY_BUFFER`). If ``last_event_id`` is older than the
+            oldest buffered frame the buffered frames are still replayed, but the
+            client is missing the frames between its id and the oldest buffered one
+            — it relies on the REST snapshot re-hydration for current state, and
+            those discrete in-gap events are unrecoverable. A subscriber too slow
+            to drain (queue full) still drops live frames per :meth:`_publish`.
+        """
         queue: asyncio.Queue[SseEvent] = asyncio.Queue(maxsize=self._max_queue)
+        if last_event_id is not None:
+            for event in self._replay_buffer:
+                if event.id is not None and event.id > last_event_id:
+                    # Pre-seed in order (deque iterates oldest→newest). The
+                    # resumable slice is a suffix of the buffer, and the constructor
+                    # guarantees replay_buffer <= max_queue, so the slice always fits
+                    # the queue — the suppress is a defensive no-op, never the path
+                    # that decides which frames survive.
+                    with contextlib.suppress(asyncio.QueueFull):
+                        queue.put_nowait(event)
         self._subscribers.add(queue)
         return queue
 
@@ -245,6 +315,11 @@ class EventBroadcaster:
         # render(), so no client can observe another's state.
         self._sequence += 1
         event = SseEvent(event=event_type, data=data, id=self._sequence)
+        # Retain in the ring buffer for Last-Event-ID resume (O(1), bounded by
+        # maxlen — oldest evicted automatically). Done before fan-out so a
+        # subscriber that reconnects mid-publish never sees a frame missing from
+        # the buffer it would resume against.
+        self._replay_buffer.append(event)
         for queue in self._subscribers:
             # The client fell behind; drop rather than block the roast. It
             # resyncs from REST snapshots on reconnect.
@@ -1708,6 +1783,22 @@ async def delete_bean_profile(profile_id: str, service: ServiceDep) -> dict[str,
     return {"id": profile_id, "result": "archived"}
 
 
+def _parse_last_event_id(raw: str | None) -> int | None:
+    """Parse the SSE ``Last-Event-ID`` header into a sequence int (#339).
+
+    Returns the int when ``raw`` is a clean integer, else ``None`` — a missing or
+    malformed header (empty, non-numeric, whitespace) is treated as a fresh
+    connection rather than raising on the SSE entry path. A negative value parses
+    fine and simply replays the whole buffer, which is harmless (the client
+    dedupes by id)."""
+    if raw is None:
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return None
+
+
 async def stream_events(
     run_id: str,
     request: Request,
@@ -1723,12 +1814,27 @@ async def stream_events(
     unsubscribes — a UI disconnect removes only that subscriber and never
     touches the controller (no cooling, no state change); backend safety runs
     on with no client attached.
+
+    On reconnect the client's ``Last-Event-ID`` is parsed and passed to
+    :meth:`EventBroadcaster.subscribe`, which replays the buffered gap before live
+    frames resume (#339). It is read from the ``Last-Event-ID`` request header
+    (set natively on EventSource auto-reconnect) and falls back to a
+    ``last_event_id`` query param (the hook's explicit-backoff path, where a freshly
+    constructed EventSource sends no header). A malformed value is ignored — the
+    connection falls back to a fresh stream plus REST re-hydration.
     """
     try:
         await service.detail(run_id)  # 404 a stream for an unknown run
     except RoastRunNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    queue = service.events.subscribe()
+    # Header first (native EventSource resume), query param as the explicit-reconnect
+    # fallback. Either parses defensively to None on a malformed value. Use an
+    # explicit None check (not `or`) so a legitimate id of 0 — replay the whole
+    # buffer — is not collapsed to the query-param fallback.
+    last_event_id = _parse_last_event_id(request.headers.get("last-event-id"))
+    if last_event_id is None:
+        last_event_id = _parse_last_event_id(request.query_params.get("last_event_id"))
+    queue = service.events.subscribe(last_event_id)
     heartbeat = service.sse_heartbeat_seconds
 
     async def frames() -> AsyncIterator[bytes]:

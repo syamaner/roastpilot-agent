@@ -153,6 +153,13 @@ export function useRoastStream(
 
   // Refs hold transport state the effect mutates without re-subscribing.
   const lastFrameAt = useRef<number>(Date.now());
+  // Highest applied SSE event id, tracked transport-side so the EXPLICIT reconnect
+  // can resume (#339). A freshly constructed EventSource sends no Last-Event-ID
+  // header (the browser only sets it on its OWN internal reconnect of the same
+  // instance), so the hook's backoff reconnect would lose the resume position; we
+  // pass this id as a query param the server honors, and the broadcaster replays
+  // the buffered gap. Reset per run alongside the rest of the per-run state.
+  const lastAppliedId = useRef<number | null>(null);
 
   // Reset per-run state the instant the run changes (or clears), BEFORE the
   // connect effect below re-subscribes (#215 FIX H). This runs in render-commit
@@ -172,6 +179,7 @@ export function useRoastStream(
     setLastEvent(null);
     framesRef.current = [];
     setFrameCount(0);
+    lastAppliedId.current = null;
   }, [runId]);
 
   useEffect(() => {
@@ -216,7 +224,10 @@ export function useRoastStream(
 
     const openStream = () => {
       if (cancelled) return;
-      const es = createEventSourceRef.current(api.eventsUrl(runId));
+      // Carry the last applied id on the explicit reconnect so the server replays
+      // the buffered gap (#339). null on the first connect → fresh stream (no
+      // resume), the snapshot hydrate above re-bases current state either way.
+      const es = createEventSourceRef.current(api.eventsUrl(runId, lastAppliedId.current));
       source = es;
 
       es.onopen = () => {
@@ -255,8 +266,13 @@ export function useRoastStream(
           // up to the replay step's `last_event_id` before screenshotting — a
           // deterministic settle signal, no arbitrary sleep. Same monotonic
           // sequence the broadcaster stamps + the reducer dedups on.
-          if (id !== null && typeof window !== "undefined") {
-            window.__lastEventId = Math.max(window.__lastEventId ?? 0, id);
+          if (id !== null) {
+            // Track the highest applied id for the explicit-reconnect resume (#339),
+            // monotonic so an out-of-order/duplicate replay frame never rewinds it.
+            lastAppliedId.current = Math.max(lastAppliedId.current ?? 0, id);
+            if (typeof window !== "undefined") {
+              window.__lastEventId = Math.max(window.__lastEventId ?? 0, id);
+            }
           }
         });
       }
