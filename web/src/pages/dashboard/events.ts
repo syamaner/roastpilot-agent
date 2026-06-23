@@ -78,3 +78,12 @@ export interface FirstCrackData {
   source: string;
   bean_temp_c?: number;
 }
+
+/** The `drying_end` payload (#351) — the pre-FC drying→browning landmark. Carries
+ *  the bean temp at the cross + the server threshold that fired it; like
+ *  `first_crack` it carries NO clock, so the marker's x is derived from the latest
+ *  plotted telemetry point (the same serve-elapsed axis, #326). */
+export interface DryingEndData {
+  bean_temp_c?: number;
+  threshold_c?: number;
+}

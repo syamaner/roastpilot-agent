@@ -456,6 +456,20 @@ export function dashboardReducer(
         markers: withMarker(state.markers, { kind: "t0", t: at, label: "T0" }),
       };
     }
+    case "drying_end": {
+      // The pre-FC drying-end landmark (#351) — a SUBORDINATE marker, server-
+      // sourced (the controller's bean-temp threshold cross), never inferred here.
+      // Like first_crack the SSE payload (DryingEndData: bean/threshold, no clock)
+      // carries no time, so the marker's x is the latest plotted point's serve-
+      // elapsed (the buffer axis is serve-elapsed seconds, #326; the roast-time
+      // re-label is a display transform in LiveCurve). Fire-once via withMarker; the
+      // payload isn't needed to place the marker, so we don't read it here.
+      const at = state.points.length > 0 ? state.points[state.points.length - 1].t : 0;
+      return {
+        ...state,
+        markers: withMarker(state.markers, { kind: "dry_end", t: at, label: "DRY END" }),
+      };
+    }
     case "first_crack": {
       const data = event.data as unknown as FirstCrackData;
       // The FC marker's x is the serve-elapsed at detection — the latest plotted

@@ -24,8 +24,10 @@ export interface CurvePoint {
   fan: number | null;
 }
 
-/** A vertical event marker on the curve (T0 / first crack / drop / cooling). */
-export type CurveMarkerKind = "t0" | "first_crack" | "drop" | "cooling";
+/** A vertical event marker on the curve (T0 / dry end / first crack / drop /
+ *  cooling). `dry_end` is the pre-FC drying→browning landmark (#351), rendered
+ *  subordinate to the operator's primary timing marks (FC / drop). */
+export type CurveMarkerKind = "t0" | "dry_end" | "first_crack" | "drop" | "cooling";
 
 export interface CurveMarker {
   kind: CurveMarkerKind;

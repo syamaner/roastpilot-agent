@@ -386,6 +386,10 @@ export type RoastEventKind =
   | "phase_changed"
   | "charge_guidance"
   | "t0_detected"
+  // The pre-FC drying→browning landmark (#351), persisted to the timeline so the
+  // detail page re-hydrates its chart marker on reload. Payload: {bean_temp_c,
+  // threshold_c}; no tick (it is not a tick-keyed trace record).
+  | "drying_end"
   | "first_crack"
   | "advisory"
   | "command_executed"

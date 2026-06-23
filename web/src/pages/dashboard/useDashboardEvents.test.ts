@@ -499,22 +499,35 @@ describe("dashboardReducer", () => {
     expect(s.markers).toHaveLength(0);
   });
 
-  it("renders the full server-sourced marker set: charge/T0, FC, drop, cooling (#309)", () => {
-    // The four markers #309 surfaces, each from its server signal, all riding the
-    // same serve-elapsed axis (#326). Dry-end is intentionally absent — no server
-    // signal exists in M1 (deferred to a server-DRYING_END follow-up).
+  it("adds the dry-end marker at the latest point's serve-elapsed on drying_end, once (#351)", () => {
+    // The pre-FC drying-end landmark (#351) is server-sourced (the controller's
+    // bean-temp threshold cross → the drying_end SSE event). Like FC its payload
+    // carries no clock, so the marker rides the latest plotted point's serve-elapsed
+    // (the same #326 axis as T0/FC/drop/cooling) and fires exactly once.
+    let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 480, charge_elapsed_seconds: null, bean_temp_c: 90, env_temp_c: 180 }));
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 870, charge_elapsed_seconds: 360, bean_temp_c: 150, env_temp_c: 200 }));
+    s = dashboardReducer(s, ev("drying_end", { bean_temp_c: 151, threshold_c: 150 }));
+    // Re-deliver drying_end — must not duplicate the marker.
+    s = dashboardReducer(s, ev("drying_end", { bean_temp_c: 151, threshold_c: 150 }));
+    expect(s.markers.filter((m) => m.kind === "dry_end")).toHaveLength(1);
+    expect(s.markers.find((m) => m.kind === "dry_end")).toEqual({ kind: "dry_end", t: 870, label: "DRY END" });
+  });
+
+  it("renders the full server-sourced marker set: charge/T0, dry-end, FC, drop, cooling (#309/#351)", () => {
+    // Every marker from its own server signal, all riding the same serve-elapsed
+    // axis (#326). Dry-end (#351) now has a server signal (the drying_end event),
+    // so it joins the four #309 markers in roast order.
     let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 510, charge_elapsed_seconds: 0, bean_temp_c: 160, env_temp_c: 200 }));
     s = dashboardReducer(s, ev("t0_detected", { bean_temp_c: 160 }));
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 870, charge_elapsed_seconds: 360, bean_temp_c: 151, env_temp_c: 205 }));
+    s = dashboardReducer(s, ev("drying_end", { bean_temp_c: 151, threshold_c: 150 }));
     s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 1010, charge_elapsed_seconds: 500, bean_temp_c: 201, env_temp_c: 215 }));
     s = dashboardReducer(s, ev("first_crack", { source: "mcp", bean_temp_c: 201 }));
     s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 1100, charge_elapsed_seconds: 590, bean_temp_c: 213, env_temp_c: 218 }));
     s = dashboardReducer(s, ev("command_executed", { command: "drop_beans", source: "operator" }));
     s = dashboardReducer(s, ev("phase_changed", { phase: "cooling" }));
     const byKind = Object.fromEntries(s.markers.map((m) => [m.kind, m.t]));
-    expect(byKind).toEqual({ t0: 510, first_crack: 1010, drop: 1100, cooling: 1100 });
-    // Dry-end is NOT a marker kind in M1 (no server signal; deferred). Guard that
-    // nothing slipped a drying-end kind in (string compare — not in the union).
-    expect(s.markers.map((m) => String(m.kind))).not.toContain("drying_end");
+    expect(byKind).toEqual({ t0: 510, dry_end: 870, first_crack: 1010, drop: 1100, cooling: 1100 });
   });
 
   it("resets to the initial view-model", () => {

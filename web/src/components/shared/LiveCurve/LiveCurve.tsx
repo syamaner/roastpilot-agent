@@ -49,12 +49,22 @@ import {
  */
 const MARKER_RGB: Record<CurveMarkerKind, string> = {
   t0: "212, 212, 216", // neutral grey (unchanged from pre-#309)
+  dry_end: "161, 161, 170", // muted zinc — a minor landmark (#351), see DRY_END_ALPHA
   first_crack: "251, 191, 36", // amber — the crack landmark
   drop: "248, 113, 113", // red — beans out
   cooling: "96, 165, 250", // blue — cooling air
 };
 
-/** The marker line/label colour at the given alpha (line 0.6, label 0.9). */
+/**
+ * Per-kind line/label alpha (#351). Dry-end is a SUBORDINATE landmark — quieter than
+ * the operator's primary timing marks (FC / drop / cooling) — so it draws at a lower
+ * opacity. Every other kind keeps the #309 default (line 0.6, label 0.9), passed by
+ * the caller; this map only carries the overrides.
+ */
+const DRY_END_ALPHA = { line: 0.32, label: 0.55 } as const;
+
+/** The marker line/label colour at the given alpha (default line 0.6, label 0.9;
+ *  dry-end is dialled down per {@link DRY_END_ALPHA} to read as subordinate). */
 function markerColor(kind: CurveMarkerKind, alpha: number): string {
   return `rgba(${MARKER_RGB[kind]}, ${alpha})`;
 }
@@ -516,19 +526,27 @@ function drawOverlays(
   let labelRow = 0;
   for (const marker of ordered) {
     const x = u.valToPos(marker.t, "x", true);
-    ctx.strokeStyle = markerColor(marker.kind, 0.6);
+    // Dry-end (#351) is a SUBORDINATE landmark — dimmer line + label + a dashed
+    // line — so it never competes with the operator's primary marks (FC / drop /
+    // cooling). Every other kind keeps the #309 solid line at the default alphas.
+    const isDryEnd = marker.kind === "dry_end";
+    const lineAlpha = isDryEnd ? DRY_END_ALPHA.line : 0.6;
+    const labelAlpha = isDryEnd ? DRY_END_ALPHA.label : 0.9;
+    ctx.strokeStyle = markerColor(marker.kind, lineAlpha);
     ctx.lineWidth = 1;
+    ctx.setLineDash(isDryEnd ? [3, 4] : []);
     line(ctx, x, u.bbox.top, x, u.bbox.top + u.bbox.height);
-    // Label the marker (T0 / FIRST CRACK / DROP / COOLING) near the top of its
-    // line — ui-prompts.md Prompt A requires labeled event markers, not bare
-    // lines. Per-kind colour (#309) keeps clustered labels distinguishable.
+    ctx.setLineDash([]);
+    // Label the marker (T0 / DRY END / FIRST CRACK / DROP / COOLING) near the top
+    // of its line — ui-prompts.md Prompt A requires labeled event markers, not
+    // bare lines. Per-kind colour (#309) keeps clustered labels distinguishable.
     if (prevLabelX !== null && x - prevLabelX < LABEL_CLUSTER_PX) {
       labelRow += 1;
     } else {
       labelRow = 0;
     }
     prevLabelX = x;
-    ctx.fillStyle = markerColor(marker.kind, 0.9);
+    ctx.fillStyle = markerColor(marker.kind, labelAlpha);
     ctx.fillText(marker.label, x + 3, u.bbox.top + 2 + labelRow * LABEL_ROW_PX);
   }
 

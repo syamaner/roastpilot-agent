@@ -67,6 +67,58 @@ describe("toCurveMarkers", () => {
     const markers = toCurveMarkers(FIXTURE_TIMELINE, series);
     expect(markers.map((m) => m.kind)).toEqual(["t0"]);
   });
+
+  it("places dry-end (#351) at the first telemetry point reaching the event's server threshold", () => {
+    // The persisted drying_end timeline event carries the server's threshold but no
+    // tick — so its x is the first telemetry point whose bean_temp_c reaches that
+    // threshold (the server's own rising cross, replayed against persisted readings).
+    // Fixture bean_temp_c = 92 + i*8.2 → tick 7 = 149.4 (below), tick 8 = 157.6 (≥150),
+    // elapsed 240 s.
+    const timeline: RoastTimeline = {
+      ...FIXTURE_TIMELINE,
+      events: [
+        ...FIXTURE_TIMELINE.events,
+        {
+          kind: "drying_end",
+          source: "controller",
+          monotonic_seconds: 240,
+          recorded_at_utc: "2026-06-07T09:16:00Z",
+          payload: { bean_temp_c: 157.6, threshold_c: 150 },
+        },
+      ],
+    };
+    const markers = toCurveMarkers(timeline, FIXTURE_TELEMETRY);
+    expect(markers.find((m) => m.kind === "dry_end")).toEqual({
+      kind: "dry_end",
+      t: 240,
+      label: "DRY END",
+    });
+  });
+
+  it("omits dry-end when no drying_end event is on the timeline", () => {
+    // FIXTURE_TIMELINE has no drying_end event → no marker, even though the bean
+    // curve crosses 150 °C (the event's presence is the gate, never a client threshold).
+    const markers = toCurveMarkers(FIXTURE_TIMELINE, FIXTURE_TELEMETRY);
+    expect(markers.some((m) => m.kind === "dry_end")).toBe(false);
+  });
+
+  it("omits dry-end when the drying_end event carries no numeric threshold", () => {
+    const timeline: RoastTimeline = {
+      ...FIXTURE_TIMELINE,
+      events: [
+        ...FIXTURE_TIMELINE.events,
+        {
+          kind: "drying_end",
+          source: "controller",
+          monotonic_seconds: 240,
+          recorded_at_utc: "2026-06-07T09:16:00Z",
+          payload: { bean_temp_c: 157.6 },
+        },
+      ],
+    };
+    const markers = toCurveMarkers(timeline, FIXTURE_TELEMETRY);
+    expect(markers.some((m) => m.kind === "dry_end")).toBe(false);
+  });
 });
 
 describe("toTraceRows", () => {
