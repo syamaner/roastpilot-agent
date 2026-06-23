@@ -1106,6 +1106,16 @@ def test_subscribe_with_caught_up_last_event_id_replays_nothing() -> None:
     assert queue.empty()
 
 
+def test_broadcaster_rejects_replay_buffer_larger_than_queue() -> None:
+    """A replay buffer bigger than the queue is rejected at construction (#339):
+    pre-seeding iterates oldest-first under QueueFull-suppress, so a larger buffer
+    would silently drop the NEWEST gap frames — fail loudly instead."""
+    with pytest.raises(ValueError, match="must not exceed max_queue"):
+        EventBroadcaster(max_queue=10, replay_buffer=11)
+    # Equal is allowed (the default config); strictly larger is the only failure.
+    EventBroadcaster(max_queue=10, replay_buffer=10)
+
+
 def test_subscribe_id_beyond_buffer_replays_only_what_remains() -> None:
     """When the client's id is older than the oldest buffered frame, the gap
     before the buffer is unrecoverable — only the buffered frames replay (#339).

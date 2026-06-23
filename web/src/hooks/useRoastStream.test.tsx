@@ -231,13 +231,20 @@ describe("useRoastStream", () => {
     expect(latest!.frameCount).toBe(1);
 
     // A re-delivered id-5 frame (the server replayed the gap boundary) is deduped
-    // by the reducer: phase does not double-apply or rewind.
+    // by the REDUCER: rendered phase does not double-apply or rewind.
     await act(async () => first.emit("phase_changed", { phase: "development" }, 5));
     expect(latest!.phase).toBe("development");
+    // The raw non-lossy `frames`/`frameCount` channel (#122) is deliberately NOT
+    // id-deduped — it appends every delivered frame so a burst can't coalesce a
+    // frame away — so a re-delivered id DOES advance frameCount. The dedupe that
+    // matters for state lives in the reducer (asserted above); a `useFrameDrain`
+    // consumer that must not act twice keys on event.id itself.
+    expect(latest!.frameCount).toBe(2);
 
     // The genuinely-new id-6 frame applies once and moves state.
     await act(async () => first.emit("phase_changed", { phase: "cooling" }, 6));
     expect(latest!.phase).toBe("cooling");
+    expect(latest!.frameCount).toBe(3);
   });
 
   it("does nothing when runId is null (no stream, status connecting)", () => {

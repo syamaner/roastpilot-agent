@@ -230,12 +230,28 @@ class EventBroadcaster:
         self._subscribers: set[asyncio.Queue[SseEvent]] = set()
         self._max_queue = max_queue
         self._sequence = 0
+        # Enforce replay_buffer <= max_queue: subscribe() pre-seeds oldest-first and
+        # suppresses QueueFull, so a resumable slice larger than the queue would
+        # silently drop the NEWEST gap frames (delivering stale ones and missing the
+        # most recent). Keeping the buffer no larger than the queue makes that
+        # overflow impossible, so the suppress is only a defensive no-op. An
+        # EXPLICIT oversized replay_buffer is a caller error → fail loudly; the
+        # default just clamps to max_queue (so a small max_queue still constructs).
+        if replay_buffer is not None and replay_buffer > max_queue:
+            raise ValueError(
+                f"replay_buffer ({replay_buffer}) must not exceed max_queue "
+                f"({max_queue}): pre-seeding iterates oldest-first and would drop the "
+                "newest gap frames if the resumable slice overflowed the queue."
+            )
+        effective_replay = (
+            replay_buffer
+            if replay_buffer is not None
+            else min(self.DEFAULT_REPLAY_BUFFER, max_queue)
+        )
         # Bounded recent-frame history for Last-Event-ID resume. ``deque`` with a
         # ``maxlen`` evicts the oldest in O(1) on append, so the buffer never grows
         # and the append never stalls the controller tick.
-        self._replay_buffer: deque[SseEvent] = deque(
-            maxlen=replay_buffer if replay_buffer is not None else self.DEFAULT_REPLAY_BUFFER
-        )
+        self._replay_buffer: deque[SseEvent] = deque(maxlen=effective_replay)
 
     @property
     def subscriber_count(self) -> int:
@@ -279,10 +295,11 @@ class EventBroadcaster:
         if last_event_id is not None:
             for event in self._replay_buffer:
                 if event.id is not None and event.id > last_event_id:
-                    # Pre-seed in order. A backlog larger than the queue can't
-                    # arise: the buffer and the queue are the same order of size,
-                    # and the resumable slice (ids > last_event_id) is a suffix of
-                    # the buffer, so it fits.
+                    # Pre-seed in order (deque iterates oldest→newest). The
+                    # resumable slice is a suffix of the buffer, and the constructor
+                    # guarantees replay_buffer <= max_queue, so the slice always fits
+                    # the queue — the suppress is a defensive no-op, never the path
+                    # that decides which frames survive.
                     with contextlib.suppress(asyncio.QueueFull):
                         queue.put_nowait(event)
         self._subscribers.add(queue)
