@@ -205,6 +205,31 @@ clean.
   fresh instance with no authoring context — independent of the author even when
   it's the same model; this rule keeps the *triage decision* independent too.)
 
+### PR Hygiene (size & rework)
+
+PR-flow metrics flag the build for **large PRs** and **high rework** (23 Jun
+baseline, last 30 merged PRs: median ~735 churn, 63 % of PRs >400 lines, and
+~41 % of commits were review-finding fixes landing *after* the PR opened).
+Shape PRs to cut both; the `pr-preflight` skill runs this checklist before you
+open.
+
+- **Separate data from logic.** Fixtures, snapshots, generated files, research
+  output, bake-off results go in their OWN PR (or at least their own commit),
+  never bundled with logic — they were the size outliers and don't need code
+  review the way logic does.
+- **Keep logic PRs small.** Target ≤ ~400 changed lines; split a story into thin
+  vertical slices at kickoff, not at review (a story may be several stacked PRs).
+- **Shift review LEFT.** Before opening: run all gates + an adversarial
+  self-critique of the diff, and run the domain reviewer on the BRANCH
+  (`safety-reviewer` for safety/controller/enum/recovery, `qa` for tests) — so
+  findings fold into the first push instead of the post-open rework tail.
+- **Kill avoidable churn.** Gates before opening (no post-open lint/format
+  commits); flakes are P1 (fix, don't re-run); never add a junk "re-trigger CI"
+  commit — re-push cleanly if a push didn't fire CI.
+- **Healthy rework stays.** A reviewer catching a real defect is the system
+  working — don't game the metric by skipping review; the goal is to fold the
+  *catchable-pre-open* findings in early, keeping the genuine ones.
+
 ## Code Review Rubric
 
 **The PR review roster (operator, 15 Jun 2026): `Claude Code Review` + `Augment
