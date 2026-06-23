@@ -1243,26 +1243,22 @@ class RoastController:
                 self._charge_monotonic = self._clock()
             return
         if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK and telemetry is not None:
-            # Drying-end signal (#351) before the FC check: a pre-FC observability
-            # landmark, so it can only fire while still pre-FC (the FC transition
-            # below moves the phase out of pre-FC and ends the window).
+            # Drying-end signal (#351) BEFORE the FC check: a pre-FC observability
+            # landmark, so it can only fire while still pre-FC — the FC transition
+            # below moves the phase out of pre-FC and ends the window.
             self._maybe_emit_drying_end(telemetry)
-        if (
-            self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-            and telemetry is not None
-            and telemetry.first_crack_detected
-        ):
-            source = self._safety.evaluate_event_source(
-                transition="first_crack", source=RoastEventSource.MCP
-            )
-            await self._snapshots.persist_evaluation(source)
-            if source.verdict is not SafetyVerdict.ALLOW:
-                return
-            self._events.emit(
-                RoastEventKind.FIRST_CRACK,
-                {"source": RoastEventSource.MCP.value, "bean_temp_c": telemetry.bean_temp_c},
-            )
-            self.transition_to(RoastPhase.DEVELOPMENT)
+            if telemetry.first_crack_detected:
+                source = self._safety.evaluate_event_source(
+                    transition="first_crack", source=RoastEventSource.MCP
+                )
+                await self._snapshots.persist_evaluation(source)
+                if source.verdict is not SafetyVerdict.ALLOW:
+                    return
+                self._events.emit(
+                    RoastEventKind.FIRST_CRACK,
+                    {"source": RoastEventSource.MCP.value, "bean_temp_c": telemetry.bean_temp_c},
+                )
+                self.transition_to(RoastPhase.DEVELOPMENT)
 
     def _maybe_emit_charge_guidance(self, telemetry: RoastTelemetry) -> None:
         """Emit the one-shot add-beans cue when the BEAN probe enters the band.

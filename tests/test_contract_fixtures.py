@@ -320,10 +320,12 @@ def _gap_fill_frames() -> list[SseEvent]:
     )
     # controller.py _maybe_emit_drying_end emit site shape (#351): the pre-FC
     # drying-end marker carries the bean temp at the cross + the configured
-    # threshold. 150.0 is the .alog-validated default (config.drying_end_bean_temp_c).
+    # threshold (150.0 = the .alog-validated default config.drying_end_bean_temp_c).
+    # bean_temp_c sits just ABOVE the threshold, mirroring a real `>=` cross (the
+    # first tick the rising bean reaches it lands a touch over, not exactly on it).
     broadcaster.emit(
         RoastEventKind.DRYING_END,
-        {"bean_temp_c": 150.0, "threshold_c": 150.0},
+        {"bean_temp_c": 151.0, "threshold_c": 150.0},
     )
 
     broadcaster.emit(RoastEventKind.SAFETY_ALERT, alert_eval.model_dump(mode="json"))
