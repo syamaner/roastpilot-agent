@@ -207,11 +207,13 @@ clean.
 
 ### PR Hygiene (size & rework)
 
-PR-flow metrics flag the build for **large PRs** and **high rework** (23 Jun
-baseline, last 30 merged PRs: median ~735 churn, 63 % of PRs >400 lines, and
-~41 % of commits were review-finding fixes landing *after* the PR opened).
-Shape PRs to cut both; the `pr-preflight` skill runs this checklist before you
-open.
+PR-flow metrics flag the build for **large PRs** and **high rework**. The first
+levers (below) clearly cut size (median churn ~735→~388, the >800 giants gone),
+but the gross rework rate stayed flat — because the rework that remains is ~half
+**healthy** (real review catches we want) and ~half **preventable** (a
+backend-only change reddening a frontend contract test, low-finding folds,
+fixture regens). Cut the preventable half; the `pr-preflight` skill runs this
+checklist before you open.
 
 - **Separate data from logic.** Fixtures, snapshots, generated files, research
   output, bake-off results go in their OWN PR (or at least their own commit),
@@ -219,16 +221,28 @@ open.
   review the way logic does.
 - **Keep logic PRs small.** Target ≤ ~400 changed lines; split a story into thin
   vertical slices at kickoff, not at review (a story may be several stacked PRs).
-- **Shift review LEFT.** Before opening: run all gates + an adversarial
-  self-critique of the diff, and run the domain reviewer on the BRANCH
-  (`safety-reviewer` for safety/controller/enum/recovery, `qa` for tests) — so
-  findings fold into the first push instead of the post-open rework tail.
+- **Shift review LEFT — mandatory, not optional.** Before opening: run all gates +
+  an adversarial self-critique, AND run the domain reviewer on the BRANCH
+  (`safety-reviewer` for safety/controller/enum/recovery, `qa` for tests) and
+  resolve its findings. Do not open until that pass is done. Findings folded
+  pre-open are not rework; the same findings raised by the bots post-open are.
+- **A "backend-only" change is a lie when a contract test spans the boundary.**
+  Adding or changing a server event kind / SSE field reddens the FE event-kind
+  contract test. Always run the **cross-boundary contract tests** (and regen any
+  contract fixtures) PRE-open, regardless of which side you touched — the
+  collision graph includes the contract test, not just the files you edited.
+- **Don't fold LOW findings as post-open commits.** Per the Code Review Rubric
+  lows are non-blocking (summary, not inline); fixing them in post-open commits is
+  self-inflicted rework. Fix lows pre-open, or defer/dismiss them in-thread.
 - **Kill avoidable churn.** Gates before opening (no post-open lint/format
   commits); flakes are P1 (fix, don't re-run); never add a junk "re-trigger CI"
   commit — re-push cleanly if a push didn't fire CI.
-- **Healthy rework stays.** A reviewer catching a real defect is the system
-  working — don't game the metric by skipping review; the goal is to fold the
-  *catchable-pre-open* findings in early, keeping the genuine ones.
+- **What "good" looks like (the KPI).** Judge hygiene by **avoidable churn → ~0**
+  (rebase / CI-retrigger / flake / lint), **preventable post-open rework → ~0**
+  (contract drift, low folds, fixture regens), and **findings caught pre-open**
+  trending UP — NOT by the gross review-fix rate, which stays non-zero because
+  **healthy rework stays**: a reviewer catching a real defect is the system
+  working, so never game the metric by skipping review.
 
 ## Code Review Rubric
 
