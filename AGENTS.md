@@ -243,6 +243,26 @@ checklist before you open.
   trending UP — NOT by the gross review-fix rate, which stays non-zero because
   **healthy rework stays**: a reviewer catching a real defect is the system
   working, so never game the metric by skipping review.
+- **Lead time: expect time-to-OPEN to rise and time-to-MERGE to fall.** Shift-left
+  front-loads the gates + review before the PR opens, so the open→merge window
+  shrinks while branch→open grows. That is the intended trade — always run the full
+  local gates + the pre-open review before opening; never skip the pre-open review to
+  shave a lead-time number.
+- **Thin slices off `main`; don't homegrow PR-stacking.** Split a story into
+  independent slices off `main`, serialised by one owner (resume-on-merge). The
+  measured rebase cost of that is ~nil (1 commit across 30 PRs), so true PR-stacking
+  is not worth a fragile hand-rolled restacker under squash-merge + branch protection;
+  if real stacks are ever wanted, evaluate a dedicated tool (Graphite / spr) as its
+  own decision rather than scripting it.
+- **Log prevented work.** The strongest shift-left win is a bad PR that never opens
+  (e.g. #346, closed pre-PR on a wrong premise → D56), and PR-flow metrics are blind
+  to it. When you close an issue WITHOUT a PR on a wrong-premise / superseded /
+  infeasible decision, add the `prevented-pre-pr` label + a one-line decision note,
+  so the prevented work stays countable.
+- **Link the issue correctly.** Use `Closes #N` only for the issue a PR FULLY
+  resolves (it auto-closes on merge — keeps the board honest); use `Refs #N` /
+  `Part of #N` for partial or related work so an unfinished issue isn't auto-closed.
+  The PR template prompts this.
 
 ## Code Review Rubric
 
