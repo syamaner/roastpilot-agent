@@ -336,6 +336,32 @@ class _BeanProfileFieldsBase(BaseModel):
     charge_guidance_max_c: float = 200.0
     initial_heat_percent: int = Field(ge=0, le=100)
     initial_fan_percent: int = Field(ge=0, le=100)
+    pre_fc_heat: int | None = Field(default=None, ge=0, le=100)
+    """The per-bean deterministic pre-first-crack HEAT target the controller
+    drives every tick pre-FC (D59 / #318, option C; refines D35). When set, it
+    replaces the global :class:`~roastpilot_agent.config.PreFirstCrackLevers`
+    ``heat_target_percent`` for this bean; when ``None`` the controller falls back
+    to that config default (100 %). Distinct from ``initial_heat_percent``, which
+    only SEEDS the ``start_run`` command and is then overwritten by the
+    deterministic policy — ``pre_fc_heat`` is the value the policy actually holds
+    to first crack. Optional / defaulted ``None`` for back-compat so every frozen
+    ``profile_json`` and saved template from before #318 still deserializes. The
+    resolved value stays bounded by the pre-FC safety box (the policy clamps it
+    in range; the #327 trim still composes ≤ the resolved floor)."""
+    pre_fc_fan: int | None = Field(default=None, ge=0, le=100)
+    """The per-bean deterministic pre-first-crack FAN target the controller drives
+    every tick pre-FC (D59 / #318, option C; refines D35). When set, it replaces
+    the global :class:`~roastpilot_agent.config.PreFirstCrackLevers`
+    ``fan_target_percent`` for this bean (e.g. a delicate natural at fan 20); when
+    ``None`` the controller falls back to that config default (30 %). Distinct from
+    ``initial_fan_percent``, which only SEEDS the ``start_run`` command and is then
+    overwritten by the deterministic policy. Optional / defaulted ``None`` for
+    back-compat. The resolved value stays bounded by the pre-FC safety box: a
+    value above the configured ``fan_ceiling_percent`` is CLAMPED to the ceiling by
+    the policy (never honoured blindly — the every-write-through-safety
+    invariant), so the field is bounded to 0–100 here but the runtime ceiling is
+    enforced where the config-side ceiling is known (the policy), not on the
+    config-blind profile model."""
     target_drop_temp_c: float = Field(gt=0)
     target_development_percent: float = Field(gt=0, lt=100)
 

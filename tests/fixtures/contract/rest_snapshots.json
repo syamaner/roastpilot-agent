@@ -37,6 +37,8 @@
       "initial_heat_percent": 100,
       "is_blend": false,
       "name": "cooling-complete",
+      "pre_fc_fan": null,
+      "pre_fc_heat": null,
       "processing": null,
       "source_url": null,
       "target_development_percent": 15.0,

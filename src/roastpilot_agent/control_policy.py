@@ -212,6 +212,18 @@ class RoastControlPolicy:
     above the roast it was configured for. The emergency-drop bound stays the
     hard ``SafetyLimits`` value (the last-resort bound is profile-independent).
 
+    The pre-FC deterministic *lever targets* are profile-aware too (D59 / #318,
+    option C): the heat/fan the controller holds to first crack is sourced from
+    the active profile's ``pre_fc_heat`` / ``pre_fc_fan`` when that bean specifies
+    them, falling back to the global :class:`PreFirstCrackLevers` config default
+    otherwise — so a delicate natural's profile drives fan 20 pre-FC while the
+    controller still OWNS the loop deterministically (D35 intact; no live
+    free-hand override). The per-bean value stays bounded by the SAME pre-FC
+    safety box: the fan target is clamped into ``fan_ceiling_percent`` and the
+    #327 trim still composes ≤ the resolved heat floor (the policy is the one
+    place that holds both the profile and the config-side ceiling, so the clamp
+    belongs here, not on the config-blind profile model).
+
     Deterministic and side-effect free: it reads the configured
     :class:`SafetyLimits` and the optional active :class:`RoastProfile` only. The
     policy is constructed once per run (the profile is frozen at run start) and
@@ -299,16 +311,29 @@ class RoastControlPolicy:
         emergency = self._limits.emergency_drop_temp_c
         if phase in _PRE_FIRST_CRACK_PHASES:
             levers = self._pre_fc_levers
+            fan_ceiling = levers.fan_ceiling_percent
+            # The PER-BEAN deterministic targets (D59 / #318): the active
+            # profile's pre-FC heat/fan when set, else the global #222 config
+            # default. The fan target is CLAMPED into the box ceiling so a profile
+            # value above the configured fan ceiling cannot be honoured blindly
+            # (the every-write-through-safety invariant; the policy is the one
+            # place that holds BOTH the profile and the config-side ceiling).
+            base_heat = self._pre_fc_heat_target(levers)
+            fan_target = min(self._pre_fc_fan_target(levers), fan_ceiling)
             # The deterministic heat the controller holds this tick: the trim
-            # level while the late-Maillard window is open (#327), else the flat
-            # #222 floor target. The floor is pinned to whichever heat is active
-            # so the gate clamps any lower value back up to it (no cut below the
-            # active level), and the trim is a strict reduction so the floor never
-            # rises above the #222 target.
+            # level while the late-Maillard window is open (#327), else the
+            # per-bean / #222 floor target. The floor is pinned to whichever heat
+            # is active so the gate clamps any lower value back up to it (no cut
+            # below the active level). The trim is a strict reduction *of the
+            # config flat-floor target* (a config validator pins
+            # trim_heat_percent <= heat_target_percent); clamping the engaged heat
+            # to the resolved base keeps the trim ≤ the resolved floor even when a
+            # per-bean profile lowers the base below the config target, so the
+            # trim never RAISES the per-bean heat.
             heat = (
-                levers.late_maillard_trim.trim_heat_percent
+                min(levers.late_maillard_trim.trim_heat_percent, base_heat)
                 if self._trim_engaged(trim_signal)
-                else levers.heat_target_percent
+                else base_heat
             )
             return PhaseControlLimits(
                 heat_floor_percent=heat,
@@ -317,11 +342,11 @@ class RoastControlPolicy:
                 # — the operator's low-fan-to-browning method. The trim leaves fan
                 # at the floor (plan §3 "fan controlled", not raised).
                 fan_floor_percent=_LEVER_MIN_PERCENT,
-                fan_ceiling_percent=levers.fan_ceiling_percent,
+                fan_ceiling_percent=fan_ceiling,
                 bitter_ceiling_temp_c=bitter,
                 emergency_drop_temp_c=emergency,
                 heat_target_percent=heat,
-                fan_target_percent=levers.fan_target_percent,
+                fan_target_percent=fan_target,
             )
         return PhaseControlLimits(
             heat_floor_percent=_LEVER_MIN_PERCENT,
@@ -391,6 +416,50 @@ class RoastControlPolicy:
         if trim_signal is None or not self._pre_fc_levers.late_maillard_trim.enabled:
             return False
         return trim_signal.latched or self.trim_window_open(trim_signal)
+
+    def _pre_fc_heat_target(self, levers: PreFirstCrackLevers) -> int:
+        """The deterministic pre-FC heat target — per-bean when set, else config.
+
+        D59 / #318 (option C): source the pre-FC heat the controller holds from
+        the active profile's :attr:`~roastpilot_agent.models.RoastProfile.pre_fc_heat`
+        when that bean specifies it, falling back to the global
+        :attr:`PreFirstCrackLevers.heat_target_percent` (the proven n8n default,
+        100 %) otherwise. The profile field is bounded 0–100, and the heat box
+        ceiling stays 100, so the resolved value always sits inside its box (no
+        clamp needed for heat; the floor is pinned to it by :meth:`limits_for`).
+
+        Args:
+            levers: The configured deterministic pre-FC levers (the fallback).
+
+        Returns:
+            The per-bean pre-FC heat target, or the config default when the
+            active profile is absent or does not specify ``pre_fc_heat``.
+        """
+        if self._profile is not None and self._profile.pre_fc_heat is not None:
+            return self._profile.pre_fc_heat
+        return levers.heat_target_percent
+
+    def _pre_fc_fan_target(self, levers: PreFirstCrackLevers) -> int:
+        """The deterministic pre-FC fan target — per-bean when set, else config.
+
+        D59 / #318 (option C): source the pre-FC fan the controller holds from the
+        active profile's :attr:`~roastpilot_agent.models.RoastProfile.pre_fc_fan`
+        when that bean specifies it, falling back to the global
+        :attr:`PreFirstCrackLevers.fan_target_percent` (30 %) otherwise. The caller
+        (:meth:`limits_for`) CLAMPS this into the configured ``fan_ceiling_percent``
+        so a per-bean value above the box ceiling is bounded by safety, never
+        honoured blindly (the every-write-through-safety invariant).
+
+        Args:
+            levers: The configured deterministic pre-FC levers (the fallback).
+
+        Returns:
+            The per-bean pre-FC fan target (pre-clamp), or the config default when
+            the active profile is absent or does not specify ``pre_fc_fan``.
+        """
+        if self._profile is not None and self._profile.pre_fc_fan is not None:
+            return self._profile.pre_fc_fan
+        return levers.fan_target_percent
 
     def _bitter_ceiling_temp_c(self) -> float:
         """The told ≤196 °C bitter / drop ceiling, capped at the profile target.
