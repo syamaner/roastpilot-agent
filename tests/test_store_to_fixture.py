@@ -341,6 +341,38 @@ async def test_events_are_rebased_off_the_absolute_monotonic_clock(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_inverted_mark_order_fails_closed(tmp_path: Path) -> None:
+    """A mis-stamped run (fc after drop) is refused, not emitted with negative time.
+
+    The fixture is the eval corpus, so a negative development/total time would
+    poison any scorer; the converter fails closed rather than emit it.
+    """
+    db_path = tmp_path / "inverted.sqlite3"
+    store = RoastStore(db_path=db_path)
+    await store.initialize()
+    await store.create_run(
+        run_id="r", profile=_PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    await store.record_telemetry(
+        run_id="r",
+        tick=0,
+        agent_phase=RoastPhase.DEVELOPMENT,
+        elapsed_seconds=0.0,
+        interval_seconds=0.0,
+        telemetry=RoastTelemetry(bean_temp_c=180.0, env_temp_c=200.0),
+        heat_level_percent=100,
+        fan_level_percent=30,
+    )
+    # first crack (800) AFTER the drop (720): inverted.
+    await _record_marks(store, "r", charge_s=60.0, first_crack_s=800.0, drop_s=720.0)
+    await store.complete_run(run_id="r", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    await store.close()
+
+    with pytest.raises(s2f.FixtureConversionError, match="mark order invalid"):
+        s2f.convert(db_path, tmp_path / "fixture")
+
+
+@pytest.mark.asyncio
 async def test_unrated_roast_carries_null_label(tmp_path: Path) -> None:
     """An unrated roast still converts; the label fields are null, not missing."""
     db_path = tmp_path / "unrated.sqlite3"

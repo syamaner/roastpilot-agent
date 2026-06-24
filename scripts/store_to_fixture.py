@@ -205,7 +205,9 @@ def _event_time(connection: sqlite3.Connection, run_id: str, kind: str) -> float
         " ORDER BY recorded_at_utc ASC, id ASC LIMIT 1",
         (run_id, kind),
     ).fetchone()
-    if row is None or row["monotonic_seconds"] is None:
+    # The SQL already filters monotonic_seconds IS NOT NULL, so a returned row
+    # always carries a non-null value — only the no-row case needs guarding.
+    if row is None:
         return None
     return float(row["monotonic_seconds"])
 
@@ -235,7 +237,8 @@ def _drop_time(connection: sqlite3.Connection, run_id: str) -> float | None:
         " ORDER BY recorded_at_utc ASC, id ASC LIMIT 1",
         (run_id, _PHASE_CHANGED_KIND, _COOLING_PHASE),
     ).fetchone()
-    if row is None or row["monotonic_seconds"] is None:
+    # The SQL already filters monotonic_seconds IS NOT NULL (see _event_time).
+    if row is None:
         return None
     return float(row["monotonic_seconds"])
 
@@ -371,7 +374,18 @@ def build_fixture_rows(roast: StoreRoast) -> list[dict[str, Any]]:
     if missing:
         raise FixtureConversionError(f"run {roast.run_id} lacks required marks: {missing}")
 
-    drop_seconds = float(roast.drop_seconds)  # type: ignore[arg-type]  # guarded above
+    charge_seconds = float(roast.charge_seconds)  # type: ignore[arg-type]  # guarded above
+    first_crack_seconds = float(roast.first_crack_seconds)  # type: ignore[arg-type]
+    drop_seconds = float(roast.drop_seconds)  # type: ignore[arg-type]
+    # Fail closed on a mis-stamped run: a clock-reconciliation glitch or a bad
+    # store could leave charge > first crack > drop, which would emit a NEGATIVE
+    # development time / total time into the fixture and poison any scorer. The
+    # corpus-integrity purpose means refusing > emitting garbage.
+    if not charge_seconds <= first_crack_seconds <= drop_seconds:
+        raise FixtureConversionError(
+            f"run {roast.run_id} mark order invalid: charge {charge_seconds} "
+            f"fc {first_crack_seconds} drop {drop_seconds}"
+        )
     # The thermocouple-readable rows in recorded order (a null-temperature row
     # carries no signal for the scorer and would break ``load_roast``).
     readable = [
