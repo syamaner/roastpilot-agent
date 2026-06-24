@@ -106,12 +106,12 @@
 ## Active Context
 
 **23 Jun 2026 (later) — MCP v0.1.7 BACKDATING LOCKSTEP COMPLETE. The only remaining gate is the
-operator running roast 4.** `coffee-roaster-mcp` **v0.1.7 released** (operator-approved publish):
-#169 (auto-T0 → turning point) + #170 (FC → crack onset) backdating, on PyPI + the MCP Registry.
+operator running roast 4.** `coffee-roaster-mcp` **v0.1.7 released** (operator-approved publish): #169
+(auto-T0 → turning point) + #170 (FC → crack onset) backdating, on PyPI + the MCP Registry.
 The agent-side consumer **#337 merged (#362, `7f70fd1`; plan D57)**: bumps the pin 0.1.6 → 0.1.7 and
 honours the backdated timestamps by subtracting the MCP-domain backdating *delta* from the agent's
 receive clock (never the non-comparable absolute cross-process value), failing closed to receive-tick
-when fields are absent/invalid. **Independent D23 review caught that the author's "display-only"
+when fields are absent/invalid. Independent D23 review caught that the author's "display-only"
 self-assessment was wrong: the backdated clocks feed `_development_percent`, which the #313
 drop-coherence guard reads → the advisor drop releases ~1-2 pp earlier on a truer dev% (fails safe;
 the #327 trim's FC-ETA is charge-clock-independent, so the trim is unaffected). **OPERATOR-CONFIRMED
