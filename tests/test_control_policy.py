@@ -90,6 +90,118 @@ def test_pre_fc_levers_are_parameterised_not_hardcoded() -> None:
     assert box.fan_ceiling_percent == 40
 
 
+@pytest.mark.parametrize("phase", _PRE_FC_PHASES)
+def test_pre_fc_targets_sourced_from_profile_when_set(phase: RoastPhase) -> None:
+    """D59 / #318 (option C): the deterministic pre-FC heat/fan targets are sourced
+    from the ACTIVE bean profile's ``pre_fc_heat`` / ``pre_fc_fan`` when set — a
+    delicate natural's profile (fan 20) drives fan 20 pre-FC, not the config 30."""
+    profile = _PROFILE.model_copy(update={"pre_fc_heat": 90, "pre_fc_fan": 20})
+    policy = RoastControlPolicy(SafetyLimits(), profile)
+    box = policy.limits_for(phase)
+    assert box.heat_target_percent == 90
+    assert box.heat_floor_percent == 90  # pinned to the per-bean heat — no cut below
+    assert box.fan_target_percent == 20  # the per-bean fan, not the config 30
+    assert box.fan_ceiling_percent == 30  # the box ceiling is unchanged (config)
+
+
+@pytest.mark.parametrize("phase", _PRE_FC_PHASES)
+def test_pre_fc_targets_fall_back_to_config_when_profile_unset(phase: RoastPhase) -> None:
+    """D59: a profile that does NOT specify ``pre_fc_heat`` / ``pre_fc_fan`` (the
+    fields default ``None``) falls back to the global ``PreFirstCrackLevers``
+    config default — heat 100 / fan 30 — so every pre-#318 profile is unchanged."""
+    assert _PROFILE.pre_fc_heat is None and _PROFILE.pre_fc_fan is None
+    box = RoastControlPolicy(SafetyLimits(), _PROFILE).limits_for(phase)
+    assert box.heat_target_percent == 100
+    assert box.fan_target_percent == 30
+
+
+def test_pre_fc_targets_fall_back_to_config_with_no_profile() -> None:
+    """D59: with no active profile at all, the pre-FC targets are the config
+    default (the policy guards the absent profile, not just the unset field)."""
+    box = RoastControlPolicy(SafetyLimits()).limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert box.heat_target_percent == 100
+    assert box.fan_target_percent == 30
+
+
+def test_pre_fc_one_field_set_other_falls_back() -> None:
+    """D59: the two per-bean fields are independent — a profile may set only the
+    fan (the delicate-natural case) and inherit the config heat default."""
+    profile = _PROFILE.model_copy(update={"pre_fc_fan": 20})
+    box = RoastControlPolicy(SafetyLimits(), profile).limits_for(
+        RoastPhase.ROASTING_PRE_FIRST_CRACK
+    )
+    assert box.heat_target_percent == 100  # config default (heat unset on the profile)
+    assert box.fan_target_percent == 20  # the per-bean fan
+
+
+@pytest.mark.parametrize("phase", _PRE_FC_PHASES)
+def test_pre_fc_profile_fan_above_ceiling_is_clamped_by_the_box(phase: RoastPhase) -> None:
+    """D59 INVARIANT: a per-bean ``pre_fc_fan`` ABOVE the configured fan ceiling is
+    CLAMPED into the box, never honoured blindly (every roaster write stays inside
+    the pre-FC safety box). The resolved fan target cannot exceed the ceiling."""
+    # pre_fc_fan 80 is well above the default fan_ceiling_percent (30).
+    profile = _PROFILE.model_copy(update={"pre_fc_fan": 80})
+    box = RoastControlPolicy(SafetyLimits(), profile).limits_for(phase)
+    assert box.fan_ceiling_percent == 30
+    assert box.fan_target_percent == 30  # clamped to the ceiling, not 80
+    assert box.fan_target_percent <= box.fan_ceiling_percent  # the invariant
+
+
+@pytest.mark.parametrize("phase", _PRE_FC_PHASES)
+def test_pre_fc_profile_heat_is_bounded_by_the_heat_ceiling(phase: RoastPhase) -> None:
+    """D59 INVARIANT (symmetric with the fan clamp): the resolved per-bean
+    ``pre_fc_heat`` is CLAMPED into the pre-FC heat ceiling, never honoured above
+    it. The field max (100) equals the ceiling today so a breach isn't
+    constructible, but the resolved target must stay ≤ the ceiling so a future
+    lower heat ceiling cannot un-bound a per-bean heat."""
+    # The field maximum — exercises the upper edge of the clamp.
+    profile = _PROFILE.model_copy(update={"pre_fc_heat": 100})
+    box = RoastControlPolicy(SafetyLimits(), profile).limits_for(phase)
+    assert box.heat_target_percent == 100  # honoured at the ceiling, not above
+    assert box.heat_target_percent <= box.heat_ceiling_percent  # the invariant
+
+
+def test_pre_fc_profile_fan_at_a_raised_ceiling_is_honoured() -> None:
+    """D59: when config raises ``fan_ceiling_percent`` to leave room, a per-bean
+    fan inside the wider box is honoured exactly (the clamp only bites above the
+    ceiling — it does not floor a legitimately-low per-bean value)."""
+    levers = PreFirstCrackLevers(fan_target_percent=30, fan_ceiling_percent=50)
+    profile = _PROFILE.model_copy(update={"pre_fc_fan": 45})
+    box = RoastControlPolicy(SafetyLimits(), profile, pre_fc_levers=levers).limits_for(
+        RoastPhase.ROASTING_PRE_FIRST_CRACK
+    )
+    assert box.fan_ceiling_percent == 50
+    assert box.fan_target_percent == 45  # inside the wider box — honoured, not clamped
+
+
+def test_pre_fc_trim_composes_with_a_profile_sourced_heat() -> None:
+    """D59 + #327: the anticipatory heat trim still composes with a per-bean heat.
+    With the window open the engaged heat is the trim level, and it stays ≤ the
+    resolved floor (the trim only ever REDUCES heat, never raises the per-bean
+    target)."""
+    # Per-bean heat 90; default trim level 65 < 90, so the window lowers heat to 65.
+    profile = _PROFILE.model_copy(update={"pre_fc_heat": 90})
+    box = RoastControlPolicy(SafetyLimits(), profile).limits_for(
+        RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=_TRIM_OPEN
+    )
+    assert box.heat_target_percent == 65  # the trim level
+    assert box.heat_floor_percent == 65
+    assert box.heat_target_percent <= 90  # the trim never raises the per-bean heat
+
+
+def test_pre_fc_trim_never_raises_a_below_trim_profile_heat() -> None:
+    """D59 + #327: if a per-bean ``pre_fc_heat`` is BELOW the config trim level, the
+    engaged trim must not RAISE heat up to the trim level — the trim is clamped to
+    the resolved base so it stays ≤ the per-bean floor (never delays FC)."""
+    # Per-bean heat 50, below the default trim level 65: the trim must not lift it.
+    profile = _PROFILE.model_copy(update={"pre_fc_heat": 50})
+    box = RoastControlPolicy(SafetyLimits(), profile).limits_for(
+        RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=_TRIM_OPEN
+    )
+    assert box.heat_target_percent == 50  # clamped to the per-bean base, not raised to 65
+    assert box.heat_floor_percent == 50
+
+
 def test_bitter_and_emergency_ceilings_come_from_config() -> None:
     """The told drop/bitter ceiling + emergency-drop bound are the config values."""
     limits = SafetyLimits()

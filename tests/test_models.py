@@ -151,6 +151,36 @@ def test_roast_profile_bean_identity_defaults() -> None:
     assert profile.is_blend is False
 
 
+def test_roast_profile_pre_fc_levers_default_to_none() -> None:
+    """D59 / #318: the per-bean deterministic pre-FC heat/fan targets default to
+    ``None`` (the controller then falls back to the config levers), so every
+    pre-#318 profile and frozen ``profile_json`` is valid unchanged."""
+    profile = RoastProfile.model_validate(_profile())
+    assert profile.pre_fc_heat is None
+    assert profile.pre_fc_fan is None
+
+
+def test_roast_profile_pre_fc_levers_round_trip() -> None:
+    """D59: a profile that specifies the per-bean pre-FC targets round-trips the
+    explicit values (the controller then drives them deterministically pre-FC)."""
+    profile = RoastProfile.model_validate(_profile(pre_fc_heat=90, pre_fc_fan=20))
+    assert profile.pre_fc_heat == 90
+    assert profile.pre_fc_fan == 20
+    # And survives a JSON serialize/deserialize (the frozen profile_json path).
+    assert RoastProfile.model_validate_json(profile.model_dump_json()) == profile
+
+
+@pytest.mark.parametrize("bad", [-1, 101])
+def test_roast_profile_pre_fc_levers_reject_out_of_percent_range(bad: int) -> None:
+    """D59: the per-bean pre-FC targets are bounded 0–100 like every lever; an
+    out-of-percent value is rejected at construction (the runtime fan-ceiling
+    bound is enforced by the policy, this is just the field-level 0–100 guard)."""
+    with pytest.raises(pydantic.ValidationError):
+        RoastProfile.model_validate(_profile(pre_fc_heat=bad))
+    with pytest.raises(pydantic.ValidationError):
+        RoastProfile.model_validate(_profile(pre_fc_fan=bad))
+
+
 def test_roast_profile_bean_identity_populated() -> None:
     """#164 bean-identity fields round-trip a fully-specified single origin."""
     profile = RoastProfile.model_validate(
@@ -643,12 +673,17 @@ def test_bean_profile_to_roast_profile_copies_shared_fields() -> None:
             bean_species="arabica",
             processing="natural",
             altitude_m=1885,
+            pre_fc_heat=90,
+            pre_fc_fan=20,
             default_bean_weight_grams=250.0,
         )
     )
     roast = bean.to_roast_profile(bean_weight_grams=200.0)
     assert isinstance(roast, RoastProfile)
     assert roast.bean_weight_grams == 200.0  # the entered per-roast weight wins
+    # The D59 per-bean pre-FC targets carry through to the per-roast profile.
+    assert roast.pre_fc_heat == 90
+    assert roast.pre_fc_fan == 20
     # Every shared field copied verbatim.
     for field in set(RoastProfile.model_fields) - {"bean_weight_grams"}:
         assert getattr(roast, field) == getattr(bean, field)
