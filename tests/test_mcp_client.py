@@ -8,7 +8,6 @@ source and validated here against the 7 Jun 2026 live-roast exports.
 import asyncio
 import json
 import os
-import shutil
 import signal
 import subprocess
 import sys
@@ -556,8 +555,12 @@ async def test_transport_feeds_the_typed_client() -> None:
 
 
 @pytest.mark.skipif(
-    shutil.which("coffee-roaster-mcp") is None,
-    reason="coffee-roaster-mcp not installed (E9 adds it for the vertical slice)",
+    not os.path.isfile(resolve_mcp_command(DEFAULT_MCP_COMMAND)),
+    reason=(
+        "coffee-roaster-mcp not installed where the spawn resolves it "
+        "(resolve_mcp_command prefers the in-venv console script, then PATH; "
+        "E9 adds it for the vertical slice)"
+    ),
 )
 @pytest.mark.asyncio
 async def test_real_child_process_round_trip() -> None:
