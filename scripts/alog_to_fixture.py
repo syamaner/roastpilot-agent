@@ -39,9 +39,14 @@ import argparse
 import ast
 import json
 import re
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from roast_degree import classify_degree  # noqa: E402
 
 # Artisan timeindex slots.
 _CHARGE, _FCS, _DROP = 0, 2, 6
@@ -250,16 +255,22 @@ def _summary(profile: dict[str, Any], marks: RoastMarks) -> dict[str, Any]:
     """Build a minimal ``summary.json`` mirroring the live-roast fixtures."""
     span = marks.drop_seconds - marks.charge_seconds
     dev = marks.drop_seconds - marks.first_crack_seconds
+    drop_temp_c = round(marks.drop_temp_c, 1)
     return {
         "active": False,
         "phase": "complete",
         "source": "artisan-alog",
         "roaster_driver": "hottop_kn8828b_2k_plus",
         "first_crack_temp_c": round(marks.first_crack_temp_c, 1),
-        "drop_temp_c": round(marks.drop_temp_c, 1),
+        "drop_temp_c": drop_temp_c,
         "development_time_seconds": round(dev, 1),
         "development_time_percent": round(dev / span * 100, 1) if span > 0 else None,
         "total_roast_seconds": round(span, 1),
+        # Outcome label (#300): an .alog has no operator rating, so it is null;
+        # degree is the shared drop-temperature rule.
+        "operator_rating": None,
+        "operator_notes": None,
+        "degree": classify_degree(drop_temp_c),
     }
 
 
