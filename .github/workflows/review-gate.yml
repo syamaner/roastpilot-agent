@@ -1,0 +1,142 @@
+name: Review gate
+
+# Closes the auto-merge-before-review race (#159).
+#
+# THE RACE. main's required checks (Checks / Web ×2 / codecov/patch) finish in
+# ~1-2 min, so repo auto-merge fires almost immediately. The findings gate —
+# `Claude Code Review` (claude-code-review.yml) — is NON-required (it fails by
+# design on workflow-editing + Dependabot PRs and passes-on-findings), is slow
+# (~10 min), and posts findings as INLINE review threads. `required_conversation
+# _resolution` only blocks on threads that ALREADY exist, so if the review hasn't
+# posted yet, nothing blocks and the PR merges un-triaged. AGENTS.md / the merge
+# policy require every PR to face the review roster before merge.
+#
+# THE FIX (operator decision, 24 Jun — "Option 1: build gate + operator
+# activates"). This workflow publishes a commit STATUS context named
+# `review-gate` on the PR head SHA:
+#
+#   - PR opened / synchronized  -> review-gate = PENDING   (once the operator
+#     marks it a required check, auto-merge then WAITS for it — the race closes).
+#   - `Claude Code Review` completes -> review-gate = SUCCESS  (the review has
+#     now posted; its inline threads + required_conversation_resolution become
+#     the real findings gate from here. review-gate asserts the review RAN, not
+#     that it had no findings — findings are gated by conversation-resolution).
+#   - Dependabot PR, OR a PR that edits any .github/workflows/** file ->
+#     review-gate = SUCCESS immediately. These are exactly the PR classes where
+#     `Claude Code Review` legitimately cannot run (Dependabot gets no secret;
+#     the App's workflow-validation guard 401s on workflow edits), which is why
+#     claude-review is un-required. The gate MUST inherit that property or it
+#     would deadlock those PRs — including THIS PR, which edits a workflow file.
+#
+# ACTIVATION SEQUENCING. `workflow_run` only fires for the version of this
+# workflow that lives on the DEFAULT branch. So the `workflow_run` half does
+# nothing until this file is merged to main. The operator must therefore merge
+# this PR FIRST, then mark `review-gate` a required check — not the reverse, or
+# normal PRs would hang on a PENDING that never resolves. (This PR's own
+# workflow-edit auto-pass path keeps it mergeable before activation.)
+#
+# Branch protection (marking review-gate required) is the operator's governance
+# call (main has enforce_admins on) and is NOT changed here — this PR ships only
+# the mechanism.
+
+on:
+  # Stamp the gate on every PR head as soon as it appears / updates.
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Flip the gate to success once the review workflow has finished. `workflow_run`
+  # carries the originating run's head_sha so the status lands on the PR head.
+  workflow_run:
+    workflows: ["Claude Code Review"]
+    types: [completed]
+
+# statuses: write is the only privilege needed — we POST a commit status. No
+# code is checked out or executed from the PR, so this stays safe even on the
+# pull_request trigger (which, for same-repo PRs, runs with the repo token).
+permissions:
+  contents: read
+  statuses: write
+  pull-requests: read
+
+jobs:
+  # ---- PR opened / synchronized: stamp PENDING, or auto-pass the exempt classes.
+  stamp-on-pr:
+    name: Stamp review-gate on PR head
+    if: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decide pending vs immediate success, then post the status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const sha = pr.head.sha;
+
+            // Dependabot PRs run with a read-only token (no secrets), so
+            // `Claude Code Review` is skipped for them — never wait on a review
+            // that will not run. Match the same actor the review workflow excludes.
+            const isDependabot = pr.user.login === 'dependabot[bot]'
+              || context.actor === 'dependabot[bot]';
+
+            // A PR that edits any .github/workflows/** file trips the Claude App's
+            // workflow-validation guard (a 401), so the review cannot post. Detect
+            // it from the PR file list and auto-pass — exactly the property that
+            // keeps THIS workflow-editing PR mergeable, and why claude-review is
+            // un-required.
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+            const editsWorkflow = files.some((f) =>
+              f.filename.startsWith('.github/workflows/'),
+            );
+
+            const exempt = isDependabot || editsWorkflow;
+            const reason = isDependabot
+              ? 'Dependabot PR — Claude Code Review does not run (no secret); auto-pass.'
+              : editsWorkflow
+                ? 'PR edits .github/workflows/** — Claude Code Review cannot run (workflow-validation guard); auto-pass.'
+                : 'Awaiting Claude Code Review to post its findings.';
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha,
+              context: 'review-gate',
+              state: exempt ? 'success' : 'pending',
+              description: reason.slice(0, 140),
+            });
+
+            core.info(`review-gate=${exempt ? 'success' : 'pending'} on ${sha}: ${reason}`);
+
+  # ---- Claude Code Review finished: flip the gate to success on the PR head.
+  flip-on-review:
+    name: Flip review-gate to success after review
+    if: ${{ github.event_name == 'workflow_run' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mark review-gate success on the reviewed head SHA
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // The review run carries the PR head SHA (NOT a synthetic merge
+            // commit), so the status lands on the commit branch protection
+            // evaluates. We flip to success on ANY completion (success, failure,
+            // cancelled): `Claude Code Review` fails by design on workflow/
+            // Dependabot PRs and "passes on findings", so its CONCLUSION is not a
+            // findings signal. review-gate only asserts the review RAN; the
+            // findings gate is the inline threads + required_conversation_resolution.
+            const run = context.payload.workflow_run;
+            const sha = run.head_sha;
+
+            await github.rest.repos.createCommitStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha,
+              context: 'review-gate',
+              state: 'success',
+              description: `Claude Code Review completed (${run.conclusion}); findings gated by conversation resolution.`.slice(0, 140),
+            });
+
+            core.info(`review-gate=success on ${sha} (review run ${run.id}, conclusion=${run.conclusion}).`);
