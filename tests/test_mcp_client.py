@@ -761,6 +761,29 @@ async def test_stop_bounds_a_wedged_child_and_force_terminates() -> None:
     assert not process.running  # state cleared even on the timeout path
 
 
+@pytest.mark.asyncio
+async def test_stop_swallows_a_raising_force_terminate_hook() -> None:
+    """Contract-hardening (#212/#365): a buggy force-terminate hook that
+    raises must NOT propagate out of teardown — stop() still returns, sets
+    stop_unconfirmed, and clears state, because it is on the fail-closed
+    shutdown path that must always let the agent exit."""
+
+    def force_terminate() -> bool:
+        raise RuntimeError("hook blew up")
+
+    session = FakeInitializableSession(info_result())
+    probe = WedgedFactoryProbe(session)
+    process = MCPServerProcess(
+        MCPConfig(stop_timeout_seconds=0.05),
+        session_factory=probe,
+        force_terminate=force_terminate,
+    )
+    await process.start()
+    await asyncio.wait_for(process.stop(), timeout=1.0)  # no raise escapes
+    assert process.stop_unconfirmed is True
+    assert not process.running
+
+
 @pytest.mark.skipif(
     not hasattr(os, "killpg"), reason="POSIX process-group kill only (#212 targets darwin/linux)"
 )

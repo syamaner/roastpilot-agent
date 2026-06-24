@@ -969,7 +969,13 @@ class MCPServerProcess:
                 self._config.stop_timeout_seconds,
             )
             if self._force_terminate is not None:
-                self._force_terminate()
+                # The hook must never block exit either: a raising hook (a
+                # buggy injected seam — the real one absorbs OSError) is
+                # logged and swallowed, not propagated out of teardown.
+                try:
+                    self._force_terminate()
+                except Exception as ft_exc:
+                    _log.error("force-terminate hook raised unexpectedly: %s", ft_exc)
             else:  # pragma: no cover - defensive: pid never captured
                 _log.error(
                     "no force-terminate hook registered for wedged MCP child — "
