@@ -152,6 +152,19 @@ are metric-blind (#306 resolved with zero agent code; the folded coverage gap). 
 else is OPERATOR-GATED — **roast 4 (#134)** + device SSE (#135), then the post-roast-4 sequence (#323
 ceiling-override → #228 LAST → M2/D42). Untouched: #318. Nothing else agent-startable until roast 4.
 
+**#300 — roast-data pipeline (D44) — DONE (store → labelled replay fixture).** The store-side
+sibling of `alog_to_fixture.py`: `scripts/store_to_fixture.py` reads a completed roast out of the
+agent SQLite store (read-only) and emits the same `roast.jsonl` + `summary.json` the bake-off scores,
+mapping store event kinds → the three fixture kinds (`t0_detected`→`beans_added` /
+`first_crack`→`first_crack_detected` / `run_completed`→`beans_dropped`). Adds the #300/D42 outcome
+label on `summary.json` — `operator_rating` / `operator_notes` (from `roast_runs`) + a `degree`
+(`core_medium` ≤195 / `soft_medium` (195,197] / `over` >197) from the shared `scripts/roast_degree.py`
+helper, which `alog_to_fixture.py` now emits too (parity). Privacy invariant held: real stores are
+never committed; the unit test builds a synthetic store via the store write API and asserts the
+output parses via `bakeoff_replay.load_roast` with the label fields present. Registering a real
+fixture into the bake-off set stays a LOCAL operator action (gitignored). Extends #224 (consolidation
+half); feeds D42. Real roast-2/3 ingestion is a manual operator validation, not a committed test.
+
 ---
 
 **23 Jun 2026 (later) — MCP v0.1.7 BACKDATING LOCKSTEP COMPLETE. The only remaining gate is the

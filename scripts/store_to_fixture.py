@@ -1,0 +1,435 @@
+"""Convert a completed agent roast (SQLite store) into a bake-off replay fixture.
+
+The roast-data pipeline (#300, D44) makes the #277 control-advisor eval
+**repeatable on new data**: every roast the agent itself runs lands in the
+SQLite store (``store.py``: ``roast_runs`` / ``telemetry_snapshots`` /
+``roast_events``), and this adapter turns one such run into the same replay
+fixture format the bake-off scores — ``<dir>/roast.jsonl`` (telemetry + the
+three event rows) plus a labelled ``summary.json``. It is the store-side sibling
+of ``alog_to_fixture.py`` (the Artisan ``.alog`` adapter); both emit the identical
+contract so the bake-off (``bakeoff_replay.load_roast``) needs zero changes.
+
+Outcome label (#300 / D42): the store carries the operator's per-roast rating
+(``roast_runs.operator_rating`` 1–5 + ``operator_notes``), so the fixture's
+``summary.json`` carries them through as the outcome label, alongside the shared
+``degree`` classification (``roast_degree.classify_degree`` on the drop bean
+temperature). That is what turns a recorded roast into a *labelled* corpus entry
+for the D42 learning loop, not just a replayable trace.
+
+Event-kind mapping (store → the fixture's three event kinds):
+
+- ``t0_detected`` → ``beans_added`` (the charge/turning-point instant the agent
+  origins its roast clock on);
+- ``first_crack`` → ``first_crack_detected``;
+- ``run_completed`` → ``beans_dropped`` (the drop / end-of-roast instant).
+
+Telemetry ``monotonic_seconds`` comes from the snapshot's stored
+``elapsed_seconds`` (the controller clock the events are also stamped on, so
+telemetry and events are coherent), falling back to ``tick × tick_interval`` when
+a row predates that column. Temperatures are Celsius throughout (the store keeps
+everything in °C).
+
+**Privacy (AGENTS.md invariant).** Real roast stores are the operator's personal
+data and are NEVER committed. This adapter reads a store **read-only** and writes
+the fixture to a local working directory (``--out-dir``, gitignored). Registering
+a real fixture into the bake-off test-set list is a LOCAL operator action — this
+script never writes any source roast id or timestamp into a committed artefact.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from roast_degree import classify_degree  # noqa: E402
+
+#: The controller tick interval (seconds) — the fallback when a telemetry row
+#: predates the ``elapsed_seconds`` column. Mirrors
+#: ``ControllerConfig.tick_interval_seconds`` (1.0 s, the Hottop thermocouple
+#: response time); kept as a literal so this stdlib-only script imports no agent
+#: package.
+_TICK_INTERVAL_SECONDS = 1.0
+
+#: Store ``roast_events.kind`` → the fixture event kind the scorer requires.
+_CHARGE_KIND = "t0_detected"
+_FIRST_CRACK_KIND = "first_crack"
+_DROP_KIND = "run_completed"
+
+#: The roaster the agent runs (Hottop), matching the ``.alog`` fixtures' summary.
+#: The frozen ``profile_json`` / ``config_json`` carry no driver id (it is an
+#: MCP/serve runtime detail, not part of ``RoastProfile`` or ``ControllerConfig``),
+#: so the summary records the known roaster rather than inventing a lookup.
+_ROASTER_DRIVER = "hottop_kn8828b_2k_plus"
+
+
+class FixtureConversionError(ValueError):
+    """The store run cannot produce a scorable fixture (missing marks/telemetry)."""
+
+
+@dataclass(frozen=True)
+class StoreRoast:
+    """One completed roast read out of the agent SQLite store.
+
+    Attributes:
+        run_id: The ``roast_runs.id`` (uuid4 hex).
+        operator_rating: The operator's 1–5 self-rating, or ``None`` if unrated.
+        operator_notes: The operator's free-text notes, or ``None``.
+        roaster_driver: The roaster driver id (the known Hottop default; see
+            ``_ROASTER_DRIVER``).
+        telemetry: Tick-ordered telemetry rows (``tick`` / ``elapsed_seconds`` /
+            ``bean_temp_c`` / ``env_temp_c`` / ``heat_level_percent`` /
+            ``fan_level_percent``).
+        charge_seconds: ``t0_detected`` event time (controller clock), or ``None``.
+        first_crack_seconds: ``first_crack`` event time, or ``None``.
+        drop_seconds: ``run_completed`` event time, or ``None``.
+    """
+
+    run_id: str
+    operator_rating: int | None
+    operator_notes: str | None
+    roaster_driver: str
+    telemetry: list[dict[str, Any]]
+    charge_seconds: float | None
+    first_crack_seconds: float | None
+    drop_seconds: float | None
+
+
+def _connect_readonly(db_path: Path) -> sqlite3.Connection:
+    """Open the store strictly read-only (never mutate the operator's roast data).
+
+    Args:
+        db_path: Path to the SQLite store.
+
+    Returns:
+        A read-only connection with a name-keyed row factory.
+
+    Raises:
+        FileNotFoundError: If the database file does not exist (the read-only
+            ``file:`` URI would otherwise create an empty database).
+    """
+    if not db_path.exists():
+        raise FileNotFoundError(f"no store at {db_path}")
+    uri = f"file:{db_path}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def _resolve_run_id(connection: sqlite3.Connection, run_id: str | None) -> str:
+    """Resolve the run to export: the given id, or the most-recent completed run.
+
+    Args:
+        connection: An open store connection.
+        run_id: An explicit ``roast_runs.id``, or ``None`` to pick the latest
+            completed run.
+
+    Returns:
+        The resolved run id.
+
+    Raises:
+        FixtureConversionError: If no matching completed run exists.
+    """
+    if run_id is not None:
+        row = connection.execute(
+            "SELECT id FROM roast_runs WHERE id = ? AND completed_at_utc IS NOT NULL",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            raise FixtureConversionError(f"no completed roast_run with id {run_id!r}")
+        return str(row["id"])
+    row = connection.execute(
+        "SELECT id FROM roast_runs WHERE completed_at_utc IS NOT NULL"
+        " ORDER BY completed_at_utc DESC, rowid DESC LIMIT 1"
+    ).fetchone()
+    if row is None:
+        raise FixtureConversionError("the store has no completed roast_runs")
+    return str(row["id"])
+
+
+def _event_time(connection: sqlite3.Connection, run_id: str, kind: str) -> float | None:
+    """The earliest persisted controller-clock time for an event kind, or ``None``.
+
+    Args:
+        connection: An open store connection.
+        run_id: The run id.
+        kind: The ``roast_events.kind`` to look up.
+
+    Returns:
+        The event's ``monotonic_seconds`` (controller clock), or ``None`` when the
+        run never recorded that event or recorded it without a timestamp.
+    """
+    row = connection.execute(
+        "SELECT monotonic_seconds FROM roast_events"
+        " WHERE run_id = ? AND kind = ? AND monotonic_seconds IS NOT NULL"
+        " ORDER BY recorded_at_utc ASC, id ASC LIMIT 1",
+        (run_id, kind),
+    ).fetchone()
+    if row is None or row["monotonic_seconds"] is None:
+        return None
+    return float(row["monotonic_seconds"])
+
+
+def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
+    """Read one completed roast out of the agent SQLite store (read-only).
+
+    Args:
+        db_path: Path to the SQLite store.
+        run_id: An explicit run id, or ``None`` for the most-recent completed run.
+
+    Returns:
+        The roast's telemetry, marks, and operator label.
+
+    Raises:
+        FileNotFoundError: If the store file does not exist.
+        FixtureConversionError: If no matching completed run exists.
+    """
+    connection = _connect_readonly(db_path)
+    try:
+        resolved = _resolve_run_id(connection, run_id)
+        run_row = connection.execute(
+            "SELECT operator_rating, operator_notes FROM roast_runs WHERE id = ?",
+            (resolved,),
+        ).fetchone()
+        telemetry_rows = connection.execute(
+            "SELECT tick, elapsed_seconds, bean_temp_c, env_temp_c,"
+            " heat_level_percent, fan_level_percent FROM telemetry_snapshots"
+            " WHERE run_id = ? ORDER BY tick ASC, id ASC",
+            (resolved,),
+        ).fetchall()
+        telemetry = [
+            {
+                "tick": int(row["tick"]),
+                "elapsed_seconds": None
+                if row["elapsed_seconds"] is None
+                else float(row["elapsed_seconds"]),
+                "bean_temp_c": row["bean_temp_c"],
+                "env_temp_c": row["env_temp_c"],
+                "heat_level_percent": row["heat_level_percent"],
+                "fan_level_percent": row["fan_level_percent"],
+            }
+            for row in telemetry_rows
+        ]
+        return StoreRoast(
+            run_id=resolved,
+            operator_rating=None
+            if run_row is None or run_row["operator_rating"] is None
+            else int(run_row["operator_rating"]),
+            operator_notes=None
+            if run_row is None or run_row["operator_notes"] is None
+            else str(run_row["operator_notes"]),
+            roaster_driver=_ROASTER_DRIVER,
+            telemetry=telemetry,
+            charge_seconds=_event_time(connection, resolved, _CHARGE_KIND),
+            first_crack_seconds=_event_time(connection, resolved, _FIRST_CRACK_KIND),
+            drop_seconds=_event_time(connection, resolved, _DROP_KIND),
+        )
+    finally:
+        connection.close()
+
+
+def _telemetry_seconds(row: dict[str, Any]) -> float:
+    """The fixture ``monotonic_seconds`` for a telemetry row.
+
+    Prefers the stored controller-clock ``elapsed_seconds`` (the same clock the
+    events carry, so telemetry and events stay coherent); falls back to
+    ``tick × tick_interval`` for a row that predates the column.
+
+    Args:
+        row: A telemetry row from :func:`read_store_roast`.
+
+    Returns:
+        The monotonic timestamp in seconds.
+    """
+    elapsed = row["elapsed_seconds"]
+    if elapsed is not None:
+        return float(elapsed)
+    return float(row["tick"]) * _TICK_INTERVAL_SECONDS
+
+
+def build_fixture_rows(roast: StoreRoast) -> list[dict[str, Any]]:
+    """Build the ``roast.jsonl`` rows (telemetry + the three event rows).
+
+    Args:
+        roast: The roast read from the store.
+
+    Returns:
+        The ordered fixture rows.
+
+    Raises:
+        FixtureConversionError: If the roast lacks telemetry, or any of the
+            charge / first-crack / drop marks the scorer requires.
+    """
+    if not roast.telemetry:
+        raise FixtureConversionError(f"run {roast.run_id} has no telemetry snapshots")
+    marks = {
+        "beans_added": roast.charge_seconds,
+        "first_crack_detected": roast.first_crack_seconds,
+        "beans_dropped": roast.drop_seconds,
+    }
+    missing = sorted(kind for kind, when in marks.items() if when is None)
+    if missing:
+        raise FixtureConversionError(f"run {roast.run_id} lacks required marks: {missing}")
+
+    rows: list[dict[str, Any]] = []
+    for row in roast.telemetry:
+        if row["bean_temp_c"] is None or row["env_temp_c"] is None:
+            # A telemetry row with no thermocouple reading carries no signal for
+            # the scorer; skip it rather than emit a null-temperature row that
+            # ``load_roast`` would choke on (it floats every temperature).
+            continue
+        rows.append(
+            {
+                "type": "telemetry",
+                "monotonic_seconds": round(_telemetry_seconds(row), 3),
+                "bean_temp_c": round(float(row["bean_temp_c"]), 1),
+                "env_temp_c": round(float(row["env_temp_c"]), 1),
+                "heat_level_percent": int(row["heat_level_percent"] or 0),
+                "fan_level_percent": int(row["fan_level_percent"] or 0),
+            }
+        )
+    if not rows:
+        raise FixtureConversionError(
+            f"run {roast.run_id} has no telemetry rows with temperature readings"
+        )
+    for kind, when in (
+        ("beans_added", roast.charge_seconds),
+        ("first_crack_detected", roast.first_crack_seconds),
+        ("beans_dropped", roast.drop_seconds),
+    ):
+        assert when is not None  # guarded by the missing-marks check above
+        rows.append({"type": "event", "kind": kind, "monotonic_seconds": round(when, 3)})
+    return rows
+
+
+def _drop_temp_c(rows: list[dict[str, Any]], drop_seconds: float) -> float:
+    """Bean temperature at the telemetry row nearest the drop instant."""
+    telemetry = [r for r in rows if r["type"] == "telemetry"]
+    nearest = min(telemetry, key=lambda r: abs(float(r["monotonic_seconds"]) - drop_seconds))
+    return float(nearest["bean_temp_c"])
+
+
+def _first_crack_temp_c(rows: list[dict[str, Any]], first_crack_seconds: float) -> float:
+    """Bean temperature at the telemetry row nearest the first-crack instant."""
+    telemetry = [r for r in rows if r["type"] == "telemetry"]
+    nearest = min(telemetry, key=lambda r: abs(float(r["monotonic_seconds"]) - first_crack_seconds))
+    return float(nearest["bean_temp_c"])
+
+
+def build_summary(roast: StoreRoast, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build the labelled ``summary.json`` for the fixture.
+
+    Mirrors the ``alog_to_fixture`` summary keys (so the bake-off reads both
+    sources identically) and adds the #300 outcome label: the operator rating /
+    notes from the store and the shared drop-temperature ``degree``.
+
+    Args:
+        roast: The roast read from the store.
+        rows: The fixture rows from :func:`build_fixture_rows`.
+
+    Returns:
+        The summary dict.
+    """
+    # All three marks are guaranteed non-None: build_fixture_rows raised otherwise.
+    charge = float(roast.charge_seconds)  # type: ignore[arg-type]
+    first_crack = float(roast.first_crack_seconds)  # type: ignore[arg-type]
+    drop = float(roast.drop_seconds)  # type: ignore[arg-type]
+    span = drop - charge
+    dev = drop - first_crack
+    drop_temp_c = round(_drop_temp_c(rows, drop), 1)
+    return {
+        "active": False,
+        "phase": "complete",
+        "source": "agent-store",
+        "roaster_driver": roast.roaster_driver,
+        "first_crack_temp_c": round(_first_crack_temp_c(rows, first_crack), 1),
+        "drop_temp_c": drop_temp_c,
+        "development_time_seconds": round(dev, 1),
+        "development_time_percent": round(dev / span * 100, 1) if span > 0 else None,
+        "total_roast_seconds": round(span, 1),
+        # Outcome label (#300 / D42): the operator's per-roast rating + notes are
+        # the corpus labels; degree is the shared drop-temperature rule.
+        "operator_rating": roast.operator_rating,
+        "operator_notes": roast.operator_notes,
+        "degree": classify_degree(drop_temp_c),
+    }
+
+
+def convert(db_path: Path, out_dir: Path, run_id: str | None = None) -> dict[str, Any]:
+    """Convert one store roast into a fixture directory and return a manifest entry.
+
+    Args:
+        db_path: Path to the SQLite store (read-only).
+        out_dir: The fixture directory to write ``roast.jsonl`` + ``summary.json``
+            into (created if absent; gitignored working dir).
+        run_id: An explicit run id, or ``None`` for the most-recent completed run.
+
+    Returns:
+        A small manifest entry (run id, drop temp, degree, rating, row count) — no
+        raw telemetry, suitable for a local run log.
+
+    Raises:
+        FileNotFoundError: If the store file does not exist.
+        FixtureConversionError: If the run is unusable (no telemetry / marks).
+    """
+    roast = read_store_roast(db_path, run_id)
+    rows = build_fixture_rows(roast)
+    summary = build_summary(roast, rows)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fixture = out_dir / "roast.jsonl"
+    fixture.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    return {
+        "run_id": roast.run_id,
+        "fixture": str(fixture),
+        "drop_temp_c": summary["drop_temp_c"],
+        "degree": summary["degree"],
+        "operator_rating": summary["operator_rating"],
+        "telemetry_rows": sum(1 for r in rows if r["type"] == "telemetry"),
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI: convert a completed store roast into a labelled replay fixture.
+
+    Args:
+        argv: Optional argument vector (defaults to ``sys.argv``).
+
+    Returns:
+        Process exit code (``0`` on success, ``1`` on a conversion error).
+    """
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("db_path", type=Path, help="path to the agent SQLite store (read-only)")
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="explicit roast_runs.id to export (default: the most-recent completed run)",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=Path,
+        required=True,
+        help="fixture directory to write roast.jsonl + summary.json (gitignored working dir)",
+    )
+    args = parser.parse_args(argv)
+    try:
+        entry = convert(args.db_path, args.out_dir, args.run_id)
+    except (FileNotFoundError, FixtureConversionError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"converted run {entry['run_id']} -> {entry['fixture']} "
+        f"(drop {entry['drop_temp_c']} °C, degree {entry['degree']}, "
+        f"rating {entry['operator_rating']}, rows {entry['telemetry_rows']})"
+    )
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entrypoint guard
+    raise SystemExit(main())
