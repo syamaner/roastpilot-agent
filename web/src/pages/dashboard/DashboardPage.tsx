@@ -386,7 +386,12 @@ export function DashboardPage(): React.JSX.Element {
           originSeconds={view.t0ElapsedSeconds}
         />
 
+        {/* Pre-FC the controller drives heat/fan deterministically off the bean
+            profile (D59), so the control row renders them as READ-OUTS, not dials
+            (#318) — gated on the server `phase` (never inferred). Post-FC the bar +
+            advisor-target ghost render unchanged. */}
         <ControlRow
+          phase={phase}
           heatPercent={telemetry?.heat_percent ?? null}
           fanPercent={telemetry?.fan_percent ?? null}
           targetHeatPercent={targetHeat}

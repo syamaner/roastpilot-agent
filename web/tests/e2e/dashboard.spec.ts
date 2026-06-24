@@ -81,6 +81,18 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   await expect(page.getByTestId("roast-timer")).toHaveText("00:00");
   await expect(page.getByTestId("preheat-timer")).toBeVisible();
 
+  // #318: pre-FC the controller drives heat/fan deterministically off the bean
+  // profile (D59), so the control row renders them as READ-OUTS — gated on the
+  // server phase (preheating here), never inferred. Assert the read-out mode + the
+  // controller-driven note and the ABSENCE of the slider-bar/advisor-target
+  // affordance that implied a settable dial (the roast-2 silent-revert confusion).
+  // A revert to the interactive (post-FC) presentation pre-FC fails HERE, not only
+  // in the regenerated pixel baseline.
+  await expect(page.getByTestId("control-heat")).toHaveAttribute("data-mode", "readout");
+  await expect(page.getByTestId("control-fan")).toHaveAttribute("data-mode", "readout");
+  await expect(page.getByTestId("control-heat-readout-note")).toBeVisible();
+  await expect(page.getByTestId("control-fan-readout-note")).toBeVisible();
+
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-live.png");
 });
@@ -291,6 +303,14 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   const roastTimerSeconds = mm * 60 + ss;
   expect(roastTimerSeconds).toBeGreaterThan(0); // a real post-charge clock, ticking
   expect(roastTimerSeconds).toBeLessThan(900); // charge-referenced, not the ~1029 s serve clock
+
+  // #318: POST-FC (development) the advisor advises + the operator can act + the
+  // deadband gate applies, so the control row stays in its INTERACTIVE presentation
+  // (the slider-style bar + advisor-target ghost). Gated on the server phase — the
+  // read-out treatment is pre-FC only. A regression that read-out'd heat/fan post-FC
+  // fails HERE.
+  await expect(page.getByTestId("control-heat")).toHaveAttribute("data-mode", "interactive");
+  await expect(page.getByTestId("control-fan")).toHaveAttribute("data-mode", "interactive");
 
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-developed.png");

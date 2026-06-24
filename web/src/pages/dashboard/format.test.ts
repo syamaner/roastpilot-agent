@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 
+import type { RoastPhase } from "@/lib/types";
+
 import {
   formatClock,
   formatConfidence,
   formatPercent,
   formatRoR,
   formatTempC,
+  isPreFirstCrackPhase,
   PHASE_LABEL,
   phaseAccentVar,
 } from "./format";
@@ -54,5 +57,24 @@ describe("format helpers", () => {
     expect(phaseAccentVar("faulted")).toContain("--roast-fault");
     expect(phaseAccentVar("complete")).toBeNull();
     expect(phaseAccentVar(null)).toBeNull();
+  });
+
+  it("flags pre-first-crack phases for the heat/fan read-out gate (#318)", () => {
+    // The read-out-vs-interactive gate keys on the SERVER phase only.
+    expect(isPreFirstCrackPhase("preheating")).toBe(true);
+    expect(isPreFirstCrackPhase("roasting_pre_first_crack")).toBe(true);
+    const notPreFc: (RoastPhase | null)[] = [
+      "development",
+      "cooling",
+      "complete",
+      "faulted",
+      "operator_recovery_required",
+      "idle",
+      "starting",
+      null,
+    ];
+    for (const phase of notPreFc) {
+      expect(isPreFirstCrackPhase(phase)).toBe(false);
+    }
   });
 });
