@@ -280,9 +280,13 @@ D-numbers still want the operator's plan commit:** the #327 trim (plan §3 / §8
 
 **Operator-gated / untouched (leave as-is):** coffee-roaster-mcp **#169/#170** (T0/FC backdating —
 CI-green + review-clean, awaiting the operator's gated merge + v0.1.7 release); **#323** (drop-ceiling
-override — the guard-vs-ceiling conflict from roast 3); **#318** (pre-FC manual heat/fan silently
-reverts — read-out vs operator-override decision); **#134/#135** (supervised hardware roast + device
+override — the guard-vs-ceiling conflict from roast 3); **#134/#135** (supervised hardware roast + device
 SSE); **#228** (pre-FC anticipatory LLM advisory layer — deferred LAST, D50).
+
+**#318 RESOLVED as option C + read-out UI (24 Jun, D59):** pre-FC heat/fan are now per-bean
+deterministic values the controller owns off the bean profile (BE slice PR #374/#375, merged). FE
+slice (this PR) makes the dashboard control row render pre-FC heat/fan as READ-OUTS, not dials
+(server-phase-gated) so nothing silently reverts. Closes #318.
 
 **Next gate:** roast 4 — supervised validation of the deterministic trim (#336, enabled) + the c3
 prompt (live default), targeting a clean ≤195 °C drop. Then the operator's call on marking #134 Done.
@@ -386,8 +390,9 @@ D35 build. Honest state:
 - **22 Jun follow-ups (open):** #344 (Savitzky-Golay chart smoothing, approved), #346
   (server-side roast-elapsed freeze), #351 (server DRYING_END + chart marker), #337
   (agent honors MCP backdated T0/FC timestamp, gated on the MCP release).
-- **Operator-gated:** #323 (drop-ceiling override), #318 (pre-FC manual revert), mcp
-  #169/#170 (T0/FC backdating, awaiting operator merge + v0.1.7).
+- **Operator-gated:** #323 (drop-ceiling override), mcp #169/#170 (T0/FC backdating,
+  awaiting operator merge + v0.1.7). (#318 resolved as option C + read-out UI, D59 — BE
+  #374/#375 merged, FE read-out slice in PR; Closes #318.)
 - **E11 (packaging, BLOCKED — D28 + D27):** #136/#137/#138, gated on #134 (supervised
   hardware roast) + the torch-free chain.
 - **E12 (validation/demo):** #139/#140/#141, #134.

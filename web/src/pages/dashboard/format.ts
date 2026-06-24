@@ -88,3 +88,19 @@ export function phaseAccentVar(phase: RoastPhase | null): string | null {
       return null;
   }
 }
+
+/**
+ * Server roast phases BEFORE first crack, where the controller drives heat/fan
+ * deterministically off the bean profile (D59) and re-asserts them every tick, so
+ * the dashboard renders heat/fan as READ-OUTS, not dials (#318). Membership is a
+ * pure projection of the SERVER-provided phase — never inferred from telemetry.
+ */
+const PRE_FIRST_CRACK_PHASES: ReadonlySet<RoastPhase> = new Set<RoastPhase>([
+  "preheating",
+  "roasting_pre_first_crack",
+]);
+
+/** True iff the server phase is a pre-first-crack phase (read-out presentation). */
+export function isPreFirstCrackPhase(phase: RoastPhase | null): boolean {
+  return phase !== null && PRE_FIRST_CRACK_PHASES.has(phase);
+}
