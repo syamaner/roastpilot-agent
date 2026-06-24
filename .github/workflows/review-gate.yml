@@ -17,16 +17,26 @@ name: Review gate
 #
 #   - PR opened / synchronized  -> review-gate = PENDING   (once the operator
 #     marks it a required check, auto-merge then WAITS for it — the race closes).
-#   - `Claude Code Review` completes -> review-gate = SUCCESS  (the review has
-#     now posted; its inline threads + required_conversation_resolution become
-#     the real findings gate from here. review-gate asserts the review RAN, not
-#     that it had no findings — findings are gated by conversation-resolution).
+#   - `Claude Code Review` completes with conclusion=SUCCESS -> review-gate =
+#     SUCCESS (the review has now posted; its inline threads + required_
+#     conversation_resolution become the real findings gate from here. review-gate
+#     asserts the review RAN, not that it had no findings — findings are gated by
+#     conversation-resolution. A normal PR's review concludes success whether or
+#     not it posts findings, so this still lets a findings-bearing review through).
+#   - `Claude Code Review` completes with a NON-SUCCESS conclusion (failure /
+#     cancelled — e.g. the action crashed on infra) -> review-gate is NOT flipped;
+#     the stamp-time PENDING stays in place. FAIL-CLOSED: a crashed review on a
+#     normal PR never posted, so auto-merge must stay blocked until the operator
+#     re-runs the review (which on success then flips it).
 #   - Dependabot PR, OR a PR that edits any .github/workflows/** file ->
-#     review-gate = SUCCESS immediately. These are exactly the PR classes where
-#     `Claude Code Review` legitimately cannot run (Dependabot gets no secret;
-#     the App's workflow-validation guard 401s on workflow edits), which is why
-#     claude-review is un-required. The gate MUST inherit that property or it
-#     would deadlock those PRs — including THIS PR, which edits a workflow file.
+#     review-gate = SUCCESS immediately at STAMP time. These are exactly the PR
+#     classes where `Claude Code Review` legitimately cannot run (Dependabot gets
+#     no secret; the App's workflow-validation guard 401s on workflow edits),
+#     which is why claude-review is un-required. The UNBLOCK for these classes
+#     comes from this stamp-time auto-pass, NOT from the conclusion-gated flip —
+#     so the success-only flip above does not re-introduce a deadlock. The gate
+#     MUST inherit that property — including for THIS PR, which edits a workflow
+#     file.
 #
 # ACTIVATION SEQUENCING. `workflow_run` only fires for the version of this
 # workflow that lives on the DEFAULT branch. So the `workflow_run` half does
@@ -122,13 +132,34 @@ jobs:
           script: |
             // The review run carries the PR head SHA (NOT a synthetic merge
             // commit), so the status lands on the commit branch protection
-            // evaluates. We flip to success on ANY completion (success, failure,
-            // cancelled): `Claude Code Review` fails by design on workflow/
-            // Dependabot PRs and "passes on findings", so its CONCLUSION is not a
-            // findings signal. review-gate only asserts the review RAN; the
-            // findings gate is the inline threads + required_conversation_resolution.
+            // evaluates.
+            //
+            // FAIL-CLOSED: flip to success ONLY when the review concluded
+            // `success`. On a normal PR, `Claude Code Review` concludes success
+            // whether or not it posts findings ("passes-on-findings" — findings
+            // are gated separately by the inline threads + required_conversation
+            // _resolution), so gating on success still lets a findings-bearing
+            // review through; review-gate only asserts the review RAN. But a
+            // non-success conclusion (failure/cancelled — e.g. the action
+            // crashed on infra) on a normal PR means the review never really
+            // posted, so we must NOT flip: leave the stamp-time `pending` in
+            // place so auto-merge stays blocked until the operator re-runs the
+            // review (which on success then flips it).
+            //
+            // This does NOT re-introduce the workflow-edit / Dependabot deadlock
+            // (the reason claude-review is un-required): those classes are set to
+            // `success` at STAMP time by stamp-on-pr, so the flip is moot for
+            // them — the unblock comes from the stamp-time auto-pass, never from
+            // this conclusion-gated flip.
             const run = context.payload.workflow_run;
             const sha = run.head_sha;
+
+            if (run.conclusion !== 'success') {
+              core.info(
+                `review-gate NOT flipping on ${sha}: review run ${run.id} conclusion=${run.conclusion}, staying pending (fail-closed).`,
+              );
+              return;
+            }
 
             await github.rest.repos.createCommitStatus({
               owner: context.repo.owner,
@@ -136,7 +167,7 @@ jobs:
               sha,
               context: 'review-gate',
               state: 'success',
-              description: `Claude Code Review completed (${run.conclusion}); findings gated by conversation resolution.`.slice(0, 140),
+              description: 'Claude Code Review completed; findings gated by conversation resolution.'.slice(0, 140),
             });
 
-            core.info(`review-gate=success on ${sha} (review run ${run.id}, conclusion=${run.conclusion}).`);
+            core.info(`review-gate=success on ${sha} (review run ${run.id}, conclusion=success).`);
