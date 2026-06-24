@@ -16,13 +16,20 @@ each before moving on; **do not open the PR until all four pass.**
 
 ## 1. Gates — green before opening (not after)
 
-Run only the gates for what the diff touches. A post-open "fix lint/format/types"
+Run the gates for what the diff touches. A post-open "fix lint/format/types"
 commit is exactly the rework we are cutting, so run them HERE.
 
 - **Python** (`src/` or `tests/` changed):
   `python -m ruff check . && python -m ruff format --check . && python -m pyright && python -m pytest`
 - **Web** (`web/` changed), from `web/`:
   `npm run lint && npm run typecheck && npm test && npm run build`
+- **Cross-boundary contract — if the diff touches the contract surface, run BOTH sides'
+  gates, regardless of which side you edited.** The contract surface = any SSE event
+  kind, shared model, or cross-side schema. A "backend-only" change there (e.g. adding
+  a server event kind) reddens the FE event-kind contract test, so it must run the
+  **web gates too** (and a FE-only contract change must run the Python gates), and
+  regenerate any contract fixtures (e.g. `sse_frames`) **here, pre-open** — never as
+  post-open commits. If unsure whether your change is contract-surface, run both.
 
 If a gate fails, fix it and re-run before continuing.
 
@@ -50,18 +57,31 @@ Read your own diff as a hostile reviewer would. Check:
 
 Fix what you find now, before the PR exists.
 
-## 4. Domain review ON THE BRANCH (shift review left)
+## 4. Domain review ON THE BRANCH (shift review left — MANDATORY)
 
 Before opening — not after — run the right reviewer against the branch diff and
-resolve its findings, so review-caught fixes fold into the first push:
+**resolve its findings**. This step is NOT optional: gates passing is not a
+substitute for review, and skipping it just moves findings to post-open rework
+(the measured failure mode — review findings were still landing post-open from the
+bots because this pass was skipped).
 - touches `safety.py` / `controller.py` / `models.py` enums / the recovery or
   command×phase path → **safety-reviewer** (Agent);
-- test quality / coverage / acceptance-criteria coverage → **qa** (Agent).
+- test quality / coverage / acceptance-criteria coverage → **qa** (Agent);
+- otherwise, a general code-review pass over the diff.
 
-The automated reviewers (Claude Code Review, Augment) still run post-open, but on
-a cleaner branch they find less. The goal is to remove the *catchable-pre-open*
-findings from the rework count — **not** to skip review: a reviewer catching a
-real defect is the system working, so keep the genuinely-new findings.
+Fold every finding in BEFORE opening, and **note in the PR body how many the
+pre-open review caught** (e.g. "pre-open review: 3 findings folded"). That count is
+shift-left's real output and the only place it is visible — the PR-flow metrics are
+structurally blind to it (they can only measure the PRs you open, not the rework you
+prevented).
+
+- **Don't fold LOW findings as post-open commits.** Per the Code Review Rubric lows
+  are non-blocking; fix them in this pre-open pass or defer/dismiss them in-thread,
+  never as a separate post-open commit.
+- **Healthy rework stays.** The bots (Claude Code Review, Augment) still run
+  post-open; on a cleaner branch they find less, but a reviewer catching a real
+  defect is the system working. Remove the *catchable-pre-open* findings, not the
+  review itself.
 
 ## Only when 1–4 pass
 
