@@ -36,11 +36,14 @@ commit is exactly the rework we are cutting, so run them HERE.
   data: a synthetic fixture is built from the same mental model as the code and inherits
   its blind spots. The #300 converter passed 27 tests at full coverage while silently
   reading the drop temperature off the cooled-down tail, because the synthetic store
-  could not reproduce the real store's dual clocks (telemetry on a run-relative clock vs
-  events on absolute `time.monotonic()`), its missing terminal event, or an unfinalised
-  run. Run it on a real recorded
-  roast (e.g. `~/.local/state/roastpilot/roastpilot.sqlite3`; outputs are gitignored,
-  never commit them) and paste the real output in the PR body before opening.
+  could not reproduce the real store's two time origins (telemetry timestamped relative to
+  run start, vs events carrying the raw `time.monotonic()` value with its own arbitrary
+  process-uptime origin, never rebased to run start), its missing terminal event, or an
+  unfinalised run. Run it on a real recorded roast (e.g.
+  `~/.local/state/roastpilot/roastpilot.sqlite3`; outputs are gitignored, never commit
+  them) and paste a **sanitised summary** of the real run into the PR body before opening
+  — the derived values that prove correctness (drop temp, degree, row counts, truncation),
+  not raw paths, usernames, or full telemetry.
 
 If a gate fails, fix it and re-run before continuing.
 
