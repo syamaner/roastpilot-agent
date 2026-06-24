@@ -30,6 +30,20 @@ commit is exactly the rework we are cutting, so run them HERE.
   **web gates too** (and a FE-only contract change must run the Python gates), and
   regenerate any contract fixtures (e.g. `sse_frames`) **here, pre-open** — never as
   post-open commits. If unsure whether your change is contract-surface, run both.
+- **Real-data validation — converters / replay tooling / anything that ingests recorded
+  roast data must be run against a REAL store or log pre-open, not just a synthetic
+  fixture.** Green gates and 100 % coverage on synthetic data prove nothing about real
+  data: a synthetic fixture is built from the same mental model as the code and inherits
+  its blind spots. The #300 converter passed 27 tests at full coverage while silently
+  reading the drop temperature off the cooled-down tail, because the synthetic store
+  could not reproduce the real store's two time origins (telemetry timestamped relative to
+  run start, vs events carrying the raw `time.monotonic()` value with its own arbitrary
+  process-uptime origin, never rebased to run start), its missing terminal event, or an
+  unfinalised run. Run it on a real recorded roast (e.g.
+  `~/.local/state/roastpilot/roastpilot.sqlite3`; outputs are gitignored, never commit
+  them) and paste a **sanitised summary** of the real run into the PR body before opening
+  — the derived values that prove correctness (drop temp, degree, row counts, truncation),
+  not raw paths, usernames, or full telemetry.
 
 If a gate fails, fix it and re-run before continuing.
 
