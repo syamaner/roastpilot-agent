@@ -147,6 +147,20 @@ def test_pre_fc_profile_fan_above_ceiling_is_clamped_by_the_box(phase: RoastPhas
     assert box.fan_target_percent <= box.fan_ceiling_percent  # the invariant
 
 
+@pytest.mark.parametrize("phase", _PRE_FC_PHASES)
+def test_pre_fc_profile_heat_is_bounded_by_the_heat_ceiling(phase: RoastPhase) -> None:
+    """D59 INVARIANT (symmetric with the fan clamp): the resolved per-bean
+    ``pre_fc_heat`` is CLAMPED into the pre-FC heat ceiling, never honoured above
+    it. The field max (100) equals the ceiling today so a breach isn't
+    constructible, but the resolved target must stay ≤ the ceiling so a future
+    lower heat ceiling cannot un-bound a per-bean heat."""
+    # The field maximum — exercises the upper edge of the clamp.
+    profile = _PROFILE.model_copy(update={"pre_fc_heat": 100})
+    box = RoastControlPolicy(SafetyLimits(), profile).limits_for(phase)
+    assert box.heat_target_percent == 100  # honoured at the ceiling, not above
+    assert box.heat_target_percent <= box.heat_ceiling_percent  # the invariant
+
+
 def test_pre_fc_profile_fan_at_a_raised_ceiling_is_honoured() -> None:
     """D59: when config raises ``fan_ceiling_percent`` to leave room, a per-bean
     fan inside the wider box is honoured exactly (the clamp only bites above the

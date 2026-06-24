@@ -311,14 +311,20 @@ class RoastControlPolicy:
         emergency = self._limits.emergency_drop_temp_c
         if phase in _PRE_FIRST_CRACK_PHASES:
             levers = self._pre_fc_levers
+            heat_ceiling = _LEVER_MAX_PERCENT
             fan_ceiling = levers.fan_ceiling_percent
             # The PER-BEAN deterministic targets (D59 / #318): the active
             # profile's pre-FC heat/fan when set, else the global #222 config
-            # default. The fan target is CLAMPED into the box ceiling so a profile
-            # value above the configured fan ceiling cannot be honoured blindly
-            # (the every-write-through-safety invariant; the policy is the one
-            # place that holds BOTH the profile and the config-side ceiling).
-            base_heat = self._pre_fc_heat_target(levers)
+            # default. BOTH targets are CLAMPED into their box ceiling so a profile
+            # value above the configured ceiling cannot be honoured blindly (the
+            # every-write-through-safety invariant; the policy is the one place
+            # that holds BOTH the profile and the config-side ceiling). The heat
+            # clamp is symmetric with the fan clamp below: pre_fc_heat's le=100
+            # equals heat_ceiling (_LEVER_MAX_PERCENT) TODAY, so the breach isn't
+            # constructible — but pinning the clamp keeps a future lower pre-FC heat
+            # ceiling from un-bounding a per-bean heat (don't rely on the numeric
+            # coincidence).
+            base_heat = min(self._pre_fc_heat_target(levers), heat_ceiling)
             fan_target = min(self._pre_fc_fan_target(levers), fan_ceiling)
             # The deterministic heat the controller holds this tick: the trim
             # level while the late-Maillard window is open (#327), else the
@@ -337,7 +343,7 @@ class RoastControlPolicy:
             )
             return PhaseControlLimits(
                 heat_floor_percent=heat,
-                heat_ceiling_percent=_LEVER_MAX_PERCENT,
+                heat_ceiling_percent=heat_ceiling,
                 # Fan capped low: floor 0, ceiling the configured low value (~30)
                 # — the operator's low-fan-to-browning method. The trim leaves fan
                 # at the floor (plan §3 "fan controlled", not raised).
