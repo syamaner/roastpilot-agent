@@ -23,11 +23,13 @@ commit is exactly the rework we are cutting, so run them HERE.
   `python -m ruff check . && python -m ruff format --check . && python -m pyright && python -m pytest`
 - **Web** (`web/` changed), from `web/`:
   `npm run lint && npm run typecheck && npm test && npm run build`
-- **Cross-boundary contract — ALWAYS, regardless of which side you touched.** A
-  "backend-only" change (e.g. adding a server event kind / SSE field) reddens the
-  FE event-kind contract test. If the diff touches SSE event kinds, models, or any
-  cross-side contract surface, run the **web gates too** and regenerate any contract
-  fixtures (e.g. `sse_frames`) **here, pre-open** — never as post-open commits.
+- **Cross-boundary contract — if the diff touches the contract surface, run BOTH sides'
+  gates, regardless of which side you edited.** The contract surface = any SSE event
+  kind, shared model, or cross-side schema. A "backend-only" change there (e.g. adding
+  a server event kind) reddens the FE event-kind contract test, so it must run the
+  **web gates too** (and a FE-only contract change must run the Python gates), and
+  regenerate any contract fixtures (e.g. `sse_frames`) **here, pre-open** — never as
+  post-open commits. If unsure whether your change is contract-surface, run both.
 
 If a gate fails, fix it and re-run before continuing.
 
