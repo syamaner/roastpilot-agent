@@ -105,6 +105,55 @@
 
 ## Active Context
 
+**24 Jun 2026 — PRE-ROAST-4 RELIABILITY + CLEANUP BATCH COMPLETE (the measured "after-v2"
+PR-hygiene sample). The next gate remains the operator running roast 4.** Four issues closed as
+lead/PM with engineer/reviewer teammates; every PR through `pr-preflight` (gates + self-critique +
+the pre-open domain reviewer on the branch) and independent D23 triage (author never self-triages):
+
+- **#212 — Ctrl-C hangs the server on a live roast — FIXED (PR #365, `f6c0c52`).** `MCPServerProcess.stop()`
+  was an unbounded `_stack.aclose()` that could hang forever on a wedged MCP child (the thing that
+  bit roast 3). Now bounded by `MCPConfig.stop_timeout_seconds` (10 s) via `asyncio.timeout`; on
+  timeout it force-terminates the child process group (`os.killpg(SIGKILL)`; SDK spawns with
+  `start_new_session=True` so pgid==pid) and sets a `stop_unconfirmed` seam. Teardown order
+  unchanged — heat-off (`safe_shutdown_heat_off`, already bounded) still lands BEFORE `mcp.stop`.
+  safety-reviewer PASS; a folded low turned out to be a real test-not-collected coverage gap.
+- **#177 — harden the wedged-child shutdown — FIXED (PR #367, `2fc1d91`).** Single retry of the
+  heat-off write on timeout before giving up (the first attempt's `CancelledError` propagates out
+  before the FAULTED transition, so the retry hits a still-hot run); persist a 'stop unconfirmed'
+  marker for BOTH signals — heat-off-unconfirmed and the force-killed child (`COMMAND_FAILED` reuse →
+  no FE-contract change), making #212's flag *read* not dead code; multi-start reset of
+  `_stop_unconfirmed` in `start()`. Markers are diagnosis-only — restart still enters
+  `operator_recovery_required`. safety-reviewer PASS.
+- **#159 — auto-merge-before-`claude-review` race — FIXED + plan D58 (PR #366, `12d14e1`).** A
+  skip-aware `review-gate` commit-status workflow (pending on open → success-only/fail-closed when
+  Claude Code Review completes; Dependabot + workflow-editing PRs auto-pass at stamp time).
+  **Validated end-to-end on three real PRs this batch** (#366/#367/#368). **OPERATOR ACTION
+  OUTSTANDING:** mark `review-gate` a REQUIRED status check on `main` to arm it (build gate + operator
+  activates; the mechanism is inert until required). See plan D58.
+- **#306 — per-tick MCP console flood — CLOSED via the MCP release lockstep.** Root cause is
+  child-side (the MCP SDK's `mcp.server.lowlevel.server` per-request INFO, piped as raw stderr — the
+  agent can't filter another process's logger), so NO agent code change. Fixed in
+  **coffee-roaster-mcp#162 → v0.1.8** (raise that logger to WARNING only when more verbose, never
+  lowering a stricter user setting — observability-only), RELEASED to PyPI + the MCP Registry
+  (operator-approved publish); agent pin bumped 0.1.7 → 0.1.8 (PR #368, `4a4e03f`), mcp-contract-checker
+  PASS (13-tool surface / 11 model mirrors / the #337 backdating fields all unchanged). Filed **#369**
+  (non-blocking: the round-trip test skip-gate keys off the homebrew binary, not the venv-resolved one).
+
+**PR-hygiene after-v2 sample (`--since 364`, n=3 logic PRs #365/#366/#367):** churn median **389**
+(>800 **0%**), **avoidable churn = 0** (no rebase/CI-retrigger/flake/lint commits), **preventable
+rework = 0%** — the 2 rework commits both HEALTHY (real Augment correctness catches the pre-open
+review missed: the #365 force-terminate-hook re-raise + the #366 fail-closed flip). Lead 0.3 h
+open→merge. v2 targets hit on this small sample; n=3 is not a trend (re-measure at n≥15). Honest
+caveat: an independent post-open lens (Augment) still earned its keep twice; shift-left's biggest wins
+are metric-blind (#306 resolved with zero agent code; the folded coverage gap). Memory
+`pr-flow-improvement-experiment`.
+
+**Still open / next:** **operator activates the `review-gate` required check (#159 / D58)**; everything
+else is OPERATOR-GATED — **roast 4 (#134)** + device SSE (#135), then the post-roast-4 sequence (#323
+ceiling-override → #228 LAST → M2/D42). Untouched: #318. Nothing else agent-startable until roast 4.
+
+---
+
 **23 Jun 2026 (later) — MCP v0.1.7 BACKDATING LOCKSTEP COMPLETE. The only remaining gate is the
 operator running roast 4.** `coffee-roaster-mcp` **v0.1.7 released** (operator-approved publish): #169
 (auto-T0 → turning point) + #170 (FC → crack onset) backdating, on PyPI + the MCP Registry.
