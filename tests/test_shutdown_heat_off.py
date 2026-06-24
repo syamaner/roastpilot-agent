@@ -25,6 +25,8 @@ from roastpilot_agent.config import AppConfig, ControllerConfig
 from roastpilot_agent.mcp_client import MCPServerProcess
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
+    RoastEventKind,
+    RoastEventSource,
     RoastPhase,
     RoastProfile,
     RoastTelemetry,
@@ -207,9 +209,13 @@ async def test_shutdown_heat_off_is_noop_in_inactive_phase(store: RoastStore) ->
 
 
 @pytest.mark.asyncio
-async def test_shutdown_heat_off_is_bounded_and_does_not_hang(store: RoastStore) -> None:
-    """A wedged MCP emergency_stop must not hang shutdown: the heat-off write is
-    bounded, so a hanging child times out and shutdown proceeds (fail closed)."""
+async def test_shutdown_heat_off_is_bounded_and_persists_unconfirmed_marker(
+    store: RoastStore,
+) -> None:
+    """A persistently-wedged MCP emergency_stop must not hang shutdown: the
+    heat-off write is bounded, retried once (#177), and on a second timeout it
+    returns False AND persists a 'shutdown unconfirmed' marker to the trace so
+    post-roast it is unambiguous the commanded stop went unacknowledged."""
     clock = FakeClock()
 
     class HangingMCP(FakeMCPClient):
@@ -225,23 +231,136 @@ async def test_shutdown_heat_off_is_bounded_and_does_not_hang(store: RoastStore)
         run_loop=False,
         clock=clock,
     )
-    await service.start_roast(_profile())
+    detail = await service.start_roast(_profile())
+    run_id = detail.id
 
-    # Bounded: returns within the timeout, never hangs, and reports it did not
-    # confirm (False) rather than blocking teardown.
+    # Bounded: returns within the (doubled, retried) timeout, never hangs, and
+    # reports it did not confirm (False) rather than blocking teardown.
     issued = await asyncio.wait_for(
         service.safe_shutdown_heat_off(timeout_seconds=0.05), timeout=2.0
     )
     assert issued is False
+
+    # The give-up persisted an unambiguous trace marker (reused COMMAND_FAILED
+    # kind, so no new SSE event kind / FE-contract change).
+    timeline = await service.timeline(run_id)
+    markers = [
+        e
+        for e in timeline.events
+        if e.kind is RoastEventKind.COMMAND_FAILED
+        and e.payload is not None
+        and e.payload.get("command") == "shutdown_heat_off"
+    ]
+    assert len(markers) == 1, "exactly one shutdown-unconfirmed marker after give-up"
+    marker = markers[0]
+    assert marker.source is RoastEventSource.SAFETY
+    assert marker.payload is not None
+    assert marker.payload["unconfirmed"] is True
+    assert marker.payload["context"] == "shutdown"
+    assert marker.payload["reason"] == "timeout"
+
+
+@pytest.mark.asyncio
+async def test_shutdown_heat_off_retry_recovers_without_marker(store: RoastStore) -> None:
+    """A TRANSIENT wedge — the first emergency_stop hangs, the retry succeeds —
+    confirms heat-off on the retry and persists NO unconfirmed marker (#177):
+    the marker is only for a genuine give-up, not a recovered retry."""
+    clock = FakeClock()
+
+    class TransientHangMCP(FakeMCPClient):
+        def __init__(self, frames: list[RoastTelemetry | None | Exception]) -> None:
+            super().__init__(frames)
+            self._estop_attempts = 0
+
+        async def emergency_stop(self, *, reason: str) -> None:
+            self._estop_attempts += 1
+            if self._estop_attempts == 1:
+                await asyncio.Event().wait()  # first attempt wedges → times out
+            await super().emergency_stop(reason=reason)  # retry confirms
+
+    mcp = TransientHangMCP([_reading(bean=178.0, env=185.0)])
+    service = RoastService(
+        store,
+        config=_config(),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_decision()),
+        run_loop=False,
+        clock=clock,
+    )
+    detail = await service.start_roast(_profile())
+    run_id = detail.id
+
+    issued = await asyncio.wait_for(
+        service.safe_shutdown_heat_off(timeout_seconds=0.05), timeout=2.0
+    )
+    assert issued is True, "retry confirmed the heat-off"
+    assert "emergency_stop" in mcp.commands()
+    assert service.runner is not None
+    assert service.runner.controller_snapshot().phase is RoastPhase.FAULTED
+
+    # No give-up marker — the retry recovered.
+    timeline = await service.timeline(run_id)
+    assert not [
+        e
+        for e in timeline.events
+        if e.kind is RoastEventKind.COMMAND_FAILED
+        and e.payload is not None
+        and e.payload.get("command") == "shutdown_heat_off"
+    ], "a recovered retry must NOT leave an unconfirmed marker"
 
 
 @pytest.mark.asyncio
 async def test_shutdown_heat_off_fails_closed_on_unexpected_error(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unexpected error in the heat-off path fails closed: it is logged loudly
-    and swallowed (returns False) so teardown still proceeds to stop the MCP child
-    rather than aborting and orphaning it."""
+    """A persistent unexpected error in the heat-off path fails closed: it is
+    retried once (#177), logged loudly, swallowed (returns False) so teardown
+    still stops the MCP child, and the give-up persists an unconfirmed marker
+    stamped ``reason="error"``."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    service = RoastService(
+        store,
+        config=_config(),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_decision()),
+        run_loop=False,
+        clock=clock,
+    )
+    detail = await service.start_roast(_profile())
+    run_id = detail.id
+    assert service.runner is not None
+
+    attempts = 0
+
+    async def _boom() -> bool:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("unexpected runner failure")
+
+    monkeypatch.setattr(service.runner, "shutdown_heat_off", _boom)
+    assert await service.safe_shutdown_heat_off() is False
+    assert attempts == 2, "the heat-off write is retried once before giving up"
+
+    timeline = await service.timeline(run_id)
+    markers = [
+        e
+        for e in timeline.events
+        if e.kind is RoastEventKind.COMMAND_FAILED
+        and e.payload is not None
+        and e.payload.get("command") == "shutdown_heat_off"
+    ]
+    assert len(markers) == 1
+    assert markers[0].payload is not None
+    assert markers[0].payload["reason"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_record_shutdown_unconfirmed_swallows_store_error(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The marker write is fail-safe: a store error while persisting it is logged
+    and swallowed, never raised, so it cannot block the rest of teardown (#177)."""
     clock = FakeClock()
     mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
     service = RoastService(
@@ -255,11 +374,95 @@ async def test_shutdown_heat_off_fails_closed_on_unexpected_error(
     await service.start_roast(_profile())
     assert service.runner is not None
 
-    async def _boom() -> bool:
-        raise RuntimeError("unexpected runner failure")
+    async def _boom(**_kwargs: object) -> None:
+        raise RuntimeError("store write failed")
 
-    monkeypatch.setattr(service.runner, "shutdown_heat_off", _boom)
-    assert await service.safe_shutdown_heat_off() is False
+    monkeypatch.setattr(store, "record_event", _boom)
+    # Must not raise even though the underlying store write blows up.
+    await service.runner.record_shutdown_unconfirmed(command="shutdown_heat_off", reason="timeout")
+
+
+@pytest.mark.asyncio
+async def test_record_child_stop_unconfirmed_persists_marker_when_force_killed(
+    store: RoastStore,
+) -> None:
+    """When the MCP child stop went unconfirmed (force-killed), the teardown
+    step persists an ``mcp_stop`` unconfirmed marker a recovery read can see (#177)."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    service = RoastService(
+        store,
+        config=_config(),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_decision()),
+        run_loop=False,
+        clock=clock,
+    )
+    detail = await service.start_roast(_profile())
+    run_id = detail.id
+
+    await service.record_child_stop_unconfirmed(stop_unconfirmed=True)
+
+    timeline = await service.timeline(run_id)
+    markers = [
+        e
+        for e in timeline.events
+        if e.kind is RoastEventKind.COMMAND_FAILED
+        and e.payload is not None
+        and e.payload.get("command") == "mcp_stop"
+    ]
+    assert len(markers) == 1
+    marker = markers[0]
+    assert marker.source is RoastEventSource.SAFETY
+    assert marker.payload is not None
+    assert marker.payload["unconfirmed"] is True
+    assert marker.payload["context"] == "shutdown"
+    assert marker.payload["reason"] == "child_stop_unconfirmed"
+
+
+@pytest.mark.asyncio
+async def test_record_child_stop_unconfirmed_is_noop_on_clean_stop(store: RoastStore) -> None:
+    """A clean child stop (stop_unconfirmed False) records NO marker (#177)."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    service = RoastService(
+        store,
+        config=_config(),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_decision()),
+        run_loop=False,
+        clock=clock,
+    )
+    detail = await service.start_roast(_profile())
+    run_id = detail.id
+
+    await service.record_child_stop_unconfirmed(stop_unconfirmed=False)
+
+    timeline = await service.timeline(run_id)
+    assert not [
+        e
+        for e in timeline.events
+        if e.kind is RoastEventKind.COMMAND_FAILED
+        and e.payload is not None
+        and e.payload.get("command") == "mcp_stop"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_record_child_stop_unconfirmed_is_noop_without_runner(store: RoastStore) -> None:
+    """No live runner (API-only / never started) → the marker step is a safe
+    no-op even when the child stop was unconfirmed (nothing to key it to)."""
+    service = RoastService(
+        store,
+        config=_config(),
+        roaster=FakeMCPClient(),
+        advisor=FakeAdvisor(),
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    assert service.runner is None
+    # Must not raise.
+    await service.record_child_stop_unconfirmed(stop_unconfirmed=True)
 
 
 @pytest.mark.asyncio
@@ -267,9 +470,11 @@ async def test_teardown_runs_heat_off_before_mcp_stop() -> None:
     """The live-serve teardown calls heat-off BEFORE stopping the MCP child.
 
     The ordering is load-bearing: the heat→0 write must land while the MCP child
-    is still alive. Drives :func:`roastpilot_agent.cli._teardown_live` with
+    is still alive, and the child-stop-unconfirmed marker (#177) must be recorded
+    after ``mcp.stop`` (so the verdict is known) but before ``store.close`` (so
+    it can be written). Drives :func:`roastpilot_agent.cli._teardown_live` with
     recorders and asserts the recorded order is heat-off → service.shutdown →
-    mcp.stop → store.close.
+    mcp.stop → record_child_stop_unconfirmed → store.close.
     """
     order: list[str] = []
 
@@ -281,7 +486,14 @@ async def test_teardown_runs_heat_off_before_mcp_stop() -> None:
         async def shutdown(self) -> None:
             order.append("service.shutdown")
 
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            # The marker step reads mcp.stop_unconfirmed, set True by the recorder
+            # below; assert the verdict reached it.
+            order.append(f"record_child_stop_unconfirmed:{stop_unconfirmed}")
+
     class _RecordingMCP:
+        stop_unconfirmed = True  # the child stop went unconfirmed this teardown
+
         async def stop(self) -> None:
             order.append("mcp.stop")
 
@@ -302,9 +514,13 @@ async def test_teardown_runs_heat_off_before_mcp_stop() -> None:
         "safe_shutdown_heat_off",
         "service.shutdown",
         "mcp.stop",
+        "record_child_stop_unconfirmed:True",
         "store.close",
     ]
     assert order.index("safe_shutdown_heat_off") < order.index("mcp.stop")
+    # The marker step sees the verdict AFTER mcp.stop and writes BEFORE store.close.
+    assert order.index("mcp.stop") < order.index("record_child_stop_unconfirmed:True")
+    assert order.index("record_child_stop_unconfirmed:True") < order.index("store.close")
 
 
 @pytest.mark.asyncio
@@ -322,7 +538,12 @@ async def test_teardown_continues_when_heat_off_raises() -> None:
         async def shutdown(self) -> None:
             order.append("service.shutdown")
 
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            order.append("record_child_stop_unconfirmed")
+
     class _RecordingMCP:
+        stop_unconfirmed = False  # a clean child stop this teardown
+
         async def stop(self) -> None:
             order.append("mcp.stop")
 
@@ -340,6 +561,7 @@ async def test_teardown_continues_when_heat_off_raises() -> None:
         "safe_shutdown_heat_off",
         "service.shutdown",
         "mcp.stop",
+        "record_child_stop_unconfirmed",
         "store.close",
     ]
 

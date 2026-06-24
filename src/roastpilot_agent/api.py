@@ -656,6 +656,75 @@ class RoastRunner:
         await self._persist_phase_if_changed()
         return True
 
+    async def record_shutdown_unconfirmed(self, *, command: str, reason: str) -> None:
+        """Persist a 'shutdown step did NOT confirm' marker to the trace (#177).
+
+        Records that a fail-closed shutdown step went unacknowledged, so the
+        post-roast decision trace makes it unambiguous and a recovery read / a
+        human can see it. Two callers, two signals:
+
+        - ``command="shutdown_heat_off"`` — :meth:`RoastService.safe_shutdown_heat_off`
+          when the bounded heat-off (including its single retry) timed out or
+          errored against a wedged child. The controller already persisted the
+          ``EMERGENCY_STOP`` *intent* before the hang, but no confirmation
+          landed — the heater may have stayed commanded and the power switch
+          was the real stop.
+        - ``command="mcp_stop"`` — :meth:`RoastService.record_child_stop_unconfirmed`
+          when ``MCPServerProcess.stop_unconfirmed`` is True after teardown: the
+          child stop overran its bound and was force-killed, so the clean-stop
+          handshake never confirmed.
+
+        Written **directly to the store** (not via the emitter buffer): the
+        heat-off coroutine that owns the buffer may have just been cancelled by
+        a timeout, so a drain is unreliable — a direct ``record_event`` is the
+        robust channel. Reuses the existing ``COMMAND_FAILED`` event kind (no
+        new SSE event kind, so no cross-boundary FE-contract change) with a
+        distinguishing ``command`` / ``unconfirmed`` payload.
+
+        This is **observability for diagnosis / recovery only** — never a
+        trigger to auto-act. A restart still enters
+        ``operator_recovery_required`` and never auto-resumes heat/fan.
+
+        Fail-safe: a store error here is logged and swallowed — a missing trace
+        breadcrumb must never block the rest of teardown.
+
+        Args:
+            command: The shutdown step that went unconfirmed
+                (``"shutdown_heat_off"`` or ``"mcp_stop"``), stamped on the
+                marker payload.
+            reason: A short human-readable cause (e.g. ``"timeout"``) stamped on
+                the marker payload for the trace.
+        """
+        try:
+            # Deliberate kind choice: COMMAND_FAILED, not a new event kind.
+            # (a) An unacknowledged safety command IS a failed command from the
+            # trace's point of view; (b) a new kind would force a cross-boundary
+            # FE event-kind contract change (the BE/FE parity rule in
+            # web/src/lib/contract.test.ts). The payload — context="shutdown",
+            # unconfirmed=True, command, reason — disambiguates it from an
+            # ordinary tick-time command failure, so the semantics are
+            # deliberate, not incidental.
+            await self._store.record_event(
+                run_id=self._run_id,
+                kind=RoastEventKind.COMMAND_FAILED,
+                source=RoastEventSource.SAFETY,
+                payload={
+                    "command": command,
+                    "context": "shutdown",
+                    "unconfirmed": True,
+                    "reason": reason,
+                },
+            )
+        except Exception:  # noqa: BLE001 — fail-safe: a marker write must never block teardown
+            _log.error(
+                "could not persist the shutdown-unconfirmed marker (command=%s, reason=%s) "
+                "— the trace will not record that %s went unacknowledged",
+                command,
+                reason,
+                command,
+                exc_info=True,
+            )
+
     @property
     def finalized(self) -> bool:
         """Whether the run reached a terminal phase and was completed."""
@@ -1376,14 +1445,22 @@ class RoastService:
 
         Bounded and fail-closed: the heat-off write is wrapped in a short
         :func:`asyncio.wait_for` so a wedged MCP child can never hang shutdown.
-        A timeout or any error is logged loudly (the operator must know the
-        commanded stop did not confirm and may need the power switch) and
-        swallowed so the rest of teardown — including ``mcp.stop`` — still runs.
+        On a timeout or error the write is **retried once** before giving up
+        (#177): the first attempt's cancellation propagates out of the
+        controller before it transitions to ``FAULTED``, so the run is still in
+        an active hot phase and the retry meaningfully re-attempts the write. If
+        the retry also fails, a 'shutdown heat-off did NOT confirm' marker is
+        persisted to the decision trace (:meth:`RoastRunner.record_shutdown_unconfirmed`)
+        so post-roast it is unambiguous the commanded stop went unacknowledged.
+        Every failure is logged loudly (the operator must know the stop did not
+        confirm and may need the power switch) and swallowed so the rest of
+        teardown — including ``mcp.stop`` — still runs.
 
         Args:
-            timeout_seconds: Upper bound on the heat-off write before shutdown
-                proceeds regardless (default 5 s — generous for one MCP call,
-                short enough never to wedge a Ctrl-C).
+            timeout_seconds: Upper bound on EACH heat-off write attempt before
+                shutdown proceeds (default 5 s — generous for one MCP call,
+                short enough never to wedge a Ctrl-C). Applied to both the first
+                attempt and the single retry, so worst-case bound is ~2×.
 
         Returns:
             ``True`` if the heat-off safety path ran and the controller faulted
@@ -1393,27 +1470,56 @@ class RoastService:
             still emits ``COMMAND_FAILED``, faults the run, and reports success
             here — fail-safe is the controller's job, not the caller's.
             ``False`` if it was a no-op (no active run / already hardware-off) or
-            the safety path did not run to completion (the ``wait_for`` timeout
-            or an unexpected error in this method, both logged + swallowed).
+            the safety path did not run to completion after the retry (the
+            ``wait_for`` timeout or an unexpected error, logged + a trace marker
+            persisted + swallowed).
         """
         runner = self.runner
         if runner is None:
             return False
+        # One retry on a wedged-child timeout before giving up (#177): the
+        # first attempt's cancel propagates out of the controller BEFORE it
+        # transitions to FAULTED, so the run is still in an active hot phase
+        # and the retry meaningfully re-attempts the heat-off write rather than
+        # short-circuiting as a no-op. A second timeout is the give-up point.
+        #
+        # Narrow benign branch: if a NON-timeout first-attempt error originates
+        # AFTER the controller already transitioned to FAULTED, the retry's
+        # phase guard makes it a no-op returning False with NO marker. That is
+        # fine — the run is already FAULTED and the e-stop was dispatched, so
+        # there is no still-hot ambiguity to record. The dangerous still-hot
+        # case is the timeout path, which IS marked.
         try:
             return await asyncio.wait_for(runner.shutdown_heat_off(), timeout=timeout_seconds)
         except TimeoutError:
             _log.error(
-                "SHUTDOWN heat-off did not confirm within %.1fs — the roaster may still "
-                "be commanded hot; use the Hottop power switch if needed",
+                "SHUTDOWN heat-off did not confirm within %.1fs — retrying once before "
+                "giving up; the roaster may still be commanded hot",
                 timeout_seconds,
             )
+        except Exception:  # noqa: BLE001 — fail closed: log loudly, never block teardown
+            _log.error(
+                "SHUTDOWN heat-off failed — retrying once before giving up; "
+                "the roaster may still be commanded hot",
+                exc_info=True,
+            )
+        try:
+            return await asyncio.wait_for(runner.shutdown_heat_off(), timeout=timeout_seconds)
+        except TimeoutError:
+            _log.error(
+                "SHUTDOWN heat-off did not confirm within %.1fs on retry — the roaster may "
+                "still be commanded hot; use the Hottop power switch if needed",
+                timeout_seconds,
+            )
+            await runner.record_shutdown_unconfirmed(command="shutdown_heat_off", reason="timeout")
             return False
         except Exception:  # noqa: BLE001 — fail closed: log loudly, never block teardown
             _log.error(
-                "SHUTDOWN heat-off failed — the roaster may still be commanded hot; "
-                "use the Hottop power switch if needed",
+                "SHUTDOWN heat-off failed on retry — the roaster may still be commanded "
+                "hot; use the Hottop power switch if needed",
                 exc_info=True,
             )
+            await runner.record_shutdown_unconfirmed(command="shutdown_heat_off", reason="error")
             return False
 
     async def shutdown(self) -> None:
@@ -1425,6 +1531,39 @@ class RoastService:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+
+    async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+        """Persist a marker if the MCP child stop went unconfirmed (#177).
+
+        Called by the live-serve teardown **after** ``mcp.stop`` (so the
+        force-kill verdict is known) and **before** ``store.close`` (so the
+        store is still open to write to). When
+        ``MCPServerProcess.stop_unconfirmed`` is True the child overran its
+        stop bound and was force-killed, so the clean-stop handshake never
+        confirmed — this records that in the decision trace for post-roast
+        diagnosis. A no-op when the stop confirmed cleanly or there is no live
+        runner to key the marker to (API-only / never started).
+
+        Observability only — never an auto-resume trigger (a restart still
+        enters ``operator_recovery_required``). Fail-closed: delegates to the
+        runner's swallow-on-error marker write, so it can never abort teardown.
+
+        Args:
+            stop_unconfirmed: ``MCPServerProcess.stop_unconfirmed`` after
+                ``mcp.stop`` — whether the child stop had to force-terminate.
+        """
+        if not stop_unconfirmed:
+            return
+        runner = self.runner
+        if runner is None:
+            return
+        _log.error(
+            "MCP child stop went UNCONFIRMED (force-killed) — recording a trace marker; "
+            "a restart will enter operator_recovery_required"
+        )
+        await runner.record_shutdown_unconfirmed(
+            command="mcp_stop", reason="child_stop_unconfirmed"
+        )
 
     async def history(self) -> RoastHistory:
         """The roast history list, newest first (plan §6)."""

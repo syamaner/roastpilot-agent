@@ -638,7 +638,14 @@ async def _teardown_live(
        fail-closed; a no-op when no live run is active);
     2. ``service.shutdown`` — cancel the tick loop;
     3. ``mcp.stop`` — end the MCP child (after heat-off has landed);
-    4. ``store.close`` — close the decision-trace store.
+    4. ``record_child_stop_unconfirmed`` — if ``mcp.stop`` had to force-kill the
+       child (``mcp.stop_unconfirmed``), persist a trace marker (#177) while the
+       store is still open;
+    5. ``store.close`` — close the decision-trace store.
+
+    Step 4 sits between ``mcp.stop`` and ``store.close`` deliberately: the
+    force-kill verdict is only known after step 3, and the marker must be
+    written before the store closes in step 5.
 
     (A hard kill / SIGKILL / power loss is uncatchable and skips this entirely —
     it still relies on restart → ``operator_recovery_required``, never an
@@ -654,6 +661,12 @@ async def _teardown_live(
     await _cleanup_step("safe_shutdown_heat_off", service.safe_shutdown_heat_off)
     await _cleanup_step("service.shutdown", service.shutdown)
     await _cleanup_step("mcp.stop", mcp.stop)
+    # After mcp.stop so stop_unconfirmed reflects the just-completed teardown;
+    # before store.close so the marker can be written.
+    await _cleanup_step(
+        "record_child_stop_unconfirmed",
+        lambda: service.record_child_stop_unconfirmed(stop_unconfirmed=mcp.stop_unconfirmed),
+    )
     await _cleanup_step("store.close", store.close)
 
 

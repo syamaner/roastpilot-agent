@@ -897,20 +897,30 @@ class MCPServerProcess:
 
     @property
     def stop_unconfirmed(self) -> bool:
-        """Whether the last :meth:`stop` had to force-terminate the child.
+        """Whether the *most recent* :meth:`stop` had to force-terminate the child.
 
-        ``True`` means graceful teardown overran ``stop_timeout_seconds`` and
-        the child process group was force-killed, so a clean shutdown was
-        never confirmed. A clean stop leaves this ``False``. #177 persists
-        this so a restart after an unconfirmed stop enters
-        ``operator_recovery_required``.
+        ``True`` means the last graceful teardown overran ``stop_timeout_seconds``
+        and the child process group was force-killed, so a clean shutdown was
+        never confirmed. It is reset to ``False`` at the top of :meth:`start`,
+        so across a ``start → stop → start`` cycle a fresh run never inherits a
+        previous run's unconfirmed flag — the flag describes the last completed
+        teardown, not the lifetime. A clean stop leaves it ``False``. #177
+        persists this to the decision trace so an unconfirmed stop is visible
+        post-roast (observability for diagnosis / recovery — never an
+        auto-resume trigger).
         """
         return self._stop_unconfirmed
 
     async def start(self) -> None:
-        """Spawn the child, initialize the MCP session, health-check it."""
+        """Spawn the child, initialize the MCP session, health-check it.
+
+        Resets :attr:`stop_unconfirmed` to ``False`` first: the flag describes
+        the most recent teardown, so a reused process (start → stop → start)
+        must not carry a prior run's unconfirmed verdict into the new run.
+        """
         if self._session is not None:
             return
+        self._stop_unconfirmed = False
         stack = AsyncExitStack()
         try:
             session = await stack.enter_async_context(
@@ -945,10 +955,14 @@ class MCPServerProcess:
         commanded-hot — so this method NEVER blocks past the bound and NEVER
         re-raises: the agent must always be able to exit.
 
-        On a clean stop within the bound, ``stop_unconfirmed`` stays
-        ``False`` and the force-terminate hook is not invoked. On overrun the
-        child process group is force-killed, ``stop_unconfirmed`` is set, and
-        the method returns cleanly after logging at ERROR.
+        On a clean stop within the bound, ``stop_unconfirmed`` is left
+        ``False`` (it was reset by the preceding :meth:`start`, and the clean
+        path never sets it) and the force-terminate hook is not invoked — so a
+        ``start → stop`` cycle that confirms cleanly always reports
+        ``stop_unconfirmed is False``, even after a previous run's stop went
+        unconfirmed. On overrun the child process group is force-killed,
+        ``stop_unconfirmed`` is set, and the method returns cleanly after
+        logging at ERROR.
         """
         if self._stack is None:
             return

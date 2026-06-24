@@ -784,6 +784,27 @@ async def test_stop_swallows_a_raising_force_terminate_hook() -> None:
     assert not process.running
 
 
+@pytest.mark.asyncio
+async def test_start_resets_stop_unconfirmed_for_a_reused_process() -> None:
+    """Multi-start safety (#177, deferred from #365 triage): stop_unconfirmed
+    describes the MOST RECENT teardown, so a reused process (start → wedged stop
+    → start) must not carry the prior run's unconfirmed verdict into the new run
+    — start() resets it to False before spawning."""
+    session = FakeInitializableSession(info_result())
+    process = MCPServerProcess(
+        MCPConfig(stop_timeout_seconds=0.05),
+        session_factory=WedgedFactoryProbe(session),
+        force_terminate=lambda: True,
+    )
+    await process.start()
+    await asyncio.wait_for(process.stop(), timeout=1.0)
+    assert process.stop_unconfirmed is True  # first teardown went unconfirmed
+
+    # A fresh start must clear the stale flag (the reset is at the top of start).
+    await process.start()
+    assert process.stop_unconfirmed is False
+
+
 @pytest.mark.skipif(
     not hasattr(os, "killpg"), reason="POSIX process-group kill only (#212 targets darwin/linux)"
 )
