@@ -105,11 +105,14 @@ dev = [
   # timestamps to the turning-point / crack-onset instant and adds the
   # `turning_point_monotonic_seconds` / `confirmed_at_monotonic_seconds` /
   # `confirmed_at_utc` payload fields — coffee-roaster-mcp#169/#170, consumed
-  # agent-side by #337; none of these change the 13-tool surface). It pulls
+  # agent-side by #337; 0.1.8 quiets the MCP SDK's per-request INFO flood
+  # during a live roast (raises `mcp.server.lowlevel.server` to WARNING only
+  # when more verbose, never lowering a stricter setting) — coffee-roaster-mcp#162,
+  # observability-only; none of these change the 13-tool surface). It pulls
   # heavy ML/audio deps
   # (transformers/onnxruntime/sounddevice) that mock mode never activates;
   # CI installs libportaudio2 for sounddevice's import.
-  "coffee-roaster-mcp==0.1.7",
+  "coffee-roaster-mcp==0.1.8",
   # Analysis-harness numeric core (scripts/curve_feature_eval.py, #229). numpy
   # is already present transitively (via the MCP server's ML stack), but the
   # curve-feature analysis imports it directly, so declare it explicitly here:
