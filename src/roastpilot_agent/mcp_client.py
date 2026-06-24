@@ -24,9 +24,11 @@ passed through from MCP, never recomputed.
 
 import asyncio
 import json
+import logging
 import math
 import os
 import shutil
+import signal
 import sys
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
@@ -40,6 +42,8 @@ from pydantic import BaseModel, ConfigDict
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
 from roastpilot_agent.models import MicStatus, RoastTelemetry
+
+_log = logging.getLogger(__name__)
 
 # --- vocabulary mirrored from coffee_roaster_mcp (session.py / config.py) ---
 
@@ -600,6 +604,50 @@ SessionFactory = Callable[
     [StdioServerParameters], AbstractAsyncContextManager[InitializableSession]
 ]
 
+#: A best-effort, synchronous force-terminate of the spawned child process
+#: tree, invoked only when graceful ``stop`` overruns ``stop_timeout_seconds``.
+#: Returns ``True`` if a termination signal was actually delivered (a child was
+#: known and alive), ``False`` otherwise. Injectable so the timeout path is
+#: unit-testable without a real process.
+ForceTerminate = Callable[[], bool]
+
+
+def force_terminate_process_group(pid: int) -> bool:
+    """Force-kill the child process *group* by pid (POSIX only).
+
+    The transport spawns the child with ``start_new_session=True`` (the MCP
+    SDK's ``_create_platform_compatible_process``), so the child is its own
+    session/process-group leader and ``pgid == pid``. Sending ``SIGKILL`` to
+    the group atomically reaps the child and anything it forked (the audio
+    worker), which is exactly what a wedged-child shutdown needs.
+
+    This is the uncatchable last resort: it runs only after graceful
+    ``aclose`` has already overrun ``stop_timeout_seconds``, so SIGKILL (not a
+    catchable SIGTERM the wedged child may never service) is deliberate.
+
+    POSIX-only: ``os.killpg``/``os.getpgid`` do not exist on Windows. This
+    repo targets darwin/linux; on any other platform the helper is a no-op.
+
+    Args:
+        pid: The spawned child's OS process id (also its process-group id).
+
+    Returns:
+        ``True`` if ``SIGKILL`` was delivered to the group, ``False`` if the
+        platform is unsupported or the process group was already gone.
+    """
+    if not hasattr(os, "killpg"):  # pragma: no cover - non-POSIX (Windows)
+        _log.error("cannot force-terminate MCP child %d: killpg unavailable", pid)
+        return False
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except ProcessLookupError:
+        # Already exited between the timeout and the kill — nothing to do.
+        return False
+    except OSError as exc:  # pragma: no cover - defensive: permission/race
+        _log.error("force-terminate of MCP child %d failed: %s", pid, exc)
+        return False
+    return True
+
 
 def resolve_mcp_command(command: str) -> str:
     """Resolve the MCP child command, pinning the default to the agent's own env.
@@ -656,18 +704,59 @@ def resolve_mcp_command(command: str) -> str:
 @asynccontextmanager
 async def _spawn_stdio_session(
     params: StdioServerParameters,
+    *,
+    on_spawn: Callable[[int], None] | None = None,
 ) -> AsyncGenerator[ClientSession]:
     """Default factory: spawn the child and open a ClientSession over it.
+
+    The MCP SDK's ``stdio_client`` owns the spawn and does not expose the
+    child process, but the agent must be able to force-terminate a wedged
+    child whose graceful ``aclose`` has overrun (#212). Rather than
+    reimplement the transport, this shim briefly wraps the SDK's own
+    ``_create_platform_compatible_process`` so it can read the spawned
+    child's OS pid and hand it to ``on_spawn``; the wrap is removed before
+    the session is yielded. The child is spawned with
+    ``start_new_session=True`` (SDK), so that pid is also the process-group
+    id used by :func:`force_terminate_process_group`.
+
+    Args:
+        params: The stdio spawn parameters (command, args, env).
+        on_spawn: Optional callback invoked once with the child pid as soon
+            as the process is created — the seam that lets the owning
+            :class:`MCPServerProcess` register a force-terminate hook.
 
     Excluded from unit coverage: this is the thin real-IO shim that only
     runs with the actual coffee-roaster-mcp binary — exercised by
     test_real_child_process_round_trip, which auto-activates at E9.
     """
-    async with (  # pragma: no cover
-        stdio_client(params) as (read, write),
-        ClientSession(read, write) as session,
-    ):
-        yield session
+    import mcp.client.stdio as _stdio  # pragma: no cover - real-IO shim
+
+    original = _stdio._create_platform_compatible_process  # pyright: ignore[reportPrivateUsage]
+    # Forward through a permissive signature: this thin wrapper only reads the
+    # spawned process's pid and re-emits it, never inspecting the SDK's args.
+    spawn = cast("Callable[..., Awaitable[object]]", original)
+
+    async def _capturing_create(*args: object, **kwargs: object) -> object:  # pragma: no cover
+        process = await spawn(*args, **kwargs)
+        pid = getattr(process, "pid", None)
+        if on_spawn is not None and isinstance(pid, int):
+            on_spawn(pid)
+        return process
+
+    # This save/restore is a PROCESS-WIDE monkeypatch of a module global; it is
+    # safe only because the agent starts exactly one MCP child at a time (no
+    # concurrent ``start``), so no other spawn can race the patched window.
+    _stdio._create_platform_compatible_process = _capturing_create  # type: ignore[assignment]  # pyright: ignore[reportAttributeAccessIssue, reportPrivateUsage]
+    try:  # pragma: no cover
+        async with (
+            stdio_client(params) as (read, write),
+            ClientSession(read, write) as session,
+        ):
+            yield session
+    finally:  # pragma: no cover
+        # Restore as soon as the spawn-and-yield scope exits (or raises): the
+        # capturing wrap is only needed for the single spawn inside this block.
+        _stdio._create_platform_compatible_process = original  # pyright: ignore[reportPrivateUsage]
 
 
 def parse_tool_result(result: object) -> object:
@@ -723,11 +812,66 @@ class MCPServerProcess:
         *,
         session: ToolSession | None = None,
         session_factory: SessionFactory | None = None,
+        force_terminate: ForceTerminate | None = None,
     ) -> None:
+        """Initialize the transport.
+
+        Args:
+            config: MCP child settings (command, timeouts). Defaults applied.
+            session: A pre-attached ``ToolSession`` (test seam); skips spawn.
+            session_factory: Override the real ``stdio_client`` spawn (test
+                seam). When omitted, the default factory both spawns the child
+                and registers a process-group force-terminate hook used if
+                graceful :meth:`stop` overruns ``stop_timeout_seconds``.
+            force_terminate: An injectable force-terminate hook (test seam).
+                When provided, it is used directly on a stop timeout instead
+                of the spawned-pid hook — letting the timeout path be unit
+                tested without a real process.
+        """
         self._config = config or MCPConfig()
         self._session: ToolSession | None = session  # injectable test seam
-        self._session_factory: SessionFactory = session_factory or _spawn_stdio_session
+        self._session_factory: SessionFactory = (
+            session_factory if session_factory is not None else self._default_session_factory
+        )
         self._stack: AsyncExitStack | None = None
+        #: Set on the timeout path of :meth:`stop` when the child did not
+        #: confirm a clean shutdown and had to be force-terminated. #177 will
+        #: persist it so a restart enters ``operator_recovery_required``.
+        self._stop_unconfirmed = False
+        #: Best-effort force-terminate of the spawned child group, populated by
+        #: the default factory once the pid is known (or injected for tests).
+        self._force_terminate: ForceTerminate | None = force_terminate
+
+    def _default_session_factory(
+        self, params: StdioServerParameters
+    ) -> AbstractAsyncContextManager[InitializableSession]:
+        """The real spawn factory: spawn the child and capture its pid.
+
+        Wires :func:`_spawn_stdio_session`'s ``on_spawn`` to
+        :meth:`_register_force_terminate` so a wedged-child timeout in
+        :meth:`stop` can force-kill the process group. An explicitly injected
+        ``force_terminate`` (test seam) is left untouched — only an unset hook
+        is populated by the spawn.
+
+        Args:
+            params: The stdio spawn parameters.
+
+        Returns:
+            An async context manager yielding the initialized session.
+        """
+        return _spawn_stdio_session(params, on_spawn=self._register_force_terminate)
+
+    def _register_force_terminate(self, pid: int) -> None:
+        """Record a process-group force-terminate hook for the spawned ``pid``.
+
+        Skips registration if a force-terminate hook was injected at
+        construction (test seam): the injected hook must win.
+
+        Args:
+            pid: The spawned child's OS pid (also its process-group id).
+        """
+        if self._force_terminate is None:  # pragma: no cover - real-IO path
+            self._force_terminate = lambda: force_terminate_process_group(pid)
 
     def build_server_parameters(self) -> StdioServerParameters:
         """The spawn argv: ``<command> serve`` (server.json packageArguments).
@@ -750,6 +894,18 @@ class MCPServerProcess:
     def running(self) -> bool:
         """Whether a session is attached (spawned or injected)."""
         return self._session is not None
+
+    @property
+    def stop_unconfirmed(self) -> bool:
+        """Whether the last :meth:`stop` had to force-terminate the child.
+
+        ``True`` means graceful teardown overran ``stop_timeout_seconds`` and
+        the child process group was force-killed, so a clean shutdown was
+        never confirmed. A clean stop leaves this ``False``. #177 persists
+        this so a restart after an unconfirmed stop enters
+        ``operator_recovery_required``.
+        """
+        return self._stop_unconfirmed
 
     async def start(self) -> None:
         """Spawn the child, initialize the MCP session, health-check it."""
@@ -779,11 +935,52 @@ class MCPServerProcess:
             raise MCPConnectionError(f"failed to start coffee-roaster-mcp: {exc}") from exc
 
     async def stop(self) -> None:
-        """Shut the child down cleanly."""
-        if self._stack is not None:
-            await self._stack.aclose()
-        self._stack = None
-        self._session = None
+        """Shut the child down, bounded by ``stop_timeout_seconds`` (#212).
+
+        Graceful teardown (``AsyncExitStack.aclose`` → the SDK's
+        stdin-close → SIGTERM → SIGKILL sequence) can stall forever on a
+        wedged native child (blocked PortAudio read) or a task group still
+        awaiting an open pipe. A hung shutdown drives the operator to
+        ``kill -9`` — the one uncatchable path that leaves the roaster
+        commanded-hot — so this method NEVER blocks past the bound and NEVER
+        re-raises: the agent must always be able to exit.
+
+        On a clean stop within the bound, ``stop_unconfirmed`` stays
+        ``False`` and the force-terminate hook is not invoked. On overrun the
+        child process group is force-killed, ``stop_unconfirmed`` is set, and
+        the method returns cleanly after logging at ERROR.
+        """
+        if self._stack is None:
+            return
+        stack = self._stack
+        try:
+            # asyncio.timeout (not wait_for) keeps aclose() running in THIS
+            # task: the stdio_client context was entered in this task during
+            # start(), and anyio cancel scopes must be exited in the task that
+            # entered them — wait_for would re-parent aclose() into a child
+            # task and trip "exit cancel scope in a different task".
+            async with asyncio.timeout(self._config.stop_timeout_seconds):
+                await stack.aclose()
+        except TimeoutError:
+            self._stop_unconfirmed = True
+            _log.error(
+                "MCP child did not confirm clean stop within %.1fs — "
+                "force-terminating; restart will enter operator_recovery_required",
+                self._config.stop_timeout_seconds,
+            )
+            if self._force_terminate is not None:
+                self._force_terminate()
+            else:  # pragma: no cover - defensive: pid never captured
+                _log.error(
+                    "no force-terminate hook registered for wedged MCP child — "
+                    "child may survive agent exit"
+                )
+        except Exception as exc:  # pragma: no cover - defensive: aclose error
+            # A teardown error must not block exit either: log and move on.
+            _log.error("error during MCP child stop: %s", exc)
+        finally:
+            self._stack = None
+            self._session = None
 
     async def call_tool(self, name: str, arguments: dict[str, object]) -> object:
         """ToolCaller implementation: timeout-bounded, typed failures only."""

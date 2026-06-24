@@ -649,11 +649,22 @@ class MCPConfig(BaseModel):
     - ``startup_timeout_seconds`` 15.0: the bootstrap-safe mock server
       starts in well under a second; 15 s tolerates first-run environment
       slowness without masking a wedged child.
+    - ``stop_timeout_seconds`` 10.0: the ceiling on graceful child teardown
+      (``MCPServerProcess.stop``). The MCP SDK's own stdin-close → wait →
+      SIGTERM → SIGKILL sequence is bounded by a 2 s grace, but the agent
+      must not depend on that internal escalation: a wedged native child
+      (blocked PortAudio read) or a task group still awaiting an open pipe
+      can stall ``aclose`` indefinitely (#212, bit roast 3). When this
+      bound trips, the agent force-terminates the child process group and
+      exits anyway — a hung shutdown otherwise drives the operator to
+      ``kill -9``, the one uncatchable path that leaves the roaster
+      commanded-hot. 10 s clears the SDK's 2 s with margin.
     """
 
     command: str = Field(default=DEFAULT_MCP_COMMAND, min_length=1)
     call_timeout_seconds: float = Field(default=5.0, gt=0)
     startup_timeout_seconds: float = Field(default=15.0, gt=0)
+    stop_timeout_seconds: float = Field(default=10.0, gt=0)
     #: Environment overrides for the spawned child, merged over the agent's own
     #: environment at spawn (so ``PATH``/``HOME`` are preserved). Empty by
     #: default — production inherits the deployment environment (the real

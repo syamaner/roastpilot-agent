@@ -7,7 +7,12 @@ source and validated here against the 7 Jun 2026 live-roast exports.
 
 import asyncio
 import json
+import os
 import shutil
+import signal
+import subprocess
+import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
@@ -32,6 +37,7 @@ from roastpilot_agent.mcp_client import (
     ServerInfo,
     StartRoastSessionResult,
     event_backdate_seconds,
+    force_terminate_process_group,
     parse_tool_result,
     project_mic_status,
     project_session_state,
@@ -676,6 +682,130 @@ async def test_stop_without_start_is_safe() -> None:
     process = MCPServerProcess()
     await process.stop()
     assert not process.running
+    assert process.stop_unconfirmed is False
+
+
+@pytest.mark.asyncio
+async def test_clean_stop_does_not_force_terminate() -> None:
+    """A graceful stop within the bound leaves stop_unconfirmed False and
+    never invokes the force-terminate hook (#212)."""
+    calls: list[int] = []
+
+    def force_terminate() -> bool:
+        calls.append(1)
+        return True
+
+    session = FakeInitializableSession(info_result())
+    probe = FactoryProbe(session)
+    process = MCPServerProcess(session_factory=probe, force_terminate=force_terminate)
+    await process.start()
+    await process.stop()
+    assert not process.running
+    assert probe.exited  # graceful teardown ran
+    assert process.stop_unconfirmed is False
+    assert calls == []  # force-terminate never reached
+
+
+class WedgedContext:
+    """A session context whose teardown blocks forever — models a wedged MCP
+    child whose graceful ``aclose`` never returns (#212)."""
+
+    def __init__(self, probe: "WedgedFactoryProbe") -> None:
+        self._probe = probe
+
+    async def __aenter__(self) -> FakeInitializableSession:
+        return self._probe.session
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self._probe.exited = True
+        await asyncio.sleep(100)  # never returns within the test
+
+
+class WedgedFactoryProbe:
+    """A session factory that hands back a :class:`WedgedContext`."""
+
+    def __init__(self, session: FakeInitializableSession) -> None:
+        self.session = session
+        self.params: object | None = None
+        self.exited = False
+
+    def __call__(self, params: object) -> WedgedContext:
+        self.params = params
+        return WedgedContext(self)
+
+
+@pytest.mark.asyncio
+async def test_stop_bounds_a_wedged_child_and_force_terminates() -> None:
+    """The headline #212 guarantee: a wedged-child teardown does not hang
+    stop() past stop_timeout_seconds; it force-terminates exactly once, sets
+    stop_unconfirmed, and returns cleanly so the agent can always exit."""
+    calls: list[int] = []
+
+    def force_terminate() -> bool:
+        calls.append(1)
+        return True
+
+    session = FakeInitializableSession(info_result())
+    probe = WedgedFactoryProbe(session)
+    process = MCPServerProcess(
+        MCPConfig(stop_timeout_seconds=0.05),
+        session_factory=probe,
+        force_terminate=force_terminate,
+    )
+    await process.start()
+    # Outer guard: if stop() failed to bound the wedged aclose, this raises
+    # rather than hanging the suite — proving the bound, not just observing it.
+    await asyncio.wait_for(process.stop(), timeout=1.0)
+    assert process.stop_unconfirmed is True
+    assert calls == [1]  # force-terminate invoked exactly once
+    assert not process.running  # state cleared even on the timeout path
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "killpg"), reason="POSIX process-group kill only (#212 targets darwin/linux)"
+)
+def test_force_terminate_process_group_kills_a_real_child() -> None:
+    """The real force-kill: spawn a child in its own session (as the MCP
+    transport does, ``start_new_session=True``) and assert the helper
+    SIGKILLs the group, returning True (#212)."""
+    child = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        start_new_session=True,
+    )
+    try:
+        assert force_terminate_process_group(child.pid) is True
+        # The child is reaped within a beat; -9 is SIGKILL on POSIX.
+        assert child.wait(timeout=5.0) == -signal.SIGKILL
+    finally:
+        if child.poll() is None:  # pragma: no cover - defensive cleanup
+            child.kill()
+            child.wait(timeout=5.0)
+
+
+@pytest.mark.skipif(not hasattr(os, "killpg"), reason="POSIX process-group kill only")
+def test_force_terminate_process_group_returns_false_when_already_gone() -> None:
+    """An already-exited child yields False (ProcessLookupError path) — the
+    hook reports it delivered no signal so callers don't over-claim (#212)."""
+    child = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", ""],
+        start_new_session=True,
+    )
+    child.wait(timeout=5.0)
+    # Give the OS a beat to release the now-dead group before we target it.
+    for _ in range(50):
+        if not _pgid_alive(child.pid):
+            break
+        time.sleep(0.02)
+    assert force_terminate_process_group(child.pid) is False
+
+
+def _pgid_alive(pid: int) -> bool:
+    """Whether the process group led by ``pid`` still exists (test helper)."""
+    try:
+        os.killpg(os.getpgid(pid), 0)
+    except (ProcessLookupError, OSError):
+        return False
+    return True
 
 
 @pytest.mark.asyncio
