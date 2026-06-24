@@ -430,9 +430,13 @@ class RoastControlPolicy:
         the active profile's :attr:`~roastpilot_agent.models.RoastProfile.pre_fc_heat`
         when that bean specifies it, falling back to the global
         :attr:`PreFirstCrackLevers.heat_target_percent` (the proven n8n default,
-        100 %) otherwise. The profile field is bounded 0–100, and the heat box
-        ceiling stays 100, so the resolved value always sits inside its box (no
-        clamp needed for heat; the floor is pinned to it by :meth:`limits_for`).
+        100 %) otherwise. The profile field's max (100) equals the heat box
+        ceiling TODAY, so this resolved value already sits inside its box — but the
+        caller (:meth:`limits_for`) still applies a symmetric clamp into the heat
+        ceiling (``min(target, heat_ceiling)``, mirroring the fan clamp) as
+        forward-looking defense: if the pre-FC heat ceiling is ever lowered below
+        the field max, a per-bean heat must stay bounded. Do NOT read this as "no
+        clamp needed" and drop that clamp.
 
         Args:
             levers: The configured deterministic pre-FC levers (the fallback).

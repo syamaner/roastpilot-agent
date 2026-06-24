@@ -174,30 +174,28 @@ def test_pre_fc_profile_fan_at_a_raised_ceiling_is_honoured() -> None:
     assert box.fan_target_percent == 45  # inside the wider box — honoured, not clamped
 
 
-def test_pre_fc_trim_composes_with_a_profile_sourced_heat() -> None:
+@pytest.mark.parametrize("phase", _PRE_FC_PHASES)
+def test_pre_fc_trim_composes_with_a_profile_sourced_heat(phase: RoastPhase) -> None:
     """D59 + #327: the anticipatory heat trim still composes with a per-bean heat.
     With the window open the engaged heat is the trim level, and it stays ≤ the
     resolved floor (the trim only ever REDUCES heat, never raises the per-bean
     target)."""
     # Per-bean heat 90; default trim level 65 < 90, so the window lowers heat to 65.
     profile = _PROFILE.model_copy(update={"pre_fc_heat": 90})
-    box = RoastControlPolicy(SafetyLimits(), profile).limits_for(
-        RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=_TRIM_OPEN
-    )
+    box = RoastControlPolicy(SafetyLimits(), profile).limits_for(phase, trim_signal=_TRIM_OPEN)
     assert box.heat_target_percent == 65  # the trim level
     assert box.heat_floor_percent == 65
     assert box.heat_target_percent <= 90  # the trim never raises the per-bean heat
 
 
-def test_pre_fc_trim_never_raises_a_below_trim_profile_heat() -> None:
+@pytest.mark.parametrize("phase", _PRE_FC_PHASES)
+def test_pre_fc_trim_never_raises_a_below_trim_profile_heat(phase: RoastPhase) -> None:
     """D59 + #327: if a per-bean ``pre_fc_heat`` is BELOW the config trim level, the
     engaged trim must not RAISE heat up to the trim level — the trim is clamped to
     the resolved base so it stays ≤ the per-bean floor (never delays FC)."""
     # Per-bean heat 50, below the default trim level 65: the trim must not lift it.
     profile = _PROFILE.model_copy(update={"pre_fc_heat": 50})
-    box = RoastControlPolicy(SafetyLimits(), profile).limits_for(
-        RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=_TRIM_OPEN
-    )
+    box = RoastControlPolicy(SafetyLimits(), profile).limits_for(phase, trim_signal=_TRIM_OPEN)
     assert box.heat_target_percent == 50  # clamped to the per-bean base, not raised to 65
     assert box.heat_floor_percent == 50
 
