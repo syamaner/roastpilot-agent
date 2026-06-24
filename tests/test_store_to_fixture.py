@@ -50,6 +50,17 @@ _PROFILE = RoastProfile(
 )
 
 
+# The REAL store's two clocks (verified against ~/.local/state/roastpilot on the
+# real roasts fa24e673 / c3b84625): roast_events.monotonic_seconds is ABSOLUTE
+# time.monotonic() (hundreds of thousands of seconds — process uptime), while
+# telemetry_snapshots.elapsed_seconds is run-relative (≈0 at the first tick).
+# The synthetic store MUST reproduce that offset, or it silently lets a
+# same-origin bug through (the failure that shipped on the first fix). So every
+# event is recorded at _MONOTONIC_OFFSET + its run-relative time; telemetry stays
+# run-relative. run_started is the offset itself (its monotonic == the origin).
+_MONOTONIC_OFFSET = 500_000.0
+
+
 async def _record_marks(
     store: RoastStore,
     run_id: str,
@@ -58,29 +69,38 @@ async def _record_marks(
     first_crack_s: float,
     drop_s: float,
 ) -> None:
-    """Record the three roast marks, with the drop as a ``phase_changed``→cooling.
+    """Record run_started + the three marks on the REAL two-clock layout.
 
-    The drop is the transition into cooling (the controller's ``_drop_monotonic``,
-    #239) — a ``phase_changed`` event carrying ``{"phase": "cooling"}`` — NOT
-    ``run_completed``. Helper shared by the tests that only need a valid drop mark.
+    Event ``monotonic_seconds`` are ABSOLUTE (``_MONOTONIC_OFFSET`` + the
+    run-relative time), mirroring the store; ``run_started`` carries the offset so
+    the converter can rebase onto the run-relative telemetry clock. The drop is the
+    transition into cooling (the controller's ``_drop_monotonic``, #239) — a
+    ``phase_changed`` event with ``{"phase": "cooling"}`` — NOT ``run_completed``.
+    Shared by the tests that only need a valid drop mark.
     """
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.RUN_STARTED,
+        source=RoastEventSource.CONTROLLER,
+        monotonic_seconds=_MONOTONIC_OFFSET,
+    )
     await store.record_event(
         run_id=run_id,
         kind=RoastEventKind.T0_DETECTED,
         source=RoastEventSource.CONTROLLER,
-        monotonic_seconds=charge_s,
+        monotonic_seconds=_MONOTONIC_OFFSET + charge_s,
     )
     await store.record_event(
         run_id=run_id,
         kind=RoastEventKind.FIRST_CRACK,
         source=RoastEventSource.CONTROLLER,
-        monotonic_seconds=first_crack_s,
+        monotonic_seconds=_MONOTONIC_OFFSET + first_crack_s,
     )
     await store.record_event(
         run_id=run_id,
         kind=RoastEventKind.PHASE_CHANGED,
         source=RoastEventSource.CONTROLLER,
-        monotonic_seconds=drop_s,
+        monotonic_seconds=_MONOTONIC_OFFSET + drop_s,
         payload={"phase": RoastPhase.COOLING.value},
     )
 
@@ -94,7 +114,7 @@ async def _synthetic_store(
     drop_bean_temp_c: float = 194.0,
     cooled_bean_temp_c: float = 170.0,
     record_run_completed: bool = True,
-    outcome: str = "completed",
+    outcome: str | None = "completed",
 ) -> RoastStore:
     """Build a completed roast modelling the REAL drop→cooling→complete sequence.
 
@@ -125,10 +145,12 @@ async def _synthetic_store(
             roast-2-shaped run cooled but its MCP child segfaulted before COMPLETE
             — set ``False``).
         outcome: The terminal ``complete_run`` outcome (``completed`` / ``faulted``
-            / ``aborted``). Roast 2 was finalised ``faulted`` after the segfault.
-            A non-``completed`` outcome skips the operator rating (the store
-            rejects rating a faulted run only if uncompleted — here it is
-            finalised, so the rating is skipped for realism, not correctness).
+            / ``aborted``), or ``None`` to leave the run NEVER finalised
+            (``completed_at_utc`` stays NULL). The real roast 2 (``c3b84625``) is
+            the ``None`` case — its MCP child segfaulted and it was never
+            restart-finalised, so it has a NULL ``completed_at_utc`` and is only
+            reachable by an explicit ``--run-id``. A non-``completed`` outcome
+            skips the operator rating.
 
     Returns:
         The initialized, populated (still-open) store.
@@ -188,25 +210,33 @@ async def _synthetic_store(
         tick += 1
         elapsed += 5.0
 
-    # Events. The drop is the phase_changed→cooling transition (payload phase),
-    # NOT run_completed (which lands after the cooling tail).
+    # Events on the REAL two-clock layout: ABSOLUTE monotonic = _MONOTONIC_OFFSET +
+    # the run-relative time (telemetry above stays run-relative). run_started is the
+    # offset, the rebasing origin. The drop is the phase_changed→cooling transition
+    # (payload phase), NOT run_completed (which lands after the cooling tail).
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.RUN_STARTED,
+        source=RoastEventSource.CONTROLLER,
+        monotonic_seconds=_MONOTONIC_OFFSET,
+    )
     await store.record_event(
         run_id=run_id,
         kind=RoastEventKind.T0_DETECTED,
         source=RoastEventSource.CONTROLLER,
-        monotonic_seconds=charge_s,
+        monotonic_seconds=_MONOTONIC_OFFSET + charge_s,
     )
     await store.record_event(
         run_id=run_id,
         kind=RoastEventKind.FIRST_CRACK,
         source=RoastEventSource.CONTROLLER,
-        monotonic_seconds=first_crack_s,
+        monotonic_seconds=_MONOTONIC_OFFSET + first_crack_s,
     )
     await store.record_event(
         run_id=run_id,
         kind=RoastEventKind.PHASE_CHANGED,
         source=RoastEventSource.CONTROLLER,
-        monotonic_seconds=drop_s,
+        monotonic_seconds=_MONOTONIC_OFFSET + drop_s,
         payload={"phase": RoastPhase.COOLING.value},
     )
     if record_run_completed:
@@ -214,17 +244,18 @@ async def _synthetic_store(
             run_id=run_id,
             kind=RoastEventKind.RUN_COMPLETED,
             source=RoastEventSource.CONTROLLER,
-            monotonic_seconds=cooling_end_s,
+            monotonic_seconds=_MONOTONIC_OFFSET + cooling_end_s,
         )
 
-    terminal_phase = RoastPhase.FAULTED if outcome == "faulted" else RoastPhase.COMPLETE
-    await store.complete_run(
-        run_id=run_id,
-        outcome=outcome,  # type: ignore[arg-type]
-        agent_phase=terminal_phase,
-    )
-    if outcome == "completed" and rating is not None:
-        await store.set_operator_rating(run_id, rating=rating, notes=notes)  # type: ignore[arg-type]
+    if outcome is not None:
+        terminal_phase = RoastPhase.FAULTED if outcome == "faulted" else RoastPhase.COMPLETE
+        await store.complete_run(
+            run_id=run_id,
+            outcome=outcome,  # type: ignore[arg-type]
+            agent_phase=terminal_phase,
+        )
+        if outcome == "completed" and rating is not None:
+            await store.set_operator_rating(run_id, rating=rating, notes=notes)  # type: ignore[arg-type]
     return store
 
 
@@ -281,6 +312,35 @@ async def test_converter_emits_a_loadable_labelled_fixture(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_events_are_rebased_off_the_absolute_monotonic_clock(tmp_path: Path) -> None:
+    """Events (absolute monotonic) are rebased onto the run-relative telemetry clock.
+
+    The store keeps events on absolute ``time.monotonic()`` (here
+    ``_MONOTONIC_OFFSET`` + run-relative) but telemetry on a run-relative clock.
+    Treating them as one origin (the bug that shipped on the first fix) matches the
+    drop against telemetry that maxes near the run length, so it always resolves to
+    the LAST/cooled row → ``drop_temp_c`` off the cooled tail. With correct rebasing
+    the drop lands at the true drop (194 °C, ``core_medium``), and the emitted event
+    times are run-relative (drop at 720 s ≪ ``_MONOTONIC_OFFSET``).
+    """
+    db_path = tmp_path / "rebase.sqlite3"
+    store = await _synthetic_store(db_path, drop_bean_temp_c=194.0, cooled_bean_temp_c=150.0)
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    rows = [json.loads(line) for line in (out_dir / "roast.jsonl").read_text().splitlines()]
+    events = {r["kind"]: r["monotonic_seconds"] for r in rows if r["type"] == "event"}
+    # Run-relative, NOT absolute (would be ~500_000 if the offset leaked through).
+    assert events["beans_added"] == 60.0
+    assert events["first_crack_detected"] == 600.0
+    assert events["beans_dropped"] == 720.0
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["drop_temp_c"] == 194.0  # the true drop, not the 150 °C tail
+    assert summary["degree"] == "core_medium"
+
+
+@pytest.mark.asyncio
 async def test_unrated_roast_carries_null_label(tmp_path: Path) -> None:
     """An unrated roast still converts; the label fields are null, not missing."""
     db_path = tmp_path / "unrated.sqlite3"
@@ -318,14 +378,14 @@ async def test_over_roast_label_is_not_corrupted_by_the_cooling_tail(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_roast2_shaped_run_cooled_but_no_run_completed(tmp_path: Path) -> None:
-    """A roast-2-shaped run (cooled, no ``run_completed``) must still convert.
+async def test_roast2_shaped_run_cooled_but_never_finalised(tmp_path: Path) -> None:
+    """A roast-2-shaped run (cooled, NULL completed_at_utc) must still convert.
 
     Roast 2 (``c3b84625``) dropped + cooled but the MCP child segfaulted before
-    ``run_completed``; it was finalised ``faulted`` on the next restart. The drop
-    marker is the cooling transition, so the converter must produce a valid fixture
-    with no ``run_completed`` row at all — the case the old ``run_completed``-as-drop
-    logic raised "missing beans_dropped" on, on the exact roast the PR targets.
+    ``run_completed`` and was NEVER restart-finalised — its ``completed_at_utc`` is
+    NULL (verified in the real store). The explicit ``--run-id`` path must resolve
+    it regardless of completion (the marks-presence check is the real gate) and
+    read the drop off the cooling transition, with no ``run_completed`` row at all.
     """
     db_path = tmp_path / "roast2.sqlite3"
     store = await _synthetic_store(
@@ -333,11 +393,14 @@ async def test_roast2_shaped_run_cooled_but_no_run_completed(tmp_path: Path) -> 
         run_id="c3b84625",
         drop_bean_temp_c=193.0,
         record_run_completed=False,  # segfaulted before run_completed
-        outcome="faulted",  # finalised faulted on restart
+        outcome=None,  # NEVER finalised → completed_at_utc NULL
         rating=None,
     )
     await store.close()
 
+    # The no-arg auto-pick would NOT find it (no completed run); an explicit id must.
+    with pytest.raises(s2f.FixtureConversionError, match="no completed roast_runs"):
+        s2f.convert(db_path, tmp_path / "auto")
     out_dir = tmp_path / "fixture"
     entry = s2f.convert(db_path, out_dir, run_id="c3b84625")
     summary = json.loads((out_dir / "summary.json").read_text())
@@ -388,17 +451,21 @@ async def test_default_run_is_most_recent_completed(tmp_path: Path) -> None:
     assert entry["run_id"] == "newer"
 
 
-@pytest.mark.asyncio
-async def test_missing_marks_raises(tmp_path: Path) -> None:
-    """A completed run without the FC/drop marks is not a scorable fixture."""
-    db_path = tmp_path / "no-marks.sqlite3"
+async def _run_with_telemetry_and_run_started(db_path: Path, run_id: str = "bare") -> RoastStore:
+    """A completed run with run_started + telemetry but NO charge/FC/drop marks."""
     store = RoastStore(db_path=db_path)
     await store.initialize()
     await store.create_run(
-        run_id="bare", profile=_PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+        run_id=run_id, profile=_PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.RUN_STARTED,
+        source=RoastEventSource.CONTROLLER,
+        monotonic_seconds=_MONOTONIC_OFFSET,
     )
     await store.record_telemetry(
-        run_id="bare",
+        run_id=run_id,
         tick=0,
         agent_phase=RoastPhase.PREHEATING,
         elapsed_seconds=0.0,
@@ -407,7 +474,15 @@ async def test_missing_marks_raises(tmp_path: Path) -> None:
         heat_level_percent=100,
         fan_level_percent=30,
     )
-    await store.complete_run(run_id="bare", outcome="aborted", agent_phase=RoastPhase.COMPLETE)
+    await store.complete_run(run_id=run_id, outcome="aborted", agent_phase=RoastPhase.COMPLETE)
+    return store
+
+
+@pytest.mark.asyncio
+async def test_missing_marks_raises(tmp_path: Path) -> None:
+    """A run with run_started but no FC/drop marks is not a scorable fixture."""
+    db_path = tmp_path / "no-marks.sqlite3"
+    store = await _run_with_telemetry_and_run_started(db_path)
     await store.close()
 
     with pytest.raises(s2f.FixtureConversionError, match="required marks"):
@@ -415,12 +490,46 @@ async def test_missing_marks_raises(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_missing_run_started_raises(tmp_path: Path) -> None:
+    """No run_started event → the event/telemetry clocks cannot be reconciled."""
+    db_path = tmp_path / "no-run-started.sqlite3"
+    store = RoastStore(db_path=db_path)
+    await store.initialize()
+    await store.create_run(
+        run_id="r", profile=_PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    await store.record_telemetry(
+        run_id="r",
+        tick=0,
+        agent_phase=RoastPhase.DEVELOPMENT,
+        elapsed_seconds=0.0,
+        interval_seconds=0.0,
+        telemetry=RoastTelemetry(bean_temp_c=60.0, env_temp_c=80.0),
+        heat_level_percent=100,
+        fan_level_percent=30,
+    )
+    # Marks present, but NO run_started → no rebasing origin.
+    await store.record_event(
+        run_id="r",
+        kind=RoastEventKind.PHASE_CHANGED,
+        source=RoastEventSource.CONTROLLER,
+        monotonic_seconds=_MONOTONIC_OFFSET + 120.0,
+        payload={"phase": RoastPhase.COOLING.value},
+    )
+    await store.complete_run(run_id="r", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    await store.close()
+
+    with pytest.raises(s2f.FixtureConversionError, match="no run_started event"):
+        s2f.convert(db_path, tmp_path / "fixture")
+
+
+@pytest.mark.asyncio
 async def test_explicit_unknown_run_id_raises(tmp_path: Path) -> None:
-    """An explicit run id that is not a completed run raises, not silently picks another."""
+    """An explicit run id that does not exist raises, not silently picks another."""
     db_path = tmp_path / "one-run.sqlite3"
     store = await _synthetic_store(db_path, run_id="real")
     await store.close()
-    with pytest.raises(s2f.FixtureConversionError, match="no completed roast_run"):
+    with pytest.raises(s2f.FixtureConversionError, match="no roast_run with id"):
         s2f.convert(db_path, tmp_path / "fixture", run_id="ghost")
 
 

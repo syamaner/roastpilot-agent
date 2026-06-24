@@ -28,14 +28,21 @@ Event-kind mapping (store → the fixture's three event kinds):
   drop), so it would corrupt ``drop_temp_c`` + the degree label, and a roast that
   cooled-but-never-completed (e.g. roast 2) records no ``run_completed`` at all.
 
-Telemetry is emitted from charge through the drop only (parity with
-``alog_to_fixture``); the cooling tail is truncated so ``drop_temp_c`` reads the
-true drop, not a cooled-down sample. ``monotonic_seconds`` comes from the
-snapshot's stored ``elapsed_seconds`` (the controller clock the events are also
-stamped on, so telemetry and events are coherent), falling back to
-``tick × tick_interval`` when a row predates that column. Temperatures are
-Celsius throughout (the store keeps
-everything in °C).
+**Two clocks — reconciled via ``run_started``.** Telemetry ``elapsed_seconds``
+is **run-relative** (≈0 at the first tick), but ``roast_events.monotonic_seconds``
+is the **absolute** ``time.monotonic()`` reading (hundreds of thousands of
+seconds — process uptime). They do NOT share an origin. So every event time is
+rebased onto the telemetry clock by subtracting the ``run_started`` event's
+``monotonic_seconds`` (the controller's ``_run_started_monotonic``) before any
+nearest-row match or truncation. (A run with no ``run_started`` event — and so no
+resolvable offset — cannot be reconciled and is rejected.)
+
+The output fixture ``monotonic_seconds`` is on that single reconciled run-relative
+clock: telemetry from the snapshot's ``elapsed_seconds`` (``tick × tick_interval``
+fallback for a row predating the column), events rebased as above. Telemetry is
+emitted from charge through the drop only (parity with ``alog_to_fixture``); the
+cooling tail is truncated so ``drop_temp_c`` reads the true drop, not a cooled-down
+sample. Temperatures are Celsius throughout (the store keeps everything in °C).
 
 **Privacy (AGENTS.md invariant).** Real roast stores are the operator's personal
 data and are NEVER committed. This adapter reads a store **read-only** and writes
@@ -66,6 +73,7 @@ from roast_degree import classify_degree  # noqa: E402
 _TICK_INTERVAL_SECONDS = 1.0
 
 #: Store ``roast_events.kind`` → the fixture event kind the scorer requires.
+_RUN_STARTED_KIND = "run_started"
 _CHARGE_KIND = "t0_detected"
 _FIRST_CRACK_KIND = "first_crack"
 #: The drop instant is the transition INTO cooling (``_drop_monotonic``, #239),
@@ -101,10 +109,12 @@ class StoreRoast:
         telemetry: Tick-ordered telemetry rows (``tick`` / ``elapsed_seconds`` /
             ``bean_temp_c`` / ``env_temp_c`` / ``heat_level_percent`` /
             ``fan_level_percent``).
-        charge_seconds: ``t0_detected`` event time (controller clock), or ``None``.
-        first_crack_seconds: ``first_crack`` event time, or ``None``.
+        charge_seconds: ``t0_detected`` time, **rebased onto the run-relative
+            telemetry clock** (absolute event monotonic − ``run_started``), or
+            ``None``.
+        first_crack_seconds: ``first_crack`` time, rebased, or ``None``.
         drop_seconds: The drop instant — the transition into cooling
-            (``phase_changed`` with ``phase == "cooling"``) — or ``None``.
+            (``phase_changed`` with ``phase == "cooling"``) — rebased, or ``None``.
     """
 
     run_id: str
@@ -141,6 +151,13 @@ def _connect_readonly(db_path: Path) -> sqlite3.Connection:
 def _resolve_run_id(connection: sqlite3.Connection, run_id: str | None) -> str:
     """Resolve the run to export: the given id, or the most-recent completed run.
 
+    An **explicit** ``run_id`` resolves regardless of completion — the
+    marks-presence check is the real gate, and a roast that dropped + cooled but
+    never finalised (e.g. roast 2, whose MCP child segfaulted before COMPLETE so
+    ``completed_at_utc`` is NULL) is still a scorable fixture. The completed-run
+    filter applies only to the **no-arg auto-pick**, where "latest completed" is
+    the sensible default and an in-progress run must not be grabbed mid-roast.
+
     Args:
         connection: An open store connection.
         run_id: An explicit ``roast_runs.id``, or ``None`` to pick the latest
@@ -150,15 +167,16 @@ def _resolve_run_id(connection: sqlite3.Connection, run_id: str | None) -> str:
         The resolved run id.
 
     Raises:
-        FixtureConversionError: If no matching completed run exists.
+        FixtureConversionError: If the explicit id is unknown, or (auto-pick) the
+            store has no completed run.
     """
     if run_id is not None:
         row = connection.execute(
-            "SELECT id FROM roast_runs WHERE id = ? AND completed_at_utc IS NOT NULL",
+            "SELECT id FROM roast_runs WHERE id = ?",
             (run_id,),
         ).fetchone()
         if row is None:
-            raise FixtureConversionError(f"no completed roast_run with id {run_id!r}")
+            raise FixtureConversionError(f"no roast_run with id {run_id!r}")
         return str(row["id"])
     row = connection.execute(
         "SELECT id FROM roast_runs WHERE completed_at_utc IS NOT NULL"
@@ -262,6 +280,16 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
             }
             for row in telemetry_rows
         ]
+        # Reconcile the two clocks: roast_events.monotonic_seconds is ABSOLUTE
+        # time.monotonic(), telemetry.elapsed_seconds is run-relative. Rebase every
+        # event onto the telemetry clock by subtracting the run-start monotonic
+        # (the run_started event). Without it the clocks cannot be reconciled.
+        run_started = _event_time(connection, resolved, _RUN_STARTED_KIND)
+        if run_started is None:
+            raise FixtureConversionError(
+                f"run {resolved} has no run_started event — event/telemetry clocks "
+                f"cannot be reconciled"
+            )
         return StoreRoast(
             run_id=resolved,
             operator_rating=None
@@ -272,12 +300,32 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
             else str(run_row["operator_notes"]),
             roaster_driver=_ROASTER_DRIVER,
             telemetry=telemetry,
-            charge_seconds=_event_time(connection, resolved, _CHARGE_KIND),
-            first_crack_seconds=_event_time(connection, resolved, _FIRST_CRACK_KIND),
-            drop_seconds=_drop_time(connection, resolved),
+            charge_seconds=_rebase(_event_time(connection, resolved, _CHARGE_KIND), run_started),
+            first_crack_seconds=_rebase(
+                _event_time(connection, resolved, _FIRST_CRACK_KIND), run_started
+            ),
+            drop_seconds=_rebase(_drop_time(connection, resolved), run_started),
         )
     finally:
         connection.close()
+
+
+def _rebase(event_seconds: float | None, run_started_seconds: float) -> float | None:
+    """Rebase an absolute event time onto the run-relative telemetry clock.
+
+    Args:
+        event_seconds: An event's absolute ``time.monotonic()`` reading, or
+            ``None`` when the event is absent.
+        run_started_seconds: The ``run_started`` event's absolute monotonic time
+            (the run-relative origin).
+
+    Returns:
+        ``event_seconds - run_started_seconds`` (run-relative), or ``None`` when
+        the event was absent.
+    """
+    if event_seconds is None:
+        return None
+    return event_seconds - run_started_seconds
 
 
 def _telemetry_seconds(row: dict[str, Any]) -> float:
@@ -324,34 +372,38 @@ def build_fixture_rows(roast: StoreRoast) -> list[dict[str, Any]]:
         raise FixtureConversionError(f"run {roast.run_id} lacks required marks: {missing}")
 
     drop_seconds = float(roast.drop_seconds)  # type: ignore[arg-type]  # guarded above
-    rows: list[dict[str, Any]] = []
-    for row in roast.telemetry:
-        if row["bean_temp_c"] is None or row["env_temp_c"] is None:
-            # A telemetry row with no thermocouple reading carries no signal for
-            # the scorer; skip it rather than emit a null-temperature row that
-            # ``load_roast`` would choke on (it floats every temperature).
-            continue
-        # Truncate at the drop instant — parity with ``alog_to_fixture``, which
-        # emits start→drop only. The cooling tail (bean falling tens of °C) must
-        # NOT enter the fixture: it would pull ``drop_temp_c`` (nearest-row) down
-        # off the true drop and corrupt the degree label. A small epsilon keeps
-        # the row at the exact drop instant (inclusive, like the .alog adapter).
-        if _telemetry_seconds(row) > drop_seconds + 1e-6:
-            continue
-        rows.append(
-            {
-                "type": "telemetry",
-                "monotonic_seconds": round(_telemetry_seconds(row), 3),
-                "bean_temp_c": round(float(row["bean_temp_c"]), 1),
-                "env_temp_c": round(float(row["env_temp_c"]), 1),
-                "heat_level_percent": int(row["heat_level_percent"] or 0),
-                "fan_level_percent": int(row["fan_level_percent"] or 0),
-            }
-        )
-    if not rows:
+    # The thermocouple-readable rows in recorded order (a null-temperature row
+    # carries no signal for the scorer and would break ``load_roast``).
+    readable = [
+        row
+        for row in roast.telemetry
+        if row["bean_temp_c"] is not None and row["env_temp_c"] is not None
+    ]
+    if not readable:
         raise FixtureConversionError(
             f"run {roast.run_id} has no telemetry rows with temperature readings"
         )
+    # Truncate at the drop — parity with ``alog_to_fixture``, which emits start→drop
+    # inclusive (``range(drop_index + 1)`` where ``drop_index`` is the row NEAREST
+    # the drop). The drop instant typically falls BETWEEN two samples, so a strict
+    # time cutoff would drop the sample just after it — the one actually nearest the
+    # drop — landing ``drop_temp_c`` one row early (off the true drop). Keep through
+    # the nearest row instead; the cooling tail beyond it never enters the fixture.
+    drop_index = min(
+        range(len(readable)),
+        key=lambda i: abs(_telemetry_seconds(readable[i]) - drop_seconds),
+    )
+    rows: list[dict[str, Any]] = [
+        {
+            "type": "telemetry",
+            "monotonic_seconds": round(_telemetry_seconds(row), 3),
+            "bean_temp_c": round(float(row["bean_temp_c"]), 1),
+            "env_temp_c": round(float(row["env_temp_c"]), 1),
+            "heat_level_percent": int(row["heat_level_percent"] or 0),
+            "fan_level_percent": int(row["fan_level_percent"] or 0),
+        }
+        for row in readable[: drop_index + 1]
+    ]
     for kind, when in (
         ("beans_added", roast.charge_seconds),
         ("first_crack_detected", roast.first_crack_seconds),
