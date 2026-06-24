@@ -170,15 +170,40 @@ def test_roast_profile_pre_fc_levers_round_trip() -> None:
     assert RoastProfile.model_validate_json(profile.model_dump_json()) == profile
 
 
-@pytest.mark.parametrize("bad", [-1, 101])
-def test_roast_profile_pre_fc_levers_reject_out_of_percent_range(bad: int) -> None:
-    """D59: the per-bean pre-FC targets are bounded 0–100 like every lever; an
-    out-of-percent value is rejected at construction (the runtime fan-ceiling
-    bound is enforced by the policy, this is just the field-level 0–100 guard)."""
+@pytest.mark.parametrize("bad", [101, 200])
+def test_roast_profile_pre_fc_levers_reject_above_percent_ceiling(bad: int) -> None:
+    """D59: the per-bean pre-FC targets are bounded ``le=100`` like every lever; a
+    value above the percent ceiling is rejected at construction (the runtime
+    fan-ceiling bound is enforced by the policy — this is the field-level guard)."""
     with pytest.raises(pydantic.ValidationError):
         RoastProfile.model_validate(_profile(pre_fc_heat=bad))
     with pytest.raises(pydantic.ValidationError):
         RoastProfile.model_validate(_profile(pre_fc_fan=bad))
+
+
+def test_roast_profile_pre_fc_heat_rejects_near_zero_floor() -> None:
+    """D59 (#318 follow-up): ``pre_fc_heat`` is bounded ``ge=10`` (not 0) to match
+    ``LateMaillardTrim.trim_heat_percent`` and the "no near-zero heat during active
+    roasting" invariant — a typo'd near-zero pre-FC heat would stall the roast, so
+    it is rejected at construction. ``10`` (the boundary) and ``None`` are valid."""
+    with pytest.raises(pydantic.ValidationError):
+        RoastProfile.model_validate(_profile(pre_fc_heat=9))
+    with pytest.raises(pydantic.ValidationError):
+        RoastProfile.model_validate(_profile(pre_fc_heat=0))
+    with pytest.raises(pydantic.ValidationError):
+        RoastProfile.model_validate(_profile(pre_fc_heat=-1))
+    assert RoastProfile.model_validate(_profile(pre_fc_heat=10)).pre_fc_heat == 10
+    assert RoastProfile.model_validate(_profile(pre_fc_heat=None)).pre_fc_heat is None
+
+
+def test_roast_profile_pre_fc_fan_allows_low_and_zero() -> None:
+    """D59: ``pre_fc_fan`` keeps the ``ge=0`` floor (asymmetric with ``pre_fc_heat``'s
+    ``ge=10``) — a low or zero pre-FC fan is a legitimate airflow choice, unlike a
+    near-zero heat that would stall the roast."""
+    assert RoastProfile.model_validate(_profile(pre_fc_fan=0)).pre_fc_fan == 0
+    assert RoastProfile.model_validate(_profile(pre_fc_fan=9)).pre_fc_fan == 9
+    with pytest.raises(pydantic.ValidationError):
+        RoastProfile.model_validate(_profile(pre_fc_fan=-1))
 
 
 def test_roast_profile_bean_identity_populated() -> None:

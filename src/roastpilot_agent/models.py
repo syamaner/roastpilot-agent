@@ -336,7 +336,7 @@ class _BeanProfileFieldsBase(BaseModel):
     charge_guidance_max_c: float = 200.0
     initial_heat_percent: int = Field(ge=0, le=100)
     initial_fan_percent: int = Field(ge=0, le=100)
-    pre_fc_heat: int | None = Field(default=None, ge=0, le=100)
+    pre_fc_heat: int | None = Field(default=None, ge=10, le=100)
     """The per-bean deterministic pre-first-crack HEAT target the controller
     drives every tick pre-FC (D59 / #318, option C; refines D35). When set, it
     replaces the global :class:`~roastpilot_agent.config.PreFirstCrackLevers`
@@ -345,7 +345,11 @@ class _BeanProfileFieldsBase(BaseModel):
     only SEEDS the ``start_run`` command and is then overwritten by the
     deterministic policy — ``pre_fc_heat`` is the value the policy actually holds
     to first crack. Optional / defaulted ``None`` for back-compat so every frozen
-    ``profile_json`` and saved template from before #318 still deserializes. The
+    ``profile_json`` and saved template from before #318 still deserializes.
+    Bounded ``ge=10`` (not 0) to match
+    :attr:`~roastpilot_agent.config.LateMaillardTrim.trim_heat_percent` and the
+    "no near-zero heat during active roasting" invariant: a typo'd near-zero
+    pre-FC heat would stall the roast, so it is rejected at construction. The
     resolved value stays bounded by the pre-FC safety box (the policy clamps it
     in range; the #327 trim still composes ≤ the resolved floor)."""
     pre_fc_fan: int | None = Field(default=None, ge=0, le=100)
