@@ -50,6 +50,41 @@ _PROFILE = RoastProfile(
 )
 
 
+async def _record_marks(
+    store: RoastStore,
+    run_id: str,
+    *,
+    charge_s: float,
+    first_crack_s: float,
+    drop_s: float,
+) -> None:
+    """Record the three roast marks, with the drop as a ``phase_changed``→cooling.
+
+    The drop is the transition into cooling (the controller's ``_drop_monotonic``,
+    #239) — a ``phase_changed`` event carrying ``{"phase": "cooling"}`` — NOT
+    ``run_completed``. Helper shared by the tests that only need a valid drop mark.
+    """
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.T0_DETECTED,
+        source=RoastEventSource.CONTROLLER,
+        monotonic_seconds=charge_s,
+    )
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.FIRST_CRACK,
+        source=RoastEventSource.CONTROLLER,
+        monotonic_seconds=first_crack_s,
+    )
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.PHASE_CHANGED,
+        source=RoastEventSource.CONTROLLER,
+        monotonic_seconds=drop_s,
+        payload={"phase": RoastPhase.COOLING.value},
+    )
+
+
 async def _synthetic_store(
     db_path: Path,
     *,
@@ -57,21 +92,43 @@ async def _synthetic_store(
     rating: int | None = 4,
     notes: str | None = "bright, clean",
     drop_bean_temp_c: float = 194.0,
+    cooled_bean_temp_c: float = 170.0,
+    record_run_completed: bool = True,
+    outcome: str = "completed",
 ) -> RoastStore:
-    """Build a small completed roast in a fresh store via the real write API.
+    """Build a completed roast modelling the REAL drop→cooling→complete sequence.
 
-    Lays down a charge → first-crack → drop timeline: telemetry every 5 s on the
-    controller clock, a ``t0_detected`` / ``first_crack`` / ``run_completed``
-    event at the matching instants, run completion, and (optionally) an operator
-    rating. The drop telemetry row is forced to ``drop_bean_temp_c`` so the degree
-    classification is deterministic.
+    The drop is the transition INTO cooling — a ``phase_changed`` event carrying
+    ``{"phase": "cooling"}`` at ``drop_bean_temp_c`` — NOT ``run_completed`` (which
+    fires later, at COOLING→COMPLETE, after the bean has cooled to
+    ``cooled_bean_temp_c``). So the timeline is:
+
+    - charge (``t0_detected``) → first crack (``first_crack``) → a heating ramp to
+      ``drop_bean_temp_c`` (telemetry every 5 s);
+    - the drop: a ``phase_changed`` → cooling event at the ramp's peak;
+    - a descending cooling tail (telemetry every 5 s down toward
+      ``cooled_bean_temp_c``) the converter must NOT include;
+    - (optionally) a ``run_completed`` event after the cooling tail.
+
+    A correct converter must read the drop temp / degree from the cooling
+    transition, never the cooled tail or ``run_completed`` — the gap between
+    ``drop_bean_temp_c`` and ``cooled_bean_temp_c`` is what proves it.
 
     Args:
         db_path: Where to create the store.
         run_id: The run id to seed.
         rating: The operator rating to stamp (or ``None`` to leave unrated).
         notes: The operator notes.
-        drop_bean_temp_c: Bean temperature at the drop instant.
+        drop_bean_temp_c: Bean temperature at the drop (cooling transition).
+        cooled_bean_temp_c: Bean temperature the cooling tail descends to.
+        record_run_completed: Emit a ``run_completed`` event after cooling (a
+            roast-2-shaped run cooled but its MCP child segfaulted before COMPLETE
+            — set ``False``).
+        outcome: The terminal ``complete_run`` outcome (``completed`` / ``faulted``
+            / ``aborted``). Roast 2 was finalised ``faulted`` after the segfault.
+            A non-``completed`` outcome skips the operator rating (the store
+            rejects rating a faulted run only if uncompleted — here it is
+            finalised, so the rating is skipped for realism, not correctness).
 
     Returns:
         The initialized, populated (still-open) store.
@@ -86,8 +143,10 @@ async def _synthetic_store(
     )
 
     charge_s, first_crack_s, drop_s = 60.0, 600.0, 720.0
-    # Telemetry every 5 s from charge through drop; a gentle ramp to the drop temp.
+    cooling_end_s = 960.0  # 240 s cooling tail after the drop
     tick = 0
+
+    # Heating ramp from charge through the drop, peaking at drop_bean_temp_c.
     elapsed = 0.0
     while elapsed <= drop_s:
         if abs(elapsed - drop_s) < 1e-6:
@@ -108,20 +167,63 @@ async def _synthetic_store(
         tick += 1
         elapsed += 5.0
 
-    for kind, when in (
-        (RoastEventKind.T0_DETECTED, charge_s),
-        (RoastEventKind.FIRST_CRACK, first_crack_s),
-        (RoastEventKind.RUN_COMPLETED, drop_s),
-    ):
+    # Descending COOLING tail (the bean falls toward cooled_bean_temp_c). A correct
+    # converter truncates these rows out of the fixture; including them would drag
+    # drop_temp_c down off the true drop.
+    elapsed = drop_s + 5.0
+    while elapsed <= cooling_end_s:
+        frac = (elapsed - drop_s) / (cooling_end_s - drop_s)
+        bean = drop_bean_temp_c - (drop_bean_temp_c - cooled_bean_temp_c) * frac
+        await store.record_telemetry(
+            run_id=run_id,
+            tick=tick,
+            agent_phase=RoastPhase.COOLING,
+            elapsed_seconds=elapsed,
+            interval_seconds=0.0,
+            telemetry=RoastTelemetry(bean_temp_c=bean, env_temp_c=bean + 5.0, cooling_on=True),
+            heat_level_percent=0,
+            fan_level_percent=100,
+            development_percent=None,
+        )
+        tick += 1
+        elapsed += 5.0
+
+    # Events. The drop is the phase_changed→cooling transition (payload phase),
+    # NOT run_completed (which lands after the cooling tail).
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.T0_DETECTED,
+        source=RoastEventSource.CONTROLLER,
+        monotonic_seconds=charge_s,
+    )
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.FIRST_CRACK,
+        source=RoastEventSource.CONTROLLER,
+        monotonic_seconds=first_crack_s,
+    )
+    await store.record_event(
+        run_id=run_id,
+        kind=RoastEventKind.PHASE_CHANGED,
+        source=RoastEventSource.CONTROLLER,
+        monotonic_seconds=drop_s,
+        payload={"phase": RoastPhase.COOLING.value},
+    )
+    if record_run_completed:
         await store.record_event(
             run_id=run_id,
-            kind=kind,
+            kind=RoastEventKind.RUN_COMPLETED,
             source=RoastEventSource.CONTROLLER,
-            monotonic_seconds=when,
+            monotonic_seconds=cooling_end_s,
         )
 
-    await store.complete_run(run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
-    if rating is not None:
+    terminal_phase = RoastPhase.FAULTED if outcome == "faulted" else RoastPhase.COMPLETE
+    await store.complete_run(
+        run_id=run_id,
+        outcome=outcome,  # type: ignore[arg-type]
+        agent_phase=terminal_phase,
+    )
+    if outcome == "completed" and rating is not None:
         await store.set_operator_rating(run_id, rating=rating, notes=notes)  # type: ignore[arg-type]
     return store
 
@@ -141,10 +243,16 @@ async def test_converter_emits_a_loadable_labelled_fixture(tmp_path: Path) -> No
     fixture = out_dir / "roast.jsonl"
     telemetry, ground = bakeoff_replay.load_roast(fixture)
     assert telemetry, "expected telemetry rows"
+    # The drop is the cooling transition (720 s, bean 194), NOT run_completed
+    # (960 s, bean cooled to 170): drop_temp_c must read the true drop.
     assert ground.drop_temp_c == 194.0
     assert ground.first_crack_seconds == 600.0
     assert ground.drop_seconds == 720.0
     assert ground.t0_seconds == 60.0
+    # The cooling tail is truncated: no telemetry row past the drop instant, and
+    # nothing as cool as the cooled-down tail (which would corrupt drop_temp_c).
+    assert all(float(r["monotonic_seconds"]) <= 720.0 for r in telemetry)
+    assert min(float(r["bean_temp_c"]) for r in telemetry[-3:]) > 170.0
 
     # summary.json carries the #300 outcome label.
     summary = json.loads((out_dir / "summary.json").read_text())
@@ -153,6 +261,8 @@ async def test_converter_emits_a_loadable_labelled_fixture(tmp_path: Path) -> No
     assert summary["degree"] == "core_medium"  # drop 194 ≤ 195
     assert summary["source"] == "agent-store"
     assert summary["drop_temp_c"] == 194.0
+    # total_roast_seconds is charge→drop (660 s), NOT charge→run_completed.
+    assert summary["total_roast_seconds"] == 660.0
     # Parity with alog_to_fixture's summary keys.
     for key in (
         "active",
@@ -183,6 +293,59 @@ async def test_unrated_roast_carries_null_label(tmp_path: Path) -> None:
     assert summary["operator_rating"] is None
     assert summary["operator_notes"] is None
     assert summary["degree"] == "soft_medium"  # 195 < 196.5 ≤ 197
+
+
+@pytest.mark.asyncio
+async def test_over_roast_label_is_not_corrupted_by_the_cooling_tail(tmp_path: Path) -> None:
+    """The exact triage bug: an over-done drop whose cooled tail looks core_medium.
+
+    Drop at 198 °C (> 197 → ``over``) but the cooling tail falls to 170 °C
+    (≤ 195 → ``core_medium``). Reading the drop off ``run_completed`` / the cooled
+    tail would mislabel it ``core_medium`` — the converter must read the cooling
+    transition and label it ``over`` (the verified ``fa24e673`` failure mode).
+    """
+    db_path = tmp_path / "over.sqlite3"
+    store = await _synthetic_store(
+        db_path, drop_bean_temp_c=198.0, cooled_bean_temp_c=170.0, rating=2
+    )
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["drop_temp_c"] == 198.0
+    assert summary["degree"] == "over"  # would be core_medium off the cooled tail
+
+
+@pytest.mark.asyncio
+async def test_roast2_shaped_run_cooled_but_no_run_completed(tmp_path: Path) -> None:
+    """A roast-2-shaped run (cooled, no ``run_completed``) must still convert.
+
+    Roast 2 (``c3b84625``) dropped + cooled but the MCP child segfaulted before
+    ``run_completed``; it was finalised ``faulted`` on the next restart. The drop
+    marker is the cooling transition, so the converter must produce a valid fixture
+    with no ``run_completed`` row at all — the case the old ``run_completed``-as-drop
+    logic raised "missing beans_dropped" on, on the exact roast the PR targets.
+    """
+    db_path = tmp_path / "roast2.sqlite3"
+    store = await _synthetic_store(
+        db_path,
+        run_id="c3b84625",
+        drop_bean_temp_c=193.0,
+        record_run_completed=False,  # segfaulted before run_completed
+        outcome="faulted",  # finalised faulted on restart
+        rating=None,
+    )
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    entry = s2f.convert(db_path, out_dir, run_id="c3b84625")
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["drop_temp_c"] == 193.0
+    assert summary["degree"] == "core_medium"
+    _, ground = bakeoff_replay.load_roast(out_dir / "roast.jsonl")
+    assert ground.drop_seconds == 720.0
+    assert entry["run_id"] == "c3b84625"
 
 
 @pytest.mark.asyncio
@@ -217,17 +380,7 @@ async def test_default_run_is_most_recent_completed(tmp_path: Path) -> None:
         heat_level_percent=40,
         fan_level_percent=30,
     )
-    for kind, when in (
-        (RoastEventKind.T0_DETECTED, 0.0),
-        (RoastEventKind.FIRST_CRACK, 90.0),
-        (RoastEventKind.RUN_COMPLETED, 120.0),
-    ):
-        await store.record_event(
-            run_id="newer",
-            kind=kind,
-            source=RoastEventSource.CONTROLLER,
-            monotonic_seconds=when,
-        )
+    await _record_marks(store, "newer", charge_s=0.0, first_crack_s=90.0, drop_s=120.0)
     await store.complete_run(run_id="newer", outcome="completed", agent_phase=RoastPhase.COMPLETE)
     await store.close()
 
@@ -329,14 +482,7 @@ async def test_telemetry_seconds_falls_back_to_tick_when_elapsed_null(tmp_path: 
             ("r", tick, "2026-01-01T00:00:00+00:00", "development", bean, bean + 20, 100, 30),
         )
     await store.connection.commit()
-    for kind, when in (
-        (RoastEventKind.T0_DETECTED, 0.0),
-        (RoastEventKind.FIRST_CRACK, 90.0),
-        (RoastEventKind.RUN_COMPLETED, 120.0),
-    ):
-        await store.record_event(
-            run_id="r", kind=kind, source=RoastEventSource.CONTROLLER, monotonic_seconds=when
-        )
+    await _record_marks(store, "r", charge_s=0.0, first_crack_s=90.0, drop_s=120.0)
     await store.complete_run(run_id="r", outcome="completed", agent_phase=RoastPhase.COMPLETE)
     await store.close()
 
@@ -386,14 +532,7 @@ async def test_null_temperature_rows_are_skipped(tmp_path: Path) -> None:
         heat_level_percent=40,
         fan_level_percent=30,
     )
-    for kind, when in (
-        (RoastEventKind.T0_DETECTED, 0.0),
-        (RoastEventKind.FIRST_CRACK, 90.0),
-        (RoastEventKind.RUN_COMPLETED, 120.0),
-    ):
-        await store.record_event(
-            run_id="r", kind=kind, source=RoastEventSource.CONTROLLER, monotonic_seconds=when
-        )
+    await _record_marks(store, "r", charge_s=0.0, first_crack_s=90.0, drop_s=120.0)
     await store.complete_run(run_id="r", outcome="completed", agent_phase=RoastPhase.COMPLETE)
     await store.close()
 
@@ -431,14 +570,7 @@ async def _completed_run_with_events_only(db_path: Path, run_id: str = "r") -> R
     await store.create_run(
         run_id=run_id, profile=_PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
     )
-    for kind, when in (
-        (RoastEventKind.T0_DETECTED, 0.0),
-        (RoastEventKind.FIRST_CRACK, 90.0),
-        (RoastEventKind.RUN_COMPLETED, 120.0),
-    ):
-        await store.record_event(
-            run_id=run_id, kind=kind, source=RoastEventSource.CONTROLLER, monotonic_seconds=when
-        )
+    await _record_marks(store, run_id, charge_s=0.0, first_crack_s=90.0, drop_s=120.0)
     await store.complete_run(run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
     return store
 

@@ -21,12 +21,20 @@ Event-kind mapping (store → the fixture's three event kinds):
 - ``t0_detected`` → ``beans_added`` (the charge/turning-point instant the agent
   origins its roast clock on);
 - ``first_crack`` → ``first_crack_detected``;
-- ``run_completed`` → ``beans_dropped`` (the drop / end-of-roast instant).
+- the transition INTO cooling (a ``phase_changed`` event with ``phase ==
+  "cooling"``, where the controller sets ``_drop_monotonic``, #239) →
+  ``beans_dropped`` — the true drop instant. NOT ``run_completed``: that fires at
+  COOLING→COMPLETE *after* the cooling tail (bean already tens of °C below the
+  drop), so it would corrupt ``drop_temp_c`` + the degree label, and a roast that
+  cooled-but-never-completed (e.g. roast 2) records no ``run_completed`` at all.
 
-Telemetry ``monotonic_seconds`` comes from the snapshot's stored
-``elapsed_seconds`` (the controller clock the events are also stamped on, so
-telemetry and events are coherent), falling back to ``tick × tick_interval`` when
-a row predates that column. Temperatures are Celsius throughout (the store keeps
+Telemetry is emitted from charge through the drop only (parity with
+``alog_to_fixture``); the cooling tail is truncated so ``drop_temp_c`` reads the
+true drop, not a cooled-down sample. ``monotonic_seconds`` comes from the
+snapshot's stored ``elapsed_seconds`` (the controller clock the events are also
+stamped on, so telemetry and events are coherent), falling back to
+``tick × tick_interval`` when a row predates that column. Temperatures are
+Celsius throughout (the store keeps
 everything in °C).
 
 **Privacy (AGENTS.md invariant).** Real roast stores are the operator's personal
@@ -60,7 +68,14 @@ _TICK_INTERVAL_SECONDS = 1.0
 #: Store ``roast_events.kind`` → the fixture event kind the scorer requires.
 _CHARGE_KIND = "t0_detected"
 _FIRST_CRACK_KIND = "first_crack"
-_DROP_KIND = "run_completed"
+#: The drop instant is the transition INTO cooling (``_drop_monotonic``, #239),
+#: emitted as a ``phase_changed`` event whose payload ``phase`` is ``cooling``
+#: (controller.py). It is NOT ``run_completed`` — that fires at COOLING→COMPLETE,
+#: *after* the cooling tail, by which point the bean has fallen tens of °C below
+#: the true drop temperature (so ``run_completed`` would corrupt ``drop_temp_c``
+#: and the degree label, and roast 2 never recorded one at all).
+_PHASE_CHANGED_KIND = "phase_changed"
+_COOLING_PHASE = "cooling"
 
 #: The roaster the agent runs (Hottop), matching the ``.alog`` fixtures' summary.
 #: The frozen ``profile_json`` / ``config_json`` carry no driver id (it is an
@@ -88,7 +103,8 @@ class StoreRoast:
             ``fan_level_percent``).
         charge_seconds: ``t0_detected`` event time (controller clock), or ``None``.
         first_crack_seconds: ``first_crack`` event time, or ``None``.
-        drop_seconds: ``run_completed`` event time, or ``None``.
+        drop_seconds: The drop instant — the transition into cooling
+            (``phase_changed`` with ``phase == "cooling"``) — or ``None``.
     """
 
     run_id: str
@@ -176,6 +192,36 @@ def _event_time(connection: sqlite3.Connection, run_id: str, kind: str) -> float
     return float(row["monotonic_seconds"])
 
 
+def _drop_time(connection: sqlite3.Connection, run_id: str) -> float | None:
+    """The drop instant: the earliest transition INTO cooling, or ``None``.
+
+    The drop is the ``phase_changed`` event whose payload ``phase`` is
+    ``cooling`` (controller.py sets ``_drop_monotonic`` on that transition, #239),
+    NOT ``run_completed`` (which fires after the cooling tail). Filtered with
+    ``json_extract`` on the stored payload so a non-cooling ``phase_changed`` (the
+    other transitions all emit the same kind) is never mistaken for the drop.
+
+    Args:
+        connection: An open store connection.
+        run_id: The run id.
+
+    Returns:
+        The drop's ``monotonic_seconds`` (controller clock), or ``None`` when the
+        run never transitioned into cooling (never dropped) or recorded it without
+        a timestamp.
+    """
+    row = connection.execute(
+        "SELECT monotonic_seconds FROM roast_events"
+        " WHERE run_id = ? AND kind = ? AND monotonic_seconds IS NOT NULL"
+        " AND json_extract(payload_json, '$.phase') = ?"
+        " ORDER BY recorded_at_utc ASC, id ASC LIMIT 1",
+        (run_id, _PHASE_CHANGED_KIND, _COOLING_PHASE),
+    ).fetchone()
+    if row is None or row["monotonic_seconds"] is None:
+        return None
+    return float(row["monotonic_seconds"])
+
+
 def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
     """Read one completed roast out of the agent SQLite store (read-only).
 
@@ -228,7 +274,7 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
             telemetry=telemetry,
             charge_seconds=_event_time(connection, resolved, _CHARGE_KIND),
             first_crack_seconds=_event_time(connection, resolved, _FIRST_CRACK_KIND),
-            drop_seconds=_event_time(connection, resolved, _DROP_KIND),
+            drop_seconds=_drop_time(connection, resolved),
         )
     finally:
         connection.close()
@@ -277,12 +323,20 @@ def build_fixture_rows(roast: StoreRoast) -> list[dict[str, Any]]:
     if missing:
         raise FixtureConversionError(f"run {roast.run_id} lacks required marks: {missing}")
 
+    drop_seconds = float(roast.drop_seconds)  # type: ignore[arg-type]  # guarded above
     rows: list[dict[str, Any]] = []
     for row in roast.telemetry:
         if row["bean_temp_c"] is None or row["env_temp_c"] is None:
             # A telemetry row with no thermocouple reading carries no signal for
             # the scorer; skip it rather than emit a null-temperature row that
             # ``load_roast`` would choke on (it floats every temperature).
+            continue
+        # Truncate at the drop instant — parity with ``alog_to_fixture``, which
+        # emits start→drop only. The cooling tail (bean falling tens of °C) must
+        # NOT enter the fixture: it would pull ``drop_temp_c`` (nearest-row) down
+        # off the true drop and corrupt the degree label. A small epsilon keeps
+        # the row at the exact drop instant (inclusive, like the .alog adapter).
+        if _telemetry_seconds(row) > drop_seconds + 1e-6:
             continue
         rows.append(
             {
