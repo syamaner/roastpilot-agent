@@ -105,6 +105,21 @@
 
 ## Active Context
 
+**23 Jun 2026 (later) — MCP v0.1.7 BACKDATING LOCKSTEP COMPLETE. The only remaining gate is the
+operator running roast 4.** `coffee-roaster-mcp` **v0.1.7 released** (operator-approved publish): #169
+(auto-T0 → turning point) + #170 (FC → crack onset) backdating, on PyPI + the MCP Registry.
+The agent-side consumer **#337 merged (#362, `7f70fd1`; plan D57)**: bumps the pin 0.1.6 → 0.1.7 and
+honours the backdated timestamps by subtracting the MCP-domain backdating *delta* from the agent's
+receive clock (never the non-comparable absolute cross-process value), failing closed to receive-tick
+when fields are absent/invalid. Independent D23 review caught that the author's "display-only"
+self-assessment was wrong: the backdated clocks feed `_development_percent`, which the #313
+drop-coherence guard reads → the advisor drop releases ~1-2 pp earlier on a truer dev% (fails safe;
+the #327 trim's FC-ETA is charge-clock-independent, so the trim is unaffected). **OPERATOR-CONFIRMED
+decision:** accept the ~1-2 pp-earlier release with `drop_dev_margin_percent` UNCHANGED at the 3 pp
+default, and **RE-CHECK where the advisor drop releases on roast 4**, tuning the margin only if needed
+(memory `roast4-drop-release-watch-337`). Reviews: safety not-blocking, mcp-contract-checker PASS,
+claude-review no-blockers. This supersedes the "open/gated" framings for #169/#170/#337 below.
+
 **23 Jun 2026 — ROAST-4 PREP CYCLE COMPLETE (first run under the new PR-hygiene discipline,
 #356). Before-roast-4 reliability/readability shipped; one cleanup closed as superseded; the
 DRYING_END landmark added end-to-end. The next gate is the operator running roast 4.** Worked the
@@ -193,7 +208,7 @@ D-numbers still want the operator's plan commit:** the #327 trim (plan §3 / §8
 - **#337** — honours MCP v0.1.7 backdated T0/FC (IN PR #362). NOT display-only: the backdated
   clocks raise `_development_percent` (~+1.8 pp), which the #313 drop-coherence guard reads →
   advisor-drop-release ~1-2 pp earlier (truer dev%, fails safe — a guard REJECT is still a held
-  drop, no roaster write). PM-relayed decision (to confirm with the operator): keep
+  drop, no roaster write). **MERGED #362 (D57); OPERATOR-CONFIRMED decision:** keep
   `drop_dev_margin_percent` unchanged at the 3 pp default, RE-CHECK on roast 4 and tune only if
   needed. Mechanism: the controller subtracts the MCP-domain backdating *delta* (`confirmed_at −
   onset`, surfaced on `RoastTelemetry`) from its own receive-tick clock — never the cross-process
