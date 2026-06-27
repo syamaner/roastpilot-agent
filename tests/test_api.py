@@ -1379,6 +1379,56 @@ async def _tick(service: RoastService, clock: FakeClock) -> bool:
     return await service.runner.tick_once()
 
 
+def _start_session_roast_nums(mcp: FakeMCPClient) -> list[int | None]:
+    """The recording_roast_num captured on each FakeMCPClient start_session call."""
+    return [
+        cast("int | None", args["recording_roast_num"])
+        for name, args in mcp.calls
+        if name == "start_session"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recording_roast_num_is_store_derived_per_origin(
+    store: RoastStore,
+) -> None:
+    """#385: the recording roast number handed to the MCP is prior COMPLETED roasts
+    of this origin + 1 — stable across the per-process counter (a fresh service per
+    run would otherwise always pass 1)."""
+    profile = _profile(origin="Colombia")
+
+    # A fresh service starts the first Colombia roast: store has no completed runs
+    # → roast_num 1. Then finalise it so it counts toward the next.
+    mcp1 = FakeMCPClient()
+    service1 = RoastService(
+        store,
+        config=AppConfig(),
+        roaster=mcp1,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        exporter=mcp1,
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    detail = await service1.start_roast(profile)
+    assert _start_session_roast_nums(mcp1) == [1]
+    await store.complete_run(run_id=detail.id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+
+    # A brand-new service (per-process counter reset to 0) starts a second Colombia
+    # roast: the store-derived count makes it roast_num 2, not 1.
+    mcp2 = FakeMCPClient()
+    service2 = RoastService(
+        store,
+        config=AppConfig(),
+        roaster=mcp2,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        exporter=mcp2,
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    await service2.start_roast(profile)
+    assert _start_session_roast_nums(mcp2) == [2]
+
+
 def _session_state(*, fc_status: str, audio_running: bool) -> RoastSessionState:
     """A minimal valid ``RoastSessionState`` with the first-crack status set (#197)."""
     fc = FirstCrackStatus(

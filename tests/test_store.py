@@ -302,6 +302,7 @@ from roastpilot_agent.models import (  # noqa: E402
     RoastPhase,
     RoastProfile,
     RoastTelemetry,
+    recording_origin_slug,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict  # noqa: E402
 
@@ -1394,5 +1395,93 @@ async def test_list_runs_maps_every_column_to_its_field(tmp_store: RoastStore) -
         assert summary.advisor_clamped == 2
         assert summary.advisor_rejected == 1
         assert summary.advisor_failed == 3
+    finally:
+        await tmp_store.close()
+
+
+def _origin_profile(origin: str) -> RoastProfile:
+    return RoastProfile(
+        name=f"{origin} test",
+        bean_origin=origin,
+        bean_weight_grams=250.0,
+        initial_heat_percent=70,
+        initial_fan_percent=40,
+        target_drop_temp_c=205.0,
+        target_development_percent=20.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_count_completed_runs_for_origin_counts_only_finalised_matches(
+    tmp_store: RoastStore,
+) -> None:
+    """#385: the per-origin recording count is prior COMPLETED runs of the same
+    origin slug — excluding other origins and the still-active (uncompleted) run."""
+    await tmp_store.initialize()
+    try:
+        colombia = _origin_profile("Colombia")
+        ethiopia = _origin_profile("Ethiopia")
+        slug = recording_origin_slug(colombia)
+        assert slug is not None
+
+        # First roast of the bean: no prior completed runs.
+        assert await tmp_store.count_completed_runs_for_origin(slug) == 0
+
+        # Two completed Colombia roasts + one completed Ethiopia + one active
+        # Colombia run that must NOT count (not finalised).
+        for run_id, profile in (
+            ("c1", colombia),
+            ("c2", colombia),
+            ("e1", ethiopia),
+        ):
+            await tmp_store.create_run(
+                run_id=run_id,
+                profile=profile,
+                config=AppConfig(),
+                agent_phase=RoastPhase.STARTING,
+            )
+            await tmp_store.complete_run(
+                run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE
+            )
+        await tmp_store.create_run(
+            run_id="c-active",
+            profile=colombia,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+
+        # Two completed Colombia → next Colombia roast is roast_num 3.
+        assert await tmp_store.count_completed_runs_for_origin(slug) == 2
+        ethiopia_slug = recording_origin_slug(ethiopia)
+        assert ethiopia_slug is not None
+        assert await tmp_store.count_completed_runs_for_origin(ethiopia_slug) == 1
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_count_completed_runs_for_origin_counts_finalised_faulted(
+    tmp_store: RoastStore,
+) -> None:
+    """#385: a faulted-but-FINALISED run consumed a recording slot, so it counts
+    (the criterion is ``completed_at_utc IS NOT NULL``, not a 'completed' outcome)."""
+    await tmp_store.initialize()
+    try:
+        colombia = _origin_profile("Colombia")
+        slug = recording_origin_slug(colombia)
+        assert slug is not None
+        await tmp_store.create_run(
+            run_id="c-faulted",
+            profile=colombia,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await tmp_store.complete_run(
+            run_id="c-faulted",
+            outcome="faulted",
+            agent_phase=RoastPhase.FAULTED,
+            fault_reason="test",
+        )
+        assert await tmp_store.count_completed_runs_for_origin(slug) == 1
     finally:
         await tmp_store.close()

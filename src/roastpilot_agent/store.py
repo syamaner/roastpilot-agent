@@ -41,6 +41,7 @@ from roastpilot_agent.models import (
     TimelineEvent,
     TimelineSafetyEvaluation,
     TimelineVerdict,
+    recording_origin_slug,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
 
@@ -477,6 +478,43 @@ class RoastStore:
             ),
         )
         await self.connection.commit()
+
+    async def count_completed_runs_for_origin(self, origin_slug: str) -> int:
+        """Count prior *completed* roasts whose origin slug matches (#385).
+
+        The per-origin recording roast number (the MCP ``set_recording_metadata``
+        filename counter) is derived as ``this count + 1`` so numbering is stable
+        and meaningful across agent restarts, replacing the per-process counter
+        that reset to 0 each restart (colliding two roasts of the same bean).
+
+        "Completed" means ``completed_at_utc IS NOT NULL`` — a finalised run,
+        whatever its outcome (a faulted-but-finalised roast still consumed a
+        recording slot). The active run being started is excluded by definition (it
+        is not yet completed). The origin is derived from each completed run's
+        frozen ``profile_json`` via the shared :func:`recording_origin_slug`, the
+        same slug the controller hands the MCP, so the count and the filename agree.
+
+        Args:
+            origin_slug: The recording-origin slug to match (from
+                :func:`recording_origin_slug` on the new run's profile).
+
+        Returns:
+            The number of completed runs with the same origin slug (``0`` when this
+            is the first roast of the bean).
+        """
+        cursor = await self.connection.execute(
+            "SELECT profile_json FROM roast_runs WHERE completed_at_utc IS NOT NULL"
+        )
+        rows = await cursor.fetchall()
+        count = 0
+        for row in rows:
+            try:
+                profile = RoastProfile.model_validate_json(str(row["profile_json"]))
+            except ValueError:  # pragma: no cover - a frozen profile is always valid
+                continue
+            if recording_origin_slug(profile) == origin_slug:
+                count += 1
+        return count
 
     async def update_run_phase(self, run_id: str, agent_phase: RoastPhase) -> None:
         """Persist the last-known agent phase (the recovery read, E6-S3).

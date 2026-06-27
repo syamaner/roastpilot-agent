@@ -80,6 +80,7 @@ from roastpilot_agent.models import (
     SseEventType,
     TelemetryEventData,
     TelemetrySeries,
+    recording_origin_slug,
 )
 from roastpilot_agent.safety import (
     OPERATOR_ACTION_COMMAND,
@@ -553,12 +554,20 @@ class RoastRunner:
         self._t0_persisted = False
         self._scheduler: TickScheduler | None = None
 
-    async def start(self, profile: RoastProfile) -> None:
+    async def start(self, profile: RoastProfile, *, recording_roast_num: int | None = None) -> None:
         """Begin the run: drive the controller's idle→preheating start, then
         flush its startup events and persist the resulting phase. Issues the
         profile's initial heat/fan through the controller's safety policy (never
-        raw) — the controller owns that, not the runner."""
-        await self._controller.start_run(profile)
+        raw) — the controller owns that, not the runner.
+
+        Args:
+            profile: The roast profile to start.
+            recording_roast_num: The store-derived per-origin recording roast
+                number (#385), forwarded to the controller for the MCP recording
+                filename. ``None`` lets the controller fall back to its per-process
+                counter.
+        """
+        await self._controller.start_run(profile, recording_roast_num=recording_roast_num)
         await self._flush_events()
         await self._persist_phase_if_changed()
 
@@ -1330,9 +1339,44 @@ class RoastService:
         runner = self._build_runner(run_id)
         if runner is None:  # pragma: no cover — guarded by the caller
             return
-        await runner.start(profile)
+        recording_roast_num = await self._recording_roast_num(profile)
+        await runner.start(profile, recording_roast_num=recording_roast_num)
         if self._run_loop:
             self._loop_task = asyncio.create_task(runner.run())
+
+    async def _recording_roast_num(self, profile: RoastProfile) -> int | None:
+        """The store-derived per-origin recording roast number (#385).
+
+        Prior completed roasts of this profile's origin + 1, so the MCP recording
+        filename counter is stable and meaningful across agent restarts (the
+        per-process counter reset to 0 each restart, colliding same-bean roasts).
+
+        Best-effort: returns ``None`` when the profile yields no origin slug (the
+        controller then skips the metadata call) or when the count query fails for
+        any reason — the controller falls back to its per-process counter rather
+        than blocking the roast on a recording-naming detail.
+
+        Args:
+            profile: The roast profile being started.
+
+        Returns:
+            The 1-based per-origin roast number, or ``None`` to defer to the
+            controller's per-process fallback.
+        """
+        origin_slug = recording_origin_slug(profile)
+        if origin_slug is None:
+            return None
+        try:
+            prior = await self._store.count_completed_runs_for_origin(origin_slug)
+        except Exception:  # pragma: no cover - defensive; never block the roast
+            _log.warning(
+                "count_completed_runs_for_origin failed (origin=%r); "
+                "falling back to the per-process recording roast number",
+                origin_slug,
+                exc_info=True,
+            )
+            return None
+        return prior + 1
 
     def _build_runner(self, run_id: str) -> "RoastRunner | None":
         """Construct a controller + runner bound to ``run_id`` (shared by the

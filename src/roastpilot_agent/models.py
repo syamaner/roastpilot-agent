@@ -10,6 +10,7 @@ invariant. Use ``.value`` at serialization boundaries.
 """
 
 import json
+import re
 from enum import Enum
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -473,6 +474,48 @@ class RoastProfile(_BeanProfileFieldsBase):
     """
 
     bean_weight_grams: float = Field(gt=0)
+
+
+def recording_origin_slug(profile: RoastProfile) -> str | None:
+    """Derive a recording-origin slug from a roast profile (v0.1.9, #176).
+
+    Joins the populated ``country`` / ``bean_origin`` / ``name`` fields into a
+    lowercase hyphen slug (e.g. ``"colombia-excelso-huila-washed"``) so the MCP
+    export filename carries a human-readable origin. The MCP re-slugifies, so this
+    only needs to surface the identity words; punctuation and spacing are
+    normalised to single hyphens.
+
+    Those three fields routinely overlap (the Colombia seed has country ==
+    bean_origin == ``"Colombia"`` and a ``"Colombia ..."`` name), so repeated
+    words are deduped, first-seen order preserved. If no field yields any slug
+    characters (all empty / punctuation-only), returns ``None`` so the caller
+    skips the metadata call and the MCP falls back safely.
+
+    Lives in ``models`` (with :class:`RoastProfile`) so the per-origin
+    recording-count query in :mod:`store` (#385) can derive the same slug from a
+    completed run's frozen ``profile_json`` without importing the controller.
+
+    Args:
+        profile: The active roast profile.
+
+    Returns:
+        A hyphen-slug like ``"colombia-excelso-huila-washed"``, or ``None`` when
+        no usable identity text is available.
+    """
+    parts = [profile.country, profile.bean_origin, profile.name]
+    raw = " ".join(part for part in parts if part)
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    # country / bean_origin / name routinely overlap (the Colombia seed has
+    # country "Colombia", bean_origin "Colombia", name "Colombia Excelso Huila
+    # (Washed)" → "colombia-colombia-colombia-..."), so dedupe repeated words,
+    # preserving first-seen order, for a clean origin like "colombia-excelso-huila-washed".
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for word in slug.split("-"):
+        if word and word not in seen:
+            seen.add(word)
+            deduped.append(word)
+    return "-".join(deduped) or None
 
 
 class BeanProfile(_BeanProfileFieldsBase):

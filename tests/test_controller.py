@@ -2961,6 +2961,33 @@ async def test_start_run_sets_recording_metadata_before_session() -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_run_uses_store_derived_recording_roast_num() -> None:
+    """#385: a store-derived per-origin roast number passed to start_run is used
+    in the recording metadata, overriding the per-process counter (which on a
+    fresh controller would be 1)."""
+    harness = make_harness(readings=[reading()])
+    await harness.controller.start_run(PROFILE, recording_roast_num=7)
+    assert harness.controller.phase is RoastPhase.PREHEATING
+    assert harness.executor.start_session_metadata == [("ethiopia-harness", 7)]
+
+
+@pytest.mark.asyncio
+async def test_start_run_falls_back_to_per_process_roast_num_when_none() -> None:
+    """#385: with no store-derived number (a direct caller / a count failure), the
+    per-process counter still advances and is used — best-effort, never blocking."""
+    harness = make_harness(readings=[reading(), reading()])
+    await harness.controller.start_run(PROFILE, recording_roast_num=None)
+    # Drive back to idle so a second run is legal, then start again.
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    harness.controller.transition_to(RoastPhase.IDLE)
+    await harness.controller.start_run(PROFILE, recording_roast_num=None)
+    assert harness.executor.start_session_metadata == [
+        ("ethiopia-harness", 1),
+        ("ethiopia-harness", 2),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "persisted",
     [
