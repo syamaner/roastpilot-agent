@@ -84,27 +84,39 @@ AsyncSleep = Callable[[float], Awaitable[None]]
 def recording_origin_slug(profile: RoastProfile) -> str | None:
     """Derive a recording-origin slug from a roast profile (v0.1.9, #176).
 
-    Builds a lowercase ``country-origin`` slug (e.g. ``"colombia-huila"``) from
-    the profile's bean identity so the MCP export filename carries a human-readable
-    origin. The MCP re-slugifies, so this only needs to surface the country / origin
-    words; punctuation and spacing are normalised to single hyphens.
+    Joins the populated ``country`` / ``bean_origin`` / ``name`` fields into a
+    lowercase hyphen slug (e.g. ``"colombia-excelso-huila-washed"``) so the MCP
+    export filename carries a human-readable origin. The MCP re-slugifies, so this
+    only needs to surface the identity words; punctuation and spacing are
+    normalised to single hyphens.
 
-    The slug prefers the producing ``country`` then the ``bean_origin``, falling
-    back to the bean ``name`` — using whatever identity fields are populated. If no
-    field yields any slug characters (all empty / punctuation-only), returns
-    ``None`` so the caller skips the metadata call and the MCP falls back safely.
+    Those three fields routinely overlap (the Colombia seed has country ==
+    bean_origin == ``"Colombia"`` and a ``"Colombia ..."`` name), so repeated
+    words are deduped, first-seen order preserved. If no field yields any slug
+    characters (all empty / punctuation-only), returns ``None`` so the caller
+    skips the metadata call and the MCP falls back safely.
 
     Args:
         profile: The active roast profile.
 
     Returns:
-        A hyphen-slug like ``"colombia-huila"``, or ``None`` when no usable
-        identity text is available.
+        A hyphen-slug like ``"colombia-excelso-huila-washed"``, or ``None`` when
+        no usable identity text is available.
     """
     parts = [profile.country, profile.bean_origin, profile.name]
     raw = " ".join(part for part in parts if part)
     slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
-    return slug or None
+    # country / bean_origin / name routinely overlap (the Colombia seed has
+    # country "Colombia", bean_origin "Colombia", name "Colombia Excelso Huila
+    # (Washed)" → "colombia-colombia-colombia-..."), so dedupe repeated words,
+    # preserving first-seen order, for a clean origin like "colombia-excelso-huila-washed".
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for word in slug.split("-"):
+        if word and word not in seen:
+            seen.add(word)
+            deduped.append(word)
+    return "-".join(deduped) or None
 
 
 class InvalidTransitionError(Exception):

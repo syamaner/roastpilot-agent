@@ -2862,7 +2862,7 @@ async def test_failed_start_session_faults_cleanly() -> None:
     assert harness.executor.targets == []  # no half-started run, no writes
 
 
-def test_recording_origin_slug_prefers_country_then_origin() -> None:
+def test_recording_origin_slug_joins_identity_and_dedupes_repeats() -> None:
     profile = RoastProfile(
         name="Roast 5",
         bean_origin="Huila",
@@ -2877,6 +2877,20 @@ def test_recording_origin_slug_prefers_country_then_origin() -> None:
     assert recording_origin_slug(profile) == "colombia-huila-roast-5"
     # No country: falls back to origin + name.
     assert recording_origin_slug(PROFILE) == "ethiopia-harness"
+    # Repeated words across country / bean_origin / name are deduped — the real
+    # Colombia seed has country == bean_origin == "Colombia" and a "Colombia ..."
+    # name, which without dedup slugs to "colombia-colombia-colombia-...".
+    redundant = RoastProfile(
+        name="Colombia Excelso Huila (Washed)",
+        bean_origin="Colombia",
+        country="Colombia",
+        bean_weight_grams=250.0,
+        initial_heat_percent=70,
+        initial_fan_percent=40,
+        target_drop_temp_c=195.0,
+        target_development_percent=13.0,
+    )
+    assert recording_origin_slug(redundant) == "colombia-excelso-huila-washed"
 
 
 @pytest.mark.asyncio
