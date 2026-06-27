@@ -2563,6 +2563,62 @@ async def test_t0_backdate_latched_when_it_arrives_mid_streak() -> None:
 
 
 @pytest.mark.asyncio
+async def test_t0_lands_at_turning_point_on_realistic_charge_crash() -> None:
+    """#387: a dry-run replay of the roast-6 charge crash proves T0 stamps at the
+    bean-temp turning point, NOT ~11 s late.
+
+    Reproduces the roast-6 shape (trace ``~/roasts/roastpilot.sqlite3`` run
+    ``d251013e…``, ``auto_t0_drop_threshold_c=25``): the bean peaks at 174 °C (the
+    turning point) at MCP-elapsed 351.759, then crashes on the charge; the MCP
+    confirms auto-T0 8 s later (at 359.758) when the bean has dropped 25 °C, and
+    reports a turning-point backdate of ``confirmed − turning_point = 8.0`` s.
+
+    The agent receives ``t0_detected`` at ≈ the MCP confirmation instant, so its
+    first-detect anchor equals that confirmation tick; subtracting the MCP backdate
+    (confirmation − turning point) lands the charge origin EXACTLY on the turning
+    point — the agent applies the FULL delta and does not double-count its own
+    debounce anchor against the MCP backdate. That is why roast-6's stamped T0 sat
+    ~2 s (sampling granularity) from the 174 °C peak, NOT 11 s late.
+    """
+    harness = make_harness()
+    debounce = harness.controller._config.t0_debounce_ticks  # pyright: ignore[reportPrivateUsage]
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+
+    # Climb to the 174 °C peak; the LAST rising sample is the turning point.
+    rising = [150.0, 157.0, 163.0, 167.0, 170.0, 172.0, 174.0]
+    for bean in rising:
+        harness.reader.readings = [reading(bean=bean, t0_detected=False)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    turning_point_monotonic = harness.clock.now - 1.0  # the 174 °C tick instant
+
+    # The charge crash. The MCP only confirms once the bean has dropped past the
+    # threshold, so the agent first sees ``t0_detected`` on the confirmation tick;
+    # the agent debounce then needs ``debounce`` consecutive detected ticks. Every
+    # detected tick carries the SAME backdate the MCP computed at confirmation:
+    # ``mcp_confirmation − turning_point``. The first detected tick lands at the
+    # current clock, so that backdate is exactly ``now − turning_point``.
+    mcp_backdate = harness.clock.now - turning_point_monotonic
+    bean = 166.0
+    for _ in range(debounce):
+        harness.reader.readings = [
+            reading(bean=bean, t0_detected=True, t0_backdate_seconds=mcp_backdate)
+        ]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean -= 6.0
+
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    # The charge clock origins on the 174 °C turning point — the agent's debounce
+    # anchor (first detect) minus the MCP backdate composes to the peak instant,
+    # never the later confirmation/transition tick.
+    charge = harness.controller._charge_monotonic  # pyright: ignore[reportPrivateUsage]
+    assert charge == pytest.approx(turning_point_monotonic)
+
+
+@pytest.mark.asyncio
 async def test_t0_charge_clock_re_anchors_after_a_broken_streak() -> None:
     """#174: a broken debounce streak discards the stale candidate charge instant;
     the charge clock origins on the POST-break first detect, never the pre-break
