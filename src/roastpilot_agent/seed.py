@@ -72,9 +72,15 @@ COLOMBIA_HUILA_ID = "seed-colombia-excelso-huila-washed"
 #: more forgiving than the delicate Koke natural, so the targets sit at a
 #: balanced-medium starting point the operator edits to taste. The drop ceiling
 #: stays at the operator's proven 195 °C known-good line (bitter > 196 °C), which
-#: also keeps momentum headroom for the #336 anticipatory-trim validation; the
-#: development target is a touch fuller (15 %, matching the operator's verified
-#: 15–16 % DTR) for the bean's chocolate / body. All temperatures are Celsius.
+#: also keeps momentum headroom for the #336 anticipatory-trim validation. The
+#: development target is 18 % DTR (up from the Koke's light 13 %): a washed,
+#: dense, high-grown bean rewards MORE development for chocolate / body than a
+#: delicate natural. 18 % is the convergence of our own corpus (Costa Rica
+#: high-grown washed analog ~17.7 %; pooled high-grown washed ~17.1 %) and the
+#: external consensus (Roast Rebels' SAME-machine Hottop KN-8828B-2K page = 19 %
+#: for SHB South/Central American; Rao 20–25 % general, pulled toward the low end
+#: by the small 250 g / high-burner-ratio batch), biased low to protect the
+#: bright citrus. Research note 2026-06-27. All temperatures are Celsius.
 COLOMBIA_HUILA_SEED = BeanProfile(
     id=COLOMBIA_HUILA_ID,
     created_at=_SEED_TIMESTAMP,
@@ -100,7 +106,10 @@ COLOMBIA_HUILA_SEED = BeanProfile(
     # anticipatory trim headroom against the roast-3 momentum overshoot. Edit up
     # toward a fuller medium once the trim is validated on hardware.
     target_drop_temp_c=195.0,
-    target_development_percent=15.0,
+    # 18 % DTR — washed high-grown bean wants more development than the delicate
+    # Koke natural (13 %). Corpus + same-machine external research converge ~18 %
+    # (see the docstring above); biased low (18 vs 19–22) to keep the citrus.
+    target_development_percent=18.0,
     default_bean_weight_grams=250.0,  # 1 kg / 4 batches
     description=(
         "Huila, southern Colombia. Excelso grade, washed; grown 1,200–2,000 m on "
