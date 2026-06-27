@@ -105,6 +105,30 @@
 
 ## Active Context
 
+**27 Jun 2026 — STATE SYNC (no code). `main` @ `92cdab3`; the autonomous/no-hardware backlog is
+fully cleared and roast 4 (#134) is re-validated as the sole next operator gate.** Two housekeeping
+items this session, no roaster behaviour touched:
+
+- **#318 is CLOSED + merged** (the D59 read-out slice #374/#375/#376 landed) — the "Untouched: #318"
+  lines in the 24 Jun / 22 Jun blocks below are SUPERSEDED; there is no open #318 work.
+- **#342 ambient covariate — sensor decision synced across all surfaces (plan D60).** The operator
+  ordered the **Yoctopuce Yocto-Meteo-V2-C USB probe** (in transit, 27 Jun); it supersedes the
+  issue's original Home-Assistant-REST plan. Plan `D60` was already committed (`roastpilot-plan`
+  `c3bad82`); this session re-synced the **#342 issue title + Integration section**, the
+  `operator-decisions-318-342-176` memory, and this registry to match. **#342 becomes agent-startable
+  the moment the probe arrives** — a single no-roast build (read the triad over USB at charge, fail
+  soft to null, store on `roast_run`, add `yoctopuce` to `pyproject.toml`). NOT on the GitHub project
+  board (project 5 tracks only a subset; #134 isn't on it either — board reconciliation is a separate
+  operator call).
+
+Everything else remains exactly as the 24 Jun block records: **roast 4 (#134) is the keystone gate**
+(validates the #336 trim + c3 prompt + MCP 0.1.8 on hardware; gates E11/E12/#323/#228/#277/M2). The
+config that roast 4 must validate is confirmed live on `main`: MCP pin `0.1.8` (`pyproject.toml:115`),
+`late_maillard_trim` default 65 %/60 s/155 °C (`config.py` `LateMaillardTrim`, default fields ~L126–138), advisor `prompt_version="c3"`
+(`config.py:479`). Operator prerequisite unchanged: a **fresh, non-expiring OpenRouter key** (the
+13 Jun attempt-1 failure mode). Open operator action carried over: arm the `review-gate` required
+check (#159 / D58).
+
 **24 Jun 2026 — PRE-ROAST-4 RELIABILITY + CLEANUP BATCH COMPLETE (the measured "after-v2"
 PR-hygiene sample). The next gate remains the operator running roast 4.** Four issues closed as
 lead/PM with engineer/reviewer teammates; every PR through `pr-preflight` (gates + self-critique +
