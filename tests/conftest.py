@@ -66,9 +66,16 @@ class FakeMCPClient:
             raise frame
         return frame
 
-    async def start_session(self) -> None:
+    async def start_session(
+        self, *, recording_origin: str | None = None, recording_roast_num: int | None = None
+    ) -> None:
         self._log.append("start_session")
-        self.calls.append(("start_session", {}))
+        self.calls.append(
+            (
+                "start_session",
+                {"recording_origin": recording_origin, "recording_roast_num": recording_roast_num},
+            )
+        )
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
         self._log.append("set_targets")
@@ -145,10 +152,15 @@ class RecordingExecutor:
         self.targets: list[tuple[int, int]] = []
         self.estop_reasons: list[str] = []
         self.commands: list[str] = []
+        #: (recording_origin, recording_roast_num) captured per start_session call.
+        self.start_session_metadata: list[tuple[str | None, int | None]] = []
 
-    async def start_session(self) -> None:
+    async def start_session(
+        self, *, recording_origin: str | None = None, recording_roast_num: int | None = None
+    ) -> None:
         self._log.append("start_session")
         self.commands.append("start_session")
+        self.start_session_metadata.append((recording_origin, recording_roast_num))
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
         self._log.append("set_targets")

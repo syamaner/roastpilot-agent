@@ -14,6 +14,7 @@ fan (``operator_recovery_required``).
 
 import asyncio
 import math
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -78,6 +79,32 @@ __all__ = [
 
 Clock = Callable[[], float]
 AsyncSleep = Callable[[float], Awaitable[None]]
+
+
+def recording_origin_slug(profile: RoastProfile) -> str | None:
+    """Derive a recording-origin slug from a roast profile (v0.1.9, #176).
+
+    Builds a lowercase ``country-origin`` slug (e.g. ``"colombia-huila"``) from
+    the profile's bean identity so the MCP export filename carries a human-readable
+    origin. The MCP re-slugifies, so this only needs to surface the country / origin
+    words; punctuation and spacing are normalised to single hyphens.
+
+    The slug prefers the producing ``country`` then the ``bean_origin``, falling
+    back to the bean ``name`` — using whatever identity fields are populated. If no
+    field yields any slug characters (all empty / punctuation-only), returns
+    ``None`` so the caller skips the metadata call and the MCP falls back safely.
+
+    Args:
+        profile: The active roast profile.
+
+    Returns:
+        A hyphen-slug like ``"colombia-huila"``, or ``None`` when no usable
+        identity text is available.
+    """
+    parts = [profile.country, profile.bean_origin, profile.name]
+    raw = " ".join(part for part in parts if part)
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    return slug or None
 
 
 class InvalidTransitionError(Exception):
@@ -183,8 +210,18 @@ class StateReader(Protocol):
 class CommandExecutor(Protocol):
     """Executes safety-approved roaster writes (E5 wraps the MCP tools)."""
 
-    async def start_session(self) -> None:
-        """Start a new MCP roast session."""
+    async def start_session(
+        self, *, recording_origin: str | None = None, recording_roast_num: int | None = None
+    ) -> None:
+        """Start a new MCP roast session.
+
+        Args:
+            recording_origin: Optional origin slug for the export filename
+                (v0.1.9 ``set_recording_metadata``, #176); ``None`` lets the MCP
+                fall back to its default naming.
+            recording_roast_num: Optional per-origin roast counter; ``None``
+                falls back with ``recording_origin``.
+        """
         ...
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
@@ -627,6 +664,12 @@ class RoastController:
         self._advisory_policy = AdvisoryCallPolicy(config)
         self._current_heat = 0
         self._current_fan = 0
+        # Per-process roast counter for the v0.1.9 recording filename (#176).
+        # The MCP filename only needs origin + an incrementing number; a simple
+        # monotonic per-controller-lifetime counter (incremented at each
+        # start_run) gives that without coupling the start path to the store.
+        # Best-effort and advisory-only: it never touches control or safety.
+        self._recording_roast_num = 0
         # Fail-closed retry latch (#206 / PR review, blocker finding). The
         # heat-off / safe-fan write is applied ONCE on entry into a terminal HOLD
         # phase. If that write (or an e-stop) fails TRANSIENTLY, the roaster may
@@ -2211,8 +2254,22 @@ class RoastController:
         # new roast fires on its own merits, not on a previous run's timer.
         self._advisory_policy = AdvisoryCallPolicy(self._config)
         self._consecutive_advisor_failures = 0  # new run: availability streak resets (D30)
+        # v0.1.9 recording metadata (#176): derive an origin slug from the bean
+        # profile + a per-process roast counter, and hand them to start_session so
+        # set_recording_metadata fires BEFORE start_roast_session (the MCP applies
+        # the filename only if metadata precedes the session). Skipped when the
+        # profile yields no slug — the MCP then falls back safely. The counter
+        # increments per run regardless; recording naming is best-effort and never
+        # blocks the roast (the executor swallows + logs a metadata failure).
+        recording_origin = recording_origin_slug(profile)
+        self._recording_roast_num += 1
         try:
-            await self._executor.start_session()
+            await self._executor.start_session(
+                recording_origin=recording_origin,
+                recording_roast_num=(
+                    self._recording_roast_num if recording_origin is not None else None
+                ),
+            )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "start_roast_session"})
             self.transition_to(RoastPhase.FAULTED)

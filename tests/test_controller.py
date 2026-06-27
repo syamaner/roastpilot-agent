@@ -40,6 +40,7 @@ from roastpilot_agent.controller import (
     RoastController,
     RoastPhase,
     TickScheduler,
+    recording_origin_slug,
 )
 from roastpilot_agent.models import (
     AdvisorHealth,
@@ -2847,13 +2848,46 @@ async def test_start_run_clamps_initial_targets_to_pre_fc_box() -> None:
 @pytest.mark.asyncio
 async def test_failed_start_session_faults_cleanly() -> None:
     class FailingStartExecutor(RecordingExecutor):
-        async def start_session(self) -> None:
+        async def start_session(
+            self,
+            *,
+            recording_origin: str | None = None,
+            recording_roast_num: int | None = None,
+        ) -> None:
             raise RuntimeError("mcp down")
 
     harness = make_harness(readings=[reading()], executor=FailingStartExecutor())
     await harness.controller.start_run(PROFILE)
     assert harness.controller.phase is RoastPhase.FAULTED
     assert harness.executor.targets == []  # no half-started run, no writes
+
+
+def test_recording_origin_slug_prefers_country_then_origin() -> None:
+    profile = RoastProfile(
+        name="Roast 5",
+        bean_origin="Huila",
+        country="Colombia",
+        bean_weight_grams=250.0,
+        initial_heat_percent=70,
+        initial_fan_percent=40,
+        target_drop_temp_c=205.0,
+        target_development_percent=20.0,
+    )
+    # country + origin + name, lowercased and hyphen-slugged.
+    assert recording_origin_slug(profile) == "colombia-huila-roast-5"
+    # No country: falls back to origin + name.
+    assert recording_origin_slug(PROFILE) == "ethiopia-harness"
+
+
+@pytest.mark.asyncio
+async def test_start_run_sets_recording_metadata_before_session() -> None:
+    """The v0.1.9 recording metadata (#176) is derived from the profile and
+    handed to start_session (which fires set_recording_metadata FIRST)."""
+    harness = make_harness(readings=[reading()])
+    await harness.controller.start_run(PROFILE)
+    assert harness.controller.phase is RoastPhase.PREHEATING
+    # origin slug derived from the profile; roast_num is the per-process counter.
+    assert harness.executor.start_session_metadata == [("ethiopia-harness", 1)]
 
 
 @pytest.mark.asyncio
