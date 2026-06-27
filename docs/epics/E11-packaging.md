@@ -71,12 +71,53 @@ Acceptance criteria:
   upgrade (`pipx upgrade`), log access, the mDNS access story. Follows the plan's
   accuracy boundaries (no "fully autonomous"/"production-ready" pre-hardware-validation).
 
+### E11-S3 — Pi 5 dual-mic recording + FC-detection CPU soak (overflow validation)
+
+The dual-mic roast audio capture (#176) is **CPU-heavy and shares the audio path with
+FC detection**, so on the constrained Pi it must be soak-validated before the appliance
+ships with recording on.
+
+**Why this story exists (roast 5, 27 Jun):** on the *Mac*, the recording WAV flush
+packed each 16k-sample block one sample at a time via `struct.pack` in a Python loop
+(GIL held ~3.6 ms), in the detector capture worker **and** the 2nd-mic thread — that
+stalled the detector read enough to overflow the mic input **30 consecutive reads →
+audio faulted, FC dead, roast aborted**. Fixed in **coffee-roaster-mcp#180**
+(numpy-vectorised flush, 0.28 ms, 13×, byte-identical PCM16); a 2.5-min Mac soak at
+`onnx_threads=8`, both mics, then showed **max 1 consecutive overflow, no fault**.
+
+**The Pi risk:** the Mac has huge CPU headroom that hid the margin. The Pi 5 is far
+tighter — RP1 xHCI, fewer/slower cores, **`onnx_threads=2`**, int8 — running the 2-mic
+capture + 2 WAV writers + ONNX inference + the USB-serial on one budget. The #180 fix is
+**necessary but may not be sufficient** on the Pi.
+
+Acceptance criteria:
+
+- [ ] **Sustained soak on the Pi 5** (real appliance load, several minutes, both mics +
+  detector + a live/dry roast): the consecutive-overflow counter stays well under the
+  fatal threshold and the audio never faults. Method: the `audio.py` "overflowed (N
+  consecutive)" log + the dashboard mic-status — the same gate used on the Mac soak.
+- [ ] If the Pi overflows even with #180, apply optimisation levers (in order) and
+  re-soak: **(a)** move the teed WAV write off the detector read loop — bounded queue +
+  a separate writer thread (the structural decouple, the #180 follow-on); **(b)** lower
+  the recording flush threshold; **(c)** drop to **single-mic capture on the Pi** (the
+  detector mic only, or one extra); **(d)** trim the detector cost (window/overlap/
+  threads); **(e)** fall back to a separate capture process. Record which lever the Pi
+  needed.
+- [ ] Deployment doc notes the recording CPU cost + the validated appliance config (mic
+  count, `onnx_threads`, flush threshold).
+
+Depends on coffee-roaster-mcp#180 (the flush fix) + #176 (recording). Pairs with the
+local Pi dual-mic capture validation (research 27 Jun: no published Pi-5 CPU numbers; the
+CM4 dwc2 USB gap does not apply to the Pi 5's RP1 xHCI; independent streams are not
+sample-locked, which is fine for FC training).
+
 ## Status
 
 | Story | Title | Status |
 |-------|-------|--------|
 | E11-S1 | Wheel with bundled SPA + the `[pi]` extra | not started |
 | E11-S2 | Native installer, systemd unit, bundled model, deploy doc | not started |
+| E11-S3 | Pi 5 dual-mic recording + FC-detection CPU soak (overflow validation) | not started |
 
 Epic status: **not started — BLOCKED.** Two gates before any story starts: (1) the
 **operator manual tests** (D28) — **#135 ✅ DONE**, **#134** the sole remaining operator

@@ -105,6 +105,57 @@
 
 ## Active Context
 
+**27 Jun 2026 (later) — ROASTS 5 + 6 + MCP 0.1.9 + the recording-overflow saga. Roast 6 is the
+FIRST FULL-STACK SUCCESS with auto-FC; roast 5 aborted on a recording regression, since fixed. All
+agent work stays on `feature/134-roast4-colombia-huila-seed` (NO PR yet — still the roast branch).**
+The session built the FC training-data flywheel onto live hardware and shook out the decoupling
+invariant (D65) the hard way.
+
+- **MCP 0.1.9 RELEASED** (operator-approved publish; PyPI + MCP Registry): **#175** (per-window FC
+  confidence observability — `fc_window` log rows + a `first_crack_detection` summary) + **#176**
+  (config-driven roast audio capture: mono + **multi-device "option A" = two INDEPENDENT USB-mic
+  streams, NOT sample-locked** — research-confirmed fine for FC training; + a record-check CLI + the
+  **14th tool `set_recording_metadata(origin, roast_num)`** + `record_mics`-compatible naming
+  `mic{N}-{origin}-roast{N}.wav` + a session JSON).
+- **Agent-side 0.1.9 integration DONE** (the local "task #9"), all on `feature/134`, safety-reviewer
+  **PASS:** pin bump 0.1.8 → 0.1.9, the `mcp_client` mirror for the 14th tool, and
+  `controller.start_run` now derives a deduped `recording_origin_slug` + a per-process `roast_num`
+  and calls `set_recording_metadata` **BEFORE `start_roast_session`** (HARD ordering — after, the
+  MCP silently falls back to no metadata). Live config gained a `recording` section (both mics @
+  16 kHz, autocapture → `~/roasts/captures`).
+- **ROAST 5 = ABORTED by a recording regression (coffee-roaster-mcp #180).** The multi-device
+  capture's WAV flush packed each 16 k-sample block one-by-one via a `struct.pack` Python loop (GIL
+  held ~3.6 ms) **inside the detector's capture-read worker AND the 2nd-mic thread** → stalled the
+  detector read → **30 consecutive mic overflows → audio faulted, FC dead** → operator stopped
+  pre-FC. **#180 FIXED tonight** (numpy-vectorised flush: 0.28 ms, 13×, byte-identical PCM16) on
+  `feature/180-vectorise-recording-flush` (`fe1a9c6`), **editable-installed into the agent .venv**
+  (operator's "local MCP release without CI") + **soak-validated** (2.5 min @ onnx_threads=8, both
+  mics: max 1 consecutive overflow, no fault). Proper **0.1.10** PR/release still pending.
+- **ROAST 6 = FULL-STACK SUCCESS.** Deterministic trim engaged (heat 100 → 65 at ~155 °C),
+  **auto-FC detected on a real roast for the FIRST time** (R4 missed, R5 faulted), the advisor drove
+  a clean dev%-gated drop (~190 °C / ~13.9 %, under the 195 ceiling, confidence 0.98), both mics
+  captured. The lowered USB-PnP gain (operator set it after a clip-headroom concern) did NOT starve
+  detection. **#134 flagged validated by roast 6** (recommend close → unblocks E11; operator's gate).
+- **Open 0.1.10 bundle + follow-ups filed:** coffee-roaster-mcp **#180** (the flush fix, done,
+  awaiting release) + **#181** (recorder lifecycle stops at FC — it is owned by the FC-detection
+  pipeline → must capture the FULL roast) + **#162 REOPENED** (per-request log flood: the guard reads
+  `getEffectiveLevel()` = inherited default WARNING at startup before the SDK's `.run()` sets INFO, so
+  the guard skips; fix = guard on `.level`/NOTSET; **#173 closed as a dup**) + **#178** (live
+  mic-levels check at roaster start) + **#179** (pin pyright — unpinned caused 2 CI failures). Agent:
+  **#385** (store-backed roast_num), **#386** (adaptive pre-FC trim DEPTH from curve/RoR/FC-ETA — keep
+  it deterministic), **#387** (T0 STILL ~11 s late after #174 — backdate not reaching the turning
+  point; suspects: `auto_t0_drop_threshold_c=25` too coarse / MCP backdate short / agent delta),
+  **#388** (capture roasted weight + compute weight-loss % as an objective D42 corpus label). **E11
+  gained E11-S3** (Pi dual-mic + FC CPU soak — the overflow bites harder on the Pi 5: RP1,
+  onnx_threads=2, int8; #180 necessary but maybe not sufficient).
+- **Stale issues closed:** MCP #175 + #176 (shipped in 0.1.9), #173 (dup of #162).
+- **Plan (source of truth):** the recording/training-data-capture architecture is **D65** (revises
+  D64) — option A two-independent-mic streams + the best-effort-and-decoupled-from-the-FC-read-loop-
+  AND-lifecycle invariant + the 0.1.10 bundle + the weight-loss-% label (#388).
+- **Branch state:** `feature/134` now carries the 0.1.9 wiring (pin / mirror / `set_recording_metadata`
+  ordering / `recording` config) **on top of** the prior roast-4 seed + #379 timeline fix + the E11-S3
+  doc edit, and **still needs PR(s) to `main`** once the roast season pauses.
+
 **27 Jun 2026 (later) — ROAST 4 IN PROGRESS. New bean (Colombia Huila) seeded + de-risked; one FE
 bug found+fixed; two follow-ups filed. Work is on `feature/134-roast4-colombia-huila-seed` (NO PR
 yet — operator's deliberate mode for the roast session).** Branch = 4 commits off `main`: Colombia
