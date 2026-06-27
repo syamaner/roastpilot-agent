@@ -124,7 +124,7 @@ items this session, no roaster behaviour touched:
 Everything else remains exactly as the 24 Jun block records: **roast 4 (#134) is the keystone gate**
 (validates the #336 trim + c3 prompt + MCP 0.1.8 on hardware; gates E11/E12/#323/#228/#277/M2). The
 config that roast 4 must validate is confirmed live on `main`: MCP pin `0.1.8` (`pyproject.toml:115`),
-`late_maillard_trim` default 65 %/60 s/155 °C (`config.py:83`), advisor `prompt_version="c3"`
+`late_maillard_trim` default 65 %/60 s/155 °C (`config.py` `LateMaillardTrim`, default fields ~L126–138), advisor `prompt_version="c3"`
 (`config.py:479`). Operator prerequisite unchanged: a **fresh, non-expiring OpenRouter key** (the
 13 Jun attempt-1 failure mode). Open operator action carried over: arm the `review-gate` required
 check (#159 / D58).
