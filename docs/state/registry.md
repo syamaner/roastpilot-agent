@@ -105,6 +105,48 @@
 
 ## Active Context
 
+**27 Jun 2026 (later) — ROAST 4 IN PROGRESS. New bean (Colombia Huila) seeded + de-risked; one FE
+bug found+fixed; two follow-ups filed. Work is on `feature/134-roast4-colombia-huila-seed` (NO PR
+yet — operator's deliberate mode for the roast session).** Branch = 4 commits off `main`: Colombia
+seed → dev 15→18 → dev 18→13 → #379 timeline fix.
+
+- **Roast 4 bean = Colombia Excelso Huila (Washed)** (Redber GRE-COEX-BE250), seeded as the second
+  built-in `BeanProfile` (`seed.py`, idempotent at `serve` startup). Charge 170–200, **drop 195**,
+  250 g (1 kg / 4 batches), washed, pre-FC levers at config default.
+- **Dev guide DE-RISKED to 13 %** for this first roast on the bean (operator). Research (our `.alog`
+  corpus + a deep-research pass) put the *eventual* medium at **~18 % DTR** for a washed high-grown
+  bean (Costa Rica analog 17.7 %; same-machine Roast Rebels Hottop page 19 %) — but for roast 1 the
+  operator guides LIGHT (13 %) to avoid a dark roast, knowing audio FC lags ~30 s so true development
+  runs longer than the number. Memory `per-origin-dtr-washed-highgrown`. **Priority: watch the
+  AUTO-drop fire** (should land light ~188–193 before the 195 ceiling); **the un-gated manual drop is
+  the backstop** (confirmed in code: `controller.py` — the #313 coherence guard gates only the advisor
+  drop, never the operator DROP BEANS). Residual risk = the #323 guard-vs-ceiling hold on a fast
+  (40 °C-ambient) roast.
+- **Preflight done, all green:** Hottop serial present (`cu.usbserial-DN016OJ3`, was just powered off),
+  USB-PnP mic present, real driver (not mock), FC audio, advisor **REACHABLE** (gpt-4o, key good —
+  the attempt-1 trap avoided), Colombia profile loaded (dev 13 / drop 195).
+- **Roast 3 rated 2★ "too dark / bitter"** by the operator (the D42 corpus label) — its detail page
+  shows the overshoot live: 5× advisor-drop REJECT while the bean climbed 197→203 °C (the #323
+  guard-vs-ceiling conflict). Direct evidence for why roast 4 is de-risked.
+
+**Follow-ups filed this session (all sequenced POST-roast-4):**
+- **#379 — detail Timeline milestone times blank — FIXED on-branch (`35fd2ff`, no PR).** Root cause:
+  `EventTimeline.tsx` placed milestones via `event.payload.tick`, but controller milestone events
+  (first_crack/run_completed/logs_exported) carry no tick — only `monotonic_seconds`. Fix rebases each
+  event's monotonic to the T0 event's. FE-only, lint+typecheck+513 unit tests green. Detail Playwright
+  baselines need regen at PR time. The Decision-trace `RECOMMENDED/EXECUTED = —/—` and pre-T0 `TIME = —`
+  are **working-as-intended** (passive telemetry rows / pre-charge ticks), not bugs.
+- **#380 — FC-lag offset → re-pointed to an MCP-config architecture.** Originally an agent-side dev%
+  offset; operator's better framing: put it in `coffee-roaster-mcp` (single source of truth for FC
+  timing, already onset-backdates via #337) as **optional config** (`first_crack.onset_offset_seconds`),
+  MCP reports the corrected FC, the agent computes dev% from it, UI follows — no agent offset, no
+  double-correction. Corrected dev% releases the auto-drop earlier ⇒ mitigates #323. **Revises D49/D57**
+  (needs a plan D-number) + safety review; tune to roast-4 data first.
+- **coffee-roaster-mcp #173 — console-flood regression.** The 1 Hz `CallToolRequest` INFO flood is back
+  on 0.1.8: `quiet_sdk_per_request_log()` guards on `getEffectiveLevel() < WARNING` but runs *before*
+  logging is configured, so the guard is False and it no-ops; the SDK then sets INFO. **Cosmetic only**
+  (no roast/control/safety impact). Fix = unconditional `setLevel` (or post-`.run()`), 0.1.9 + pin bump.
+
 **27 Jun 2026 — STATE SYNC (no code). `main` @ `92cdab3`; the autonomous/no-hardware backlog is
 fully cleared and roast 4 (#134) is re-validated as the sole next operator gate.** Two housekeeping
 items this session, no roaster behaviour touched:
