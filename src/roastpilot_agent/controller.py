@@ -588,6 +588,17 @@ class RoastController:
         # cleared on a new run/preheat. Stamps the charge clock for the advisor's
         # ``seconds_since_charge`` context and the charge-referenced DTR clock.
         self._charge_monotonic: float | None = None
+        # T0-clock latches (#174), captured across the debounce streak so the
+        # charge clock origins on the FIRST detect, not the later debounced
+        # transition (which lands ~``t0_debounce_ticks`` late). ``_t0_first_detect_
+        # monotonic`` is the clock at the streak's first detect tick; ``_pending_t0_
+        # backdate`` latches the MCP turning-point delta (#337) whenever it first
+        # appears during the streak (the ``beans_added`` event can race in a tick
+        # after ``t0_status`` flips, so reading it only at the transition tick
+        # missed it — one roast stamped T0 at bean 150 °C, ~10 s past the 179 °C
+        # peak). Both reset on a broken streak / new run.
+        self._t0_first_detect_monotonic: float | None = None
+        self._pending_t0_backdate: float | None = None
         # Monotonic instant of the drop (the transition into COOLING), set in
         # ``transition_to`` and cleared on a new run/preheat (#239). Freezes the
         # development + charge clocks — and so the derived DTR (#220) — at their
@@ -835,6 +846,52 @@ class RoastController:
             return now  # never fabricate a future-referenced milestone clock
         return now - backdate_seconds
 
+    def _reset_t0_debounce(self) -> None:
+        """Reset the T0 debounce streak and the charge-clock latches (#174).
+
+        A broken streak — an absent/faulted read, or a tick without MCP-reported
+        T0 — discards the candidate charge instant; the next streak re-latches its
+        own first detect + turning-point delta.
+        """
+        self._t0_streak = 0
+        self._t0_first_detect_monotonic = None
+        self._pending_t0_backdate = None
+
+    def _charge_origin_monotonic(
+        self, first_detect: float | None, backdate_seconds: float | None
+    ) -> float:
+        """Charge-clock origin: the first debounced-T0 detect, backdated to onset (#174).
+
+        Anchors the charge clock at ``first_detect`` — the instant the MCP first
+        reported T0 (the start of the debounce streak), NOT the later debounced
+        transition tick that lands ~``t0_debounce_ticks`` late — then subtracts the
+        MCP turning-point backdating delta (#337, confirmed − turning point) to
+        reach the local-max bean temp before the decline (the true charge / dip
+        onset). Without both corrections T0 stamped ~10 s late (one roast: bean
+        150 °C, past the 179 °C peak).
+
+        Defensive: falls back to the live clock if ``first_detect`` is absent (the
+        streak reaching its threshold always sets it). Never future-referenced —
+        ``first_detect`` ≤ now, and only a finite non-negative delta moves it
+        earlier (a None / non-finite / negative delta is ignored, as in
+        :meth:`_backdated_now`).
+
+        Args:
+            first_detect: Monotonic instant of the streak's first detect, or None.
+            backdate_seconds: The MCP turning-point backdating delta, or None.
+
+        Returns:
+            The backdated charge-clock origin in the agent's monotonic domain.
+        """
+        base = first_detect if first_detect is not None else self._clock()
+        if (
+            backdate_seconds is None
+            or not math.isfinite(backdate_seconds)
+            or backdate_seconds < 0.0
+        ):
+            return base
+        return base - backdate_seconds
+
     def _development_elapsed_seconds(self) -> float | None:
         """Seconds since first crack, frozen at drop, or ``None`` before FC.
 
@@ -967,6 +1024,10 @@ class RoastController:
             # so ``seconds_since_charge`` is None (#219). It is restamped at the
             # debounced T0 transition.
             self._charge_monotonic = None
+            # Clear the T0-clock latches (#174) so a prior roast's streak can never
+            # origin a fresh charge clock.
+            self._t0_first_detect_monotonic = None
+            self._pending_t0_backdate = None
             # A new run/preheat un-freezes the elapsed clocks (#239): clear the
             # drop instant so the next roast's development time and DTR run live
             # again rather than staying frozen at the prior roast's drop value.
@@ -1286,13 +1347,22 @@ class RoastController:
         """
         if self._phase is RoastPhase.PREHEATING:
             if telemetry is None:
-                self._t0_streak = 0  # a failed/absent read breaks the window
+                self._reset_t0_debounce()  # a failed/absent read breaks the window
                 return
             self._maybe_emit_charge_guidance(telemetry)
             if telemetry.t0_detected:
+                if self._t0_streak == 0:
+                    # Origin the charge clock on the FIRST detect tick (#174), not
+                    # the later debounced transition.
+                    self._t0_first_detect_monotonic = self._clock()
                 self._t0_streak += 1
+                # Latch the MCP turning-point backdate the first tick it appears
+                # (#174/#337): the ``beans_added`` event can race in a tick after
+                # ``t0_status`` flips, so reading it only at the transition missed it.
+                if telemetry.t0_backdate_seconds is not None:
+                    self._pending_t0_backdate = telemetry.t0_backdate_seconds
             else:
-                self._t0_streak = 0
+                self._reset_t0_debounce()
             if self._t0_streak >= self._config.t0_debounce_ticks:
                 source = self._safety.evaluate_event_source(
                     transition="t0", source=RoastEventSource.MCP
@@ -1316,15 +1386,22 @@ class RoastController:
                 # the advisor is no longer consulted pre-FC, so there is no
                 # automatic post-charge consult left to suppress.
                 #
-                # #337: origin the charge clock on the MCP-reported TURNING POINT
-                # (the local-max bean temp before the decline), not this debounced
-                # receive-tick — apply the backdating delta the v0.1.7 server
-                # carries on the ``beans_added`` event. The delta is an MCP-domain
-                # duration (confirmed − turning point), subtracted from the agent's
-                # own clock; a manual mark or pre-0.1.7 payload carries no delta
-                # (None) ⇒ stamp at receive-tick, the prior behaviour. This shifts
-                # dev%/DTR/curve x-origin ~17 s earlier (the lag corrected at T0).
-                self._charge_monotonic = self._backdated_now(telemetry.t0_backdate_seconds)
+                # #174/#337: origin the charge clock on the FIRST detect tick of
+                # the debounce streak (un-debounced), backdated to the MCP TURNING
+                # POINT (the local-max bean temp before the decline) — NOT this
+                # debounced transition tick. Two corrections compose: (1) the
+                # agent's own ``t0_debounce_ticks`` debounce, by anchoring to the
+                # latched first detect; (2) the MCP confirmation lag, by subtracting
+                # the latched turning-point delta (confirmed − turning point). A
+                # manual mark / pre-0.1.7 payload carries no delta ⇒ no backdate,
+                # but the first-detect anchor still removes the debounce. Shifts
+                # dev%/DTR/curve x-origin earlier (the lag corrected at T0): one
+                # roast stamped T0 ~10 s late at bean 150 °C vs the 179 °C peak.
+                self._charge_monotonic = self._charge_origin_monotonic(
+                    self._t0_first_detect_monotonic, self._pending_t0_backdate
+                )
+                self._t0_first_detect_monotonic = None
+                self._pending_t0_backdate = None
             return
         if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK and telemetry is not None:
             # Drying-end signal (#351) BEFORE the FC check: a pre-FC observability

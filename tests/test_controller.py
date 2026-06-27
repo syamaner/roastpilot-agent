@@ -2516,17 +2516,19 @@ async def test_t0_backdate_anchors_charge_clock_earlier_and_moves_dtr() -> None:
 
 
 @pytest.mark.asyncio
-async def test_t0_backdate_absent_stamps_at_receive_tick() -> None:
-    """#337 fallback: no ``t0_backdate_seconds`` (a manual mark / pre-0.1.7
-    payload) stamps the charge clock at the receive-tick — the pre-backdating
-    behaviour. The charge clock equals the receive-tick instant exactly."""
+async def test_t0_backdate_absent_anchors_at_first_detect() -> None:
+    """#174: no ``t0_backdate_seconds`` (a manual mark / pre-0.1.7 payload) still
+    origins the charge clock on the FIRST detect tick of the debounce streak, not
+    the later debounced transition. There is no MCP backdate to apply, but the
+    first-detect anchor removes the agent's own debounce lag (here the streak
+    started at clock=0.0 and confirmed on the 3rd tick at clock=2.0)."""
     harness = make_harness()
     t0 = reading(bean=160.0, t0_detected=True)  # no backdate field
     await _drive_to_pre_fc(harness, t0)
-    # Charge stamped on the 3rd (debounce) tick at clock=2.0 (advanced 1 s/tick),
-    # so with the clock now at 3.0 the elapsed is exactly 1.0 — no backdating.
+    # Charge origins on the first detect (clock=0.0), NOT the debounced transition
+    # at clock=2.0 — the debounce confirms T0 but must not define the charge moment.
     charge_monotonic = harness.controller._charge_monotonic  # pyright: ignore[reportPrivateUsage]
-    assert charge_monotonic == pytest.approx(2.0)
+    assert charge_monotonic == pytest.approx(0.0)
 
 
 @pytest.mark.asyncio
@@ -3319,10 +3321,11 @@ async def test_advisor_roast_elapsed_counts_from_charge_not_run_start() -> None:
     await harness.controller.tick()  # → DEVELOPMENT, first (PHASE_CHANGE) consult
     assert harness.controller.phase is RoastPhase.DEVELOPMENT
     ctx = advisor.contexts[-1]
-    # Charge stamped at clock=302.0; the first development consult fires on the FC
-    # tick at clock=304.0 → 2.0 s (the ~5 s post-FC dwell, #276, means the very
-    # next tick does NOT re-consult), NOT ~304 s from run start (the old bug).
-    assert ctx.roast_elapsed_seconds == pytest.approx(2.0)
+    # Charge origins on the FIRST detect (clock=300.0, #174 — not the debounced
+    # transition at 302.0); the first development consult fires on the FC tick at
+    # clock=304.0 → 4.0 s (the ~5 s post-FC dwell, #276, means the very next tick
+    # does NOT re-consult), NOT ~304 s from run start (the old #219 bug).
+    assert ctx.roast_elapsed_seconds == pytest.approx(4.0)
     assert ctx.roast_elapsed_seconds < 300.0
     # It matches seconds_since_charge (same charge instant, the bake-off convention).
     assert ctx.roast_elapsed_seconds == pytest.approx(ctx.seconds_since_charge)
@@ -3332,8 +3335,9 @@ async def test_advisor_roast_elapsed_counts_from_charge_not_run_start() -> None:
 async def test_advisor_dtr_is_charge_referenced_post_fc() -> None:
     """The DTR the advisor computes (development_elapsed / roast_elapsed) is now
     charge-referenced end to end (#219), matching the v4-prompt definition the
-    bake-off validated. Charge → 100 s pre-FC → FC → 25 s development gives DTR =
-    25 / 125 = 0.20, not 25 / (preheat + 125)."""
+    bake-off validated. The charge origins on the first detect (#174, 2 s before
+    the debounced transition), so 102 s pre-FC → FC → 25 s development gives DTR =
+    25 / 127, charge-referenced — NOT 25 / (preheat + 127)."""
     crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
     advisor = FakeAdvisor([decision()])
     harness = make_harness(readings=[crashing], advisor=advisor)
@@ -3354,9 +3358,11 @@ async def test_advisor_dtr_is_charge_referenced_post_fc() -> None:
     ctx = advisor.contexts[-1]
     assert ctx.development_elapsed_seconds is not None
     assert ctx.development_elapsed_seconds == pytest.approx(25.0)
-    assert ctx.roast_elapsed_seconds == pytest.approx(125.0)  # NOT 600 + 125
+    # #174: charge origins on the first detect (2 s before the debounced transition),
+    # so the charge-referenced clock is 127 s, NOT 125 — and still NOT 600 + 125.
+    assert ctx.roast_elapsed_seconds == pytest.approx(127.0)
     dtr = ctx.development_elapsed_seconds / ctx.roast_elapsed_seconds
-    assert dtr == pytest.approx(0.20)
+    assert dtr == pytest.approx(25.0 / 127.0)
 
 
 @pytest.mark.asyncio
@@ -3450,8 +3456,9 @@ async def test_snapshot_development_fields_post_fc_are_charge_referenced() -> No
     """Post-FC the snapshot exposes BOTH live readouts (#220): development time
     (seconds since FC) and DTR as a percentage of the WHOLE roast, computed on
     the charge-referenced clock (consistent with the advisor's DTR, #219). With a
-    long preheat, charge → 100 s pre-FC → FC → 25 s development, DTR =
-    25 / 125 * 100 = 20% (NOT 25 / (preheat + 125))."""
+    long preheat, the charge origins on the first detect (#174, 2 s before the
+    debounced transition): 102 s pre-FC → FC → 25 s development, DTR =
+    25 / 127 * 100 ≈ 19.7% (NOT 25 / (preheat + 127))."""
     crashing = reading(bean=160.0, t0_detected=True, bean_ror_c_per_min=-80.0)
     harness = make_harness(readings=[crashing])
     harness.controller.load_profile(PROFILE)
@@ -3467,7 +3474,8 @@ async def test_snapshot_development_fields_post_fc_are_charge_referenced() -> No
     harness.clock.advance(25.0)  # development time
     snap = harness.controller.snapshot()
     assert snap.development_elapsed_seconds == pytest.approx(25.0)
-    assert snap.development_percent == pytest.approx(20.0)  # 25 / 125 * 100
+    # #174: charge origins 2 s earlier (first detect) → 127 s denominator.
+    assert snap.development_percent == pytest.approx(25.0 / 127.0 * 100.0)
     # The two readouts are DISTINCT (a duration vs a ratio), and the snapshot's
     # chart clock still counts from run start (~600 preheat + ~100 + 25, NOT the
     # charge-referenced ~125) — the chart origin is unchanged by #220.
