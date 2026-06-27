@@ -70,17 +70,18 @@ COLOMBIA_HUILA_ID = "seed-colombia-excelso-huila-washed"
 #: The Colombia Excelso Huila (Washed) seed profile — the second selectable bean,
 #: added for the roast-4 origin (Redber GRE-COEX-BE250). A washed Colombian is
 #: more forgiving than the delicate Koke natural, so the targets sit at a
-#: balanced-medium starting point the operator edits to taste. The drop ceiling
-#: stays at the operator's proven 195 °C known-good line (bitter > 196 °C), which
-#: also keeps momentum headroom for the #336 anticipatory-trim validation. The
-#: development target is 18 % DTR (up from the Koke's light 13 %): a washed,
-#: dense, high-grown bean rewards MORE development for chocolate / body than a
-#: delicate natural. 18 % is the convergence of our own corpus (Costa Rica
-#: high-grown washed analog ~17.7 %; pooled high-grown washed ~17.1 %) and the
-#: external consensus (Roast Rebels' SAME-machine Hottop KN-8828B-2K page = 19 %
-#: for SHB South/Central American; Rao 20–25 % general, pulled toward the low end
-#: by the small 250 g / high-burner-ratio batch), biased low to protect the
-#: bright citrus. Research note 2026-06-27. All temperatures are Celsius.
+#: balanced-medium starting point the operator edits to taste. The drop guide
+#: stays at the operator's proven 195 °C known-good line (bitter > 196 °C). The
+#: development target is set LOW at 13 % for a deliberately LIGHT FIRST roast on
+#: this bean (de-risk: get a cup to taste, then go darker) — with the default
+#: 3 pp drop margin this guides the advisor to release the drop in a ~10–13 %
+#: window. Because audio FC detection lags the true crack (~30 s), the REAL
+#: development runs ~30 s longer than the number, so a low guide lands a safe
+#: light-medium, not under-developed; the operator's MANUAL drop (un-gated) is
+#: the backstop for going lighter still. The research-backed medium for this
+#: washed high-grown bean is ~18 % DTR (corpus CR-washed ~17.7 %; same-machine
+#: Roast Rebels 19 %) — raise toward it once the machine behaviour is dialled in.
+#: Decision 2026-06-27. All temperatures are Celsius.
 COLOMBIA_HUILA_SEED = BeanProfile(
     id=COLOMBIA_HUILA_ID,
     created_at=_SEED_TIMESTAMP,
@@ -106,10 +107,13 @@ COLOMBIA_HUILA_SEED = BeanProfile(
     # anticipatory trim headroom against the roast-3 momentum overshoot. Edit up
     # toward a fuller medium once the trim is validated on hardware.
     target_drop_temp_c=195.0,
-    # 18 % DTR — washed high-grown bean wants more development than the delicate
-    # Koke natural (13 %). Corpus + same-machine external research converge ~18 %
-    # (see the docstring above); biased low (18 vs 19–22) to keep the citrus.
-    target_development_percent=18.0,
+    # 13 % dev guide — deliberately LIGHT for the first roast on this bean
+    # (de-risk; taste, then go darker). With the default 3 pp margin the advisor
+    # releases the drop in a ~10–13 % window. Audio FC lags ~30 s, so true
+    # development runs ~30 s longer than the number → a low guide lands a safe
+    # light-medium. Research medium for this washed high-grown bean is ~18 %
+    # (raise later). Drop guide stays 195 °C; operator manual drop is un-gated.
+    target_development_percent=13.0,
     default_bean_weight_grams=250.0,  # 1 kg / 4 batches
     description=(
         "Huila, southern Colombia. Excelso grade, washed; grown 1,200–2,000 m on "

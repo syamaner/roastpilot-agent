@@ -2670,4 +2670,4 @@ async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) ->
     assert colombia["processing"] == "washed"
     assert colombia["altitude_m"] == 1600
     assert colombia["target_drop_temp_c"] == 195.0
-    assert colombia["target_development_percent"] == 18.0
+    assert colombia["target_development_percent"] == 13.0
