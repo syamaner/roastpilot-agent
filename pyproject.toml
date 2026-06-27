@@ -113,11 +113,17 @@ dev = [
   # config-driven roast audio capture (mono + multi-device + record-check —
   # #176), and the 14th tool `set_recording_metadata(origin, roast_num)` (the
   # FIRST tool-surface change since the 13-tool baseline; mirrored in
-  # mcp_client + contract fixtures). It pulls
+  # mcp_client + contract fixtures). 0.1.10 fixes two recording-path bugs found on
+  # roast 5/6 (no tool/contract change, so the 14-tool mirror is unchanged): #180
+  # (the multi-device WAV flush packed PCM16 one sample at a time in a Python loop
+  # on the detector's read worker → starved FC detection → mic overflow; now
+  # numpy-vectorised) and #162 (the per-request SDK INFO flood regression: the
+  # quiet guard ran before logging was configured; now `getEffectiveLevel() <=
+  # WARNING`). It pulls
   # heavy ML/audio deps
   # (transformers/onnxruntime/sounddevice) that mock mode never activates;
   # CI installs libportaudio2 for sounddevice's import.
-  "coffee-roaster-mcp==0.1.9",
+  "coffee-roaster-mcp==0.1.10",
   # Analysis-harness numeric core (scripts/curve_feature_eval.py, #229). numpy
   # is already present transitively (via the MCP server's ML stack), but the
   # curve-feature analysis imports it directly, so declare it explicitly here:
