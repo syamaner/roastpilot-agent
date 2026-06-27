@@ -415,8 +415,15 @@ class ReplayRoasterControl:
             return None
         return self._frames[self._cursor]
 
-    async def start_session(self) -> None:
-        self.commands.append(("start_session", {}))
+    async def start_session(
+        self, *, recording_origin: str | None = None, recording_roast_num: int | None = None
+    ) -> None:
+        self.commands.append(
+            (
+                "start_session",
+                {"recording_origin": recording_origin, "recording_roast_num": recording_roast_num},
+            )
+        )
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
         self.commands.append(("set_targets", {"heat": heat_percent, "fan": fan_percent}))

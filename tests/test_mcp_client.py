@@ -34,6 +34,7 @@ from roastpilot_agent.mcp_client import (
     RoastSessionState,
     RuntimeConfigSnapshot,
     ServerInfo,
+    SetRecordingMetadataResult,
     StartRoastSessionResult,
     event_backdate_seconds,
     force_terminate_process_group,
@@ -188,6 +189,7 @@ CANNED: dict[str, object] = {
         "note": "export complete",
     },
     "emergency_stop": EVENT_RESULT_PAYLOAD,
+    "set_recording_metadata": {"origin": "colombia-huila", "roast_num": 5},
 }
 
 
@@ -211,7 +213,7 @@ def client(caller: FakeToolCaller) -> RoasterMCPClient:
 
 
 @pytest.mark.asyncio
-async def test_all_thirteen_tools_typed(client: RoasterMCPClient, caller: FakeToolCaller) -> None:
+async def test_all_fourteen_tools_typed(client: RoasterMCPClient, caller: FakeToolCaller) -> None:
     """Every verified tool has a typed method; results validate into the
     named mirrors; the wire tool names match plan §2 exactly."""
     assert isinstance(await client.get_server_info(), ServerInfo)
@@ -227,6 +229,10 @@ async def test_all_thirteen_tools_typed(client: RoasterMCPClient, caller: FakeTo
     assert isinstance(await client.stop_cooling(), EventCommandResult)
     assert isinstance(await client.export_roast_log(), ExportRoastLogResult)
     assert isinstance(await client.emergency_stop("test"), EventCommandResult)
+    assert isinstance(
+        await client.set_recording_metadata("colombia-huila", 5),
+        SetRecordingMetadataResult,
+    )
     assert [name for name, _ in caller.calls] == [
         "get_server_info",
         "get_runtime_config",
@@ -241,6 +247,7 @@ async def test_all_thirteen_tools_typed(client: RoasterMCPClient, caller: FakeTo
         "stop_cooling",
         "export_roast_log",
         "emergency_stop",
+        "set_recording_metadata",
     ]
 
 
@@ -265,7 +272,7 @@ async def test_arguments_are_passed_through(
 
 
 def test_no_arbitrary_tool_surface() -> None:
-    """Exactly the 13 verified tools — nothing generic, nothing extra."""
+    """Exactly the 14 verified tools — nothing generic, nothing extra."""
     public = {
         name
         for name in dir(RoasterMCPClient)
@@ -285,6 +292,7 @@ def test_no_arbitrary_tool_surface() -> None:
         "stop_cooling",
         "export_roast_log",
         "emergency_stop",
+        "set_recording_metadata",
     }
 
 
@@ -888,12 +896,13 @@ FIXTURE_MIRRORS: dict[str, type[MCPMirror]] = {
     "stop_cooling": EventCommandResult,
     "export_roast_log": ExportRoastLogResult,
     "emergency_stop": EventCommandResult,
+    "set_recording_metadata": SetRecordingMetadataResult,
 }
 
 
 def test_every_tool_has_a_captured_fixture() -> None:
     """One example per tool result shape (E5-S3 criterion) — exactly the
-    13-tool surface, no strays."""
+    14-tool surface, no strays."""
     captured = {path.stem for path in TOOL_RESULT_FIXTURES.glob("*.json")}
     assert captured == set(FIXTURE_MIRRORS)
 
@@ -1301,3 +1310,44 @@ async def test_adapter_start_session_clears_cached_state() -> None:
     assert adapter.last_state is not None
     await adapter.start_session()  # the next session must start from a clean cache
     assert adapter.last_state is None
+
+
+@pytest.mark.asyncio
+async def test_adapter_sets_recording_metadata_before_session() -> None:
+    """v0.1.9 (#176): set_recording_metadata must fire BEFORE start_roast_session
+    — the MCP only applies the filename if metadata precedes the session."""
+    caller = FakeToolCaller()
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+    await adapter.start_session(recording_origin="colombia-huila", recording_roast_num=5)
+    assert caller.calls == [
+        ("set_recording_metadata", {"origin": "colombia-huila", "roast_num": 5}),
+        ("start_roast_session", {}),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_adapter_skips_recording_metadata_when_origin_missing() -> None:
+    """No origin (or no roast_num) → skip the metadata call; the MCP falls back
+    to its default recording naming."""
+    caller = FakeToolCaller()
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+    await adapter.start_session()
+    assert [name for name, _ in caller.calls] == ["start_roast_session"]
+
+
+@pytest.mark.asyncio
+async def test_adapter_recording_metadata_failure_never_blocks_roast() -> None:
+    """Recording naming is best-effort: a set_recording_metadata failure is
+    swallowed and the session still starts."""
+    calls: list[str] = []
+
+    async def caller(tool: str, arguments: dict[str, object]) -> object:
+        calls.append(tool)
+        if tool == "set_recording_metadata":
+            raise MCPToolError("metadata rejected")
+        return CANNED[tool]
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller))
+    await adapter.start_session(recording_origin="colombia-huila", recording_roast_num=5)
+    # The metadata attempt failed but the session still opened.
+    assert calls == ["set_recording_metadata", "start_roast_session"]

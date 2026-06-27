@@ -43,6 +43,15 @@ export function EventTimeline({
     (event) => event.kind in MILESTONE_LABELS,
   );
 
+  // The controller's milestone events carry no `payload.tick`, so place each on
+  // the roast clock by rebasing its `monotonic_seconds` against the T0 event's
+  // (#379). Both share the same per-run monotonic domain, so the difference is
+  // the since-T0 elapsed. Pre-T0 events (negative) keep `—` — formatClock clamps
+  // negatives to 0, which would mislabel them 00:00 — falling back to the tick
+  // path for the legacy/fixture case that does carry a tick.
+  const t0Monotonic =
+    milestones.find((event) => event.kind === "t0_detected")?.monotonic_seconds ?? null;
+
   if (milestones.length === 0) {
     return (
       <div
@@ -61,7 +70,18 @@ export function EventTimeline({
     >
       {milestones.map((event, i) => {
         const tick = typeof event.payload?.tick === "number" ? event.payload.tick : null;
-        const seconds = event.kind === "t0_detected" ? 0 : tick === null ? null : tickToSeconds(tick);
+        const sinceT0 =
+          event.monotonic_seconds !== null && t0Monotonic !== null
+            ? event.monotonic_seconds - t0Monotonic
+            : null;
+        const seconds =
+          event.kind === "t0_detected"
+            ? 0
+            : sinceT0 !== null && sinceT0 >= 0
+              ? sinceT0
+              : tick === null
+                ? null
+                : tickToSeconds(tick);
         const confidence =
           typeof event.payload?.confidence === "number" ? event.payload.confidence : null;
         const source = typeof event.payload?.source === "string" ? event.payload.source : null;

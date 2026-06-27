@@ -2,10 +2,12 @@
 
 E5-S1: Pydantic mirrors of every tool result shape, derived from the
 actual coffee-roaster-mcp source (`mcp_server.py` dataclasses, v0.1.3
-surface verified in plan §2 — unchanged through v0.1.5, the pinned
-version: 0.1.4 added the `mic-check` CLI and 0.1.5 made a transient mic
-overflow recoverable, neither touching the 13-tool surface;
-mcp-contract-checker confirmed zero drift) and validated against the
+surface verified in plan §2 — the 13-tool surface held unchanged through
+v0.1.5 (0.1.4 added the `mic-check` CLI; 0.1.5 made a transient mic
+overflow recoverable, neither touching the tool surface), and v0.1.9 adds
+the 14th tool `set_recording_metadata` (#176 — sets the export filename's
+origin slug + roast number; the 13 pre-existing tools have zero drift,
+mcp-contract-checker confirmed) and validated against the
 7 Jun 2026 live-roast exports. The mirrors use ``extra="ignore"`` so new optional
 upstream fields never break the agent — drift is detected by the
 mcp-contract-checker sub-agent and the contract fixtures (E5-S3), not by
@@ -238,6 +240,13 @@ class ControlCommandResult(MCPMirror):
     cooling_on: bool
 
 
+class SetRecordingMetadataResult(MCPMirror):
+    """Mirror of mcp_server.SetRecordingMetadataResult (#176)."""
+
+    origin: str
+    roast_num: int
+
+
 class EventCommandResult(MCPMirror):
     """Mirror of mcp_server.EventCommandResult (mark_*, drop, cooling,
     emergency_stop)."""
@@ -267,7 +276,7 @@ ToolCaller = Callable[[str, dict[str, object]], Awaitable[object]]
 
 
 class RoasterMCPClient:
-    """Typed client for exactly the verified 13-tool MCP surface.
+    """Typed client for exactly the verified 14-tool MCP surface.
 
     Every method validates the raw result into its mirror — there is no
     arbitrary tool-execution surface. Child-process lifecycle (spawn,
@@ -324,6 +333,28 @@ class RoasterMCPClient:
     async def emergency_stop(self, reason: str = "manual emergency stop") -> EventCommandResult:
         return EventCommandResult.model_validate(
             await self._call("emergency_stop", {"reason": reason})
+        )
+
+    async def set_recording_metadata(
+        self, origin: str, roast_num: int
+    ) -> SetRecordingMetadataResult:
+        """Set the export filename's origin slug + roast number (v0.1.9, #176).
+
+        Must be called BEFORE ``start_roast_session``: the MCP applies the
+        metadata to the recording filename when the session opens, so calling it
+        after the session has started silently falls back to session-id / roast 0
+        naming (verified on hardware). The server re-slugifies ``origin``.
+
+        Args:
+            origin: A bean/origin slug (e.g. ``"colombia-huila"``); re-slugified
+                by the server.
+            roast_num: The per-origin roast counter used in the filename.
+
+        Returns:
+            The origin + roast number the server recorded.
+        """
+        return SetRecordingMetadataResult.model_validate(
+            await self._call("set_recording_metadata", {"origin": origin, "roast_num": roast_num})
         )
 
 
@@ -523,7 +554,25 @@ class RoasterControlAdapter:
         self._last_state = state
         return project_session_state(state, age_seconds=age)
 
-    async def start_session(self) -> None:
+    async def start_session(
+        self, *, recording_origin: str | None = None, recording_roast_num: int | None = None
+    ) -> None:
+        """Start a new MCP roast session, optionally naming the recording.
+
+        When ``recording_origin`` and ``recording_roast_num`` are both supplied,
+        ``set_recording_metadata`` is called FIRST (v0.1.9, #176): the MCP only
+        applies the origin slug + roast number to the export filename if the
+        metadata is set before the session opens — set afterwards it silently
+        falls back to session-id / roast 0 naming (verified on hardware). The
+        metadata call is best-effort: a failure is logged and the roast proceeds
+        (recording naming must never block a roast). When either argument is
+        ``None`` the call is skipped and the MCP falls back safely.
+
+        Args:
+            recording_origin: A bean/origin slug for the export filename, or
+                ``None`` to let the MCP fall back to its default naming.
+            recording_roast_num: The per-origin roast counter, or ``None``.
+        """
         # A new session must not inherit the previous roast's cached read. Until
         # the first read_telemetry tick lands, last_state (and the age tracking)
         # would otherwise expose the prior session's state — e.g. a stale mic
@@ -532,6 +581,19 @@ class RoasterControlAdapter:
         self._last_state = None
         self._last_elapsed = None
         self._last_change_monotonic = None
+        if recording_origin is not None and recording_roast_num is not None:
+            try:
+                await self._client.set_recording_metadata(recording_origin, recording_roast_num)
+            except Exception:
+                # Recording naming is best-effort: never block the roast on it.
+                # The MCP falls back to session-id / roast 0 naming.
+                _log.warning(
+                    "set_recording_metadata failed (origin=%r, roast_num=%r); "
+                    "MCP will fall back to default recording naming",
+                    recording_origin,
+                    recording_roast_num,
+                    exc_info=True,
+                )
         await self._client.start_roast_session()
 
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:

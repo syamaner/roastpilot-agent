@@ -2624,10 +2624,11 @@ async def test_delete_unknown_bean_profile_is_404(client: AsyncClient) -> None:
 
 
 @pytest.mark.asyncio
-async def test_lifespan_seeds_ethiopia_profile_idempotently(store: RoastStore) -> None:
-    """#303: the app lifespan seeds the Ethiopia Koke profile (present once after
-    two startups — idempotent)."""
-    from roastpilot_agent.seed import ETHIOPIA_KOKE_ID
+async def test_lifespan_seeds_bean_profiles_idempotently(store: RoastStore) -> None:
+    """#303: the app lifespan seeds the built-in bean profiles (each present once
+    after two startups — idempotent). Ordered by name, so Colombia precedes
+    Ethiopia."""
+    from roastpilot_agent.seed import COLOMBIA_HUILA_ID, ETHIOPIA_KOKE_ID
 
     service = RoastService(store)
     app = create_app(service)
@@ -2635,15 +2636,15 @@ async def test_lifespan_seeds_ethiopia_profile_idempotently(store: RoastStore) -
         first = await store.list_bean_profiles()
     async with app.router.lifespan_context(app):
         second = await store.list_bean_profiles()
-    assert [p.id for p in first] == [ETHIOPIA_KOKE_ID]
-    assert [p.id for p in second] == [ETHIOPIA_KOKE_ID]  # not double-inserted
+    assert [p.id for p in first] == [COLOMBIA_HUILA_ID, ETHIOPIA_KOKE_ID]
+    assert [p.id for p in second] == [COLOMBIA_HUILA_ID, ETHIOPIA_KOKE_ID]  # not double-inserted
 
 
 @pytest.mark.asyncio
 async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) -> None:
     """#303: end-to-end seam — lifespan seed → GET /api/bean-profiles returns the
     Ethiopia Koke profile with its locked values over HTTP (the FE-visible path)."""
-    from roastpilot_agent.seed import ETHIOPIA_KOKE_ID
+    from roastpilot_agent.seed import COLOMBIA_HUILA_ID, ETHIOPIA_KOKE_ID
 
     service = RoastService(store)
     app = create_app(service)
@@ -2655,12 +2656,18 @@ async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) ->
         response = await http.get("/api/bean-profiles")
     assert response.status_code == 200
     profiles = response.json()["profiles"]
-    assert len(profiles) == 1
-    koke = profiles[0]
-    assert koke["id"] == ETHIOPIA_KOKE_ID
+    by_id = {p["id"]: p for p in profiles}
+    assert set(by_id) == {ETHIOPIA_KOKE_ID, COLOMBIA_HUILA_ID}
+    koke = by_id[ETHIOPIA_KOKE_ID]
     assert koke["name"] == "Ethiopia Yirgacheffe Koke (Natural)"
     assert koke["processing"] == "natural"
     assert koke["altitude_m"] == 1885
     assert koke["default_bean_weight_grams"] == 250.0
     assert koke["target_drop_temp_c"] == 195.0  # roast-2 tuning: latest acceptable drop
     assert koke["target_development_percent"] == 13.0
+    colombia = by_id[COLOMBIA_HUILA_ID]
+    assert colombia["name"] == "Colombia Excelso Huila (Washed)"
+    assert colombia["processing"] == "washed"
+    assert colombia["altitude_m"] == 1600
+    assert colombia["target_drop_temp_c"] == 195.0
+    assert colombia["target_development_percent"] == 13.0

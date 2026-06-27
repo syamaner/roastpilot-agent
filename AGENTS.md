@@ -104,7 +104,7 @@ src/roastpilot_agent/
   cli.py          - console entrypoint
   controller.py   - transition table, tick() loop, T0 debounce (re-exports
                     RoastPhase from models.py, its home per D15)
-  mcp_client.py   - typed wrapper over the 13 coffee-roaster-mcp tools; owns
+  mcp_client.py   - typed wrapper over the 14 coffee-roaster-mcp tools; owns
                     the MCP child process (spawn, health, restart → recovery)
   advisor.py      - RoastAdvisor ABC, AdvisorContext, RoastDecision,
                     PydanticAIAdvisor (OpenRouter), FakeAdvisor

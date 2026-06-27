@@ -108,11 +108,16 @@ dev = [
   # agent-side by #337; 0.1.8 quiets the MCP SDK's per-request INFO flood
   # during a live roast (raises `mcp.server.lowlevel.server` to WARNING only
   # when more verbose, never lowering a stricter setting) — coffee-roaster-mcp#162,
-  # observability-only; none of these change the 13-tool surface). It pulls
+  # observability-only. 0.1.9 adds per-window FC confidence observability
+  # (fc_window log rows + a first_crack_detection summary block — #175),
+  # config-driven roast audio capture (mono + multi-device + record-check —
+  # #176), and the 14th tool `set_recording_metadata(origin, roast_num)` (the
+  # FIRST tool-surface change since the 13-tool baseline; mirrored in
+  # mcp_client + contract fixtures). It pulls
   # heavy ML/audio deps
   # (transformers/onnxruntime/sounddevice) that mock mode never activates;
   # CI installs libportaudio2 for sounddevice's import.
-  "coffee-roaster-mcp==0.1.8",
+  "coffee-roaster-mcp==0.1.9",
   # Analysis-harness numeric core (scripts/curve_feature_eval.py, #229). numpy
   # is already present transitively (via the MCP server's ML stack), but the
   # curve-feature analysis imports it directly, so declare it explicitly here:
