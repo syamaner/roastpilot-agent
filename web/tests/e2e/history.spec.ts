@@ -35,7 +35,7 @@ import type { RoastSummary } from "../../src/lib/types";
 // populated-state test asserts the live header row matches this EXACTLY, so a
 // column added or dropped fails structurally even if the pixel diff stays under
 // tolerance — closing the #241 blind spot at the DOM layer, not just the image.
-const EXPECTED_COLUMNS = ["Date", "Bean", "Outcome", "Advisor", "FC", "Dev %", "Rating"] as const;
+const EXPECTED_COLUMNS = ["Date", "Bean", "Outcome", "Advisor", "FC", "Dev %", "Loss %", "Rating"] as const;
 
 // A fixed, hand-authored history payload typed to the FULL `RoastSummary`
 // contract (web/src/lib/types.ts) so the snapshot exercises EVERY populated
