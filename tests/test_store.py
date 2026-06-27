@@ -1003,6 +1003,80 @@ async def test_rating_an_active_run_raises(tmp_store: RoastStore) -> None:
 
 
 @pytest.mark.asyncio
+async def test_set_roasted_weight_persists_and_derives_weight_loss(
+    tmp_store: RoastStore,
+) -> None:
+    """#388: the operator roasted-out weight stamps on a completed run and the read
+    paths derive weight-loss % against the frozen 250 g charge weight."""
+    # PROFILE.bean_weight_grams == 250.0
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=221.0)
+
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.roasted_weight_grams == 221.0
+        assert detail.weight_loss_percent == 11.6  # (250 - 221) / 250 * 100
+
+        summaries = await tmp_store.list_runs()
+        summary = next(s for s in summaries if s.id == "run-1")
+        assert summary.roasted_weight_grams == 221.0
+        assert summary.weight_loss_percent == 11.6
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_roasted_weight_is_an_immutability_exception(tmp_store: RoastStore) -> None:
+    """#388: the roasted weight is operator-editable AFTER completion (same lifecycle
+    as the rating) — the v2 immutability trigger does not guard the new column."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        # Set, then correct it on the already-completed run — both must succeed.
+        await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=221.0)
+        await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=219.0)
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.roasted_weight_grams == 219.0
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_unweighed_completed_run_has_null_weight_loss(tmp_store: RoastStore) -> None:
+    """#388: a completed-but-unweighed run reads back null roasted weight + null
+    weight-loss %."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.roasted_weight_grams is None
+        assert detail.weight_loss_percent is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_on_active_run_raises(tmp_store: RoastStore) -> None:
+    """#388: completed-only, like the rating — an in-progress run cannot be stamped."""
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no completed roast_run"):
+            await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=221.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_persisted_run_is_frozen(tmp_path: Path) -> None:
     import pydantic
 

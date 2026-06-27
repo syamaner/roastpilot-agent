@@ -758,6 +758,68 @@ async def test_rate_rejects_out_of_range_stars(client: AsyncClient, store: Roast
     assert response.status_code == 422
 
 
+# --- roasted weight (#388) ---
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_completed_run(client: AsyncClient, store: RoastStore) -> None:
+    await store.create_run(
+        run_id="run-w",
+        profile=_profile(),  # bean_weight_grams 250
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(run_id="run-w", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post(
+        "/api/roasts/run-w/roasted-weight", json={"roasted_weight_grams": 221.0}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["roasted_weight_grams"] == 221.0
+    assert body["weight_loss_percent"] == 11.6  # (250 - 221) / 250 * 100
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_in_progress_conflicts(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="run-wip",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.DEVELOPMENT,
+    )
+    response = await client.post(
+        "/api/roasts/run-wip/roasted-weight", json={"roasted_weight_grams": 221.0}
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_unknown_run_404(client: AsyncClient) -> None:
+    response = await client.post(
+        "/api/roasts/nope/roasted-weight", json={"roasted_weight_grams": 221.0}
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_rejects_non_positive(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="run-wb",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(run_id="run-wb", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post(
+        "/api/roasts/run-wb/roasted-weight", json={"roasted_weight_grams": 0}
+    )
+    assert response.status_code == 422
+
+
 # --- operator action queue (E7-S2) ---
 
 

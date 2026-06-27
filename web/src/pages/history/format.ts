@@ -63,6 +63,16 @@ export function formatDevPercent(value: number | null): string {
 }
 
 /**
+ * Format the roast weight-loss % (#388) for the history column — one decimal, or
+ * an em dash for an un-weighed roast (`weight_loss_percent: null`). Distinct from
+ * `formatDevPercent`'s whole-number rounding: weight loss is a tighter, more
+ * granular signal (an ~11.6% reads differently from ~12%).
+ */
+export function formatWeightLoss(value: number | null | undefined): string {
+  return value === null || value === undefined ? "—" : `${value.toFixed(1)}%`;
+}
+
+/**
  * Format the first-crack timestamp (#111) as a UTC time-of-day `HH:MM` for the
  * FC-time column, or an em dash when no first crack was recorded for the run.
  *

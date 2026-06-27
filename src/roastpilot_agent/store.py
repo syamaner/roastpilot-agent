@@ -42,6 +42,7 @@ from roastpilot_agent.models import (
     TimelineSafetyEvaluation,
     TimelineVerdict,
     recording_origin_slug,
+    weight_loss_percent,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict, enabled_operator_actions
 
@@ -296,6 +297,24 @@ ALTER TABLE roast_events_new RENAME TO roast_events;
 CREATE INDEX idx_roast_events_run_kind ON roast_events(run_id, kind);
 """
 
+SCHEMA_V7_ROASTED_WEIGHT = """
+-- #388 (D42): the operator-entered roasted-OUT weight (grams), captured
+-- post-roast after weighing. The green/charge weight is the frozen
+-- RoastProfile.bean_weight_grams (the "in" side); this is the "out" side, so the
+-- pair yields weight-loss % = (charge - roasted) / charge * 100 (predominantly
+-- moisture but also dry-matter loss — CO2, volatiles, chaff — so NOT pure water
+-- loss; computed on read, never stored, single source of truth).
+--
+-- Operator-editable on a completed run, the SAME lifecycle as operator_rating:
+-- it is set after cooling/weighing. The v2 completed-run immutability trigger
+-- guards a fixed column allow-list (it ABORTs only on the enumerated frozen
+-- columns), so a NEW column is permitted to change after completion without
+-- editing the shipped trigger. Nullable; pre-existing rows + un-weighed roasts
+-- read back NULL (no weight-loss %).
+ALTER TABLE roast_runs ADD COLUMN roasted_weight_grams REAL
+  CHECK (roasted_weight_grams IS NULL OR roasted_weight_grams > 0);
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
@@ -306,6 +325,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V4_BEAN_PROFILES,
     SCHEMA_V5_CHARGE_ELAPSED,
     SCHEMA_V6_DRYING_END_EVENT,
+    SCHEMA_V7_ROASTED_WEIGHT,
 )
 
 
@@ -902,6 +922,28 @@ class RoastStore:
         if cursor.rowcount == 0:
             raise RuntimeError(f"no completed roast_run with id {run_id!r}")
 
+    async def set_roasted_weight(self, run_id: str, *, roasted_weight_grams: float) -> None:
+        """Operator-entered roasted-out weight (#388) — completed runs only.
+
+        The same immutability-exception lifecycle as :meth:`set_operator_rating`:
+        captured post-roast after weighing, guarded to completed runs so an
+        in-progress run cannot be stamped. The weight-loss % is derived on read,
+        never stored. Raises when the run is unknown or still in progress.
+
+        Args:
+            run_id: The completed run to update.
+            roasted_weight_grams: The roasted-out weight in grams (> 0; the API
+                model enforces the bound before this is called).
+        """
+        cursor = await self.connection.execute(
+            "UPDATE roast_runs SET roasted_weight_grams = ?, updated_at_utc = ?"
+            " WHERE id = ? AND completed_at_utc IS NOT NULL",
+            (roasted_weight_grams, _utc_now(), run_id),
+        )
+        await self.connection.commit()
+        if cursor.rowcount == 0:
+            raise RuntimeError(f"no completed roast_run with id {run_id!r}")
+
     # --- E7-S1: API read paths (component plan §6) ---
     #
     # Read-only projections backing the REST surface. They return the typed
@@ -978,7 +1020,7 @@ class RoastStore:
         compare)."""
         async with self.connection.execute(
             "SELECT r.id, r.started_at_utc, r.completed_at_utc, r.agent_phase,"
-            " r.outcome, r.profile_json, r.operator_rating,"
+            " r.outcome, r.profile_json, r.operator_rating, r.roasted_weight_grams,"
             " (SELECT t.development_percent FROM telemetry_snapshots t"
             "  WHERE t.run_id = r.id AND t.development_percent IS NOT NULL"
             "  ORDER BY t.tick DESC LIMIT 1) AS dev_pct,"
@@ -1007,6 +1049,9 @@ class RoastStore:
         summaries: list[RoastSummary] = []
         for row in rows:
             profile = RoastProfile.model_validate_json(str(row["profile_json"]))
+            roasted_weight = (
+                None if row["roasted_weight_grams"] is None else float(row["roasted_weight_grams"])
+            )
             summaries.append(
                 RoastSummary(
                     id=str(row["id"]),
@@ -1025,6 +1070,11 @@ class RoastStore:
                     processing=profile.processing,
                     altitude_m=profile.altitude_m,
                     rating=None if row["operator_rating"] is None else int(row["operator_rating"]),
+                    roasted_weight_grams=roasted_weight,
+                    weight_loss_percent=weight_loss_percent(
+                        charge_weight_grams=profile.bean_weight_grams,
+                        roasted_weight_grams=roasted_weight,
+                    ),
                     development_percent=None if row["dev_pct"] is None else float(row["dev_pct"]),
                     advisor_consults=int(row["advisor_consults"]),
                     advisor_failed=int(row["advisor_failed"]),
@@ -1040,7 +1090,7 @@ class RoastStore:
         async with self.connection.execute(
             "SELECT id, agent_phase, profile_json, outcome, started_at_utc,"
             " completed_at_utc, fault_reason, operator_rating, operator_notes,"
-            " export_manifest_json FROM roast_runs WHERE id = ?",
+            " roasted_weight_grams, export_manifest_json FROM roast_runs WHERE id = ?",
             (run_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -1052,10 +1102,14 @@ class RoastStore:
             else LogManifest.model_validate_json(str(row["export_manifest_json"]))
         )
         agent_phase = RoastPhase(str(row["agent_phase"]))
+        profile = RoastProfile.model_validate_json(str(row["profile_json"]))
+        roasted_weight = (
+            None if row["roasted_weight_grams"] is None else float(row["roasted_weight_grams"])
+        )
         return RoastDetail(
             id=str(row["id"]),
             agent_phase=agent_phase,
-            profile=RoastProfile.model_validate_json(str(row["profile_json"])),
+            profile=profile,
             outcome=row["outcome"],
             started_at_utc=str(row["started_at_utc"]),
             completed_at_utc=None
@@ -1064,6 +1118,11 @@ class RoastStore:
             fault_reason=None if row["fault_reason"] is None else str(row["fault_reason"]),
             rating=None if row["operator_rating"] is None else int(row["operator_rating"]),
             notes=None if row["operator_notes"] is None else str(row["operator_notes"]),
+            roasted_weight_grams=roasted_weight,
+            weight_loss_percent=weight_loss_percent(
+                charge_weight_grams=profile.bean_weight_grams,
+                roasted_weight_grams=roasted_weight,
+            ),
             export_manifest=manifest,
             # Derived read-only from the phase (E10 option (a)): the SPA's action
             # bar mirrors this set; the live SSE phase_changed frame re-sends it.

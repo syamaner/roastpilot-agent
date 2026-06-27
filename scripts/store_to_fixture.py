@@ -104,6 +104,11 @@ class StoreRoast:
         run_id: The ``roast_runs.id`` (uuid4 hex).
         operator_rating: The operator's 1–5 self-rating, or ``None`` if unrated.
         operator_notes: The operator's free-text notes, or ``None``.
+        charge_weight_grams: The green/charge weight from the frozen profile
+            (``RoastProfile.bean_weight_grams``), or ``None`` if unreadable.
+        roasted_weight_grams: The operator-entered roasted-out weight (#388), or
+            ``None`` if not weighed. With ``charge_weight_grams`` it yields the
+            ``weight_loss_percent`` corpus label.
         roaster_driver: The roaster driver id (the known Hottop default; see
             ``_ROASTER_DRIVER``).
         telemetry: Tick-ordered telemetry rows (``tick`` / ``elapsed_seconds`` /
@@ -120,6 +125,8 @@ class StoreRoast:
     run_id: str
     operator_rating: int | None
     operator_notes: str | None
+    charge_weight_grams: float | None
+    roasted_weight_grams: float | None
     roaster_driver: str
     telemetry: list[dict[str, Any]]
     charge_seconds: float | None
@@ -261,7 +268,8 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
     try:
         resolved = _resolve_run_id(connection, run_id)
         run_row = connection.execute(
-            "SELECT operator_rating, operator_notes FROM roast_runs WHERE id = ?",
+            "SELECT operator_rating, operator_notes, roasted_weight_grams, profile_json"
+            " FROM roast_runs WHERE id = ?",
             (resolved,),
         ).fetchone()
         telemetry_rows = connection.execute(
@@ -293,6 +301,14 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
                 f"run {resolved} has no run_started event — event/telemetry clocks "
                 f"cannot be reconciled"
             )
+        charge_weight_grams: float | None = None
+        if run_row is not None and run_row["profile_json"] is not None:
+            try:
+                profile = json.loads(str(run_row["profile_json"]))
+                raw_charge = profile.get("bean_weight_grams")
+                charge_weight_grams = None if raw_charge is None else float(raw_charge)
+            except (ValueError, TypeError, AttributeError):
+                charge_weight_grams = None
         return StoreRoast(
             run_id=resolved,
             operator_rating=None
@@ -301,6 +317,10 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
             operator_notes=None
             if run_row is None or run_row["operator_notes"] is None
             else str(run_row["operator_notes"]),
+            charge_weight_grams=charge_weight_grams,
+            roasted_weight_grams=None
+            if run_row is None or run_row["roasted_weight_grams"] is None
+            else float(run_row["roasted_weight_grams"]),
             roaster_driver=_ROASTER_DRIVER,
             telemetry=telemetry,
             charge_seconds=_rebase(_event_time(connection, resolved, _CHARGE_KIND), run_started),
@@ -478,7 +498,42 @@ def build_summary(roast: StoreRoast, rows: list[dict[str, Any]]) -> dict[str, An
         "operator_rating": roast.operator_rating,
         "operator_notes": roast.operator_notes,
         "degree": classify_degree(drop_temp_c),
+        # Objective outcome label (#388): the roasted-out weight + derived
+        # weight-loss % = (charge - roasted) / charge * 100 — predominantly
+        # moisture, but also dry-matter loss (CO2, volatiles, chaff), so NOT pure
+        # water loss. ``None`` when the roast was not weighed.
+        "charge_weight_grams": roast.charge_weight_grams,
+        "roasted_weight_grams": roast.roasted_weight_grams,
+        "weight_loss_percent": _weight_loss_percent(
+            roast.charge_weight_grams, roast.roasted_weight_grams
+        ),
     }
+
+
+def _weight_loss_percent(
+    charge_weight_grams: float | None, roasted_weight_grams: float | None
+) -> float | None:
+    """Roast weight-loss % for the fixture label (#388).
+
+    Mirrors ``models.weight_loss_percent`` (kept local so this standalone script
+    has no app-package import): ``(charge - roasted) / charge * 100``, ``None``
+    when either weight is absent / non-positive.
+
+    Args:
+        charge_weight_grams: The green/charge weight, or ``None``.
+        roasted_weight_grams: The roasted-out weight, or ``None``.
+
+    Returns:
+        The weight-loss percentage rounded to two decimals, or ``None``.
+    """
+    if (
+        charge_weight_grams is None
+        or roasted_weight_grams is None
+        or charge_weight_grams <= 0
+        or roasted_weight_grams <= 0
+    ):
+        return None
+    return round((charge_weight_grams - roasted_weight_grams) / charge_weight_grams * 100.0, 2)
 
 
 def convert(db_path: Path, out_dir: Path, run_id: str | None = None) -> dict[str, Any]:

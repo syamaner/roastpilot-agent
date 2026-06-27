@@ -70,6 +70,7 @@ from roastpilot_agent.models import (
     OperatorRatingRequest,
     RoastCommand,
     RoastDetail,
+    RoastedWeightRequest,
     RoastEventKind,
     RoastEventSource,
     RoastHistory,
@@ -1725,6 +1726,30 @@ class RoastService:
             raise RuntimeError(f"read_run returned None for rated run {run_id}")
         return rated
 
+    async def set_roasted_weight(self, run_id: str, request: RoastedWeightRequest) -> RoastDetail:
+        """Record the operator-entered roasted-out weight (#388), or 404/409.
+
+        Mirrors :meth:`rate`: 404 when the run is unknown; 409 when it is still in
+        progress — the roasted weight is a completed-run immutability exception
+        (entered post-weighing), so the in-progress case surfaces as a conflict
+        rather than letting the store's RuntimeError escape as a 500. The response
+        carries the derived ``weight_loss_percent``.
+        """
+        detail = await self._store.read_run(run_id)
+        if detail is None:
+            raise RoastRunNotFoundError(run_id)
+        if detail.completed_at_utc is None:
+            raise RoastRunConflictError(
+                f"run {run_id} is still in progress; record its weight after completion"
+            )
+        await self._store.set_roasted_weight(
+            run_id, roasted_weight_grams=request.roasted_weight_grams
+        )
+        weighed = await self._store.read_run(run_id)
+        if weighed is None:  # pragma: no cover — immutable once completed
+            raise RuntimeError(f"read_run returned None for weighed run {run_id}")
+        return weighed
+
     async def submit_operator_action(
         self, run_id: str, request: OperatorActionRequest
     ) -> OperatorActionResult:
@@ -1959,6 +1984,20 @@ async def rate_roast(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+async def set_roasted_weight(
+    run_id: str,
+    request: RoastedWeightRequest,
+    service: ServiceDep,
+) -> RoastDetail:
+    """``POST /api/roasts/{run_id}/roasted-weight`` — operator roasted-out weight (#388)."""
+    try:
+        return await service.set_roasted_weight(run_id, request)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 async def submit_operator_action(
     run_id: str,
     action: OperatorActionRequest,
@@ -2167,6 +2206,7 @@ def create_app(
     app.get("/api/roasts/{run_id}/log")(get_log_manifest)
     app.get("/api/roasts/{run_id}/log/{artifact}")(download_log)
     app.post("/api/roasts/{run_id}/rating")(rate_roast)
+    app.post("/api/roasts/{run_id}/roasted-weight")(set_roasted_weight)
     app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)
     app.get("/api/bean-profiles")(list_bean_profiles)
     app.post("/api/bean-profiles", status_code=201)(create_bean_profile)

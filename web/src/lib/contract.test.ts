@@ -398,6 +398,8 @@ describe("REST snapshot contract", () => {
       "fault_reason",
       "rating",
       "notes",
+      "roasted_weight_grams",
+      "weight_loss_percent",
       "export_manifest",
       "enabled_actions",
     ]);
@@ -441,6 +443,8 @@ describe("REST snapshot contract", () => {
       "bean_origin",
       "bean_varietal",
       "rating",
+      "roasted_weight_grams",
+      "weight_loss_percent",
       "development_percent",
       "advisor_consults",
       "advisor_clamped",

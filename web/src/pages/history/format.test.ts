@@ -10,6 +10,7 @@ import {
   formatDevPercent,
   formatFcTime,
   formatStartedAt,
+  formatWeightLoss,
 } from "./format";
 
 function run(overrides: Partial<RoastSummary> = {}): RoastSummary {
@@ -70,6 +71,18 @@ describe("formatDevPercent", () => {
 
   it("renders an em dash for null", () => {
     expect(formatDevPercent(null)).toBe("—");
+  });
+});
+
+describe("formatWeightLoss", () => {
+  it("formats to one decimal", () => {
+    expect(formatWeightLoss(11.6)).toBe("11.6%");
+    expect(formatWeightLoss(15)).toBe("15.0%");
+  });
+
+  it("renders an em dash for null/undefined (un-weighed)", () => {
+    expect(formatWeightLoss(null)).toBe("—");
+    expect(formatWeightLoss(undefined)).toBe("—");
   });
 });
 

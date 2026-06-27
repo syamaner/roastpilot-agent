@@ -17,6 +17,7 @@ import type {
   OperatorRatingRequest,
   RoastDetail,
   RoastHistory,
+  RoastedWeightRequest,
   RoastProfile,
   RoastTimeline,
   TelemetrySeries,
@@ -92,6 +93,13 @@ export const api = {
     request<RoastDetail>(`/api/roasts/${runId}/rating`, {
       method: "POST",
       body: JSON.stringify(rating),
+    }),
+
+  /** `POST /api/roasts/{id}/roasted-weight` — operator roasted-out weight (#388). */
+  setRoastedWeight: (runId: string, body: RoastedWeightRequest) =>
+    request<RoastDetail>(`/api/roasts/${runId}/roasted-weight`, {
+      method: "POST",
+      body: JSON.stringify(body),
     }),
 
   /** `POST /api/roasts/{id}/operator-actions` — queue an operator action. */

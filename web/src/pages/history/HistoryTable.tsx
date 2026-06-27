@@ -14,7 +14,13 @@ import { useNavigate } from "react-router-dom";
 import { cn } from "@/lib/cn";
 import type { RoastSummary } from "@/lib/types";
 
-import { beanLabel, formatDevPercent, formatFcTime, formatStartedAt } from "./format";
+import {
+  beanLabel,
+  formatDevPercent,
+  formatFcTime,
+  formatStartedAt,
+  formatWeightLoss,
+} from "./format";
 import { HistoryAdvisorCell } from "./HistoryAdvisorCell";
 import { OutcomeBadge } from "./OutcomeBadge";
 import { StarRating } from "./StarRating";
@@ -44,6 +50,7 @@ export function HistoryTable({ runs }: HistoryTableProps): React.JSX.Element {
               <th className={HEAD_CELL}>Advisor</th>
               <th className={HEAD_CELL}>FC</th>
               <th className={HEAD_CELL}>Dev %</th>
+              <th className={HEAD_CELL}>Loss %</th>
               <th className={HEAD_CELL}>Rating</th>
             </tr>
           </thead>
@@ -109,6 +116,18 @@ export function HistoryTable({ runs }: HistoryTableProps): React.JSX.Element {
                 </td>
                 <td className={cn(BODY_CELL, "font-mono text-sm text-foreground")}>
                   {formatDevPercent(run.development_percent)}
+                </td>
+                <td
+                  data-testid="history-weight-loss"
+                  className={cn(
+                    BODY_CELL,
+                    "whitespace-nowrap font-mono text-sm",
+                    run.weight_loss_percent === null || run.weight_loss_percent === undefined
+                      ? "text-muted-foreground"
+                      : "text-foreground",
+                  )}
+                >
+                  {formatWeightLoss(run.weight_loss_percent)}
                 </td>
                 <td className={BODY_CELL}>
                   <StarRating rating={run.rating} />
