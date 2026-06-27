@@ -62,5 +62,54 @@ ETHIOPIA_KOKE_SEED = BeanProfile(
     ),
 )
 
+#: Stable id for the Colombia Excelso Huila (Washed) seed (#134 roast-4 origin).
+#: Fixed so the idempotent ``seed_bean_profile`` insert is a no-op after the
+#: first boot and an operator edit to the seeded row is never clobbered.
+COLOMBIA_HUILA_ID = "seed-colombia-excelso-huila-washed"
+
+#: The Colombia Excelso Huila (Washed) seed profile — the second selectable bean,
+#: added for the roast-4 origin (Redber GRE-COEX-BE250). A washed Colombian is
+#: more forgiving than the delicate Koke natural, so the targets sit at a
+#: balanced-medium starting point the operator edits to taste. The drop ceiling
+#: stays at the operator's proven 195 °C known-good line (bitter > 196 °C), which
+#: also keeps momentum headroom for the #336 anticipatory-trim validation; the
+#: development target is a touch fuller (15 %, matching the operator's verified
+#: 15–16 % DTR) for the bean's chocolate / body. All temperatures are Celsius.
+COLOMBIA_HUILA_SEED = BeanProfile(
+    id=COLOMBIA_HUILA_ID,
+    created_at=_SEED_TIMESTAMP,
+    updated_at=_SEED_TIMESTAMP,
+    name="Colombia Excelso Huila (Washed)",
+    bean_origin="Colombia",
+    country="Colombia",
+    farm="Huila (regional Excelso lot)",
+    bean_varietal="Caturra, Typica, Bourbon",
+    bean_species="arabica",
+    is_blend=False,
+    processing="washed",
+    # Huila grows 1,200–2,000 m; 1600 m is a representative central value for the
+    # single ``altitude_m`` axis (the full range is in ``description``).
+    altitude_m=1600,
+    source_url="https://www.redber.co.uk/products/colombia-excelso-huila-green-coffee-beans",
+    charge_guidance_min_c=170.0,
+    charge_guidance_max_c=200.0,
+    initial_heat_percent=100,
+    initial_fan_percent=30,
+    # 195 °C = the operator's proven known-good drop line (bitter > 196 °C); a
+    # conservative ceiling for the first roast on this bean that also leaves the
+    # anticipatory trim headroom against the roast-3 momentum overshoot. Edit up
+    # toward a fuller medium once the trim is validated on hardware.
+    target_drop_temp_c=195.0,
+    target_development_percent=15.0,
+    default_bean_weight_grams=250.0,  # 1 kg / 4 batches
+    description=(
+        "Huila, southern Colombia. Excelso grade, washed; grown 1,200–2,000 m on "
+        "volcanic soil. Caturra / Typica / Bourbon. Sweet citrus + chocolate, "
+        "bright acidity, round body, clean aroma. Balanced and forgiving — roast "
+        "to a medium for body + sweetness. Targets are a conservative-medium "
+        "starting point; edit to taste."
+    ),
+)
+
 #: Every built-in seed profile, inserted idempotently at startup (#303).
-SEED_BEAN_PROFILES: tuple[BeanProfile, ...] = (ETHIOPIA_KOKE_SEED,)
+SEED_BEAN_PROFILES: tuple[BeanProfile, ...] = (ETHIOPIA_KOKE_SEED, COLOMBIA_HUILA_SEED)
