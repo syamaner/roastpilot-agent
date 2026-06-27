@@ -2532,6 +2532,64 @@ async def test_t0_backdate_absent_anchors_at_first_detect() -> None:
 
 
 @pytest.mark.asyncio
+async def test_t0_backdate_latched_when_it_arrives_mid_streak() -> None:
+    """#174: the MCP turning-point backdate can arrive a tick AFTER the first
+    detect (the ``beans_added`` event racing into ``state.events`` late — the
+    roast-4 root cause). It is latched the first tick it appears and applied at the
+    transition even though the first-detect tick carried no delta."""
+    backdate = 6.0
+    harness = make_harness()
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    harness.clock.advance(100.0)  # first detect lands at a positive instant
+    first_detect = 100.0
+    # First detect: backdate NOT yet present.
+    harness.reader.readings = [reading(bean=160.0, t0_detected=True)]
+    await harness.controller.tick()  # streak 1, first_detect=100.0, no latch yet
+    harness.clock.advance(1.0)
+    # The backdate races in on the 2nd streak tick.
+    harness.reader.readings = [reading(bean=158.0, t0_detected=True, t0_backdate_seconds=backdate)]
+    await harness.controller.tick()  # streak 2 → latch the delta
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=156.0, t0_detected=True)]
+    await harness.controller.tick()  # streak 3 → transition
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    # Charge origins at first_detect − the LATCHED backdate, despite the delta being
+    # absent on the first-detect tick (100 − 6 = 94) — not the transition tick.
+    charge = harness.controller._charge_monotonic  # pyright: ignore[reportPrivateUsage]
+    assert charge == pytest.approx(first_detect - backdate)
+
+
+@pytest.mark.asyncio
+async def test_t0_charge_clock_re_anchors_after_a_broken_streak() -> None:
+    """#174: a broken debounce streak discards the stale candidate charge instant;
+    the charge clock origins on the POST-break first detect, never the pre-break
+    one (no cross-streak anchor bleed)."""
+    harness = make_harness()
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    harness.clock.advance(50.0)
+    # A first (stale) streak that breaks before it can confirm.
+    harness.reader.readings = [reading(bean=160.0, t0_detected=True)]
+    await harness.controller.tick()  # stale first_detect=50.0
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=160.0, t0_detected=False)]
+    await harness.controller.tick()  # break → reset, stale first_detect cleared
+    harness.clock.advance(1.0)
+    post_break_first_detect = 52.0
+    for _ in range(harness.controller._config.t0_debounce_ticks):  # pyright: ignore[reportPrivateUsage]
+        harness.reader.readings = [reading(bean=158.0, t0_detected=True)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    # Anchored to the POST-break first detect (52.0), NOT the stale 50.0.
+    charge = harness.controller._charge_monotonic  # pyright: ignore[reportPrivateUsage]
+    assert charge == pytest.approx(post_break_first_detect)
+
+
+@pytest.mark.asyncio
 async def test_fc_backdate_anchors_development_clock_earlier_and_moves_dtr() -> None:
     """#337: an FC ``first_crack_backdate_seconds`` delta anchors the development
     clock at the crack ONSET, so the development-elapsed (and the dev% it drives)
