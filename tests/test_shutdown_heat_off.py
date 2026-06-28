@@ -290,8 +290,14 @@ async def test_shutdown_heat_off_retry_recovers_without_marker(store: RoastStore
     detail = await service.start_roast(_profile())
     run_id = detail.id
 
+    # timeout_seconds=1.0: large enough that the genuine-hang first attempt
+    # still times out (asyncio.Event().wait() never returns), while the retry
+    # (pure in-process FakeMCPClient call) comfortably completes within the
+    # same 1.0 s window even under heavy CI scheduler load.  The previous
+    # 0.05 s was too tight for the retry's SQLite store writes on a loaded
+    # runner, causing intermittent failures (#399).
     issued = await asyncio.wait_for(
-        service.safe_shutdown_heat_off(timeout_seconds=0.05), timeout=2.0
+        service.safe_shutdown_heat_off(timeout_seconds=1.0), timeout=10.0
     )
     assert issued is True, "retry confirmed the heat-off"
     assert "emergency_stop" in mcp.commands()
