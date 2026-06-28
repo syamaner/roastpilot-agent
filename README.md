@@ -25,8 +25,8 @@ directly.
 
 **Start a roast.** Pick a saved bean profile or enter the bean by hand, set the
 roast targets (charge window, target drop temperature, target development) and
-the charge weight. Starting commands the roaster to preheat, so the operator is
-always in the loop before any real heat is applied.
+the charge weight. Starting commands the roaster to preheat, which turns on real
+heat, so it is always an explicit operator action.
 
 ![Start a roast](docs/screenshots/start-roast.png)
 
@@ -68,8 +68,8 @@ The advisor's model and prompt are not picked by vibes; they are chosen by a
 **replay bake-off** that scores candidate models against real roasts:
 
 - **Test set:** known-good Hottop roasts replayed tick-by-tick. The current set
-  is the operator's annotated Artisan `.alog` history, quality-filtered to drop
-  below the operator's bitterness ceiling (< 198 °C) and converted to the replay
+  is the operator's annotated Artisan `.alog` history, quality-filtered to drops
+  below the operator's over-roast threshold (< 198 °C) and converted to the replay
   format by [`scripts/alog_to_fixture.py`](scripts/alog_to_fixture.py) (it
   decodes the BT/ET curve, the charge / first-crack / drop marks, and the manual
   heat/fan control track). The roast logs themselves are personal and are **not**
