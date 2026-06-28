@@ -112,7 +112,7 @@ Acceptance criteria:
   count, `onnx_threads`, flush threshold).
 
 Depends on coffee-roaster-mcp#180 (the flush fix) + #176 (recording) — **both now SHIPPED:
-#180 + #162 in MCP 0.1.10, #181 (full-roast recorder lifecycle) + #178 (live mic peak/RMS
+#176 (capture) in MCP 0.1.9, #180 + #162 in MCP 0.1.10, #181 (full-roast recorder lifecycle) + #178 (live mic peak/RMS
 levels) in MCP 0.1.11, agent pinned 0.1.11 (`pyproject.toml:131`); the recording now spans
 charge→drop on the Mac. The Pi-5 soak is the remaining open validation.** Pairs with the
 local Pi dual-mic capture validation (research 27 Jun: no published Pi-5 CPU numbers; the
