@@ -601,9 +601,10 @@ D35 build. Honest state:
   (#254) curve hydration, #242 (#248) name-keyed rows, #103 (#251) replay-harness
   hardening, #257 Dependabot. **#112 closed** (GAP A shipped via #220; GAP B = live
   FC-detector health is M2/MCP scope, out of E10).
-- **Governance / CI — DONE:** PR review roster curated to Claude Code Review + Augment
-  (auggie); Codex + CodeRabbit disabled (#246, **plan D37**) — a conversation-resolution
-  gate + a re-review-on-every-push bot was a non-terminating merge loop. CI Playwright
+- **Governance / CI — DONE:** PR review roster = Claude Code Review (+ human reviewers);
+  the Augment Code trial ended 28 Jun 2026, and Codex + CodeRabbit were disabled (#246,
+  **plan D37**) — a conversation-resolution gate + a re-review-on-every-push bot was a
+  non-terminating merge loop. CI Playwright
   image mirrored to GHCR off MCR's anonymous-pull hot path; `mirror-playwright.yml`
   self-refreshes weekly + on bump (#262/#263, **plan D38**).
 
