@@ -20,7 +20,9 @@ child, per D6), mDNS, and a deployment doc. **No Docker image; no PyTorch on the
 > real devices) is **✅ DONE/CLOSED** (13 Jun, iPad + iPhone Safari). **#134** (E12-S1
 > supervised hardware roast through the agent harness, D17 criterion 3) is **✅ VALIDATED
 > by roast 6** (27 Jun — auto-FC detection + advisor dev%-gated drop + full charge→drop
-> recording, supervised, clean light roast). **The D28 gate no longer blocks E11.**
+> recording, supervised, clean light roast) and **re-confirmed by roast 8** (28 Jun — first
+> fully autonomous LLM-driven drop through the safety box, clean medium ~193 °C / 21 % DTR).
+> **The D28 gate no longer blocks E11.**
 >
 > **Still gated on D27 (independent):** the **torch-free `coffee-roaster-mcp`** chain
 > (Phase 1 `coffee-first-crack-detection#54` → Phase 2 `coffee-roaster-mcp#157`, both

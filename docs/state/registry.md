@@ -102,6 +102,46 @@
 
 ## Active Context
 
+**28 Jun 2026 (latest) — ROAST 8 + the c5/c6 control prompts. Roast 8 = the FIRST fully
+autonomous LLM-driven drop on this stack that landed a proper roast. c5/c6 prompts merged
+(selectable; c3 stays default). The deterministic post-FC heat floor (#405) is now the
+ACTIVE PRIORITY (In Progress).** Plan decisions **D72/D73/D74** (`roastpilot-plan`).
+What landed on `main` / happened tonight:
+
+- **c5 prompt MERGED (#406; D72).** Post-FC heat-floor control-teaching ("keep the bean
+  climbing"). Additive + selectable; **c3 stays the live default**. Refs #396.
+- **c6 prompt MERGED (#407; D72).** c5 + an explicit heat-RECOVERY action ("if heat = 0 and
+  the bean is below drop temp, RESTORE heat"). Additive + selectable; c3 stays default. Refs #396.
+- **roast-live.sh banner MERGED (#408).** The runner now reads out the resolved advisor model
+  + prompt, tagged ⚠ EXPERIMENT when non-default. Refs #396.
+- **Bake-off (mini+c6 round; D73).** gpt-4o vs **gpt-4.1-mini** × c3/c4/c5/c6 × 3 Colombia +
+  Artisan. **gpt-4.1-mini WINS the Artisan heat-fidelity reference** (heat-MAE ~18–22 vs gpt-4o
+  ~30–40, ~2× closer; higher drop-F1; ~5× cheaper) — the EXACT metric D43/D69 pinned gpt-4o on.
+  c6 recovers the post-FC floor (strong for mini, late for gpt-4o). **Pin NOT overturned** (the
+  replay eval scores RECOVERY not PREVENTION; mini was never hardware-run until roast 8).
+  Recommendation = add a **mini arm** (mini+c4 / mini+c6 vs gpt-4o+c1) to the #396 A/B. Commented on #396.
+- **ROAST 8 (hardware, 28 Jun; D74) = FIRST FULLY AUTONOMOUS LLM-DRIVEN DROP that landed a
+  proper roast.** Config = gpt-4.1-mini + c6 (the experiment), pre-FC trim fixed 65 %. The
+  controller executed mini's `should_drop` through the safety box (operator did not touch the
+  drop) at **bean 193 °C / DTR 21.1 % / RoR 3, t+13:01 from charge** — a solid slightly-developed
+  medium for washed Colombia Huila, far better than roast 7's under-temp 188 °C / 16 %.
+  **c6 hardware verdict: does NOT prevent the over-brake** (heat still crashed 40→0 one tick
+  post-FC) **but DOES recover from it** (~30 s later, 0→30→40, fast enough the bean never
+  stalled — roast 7 / gpt-4o+c3 never recovered). So c6 = a real improvement, but the wobble
+  persists → **#405 (deterministic post-FC heat floor + LLM-drop-only) is the robust fix and is
+  now the priority** (board: In Progress).
+- **Filed: #409** — tag the turning point (post-charge bean-temp minimum) as a landmark event +
+  chart marker, mirroring drying_end (open; board To Do). (Plan **D74**.)
+
+**Open / next:** **#405** (deterministic post-FC redesign — TOP priority, carries the roast-8 +
+c6 evidence), **#396** (the operator-gated prompt A/B — now wants a mini arm; do NOT close),
+**#404** (T0 chart marker mis-anchored to the detection-fire point, not the backdated charge —
+open; supersedes the #387 line), **#409** (turning-point landmark), **#386** (pre-FC adaptive-trim
+thrash — already closed via #402's interim toggle / config-gated depth), **#342** (ambient probe),
+**MCP E11-S3** (Pi soak), **#178** / **#179**.
+
+---
+
 **28 Jun 2026 (later) — BAKE-OFF RE-VALIDATION + ADVISOR/CORPUS CLOSEOUT. The post-FC pin HOLDS
 (no re-pin), c4 added selectable (c3 stays default), the store corpus + finalists report shipped,
 Colombia dev stepped to 16 %. #277 and #224 are CLOSED; the open follow-up is the operator-gated
