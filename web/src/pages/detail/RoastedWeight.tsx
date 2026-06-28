@@ -55,7 +55,11 @@ export function RoastedWeight({
   });
 
   const parsed = Number.parseFloat(draft);
-  const valid = Number.isFinite(parsed) && parsed > 0;
+  // The roasted weight must be positive AND below the charge weight — a value at
+  // or above the charge is a tare/scale error (you can't gain mass roasting), so
+  // the API rejects it (409) and the Save button stays disabled.
+  const overCharge = Number.isFinite(parsed) && parsed >= chargeWeightGrams;
+  const valid = Number.isFinite(parsed) && parsed > 0 && parsed < chargeWeightGrams;
 
   const onSave = () => {
     if (!valid) return;
@@ -108,6 +112,11 @@ export function RoastedWeight({
         >
           {mutation.isPending ? "Saving…" : "Save weight"}
         </button>
+        {overCharge && (
+          <span data-testid="roasted-weight-invalid" className="text-xs text-roast-fault">
+            Must be under the {chargeWeightGrams} g charge.
+          </span>
+        )}
         {mutation.isError && (
           <span data-testid="roasted-weight-error" className="text-xs text-roast-fault">
             Save failed — try again.

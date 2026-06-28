@@ -820,6 +820,24 @@ async def test_set_roasted_weight_rejects_non_positive(
     assert response.status_code == 422
 
 
+@pytest.mark.asyncio
+async def test_set_roasted_weight_rejects_over_charge(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """A roasted weight above the charge weight is physically impossible → 409."""
+    await store.create_run(
+        run_id="run-oc",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(run_id="run-oc", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post(
+        "/api/roasts/run-oc/roasted-weight", json={"roasted_weight_grams": 9999.0}
+    )
+    assert response.status_code == 409
+
+
 # --- operator action queue (E7-S2) ---
 
 

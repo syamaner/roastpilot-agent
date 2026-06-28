@@ -1732,8 +1732,11 @@ class RoastService:
         Mirrors :meth:`rate`: 404 when the run is unknown; 409 when it is still in
         progress — the roasted weight is a completed-run immutability exception
         (entered post-weighing), so the in-progress case surfaces as a conflict
-        rather than letting the store's RuntimeError escape as a 500. The response
-        carries the derived ``weight_loss_percent``.
+        rather than letting the store's RuntimeError escape as a 500. A roasted
+        weight above the charge weight is physically impossible (a tare/scale
+        error) and is rejected as a 409 too, rather than persisted as a row whose
+        derived loss reads as null/"unweighed". The response carries the derived
+        ``weight_loss_percent``.
         """
         detail = await self._store.read_run(run_id)
         if detail is None:
@@ -1741,6 +1744,11 @@ class RoastService:
         if detail.completed_at_utc is None:
             raise RoastRunConflictError(
                 f"run {run_id} is still in progress; record its weight after completion"
+            )
+        if request.roasted_weight_grams > detail.profile.bean_weight_grams:
+            raise RoastRunConflictError(
+                f"roasted weight {request.roasted_weight_grams} g exceeds the charge "
+                f"weight {detail.profile.bean_weight_grams} g (physically impossible)"
             )
         await self._store.set_roasted_weight(
             run_id, roasted_weight_grams=request.roasted_weight_grams
