@@ -32,10 +32,12 @@ Availability: gpt-5-nano and gpt-5-mini timed out on reachability probe (both se
 grok-4.3 also produced `confidence > 1.0` on 3 ticks (AdvisorUnsafeOutputError),
 making it structurally unreliable independent of latency.
 
-### Finalists (3 models, 17 roasts, 2 seeds)
+### Finalists (3 models, 17 roasts, 1–2 seeds)
 
 After the screen, the 3 latency-passing models with highest drop F1 were carried
-to the full 17-roast medium set with 2 independent seeds:
+to the full 17-roast medium set. gpt-4o and gemini-3.1-flash-lite ran 2 seeds
+(34 roast-seed pairs each); gemini-3-flash-preview completed 1 seed (17 pairs)
+only — see the † caveat below:
 
 | Model                        | Drop F1 (n pairs)     | Heat MAE | Heat DA | Fan MAE | FC Lat |
 |------------------------------|----------------------|----------|---------|---------|--------|
@@ -118,12 +120,15 @@ model without first isolating the prompt.
 The 21 Jun pin was decided primarily on heat-magnitude MAE and heat-direction
 agreement, not drop F1 (gpt-4o's heat MAE ~7.5 pp vs gemini ~22 pp on c1).
 
-| Model                        | Drop F1 | Heat MAE | Heat DA |
-|------------------------------|---------|----------|---------|
-| gemini-3.1-flash-lite (c3)   | 0.931   | 59.8 pp  | 0.44    |
-| gemini-3-flash-preview (c3)  | 0.902   | 48.5 pp  | 0.47    |
-| gpt-4o (c3)                  | 0.765   | 46.9 pp  | 0.48    |
-| gpt-4o (c1, screen only)     | 0.833   | (not scored in this run) | — |
+| Model                        | Drop F1 | Pairs | Heat MAE | Heat DA |
+|------------------------------|---------|-------|----------|---------|
+| gemini-3.1-flash-lite (c3)   | 0.931   | n=34  | 59.8 pp  | 0.44    |
+| gemini-3-flash-preview (c3)  | 0.902 † | n=17  | 48.5 pp  | 0.47    |
+| gpt-4o (c3)                  | 0.765   | n=34  | 46.9 pp  | 0.48    |
+| gpt-4o (c1, screen only)     | 0.833   | n=6   | (not scored in this run) | — |
+
+† gemini-3-flash-preview is 1-seed / 17-pairs (half the samples of the n=34
+rows) — wider uncertainty, not directly comparable. See §1.
 
 Heat DA for all finalists is tightly clustered (0.44–0.48). Heat MAE is high
 for all models on c3 — this is believed to be a prompt confound (models reason
@@ -169,7 +174,7 @@ dedicated run with full heat scoring on both prompts; not done in this session.
 | `docs/advisor/bakeoff-screen-2026-06-28.json` | Screen pass raw data (7 models, 6 roasts, 1 seed, c3) |
 | `docs/advisor/bakeoff-finalists-2026-06-28.md` | This report |
 | `docs/advisor/store-roast-corpus-manifest.json` | Labelled store-corpus manifest (#224) |
-| `/tmp/bakeoff-finalists-2026-06-28.json` | Finalists raw data (3 models, 17 roasts, 2 seeds, c3) — gitignored |
+| `/tmp/bakeoff-finalists-2026-06-28.json` | Finalists raw data (3 models, 17 roasts, c3; 2 seeds for gpt-4o & gemini-3.1-flash-lite, 1 seed for gemini-3-flash-preview) — gitignored |
 | `/tmp/bakeoff-gpt4o-c1-screen-2026-06-28.json.capture.jsonl` | c1 comparison capture — gitignored |
 
 The finalists JSON and c1 capture are in `/tmp` (not committed — too large for the
