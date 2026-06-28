@@ -110,6 +110,27 @@ class LateMaillardTrim(BaseModel):
 
     The window can be disabled wholesale with ``enabled=False`` (reverts to the
     pure #222 flat floor). All values are percentages, Celsius, or seconds.
+
+    **Adaptive trim depth (#386).** The default ``adaptive_depth_enabled=False``
+    keeps the current fixed-depth behaviour byte-for-byte — the roast-6-proven
+    method stays the default and no hardware change is made without opt-in.  When
+    enabled, :meth:`depth_for` applies the formula::
+
+        clamp(base_trim − k_ror·max(0, ror − ror_ref)
+              − k_eta·max(0, eta_ref − eta),
+              min_trim, max_trim)
+
+    A hotter approach (high RoR, short ETA) deepens the cut; a gentle approach
+    (low RoR, long ETA near the window boundary) produces a shallower cut near
+    ``base_trim``.  All coefficients are D42-learnable config fields; the
+    conservative starting defaults are validated offline for monotonicity but
+    tuned on hardware at roast 7.  ``base_trim=65`` means enabled-but-untuned ==
+    the current fixed depth — a safe enable path with no change until the
+    coefficients are dialled in.
+
+    Fan is NEVER touched by this feature: no pre-FC fan raise (the #218
+    anti-pattern).  The latch still governs *engagement*; depth eases with the
+    signal but the trim does not thrash on/off.
     """
 
     #: Whether the anticipatory trim is active. ``False`` reverts to the pure
@@ -123,6 +144,8 @@ class LateMaillardTrim(BaseModel):
     #: bend RoR into FC, NOT a momentum-killing cut (the #218 pre-FC crash). Must
     #: stay <= the flat-floor ``PreFirstCrackLevers.heat_target_percent`` (the
     #: trim only ever lowers heat — a validator on the parent pins this).
+    #: Also the default ``base_trim`` for adaptive depth (#386): enabling adaptive
+    #: mode with default coefficients preserves the proven fixed depth.
     trim_heat_percent: int = Field(default=65, ge=10, le=100)
     #: Seconds-before-predicted-FC at which the window OPENS. Default 60 — the
     #: trim engages in late Maillard, ~1 min ahead of the projected crack, so the
@@ -136,6 +159,154 @@ class LateMaillardTrim(BaseModel):
     #: ``ControllerConfig.first_crack_target_bean_temp_c`` 176 °C), ~20 °C below
     #: the FC target. Guards the FC-ETA trigger against an early false positive.
     min_bean_temp_c: float = Field(default=155.0, gt=0)
+
+    # ------------------------------------------------------------------
+    # Adaptive trim-depth (#386) — opt-in, default OFF.
+    # All fields below are TUNING PARAMETERS refined on hardware (roast 7+).
+    # The conservative starting defaults ensure monotonicity offline but are
+    # not thermally validated — see the offline choice-validation tests.
+    # ------------------------------------------------------------------
+
+    #: Whether adaptive trim depth is active (#386). Default ``False`` — the
+    #: current fixed-depth method is the default; adaptive depth is opt-in.
+    #: When ``False`` (or when RoR / FC-ETA is unavailable), ``depth_for``
+    #: returns the fixed ``trim_heat_percent`` unchanged — byte-for-byte the
+    #: proven roast-6 behaviour.
+    adaptive_depth_enabled: bool = Field(default=False)
+    #: The adaptive-depth baseline (percentage). Default 65 — equal to the
+    #: fixed ``trim_heat_percent`` so that enabling adaptive mode without
+    #: tuning the gain coefficients reproduces the fixed depth exactly. Must
+    #: satisfy ``min_trim ≤ base_trim ≤ max_trim`` (a validator pins this).
+    base_trim: int = Field(default=65, ge=10, le=100)
+    #: RoR sensitivity coefficient (°C/min per pp of trim deepening). Default
+    #: 1.5 — each extra °C/min above ``ror_ref`` deepens the cut by 1.5 pp,
+    #: so a roast-3-style hot approach (+8 °C/min above ref) deepens by 12 pp
+    #: (65 → 53, still above ``min_trim``). Conservative: offline validation
+    #: confirms monotonicity; thermal outcome on hardware at roast 7.
+    k_ror: float = Field(default=1.5, ge=0.0)
+    #: ETA sensitivity coefficient (seconds per pp of trim deepening). Default
+    #: 0.2 — each 1 s under ``eta_ref`` deepens by 0.2 pp, so a very short
+    #: ETA (30 s vs. the 60 s ``eta_ref``) deepens by 6 pp. Modest by design;
+    #: the RoR term is the primary dial. Conservative; tuned at roast 7.
+    k_eta: float = Field(default=0.2, ge=0.0)
+    #: RoR reference level (°C/min). Default 8.0 — below this the RoR term
+    #: contributes 0; above it the cut deepens. Calibrated on the corpus
+    #: (roast 3 hot approach ≈ 12–14 °C/min; roast 6 gentle ≈ 4–6 °C/min);
+    #: 8 is the mid-point between roast-3 and roast-6 RoR in late Maillard.
+    ror_ref: float = Field(default=8.0, ge=0.0)
+    #: ETA reference (seconds). Default 60.0 — equal to ``window_fc_eta_seconds``
+    #: so the ETA term is 0 at the window boundary and deepens only when the
+    #: predicted crack is closer than the reference. Must be positive.
+    eta_ref: float = Field(default=60.0, gt=0)
+    #: Deepest permitted trim (percentage). Default 45 — the floor the adaptive
+    #: formula cannot go below, preventing a stall of FC. This value must NOT
+    #: be so low that the heat cut could arrest the exothermic first-crack
+    #: reaction (plan §8.4 "FC always arrives"). Must satisfy
+    #: ``min_trim ≤ base_trim`` (validator) and ``ge=10`` (same hard floor as
+    #: ``trim_heat_percent`` itself).
+    min_trim: int = Field(default=45, ge=10, le=100)
+    #: Shallowest permitted trim (percentage). Default 75 — the ceiling above
+    #: which the adaptive formula cannot go. The validator on the parent model
+    #: pins ``max_trim ≤ heat_target_percent`` so adaptive depth is always a
+    #: strict reduction even at its shallowest.
+    max_trim: int = Field(default=75, ge=10, le=100)
+
+    @model_validator(mode="after")
+    def _check_adaptive_range(self) -> "LateMaillardTrim":
+        """The adaptive depth range must be internally consistent (#386).
+
+        Guards three invariants:
+
+        - ``min_trim ≤ base_trim``: the deepest cut must not exceed the
+          baseline (otherwise the formula could raise heat above ``base_trim``
+          when both terms are zero, which contradicts the "baseline = no-signal
+          depth" contract).
+        - ``base_trim ≤ max_trim``: the baseline must not exceed the shallowest
+          permitted cut (otherwise the formula's clamp would always override the
+          baseline even when both gain terms are zero).
+        - ``min_trim ≤ max_trim``: derived from the two above, but checked
+          explicitly for a clear error message.
+
+        These constraints are meaningful only when ``adaptive_depth_enabled``
+        is ``True``; they are validated unconditionally so a misconfigured
+        disabled object is caught at construction rather than silently at
+        enable-time.
+
+        Returns:
+            The validated ``LateMaillardTrim`` instance.
+
+        Raises:
+            ValueError: If any of the three adaptive range invariants is
+                violated.
+        """
+        if self.min_trim > self.base_trim:
+            raise ValueError(
+                f"min_trim must not exceed base_trim ({self.min_trim} > {self.base_trim})"
+            )
+        if self.base_trim > self.max_trim:
+            raise ValueError(
+                f"base_trim must not exceed max_trim ({self.base_trim} > {self.max_trim})"
+            )
+        if self.min_trim > self.max_trim:  # pragma: no cover - unreachable (min<=base<=max)
+            raise ValueError(
+                f"min_trim must not exceed max_trim ({self.min_trim} > {self.max_trim})"
+            )
+        return self
+
+    def depth_for(
+        self, bean_ror_c_per_min: float | None, first_crack_eta_seconds: float | None
+    ) -> int:
+        """Resolve the trim depth for this tick's signal (#386).
+
+        Returns the adaptive trim depth when ``adaptive_depth_enabled`` is
+        ``True`` AND both ``bean_ror_c_per_min`` and ``first_crack_eta_seconds``
+        are non-``None``.  In every other case — flag off, or either signal
+        value missing — returns the fixed ``trim_heat_percent`` unchanged.
+        This is the *fail-closed* guarantee: any missing signal falls back to
+        the proven fixed depth.
+
+        The adaptive formula::
+
+            clamp(
+                base_trim
+                    − k_ror · max(0, ror − ror_ref)
+                    − k_eta · max(0, eta_ref − eta),
+                min_trim,
+                max_trim,
+            )
+
+        A hotter approach (high RoR or short ETA) deepens the cut (lower %);
+        a gentle approach (RoR at or below ``ror_ref``, ETA at or above
+        ``eta_ref``) contributes 0 from each term, yielding ``base_trim``
+        exactly (clamped into [min_trim, max_trim]).
+
+        Fan is NEVER modified by this method — it governs heat depth only.
+
+        Args:
+            bean_ror_c_per_min: The current bean rate of rise (°C/min), or
+                ``None`` when unavailable. ``None`` ⇒ fixed depth.
+            first_crack_eta_seconds: The predicted seconds until first crack,
+                or ``None`` when unavailable. ``None`` ⇒ fixed depth.
+
+        Returns:
+            The trim depth as a heat percentage (integer, always in
+            [min_trim, max_trim] when adaptive, else ``trim_heat_percent``).
+        """
+        if (
+            not self.adaptive_depth_enabled
+            or bean_ror_c_per_min is None
+            or first_crack_eta_seconds is None
+        ):
+            return self.trim_heat_percent
+
+        ror_term = self.k_ror * max(0.0, bean_ror_c_per_min - self.ror_ref)
+        eta_term = self.k_eta * max(0.0, self.eta_ref - first_crack_eta_seconds)
+        raw = self.base_trim - ror_term - eta_term
+        # round() is ties-to-even (banker's), intentional here: the depth is a
+        # coarse 1-pp control value and ties-to-even stays monotonic (non-increasing
+        # in the subtracted terms), so it cannot invert the hotter→deeper ordering
+        # the formula guarantees (#386 Augment low).
+        return max(self.min_trim, min(self.max_trim, round(raw)))
 
 
 class PreFirstCrackLevers(BaseModel):
@@ -195,12 +366,19 @@ class PreFirstCrackLevers(BaseModel):
         never raises heat above the floor and so can never delay FC by adding
         heat — the floor stays the always-on guarantee that FC arrives (§8.4).
 
+        For the adaptive trim (#386), ``max_trim`` — the shallowest depth the
+        adaptive formula can produce — must also stay <= ``heat_target_percent``
+        so that adaptive depth is always a strict reduction at its SHALLOWEST
+        end: even when both gain terms are zero the formula cannot produce a heat
+        level above the pre-FC floor target.
+
         Returns:
             The validated levers instance.
 
         Raises:
-            ValueError: If ``fan_ceiling_percent`` is below ``fan_target_percent``
-                or the trim heat exceeds ``heat_target_percent``.
+            ValueError: If ``fan_ceiling_percent`` is below ``fan_target_percent``,
+                the fixed trim heat exceeds ``heat_target_percent``, or the
+                adaptive ``max_trim`` exceeds ``heat_target_percent``.
         """
         if self.fan_ceiling_percent < self.fan_target_percent:
             raise ValueError(
@@ -212,6 +390,22 @@ class PreFirstCrackLevers(BaseModel):
                 "late_maillard_trim.trim_heat_percent must not exceed "
                 "heat_target_percent (the trim only lowers heat) "
                 f"({self.late_maillard_trim.trim_heat_percent} > {self.heat_target_percent})"
+            )
+        # Scoped to adaptive-enabled configs (#386 Augment medium): when the
+        # adaptive depth is OFF, max_trim is unused (depth_for returns the fixed
+        # trim_heat_percent, whose own ≤ heat_target_percent check above is the
+        # disabled-path guarantee), so a profile/learned plan that lowers
+        # heat_target_percent below the default max_trim (75) must not be rejected
+        # for a field it never reads.
+        if (
+            self.late_maillard_trim.adaptive_depth_enabled
+            and self.late_maillard_trim.max_trim > self.heat_target_percent
+        ):
+            raise ValueError(
+                "late_maillard_trim.max_trim must not exceed heat_target_percent "
+                "when adaptive_depth_enabled (adaptive depth is always a strict "
+                "reduction, even at its shallowest) "
+                f"({self.late_maillard_trim.max_trim} > {self.heat_target_percent})"
             )
         return self
 

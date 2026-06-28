@@ -2732,15 +2732,23 @@ class RoastController:
     def _trim_signal(self, telemetry: RoastTelemetry | None) -> TrimSignal | None:
         """Build the live anticipatory-trim signal for this tick, or ``None`` (#327).
 
-        Pairs the freshest bean temperature with the #229 predicted-FC ETA and the
-        controller's current per-run latch state so
-        :meth:`RoastControlPolicy.limits_for` can decide whether the late-Maillard
-        trim is engaged. The bean temperature is this tick's ``telemetry`` reading
-        when present, else the last accumulated curve sample (the FC-ETA is always
-        derived from the curve window). Returns ``None`` — fail closed to the flat
-        floor — only when neither a live read nor any curve sample exists (the very
-        first ticks of a run). A present signal with an unknown (``None``) FC-ETA
-        is equally safe: the policy fails a *fresh* engage closed on it.
+        Pairs the freshest bean temperature with the #229 predicted-FC ETA, the
+        controller's current per-run latch state, and the bean RoR (for adaptive
+        trim depth, #386) so :meth:`RoastControlPolicy.limits_for` can decide
+        whether the late-Maillard trim is engaged and at what depth. The bean
+        temperature is this tick's ``telemetry`` reading when present, else the
+        last accumulated curve sample (the FC-ETA is always derived from the
+        curve window). Returns ``None`` — fail closed to the flat floor — only
+        when neither a live read nor any curve sample exists (the very first ticks
+        of a run). A present signal with an unknown (``None``) FC-ETA is equally
+        safe: the policy fails a *fresh* engage closed on it.
+
+        The bean RoR is sourced from ``telemetry.bean_ror_c_per_min`` when the
+        reading is available (the controller already computes it for the #229
+        ETA and for the advisory change trigger); ``None`` when the telemetry
+        read failed or the MCP has not yet produced a RoR reading. A ``None`` RoR
+        causes :meth:`LateMaillardTrim.depth_for` to fall back to the fixed
+        ``trim_heat_percent`` — the adaptive depth's own fail-closed guarantee.
 
         Pure builder: it reads ``self._trim_latched`` but never arms it — the latch
         is armed in :meth:`_apply_deterministic_pre_fc_levers` (the actuation path),
@@ -2756,15 +2764,18 @@ class RoastController:
         """
         if telemetry is not None:
             bean_temp_c = telemetry.bean_temp_c
+            bean_ror_c_per_min = telemetry.bean_ror_c_per_min
         else:
             window = self._history.curve_window()
             if not window:
                 return None
             bean_temp_c = window[-1].bean_temp_c
+            bean_ror_c_per_min = window[-1].bean_ror_c_per_min
         return TrimSignal(
             bean_temp_c=bean_temp_c,
             first_crack_eta_seconds=self._first_crack_eta_seconds(),
             latched=self._trim_latched,
+            bean_ror_c_per_min=bean_ror_c_per_min,
         )
 
     def _arm_trim_latch(self, trim_signal: TrimSignal | None) -> TrimSignal | None:
@@ -2799,6 +2810,7 @@ class RoastController:
             bean_temp_c=trim_signal.bean_temp_c,
             first_crack_eta_seconds=trim_signal.first_crack_eta_seconds,
             latched=True,
+            bean_ror_c_per_min=trim_signal.bean_ror_c_per_min,
         )
 
     def _record_curve_history(self, telemetry: RoastTelemetry | None) -> None:
