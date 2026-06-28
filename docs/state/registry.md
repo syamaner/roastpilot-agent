@@ -67,15 +67,12 @@
 > *the scores find the symptom, only the reasoning found the cause*; #281 (bounded-concurrency
 > replay) queued on top. Plan: D40/D41 in `plan.md` §1.
 
-- Epic file: `docs/epics/E11-packaging.md` — **BLOCKED, do not start (D28 + D27)**.
-  E10 closed 11 Jun 2026. E11 is next in order but **gated**: do **not** begin E11
-  implementation (#136/#137/#138) until **both** operator manual tests are Done —
-  **#135** (real-device Safari/iPad SSE) is **✅ DONE**; **#134** (supervised hardware
-  roast, D17 criterion 3) is the **sole remaining operator gate** (running 13 Jun) —
-  **and** the torch-free chain is green (**D27**: `coffee-first-crack-detection#54` →
-  `coffee-roaster-mcp#157` — cross-repo, NOT this repo's #54/#157). See **D28**. Until
-  both gates clear there is no agent-startable story; the next session should verify them
-  before touching E11.
+- Epic file: `docs/epics/E11-packaging.md` — **D28 gate ✅ CLEARED (28 Jun 2026); now
+  gated only on D27 (torch-free chain).** E10 closed 11 Jun 2026. E11 is next in order;
+  S1/S2 contract-buildable scaffolding is startable on operator opt-in — do **not** begin
+  S3 or pin/ship the `[pi]` extra until the torch-free `coffee-roaster-mcp` (**D27**:
+  `coffee-first-crack-detection#54` → `coffee-roaster-mcp#157`, cross-repo) lands. See
+  **D28**.
 - Project: RoastPilot (GitHub user project, owner `syamaner`)
 - Repository: `syamaner/roastpilot-agent`
 - Package: `roastpilot-agent`
