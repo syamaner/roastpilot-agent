@@ -925,6 +925,23 @@ def test_levers_reject_adaptive_max_trim_above_heat_target() -> None:
         )
 
 
+def test_levers_allow_max_trim_above_heat_target_when_adaptive_disabled() -> None:
+    """Backward-compat (#386): with adaptive depth OFF, max_trim is unused, so it
+    may exceed a lowered heat_target_percent without invalidating the config."""
+    levers = PreFirstCrackLevers(
+        heat_target_percent=70,
+        late_maillard_trim=LateMaillardTrim(
+            adaptive_depth_enabled=False,
+            trim_heat_percent=65,  # <= heat_target 70 — the disabled-path guarantee
+            base_trim=65,
+            min_trim=45,
+            max_trim=75,  # > heat_target 70, but unused while disabled → allowed
+        ),
+    )
+    assert levers.late_maillard_trim.max_trim == 75
+    assert levers.heat_target_percent == 70
+
+
 def test_trim_signal_carries_ror() -> None:
     """TrimSignal accepts bean_ror_c_per_min (new field, #386)."""
     sig = TrimSignal(

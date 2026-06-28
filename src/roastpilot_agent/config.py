@@ -302,6 +302,10 @@ class LateMaillardTrim(BaseModel):
         ror_term = self.k_ror * max(0.0, bean_ror_c_per_min - self.ror_ref)
         eta_term = self.k_eta * max(0.0, self.eta_ref - first_crack_eta_seconds)
         raw = self.base_trim - ror_term - eta_term
+        # round() is ties-to-even (banker's), intentional here: the depth is a
+        # coarse 1-pp control value and ties-to-even stays monotonic (non-increasing
+        # in the subtracted terms), so it cannot invert the hotter→deeper ordering
+        # the formula guarantees (#386 Augment low).
         return max(self.min_trim, min(self.max_trim, round(raw)))
 
 
@@ -387,10 +391,20 @@ class PreFirstCrackLevers(BaseModel):
                 "heat_target_percent (the trim only lowers heat) "
                 f"({self.late_maillard_trim.trim_heat_percent} > {self.heat_target_percent})"
             )
-        if self.late_maillard_trim.max_trim > self.heat_target_percent:
+        # Scoped to adaptive-enabled configs (#386 Augment medium): when the
+        # adaptive depth is OFF, max_trim is unused (depth_for returns the fixed
+        # trim_heat_percent, whose own ≤ heat_target_percent check above is the
+        # disabled-path guarantee), so a profile/learned plan that lowers
+        # heat_target_percent below the default max_trim (75) must not be rejected
+        # for a field it never reads.
+        if (
+            self.late_maillard_trim.adaptive_depth_enabled
+            and self.late_maillard_trim.max_trim > self.heat_target_percent
+        ):
             raise ValueError(
                 "late_maillard_trim.max_trim must not exceed heat_target_percent "
-                "(adaptive depth is always a strict reduction, even at its shallowest) "
+                "when adaptive_depth_enabled (adaptive depth is always a strict "
+                "reduction, even at its shallowest) "
                 f"({self.late_maillard_trim.max_trim} > {self.heat_target_percent})"
             )
         return self
