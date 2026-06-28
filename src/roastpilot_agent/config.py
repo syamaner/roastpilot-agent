@@ -247,7 +247,7 @@ class LateMaillardTrim(BaseModel):
             raise ValueError(
                 f"base_trim must not exceed max_trim ({self.base_trim} > {self.max_trim})"
             )
-        if self.min_trim > self.max_trim:
+        if self.min_trim > self.max_trim:  # pragma: no cover - unreachable (min<=base<=max)
             raise ValueError(
                 f"min_trim must not exceed max_trim ({self.min_trim} > {self.max_trim})"
             )
