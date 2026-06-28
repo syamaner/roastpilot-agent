@@ -320,7 +320,7 @@ def test_colombia_huila_seed_values() -> None:
     assert s.initial_heat_percent == 100
     assert s.initial_fan_percent == 30
     assert s.target_drop_temp_c == 195.0  # operator's proven known-good drop line
-    assert s.target_development_percent == 13.0  # LIGHT first-roast de-risk guide (~10-13%)
+    assert s.target_development_percent == 16.0  # 16 (was 13) after roast 6, ~192-193C drop
     assert s.default_bean_weight_grams == 250.0  # 1 kg / 4 batches
 
 
