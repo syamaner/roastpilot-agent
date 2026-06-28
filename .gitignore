@@ -62,3 +62,10 @@ docs/advisor/bakeoff-results-2026-06-16.md
 # Large + contains raw advisor I/O — only the derived summary / report is
 # committed, never the raw capture (mirrors the .artisan-fixtures convention).
 *.capture.jsonl
+
+# design-sync (claude.ai/design) — staged scripts, build output, machine state
+.ds-sync/
+ds-bundle/
+.design-sync/.cache/
+.design-sync/learnings/
+.design-sync/node_modules
