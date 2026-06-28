@@ -21,6 +21,7 @@ from roastpilot_agent.models import (
     RoastEventSource,
     RoastPhase,
     RoastProfile,
+    weight_loss_percent,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 
@@ -724,3 +725,21 @@ def test_bean_profile_json_round_trip() -> None:
     )
     restored = BeanProfile.model_validate_json(bean.model_dump_json())
     assert restored == bean
+
+
+@pytest.mark.parametrize(
+    ("charge", "roasted", "expected"),
+    [
+        (250.0, 221.0, 11.6),  # the issue's worked example
+        (250.0, 250.0, 0.0),  # no loss
+        (1000.0, 850.0, 15.0),
+        (250.0, None, None),  # un-weighed
+        (0.0, 200.0, None),  # non-positive charge → no denominator
+        (250.0, 0.0, None),  # non-positive roasted
+        (250.0, -5.0, None),
+        (250.0, 300.0, None),  # roasted > charge → tare/scale error
+    ],
+)
+def test_weight_loss_percent(charge: float, roasted: float | None, expected: float | None) -> None:
+    """#388: weight loss % = (charge - roasted) / charge * 100, None on bad inputs."""
+    assert weight_loss_percent(charge_weight_grams=charge, roasted_weight_grams=roasted) == expected

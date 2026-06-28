@@ -10,6 +10,7 @@ invariant. Use ``.value`` at serialization boundaries.
 """
 
 import json
+import re
 from enum import Enum
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -475,6 +476,48 @@ class RoastProfile(_BeanProfileFieldsBase):
     bean_weight_grams: float = Field(gt=0)
 
 
+def recording_origin_slug(profile: RoastProfile) -> str | None:
+    """Derive a recording-origin slug from a roast profile (v0.1.9, #176).
+
+    Joins the populated ``country`` / ``bean_origin`` / ``name`` fields into a
+    lowercase hyphen slug (e.g. ``"colombia-excelso-huila-washed"``) so the MCP
+    export filename carries a human-readable origin. The MCP re-slugifies, so this
+    only needs to surface the identity words; punctuation and spacing are
+    normalised to single hyphens.
+
+    Those three fields routinely overlap (the Colombia seed has country ==
+    bean_origin == ``"Colombia"`` and a ``"Colombia ..."`` name), so repeated
+    words are deduped, first-seen order preserved. If no field yields any slug
+    characters (all empty / punctuation-only), returns ``None`` so the caller
+    skips the metadata call and the MCP falls back safely.
+
+    Lives in ``models`` (with :class:`RoastProfile`) so the per-origin
+    recording-count query in :mod:`store` (#385) can derive the same slug from a
+    completed run's frozen ``profile_json`` without importing the controller.
+
+    Args:
+        profile: The active roast profile.
+
+    Returns:
+        A hyphen-slug like ``"colombia-excelso-huila-washed"``, or ``None`` when
+        no usable identity text is available.
+    """
+    parts = [profile.country, profile.bean_origin, profile.name]
+    raw = " ".join(part for part in parts if part)
+    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
+    # country / bean_origin / name routinely overlap (the Colombia seed has
+    # country "Colombia", bean_origin "Colombia", name "Colombia Excelso Huila
+    # (Washed)" → "colombia-colombia-colombia-..."), so dedupe repeated words,
+    # preserving first-seen order, for a clean origin like "colombia-excelso-huila-washed".
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for word in slug.split("-"):
+        if word and word not in seen:
+            seen.add(word)
+            deduped.append(word)
+    return "-".join(deduped) or None
+
+
 class BeanProfile(_BeanProfileFieldsBase):
     """A reusable, saved bean-profile template the operator picks per roast (#303).
 
@@ -675,6 +718,14 @@ class RoastSummary(BaseModel):
     processing: ProcessingMethod | None = None
     altitude_m: int | None = None
     rating: int | None = None
+    roasted_weight_grams: float | None = None
+    """Operator-entered roasted-out weight in grams (#388), or ``None`` when not
+    yet weighed. The green/charge weight lives on the frozen profile
+    (``bean_weight_grams``)."""
+    weight_loss_percent: float | None = None
+    """Derived roast weight loss % — ``(charge - roasted) / charge * 100`` (#388),
+    ``None`` until the roasted weight is entered. Predominantly moisture but also
+    dry-matter loss (CO₂, volatiles, chaff), so NOT pure water loss."""
     development_percent: float | None = None
     advisor_consults: int = 0
     """Total persisted advisor consults for this run (#184), aggregated
@@ -761,6 +812,13 @@ class RoastDetail(BaseModel):
     fault_reason: str | None = None
     rating: int | None = None
     notes: str | None = None
+    roasted_weight_grams: float | None = None
+    """Operator-entered roasted-out weight in grams (#388), or ``None`` when not
+    yet weighed. The green/charge weight is ``profile.bean_weight_grams``."""
+    weight_loss_percent: float | None = None
+    """Derived roast weight loss % — ``(charge - roasted) / charge * 100`` (#388),
+    ``None`` until the roasted weight is entered. Predominantly moisture but also
+    dry-matter loss (CO₂, volatiles, chaff), so NOT pure water loss."""
     export_manifest: LogManifest | None = None
     enabled_actions: list[OperatorAction] = Field(default_factory=_empty_actions)
     mic_status: MicStatus | None = None
@@ -882,11 +940,52 @@ class RoastTimeline(BaseModel):
     commands: list[TimelineCommand]
 
 
+def weight_loss_percent(
+    *, charge_weight_grams: float, roasted_weight_grams: float | None
+) -> float | None:
+    """Roast weight loss as a percentage of the green/charge weight (#388, D42).
+
+    ``(charge - roasted) / charge * 100`` — the objective roast-degree/consistency
+    signal that partners the subjective operator rating as a D42 corpus label.
+
+    This is **weight loss %**, predominantly moisture but also dry-matter loss
+    (CO₂, volatiles, chaff), so it is NOT pure "water loss" — true moisture loss
+    would need green-vs-roasted moisture readings (out of scope). Shared by the
+    store read path and the D44 fixture exporter so the corpus label and the UI
+    agree on one derivation.
+
+    Args:
+        charge_weight_grams: The green/charge weight in (``RoastProfile.bean_weight_grams``).
+        roasted_weight_grams: The operator-entered roasted-out weight, or ``None``.
+
+    Returns:
+        The weight-loss percentage rounded to two decimals, or ``None`` when the
+        roasted weight is absent or either weight is non-positive (an unusable
+        denominator / un-weighed roast yields no percentage).
+    """
+    if roasted_weight_grams is None or charge_weight_grams <= 0 or roasted_weight_grams <= 0:
+        return None
+    if roasted_weight_grams > charge_weight_grams:  # tare/scale error; physically impossible
+        return None
+    return round((charge_weight_grams - roasted_weight_grams) / charge_weight_grams * 100.0, 2)
+
+
 class OperatorRatingRequest(BaseModel):
     """``POST /api/roasts/{id}/rating`` body (plan §6: ``{stars, notes}``)."""
 
     stars: Literal[1, 2, 3, 4, 5]
     notes: str | None = None
+
+
+class RoastedWeightRequest(BaseModel):
+    """``POST /api/roasts/{id}/roasted-weight`` body (#388).
+
+    The operator-entered roasted-OUT weight in grams, captured post-roast after
+    weighing — the same completion-only lifecycle as the rating. Must be > 0; the
+    server derives weight-loss % from it against the frozen charge weight.
+    """
+
+    roasted_weight_grams: float = Field(gt=0)
 
 
 # --- E7-S2: operator action queue (component plan §6) ---

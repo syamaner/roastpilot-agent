@@ -302,6 +302,7 @@ from roastpilot_agent.models import (  # noqa: E402
     RoastPhase,
     RoastProfile,
     RoastTelemetry,
+    recording_origin_slug,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict  # noqa: E402
 
@@ -1002,6 +1003,80 @@ async def test_rating_an_active_run_raises(tmp_store: RoastStore) -> None:
 
 
 @pytest.mark.asyncio
+async def test_set_roasted_weight_persists_and_derives_weight_loss(
+    tmp_store: RoastStore,
+) -> None:
+    """#388: the operator roasted-out weight stamps on a completed run and the read
+    paths derive weight-loss % against the frozen 250 g charge weight."""
+    # PROFILE.bean_weight_grams == 250.0
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=221.0)
+
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.roasted_weight_grams == 221.0
+        assert detail.weight_loss_percent == 11.6  # (250 - 221) / 250 * 100
+
+        summaries = await tmp_store.list_runs()
+        summary = next(s for s in summaries if s.id == "run-1")
+        assert summary.roasted_weight_grams == 221.0
+        assert summary.weight_loss_percent == 11.6
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_roasted_weight_is_an_immutability_exception(tmp_store: RoastStore) -> None:
+    """#388: the roasted weight is operator-editable AFTER completion (same lifecycle
+    as the rating) — the v2 immutability trigger does not guard the new column."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        # Set, then correct it on the already-completed run — both must succeed.
+        await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=221.0)
+        await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=219.0)
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.roasted_weight_grams == 219.0
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_unweighed_completed_run_has_null_weight_loss(tmp_store: RoastStore) -> None:
+    """#388: a completed-but-unweighed run reads back null roasted weight + null
+    weight-loss %."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.roasted_weight_grams is None
+        assert detail.weight_loss_percent is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_on_active_run_raises(tmp_store: RoastStore) -> None:
+    """#388: completed-only, like the rating — an in-progress run cannot be stamped."""
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no completed roast_run"):
+            await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=221.0)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_persisted_run_is_frozen(tmp_path: Path) -> None:
     import pydantic
 
@@ -1394,5 +1469,93 @@ async def test_list_runs_maps_every_column_to_its_field(tmp_store: RoastStore) -
         assert summary.advisor_clamped == 2
         assert summary.advisor_rejected == 1
         assert summary.advisor_failed == 3
+    finally:
+        await tmp_store.close()
+
+
+def _origin_profile(origin: str) -> RoastProfile:
+    return RoastProfile(
+        name=f"{origin} test",
+        bean_origin=origin,
+        bean_weight_grams=250.0,
+        initial_heat_percent=70,
+        initial_fan_percent=40,
+        target_drop_temp_c=205.0,
+        target_development_percent=20.0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_count_completed_runs_for_origin_counts_only_finalised_matches(
+    tmp_store: RoastStore,
+) -> None:
+    """#385: the per-origin recording count is prior COMPLETED runs of the same
+    origin slug — excluding other origins and the still-active (uncompleted) run."""
+    await tmp_store.initialize()
+    try:
+        colombia = _origin_profile("Colombia")
+        ethiopia = _origin_profile("Ethiopia")
+        slug = recording_origin_slug(colombia)
+        assert slug is not None
+
+        # First roast of the bean: no prior completed runs.
+        assert await tmp_store.count_completed_runs_for_origin(slug) == 0
+
+        # Two completed Colombia roasts + one completed Ethiopia + one active
+        # Colombia run that must NOT count (not finalised).
+        for run_id, profile in (
+            ("c1", colombia),
+            ("c2", colombia),
+            ("e1", ethiopia),
+        ):
+            await tmp_store.create_run(
+                run_id=run_id,
+                profile=profile,
+                config=AppConfig(),
+                agent_phase=RoastPhase.STARTING,
+            )
+            await tmp_store.complete_run(
+                run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE
+            )
+        await tmp_store.create_run(
+            run_id="c-active",
+            profile=colombia,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+
+        # Two completed Colombia → next Colombia roast is roast_num 3.
+        assert await tmp_store.count_completed_runs_for_origin(slug) == 2
+        ethiopia_slug = recording_origin_slug(ethiopia)
+        assert ethiopia_slug is not None
+        assert await tmp_store.count_completed_runs_for_origin(ethiopia_slug) == 1
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_count_completed_runs_for_origin_counts_finalised_faulted(
+    tmp_store: RoastStore,
+) -> None:
+    """#385: a faulted-but-FINALISED run consumed a recording slot, so it counts
+    (the criterion is ``completed_at_utc IS NOT NULL``, not a 'completed' outcome)."""
+    await tmp_store.initialize()
+    try:
+        colombia = _origin_profile("Colombia")
+        slug = recording_origin_slug(colombia)
+        assert slug is not None
+        await tmp_store.create_run(
+            run_id="c-faulted",
+            profile=colombia,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await tmp_store.complete_run(
+            run_id="c-faulted",
+            outcome="faulted",
+            agent_phase=RoastPhase.FAULTED,
+            fault_reason="test",
+        )
+        assert await tmp_store.count_completed_runs_for_origin(slug) == 1
     finally:
         await tmp_store.close()

@@ -758,6 +758,86 @@ async def test_rate_rejects_out_of_range_stars(client: AsyncClient, store: Roast
     assert response.status_code == 422
 
 
+# --- roasted weight (#388) ---
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_completed_run(client: AsyncClient, store: RoastStore) -> None:
+    await store.create_run(
+        run_id="run-w",
+        profile=_profile(),  # bean_weight_grams 250
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(run_id="run-w", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post(
+        "/api/roasts/run-w/roasted-weight", json={"roasted_weight_grams": 221.0}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["roasted_weight_grams"] == 221.0
+    assert body["weight_loss_percent"] == 11.6  # (250 - 221) / 250 * 100
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_in_progress_conflicts(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="run-wip",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.DEVELOPMENT,
+    )
+    response = await client.post(
+        "/api/roasts/run-wip/roasted-weight", json={"roasted_weight_grams": 221.0}
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_unknown_run_404(client: AsyncClient) -> None:
+    response = await client.post(
+        "/api/roasts/nope/roasted-weight", json={"roasted_weight_grams": 221.0}
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_rejects_non_positive(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="run-wb",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(run_id="run-wb", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post(
+        "/api/roasts/run-wb/roasted-weight", json={"roasted_weight_grams": 0}
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_rejects_over_charge(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """A roasted weight above the charge weight is physically impossible → 409."""
+    await store.create_run(
+        run_id="run-oc",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(run_id="run-oc", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post(
+        "/api/roasts/run-oc/roasted-weight", json={"roasted_weight_grams": 9999.0}
+    )
+    assert response.status_code == 409
+
+
 # --- operator action queue (E7-S2) ---
 
 
@@ -1377,6 +1457,56 @@ async def _tick(service: RoastService, clock: FakeClock) -> bool:
     assert service.runner is not None
     clock.advance(3.0)
     return await service.runner.tick_once()
+
+
+def _start_session_roast_nums(mcp: FakeMCPClient) -> list[int | None]:
+    """The recording_roast_num captured on each FakeMCPClient start_session call."""
+    return [
+        cast("int | None", args["recording_roast_num"])
+        for name, args in mcp.calls
+        if name == "start_session"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_recording_roast_num_is_store_derived_per_origin(
+    store: RoastStore,
+) -> None:
+    """#385: the recording roast number handed to the MCP is prior COMPLETED roasts
+    of this origin + 1 — stable across the per-process counter (a fresh service per
+    run would otherwise always pass 1)."""
+    profile = _profile(origin="Colombia")
+
+    # A fresh service starts the first Colombia roast: store has no completed runs
+    # → roast_num 1. Then finalise it so it counts toward the next.
+    mcp1 = FakeMCPClient()
+    service1 = RoastService(
+        store,
+        config=AppConfig(),
+        roaster=mcp1,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        exporter=mcp1,
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    detail = await service1.start_roast(profile)
+    assert _start_session_roast_nums(mcp1) == [1]
+    await store.complete_run(run_id=detail.id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+
+    # A brand-new service (per-process counter reset to 0) starts a second Colombia
+    # roast: the store-derived count makes it roast_num 2, not 1.
+    mcp2 = FakeMCPClient()
+    service2 = RoastService(
+        store,
+        config=AppConfig(),
+        roaster=mcp2,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        exporter=mcp2,
+        run_loop=False,
+        clock=FakeClock(),
+    )
+    await service2.start_roast(profile)
+    assert _start_session_roast_nums(mcp2) == [2]
 
 
 def _session_state(*, fc_status: str, audio_running: bool) -> RoastSessionState:

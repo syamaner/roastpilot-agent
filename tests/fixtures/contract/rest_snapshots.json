@@ -45,7 +45,9 @@
       "target_drop_temp_c": 195.0
     },
     "rating": null,
-    "started_at_utc": "2026-01-01T00:00:00+00:00"
+    "roasted_weight_grams": null,
+    "started_at_utc": "2026-01-01T00:00:00+00:00",
+    "weight_loss_percent": null
   },
   "roast_summary": {
     "advisor_clamped": 0,
@@ -66,7 +68,9 @@
     "outcome": "completed",
     "processing": null,
     "rating": null,
-    "started_at_utc": "2026-01-01T00:00:00+00:00"
+    "roasted_weight_grams": null,
+    "started_at_utc": "2026-01-01T00:00:00+00:00",
+    "weight_loss_percent": null
   },
   "telemetry_series": {
     "downsample": 1,

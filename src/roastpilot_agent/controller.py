@@ -14,7 +14,6 @@ fan (``operator_recovery_required``).
 
 import asyncio
 import math
-import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -45,6 +44,7 @@ from roastpilot_agent.models import (
     RoastPhase,
     RoastProfile,
     RoastTelemetry,
+    recording_origin_slug,
 )
 from roastpilot_agent.roast_history import (
     DecisionTraceEntry,
@@ -75,48 +75,17 @@ __all__ = [
     "SnapshotSink",
     "StateReader",
     "TickScheduler",
+    "recording_origin_slug",
 ]
 
 Clock = Callable[[], float]
 AsyncSleep = Callable[[float], Awaitable[None]]
 
 
-def recording_origin_slug(profile: RoastProfile) -> str | None:
-    """Derive a recording-origin slug from a roast profile (v0.1.9, #176).
-
-    Joins the populated ``country`` / ``bean_origin`` / ``name`` fields into a
-    lowercase hyphen slug (e.g. ``"colombia-excelso-huila-washed"``) so the MCP
-    export filename carries a human-readable origin. The MCP re-slugifies, so this
-    only needs to surface the identity words; punctuation and spacing are
-    normalised to single hyphens.
-
-    Those three fields routinely overlap (the Colombia seed has country ==
-    bean_origin == ``"Colombia"`` and a ``"Colombia ..."`` name), so repeated
-    words are deduped, first-seen order preserved. If no field yields any slug
-    characters (all empty / punctuation-only), returns ``None`` so the caller
-    skips the metadata call and the MCP falls back safely.
-
-    Args:
-        profile: The active roast profile.
-
-    Returns:
-        A hyphen-slug like ``"colombia-excelso-huila-washed"``, or ``None`` when
-        no usable identity text is available.
-    """
-    parts = [profile.country, profile.bean_origin, profile.name]
-    raw = " ".join(part for part in parts if part)
-    slug = re.sub(r"[^a-z0-9]+", "-", raw.lower()).strip("-")
-    # country / bean_origin / name routinely overlap (the Colombia seed has
-    # country "Colombia", bean_origin "Colombia", name "Colombia Excelso Huila
-    # (Washed)" → "colombia-colombia-colombia-..."), so dedupe repeated words,
-    # preserving first-seen order, for a clean origin like "colombia-excelso-huila-washed".
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for word in slug.split("-"):
-        if word and word not in seen:
-            seen.add(word)
-            deduped.append(word)
-    return "-".join(deduped) or None
+# recording_origin_slug now lives in models.py (with RoastProfile) so the
+# store's per-origin recording-count query (#385) can derive the same slug from a
+# completed run's frozen profile without importing the controller. Re-exported
+# here for the existing import path.
 
 
 class InvalidTransitionError(Exception):
@@ -2246,7 +2215,9 @@ class RoastController:
 
     # --- E4-S4: run lifecycle and operator actions ---
 
-    async def start_run(self, profile: RoastProfile) -> None:
+    async def start_run(
+        self, profile: RoastProfile, *, recording_roast_num: int | None = None
+    ) -> None:
         """Start a new roast run (E4-S4).
 
         Serialized by the transition table: legal only from ``idle``, so a
@@ -2255,6 +2226,14 @@ class RoastController:
         is the outer guard, this is the inner one (E3-S5 carry-forward).
         A failed start_session lands in ``faulted`` (operator acks → idle),
         never a half-started run.
+
+        Args:
+            profile: The roast profile to freeze for this run.
+            recording_roast_num: The store-derived per-origin recording roast
+                number (#385), passed by the API layer (prior completed roasts of
+                this origin + 1). When ``None`` (a direct caller / a count
+                failure), the controller falls back to its per-process counter so
+                recording naming is always best-effort and never blocks the roast.
         """
         self.transition_to(RoastPhase.STARTING)  # raises unless idle
         self._profile = profile
@@ -2267,20 +2246,32 @@ class RoastController:
         self._advisory_policy = AdvisoryCallPolicy(self._config)
         self._consecutive_advisor_failures = 0  # new run: availability streak resets (D30)
         # v0.1.9 recording metadata (#176): derive an origin slug from the bean
-        # profile + a per-process roast counter, and hand them to start_session so
+        # profile + a per-origin roast number, and hand them to start_session so
         # set_recording_metadata fires BEFORE start_roast_session (the MCP applies
         # the filename only if metadata precedes the session). Skipped when the
-        # profile yields no slug — the MCP then falls back safely. The counter
-        # increments per run regardless; recording naming is best-effort and never
-        # blocks the roast (the executor swallows + logs a metadata failure).
+        # profile yields no slug — the MCP then falls back safely.
+        #
+        # #385: the roast number is the STORE-DERIVED per-origin count the API
+        # passes (stable + meaningful across restarts). The per-process counter
+        # still advances every run as the fallback when no store-derived number is
+        # supplied (a direct caller, or a best-effort count failure upstream).
+        # Recording naming is best-effort and never blocks the roast (the executor
+        # swallows + logs a metadata failure).
         recording_origin = recording_origin_slug(profile)
         self._recording_roast_num += 1
+        roast_num = (
+            recording_roast_num if recording_roast_num is not None else self._recording_roast_num
+        )
+        # Advance the per-process counter to at least the store-derived value so a
+        # fallback run (store failure) can never produce a number below an already-used
+        # per-origin recording filename (#385 auggie finding: without this, a fallback
+        # after store-derived 4 would use per-process counter 2 → collision).
+        if recording_roast_num is not None:
+            self._recording_roast_num = max(self._recording_roast_num, recording_roast_num)
         try:
             await self._executor.start_session(
                 recording_origin=recording_origin,
-                recording_roast_num=(
-                    self._recording_roast_num if recording_origin is not None else None
-                ),
+                recording_roast_num=(roast_num if recording_origin is not None else None),
             )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "start_roast_session"})

@@ -119,11 +119,16 @@ dev = [
   # on the detector's read worker → starved FC detection → mic overflow; now
   # numpy-vectorised) and #162 (the per-request SDK INFO flood regression: the
   # quiet guard ran before logging was configured; now `getEffectiveLevel() <=
-  # WARNING`). It pulls
+  # WARNING`). 0.1.11 makes recordings span the full roast — the recorder no
+  # longer dies at FC, it finalises at session stop (#181, so the post-FC crack
+  # series + the negative-class training data are captured) — and adds live
+  # in-session mic peak/RMS dBFS on the FirstCrackStatus readout (#178). Both
+  # are agent-tolerated (the new mic_*_dbfs fields are extra="ignore" in the
+  # mirror; 14-tool surface unchanged). It pulls
   # heavy ML/audio deps
   # (transformers/onnxruntime/sounddevice) that mock mode never activates;
   # CI installs libportaudio2 for sounddevice's import.
-  "coffee-roaster-mcp==0.1.10",
+  "coffee-roaster-mcp==0.1.11",
   # Analysis-harness numeric core (scripts/curve_feature_eval.py, #229). numpy
   # is already present transitively (via the MCP server's ML stack), but the
   # curve-feature analysis imports it directly, so declare it explicitly here:

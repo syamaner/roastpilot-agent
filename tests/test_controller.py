@@ -2563,6 +2563,62 @@ async def test_t0_backdate_latched_when_it_arrives_mid_streak() -> None:
 
 
 @pytest.mark.asyncio
+async def test_t0_lands_at_turning_point_on_realistic_charge_crash() -> None:
+    """#387: a dry-run replay of the roast-6 charge crash proves T0 stamps at the
+    bean-temp turning point, NOT ~11 s late.
+
+    Reproduces the roast-6 shape (trace ``~/roasts/roastpilot.sqlite3`` run
+    ``d251013e…``, ``auto_t0_drop_threshold_c=25``): the bean peaks at 174 °C (the
+    turning point) at MCP-elapsed 351.759, then crashes on the charge; the MCP
+    confirms auto-T0 8 s later (at 359.758) when the bean has dropped 25 °C, and
+    reports a turning-point backdate of ``confirmed − turning_point = 8.0`` s.
+
+    The agent receives ``t0_detected`` at ≈ the MCP confirmation instant, so its
+    first-detect anchor equals that confirmation tick; subtracting the MCP backdate
+    (confirmation − turning point) lands the charge origin EXACTLY on the turning
+    point — the agent applies the FULL delta and does not double-count its own
+    debounce anchor against the MCP backdate. That is why roast-6's stamped T0 sat
+    ~2 s (sampling granularity) from the 174 °C peak, NOT 11 s late.
+    """
+    harness = make_harness()
+    debounce = harness.controller._config.t0_debounce_ticks  # pyright: ignore[reportPrivateUsage]
+    harness.controller.load_profile(PROFILE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+
+    # Climb to the 174 °C peak; the LAST rising sample is the turning point.
+    rising = [150.0, 157.0, 163.0, 167.0, 170.0, 172.0, 174.0]
+    for bean in rising:
+        harness.reader.readings = [reading(bean=bean, t0_detected=False)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    turning_point_monotonic = harness.clock.now - 1.0  # the 174 °C tick instant
+
+    # The charge crash. The MCP only confirms once the bean has dropped past the
+    # threshold, so the agent first sees ``t0_detected`` on the confirmation tick;
+    # the agent debounce then needs ``debounce`` consecutive detected ticks. Every
+    # detected tick carries the SAME backdate the MCP computed at confirmation:
+    # ``mcp_confirmation − turning_point``. The first detected tick lands at the
+    # current clock, so that backdate is exactly ``now − turning_point``.
+    mcp_backdate = harness.clock.now - turning_point_monotonic
+    bean = 166.0
+    for _ in range(debounce):
+        harness.reader.readings = [
+            reading(bean=bean, t0_detected=True, t0_backdate_seconds=mcp_backdate)
+        ]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean -= 6.0
+
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    # The charge clock origins on the 174 °C turning point — the agent's debounce
+    # anchor (first detect) minus the MCP backdate composes to the peak instant,
+    # never the later confirmation/transition tick.
+    charge = harness.controller._charge_monotonic  # pyright: ignore[reportPrivateUsage]
+    assert charge == pytest.approx(turning_point_monotonic)
+
+
+@pytest.mark.asyncio
 async def test_t0_charge_clock_re_anchors_after_a_broken_streak() -> None:
     """#174: a broken debounce streak discards the stale candidate charge instant;
     the charge clock origins on the POST-break first detect, never the pre-break
@@ -2902,6 +2958,54 @@ async def test_start_run_sets_recording_metadata_before_session() -> None:
     assert harness.controller.phase is RoastPhase.PREHEATING
     # origin slug derived from the profile; roast_num is the per-process counter.
     assert harness.executor.start_session_metadata == [("ethiopia-harness", 1)]
+
+
+@pytest.mark.asyncio
+async def test_start_run_uses_store_derived_recording_roast_num() -> None:
+    """#385: a store-derived per-origin roast number passed to start_run is used
+    in the recording metadata, overriding the per-process counter (which on a
+    fresh controller would be 1)."""
+    harness = make_harness(readings=[reading()])
+    await harness.controller.start_run(PROFILE, recording_roast_num=7)
+    assert harness.controller.phase is RoastPhase.PREHEATING
+    assert harness.executor.start_session_metadata == [("ethiopia-harness", 7)]
+
+
+@pytest.mark.asyncio
+async def test_start_run_falls_back_to_per_process_roast_num_when_none() -> None:
+    """#385: with no store-derived number (a direct caller / a count failure), the
+    per-process counter still advances and is used — best-effort, never blocking."""
+    harness = make_harness(readings=[reading(), reading()])
+    await harness.controller.start_run(PROFILE, recording_roast_num=None)
+    # Drive back to idle so a second run is legal, then start again.
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    harness.controller.transition_to(RoastPhase.IDLE)
+    await harness.controller.start_run(PROFILE, recording_roast_num=None)
+    assert harness.executor.start_session_metadata == [
+        ("ethiopia-harness", 1),
+        ("ethiopia-harness", 2),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_start_run_per_process_counter_syncs_to_store_derived_number() -> None:
+    """#385 auggie: when a store-derived number is used, the per-process counter
+    is advanced to at least that value so a subsequent fallback (None) cannot produce
+    a number lower than an already-used per-origin recording filename."""
+    harness = make_harness(readings=[reading(), reading()])
+    # First run uses store-derived 5 (5 prior completed roasts of this origin).
+    await harness.controller.start_run(PROFILE, recording_roast_num=5)
+    # Drive back to idle for a second run.
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    harness.controller.transition_to(RoastPhase.IDLE)
+    # Second run: no store-derived number (simulates a count failure). The
+    # per-process counter must be ≥ 5 so it never collides with files 1–5.
+    await harness.controller.start_run(PROFILE, recording_roast_num=None)
+    # The fallback counter advanced to max(1, 5)=5 after the first run, then +1 → 6.
+    assert harness.executor.start_session_metadata == [
+        ("ethiopia-harness", 5),
+        ("ethiopia-harness", 6),
+    ]
 
 
 @pytest.mark.asyncio

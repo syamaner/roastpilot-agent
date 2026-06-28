@@ -111,6 +111,7 @@ async def _synthetic_store(
     run_id: str = "synthetic-run",
     rating: int | None = 4,
     notes: str | None = "bright, clean",
+    roasted_weight_grams: float | None = None,
     drop_bean_temp_c: float = 194.0,
     cooled_bean_temp_c: float = 170.0,
     record_run_completed: bool = True,
@@ -256,6 +257,8 @@ async def _synthetic_store(
         )
         if outcome == "completed" and rating is not None:
             await store.set_operator_rating(run_id, rating=rating, notes=notes)  # type: ignore[arg-type]
+        if outcome == "completed" and roasted_weight_grams is not None:
+            await store.set_roasted_weight(run_id, roasted_weight_grams=roasted_weight_grams)
     return store
 
 
@@ -309,6 +312,36 @@ async def test_converter_emits_a_loadable_labelled_fixture(tmp_path: Path) -> No
     assert entry["run_id"] == "synthetic-run"
     assert entry["operator_rating"] == 4
     assert entry["degree"] == "core_medium"
+
+
+@pytest.mark.asyncio
+async def test_summary_carries_roasted_weight_and_weight_loss_label(tmp_path: Path) -> None:
+    """#388: the store roasted-out weight + derived weight-loss % become corpus
+    labels — 250 g in, 221 g out → 11.6 %."""
+    db_path = tmp_path / "weighed.sqlite3"
+    store = await _synthetic_store(db_path, roasted_weight_grams=221.0)
+    await store.close()
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["charge_weight_grams"] == 250.0  # _PROFILE.bean_weight_grams
+    assert summary["roasted_weight_grams"] == 221.0
+    assert summary["weight_loss_percent"] == 11.6  # (250 - 221) / 250 * 100
+
+
+@pytest.mark.asyncio
+async def test_summary_weight_loss_is_null_when_unweighed(tmp_path: Path) -> None:
+    """#388: an un-weighed roast carries a null weight-loss label (charge weight is
+    still surfaced from the frozen profile)."""
+    db_path = tmp_path / "unweighed.sqlite3"
+    store = await _synthetic_store(db_path)  # no roasted weight
+    await store.close()
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["charge_weight_grams"] == 250.0
+    assert summary["roasted_weight_grams"] is None
+    assert summary["weight_loss_percent"] is None
 
 
 @pytest.mark.asyncio

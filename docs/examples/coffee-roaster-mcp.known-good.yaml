@@ -61,6 +61,12 @@ logging:
 
 session:
   auto_t0_detection_enabled: true
-  auto_t0_drop_threshold_c: 25.0
+  # #387: 15 °C (was 25 °C) confirms auto-T0 closer to the bean-temp turning
+  # point at the steep charge-crash RoR, so the MCP turning-point backdate
+  # (#169, confirmed − turning point) has a smaller delta to span. The stamped
+  # T0 origin is the turning point either way (the agent applies the full
+  # backdate; roast-6 trace landed ~2 s of it), but a smaller delta is more
+  # robust if a noisy peak ever leaves the MCP turning-point tracker short.
+  auto_t0_drop_threshold_c: 15.0
   ror_window_seconds: 60
   ror_min_sample_seconds: 10

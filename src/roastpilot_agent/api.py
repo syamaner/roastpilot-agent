@@ -70,6 +70,7 @@ from roastpilot_agent.models import (
     OperatorRatingRequest,
     RoastCommand,
     RoastDetail,
+    RoastedWeightRequest,
     RoastEventKind,
     RoastEventSource,
     RoastHistory,
@@ -80,6 +81,7 @@ from roastpilot_agent.models import (
     SseEventType,
     TelemetryEventData,
     TelemetrySeries,
+    recording_origin_slug,
 )
 from roastpilot_agent.safety import (
     OPERATOR_ACTION_COMMAND,
@@ -553,12 +555,20 @@ class RoastRunner:
         self._t0_persisted = False
         self._scheduler: TickScheduler | None = None
 
-    async def start(self, profile: RoastProfile) -> None:
+    async def start(self, profile: RoastProfile, *, recording_roast_num: int | None = None) -> None:
         """Begin the run: drive the controller's idle→preheating start, then
         flush its startup events and persist the resulting phase. Issues the
         profile's initial heat/fan through the controller's safety policy (never
-        raw) — the controller owns that, not the runner."""
-        await self._controller.start_run(profile)
+        raw) — the controller owns that, not the runner.
+
+        Args:
+            profile: The roast profile to start.
+            recording_roast_num: The store-derived per-origin recording roast
+                number (#385), forwarded to the controller for the MCP recording
+                filename. ``None`` lets the controller fall back to its per-process
+                counter.
+        """
+        await self._controller.start_run(profile, recording_roast_num=recording_roast_num)
         await self._flush_events()
         await self._persist_phase_if_changed()
 
@@ -1330,9 +1340,44 @@ class RoastService:
         runner = self._build_runner(run_id)
         if runner is None:  # pragma: no cover — guarded by the caller
             return
-        await runner.start(profile)
+        recording_roast_num = await self._recording_roast_num(profile)
+        await runner.start(profile, recording_roast_num=recording_roast_num)
         if self._run_loop:
             self._loop_task = asyncio.create_task(runner.run())
+
+    async def _recording_roast_num(self, profile: RoastProfile) -> int | None:
+        """The store-derived per-origin recording roast number (#385).
+
+        Prior completed roasts of this profile's origin + 1, so the MCP recording
+        filename counter is stable and meaningful across agent restarts (the
+        per-process counter reset to 0 each restart, colliding same-bean roasts).
+
+        Best-effort: returns ``None`` when the profile yields no origin slug (the
+        controller then skips the metadata call) or when the count query fails for
+        any reason — the controller falls back to its per-process counter rather
+        than blocking the roast on a recording-naming detail.
+
+        Args:
+            profile: The roast profile being started.
+
+        Returns:
+            The 1-based per-origin roast number, or ``None`` to defer to the
+            controller's per-process fallback.
+        """
+        origin_slug = recording_origin_slug(profile)
+        if origin_slug is None:  # pragma: no cover - slug=None tested at the unit level
+            return None
+        try:
+            prior = await self._store.count_completed_runs_for_origin(origin_slug)
+        except Exception:  # pragma: no cover - defensive; never block the roast
+            _log.warning(
+                "count_completed_runs_for_origin failed (origin=%r); "
+                "falling back to the per-process recording roast number",
+                origin_slug,
+                exc_info=True,
+            )
+            return None
+        return prior + 1
 
     def _build_runner(self, run_id: str) -> "RoastRunner | None":
         """Construct a controller + runner bound to ``run_id`` (shared by the
@@ -1681,6 +1726,38 @@ class RoastService:
             raise RuntimeError(f"read_run returned None for rated run {run_id}")
         return rated
 
+    async def set_roasted_weight(self, run_id: str, request: RoastedWeightRequest) -> RoastDetail:
+        """Record the operator-entered roasted-out weight (#388), or 404/409.
+
+        Mirrors :meth:`rate`: 404 when the run is unknown; 409 when it is still in
+        progress — the roasted weight is a completed-run immutability exception
+        (entered post-weighing), so the in-progress case surfaces as a conflict
+        rather than letting the store's RuntimeError escape as a 500. A roasted
+        weight above the charge weight is physically impossible (a tare/scale
+        error) and is rejected as a 409 too, rather than persisted as a row whose
+        derived loss reads as null/"unweighed". The response carries the derived
+        ``weight_loss_percent``.
+        """
+        detail = await self._store.read_run(run_id)
+        if detail is None:
+            raise RoastRunNotFoundError(run_id)
+        if detail.completed_at_utc is None:
+            raise RoastRunConflictError(
+                f"run {run_id} is still in progress; record its weight after completion"
+            )
+        if request.roasted_weight_grams > detail.profile.bean_weight_grams:
+            raise RoastRunConflictError(
+                f"roasted weight {request.roasted_weight_grams} g exceeds the charge "
+                f"weight {detail.profile.bean_weight_grams} g (physically impossible)"
+            )
+        await self._store.set_roasted_weight(
+            run_id, roasted_weight_grams=request.roasted_weight_grams
+        )
+        weighed = await self._store.read_run(run_id)
+        if weighed is None:  # pragma: no cover — immutable once completed
+            raise RuntimeError(f"read_run returned None for weighed run {run_id}")
+        return weighed
+
     async def submit_operator_action(
         self, run_id: str, request: OperatorActionRequest
     ) -> OperatorActionResult:
@@ -1915,6 +1992,20 @@ async def rate_roast(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+async def set_roasted_weight(
+    run_id: str,
+    request: RoastedWeightRequest,
+    service: ServiceDep,
+) -> RoastDetail:
+    """``POST /api/roasts/{run_id}/roasted-weight`` — operator roasted-out weight (#388)."""
+    try:
+        return await service.set_roasted_weight(run_id, request)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 async def submit_operator_action(
     run_id: str,
     action: OperatorActionRequest,
@@ -2123,6 +2214,7 @@ def create_app(
     app.get("/api/roasts/{run_id}/log")(get_log_manifest)
     app.get("/api/roasts/{run_id}/log/{artifact}")(download_log)
     app.post("/api/roasts/{run_id}/rating")(rate_roast)
+    app.post("/api/roasts/{run_id}/roasted-weight")(set_roasted_weight)
     app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)
     app.get("/api/bean-profiles")(list_bean_profiles)
     app.post("/api/bean-profiles", status_code=201)(create_bean_profile)

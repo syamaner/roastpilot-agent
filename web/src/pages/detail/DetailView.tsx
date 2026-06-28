@@ -30,6 +30,7 @@ import { DecisionTraceTable } from "./DecisionTraceTable";
 import { EventTimeline } from "./EventTimeline";
 import { ExportOptions } from "./ExportOptions";
 import { RoastRating } from "./RoastRating";
+import { RoastedWeight } from "./RoastedWeight";
 import { TitleBlock } from "./TitleBlock";
 import {
   headlineStats,
@@ -138,6 +139,12 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
         </section>
         <div className="flex flex-col gap-6">
           <RoastRating runId={detail.id} rating={detail.rating} notes={detail.notes} />
+          <RoastedWeight
+            runId={detail.id}
+            chargeWeightGrams={detail.profile.bean_weight_grams}
+            roastedWeightGrams={detail.roasted_weight_grams ?? null}
+            weightLossPercent={detail.weight_loss_percent ?? null}
+          />
           <ExportOptions runId={detail.id} manifest={detail.export_manifest} />
         </div>
       </div>

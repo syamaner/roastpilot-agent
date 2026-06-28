@@ -271,6 +271,13 @@ def _summary(profile: dict[str, Any], marks: RoastMarks) -> dict[str, Any]:
         "operator_rating": None,
         "operator_notes": None,
         "degree": classify_degree(drop_temp_c),
+        # Objective outcome label (#388): this adapter does not extract Artisan's
+        # in/out weight, so the weight-loss label is null here — kept in the key set
+        # for parity with store_to_fixture (the bake-off reads both identically).
+        # Extracting .alog weight is a separate enhancement.
+        "charge_weight_grams": None,
+        "roasted_weight_grams": None,
+        "weight_loss_percent": None,
     }
 
 

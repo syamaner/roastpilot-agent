@@ -69,3 +69,20 @@ describe("HistoryTable first-crack time (#111)", () => {
     expect(screen.getByTestId("history-fc")).toHaveTextContent("—");
   });
 });
+
+describe("HistoryTable weight loss % (#388)", () => {
+  it("renders a Loss % column header", () => {
+    renderTable([summary()]);
+    expect(screen.getByRole("columnheader", { name: "Loss %" })).toBeInTheDocument();
+  });
+
+  it("shows the weight-loss % to one decimal", () => {
+    renderTable([summary({ id: "wl", weight_loss_percent: 11.6 })]);
+    expect(screen.getByTestId("history-weight-loss")).toHaveTextContent("11.6%");
+  });
+
+  it("shows an em-dash when the run was not weighed", () => {
+    renderTable([summary({ id: "unweighed", weight_loss_percent: null })]);
+    expect(screen.getByTestId("history-weight-loss")).toHaveTextContent("—");
+  });
+});

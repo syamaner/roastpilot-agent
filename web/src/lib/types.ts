@@ -317,6 +317,11 @@ export interface RoastSummary {
   processing?: ProcessingMethod | null;
   altitude_m?: number | null;
   rating: number | null;
+  // Operator roasted-out weight (#388) + derived weight-loss % =
+  // (charge - roasted) / charge * 100. `null` until weighed; predominantly
+  // moisture but also dry-matter loss, so NOT pure water loss.
+  roasted_weight_grams?: number | null;
+  weight_loss_percent?: number | null;
   development_percent: number | null;
   // Advisor stats (#184) aggregated server-side from `advisor_decisions`, so the
   // history advisor column renders without N+1ing `GET /api/roasts/{id}/timeline`.
@@ -344,6 +349,10 @@ export interface RoastDetail {
   fault_reason: string | null;
   rating: number | null;
   notes: string | null;
+  // Operator roasted-out weight (#388) + derived weight-loss %. `null` until
+  // weighed. The green/charge weight is `profile.bean_weight_grams`.
+  roasted_weight_grams?: number | null;
+  weight_loss_percent?: number | null;
   export_manifest: LogManifest | null;
   // Forward-compatible with the planned E7 `enabled_actions` addition (option
   // (a), separate PR). Optional until that contract change lands.
@@ -484,6 +493,11 @@ export interface RoastTimeline {
 export interface OperatorRatingRequest {
   stars: 1 | 2 | 3 | 4 | 5;
   notes?: string | null;
+}
+
+/** `POST /api/roasts/{id}/roasted-weight` body (#388). Grams, must be > 0. */
+export interface RoastedWeightRequest {
+  roasted_weight_grams: number;
 }
 
 // --- Health (models.HealthResponse) ---
