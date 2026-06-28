@@ -764,6 +764,9 @@ def test_c3_is_the_default_prompt_version() -> None:
     assert instructions_for("c2") == control_teaching_prompt("c2")
     assert instructions_for("c1") != instructions_for("c2")
     assert instructions_for("c2") != instructions_for("c3")
+    # c4 is added selectable (the #396 drop-decisiveness A/B arm); c3 stays default.
+    assert instructions_for("c4") == control_teaching_prompt("c4")
+    assert instructions_for("c3") != instructions_for("c4")
     assert instructions_for("c3") != instructions_for("v4")
     assert instructions_for("v4") != instructions_for("v2")
     assert instructions_for("v3") != instructions_for("v2")
@@ -836,6 +839,40 @@ def test_c3_extends_c2_with_post_fc_fan_brake() -> None:
     # Keeps the lever-stability discipline: a deliberate step, NOT a twiddle.
     assert "twiddle" in lowered
     assert "deliberate" in lowered or "intentional" in lowered
+
+
+def test_c4_extends_c3_with_drop_decisiveness() -> None:
+    """c4 is c3 PLUS a brake-vs-drop decisiveness section, with all of c1+c2+c3
+    grounding kept.
+
+    #277 finalists bake-off: on c3 gpt-4o never recommended the drop on 2 roasts —
+    it stated in its rationale that development was at target and the bean at the
+    drop temperature, then cut heat to 0 and raised fan (the c3 fan-brake) instead
+    of dropping, and recovered to a clean drop on c1. c4 makes the brake<->drop
+    boundary explicit: the brake shapes the APPROACH while behind target; once in
+    the drop window the decision is should_drop=TRUE, not more braking. It keeps
+    c3's fan-brake + c2's stretch + c1's grounding, and names NO numbers."""
+    c3 = control_teaching_prompt("c3")
+    c4 = control_teaching_prompt("c4")
+    # c4 is a strict superset of c3's grounding: every c3 line survives.
+    assert c3 in c4 or all(block in c4 for block in c3.split("\n\n")), (
+        "c4 must preserve c3's grounding verbatim"
+    )
+    lowered = c4.lower()
+    # The new brake-vs-drop decisiveness teaching.
+    assert "braking is not the finish" in lowered
+    assert "should_drop = true" in lowered
+    # The specific failure: stating the conditions then braking instead of dropping.
+    assert "that sentence is the drop signal" in lowered
+    assert "holding or braking rather than dropping" in lowered
+    # Keeps c3's fan-brake teaching (c4 is a superset of c3).
+    assert "fan is an active brake" in lowered or "only brake left" in lowered
+    # The new section names NO fixed drop/dev threshold numbers of its own
+    # (told==enforced; the live limits carry every threshold).
+    start = c4.index("WHEN YOU ARE IN THE DROP WINDOW")
+    new_section = c4[start : c4.index("THE OBJECTIVE\n", start)]
+    assert "195" not in new_section
+    assert "13 %" not in new_section
     # The c2 stretch teaching is still present (strict superset).
     assert "stretch development" in lowered
     # The new section names NO fixed temperature/limit THRESHOLD numbers of its own
