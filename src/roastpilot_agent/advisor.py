@@ -839,8 +839,10 @@ those are the per-call user-instruction lenses. ``c2`` adds the post-FC
 development-stretch teaching (roast-2 evidence) on top of ``c1``; ``c3`` adds the
 post-FC fan-as-active-brake teaching (roast-3 evidence) on top of ``c2``; ``c4``
 adds the brake-vs-drop decisiveness teaching (#277 bake-off evidence: c3 made
-gpt-4o brake instead of dropping) on top of ``c3``. ``c1`` / ``c2`` / ``c4`` stay
-selectable for the #396 A/B; ``c3`` remains the live default until c4 is validated
+gpt-4o brake instead of dropping) on top of ``c3``; ``c5`` adds the roast-7
+heat-floor / keep-climbing teaching (the c3 brake crashed the RoR to an under-temp
+drop) on top of ``c4``. ``c1`` / ``c2`` / ``c4`` / ``c5`` stay selectable for the
+#396 A/B; ``c3`` remains the live default until the A/B validates a successor
 (operator-gated).
 """
 
@@ -1091,6 +1093,54 @@ _C4_DROP_DECISIVENESS_SECTION = (
 )
 _CONTROL_TEACHING_PROMPTS["c4"] = _CONTROL_TEACHING_PROMPTS["c3"].replace(
     "THE OBJECTIVE\n", _C4_DROP_DECISIVENESS_SECTION + "THE OBJECTIVE\n", 1
+)
+
+# --- c5 (#396; roast-7 heat-floor — keep the bean climbing to the drop temp) ---
+#
+# c5 is c4 PLUS one section, spliced just before THE OBJECTIVE so all of
+# c1+c2+c3+c4 is preserved byte-for-byte. It answers roast 7 (run b74153ed): on the
+# c3 live frame gpt-4o cut heat to 0 immediately at first crack and ramped fan
+# 50->100 (the c2 cut-hard + c3 fan-brake moves, executed faithfully), which crashed
+# the rate of rise so the bean STALLED at 188 C while the DTR clock reached the 16 %
+# target — an under-temp drop 7 C below the 195 target. c2's "the two should arrive
+# together" intent is right, but nothing taught the HEAT FLOOR that keeps the bean
+# climbing; c2+c3 only ever push heat DOWN. This section is the counterweight: a low
+# POSITIVE RoR held by a heat floor so the bean reaches the drop temperature as
+# development hits target — the mirror of c2's sprint-to-the-ceiling failure. It
+# names NO numbers (the live limits / drop temperature come from context, the #218
+# two-copies rule). Added selectable for the c1-vs-c3-vs-c4-vs-c5 A/B (#396); c3
+# stays the live default until the A/B validates a successor (operator-gated).
+_C5_HEAT_FLOOR_SECTION = (
+    "POST-FIRST-CRACK: KEEP THE BEAN CLIMBING TO THE DROP TEMPERATURE - A STALLED "
+    "BEAN DROPS TOO COOL\n"
+    "- Stretching development and reaching the drop TEMPERATURE are ONE coupled "
+    "goal, not a trade-off. The target is for the bean to arrive AT the drop "
+    "temperature exactly as the development target is met - the two converge. A "
+    "roast that reaches the DTR target while the bean has STALLED several degrees "
+    "below the drop temperature is dropped TOO COOL: under-developed in temperature "
+    "even though the development clock reads done.\n"
+    "- The failure this prevents (the mirror image of sprinting to the ceiling): "
+    "cutting heat to 0 too early or too hard so the rate of rise collapses to near "
+    "FLAT, the bean stops climbing while still below the drop temperature, and the "
+    "DTR clock catches up to target with the bean short. You are then forced to "
+    "drop cool, or to hold while development drifts past target.\n"
+    "- Keep a HEAT FLOOR through development: enough element duty to hold a LOW but "
+    "POSITIVE rate of rise - a gentle, controlled climb - so the bean keeps moving "
+    "toward the drop temperature. Cutting heat ALL the way to 0 is correct only "
+    "when the rate of rise is genuinely too high, or the bean is already at/near "
+    "the drop temperature; otherwise a heat floor that keeps a slow climb beats a "
+    "flat stall. Use the fan to TRIM the rate of rise down, not to flatten it to "
+    "zero.\n"
+    "- Read the gap between the bean and the drop temperature against the "
+    "development remaining: if the bean is well below the drop temperature with "
+    "development still short, you have braked too hard - restore some heat to "
+    "resume the climb. If both are converging on the window together, hold the "
+    "line. The drop teaching above governs the finish; this governs the APPROACH "
+    "so the bean actually arrives.\n"
+    "\n"
+)
+_CONTROL_TEACHING_PROMPTS["c5"] = _CONTROL_TEACHING_PROMPTS["c4"].replace(
+    "THE OBJECTIVE\n", _C5_HEAT_FLOOR_SECTION + "THE OBJECTIVE\n", 1
 )
 
 

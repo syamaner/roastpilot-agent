@@ -767,6 +767,9 @@ def test_c3_is_the_default_prompt_version() -> None:
     # c4 is added selectable (the #396 drop-decisiveness A/B arm); c3 stays default.
     assert instructions_for("c4") == control_teaching_prompt("c4")
     assert instructions_for("c3") != instructions_for("c4")
+    # c5 is added selectable (the #396 heat-floor A/B arm); c3 stays default.
+    assert instructions_for("c5") == control_teaching_prompt("c5")
+    assert instructions_for("c4") != instructions_for("c5")
     assert instructions_for("c3") != instructions_for("v4")
     assert instructions_for("v4") != instructions_for("v2")
     assert instructions_for("v3") != instructions_for("v2")
@@ -886,6 +889,45 @@ def test_c4_extends_c3_with_drop_decisiveness() -> None:
     new_section = c3[start : c3.index("THE OBJECTIVE\n", start)]
     for literal in ("195", "203", "239"):
         assert literal not in new_section, f"c3 fan section must not bake in {literal!r}"
+
+
+def test_c5_extends_c4_with_heat_floor() -> None:
+    """c5 is c4 PLUS a heat-floor / keep-climbing section, with all of c1+c2+c3+c4
+    grounding kept.
+
+    Roast 7 (run b74153ed): on c3 gpt-4o cut heat to 0 immediately at first crack and
+    ramped fan 50->100, crashing the RoR so the bean stalled at 188 C while the DTR
+    clock reached the 16 % target — an under-temp drop 7 C below the 195 target. c2's
+    "the two arrive together" intent is right but nothing taught the HEAT FLOOR that
+    keeps the bean climbing. c5 adds it: a low POSITIVE RoR held by a heat floor so
+    the bean reaches the drop temperature as development hits target. It keeps c4's
+    drop-decisiveness + c3's fan-brake + c2's stretch + c1's grounding, names NO
+    numbers."""
+    c4 = control_teaching_prompt("c4")
+    c5 = control_teaching_prompt("c5")
+    # c5 is a strict superset of c4's grounding: every c4 line survives.
+    assert c4 in c5 or all(block in c5 for block in c4.split("\n\n")), (
+        "c5 must preserve c4's grounding verbatim"
+    )
+    lowered = c5.lower()
+    # The new heat-floor / keep-climbing teaching.
+    assert "keep the bean climbing to the drop temperature" in lowered
+    assert "heat floor" in lowered
+    assert "drops too cool" in lowered
+    assert "positive rate of rise" in lowered  # the low-but-positive RoR target
+    assert "restore some heat" in lowered  # the corrective when over-braked
+    assert "flatten it to zero" in lowered  # fan TRIMS the RoR, does not flatten it
+    # Keeps c4's drop-decisiveness + c3's fan-brake + c2's stretch (strict superset).
+    assert "braking is not the finish" in lowered
+    assert "fan is an active brake" in lowered or "only brake left" in lowered
+    assert "stretch development" in lowered
+    # The new section names NO fixed drop/dev/temperature THRESHOLD numbers of its
+    # own (told==enforced; the live limits carry every threshold). It must not bake
+    # in the roast-7 figures (188 stall / 195 drop / 16 % DTR).
+    start = c5.index("KEEP THE BEAN CLIMBING")
+    new_section = c5[start : c5.index("THE OBJECTIVE\n", start)]
+    for literal in ("188", "195", "16 %", "13 %"):
+        assert literal not in new_section, f"c5 heat-floor section must not bake in {literal!r}"
 
 
 def test_c1_grounds_development_numbers_to_context_no_invention() -> None:
