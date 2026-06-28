@@ -267,8 +267,19 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
     connection = _connect_readonly(db_path)
     try:
         resolved = _resolve_run_id(connection, run_id)
+        # Guard: ``roasted_weight_grams`` was added in store schema v7 (#388).
+        # Real stores from roasts 3–6 are at v6 (column absent); treat as NULL
+        # so the converter does not crash on the real operator store.
+        _store_cols = {
+            row[1] for row in connection.execute("PRAGMA table_info(roast_runs)").fetchall()
+        }
+        _weight_col = (
+            "roasted_weight_grams"
+            if "roasted_weight_grams" in _store_cols
+            else "NULL AS roasted_weight_grams"
+        )
         run_row = connection.execute(
-            "SELECT operator_rating, operator_notes, roasted_weight_grams, profile_json"
+            f"SELECT operator_rating, operator_notes, {_weight_col}, profile_json"
             " FROM roast_runs WHERE id = ?",
             (resolved,),
         ).fetchone()
