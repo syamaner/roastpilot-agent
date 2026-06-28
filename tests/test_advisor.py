@@ -770,6 +770,9 @@ def test_c3_is_the_default_prompt_version() -> None:
     # c5 is added selectable (the #396 heat-floor A/B arm); c3 stays default.
     assert instructions_for("c5") == control_teaching_prompt("c5")
     assert instructions_for("c4") != instructions_for("c5")
+    # c6 is added selectable (the #396 over-braked recovery A/B arm); c3 stays default.
+    assert instructions_for("c6") == control_teaching_prompt("c6")
+    assert instructions_for("c5") != instructions_for("c6")
     assert instructions_for("c3") != instructions_for("v4")
     assert instructions_for("v4") != instructions_for("v2")
     assert instructions_for("v3") != instructions_for("v2")
@@ -928,6 +931,42 @@ def test_c5_extends_c4_with_heat_floor() -> None:
     new_section = c5[start : c5.index("THE OBJECTIVE\n", start)]
     for literal in ("188", "195", "16 %", "13 %"):
         assert literal not in new_section, f"c5 heat-floor section must not bake in {literal!r}"
+
+
+def test_c6_extends_c5_with_recovery() -> None:
+    """c6 is c5 PLUS an explicit over-braked recovery section, with all of
+    c1+c2+c3+c4+c5 grounding kept.
+
+    c5 bake-off evidence: gpt-4o (and Gemini) read 'heat is already 0' from
+    the over-braked Colombia recordings as a reason to HOLD — the c5 heat-floor
+    section's general "restore some heat if you have braked too hard" was not
+    enough; the model treated the literal heat=0 context as confirming a settled
+    state. c6 makes the REVERSE action explicit: heat=0 + bean below drop temp
+    + development short = the over-braked state → RESTORE heat to a positive
+    value now. It names NO fixed numbers (the live limits carry every threshold).
+    """
+    c5 = control_teaching_prompt("c5")
+    c6 = control_teaching_prompt("c6")
+    # c6 is a strict superset of c5's grounding: every c5 line survives.
+    assert c5 in c6 or all(block in c6 for block in c5.split("\n\n")), (
+        "c6 must preserve c5's grounding verbatim"
+    )
+    lowered = c6.lower()
+    # The new over-braked recovery teaching.
+    assert "restore heat" in lowered
+    assert "recommend a positive target_heat" in lowered or "positive target_heat" in lowered
+    assert "that reading is the trap" in lowered
+    # Keeps c5's heat-floor teaching (strict superset).
+    assert "heat floor" in lowered
+    # Keeps c4's brake-vs-drop and c2's stretch (strict superset via c5).
+    assert "braking is not the finish" in lowered
+    # The new section names NO fixed temperature/limit threshold numbers of its own
+    # (told==enforced; the live limits carry every threshold). It must not bake in
+    # the Colombia fixture figures (188 / 195 / 16 % / 13 %).
+    start = c6.index("POST-FIRST-CRACK: IF HEAT IS ALREADY 0")
+    new_section = c6[start : c6.index("THE OBJECTIVE\n", start)]
+    for literal in ("188", "195", "16 %", "13 %"):
+        assert literal not in new_section, f"c6 recovery section must not bake in {literal!r}"
 
 
 def test_c1_grounds_development_numbers_to_context_no_invention() -> None:
