@@ -102,6 +102,43 @@
 
 ## Active Context
 
+**28 Jun 2026 (later) — BAKE-OFF RE-VALIDATION + ADVISOR/CORPUS CLOSEOUT. The post-FC pin HOLDS
+(no re-pin), c4 added selectable (c3 stays default), the store corpus + finalists report shipped,
+Colombia dev stepped to 16 %. #277 and #224 are CLOSED; the open follow-up is the operator-gated
+#396 prompt A/B.** Plan decisions **D69/D70/D71** (`roastpilot-plan` `8b23178`). What landed on `main`
+tonight (PRs #395 / #397 / #394):
+
+- **#277 post-FC loop re-validation — DONE; the gpt-4o + c1 pin HOLDS (D69).** A fresh finalists
+  bake-off (17 known-good mediums × 3 finalists, scored on the c3 live prompt;
+  `docs/advisor/bakeoff-finalists-2026-06-28.md` + `postfc-validation-2026-06-28.md`, shipped in #395)
+  gave gemini-3.1-flash-lite the drop-F1 lead (0.931 vs gpt-4o 0.765 / 0.611 on the 6-roast screen)
+  — but that gap is a **c1→c3 PROMPT confound, not a model verdict**: gpt-4o recovered to drop-F1
+  0.833 on c1 (both c3 never-drops, artisan-01/-12, returned F1=1.0), and at TRACE level it stated
+  the drop conditions (dev at target, bean at drop temp) then BRAKED (heat-0 + fan-up, the c3
+  fan-brake) instead of dropping. The D43 pin's deciding axis was heat-magnitude fidelity (gpt-4o
+  ≈7.5 pp on c1 vs gemini ≈22 pp), unchanged. **NO re-pin.** **grok-4.3 REMOVED from the finalist
+  roster** (6.12 s median FC latency > the 2.5 s gate AND confidence > 1.0 on 3 ticks =
+  `AdvisorUnsafeOutputError`); screen-coverage only (`finalist=False`).
+- **c4 control prompt MERGED (#397; D70).** c4 = c3 + a brake-vs-drop decisiveness section (the
+  fan-brake shapes the APPROACH while behind target; once IN the drop window, `should_drop=TRUE`,
+  not more braking) — targeting the exact c3 overshoot D69 found. **Additive + selectable; `c3`
+  STAYS the live default** (`AdvisorConfig.prompt_version` default `c3`). The **c1-vs-c3-vs-c4 A/B
+  is #396** (operator-gated, full 17-roast set / all three prompts / one session) — **any
+  prompt-default change is gated on #396**, no flip ships off this analysis alone.
+- **#224 corpus — DONE.** Roasts 3–6 → replay fixtures (two-clock reconciliation + the
+  `phase_changed`→cooling drop clock) + a labelled-corpus manifest
+  (`docs/advisor/store-roast-corpus-manifest.json`); `store_to_fixture` v6+v7 compat. Shipped in #395.
+- **Colombia Huila seed dev 13 → 16 % (#394; D71).** Auto-drop now has room to land ~192–193 °C; the
+  195 °C ceiling is UNCHANGED (it caps bitter regardless). The planned de-risk step-up toward the
+  bean's ~18 % research DTR, safe after roast 6 validated the full stack.
+
+**Closed by this session:** #277 (post-FC loop re-validation — pin holds), #224 (consolidate roast
+logs → labelled replay corpus). **Open follow-up:** **#396** — the operator-gated c1-vs-c3-vs-c4
+prompt A/B that gates any prompt-default change. Everything else open before the next roast (roast 7)
+is unchanged from the block below (#386 / #342 / MCP E11-S3 / #178 / #179).
+
+---
+
 **28 Jun 2026 — BEFORE-NEXT-ROAST BATCH SHIPPED. The two MCP releases + the agent batch all landed;
 #387 re-diagnosed as a NON-BUG (T0 is correct); #134 validated by roast 6 → E11 unblocked. Roast 7
 is ready. This supersedes every "P0 = run roast 4" / "0.1.10 bundle still open" framing below.** The
