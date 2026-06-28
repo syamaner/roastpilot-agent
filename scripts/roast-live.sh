@@ -87,11 +87,12 @@ IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null |
 ADV="advisor configured"
 [ -n "${OPENROUTER_API_KEY:-}" ] || ADV="ADVISORY-PAUSED (no OPENROUTER_API_KEY)"
 
-# Derive the banner from the EFFECTIVE agent env var (set above by ADAPTIVE_TRIM=1,
-# OR exported directly by the operator) so the readout always matches runtime, not
-# just the convenience flag (Augment #402).
+# Derive the banner from the agent's OWN resolved config (the .venv is active by
+# now), so it can never drift from runtime: this covers ADAPTIVE_TRIM=1, a directly
+# exported var, AND pydantic's full truthy set (1/true/yes/on/…) identically, using
+# the same parser the serving agent used (Augment #402).
 TRIM="fixed 65% (proven roast-6 default)"
-if [ "${ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ADAPTIVE_DEPTH_ENABLED:-}" = "true" ]; then
+if python -c "import sys; from roastpilot_agent.config import AppConfig as A; sys.exit(0 if A().controller.pre_first_crack_levers.late_maillard_trim.adaptive_depth_enabled else 1)" 2>/dev/null; then
   TRIM="ADAPTIVE — #386 RoR-keyed depth (experiment, watch the cut)"
 fi
 
