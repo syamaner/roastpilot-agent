@@ -837,9 +837,11 @@ A ``c``-prefixed namespace, distinct from the ``v``-prefixed per-tick advisory
 prompt versions in :data:`_PROMPTS`: this is the stable, cached SYSTEM frame,
 those are the per-call user-instruction lenses. ``c2`` adds the post-FC
 development-stretch teaching (roast-2 evidence) on top of ``c1``; ``c3`` adds the
-post-FC fan-as-active-brake teaching (roast-3 evidence) on top of ``c2``. ``c1``
-and ``c2`` stay selectable for an A/B; prompt-efficacy of ``c3`` is validated on
-the next roast / bake-off (operator-gated).
+post-FC fan-as-active-brake teaching (roast-3 evidence) on top of ``c2``; ``c4``
+adds the brake-vs-drop decisiveness teaching (#277 bake-off evidence: c3 made
+gpt-4o brake instead of dropping) on top of ``c3``. ``c1`` / ``c2`` / ``c4`` stay
+selectable for the #396 A/B; ``c3`` remains the live default until c4 is validated
+(operator-gated).
 """
 
 _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
@@ -1044,6 +1046,51 @@ _C3_FAN_BRAKE_SECTION = (
 )
 _CONTROL_TEACHING_PROMPTS["c3"] = _CONTROL_TEACHING_PROMPTS["c2"].replace(
     "THE OBJECTIVE\n", _C3_FAN_BRAKE_SECTION + "THE OBJECTIVE\n", 1
+)
+
+# --- c4 (#396; drop-decisiveness — brake-vs-drop) -----------------------------
+#
+# c4 is c3 PLUS one section, spliced just before THE OBJECTIVE so all of c1+c2+c3
+# is preserved byte-for-byte. It answers the #277 finalists bake-off: on the c3
+# screen gpt-4o NEVER recommended the drop on 2 roasts (artisan-01, artisan-12),
+# STATING in its own rationale that development was at target and the bean at the
+# drop temperature, then cutting heat to 0 and raising fan (the c3 fan-as-brake
+# move) INSTEAD of dropping — and recovered to a clean drop on c1. The c3 fan-brake
+# teaching competes with the drop trigger: the model brakes the approach
+# indefinitely rather than finishing. This section makes the brake<->drop boundary
+# explicit — the brake shapes the APPROACH while behind target; once IN the drop
+# window, the decision is should_drop=TRUE, not another tick of braking. It names
+# NO numbers (the development target + drop window come from context, the #218
+# two-copies rule). Added selectable for the c1-vs-c3-vs-c4 A/B (#396); c3 stays
+# the live default until the A/B validates c4 (operator-gated).
+_C4_DROP_DECISIVENESS_SECTION = (
+    "POST-FIRST-CRACK: WHEN YOU ARE IN THE DROP WINDOW, DROP - BRAKING IS NOT THE FINISH\n"
+    "- The heat-to-zero and the fan-as-brake above are tools for SHAPING THE "
+    "APPROACH while development is still BEHIND target: they hold the rate of rise "
+    "down so development accrues before the bean reaches the window. They buy time. "
+    "They do NOT end the roast.\n"
+    "- The roast ENDS with the DROP, and recommending it is YOUR most important "
+    "post-first-crack call. When the development percent / DTR is AT or just below "
+    "the profile target AND the bean is in the drop window at or near the indicated "
+    "drop temperature (both from the context, below the bitter ceiling), the "
+    "correct decision is should_drop = TRUE - not another tick of braking.\n"
+    "- Watch for this specific failure: if you find yourself STATING in your "
+    "rationale that development is at target and the bean is at the drop "
+    "temperature, that sentence IS the drop signal. Set should_drop true; do NOT "
+    "instead cut heat again or raise the fan for one more tick. Recognising the "
+    "drop conditions and then holding or braking rather than dropping is exactly "
+    "the failure this teaching exists to prevent.\n"
+    "- Braking harder once you are already in the window does not finish the roast "
+    "- it lets development drift PAST target and leaves the bean coasting toward "
+    "the bitter ceiling with no drop called. Use the fan-brake to ARRIVE at the "
+    "window on a controlled decline; once you are IN it, DROP. (A drop is "
+    "irreversible, so never drop EARLY on an assumed number - but when the "
+    "context's development and temperature both sit in the window, drop decisively "
+    "rather than hold for a few more seconds.)\n"
+    "\n"
+)
+_CONTROL_TEACHING_PROMPTS["c4"] = _CONTROL_TEACHING_PROMPTS["c3"].replace(
+    "THE OBJECTIVE\n", _C4_DROP_DECISIVENESS_SECTION + "THE OBJECTIVE\n", 1
 )
 
 
