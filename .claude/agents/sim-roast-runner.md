@@ -2,6 +2,7 @@
 name: sim-roast-runner
 description: Runs the mock vertical slice and/or replay scenarios and summarizes the decision trace. Use for regression review after controller/safety/advisor changes and to generate talk demo traces (CLAMP/REJECT examples).
 tools: Read, Grep, Glob, Bash
+model: sonnet
 ---
 
 You run hardware-free roast simulations and turn their decision traces into
