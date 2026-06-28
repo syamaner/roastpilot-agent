@@ -715,13 +715,16 @@ ROSTER: tuple[Candidate, ...] = (
         (RoastPhase.DEVELOPMENT,),
         reasoning="low",
     ),
-    # grok-4.3 — recovery slug for the deprecated grok-4-fast (the only
-    # non-Google/non-OpenAI control datapoint). Reasoning pinned low.
+    # grok-4.3 — recovery slug for the deprecated grok-4-fast. Screen-only:
+    # showed 6.0 s median FC latency on the screen (28 Jun 2026), well outside
+    # the 2.5 s FC gate, so removed from the finalist carry. Also outputs
+    # confidence values > 1.0 on some ticks (AdvisorUnsafeOutputError), making
+    # it structurally unreliable for the live loop. Kept in the roster so the
+    # screen still covers xAI; not carried to the full set.
     Candidate(
         "x-ai/grok-4.3",
         Tier.CONTROL_CANDIDATE,
         (RoastPhase.DEVELOPMENT,),
-        finalist=True,
         reasoning="low",
     ),
 )

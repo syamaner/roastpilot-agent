@@ -1,0 +1,44 @@
+{
+  "generated": "2026-06-28",
+  "note": "Finalists bakeoff scorecard (#277). Raw cells and capture are in /tmp (gitignored). See bakeoff-finalists-2026-06-28.md for analysis. COVERAGE ASYMMETRY: 'seeds_requested' was 2, but gemini-3-flash-preview completed only 1 seed (17 roast-seed pairs) vs 2 seeds (34 pairs) for gpt-4o and gemini-3.1-flash-lite \u2014 unavailable on the final availability sweep, its 17 checkpoint cells are valid. Read its row as a 1-seed point estimate, not a 2-seed average. Per-model 'seeds_completed' and 'n_roast_seed_pairs' below carry the true coverage.",
+  "mode": "replay",
+  "roster": "finalists",
+  "test_set": "full",
+  "seeds_requested": 2,
+  "prompt_versions": [
+    "c3"
+  ],
+  "stopped_for_budget": false,
+  "resumed_cells": 78,
+  "fresh_cells": 7,
+  "captured_calls": 400,
+  "per_model_summary": {
+    "google/gemini-3-flash-preview": {
+      "seeds_completed": 1,
+      "n_roast_seed_pairs": 17,
+      "drop_f1_avg": 0.9021,
+      "heat_mae_avg_pp": 48.5,
+      "heat_directional_agreement_avg": 0.475,
+      "fan_mae_avg_pp": 15.3,
+      "fc_latency_median_s": 2.47
+    },
+    "google/gemini-3.1-flash-lite": {
+      "seeds_completed": 2,
+      "n_roast_seed_pairs": 34,
+      "drop_f1_avg": 0.9314,
+      "heat_mae_avg_pp": 59.8,
+      "heat_directional_agreement_avg": 0.436,
+      "fan_mae_avg_pp": 11.1,
+      "fc_latency_median_s": 1.21
+    },
+    "openai/gpt-4o": {
+      "seeds_completed": 2,
+      "n_roast_seed_pairs": 34,
+      "drop_f1_avg": 0.7647,
+      "heat_mae_avg_pp": 46.9,
+      "heat_directional_agreement_avg": 0.478,
+      "fan_mae_avg_pp": 13.3,
+      "fc_latency_median_s": 1.7
+    }
+  }
+}

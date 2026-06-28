@@ -95,8 +95,12 @@ def test_finalists_are_the_ones_carried_to_the_full_set() -> None:
 
     These are the candidates carried to the FULL 17-medium set with 2 seeds.
     Of these, gpt-4o / gemini-3.1-flash-lite / gemini-3-flash-preview produced
-    usable full data; gpt-5-nano / gpt-5-mini / grok-4.3 were attempted but
-    proved unreachable on this OpenRouter access (see the 21 Jun results doc).
+    usable full data; gpt-5-nano / gpt-5-mini were attempted but proved
+    unreachable on this OpenRouter access (see the 21 Jun results doc).
+    grok-4.3 was removed from the finalist set (28 Jun 2026) after it
+    produced 6.0 s median FC latency — well outside the 2.5 s FC gate — and
+    emitted confidence > 1.0 on some ticks (AdvisorUnsafeOutputError);
+    it is kept in the ROSTER for screen coverage only.
     """
     expected = {
         "openai/gpt-4o",
@@ -104,7 +108,6 @@ def test_finalists_are_the_ones_carried_to_the_full_set() -> None:
         "google/gemini-3-flash-preview",
         "openai/gpt-5-nano",
         "openai/gpt-5-mini",
-        "x-ai/grok-4.3",
     }
     assert {c.slug for c in bakeoff.ROSTER if c.finalist} == expected
     assert {c.slug for c in bakeoff.finalist_roster()} == expected

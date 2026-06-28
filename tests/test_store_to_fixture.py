@@ -345,6 +345,29 @@ async def test_summary_weight_loss_is_null_when_unweighed(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_schema_v6_compat_roasted_weight_grams_absent(tmp_path: Path) -> None:
+    """#224: schema v6 stores lack the roasted_weight_grams column (added in v7/#388).
+
+    read_store_roast must not crash when the column is absent; it should fall
+    back to NULL AS roasted_weight_grams and return roasted_weight_grams=None.
+    """
+    import sqlite3
+
+    db_path = tmp_path / "v6store.sqlite3"
+    store = await _synthetic_store(db_path)
+    await store.close()
+    # Simulate schema v6 by dropping the column that was added in v7.
+    # SQLite 3.35+ supports ALTER TABLE DROP COLUMN.
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("ALTER TABLE roast_runs DROP COLUMN roasted_weight_grams")
+    conn.commit()
+    conn.close()
+
+    result = s2f.read_store_roast(db_path)
+    assert result.roasted_weight_grams is None
+
+
+@pytest.mark.asyncio
 async def test_events_are_rebased_off_the_absolute_monotonic_clock(tmp_path: Path) -> None:
     """Events (absolute monotonic) are rebased onto the run-relative telemetry clock.
 
