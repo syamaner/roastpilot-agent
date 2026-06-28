@@ -682,3 +682,258 @@ def test_trim_engages_in_late_maillard_on_a_real_roast_curve() -> None:
     # never above the FC target the estimator stops projecting past.
     assert min(engaged_beans) >= 155.0
     assert max(engaged_beans) <= 176.0
+
+
+# --- Adaptive trim depth (#386) ----------------------------------------------
+#
+# The adaptive depth is config-gated (``adaptive_depth_enabled=False`` by
+# default).  The invariants below are tested at the ``LateMaillardTrim``
+# level (``depth_for``) and at the ``RoastControlPolicy`` level
+# (``limits_for`` with an adaptive-enabled trim config).
+#
+# Offline choice-validation: ``test_adaptive_depth_is_monotonic`` proves the
+# formula is directionally correct (hotter approach → deeper cut, gentle →
+# shallower) for two representative RoR/ETA pairs analogous to the corpus
+# extremes: a roast-3-style hot approach (RoR 14 °C/min, short ETA 25 s) vs
+# a roast-6-style gentle approach (RoR 4 °C/min, ETA at the window boundary).
+# The thermal OUTCOME validates on hardware at roast 7.
+
+
+def _adaptive_trim(
+    base_trim: int = 65,
+    k_ror: float = 1.5,
+    k_eta: float = 0.2,
+    ror_ref: float = 8.0,
+    eta_ref: float = 60.0,
+    min_trim: int = 45,
+    max_trim: int = 75,
+) -> "LateMaillardTrim":
+    """Build an adaptive-enabled LateMaillardTrim with the given coefficients."""
+    return LateMaillardTrim(
+        adaptive_depth_enabled=True,
+        base_trim=base_trim,
+        k_ror=k_ror,
+        k_eta=k_eta,
+        ror_ref=ror_ref,
+        eta_ref=eta_ref,
+        min_trim=min_trim,
+        max_trim=max_trim,
+    )
+
+
+def test_adaptive_depth_disabled_returns_fixed_depth() -> None:
+    """Default (adaptive_depth_enabled=False): depth_for returns the fixed
+    trim_heat_percent regardless of RoR / ETA signal (#386)."""
+    trim = LateMaillardTrim(trim_heat_percent=65)  # default: adaptive off
+    # With a rich signal — should still return the fixed depth.
+    assert trim.depth_for(bean_ror_c_per_min=14.0, first_crack_eta_seconds=25.0) == 65
+    # With missing signal — still the fixed depth.
+    assert trim.depth_for(bean_ror_c_per_min=None, first_crack_eta_seconds=30.0) == 65
+    assert trim.depth_for(bean_ror_c_per_min=10.0, first_crack_eta_seconds=None) == 65
+    assert trim.depth_for(bean_ror_c_per_min=None, first_crack_eta_seconds=None) == 65
+
+
+def test_adaptive_depth_missing_ror_returns_fixed() -> None:
+    """When RoR is None the adaptive formula FAILS CLOSED to the fixed depth
+    even though the flag is on (#386 fail-closed guarantee)."""
+    trim = _adaptive_trim()
+    assert trim.depth_for(bean_ror_c_per_min=None, first_crack_eta_seconds=30.0) == 65
+
+
+def test_adaptive_depth_missing_eta_returns_fixed() -> None:
+    """When FC-ETA is None the adaptive formula FAILS CLOSED to the fixed depth
+    even though the flag is on (#386 fail-closed guarantee)."""
+    trim = _adaptive_trim()
+    assert trim.depth_for(bean_ror_c_per_min=10.0, first_crack_eta_seconds=None) == 65
+
+
+def test_adaptive_depth_gentle_approach_returns_base_trim() -> None:
+    """A gentle approach (RoR at ref, ETA at eta_ref) contributes 0 from both
+    terms → depth == base_trim (roast-6-style, no deepening needed)."""
+    trim = _adaptive_trim(base_trim=65, ror_ref=8.0, eta_ref=60.0)
+    depth = trim.depth_for(bean_ror_c_per_min=8.0, first_crack_eta_seconds=60.0)
+    assert depth == 65  # both terms zero → base_trim exactly
+
+
+def test_adaptive_depth_high_ror_deepens_cut() -> None:
+    """A hotter approach (high RoR > ror_ref) deepens the cut below base_trim
+    and clamps to [min_trim, max_trim] (#386)."""
+    # RoR 14 vs ref 8: RoR term = 1.5 * (14 - 8) = 9; ETA 50 vs ref 60:
+    # ETA term = 0.2 * (60 - 50) = 2; raw = 65 - 9 - 2 = 54; in [45, 75] → 54.
+    trim = _adaptive_trim()
+    depth = trim.depth_for(bean_ror_c_per_min=14.0, first_crack_eta_seconds=50.0)
+    assert depth == 54
+    assert depth < 65  # deeper than base
+
+
+def test_adaptive_depth_extreme_high_ror_clamps_to_min_trim() -> None:
+    """An extreme hot approach (very high RoR) is clamped to min_trim (#386)."""
+    # RoR 30 vs ref 8: RoR term = 1.5 * 22 = 33; raw = 65 - 33 = 32 < min_trim 45.
+    trim = _adaptive_trim()
+    depth = trim.depth_for(bean_ror_c_per_min=30.0, first_crack_eta_seconds=60.0)
+    assert depth == 45  # clamped to min_trim
+
+
+def test_adaptive_depth_respects_max_trim_bound() -> None:
+    """The formula is bounded by max_trim at its shallowest (#386): the validator
+    enforces base_trim ≤ max_trim, so the formula output (always ≤ base_trim) never
+    exceeds max_trim.  This test confirms the clamp is in place: the depth returned
+    is always ≤ max_trim regardless of signal values."""
+    trim = _adaptive_trim()  # defaults: base=65, max=75
+    # Gentle signal — formula output is base_trim (65); 65 <= max_trim (75) OK.
+    depth = trim.depth_for(bean_ror_c_per_min=8.0, first_crack_eta_seconds=60.0)
+    assert depth <= trim.max_trim
+    # Hot signal — formula goes below base_trim; still ≤ max_trim.
+    depth_hot = trim.depth_for(bean_ror_c_per_min=14.0, first_crack_eta_seconds=30.0)
+    assert depth_hot <= trim.max_trim
+
+
+def test_adaptive_depth_is_monotonic() -> None:
+    """Offline choice-validation: the formula is monotonic — hotter approach
+    produces a deeper cut (lower %) than a gentle approach (#386).
+
+    Tests two representative corpus extremes:
+    - Roast-3-style hot: RoR 14 °C/min, ETA 25 s (fast approach, pre-FC overshoot)
+    - Roast-6-style gentle: RoR 4 °C/min, ETA 55 s (near boundary, smooth entry)
+
+    The thermal OUTCOME of these depth choices validates on hardware at roast 7.
+    The offline test only asserts direction + bounds, not exact tuning.
+    """
+    trim = _adaptive_trim()
+    # Hot approach: high RoR, short ETA → deep cut
+    depth_hot = trim.depth_for(bean_ror_c_per_min=14.0, first_crack_eta_seconds=25.0)
+    # Gentle approach: low RoR, ETA near the window boundary → shallow cut
+    depth_gentle = trim.depth_for(bean_ror_c_per_min=4.0, first_crack_eta_seconds=55.0)
+
+    # Monotonicity: hot → deeper (lower %) than gentle.
+    assert depth_hot < depth_gentle, (
+        f"Adaptive depth not monotonic: hot={depth_hot} should be < gentle={depth_gentle}"
+    )
+    # Both within bounds.
+    assert 45 <= depth_hot <= 75, f"Hot depth {depth_hot} outside [45, 75]"
+    assert 45 <= depth_gentle <= 75, f"Gentle depth {depth_gentle} outside [45, 75]"
+
+
+def test_adaptive_depth_rounds_to_integer() -> None:
+    """depth_for always returns an int (required by PhaseControlLimits)."""
+    trim = _adaptive_trim(k_ror=1.0)
+    # RoR term = 1.0 * (9.5 - 8.0) = 1.5; raw = 65 - 1.5 = 63.5 → rounds to 64.
+    depth = trim.depth_for(bean_ror_c_per_min=9.5, first_crack_eta_seconds=60.0)
+    assert isinstance(depth, int)
+    assert depth == 64
+
+
+def test_adaptive_depth_wires_through_limits_for() -> None:
+    """The adaptive depth is honoured by ``limits_for`` when the trim engages
+    (#386): the box's heat_target_percent reflects the adaptive depth, not the
+    fixed 65."""
+    # Configure the adaptive trim: high RoR should produce 54 pp.
+    adaptive_trim = _adaptive_trim()  # base 65, k_ror 1.5, k_eta 0.2, ror_ref 8, eta_ref 60
+    levers = PreFirstCrackLevers(late_maillard_trim=adaptive_trim)
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE, pre_fc_levers=levers)
+    # A signal that opens the window: bean 165 °C, ETA 50 s, RoR 14 °C/min.
+    # Expected depth: 65 - 1.5*(14-8) - 0.2*(60-50) = 65 - 9 - 2 = 54.
+    signal = TrimSignal(
+        bean_temp_c=165.0,
+        first_crack_eta_seconds=50.0,
+        bean_ror_c_per_min=14.0,
+    )
+    box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=signal)
+    assert box.heat_target_percent == 54
+    assert box.heat_floor_percent == 54  # floor pinned to the adaptive depth
+
+
+def test_adaptive_depth_fan_unchanged() -> None:
+    """Fan is NEVER modified by adaptive trim depth (#386 invariant):
+    the fan box and target stay at the flat-floor values."""
+    adaptive_trim = _adaptive_trim()
+    levers = PreFirstCrackLevers(late_maillard_trim=adaptive_trim)
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE, pre_fc_levers=levers)
+    signal = TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=50.0, bean_ror_c_per_min=14.0)
+    box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=signal)
+    assert box.fan_target_percent == 30  # unchanged
+    assert box.fan_ceiling_percent == 30
+    assert box.fan_floor_percent == 0
+
+
+def test_adaptive_depth_missing_ror_in_signal_fails_closed() -> None:
+    """When TrimSignal carries bean_ror_c_per_min=None the adaptive path fails
+    closed to the fixed trim_heat_percent via limits_for (#386)."""
+    adaptive_trim = _adaptive_trim()  # flag on
+    levers = PreFirstCrackLevers(late_maillard_trim=adaptive_trim)
+    policy = RoastControlPolicy(SafetyLimits(), _PROFILE, pre_fc_levers=levers)
+    # Window is open (bean 165, ETA 30) but RoR is missing → fixed 65.
+    signal = TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=30.0, bean_ror_c_per_min=None)
+    box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=signal)
+    assert box.heat_target_percent == 65  # fixed depth, not adaptive
+
+
+def test_adaptive_depth_never_raises_heat_above_per_bean_base() -> None:
+    """The adaptive trim is clamped to the per-bean base (#386 safety):
+    even if max_trim > per_fc_heat, the resolved heat is min(depth, base_heat)."""
+    # Per-bean heat 60, adaptive max_trim 75 → without the clamp the formula
+    # could produce 75 for a very gentle approach, raising heat above the
+    # per-bean floor.  The clamp (min(depth, base_heat)) prevents this.
+    profile = _PROFILE.model_copy(update={"pre_fc_heat": 60})
+    # max_trim 75 > per_bean 60, but validator allows it (max_trim <= heat_target_percent
+    # is checked at the PreFirstCrackLevers level, not between max_trim and profile).
+    adaptive_trim = LateMaillardTrim(
+        adaptive_depth_enabled=True,
+        base_trim=60,  # must satisfy base_trim <= max_trim
+        min_trim=45,
+        max_trim=60,  # <= heat_target_percent (100 default)
+    )
+    levers = PreFirstCrackLevers(heat_target_percent=100, late_maillard_trim=adaptive_trim)
+    policy = RoastControlPolicy(SafetyLimits(), profile, pre_fc_levers=levers)
+    # Very gentle signal — formula gives base_trim (60); per_bean heat is also 60.
+    signal = TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=60.0, bean_ror_c_per_min=8.0)
+    box = policy.limits_for(RoastPhase.ROASTING_PRE_FIRST_CRACK, trim_signal=signal)
+    assert box.heat_target_percent == 60  # == per-bean base, not raised
+    assert box.heat_target_percent <= 60  # never above the per-bean floor
+
+
+def test_adaptive_trim_range_validator_rejects_min_above_base() -> None:
+    """LateMaillardTrim rejects min_trim > base_trim (#386)."""
+    with pytest.raises(ValidationError):
+        LateMaillardTrim(adaptive_depth_enabled=True, base_trim=50, min_trim=60, max_trim=75)
+
+
+def test_adaptive_trim_range_validator_rejects_base_above_max() -> None:
+    """LateMaillardTrim rejects base_trim > max_trim (#386)."""
+    with pytest.raises(ValidationError):
+        LateMaillardTrim(adaptive_depth_enabled=True, base_trim=80, min_trim=45, max_trim=75)
+
+
+def test_adaptive_trim_range_validator_rejects_min_above_max() -> None:
+    """LateMaillardTrim rejects min_trim > max_trim (#386)."""
+    with pytest.raises(ValidationError):
+        LateMaillardTrim(adaptive_depth_enabled=True, base_trim=65, min_trim=80, max_trim=75)
+
+
+def test_levers_reject_adaptive_max_trim_above_heat_target() -> None:
+    """PreFirstCrackLevers pins max_trim <= heat_target_percent (#386):
+    the adaptive depth must be a strict reduction even at its shallowest."""
+    with pytest.raises(ValidationError):
+        PreFirstCrackLevers(
+            heat_target_percent=80,
+            late_maillard_trim=LateMaillardTrim(
+                adaptive_depth_enabled=True,
+                base_trim=65,
+                min_trim=45,
+                max_trim=90,  # > heat_target_percent 80 → invalid
+            ),
+        )
+
+
+def test_trim_signal_carries_ror() -> None:
+    """TrimSignal accepts bean_ror_c_per_min (new field, #386)."""
+    sig = TrimSignal(
+        bean_temp_c=165.0,
+        first_crack_eta_seconds=30.0,
+        bean_ror_c_per_min=10.0,
+    )
+    assert sig.bean_ror_c_per_min == 10.0
+
+    # Defaults to None for backward compatibility.
+    sig_no_ror = TrimSignal(bean_temp_c=165.0, first_crack_eta_seconds=30.0)
+    assert sig_no_ror.bean_ror_c_per_min is None

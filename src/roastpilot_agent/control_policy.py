@@ -75,6 +75,12 @@ class TrimSignal:
     still requires the full window precondition (valid ETA + bean ≥ floor), so a
     garbage ETA never latches.
 
+    **Adaptive depth (#386).** When ``LateMaillardTrim.adaptive_depth_enabled`` is
+    ``True``, the policy uses ``bean_ror_c_per_min`` and ``first_crack_eta_seconds``
+    to compute a depth via :meth:`LateMaillardTrim.depth_for`. The controller
+    threads the current bean RoR in here (already computed for #229 ETA); ``None``
+    means unavailable — falls closed to the fixed depth.
+
     Side-effect free and immutable. All temperatures are Celsius.
     """
 
@@ -88,6 +94,11 @@ class TrimSignal:
     #: opened this pre-FC phase. Keeps the trim engaged through an ETA bounce
     #: (hysteresis); reset per run/preheat. Defaults ``False`` (no prior engage).
     latched: bool = False
+    #: The current bean rate-of-rise (°C/min), or ``None`` when unavailable.
+    #: Used by the adaptive trim depth formula (#386) when
+    #: ``LateMaillardTrim.adaptive_depth_enabled`` is ``True``; ignored (fails
+    #: closed to the fixed depth) when ``None``.
+    bean_ror_c_per_min: float | None = None
 
 
 class PhaseControlLimits(BaseModel):
@@ -330,14 +341,29 @@ class RoastControlPolicy:
             # level while the late-Maillard window is open (#327), else the
             # per-bean / #222 floor target. The floor is pinned to whichever heat
             # is active so the gate clamps any lower value back up to it (no cut
-            # below the active level). The trim is a strict reduction *of the
-            # config flat-floor target* (a config validator pins
-            # trim_heat_percent <= heat_target_percent); clamping the engaged heat
-            # to the resolved base keeps the trim ≤ the resolved floor even when a
-            # per-bean profile lowers the base below the config target, so the
-            # trim never RAISES the per-bean heat.
+            # below the active level).
+            #
+            # The trim depth is resolved via `depth_for` (#386): when adaptive
+            # depth is disabled (the default), `depth_for` returns the fixed
+            # `trim_heat_percent` — byte-for-byte the proven roast-6 behaviour.
+            # When enabled, it returns a signal-keyed depth (clamped to
+            # [min_trim, max_trim]).  Either way, the depth is then clamped to
+            # `base_heat` (the resolved per-bean / config floor) so the trim
+            # never RAISES heat above the per-bean floor (a config validator pins
+            # trim_heat_percent <= heat_target_percent; the same `min(depth, base_heat)`
+            # clamp extends that guarantee to the adaptive path).
             heat = (
-                min(levers.late_maillard_trim.trim_heat_percent, base_heat)
+                min(
+                    levers.late_maillard_trim.depth_for(
+                        bean_ror_c_per_min=(
+                            trim_signal.bean_ror_c_per_min if trim_signal is not None else None
+                        ),
+                        first_crack_eta_seconds=(
+                            trim_signal.first_crack_eta_seconds if trim_signal is not None else None
+                        ),
+                    ),
+                    base_heat,
+                )
                 if self._trim_engaged(trim_signal)
                 else base_heat
             )
