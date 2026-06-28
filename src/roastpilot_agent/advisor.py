@@ -841,9 +841,11 @@ post-FC fan-as-active-brake teaching (roast-3 evidence) on top of ``c2``; ``c4``
 adds the brake-vs-drop decisiveness teaching (#277 bake-off evidence: c3 made
 gpt-4o brake instead of dropping) on top of ``c3``; ``c5`` adds the roast-7
 heat-floor / keep-climbing teaching (the c3 brake crashed the RoR to an under-temp
-drop) on top of ``c4``. ``c1`` / ``c2`` / ``c4`` / ``c5`` stay selectable for the
-#396 A/B; ``c3`` remains the live default until the A/B validates a successor
-(operator-gated).
+drop) on top of ``c4``; ``c6`` adds an explicit recovery action for the over-braked
+state (heat already 0, bean below drop temp — c5 bake-off showed gpt-4o reading
+heat=0 as a reason to HOLD rather than restoring heat) on top of ``c5``.
+``c1`` / ``c2`` / ``c4`` / ``c5`` / ``c6`` stay selectable for the #396 A/B;
+``c3`` remains the live default until the A/B validates a successor (operator-gated).
 """
 
 _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
@@ -1141,6 +1143,46 @@ _C5_HEAT_FLOOR_SECTION = (
 )
 _CONTROL_TEACHING_PROMPTS["c5"] = _CONTROL_TEACHING_PROMPTS["c4"].replace(
     "THE OBJECTIVE\n", _C5_HEAT_FLOOR_SECTION + "THE OBJECTIVE\n", 1
+)
+
+# --- c6 (#396; over-braked recovery — heat=0 + bean below drop temp → restore) ---
+#
+# c6 is c5 PLUS one section, spliced just before THE OBJECTIVE so all of
+# c1+c2+c3+c4+c5 is preserved byte-for-byte. It answers a specific failure the
+# c5 bake-off revealed: gpt-4o (and Gemini) read 'heat is already 0' in the
+# over-braked Colombia recordings as a reason to HOLD rather than to restore heat.
+# The c5 heat-floor section teaches the general principle ("keep a heat floor",
+# "restore some heat if you have braked too hard"), but the model apparently reads
+# the LITERAL heat=0 context as confirming the CURRENT state is correct rather than
+# as an error state to CORRECT. c6 makes the reverse action explicit: when heat is
+# already 0 AND the bean is still below the drop temperature AND development is
+# behind target, that specific combination is the over-braked state — the trigger
+# to RESTORE heat, not to hold. It names NO numbers (the live limits / drop
+# temperature come from context, the #218 two-copies rule). Added selectable for
+# the #396 A/B; c3 stays the live default (operator-gated).
+_C6_HEAT_RECOVERY_SECTION = (
+    "POST-FIRST-CRACK: IF HEAT IS ALREADY 0 AND THE BEAN IS BELOW THE DROP "
+    "TEMPERATURE, RESTORE HEAT\n"
+    "- This is the SPECIFIC state to catch and REVERSE: the context shows heat "
+    "ALREADY at 0 (or near it), the bean is more than a few degrees BELOW the "
+    "drop temperature from the context, AND development is still short of target. "
+    "That is the over-braked state - the rate of rise has been flattened and the "
+    "bean has stopped climbing toward the window. Do NOT read 'heat is already at "
+    "the floor' as a reason to HOLD: that reading is the trap that drops the bean "
+    "cool.\n"
+    "- The correct action is to RESTORE heat NOW. Recommend a POSITIVE target_heat "
+    "- step heat back UP to a real positive floor (not 0, not a token) to resume "
+    "a low controlled climb to the drop temperature. A context showing heat 0 with "
+    "the bean stalled below the drop target is not a settled state to maintain; it "
+    "is a braking error to correct. Do not recommend target_heat 0 while the bean "
+    "is short of the drop temperature.\n"
+    "- Keep heat at 0 ONLY when the bean is already AT or ABOVE the drop "
+    "temperature, or the rate of rise is still genuinely too high. Below the drop "
+    "temperature with a flat or falling RoR, heat 0 is wrong - bring it back up.\n"
+    "\n"
+)
+_CONTROL_TEACHING_PROMPTS["c6"] = _CONTROL_TEACHING_PROMPTS["c5"].replace(
+    "THE OBJECTIVE\n", _C6_HEAT_RECOVERY_SECTION + "THE OBJECTIVE\n", 1
 )
 
 
