@@ -92,8 +92,8 @@ prevented).
 - **Don't fold LOW findings as post-open commits.** Per the Code Review Rubric lows
   are non-blocking; fix them in this pre-open pass or defer/dismiss them in-thread,
   never as a separate post-open commit.
-- **Healthy rework stays.** The bots (Claude Code Review, Augment) still run
-  post-open; on a cleaner branch they find less, but a reviewer catching a real
+- **Healthy rework stays.** Claude Code Review (and any human reviewer) still runs
+  post-open; on a cleaner branch it finds less, but a reviewer catching a real
   defect is the system working. Remove the *catchable-pre-open* findings, not the
   review itself.
 

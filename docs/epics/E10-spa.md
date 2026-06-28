@@ -341,8 +341,8 @@ all merged to `main`. None re-open a story; they harden the shipped surface.
 | #257 | Dependabot: bump `form-data` | #257 |
 
 **Governance / CI (cross-epic, recorded here for board completeness):** PR review
-roster curated to Claude Code Review + Augment (auggie); Codex + CodeRabbit
-disabled (#246, plan **D37**). CI Playwright image mirrored to GHCR off MCR's
+roster = Claude Code Review (+ human reviewers); the Augment Code trial ended
+28 Jun 2026, and Codex + CodeRabbit were disabled (#246, plan **D37**). CI Playwright image mirrored to GHCR off MCR's
 anonymous-pull hot path; `mirror-playwright.yml` self-refreshes (#262/#263, plan
 **D38**).
 
