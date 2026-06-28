@@ -13,6 +13,9 @@
 #          COFFEE_ROASTER_MCP_CONFIG=~/roasts/coffee-roaster-mcp.yaml  (default)
 #          ROASTPILOT_DB=~/roasts/roastpilot.sqlite3  (default) — the agent
 #            decision trace; persists across shutdown/restart (issue #161).
+#          ADAPTIVE_TRIM=1  enable the #386 RoR-keyed ADAPTIVE late-Maillard trim
+#            depth (default off = the proven fixed 65% cut). Interim opt-in until
+#            the config UI lands; e.g. ADAPTIVE_TRIM=1 ./scripts/roast-live.sh
 #
 set -euo pipefail
 
@@ -26,6 +29,15 @@ export COFFEE_ROASTER_MCP_CONFIG
 # so the operator finds it and it survives a Ctrl-C / restart for recovery.
 : "${ROASTPILOT_DB:=$HOME/roasts/roastpilot.sqlite3}"
 export ROASTPILOT_DB
+
+# Opt-in (#386): the RoR-keyed ADAPTIVE late-Maillard trim depth. Default OFF —
+# the proven fixed 65% cut (roast-6 behaviour) stays the checked-in default; this
+# only flips it when the operator asks. Maps to the agent's AppConfig nested env
+# path (controller.pre_first_crack_levers.late_maillard_trim.adaptive_depth_enabled).
+# Interim toggle until the agent config UI lands.
+if [ "${ADAPTIVE_TRIM:-0}" = "1" ]; then
+  export ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ADAPTIVE_DEPTH_ENABLED=true
+fi
 
 if [ ! -f "$COFFEE_ROASTER_MCP_CONFIG" ]; then
   echo "ERROR: MCP config not found: $COFFEE_ROASTER_MCP_CONFIG" >&2
@@ -75,6 +87,9 @@ IP="$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null |
 ADV="advisor configured"
 [ -n "${OPENROUTER_API_KEY:-}" ] || ADV="ADVISORY-PAUSED (no OPENROUTER_API_KEY)"
 
+TRIM="fixed 65% (proven roast-6 default)"
+if [ "${ADAPTIVE_TRIM:-0}" = "1" ]; then TRIM="ADAPTIVE — #386 RoR-keyed depth (experiment, watch the cut)"; fi
+
 echo "→ starting agent + spawning MCP child (takes a few seconds — don't Ctrl-C yet)…"
 echo "  MCP config: ${COFFEE_ROASTER_MCP_CONFIG}"
 roastpilot-agent serve --host 0.0.0.0 --port "$PORT" &
@@ -95,6 +110,7 @@ for _ in $(seq 1 120); do
   ✅ READY — SUPERVISED LIVE ROAST (#134). Stay at the machine, abort-ready.
 
   Advisor    : ${ADV}
+  Pre-FC trim: ${TRIM}
   Dashboard  : http://${IP}:${PORT}/
   Trace DB   : ${ROASTPILOT_DB}  (persists after shutdown — #161)
 
