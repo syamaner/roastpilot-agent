@@ -51,6 +51,10 @@ export function RoastedWeight({
     mutationFn: (body: RoastedWeightRequest) => api.setRoastedWeight(runId, body),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: roastKeys.detail(runId) });
+      // The History list (roastKeys.history) renders the Loss % column (#388), so
+      // invalidate it too — otherwise the saved weight_loss_percent stays stale
+      // there until the 30s staleTime elapses.
+      void queryClient.invalidateQueries({ queryKey: roastKeys.history });
     },
   });
 
