@@ -102,23 +102,18 @@ if python -c "import sys; from roastpilot_agent.config import AppConfig as A; sy
   TRIM="ADAPTIVE — #386 RoR-keyed depth (experiment, watch the cut)"
 fi
 
-# Same drift-proof read for the advisor model + control-teaching prompt: print the
-# agent's OWN resolved AppConfig values (covers ROASTPILOT_ADVISOR__MODEL_SLUG /
-# __PROMPT_VERSION overrides identically), and TAG it as an experiment when either
-# differs from the checked-in defaults (e.g. roast 8 = gpt-4.1-mini + c6). So the
-# operator can SEE which model/prompt is live before charging, not trust the env
-# silently took. Falls back to a marker if the config can't be read.
+# Drift-proof read of the resolved advisor model + prompt, tagged when non-default (e.g. roast 8 = mini+c6); rationale in the PR.
 ADVISOR_CFG="$(python -c '
-from roastpilot_agent.advisor import CONTROL_TEACHING_PROMPT_VERSION
-from roastpilot_agent.config import AppConfig, DEFAULT_ADVISOR_MODEL
+from roastpilot_agent.config import AppConfig
 
-cfg = AppConfig().advisor
+adv = AppConfig().advisor
+fields = type(adv).model_fields
 default = (
-    cfg.model_slug == DEFAULT_ADVISOR_MODEL
-    and cfg.prompt_version == CONTROL_TEACHING_PROMPT_VERSION
+    adv.model_slug == fields["model_slug"].default
+    and adv.prompt_version == fields["prompt_version"].default
 )
 tag = "" if default else "   ⚠ EXPERIMENT — non-default, watch it"
-print(f"{cfg.model_slug}  ·  prompt {cfg.prompt_version}{tag}")
+print(f"{adv.model_slug}  ·  prompt {adv.prompt_version}{tag}")
 ' 2>/dev/null || echo 'unresolved (config read failed — check the agent output above)')"
 
 echo "→ starting agent + spawning MCP child (takes a few seconds — don't Ctrl-C yet)…"
