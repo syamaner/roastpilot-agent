@@ -328,6 +328,18 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   beyond coverage), `pr-triage` (independent PR-feedback triage — also the
   `triage-pr` skill), `engineer-fe` (web/ SPA), `engineer-be` (Python agent). The
   human is the lead + domain expert/architect, consulted on escalations.
+- **Model selection — decide it WITH the topology, every time.** When you pick a
+  primitive (sub-agent / agent team / workflow), pick the model in the same breath.
+  **Default to Sonnet** for the bulk of the work: scoped implementation (`engineer-be`,
+  `engineer-fe`), mechanical checks (`mcp-contract-checker`, `sim-roast-runner`), and
+  routine review/audit (`pr-triage`, `qa`, `ui-reviewer`, `product-pm`) — all pinned
+  `model: sonnet`. **Reserve Opus** for genuinely hard reasoning: `safety-reviewer` is
+  pinned `model: opus` (the one always-Opus role — a missed safety bug is the costly
+  failure), and you may bump a specific spawn to Opus for gnarly architecture/design
+  judgment or subtle correctness triage. Why the pins matter: an agent with no `model:`
+  inherits the PARENT, so a careless spawn from the Opus main loop silently runs Opus —
+  the per-role defaults stop that. The Opus main loop conserves credits by delegating
+  execution to Sonnet.
 - **Skills** (`.claude/skills/`): `triage-pr` (→ `pr-triage`), `capture` (drive
   the replay harness + SPA, screenshot a named page state — E10+).
 - **Workflows** (`.claude/workflows/`): `review-branch` (cross-checked roster

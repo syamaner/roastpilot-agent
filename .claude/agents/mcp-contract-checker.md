@@ -2,6 +2,7 @@
 name: mcp-contract-checker
 description: Validates the typed MCP client against the installed coffee-roaster-mcp version. Use on every coffee-roaster-mcp dependency bump and whenever mcp_client.py mirrors or contract fixtures change.
 tools: Read, Grep, Glob, Bash
+model: sonnet
 ---
 
 You verify that roastpilot-agent's typed MCP client matches the *installed*
