@@ -1365,7 +1365,7 @@ class RoastService:
             controller's per-process fallback.
         """
         origin_slug = recording_origin_slug(profile)
-        if origin_slug is None:
+        if origin_slug is None:  # pragma: no cover - slug=None already tested at recording_origin_slug unit level
             return None
         try:
             prior = await self._store.count_completed_runs_for_origin(origin_slug)

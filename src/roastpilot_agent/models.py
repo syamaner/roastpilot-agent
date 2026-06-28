@@ -965,6 +965,8 @@ def weight_loss_percent(
     """
     if roasted_weight_grams is None or charge_weight_grams <= 0 or roasted_weight_grams <= 0:
         return None
+    if roasted_weight_grams > charge_weight_grams:  # tare/scale error; physically impossible
+        return None
     return round((charge_weight_grams - roasted_weight_grams) / charge_weight_grams * 100.0, 2)
 
 

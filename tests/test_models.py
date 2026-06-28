@@ -737,6 +737,7 @@ def test_bean_profile_json_round_trip() -> None:
         (0.0, 200.0, None),  # non-positive charge → no denominator
         (250.0, 0.0, None),  # non-positive roasted
         (250.0, -5.0, None),
+        (250.0, 300.0, None),  # roasted > charge → tare/scale error
     ],
 )
 def test_weight_loss_percent(charge: float, roasted: float | None, expected: float | None) -> None:
