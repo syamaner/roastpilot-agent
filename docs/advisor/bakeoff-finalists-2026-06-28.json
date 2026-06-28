@@ -1,0 +1,41 @@
+{
+  "generated": "2026-06-28",
+  "note": "Finalists bakeoff scorecard (#277). Raw cells and capture are in /tmp (gitignored). See bakeoff-finalists-2026-06-28.md for analysis. NOTE: availability field shows gemini-3-flash-preview as unavailable on the final availability sweep but its 17 cells were fully present in the checkpoint from earlier runs \u2014 data is valid.",
+  "mode": "replay",
+  "roster": "finalists",
+  "test_set": "full",
+  "seeds": 2,
+  "prompt_versions": [
+    "c3"
+  ],
+  "stopped_for_budget": false,
+  "resumed_cells": 78,
+  "fresh_cells": 7,
+  "captured_calls": 400,
+  "per_model_summary": {
+    "google/gemini-3-flash-preview": {
+      "n_roast_seed_pairs": 17,
+      "drop_f1_avg": 0.9021,
+      "heat_mae_avg_pp": 48.5,
+      "heat_directional_agreement_avg": 0.475,
+      "fan_mae_avg_pp": 15.3,
+      "fc_latency_median_s": 2.47
+    },
+    "google/gemini-3.1-flash-lite": {
+      "n_roast_seed_pairs": 34,
+      "drop_f1_avg": 0.9314,
+      "heat_mae_avg_pp": 59.8,
+      "heat_directional_agreement_avg": 0.436,
+      "fan_mae_avg_pp": 11.1,
+      "fc_latency_median_s": 1.21
+    },
+    "openai/gpt-4o": {
+      "n_roast_seed_pairs": 34,
+      "drop_f1_avg": 0.7647,
+      "heat_mae_avg_pp": 46.9,
+      "heat_directional_agreement_avg": 0.478,
+      "fan_mae_avg_pp": 13.3,
+      "fc_latency_median_s": 1.7
+    }
+  }
+}
