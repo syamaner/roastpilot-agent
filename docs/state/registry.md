@@ -110,7 +110,7 @@ tonight (PRs #395 / #397 / #394):
 
 - **#277 post-FC loop re-validation — DONE; the gpt-4o + c1 pin HOLDS (D69).** A fresh finalists
   bake-off (17 known-good mediums × 3 finalists, scored on the c3 live prompt;
-  `docs/advisor/bakeoff-finalists-2026-06-28.md` + `postfc-validation-2026-06-28.md`, shipped in #395)
+  `docs/advisor/bakeoff-finalists-2026-06-28.md` + `docs/advisor/postfc-validation-2026-06-28.md`, shipped in #395)
   gave gemini-3.1-flash-lite the drop-F1 lead (0.931 vs gpt-4o 0.765 / 0.611 on the 6-roast screen)
   — but that gap is a **c1→c3 PROMPT confound, not a model verdict**: gpt-4o recovered to drop-F1
   0.833 on c1 (both c3 never-drops, artisan-01/-12, returned F1=1.0), and at TRACE level it stated
