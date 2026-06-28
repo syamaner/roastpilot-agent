@@ -16,6 +16,12 @@
 #          ADAPTIVE_TRIM=1  enable the #386 RoR-keyed ADAPTIVE late-Maillard trim
 #            depth (default off = the proven fixed 65% cut). Interim opt-in until
 #            the config UI lands; e.g. ADAPTIVE_TRIM=1 ./scripts/roast-live.sh
+#          ROASTPILOT_ADVISOR__MODEL_SLUG / ROASTPILOT_ADVISOR__PROMPT_VERSION
+#            override the advisor model + control-teaching prompt (defaults
+#            openai/gpt-4o + c3). The banner prints the resolved pair and tags it
+#            ⚠ EXPERIMENT when non-default, e.g. roast 8:
+#              ROASTPILOT_ADVISOR__MODEL_SLUG=openai/gpt-4.1-mini \
+#              ROASTPILOT_ADVISOR__PROMPT_VERSION=c6 ./scripts/roast-live.sh
 #
 set -euo pipefail
 
@@ -96,6 +102,25 @@ if python -c "import sys; from roastpilot_agent.config import AppConfig as A; sy
   TRIM="ADAPTIVE — #386 RoR-keyed depth (experiment, watch the cut)"
 fi
 
+# Same drift-proof read for the advisor model + control-teaching prompt: print the
+# agent's OWN resolved AppConfig values (covers ROASTPILOT_ADVISOR__MODEL_SLUG /
+# __PROMPT_VERSION overrides identically), and TAG it as an experiment when either
+# differs from the checked-in defaults (e.g. roast 8 = gpt-4.1-mini + c6). So the
+# operator can SEE which model/prompt is live before charging, not trust the env
+# silently took. Falls back to a marker if the config can't be read.
+ADVISOR_CFG="$(python -c '
+from roastpilot_agent.advisor import CONTROL_TEACHING_PROMPT_VERSION
+from roastpilot_agent.config import AppConfig, DEFAULT_ADVISOR_MODEL
+
+cfg = AppConfig().advisor
+default = (
+    cfg.model_slug == DEFAULT_ADVISOR_MODEL
+    and cfg.prompt_version == CONTROL_TEACHING_PROMPT_VERSION
+)
+tag = "" if default else "   ⚠ EXPERIMENT — non-default, watch it"
+print(f"{cfg.model_slug}  ·  prompt {cfg.prompt_version}{tag}")
+' 2>/dev/null || echo 'unresolved (config read failed — check the agent output above)')"
+
 echo "→ starting agent + spawning MCP child (takes a few seconds — don't Ctrl-C yet)…"
 echo "  MCP config: ${COFFEE_ROASTER_MCP_CONFIG}"
 roastpilot-agent serve --host 0.0.0.0 --port "$PORT" &
@@ -116,6 +141,7 @@ for _ in $(seq 1 120); do
   ✅ READY — SUPERVISED LIVE ROAST (#134). Stay at the machine, abort-ready.
 
   Advisor    : ${ADV}
+  Advisor cfg: ${ADVISOR_CFG}
   Pre-FC trim: ${TRIM}
   Dashboard  : http://${IP}:${PORT}/
   Trace DB   : ${ROASTPILOT_DB}  (persists after shutdown — #161)
