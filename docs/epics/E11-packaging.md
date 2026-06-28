@@ -15,15 +15,20 @@ child, per D6), mDNS, and a deployment doc. **No Docker image; no PyTorch on the
 > E11 can be *specced/built* against the contract now, but the `[pi]` extra pins the
 > torch-free MCP release.
 
-> **BLOCKED — operator manual-test gate (D28):** do **not** begin E11
-> implementation until **both** operator-owned (@syamaner) manual test tasks are Done.
-> **#135** (E10-S6 manual Safari/iPadOS SSE on real devices) is **✅ DONE/CLOSED**
-> (13 Jun, iPad + iPhone Safari). **#134** (E12-S1 supervised hardware roast through the
-> agent harness, D17 criterion 3) is the **sole remaining gate** — operator running it
-> 13 Jun, now with a persistent decision trace (#161). This is *separate from and
-> additional to* the D27 torch-free gate above. Contract-buildable scaffolding may be
-> pre-staged only on explicit operator opt-in. (Prove the harness on real hardware +
-> devices before packaging it.)
+> **Operator manual-test gate (D28) — ✅ CLEARED (28 Jun 2026).** Both operator-owned
+> (@syamaner) manual test tasks are Done. **#135** (E10-S6 manual Safari/iPadOS SSE on
+> real devices) is **✅ DONE/CLOSED** (13 Jun, iPad + iPhone Safari). **#134** (E12-S1
+> supervised hardware roast through the agent harness, D17 criterion 3) is **✅ VALIDATED
+> by roast 6** (27 Jun — auto-FC detection + advisor dev%-gated drop + full charge→drop
+> recording, supervised, clean light roast). **The D28 gate no longer blocks E11.**
+>
+> **Still gated on D27 (independent):** the **torch-free `coffee-roaster-mcp`** chain
+> (Phase 1 `coffee-first-crack-detection#54` → Phase 2 `coffee-roaster-mcp#157`, both
+> cross-repo) — E11's `[pi]` extra pins the torch-free MCP release, so do not pin/ship
+> the `[pi]` extra until that lands. Contract-buildable scaffolding (S1/S2 against the
+> contract) is now startable on operator opt-in; E11-S3 (the Pi soak) depends on the
+> recording bundle that shipped in MCP 0.1.10/0.1.11 (see below). (Prove the harness on
+> real hardware + devices before packaging it.)
 
 ## Plan links
 
@@ -106,7 +111,10 @@ Acceptance criteria:
 - [ ] Deployment doc notes the recording CPU cost + the validated appliance config (mic
   count, `onnx_threads`, flush threshold).
 
-Depends on coffee-roaster-mcp#180 (the flush fix) + #176 (recording). Pairs with the
+Depends on coffee-roaster-mcp#180 (the flush fix) + #176 (recording) — **both now SHIPPED:
+#176 (capture) in MCP 0.1.9, #180 + #162 in MCP 0.1.10, #181 (full-roast recorder lifecycle) + #178 (live mic peak/RMS
+levels) in MCP 0.1.11, agent pinned 0.1.11 (`pyproject.toml:131`); the recording now spans
+charge→drop on the Mac. The Pi-5 soak is the remaining open validation.** Pairs with the
 local Pi dual-mic capture validation (research 27 Jun: no published Pi-5 CPU numbers; the
 CM4 dwc2 USB gap does not apply to the Pi 5's RP1 xHCI; independent streams are not
 sample-locked, which is fine for FC training).
@@ -119,10 +127,14 @@ sample-locked, which is fine for FC training).
 | E11-S2 | Native installer, systemd unit, bundled model, deploy doc | not started |
 | E11-S3 | Pi 5 dual-mic recording + FC-detection CPU soak (overflow validation) | not started |
 
-Epic status: **not started — BLOCKED.** Two gates before any story starts: (1) the
-**operator manual tests** (D28) — **#135 ✅ DONE**, **#134** the sole remaining operator
-gate (running 13 Jun); and (2) the **torch-free `coffee-roaster-mcp`** (D27 rollout
-Phase 2 = `coffee-roaster-mcp#157`, gated on FC-repo Phase 1 `coffee-first-crack-detection#54`
-— both cross-repo, NOT this repo's #134/#135/#54/#157). Re-sliced for native-only +
+Epic status: **not started — D28 manual-test gate ✅ CLEARED (28 Jun 2026); now gated only
+on the D27 torch-free chain.** The **operator manual tests** (D28) are both Done — **#135
+✅** (device SSE) and **#134 ✅ validated by roast 6** (27 Jun). The remaining gate is the
+**torch-free `coffee-roaster-mcp`** (D27 rollout Phase 2 = `coffee-roaster-mcp#157`, gated
+on FC-repo Phase 1 `coffee-first-crack-detection#54` — both cross-repo, NOT this repo's
+#134/#135/#54/#157); E11's `[pi]` extra pins that release. S1/S2 contract-buildable
+scaffolding is now startable on operator opt-in. **E11-S3 logged:** the recording bundle it
+soaks shipped in MCP 0.1.10/0.1.11 (#180/#162/#181/#178; agent pinned 0.1.11), so the Mac
+side is validated and the Pi-5 CPU soak is the open work. Re-sliced for native-only +
 torch-free + bundled-model distribution (D27, 11 Jun 2026); manual-test gate recorded as
-D28 (13 Jun 2026).
+D28 (13 Jun 2026), cleared 28 Jun 2026.

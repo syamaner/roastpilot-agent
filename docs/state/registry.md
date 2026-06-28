@@ -67,15 +67,12 @@
 > *the scores find the symptom, only the reasoning found the cause*; #281 (bounded-concurrency
 > replay) queued on top. Plan: D40/D41 in `plan.md` §1.
 
-- Epic file: `docs/epics/E11-packaging.md` — **BLOCKED, do not start (D28 + D27)**.
-  E10 closed 11 Jun 2026. E11 is next in order but **gated**: do **not** begin E11
-  implementation (#136/#137/#138) until **both** operator manual tests are Done —
-  **#135** (real-device Safari/iPad SSE) is **✅ DONE**; **#134** (supervised hardware
-  roast, D17 criterion 3) is the **sole remaining operator gate** (running 13 Jun) —
-  **and** the torch-free chain is green (**D27**: `coffee-first-crack-detection#54` →
-  `coffee-roaster-mcp#157` — cross-repo, NOT this repo's #54/#157). See **D28**. Until
-  both gates clear there is no agent-startable story; the next session should verify them
-  before touching E11.
+- Epic file: `docs/epics/E11-packaging.md` — **D28 gate ✅ CLEARED (28 Jun 2026); now
+  gated only on D27 (torch-free chain).** E10 closed 11 Jun 2026. E11 is next in order;
+  S1/S2 contract-buildable scaffolding is startable on operator opt-in — do **not** begin
+  S3 or pin/ship the `[pi]` extra until the torch-free `coffee-roaster-mcp` (**D27**:
+  `coffee-first-crack-detection#54` → `coffee-roaster-mcp#157`, cross-repo) lands. See
+  **D28**.
 - Project: RoastPilot (GitHub user project, owner `syamaner`)
 - Repository: `syamaner/roastpilot-agent`
 - Package: `roastpilot-agent`
@@ -104,6 +101,53 @@
   E9 (vertical slice) → E10 (SPA) → E11 (packaging) → E12 (validation/demo).
 
 ## Active Context
+
+**28 Jun 2026 — BEFORE-NEXT-ROAST BATCH SHIPPED. The two MCP releases + the agent batch all landed;
+#387 re-diagnosed as a NON-BUG (T0 is correct); #134 validated by roast 6 → E11 unblocked. Roast 7
+is ready. This supersedes every "P0 = run roast 4" / "0.1.10 bundle still open" framing below.** The
+recording-flywheel + accuracy gaps from the roast-5/6 session are now closed on `main`; `coffee-roaster-mcp`
+is pinned at **0.1.11** (`pyproject.toml:131`). What shipped tonight:
+
+- **MCP 0.1.10 SHIPPED** (published — PyPI + MCP Registry): **#180** (numpy-vectorised WAV flush — the
+  roast-5 recording overflow that starved FC detection, now 0.28 ms / 13× / byte-identical PCM16) +
+  **#162** (per-request SDK log flood; fix = the guard reads `getEffectiveLevel() <= WARNING`, so it no
+  longer no-ops before the SDK raises the level). Agent pin bumped 0.1.9 → 0.1.10 (#390).
+- **MCP 0.1.11 SHIPPED** (published): **#181** (the recorder finalises at session **STOP**, not first
+  crack → recordings now span charge→drop; auggie-confirmed the FC training pipeline `chunk_audio.py`
+  slides across the FULL recording, so truncating at FC was discarding ~80 % of the **negative-class**
+  training data) + **#178** (live in-session mic peak/RMS dBFS readout on the FC-status). Agent pin
+  bumped 0.1.10 → 0.1.11 (#391).
+- **Agent batch merged (PR #391):**
+  - **#387 — RE-DIAGNOSED as NOT a bug; the T0-accuracy question is CLOSED.** The roast-6 store trace
+    shows T0 is stamped at the turning point within ~2 s (sampling granularity), NOT ~11 s late. The
+    earlier "~11 s late" was a **chart-read artifact** — the 170 °C *rising* crossing was misread as the
+    turning point, vs the true 174 °C *peak* ~14 s later. Auggie-confirmed against `coffee-roaster-mcp`
+    `session.py:1590-1630`: the MCP backdates `beans_added` to the running-max bean-temp peak;
+    `auto_t0_drop_threshold_c` only controls detection latency / the backdate *delta*, NEVER the stamped
+    origin. Resolution = a turning-point regression test + lowering the *example* threshold 25→15
+    (robustness only; it does not move the origin). **The #174 T0 fix is correct.** (Plan **D66**.)
+  - **#385** — store-backed per-origin recording `roast_num` (the counter syncs forward so a fallback
+    can't collide).
+  - **#388** — capture roasted weight + compute `weight_loss_percent`, an objective D42 corpus label
+    alongside the operator rating; the API + FE reject `roasted > charge`. (Plan **D68**.)
+- **#181 implements D65's recorder-lifecycle decouple** (recording spans the full roast; recorder
+  lifecycle = the SESSION, not FC) — the negative-class-data rationale is recorded as plan **D67**.
+- **#134 validated by roast 6** (auto-FC detection + advisor drop + full recording, supervised, clean
+  light roast) → **E11 (Pi packaging) is unblocked** on the D28 hardware-roast gate. (E11's other gate,
+  the D27 torch-free chain, is independent and unchanged.)
+
+**Remaining OPEN before the next roast (roast 7):**
+- **#386** — adaptive pre-FC trim DEPTH from curve / RoR / FC-ETA (keep it deterministic).
+- **#342** — ambient probe (Yoctopuce Yocto-Meteo-V2-C, plan D60); agent-startable on probe arrival.
+- **MCP E11-S3** — Pi 5 dual-mic + FC-detection CPU soak (the overflow bites harder on the Pi 5: RP1,
+  `onnx_threads=2`, int8; #180 necessary but maybe not sufficient — logged in the E11 epic).
+- **#178** — live mic peak/RMS levels validated at the next roast (shipped in 0.1.11; confirm on hardware).
+- **#179** — pin pyright (unpinned caused 2 CI failures).
+
+**Roast 7 readiness:** full charge→drop recordings (#181) + accurate T0 (#387 closed) + live mic levels
+(#178) + roasted-weight/loss-% label (#388) + per-origin roast numbering (#385), all on `main` @ 0.1.11.
+
+---
 
 **27 Jun 2026 (later) — ROASTS 5 + 6 + MCP 0.1.9 + the recording-overflow saga. Roast 6 is the
 FIRST FULL-STACK SUCCESS with auto-FC; roast 5 aborted on a recording regression, since fixed. All
