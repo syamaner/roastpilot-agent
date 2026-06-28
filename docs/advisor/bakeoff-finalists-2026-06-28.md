@@ -3,7 +3,7 @@
 **Scope:** Post-FC development phase only (D35: pre-FC is deterministic).
 **Corpus:** 17 known-good medium roasts (Artisan `.alog` exports, drop ≤ 196°C,
 operator validated). See `bakeoff-screen-2026-06-28.json` (screen pass) and
-`bakeoff-finalists-2026-06-28.json` (finalists, 17 roasts × 2 seeds) for raw data.
+`bakeoff-finalists-2026-06-28.json` (finalists, 17 roasts × 1–2 seeds; see §1) for raw data.
 **Prompt version:** c3 throughout (live control prompt as of this run date).
 **c1 comparison:** targeted 6-roast screen re-run on gpt-4o only; see §4.
 
@@ -37,11 +37,15 @@ making it structurally unreliable independent of latency.
 After the screen, the 3 latency-passing models with highest drop F1 were carried
 to the full 17-roast medium set with 2 independent seeds:
 
-| Model                        | Drop F1 (avg 2 seeds) | Heat MAE | Heat DA | Fan MAE | FC Lat |
+| Model                        | Drop F1 (n pairs)     | Heat MAE | Heat DA | Fan MAE | FC Lat |
 |------------------------------|----------------------|----------|---------|---------|--------|
-| google/gemini-3.1-flash-lite | **0.931**            | 59.8 pp  | 0.44    | 11.1 pp | 1.21 s |
-| google/gemini-3-flash-preview | 0.902               | 48.5 pp  | 0.47    | 15.3 pp | 2.47 s |
-| openai/gpt-4o                | 0.765                | 46.9 pp  | **0.48**| 13.3 pp | 1.70 s |
+| google/gemini-3.1-flash-lite | **0.931** (n=34)     | 59.8 pp  | 0.44    | 11.1 pp | 1.21 s |
+| google/gemini-3-flash-preview | 0.902 (n=17) †      | 48.5 pp  | 0.47    | 15.3 pp | 2.47 s |
+| openai/gpt-4o                | 0.765 (n=34)         | 46.9 pp  | **0.48**| 13.3 pp | 1.70 s |
+
+† gemini-3-flash-preview completed seed 1 only (17 pairs): unavailable on the
+final availability sweep but its 17 checkpoint cells are valid. Score is from a
+single seed, not a 2-seed average; use with that caveat for re-pin decisions.
 
 Per-seed breakdown for gpt-4o (seed 1 = 0.804, seed 2 = 0.726) and
 gemini-3.1-flash-lite (seed 1 = 0.941, seed 2 = 0.922) show stable ranking.
