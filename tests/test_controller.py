@@ -2988,6 +2988,27 @@ async def test_start_run_falls_back_to_per_process_roast_num_when_none() -> None
 
 
 @pytest.mark.asyncio
+async def test_start_run_per_process_counter_syncs_to_store_derived_number() -> None:
+    """#385 auggie: when a store-derived number is used, the per-process counter
+    is advanced to at least that value so a subsequent fallback (None) cannot produce
+    a number lower than an already-used per-origin recording filename."""
+    harness = make_harness(readings=[reading(), reading()])
+    # First run uses store-derived 5 (5 prior completed roasts of this origin).
+    await harness.controller.start_run(PROFILE, recording_roast_num=5)
+    # Drive back to idle for a second run.
+    harness.controller.transition_to(RoastPhase.FAULTED)
+    harness.controller.transition_to(RoastPhase.IDLE)
+    # Second run: no store-derived number (simulates a count failure). The
+    # per-process counter must be ≥ 5 so it never collides with files 1–5.
+    await harness.controller.start_run(PROFILE, recording_roast_num=None)
+    # The fallback counter advanced to max(1, 5)=5 after the first run, then +1 → 6.
+    assert harness.executor.start_session_metadata == [
+        ("ethiopia-harness", 5),
+        ("ethiopia-harness", 6),
+    ]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "persisted",
     [

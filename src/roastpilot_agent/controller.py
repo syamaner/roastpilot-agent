@@ -2262,6 +2262,12 @@ class RoastController:
         roast_num = (
             recording_roast_num if recording_roast_num is not None else self._recording_roast_num
         )
+        # Advance the per-process counter to at least the store-derived value so a
+        # fallback run (store failure) can never produce a number below an already-used
+        # per-origin recording filename (#385 auggie finding: without this, a fallback
+        # after store-derived 4 would use per-process counter 2 → collision).
+        if recording_roast_num is not None:
+            self._recording_roast_num = max(self._recording_roast_num, recording_roast_num)
         try:
             await self._executor.start_session(
                 recording_origin=recording_origin,
