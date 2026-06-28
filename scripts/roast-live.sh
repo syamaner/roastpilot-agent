@@ -16,6 +16,12 @@
 #          ADAPTIVE_TRIM=1  enable the #386 RoR-keyed ADAPTIVE late-Maillard trim
 #            depth (default off = the proven fixed 65% cut). Interim opt-in until
 #            the config UI lands; e.g. ADAPTIVE_TRIM=1 ./scripts/roast-live.sh
+#          ROASTPILOT_ADVISOR__MODEL_SLUG / ROASTPILOT_ADVISOR__PROMPT_VERSION
+#            override the advisor model + control-teaching prompt (defaults
+#            openai/gpt-4o + c3). The banner prints the resolved pair and tags it
+#            ⚠ EXPERIMENT when non-default, e.g. roast 8:
+#              ROASTPILOT_ADVISOR__MODEL_SLUG=openai/gpt-4.1-mini \
+#              ROASTPILOT_ADVISOR__PROMPT_VERSION=c6 ./scripts/roast-live.sh
 #
 set -euo pipefail
 
@@ -96,6 +102,20 @@ if python -c "import sys; from roastpilot_agent.config import AppConfig as A; sy
   TRIM="ADAPTIVE — #386 RoR-keyed depth (experiment, watch the cut)"
 fi
 
+# Drift-proof read of the resolved advisor model + prompt, tagged when non-default (e.g. roast 8 = mini+c6); rationale in the PR.
+ADVISOR_CFG="$(python -c '
+from roastpilot_agent.config import AppConfig
+
+adv = AppConfig().advisor
+fields = type(adv).model_fields
+default = (
+    adv.model_slug == fields["model_slug"].default
+    and adv.prompt_version == fields["prompt_version"].default
+)
+tag = "" if default else "   ⚠ EXPERIMENT — non-default, watch it"
+print(f"{adv.model_slug}  ·  prompt {adv.prompt_version}{tag}")
+' 2>/dev/null || echo 'unresolved (config read failed — check the agent output above)')"
+
 echo "→ starting agent + spawning MCP child (takes a few seconds — don't Ctrl-C yet)…"
 echo "  MCP config: ${COFFEE_ROASTER_MCP_CONFIG}"
 roastpilot-agent serve --host 0.0.0.0 --port "$PORT" &
@@ -116,6 +136,7 @@ for _ in $(seq 1 120); do
   ✅ READY — SUPERVISED LIVE ROAST (#134). Stay at the machine, abort-ready.
 
   Advisor    : ${ADV}
+  Advisor cfg: ${ADVISOR_CFG}
   Pre-FC trim: ${TRIM}
   Dashboard  : http://${IP}:${PORT}/
   Trace DB   : ${ROASTPILOT_DB}  (persists after shutdown — #161)
