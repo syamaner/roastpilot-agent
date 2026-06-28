@@ -1,0 +1,26 @@
+{
+  "projectId": "a6c9090e-388d-4465-9ee0-1071a14cd585",
+  "shape": "package",
+  "pkg": "roastpilot-web",
+  "globalName": "RoastPilotDS",
+  "buildCmd": "npm run build",
+  "readmeHeader": ".design-sync/conventions.md",
+  "tsconfig": "tsconfig.app.json",
+  "cssEntry": "dist/assets/index-rn2fByNU.css",
+  "componentSrcMap": {
+    "AppFrame": "src/components/shared/AppFrame.tsx",
+    "VerdictBadge": "src/components/shared/VerdictBadge.tsx",
+    "ConnectionIndicator": "src/components/shared/ConnectionIndicator.tsx",
+    "LiveCurve": "src/components/shared/LiveCurve/LiveCurve.tsx"
+  },
+  "overrides": {
+    "AppFrame": { "cardMode": "single", "primaryStory": "DeviceConsole", "viewport": "1000x560" },
+    "LiveCurve": { "cardMode": "column" }
+  },
+  "dtsPropsFor": {
+    "AppFrame": "  /** Right-aligned header slot — e.g. a ConnectionIndicator or phase badge. */\n  headerRight?: React.ReactNode;\n  children: React.ReactNode;\n  className?: string;",
+    "VerdictBadge": "  /** Safety verdict (wire form, lowercase). Only allow/clamp/reject render a\n   *  badge; recovery/fault/emergency_stop render nothing (modal/banner/phase). */\n  verdict: \"allow\" | \"clamp\" | \"reject\" | \"recovery\" | \"fault\" | \"emergency_stop\";\n  className?: string;",
+    "ConnectionIndicator": "  /** Stream liveness — drives the dot colour + label. */\n  status: \"connecting\" | \"live\" | \"reconnecting\" | \"stale\";\n  className?: string;",
+    "LiveCurve": "  /** Curve points. Temps in °C, RoR in °C/min, heat/fan in %. `null` = gap. */\n  points: Array<{\n    /** Serve-elapsed seconds (the chart x-axis). */\n    t: number;\n    bean: number | null;\n    env: number | null;\n    ror: number | null;\n    heat: number | null;\n    fan: number | null;\n  }>;\n  /** Vertical event markers (T0 / dry end / first crack / drop / cooling). */\n  markers?: Array<{\n    kind: \"t0\" | \"dry_end\" | \"first_crack\" | \"drop\" | \"cooling\";\n    t: number;\n    label: string;\n  }>;\n  /** Current roast phase — the preheat charge band shows in \"preheating\" only. */\n  phase?:\n    | \"idle\"\n    | \"starting\"\n    | \"preheating\"\n    | \"roasting_pre_first_crack\"\n    | \"development\"\n    | \"cooling\"\n    | \"complete\"\n    | \"faulted\"\n    | \"operator_recovery_required\"\n    | null;\n  /** Charge guidance band (°C); shown only while phase === \"preheating\". */\n  chargeBand?: { minC: number; maxC: number };\n  /** Controlled highlight time (serve-elapsed seconds); null clears it. */\n  highlightTime?: number | null;\n  /** Serve-elapsed seconds at T0/charge, for the charge-referenced roast-time axis. */\n  originSeconds?: number | null;\n  /** Series hidden by default (e.g. detail view may start with heat/fan off). */\n  initialHidden?: Array<\"bean\" | \"env\" | \"ror\" | \"heat\" | \"fan\">;\n  className?: string;\n  /** Chart height in px (default 420). */\n  height?: number;"
+  }
+}
