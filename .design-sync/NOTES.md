@@ -66,6 +66,26 @@ claude.ai/design (project `RoastPilot Design System`,
 - The `web/ds-entry.tsx` entry lives in `web/`, NOT under `.design-sync/`
   (required for PKG_DIR resolution). It's part of the durable sync inputs even
   though it sits outside `.design-sync/`.
+- **`.design-sync/overrides/emit.mjs` is a FULL-FILE fork** of the bundled
+  `lib/emit.mjs` (declared in `cfg.libOverrides`). It exists for one reason:
+  `collectTokenNames` excludes `--tw-*` Tailwind machinery and scopes token
+  extraction to `:root`/`[data-*]`, so the generated README's "## Tokens" list
+  is the ~16–35 real tokens instead of ~88 (Tailwind internals swept in by the
+  stock context-free scrape). It touches ONLY the README prose — not the
+  `@dsCard`/bundle-header/`.d.ts` output contract — so it's contract-safe
+  despite the "don't fork emit.mjs" guidance. **On every re-sync: diff it
+  against the bundled `lib/emit.mjs` and re-apply the patch if upstream moved**
+  (the diff is total — it's a whole-file copy). Its relative imports are
+  repointed at `../../.ds-sync/lib/`, and the bare `esbuild` import resolves via
+  the gitignored `.design-sync/node_modules` → `../.ds-sync/node_modules`
+  symlink (recreate on a fresh clone: `ln -sfn ../.ds-sync/node_modules
+  .design-sync/node_modules`).
+- **This fork does NOT clear claude.ai/design's component-selector /
+  unclassifiable-token warnings.** Those come from the app's own server-side
+  scope filter scraping the uploaded `_ds_bundle.css` (a permissive heuristic;
+  see `lib/css.mjs` `writeStylesCss`), are inherent to shipping Tailwind-
+  compiled CSS, and are documented there as tolerable. They are not fixable from
+  this repo without breaking Tailwind utilities in rendered designs.
 
 ## Known render warns
 

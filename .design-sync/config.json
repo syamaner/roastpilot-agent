@@ -7,6 +7,9 @@
   "readmeHeader": ".design-sync/conventions.md",
   "tsconfig": "tsconfig.app.json",
   "cssEntry": "dist/assets/index-rn2fByNU.css",
+  "libOverrides": {
+    "emit.mjs": "exclude --tw-* Tailwind internals + scope token extraction to :root/[data-*] (README token-list cleanup; output contract untouched)"
+  },
   "componentSrcMap": {
     "AppFrame": "src/components/shared/AppFrame.tsx",
     "VerdictBadge": "src/components/shared/VerdictBadge.tsx",
