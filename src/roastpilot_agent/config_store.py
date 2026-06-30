@@ -920,10 +920,22 @@ def _inject_saved_as_env(saved_raw: _RawSavedConfig) -> None:
     Only keys NOT already present in the environment are injected, so real
     env-var overrides still win (env-overrides-file precedence, D78).
 
+    **Safety guard:** the ``safety`` section is never injected from the saved
+    file. :class:`SafetyLimits` are read-only in M1 — no PUT path writes them
+    (``AppConfigEdit`` has no ``safety`` field), but a hand-edited YAML could
+    contain a ``safety:`` block. Skipping it here ensures the saved file can
+    never weaken a safety limit, even via hand-edit. The environment can still
+    override :class:`SafetyLimits` via explicit ``ROASTPILOT_SAFETY__*`` vars;
+    that is a deliberate operator choice, not a silent file path.
+
     Args:
         saved_raw: The raw dict loaded from the saved-config YAML file.
     """
     for section, section_val in saved_raw.items():
+        if section == "safety":
+            # Never inject safety values from the saved file — read-only in M1
+            # (D78 constraint 2). A hand-edited yaml cannot weaken safety limits.
+            continue
         if not isinstance(section_val, dict):
             continue
         prefix = f"ROASTPILOT_{section.upper()}__"

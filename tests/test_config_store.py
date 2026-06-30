@@ -26,6 +26,7 @@ from roastpilot_agent.config_store import (
     PreFirstCrackLeversEdit,
     SafetyLimitsSnapshot,
     _config_file_path,  # pyright: ignore[reportPrivateUsage]
+    _inject_saved_as_env,  # pyright: ignore[reportPrivateUsage]
     _load_saved_config,  # pyright: ignore[reportPrivateUsage]
     _write_saved_config,  # pyright: ignore[reportPrivateUsage]
     apply_config_edit,
@@ -447,3 +448,30 @@ def test_api_key_env_is_read_only_and_masked() -> None:
     assert snapshot.advisor.api_key_env.saved_value is None
     # effective_value is the env var NAME, not the key contents.
     assert snapshot.advisor.api_key_env.effective_value == "OPENROUTER_API_KEY"
+
+
+def test_saved_file_safety_section_not_injected(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A hand-edited saved file with a 'safety' section must NOT weaken limits.
+
+    _inject_saved_as_env skips the 'safety' section so that even a hand-edited
+    YAML file cannot silently lower a safety limit (D78 constraint 2).
+    """
+    monkeypatch.delenv("ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C", raising=False)
+
+    # Simulate a hand-edited saved file with a lowered safety limit.
+    saved_raw_with_safety: dict[str, Any] = {
+        "safety": {"max_bean_temp_c": 180.0},
+        "advisor": {"model_slug": "openai/gpt-4o-mini"},
+    }
+    _inject_saved_as_env(saved_raw_with_safety)
+
+    # The safety section must NOT have been injected.
+    assert "ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C" not in os.environ
+    # The non-safety section IS injected.
+    assert os.environ.get("ROASTPILOT_ADVISOR__MODEL_SLUG") == "openai/gpt-4o-mini"
+
+    # Clean up the injected var.
+    monkeypatch.delenv("ROASTPILOT_ADVISOR__MODEL_SLUG", raising=False)
