@@ -793,3 +793,61 @@ def test_replay_returns_error_on_malformed_config_file(
     assert cli.main() == 1
     out = capsys.readouterr().out
     assert "malformed" in out or "error" in out
+
+
+def test_serve_live_returns_error_on_schema_invalid_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``serve`` returns exit-code 1 with an error message when the saved-config
+    file is valid YAML but violates the schema (``ValidationError``).
+
+    Distinct from the malformed-YAML case: the file parses as YAML but Pydantic
+    rejects the value (e.g. a string where a number is required).  Both
+    ``ConfigFileError`` and ``pydantic.ValidationError`` must produce a clean
+    error message rather than a raw traceback (Codex P2 finding, PR #425).
+    """
+    cfg_path = tmp_path / "config.yaml"
+    # Valid YAML structure, but tick_interval_seconds must be a float — a string
+    # that cannot be coerced is a schema violation raising ValidationError, not
+    # ConfigFileError.
+    cfg_path.write_text(
+        "advisor:\n  timeout_seconds: 'not_a_number'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    import roastpilot_agent.live as _live
+
+    def _should_not_be_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("build_live_service must not be called on config error")
+
+    monkeypatch.setattr(_live, "build_live_service", _should_not_be_called)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+    assert cli.main() == 1
+    out = capsys.readouterr().out
+    assert "invalid" in out or "error" in out
+
+
+def test_replay_returns_error_on_schema_invalid_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--replay`` returns exit-code 1 with a clear message when the saved-config
+    file is valid YAML but fails schema validation (``ValidationError``).
+
+    Mirrors the live-serve case for the replay path (Codex P2 finding, PR #425).
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "advisor:\n  timeout_seconds: 'not_a_number'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--step", "--port", "0"],
+    )
+    assert cli.main() == 1
+    out = capsys.readouterr().out
+    assert "invalid" in out or "error" in out

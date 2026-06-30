@@ -2987,3 +2987,136 @@ async def test_put_config_no_safety_field_in_edit_type(
     assert "safety" not in (saved or {})
     temp = response.json()["advisor"]["temperature"]
     assert temp["saved_value"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_put_config_first_run_creates_parent_dir(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """PUT /api/config creates the parent directory when it does not yet exist.
+
+    On first install ~/.roastpilot/ is absent; filelock raises OSError constructing
+    the .lock file when the parent is missing.  The fix adds mkdir before FileLock
+    (Codex P1 finding — first-run lock dir).
+    """
+    nested_cfg = tmp_path / "subdir" / "nested" / "config.yaml"
+    assert not nested_cfg.parent.exists()
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(nested_cfg))
+
+    body = {"advisor": {"model_slug": "openai/gpt-4o"}}
+    response = await client.put("/api/config", json=body)
+    assert response.status_code == 200
+    assert nested_cfg.exists(), "config.yaml must be written after the parent dir is created"
+
+
+@pytest.mark.asyncio
+async def test_put_config_sequential_writes_no_stale_env_overridden(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """Two sequential PUTs of the same field: second value wins; env_overridden stays False.
+
+    Without the snapshot/restore fix for _inject_saved_as_env, the first PUT
+    left the injected env key in os.environ so the second PUT's load_app_config()
+    saw it as a real env-var override and returned env_overridden=True — wrong.
+    """
+    import os
+
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    # Remove any ROASTPILOT_ADVISOR__MODEL_SLUG env var (the test must not have one).
+    monkeypatch.delenv("ROASTPILOT_ADVISOR__MODEL_SLUG", raising=False)
+
+    body1 = {"advisor": {"model_slug": "openai/gpt-4o"}}
+    r1 = await client.put("/api/config", json=body1)
+    assert r1.status_code == 200
+    # After first PUT: field must not be env_overridden.
+    slug1 = r1.json()["advisor"]["model_slug"]
+    assert slug1["effective_value"] == "openai/gpt-4o"
+    assert slug1["env_overridden"] is False
+
+    body2 = {"advisor": {"model_slug": "openai/gpt-4.1"}}
+    r2 = await client.put("/api/config", json=body2)
+    assert r2.status_code == 200
+    slug2 = r2.json()["advisor"]["model_slug"]
+    assert slug2["effective_value"] == "openai/gpt-4.1"
+    # Must still be False — the value came from the file, not a real env var.
+    assert slug2["env_overridden"] is False
+    _ = os  # imported above for possible future assertions
+
+
+@pytest.mark.asyncio
+async def test_get_config_nested_env_override_sets_env_overridden(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """A nested trim field overridden by env var appears env_overridden=True.
+
+    Codex P2 finding: before the fix the nested trim fields all used
+    env_var=None in build_config_snapshot(), so env_overridden was always
+    False regardless of whether an env var was set.  After the fix the full
+    nested env-var path is supplied so the badge is accurate.
+    """
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    env_key = "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__TRIM_HEAT_PERCENT"
+    monkeypatch.setenv(env_key, "55")
+
+    response = await client.get("/api/config")
+    assert response.status_code == 200
+    field = response.json()["controller"]["late_maillard_trim_heat_percent"]
+    assert field["effective_value"] == 55
+    assert field["env_overridden"] is True
+
+
+@pytest.mark.asyncio
+async def test_put_config_422_on_cross_field_violation(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """PUT /api/config returns 422 for a cross-field constraint violation.
+
+    Field-level bounds (e.g. heat_target_percent > 100) are caught by FastAPI
+    before the handler runs and already produce 422.  This test covers the
+    case where the merged config violates a cross-field constraint — e.g.
+    min_trim > max_trim — which can only be detected after merging with the
+    existing saved file.  The handler now catches pydantic.ValidationError and
+    converts it to 422 rather than letting it propagate as 500 (Codex P2).
+    """
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+
+    # First write a valid combination: min_trim=30, base_trim=40, max_trim=50.
+    # The model validator requires min_trim <= base_trim <= max_trim.
+    setup_body = {
+        "controller": {
+            "pre_first_crack_levers": {
+                "late_maillard_trim": {
+                    "min_trim": 30,
+                    "base_trim": 40,
+                    "max_trim": 50,
+                }
+            }
+        }
+    }
+    r1 = await client.put("/api/config", json=setup_body)
+    assert r1.status_code == 200
+
+    # Now raise min_trim above the already-saved max_trim (50).  The merged config
+    # will have min_trim=70 + max_trim=50, violating the cross-field invariant.
+    # This is only detectable after merging with the existing saved file.
+    bad_body = {
+        "controller": {
+            "pre_first_crack_levers": {
+                "late_maillard_trim": {"min_trim": 70}  # > max_trim (50) → invalid
+            }
+        }
+    }
+    r2 = await client.put("/api/config", json=bad_body)
+    assert r2.status_code == 422

@@ -29,7 +29,7 @@ from typing import Annotated, Any, Literal, Protocol, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import (
@@ -2121,6 +2121,14 @@ async def put_config(edit: AppConfigEdit, request: Request) -> AppConfigSnapshot
     # a thread so the async event loop is not blocked during the write.
     try:
         await asyncio.to_thread(persist_config_edit, edit)
+    except ValidationError as exc:
+        # Cross-field constraints (e.g. min_trim > max_trim) are only caught
+        # after merging the edit with the existing saved config.  Map to 422
+        # so the client knows to fix the request body, not retry unchanged.
+        # Use str() rather than exc.errors(): the pydantic v2 error ctx dict can
+        # include non-JSON-serialisable objects (e.g. ValueError instances from
+        # model validators), so .errors() may raise TypeError during serialisation.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ConfigFileError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     # Re-read effective config + saved raw after write so the response reflects

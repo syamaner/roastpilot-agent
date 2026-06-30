@@ -125,17 +125,32 @@ _ALL_SAFETY_ENV_KEYS: frozenset[str] = frozenset(
 
 # Non-safety individual read-only env-var keys — fields whose env vars must
 # not be injected from the saved-config file even though they live outside the
-# safety section.  Each entry is derived from the model field name so the set
-# is metadata-anchored: a field rename in ControllerConfig will make the
-# derivation visibly wrong (the old key no longer matches model_fields) rather
-# than silently letting an injection slip through.
+# safety section.  Each entry is metadata-anchored (derived from the real
+# model field name) so a rename fails visibly rather than silently reopening
+# an injection path.
 #
-# Current M1 entries:
-#   - tick_interval_seconds: hardware-pinned Hottop polling rate (read-only).
+# Current M1 entries and rationale:
+#   - controller.tick_interval_seconds: hardware-pinned Hottop polling rate.
+#   - advisor.api_key_env: the env-var *name* that holds the API key.
+#     Injecting this would silently redirect where the advisor reads the key,
+#     contradicting the "the key itself is never stored in config" contract.
+#     api_key_env has no env_var in the snapshot (env_var=None → saved=None
+#     always) precisely because it must never come from the saved file.
 _NEVER_INJECT_NON_SAFETY_KEYS: frozenset[str] = frozenset(
-    f"ROASTPILOT_CONTROLLER__{name.upper()}"
-    for name in ("tick_interval_seconds",)
-    if name in ControllerConfig.model_fields  # metadata anchor — fails visibly on rename
+    {
+        # Controller: hardware-pinned tick rate.
+        *(
+            f"ROASTPILOT_CONTROLLER__{name.upper()}"
+            for name in ("tick_interval_seconds",)
+            if name in ControllerConfig.model_fields  # metadata anchor
+        ),
+        # Advisor: api_key_env must never be injected from the saved file.
+        *(
+            f"ROASTPILOT_ADVISOR__{name.upper()}"
+            for name in ("api_key_env",)
+            if name in AdvisorConfig.model_fields  # metadata anchor
+        ),
+    }
 )
 
 
@@ -569,11 +584,15 @@ def build_config_snapshot(
             ),
         ),
         # --- late Maillard trim ------------------------------------------
+        # Pydantic-settings resolves nested models via the double-underscore
+        # delimiter, so each nested field has a full env-var path.  Supplying
+        # these here makes env_overridden=True when the operator sets the var
+        # directly (e.g. in roast-live.sh), matching the D78-1 badge contract.
         late_maillard_trim_enabled=_meta(
             trim_saved.get("enabled"),
             trim.enabled,
             trim_def.enabled,
-            None,  # nested — no single top-level env var
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ENABLED",
             description=(
                 "Enable the anticipatory heat trim in the late-Maillard → FC window."
                 " When off, the flat heat floor (100 %) is used to FC."
@@ -583,7 +602,7 @@ def build_config_snapshot(
             trim_saved.get("trim_heat_percent"),
             trim.trim_heat_percent,
             trim_def.trim_heat_percent,
-            None,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__TRIM_HEAT_PERCENT",
             description=(
                 "Trimmed heat level (%) held once the late-Maillard window opens."
                 " Default 65 — a moderate reduction from 100 %, not a stall."
@@ -593,7 +612,7 @@ def build_config_snapshot(
             trim_saved.get("window_fc_eta_seconds"),
             trim.window_fc_eta_seconds,
             trim_def.window_fc_eta_seconds,
-            None,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__WINDOW_FC_ETA_SECONDS",
             description=(
                 "Seconds before the predicted first crack at which the trim window"
                 " opens. Default 60 s (late Maillard, ~1 min ahead of the crack)."
@@ -603,7 +622,7 @@ def build_config_snapshot(
             trim_saved.get("min_bean_temp_c"),
             trim.min_bean_temp_c,
             trim_def.min_bean_temp_c,
-            None,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__MIN_BEAN_TEMP_C",
             description=(
                 "Minimum bean temperature (°C) below which the trim never engages,"
                 " even if FC-ETA projects a near-term crack. Default 155 °C."
@@ -614,7 +633,7 @@ def build_config_snapshot(
             trim_saved.get("adaptive_depth_enabled"),
             trim.adaptive_depth_enabled,
             trim_def.adaptive_depth_enabled,
-            None,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ADAPTIVE_DEPTH_ENABLED",
             description=(
                 "Enable adaptive trim depth (#386). When enabled, the trim deepens"
                 " on hotter approaches (high RoR, short FC-ETA). Default off."
@@ -624,7 +643,7 @@ def build_config_snapshot(
             trim_saved.get("base_trim"),
             trim.base_trim,
             trim_def.base_trim,
-            None,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__BASE_TRIM",
             description=(
                 "Adaptive-depth baseline trim (%). The formula produces this depth"
                 " when both RoR and ETA gain terms are zero. Default 65 — equal to"
@@ -636,7 +655,7 @@ def build_config_snapshot(
             trim_saved.get("k_ror"),
             trim.k_ror,
             trim_def.k_ror,
-            None,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__K_ROR",
             description=(
                 "RoR sensitivity (°C/min per pp of trim deepening). Each extra"
                 " °C/min above ror_ref deepens the cut by this many pp. Default 1.5."
@@ -646,7 +665,7 @@ def build_config_snapshot(
             trim_saved.get("k_eta"),
             trim.k_eta,
             trim_def.k_eta,
-            None,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__K_ETA",
             description=(
                 "ETA sensitivity (s per pp of trim deepening). Each 1 s under"
                 " eta_ref deepens the cut by this many pp. Default 0.2."
@@ -656,7 +675,7 @@ def build_config_snapshot(
             trim_saved.get("ror_ref"),
             trim.ror_ref,
             trim_def.ror_ref,
-            None,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ROR_REF",
             description=(
                 "RoR reference level (°C/min). Below this the RoR term contributes"
                 " 0; above it the cut deepens. Default 8.0."
@@ -666,7 +685,7 @@ def build_config_snapshot(
             trim_saved.get("eta_ref"),
             trim.eta_ref,
             trim_def.eta_ref,
-            None,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ETA_REF",
             description=(
                 "ETA reference (seconds). The ETA term is 0 at the window boundary"
                 " and deepens only when FC is closer than this. Default 60.0."
@@ -676,7 +695,7 @@ def build_config_snapshot(
             trim_saved.get("min_trim"),
             trim.min_trim,
             trim_def.min_trim,
-            None,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__MIN_TRIM",
             description=(
                 "Deepest permitted adaptive trim (%). The formula cannot go below"
                 " this, preventing stall of first crack. Default 45."
@@ -686,7 +705,7 @@ def build_config_snapshot(
             trim_saved.get("max_trim"),
             trim.max_trim,
             trim_def.max_trim,
-            None,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__MAX_TRIM",
             description=(
                 "Shallowest permitted adaptive trim (%). The formula cannot go above"
                 " this (adaptive depth is always a reduction). Default 75."
@@ -1075,9 +1094,28 @@ def load_app_config() -> tuple[AppConfig, frozenset[str]]:
     # apply correctly.  Any real ``ROASTPILOT_*`` env var (step 3) already
     # wins because os.environ takes precedence — we only inject for keys that
     # are absent from the real environment.
+    #
+    # The injection is scoped to this call via a snapshot/restore so that
+    # repeated calls to load_app_config() are idempotent and do not
+    # permanently mutate os.environ.  Without the restore, a second call
+    # after a PUT would see the previously-injected value as an env var,
+    # making env_overridden=True for a field that was never set by the
+    # operator (cross-request env pollution, D78 PR b Codex finding).
     saved_raw = _load_saved_config(_config_file_path())
-    injected_keys = _inject_saved_as_env(saved_raw)
-    return AppConfig(), injected_keys
+    env_snapshot = os.environ.copy()
+    try:
+        injected_keys = _inject_saved_as_env(saved_raw)
+        config = AppConfig()
+    finally:
+        # Restore os.environ to its pre-injection state.  Keys that existed
+        # before are put back; keys that were added by injection are removed.
+        for key in list(os.environ):
+            if key not in env_snapshot:
+                del os.environ[key]
+        for key, val in env_snapshot.items():
+            if os.environ.get(key) != val:
+                os.environ[key] = val  # pragma: no cover
+    return config, injected_keys
 
 
 def _inject_saved_as_env(saved_raw: _RawSavedConfig) -> frozenset[str]:
@@ -1196,6 +1234,10 @@ def persist_config_edit(edit: AppConfigEdit) -> None:
     import filelock
 
     path = _config_file_path()
+    # Ensure the parent directory exists before acquiring the lock file.
+    # On first save the directory (~/.roastpilot/ by default) may not exist;
+    # filelock raises OSError creating the .lock file if the parent is absent.
+    path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(".lock")
     with filelock.FileLock(lock_path):
         existing = _load_saved_config(path)

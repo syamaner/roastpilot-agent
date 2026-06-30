@@ -551,6 +551,7 @@ async def _serve_live(args: argparse.Namespace) -> int:
     non-zero exit, with the child cleaned up by
     :func:`~roastpilot_agent.live.build_live_service`."""
     import uvicorn
+    from pydantic import ValidationError
 
     from roastpilot_agent.api import create_app
     from roastpilot_agent.config_store import ConfigFileError, load_app_config
@@ -561,6 +562,9 @@ async def _serve_live(args: argparse.Namespace) -> int:
         config, _injected = load_app_config()
     except ConfigFileError as exc:
         print(f"error: saved-config file is malformed — {exc}")
+        return 1
+    except ValidationError as exc:
+        print(f"error: saved-config file has invalid values — {exc}")
         return 1
     # Let the operator configure the Hottop with plain `export COFFEE_…`.
     forward_coffee_env(config)
@@ -726,6 +730,8 @@ async def _serve_replay(args: argparse.Namespace) -> int:
             print("  (serves the final frame after the roast ends; Ctrl-C to stop)")
         # Access-log verbosity (#267): same CLI > env > config resolution as the
         # live serve. Logging-only — the replay SSE pipeline is unchanged.
+        from pydantic import ValidationError as _ValErr
+
         from roastpilot_agent.config_store import ConfigFileError as _CfgErr
         from roastpilot_agent.config_store import load_app_config as _load_cfg
 
@@ -733,6 +739,9 @@ async def _serve_replay(args: argparse.Namespace) -> int:
             _cfg, _ = _load_cfg()
         except _CfgErr as exc:
             print(f"error: saved-config file is malformed — {exc}")
+            return 1
+        except _ValErr as exc:
+            print(f"error: saved-config file has invalid values — {exc}")
             return 1
         log_level, access_log = _configure_access_log(args, _cfg.logging)
         config = uvicorn.Config(
