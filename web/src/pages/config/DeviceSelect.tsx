@@ -169,6 +169,16 @@ export function DeviceListBody({
   if (queryError) {
     return (
       <div data-testid="device-list-query-error">
+        {/* Clearing back to inherit does NOT require the device list — always
+            render the row even when enumeration fails (#439 fix). */}
+        {allowClear && (
+          <OptionRow
+            option={{ value: "", label: "Inherit from yaml", note: "Use value from hand-authored coffee-roaster-mcp.yaml" }}
+            isSelected={selectedValue === ""}
+            isUnavailable={false}
+            onSelect={() => onSelect("")}
+          />
+        )}
         <div className="px-3 py-4">
           <p className="text-sm font-medium text-roast-fault">Couldn't load devices</p>
           <p className="mt-0.5 font-mono text-xs text-muted-foreground/70">{queryError}</p>
@@ -181,6 +191,16 @@ export function DeviceListBody({
   if (error) {
     return (
       <div data-testid="device-list-error">
+        {/* Clearing back to inherit does NOT require the device list — always
+            render the row even when enumeration fails (#439 fix). */}
+        {allowClear && (
+          <OptionRow
+            option={{ value: "", label: "Inherit from yaml", note: "Use value from hand-authored coffee-roaster-mcp.yaml" }}
+            isSelected={selectedValue === ""}
+            isUnavailable={false}
+            onSelect={() => onSelect("")}
+          />
+        )}
         <div className="px-3 py-4">
           <p className="text-sm font-medium text-roast-fault">Device enumeration failed</p>
           <p className="mt-0.5 font-mono text-xs text-muted-foreground/70">{error}</p>

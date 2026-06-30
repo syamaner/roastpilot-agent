@@ -1209,17 +1209,14 @@ def apply_config_edit(
         # A field absent from the PUT body (not in model_fields_set) is skipped.
         # A field set to a non-None value is written as before.
         #
-        # Blank string guard: a roaster_driver of "" is treated as clear (inherit)
-        # rather than writing driver: "" into the MCP yaml — an empty driver name
-        # is never valid and would crash the MCP child on next spawn.
+        # Blank-string guard: an empty string for any string device field is not a
+        # valid device path/name and would write port:""/driver:""/input_device:""
+        # into the MCP yaml — crashing the child on the next spawn.  Treat "" as
+        # None (clear → inherit from hand-authored yaml) for all three (#439).
         dev_fields: dict[str, Any] = {
-            "serial_port": d.serial_port,
-            "roaster_driver": (
-                d.roaster_driver
-                if d.roaster_driver  # guards against "" → treat as None
-                else None
-            ),
-            "audio_input_device": d.audio_input_device,
+            "serial_port": d.serial_port or None,
+            "roaster_driver": d.roaster_driver or None,
+            "audio_input_device": d.audio_input_device or None,
             "recording_enabled": d.recording_enabled,
             "recording_autocapture": d.recording_autocapture,
             "recording_devices": recording_devices_val,

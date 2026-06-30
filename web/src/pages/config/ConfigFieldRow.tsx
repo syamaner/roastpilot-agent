@@ -339,9 +339,9 @@ export function ConfigFieldRow({
       // from the hand-authored yaml, true = on, false = off. Other boolean fields
       // (controller, advisor) only have two states (true/false), so they keep the
       // simple toggle — their defaults are non-null and they never need "inherit".
-      control = fieldDef.category === "Hardware" ||
-                fieldDef.category === "Audio" ||
-                fieldDef.category === "FC-Detection"
+      // Keyed off fieldDef.key prefix, not category, so renaming a category never
+      // silently reintroduces the null→off collapse (#439 review fix).
+      control = fieldDef.key.startsWith("mcp_device.")
         ? <NullableBooleanControl {...controlProps} />
         : <BooleanControl {...controlProps} />;
       break;

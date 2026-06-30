@@ -1211,3 +1211,29 @@ def test_apply_config_edit_mcp_device_recording_devices_clear_to_inherit() -> No
     result = apply_config_edit(edit, existing)
     # Key must be deleted — inherit from hand-authored MCP yaml.
     assert "recording_devices" not in result.get("mcp_device", {})
+
+
+def test_apply_config_edit_blank_serial_port_treated_as_inherit() -> None:
+    """A blank serial_port string must NOT write port:'' to the MCP yaml.
+
+    An empty string is not a valid serial port path; the blank-string guard
+    must convert it to None so the key is deleted (inherit from yaml) (#439
+    review fix — extends the guard to all three string device fields).
+    """
+    existing: dict[str, Any] = {"mcp_device": {"serial_port": "/dev/ttyUSB0"}}
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit.model_validate({"serial_port": ""}))
+    result = apply_config_edit(edit, existing)
+    assert "serial_port" not in result.get("mcp_device", {})
+
+
+def test_apply_config_edit_blank_audio_input_device_treated_as_inherit() -> None:
+    """A blank audio_input_device string must NOT write input_device:'' to the MCP yaml.
+
+    An empty string is not a valid audio device name; the blank-string guard
+    must convert it to None so the key is deleted (inherit from yaml) (#439
+    review fix — extends the guard to all three string device fields).
+    """
+    existing: dict[str, Any] = {"mcp_device": {"audio_input_device": "USB PnP Sound Device"}}
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit.model_validate({"audio_input_device": ""}))
+    result = apply_config_edit(edit, existing)
+    assert "audio_input_device" not in result.get("mcp_device", {})
