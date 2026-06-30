@@ -150,11 +150,12 @@ describe("DeviceSelect — loaded state", () => {
     expect(onChange).toHaveBeenCalledWith(SERIAL_DEVICES[0]!.value);
   });
 
-  it("closes the popover after a selection", () => {
+  it("closes the popover and returns focus to the trigger after a selection", () => {
     renderSelect();
     fireEvent.click(screen.getByTestId("device-select-trigger"));
     fireEvent.click(screen.getByTestId(`device-option-${SERIAL_DEVICES[0]!.value}`));
     expect(screen.queryByTestId(`device-option-${SERIAL_DEVICES[0]!.value}`)).toBeNull();
+    expect(screen.getByTestId("device-select-trigger")).toHaveFocus();
   });
 
   it("marks the currently-selected row aria-selected=true; others aria-selected=false", () => {
@@ -180,6 +181,14 @@ describe("DeviceSelect — loaded state", () => {
     expect(onChange).toHaveBeenCalledWith(SERIAL_DEVICES[0]!.value);
   });
 
+  it("selects an option via keyboard Space", () => {
+    const { onChange } = renderSelect();
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    const row = screen.getByTestId(`device-option-${SERIAL_DEVICES[0]!.value}`);
+    fireEvent.keyDown(row, { key: " " });
+    expect(onChange).toHaveBeenCalledWith(SERIAL_DEVICES[0]!.value);
+  });
+
   it("closes the popover on Escape", () => {
     renderSelect();
     fireEvent.click(screen.getByTestId("device-select-trigger"));
@@ -196,11 +205,41 @@ describe("DeviceSelect — loaded state", () => {
   });
 });
 
+describe("DeviceSelect — trigger ARIA + no free-text invariant", () => {
+  beforeEach(() => defaultMockState());
+
+  it("trigger has aria-haspopup='listbox' and aria-expanded=false when closed", () => {
+    renderSelect();
+    const trigger = screen.getByTestId("device-select-trigger");
+    expect(trigger).toHaveAttribute("aria-haspopup", "listbox");
+    expect(trigger).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("trigger aria-expanded flips to true when the popover opens", () => {
+    renderSelect();
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    expect(screen.getByTestId("device-select-trigger")).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("no text input is ever rendered — device selection is enumerated, never free-text", () => {
+    renderSelect();
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    expect(screen.queryByRole("textbox")).toBeNull();
+  });
+});
+
 describe("DeviceSelect — loading state", () => {
   it("shows spinner and scanning message in the trigger when isPending", () => {
     defaultMockState({ data: undefined, isPending: true });
     renderSelect();
     expect(screen.getByTestId("device-select-trigger")).toHaveTextContent("Scanning for devices…");
+  });
+
+  it("shows the loading body (spinner div) inside the popover when isPending", () => {
+    defaultMockState({ data: undefined, isPending: true });
+    renderSelect();
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    expect(screen.getByTestId("device-list-loading")).toBeInTheDocument();
   });
 
   it("shows spinner and scanning message in the trigger when isRefetching", () => {
