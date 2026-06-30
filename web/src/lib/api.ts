@@ -12,6 +12,7 @@ import type {
   BeanProfileDeleteResult,
   BeanProfileInput,
   BeanProfileList,
+  DevicesSnapshot,
   HealthResponse,
   OperatorActionRequest,
   OperatorActionResult,
@@ -167,4 +168,7 @@ export const api = {
       method: "PUT",
       body: JSON.stringify(edit),
     }),
+
+  /** `GET /api/config/devices` — enumerate connected serial + audio devices. */
+  devices: () => request<DevicesSnapshot>("/api/config/devices"),
 };
