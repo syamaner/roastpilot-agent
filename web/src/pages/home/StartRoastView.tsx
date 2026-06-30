@@ -1,15 +1,16 @@
 /**
- * Start-a-roast route (#324) — the `/start` entry point from the home hub.
+ * Start-a-roast route (#324, updated #403) — the `/start` entry point from the
+ * home hub.
  *
  * Reuses the dashboard's `StartRoastForm` (the same component shown in the
  * dashboard's idle state, #158/#303) rather than re-implementing the form: this
  * view only wires the bean-profile library hooks + the start handler around it.
  *
  * On a successful start the server's `/health` refetch surfaces the new
- * `active_run_id`; we navigate to `/`, where `HomeGate` then renders the live
- * dashboard. We do NOT fabricate local run state (render from server, invariant).
- * Errors (e.g. 409 a roast is already active) are surfaced inline by the form,
- * which catches the thrown `ApiError`.
+ * `active_run_id`; we navigate to `/live` (the stable reload-safe live-roast
+ * route, #403). We do NOT fabricate local run state (render from server,
+ * invariant). Errors (e.g. 409 a roast is already active) are surfaced inline
+ * by the form, which catches the thrown `ApiError`.
  */
 
 import { useCallback } from "react";
@@ -54,17 +55,18 @@ export function StartRoastView(): React.JSX.Element {
   );
 
   // Start a roast: POST, then AWAIT a health refetch so the cache holds the new
-  // `active_run_id` BEFORE we route to `/`. `invalidateQueries` alone would leave
-  // the previous (idle) health data in place while the refetch is in flight, so
-  // `HomeGate` could briefly render the idle hub at `/` until `/health` returns —
+  // `active_run_id` BEFORE we route to `/live`. `invalidateQueries` alone would
+  // leave the previous (idle) health data in place while the refetch is in flight,
+  // so `LivePage` could briefly show the start form before `/health` returns —
   // `refetchQueries` (awaited) closes that window. We still fabricate no run state:
   // the active run is discovered from the server's refreshed snapshot, then
-  // `HomeGate` resolves to the live dashboard with no idle-hub flash.
+  // `LivePage` resolves to the live dashboard with no start-form flash. We route to
+  // `/live` (the stable reload-safe route, #403) rather than `/`.
   const handleStartRoast = useCallback(
     async (profile: RoastProfile) => {
       await api.startRoast(profile);
       await queryClient.refetchQueries({ queryKey: roastKeys.health });
-      navigate("/");
+      navigate("/live");
     },
     [navigate, queryClient],
   );
