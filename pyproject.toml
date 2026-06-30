@@ -49,6 +49,10 @@ dependencies = [
   # provider. Native anthropic/google are optional extras below.
   "pydantic-ai-slim[openai]>=1.0,<2",
   "pydantic-settings>=2.7,<3",
+  # D78: saved-config file persistence (config_store.py). PyYAML is used for
+  # reading / writing the operator's saved-config file; it is a direct
+  # runtime dep (not transitive) so we declare it explicitly.
+  "pyyaml>=6.0,<7",
   "uvicorn>=0.34,<1"
 ]
 
