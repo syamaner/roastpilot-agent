@@ -15,7 +15,8 @@
  *
  * Split into PR slices:
  *  PR2 (this file): layout + category rail + field rows + save model.
- *  PR3: env-override badge, Guarded chip on safety, device-dropdown control type.
+ *  PR3a (3b): env-override badge in ConfigFieldRow.
+ *  PR3b (3c, this PR): Hardware/Audio/FC-Detection categories + mic-test placeholder.
  */
 
 import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";

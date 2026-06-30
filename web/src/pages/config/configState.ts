@@ -119,6 +119,7 @@ export function buildEditFromDirty(
 ): Record<string, unknown> {
   const controller: Record<string, unknown> = {};
   const advisor: Record<string, unknown> = {};
+  const mcp_device: Record<string, unknown> = {};
 
   for (const [key, current] of Object.entries(values)) {
     if (current === saved[key]) continue;          // not dirty
@@ -132,12 +133,16 @@ export function buildEditFromDirty(
       setPath(controller, def.editKey, current);
     } else if (section === "advisor") {
       setPath(advisor, def.editKey, current);
+    } else if (section === "mcp_device") {
+      setPath(mcp_device, def.editKey, current);
     }
     // "safety" is intentionally omitted (editKey is null for all safety fields)
+    // "mcp_device._mic_test" is omitted (editKey is null; button is not a field)
   }
 
   const edit: Record<string, unknown> = {};
   if (Object.keys(controller).length > 0) edit.controller = controller;
   if (Object.keys(advisor).length > 0) edit.advisor = advisor;
+  if (Object.keys(mcp_device).length > 0) edit.mcp_device = mcp_device;
   return edit;
 }
