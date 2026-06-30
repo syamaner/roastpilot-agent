@@ -14,6 +14,8 @@
 import { lazy } from "react";
 import type { RouteObject } from "react-router-dom";
 
+import { AppFrame } from "@/components/shared";
+
 const RootLayout = lazy(() =>
   import("@/pages/home/RootLayout").then((m) => ({ default: m.RootLayout })),
 );
@@ -75,18 +77,37 @@ const StartRoastHarnessPage = lazy(() =>
 const HomeHarnessPage = lazy(() =>
   import("@/pages/home/HomeHarnessPage").then((m) => ({ default: m.HomeHarnessPage })),
 );
+// #403: stable, reload-safe /live route — the running roast's permanent address.
+const LivePage = lazy(() =>
+  import("@/pages/live/LivePage").then((m) => ({ default: m.LivePage })),
+);
 
 export const routes: RouteObject[] = [
   // Operator-facing routes nest under RootLayout → the persistent nav (#324) is
   // mounted above each page. `/` is state-aware (HomeGate): active run → live
   // dashboard, idle → home hub. `/start` is the Start-Roast form (reached from the
-  // home hub or the idle redirect). Phase is never inferred client-side — the
-  // active-run decision reads the server's `/health` snapshot.
+  // home hub or the idle redirect). `/live` is the stable reload-safe live-roast
+  // route (#403). Phase is never inferred client-side — the active-run decision
+  // reads the server's `/health` snapshot.
   {
     element: <RootLayout />,
     children: [
       { path: "/", element: <HomeGate /> },
+      { path: "/live", element: <LivePage /> },
       { path: "/start", element: <StartRoastView /> },
+      // /config placeholder (S2 #419 adds the Config view; route shell established here
+      // per #403's brief so S2 has the pattern to follow without editing the router).
+      // A minimal placeholder renders instead of a blank nav shell while S2 is pending.
+      {
+        path: "/config",
+        element: (
+          <AppFrame>
+            <p className="text-sm text-muted-foreground">
+              Configuration — coming in a future update.
+            </p>
+          </AppFrame>
+        ),
+      },
       { path: "/roasts", element: <HistoryPage /> },
       { path: "/roasts/:runId", element: <DetailPage /> },
     ],
