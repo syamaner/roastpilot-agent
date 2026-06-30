@@ -170,13 +170,16 @@ describe("DeviceMultiSelect — loaded state", () => {
     expect(screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[0]!.value}`)).toBeInTheDocument();
   });
 
-  it("checked row has role='checkbox' aria-checked=true; unchecked row has aria-checked=false", () => {
+  it("checked row has aria-selected=true; unchecked row has aria-selected=false; listbox has aria-multiselectable", () => {
     renderMultiSelect({ values: [AUDIO_DEVICES[0]!.value] });
     fireEvent.click(screen.getByTestId("device-multi-select-trigger"));
     const checkedRow = screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[0]!.value}`);
     const uncheckedRow = screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[1]!.value}`);
-    expect(checkedRow.querySelector('[role="checkbox"]')).toHaveAttribute("aria-checked", "true");
-    expect(uncheckedRow.querySelector('[role="checkbox"]')).toHaveAttribute("aria-checked", "false");
+    // Semantics on the option rows (not the decorative inner box).
+    expect(checkedRow).toHaveAttribute("aria-selected", "true");
+    expect(uncheckedRow).toHaveAttribute("aria-selected", "false");
+    // Listbox declares multi-selectable so the aria-selected pattern is well-formed.
+    expect(screen.getByRole("listbox")).toHaveAttribute("aria-multiselectable", "true");
   });
 
   it("toggles a row via keyboard Enter", () => {
@@ -285,12 +288,13 @@ describe("DeviceMultiSelect — empty state", () => {
 });
 
 describe("DeviceMultiSelect — per-source error state", () => {
-  it("renders the audio_input_error string for operator diagnostics", () => {
+  it("renders the audio_input_error string for operator diagnostics, not the empty state", () => {
     defaultMockState({ data: ERROR_SNAPSHOT });
     renderMultiSelect();
     fireEvent.click(screen.getByTestId("device-multi-select-trigger"));
     expect(screen.getByTestId("device-list-error"))
       .toHaveTextContent(ERROR_SNAPSHOT.audio_input_error!);
+    expect(screen.queryByTestId("device-list-empty")).toBeNull();
   });
 });
 
@@ -335,7 +339,7 @@ describe("DeviceMultiSelect — ghost rows", () => {
     fireEvent.click(screen.getByTestId("device-multi-select-trigger"));
     const row = screen.getByTestId(`device-multi-option-${ghostValue}`);
     expect(row).toBeInTheDocument();
-    expect(row.querySelector('[role="checkbox"]')).toHaveAttribute("aria-checked", "true");
+    expect(row).toHaveAttribute("aria-selected", "true");
     expect(row).toHaveTextContent("Not found on rescan — previously configured");
   });
 });

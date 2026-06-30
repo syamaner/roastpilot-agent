@@ -61,9 +61,9 @@ function MultiOptionRow({ option, isChecked, isUnavailable, onToggle }: MultiOpt
         isUnavailable && "opacity-60",
       )}
     >
+      {/* Decorative checkbox box — semantics are on the parent role="option" + aria-selected. */}
       <span
-        role="checkbox"
-        aria-checked={isChecked}
+        aria-hidden="true"
         className={cn(
           "flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border transition-colors",
           isChecked
