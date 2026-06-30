@@ -10,6 +10,8 @@
  *     (masked/api-key fields that are never env-injected).
  *  5. Guarded chip and env badge can coexist (safety field with env override).
  *  6. Reset button still available when env_overridden=true and value≠default.
+ *  7. Field row carries responsive grid classes so it collapses to single-column
+ *     at <900px (control stacks below description).
  */
 
 import { cleanup, render, screen } from "@testing-library/react";
@@ -155,5 +157,17 @@ describe("ConfigFieldRow — env-override badge", () => {
     // default (the saved value takes effect once the env var is removed).
     renderRow(NUMBER_FIELD, makeFieldMeta({ env_overridden: true, default: 100 }), 80);
     expect(screen.getByTestId(`reset-${NUMBER_FIELD.key}`)).toBeInTheDocument();
+  });
+});
+
+describe("ConfigFieldRow — responsive layout", () => {
+  it("field row carries the two-column grid class and the <900px single-column override", () => {
+    // Asserts the inline-style→Tailwind migration: the row must use Tailwind classes
+    // so the max-[900px]:grid-cols-1 variant can collapse the layout at narrow widths
+    // (control stacks below description, per design handoff S4 responsive spec).
+    renderRow(NUMBER_FIELD, makeFieldMeta());
+    const row = screen.getByTestId(`config-field-${NUMBER_FIELD.key}`);
+    expect(row.className).toContain("grid-cols-[minmax(0,1fr)_384px]");
+    expect(row.className).toContain("max-[900px]:grid-cols-1");
   });
 });
