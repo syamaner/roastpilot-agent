@@ -27,8 +27,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, cast
 
-import serial.tools.list_ports as _list_ports
-import sounddevice as _sounddevice  # type: ignore[import-untyped]
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
@@ -2195,12 +2193,18 @@ def _enumerate_serial() -> tuple[list[DeviceOption], str | None]:
     active MCP session is safe — ``comports()`` only reads the OS port list
     and does not open any port.
 
+    The import of ``serial.tools.list_ports`` is deferred to this function so
+    that a missing or unimportable pyserial wheel never crashes server startup
+    — the error is returned as ``serial_error`` instead.
+
     Returns:
         A 2-tuple of ``(devices, error)``.  ``devices`` is empty on failure;
         ``error`` is ``None`` on success or the exception message on failure.
     """
     try:
-        ports = _list_ports.comports()
+        import serial.tools.list_ports as _lp  # noqa: PLC0415
+
+        ports = _lp.comports()
         return (
             [
                 DeviceOption(
@@ -2226,12 +2230,19 @@ def _enumerate_audio_inputs() -> tuple[list[DeviceOption], str | None]:
     holds an open audio stream is safe (PortAudio supports concurrent device
     queries), but the operator should not reconfigure audio mid-capture.
 
+    The import of ``sounddevice`` is deferred to this function so that a
+    missing native PortAudio library (common in headless / CI environments)
+    never crashes server startup — the ``ImportError`` is caught by the broad
+    ``except`` and returned as ``audio_input_error`` instead.
+
     Returns:
         A 2-tuple of ``(devices, error)``.  ``devices`` is empty on failure;
         ``error`` is ``None`` on success or the exception message on failure.
     """
     try:
-        raw: object = _sounddevice.query_devices()  # type: ignore[reportUnknownMemberType]
+        import sounddevice as _sd  # type: ignore[import-untyped]  # noqa: PLC0415
+
+        raw: object = _sd.query_devices()  # type: ignore[reportUnknownMemberType]
         # query_devices() returns a DeviceList (iterable of dicts) when called
         # with no arguments.  Explicitly cast to list[dict[str, object]] for
         # pyright; the runtime type is sounddevice.DeviceList which iterates
