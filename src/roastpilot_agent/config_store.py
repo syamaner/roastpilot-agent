@@ -95,6 +95,9 @@ _DEFAULT_CONFIG = AppConfig.model_construct(
     controller=ControllerConfig(),
     advisor=AdvisorConfig(),
     safety=SafetyLimits(),
+    # mcp and logging omitted intentionally: their default_factory values are
+    # populated on attribute access / model_dump, so they are never bleed-prone
+    # and are not referenced in build_config_snapshot.
 )
 
 #: The default file location when the operator does not override it. Lives in

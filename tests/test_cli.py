@@ -768,3 +768,28 @@ def test_serve_live_returns_error_on_malformed_config_file(
     assert cli.main() == 1
     out = capsys.readouterr().out
     assert "malformed" in out or "error" in out
+
+
+def test_replay_returns_error_on_malformed_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--replay`` returns exit-code 1 with a clear message when the saved-config
+    file is malformed (``ConfigFileError`` from ``load_app_config``).
+
+    Mirrors ``test_serve_live_returns_error_on_malformed_config_file`` for the
+    replay path.  Uses the real session-2 fixture so the missing-jsonl guard
+    passes; the malformed config error fires inside the ``with TemporaryDirectory``
+    block after create_replay_app succeeds.
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(": broken: yaml\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--step", "--port", "0"],
+    )
+    assert cli.main() == 1
+    out = capsys.readouterr().out
+    assert "malformed" in out or "error" in out

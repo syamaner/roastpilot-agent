@@ -726,9 +726,15 @@ async def _serve_replay(args: argparse.Namespace) -> int:
             print("  (serves the final frame after the roast ends; Ctrl-C to stop)")
         # Access-log verbosity (#267): same CLI > env > config resolution as the
         # live serve. Logging-only — the replay SSE pipeline is unchanged.
+        from roastpilot_agent.config_store import ConfigFileError as _CfgErr
         from roastpilot_agent.config_store import load_app_config as _load_cfg
 
-        log_level, access_log = _configure_access_log(args, _load_cfg()[0].logging)
+        try:
+            _cfg, _ = _load_cfg()
+        except _CfgErr as exc:
+            print(f"error: saved-config file is malformed — {exc}")
+            return 1
+        log_level, access_log = _configure_access_log(args, _cfg.logging)
         config = uvicorn.Config(
             app,
             host=args.host,
