@@ -238,9 +238,11 @@ function originFromClocks(
 }
 
 /** Fold a recovered T0 origin into the view-model iff it isn't already known —
- *  setting `t0ElapsedSeconds` and placing the T0 marker at that serve-elapsed (the
- *  reload path; the live `t0_detected` handler owns the streamed case). A no-op once
- *  the origin is set, so a later frame never moves an established origin/marker. */
+ *  setting `t0ElapsedSeconds` and placing the T0 marker at that serve-elapsed. This
+ *  is the SOLE place the T0 marker is placed (#404): both the live-stream path (first
+ *  post-charge telemetry frame via `originFromClocks`) and the reload/seed path call
+ *  through here. `t0_detected` no longer sets the origin or marker. A no-op once the
+ *  origin is set, so a later frame never moves an established origin/marker. */
 function withRecoveredOrigin(state: DashboardViewModel, origin: number | null): DashboardViewModel {
   if (origin === null || state.t0ElapsedSeconds !== null) return state;
   return {
