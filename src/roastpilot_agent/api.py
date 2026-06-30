@@ -58,6 +58,7 @@ from roastpilot_agent.controller import (
 )
 from roastpilot_agent.mcp_client import (
     ExportRoastLogResult,
+    MCPConnectionError,
     MCPServerProcess,
     RoastSessionState,
     project_mic_status,
@@ -1363,6 +1364,17 @@ class RoastService:
         # stop() bypasses record_child_stop_unconfirmed intentionally: there
         # is no active run to key a marker to, and start() resets the flag.
         await self._mcp.stop()
+        # If stop() timed out and force-killed the child, the old process may
+        # still be holding the serial port or audio device.  Starting a new
+        # child into that state risks a resource conflict or a hidden live
+        # process.  Abort the respawn; the None baseline ensures the next
+        # start_roast re-attempts cleanly once the operator has confirmed the
+        # hardware is clear.
+        if self._mcp.stop_unconfirmed:
+            raise MCPConnectionError(
+                "old MCP child stop was unconfirmed (force-killed); "
+                "aborting respawn — retry start_roast once hardware is clear"
+            )
         self._mcp.set_device_config(new_device_config)
         await self._mcp.start()
         self._spawned_mcp_device = new_device_config  # success → new baseline

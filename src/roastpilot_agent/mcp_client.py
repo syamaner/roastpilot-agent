@@ -910,6 +910,13 @@ class MCPServerProcess:
         #: Best-effort force-terminate of the spawned child group, populated by
         #: the default factory once the pid is known (or injected for tests).
         self._force_terminate: ForceTerminate | None = force_terminate
+        #: True when ``force_terminate`` was supplied at construction (test seam).
+        #: An injected hook must win over the auto-registered hook and must NOT
+        #: be cleared between respawns — only the auto-registered (real-IO) hook
+        #: is replaced per spawn.  Without this flag, the re-arm logic in
+        #: :meth:`start` cannot distinguish "no hook yet" from "hook from prev
+        #: pid" and would leave the seam intact on the wrong branch.
+        self._force_terminate_injected: bool = force_terminate is not None
         #: Rendered yaml temp dir; created in :meth:`build_server_parameters`
         #: when ``_device_config`` is set, cleaned up in :meth:`stop`.
         self._rendered_yaml_dir: Path | None = None
@@ -1109,10 +1116,23 @@ class MCPServerProcess:
         Resets :attr:`stop_unconfirmed` to ``False`` first: the flag describes
         the most recent teardown, so a reused process (start → stop → start)
         must not carry a prior run's unconfirmed verdict into the new run.
+
+        Re-arms the force-terminate hook for each spawn: on the first start the
+        auto-registered hook captures the spawned pid via
+        :meth:`_register_force_terminate`; on a respawn the previous pid's
+        closure would still be held, so the hook is cleared here (before the
+        spawn) so :meth:`_register_force_terminate` re-registers with the new
+        pid.  An injected hook (test seam, ``_force_terminate_injected=True``)
+        is never cleared — it must win and be reused across respawns.
         """
         if self._session is not None:
             return
         self._stop_unconfirmed = False
+        # Re-arm: clear the auto-registered hook before each spawn so
+        # _register_force_terminate captures the new pid, not the previous one.
+        # Injected hooks (test seam) are left untouched.
+        if not self._force_terminate_injected:
+            self._force_terminate = None
         stack = AsyncExitStack()
         try:
             session = await stack.enter_async_context(
