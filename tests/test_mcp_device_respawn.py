@@ -395,6 +395,7 @@ def test_set_spawned_mcp_device_records_baseline(tmp_path: Path) -> None:
             device = MCPDeviceConfig(serial_port="/dev/ttyUSB0", roaster_driver="mock")
             svc.set_spawned_mcp_device(device)
 
+            assert svc._spawned_mcp_device is not None  # pyright: ignore[reportPrivateUsage]
             assert svc._spawned_mcp_device == device  # pyright: ignore[reportPrivateUsage]
             assert svc._spawned_mcp_device.serial_port == "/dev/ttyUSB0"  # pyright: ignore[reportPrivateUsage]
         finally:
@@ -436,6 +437,7 @@ def test_mcp_process_set_device_config() -> None:
     )
     mcp.set_device_config(new_device)
 
+    assert mcp.device_config is not None
     assert mcp.device_config == new_device
     assert mcp.device_config.serial_port == "/dev/ttyUSB1"
     assert mcp.device_config.roaster_driver == "hottop_kn8828b_2k_plus"
