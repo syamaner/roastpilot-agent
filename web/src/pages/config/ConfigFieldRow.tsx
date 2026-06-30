@@ -220,9 +220,11 @@ export function ConfigFieldRow({
   dynMax,
 }: ConfigFieldRowProps): React.JSX.Element {
   const isEnvOverridden = meta.env_overridden && fieldDef.envVar !== null;
-  // Env-overridden fields are effectively read-only from the operator's perspective:
-  // the saved value won't take effect while the env var is set.
-  const isReadOnly = fieldDef.readOnlyStatic || meta.read_only || isEnvOverridden;
+  // env_overridden and read_only are SEPARATE server flags: an env-overridden
+  // non-safety field has read_only=false and PUT /api/config accepts it. The badge
+  // is purely informational — the operator can save a value that becomes effective
+  // once the env var is removed. Only readOnlyStatic and server read_only gate edits.
+  const isReadOnly = fieldDef.readOnlyStatic || meta.read_only;
   const isSafetyField = fieldDef.category === "Safety";
   const isDirtyFromDefault = value !== meta.default;
 

@@ -4,12 +4,12 @@
  * Asserts real behaviour:
  *  1. Badge absent when env_overridden=false.
  *  2. Badge present when env_overridden=true; shows the envVar name and note.
- *  3. Control is disabled when env_overridden=true (saved value won't apply).
- *  4. Control is NOT disabled by the badge alone when env_overridden=false.
- *  5. Badge absent when env_overridden=true but fieldDef.envVar is null
+ *  3. Control is NOT disabled by env_overridden — env_overridden and read_only are
+ *     separate server flags; PUT /api/config accepts env-overridden non-safety fields.
+ *  4. Badge absent when env_overridden=true but fieldDef.envVar is null
  *     (masked/api-key fields that are never env-injected).
- *  6. Guarded chip and env badge can coexist (safety field with env override).
- *  7. Reset button absent when env_overridden=true (field is effectively read-only).
+ *  5. Guarded chip and env badge can coexist (safety field with env override).
+ *  6. Reset button still available when env_overridden=true and value≠default.
  */
 
 import { cleanup, render, screen } from "@testing-library/react";
@@ -122,13 +122,17 @@ describe("ConfigFieldRow — env-override badge", () => {
     expect(badge).toHaveTextContent("Saved value won't take effect while this env var is set.");
   });
 
-  it("control is disabled when env_overridden=true", () => {
+  it("control is NOT disabled by env_overridden alone — field stays editable", () => {
+    // env_overridden and read_only are separate server flags. The backend accepts
+    // PUT /api/config for env-overridden non-safety fields (read_only=false). The
+    // badge is informational; the operator can still save a value that takes effect
+    // once the env var is removed.
     renderRow(NUMBER_FIELD, makeFieldMeta({ env_overridden: true }), 80);
     const input = screen.getByLabelText(NUMBER_FIELD.label);
-    expect(input).toBeDisabled();
+    expect(input).not.toBeDisabled();
   });
 
-  it("control is NOT disabled by the badge alone when env_overridden=false", () => {
+  it("control is NOT disabled when env_overridden=false either (sanity)", () => {
     renderRow(NUMBER_FIELD, makeFieldMeta({ env_overridden: false }));
     const input = screen.getByLabelText(NUMBER_FIELD.label);
     expect(input).not.toBeDisabled();
@@ -146,9 +150,10 @@ describe("ConfigFieldRow — env-override badge", () => {
     expect(screen.getByTestId("env-override-badge")).toBeInTheDocument();
   });
 
-  it("reset button is absent when env_overridden=true (field effectively read-only)", () => {
-    // Value differs from default — reset would normally show, but not when overridden.
+  it("reset button is still available when env_overridden=true and value differs from default", () => {
+    // The field is editable while env-overridden; the operator can still reset to
+    // default (the saved value takes effect once the env var is removed).
     renderRow(NUMBER_FIELD, makeFieldMeta({ env_overridden: true, default: 100 }), 80);
-    expect(screen.queryByTestId(`reset-${NUMBER_FIELD.key}`)).toBeNull();
+    expect(screen.getByTestId(`reset-${NUMBER_FIELD.key}`)).toBeInTheDocument();
   });
 });
