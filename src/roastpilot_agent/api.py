@@ -38,7 +38,7 @@ from roastpilot_agent.advisor import (
     RoastAdvisor,
     RoastDecision,
 )
-from roastpilot_agent.config import AppConfig
+from roastpilot_agent.config import AppConfig, MCPDeviceConfig
 from roastpilot_agent.config_store import (
     AppConfigEdit,
     AppConfigSnapshot,
@@ -58,6 +58,7 @@ from roastpilot_agent.controller import (
 )
 from roastpilot_agent.mcp_client import (
     ExportRoastLogResult,
+    MCPConnectionError,
     MCPServerProcess,
     RoastSessionState,
     project_mic_status,
@@ -1263,6 +1264,14 @@ class RoastService:
         self.operator_queue: asyncio.Queue[QueuedOperatorAction] = asyncio.Queue(
             maxsize=self.OPERATOR_QUEUE_MAX
         )
+        # The mcp_device config that the MCP child was most recently spawned
+        # with.  Compared against the freshly-reloaded config at each
+        # start_roast: when they differ the child is respawned with the new
+        # device config so a PUT /api/config mcp_device change applies
+        # next-roast without an agent restart (#431).  Initialised to None
+        # (service started with no MCP yet); set by set_spawned_mcp_device()
+        # once the live-serve path has successfully spawned the child.
+        self._spawned_mcp_device: MCPDeviceConfig | None = None
 
     def mcp_child_status(self) -> MCPChildStatus:
         """Liveness of the coffee-roaster-mcp child for the health route.
@@ -1297,6 +1306,80 @@ class RoastService:
         """
         self._advisor_health = health
 
+    def set_spawned_mcp_device(self, device_config: MCPDeviceConfig) -> None:
+        """Record the device config the MCP child was most recently spawned with.
+
+        Called by :func:`~roastpilot_agent.live.build_live_service` after a
+        successful initial spawn, and by the between-roast respawn path in
+        :meth:`start_roast` after each respawn.  Provides the baseline that
+        :meth:`start_roast` compares the reloaded config against to detect
+        device-config drift (#431).
+
+        Args:
+            device_config: The :class:`~roastpilot_agent.config.MCPDeviceConfig`
+                that was rendered into the MCP yaml for the most recent spawn.
+        """
+        self._spawned_mcp_device = device_config
+
+    async def _respawn_mcp_for_device_config(self, new_device_config: MCPDeviceConfig) -> None:
+        """Stop the running MCP child and restart it with *new_device_config* (#431).
+
+        Called from :meth:`start_roast` when a reloaded ``mcp_device`` section
+        differs from :attr:`_spawned_mcp_device`, so a ``PUT /api/config``
+        device change applies next-roast without an agent restart.
+
+        **Safety invariant (AGENTS.md):** this method is called only when no
+        roast is active — the ``active_run()`` guard in :meth:`start_roast`
+        (under ``_start_lock``) runs before this.  A between-roast respawn of an
+        idle child never auto-resumes heat or fan: the child simply restarts in a
+        clean, heat-off state (the MCP's own start-up posture).  The
+        ``operator_recovery_required`` invariant applies to an agent RESTART over
+        a POSSIBLY-ACTIVE run; this is a deliberate between-roast respawn where
+        the agent owns the full lifecycle and knows the state is idle.
+
+        Fail-closed: if stop or re-start raises, the exception propagates out
+        of :meth:`start_roast`, surfacing as a 500 to the operator.  The
+        baseline is invalidated (``None``) before the stop/start sequence so
+        that a failed respawn does NOT leave a stale match: on the next
+        ``start_roast`` the reverted config is compared against ``None`` →
+        drift is re-detected → respawn is re-attempted automatically.  Only a
+        successful start records the new baseline.
+
+        Args:
+            new_device_config: The new device config to render into the MCP yaml
+                on the next spawn.
+        """
+        if self._mcp is None:
+            return  # pragma: no cover - only reached with a live _mcp wired
+        _log.info(
+            "mcp_device config changed since last spawn — respawning MCP child"
+            " with new device config"
+        )
+        # Invalidate the baseline BEFORE touching the child so any failure
+        # (stop or start) leaves _spawned_mcp_device=None.  On the next
+        # start_roast the None baseline forces a re-detect and re-attempt,
+        # avoiding the "reverted config matches stale baseline → child
+        # silently dead" trap.
+        self._spawned_mcp_device = None
+        # stop() bypasses record_child_stop_unconfirmed intentionally: there
+        # is no active run to key a marker to, and start() resets the flag.
+        await self._mcp.stop()
+        # If stop() timed out and force-killed the child, the old process may
+        # still be holding the serial port or audio device.  Starting a new
+        # child into that state risks a resource conflict or a hidden live
+        # process.  Abort the respawn; the None baseline ensures the next
+        # start_roast re-attempts cleanly once the operator has confirmed the
+        # hardware is clear.
+        if self._mcp.stop_unconfirmed:
+            raise MCPConnectionError(
+                "old MCP child stop was unconfirmed (force-killed); "
+                "aborting respawn — retry start_roast once hardware is clear"
+            )
+        self._mcp.set_device_config(new_device_config)
+        await self._mcp.start()
+        self._spawned_mcp_device = new_device_config  # success → new baseline
+        _log.info("MCP child respawned successfully with updated device config")
+
     async def health(self) -> HealthResponse:
         """Liveness + MCP child status + active run id + advisor health (plan §6).
 
@@ -1315,7 +1398,7 @@ class RoastService:
         )
 
     async def start_roast(self, profile: RoastProfile) -> RoastDetail:
-        """Start a roast: reload saved config, persist the run record, claim it as active.
+        """Start a roast: reload saved config, respawn MCP if needed, persist the run.
 
         **Config reload (D76/D78 apply-next-roast guarantee):** the saved config
         is re-read from disk at the start of every roast so that a ``PUT
@@ -1324,6 +1407,13 @@ class RoastService:
         requiring an agent restart.  The reload happens inside ``_start_lock``
         and only when no run is active, so a running roast's config is never
         mutated mid-loop.
+
+        **MCP device respawn (#431):** when the reloaded ``mcp_device`` section
+        differs from the config used at the most recent spawn, the MCP child is
+        stopped and restarted with a fresh YAML rendered from the new device
+        config.  This makes serial-port, driver, audio-input, and FC-mode
+        changes apply next-roast.  The respawn is between-roast only (the
+        active-run guard runs first) and never auto-resumes heat or fan.
 
         Safety limits are **env-resolved** by :func:`load_app_config` — the
         :func:`~roastpilot_agent.config_store._inject_saved_as_env` injector
@@ -1387,6 +1477,30 @@ class RoastService:
                 self._config = fresh_config
                 self._safety = fresh_safety
                 self._advisor = fresh_advisor
+                # MCP device respawn (#431): when the reloaded mcp_device differs
+                # from what the child was spawned with, stop and restart the child
+                # so hardware changes (serial port, driver, audio input, FC mode,
+                # etc.) take effect next-roast without an agent restart.
+                #
+                # MCP is only wired (non-None) in live-serve mode
+                # (build_live_service), so _mcp is not None is already the
+                # live-mode guard.  The baseline (_spawned_mcp_device) is
+                # None in two cases:
+                #   1. Before the first roast: build_live_service calls
+                #      set_spawned_mcp_device() right after spawn, so this
+                #      is only reachable if the caller skips that step — which
+                #      production never does.  A None baseline with a live _mcp
+                #      is treated conservatively as "respawn needed".
+                #   2. After a failed respawn: _respawn_mcp_for_device_config
+                #      invalidates the baseline so a stuck child is re-attempted
+                #      next start rather than silently skipped.
+                # Between-roasts guarantee: the active_run() check above (under
+                # _start_lock) confirms no roast is active before this block.
+                if self._mcp is not None and (
+                    self._spawned_mcp_device is None
+                    or fresh_config.mcp_device != self._spawned_mcp_device
+                ):
+                    await self._respawn_mcp_for_device_config(fresh_config.mcp_device)
             run_id = uuid.uuid4().hex
             await self._store.create_run(
                 run_id=run_id,
