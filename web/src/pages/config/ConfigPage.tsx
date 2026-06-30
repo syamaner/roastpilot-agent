@@ -355,7 +355,7 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
                 <ConfigFieldRow
                   key={fieldDef.key}
                   fieldDef={fieldDef}
-                  meta={meta as import("@/lib/types").ConfigFieldMeta}
+                  meta={meta as unknown as import("@/lib/types").ConfigFieldMeta}
                   value={state.values[fieldDef.key] ?? null}
                   isLast={idx === activeCategory.fields.length - 1}
                   onChange={(v) =>

@@ -116,6 +116,20 @@ export interface ConfigFieldDef {
    */
   envVar: string | null;
 
+  /**
+   * Dot-path key used when building the PUT /api/config body (AppConfigEdit).
+   *
+   * For advisor fields this is just the field name (same as the snapshot key's
+   * second segment), e.g. `"model_slug"`. For controller fields the snapshot
+   * denormalises nested config into flat names (e.g.
+   * `late_maillard_trim_enabled`), but the edit body uses the real nesting:
+   *   `"pre_first_crack_levers.late_maillard_trim.enabled"`
+   *
+   * Set to `null` for always-read-only fields (safety, hardware-pinned) that
+   * are never sent in the PUT body.
+   */
+  editKey: string | null;
+
   /** Category this field belongs to, used to group rows in the rail. */
   category: FieldCategory;
 }
@@ -158,6 +172,7 @@ const ADVISOR_FIELDS: ConfigFieldDef[] = [
     hint:           "Advisor model slug via the configured provider (e.g. openai/gpt-4o for OpenRouter).",
     type:           "text",
     envVar:         "ROASTPILOT_ADVISOR__MODEL_SLUG",
+    editKey:        "model_slug",
     category:       "Advisor",
     readOnlyStatic: false,
   },
@@ -168,6 +183,7 @@ const ADVISOR_FIELDS: ConfigFieldDef[] = [
     type:           "select",
     options:        PROMPT_VERSION_OPTIONS,
     envVar:         "ROASTPILOT_ADVISOR__PROMPT_VERSION",
+    editKey:        "prompt_version",
     category:       "Advisor",
     readOnlyStatic: false,
   },
@@ -178,6 +194,7 @@ const ADVISOR_FIELDS: ConfigFieldDef[] = [
     type:           "select",
     options:        PROVIDER_OPTIONS,
     envVar:         "ROASTPILOT_ADVISOR__PROVIDER",
+    editKey:        "provider",
     category:       "Advisor",
     readOnlyStatic: false,
   },
@@ -187,6 +204,7 @@ const ADVISOR_FIELDS: ConfigFieldDef[] = [
     hint:           "API endpoint for OpenAI-compatible providers. Default is OpenRouter. Override for Ollama or custom endpoints.",
     type:           "text",
     envVar:         "ROASTPILOT_ADVISOR__PROVIDER_BASE_URL",
+    editKey:        "provider_base_url",
     category:       "Advisor",
     readOnlyStatic: false,
   },
@@ -196,6 +214,7 @@ const ADVISOR_FIELDS: ConfigFieldDef[] = [
     hint:           "The environment variable that holds the advisor API key. The key itself is never stored in config — set this env var on the host.",
     type:           "masked",
     envVar:         null,           // never env-injected; server returns saved=null, read_only=true
+    editKey:        null,           // read-only: never sent in PUT body
     category:       "Advisor",
     readOnlyStatic: true,
   },
@@ -208,6 +227,7 @@ const ADVISOR_FIELDS: ConfigFieldDef[] = [
     min:            0.1,  // gt=0 (exclusive) in AdvisorConfigEdit
     step:           1,
     envVar:         "ROASTPILOT_ADVISOR__TIMEOUT_SECONDS",
+    editKey:        "timeout_seconds",
     category:       "Advisor",
     readOnlyStatic: false,
   },
@@ -220,6 +240,7 @@ const ADVISOR_FIELDS: ConfigFieldDef[] = [
     max:            2,
     step:           0.1,
     envVar:         "ROASTPILOT_ADVISOR__TEMPERATURE",
+    editKey:        "temperature",
     category:       "Advisor",
     readOnlyStatic: false,
   },
@@ -235,6 +256,7 @@ const PRE_FC_FIELDS: ConfigFieldDef[] = [
     type:           "number",
     unit:           "s",
     envVar:         "ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS",
+    editKey:        null,           // hardware-pinned, read-only: never sent in PUT body
     category:       "Pre-FC Control",
     readOnlyStatic: true,
   },
@@ -248,6 +270,8 @@ const PRE_FC_FIELDS: ConfigFieldDef[] = [
     max:            100,
     step:           1,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__HEAT_TARGET_PERCENT",
+    // Maps to ControllerConfigEdit.pre_first_crack_levers.heat_target_percent
+    editKey:        "pre_first_crack_levers.heat_target_percent",
     category:       "Pre-FC Control",
     readOnlyStatic: false,
   },
@@ -261,6 +285,8 @@ const PRE_FC_FIELDS: ConfigFieldDef[] = [
     max:            100,
     step:           1,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__FAN_TARGET_PERCENT",
+    // Maps to ControllerConfigEdit.pre_first_crack_levers.fan_target_percent
+    editKey:        "pre_first_crack_levers.fan_target_percent",
     category:       "Pre-FC Control",
     readOnlyStatic: false,
   },
@@ -275,6 +301,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     hint:           "Enable the anticipatory heat trim in the late-Maillard → FC window. When off, the flat 100% heat floor is used to FC.",
     type:           "boolean",
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ENABLED",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.enabled",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
   },
@@ -288,6 +315,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     max:            100,
     step:           1,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__TRIM_HEAT_PERCENT",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.trim_heat_percent",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
   },
@@ -300,6 +328,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     min:            0.1,  // gt=0 (exclusive) in LateMaillardTrimEdit
     step:           5,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__WINDOW_FC_ETA_SECONDS",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.window_fc_eta_seconds",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
   },
@@ -312,6 +341,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     min:            0.1,  // gt=0 (exclusive) in LateMaillardTrimEdit
     step:           1,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__MIN_BEAN_TEMP_C",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.min_bean_temp_c",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
   },
@@ -321,6 +351,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     hint:           "Enable adaptive trim depth (#386). The trim deepens on hotter approaches (high RoR, short FC-ETA). Default off.",
     type:           "boolean",
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ADAPTIVE_DEPTH_ENABLED",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.adaptive_depth_enabled",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
   },
@@ -334,6 +365,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     max:            100,
     step:           1,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__BASE_TRIM",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.base_trim",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
   },
@@ -344,6 +376,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     type:           "number",
     step:           0.1,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__K_ROR",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.k_ror",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
   },
@@ -354,6 +387,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     type:           "number",
     step:           0.01,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__K_ETA",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.k_eta",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
   },
@@ -366,6 +400,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     min:            0,
     step:           0.5,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ROR_REF",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.ror_ref",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
   },
@@ -378,6 +413,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     min:            0.1,  // gt=0 (exclusive) in LateMaillardTrimEdit
     step:           5,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ETA_REF",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.eta_ref",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
   },
@@ -391,6 +427,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     max:            100,
     step:           1,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__MIN_TRIM",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.min_trim",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
   },
@@ -404,6 +441,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     max:            100,
     step:           1,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__MAX_TRIM",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.max_trim",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
   },
@@ -419,6 +457,7 @@ const SAFETY_FIELDS: ConfigFieldDef[] = [
     type:           "number",
     unit:           "°C",
     envVar:         "ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C",
+    editKey:        null,   // safety: all read-only in M1 (D78 decision 2)
     category:       "Safety",
     readOnlyStatic: true,
   },
@@ -429,6 +468,7 @@ const SAFETY_FIELDS: ConfigFieldDef[] = [
     type:           "number",
     unit:           "°C",
     envVar:         "ROASTPILOT_SAFETY__MAX_ENV_TEMP_C",
+    editKey:        null,
     category:       "Safety",
     readOnlyStatic: true,
   },
@@ -439,6 +479,7 @@ const SAFETY_FIELDS: ConfigFieldDef[] = [
     type:           "number",
     unit:           "°C",
     envVar:         "ROASTPILOT_SAFETY__PRE_T0_MAX_BEAN_TEMP_C",
+    editKey:        null,
     category:       "Safety",
     readOnlyStatic: true,
   },
@@ -449,6 +490,7 @@ const SAFETY_FIELDS: ConfigFieldDef[] = [
     type:           "number",
     unit:           "%",
     envVar:         "ROASTPILOT_SAFETY__OVERRUN_SAFE_FAN_PERCENT",
+    editKey:        null,
     category:       "Safety",
     readOnlyStatic: true,
   },
@@ -464,6 +506,7 @@ const SAFETY_FIELDS: ConfigFieldDef[] = [
       { value: "fault",    label: "fault — immediate halt" },
     ],
     envVar:         "ROASTPILOT_SAFETY__PRE_T0_OVERRUN_SEVERITY",
+    editKey:        null,
     category:       "Safety",
     readOnlyStatic: true,
   },
@@ -474,6 +517,7 @@ const SAFETY_FIELDS: ConfigFieldDef[] = [
     type:           "number",
     unit:           "s",
     envVar:         "ROASTPILOT_SAFETY__MIN_SECONDS_BETWEEN_COMMANDS",
+    editKey:        null,
     category:       "Safety",
     readOnlyStatic: true,
   },
@@ -483,6 +527,7 @@ const SAFETY_FIELDS: ConfigFieldDef[] = [
     hint:           "Consecutive MCP read failures tolerated before a fault. Default 3 (~3 s at 1 Hz).",
     type:           "number",
     envVar:         "ROASTPILOT_SAFETY__MAX_CONSECUTIVE_MCP_FAILURES",
+    editKey:        null,
     category:       "Safety",
     readOnlyStatic: true,
   },
@@ -492,6 +537,7 @@ const SAFETY_FIELDS: ConfigFieldDef[] = [
     hint:           "Consecutive advisor availability failures before failing closed. Default 3.",
     type:           "number",
     envVar:         "ROASTPILOT_SAFETY__MAX_CONSECUTIVE_ADVISOR_FAILURES",
+    editKey:        null,
     category:       "Safety",
     readOnlyStatic: true,
   },
@@ -502,6 +548,7 @@ const SAFETY_FIELDS: ConfigFieldDef[] = [
     type:           "number",
     unit:           "°C",
     envVar:         "ROASTPILOT_SAFETY__BITTER_CEILING_TEMP_C",
+    editKey:        null,
     category:       "Safety",
     readOnlyStatic: true,
   },
@@ -512,6 +559,7 @@ const SAFETY_FIELDS: ConfigFieldDef[] = [
     type:           "number",
     unit:           "°C",
     envVar:         "ROASTPILOT_SAFETY__EMERGENCY_DROP_TEMP_C",
+    editKey:        null,
     category:       "Safety",
     readOnlyStatic: true,
   },

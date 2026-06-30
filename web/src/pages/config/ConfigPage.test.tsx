@@ -28,7 +28,7 @@ function makeFieldMeta(overrides?: Partial<ConfigFieldMeta>): ConfigFieldMeta {
   return {
     saved_value: null,
     effective_value: null,
-    default_value: null,
+    default: null,
     env_var: null,
     env_overridden: false,
     read_only: false,
@@ -47,42 +47,42 @@ function makeSnapshot(overrides?: {
   const o = { model_slug: "openai/gpt-4o", pre_fc_heat: 100, trim_enabled: true, max_bean_temp: 230, ...overrides };
   return {
     controller: {
-      tick_interval_seconds: makeFieldMeta({ effective_value: 1.0, default_value: 1.0, read_only: true }),
-      pre_fc_heat_target_percent: makeFieldMeta({ effective_value: o.pre_fc_heat, default_value: 100 }),
-      pre_fc_fan_target_percent: makeFieldMeta({ effective_value: 30, default_value: 30 }),
-      late_maillard_trim_enabled: makeFieldMeta({ effective_value: o.trim_enabled, default_value: true }),
-      late_maillard_trim_heat_percent: makeFieldMeta({ effective_value: 65, default_value: 65 }),
-      late_maillard_trim_window_fc_eta_seconds: makeFieldMeta({ effective_value: 60.0, default_value: 60.0 }),
-      late_maillard_trim_min_bean_temp_c: makeFieldMeta({ effective_value: 155.0, default_value: 155.0 }),
-      late_maillard_trim_adaptive_depth_enabled: makeFieldMeta({ effective_value: false, default_value: false }),
-      late_maillard_trim_base_trim: makeFieldMeta({ effective_value: 65, default_value: 65 }),
-      late_maillard_trim_k_ror: makeFieldMeta({ effective_value: 1.5, default_value: 1.5 }),
-      late_maillard_trim_k_eta: makeFieldMeta({ effective_value: 0.2, default_value: 0.2 }),
-      late_maillard_trim_ror_ref: makeFieldMeta({ effective_value: 8.0, default_value: 8.0 }),
-      late_maillard_trim_eta_ref: makeFieldMeta({ effective_value: 60.0, default_value: 60.0 }),
-      late_maillard_trim_min_trim: makeFieldMeta({ effective_value: 45, default_value: 45 }),
-      late_maillard_trim_max_trim: makeFieldMeta({ effective_value: 75, default_value: 75 }),
+      tick_interval_seconds: makeFieldMeta({ effective_value: 1.0, default: 1.0, read_only: true }),
+      pre_fc_heat_target_percent: makeFieldMeta({ effective_value: o.pre_fc_heat, default: 100 }),
+      pre_fc_fan_target_percent: makeFieldMeta({ effective_value: 30, default: 30 }),
+      late_maillard_trim_enabled: makeFieldMeta({ effective_value: o.trim_enabled, default: true }),
+      late_maillard_trim_heat_percent: makeFieldMeta({ effective_value: 65, default: 65 }),
+      late_maillard_trim_window_fc_eta_seconds: makeFieldMeta({ effective_value: 60.0, default: 60.0 }),
+      late_maillard_trim_min_bean_temp_c: makeFieldMeta({ effective_value: 155.0, default: 155.0 }),
+      late_maillard_trim_adaptive_depth_enabled: makeFieldMeta({ effective_value: false, default: false }),
+      late_maillard_trim_base_trim: makeFieldMeta({ effective_value: 65, default: 65 }),
+      late_maillard_trim_k_ror: makeFieldMeta({ effective_value: 1.5, default: 1.5 }),
+      late_maillard_trim_k_eta: makeFieldMeta({ effective_value: 0.2, default: 0.2 }),
+      late_maillard_trim_ror_ref: makeFieldMeta({ effective_value: 8.0, default: 8.0 }),
+      late_maillard_trim_eta_ref: makeFieldMeta({ effective_value: 60.0, default: 60.0 }),
+      late_maillard_trim_min_trim: makeFieldMeta({ effective_value: 45, default: 45 }),
+      late_maillard_trim_max_trim: makeFieldMeta({ effective_value: 75, default: 75 }),
     },
     advisor: {
-      model_slug: makeFieldMeta({ effective_value: o.model_slug, default_value: "openai/gpt-4o" }),
-      prompt_version: makeFieldMeta({ effective_value: "c3", default_value: "c3" }),
-      provider: makeFieldMeta({ effective_value: "openai_compatible", default_value: "openai_compatible" }),
-      provider_base_url: makeFieldMeta({ effective_value: "https://openrouter.ai/api/v1", default_value: "https://openrouter.ai/api/v1" }),
-      api_key_env: makeFieldMeta({ effective_value: "OPENROUTER_API_KEY", default_value: "OPENROUTER_API_KEY", read_only: true }),
-      timeout_seconds: makeFieldMeta({ effective_value: 10.0, default_value: 10.0 }),
-      temperature: makeFieldMeta({ effective_value: 0.0, default_value: 0.0 }),
+      model_slug: makeFieldMeta({ effective_value: o.model_slug, default: "openai/gpt-4o" }),
+      prompt_version: makeFieldMeta({ effective_value: "c3", default: "c3" }),
+      provider: makeFieldMeta({ effective_value: "openai_compatible", default: "openai_compatible" }),
+      provider_base_url: makeFieldMeta({ effective_value: "https://openrouter.ai/api/v1", default: "https://openrouter.ai/api/v1" }),
+      api_key_env: makeFieldMeta({ effective_value: "OPENROUTER_API_KEY", default: "OPENROUTER_API_KEY", read_only: true }),
+      timeout_seconds: makeFieldMeta({ effective_value: 10.0, default: 10.0 }),
+      temperature: makeFieldMeta({ effective_value: 0.0, default: 0.0 }),
     },
     safety: {
-      max_bean_temp_c: makeFieldMeta({ effective_value: o.max_bean_temp, default_value: 230, read_only: true }),
-      max_env_temp_c: makeFieldMeta({ effective_value: 240, default_value: 240, read_only: true }),
-      pre_t0_max_bean_temp_c: makeFieldMeta({ effective_value: 200, default_value: 200, read_only: true }),
-      overrun_safe_fan_percent: makeFieldMeta({ effective_value: 100, default_value: 100, read_only: true }),
-      pre_t0_overrun_severity: makeFieldMeta({ effective_value: "recovery", default_value: "recovery", read_only: true }),
-      min_seconds_between_commands: makeFieldMeta({ effective_value: 2.0, default_value: 2.0, read_only: true }),
-      max_consecutive_mcp_failures: makeFieldMeta({ effective_value: 3, default_value: 3, read_only: true }),
-      max_consecutive_advisor_failures: makeFieldMeta({ effective_value: 3, default_value: 3, read_only: true }),
-      bitter_ceiling_temp_c: makeFieldMeta({ effective_value: 196, default_value: 196, read_only: true }),
-      emergency_drop_temp_c: makeFieldMeta({ effective_value: 198, default_value: 198, read_only: true }),
+      max_bean_temp_c: makeFieldMeta({ effective_value: o.max_bean_temp, default: 230, read_only: true }),
+      max_env_temp_c: makeFieldMeta({ effective_value: 240, default: 240, read_only: true }),
+      pre_t0_max_bean_temp_c: makeFieldMeta({ effective_value: 200, default: 200, read_only: true }),
+      overrun_safe_fan_percent: makeFieldMeta({ effective_value: 100, default: 100, read_only: true }),
+      pre_t0_overrun_severity: makeFieldMeta({ effective_value: "recovery", default: "recovery", read_only: true }),
+      min_seconds_between_commands: makeFieldMeta({ effective_value: 2.0, default: 2.0, read_only: true }),
+      max_consecutive_mcp_failures: makeFieldMeta({ effective_value: 3, default: 3, read_only: true }),
+      max_consecutive_advisor_failures: makeFieldMeta({ effective_value: 3, default: 3, read_only: true }),
+      bitter_ceiling_temp_c: makeFieldMeta({ effective_value: 196, default: 196, read_only: true }),
+      emergency_drop_temp_c: makeFieldMeta({ effective_value: 198, default: 198, read_only: true }),
     },
   };
 }
@@ -91,8 +91,8 @@ function makeSnapshot(overrides?: {
 // Mock api.config + api.saveConfig
 // ---------------------------------------------------------------------------
 
-const configMock = vi.hoisted(() => vi.fn<[], Promise<AppConfigSnapshot>>());
-const saveConfigMock = vi.hoisted(() => vi.fn<[unknown], Promise<AppConfigSnapshot>>());
+const configMock = vi.hoisted(() => vi.fn<() => Promise<AppConfigSnapshot>>());
+const saveConfigMock = vi.hoisted(() => vi.fn<(edit: unknown) => Promise<AppConfigSnapshot>>());
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -280,14 +280,14 @@ describe("ConfigPage — field controls", () => {
   it("shows Reset to default button only when a field differs from its default, and clicking it restores the default", async () => {
     renderPage();
     await waitFor(() => screen.getByTestId("config-layout"));
-    // Initially at default (effective_value = default_value = "openai/gpt-4o") → no reset
+    // Initially at default (effective_value = meta.default = "openai/gpt-4o") → no reset
     expect(screen.queryByTestId("reset-advisor.model_slug")).toBeNull();
     const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
     fireEvent.change(modelInput!, { target: { value: "anthropic/claude-3-haiku" } });
     // Differs from default → reset button appears
     const resetBtn = screen.getByTestId("reset-advisor.model_slug");
     expect(resetBtn).toBeInTheDocument();
-    // Clicking reset restores meta.default_value ("openai/gpt-4o")
+    // Clicking reset restores meta.default ("openai/gpt-4o")
     fireEvent.click(resetBtn);
     expect(modelInput!.value).toBe("openai/gpt-4o");
     // Save bar disappears: field is now equal to its saved (= effective) value
@@ -306,5 +306,56 @@ describe("ConfigPage — field controls", () => {
     expect(input).toHaveAttribute("disabled");
     // Guarded chip
     expect(maxBeanField.textContent).toMatch(/Guarded/);
+  });
+});
+
+describe("ConfigPage — PUT body nesting", () => {
+  it("sends correctly nested pre_first_crack_levers when a Pre-FC heat field is dirty", async () => {
+    saveConfigMock.mockResolvedValue(makeSnapshot({ pre_fc_heat: 80 }));
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Pre-FC Control"));
+    await waitFor(() => screen.getByTestId("config-pane-Pre-FC Control"));
+    const heatInput = screen.getByTestId("config-field-controller.pre_fc_heat_target_percent")
+      .querySelector("input");
+    fireEvent.change(heatInput!, { target: { value: "80" } });
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    const body = saveConfigMock.mock.calls[0]![0] as Record<string, unknown>;
+    // Must nest under pre_first_crack_levers, NOT flat
+    expect(body).toEqual({
+      controller: {
+        pre_first_crack_levers: {
+          heat_target_percent: 80,
+        },
+      },
+    });
+    expect(body).not.toHaveProperty("safety");
+  });
+
+  it("sends correctly nested late_maillard_trim when a trim field is dirty", async () => {
+    saveConfigMock.mockResolvedValue(makeSnapshot());
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Late-Maillard Trim"));
+    await waitFor(() => screen.getByTestId("config-pane-Late-Maillard Trim"));
+    // Change the trim_heat_percent field
+    const trimHeatInput = screen.getByTestId("config-field-controller.late_maillard_trim_heat_percent")
+      .querySelector("input");
+    fireEvent.change(trimHeatInput!, { target: { value: "70" } });
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    const body = saveConfigMock.mock.calls[0]![0] as Record<string, unknown>;
+    // Must nest under pre_first_crack_levers.late_maillard_trim
+    expect(body).toEqual({
+      controller: {
+        pre_first_crack_levers: {
+          late_maillard_trim: {
+            trim_heat_percent: 70,
+          },
+        },
+      },
+    });
+    expect(body).not.toHaveProperty("safety");
   });
 });

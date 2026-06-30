@@ -7,7 +7,7 @@
  * Safety fields are never included in the edit object sent to PUT /api/config
  * (D78 decision 2 + the server enforces this via AppConfigEdit which has no
  * safety key). The `buildEditFromDirty` function enforces this on the FE side
- * too: it skips any field with `readOnlyStatic: true`.
+ * too: it skips any field with `editKey: null` (read-only or safety).
  */
 
 import type { AppConfigSnapshot, ConfigFieldMeta } from "@/lib/types";
@@ -54,14 +54,48 @@ export function resolveFieldMeta(
 }
 
 /**
+ * Set a value at a dot-path inside a mutable nested object, creating
+ * intermediate objects as needed.
+ *
+ * e.g. setPath(obj, "pre_first_crack_levers.late_maillard_trim.enabled", true)
+ * produces { pre_first_crack_levers: { late_maillard_trim: { enabled: true } } }
+ */
+function setPath(
+  target: Record<string, unknown>,
+  path: string,
+  value: unknown,
+): void {
+  const parts = path.split(".");
+  let node: Record<string, unknown> = target;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const key = parts[i]!;
+    if (typeof node[key] !== "object" || node[key] === null) {
+      node[key] = {};
+    }
+    node = node[key] as Record<string, unknown>;
+  }
+  node[parts[parts.length - 1]!] = value;
+}
+
+/**
  * Build the PUT /api/config body from dirty fields.
  *
- * Only includes non-read-only fields whose value has changed from the saved
- * baseline. Organises fields back into the server's nested structure
- * (controller / advisor), matching AppConfigEdit's shape.
+ * Uses `ConfigFieldDef.editKey` to map each flat snapshot key to its correct
+ * nested location in `AppConfigEdit`:
  *
- * Safety fields (readOnlyStatic: true) are never included — the server also
- * enforces this; this is defense-in-depth on the FE side.
+ *   advisor.model_slug
+ *     → advisor.model_slug (flat)
+ *   controller.pre_fc_heat_target_percent
+ *     → controller.pre_first_crack_levers.heat_target_percent
+ *   controller.late_maillard_trim_enabled
+ *     → controller.pre_first_crack_levers.late_maillard_trim.enabled
+ *
+ * Fields with `editKey: null` (safety, hardware-pinned) are skipped.
+ * Fields with `meta.read_only: true` from the server are also skipped
+ * (defense-in-depth; the server enforces this too).
+ *
+ * Only sections with dirty writable fields are included: if only advisor
+ * fields changed, the controller key is omitted from the result.
  */
 export function buildEditFromDirty(
   values: ConfigValues,
@@ -74,16 +108,17 @@ export function buildEditFromDirty(
   for (const [key, current] of Object.entries(values)) {
     if (current === saved[key]) continue;          // not dirty
     const def = CONFIG_FIELD_MAP[key];
-    if (!def || def.readOnlyStatic) continue;      // read-only — never send
+    if (!def || def.editKey === null) continue;    // read-only or safety — never send
     const meta = resolveFieldMeta(snapshot, key);
     if (meta?.read_only) continue;                 // server also says read-only
 
-    const parts = key.split(".");
-    const [section, ...rest] = parts;
-    const fieldName = rest.join("_"); // controller.pre_fc_heat_target_percent → pre_fc_heat_target_percent
-    if (section === "controller") controller[fieldName] = current;
-    if (section === "advisor") advisor[fieldName] = current;
-    // "safety" is intentionally omitted
+    const section = key.split(".")[0];
+    if (section === "controller") {
+      setPath(controller, def.editKey, current);
+    } else if (section === "advisor") {
+      setPath(advisor, def.editKey, current);
+    }
+    // "safety" is intentionally omitted (editKey is null for all safety fields)
   }
 
   const edit: Record<string, unknown> = {};

@@ -174,7 +174,7 @@ export function ConfigFieldRow({
 }: ConfigFieldRowProps): React.JSX.Element {
   const isReadOnly = fieldDef.readOnlyStatic || meta.read_only;
   const isSafetyField = fieldDef.category === "Safety";
-  const isDirtyFromDefault = value !== meta.default_value;
+  const isDirtyFromDefault = value !== meta.default;
 
   const controlProps: ControlProps = {
     fieldDef,
@@ -246,7 +246,7 @@ export function ConfigFieldRow({
             <span className="text-xs text-muted-foreground/50">Managed via env-var</span>
           ) : (
             <span className="font-mono text-xs tabular-nums text-muted-foreground/50">
-              Default {String(meta.default_value ?? "—")}
+              Default {String(meta.default ?? "—")}
               {fieldDef.unit ? ` ${fieldDef.unit}` : ""}
             </span>
           )}
@@ -254,7 +254,7 @@ export function ConfigFieldRow({
           {!isReadOnly && isDirtyFromDefault && (
             <button
               type="button"
-              onClick={() => onReset(meta.default_value)}
+              onClick={() => onReset(meta.default)}
               className="text-xs text-muted-foreground/70 transition-colors hover:text-foreground"
               data-testid={`reset-${fieldDef.key}`}
             >

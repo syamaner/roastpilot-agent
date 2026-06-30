@@ -521,8 +521,10 @@ export interface ConfigFieldMeta {
   saved_value: unknown;
   /** Fully resolved effective value (env override > saved file > default). */
   effective_value: unknown;
-  /** Schema default — shown in the "Default <value>" meta line per field. */
-  default_value: unknown;
+  /** Schema default — shown in the "Default <value>" meta line per field.
+   *  Named "default" to match the server's JSON key exactly (Python `model_dump`
+   *  serialises the `default` field name verbatim). */
+  default: unknown;
   /** Env-var name for this field, or null (e.g. api_key_env). */
   env_var: string | null;
   /** True when the env var is set in the host environment (not injected from the
