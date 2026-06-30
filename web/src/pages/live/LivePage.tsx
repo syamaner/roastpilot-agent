@@ -22,7 +22,6 @@
  */
 
 import { useCallback } from "react";
-import { useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { AppFrame } from "@/components/shared";
@@ -76,7 +75,6 @@ export function LivePage(): React.JSX.Element {
 // --- Internal start-roast view shown at /live when no run is active. ---
 
 function LiveStartView(): React.JSX.Element {
-  const navigate = useNavigate();
   const queryClient = useQueryClient();
 
   const beanProfiles = useBeanProfiles();
@@ -98,17 +96,15 @@ function LiveStartView(): React.JSX.Element {
   );
 
   // Start a roast: POST, then AWAIT a health refetch so the cache holds the new
-  // active_run_id BEFORE re-evaluating. We stay on /live — the page re-renders
-  // with the new active run id and DashboardPage mounts. We navigate to /live
-  // explicitly so a possible `push` history entry (e.g. from /start) is replaced
-  // by the live route, keeping the URL stable.
+  // active_run_id BEFORE re-evaluating. LiveStartView only ever mounts at /live,
+  // so the health refetch alone re-renders the page into DashboardPage — no
+  // navigate() call needed (which would push a duplicate /live history entry).
   const handleStartRoast = useCallback(
     async (profile: RoastProfile) => {
       await api.startRoast(profile);
       await queryClient.refetchQueries({ queryKey: roastKeys.health });
-      navigate("/live");
     },
-    [navigate, queryClient],
+    [queryClient],
   );
 
   return (
