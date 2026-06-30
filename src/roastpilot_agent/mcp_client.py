@@ -42,7 +42,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, ConfigDict
 
-from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
+from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
 from roastpilot_agent.models import MicStatus, RoastTelemetry
 
 _log = logging.getLogger(__name__)
@@ -872,6 +872,7 @@ class MCPServerProcess:
         self,
         config: MCPConfig | None = None,
         *,
+        device_config: MCPDeviceConfig | None = None,
         session: ToolSession | None = None,
         session_factory: SessionFactory | None = None,
         force_terminate: ForceTerminate | None = None,
@@ -880,6 +881,11 @@ class MCPServerProcess:
 
         Args:
             config: MCP child settings (command, timeouts). Defaults applied.
+            device_config: Managed device/config fields rendered into the MCP
+                yaml on each (re)spawn via passthrough-merge (D78-4, #420).
+                When ``None`` the yaml render step is skipped and the MCP
+                child reads its yaml directly (the pre-S3 behaviour; preserves
+                the E9-S2 ``MCPConfig.env`` path used by tests).
             session: A pre-attached ``ToolSession`` (test seam); skips spawn.
             session_factory: Override the real ``stdio_client`` spawn (test
                 seam). When omitted, the default factory both spawns the child
@@ -891,6 +897,7 @@ class MCPServerProcess:
                 tested without a real process.
         """
         self._config = config or MCPConfig()
+        self._device_config: MCPDeviceConfig | None = device_config
         self._session: ToolSession | None = session  # injectable test seam
         self._session_factory: SessionFactory = (
             session_factory if session_factory is not None else self._default_session_factory
@@ -903,6 +910,9 @@ class MCPServerProcess:
         #: Best-effort force-terminate of the spawned child group, populated by
         #: the default factory once the pid is known (or injected for tests).
         self._force_terminate: ForceTerminate | None = force_terminate
+        #: Rendered yaml temp dir; created in :meth:`build_server_parameters`
+        #: when ``_device_config`` is set, cleaned up in :meth:`stop`.
+        self._rendered_yaml_dir: Path | None = None
 
     def _default_session_factory(
         self, params: StdioServerParameters
@@ -947,8 +957,40 @@ class MCPServerProcess:
         Config ``env`` overrides are merged over the agent's own environment so
         the child keeps ``PATH``/``HOME`` while gaining the requested selectors
         (E9-S2 sets the mock-driver vars). With no overrides, ``env`` stays
-        ``None`` and the transport supplies its default safe environment."""
-        env = {**os.environ, **self._config.env} if self._config.env else None
+        ``None`` and the transport supplies its default safe environment.
+
+        When a :class:`~roastpilot_agent.config.MCPDeviceConfig` was supplied
+        at construction, the managed device fields are rendered into a temp yaml
+        via passthrough-merge (D78-4, #420) and ``COFFEE_ROASTER_MCP_CONFIG``
+        is set to that file's path in the child's environment.  The temp dir is
+        cleaned up in :meth:`stop`.  On each (re)spawn a fresh render is
+        produced so config changes between sessions take effect.
+        """
+        # Start from the MCPConfig.env overrides (E9-S2 mock-driver path).
+        extra_env: dict[str, str] = dict(self._config.env)
+
+        if self._device_config is not None:
+            import tempfile
+
+            from roastpilot_agent.mcp_yaml import render_mcp_yaml
+
+            # Clean up any leftover dir from a previous spawn before creating a new one.
+            if self._rendered_yaml_dir is not None:
+                shutil.rmtree(self._rendered_yaml_dir, ignore_errors=True)
+                self._rendered_yaml_dir = None
+
+            tmp_dir = Path(tempfile.mkdtemp(prefix="rp-mcp-yaml-"))
+            self._rendered_yaml_dir = tmp_dir
+            dest = tmp_dir / "coffee-roaster-mcp.yaml"
+            render_mcp_yaml(
+                self._device_config,
+                source_path=self._device_config.mcp_yaml_source_path,
+                dest_path=dest,
+            )
+            extra_env["COFFEE_ROASTER_MCP_CONFIG"] = str(dest)
+            _log.debug("rendered MCP yaml → %s", dest)
+
+        env: dict[str, str] | None = {**os.environ, **extra_env} if extra_env else None
         command = resolve_mcp_command(self._config.command)
         return StdioServerParameters(command=command, args=["serve"], env=env)
 
@@ -1063,6 +1105,11 @@ class MCPServerProcess:
         finally:
             self._stack = None
             self._session = None
+            # Clean up the rendered yaml temp dir (D78-4, #420); best-effort —
+            # a leftover temp dir is harmless, never blocks shutdown.
+            if self._rendered_yaml_dir is not None:
+                shutil.rmtree(self._rendered_yaml_dir, ignore_errors=True)
+                self._rendered_yaml_dir = None
 
     async def call_tool(self, name: str, arguments: dict[str, object]) -> object:
         """ToolCaller implementation: timeout-bounded, typed failures only."""

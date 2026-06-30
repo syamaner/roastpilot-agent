@@ -27,7 +27,13 @@ from roastpilot_agent.api import (
     _TickCounter,  # pyright: ignore[reportPrivateUsage]
     create_app,
 )
-from roastpilot_agent.config import AdvisorConfig, AppConfig, ControllerConfig, MCPConfig
+from roastpilot_agent.config import (
+    AdvisorConfig,
+    AppConfig,
+    ControllerConfig,
+    MCPConfig,
+    MCPDeviceConfig,
+)
 from roastpilot_agent.controller import ControllerSnapshot, RoastController
 from roastpilot_agent.mcp_client import (
     MCPConnectionError,
@@ -209,11 +215,20 @@ class _GoodFactory:
 
 def _good_process_factory(
     session: FakeInitializableSession,
-) -> Callable[[MCPConfig], MCPServerProcess]:
+) -> Callable[..., MCPServerProcess]:
     """A drop-in for ``live.MCPServerProcess`` that injects a healthy fake
-    session, so ``build_live_service`` starts/health-checks with no hardware."""
+    session, so ``build_live_service`` starts/health-checks with no hardware.
 
-    def _factory(config: MCPConfig) -> MCPServerProcess:
+    Accepts ``device_config`` (D78-4, #420) via ``**kwargs`` so the factory
+    signature stays forward-compatible without needing to replicate every
+    ``MCPServerProcess.__init__`` keyword argument.
+    """
+
+    def _factory(
+        config: MCPConfig, *, device_config: MCPDeviceConfig | None = None, **_kwargs: object
+    ) -> MCPServerProcess:  # noqa: E501
+        # device_config is intentionally unused here — the yaml-render path is
+        # an integration concern; unit tests inject a pre-wired session instead.
         return MCPServerProcess(config, session_factory=_GoodFactory(session))
 
     return _factory
@@ -222,8 +237,10 @@ def _good_process_factory(
 class _FailingProcess(MCPServerProcess):
     """An MCPServerProcess whose start() always fails, tracking stop() calls."""
 
-    def __init__(self, config: MCPConfig | None = None) -> None:
-        super().__init__(config)
+    def __init__(
+        self, config: MCPConfig | None = None, *, device_config: MCPDeviceConfig | None = None
+    ) -> None:
+        super().__init__(config, device_config=device_config)
         self.stop_called = False
 
     async def start(self) -> None:
@@ -236,10 +253,10 @@ class _FailingProcess(MCPServerProcess):
 
 def _failing_process_factory(
     process: _FailingProcess,
-) -> Callable[[MCPConfig], MCPServerProcess]:
+) -> Callable[..., MCPServerProcess]:
     """A drop-in for ``live.MCPServerProcess`` returning the failing double."""
 
-    def _factory(config: MCPConfig) -> MCPServerProcess:
+    def _factory(config: MCPConfig, **_kwargs: object) -> MCPServerProcess:
         return process
 
     return _factory
