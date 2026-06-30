@@ -110,6 +110,8 @@ export function OptionRow({ option, isSelected, isUnavailable, onSelect }: Optio
 interface DeviceListBodyProps {
   devices: DeviceOption[];
   error: string | null;
+  /** Non-null when GET /api/config/devices itself failed (network / 5xx). */
+  queryError: string | null;
   isLoading: boolean;
   selectedValue: string;
   onSelect: (value: string) => void;
@@ -120,6 +122,7 @@ interface DeviceListBodyProps {
 export function DeviceListBody({
   devices,
   error,
+  queryError,
   isLoading,
   selectedValue,
   onSelect,
@@ -131,6 +134,18 @@ export function DeviceListBody({
       <div className="flex items-center gap-2 px-3 py-4 text-sm text-muted-foreground" data-testid="device-list-loading">
         <SpinnerGlyph />
         Scanning for devices…
+      </div>
+    );
+  }
+
+  if (queryError) {
+    return (
+      <div data-testid="device-list-query-error">
+        <div className="px-3 py-4">
+          <p className="text-sm font-medium text-roast-fault">Couldn't load devices</p>
+          <p className="mt-0.5 font-mono text-xs text-muted-foreground/70">{queryError}</p>
+        </div>
+        <RescanFooter isRescanning={isRescanning} onRescan={onRescan} />
       </div>
     );
   }
@@ -192,16 +207,24 @@ export function DeviceListBody({
 interface PopoverProps {
   open: boolean;
   onClose: () => void;
+  /** The trigger element: excluded from the outside-click check so the
+   *  trigger's own onClick toggle remains the single authority for open/close. */
+  triggerRef: React.RefObject<HTMLButtonElement | null>;
   children: React.ReactNode;
 }
 
-export function DevicePopover({ open, onClose, children }: PopoverProps): React.JSX.Element | null {
+export function DevicePopover({ open, onClose, triggerRef, children }: PopoverProps): React.JSX.Element | null {
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!open) return;
     function onMouseDown(e: MouseEvent): void {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+      const target = e.target as Node;
+      // Skip the close when the click is inside the popover OR on the trigger —
+      // the trigger's onClick already handles toggle; firing onClose here first
+      // would reopen the menu (onClose → open=false → onClick toggle → open=true).
+      const insideTrigger = triggerRef.current?.contains(target) ?? false;
+      if (!insideTrigger && ref.current && !ref.current.contains(target)) onClose();
     }
     function onKeyDown(e: KeyboardEvent): void {
       if (e.key === "Escape") onClose();
@@ -212,7 +235,7 @@ export function DevicePopover({ open, onClose, children }: PopoverProps): React.
       document.removeEventListener("mousedown", onMouseDown);
       document.removeEventListener("keydown", onKeyDown);
     };
-  }, [open, onClose]);
+  }, [open, onClose, triggerRef]);
 
   if (!open) return null;
 
@@ -267,10 +290,12 @@ export function DeviceSelect({
   const id = useId();
   const triggerRef = useRef<HTMLButtonElement>(null);
 
-  const { data, isPending, isRefetching, refetch } = useDevices();
+  const { data, isPending, isRefetching, isError, error: queryErr, refetch } = useDevices();
 
   const devices = data?.[deviceKind] ?? [];
   const error = data?.[`${deviceKind}_error`] ?? null;
+  // Query-level failure (network/5xx): distinct from per-source enumeration errors.
+  const queryError = isError ? (queryErr instanceof Error ? queryErr.message : "Request failed") : null;
   // isPending: no data yet (initial load) → trigger shows spinner; body shows loading state.
   // isRefetching: re-scan with existing data → trigger shows spinner; body shows list + footer spinner.
   const triggerBusy = isPending || isRefetching;
@@ -332,10 +357,11 @@ export function DeviceSelect({
           <ChevronGlyph open={open} />
         </button>
 
-        <DevicePopover open={open} onClose={() => setOpen(false)}>
+        <DevicePopover open={open} onClose={() => setOpen(false)} triggerRef={triggerRef}>
           <DeviceListBody
             devices={devices}
             error={error}
+            queryError={queryError}
             isLoading={isPending}
             selectedValue={value}
             onSelect={handleSelect}

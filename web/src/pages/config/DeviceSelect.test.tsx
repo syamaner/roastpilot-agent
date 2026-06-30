@@ -39,6 +39,8 @@ interface DevicesMockReturn {
   data: DevicesSnapshot | undefined;
   isPending: boolean;
   isRefetching: boolean;
+  isError: boolean;
+  error: Error | null;
   refetch: () => Promise<unknown>;
 }
 const useDevicesMock = vi.hoisted(() => vi.fn<() => DevicesMockReturn>());
@@ -97,6 +99,8 @@ function defaultMockState(overrides?: Partial<DevicesMockReturn>): void {
     data: LOADED_SNAPSHOT,
     isPending: false,
     isRefetching: false,
+    isError: false,
+    error: null,
     refetch: makeRefetch(),
     ...overrides,
   });
@@ -189,6 +193,14 @@ describe("DeviceSelect — loaded state", () => {
     expect(onChange).toHaveBeenCalledWith(SERIAL_DEVICES[0]!.value);
   });
 
+  it("clicking the trigger while the popover is open closes it (toggle)", () => {
+    renderSelect();
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    expect(screen.getByTestId(`device-option-${SERIAL_DEVICES[0]!.value}`)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    expect(screen.queryByTestId(`device-option-${SERIAL_DEVICES[0]!.value}`)).toBeNull();
+  });
+
   it("closes the popover on Escape", () => {
     renderSelect();
     fireEvent.click(screen.getByTestId("device-select-trigger"));
@@ -276,6 +288,22 @@ describe("DeviceSelect — error state", () => {
     fireEvent.click(screen.getByTestId("device-select-trigger"));
     expect(screen.getByTestId("device-list-error"))
       .toHaveTextContent(ERROR_SNAPSHOT.audio_input_error!);
+  });
+});
+
+describe("DeviceSelect — query error state", () => {
+  it("shows a distinct query-error state (not empty) when GET /api/config/devices itself fails", () => {
+    defaultMockState({
+      data: undefined,
+      isError: true,
+      error: new Error("500 Internal Server Error"),
+    });
+    renderSelect();
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    expect(screen.getByTestId("device-list-query-error")).toBeInTheDocument();
+    expect(screen.getByTestId("device-list-query-error"))
+      .toHaveTextContent("Couldn't load devices");
+    expect(screen.queryByTestId("device-list-empty")).toBeNull();
   });
 });
 
