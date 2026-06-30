@@ -341,10 +341,17 @@ describe("dashboard page parser — folds every event it consumes", () => {
     );
   });
 
-  it("t0_detected sets the T0 marker (anchored to the latest plotted point, #326)", () => {
-    // The T0 marker anchors to the latest plotted point's serve-elapsed (#326), so
-    // fold a telemetry frame first — t0_detected on an EMPTY buffer records the
-    // detection but places no marker (the telemetry-derive path sets it later).
+  it("t0_detected records the detection; the T0 marker is placed by the first post-charge telemetry (#326/#404)", () => {
+    // t0_detected records the detection payload (wire-contract fields: bean_temp_c,
+    // debounce_ticks) but does NOT place the T0 marker itself — the marker x is
+    // derived from the first post-charge telemetry frame via
+    // elapsed_seconds − charge_elapsed_seconds, anchoring it at the ACTUAL charge
+    // tick rather than the detection-fire frame (~11 s later, in the thermal dip).
+    //
+    // The contract telemetry fixture is a preheat frame (charge_elapsed_seconds: null),
+    // so after folding it + t0_detected, t0 is recorded but no marker is placed.
+    // The marker appears once a post-charge telemetry frame arrives (tested in
+    // useDashboardEvents.test.ts).
     let next = dashboardReducer(initialDashboardViewModel, {
       kind: "event",
       event: frame("telemetry"),
@@ -354,7 +361,10 @@ describe("dashboard page parser — folds every event it consumes", () => {
       event: frame("t0_detected"),
     });
     expect(next.t0).not.toBeNull();
-    expect(next.markers.some((m) => m.kind === "t0")).toBe(true);
+    // Contract: bean_temp_c is carried in the payload.
+    expect((next.t0 as unknown as Record<string, unknown>).bean_temp_c).toBeDefined();
+    // The marker is deferred to the telemetry path (charge_elapsed_seconds non-null).
+    expect(next.markers.some((m) => m.kind === "t0")).toBe(false);
   });
 
   it("first_crack carries source and sets the FC marker", () => {
