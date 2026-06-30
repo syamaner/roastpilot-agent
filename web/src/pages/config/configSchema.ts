@@ -374,6 +374,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     label:          "k_ror",
     hint:           "RoR sensitivity: each °C/min above ror_ref deepens the cut by this many pp. Default 1.5.",
     type:           "number",
+    min:            0,    // ge=0.0 in LateMaillardTrimEdit — negative gains are rejected
     step:           0.1,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__K_ROR",
     editKey:        "pre_first_crack_levers.late_maillard_trim.k_ror",
@@ -385,6 +386,7 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     label:          "k_eta",
     hint:           "ETA sensitivity: each 1 s under eta_ref deepens the cut by this many pp. Default 0.2.",
     type:           "number",
+    min:            0,    // ge=0.0 in LateMaillardTrimEdit — negative gains are rejected
     step:           0.01,
     envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__K_ETA",
     editKey:        "pre_first_crack_levers.late_maillard_trim.k_eta",

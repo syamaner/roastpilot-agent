@@ -258,14 +258,28 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
     saved: buildValuesFromSnapshot(snapshot),
   });
 
-  // Re-initialise when the snapshot reference changes — e.g. after a successful
-  // save the mutation updates the cache to the server's confirmed snapshot.
-  // Using a ref to compare identity avoids triggering on the same snapshot.
+  // Re-initialise when the snapshot reference changes — but ONLY when there are
+  // no unsaved edits. Background refetches and reconnect snapshots must not
+  // silently clobber dirty edits the operator hasn't saved yet.
+  //
+  // The save flow is safe: handleSave awaits mutateAsync, which on success calls
+  // setQueryData (new snapshot reference) → this component re-renders with the
+  // server-confirmed snapshot. By the time that snapshot arrives, the save has
+  // completed and state.values === state.saved (both rebuilt by the last INIT
+  // from the previous snapshot), so the dirty guard is false and re-init fires.
   const snapshotRef = useRef(snapshot);
+  const stateRef = useRef(state);
+  stateRef.current = state;
   useEffect(() => {
     if (snapshotRef.current !== snapshot) {
       snapshotRef.current = snapshot;
-      dispatch({ type: "INIT", snapshot });
+      const { values, saved } = stateRef.current;
+      const isDirty = Object.keys(values).some((k) => values[k] !== saved[k]);
+      if (!isDirty) {
+        dispatch({ type: "INIT", snapshot });
+      }
+      // When dirty: skip re-init; the operator's edits are preserved.
+      // The next explicit Save or Discard will re-sync with the snapshot.
     }
   }, [snapshot]);
 
@@ -351,6 +365,31 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
                       (obj[seg] as Record<string, unknown>) ?? {},
                     snapshot as unknown as Record<string, unknown>,
                   );
+
+              // Cross-field bounds: server rejects values that violate sibling
+              // constraints. Wire dynamic min/max so the UI can't offer an
+              // unsaveable value.
+              //
+              // heat_target_percent ≥ trim_heat_percent (effective from snapshot)
+              //   → trim_heat_percent is the floor for heat.
+              // fan_target_percent ≤ fan_ceiling_percent
+              //   → fan_ceiling_percent is NOT in the snapshot; use the server
+              //     default of 30 (PreFirstCrackLevers.fan_ceiling_percent).
+              let dynMin: number | undefined;
+              let dynMax: number | undefined;
+              if (fieldDef.key === "controller.pre_fc_heat_target_percent") {
+                const trimHeatMeta = snapshot.controller.late_maillard_trim_heat_percent;
+                const trimHeat = typeof trimHeatMeta.effective_value === "number"
+                  ? trimHeatMeta.effective_value
+                  : 10;  // ge=10 floor from LateMaillardTrimEdit
+                dynMin = trimHeat;
+              } else if (fieldDef.key === "controller.pre_fc_fan_target_percent") {
+                // fan_ceiling_percent not exposed in GET /api/config snapshot;
+                // cap at the server default (30). PR3/S4 can expose and
+                // dynamically wire once the snapshot includes it.
+                dynMax = 30;
+              }
+
               return (
                 <ConfigFieldRow
                   key={fieldDef.key}
@@ -364,6 +403,8 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
                   onReset={(defaultValue) =>
                     dispatch({ type: "RESET_FIELD", key: fieldDef.key, defaultValue })
                   }
+                  dynMin={dynMin}
+                  dynMax={dynMax}
                 />
               );
             })}

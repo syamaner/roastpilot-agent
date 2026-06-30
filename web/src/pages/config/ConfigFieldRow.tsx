@@ -27,6 +27,12 @@ interface ControlProps {
   value: unknown;
   disabled: boolean;
   onChange: (v: unknown) => void;
+  /** Dynamic lower bound for number fields — overrides the static schema `min`.
+   *  Used for cross-field constraints: heat ≥ effective trim_heat_percent. */
+  dynMin?: number;
+  /** Dynamic upper bound for number fields — overrides the static schema `max`.
+   *  Used for cross-field constraints: fan ≤ effective fan_ceiling_percent. */
+  dynMax?: number;
 }
 
 function TextControl({ fieldDef, value, disabled, onChange }: ControlProps): React.JSX.Element {
@@ -62,15 +68,17 @@ function MaskedControl({ fieldDef, value, disabled }: Omit<ControlProps, "onChan
   );
 }
 
-function NumberControl({ fieldDef, value, disabled, onChange }: ControlProps): React.JSX.Element {
+function NumberControl({ fieldDef, value, disabled, onChange, dynMin, dynMax }: ControlProps): React.JSX.Element {
   const numVal = typeof value === "number" ? value : Number(value ?? 0);
+  const minVal = dynMin !== undefined ? dynMin : fieldDef.min;
+  const maxVal = dynMax !== undefined ? dynMax : fieldDef.max;
   return (
     <input
       type="number"
       id={fieldDef.key}
       value={numVal}
-      min={fieldDef.min}
-      max={fieldDef.max}
+      min={minVal}
+      max={maxVal}
       step={fieldDef.step ?? 1}
       disabled={disabled}
       onChange={(e) => onChange(Number(e.target.value))}
@@ -162,6 +170,12 @@ export interface ConfigFieldRowProps {
   onChange: (v: unknown) => void;
   /** Called with the field's schema default value so the parent can reset to it. */
   onReset: (defaultValue: unknown) => void;
+  /** Dynamic lower bound — overrides the static schema `min` for cross-field
+   *  constraints (e.g. heat_target_percent ≥ effective trim_heat_percent). */
+  dynMin?: number;
+  /** Dynamic upper bound — overrides the static schema `max` for cross-field
+   *  constraints (e.g. fan_target_percent ≤ effective fan_ceiling_percent). */
+  dynMax?: number;
 }
 
 export function ConfigFieldRow({
@@ -171,16 +185,24 @@ export function ConfigFieldRow({
   isLast,
   onChange,
   onReset,
+  dynMin,
+  dynMax,
 }: ConfigFieldRowProps): React.JSX.Element {
   const isReadOnly = fieldDef.readOnlyStatic || meta.read_only;
   const isSafetyField = fieldDef.category === "Safety";
   const isDirtyFromDefault = value !== meta.default;
+
+  // Effective bounds: dynamic override > static schema value
+  const effectiveMin = dynMin !== undefined ? dynMin : fieldDef.min;
+  const effectiveMax = dynMax !== undefined ? dynMax : fieldDef.max;
 
   const controlProps: ControlProps = {
     fieldDef,
     value,
     disabled: isReadOnly,
     onChange,
+    dynMin,
+    dynMax,
   };
 
   let control: React.JSX.Element;
@@ -228,15 +250,15 @@ export function ConfigFieldRow({
       <div className="flex flex-col gap-1.5">
         {control}
 
-        {/* Range hint for numeric fields */}
-        {fieldDef.type === "number" && (fieldDef.min !== undefined || fieldDef.max !== undefined) && (
+        {/* Range hint for numeric fields — uses effective (dynamic) bounds */}
+        {fieldDef.type === "number" && (effectiveMin !== undefined || effectiveMax !== undefined) && (
           <p className="text-xs text-muted-foreground/70">
             {fieldDef.unit ? `${fieldDef.unit} · ` : ""}
-            {fieldDef.min !== undefined && fieldDef.max !== undefined
-              ? `Range ${fieldDef.min}–${fieldDef.max}`
-              : fieldDef.min !== undefined
-              ? `Min ${fieldDef.min}`
-              : `Max ${fieldDef.max}`}
+            {effectiveMin !== undefined && effectiveMax !== undefined
+              ? `Range ${effectiveMin}–${effectiveMax}`
+              : effectiveMin !== undefined
+              ? `Min ${effectiveMin}`
+              : `Max ${effectiveMax}`}
           </p>
         )}
 

@@ -525,10 +525,11 @@ export interface ConfigFieldMeta {
    *  Named "default" to match the server's JSON key exactly (Python `model_dump`
    *  serialises the `default` field name verbatim). */
   default: unknown;
-  /** Env-var name for this field, or null (e.g. api_key_env). */
-  env_var: string | null;
   /** True when the env var is set in the host environment (not injected from the
-   *  saved file by the agent). PR3 renders the env-override badge when true. */
+   *  saved file by the agent). PR3 renders the env-override badge when it is true,
+   *  paired with the static `ConfigFieldDef.envVar` name from the schema.
+   *  NOTE: The server does NOT return `env_var` — the name comes from the static
+   *  schema; only this boolean is returned per field. */
   env_overridden: boolean;
   /** True when the field cannot be edited from the UI (hardware-pinned or safety). */
   read_only: boolean;
@@ -559,7 +560,7 @@ export interface AdvisorConfigSnapshot {
   prompt_version: ConfigFieldMeta;
   provider: ConfigFieldMeta;
   provider_base_url: ConfigFieldMeta;
-  /** api_key_env: always read_only=true; saved_value=null; env_var=null. */
+  /** api_key_env: always read_only=true; saved_value=null; env_overridden=false. */
   api_key_env: ConfigFieldMeta;
   timeout_seconds: ConfigFieldMeta;
   temperature: ConfigFieldMeta;

@@ -10,6 +10,8 @@
  *  6. Discard resets values to the saved baseline.
  *  7. Reset-to-default button restores a field's default value.
  *  8. Read-only fields (safety, hardware-pinned) render disabled controls.
+ *  9. Dirty edits preserved when a background snapshot refresh arrives.
+ * 10. PUT body nesting correct for pre_first_crack_levers and late_maillard_trim.
  */
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -29,7 +31,6 @@ function makeFieldMeta(overrides?: Partial<ConfigFieldMeta>): ConfigFieldMeta {
     saved_value: null,
     effective_value: null,
     default: null,
-    env_var: null,
     env_overridden: false,
     read_only: false,
     description: "",
@@ -243,6 +244,31 @@ describe("ConfigPage — save model", () => {
     // No dirty fields → save bar not present → no PUT possible
     expect(screen.queryByTestId("config-save-bar")).toBeNull();
     expect(saveConfigMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves dirty edits when a background snapshot refresh arrives", async () => {
+    // Simulate a background refetch delivering a new snapshot reference while
+    // the operator has unsaved edits — the INIT effect must be gated behind a
+    // dirty check so the edits are not silently clobbered.
+    const { client } = renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+
+    // Edit model slug to something non-default
+    const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
+    fireEvent.change(modelInput!, { target: { value: "anthropic/claude-3-5-sonnet" } });
+    expect(screen.getByTestId("config-save-bar")).toBeInTheDocument();
+    expect(modelInput!.value).toBe("anthropic/claude-3-5-sonnet");
+
+    // Simulate a background snapshot refresh by pushing a new (different-reference)
+    // snapshot into the query cache — this triggers a re-render with a new prop.
+    client.setQueryData(["config"], makeSnapshot({ model_slug: "openai/gpt-4o" }));
+
+    // After the cache update, the dirty edit must still be in the input
+    // (the INIT must have been skipped because the form was dirty).
+    await waitFor(() => {
+      expect(modelInput!.value).toBe("anthropic/claude-3-5-sonnet");
+    });
+    expect(screen.getByTestId("config-save-bar")).toBeInTheDocument();
   });
 });
 
