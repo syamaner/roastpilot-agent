@@ -1362,3 +1362,69 @@ def test_json_blob_env_var_does_not_affect_other_sections(
     # Controller: saved-file injection still works.
     assert effective.controller.pre_first_crack_levers.heat_target_percent == 80
     assert snap.controller.pre_fc_heat_target_percent.env_overridden is False
+
+
+def test_partial_json_blob_keeps_non_blob_saved_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial JSON blob (only some fields) must not revert non-blob fields to defaults.
+
+    The bug (#426 blocker): a whole-section skip dropped all saved-file injection
+    for a section, causing non-blob fields to silently fall back to code defaults
+    (e.g. saved timeout_seconds=99.0 reverting to default 10.0).
+
+    Fix: inject saved-file scalars only for fields NOT present in the blob.
+    pydantic-settings scalar nested env vars beat the section JSON blob, so
+    injecting a scalar for a non-blob field does not compete with the blob.
+    """
+    import json
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "advisor:\n  model_slug: saved-model\n  timeout_seconds: 99.0\n  temperature: 0.8\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_file))
+    # Partial blob: only model_slug — timeout_seconds and temperature are NOT in the blob.
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", json.dumps({"model_slug": "blob-model"}))
+
+    effective, injected = load_app_config()
+    saved_raw = _load_saved_config(cfg_file)
+    snap = build_config_snapshot(effective, saved_raw, injected)
+
+    # Blob field wins.
+    assert effective.advisor.model_slug == "blob-model"
+    assert snap.advisor.model_slug.env_overridden is True
+
+    # Non-blob fields keep their saved values (NOT code defaults).
+    assert effective.advisor.timeout_seconds == 99.0, (
+        "timeout_seconds must use the saved value (99.0), not the code default (10.0)"
+    )
+    assert effective.advisor.temperature == 0.8, (
+        "temperature must use the saved value (0.8), not the code default (0.0)"
+    )
+    assert snap.advisor.timeout_seconds.env_overridden is False
+    assert snap.advisor.temperature.env_overridden is False
+
+
+def test_malformed_json_blob_inject_saved_as_env_does_not_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed JSON-blob section env var must not crash _inject_saved_as_env.
+
+    The safe fallback is to skip the entire section (no saved-file injection for
+    it), which avoids both a crash and the original shadow bug.  The test covers
+    _inject_saved_as_env directly because AppConfig() itself raises
+    SettingsError for a malformed blob (pydantic-settings' own validation).
+    """
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", "not json")
+
+    # Must not raise.
+    injected = _inject_saved_as_env(
+        {"advisor": {"model_slug": "saved-model", "timeout_seconds": 55.0}}
+    )
+
+    # Full section skip on malformed blob — no advisor scalars injected.
+    assert not any("ROASTPILOT_ADVISOR__" in k for k in injected)
+    assert "ROASTPILOT_ADVISOR__MODEL_SLUG" not in os.environ

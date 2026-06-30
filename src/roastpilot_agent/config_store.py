@@ -542,13 +542,30 @@ def _make_field_meta(
     # A field is env-overridden when either:
     # (a) its own per-field scalar env var is set and not merely injected from
     #     the saved file (e.g. ROASTPILOT_ADVISOR__MODEL_SLUG in os.environ), OR
-    # (b) a top-level JSON-blob env var covering the whole section is set and
-    #     not injected (e.g. ROASTPILOT_ADVISOR='{"model_slug":"gpt-4o"}').
-    #     In this case the per-field scalar var is absent from os.environ even
-    #     though the field's value was supplied by the operator (#426).
+    # (b) a top-level JSON-blob env var for the section is set AND this field's
+    #     own key appears in that blob (e.g. ROASTPILOT_ADVISOR='{"model_slug":
+    #     "gpt-4o"}' — model_slug is in the blob, env_overridden=True).
+    #     Fields NOT in the blob are NOT flagged — partial-blob fix (#426).
     scalar_overridden = bool(env_var and _env_is_set(env_var) and env_var not in injected)
     section_key = env_var.split("__")[0] if env_var and "__" in env_var else None
-    blob_overridden = bool(section_key and _env_is_set(section_key) and section_key not in injected)
+    blob_overridden = False
+    if section_key and _env_is_set(section_key) and section_key not in injected:
+        # The section has a JSON-blob env var.  Parse it and check whether this
+        # field's own key is present.  env_var = "ROASTPILOT_ADVISOR__MODEL_SLUG":
+        #   section_key = "ROASTPILOT_ADVISOR"
+        #   field_key   = "MODEL_SLUG"   (first segment after stripping section__)
+        # Compare case-insensitively against the blob's top-level keys.
+        field_key_raw = env_var[len(section_key) + 2 :] if env_var else ""
+        top_field_key = field_key_raw.split("__")[0].lower()
+        import json as _json
+
+        try:
+            parsed = _json.loads(os.environ[section_key])
+            if isinstance(parsed, dict):
+                parsed_dict = cast("dict[str, Any]", parsed)
+                blob_overridden = top_field_key in {k.lower() for k in parsed_dict}
+        except (ValueError, TypeError):
+            pass  # malformed blob — leave blob_overridden=False
     env_overridden = scalar_overridden or blob_overridden
     return ConfigFieldMeta(
         saved_value=saved_value,
@@ -1440,16 +1457,40 @@ def _inject_saved_as_env(saved_raw: _RawSavedConfig) -> frozenset[str]:
             # without an explicit change to AppConfigEdit or SafetyLimitsSnapshot.
             continue
         # JSON-blob section env var precedence (#426): if the operator has set a
-        # top-level JSON-blob env var for this whole section (e.g.
-        # ROASTPILOT_ADVISOR='{"model_slug":"gpt-4o"}'), that var governs ALL
-        # fields in the section.  pydantic-settings resolves individual scalar
-        # env vars (ROASTPILOT_ADVISOR__MODEL_SLUG) AFTER the JSON blob, so
-        # injecting saved-file scalars here would shadow the JSON blob values.
-        # Skip the entire section when such a key is already set in the environment.
+        # top-level JSON-blob env var for this section (e.g.
+        # ROASTPILOT_ADVISOR='{"model_slug":"gpt-4o"}'), its fields win over
+        # any scalars we inject.  pydantic-settings resolves scalar nested env
+        # vars (ROASTPILOT_ADVISOR__MODEL_SLUG) AFTER the JSON blob, so
+        # injecting a saved scalar for a field the blob already sets would
+        # shadow the blob value — wrong.
+        #
+        # FIX (partial-blob safe): parse the blob's top-level keys and skip
+        # injection ONLY for the fields actually present in the blob.  Fields
+        # NOT in the blob don't compete with anything and must keep their saved
+        # value (the injected scalar wins because no other var is present).
+        # If the blob is malformed or not a dict, fall back to skipping the
+        # entire section so we never re-introduce the original shadow bug.
         section_key = prefix[:-2]  # strip trailing "__" → e.g. "ROASTPILOT_ADVISOR"
+        blob_fields: frozenset[str] = frozenset()
         if section_key in os.environ:
-            continue
-        _inject_section(cast("dict[str, Any]", section_val), prefix, injected)
+            import json as _json
+
+            try:
+                parsed = _json.loads(os.environ[section_key])
+                if isinstance(parsed, dict):
+                    # Normalise blob keys to uppercase to match env-var naming.
+                    parsed_dict = cast("dict[str, Any]", parsed)
+                    blob_fields = frozenset(k.upper() for k in parsed_dict)
+                else:
+                    # Non-dict blob (unexpected) — skip the whole section to
+                    # avoid injecting scalars that compete with the blob value.
+                    continue
+            except (ValueError, TypeError):
+                # Malformed blob — skip the whole section (safe fallback).
+                continue
+        _inject_section(
+            cast("dict[str, Any]", section_val), prefix, injected, blob_fields=blob_fields
+        )
     return frozenset(injected)
 
 
@@ -1457,6 +1498,8 @@ def _inject_section(
     section_dict: dict[str, Any],
     prefix: str,
     injected: set[str],
+    *,
+    blob_fields: frozenset[str] = frozenset(),
 ) -> None:
     """Recursively inject a section of the saved config as env vars.
 
@@ -1464,6 +1507,11 @@ def _inject_section(
         section_dict: The section's value dict from the saved-config YAML.
         prefix: The env-var prefix accumulated so far (already uppercased).
         injected: Mutable set to record every env-var key that is written.
+        blob_fields: Uppercase top-level keys that a JSON-blob section env var
+            already covers for this section (#426).  A saved scalar for a field
+            in this set is NOT injected — the blob value wins and injecting a
+            competing scalar would shadow it.  Nested sub-sections are passed
+            an empty blob_fields (blob coverage is top-level only).
     """
     import json
 
@@ -1473,7 +1521,13 @@ def _inject_section(
             # This non-safety field is read-only in the snapshot — skip it.
             continue
         if isinstance(val, dict):
+            # Nested sub-section: pass empty blob_fields — blob coverage only
+            # applies at the top-level keys of the blob dict, not recursively.
             _inject_section(cast("dict[str, Any]", val), f"{env_key}__", injected)
+        elif key.upper() in blob_fields:
+            # This field is already set by the JSON-blob env var — skip
+            # injection so the blob value wins (#426 partial-blob fix).
+            pass
         elif env_key not in os.environ:
             # Scalar — serialise to a JSON-compatible string so pydantic-settings
             # can coerce it back (bool → "true"/"false", int/float → numeric str).
