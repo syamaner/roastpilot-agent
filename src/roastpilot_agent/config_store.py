@@ -64,6 +64,7 @@ from roastpilot_agent.config import (
     AppConfig,
     LateMaillardTrim,
     PreFirstCrackLevers,
+    SafetyLimits,
 )
 
 
@@ -95,25 +96,27 @@ DEFAULT_CONFIG_FILE_PATH = Path.home() / ".roastpilot" / "config.yaml"
 # Read-only env-key guard
 # ---------------------------------------------------------------------------
 
-# Set of ROASTPILOT_* environment variable names that must NEVER be injected
-# from the saved-config file.  These correspond to fields with read_only=True
-# in the snapshot; they include all SafetyLimits and the hardware-pinned
-# controller tick.  The guard operates on the normalised (uppercased) env key
-# so that a hand-edited YAML with 'Safety:', 'SAFETY:', or 'SaFeTy:' cannot
-# bypass it (the key is derived via section.upper() in _inject_saved_as_env).
-#
-# Driven by metadata — not a single hardcoded section name.  If a new read-only
-# field is added to a snapshot, its env-var name must be added here as well.
-_NEVER_INJECT_ENV_KEYS: frozenset[str] = frozenset(
+# Env-var prefix for ALL SafetyLimits fields.  The entire prefix is blocked
+# at the section level in _inject_saved_as_env — field-list-independent, so
+# a new SafetyLimits field can never slip through without a code change to
+# AppConfigEdit or SafetyLimitsSnapshot (both intentionally exclude safety).
+_SAFETY_ENV_PREFIX: str = "ROASTPILOT_SAFETY__"
+
+# Derive all known ROASTPILOT_SAFETY__* env-var names from the real model so
+# tests can assert completeness against SafetyLimits.model_fields (all 10).
+# These are INFORMATIONAL (tests + comments); the injection guard operates at
+# the section-prefix level above and does not enumerate individual fields.
+_ALL_SAFETY_ENV_KEYS: frozenset[str] = frozenset(
+    f"{_SAFETY_ENV_PREFIX}{name.upper()}" for name in SafetyLimits.model_fields
+)
+
+# Non-safety individual read-only env-var keys — fields that are read_only in
+# the snapshot but live in non-safety sections.  Derived from the known set so
+# adding a new read-only controller/advisor field requires updating this set.
+# Driven by metadata: each entry maps 1:1 to a ConfigFieldMeta with
+# read_only=True and a known env_var in build_config_snapshot.
+_NEVER_INJECT_NON_SAFETY_KEYS: frozenset[str] = frozenset(
     {
-        # All SafetyLimits fields (read-only in M1, D78 constraint 2).
-        "ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C",
-        "ROASTPILOT_SAFETY__MAX_ENV_TEMP_C",
-        "ROASTPILOT_SAFETY__BITTER_CEILING_TEMP_C",
-        "ROASTPILOT_SAFETY__EMERGENCY_DROP_TEMP_C",
-        "ROASTPILOT_SAFETY__MIN_SECONDS_BETWEEN_COMMANDS",
-        "ROASTPILOT_SAFETY__MAX_CONSECUTIVE_MCP_FAILURES",
-        "ROASTPILOT_SAFETY__MAX_CONSECUTIVE_ADVISOR_FAILURES",
         # Hardware-pinned controller tick (read-only in M1).
         "ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS",
     }
@@ -217,15 +220,24 @@ class SafetyLimitsSnapshot(BaseModel, frozen=True):
     All fields are read-only in M1 (D78 constraint 2): there is no PUT path to
     any safety limit, so the UI can show explanations and defaults without the
     risk of silent weakening.
+
+    All 10 :class:`~roastpilot_agent.config.SafetyLimits` fields are present,
+    including the three enforced pre-T0 overrun fields.
+    ``pre_t0_overrun_severity`` is a ``Literal["recovery", "fault"]`` displayed
+    as a plain string; no special FE handling is required beyond showing the
+    value (it is read-only in M1).
     """
 
     max_bean_temp_c: ConfigFieldMeta
     max_env_temp_c: ConfigFieldMeta
-    bitter_ceiling_temp_c: ConfigFieldMeta
-    emergency_drop_temp_c: ConfigFieldMeta
+    pre_t0_max_bean_temp_c: ConfigFieldMeta
+    overrun_safe_fan_percent: ConfigFieldMeta
+    pre_t0_overrun_severity: ConfigFieldMeta
     min_seconds_between_commands: ConfigFieldMeta
     max_consecutive_mcp_failures: ConfigFieldMeta
     max_consecutive_advisor_failures: ConfigFieldMeta
+    bitter_ceiling_temp_c: ConfigFieldMeta
+    emergency_drop_temp_c: ConfigFieldMeta
 
 
 class AppConfigSnapshot(BaseModel, frozen=True):
@@ -772,28 +784,41 @@ def build_config_snapshot(
                 " indicate a fault. Default 240 °C. Read-only."
             ),
         ),
-        bitter_ceiling_temp_c=_meta(
+        pre_t0_max_bean_temp_c=_meta(
             None,
-            sf.bitter_ceiling_temp_c,
-            sf_def.bitter_ceiling_temp_c,
-            "ROASTPILOT_SAFETY__BITTER_CEILING_TEMP_C",
+            sf.pre_t0_max_bean_temp_c,
+            sf_def.pre_t0_max_bean_temp_c,
+            "ROASTPILOT_SAFETY__PRE_T0_MAX_BEAN_TEMP_C",
             read_only=True,
             description=(
-                "Drop/bitter ceiling (°C). Bean temperature past which a medium"
-                " roast turns bitter. Advisor and control are told this ceiling."
-                " Default 196 °C. Read-only."
+                "Maximum bean temperature (°C) permitted during preheating before"
+                " T0 (charge) is confirmed. Exceeding this while the charge has not"
+                " yet been confirmed triggers the pre-T0 overrun policy (heat 0 %,"
+                " fan to overrun_safe_fan_percent). Default 200 °C. Read-only."
             ),
         ),
-        emergency_drop_temp_c=_meta(
+        overrun_safe_fan_percent=_meta(
             None,
-            sf.emergency_drop_temp_c,
-            sf_def.emergency_drop_temp_c,
-            "ROASTPILOT_SAFETY__EMERGENCY_DROP_TEMP_C",
+            sf.overrun_safe_fan_percent,
+            sf_def.overrun_safe_fan_percent,
+            "ROASTPILOT_SAFETY__OVERRUN_SAFE_FAN_PERCENT",
             read_only=True,
             description=(
-                "Emergency-drop temperature (°C). Above this the roast must be"
-                " dropped immediately regardless of development. 2 °C above the"
-                " bitter ceiling by design. Default 198 °C. Read-only."
+                "Fan level (%) applied during a pre-T0 overrun. Keeps the chamber"
+                " ventilated while heat is cut to 0 %. Default 100 (maximum"
+                " airflow). Read-only."
+            ),
+        ),
+        pre_t0_overrun_severity=_meta(
+            None,
+            sf.pre_t0_overrun_severity,
+            sf_def.pre_t0_overrun_severity,
+            "ROASTPILOT_SAFETY__PRE_T0_OVERRUN_SEVERITY",
+            read_only=True,
+            description=(
+                "Severity of a pre-T0 temperature overrun: 'recovery' (operator"
+                " must acknowledge before resuming) or 'fault' (immediate halt)."
+                " Default 'recovery'. Displayed as a plain string. Read-only."
             ),
         ),
         min_seconds_between_commands=_meta(
@@ -828,6 +853,30 @@ def build_config_snapshot(
             description=(
                 "Consecutive advisor availability failures before failing closed."
                 " Default 3. Does not count malformed/unsafe responses. Read-only."
+            ),
+        ),
+        bitter_ceiling_temp_c=_meta(
+            None,
+            sf.bitter_ceiling_temp_c,
+            sf_def.bitter_ceiling_temp_c,
+            "ROASTPILOT_SAFETY__BITTER_CEILING_TEMP_C",
+            read_only=True,
+            description=(
+                "Drop/bitter ceiling (°C). Bean temperature past which a medium"
+                " roast turns bitter. Advisor and control are told this ceiling."
+                " Default 196 °C. Read-only."
+            ),
+        ),
+        emergency_drop_temp_c=_meta(
+            None,
+            sf.emergency_drop_temp_c,
+            sf_def.emergency_drop_temp_c,
+            "ROASTPILOT_SAFETY__EMERGENCY_DROP_TEMP_C",
+            read_only=True,
+            description=(
+                "Emergency-drop temperature (°C). Above this the roast must be"
+                " dropped immediately regardless of development. 2 °C above the"
+                " bitter ceiling by design. Default 198 °C. Read-only."
             ),
         ),
     )
@@ -1021,14 +1070,18 @@ def _inject_saved_as_env(saved_raw: _RawSavedConfig) -> frozenset[str]:
     Only keys NOT already present in the environment are injected, so real
     env-var overrides still win (env-overrides-file precedence, D78).
 
-    **Read-only guard:** fields listed in :data:`_NEVER_INJECT_ENV_KEYS` are
-    never injected, regardless of which YAML section they appear in.  The guard
-    is driven by the snapshot metadata (the frozenset mirrors each field marked
-    ``read_only=True`` that has a known env-var name) and operates on the
-    uppercased env-key form, so a hand-edited ``Safety:``, ``SAFETY:``, or
-    ``SaFeTy:`` section name cannot bypass it.  The environment can still
-    override these fields via explicit ``ROASTPILOT_SAFETY__*`` vars — that is a
-    deliberate operator choice, not a silent file path.
+    **Safety guard (field-list-independent):** the entire ``ROASTPILOT_SAFETY__``
+    prefix is skipped at the section level — no field in :class:`SafetyLimits`
+    can ever be injected from the saved file, regardless of how many fields the
+    model has or how a future contributor names them.  This is the primary guard
+    and is independent of the field list in :data:`_ALL_SAFETY_ENV_KEYS` (which
+    exists for test-completeness assertions, not enforcement).  The environment
+    can still override safety limits via explicit ``ROASTPILOT_SAFETY__*`` vars;
+    that is a deliberate operator choice, not a silent file path.
+
+    **Non-safety read-only guard:** individual keys listed in
+    :data:`_NEVER_INJECT_NON_SAFETY_KEYS` (e.g. controller tick) are also
+    skipped at the field level inside :func:`_inject_section`.
 
     Args:
         saved_raw: The raw dict loaded from the saved-config YAML file.
@@ -1036,17 +1089,21 @@ def _inject_saved_as_env(saved_raw: _RawSavedConfig) -> frozenset[str]:
     Returns:
         The frozenset of environment-variable names that were injected.  Pass
         this to :func:`build_config_snapshot` so that ``env_overridden`` in each
-        :class:`ConfigFieldMeta` correctly reflects operator-set env vars rather
-        than values injected from the saved file on the operator's behalf.
+        :class:`ConfigFieldMeta` correctly distinguishes operator-set env vars
+        from values injected from the saved file on the operator's behalf.
     """
     injected: set[str] = set()
     for section, section_val in saved_raw.items():
         if not isinstance(section_val, dict):
             continue
-        # Normalise to uppercase for the env-key prefix so that any YAML
-        # capitalisation of a section name (e.g. 'Safety', 'SAFETY') maps to
-        # the same prefix and is caught by _NEVER_INJECT_ENV_KEYS.
+        # Normalise to uppercase so that any capitalisation of a section name
+        # (e.g. 'Safety', 'SAFETY', 'SaFeTy') maps to the same prefix.
         prefix = f"ROASTPILOT_{section.upper()}__"
+        if prefix == _SAFETY_ENV_PREFIX:
+            # Skip the entire safety section — field-list-independent guard.
+            # A new SafetyLimits field cannot accidentally become injectable
+            # without an explicit change to AppConfigEdit or SafetyLimitsSnapshot.
+            continue
         _inject_section(cast("dict[str, Any]", section_val), prefix, injected)
     return frozenset(injected)
 
@@ -1067,9 +1124,8 @@ def _inject_section(
 
     for key, val in section_dict.items():
         env_key = f"{prefix}{key.upper()}"
-        if env_key in _NEVER_INJECT_ENV_KEYS:
-            # This field is read-only in the snapshot — never override it from
-            # a saved file, even if the file was hand-edited.
+        if env_key in _NEVER_INJECT_NON_SAFETY_KEYS:
+            # This non-safety field is read-only in the snapshot — skip it.
             continue
         if isinstance(val, dict):
             _inject_section(cast("dict[str, Any]", val), f"{env_key}__", injected)

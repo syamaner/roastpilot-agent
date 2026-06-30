@@ -14,9 +14,11 @@ import pydantic
 import pytest
 from pydantic import BaseModel
 
-from roastpilot_agent.config import AppConfig
+from roastpilot_agent.config import AppConfig, SafetyLimits
 from roastpilot_agent.config_store import (
-    _NEVER_INJECT_ENV_KEYS,  # pyright: ignore[reportPrivateUsage]
+    _ALL_SAFETY_ENV_KEYS,  # pyright: ignore[reportPrivateUsage]
+    _NEVER_INJECT_NON_SAFETY_KEYS,  # pyright: ignore[reportPrivateUsage]
+    _SAFETY_ENV_PREFIX,  # pyright: ignore[reportPrivateUsage]
     DEFAULT_CONFIG_FILE_PATH,
     AdvisorConfigEdit,
     AdvisorConfigSnapshot,
@@ -426,6 +428,14 @@ def test_safety_fields_show_correct_values() -> None:
         < snapshot.safety.emergency_drop_temp_c.effective_value
         < snapshot.safety.max_bean_temp_c.effective_value
     )
+    # Newly added pre-T0 overrun fields (D78-2 completeness).
+    assert snapshot.safety.pre_t0_max_bean_temp_c.effective_value == 200.0
+    assert snapshot.safety.overrun_safe_fan_percent.effective_value == 100
+    assert snapshot.safety.pre_t0_overrun_severity.effective_value == "recovery"
+    # All three are read-only.
+    assert snapshot.safety.pre_t0_max_bean_temp_c.read_only is True
+    assert snapshot.safety.overrun_safe_fan_percent.read_only is True
+    assert snapshot.safety.pre_t0_overrun_severity.read_only is True
 
 
 def test_temperatures_are_celsius() -> None:
@@ -441,6 +451,7 @@ def test_temperatures_are_celsius() -> None:
     assert snapshot.safety.max_bean_temp_c.effective_value > 100
     assert snapshot.safety.bitter_ceiling_temp_c.effective_value > 100
     assert snapshot.safety.emergency_drop_temp_c.effective_value > 100
+    assert snapshot.safety.pre_t0_max_bean_temp_c.effective_value > 100
 
 
 def test_tick_interval_is_read_only() -> None:
@@ -468,10 +479,10 @@ def test_saved_file_safety_section_not_injected(
 ) -> None:
     """A hand-edited saved file with a lowercase 'safety' section must not weaken limits.
 
-    _inject_saved_as_env skips safety env keys listed in _NEVER_INJECT_ENV_KEYS
-    so that even a hand-edited YAML cannot silently lower a safety limit (D78-2).
-    Uses setenv+delenv to ensure monkeypatch tracks the advisor key for cleanup;
-    the safety key is never set so no cleanup is needed for it.
+    _inject_saved_as_env skips the entire ROASTPILOT_SAFETY__ prefix at the
+    section level — field-list-independent, so even fields not in the snapshot
+    (pre_t0_max_bean_temp_c, overrun_safe_fan_percent, pre_t0_overrun_severity)
+    cannot be injected from the file (D78-2).
     """
     monkeypatch.delenv("ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C", raising=False)
     # setenv+delenv pattern: ensures monkeypatch tracks MODEL_SLUG for cleanup
@@ -498,11 +509,11 @@ def test_saved_file_safety_section_not_injected(
 def test_saved_file_capital_safety_section_not_injected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A capitalised 'Safety:' block bypasses the old string-compare guard.
+    """A capitalised 'Safety:' block cannot bypass the prefix-level guard.
 
     _inject_saved_as_env normalises section names via .upper() so any
-    capitalisation of 'safety' is caught by _NEVER_INJECT_ENV_KEYS.
-    Regression test for the BLOCKER 1 casing vector.
+    capitalisation of 'safety' maps to the ROASTPILOT_SAFETY__ prefix and is
+    blocked as a whole.  Regression test for the BLOCKER 1 casing vector.
     """
     monkeypatch.delenv("ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C", raising=False)
 
@@ -519,7 +530,7 @@ def test_saved_file_capital_safety_section_not_injected(
 def test_saved_file_allcaps_safety_section_not_injected(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An all-caps 'SAFETY:' block is also rejected by the normalised guard."""
+    """An all-caps 'SAFETY:' block is also rejected by the prefix-level guard."""
     monkeypatch.delenv("ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C", raising=False)
 
     injected = _inject_saved_as_env({"SAFETY": {"max_bean_temp_c": 300.0}})
@@ -534,6 +545,7 @@ def test_saved_file_tick_interval_not_injected(
     """A hand-edited 'tick_interval_seconds' in the controller section is not injected.
 
     controller tick is hardware-pinned and read-only (D78 constraint 2).
+    _NEVER_INJECT_NON_SAFETY_KEYS guards individual non-safety read-only fields.
     """
     monkeypatch.delenv("ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS", raising=False)
 
@@ -543,12 +555,81 @@ def test_saved_file_tick_interval_not_injected(
     assert "ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS" not in injected
 
 
-def test_never_inject_env_keys_covers_all_safety_fields() -> None:
-    """_NEVER_INJECT_ENV_KEYS includes all 7 SafetyLimits env-var names."""
-    safety_prefix = "ROASTPILOT_SAFETY__"
-    safety_keys = {k for k in _NEVER_INJECT_ENV_KEYS if k.startswith(safety_prefix)}
-    # Must cover all 7 SafetyLimitsSnapshot fields.
-    assert len(safety_keys) == len(SafetyLimitsSnapshot.model_fields)
+def test_all_safety_env_keys_covers_all_real_safety_model_fields() -> None:
+    """_ALL_SAFETY_ENV_KEYS covers every SafetyLimits.model_fields field (all 10).
+
+    This is the drift-prevention test: if a new SafetyLimits field is added to
+    config.py, this test will fail until _ALL_SAFETY_ENV_KEYS is regenerated
+    (it is derived from SafetyLimits.model_fields, so it auto-updates).
+    The section-level prefix guard blocks all of them regardless; this assertion
+    documents that the derivation is correct and complete.
+    """
+    expected = frozenset(
+        f"{_SAFETY_ENV_PREFIX}{name.upper()}" for name in SafetyLimits.model_fields
+    )
+    assert expected == _ALL_SAFETY_ENV_KEYS
+    # Confirm we have all 10 SafetyLimits fields (not just the 7 in the old snapshot).
+    assert len(_ALL_SAFETY_ENV_KEYS) == len(SafetyLimits.model_fields)
+
+
+def test_snapshot_covers_all_safety_model_fields() -> None:
+    """SafetyLimitsSnapshot exposes every SafetyLimits.model_fields field (D78-2).
+
+    D78-2 requires GET to SHOW every SafetyLimits value as read-only.  This
+    asserts the snapshot field names match the real model field names so a new
+    SafetyLimits field can never be silently hidden from the UI.
+    """
+    snapshot_fields = set(SafetyLimitsSnapshot.model_fields)
+    model_fields = set(SafetyLimits.model_fields)
+    assert snapshot_fields == model_fields, (
+        f"SafetyLimitsSnapshot is missing fields: {model_fields - snapshot_fields}; "
+        f"has extra fields: {snapshot_fields - model_fields}"
+    )
+
+
+def test_all_safety_fields_not_injectable_from_capital_safety_block(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hand-edited 'Safety:' block cannot inject ANY of the 10 SafetyLimits fields.
+
+    Direct reproduction of the BLOCKER 2 round-2 finding: previously only the 7
+    snapshot fields were guarded; pre_t0_max_bean_temp_c, overrun_safe_fan_percent,
+    and pre_t0_overrun_severity were injectable.  The section-prefix guard closes
+    all of them regardless of field-list size.
+    """
+    # Build a Safety: block with EVERY SafetyLimits field set to an adversarial value.
+    adversarial_safety: dict[str, Any] = {
+        "max_bean_temp_c": 999.0,
+        "max_env_temp_c": 999.0,
+        "pre_t0_max_bean_temp_c": 999.0,
+        "overrun_safe_fan_percent": 0,
+        "pre_t0_overrun_severity": "fault",
+        "min_seconds_between_commands": 0.001,
+        "max_consecutive_mcp_failures": 999,
+        "max_consecutive_advisor_failures": 999,
+        "bitter_ceiling_temp_c": 10.0,
+        "emergency_drop_temp_c": 11.0,
+    }
+
+    # Use capital-S to reproduce the casing bypass vector.
+    injected = _inject_saved_as_env({"Safety": adversarial_safety})
+
+    # None of the safety env keys must be set.
+    for env_key in _ALL_SAFETY_ENV_KEYS:
+        assert env_key not in os.environ, f"{env_key} was injected from a 'Safety:' block"
+        assert env_key not in injected
+
+    # The effective config must use schema defaults for the three previously-unguarded fields.
+    effective = AppConfig()
+    assert effective.safety.pre_t0_max_bean_temp_c == 200.0
+    assert effective.safety.overrun_safe_fan_percent == 100
+    assert effective.safety.pre_t0_overrun_severity == "recovery"
+    assert effective.safety.max_bean_temp_c == 230.0
+
+
+def test_never_inject_non_safety_keys_matches_doc() -> None:
+    """_NEVER_INJECT_NON_SAFETY_KEYS contains the controller tick key."""
+    assert "ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS" in _NEVER_INJECT_NON_SAFETY_KEYS
 
 
 # ---------------------------------------------------------------------------
