@@ -32,7 +32,7 @@ from roastpilot_agent.api import (
     RoastRunGoneError,
     RoastRunner,
     RoastService,
-    _parse_last_event_id,  # pyright: ignore[reportPrivateUsage]
+    _parse_last_event_id,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     create_app,
     stream_events,
 )
@@ -1250,14 +1250,14 @@ def test_parse_last_event_id_parses_clean_int(raw: str, expected: int) -> None:
 def test_backdated_charge_utc_returns_none_for_invalid_elapsed(elapsed: float | None) -> None:
     """#337: a missing / non-finite charge-elapsed defers to the store's own
     ``now`` (None) rather than fabricating a garbage backdated instant."""
-    assert RoastRunner._backdated_charge_utc(elapsed) is None  # pyright: ignore[reportPrivateUsage]
+    assert RoastRunner._backdated_charge_utc(elapsed) is None  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
 
 
 def test_backdated_charge_utc_backdates_by_elapsed() -> None:
     """#337: a finite charge-elapsed yields ``now - elapsed`` as an ISO-8601 UTC
     string in the PAST (the recovery breadcrumb matches the live backdated clock)."""
     before = datetime.now(UTC)
-    result = RoastRunner._backdated_charge_utc(120.0)  # pyright: ignore[reportPrivateUsage]
+    result = RoastRunner._backdated_charge_utc(120.0)  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     assert result is not None
     charged_at = datetime.fromisoformat(result)
     # ~120 s before now (allow a little slack for test execution time).
@@ -1972,7 +1972,7 @@ async def test_recover_faulted_then_acknowledge_preserves_fault_reason(
         clock=clock,
     )
     # Build the runner + re-enter operable-faulted directly (the in-session path).
-    runner = service._build_runner("run-fault-reason")  # pyright: ignore[reportPrivateUsage]
+    runner = service._build_runner("run-fault-reason")  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     assert runner is not None
     service.active_run_id = "run-fault-reason"
     await runner.recover_faulted(_profile())
@@ -3143,3 +3143,339 @@ async def test_put_config_422_on_cross_field_violation(
     }
     r2 = await client.put("/api/config", json=bad_body)
     assert r2.status_code == 422
+
+
+# --- GET /api/config/devices ---
+#
+# Both enumeration helpers use lazy imports (import inside the try block) so
+# that a missing PortAudio native library or missing wheel never crashes server
+# startup.  Tests patch _enumerate_serial and _enumerate_audio_inputs directly
+# on the api module for the happy-path / fail-soft / empty variants (cleanest,
+# hardware-free), and add one test that patches the sounddevice import itself to
+# verify the ImportError path (the Playwright regression scenario).
+
+
+class _FakePort:
+    """Minimal stand-in for a ``serial.tools.list_ports_common.ListPortInfo``."""
+
+    def __init__(self, device: str, description: str, hwid: str) -> None:
+        self.device = device
+        self.description = description
+        self.hwid = hwid
+
+
+@pytest.mark.asyncio
+async def test_get_devices_happy_path(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/config/devices returns serial + audio results from fake enumerators.
+
+    Patches _enumerate_serial and _enumerate_audio_inputs directly so the route
+    handler, response model, and JSON serialisation are fully exercised while the
+    test stays hardware-free and deterministic.
+    """
+    import roastpilot_agent.api as _api_mod
+
+    def _fake_serial() -> tuple[list[_api_mod.DeviceOption], str | None]:
+        return (
+            [
+                _api_mod.DeviceOption(
+                    value="/dev/tty.usbmodem1401",
+                    label="/dev/tty.usbmodem1401",
+                    note="Hottop Roaster",
+                )
+            ],
+            None,
+        )
+
+    def _fake_audio() -> tuple[list[_api_mod.DeviceOption], str | None]:
+        return (
+            [
+                _api_mod.DeviceOption(
+                    value="0",
+                    label="USB PnP Sound Device",
+                    note="Input · 1 ch · 48,000 Hz",
+                )
+            ],
+            None,
+        )
+
+    monkeypatch.setattr(_api_mod, "_enumerate_serial", _fake_serial)
+    monkeypatch.setattr(_api_mod, "_enumerate_audio_inputs", _fake_audio)
+
+    response = await client.get("/api/config/devices")
+    assert response.status_code == 200
+    body = response.json()
+
+    # Both top-level keys must be present.
+    assert "serial" in body
+    assert "audio_input" in body
+    assert body["serial_error"] is None
+    assert body["audio_input_error"] is None
+
+    # Serial: one port, correctly mapped.
+    assert len(body["serial"]) == 1
+    assert body["serial"][0]["value"] == "/dev/tty.usbmodem1401"
+    assert body["serial"][0]["label"] == "/dev/tty.usbmodem1401"
+    assert body["serial"][0]["note"] == "Hottop Roaster"
+
+    # Audio: one input device returned.
+    assert len(body["audio_input"]) == 1
+    assert body["audio_input"][0]["value"] == "0"
+    assert body["audio_input"][0]["label"] == "USB PnP Sound Device"
+    assert body["audio_input"][0]["note"] == "Input · 1 ch · 48,000 Hz"
+
+
+@pytest.mark.asyncio
+async def test_get_devices_serial_error_is_soft(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/config/devices returns 200 with serial_error when serial fails.
+
+    Fail-soft: a serial enumeration error must surface as an empty serial list +
+    a non-None serial_error string, while the audio source is unaffected.
+    """
+    import roastpilot_agent.api as _api_mod
+
+    def _serial_denied() -> tuple[list[_api_mod.DeviceOption], str | None]:
+        return [], "serial: permission denied"
+
+    monkeypatch.setattr(_api_mod, "_enumerate_serial", _serial_denied)
+    monkeypatch.setattr(
+        _api_mod,
+        "_enumerate_audio_inputs",
+        lambda: (
+            [
+                _api_mod.DeviceOption(
+                    value="2", label="Built-in Mic", note="Input · 1 ch · 44,100 Hz"
+                )
+            ],  # noqa: E501
+            None,
+        ),
+    )
+
+    response = await client.get("/api/config/devices")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["serial"] == []
+    assert "serial: permission denied" in body["serial_error"]
+    assert len(body["audio_input"]) == 1
+    assert body["audio_input_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_devices_audio_error_is_soft(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/config/devices returns 200 with audio_input_error when PortAudio fails.
+
+    Fail-soft: a PortAudio failure must not prevent serial ports from being
+    returned.  The audio source degrades to an empty list with an error string.
+    """
+    import roastpilot_agent.api as _api_mod
+
+    monkeypatch.setattr(
+        _api_mod,
+        "_enumerate_serial",
+        lambda: (
+            [_api_mod.DeviceOption(value="/dev/ttyUSB0", label="/dev/ttyUSB0", note="USB Serial")],
+            None,
+        ),
+    )
+
+    def _audio_portaudio_gone() -> tuple[list[_api_mod.DeviceOption], str | None]:
+        return [], "PortAudio not found"
+
+    monkeypatch.setattr(_api_mod, "_enumerate_audio_inputs", _audio_portaudio_gone)
+
+    response = await client.get("/api/config/devices")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert len(body["serial"]) == 1
+    assert body["serial_error"] is None
+    assert body["audio_input"] == []
+    assert "PortAudio not found" in body["audio_input_error"]
+
+
+@pytest.mark.asyncio
+async def test_get_devices_both_empty_is_valid(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/config/devices returns 200 with empty lists when no devices found.
+
+    An environment with no serial ports and no audio inputs (e.g. a minimal CI
+    container) must return a valid 200 response with empty lists and no errors.
+    """
+    import roastpilot_agent.api as _api_mod
+
+    def _no_serial() -> tuple[list[_api_mod.DeviceOption], str | None]:
+        return [], None
+
+    def _no_audio() -> tuple[list[_api_mod.DeviceOption], str | None]:
+        return [], None
+
+    monkeypatch.setattr(_api_mod, "_enumerate_serial", _no_serial)
+    monkeypatch.setattr(_api_mod, "_enumerate_audio_inputs", _no_audio)
+
+    response = await client.get("/api/config/devices")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["serial"] == []
+    assert body["serial_error"] is None
+    assert body["audio_input"] == []
+    assert body["audio_input_error"] is None
+
+
+def test_enumerate_audio_inputs_import_error_is_soft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_enumerate_audio_inputs degrades gracefully when sounddevice cannot be imported.
+
+    This is the Playwright-regression scenario: the sounddevice wheel is present
+    but PortAudio is not installed natively, so ``import sounddevice`` raises
+    ``OSError`` or ``ImportError`` at import time.  The lazy-import inside
+    _enumerate_audio_inputs must absorb that failure and return an empty list
+    with a non-None error string — never propagate the ImportError to the caller.
+    """
+    import sys
+
+    import roastpilot_agent.api as _api_mod
+
+    # Drop the real module from the cache so the lazy import re-executes.
+    monkeypatch.delitem(sys.modules, "sounddevice", raising=False)
+    # None is the Python sentinel meaning "import was attempted and failed".
+    monkeypatch.setitem(sys.modules, "sounddevice", None)  # type: ignore[arg-type]
+
+    devices, error = _api_mod._enumerate_audio_inputs()  # pyright: ignore[reportPrivateUsage]
+    assert devices == []
+    assert error is not None
+    assert "sounddevice" in error.lower() or "import" in error.lower() or "None" in error
+
+
+def test_enumerate_serial_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_enumerate_serial implementation: happy path and comports() error.
+
+    Calls _enumerate_serial() directly (not via the HTTP route) so the
+    lazy-import + comports() code path is exercised and counted toward
+    patch coverage.  The sys.modules patch must cover all three levels of
+    the ``serial.tools.list_ports`` namespace so that Python's import
+    machinery resolves the lazy ``import serial.tools.list_ports as _lp``
+    inside the function to our fake object.
+    """
+    import sys
+    import types
+
+    import roastpilot_agent.api as _api_mod
+
+    # --- happy path: two ports, sorted by device path ---
+    def _fake_comports_sorted() -> list[_FakePort]:
+        # Deliberately out of order to exercise the sort.
+        return [
+            _FakePort("/dev/ttyUSB1", "Second port", "HWB"),
+            _FakePort("/dev/ttyUSB0", "First port", "HWA"),
+        ]
+
+    fake_lp = types.ModuleType("serial.tools.list_ports")
+    fake_lp.comports = _fake_comports_sorted  # type: ignore[attr-defined]
+    fake_tools = types.ModuleType("serial.tools")
+    fake_tools.list_ports = fake_lp  # type: ignore[attr-defined]
+    fake_serial = types.ModuleType("serial")
+    fake_serial.tools = fake_tools  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+    monkeypatch.setitem(sys.modules, "serial.tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "serial.tools.list_ports", fake_lp)
+
+    devices, error = _api_mod._enumerate_serial()  # pyright: ignore[reportPrivateUsage]
+    assert error is None
+    assert len(devices) == 2
+    # Sorted by device path: ttyUSB0 before ttyUSB1.
+    assert devices[0].value == "/dev/ttyUSB0"
+    assert devices[0].note == "First port"
+    assert devices[1].value == "/dev/ttyUSB1"
+
+    # --- error path: comports() raises ---
+    def _boom_comports() -> list[object]:
+        raise OSError("no such file: /dev/ttyUSB0")
+
+    fake_lp_err = types.ModuleType("serial.tools.list_ports")
+    fake_lp_err.comports = _boom_comports  # type: ignore[attr-defined]
+    fake_serial.tools.list_ports = fake_lp_err  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "serial.tools.list_ports", fake_lp_err)
+
+    devices2, error2 = _api_mod._enumerate_serial()  # pyright: ignore[reportPrivateUsage]
+    assert devices2 == []
+    assert error2 is not None
+    assert "no such file" in error2
+
+
+def test_enumerate_audio_inputs_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_enumerate_audio_inputs implementation: happy path, filtering, and error.
+
+    Calls _enumerate_audio_inputs() directly so the lazy-import + query_devices()
+    code path is exercised for patch coverage.  Patches sounddevice in sys.modules.
+    """
+    import sys
+
+    import roastpilot_agent.api as _api_mod
+
+    # --- happy path: mix of input-capable and output-only devices ---
+    class _FakeSDHappy:
+        def query_devices(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "name": "USB PnP Sound Device",
+                    "max_input_channels": 1,
+                    "max_output_channels": 0,
+                    "default_samplerate": 48000.0,
+                },
+                # Output-only: must be filtered out.
+                {
+                    "name": "Built-in Output",
+                    "max_input_channels": 0,
+                    "max_output_channels": 2,
+                    "default_samplerate": 44100.0,
+                },
+                # Multi-channel input, non-integer samplerate edge-case.
+                {
+                    "name": "Aggregate Device",
+                    "max_input_channels": 4,
+                    "max_output_channels": 2,
+                    "default_samplerate": "variable",  # triggers the '?' branch
+                },
+            ]
+
+    monkeypatch.delitem(sys.modules, "sounddevice", raising=False)
+    monkeypatch.setitem(sys.modules, "sounddevice", _FakeSDHappy())  # type: ignore[arg-type]
+
+    devices, error = _api_mod._enumerate_audio_inputs()  # pyright: ignore[reportPrivateUsage]
+    assert error is None
+    # Output-only device filtered out; two input-capable devices remain.
+    assert len(devices) == 2
+    assert devices[0].value == "0"
+    assert devices[0].label == "USB PnP Sound Device"
+    assert "48,000" in devices[0].note
+    assert devices[1].value == "2"
+    assert "?" in devices[1].note  # non-numeric samplerate
+
+    # --- error path: query_devices() raises ---
+    class _FakeSDError:
+        def query_devices(self) -> list[object]:
+            raise RuntimeError("PortAudio: invalid device")
+
+    monkeypatch.setitem(sys.modules, "sounddevice", _FakeSDError())  # type: ignore[arg-type]
+
+    devices2, error2 = _api_mod._enumerate_audio_inputs()  # pyright: ignore[reportPrivateUsage]
+    assert devices2 == []
+    assert error2 is not None
+    assert "PortAudio" in error2
