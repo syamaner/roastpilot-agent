@@ -75,6 +75,18 @@ const SAFETY_FIELD: ConfigFieldDef = {
   readOnlyStatic: true,
 };
 
+// mcp_device boolean field — tri-state control (#439).
+const NULLABLE_BOOL_FIELD: ConfigFieldDef = {
+  key: "mcp_device.recording_enabled",
+  label: "Recording enabled",
+  hint: "Whether the MCP audio recorder is active.",
+  type: "boolean",
+  envVar: "ROASTPILOT_MCP_DEVICE__RECORDING_ENABLED",
+  editKey: "recording_enabled",
+  category: "Audio",
+  readOnlyStatic: false,
+};
+
 // ---------------------------------------------------------------------------
 // Helper
 // ---------------------------------------------------------------------------
@@ -157,6 +169,100 @@ describe("ConfigFieldRow — env-override badge", () => {
     // default (the saved value takes effect once the env var is removed).
     renderRow(NUMBER_FIELD, makeFieldMeta({ env_overridden: true, default: 100 }), 80);
     expect(screen.getByTestId(`reset-${NUMBER_FIELD.key}`)).toBeInTheDocument();
+  });
+});
+
+describe("ConfigFieldRow — NullableBooleanControl (mcp_device boolean, #439)", () => {
+  it("renders a tri-state radio group with Inherit / On / Off segments", () => {
+    renderRow(NULLABLE_BOOL_FIELD, makeFieldMeta({ effective_value: null, default: null }), null);
+    // The three segments must be present as radio buttons.
+    expect(screen.getByRole("radio", { name: "Inherit" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "On" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Off" })).toBeInTheDocument();
+  });
+
+  it("Inherit segment is checked when value is null", () => {
+    renderRow(NULLABLE_BOOL_FIELD, makeFieldMeta({ effective_value: null, default: null }), null);
+    const inheritBtn = screen.getByRole("radio", { name: "Inherit" });
+    expect(inheritBtn).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("radio", { name: "On" })).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByRole("radio", { name: "Off" })).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("On segment is checked when value is true", () => {
+    renderRow(NULLABLE_BOOL_FIELD, makeFieldMeta({ effective_value: true, default: null }), true);
+    expect(screen.getByRole("radio", { name: "On" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("radio", { name: "Inherit" })).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("Off segment is checked when value is false", () => {
+    renderRow(NULLABLE_BOOL_FIELD, makeFieldMeta({ effective_value: false, default: null }), false);
+    expect(screen.getByRole("radio", { name: "Off" })).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("clicking Inherit calls onChange with null", () => {
+    const onChange = vi.fn();
+    render(
+      <ConfigFieldRow
+        fieldDef={NULLABLE_BOOL_FIELD}
+        meta={makeFieldMeta({ effective_value: true, default: null })}
+        value={true}
+        isLast={false}
+        onChange={onChange}
+        onReset={vi.fn()}
+      />,
+    );
+    screen.getByRole("radio", { name: "Inherit" }).click();
+    expect(onChange).toHaveBeenCalledWith(null);
+  });
+
+  it("clicking On calls onChange with true", () => {
+    const onChange = vi.fn();
+    render(
+      <ConfigFieldRow
+        fieldDef={NULLABLE_BOOL_FIELD}
+        meta={makeFieldMeta({ effective_value: null, default: null })}
+        value={null}
+        isLast={false}
+        onChange={onChange}
+        onReset={vi.fn()}
+      />,
+    );
+    screen.getByRole("radio", { name: "On" }).click();
+    expect(onChange).toHaveBeenCalledWith(true);
+  });
+
+  it("clicking Off calls onChange with false", () => {
+    const onChange = vi.fn();
+    render(
+      <ConfigFieldRow
+        fieldDef={NULLABLE_BOOL_FIELD}
+        meta={makeFieldMeta({ effective_value: null, default: null })}
+        value={null}
+        isLast={false}
+        onChange={onChange}
+        onReset={vi.fn()}
+      />,
+    );
+    screen.getByRole("radio", { name: "Off" }).click();
+    expect(onChange).toHaveBeenCalledWith(false);
+  });
+
+  it("non-mcp_device boolean field still uses the two-state toggle (not tri-state)", () => {
+    const TRIM_BOOL_FIELD: ConfigFieldDef = {
+      key: "controller.late_maillard_trim_enabled",
+      label: "Trim enabled",
+      hint: "Enable the anticipatory heat trim.",
+      type: "boolean",
+      envVar: "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ENABLED",
+      editKey: "pre_first_crack_levers.late_maillard_trim.enabled",
+      category: "Late-Maillard Trim",
+      readOnlyStatic: false,
+    };
+    renderRow(TRIM_BOOL_FIELD, makeFieldMeta({ effective_value: true, default: true }), true);
+    // Two-state toggle: role="switch", no radio group.
+    expect(screen.getByRole("switch")).toBeInTheDocument();
+    expect(screen.queryByRole("radiogroup")).toBeNull();
   });
 });
 
