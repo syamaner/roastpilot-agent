@@ -923,10 +923,19 @@ def test_replay_passes_saved_config_to_create_replay_app(
     _real_create_replay_app = _replay.create_replay_app
 
     async def _spy_create_replay_app(
-        *args: object, config: AppConfig | None = None, **kwargs: object
+        export_dir: Path,
+        store_path: Path,
+        *,
+        config: AppConfig | None = None,
+        **kwargs: object,
     ) -> object:
         captured.append(config)  # type: ignore[arg-type]
-        return await _real_create_replay_app(*args, config=config, **kwargs)
+        return await _real_create_replay_app(
+            export_dir,
+            store_path,
+            config=config,
+            **kwargs,  # type: ignore[arg-type]
+        )
 
     monkeypatch.setattr(_replay, "create_replay_app", _spy_create_replay_app)
 
