@@ -50,8 +50,10 @@ dependencies = [
   "pydantic-ai-slim[openai]>=1.0,<2",
   "pydantic-settings>=2.7,<3",
   # D78: saved-config file persistence (config_store.py). PyYAML is used for
-  # reading / writing the operator's saved-config file; it is a direct
-  # runtime dep (not transitive) so we declare it explicitly.
+  # reading / writing the operator's saved-config file; filelock serialises
+  # concurrent PUT /api/config calls (TOCTOU guard — PR b).  Both are direct
+  # runtime deps (not transitive) so we declare them explicitly.
+  "filelock>=3.16,<4",
   "pyyaml>=6.0,<7",
   "uvicorn>=0.34,<1"
 ]

@@ -13,7 +13,7 @@ directly into the broadcaster.
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -2801,3 +2801,189 @@ async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) ->
     assert colombia["altitude_m"] == 1600
     assert colombia["target_drop_temp_c"] == 195.0
     assert colombia["target_development_percent"] == 16.0
+
+
+# ---------------------------------------------------------------------------
+# GET /api/config + PUT /api/config (D78 / #418 PR b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=False)
+def _isolated_roastpilot_env() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
+    """Isolate ROASTPILOT_* env vars for config-route tests.
+
+    ``load_app_config()`` calls ``_inject_saved_as_env()``, which writes saved
+    values into ``os.environ`` as ``ROASTPILOT_*`` keys.  Those writes are not
+    tracked by ``monkeypatch`` (the key did not exist before the call), so they
+    bleed into subsequent tests (same env-pollution class fixed in PR-a via the
+    sentinel pattern in test_config_store.py).
+
+    Fix: snapshot the set of ROASTPILOT_* keys before the test, then delete any
+    new keys added during the test in teardown.  ``monkeypatch`` restores the
+    ``ROASTPILOT_CONFIG_FILE`` override set by the test itself; this fixture
+    handles the injected non-file keys.
+    """
+    import os
+
+    before: set[str] = {k for k in os.environ if k.startswith("ROASTPILOT_")}
+    yield
+    # Delete any ROASTPILOT_* keys that were absent before the test (injected
+    # by _inject_saved_as_env during the test body).
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_") and key not in before:
+            del os.environ[key]
+
+
+@pytest.mark.asyncio
+async def test_get_config_returns_snapshot(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """GET /api/config returns a well-formed AppConfigSnapshot with all sections.
+
+    Routes through a real create_app with no saved-config file on disk so all
+    saved_value entries are None and effective_value equals the schema default.
+    """
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    response = await client.get("/api/config")
+    assert response.status_code == 200
+    body = response.json()
+    # All three top-level sections must be present.
+    assert "controller" in body
+    assert "advisor" in body
+    assert "safety" in body
+    # Each field must carry the four required keys.
+    tick = body["controller"]["tick_interval_seconds"]
+    assert tick["effective_value"] == 1.0
+    assert tick["saved_value"] is None  # no file written yet
+    assert tick["default"] == 1.0
+    assert tick["read_only"] is True
+    assert tick["env_overridden"] is False
+    # Safety fields are present and read-only.
+    max_bean = body["safety"]["max_bean_temp_c"]
+    assert max_bean["read_only"] is True
+    assert max_bean["effective_value"] == 230.0
+
+
+@pytest.mark.asyncio
+async def test_get_config_500_on_malformed_file(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """GET /api/config returns 500 when the saved-config YAML is malformed."""
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("{\n  broken: yaml: here\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+    response = await client.get("/api/config")
+    assert response.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_put_config_writes_and_returns_snapshot(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """PUT /api/config persists editable fields and returns the updated snapshot."""
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    body = {
+        "controller": {
+            "pre_first_crack_levers": {
+                "heat_target_percent": 88,
+                "fan_target_percent": 25,
+            }
+        },
+        "advisor": {
+            "model_slug": "openai/gpt-4o-mini",
+        },
+    }
+    response = await client.put("/api/config", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    # Controller field reflects the written value.
+    heat = data["controller"]["pre_fc_heat_target_percent"]
+    assert heat["saved_value"] == 88
+    assert heat["effective_value"] == 88
+    assert heat["env_overridden"] is False
+    # Advisor field reflects the written value.
+    slug = data["advisor"]["model_slug"]
+    assert slug["saved_value"] == "openai/gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_put_config_422_on_out_of_range(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """PUT /api/config returns 422 when an edit field violates its schema bounds.
+
+    heat_target_percent max is 100; sending 150 is a field-level Pydantic error
+    that FastAPI turns into a 422 before the handler runs.
+    """
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    body = {
+        "controller": {
+            "pre_first_crack_levers": {
+                "heat_target_percent": 150,
+            }
+        }
+    }
+    response = await client.put("/api/config", json=body)
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_put_config_500_on_malformed_existing_file(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """PUT /api/config returns 500 when the existing saved file is malformed.
+
+    persist_config_edit reads the existing file before merging; a malformed
+    file raises ConfigFileError which the handler converts to 500.
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(": bad: yaml\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+    body = {"advisor": {"model_slug": "openai/gpt-4o"}}
+    response = await client.put("/api/config", json=body)
+    assert response.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_put_config_no_safety_field_in_edit_type(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """PUT /api/config ignores unknown fields including any 'safety' key.
+
+    AppConfigEdit has no 'safety' field.  FastAPI/Pydantic silently ignores
+    extra keys by default (model_config default), so a body with a 'safety'
+    key is accepted but the safety section is not written.
+    """
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    body = {
+        "safety": {"max_bean_temp_c": 999},  # must not reach the file
+        "advisor": {"temperature": 0.5},
+    }
+    response = await client.put("/api/config", json=body)
+    assert response.status_code == 200
+    # Only the advisor change should appear; safety section absent from file.
+    import yaml
+
+    cfg_path = tmp_path / "config.yaml"
+    saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert "safety" not in (saved or {})
+    temp = response.json()["advisor"]["temperature"]
+    assert temp["saved_value"] == 0.5

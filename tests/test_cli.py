@@ -742,3 +742,29 @@ async def test_emit_advisor_readout_unreachable_does_not_block(
     out = capsys.readouterr().out
     assert "⚠️" in out
     assert "402 Payment Required" in out
+
+
+def test_serve_live_returns_error_on_malformed_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``serve`` returns exit-code 1 and prints an error when the saved-config
+    file is malformed (``ConfigFileError`` from ``load_app_config``).
+
+    The MCP child must NOT be started — ``load_app_config`` runs before
+    ``build_live_service``, so a bad config file is a fail-closed startup error.
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(": broken: yaml\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    # Ensure build_live_service is never called (would need a real MCP child).
+    import roastpilot_agent.live as _live
+
+    def _should_not_be_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("build_live_service must not be called on config error")
+
+    monkeypatch.setattr(_live, "build_live_service", _should_not_be_called)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+    assert cli.main() == 1
+    out = capsys.readouterr().out
+    assert "malformed" in out or "error" in out

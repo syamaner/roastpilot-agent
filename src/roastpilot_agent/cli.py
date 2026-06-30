@@ -553,11 +553,15 @@ async def _serve_live(args: argparse.Namespace) -> int:
     import uvicorn
 
     from roastpilot_agent.api import create_app
-    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.config_store import ConfigFileError, load_app_config
     from roastpilot_agent.live import build_live_service, forward_coffee_env
     from roastpilot_agent.mcp_client import MCPConnectionError
 
-    config = AppConfig()
+    try:
+        config, _injected = load_app_config()
+    except ConfigFileError as exc:
+        print(f"error: saved-config file is malformed — {exc}")
+        return 1
     # Let the operator configure the Hottop with plain `export COFFEE_…`.
     forward_coffee_env(config)
 
@@ -689,7 +693,6 @@ async def _serve_replay(args: argparse.Namespace) -> int:
     """Build and serve the replay app; free-run unless ``--step``."""
     import uvicorn
 
-    from roastpilot_agent.config import AppConfig
     from roastpilot_agent.replay import clamp_speed, create_replay_app
 
     export_dir: Path = args.replay
@@ -723,7 +726,9 @@ async def _serve_replay(args: argparse.Namespace) -> int:
             print("  (serves the final frame after the roast ends; Ctrl-C to stop)")
         # Access-log verbosity (#267): same CLI > env > config resolution as the
         # live serve. Logging-only — the replay SSE pipeline is unchanged.
-        log_level, access_log = _configure_access_log(args, AppConfig().logging)
+        from roastpilot_agent.config_store import load_app_config as _load_cfg
+
+        log_level, access_log = _configure_access_log(args, _load_cfg()[0].logging)
         config = uvicorn.Config(
             app,
             host=args.host,

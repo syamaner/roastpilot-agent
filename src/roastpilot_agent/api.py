@@ -39,6 +39,15 @@ from roastpilot_agent.advisor import (
     RoastDecision,
 )
 from roastpilot_agent.config import AppConfig
+from roastpilot_agent.config_store import (
+    AppConfigEdit,
+    AppConfigSnapshot,
+    ConfigFileError,
+    build_config_snapshot,
+    load_app_config,
+    load_saved_raw,
+    persist_config_edit,
+)
 from roastpilot_agent.controller import (
     TRANSITION_TABLE,
     CommandExecutor,
@@ -2063,6 +2072,63 @@ async def delete_bean_profile(profile_id: str, service: ServiceDep) -> dict[str,
     return {"id": profile_id, "result": "archived"}
 
 
+CONFIG_PATH = "/api/config"
+
+
+async def get_config(request: Request) -> AppConfigSnapshot:
+    """``GET /api/config`` — per-field config snapshot (D78, #418).
+
+    Returns the full :class:`~roastpilot_agent.config_store.AppConfigSnapshot`
+    for the Config UI: each managed field carries its saved value, effective
+    value, schema default, ``env_overridden`` flag, and ``read_only`` flag.
+
+    The effective config is read fresh from disk and env on every request so
+    the UI reflects the current operator state.  The live :class:`RoastService`
+    holds a snapshot baked at startup; this route reflects *current* env and
+    file state, which may differ during a live roast if the operator has edited
+    the file without restarting.
+
+    A malformed saved-config file returns 500 — the operator must fix the YAML
+    before the Config UI can render.
+    """
+    try:
+        effective, injected_keys = load_app_config()
+        saved_raw = load_saved_raw()
+    except ConfigFileError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return build_config_snapshot(effective, saved_raw, injected_keys)
+
+
+async def put_config(edit: AppConfigEdit, request: Request) -> AppConfigSnapshot:
+    """``PUT /api/config`` — write editable managed fields (D78, #418).
+
+    Accepts an :class:`~roastpilot_agent.config_store.AppConfigEdit` body
+    (controller + advisor only; safety is excluded by the type), merges it into
+    the saved-config file, and returns the updated
+    :class:`~roastpilot_agent.config_store.AppConfigSnapshot`.
+
+    Out-of-range field values are rejected by Pydantic field validators on the
+    *edit* body (FastAPI returns 422 automatically).  Schema violations caught
+    only after merging (cross-field constraints) raise 422 from
+    ``pydantic.ValidationError``; a malformed existing file raises 500.
+
+    The change takes effect for the *next* roast — the running agent's in-memory
+    config is not patched.  The FE should note this in the UI (plan §D78).
+    """
+    try:
+        persist_config_edit(edit)
+    except ConfigFileError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    # Re-read effective config + saved raw after write so the response reflects
+    # the just-written state, not a stale snapshot.
+    try:
+        effective, injected_keys = load_app_config()
+        saved_raw = load_saved_raw()
+    except ConfigFileError as exc:  # pragma: no cover — written successfully one line above
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return build_config_snapshot(effective, saved_raw, injected_keys)
+
+
 def _parse_last_event_id(raw: str | None) -> int | None:
     """Parse the SSE ``Last-Event-ID`` header into a sequence int (#339).
 
@@ -2206,6 +2272,8 @@ def create_app(
     )
     app.state.service = service
     app.get(HEALTH_PATH)(health)
+    app.get(CONFIG_PATH)(get_config)
+    app.put(CONFIG_PATH)(put_config)
     app.post("/api/roasts", status_code=201)(start_roast)
     app.get("/api/roasts")(list_roasts)
     app.get("/api/roasts/{run_id}")(get_roast)

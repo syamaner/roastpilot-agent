@@ -37,18 +37,15 @@ defaults path and is never redundantly mirrored here.
   accurately reported by the MCP process that owns the audio hardware anyway.
   This decision is noted here; the endpoint is implemented in PR (c).
 
-**TODO (PR b) — file-lock around persist_config_edit:** Add a ``filelock``
-(or ``fcntl.flock``) around the read-modify-write in :func:`persist_config_edit`
-before the PUT endpoint goes live; the current code has a TOCTOU window between
-:func:`_load_saved_config` and :func:`_write_saved_config`.
+**PR (b) — file-lock around persist_config_edit (DONE):** :func:`persist_config_edit`
+now holds a ``filelock`` advisory lock (``<config-path>.lock``) around the
+load→apply→write cycle to prevent TOCTOU races from concurrent PUT calls.
 
-**TODO (PR b) — _DEFAULT_CONFIG import-time env bleed:** ``_DEFAULT_CONFIG =
-AppConfig()`` at module import time reads the current ``os.environ``, so the
-``default`` field in each :class:`ConfigFieldMeta` will reflect any
-``ROASTPILOT_*`` env var that happens to be set when the module is first
-imported (e.g. in ``roast-live.sh``). Fix by deriving ``default`` from
-``AppConfig.model_fields`` field defaults directly, rather than from a
-pre-constructed instance.
+**PR (b) — _DEFAULT_CONFIG import-time env bleed (DONE):** ``_DEFAULT_CONFIG``
+is now built from plain-model sub-model defaults (``ControllerConfig()``,
+``AdvisorConfig()``, ``SafetyLimits()``) assembled via ``AppConfig.model_construct``,
+bypassing ``BaseSettings`` env reads so that ``ConfigFieldMeta.default`` always
+reflects schema defaults, not env-injected values.
 """
 
 from __future__ import annotations
@@ -61,7 +58,9 @@ import yaml
 from pydantic import BaseModel, Field
 
 from roastpilot_agent.config import (
+    AdvisorConfig,
     AppConfig,
+    ControllerConfig,
     LateMaillardTrim,
     PreFirstCrackLevers,
     SafetyLimits,
@@ -79,13 +78,24 @@ class ConfigFileError(ValueError):
 
 
 # ---------------------------------------------------------------------------
-# Defaults — a single frozen instance, so we compare without re-constructing.
-# TODO (PR b): _DEFAULT_CONFIG reads os.environ at import time — any ROASTPILOT_*
-#   env var set when the module is first imported will bleed into the `default`
-#   field of every ConfigFieldMeta.  Fix by deriving defaults from model_fields
-#   directly rather than from a pre-constructed AppConfig() instance.
+# Defaults — built from plain-model defaults, never from os.environ.
+#
+# AppConfig is a BaseSettings subclass and reads ROASTPILOT_* env vars on
+# construction.  Building it here at import time would bleed any env var
+# that happens to be set into every ConfigFieldMeta.default, making the
+# "default" field misleadingly show the env value instead of the schema
+# default.
+#
+# Fix: construct each sub-model (ControllerConfig, AdvisorConfig,
+# SafetyLimits) directly — they are plain BaseModel, not BaseSettings, so
+# they do not read os.environ — then assemble into an AppConfig via
+# model_construct, bypassing the BaseSettings env-read path entirely.
 # ---------------------------------------------------------------------------
-_DEFAULT_CONFIG = AppConfig()
+_DEFAULT_CONFIG = AppConfig.model_construct(
+    controller=ControllerConfig(),
+    advisor=AdvisorConfig(),
+    safety=SafetyLimits(),
+)
 
 #: The default file location when the operator does not override it. Lives in
 #: the user's home directory so it survives agent upgrades and does not litter
@@ -110,16 +120,19 @@ _ALL_SAFETY_ENV_KEYS: frozenset[str] = frozenset(
     f"{_SAFETY_ENV_PREFIX}{name.upper()}" for name in SafetyLimits.model_fields
 )
 
-# Non-safety individual read-only env-var keys — fields that are read_only in
-# the snapshot but live in non-safety sections.  Derived from the known set so
-# adding a new read-only controller/advisor field requires updating this set.
-# Driven by metadata: each entry maps 1:1 to a ConfigFieldMeta with
-# read_only=True and a known env_var in build_config_snapshot.
+# Non-safety individual read-only env-var keys — fields whose env vars must
+# not be injected from the saved-config file even though they live outside the
+# safety section.  Each entry is derived from the model field name so the set
+# is metadata-anchored: a field rename in ControllerConfig will make the
+# derivation visibly wrong (the old key no longer matches model_fields) rather
+# than silently letting an injection slip through.
+#
+# Current M1 entries:
+#   - tick_interval_seconds: hardware-pinned Hottop polling rate (read-only).
 _NEVER_INJECT_NON_SAFETY_KEYS: frozenset[str] = frozenset(
-    {
-        # Hardware-pinned controller tick (read-only in M1).
-        "ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS",
-    }
+    f"ROASTPILOT_CONTROLLER__{name.upper()}"
+    for name in ("tick_interval_seconds",)
+    if name in ControllerConfig.model_fields  # metadata anchor — fails visibly on rename
 )
 
 
@@ -1164,6 +1177,11 @@ def persist_config_edit(edit: AppConfigEdit) -> None:
     writes it back to disk atomically.  Safety limits are excluded by the
     :class:`AppConfigEdit` type — there is simply no field for them.
 
+    The load→apply→write cycle is serialised with a ``filelock`` advisory lock
+    (``<config-path>.lock``), so concurrent ``PUT /api/config`` calls — e.g.
+    from two browser tabs — cannot interleave their read-modify-write and lose
+    one caller's changes (TOCTOU guard, D78 PR b).
+
     Args:
         edit: The validated edit from a ``PUT /api/config`` request.
 
@@ -1172,7 +1190,11 @@ def persist_config_edit(edit: AppConfigEdit) -> None:
         ConfigFileError: If the existing file is malformed (read phase).
         OSError: If the file cannot be written.
     """
+    import filelock
+
     path = _config_file_path()
-    existing = _load_saved_config(path)
-    merged = apply_config_edit(edit, existing)
-    _write_saved_config(path, merged)
+    lock_path = path.with_suffix(".lock")
+    with filelock.FileLock(lock_path):
+        existing = _load_saved_config(path)
+        merged = apply_config_edit(edit, existing)
+        _write_saved_config(path, merged)
