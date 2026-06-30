@@ -752,6 +752,17 @@ const FC_DETECTION_FIELDS: ConfigFieldDef[] = [
 // Category ordering
 // ---------------------------------------------------------------------------
 
+/**
+ * A named group of fields within a category. Groups add visual structure:
+ * an `h3` subheading + hairline divider above the first field in the group.
+ * Groups are optional — a category without groups renders its fields flat.
+ */
+export interface ConfigGroup {
+  /** Displayed as an `h3` uppercase label above the group's fields. */
+  title: string;
+  fields: ConfigFieldDef[];
+}
+
 export interface ConfigCategory {
   id: FieldCategory;
   label: string;
@@ -759,56 +770,180 @@ export interface ConfigCategory {
    * Short description shown in the category rail.
    */
   description: string;
+  /**
+   * When groups is provided, fields is derived from them (concatenation).
+   * When absent, fields is defined directly and no group subheadings render.
+   */
+  groups?: ConfigGroup[];
   fields: ConfigFieldDef[];
 }
 
 /**
  * Ordered list of config categories for the /config view rail.
+ *
+ * Ordering follows the design handoff (Hardware → Audio → FC-Detection →
+ * Advisor → Pre-FC Control → Late-Maillard Trim → Safety), which puts the
+ * device/hardware configuration first — the operator typically connects hardware
+ * before tuning the advisor or roast control parameters.
+ *
  * Hardware / Audio / FC-Detection are backed by the mcp_device snapshot
  * section added in S3 (#429) and wired by PR3 of #419 (slice 3c).
  */
 export const CONFIG_CATEGORIES: ConfigCategory[] = [
   {
-    id:          "Advisor",
-    label:       "Advisor",
-    description: "LLM advisor model, provider, and call settings.",
-    fields:      ADVISOR_FIELDS,
-  },
-  {
-    id:          "Pre-FC Control",
-    label:       "Pre-FC control",
-    description: "Deterministic heat and fan levels held from charge to first crack.",
-    fields:      PRE_FC_FIELDS,
-  },
-  {
-    id:          "Late-Maillard Trim",
-    label:       "Late-Maillard trim",
-    description: "Anticipatory heat trim in the late-Maillard window ahead of first crack.",
-    fields:      TRIM_FIELDS,
-  },
-  {
-    id:          "Safety",
-    label:       "Safety",
-    description: "Safety limits — displayed for reference. All read-only in M1.",
-    fields:      SAFETY_FIELDS,
-  },
-  {
     id:          "Hardware",
     label:       "Hardware",
     description: "Serial port and roaster driver rendered into the MCP yaml on each spawn.",
+    groups: [
+      {
+        title:  "Roaster",
+        fields: HARDWARE_FIELDS,
+      },
+    ],
     fields:      HARDWARE_FIELDS,
   },
   {
     id:          "Audio",
     label:       "Audio",
     description: "Audio input device and recording settings for the MCP child process.",
+    groups: [
+      {
+        title:  "First-crack input",
+        fields: AUDIO_FIELDS.filter((f) =>
+          f.key === "mcp_device.audio_input_device",
+        ),
+      },
+      {
+        title:  "Recording",
+        fields: AUDIO_FIELDS.filter((f) =>
+          f.key !== "mcp_device.audio_input_device",
+        ),
+      },
+    ],
     fields:      AUDIO_FIELDS,
   },
   {
     id:          "FC-Detection",
     label:       "FC detection",
     description: "First-crack detection mode, confidence threshold, and auto-T0 settings.",
+    groups: [
+      {
+        title:  "Detection",
+        fields: FC_DETECTION_FIELDS.filter((f) =>
+          f.key === "mcp_device.fc_mode" ||
+          f.key === "mcp_device.fc_confidence_threshold",
+        ),
+      },
+      {
+        title:  "Auto-T0 (charge detection)",
+        fields: FC_DETECTION_FIELDS.filter((f) =>
+          f.key === "mcp_device.auto_t0_detection_enabled" ||
+          f.key === "mcp_device.auto_t0_drop_threshold_c",
+        ),
+      },
+    ],
     fields:      FC_DETECTION_FIELDS,
+  },
+  {
+    id:          "Advisor",
+    label:       "Advisor",
+    description: "LLM advisor — advises the control loop; never issues roaster commands directly.",
+    groups: [
+      {
+        title:  "Model",
+        fields: ADVISOR_FIELDS.filter((f) =>
+          f.key === "advisor.model_slug" || f.key === "advisor.prompt_version",
+        ),
+      },
+      {
+        title:  "Parameters",
+        fields: ADVISOR_FIELDS.filter((f) =>
+          f.key === "advisor.timeout_seconds" || f.key === "advisor.temperature",
+        ),
+      },
+      {
+        title:  "Credentials",
+        fields: ADVISOR_FIELDS.filter((f) => f.key === "advisor.api_key_env"),
+      },
+      {
+        title:  "Provider (read-only)",
+        fields: ADVISOR_FIELDS.filter((f) =>
+          f.key === "advisor.provider" || f.key === "advisor.provider_base_url",
+        ),
+      },
+    ],
+    fields:      ADVISOR_FIELDS,
+  },
+  {
+    id:          "Pre-FC Control",
+    label:       "Pre-FC control",
+    description: "Heat and fan levels held from charge to first crack.",
+    groups: [
+      {
+        title:  "Levers",
+        fields: PRE_FC_FIELDS,
+      },
+    ],
+    fields:      PRE_FC_FIELDS,
+  },
+  {
+    id:          "Late-Maillard Trim",
+    label:       "Late-Maillard trim",
+    description: "Anticipatory heat trim in the late-Maillard window ahead of first crack.",
+    groups: [
+      {
+        title:  "Trim",
+        fields: TRIM_FIELDS.filter((f) =>
+          f.key === "controller.late_maillard_trim_enabled" ||
+          f.key === "controller.late_maillard_trim_heat_percent" ||
+          f.key === "controller.late_maillard_trim_window_fc_eta_seconds" ||
+          f.key === "controller.late_maillard_trim_min_bean_temp_c",
+        ),
+      },
+      {
+        title:  "Adaptive depth",
+        fields: TRIM_FIELDS.filter((f) =>
+          f.key !== "controller.late_maillard_trim_enabled" &&
+          f.key !== "controller.late_maillard_trim_heat_percent" &&
+          f.key !== "controller.late_maillard_trim_window_fc_eta_seconds" &&
+          f.key !== "controller.late_maillard_trim_min_bean_temp_c",
+        ),
+      },
+    ],
+    fields:      TRIM_FIELDS,
+  },
+  {
+    id:          "Safety",
+    label:       "Safety",
+    description: "Safety limits — displayed for reference. All read-only in M1.",
+    groups: [
+      {
+        title:  "Temperatures",
+        fields: SAFETY_FIELDS.filter((f) =>
+          f.key === "safety.max_bean_temp_c" ||
+          f.key === "safety.max_env_temp_c" ||
+          f.key === "safety.pre_t0_max_bean_temp_c" ||
+          f.key === "safety.bitter_ceiling_temp_c" ||
+          f.key === "safety.emergency_drop_temp_c",
+        ),
+      },
+      {
+        title:  "Rate limits",
+        fields: SAFETY_FIELDS.filter((f) =>
+          f.key === "safety.min_seconds_between_commands" ||
+          f.key === "safety.max_consecutive_mcp_failures" ||
+          f.key === "safety.max_consecutive_advisor_failures",
+        ),
+      },
+      {
+        title:  "Recovery",
+        fields: SAFETY_FIELDS.filter((f) =>
+          f.key === "safety.overrun_safe_fan_percent" ||
+          f.key === "safety.pre_t0_overrun_severity",
+        ),
+      },
+    ],
+    fields:      SAFETY_FIELDS,
   },
 ];
 

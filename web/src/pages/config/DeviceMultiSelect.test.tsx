@@ -23,6 +23,9 @@
  * 17. Chip strip shows selected values below the trigger.
  * 18. Disabled: trigger cannot open the popover.
  * 19. Never free-text: no textbox rendered with popover open.
+ * 20. ArrowDown on the trigger (popover closed) opens the popover and focuses
+ *     the first checked option (or first option when none checked).
+ * 21. ArrowDown on the trigger (popover already open) moves focus into the list.
  */
 
 import {
@@ -265,7 +268,7 @@ describe("DeviceMultiSelect — trigger ARIA + no free-text invariant", () => {
   });
 });
 
-describe("DeviceMultiSelect — arrow-key listbox navigation", () => {
+describe("DeviceMultiSelect — arrow-key listbox navigation (option rows)", () => {
   beforeEach(() => defaultMockState());
 
   it("ArrowDown moves focus from the first option to the second", () => {
@@ -304,6 +307,57 @@ describe("DeviceMultiSelect — arrow-key listbox navigation", () => {
     firstRow.focus();
     fireEvent.keyDown(firstRow, { key: "ArrowUp" });
     expect(firstRow).toHaveFocus();
+  });
+});
+
+describe("DeviceMultiSelect — trigger ArrowDown/Up opens popover and moves focus into list", () => {
+  // This asserts the Codex P2 fix: ArrowDown on the trigger must open the popover
+  // and land focus on the first checked option (or first option when none checked).
+
+  beforeEach(() => defaultMockState());
+
+  it("ArrowDown on the trigger (closed) opens the popover and focuses the first option when none are selected", async () => {
+    renderMultiSelect({ values: [] });
+    const trigger = screen.getByTestId("device-multi-select-trigger");
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    await waitFor(() =>
+      expect(screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[0]!.value}`)).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[0]!.value}`)).toHaveFocus(),
+    );
+  });
+
+  it("ArrowDown on the trigger (closed) focuses the first checked option when one is selected", async () => {
+    renderMultiSelect({ values: [AUDIO_DEVICES[1]!.value] });
+    const trigger = screen.getByTestId("device-multi-select-trigger");
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    await waitFor(() =>
+      expect(screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[1]!.value}`)).toHaveFocus(),
+    );
+  });
+
+  it("ArrowDown on the trigger (already open) moves focus to the first option", async () => {
+    renderMultiSelect({ values: [] });
+    fireEvent.click(screen.getByTestId("device-multi-select-trigger"));
+    const trigger = screen.getByTestId("device-multi-select-trigger");
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    await waitFor(() =>
+      expect(screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[0]!.value}`)).toHaveFocus(),
+    );
+  });
+
+  it("ArrowUp on the trigger (closed) opens the popover and focuses the last option", async () => {
+    renderMultiSelect({ values: [] });
+    const trigger = screen.getByTestId("device-multi-select-trigger");
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "ArrowUp" });
+    const lastDevice = AUDIO_DEVICES[AUDIO_DEVICES.length - 1]!;
+    await waitFor(() =>
+      expect(screen.getByTestId(`device-multi-option-${lastDevice.value}`)).toHaveFocus(),
+    );
   });
 });
 

@@ -190,7 +190,10 @@ describe("ConfigPage — category rail", () => {
   it("renders a rail item for every category", async () => {
     renderPage();
     await waitFor(() => screen.getByTestId("config-layout"));
-    // The four M1 categories
+    // All seven categories (reordered in S4: Hardware first, Safety last)
+    expect(screen.getByTestId("rail-item-Hardware")).toBeInTheDocument();
+    expect(screen.getByTestId("rail-item-Audio")).toBeInTheDocument();
+    expect(screen.getByTestId("rail-item-FC-Detection")).toBeInTheDocument();
     expect(screen.getByTestId("rail-item-Advisor")).toBeInTheDocument();
     expect(screen.getByTestId("rail-item-Pre-FC Control")).toBeInTheDocument();
     expect(screen.getByTestId("rail-item-Late-Maillard Trim")).toBeInTheDocument();
@@ -200,17 +203,20 @@ describe("ConfigPage — category rail", () => {
   it("switches the content pane when a rail item is clicked", async () => {
     renderPage();
     await waitFor(() => screen.getByTestId("config-layout"));
-    // Default: Advisor pane is visible
-    expect(screen.getByTestId("config-pane-Advisor")).toBeInTheDocument();
+    // Default: Hardware pane is visible (first in the reordered rail)
+    expect(screen.getByTestId("config-pane-Hardware")).toBeInTheDocument();
     // Click Pre-FC Control
     fireEvent.click(screen.getByTestId("rail-item-Pre-FC Control"));
-    expect(screen.getByTestId("config-pane-Pre-FC Control")).toBeInTheDocument();
-    expect(screen.queryByTestId("config-pane-Advisor")).toBeNull();
+    await waitFor(() => screen.getByTestId("config-pane-Pre-FC Control"));
+    expect(screen.queryByTestId("config-pane-Hardware")).toBeNull();
   });
 
   it("shows a dirty dot on a category when one of its fields is changed", async () => {
     renderPage();
     await waitFor(() => screen.getByTestId("config-layout"));
+    // Navigate to the Advisor pane to access its fields
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
     // No dirty dot on Advisor initially
     expect(screen.queryByTestId("rail-dirty-Advisor")).toBeNull();
     // Change the model slug field (text input in Advisor)
@@ -226,6 +232,9 @@ describe("ConfigPage — save model", () => {
   it("shows the save bar when a field is changed", async () => {
     renderPage();
     await waitFor(() => screen.getByTestId("config-layout"));
+    // Navigate to Advisor pane (Hardware is the new default)
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
     expect(screen.queryByTestId("config-save-bar")).toBeNull();
     const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
     fireEvent.change(modelInput!, { target: { value: "anthropic/claude-3-5-sonnet" } });
@@ -235,6 +244,8 @@ describe("ConfigPage — save model", () => {
   it("hides the save bar after Discard", async () => {
     renderPage();
     await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
     const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
     fireEvent.change(modelInput!, { target: { value: "anthropic/claude-3-5-sonnet" } });
     expect(screen.getByTestId("config-save-bar")).toBeInTheDocument();
@@ -248,6 +259,8 @@ describe("ConfigPage — save model", () => {
     saveConfigMock.mockResolvedValue(makeSnapshot({ model_slug: "anthropic/claude-3-5-sonnet" }));
     renderPage();
     await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
     const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
     fireEvent.change(modelInput!, { target: { value: "anthropic/claude-3-5-sonnet" } });
     fireEvent.click(screen.getByTestId("config-save-btn"));
@@ -275,7 +288,9 @@ describe("ConfigPage — save model", () => {
     const { client } = renderPage();
     await waitFor(() => screen.getByTestId("config-layout"));
 
-    // Edit model slug to something non-default
+    // Navigate to Advisor and edit model slug to something non-default
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
     const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
     fireEvent.change(modelInput!, { target: { value: "anthropic/claude-3-5-sonnet" } });
     expect(screen.getByTestId("config-save-bar")).toBeInTheDocument();
@@ -320,6 +335,9 @@ describe("ConfigPage — field controls", () => {
   it("renders the api_key_env field as a masked read-only display", async () => {
     renderPage();
     await waitFor(() => screen.getByTestId("config-layout"));
+    // Navigate to Advisor pane (Hardware is the new default first category)
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
     const masked = screen.getByTestId("masked-advisor.api_key_env");
     expect(masked).toBeInTheDocument();
     expect(masked).toHaveAttribute("aria-disabled", "true");
@@ -328,6 +346,9 @@ describe("ConfigPage — field controls", () => {
   it("shows Reset to default button only when a field differs from its default, and clicking it restores the default", async () => {
     renderPage();
     await waitFor(() => screen.getByTestId("config-layout"));
+    // Navigate to Advisor pane
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
     // Initially at default (effective_value = meta.default = "openai/gpt-4o") → no reset
     expect(screen.queryByTestId("reset-advisor.model_slug")).toBeNull();
     const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
@@ -741,5 +762,112 @@ describe("ConfigPage — recording_devices array dirty detection", () => {
     const recDevices = (body.mcp_device as Record<string, unknown>)?.recording_devices;
     expect(Array.isArray(recDevices)).toBe(true);
     expect(recDevices).toContain("USB PnP");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// S4 polish: category ordering, group subheadings, a11y, dirty-guard fix (#421)
+// ---------------------------------------------------------------------------
+
+describe("ConfigPage — S4: category ordering (Hardware first, Safety last)", () => {
+  it("Hardware is the default active category (first in the new order)", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    // Hardware is now first so it renders without any click
+    expect(screen.getByTestId("config-pane-Hardware")).toBeInTheDocument();
+  });
+
+  it("Advisor appears between FC-Detection and Pre-FC Control in the rail", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    const rail = screen.getByTestId("config-rail");
+    const items = Array.from(rail.querySelectorAll("[data-testid^='rail-item-']")).map(
+      (el) => el.getAttribute("data-testid"),
+    );
+    // Verify the new ordering: Hardware → Audio → FC-Detection → Advisor → Pre-FC → Trim → Safety
+    expect(items.indexOf("rail-item-Hardware")).toBeLessThan(items.indexOf("rail-item-Audio"));
+    expect(items.indexOf("rail-item-Audio")).toBeLessThan(items.indexOf("rail-item-FC-Detection"));
+    expect(items.indexOf("rail-item-FC-Detection")).toBeLessThan(items.indexOf("rail-item-Advisor"));
+    expect(items.indexOf("rail-item-Advisor")).toBeLessThan(items.indexOf("rail-item-Pre-FC Control"));
+    expect(items.indexOf("rail-item-Pre-FC Control")).toBeLessThan(items.indexOf("rail-item-Late-Maillard Trim"));
+    expect(items.indexOf("rail-item-Late-Maillard Trim")).toBeLessThan(items.indexOf("rail-item-Safety"));
+  });
+});
+
+describe("ConfigPage — S4: group subheadings (h3 with hairline)", () => {
+  it("Hardware pane renders the 'Roaster' group h3", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    // Hardware is the default pane
+    const pane = screen.getByTestId("config-pane-Hardware");
+    const h3 = pane.querySelector("h3");
+    expect(h3).not.toBeNull();
+    expect(h3!.textContent?.toUpperCase()).toBe("ROASTER");
+  });
+
+  it("Audio pane renders 'First-crack input' and 'Recording' group h3s", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Audio"));
+    await waitFor(() => screen.getByTestId("config-pane-Audio"));
+    const pane = screen.getByTestId("config-pane-Audio");
+    const h3s = Array.from(pane.querySelectorAll("h3")).map((el) =>
+      el.textContent?.toUpperCase(),
+    );
+    expect(h3s).toContain("FIRST-CRACK INPUT");
+    expect(h3s).toContain("RECORDING");
+  });
+
+  it("FC-Detection pane renders 'Detection' and 'Auto-T0' group h3s", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+    const pane = screen.getByTestId("config-pane-FC-Detection");
+    const h3s = Array.from(pane.querySelectorAll("h3")).map((el) =>
+      el.textContent?.toUpperCase(),
+    );
+    expect(h3s).toContain("DETECTION");
+    // Auto-T0 group heading
+    expect(h3s.some((t) => t?.includes("AUTO-T0"))).toBe(true);
+  });
+
+  it("Advisor pane renders 'Model', 'Parameters', and 'Credentials' group h3s", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
+    const pane = screen.getByTestId("config-pane-Advisor");
+    const h3s = Array.from(pane.querySelectorAll("h3")).map((el) =>
+      el.textContent?.toUpperCase(),
+    );
+    expect(h3s).toContain("MODEL");
+    expect(h3s).toContain("PARAMETERS");
+    expect(h3s).toContain("CREDENTIALS");
+  });
+});
+
+describe("ConfigPage — S4: dirty-guard fix (valuesEqual in snapshot re-init guard)", () => {
+  it("re-initialises from a fresh clean snapshot even when recording_devices is the same content", async () => {
+    // Before fix: recording_devices new array ref from toggle-and-revert would
+    // mark form "dirty" via !== and block re-init from a background refresh.
+    // After fix: valuesEqual detects same content → not dirty → re-init fires.
+    const { client } = renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+
+    // Navigate to Advisor and confirm initial model slug
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
+    const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
+    expect(modelInput!.value).toBe("openai/gpt-4o");
+
+    // Push a background refresh with a NEW model (different from initial) and
+    // same-content recording_devices — with the fix, this re-init fires.
+    client.setQueryData(["config"], makeSnapshot({ model_slug: "anthropic/claude-3-5-sonnet" }));
+
+    // The form should show the new value (re-init fired, no dirty to block it)
+    await waitFor(() => {
+      expect(modelInput!.value).toBe("anthropic/claude-3-5-sonnet");
+    });
   });
 });

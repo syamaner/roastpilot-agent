@@ -328,9 +328,9 @@ export function ConfigFieldRow({
     <div
       className={cn(
         "grid gap-8 py-[22px]",
+        "grid-cols-[minmax(0,1fr)_384px] max-[900px]:grid-cols-1",
         !isLast && "border-b border-[#2e2e34]",
       )}
-      style={{ gridTemplateColumns: "minmax(0,1fr) 384px" }}
       data-testid={`config-field-${fieldDef.key}`}
     >
       {/* Left: label + description */}
