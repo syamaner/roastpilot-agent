@@ -27,6 +27,7 @@ export const roastKeys = {
 /** Query keys for the config surface (#419, D78). */
 export const configKeys = {
   snapshot: ["config"] as const,
+  devices: ["config", "devices"] as const,
 };
 
 /** Query keys for the bean-profile library (#303). */
@@ -108,6 +109,21 @@ export function useDeleteBeanProfile() {
 }
 
 // --- Config (#419, D78) ---
+
+/**
+ * GET /api/config/devices — enumerate connected serial + audio devices.
+ * staleTime: 0 (devices change on USB plug); refetchOnWindowFocus: false
+ * (avoids a rescan burst when the operator alt-tabs; Rescan button is the
+ * explicit trigger).
+ */
+export function useDevices() {
+  return useQuery({
+    queryKey: configKeys.devices,
+    queryFn: api.devices,
+    staleTime: 0,
+    refetchOnWindowFocus: false,
+  });
+}
 
 /**
  * GET /api/config — the full config snapshot with per-field metadata.
