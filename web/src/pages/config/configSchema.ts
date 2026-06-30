@@ -190,23 +190,28 @@ const ADVISOR_FIELDS: ConfigFieldDef[] = [
   {
     key:            "advisor.provider",
     label:          "Provider",
-    hint:           "Which LLM provider backend to call. openai_compatible uses OpenRouter (default).",
+    // Read-only in M1: switching provider without being able to set the
+    // corresponding API key env-var (api_key_env is also read-only) would
+    // leave the advisor incoherent. The design's Advisor category has only
+    // Model + Control-prompt as editable fields. Use env override to change.
+    hint:           "Which LLM provider backend to call. openai_compatible uses OpenRouter (default). Change via ROASTPILOT_ADVISOR__PROVIDER env var.",
     type:           "select",
     options:        PROVIDER_OPTIONS,
     envVar:         "ROASTPILOT_ADVISOR__PROVIDER",
-    editKey:        "provider",
+    editKey:        null,             // read-only in M1: not sent in PUT body
     category:       "Advisor",
-    readOnlyStatic: false,
+    readOnlyStatic: true,
   },
   {
     key:            "advisor.provider_base_url",
     label:          "Provider base URL",
-    hint:           "API endpoint for OpenAI-compatible providers. Default is OpenRouter. Override for Ollama or custom endpoints.",
+    // Read-only in M1 alongside provider (same coherence constraint).
+    hint:           "API endpoint for OpenAI-compatible providers. Default is OpenRouter. Change via ROASTPILOT_ADVISOR__PROVIDER_BASE_URL env var.",
     type:           "text",
     envVar:         "ROASTPILOT_ADVISOR__PROVIDER_BASE_URL",
-    editKey:        "provider_base_url",
+    editKey:        null,             // read-only in M1: not sent in PUT body
     category:       "Advisor",
-    readOnlyStatic: false,
+    readOnlyStatic: true,
   },
   {
     key:            "advisor.api_key_env",

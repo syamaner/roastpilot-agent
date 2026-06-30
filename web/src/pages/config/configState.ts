@@ -53,12 +53,20 @@ export function resolveFieldMeta(
   return sectionObj[fieldName] ?? null;
 }
 
+// Segments that could mutate Object.prototype — never present in our hardcoded
+// editKeys, but guard explicitly so static-analysis tools (CodeQL) don't flag
+// the assignment pattern as a prototype-pollution sink.
+const FORBIDDEN_KEY_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
+
 /**
  * Set a value at a dot-path inside a mutable nested object, creating
  * intermediate objects as needed.
  *
  * e.g. setPath(obj, "pre_first_crack_levers.late_maillard_trim.enabled", true)
  * produces { pre_first_crack_levers: { late_maillard_trim: { enabled: true } } }
+ *
+ * Throws if any segment is a forbidden prototype key — all editKeys are
+ * compile-time constants so this is unreachable in practice.
  */
 function setPath(
   target: Record<string, unknown>,
@@ -69,12 +77,19 @@ function setPath(
   let node: Record<string, unknown> = target;
   for (let i = 0; i < parts.length - 1; i++) {
     const key = parts[i]!;
+    if (FORBIDDEN_KEY_SEGMENTS.has(key)) {
+      throw new Error(`setPath: forbidden key segment "${key}"`);
+    }
     if (typeof node[key] !== "object" || node[key] === null) {
       node[key] = {};
     }
     node = node[key] as Record<string, unknown>;
   }
-  node[parts[parts.length - 1]!] = value;
+  const lastKey = parts[parts.length - 1]!;
+  if (FORBIDDEN_KEY_SEGMENTS.has(lastKey)) {
+    throw new Error(`setPath: forbidden key segment "${lastKey}"`);
+  }
+  node[lastKey] = value;
 }
 
 /**
