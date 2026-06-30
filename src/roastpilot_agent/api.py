@@ -2330,9 +2330,13 @@ class DeviceOption(BaseModel):
     """One enumerated device entry returned by ``GET /api/config/devices``.
 
     Attributes:
-        value: The machine-readable identifier to store in the config (e.g.
-            a serial port path such as ``/dev/tty.usbmodem14101``, or an
-            integer sounddevice index cast to ``str``).
+        value: The machine-readable identifier to store in the config.  For
+            serial devices this is the port path (e.g.
+            ``/dev/tty.usbmodem14101``); for audio input devices this is the
+            device NAME substring (e.g. ``"USB PnP Sound Device"``), matching
+            the ``mcp_device.audio_input_device`` config field which the MCP
+            matches case-insensitively.  Note: two audio devices can share a
+            name → duplicate values; the ``note`` disambiguates the display.
         label: Human-readable display name for the Config UI dropdown.
         note: Extra detail shown as secondary text (port description / HW id
             for serial; channel count + sample rate for audio input).
@@ -2437,7 +2441,7 @@ def _enumerate_audio_inputs() -> tuple[list[DeviceOption], str | None]:
             rate_str = f"{int(rate):,}" if isinstance(rate, (int, float)) else "?"
             options.append(
                 DeviceOption(
-                    value=str(idx),
+                    value=name,
                     label=name,
                     note=f"Input · {max_in} ch · {rate_str} Hz",
                 )
