@@ -1058,6 +1058,31 @@ class MCPServerProcess:
         return StdioServerParameters(command=command, args=["serve"], env=env)
 
     @property
+    def device_config(self) -> MCPDeviceConfig | None:
+        """The device config currently set for the next (re)spawn, or ``None``.
+
+        Read-only accessor so callers can detect whether the config that was
+        used at the most recent :meth:`start` differs from a freshly-loaded
+        config — the comparison that drives the between-roast respawn (#431).
+        """
+        return self._device_config
+
+    def set_device_config(self, device_config: MCPDeviceConfig) -> None:
+        """Update the device config rendered into the MCP yaml on the next spawn.
+
+        Safe to call while the child is stopped (between roasts).  The updated
+        config is rendered into the MCP yaml by :meth:`build_server_parameters`
+        on the *next* :meth:`start` call — calling this while the child is
+        running has no effect on the live session (the yaml was already
+        rendered; the child reads it only on spawn).
+
+        Args:
+            device_config: The new managed device fields to render on the next
+                (re)spawn via passthrough-merge (D78-4, #420).
+        """
+        self._device_config = device_config
+
+    @property
     def running(self) -> bool:
         """Whether a session is attached (spawned or injected)."""
         return self._session is not None
