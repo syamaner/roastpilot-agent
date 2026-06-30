@@ -406,6 +406,13 @@ def _load_saved_config(path: Path) -> _RawSavedConfig:
 def _write_saved_config(path: Path, data: _RawSavedConfig) -> None:
     """Write *data* to the saved-config YAML at *path*, creating parent dirs.
 
+    The write is **atomic**: YAML is written to a sibling temp file in the same
+    directory, flushed to the OS buffer, then renamed over *path* via
+    :func:`os.replace`.  On POSIX this is an atomic rename so a concurrent
+    ``GET /api/config`` that reads the file never sees a torn/partial YAML.
+    The temp file is created by :func:`tempfile.NamedTemporaryFile` with
+    ``delete=False`` and cleaned up on error.
+
     Args:
         path: The path to the saved-config YAML file.
         data: The dict to serialise as YAML. Only editable managed fields
@@ -414,9 +421,28 @@ def _write_saved_config(path: Path, data: _RawSavedConfig) -> None:
     Raises:
         OSError: If the file or its parent directories cannot be written.
     """
+    import tempfile
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as fh:
-        yaml.safe_dump(data, fh, default_flow_style=False, sort_keys=True)
+    tmp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=".config-tmp-",
+            suffix=".yaml",
+            delete=False,
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+            yaml.safe_dump(data, tmp, default_flow_style=False, sort_keys=True)
+            tmp.flush()
+        # Atomic rename: readers never see a partial file.
+        os.replace(tmp_path, path)
+    except BaseException:
+        if tmp_path is not None:  # pragma: no branch
+            tmp_path.unlink(missing_ok=True)
+        raise
 
 
 # ---------------------------------------------------------------------------

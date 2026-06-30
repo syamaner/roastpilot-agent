@@ -108,6 +108,55 @@ def test_write_saved_config_creates_parent_dirs(tmp_path: Path) -> None:
     assert _load_saved_config(path) == {"advisor": {"temperature": 0.5}}
 
 
+def test_write_saved_config_is_atomic_no_temp_file_left(tmp_path: Path) -> None:
+    """_write_saved_config uses an atomic rename and leaves no temp file behind.
+
+    The write goes through a sibling .config-tmp-*.yaml temp file; on success
+    that file is renamed over the target, leaving no leftover temp files in the
+    parent directory.  Verifies the atomic-write path (claude-review low, PR #425).
+    """
+    path = tmp_path / "config.yaml"
+    _write_saved_config(path, {"advisor": {"model_slug": "openai/gpt-4o"}})
+
+    assert path.exists()
+    assert _load_saved_config(path) == {"advisor": {"model_slug": "openai/gpt-4o"}}
+    # No .config-tmp-*.yaml sibling must survive a successful write.
+    leftover = list(tmp_path.glob(".config-tmp-*.yaml"))
+    assert leftover == [], f"temp files leaked after write: {leftover}"
+
+
+def test_write_saved_config_cleans_temp_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_write_saved_config removes the temp file when os.replace raises.
+
+    Simulates a disk/rename error after the temp file is written to verify
+    the cleanup path in the except BaseException block.
+    """
+    import os as _os
+
+    path = tmp_path / "config.yaml"
+
+    call_count = 0
+
+    def _failing_replace(src: str, dst: str) -> None:
+        nonlocal call_count
+        call_count += 1
+        raise OSError("simulated rename failure")
+
+    monkeypatch.setattr(_os, "replace", _failing_replace)
+
+    with pytest.raises(OSError, match="simulated rename failure"):
+        _write_saved_config(path, {"advisor": {"model_slug": "openai/gpt-4o"}})
+
+    assert call_count == 1
+    # The target must not exist (write failed).
+    assert not path.exists()
+    # The temp file must have been cleaned up.
+    leftover = list(tmp_path.glob(".config-tmp-*.yaml"))
+    assert leftover == [], f"temp file not cleaned up after failure: {leftover}"
+
+
 def test_load_saved_config_rejects_non_mapping(tmp_path: Path) -> None:
     """A YAML file that is a list (not a mapping) raises ConfigFileError."""
     path = tmp_path / "bad.yaml"
