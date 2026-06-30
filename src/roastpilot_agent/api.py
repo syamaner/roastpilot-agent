@@ -1203,6 +1203,8 @@ class RoastService:
         sse_heartbeat_seconds: float = 15.0,
         roaster: RoasterControl | None = None,
         advisor: RoastAdvisor | None = None,
+        advisor_from_config: bool = False,
+        config_from_env: bool = False,
         exporter: LogExporter | None = None,
         raw_state: RawStateSource | None = None,
         run_loop: bool = True,
@@ -1216,6 +1218,12 @@ class RoastService:
         #: ``starting`` row but no controller loop drives them.
         self._roaster = roaster
         self._advisor = advisor
+        # True when both the config AND the advisor were produced by the live serve
+        # path (``build_live_service``), meaning both should be refreshed from the
+        # reloaded config at each ``start_roast`` (D78 apply-next-roast guarantee).
+        # False (default) when the caller injected explicit values (test doubles,
+        # replay's custom config + no-advisor None) — never replace them on reload.
+        self._live_serve_mode = advisor_from_config and config_from_env
         #: The most recent advisor reachability probe (issue #168), set at
         #: ``serve`` startup via :meth:`set_advisor_health` and surfaced on
         #: ``GET /api/health`` so the dashboard can render an ADVISOR-OFFLINE
@@ -1306,7 +1314,21 @@ class RoastService:
         )
 
     async def start_roast(self, profile: RoastProfile) -> RoastDetail:
-        """Start a roast: persist the run record, claim it as active (plan §6).
+        """Start a roast: reload saved config, persist the run record, claim it as active.
+
+        **Config reload (D76/D78 apply-next-roast guarantee):** the saved config
+        is re-read from disk at the start of every roast so that a ``PUT
+        /api/config`` made between roasts (to a pre-FC heat/fan target, the
+        advisor model, or a device setting) drives the *next* roast without
+        requiring an agent restart.  The reload happens inside ``_start_lock``
+        and only when no run is active, so a running roast's config is never
+        mutated mid-loop.
+
+        Safety limits are **env-resolved** by :func:`load_app_config` — the
+        :func:`~roastpilot_agent.config_store._inject_saved_as_env` injector
+        skips the ``ROASTPILOT_SAFETY__`` prefix unconditionally, so no saved
+        config file can change a safety limit.  The :class:`SafetyPolicy` is
+        always rebuilt from the reloaded (env-wins) :class:`AppConfig`.
 
         Returns 409 (``RoastRunConflictError``) when a run is already active —
         the API-level guard the controller's idle-only ``start_run`` transition
@@ -1322,6 +1344,38 @@ class RoastService:
                     f"a roast is already active (run {active.run_id}, phase "
                     f"{active.agent_phase.value}); end it before starting another"
                 )
+            # Reload effective config from the saved file + env (D76/D78).
+            # Only in live-serve mode (``_live_serve_mode=True``, set by
+            # ``build_live_service`` in live.py): both the config and the advisor
+            # were produced from ``load_app_config`` / ``build_advisor`` at startup
+            # and should be refreshed from the saved file + env at each roast start
+            # so a PUT /api/config made between roasts takes effect without a
+            # restart.
+            #
+            # Skipped for test doubles, API-only mode, and the replay harness,
+            # where the caller passed explicit values that must not be replaced.
+            if self._live_serve_mode:
+                # Run in a thread: load_app_config does sync file I/O + env
+                # snapshot/restore under _ENV_INJECTION_LOCK.  Drop the
+                # injected_keys return value (only needed by build_config_snapshot
+                # for the env-badge UI).
+                fresh_config, _ = await asyncio.to_thread(load_app_config)
+                _log.debug(
+                    "start_roast: reloaded config (advisor_model_slug=%r)",
+                    fresh_config.advisor.model_slug,
+                )
+                self._config = fresh_config
+                # Safety is always env-resolved; rebuild so self._safety matches
+                # self._config (the file injector skips ROASTPILOT_SAFETY__ so the
+                # SafetyLimits field values are identical to the startup values,
+                # but rebuilding keeps the pairing explicit and invariant-safe).
+                self._safety = SafetyPolicy(fresh_config.safety)
+                # Rebuild the advisor from the fresh config so model/prompt changes
+                # apply next-roast (D78).  build_advisor handles a missing API key
+                # gracefully (logs a warning, returns None → advisory-paused).
+                from roastpilot_agent.live import build_advisor  # lazy: live.py imports api
+
+                self._advisor = build_advisor(fresh_config)
             run_id = uuid.uuid4().hex
             await self._store.create_run(
                 run_id=run_id,
