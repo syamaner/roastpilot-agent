@@ -156,6 +156,37 @@ function GuardedChip(): React.JSX.Element {
 }
 
 // ---------------------------------------------------------------------------
+// Env-override badge (D78-1, #419 slice 3b)
+// ---------------------------------------------------------------------------
+
+interface EnvOverrideBadgeProps {
+  /** The env-var name from the static schema (ConfigFieldDef.envVar). */
+  envVar: string;
+}
+
+/**
+ * Rendered below the control when ConfigFieldMeta.env_overridden is true.
+ * Communicates that the host environment is overriding the saved value so
+ * the operator knows why their saved value has no effect.
+ */
+function EnvOverrideBadge({ envVar }: EnvOverrideBadgeProps): React.JSX.Element {
+  return (
+    <div
+      className="flex flex-col gap-0.5 rounded-[6px] border border-roast-nominal/30 bg-roast-nominal/[.06] px-2.5 py-1.5"
+      data-testid="env-override-badge"
+    >
+      <span className="text-[11px] font-semibold uppercase tracking-wide text-roast-nominal">
+        Overridden by env
+      </span>
+      <span className="font-mono text-[11px] text-muted-foreground/70">{envVar}</span>
+      <span className="text-[11px] text-muted-foreground/50">
+        Saved value won't take effect while this env var is set.
+      </span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Row
 // ---------------------------------------------------------------------------
 
@@ -188,6 +219,11 @@ export function ConfigFieldRow({
   dynMin,
   dynMax,
 }: ConfigFieldRowProps): React.JSX.Element {
+  const isEnvOverridden = meta.env_overridden && fieldDef.envVar !== null;
+  // env_overridden and read_only are SEPARATE server flags: an env-overridden
+  // non-safety field has read_only=false and PUT /api/config accepts it. The badge
+  // is purely informational — the operator can save a value that becomes effective
+  // once the env var is removed. Only readOnlyStatic and server read_only gate edits.
   const isReadOnly = fieldDef.readOnlyStatic || meta.read_only;
   const isSafetyField = fieldDef.category === "Safety";
   const isDirtyFromDefault = value !== meta.default;
@@ -249,6 +285,9 @@ export function ConfigFieldRow({
       {/* Right: control + meta */}
       <div className="flex flex-col gap-1.5">
         {control}
+
+        {/* Env-override badge — shown when the host env var overrides the saved value */}
+        {isEnvOverridden && <EnvOverrideBadge envVar={fieldDef.envVar!} />}
 
         {/* Range hint for numeric fields — uses effective (dynamic) bounds */}
         {fieldDef.type === "number" && (effectiveMin !== undefined || effectiveMax !== undefined) && (
