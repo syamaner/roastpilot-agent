@@ -1237,3 +1237,128 @@ def test_apply_config_edit_blank_audio_input_device_treated_as_inherit() -> None
     edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit.model_validate({"audio_input_device": ""}))
     result = apply_config_edit(edit, existing)
     assert "audio_input_device" not in result.get("mcp_device", {})
+
+
+# ---------------------------------------------------------------------------
+# #426 — JSON-blob section env var precedence + env_overridden flag
+# ---------------------------------------------------------------------------
+
+
+def test_json_blob_env_var_beats_saved_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A top-level JSON-blob env var for a section (e.g. ROASTPILOT_ADVISOR='{"model_slug":"..."}')
+    takes precedence over saved-file values for the fields it sets (#426).
+
+    Before the fix, _inject_saved_as_env injected ROASTPILOT_ADVISOR__MODEL_SLUG
+    from the saved file, which pydantic-settings used as the effective value even
+    when ROASTPILOT_ADVISOR='{"model_slug":"json-blob-model"}' was also set,
+    because scalar nested env vars win over the JSON blob in pydantic-settings'
+    resolution order.  The fix skips injection for the whole section when a
+    section-level JSON blob key is already set in the environment.
+    """
+    import json
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("advisor:\n  model_slug: saved-file-model\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_file))
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", json.dumps({"model_slug": "json-blob-model"}))
+
+    effective, injected = load_app_config()
+
+    # JSON blob must win over the saved file.
+    assert effective.advisor.model_slug == "json-blob-model"
+    # No ROASTPILOT_ADVISOR__* keys should have been injected for this section.
+    assert not any("ROASTPILOT_ADVISOR__" in k for k in injected)
+
+
+def test_json_blob_env_var_sets_env_overridden_true(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fields set by a top-level JSON-blob env var report env_overridden=True (#426).
+
+    Before the fix, env_overridden was False for these fields because the check
+    only looked for the per-field scalar env var (ROASTPILOT_ADVISOR__MODEL_SLUG),
+    which is absent from os.environ when a JSON blob covers the section.
+    """
+    import json
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("advisor:\n  model_slug: saved-file-model\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_file))
+    monkeypatch.setenv(
+        "ROASTPILOT_ADVISOR",
+        json.dumps({"model_slug": "json-blob-model", "temperature": 0.7}),
+    )
+
+    effective, injected = load_app_config()
+    saved_raw = _load_saved_config(cfg_file)
+    snap = build_config_snapshot(effective, saved_raw, injected)
+
+    # Both fields set in the JSON blob must be flagged env_overridden.
+    assert snap.advisor.model_slug.env_overridden is True
+    assert snap.advisor.temperature.env_overridden is True
+    # saved_value is still the file value (the badge shows what's saved vs effective).
+    assert snap.advisor.model_slug.saved_value == "saved-file-model"
+    assert snap.advisor.model_slug.effective_value == "json-blob-model"
+
+
+def test_scalar_env_var_precedence_unaffected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scalar env vars (ROASTPILOT_ADVISOR__MODEL_SLUG) still win over the saved file
+    and still report env_overridden=True — the JSON-blob fix must not regress them.
+    Fields NOT shadowed by any env var retain env_overridden=False.
+    """
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "advisor:\n  model_slug: saved-model\n  temperature: 0.3\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_file))
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__MODEL_SLUG", "scalar-env-model")
+
+    effective, injected = load_app_config()
+    saved_raw = _load_saved_config(cfg_file)
+    snap = build_config_snapshot(effective, saved_raw, injected)
+
+    # Scalar env var wins for model_slug.
+    assert effective.advisor.model_slug == "scalar-env-model"
+    assert snap.advisor.model_slug.env_overridden is True
+
+    # temperature comes from the saved file (injected) — not env_overridden.
+    assert effective.advisor.temperature == 0.3
+    assert snap.advisor.temperature.env_overridden is False
+
+
+def test_json_blob_env_var_does_not_affect_other_sections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A JSON-blob env var for ROASTPILOT_ADVISOR only skips advisor injection;
+    other sections (e.g. controller) continue to be injected from the saved file.
+    """
+    import json
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "advisor:\n  model_slug: saved-advisor-model\n"
+        "controller:\n  pre_first_crack_levers:\n    heat_target_percent: 80\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_file))
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", json.dumps({"model_slug": "json-blob-model"}))
+
+    effective, injected = load_app_config()
+    saved_raw = _load_saved_config(cfg_file)
+    snap = build_config_snapshot(effective, saved_raw, injected)
+
+    # Advisor: JSON blob governs.
+    assert effective.advisor.model_slug == "json-blob-model"
+    assert snap.advisor.model_slug.env_overridden is True
+
+    # Controller: saved-file injection still works.
+    assert effective.controller.pre_first_crack_levers.heat_target_percent == 80
+    assert snap.controller.pre_fc_heat_target_percent.env_overridden is False

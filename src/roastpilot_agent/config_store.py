@@ -539,7 +539,17 @@ def _make_field_meta(
         A frozen :class:`ConfigFieldMeta` instance.
     """
     injected = injected_keys or frozenset()
-    env_overridden = bool(env_var and _env_is_set(env_var) and env_var not in injected)
+    # A field is env-overridden when either:
+    # (a) its own per-field scalar env var is set and not merely injected from
+    #     the saved file (e.g. ROASTPILOT_ADVISOR__MODEL_SLUG in os.environ), OR
+    # (b) a top-level JSON-blob env var covering the whole section is set and
+    #     not injected (e.g. ROASTPILOT_ADVISOR='{"model_slug":"gpt-4o"}').
+    #     In this case the per-field scalar var is absent from os.environ even
+    #     though the field's value was supplied by the operator (#426).
+    scalar_overridden = bool(env_var and _env_is_set(env_var) and env_var not in injected)
+    section_key = env_var.split("__")[0] if env_var and "__" in env_var else None
+    blob_overridden = bool(section_key and _env_is_set(section_key) and section_key not in injected)
+    env_overridden = scalar_overridden or blob_overridden
     return ConfigFieldMeta(
         saved_value=saved_value,
         effective_value=effective_value,
@@ -1428,6 +1438,16 @@ def _inject_saved_as_env(saved_raw: _RawSavedConfig) -> frozenset[str]:
             # Skip the entire safety section — field-list-independent guard.
             # A new SafetyLimits field cannot accidentally become injectable
             # without an explicit change to AppConfigEdit or SafetyLimitsSnapshot.
+            continue
+        # JSON-blob section env var precedence (#426): if the operator has set a
+        # top-level JSON-blob env var for this whole section (e.g.
+        # ROASTPILOT_ADVISOR='{"model_slug":"gpt-4o"}'), that var governs ALL
+        # fields in the section.  pydantic-settings resolves individual scalar
+        # env vars (ROASTPILOT_ADVISOR__MODEL_SLUG) AFTER the JSON blob, so
+        # injecting saved-file scalars here would shadow the JSON blob values.
+        # Skip the entire section when such a key is already set in the environment.
+        section_key = prefix[:-2]  # strip trailing "__" → e.g. "ROASTPILOT_ADVISOR"
+        if section_key in os.environ:
             continue
         _inject_section(cast("dict[str, Any]", section_val), prefix, injected)
     return frozenset(injected)
