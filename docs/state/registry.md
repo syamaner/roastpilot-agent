@@ -131,10 +131,12 @@ endpoint.
 on its first real outing it caught a run of bugs the Opus safety-reviewer (PASSed twice), the contract
 checker, and the author all missed: a roast-breaking render-source regression (a normal `roast-live.sh`
 roast would spawn the MCP on defaults, dropping the Hottop config), a credential-redirection hole, a
-cross-request `os.environ` mutation, and the apply-next-roast gap itself. Kept **ADVISORY + lead-triaged,
-triggered deliberately, never auto-blocking** (its re-post-on-every-trigger churn deadlocks
-conversation-resolution otherwise). Signal type = a `pull_request_review` with inline threads; the
-`review-gate` flip-on-BOTH-reviews wiring remains an open one-file governance task. Memories:
+cross-request `os.environ` mutation, and the apply-next-roast gap itself. **Operator decision (30 Jun): Codex is ADVISORY-BUT-TRIAGED, NOT a required gate — the
+planned `review-gate` flip-on-BOTH-reviews wiring is CANCELLED** (its re-post-on-every-trigger
+churn would deadlock conversation-resolution if its inline threads gated merge). Operating rule:
+auto-reviews at PR creation, re-trigger with `codex review` only ONCE on the final commit; the lead
+verifies each finding vs current code, folds the real ones, resolves the stale re-posts by hand
+(D23 — author never self-triages). AGENTS.md roster updated to match (this PR). Memories:
 `agent-config-ui-story`, `claude-review-not-a-required-check`. **This does not change roast priorities —
 #405 (deterministic post-FC heat floor) remains the top control priority; the block below is unchanged.**
 
