@@ -247,16 +247,18 @@ def test_render_known_good_passthrough_unmanaged_keys(tmp_path: Path) -> None:
     assert result["first_crack"]["confidence_threshold"] == 0.8
 
 
-def test_render_missing_source_treated_as_empty(tmp_path: Path) -> None:
-    """A source path that does not exist is silently treated as empty (fresh install)."""
+def test_render_missing_source_raises(tmp_path: Path) -> None:
+    """A resolved source_path that does not exist raises FileNotFoundError (fail closed).
+
+    This replaces the previous silent-empty behaviour: a missing explicit source
+    must not mask the real MCP's own ConfigError on a missing config path.
+    """
     missing = tmp_path / "does_not_exist.yaml"
     dest = tmp_path / "rendered.yaml"
     cfg = MCPDeviceConfig(serial_port="/dev/ttyUSB0")
 
-    render_mcp_yaml(cfg, source_path=missing, dest_path=dest)
-
-    result = yaml.safe_load(dest.read_text(encoding="utf-8"))
-    assert result["roaster"]["port"] == "/dev/ttyUSB0"
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        render_mcp_yaml(cfg, source_path=missing, dest_path=dest)
 
 
 def test_render_creates_parent_dirs(tmp_path: Path) -> None:
@@ -587,3 +589,144 @@ def test_apply_config_edit_mcp_device_none_fields_skipped(tmp_path: Path) -> Non
     dev = result["mcp_device"]
     assert dev["serial_port"] == "/dev/new"
     assert dev["fc_mode"] == "disabled"  # untouched
+
+
+# ---------------------------------------------------------------------------
+# P2 regression: fail-closed on explicit-but-missing source paths
+# ---------------------------------------------------------------------------
+
+
+def test_render_explicit_source_missing_raises(tmp_path: Path) -> None:
+    """P2-a: a resolved source path that does not exist raises FileNotFoundError.
+
+    Silently falling to base={} would mask the real MCP's own ConfigError on a
+    missing explicit config path, causing a live roast to start on defaults.
+    """
+    missing = tmp_path / "not_here.yaml"
+    assert not missing.exists()
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        render_mcp_yaml(
+            MCPDeviceConfig(serial_port="/dev/ttyUSB0"),
+            source_path=missing,
+            dest_path=tmp_path / "out.yaml",
+        )
+
+
+def test_build_server_parameters_env_source_missing_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-a: COFFEE_ROASTER_MCP_CONFIG pointing at a missing file → build raises.
+
+    The render must not mask the MCP's fail-closed behavior by silently
+    substituting an empty base.
+    """
+    from roastpilot_agent.mcp_client import MCPServerProcess
+
+    monkeypatch.setenv("COFFEE_ROASTER_MCP_CONFIG", str(tmp_path / "missing.yaml"))
+    proc = MCPServerProcess(MCPConfig(), device_config=MCPDeviceConfig(serial_port="/dev/ttyUSB0"))
+    try:
+        with pytest.raises(FileNotFoundError):
+            proc.build_server_parameters()
+    finally:
+        if proc._rendered_yaml_dir is not None:  # pyright: ignore[reportPrivateUsage]
+            shutil.rmtree(proc._rendered_yaml_dir, ignore_errors=True)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_build_server_parameters_mcp_env_source_missing_raises(
+    tmp_path: Path,
+) -> None:
+    """P2-a: COFFEE_ROASTER_MCP_CONFIG in MCPConfig.env pointing at missing file → raises."""
+    from roastpilot_agent.mcp_client import MCPServerProcess
+
+    mcp_cfg = MCPConfig(env={"COFFEE_ROASTER_MCP_CONFIG": str(tmp_path / "missing.yaml")})
+    proc = MCPServerProcess(mcp_cfg, device_config=MCPDeviceConfig(serial_port="/dev/ttyUSB0"))
+    try:
+        with pytest.raises(FileNotFoundError):
+            proc.build_server_parameters()
+    finally:
+        if proc._rendered_yaml_dir is not None:  # pyright: ignore[reportPrivateUsage]
+            shutil.rmtree(proc._rendered_yaml_dir, ignore_errors=True)  # pyright: ignore[reportPrivateUsage]
+
+
+# ---------------------------------------------------------------------------
+# P2 regression: CWD default yaml fallback preserves unmanaged keys
+# ---------------------------------------------------------------------------
+
+
+def test_build_server_parameters_cwd_default_yaml_used_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-b: operator uses CWD default yaml + UI edit → unmanaged keys preserved.
+
+    When neither mcp_yaml_source_path nor COFFEE_ROASTER_MCP_CONFIG is set but
+    coffee-roaster-mcp.yaml exists in the CWD (the MCP's own fallback), the
+    render must merge onto it — not produce an overlay-only yaml that drops the
+    operator's pinned revision, onnx_threads, etc.
+    """
+    import os
+
+    from roastpilot_agent.mcp_client import MCPServerProcess
+
+    # Write a CWD default yaml with unmanaged keys that must survive.
+    cwd_yaml = tmp_path / "coffee-roaster-mcp.yaml"
+    cwd_yaml.write_text(
+        "roaster:\n  driver: hottop_kn8828b_2k_plus\n  baudrate: 115200\n"
+        "first_crack:\n  revision: b349a919\n  onnx_threads: 8\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("COFFEE_ROASTER_MCP_CONFIG", raising=False)
+
+    # Change CWD to tmp_path so the default file is found.
+    original_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        cfg = MCPDeviceConfig(serial_port="/dev/ttyUSB1")
+        proc = MCPServerProcess(MCPConfig(), device_config=cfg)
+        try:
+            params = proc.build_server_parameters()
+            assert params.env is not None
+            result = yaml.safe_load(
+                Path(params.env["COFFEE_ROASTER_MCP_CONFIG"]).read_text(encoding="utf-8")
+            )
+            # Managed field overlaid.
+            assert result["roaster"]["port"] == "/dev/ttyUSB1"
+            # Unmanaged keys from the CWD default survive.
+            assert result["roaster"]["driver"] == "hottop_kn8828b_2k_plus"
+            assert result["roaster"]["baudrate"] == 115200
+            assert result["first_crack"]["revision"] == "b349a919"
+            assert result["first_crack"]["onnx_threads"] == 8
+        finally:
+            if proc._rendered_yaml_dir is not None:  # pyright: ignore[reportPrivateUsage]
+                shutil.rmtree(proc._rendered_yaml_dir, ignore_errors=True)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_build_server_parameters_no_cwd_default_fresh_install(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P2-b: no CWD default yaml → overlay-only render (fresh install, no error)."""
+    import os
+
+    from roastpilot_agent.mcp_client import MCPServerProcess
+
+    monkeypatch.delenv("COFFEE_ROASTER_MCP_CONFIG", raising=False)
+    original_cwd = os.getcwd()
+    os.chdir(tmp_path)  # tmp_path has no coffee-roaster-mcp.yaml
+    try:
+        cfg = MCPDeviceConfig(serial_port="/dev/ttyUSB0", roaster_driver="mock")
+        proc = MCPServerProcess(MCPConfig(), device_config=cfg)
+        try:
+            params = proc.build_server_parameters()
+            assert params.env is not None
+            result = yaml.safe_load(
+                Path(params.env["COFFEE_ROASTER_MCP_CONFIG"]).read_text(encoding="utf-8")
+            )
+            # Only managed fields present — no error on missing CWD default.
+            assert result["roaster"]["port"] == "/dev/ttyUSB0"
+            assert result["roaster"]["driver"] == "mock"
+        finally:
+            if proc._rendered_yaml_dir is not None:  # pyright: ignore[reportPrivateUsage]
+                shutil.rmtree(proc._rendered_yaml_dir, ignore_errors=True)  # pyright: ignore[reportPrivateUsage]
+    finally:
+        os.chdir(original_cwd)

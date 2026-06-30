@@ -169,18 +169,34 @@ def render_mcp_yaml(
             fields are written; ``None`` fields leave the source yaml value
             intact.
         source_path: Path to the operator's existing ``coffee-roaster-mcp.yaml``,
-            or ``None`` when no hand-authored yaml exists.  A missing file is
-            treated as an empty yaml (all keys absent).
+            or ``None`` when no hand-authored yaml exists (fresh install).
+            When non-``None`` the file **must exist** — a missing explicit path
+            raises :class:`FileNotFoundError` (fail closed: the real MCP also
+            raises on a missing explicit config path, and the render must not
+            mask that by silently substituting an empty base).
         dest_path: Destination path for the rendered yaml.  Parent directories
             are created if absent.
 
     Raises:
+        FileNotFoundError: If *source_path* is non-``None`` but the file does
+            not exist.
+        ValueError: If the source yaml parses to a non-mapping (list, scalar).
         yaml.YAMLError: If the source yaml cannot be parsed.
         OSError: If the source yaml cannot be read or the dest cannot be written.
     """
     # 1. Load the existing operator yaml (or start from an empty base).
     base: dict[str, Any] = {}
-    if source_path is not None and source_path.exists():
+    if source_path is not None:
+        if not source_path.exists():
+            # An explicit (or env-resolved) source path that is missing means the
+            # operator's config is mis-configured — fail closed rather than
+            # silently starting the MCP on defaults.  The real MCP raises
+            # ConfigError on a missing explicit path (v0.1.11); the render must
+            # not mask that by feeding an overlay-only temp yaml.
+            raise FileNotFoundError(
+                f"MCP yaml source at {source_path!r} does not exist; "
+                "refusing to render onto a missing base (fail closed)"
+            )
         with source_path.open("r", encoding="utf-8") as fh:
             loaded: Any = yaml.safe_load(fh)
         if loaded is None:

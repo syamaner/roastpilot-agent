@@ -969,19 +969,27 @@ class MCPServerProcess:
 
         **Source-yaml resolution** (render source = operator's existing yaml):
 
-        1. ``device_config.mcp_yaml_source_path`` — explicit path wins.
+        1. ``device_config.mcp_yaml_source_path`` — explicit path wins; passed
+           to :func:`~roastpilot_agent.mcp_yaml.render_mcp_yaml` as-is (raises
+           :class:`FileNotFoundError` if the file is absent — fail closed).
         2. ``COFFEE_ROASTER_MCP_CONFIG`` from ``MCPConfig.env`` — the value
            forwarded by ``forward_coffee_env`` from ``roast-live.sh``.
         3. ``COFFEE_ROASTER_MCP_CONFIG`` from ``os.environ`` — the ambient
-           operator environment.
-        4. ``None`` — no existing yaml; render from managed fields only.
+           operator environment.  Steps 2–3 also raise if the resolved path
+           is missing (same fail-closed guarantee).
+        4. ``coffee-roaster-mcp.yaml`` in the current working directory — the
+           MCP's own default fallback.  Only used if the file actually exists;
+           silently skipped otherwise so a fresh install is not treated as a
+           config error.
+        5. ``None`` — no existing yaml; render from managed fields only
+           (fresh install with no hand-authored config).
 
         **Skip condition**: if the overlay is entirely empty (all
         ``MCPDeviceConfig`` fields are ``None``) AND no source yaml is
-        resolvable, the render step is skipped and ``COFFEE_ROASTER_MCP_CONFIG``
-        is left exactly as the operator set it — so a default all-``None``
-        ``mcp_device`` on a ``roast-live.sh`` roast does not overwrite the
-        operator's proven Hottop yaml with an empty one.
+        resolvable at steps 1–5, the render step is skipped and
+        ``COFFEE_ROASTER_MCP_CONFIG`` is left exactly as the operator set it —
+        so a default all-``None`` ``mcp_device`` on a ``roast-live.sh`` roast
+        does not overwrite the operator's proven Hottop yaml with an empty one.
         """
         import tempfile  # noqa: PLC0415
 
@@ -994,7 +1002,14 @@ class MCPServerProcess:
         extra_env: dict[str, str] = dict(self._config.env)
 
         if self._device_config is not None:
-            # Resolve the source yaml: explicit path > MCPConfig.env > os.environ.
+            # Resolve the source yaml in priority order:
+            #   1. explicit mcp_yaml_source_path
+            #   2. COFFEE_ROASTER_MCP_CONFIG from MCPConfig.env (forward_coffee_env)
+            #   3. COFFEE_ROASTER_MCP_CONFIG from os.environ
+            #   4. ./coffee-roaster-mcp.yaml (the MCP's own CWD default — only if it exists)
+            # Steps 1-3 pass the path to render_mcp_yaml which raises FileNotFoundError
+            # when the file is missing (fail closed). Step 4 is checked for existence
+            # before use so a fresh install without the CWD file is silently a None source.
             source: Path | None = self._device_config.mcp_yaml_source_path
             if source is None:
                 raw = extra_env.get("COFFEE_ROASTER_MCP_CONFIG") or os.environ.get(
@@ -1002,6 +1017,11 @@ class MCPServerProcess:
                 )
                 if raw:
                     source = Path(raw)
+            if source is None:
+                # Step 4: MCP's own CWD default — use only when the file is present.
+                cwd_default = Path("coffee-roaster-mcp.yaml")
+                if cwd_default.exists():
+                    source = cwd_default
 
             # Build the overlay to decide whether we need to render at all.
             overlay = _device_config_to_overlay(self._device_config)
