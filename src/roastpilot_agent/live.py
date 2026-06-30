@@ -205,6 +205,9 @@ async def build_live_service(
         exporter=adapter,
         raw_state=adapter,
     )
+    # Record the device config the child was just spawned with so the
+    # between-roast respawn path in start_roast can detect drift (#431).
+    service.set_spawned_mcp_device(config.mcp_device)
     return service, mcp, store
 
 

@@ -910,6 +910,13 @@ class MCPServerProcess:
         #: Best-effort force-terminate of the spawned child group, populated by
         #: the default factory once the pid is known (or injected for tests).
         self._force_terminate: ForceTerminate | None = force_terminate
+        #: True when ``force_terminate`` was supplied at construction (test seam).
+        #: An injected hook must win over the auto-registered hook and must NOT
+        #: be cleared between respawns — only the auto-registered (real-IO) hook
+        #: is replaced per spawn.  Without this flag, the re-arm logic in
+        #: :meth:`start` cannot distinguish "no hook yet" from "hook from prev
+        #: pid" and would leave the seam intact on the wrong branch.
+        self._force_terminate_injected: bool = force_terminate is not None
         #: Rendered yaml temp dir; created in :meth:`build_server_parameters`
         #: when ``_device_config`` is set, cleaned up in :meth:`stop`.
         self._rendered_yaml_dir: Path | None = None
@@ -1058,6 +1065,31 @@ class MCPServerProcess:
         return StdioServerParameters(command=command, args=["serve"], env=env)
 
     @property
+    def device_config(self) -> MCPDeviceConfig | None:
+        """The device config currently set for the next (re)spawn, or ``None``.
+
+        Read-only accessor so callers can detect whether the config that was
+        used at the most recent :meth:`start` differs from a freshly-loaded
+        config — the comparison that drives the between-roast respawn (#431).
+        """
+        return self._device_config
+
+    def set_device_config(self, device_config: MCPDeviceConfig) -> None:
+        """Update the device config rendered into the MCP yaml on the next spawn.
+
+        Safe to call while the child is stopped (between roasts).  The updated
+        config is rendered into the MCP yaml by :meth:`build_server_parameters`
+        on the *next* :meth:`start` call — calling this while the child is
+        running has no effect on the live session (the yaml was already
+        rendered; the child reads it only on spawn).
+
+        Args:
+            device_config: The new managed device fields to render on the next
+                (re)spawn via passthrough-merge (D78-4, #420).
+        """
+        self._device_config = device_config
+
+    @property
     def running(self) -> bool:
         """Whether a session is attached (spawned or injected)."""
         return self._session is not None
@@ -1084,10 +1116,23 @@ class MCPServerProcess:
         Resets :attr:`stop_unconfirmed` to ``False`` first: the flag describes
         the most recent teardown, so a reused process (start → stop → start)
         must not carry a prior run's unconfirmed verdict into the new run.
+
+        Re-arms the force-terminate hook for each spawn: on the first start the
+        auto-registered hook captures the spawned pid via
+        :meth:`_register_force_terminate`; on a respawn the previous pid's
+        closure would still be held, so the hook is cleared here (before the
+        spawn) so :meth:`_register_force_terminate` re-registers with the new
+        pid.  An injected hook (test seam, ``_force_terminate_injected=True``)
+        is never cleared — it must win and be reused across respawns.
         """
         if self._session is not None:
             return
         self._stop_unconfirmed = False
+        # Re-arm: clear the auto-registered hook before each spawn so
+        # _register_force_terminate captures the new pid, not the previous one.
+        # Injected hooks (test seam) are left untouched.
+        if not self._force_terminate_injected:
+            self._force_terminate = None
         stack = AsyncExitStack()
         try:
             session = await stack.enter_async_context(
