@@ -108,6 +108,83 @@ def test_write_saved_config_creates_parent_dirs(tmp_path: Path) -> None:
     assert _load_saved_config(path) == {"advisor": {"temperature": 0.5}}
 
 
+def test_write_saved_config_is_atomic_no_temp_file_left(tmp_path: Path) -> None:
+    """_write_saved_config uses an atomic rename and leaves no temp file behind.
+
+    The write goes through a sibling .config-tmp-*.yaml temp file; on success
+    that file is renamed over the target, leaving no leftover temp files in the
+    parent directory.  Verifies the atomic-write path (claude-review low, PR #425).
+    """
+    path = tmp_path / "config.yaml"
+    _write_saved_config(path, {"advisor": {"model_slug": "openai/gpt-4o"}})
+
+    assert path.exists()
+    assert _load_saved_config(path) == {"advisor": {"model_slug": "openai/gpt-4o"}}
+    # No .config-tmp-*.yaml sibling must survive a successful write.
+    leftover = list(tmp_path.glob(".config-tmp-*.yaml"))
+    assert leftover == [], f"temp files leaked after write: {leftover}"
+
+
+def test_write_saved_config_cleans_temp_on_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_write_saved_config removes the temp file when os.replace raises.
+
+    Simulates a disk/rename error after the temp file is written to verify
+    the cleanup path in the except BaseException block (tmp_path is not None).
+    """
+    import os as _os
+
+    path = tmp_path / "config.yaml"
+
+    call_count = 0
+
+    def _failing_replace(src: str, dst: str) -> None:
+        nonlocal call_count
+        call_count += 1
+        raise OSError("simulated rename failure")
+
+    monkeypatch.setattr(_os, "replace", _failing_replace)
+
+    with pytest.raises(OSError, match="simulated rename failure"):
+        _write_saved_config(path, {"advisor": {"model_slug": "openai/gpt-4o"}})
+
+    assert call_count == 1
+    # The target must not exist (write failed).
+    assert not path.exists()
+    # The temp file must have been cleaned up.
+    leftover = list(tmp_path.glob(".config-tmp-*.yaml"))
+    assert leftover == [], f"temp file not cleaned up after failure: {leftover}"
+
+
+def test_write_saved_config_cleans_nothing_when_tempfile_creation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_write_saved_config propagates the error when NamedTemporaryFile itself raises.
+
+    When NamedTemporaryFile raises (e.g. no space left, permissions), tmp_path
+    is still None and the except block takes the False branch — nothing to
+    clean up.  Verifies the if tmp_path is not None False branch (the branch
+    removed from # pragma: no branch by claude-review low, PR #425).
+    """
+    import tempfile as _tempfile
+
+    path = tmp_path / "config.yaml"
+
+    def _failing_ntf(**_kwargs: object) -> None:
+        raise OSError("simulated no space left on device")
+
+    monkeypatch.setattr(_tempfile, "NamedTemporaryFile", _failing_ntf)
+
+    with pytest.raises(OSError, match="simulated no space left"):
+        _write_saved_config(path, {"advisor": {"model_slug": "openai/gpt-4o"}})
+
+    # Nothing was written and no temp file was created.
+    assert not path.exists()
+    leftover = list(tmp_path.glob(".config-tmp-*.yaml"))
+    assert leftover == []
+
+
 def test_load_saved_config_rejects_non_mapping(tmp_path: Path) -> None:
     """A YAML file that is a list (not a mapping) raises ConfigFileError."""
     path = tmp_path / "bad.yaml"
@@ -868,3 +945,134 @@ def test_inject_section_bool_value_serialised(
     assert os.environ.get(bool_env_key) == "false"
     assert bool_env_key in injected
     # Teardown: monkeypatch restores "key absent" (the state after delenv above).
+
+
+# ---------------------------------------------------------------------------
+# P2: api_key_env must never be injected from the saved file
+# ---------------------------------------------------------------------------
+
+
+def test_api_key_env_not_injected_from_saved_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """advisor.api_key_env is listed in _NEVER_INJECT_NON_SAFETY_KEYS and must not
+    be injected even when present in the saved-config file.
+
+    Injecting api_key_env would silently redirect where the live advisor reads
+    the API-key — a security-adjacent misconfiguration (Codex P2 finding, PR #425).
+    """
+    env_key = "ROASTPILOT_ADVISOR__API_KEY_ENV"
+    # Confirm the guard is present in the constant.
+    assert env_key in _NEVER_INJECT_NON_SAFETY_KEYS, (
+        f"{env_key!r} is missing from _NEVER_INJECT_NON_SAFETY_KEYS — "
+        "the guard against api_key_env injection was removed"
+    )
+    # Make sure the env var is not already set so we can observe injection.
+    monkeypatch.setenv(env_key, "__sentinel__")
+    monkeypatch.delenv(env_key)
+
+    injected = _inject_saved_as_env({"advisor": {"api_key_env": "ATTACKER_KEY"}})
+
+    assert env_key not in injected, "api_key_env must not appear in the injected set"
+    assert os.environ.get(env_key) is None, "api_key_env must not be written to os.environ"
+
+
+# ---------------------------------------------------------------------------
+# P1: load_app_config is idempotent — no cross-request env pollution
+# ---------------------------------------------------------------------------
+
+
+def test_load_app_config_does_not_pollute_os_environ(
+    monkeypatch: pytest.MonkeyPatch,
+    config_file: Path,
+) -> None:
+    """load_app_config() restores os.environ after building AppConfig.
+
+    Before the fix, _inject_saved_as_env permanently wrote saved values into
+    os.environ so a second call would see them as real env vars and report
+    env_overridden=True for fields that were never set by the operator
+    (cross-request env pollution, Codex P1 finding, PR #425).
+
+    After the fix, the env snapshot/restore in load_app_config() means that
+    after the call the injected keys are gone — verified here by checking that
+    the call leaves no extra ROASTPILOT_ keys behind.
+    """
+    # Clear all ROASTPILOT_* keys except ROASTPILOT_CONFIG_FILE (set by fixture).
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_") and key != "ROASTPILOT_CONFIG_FILE":
+            monkeypatch.delenv(key, raising=False)
+
+    # Write a saved config with a recognisable value.
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4o-mini")))
+
+    env_before = {k: v for k, v in os.environ.items() if k.startswith("ROASTPILOT_")}
+    load_app_config()
+    env_after = {k: v for k, v in os.environ.items() if k.startswith("ROASTPILOT_")}
+
+    assert env_before == env_after, (
+        "load_app_config() must not leave ROASTPILOT_* keys in os.environ; "
+        f"unexpected additions: {set(env_after) - set(env_before)}"
+    )
+
+
+def test_load_app_config_sequential_calls_no_stale_env(
+    monkeypatch: pytest.MonkeyPatch,
+    config_file: Path,
+) -> None:
+    """Two sequential load_app_config() calls each return env_overridden=False
+    for a field that was never set as a real env var.
+
+    Without the snapshot/restore fix, the injected key from the first call
+    would remain in os.environ so the second call would classify it as
+    env_overridden=True — incorrect.
+    """
+    from roastpilot_agent.config_store import build_config_snapshot
+
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_") and key != "ROASTPILOT_CONFIG_FILE":
+            monkeypatch.delenv(key, raising=False)
+
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4o-mini")))
+
+    # First call.
+    effective1, injected1 = load_app_config()
+    saved1 = load_saved_raw()
+    snap1 = build_config_snapshot(effective1, saved1, injected1)
+    assert snap1.advisor.model_slug.env_overridden is False
+
+    # Second call — must produce the same result (no stale env keys).
+    effective2, injected2 = load_app_config()
+    saved2 = load_saved_raw()
+    snap2 = build_config_snapshot(effective2, saved2, injected2)
+    assert snap2.advisor.model_slug.env_overridden is False
+    assert snap2.advisor.model_slug.effective_value == "openai/gpt-4o-mini"
+
+
+# ---------------------------------------------------------------------------
+# P1: persist_config_edit creates parent directory on first run
+# ---------------------------------------------------------------------------
+
+
+def test_persist_config_edit_creates_parent_dir_on_first_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """persist_config_edit creates the parent directory when it does not exist.
+
+    On a fresh install ~/.roastpilot/ does not exist.  filelock raises OSError
+    when creating a .lock file whose parent directory is absent.  The fix adds
+    path.parent.mkdir(parents=True, exist_ok=True) before FileLock construction
+    (Codex P1 finding, PR #425).
+    """
+    nested_cfg = tmp_path / "subdir" / "another" / "config.yaml"
+    # Verify the parent does NOT exist yet.
+    assert not nested_cfg.parent.exists()
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(nested_cfg))
+
+    # This must not raise — the call creates the parent dir.
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4o")))
+
+    assert nested_cfg.exists(), "config.yaml must have been written after directory creation"
+    import yaml
+
+    saved = yaml.safe_load(nested_cfg.read_text(encoding="utf-8"))
+    assert saved["advisor"]["model_slug"] == "openai/gpt-4o"
