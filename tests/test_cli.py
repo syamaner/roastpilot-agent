@@ -776,10 +776,10 @@ def test_replay_returns_error_on_malformed_config_file(
     """``--replay`` returns exit-code 1 with a clear message when the saved-config
     file is malformed (``ConfigFileError`` from ``load_app_config``).
 
-    Mirrors ``test_serve_live_returns_error_on_malformed_config_file`` for the
-    replay path.  Uses the real session-2 fixture so the missing-jsonl guard
-    passes; the malformed config error fires inside the ``with TemporaryDirectory``
-    block after create_replay_app succeeds.
+    After the resource-leak fix (Codex P2, PR #425), config is loaded BEFORE
+    ``create_replay_app`` so the aiosqlite worker / ReplaySource are never
+    allocated on a bad config — verified by the companion test
+    ``test_replay_config_error_does_not_allocate_replay_resources``.
     """
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(": broken: yaml\n", encoding="utf-8")
@@ -851,3 +851,38 @@ def test_replay_returns_error_on_schema_invalid_config_file(
     assert cli.main() == 1
     out = capsys.readouterr().out
     assert "invalid" in out or "error" in out
+
+
+def test_replay_config_error_does_not_allocate_replay_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bad saved-config file in ``--replay`` returns 1 without ever calling
+    ``create_replay_app``.
+
+    Before the resource-leak fix (Codex P2, PR #425), config was loaded AFTER
+    ``create_replay_app`` so aiosqlite + ReplaySource were allocated even on a
+    bad config.  After the fix, config is loaded first and a bad config
+    short-circuits before any replay resource is allocated.
+
+    The test patches ``create_replay_app`` to raise ``AssertionError`` if
+    called, proving the allocation never happens.
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(": broken: yaml\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    import roastpilot_agent.replay as _replay
+
+    def _must_not_be_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("create_replay_app must not be called when config fails")
+
+    monkeypatch.setattr(_replay, "create_replay_app", _must_not_be_called)
+
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--step", "--port", "0"],
+    )
+    assert cli.main() == 1
+    out = capsys.readouterr().out
+    assert "malformed" in out or "error" in out

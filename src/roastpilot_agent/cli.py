@@ -696,13 +696,29 @@ async def _cleanup_step(name: str, action: Callable[[], Awaitable[object]]) -> N
 async def _serve_replay(args: argparse.Namespace) -> int:
     """Build and serve the replay app; free-run unless ``--step``."""
     import uvicorn
+    from pydantic import ValidationError as _ValErr
 
+    from roastpilot_agent.config_store import ConfigFileError as _CfgErr
+    from roastpilot_agent.config_store import load_app_config as _load_cfg
     from roastpilot_agent.replay import clamp_speed, create_replay_app
 
     export_dir: Path = args.replay
     if not (export_dir / "roast.jsonl").is_file():
         print(f"error: {export_dir} has no roast.jsonl to replay")
         return 2
+
+    # Load and validate the saved config BEFORE allocating any replay resources
+    # (aiosqlite worker, ReplaySource) so that a bad saved-config file returns
+    # early without leaking them (Codex P2, PR #425).
+    try:
+        _cfg, _ = _load_cfg()
+    except _CfgErr as exc:
+        print(f"error: saved-config file is malformed — {exc}")
+        return 1
+    except _ValErr as exc:
+        print(f"error: saved-config file has invalid values — {exc}")
+        return 1
+    log_level, access_log = _configure_access_log(args, _cfg.logging)
 
     with tempfile.TemporaryDirectory(prefix="roastpilot-replay-") as tmp:
         store_path = Path(tmp) / "replay.sqlite3"
@@ -728,22 +744,6 @@ async def _serve_replay(args: argparse.Namespace) -> int:
             # serving the terminal state — intentional for the screen-recording
             # rig, but non-obvious (the process "hangs" rather than exits). Say so.
             print("  (serves the final frame after the roast ends; Ctrl-C to stop)")
-        # Access-log verbosity (#267): same CLI > env > config resolution as the
-        # live serve. Logging-only — the replay SSE pipeline is unchanged.
-        from pydantic import ValidationError as _ValErr
-
-        from roastpilot_agent.config_store import ConfigFileError as _CfgErr
-        from roastpilot_agent.config_store import load_app_config as _load_cfg
-
-        try:
-            _cfg, _ = _load_cfg()
-        except _CfgErr as exc:
-            print(f"error: saved-config file is malformed — {exc}")
-            return 1
-        except _ValErr as exc:
-            print(f"error: saved-config file has invalid values — {exc}")
-            return 1
-        log_level, access_log = _configure_access_log(args, _cfg.logging)
         config = uvicorn.Config(
             app,
             host=args.host,

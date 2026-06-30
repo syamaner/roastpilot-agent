@@ -51,6 +51,7 @@ reflects schema defaults, not env-injected values.
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -125,9 +126,12 @@ _ALL_SAFETY_ENV_KEYS: frozenset[str] = frozenset(
 
 # Non-safety individual read-only env-var keys — fields whose env vars must
 # not be injected from the saved-config file even though they live outside the
-# safety section.  Each entry is metadata-anchored (derived from the real
-# model field name) so a rename fails visibly rather than silently reopening
-# an injection path.
+# safety section.
+#
+# Each field name is validated against its model's model_fields at import time
+# via an explicit ``assert`` so that a rename raises immediately rather than
+# silently producing an empty set (the silent-drop class that caused the
+# round-2 BLOCKER is explicitly excluded here).
 #
 # Current M1 entries and rationale:
 #   - controller.tick_interval_seconds: hardware-pinned Hottop polling rate.
@@ -136,22 +140,24 @@ _ALL_SAFETY_ENV_KEYS: frozenset[str] = frozenset(
 #     contradicting the "the key itself is never stored in config" contract.
 #     api_key_env has no env_var in the snapshot (env_var=None → saved=None
 #     always) precisely because it must never come from the saved file.
+assert "tick_interval_seconds" in ControllerConfig.model_fields, (
+    "ControllerConfig.tick_interval_seconds was renamed — update _NEVER_INJECT_NON_SAFETY_KEYS"
+)
+assert "api_key_env" in AdvisorConfig.model_fields, (
+    "AdvisorConfig.api_key_env was renamed — update _NEVER_INJECT_NON_SAFETY_KEYS"
+)
 _NEVER_INJECT_NON_SAFETY_KEYS: frozenset[str] = frozenset(
     {
-        # Controller: hardware-pinned tick rate.
-        *(
-            f"ROASTPILOT_CONTROLLER__{name.upper()}"
-            for name in ("tick_interval_seconds",)
-            if name in ControllerConfig.model_fields  # metadata anchor
-        ),
-        # Advisor: api_key_env must never be injected from the saved file.
-        *(
-            f"ROASTPILOT_ADVISOR__{name.upper()}"
-            for name in ("api_key_env",)
-            if name in AdvisorConfig.model_fields  # metadata anchor
-        ),
+        "ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS",
+        "ROASTPILOT_ADVISOR__API_KEY_ENV",
     }
 )
+
+# Guards the snapshot→inject→construct→restore block inside load_app_config().
+# asyncio.to_thread() runs concurrent calls on separate OS threads; without the
+# lock, one thread could snapshot the other's injected ROASTPILOT_* keys and
+# restore them away, producing a race on os.environ (global mutable state).
+_ENV_INJECTION_LOCK: threading.Lock = threading.Lock()
 
 
 def _config_file_path() -> Path:
@@ -1102,19 +1108,23 @@ def load_app_config() -> tuple[AppConfig, frozenset[str]]:
     # making env_overridden=True for a field that was never set by the
     # operator (cross-request env pollution, D78 PR b Codex finding).
     saved_raw = _load_saved_config(_config_file_path())
-    env_snapshot = os.environ.copy()
-    try:
-        injected_keys = _inject_saved_as_env(saved_raw)
-        config = AppConfig()
-    finally:
-        # Restore os.environ to its pre-injection state.  Keys that existed
-        # before are put back; keys that were added by injection are removed.
-        for key in list(os.environ):
-            if key not in env_snapshot:
-                del os.environ[key]
-        for key, val in env_snapshot.items():
-            if os.environ.get(key) != val:
-                os.environ[key] = val  # pragma: no cover
+    # Serialise the env-injection window so two concurrent asyncio.to_thread()
+    # calls cannot interleave their snapshot/inject/restore cycles and corrupt
+    # each other's view of os.environ (_ENV_INJECTION_LOCK is module-level).
+    with _ENV_INJECTION_LOCK:
+        env_snapshot = os.environ.copy()
+        try:
+            injected_keys = _inject_saved_as_env(saved_raw)
+            config = AppConfig()
+        finally:
+            # Restore os.environ to its pre-injection state.  Keys that existed
+            # before are put back; keys that were added by injection are removed.
+            for key in list(os.environ):
+                if key not in env_snapshot:
+                    del os.environ[key]
+            for key, val in env_snapshot.items():
+                if os.environ.get(key) != val:
+                    os.environ[key] = val  # pragma: no cover
     return config, injected_keys
 
 
