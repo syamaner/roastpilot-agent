@@ -177,7 +177,11 @@ async def build_live_service(
             :class:`~roastpilot_agent.mcp_client.MCPConnectionError`), after the
             child is cleaned up.
     """
-    mcp = MCPServerProcess(config.mcp)
+    # D78-4 (#420): pass device_config so the managed fields are rendered into
+    # the MCP yaml via passthrough-merge on each (re)spawn.  When mcp_device
+    # is all-None the render step is a no-op (overlay = {}) and the child reads
+    # its yaml directly, preserving the existing E9-S2 env-var-only path.
+    mcp = MCPServerProcess(config.mcp, device_config=config.mcp_device)
     try:
         await mcp.start()
     except BaseException:
@@ -194,6 +198,10 @@ async def build_live_service(
         mcp=mcp,
         roaster=adapter,
         advisor=advisor,
+        # Enable config+advisor reload at each start_roast (D78).  Only the live
+        # serve path sets this — test doubles and replay inject explicit values
+        # that must not be replaced on reload.
+        live_serve_mode=True,
         exporter=adapter,
         raw_state=adapter,
     )

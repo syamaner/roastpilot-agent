@@ -13,7 +13,7 @@ directly into the broadcaster.
 
 import asyncio
 import json
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -32,7 +32,7 @@ from roastpilot_agent.api import (
     RoastRunGoneError,
     RoastRunner,
     RoastService,
-    _parse_last_event_id,  # pyright: ignore[reportPrivateUsage]
+    _parse_last_event_id,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     create_app,
     stream_events,
 )
@@ -1250,14 +1250,14 @@ def test_parse_last_event_id_parses_clean_int(raw: str, expected: int) -> None:
 def test_backdated_charge_utc_returns_none_for_invalid_elapsed(elapsed: float | None) -> None:
     """#337: a missing / non-finite charge-elapsed defers to the store's own
     ``now`` (None) rather than fabricating a garbage backdated instant."""
-    assert RoastRunner._backdated_charge_utc(elapsed) is None  # pyright: ignore[reportPrivateUsage]
+    assert RoastRunner._backdated_charge_utc(elapsed) is None  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
 
 
 def test_backdated_charge_utc_backdates_by_elapsed() -> None:
     """#337: a finite charge-elapsed yields ``now - elapsed`` as an ISO-8601 UTC
     string in the PAST (the recovery breadcrumb matches the live backdated clock)."""
     before = datetime.now(UTC)
-    result = RoastRunner._backdated_charge_utc(120.0)  # pyright: ignore[reportPrivateUsage]
+    result = RoastRunner._backdated_charge_utc(120.0)  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     assert result is not None
     charged_at = datetime.fromisoformat(result)
     # ~120 s before now (allow a little slack for test execution time).
@@ -1972,7 +1972,7 @@ async def test_recover_faulted_then_acknowledge_preserves_fault_reason(
         clock=clock,
     )
     # Build the runner + re-enter operable-faulted directly (the in-session path).
-    runner = service._build_runner("run-fault-reason")  # pyright: ignore[reportPrivateUsage]
+    runner = service._build_runner("run-fault-reason")  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     assert runner is not None
     service.active_run_id = "run-fault-reason"
     await runner.recover_faulted(_profile())
@@ -2801,3 +2801,681 @@ async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) ->
     assert colombia["altitude_m"] == 1600
     assert colombia["target_drop_temp_c"] == 195.0
     assert colombia["target_development_percent"] == 16.0
+
+
+# ---------------------------------------------------------------------------
+# GET /api/config + PUT /api/config (D78 / #418 PR b)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=False)
+def _isolated_roastpilot_env() -> Iterator[None]:  # pyright: ignore[reportUnusedFunction]
+    """Isolate ROASTPILOT_* env vars for config-route tests.
+
+    ``load_app_config()`` calls ``_inject_saved_as_env()``, which writes saved
+    values into ``os.environ`` as ``ROASTPILOT_*`` keys.  Those writes are not
+    tracked by ``monkeypatch`` (the key did not exist before the call), so they
+    bleed into subsequent tests (same env-pollution class fixed in PR-a via the
+    sentinel pattern in test_config_store.py).
+
+    Fix: snapshot the set of ROASTPILOT_* keys before the test, then delete any
+    new keys added during the test in teardown.  ``monkeypatch`` restores the
+    ``ROASTPILOT_CONFIG_FILE`` override set by the test itself; this fixture
+    handles the injected non-file keys.
+    """
+    import os
+
+    before: set[str] = {k for k in os.environ if k.startswith("ROASTPILOT_")}
+    yield
+    # Delete any ROASTPILOT_* keys that were absent before the test (injected
+    # by _inject_saved_as_env during the test body).
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_") and key not in before:
+            del os.environ[key]
+
+
+@pytest.mark.asyncio
+async def test_get_config_returns_snapshot(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """GET /api/config returns a well-formed AppConfigSnapshot with all sections.
+
+    Routes through a real create_app with no saved-config file on disk so all
+    saved_value entries are None and effective_value equals the schema default.
+    """
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    response = await client.get("/api/config")
+    assert response.status_code == 200
+    body = response.json()
+    # All three top-level sections must be present.
+    assert "controller" in body
+    assert "advisor" in body
+    assert "safety" in body
+    # Each field must carry the four required keys.
+    tick = body["controller"]["tick_interval_seconds"]
+    assert tick["effective_value"] == 1.0
+    assert tick["saved_value"] is None  # no file written yet
+    assert tick["default"] == 1.0
+    assert tick["read_only"] is True
+    assert tick["env_overridden"] is False
+    # Safety fields are present and read-only.
+    max_bean = body["safety"]["max_bean_temp_c"]
+    assert max_bean["read_only"] is True
+    assert max_bean["effective_value"] == 230.0
+
+
+@pytest.mark.asyncio
+async def test_get_config_500_on_malformed_file(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """GET /api/config returns 500 when the saved-config YAML is malformed."""
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("{\n  broken: yaml: here\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+    response = await client.get("/api/config")
+    assert response.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_get_config_500_on_schema_invalid_file(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """GET /api/config returns 500 when the saved-config is valid YAML but
+    violates the schema (``ValidationError`` from ``load_app_config``).
+
+    Mirrors ``test_get_config_500_on_malformed_file`` for the schema-invalid
+    case — both must produce a clean HTTPException(500), not a raw traceback
+    (claude-review low, PR #425).
+    """
+    cfg_path = tmp_path / "config.yaml"
+    # Valid YAML but advisor.timeout_seconds must be a float — a non-numeric
+    # string is a schema violation that raises ValidationError.
+    cfg_path.write_text("advisor:\n  timeout_seconds: 'not_a_number'\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+    response = await client.get("/api/config")
+    assert response.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_put_config_writes_and_returns_snapshot(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """PUT /api/config persists editable fields and returns the updated snapshot."""
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    body = {
+        "controller": {
+            "pre_first_crack_levers": {
+                "heat_target_percent": 88,
+                "fan_target_percent": 25,
+            }
+        },
+        "advisor": {
+            "model_slug": "openai/gpt-4o-mini",
+        },
+    }
+    response = await client.put("/api/config", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    # Controller field reflects the written value.
+    heat = data["controller"]["pre_fc_heat_target_percent"]
+    assert heat["saved_value"] == 88
+    assert heat["effective_value"] == 88
+    assert heat["env_overridden"] is False
+    # Advisor field reflects the written value.
+    slug = data["advisor"]["model_slug"]
+    assert slug["saved_value"] == "openai/gpt-4o-mini"
+
+
+@pytest.mark.asyncio
+async def test_put_config_422_on_out_of_range(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """PUT /api/config returns 422 when an edit field violates its schema bounds.
+
+    heat_target_percent max is 100; sending 150 is a field-level Pydantic error
+    that FastAPI turns into a 422 before the handler runs.
+    """
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    body = {
+        "controller": {
+            "pre_first_crack_levers": {
+                "heat_target_percent": 150,
+            }
+        }
+    }
+    response = await client.put("/api/config", json=body)
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_put_config_500_on_malformed_existing_file(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """PUT /api/config returns 500 when the existing saved file is malformed.
+
+    persist_config_edit reads the existing file before merging; a malformed
+    file raises ConfigFileError which the handler converts to 500.
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(": bad: yaml\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+    body = {"advisor": {"model_slug": "openai/gpt-4o"}}
+    response = await client.put("/api/config", json=body)
+    assert response.status_code == 500
+
+
+@pytest.mark.asyncio
+async def test_put_config_no_safety_field_in_edit_type(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """PUT /api/config ignores unknown fields including any 'safety' key.
+
+    AppConfigEdit has no 'safety' field.  FastAPI/Pydantic silently ignores
+    extra keys by default (model_config default), so a body with a 'safety'
+    key is accepted but the safety section is not written.
+    """
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    body = {
+        "safety": {"max_bean_temp_c": 999},  # must not reach the file
+        "advisor": {"temperature": 0.5},
+    }
+    response = await client.put("/api/config", json=body)
+    assert response.status_code == 200
+    # Only the advisor change should appear; safety section absent from file.
+    import yaml
+
+    cfg_path = tmp_path / "config.yaml"
+    saved = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    assert "safety" not in (saved or {})
+    temp = response.json()["advisor"]["temperature"]
+    assert temp["saved_value"] == 0.5
+
+
+@pytest.mark.asyncio
+async def test_put_config_first_run_creates_parent_dir(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """PUT /api/config creates the parent directory when it does not yet exist.
+
+    On first install ~/.roastpilot/ is absent; filelock raises OSError constructing
+    the .lock file when the parent is missing.  The fix adds mkdir before FileLock
+    (Codex P1 finding — first-run lock dir).
+    """
+    nested_cfg = tmp_path / "subdir" / "nested" / "config.yaml"
+    assert not nested_cfg.parent.exists()
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(nested_cfg))
+
+    body = {"advisor": {"model_slug": "openai/gpt-4o"}}
+    response = await client.put("/api/config", json=body)
+    assert response.status_code == 200
+    assert nested_cfg.exists(), "config.yaml must be written after the parent dir is created"
+
+
+@pytest.mark.asyncio
+async def test_put_config_sequential_writes_no_stale_env_overridden(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """Two sequential PUTs of the same field: second value wins; env_overridden stays False.
+
+    Without the snapshot/restore fix for _inject_saved_as_env, the first PUT
+    left the injected env key in os.environ so the second PUT's load_app_config()
+    saw it as a real env-var override and returned env_overridden=True — wrong.
+    """
+    import os
+
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    # Remove any ROASTPILOT_ADVISOR__MODEL_SLUG env var (the test must not have one).
+    monkeypatch.delenv("ROASTPILOT_ADVISOR__MODEL_SLUG", raising=False)
+
+    body1 = {"advisor": {"model_slug": "openai/gpt-4o"}}
+    r1 = await client.put("/api/config", json=body1)
+    assert r1.status_code == 200
+    # After first PUT: field must not be env_overridden.
+    slug1 = r1.json()["advisor"]["model_slug"]
+    assert slug1["effective_value"] == "openai/gpt-4o"
+    assert slug1["env_overridden"] is False
+
+    body2 = {"advisor": {"model_slug": "openai/gpt-4.1"}}
+    r2 = await client.put("/api/config", json=body2)
+    assert r2.status_code == 200
+    slug2 = r2.json()["advisor"]["model_slug"]
+    assert slug2["effective_value"] == "openai/gpt-4.1"
+    # Must still be False — the value came from the file, not a real env var.
+    assert slug2["env_overridden"] is False
+    _ = os  # imported above for possible future assertions
+
+
+@pytest.mark.asyncio
+async def test_get_config_nested_env_override_sets_env_overridden(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """A nested trim field overridden by env var appears env_overridden=True.
+
+    Codex P2 finding: before the fix the nested trim fields all used
+    env_var=None in build_config_snapshot(), so env_overridden was always
+    False regardless of whether an env var was set.  After the fix the full
+    nested env-var path is supplied so the badge is accurate.
+    """
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+    env_key = "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__TRIM_HEAT_PERCENT"
+    monkeypatch.setenv(env_key, "55")
+
+    response = await client.get("/api/config")
+    assert response.status_code == 200
+    field = response.json()["controller"]["late_maillard_trim_heat_percent"]
+    assert field["effective_value"] == 55
+    assert field["env_overridden"] is True
+
+
+@pytest.mark.asyncio
+async def test_put_config_422_on_cross_field_violation(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """PUT /api/config returns 422 for a cross-field constraint violation.
+
+    Field-level bounds (e.g. heat_target_percent > 100) are caught by FastAPI
+    before the handler runs and already produce 422.  This test covers the
+    case where the merged config violates a cross-field constraint — e.g.
+    min_trim > max_trim — which can only be detected after merging with the
+    existing saved file.  The handler now catches pydantic.ValidationError and
+    converts it to 422 rather than letting it propagate as 500 (Codex P2).
+    """
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(tmp_path / "config.yaml"))
+
+    # First write a valid combination: min_trim=30, base_trim=40, max_trim=50.
+    # The model validator requires min_trim <= base_trim <= max_trim.
+    setup_body = {
+        "controller": {
+            "pre_first_crack_levers": {
+                "late_maillard_trim": {
+                    "min_trim": 30,
+                    "base_trim": 40,
+                    "max_trim": 50,
+                }
+            }
+        }
+    }
+    r1 = await client.put("/api/config", json=setup_body)
+    assert r1.status_code == 200
+
+    # Now raise min_trim above the already-saved max_trim (50).  The merged config
+    # will have min_trim=70 + max_trim=50, violating the cross-field invariant.
+    # This is only detectable after merging with the existing saved file.
+    bad_body = {
+        "controller": {
+            "pre_first_crack_levers": {
+                "late_maillard_trim": {"min_trim": 70}  # > max_trim (50) → invalid
+            }
+        }
+    }
+    r2 = await client.put("/api/config", json=bad_body)
+    assert r2.status_code == 422
+
+
+# --- GET /api/config/devices ---
+#
+# Both enumeration helpers use lazy imports (import inside the try block) so
+# that a missing PortAudio native library or missing wheel never crashes server
+# startup.  Tests patch _enumerate_serial and _enumerate_audio_inputs directly
+# on the api module for the happy-path / fail-soft / empty variants (cleanest,
+# hardware-free), and add one test that patches the sounddevice import itself to
+# verify the ImportError path (the Playwright regression scenario).
+
+
+class _FakePort:
+    """Minimal stand-in for a ``serial.tools.list_ports_common.ListPortInfo``."""
+
+    def __init__(self, device: str, description: str, hwid: str) -> None:
+        self.device = device
+        self.description = description
+        self.hwid = hwid
+
+
+@pytest.mark.asyncio
+async def test_get_devices_happy_path(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/config/devices returns serial + audio results from fake enumerators.
+
+    Patches _enumerate_serial and _enumerate_audio_inputs directly so the route
+    handler, response model, and JSON serialisation are fully exercised while the
+    test stays hardware-free and deterministic.
+    """
+    import roastpilot_agent.api as _api_mod
+
+    def _fake_serial() -> tuple[list[_api_mod.DeviceOption], str | None]:
+        return (
+            [
+                _api_mod.DeviceOption(
+                    value="/dev/tty.usbmodem1401",
+                    label="/dev/tty.usbmodem1401",
+                    note="Hottop Roaster",
+                )
+            ],
+            None,
+        )
+
+    def _fake_audio() -> tuple[list[_api_mod.DeviceOption], str | None]:
+        return (
+            [
+                _api_mod.DeviceOption(
+                    value="0",
+                    label="USB PnP Sound Device",
+                    note="Input · 1 ch · 48,000 Hz",
+                )
+            ],
+            None,
+        )
+
+    monkeypatch.setattr(_api_mod, "_enumerate_serial", _fake_serial)
+    monkeypatch.setattr(_api_mod, "_enumerate_audio_inputs", _fake_audio)
+
+    response = await client.get("/api/config/devices")
+    assert response.status_code == 200
+    body = response.json()
+
+    # Both top-level keys must be present.
+    assert "serial" in body
+    assert "audio_input" in body
+    assert body["serial_error"] is None
+    assert body["audio_input_error"] is None
+
+    # Serial: one port, correctly mapped.
+    assert len(body["serial"]) == 1
+    assert body["serial"][0]["value"] == "/dev/tty.usbmodem1401"
+    assert body["serial"][0]["label"] == "/dev/tty.usbmodem1401"
+    assert body["serial"][0]["note"] == "Hottop Roaster"
+
+    # Audio: one input device returned.
+    assert len(body["audio_input"]) == 1
+    assert body["audio_input"][0]["value"] == "0"
+    assert body["audio_input"][0]["label"] == "USB PnP Sound Device"
+    assert body["audio_input"][0]["note"] == "Input · 1 ch · 48,000 Hz"
+
+
+@pytest.mark.asyncio
+async def test_get_devices_serial_error_is_soft(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/config/devices returns 200 with serial_error when serial fails.
+
+    Fail-soft: a serial enumeration error must surface as an empty serial list +
+    a non-None serial_error string, while the audio source is unaffected.
+    """
+    import roastpilot_agent.api as _api_mod
+
+    def _serial_denied() -> tuple[list[_api_mod.DeviceOption], str | None]:
+        return [], "serial: permission denied"
+
+    monkeypatch.setattr(_api_mod, "_enumerate_serial", _serial_denied)
+    monkeypatch.setattr(
+        _api_mod,
+        "_enumerate_audio_inputs",
+        lambda: (
+            [
+                _api_mod.DeviceOption(
+                    value="2", label="Built-in Mic", note="Input · 1 ch · 44,100 Hz"
+                )
+            ],  # noqa: E501
+            None,
+        ),
+    )
+
+    response = await client.get("/api/config/devices")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["serial"] == []
+    assert "serial: permission denied" in body["serial_error"]
+    assert len(body["audio_input"]) == 1
+    assert body["audio_input_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_devices_audio_error_is_soft(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/config/devices returns 200 with audio_input_error when PortAudio fails.
+
+    Fail-soft: a PortAudio failure must not prevent serial ports from being
+    returned.  The audio source degrades to an empty list with an error string.
+    """
+    import roastpilot_agent.api as _api_mod
+
+    monkeypatch.setattr(
+        _api_mod,
+        "_enumerate_serial",
+        lambda: (
+            [_api_mod.DeviceOption(value="/dev/ttyUSB0", label="/dev/ttyUSB0", note="USB Serial")],
+            None,
+        ),
+    )
+
+    def _audio_portaudio_gone() -> tuple[list[_api_mod.DeviceOption], str | None]:
+        return [], "PortAudio not found"
+
+    monkeypatch.setattr(_api_mod, "_enumerate_audio_inputs", _audio_portaudio_gone)
+
+    response = await client.get("/api/config/devices")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert len(body["serial"]) == 1
+    assert body["serial_error"] is None
+    assert body["audio_input"] == []
+    assert "PortAudio not found" in body["audio_input_error"]
+
+
+@pytest.mark.asyncio
+async def test_get_devices_both_empty_is_valid(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/config/devices returns 200 with empty lists when no devices found.
+
+    An environment with no serial ports and no audio inputs (e.g. a minimal CI
+    container) must return a valid 200 response with empty lists and no errors.
+    """
+    import roastpilot_agent.api as _api_mod
+
+    def _no_serial() -> tuple[list[_api_mod.DeviceOption], str | None]:
+        return [], None
+
+    def _no_audio() -> tuple[list[_api_mod.DeviceOption], str | None]:
+        return [], None
+
+    monkeypatch.setattr(_api_mod, "_enumerate_serial", _no_serial)
+    monkeypatch.setattr(_api_mod, "_enumerate_audio_inputs", _no_audio)
+
+    response = await client.get("/api/config/devices")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["serial"] == []
+    assert body["serial_error"] is None
+    assert body["audio_input"] == []
+    assert body["audio_input_error"] is None
+
+
+def test_enumerate_audio_inputs_import_error_is_soft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_enumerate_audio_inputs degrades gracefully when sounddevice cannot be imported.
+
+    This is the Playwright-regression scenario: the sounddevice wheel is present
+    but PortAudio is not installed natively, so ``import sounddevice`` raises
+    ``OSError`` or ``ImportError`` at import time.  The lazy-import inside
+    _enumerate_audio_inputs must absorb that failure and return an empty list
+    with a non-None error string — never propagate the ImportError to the caller.
+    """
+    import sys
+
+    import roastpilot_agent.api as _api_mod
+
+    # Drop the real module from the cache so the lazy import re-executes.
+    monkeypatch.delitem(sys.modules, "sounddevice", raising=False)
+    # None is the Python sentinel meaning "import was attempted and failed".
+    monkeypatch.setitem(sys.modules, "sounddevice", None)  # type: ignore[arg-type]
+
+    devices, error = _api_mod._enumerate_audio_inputs()  # pyright: ignore[reportPrivateUsage]
+    assert devices == []
+    assert error is not None
+    assert "sounddevice" in error.lower() or "import" in error.lower() or "None" in error
+
+
+def test_enumerate_serial_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_enumerate_serial implementation: happy path and comports() error.
+
+    Calls _enumerate_serial() directly (not via the HTTP route) so the
+    lazy-import + comports() code path is exercised and counted toward
+    patch coverage.  The sys.modules patch must cover all three levels of
+    the ``serial.tools.list_ports`` namespace so that Python's import
+    machinery resolves the lazy ``import serial.tools.list_ports as _lp``
+    inside the function to our fake object.
+    """
+    import sys
+    import types
+
+    import roastpilot_agent.api as _api_mod
+
+    # --- happy path: two ports, sorted by device path ---
+    def _fake_comports_sorted() -> list[_FakePort]:
+        # Deliberately out of order to exercise the sort.
+        return [
+            _FakePort("/dev/ttyUSB1", "Second port", "HWB"),
+            _FakePort("/dev/ttyUSB0", "First port", "HWA"),
+        ]
+
+    fake_lp = types.ModuleType("serial.tools.list_ports")
+    fake_lp.comports = _fake_comports_sorted  # type: ignore[attr-defined]
+    fake_tools = types.ModuleType("serial.tools")
+    fake_tools.list_ports = fake_lp  # type: ignore[attr-defined]
+    fake_serial = types.ModuleType("serial")
+    fake_serial.tools = fake_tools  # type: ignore[attr-defined]
+
+    monkeypatch.setitem(sys.modules, "serial", fake_serial)
+    monkeypatch.setitem(sys.modules, "serial.tools", fake_tools)
+    monkeypatch.setitem(sys.modules, "serial.tools.list_ports", fake_lp)
+
+    devices, error = _api_mod._enumerate_serial()  # pyright: ignore[reportPrivateUsage]
+    assert error is None
+    assert len(devices) == 2
+    # Sorted by device path: ttyUSB0 before ttyUSB1.
+    assert devices[0].value == "/dev/ttyUSB0"
+    assert devices[0].note == "First port"
+    assert devices[1].value == "/dev/ttyUSB1"
+
+    # --- error path: comports() raises ---
+    def _boom_comports() -> list[object]:
+        raise OSError("no such file: /dev/ttyUSB0")
+
+    fake_lp_err = types.ModuleType("serial.tools.list_ports")
+    fake_lp_err.comports = _boom_comports  # type: ignore[attr-defined]
+    fake_serial.tools.list_ports = fake_lp_err  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "serial.tools.list_ports", fake_lp_err)
+
+    devices2, error2 = _api_mod._enumerate_serial()  # pyright: ignore[reportPrivateUsage]
+    assert devices2 == []
+    assert error2 is not None
+    assert "no such file" in error2
+
+
+def test_enumerate_audio_inputs_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_enumerate_audio_inputs implementation: happy path, filtering, and error.
+
+    Calls _enumerate_audio_inputs() directly so the lazy-import + query_devices()
+    code path is exercised for patch coverage.  Patches sounddevice in sys.modules.
+    """
+    import sys
+
+    import roastpilot_agent.api as _api_mod
+
+    # --- happy path: mix of input-capable and output-only devices ---
+    class _FakeSDHappy:
+        def query_devices(self) -> list[dict[str, object]]:
+            return [
+                {
+                    "name": "USB PnP Sound Device",
+                    "max_input_channels": 1,
+                    "max_output_channels": 0,
+                    "default_samplerate": 48000.0,
+                },
+                # Output-only: must be filtered out.
+                {
+                    "name": "Built-in Output",
+                    "max_input_channels": 0,
+                    "max_output_channels": 2,
+                    "default_samplerate": 44100.0,
+                },
+                # Multi-channel input, non-integer samplerate edge-case.
+                {
+                    "name": "Aggregate Device",
+                    "max_input_channels": 4,
+                    "max_output_channels": 2,
+                    "default_samplerate": "variable",  # triggers the '?' branch
+                },
+            ]
+
+    monkeypatch.delitem(sys.modules, "sounddevice", raising=False)
+    monkeypatch.setitem(sys.modules, "sounddevice", _FakeSDHappy())  # type: ignore[arg-type]
+
+    devices, error = _api_mod._enumerate_audio_inputs()  # pyright: ignore[reportPrivateUsage]
+    assert error is None
+    # Output-only device filtered out; two input-capable devices remain.
+    assert len(devices) == 2
+    assert devices[0].value == "0"
+    assert devices[0].label == "USB PnP Sound Device"
+    assert "48,000" in devices[0].note
+    assert devices[1].value == "2"
+    assert "?" in devices[1].note  # non-numeric samplerate
+
+    # --- error path: query_devices() raises ---
+    class _FakeSDError:
+        def query_devices(self) -> list[object]:
+            raise RuntimeError("PortAudio: invalid device")
+
+    monkeypatch.setitem(sys.modules, "sounddevice", _FakeSDError())  # type: ignore[arg-type]
+
+    devices2, error2 = _api_mod._enumerate_audio_inputs()  # pyright: ignore[reportPrivateUsage]
+    assert devices2 == []
+    assert error2 is not None
+    assert "PortAudio" in error2

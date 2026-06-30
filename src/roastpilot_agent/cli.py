@@ -551,13 +551,24 @@ async def _serve_live(args: argparse.Namespace) -> int:
     non-zero exit, with the child cleaned up by
     :func:`~roastpilot_agent.live.build_live_service`."""
     import uvicorn
+    from pydantic import ValidationError
 
     from roastpilot_agent.api import create_app
-    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.config_store import ConfigFileError, load_app_config
     from roastpilot_agent.live import build_live_service, forward_coffee_env
     from roastpilot_agent.mcp_client import MCPConnectionError
 
-    config = AppConfig()
+    try:
+        config, _injected = load_app_config()
+    except ConfigFileError as exc:
+        print(f"error: saved-config file is malformed — {exc}")
+        return 1
+    except ValidationError as exc:
+        print(f"error: saved-config file has invalid values — {exc}")
+        return 1
+    except OSError as exc:
+        print(f"error: saved-config file is unreadable — {exc}")
+        return 1
     # Let the operator configure the Hottop with plain `export COFFEE_…`.
     forward_coffee_env(config)
 
@@ -688,8 +699,10 @@ async def _cleanup_step(name: str, action: Callable[[], Awaitable[object]]) -> N
 async def _serve_replay(args: argparse.Namespace) -> int:
     """Build and serve the replay app; free-run unless ``--step``."""
     import uvicorn
+    from pydantic import ValidationError as _ValErr
 
-    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.config_store import ConfigFileError as _CfgErr
+    from roastpilot_agent.config_store import load_app_config as _load_cfg
     from roastpilot_agent.replay import clamp_speed, create_replay_app
 
     export_dir: Path = args.replay
@@ -697,11 +710,28 @@ async def _serve_replay(args: argparse.Namespace) -> int:
         print(f"error: {export_dir} has no roast.jsonl to replay")
         return 2
 
+    # Load and validate the saved config BEFORE allocating any replay resources
+    # (aiosqlite worker, ReplaySource) so that a bad saved-config file returns
+    # early without leaking them (Codex P2, PR #425).
+    try:
+        _cfg, _ = _load_cfg()
+    except _CfgErr as exc:
+        print(f"error: saved-config file is malformed — {exc}")
+        return 1
+    except _ValErr as exc:
+        print(f"error: saved-config file has invalid values — {exc}")
+        return 1
+    except OSError as exc:
+        print(f"error: saved-config file is unreadable — {exc}")
+        return 1
+    log_level, access_log = _configure_access_log(args, _cfg.logging)
+
     with tempfile.TemporaryDirectory(prefix="roastpilot-replay-") as tmp:
         store_path = Path(tmp) / "replay.sqlite3"
         app, _service, source = await create_replay_app(
             export_dir,
             store_path,
+            config=_cfg,
             step_mode=args.step,
             speed=args.speed,
             spa_dir=_resolve_spa_dir(args),
@@ -721,9 +751,6 @@ async def _serve_replay(args: argparse.Namespace) -> int:
             # serving the terminal state — intentional for the screen-recording
             # rig, but non-obvious (the process "hangs" rather than exits). Say so.
             print("  (serves the final frame after the roast ends; Ctrl-C to stop)")
-        # Access-log verbosity (#267): same CLI > env > config resolution as the
-        # live serve. Logging-only — the replay SSE pipeline is unchanged.
-        log_level, access_log = _configure_access_log(args, AppConfig().logging)
         config = uvicorn.Config(
             app,
             host=args.host,
