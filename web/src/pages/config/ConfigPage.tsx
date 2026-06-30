@@ -27,7 +27,7 @@ import { cn } from "@/lib/cn";
 import type { AppConfigSnapshot } from "@/lib/types";
 
 import { CONFIG_CATEGORIES, CONFIG_FIELD_MAP } from "./configSchema";
-import type { FieldCategory } from "./configSchema";
+import type { ConfigGroup, FieldCategory } from "./configSchema";
 import { ConfigFieldRow } from "./ConfigFieldRow";
 import {
   buildEditFromDirty,
@@ -128,14 +128,17 @@ function RailItem({
       data-testid={`rail-item-${id}`}
       aria-current={isActive ? "true" : undefined}
       className={cn(
+        // Wide: full-width column item
         "flex w-full items-start gap-2 rounded-[9px] px-3 py-[11px] text-left transition-colors",
+        // Narrow: compact horizontal chip (shrinks to fit label)
+        "max-[900px]:w-auto max-[900px]:shrink-0 max-[900px]:items-center max-[900px]:py-2",
         isActive
           ? "border border-border bg-secondary text-foreground"
           : "border border-transparent text-muted-foreground hover:bg-white/[.04] hover:text-foreground",
       )}
     >
-      {/* Monospace index */}
-      <span className="mt-px shrink-0 font-mono text-[11px] text-muted-foreground/60">
+      {/* Monospace index — hidden on narrow */}
+      <span className="mt-px shrink-0 font-mono text-[11px] text-muted-foreground/60 max-[900px]:hidden">
         {String(index + 1).padStart(2, "0")}
       </span>
 
@@ -161,7 +164,8 @@ function RailItem({
             </svg>
           )}
         </span>
-        <span className="block truncate text-xs text-muted-foreground/70">
+        {/* Blurb hidden on narrow — chip is just the label */}
+        <span className="block truncate text-xs text-muted-foreground/70 max-[900px]:hidden">
           {description}
         </span>
       </span>
@@ -169,7 +173,7 @@ function RailItem({
       {/* Dirty indicator */}
       {isDirty && (
         <span
-          className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-roast-caution"
+          className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-roast-caution max-[900px]:mt-0"
           aria-label="Unsaved changes"
           data-testid={`rail-dirty-${id}`}
         />
@@ -276,7 +280,10 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
     if (snapshotRef.current !== snapshot) {
       snapshotRef.current = snapshot;
       const { values, saved } = stateRef.current;
-      const isDirty = Object.keys(values).some((k) => values[k] !== saved[k]);
+      // Use valuesEqual so array fields (recording_devices) don't produce a
+      // spurious "dirty" when a DeviceMultiSelect toggle creates a new array
+      // with the same content — which would incorrectly block re-init.
+      const isDirty = Object.keys(values).some((k) => !valuesEqual(values[k], saved[k]));
       if (!isDirty) {
         dispatch({ type: "INIT", snapshot });
       }
@@ -321,17 +328,151 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
     (c) => c.id === state.activeCategory,
   )!;
 
+  // Render the fields within one group, applying the revealWhen filter and
+  // cross-field dynamic bounds. Returns null when the group has no visible fields
+  // after filtering (possible if all fields are hidden by revealWhen).
+  function renderGroup(group: ConfigGroup): React.JSX.Element | null {
+    const visibleFields = group.fields.filter((fieldDef) =>
+      fieldDef.revealWhen === undefined ||
+      state.values[fieldDef.revealWhen.key] === fieldDef.revealWhen.equals,
+    );
+    if (visibleFields.length === 0) return null;
+
+    return (
+      <div key={group.title} className="mb-2">
+        {/* Group subheading: h3 uppercase + hairline per design handoff */}
+        <h3 className="border-b border-[#2e2e34] pb-[10px] text-[11.5px] font-semibold uppercase tracking-[.06em] text-muted-foreground/60">
+          {group.title}
+        </h3>
+        <div className="flex flex-col">
+          {visibleFields.map((fieldDef, idx) => {
+            const meta =
+              fieldDef.key
+                .split(".")
+                .reduce(
+                  (obj: Record<string, unknown>, seg) =>
+                    (obj[seg] as Record<string, unknown>) ?? {},
+                  snapshot as unknown as Record<string, unknown>,
+                );
+
+            // Cross-field bounds: wire dynamic min/max so the UI can't offer
+            // a value that the server would reject.
+            //   heat_target_percent ≥ trim_heat_percent (floor from snapshot)
+            //   fan_target_percent ≤ 30 (fan_ceiling_percent server default)
+            let dynMin: number | undefined;
+            let dynMax: number | undefined;
+            if (fieldDef.key === "controller.pre_fc_heat_target_percent") {
+              const trimHeatMeta = snapshot.controller.late_maillard_trim_heat_percent;
+              const trimHeat = typeof trimHeatMeta.effective_value === "number"
+                ? trimHeatMeta.effective_value
+                : 10;
+              dynMin = trimHeat;
+            } else if (fieldDef.key === "controller.pre_fc_fan_target_percent") {
+              dynMax = 30;
+            }
+
+            return (
+              <ConfigFieldRow
+                key={fieldDef.key}
+                fieldDef={fieldDef}
+                meta={meta as unknown as import("@/lib/types").ConfigFieldMeta}
+                value={state.values[fieldDef.key] ?? null}
+                isLast={idx === visibleFields.length - 1}
+                onChange={(v) =>
+                  dispatch({ type: "SET_VALUE", key: fieldDef.key, value: v })
+                }
+                onReset={(defaultValue) =>
+                  dispatch({ type: "RESET_FIELD", key: fieldDef.key, defaultValue })
+                }
+                dynMin={dynMin}
+                dynMax={dynMax}
+              />
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  // Render content pane fields: grouped when the category declares groups,
+  // flat (with a single implicit group) otherwise.
+  function renderFields(): React.JSX.Element {
+    if (activeCategory.groups && activeCategory.groups.length > 0) {
+      return (
+        <div className="flex flex-col gap-6">
+          {activeCategory.groups.map((g) => renderGroup(g))}
+        </div>
+      );
+    }
+    // Flat: treat all fields as one group with no subheading.
+    const visibleFields = activeCategory.fields.filter((fieldDef) =>
+      fieldDef.revealWhen === undefined ||
+      state.values[fieldDef.revealWhen.key] === fieldDef.revealWhen.equals,
+    );
+    return (
+      <div className="flex flex-col">
+        {visibleFields.map((fieldDef, idx) => {
+          const meta =
+            fieldDef.key
+              .split(".")
+              .reduce(
+                (obj: Record<string, unknown>, seg) =>
+                  (obj[seg] as Record<string, unknown>) ?? {},
+                snapshot as unknown as Record<string, unknown>,
+              );
+          let dynMin: number | undefined;
+          let dynMax: number | undefined;
+          if (fieldDef.key === "controller.pre_fc_heat_target_percent") {
+            const trimHeatMeta = snapshot.controller.late_maillard_trim_heat_percent;
+            dynMin = typeof trimHeatMeta.effective_value === "number" ? trimHeatMeta.effective_value : 10;
+          } else if (fieldDef.key === "controller.pre_fc_fan_target_percent") {
+            dynMax = 30;
+          }
+          return (
+            <ConfigFieldRow
+              key={fieldDef.key}
+              fieldDef={fieldDef}
+              meta={meta as unknown as import("@/lib/types").ConfigFieldMeta}
+              value={state.values[fieldDef.key] ?? null}
+              isLast={idx === visibleFields.length - 1}
+              onChange={(v) =>
+                dispatch({ type: "SET_VALUE", key: fieldDef.key, value: v })
+              }
+              onReset={(defaultValue) =>
+                dispatch({ type: "RESET_FIELD", key: fieldDef.key, defaultValue })
+              }
+              dynMin={dynMin}
+              dynMax={dynMax}
+            />
+          );
+        })}
+      </div>
+    );
+  }
+
   return (
     <>
-      {/* Two-pane grid: 268px rail | content */}
+      {/*
+        Two-pane layout: 268px fixed rail + content.
+        Responsive: at <900px switches to single-column; rail becomes a
+        horizontal chip scroller (blurbs hidden, sticky disabled).
+      */}
       <div
-        className="grid gap-11"
+        className={cn(
+          // Wide: two-column grid; narrow: single column stack
+          "grid gap-11",
+          "max-[900px]:flex max-[900px]:flex-col max-[900px]:gap-4",
+        )}
         style={{ gridTemplateColumns: "268px minmax(0,1fr)" }}
         data-testid="config-layout"
       >
-        {/* Category rail */}
+        {/* Category rail — sticky on wide, horizontal chip scroller on narrow */}
         <nav
-          className="sticky top-4 flex flex-col gap-[3px]"
+          className={cn(
+            "sticky top-4 flex flex-col gap-[3px]",
+            // Narrow: horizontal scrolling chip strip
+            "max-[900px]:static max-[900px]:flex-row max-[900px]:overflow-x-auto max-[900px]:gap-1.5 max-[900px]:pb-1",
+          )}
           aria-label="Configuration categories"
           data-testid="config-rail"
         >
@@ -360,67 +501,7 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
             </p>
           </header>
 
-          <div className="flex flex-col">
-            {activeCategory.fields
-              // Respect revealWhen — hide dependent fields whose controlling
-              // field doesn't match the required value.
-              .filter((fieldDef) =>
-                fieldDef.revealWhen === undefined ||
-                state.values[fieldDef.revealWhen.key] === fieldDef.revealWhen.equals,
-              )
-              .map((fieldDef, idx, visible) => {
-              const meta =
-                fieldDef.key
-                  .split(".")
-                  .reduce(
-                    (obj: Record<string, unknown>, seg) =>
-                      (obj[seg] as Record<string, unknown>) ?? {},
-                    snapshot as unknown as Record<string, unknown>,
-                  );
-
-              // Cross-field bounds: server rejects values that violate sibling
-              // constraints. Wire dynamic min/max so the UI can't offer an
-              // unsaveable value.
-              //
-              // heat_target_percent ≥ trim_heat_percent (effective from snapshot)
-              //   → trim_heat_percent is the floor for heat.
-              // fan_target_percent ≤ fan_ceiling_percent
-              //   → fan_ceiling_percent is NOT in the snapshot; use the server
-              //     default of 30 (PreFirstCrackLevers.fan_ceiling_percent).
-              let dynMin: number | undefined;
-              let dynMax: number | undefined;
-              if (fieldDef.key === "controller.pre_fc_heat_target_percent") {
-                const trimHeatMeta = snapshot.controller.late_maillard_trim_heat_percent;
-                const trimHeat = typeof trimHeatMeta.effective_value === "number"
-                  ? trimHeatMeta.effective_value
-                  : 10;  // ge=10 floor from LateMaillardTrimEdit
-                dynMin = trimHeat;
-              } else if (fieldDef.key === "controller.pre_fc_fan_target_percent") {
-                // fan_ceiling_percent not exposed in GET /api/config snapshot;
-                // cap at the server default (30). PR3/S4 can expose and
-                // dynamically wire once the snapshot includes it.
-                dynMax = 30;
-              }
-
-              return (
-                <ConfigFieldRow
-                  key={fieldDef.key}
-                  fieldDef={fieldDef}
-                  meta={meta as unknown as import("@/lib/types").ConfigFieldMeta}
-                  value={state.values[fieldDef.key] ?? null}
-                  isLast={idx === visible.length - 1}
-                  onChange={(v) =>
-                    dispatch({ type: "SET_VALUE", key: fieldDef.key, value: v })
-                  }
-                  onReset={(defaultValue) =>
-                    dispatch({ type: "RESET_FIELD", key: fieldDef.key, defaultValue })
-                  }
-                  dynMin={dynMin}
-                  dynMax={dynMax}
-                />
-              );
-            })}
-          </div>
+          {renderFields()}
         </div>
       </div>
 

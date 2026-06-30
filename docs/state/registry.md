@@ -121,11 +121,11 @@ operator's settings surface end to end. Seven PRs on `main`:
 
 **Apply-next-roast is SPLIT:** AGENT config applies next-roast now (#430); DEVICE config (serial/audio/FC
 → MCP yaml) still needs an MCP respawn → **DEFERRED to #431.** **Slice status:** S1 (#418) ✅ closed ·
-S3 (#420) ✅ closed · reload (#430) ✅ · S2 view (#428) ✅. **REMAINING:** S2 **PR3** (env badges + device
-dropdowns + the Hardware/Audio/FC categories now backed by #429 + a mic-test "not available in M1"
-placeholder, under **#419**) and **S4** polish (**#421**). Other deferred follow-ups: **#426**
-(top-level-JSON env shadow), **#423** (sticky `/live` summary), an on-demand mic-test backend sample
-endpoint.
+S3 (#420) ✅ closed · reload (#430) ✅ · S2 view (#428) ✅ · S2-PR3 (#419/#435/#436/#437/#438 ✅) ·
+**S4 polish (#421) ✅** (group subheadings + category reorder + responsive <900px + `valuesEqual` dirty
+guard + a11y arrow-key nav + help-copy review; #440 a11y → merged; S4 main → PR open). **DEFERRED:**
+**#426** (top-level-JSON env shadow), **#423** (sticky `/live` summary), on-demand mic-test backend
+sample endpoint, **#439** (mcp_device tri-state reset semantics).
 
 **Governance — Codex earned its review seat (reverses the 15-Jun D37 disable).** Re-enabled 30 Jun, and
 on its first real outing it caught a run of bugs the Opus safety-reviewer (PASSed twice), the contract
