@@ -3193,7 +3193,7 @@ async def test_get_devices_happy_path(
         return (
             [
                 _api_mod.DeviceOption(
-                    value="0",
+                    value="USB PnP Sound Device",
                     label="USB PnP Sound Device",
                     note="Input · 1 ch · 48,000 Hz",
                 )
@@ -3220,9 +3220,10 @@ async def test_get_devices_happy_path(
     assert body["serial"][0]["label"] == "/dev/tty.usbmodem1401"
     assert body["serial"][0]["note"] == "Hottop Roaster"
 
-    # Audio: one input device returned.
+    # Audio: value must be the device NAME (the MCP matches audio_input_device
+    # by name substring, not by PortAudio integer index).
     assert len(body["audio_input"]) == 1
-    assert body["audio_input"][0]["value"] == "0"
+    assert body["audio_input"][0]["value"] == "USB PnP Sound Device"
     assert body["audio_input"][0]["label"] == "USB PnP Sound Device"
     assert body["audio_input"][0]["note"] == "Input · 1 ch · 48,000 Hz"
 
@@ -3249,7 +3250,7 @@ async def test_get_devices_serial_error_is_soft(
         lambda: (
             [
                 _api_mod.DeviceOption(
-                    value="2", label="Built-in Mic", note="Input · 1 ch · 44,100 Hz"
+                    value="Built-in Mic", label="Built-in Mic", note="Input · 1 ch · 44,100 Hz"
                 )
             ],  # noqa: E501
             None,
@@ -3462,10 +3463,13 @@ def test_enumerate_audio_inputs_implementation(
     assert error is None
     # Output-only device filtered out; two input-capable devices remain.
     assert len(devices) == 2
-    assert devices[0].value == "0"
+    # value must be the device NAME so the Config UI saves the correct
+    # audio_input_device substring (the MCP matches by name, not index).
+    assert devices[0].value == "USB PnP Sound Device"
     assert devices[0].label == "USB PnP Sound Device"
     assert "48,000" in devices[0].note
-    assert devices[1].value == "2"
+    assert devices[1].value == "Aggregate Device"
+    assert devices[1].label == "Aggregate Device"
     assert "?" in devices[1].note  # non-numeric samplerate
 
     # --- error path: query_devices() raises ---
