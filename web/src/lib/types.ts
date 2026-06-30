@@ -510,3 +510,83 @@ export interface HealthResponse {
   mcp_child: MCPChildStatus;
   active_run_id: string | null;
 }
+
+// --- Config (config_store.AppConfigSnapshot / GET + PUT /api/config) ---
+// Hand-mirror of the Python models; see config_store.py for the canonical schema.
+// All safety fields are read_only=true in M1 (D78 decision 2).
+
+/** Per-field metadata returned by GET /api/config (ConfigFieldMeta in Python). */
+export interface ConfigFieldMeta {
+  /** Value written to the saved-config file; null when not set in the file. */
+  saved_value: unknown;
+  /** Fully resolved effective value (env override > saved file > default). */
+  effective_value: unknown;
+  /** Schema default — shown in the "Default <value>" meta line per field.
+   *  Named "default" to match the server's JSON key exactly (Python `model_dump`
+   *  serialises the `default` field name verbatim). */
+  default: unknown;
+  /** True when the env var is set in the host environment (not injected from the
+   *  saved file by the agent). PR3 renders the env-override badge when it is true,
+   *  paired with the static `ConfigFieldDef.envVar` name from the schema.
+   *  NOTE: The server does NOT return `env_var` — the name comes from the static
+   *  schema; only this boolean is returned per field. */
+  env_overridden: boolean;
+  /** True when the field cannot be edited from the UI (hardware-pinned or safety). */
+  read_only: boolean;
+  /** One-sentence description shown in the field's left column. */
+  description: string;
+}
+
+export interface ControllerConfigSnapshot {
+  tick_interval_seconds: ConfigFieldMeta;
+  pre_fc_heat_target_percent: ConfigFieldMeta;
+  pre_fc_fan_target_percent: ConfigFieldMeta;
+  late_maillard_trim_enabled: ConfigFieldMeta;
+  late_maillard_trim_heat_percent: ConfigFieldMeta;
+  late_maillard_trim_window_fc_eta_seconds: ConfigFieldMeta;
+  late_maillard_trim_min_bean_temp_c: ConfigFieldMeta;
+  late_maillard_trim_adaptive_depth_enabled: ConfigFieldMeta;
+  late_maillard_trim_base_trim: ConfigFieldMeta;
+  late_maillard_trim_k_ror: ConfigFieldMeta;
+  late_maillard_trim_k_eta: ConfigFieldMeta;
+  late_maillard_trim_ror_ref: ConfigFieldMeta;
+  late_maillard_trim_eta_ref: ConfigFieldMeta;
+  late_maillard_trim_min_trim: ConfigFieldMeta;
+  late_maillard_trim_max_trim: ConfigFieldMeta;
+}
+
+export interface AdvisorConfigSnapshot {
+  model_slug: ConfigFieldMeta;
+  prompt_version: ConfigFieldMeta;
+  provider: ConfigFieldMeta;
+  provider_base_url: ConfigFieldMeta;
+  /** api_key_env: always read_only=true; saved_value=null; env_overridden=false. */
+  api_key_env: ConfigFieldMeta;
+  timeout_seconds: ConfigFieldMeta;
+  temperature: ConfigFieldMeta;
+}
+
+export interface SafetyLimitsSnapshot {
+  /** All safety fields are read_only=true in M1 (D78 decision 2). */
+  max_bean_temp_c: ConfigFieldMeta;
+  max_env_temp_c: ConfigFieldMeta;
+  pre_t0_max_bean_temp_c: ConfigFieldMeta;
+  overrun_safe_fan_percent: ConfigFieldMeta;
+  pre_t0_overrun_severity: ConfigFieldMeta;
+  min_seconds_between_commands: ConfigFieldMeta;
+  max_consecutive_mcp_failures: ConfigFieldMeta;
+  max_consecutive_advisor_failures: ConfigFieldMeta;
+  bitter_ceiling_temp_c: ConfigFieldMeta;
+  emergency_drop_temp_c: ConfigFieldMeta;
+}
+
+/** GET /api/config response body (AppConfigSnapshot in Python). */
+export interface AppConfigSnapshot {
+  controller: ControllerConfigSnapshot;
+  advisor: AdvisorConfigSnapshot;
+  safety: SafetyLimitsSnapshot;
+}
+
+// AppConfigEdit is not mirrored here — the SPA sends a raw partial object built
+// from the form's dirty values. Only controller + advisor fields are accepted;
+// safety fields are never sent. The server validates the shape via Pydantic.
