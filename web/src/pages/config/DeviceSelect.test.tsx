@@ -16,6 +16,9 @@
  *     appears as a selected-but-unavailable row with a warning note.
  * 12. Disabled: trigger cannot open the popover.
  * 13. audio_input deviceKind draws from audio_input list + error.
+ * 14. ArrowDown on the trigger (popover closed) opens the popover and focuses the
+ *     selected option (or first option when none selected).
+ * 15. ArrowDown on the trigger (popover already open) focuses the selected / first option.
  */
 
 import {
@@ -252,7 +255,7 @@ describe("DeviceSelect — trigger ARIA + no free-text invariant", () => {
   });
 });
 
-describe("DeviceSelect — arrow-key listbox navigation", () => {
+describe("DeviceSelect — arrow-key listbox navigation (option rows)", () => {
   beforeEach(() => defaultMockState());
 
   it("ArrowDown moves focus from the first option to the second", () => {
@@ -293,6 +296,60 @@ describe("DeviceSelect — arrow-key listbox navigation", () => {
     fireEvent.keyDown(firstRow, { key: "ArrowUp" });
     // Focus stays on the first row
     expect(firstRow).toHaveFocus();
+  });
+});
+
+describe("DeviceSelect — trigger ArrowDown/Up opens popover and moves focus into list", () => {
+  // This asserts the Codex P2 fix: when the operator opens the dropdown via
+  // ArrowDown on the trigger, focus must land on the first (or selected) option
+  // rather than staying stranded on the trigger.
+
+  beforeEach(() => defaultMockState());
+
+  it("ArrowDown on the trigger (closed) opens the popover and focuses the first option when no selection", async () => {
+    renderSelect({ value: "" });
+    const trigger = screen.getByTestId("device-select-trigger");
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    // Popover must open (first option becomes reachable).
+    await waitFor(() =>
+      expect(screen.getByTestId(`device-option-${SERIAL_DEVICES[0]!.value}`)).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId(`device-option-${SERIAL_DEVICES[0]!.value}`)).toHaveFocus(),
+    );
+  });
+
+  it("ArrowDown on the trigger (closed) focuses the selected option when one is selected", async () => {
+    renderSelect({ value: SERIAL_DEVICES[1]!.value });
+    const trigger = screen.getByTestId("device-select-trigger");
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    await waitFor(() =>
+      expect(screen.getByTestId(`device-option-${SERIAL_DEVICES[1]!.value}`)).toHaveFocus(),
+    );
+  });
+
+  it("ArrowDown on the trigger (already open) moves focus to the first option", async () => {
+    renderSelect({ value: "" });
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    // Popover is now open; fire ArrowDown on the trigger again.
+    const trigger = screen.getByTestId("device-select-trigger");
+    fireEvent.keyDown(trigger, { key: "ArrowDown" });
+    await waitFor(() =>
+      expect(screen.getByTestId(`device-option-${SERIAL_DEVICES[0]!.value}`)).toHaveFocus(),
+    );
+  });
+
+  it("ArrowUp on the trigger (closed) opens the popover and focuses the last option", async () => {
+    renderSelect({ value: "" });
+    const trigger = screen.getByTestId("device-select-trigger");
+    trigger.focus();
+    fireEvent.keyDown(trigger, { key: "ArrowUp" });
+    const lastDevice = SERIAL_DEVICES[SERIAL_DEVICES.length - 1]!;
+    await waitFor(() =>
+      expect(screen.getByTestId(`device-option-${lastDevice.value}`)).toHaveFocus(),
+    );
   });
 });
 

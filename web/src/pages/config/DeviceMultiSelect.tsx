@@ -14,7 +14,7 @@
  * the mounting layer (slice 3c), not here.
  */
 
-import { useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 
 import { cn } from "@/lib/cn";
 import type { DeviceOption } from "@/lib/types";
@@ -241,6 +241,9 @@ export function DeviceMultiSelect({
   const [open, setOpen] = useState(false);
   const id = useId();
   const triggerRef = useRef<HTMLButtonElement>(null);
+  // "first" | "last" | null — set by the trigger ArrowDown/Up handler; cleared
+  // after the open-effect moves focus into the listbox.
+  const pendingFocusDir = useRef<"first" | "last" | null>(null);
 
   const { data, isPending, isRefetching, isError, error: queryErr, refetch } = useDevices();
 
@@ -260,11 +263,56 @@ export function DeviceMultiSelect({
           ? (devices.find((d) => d.value === values[0])?.label ?? values[0]!)
           : `${values.length.toString()} devices selected`;
 
+  // Ref for the wrapper div so the trigger's ArrowDown handler can query the
+  // rendered listbox options without coupling to DevicePopover's internals.
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  /** When the popover opens (open=true) and a focus direction is pending, move
+   *  focus to the first-checked option (or first/last) so ArrowDown from the
+   *  trigger lands in the list rather than staying on the trigger. */
+  const focusListOption = useCallback((dir: "first" | "last"): void => {
+    const listbox = wrapperRef.current?.querySelector<HTMLElement>("[role='listbox']");
+    if (!listbox) return;
+    const rows = Array.from(listbox.querySelectorAll<HTMLElement>("[role='option']"));
+    if (rows.length === 0) return;
+    if (dir === "first") {
+      const checked = rows.find((r) => r.getAttribute("aria-selected") === "true");
+      (checked ?? rows[0])?.focus();
+    } else {
+      rows[rows.length - 1]?.focus();
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!open || !pendingFocusDir.current) return;
+    const dir = pendingFocusDir.current;
+    pendingFocusDir.current = null;
+    focusListOption(dir);
+  }, [open, focusListOption]);
+
   function handleRescan(): void { void refetch(); }
 
   function handleToggle(v: string): void {
     onChange(values.includes(v) ? values.filter((x) => x !== v) : [...values, v]);
     // Multi-select intentionally stays open after toggle.
+  }
+
+  /** Move focus into the listbox when ArrowDown/ArrowUp is pressed on the trigger.
+   *
+   *  If the popover is already open the focus is moved synchronously. If it is
+   *  closed, the pending-focus direction is stored and a useEffect moves focus
+   *  once the popover DOM has rendered (open → true). */
+  function handleTriggerKeyDown(e: React.KeyboardEvent<HTMLButtonElement>): void {
+    if (disabled) return;
+    if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+    e.preventDefault();
+    const dir = e.key === "ArrowDown" ? "first" : "last";
+    if (open) {
+      focusListOption(dir);
+    } else {
+      pendingFocusDir.current = dir;
+      setOpen(true);
+    }
   }
 
   return (
@@ -276,7 +324,7 @@ export function DeviceMultiSelect({
         {label}
       </label>
 
-      <div className="relative">
+      <div className="relative" ref={wrapperRef}>
         <button
           ref={triggerRef}
           id={id}
@@ -286,6 +334,7 @@ export function DeviceMultiSelect({
           aria-expanded={open}
           disabled={disabled}
           onClick={() => !disabled && setOpen((o) => !o)}
+          onKeyDown={handleTriggerKeyDown}
           data-testid={`${testId}-trigger`}
           className={cn(
             "flex h-11 w-full items-center justify-between gap-2 rounded-[9px] border border-input bg-input px-3 text-sm transition-colors",
