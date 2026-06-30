@@ -959,36 +959,79 @@ class MCPServerProcess:
         (E9-S2 sets the mock-driver vars). With no overrides, ``env`` stays
         ``None`` and the transport supplies its default safe environment.
 
-        When a :class:`~roastpilot_agent.config.MCPDeviceConfig` was supplied
-        at construction, the managed device fields are rendered into a temp yaml
-        via passthrough-merge (D78-4, #420) and ``COFFEE_ROASTER_MCP_CONFIG``
-        is set to that file's path in the child's environment.  The temp dir is
-        cleaned up in :meth:`stop`.  On each (re)spawn a fresh render is
-        produced so config changes between sessions take effect.
+        **MCP yaml render (D78-4, #420)** — when a
+        :class:`~roastpilot_agent.config.MCPDeviceConfig` was supplied at
+        construction, the managed device fields are rendered into a temp yaml
+        via passthrough-merge and ``COFFEE_ROASTER_MCP_CONFIG`` is set to that
+        file's path in the child's environment.  The temp dir is cleaned up in
+        :meth:`stop`.  On each (re)spawn a fresh render is produced so config
+        changes between sessions take effect.
+
+        **Source-yaml resolution** (render source = operator's existing yaml):
+
+        1. ``device_config.mcp_yaml_source_path`` — explicit path wins.
+        2. ``COFFEE_ROASTER_MCP_CONFIG`` from ``MCPConfig.env`` — the value
+           forwarded by ``forward_coffee_env`` from ``roast-live.sh``.
+        3. ``COFFEE_ROASTER_MCP_CONFIG`` from ``os.environ`` — the ambient
+           operator environment.
+        4. ``None`` — no existing yaml; render from managed fields only.
+
+        **Skip condition**: if the overlay is entirely empty (all
+        ``MCPDeviceConfig`` fields are ``None``) AND no source yaml is
+        resolvable, the render step is skipped and ``COFFEE_ROASTER_MCP_CONFIG``
+        is left exactly as the operator set it — so a default all-``None``
+        ``mcp_device`` on a ``roast-live.sh`` roast does not overwrite the
+        operator's proven Hottop yaml with an empty one.
         """
+        import tempfile  # noqa: PLC0415
+
+        from roastpilot_agent.mcp_yaml import (  # noqa: PLC0415
+            _device_config_to_overlay,  # pyright: ignore[reportPrivateUsage]
+            render_mcp_yaml,
+        )
+
         # Start from the MCPConfig.env overrides (E9-S2 mock-driver path).
         extra_env: dict[str, str] = dict(self._config.env)
 
         if self._device_config is not None:
-            import tempfile
+            # Resolve the source yaml: explicit path > MCPConfig.env > os.environ.
+            source: Path | None = self._device_config.mcp_yaml_source_path
+            if source is None:
+                raw = extra_env.get("COFFEE_ROASTER_MCP_CONFIG") or os.environ.get(
+                    "COFFEE_ROASTER_MCP_CONFIG"
+                )
+                if raw:
+                    source = Path(raw)
 
-            from roastpilot_agent.mcp_yaml import render_mcp_yaml
+            # Build the overlay to decide whether we need to render at all.
+            overlay = _device_config_to_overlay(self._device_config)
 
-            # Clean up any leftover dir from a previous spawn before creating a new one.
-            if self._rendered_yaml_dir is not None:
-                shutil.rmtree(self._rendered_yaml_dir, ignore_errors=True)
-                self._rendered_yaml_dir = None
+            if not overlay and source is None:
+                # Nothing to overlay and no existing yaml to copy — skip the
+                # render entirely so COFFEE_ROASTER_MCP_CONFIG is untouched.
+                _log.debug("mcp_device: no managed fields and no source yaml — skipping render")
+            else:
+                # Clean up any leftover dir from a previous spawn.
+                if self._rendered_yaml_dir is not None:
+                    shutil.rmtree(self._rendered_yaml_dir, ignore_errors=True)
+                    self._rendered_yaml_dir = None
 
-            tmp_dir = Path(tempfile.mkdtemp(prefix="rp-mcp-yaml-"))
-            self._rendered_yaml_dir = tmp_dir
-            dest = tmp_dir / "coffee-roaster-mcp.yaml"
-            render_mcp_yaml(
-                self._device_config,
-                source_path=self._device_config.mcp_yaml_source_path,
-                dest_path=dest,
-            )
-            extra_env["COFFEE_ROASTER_MCP_CONFIG"] = str(dest)
-            _log.debug("rendered MCP yaml → %s", dest)
+                tmp_dir = Path(tempfile.mkdtemp(prefix="rp-mcp-yaml-"))
+                self._rendered_yaml_dir = tmp_dir
+                dest = tmp_dir / "coffee-roaster-mcp.yaml"
+                try:
+                    render_mcp_yaml(
+                        self._device_config,
+                        source_path=source,
+                        dest_path=dest,
+                    )
+                except Exception:
+                    # Render failed — clean up so we don't leak the temp dir.
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                    self._rendered_yaml_dir = None
+                    raise
+                extra_env["COFFEE_ROASTER_MCP_CONFIG"] = str(dest)
+                _log.debug("rendered MCP yaml → %s (source=%s)", dest, source)
 
         env: dict[str, str] | None = {**os.environ, **extra_env} if extra_env else None
         command = resolve_mcp_command(self._config.command)

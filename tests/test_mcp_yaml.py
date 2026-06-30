@@ -386,3 +386,204 @@ async def test_stop_cleans_up_rendered_yaml_dir() -> None:
     # After stop, both the dir and the internal pointer must be gone.
     assert not tmp_dir.exists(), "stop() must clean up the temp dir"
     assert proc._rendered_yaml_dir is None  # pyright: ignore[reportPrivateUsage]
+
+
+# ---------------------------------------------------------------------------
+# P1 regression: roast-live.sh flow preservation
+# ---------------------------------------------------------------------------
+
+
+def test_build_server_parameters_roast_live_sh_flow(tmp_path: Path) -> None:
+    """P1 regression: COFFEE_ROASTER_MCP_CONFIG in os.environ + all-None mcp_device.
+
+    This mirrors the roast-live.sh flow where the operator exports their proven
+    Hottop yaml via COFFEE_ROASTER_MCP_CONFIG and the agent passes a default
+    (all-None) mcp_device.  The MCP child must receive the operator's yaml, not
+    an empty one.
+    """
+    import os
+
+    from roastpilot_agent.mcp_client import MCPServerProcess
+
+    # Write a yaml that resembles the operator's known-good Hottop config.
+    operator_yaml = tmp_path / "operator.yaml"
+    operator_yaml.write_text(
+        "roaster:\n  driver: hottop_kn8828b_2k_plus\n  port: /dev/cu.usbserial-XXXX\n"
+        "first_crack:\n  mode: audio\n  confidence_threshold: 0.6\n",
+        encoding="utf-8",
+    )
+
+    # Default mcp_device: all fields None (the default construction).
+    proc = MCPServerProcess(MCPConfig(), device_config=MCPDeviceConfig())
+    try:
+        # Simulate roast-live.sh exporting COFFEE_ROASTER_MCP_CONFIG.
+        env_backup = os.environ.get("COFFEE_ROASTER_MCP_CONFIG")
+        os.environ["COFFEE_ROASTER_MCP_CONFIG"] = str(operator_yaml)
+        try:
+            params = proc.build_server_parameters()
+        finally:
+            if env_backup is None:
+                os.environ.pop("COFFEE_ROASTER_MCP_CONFIG", None)
+            else:
+                os.environ["COFFEE_ROASTER_MCP_CONFIG"] = env_backup  # pragma: no cover
+
+        # The MCP child must be pointed at the rendered yaml (passthrough copy).
+        assert params.env is not None
+        rendered_path = Path(params.env["COFFEE_ROASTER_MCP_CONFIG"])
+        assert rendered_path.exists()
+        result = yaml.safe_load(rendered_path.read_text(encoding="utf-8"))
+        # Serial, driver, and FC settings from the operator's yaml must survive.
+        assert result["roaster"]["driver"] == "hottop_kn8828b_2k_plus"
+        assert result["roaster"]["port"] == "/dev/cu.usbserial-XXXX"
+        assert result["first_crack"]["mode"] == "audio"
+        assert result["first_crack"]["confidence_threshold"] == 0.6
+    finally:
+        if proc._rendered_yaml_dir is not None:  # pyright: ignore[reportPrivateUsage]
+            shutil.rmtree(proc._rendered_yaml_dir, ignore_errors=True)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_build_server_parameters_roast_live_sh_via_mcp_env(tmp_path: Path) -> None:
+    """COFFEE_ROASTER_MCP_CONFIG in MCPConfig.env (forward_coffee_env path) is used as source."""
+    from roastpilot_agent.mcp_client import MCPServerProcess
+
+    operator_yaml = tmp_path / "operator.yaml"
+    operator_yaml.write_text(
+        "roaster:\n  driver: hottop_kn8828b_2k_plus\n  port: /dev/ttyUSB0\n",
+        encoding="utf-8",
+    )
+    # This is how forward_coffee_env delivers the operator's yaml path.
+    mcp_cfg = MCPConfig(env={"COFFEE_ROASTER_MCP_CONFIG": str(operator_yaml)})
+    proc = MCPServerProcess(mcp_cfg, device_config=MCPDeviceConfig())
+    try:
+        params = proc.build_server_parameters()
+        assert params.env is not None
+        result = yaml.safe_load(
+            Path(params.env["COFFEE_ROASTER_MCP_CONFIG"]).read_text(encoding="utf-8")
+        )
+        assert result["roaster"]["driver"] == "hottop_kn8828b_2k_plus"
+        assert result["roaster"]["port"] == "/dev/ttyUSB0"
+    finally:
+        if proc._rendered_yaml_dir is not None:  # pyright: ignore[reportPrivateUsage]
+            shutil.rmtree(proc._rendered_yaml_dir, ignore_errors=True)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_build_server_parameters_skip_when_no_managed_and_no_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No managed fields + no COFFEE_ROASTER_MCP_CONFIG → render skipped entirely.
+
+    The skip condition prevents an empty temp yaml from overwriting
+    COFFEE_ROASTER_MCP_CONFIG when there is no config to merge.
+    """
+    from roastpilot_agent.mcp_client import MCPServerProcess
+
+    monkeypatch.delenv("COFFEE_ROASTER_MCP_CONFIG", raising=False)
+    proc = MCPServerProcess(MCPConfig(), device_config=MCPDeviceConfig())
+    params = proc.build_server_parameters()
+    # No env key injected, no temp dir created.
+    assert proc._rendered_yaml_dir is None  # pyright: ignore[reportPrivateUsage]
+    assert params.env is None or "COFFEE_ROASTER_MCP_CONFIG" not in (params.env or {})
+
+
+def test_build_server_parameters_explicit_source_wins_over_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """mcp_yaml_source_path takes priority over COFFEE_ROASTER_MCP_CONFIG env var."""
+    from roastpilot_agent.mcp_client import MCPServerProcess
+
+    explicit = tmp_path / "explicit.yaml"
+    explicit.write_text("roaster:\n  driver: from_explicit\n", encoding="utf-8")
+    ambient = tmp_path / "ambient.yaml"
+    ambient.write_text("roaster:\n  driver: from_env\n", encoding="utf-8")
+
+    monkeypatch.setenv("COFFEE_ROASTER_MCP_CONFIG", str(ambient))
+    cfg = MCPDeviceConfig(mcp_yaml_source_path=explicit)
+    proc = MCPServerProcess(MCPConfig(), device_config=cfg)
+    try:
+        params = proc.build_server_parameters()
+        result = yaml.safe_load(
+            Path(params.env["COFFEE_ROASTER_MCP_CONFIG"]).read_text(encoding="utf-8")  # type: ignore[index]
+        )
+        assert result["roaster"]["driver"] == "from_explicit"
+    finally:
+        if proc._rendered_yaml_dir is not None:  # pyright: ignore[reportPrivateUsage]
+            shutil.rmtree(proc._rendered_yaml_dir, ignore_errors=True)  # pyright: ignore[reportPrivateUsage]
+
+
+# ---------------------------------------------------------------------------
+# Fail-closed: non-mapping source yaml
+# ---------------------------------------------------------------------------
+
+
+def test_render_non_mapping_source_raises(tmp_path: Path) -> None:
+    """A valid-YAML-but-non-mapping source (list, scalar) raises ValueError.
+
+    Silently treating a list or scalar as empty base would drop all operator
+    config — we fail closed instead.
+    """
+    src = tmp_path / "bad.yaml"
+    src.write_text("- item1\n- item2\n", encoding="utf-8")
+    dest = tmp_path / "out.yaml"
+    with pytest.raises(ValueError, match="not a mapping"):
+        render_mcp_yaml(MCPDeviceConfig(), source_path=src, dest_path=dest)
+
+
+def test_render_null_yaml_treated_as_empty(tmp_path: Path) -> None:
+    """An empty file (null yaml) is silently treated as an empty base, not an error."""
+    src = tmp_path / "empty.yaml"
+    src.write_text("", encoding="utf-8")
+    dest = tmp_path / "out.yaml"
+    render_mcp_yaml(MCPDeviceConfig(serial_port="/dev/ttyUSB0"), source_path=src, dest_path=dest)
+    result = yaml.safe_load(dest.read_text(encoding="utf-8"))
+    assert result["roaster"]["port"] == "/dev/ttyUSB0"
+
+
+# ---------------------------------------------------------------------------
+# config_store: apply_config_edit mcp_device coverage
+# ---------------------------------------------------------------------------
+
+
+def test_apply_config_edit_mcp_device_all_fields(tmp_path: Path) -> None:
+    """apply_config_edit wires all mcp_device fields including recording_devices."""
+    from roastpilot_agent.config_store import MCPDeviceConfigEdit, apply_config_edit
+
+    edit_data = MCPDeviceConfigEdit(
+        serial_port="/dev/ttyUSB1",
+        roaster_driver="mock",
+        audio_input_device="USB PnP",
+        recording_enabled=True,
+        recording_autocapture=False,
+        recording_devices=["USB PnP", "Built-in"],
+        fc_mode="audio",
+        fc_confidence_threshold=0.75,
+        auto_t0_detection_enabled=True,
+        auto_t0_drop_threshold_c=18.0,
+    )
+    from roastpilot_agent.config_store import AppConfigEdit
+
+    result = apply_config_edit(AppConfigEdit(mcp_device=edit_data), existing_saved={})
+
+    dev = result["mcp_device"]
+    assert dev["serial_port"] == "/dev/ttyUSB1"
+    assert dev["roaster_driver"] == "mock"
+    assert dev["audio_input_device"] == "USB PnP"
+    assert dev["recording_enabled"] is True
+    assert dev["recording_autocapture"] is False
+    # recording_devices is stored as tuple (pydantic-compatible for round-trip).
+    assert dev["recording_devices"] == ("USB PnP", "Built-in")
+    assert dev["fc_mode"] == "audio"
+    assert dev["fc_confidence_threshold"] == 0.75
+    assert dev["auto_t0_detection_enabled"] is True
+    assert dev["auto_t0_drop_threshold_c"] == 18.0
+
+
+def test_apply_config_edit_mcp_device_none_fields_skipped(tmp_path: Path) -> None:
+    """None fields in MCPDeviceConfigEdit do not overwrite existing saved values."""
+    from roastpilot_agent.config_store import AppConfigEdit, MCPDeviceConfigEdit, apply_config_edit
+
+    existing = {"mcp_device": {"serial_port": "/dev/old", "fc_mode": "disabled"}}
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit(serial_port="/dev/new"))
+    result = apply_config_edit(edit, existing_saved=existing)
+    dev = result["mcp_device"]
+    assert dev["serial_port"] == "/dev/new"
+    assert dev["fc_mode"] == "disabled"  # untouched

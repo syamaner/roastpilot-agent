@@ -183,7 +183,17 @@ def render_mcp_yaml(
     if source_path is not None and source_path.exists():
         with source_path.open("r", encoding="utf-8") as fh:
             loaded: Any = yaml.safe_load(fh)
-        if isinstance(loaded, dict):
+        if loaded is None:
+            # Empty file — treat as no config, not an error.
+            pass
+        elif not isinstance(loaded, dict):
+            # A valid-YAML-but-non-mapping source (list, scalar) would silently
+            # drop all operator config — fail closed instead.
+            raise ValueError(
+                f"MCP yaml source at {source_path!r} is not a mapping "
+                f"(got {type(loaded).__name__!r}); refusing to render over it"
+            )
+        else:
             # yaml.safe_load returns Any; cast here after isinstance guard.
             base = cast(dict[str, Any], loaded)
 
@@ -200,7 +210,7 @@ def render_mcp_yaml(
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             yaml.safe_dump(merged, fh, default_flow_style=False, allow_unicode=True)
         os.replace(tmp_name, dest_path)
-    except Exception:
+    except Exception:  # pragma: no cover - requires injecting a real disk/OS write failure
         # Clean up the temp file if something goes wrong before the rename.
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
