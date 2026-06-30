@@ -63,6 +63,7 @@ from roastpilot_agent.config import (
     AppConfig,
     ControllerConfig,
     LateMaillardTrim,
+    MCPDeviceConfig,
     PreFirstCrackLevers,
     SafetyLimits,
 )
@@ -96,6 +97,7 @@ _DEFAULT_CONFIG = AppConfig.model_construct(
     controller=ControllerConfig(),
     advisor=AdvisorConfig(),
     safety=SafetyLimits(),
+    mcp_device=MCPDeviceConfig(),
     # mcp and logging omitted intentionally: their default_factory values are
     # populated on attribute access / model_dump, so they are never bleed-prone
     # and are not referenced in build_config_snapshot.
@@ -277,6 +279,27 @@ class SafetyLimitsSnapshot(BaseModel, frozen=True):
     emergency_drop_temp_c: ConfigFieldMeta
 
 
+class MCPDeviceConfigSnapshot(BaseModel, frozen=True):
+    """Per-field snapshot for the managed MCP device fields (D78-4, #420).
+
+    These fields are rendered into the ``coffee-roaster-mcp.yaml`` on each
+    (re)spawn.  Environment overrides come from ``ROASTPILOT_MCP_DEVICE__*``.
+    The ``mcp_yaml_source_path`` field is **not** included in the snapshot
+    (it is a runtime path, not a user-facing config value).
+    """
+
+    serial_port: ConfigFieldMeta
+    roaster_driver: ConfigFieldMeta
+    audio_input_device: ConfigFieldMeta
+    recording_enabled: ConfigFieldMeta
+    recording_autocapture: ConfigFieldMeta
+    recording_devices: ConfigFieldMeta
+    fc_mode: ConfigFieldMeta
+    fc_confidence_threshold: ConfigFieldMeta
+    auto_t0_detection_enabled: ConfigFieldMeta
+    auto_t0_drop_threshold_c: ConfigFieldMeta
+
+
 class AppConfigSnapshot(BaseModel, frozen=True):
     """Full per-field snapshot returned by ``GET /api/config`` (D78).
 
@@ -288,6 +311,7 @@ class AppConfigSnapshot(BaseModel, frozen=True):
     controller: ControllerConfigSnapshot
     advisor: AdvisorConfigSnapshot
     safety: SafetyLimitsSnapshot
+    mcp_device: MCPDeviceConfigSnapshot
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +371,26 @@ class AdvisorConfigEdit(BaseModel):
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
 
 
+class MCPDeviceConfigEdit(BaseModel):
+    """Editable MCP device fields for ``PUT /api/config`` (D78-4, #420).
+
+    These are the managed fields rendered into ``coffee-roaster-mcp.yaml``
+    on each (re)spawn.  ``mcp_yaml_source_path`` is intentionally excluded —
+    it is set by the operator at deployment time, not via the UI.
+    """
+
+    serial_port: str | None = None
+    roaster_driver: str | None = None
+    audio_input_device: str | None = None
+    recording_enabled: bool | None = None
+    recording_autocapture: bool | None = None
+    recording_devices: list[str] | None = None
+    fc_mode: Literal["disabled", "audio", "manual"] | None = None
+    fc_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    auto_t0_detection_enabled: bool | None = None
+    auto_t0_drop_threshold_c: float | None = Field(default=None, gt=0)
+
+
 class AppConfigEdit(BaseModel):
     """The PUT /api/config request body — safety is intentionally excluded (D78).
 
@@ -356,6 +400,7 @@ class AppConfigEdit(BaseModel):
 
     controller: ControllerConfigEdit | None = None
     advisor: AdvisorConfigEdit | None = None
+    mcp_device: MCPDeviceConfigEdit | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -948,10 +993,125 @@ def build_config_snapshot(
         ),
     )
 
+    # --- mcp_device section (D78-4, #420) ------------------------------------
+    dev = effective.mcp_device
+    dev_def = defaults.mcp_device
+    dev_saved = _raw_section(saved_raw, "mcp_device")
+
+    mcp_device_snapshot = MCPDeviceConfigSnapshot(
+        serial_port=_meta(
+            dev_saved.get("serial_port"),
+            dev.serial_port,
+            dev_def.serial_port,
+            "ROASTPILOT_MCP_DEVICE__SERIAL_PORT",
+            description=(
+                "Serial port path for the Hottop roaster"
+                " (e.g. /dev/cu.usbserial-XXXXXXXX on macOS,"
+                " /dev/ttyUSB0 on Linux). Rendered to roaster.port in the"
+                " MCP yaml on each spawn."
+            ),
+        ),
+        roaster_driver=_meta(
+            dev_saved.get("roaster_driver"),
+            dev.roaster_driver,
+            dev_def.roaster_driver,
+            "ROASTPILOT_MCP_DEVICE__ROASTER_DRIVER",
+            description=(
+                "coffee-roaster-mcp driver name"
+                " (e.g. hottop_kn8828b_2k_plus or mock). Rendered to"
+                " roaster.driver in the MCP yaml."
+            ),
+        ),
+        audio_input_device=_meta(
+            dev_saved.get("audio_input_device"),
+            dev.audio_input_device,
+            dev_def.audio_input_device,
+            "ROASTPILOT_MCP_DEVICE__AUDIO_INPUT_DEVICE",
+            description=(
+                "PortAudio input device name substring for FC detection"
+                " (case-insensitive match, e.g. 'USB PnP'). Rendered to"
+                " audio.input_device in the MCP yaml."
+            ),
+        ),
+        recording_enabled=_meta(
+            dev_saved.get("recording_enabled"),
+            dev.recording_enabled,
+            dev_def.recording_enabled,
+            "ROASTPILOT_MCP_DEVICE__RECORDING_ENABLED",
+            description=(
+                "Whether the MCP audio recorder is active. Rendered to"
+                " recording.enabled in the MCP yaml."
+            ),
+        ),
+        recording_autocapture=_meta(
+            dev_saved.get("recording_autocapture"),
+            dev.recording_autocapture,
+            dev_def.recording_autocapture,
+            "ROASTPILOT_MCP_DEVICE__RECORDING_AUTOCAPTURE",
+            description=(
+                "Whether recording starts automatically with each roast session."
+                " Rendered to recording.autocapture in the MCP yaml."
+            ),
+        ),
+        recording_devices=_meta(
+            dev_saved.get("recording_devices"),
+            dev.recording_devices,
+            dev_def.recording_devices,
+            "ROASTPILOT_MCP_DEVICE__RECORDING_DEVICES",
+            description=(
+                "Ordered list of capture-device name substrings. The first entry"
+                " is used by the FC detector (teed); additional entries are"
+                " independent capture streams. Rendered to recording.devices."
+            ),
+        ),
+        fc_mode=_meta(
+            dev_saved.get("fc_mode"),
+            dev.fc_mode,
+            dev_def.fc_mode,
+            "ROASTPILOT_MCP_DEVICE__FC_MODE",
+            description=(
+                "First-crack detection mode: disabled, audio, or manual. Rendered"
+                " to first_crack.mode in the MCP yaml."
+            ),
+        ),
+        fc_confidence_threshold=_meta(
+            dev_saved.get("fc_confidence_threshold"),
+            dev.fc_confidence_threshold,
+            dev_def.fc_confidence_threshold,
+            "ROASTPILOT_MCP_DEVICE__FC_CONFIDENCE_THRESHOLD",
+            description=(
+                "FC detector confidence threshold [0, 1]. Lower = more sensitive;"
+                " 0.6 is the proven library default. Rendered to"
+                " first_crack.confidence_threshold in the MCP yaml."
+            ),
+        ),
+        auto_t0_detection_enabled=_meta(
+            dev_saved.get("auto_t0_detection_enabled"),
+            dev.auto_t0_detection_enabled,
+            dev_def.auto_t0_detection_enabled,
+            "ROASTPILOT_MCP_DEVICE__AUTO_T0_DETECTION_ENABLED",
+            description=(
+                "Whether the MCP's automatic charge-drop (T0) detection is active."
+                " Rendered to session.auto_t0_detection_enabled in the MCP yaml."
+            ),
+        ),
+        auto_t0_drop_threshold_c=_meta(
+            dev_saved.get("auto_t0_drop_threshold_c"),
+            dev.auto_t0_drop_threshold_c,
+            dev_def.auto_t0_drop_threshold_c,
+            "ROASTPILOT_MCP_DEVICE__AUTO_T0_DROP_THRESHOLD_C",
+            description=(
+                "Bean-temperature drop (°C) that triggers automatic T0 detection."
+                " Rendered to session.auto_t0_drop_threshold_c in the MCP yaml."
+            ),
+        ),
+    )
+
     return AppConfigSnapshot(
         controller=controller_snapshot,
         advisor=advisor_snapshot,
         safety=safety_snapshot,
+        mcp_device=mcp_device_snapshot,
     )
 
 
@@ -1029,6 +1189,32 @@ def apply_config_edit(
                 "provider_base_url": a.provider_base_url,
                 "timeout_seconds": a.timeout_seconds,
                 "temperature": a.temperature,
+            },
+        )
+
+    if edit.mcp_device is not None:
+        dev_section: dict[str, Any] = merged.setdefault("mcp_device", {})
+        d = edit.mcp_device
+        # recording_devices is list[str] | None in the edit model; convert to
+        # tuple[str, ...] when writing so it round-trips cleanly through the
+        # MCPDeviceConfig (which stores as tuple).  The yaml layer stores it
+        # as a list anyway; AppConfig/pydantic converts on load.
+        recording_devices_val: tuple[str, ...] | None = (
+            tuple(d.recording_devices) if d.recording_devices is not None else None
+        )
+        _merge_non_none(
+            dev_section,
+            {
+                "serial_port": d.serial_port,
+                "roaster_driver": d.roaster_driver,
+                "audio_input_device": d.audio_input_device,
+                "recording_enabled": d.recording_enabled,
+                "recording_autocapture": d.recording_autocapture,
+                "recording_devices": recording_devices_val,
+                "fc_mode": d.fc_mode,
+                "fc_confidence_threshold": d.fc_confidence_threshold,
+                "auto_t0_detection_enabled": d.auto_t0_detection_enabled,
+                "auto_t0_drop_threshold_c": d.auto_t0_drop_threshold_c,
             },
         )
 

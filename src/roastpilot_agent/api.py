@@ -2300,8 +2300,13 @@ async def get_devices(request: Request) -> DevicesSnapshot:
         ``*_error`` fields rather than as HTTP error codes.
     """
     del request  # unused
-    serial_devices, serial_error = await asyncio.to_thread(_enumerate_serial)
-    audio_devices, audio_error = await asyncio.to_thread(_enumerate_audio_inputs)
+    # Both enumerations are blocking (native OS / PortAudio calls with no
+    # ordering dependency) — run them in parallel via asyncio.gather so the
+    # combined latency is max(serial, audio) rather than serial + audio.
+    (serial_devices, serial_error), (audio_devices, audio_error) = await asyncio.gather(
+        asyncio.to_thread(_enumerate_serial),
+        asyncio.to_thread(_enumerate_audio_inputs),
+    )
     return DevicesSnapshot(
         serial=serial_devices,
         serial_error=serial_error,
