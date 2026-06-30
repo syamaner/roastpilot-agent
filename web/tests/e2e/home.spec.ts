@@ -1,5 +1,6 @@
 /**
- * Home / landing hub + persistent nav snapshot + data-assert suite (#324, D24/D26).
+ * Home / landing hub + persistent nav snapshot + data-assert suite (#324, D24/D26,
+ * updated #423 D81).
  *
  * Drives the deterministic `/__home-harness` route (the persistent `NavBar` + the
  * `HomePage` hub over a seeded idle `/health` snapshot — no active run), mirroring
@@ -7,6 +8,9 @@
  * (per D24) is the two entry-point links + the nav links, asserted alongside the
  * pixels so a regression fails on behaviour, not only on the (CI-regenerated)
  * baseline.
+ *
+ * D81: "Start a new roast" tile now points to `/live` (idle /live = start form;
+ * active /live = live dashboard — one URL for both cases).
  *
  * NOTE: the `home` baseline is owned by the CI Docker snapshot job (D26) — it must
  * be (re)generated there, not committed from a local macOS run.
@@ -23,8 +27,9 @@ test.beforeEach(async ({ page }) => {
 test("home — landing hub with both entry points + persistent nav (full-page snapshot)", async ({
   page,
 }) => {
-  // Data-assert: both hub entry points route to the Start form + the history list.
-  await expect(page.getByTestId("home-start-roast")).toHaveAttribute("href", "/start");
+  // Data-assert: "Start" → /live (D81 — idle /live shows the start form);
+  // "View roasts" → /roasts (unchanged).
+  await expect(page.getByTestId("home-start-roast")).toHaveAttribute("href", "/live");
   await expect(page.getByTestId("home-view-roasts")).toHaveAttribute("href", "/roasts");
 
   // The persistent nav exposes Home + History; with no active run the Live-roast

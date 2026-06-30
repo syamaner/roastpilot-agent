@@ -1,12 +1,13 @@
 /**
- * LivePage (#403): stable /live route — reload-safe, server-driven states.
+ * LivePage (#403 / #423 D81): single live-roast home at /live.
  *
- * 1. Holds (loading div) until health resolves — start form must not flash first.
- * 2. Active run  → the dashboard (DashboardPage).
- * 3. No run (idle, error, or post-completion) → the live start-roast view.
- *    — After a roast ends /live shows the start form directly (not the home hub).
- *    — On health error /live falls back to the start form (unknown = treat as idle).
- * 4. Start-roast: on success, POSTs, refetches health, navigates to /live.
+ * Four server-state-driven branches tested here:
+ * 1. Loading hold  — neither the start form nor the dashboard appears until health resolves.
+ * 2. Active run    — DashboardPage; reload-safe guarantee.
+ * 3. Sticky summary (#423) — when active_run_id transitions non-null → null in the
+ *    SAME session, LiveFinishedView appears (not the start form).
+ * 4. No run, no sticky — LiveStartView (idle / fresh session).
+ * 5. Start-roast flow — POSTs, refetches health, stays on /live.
  *
  * Phase is never inferred: the only server-state read here is active_run_id.
  * DashboardPage + StartRoastForm bodies are stubbed to isolate the gate logic.
@@ -35,6 +36,8 @@ vi.mock("@/hooks/queries", async () => {
     ...actual,
     useHealth: () => healthState,
     useBeanProfiles: () => ({ data: { profiles: [] }, isLoading: false }),
+    useRoast: () => ({ data: null }),
+    useTelemetry: () => ({ data: undefined }),
     useCreateBeanProfile: noopMutation,
     useUpdateBeanProfile: noopMutation,
     useDeleteBeanProfile: noopMutation,
@@ -45,6 +48,25 @@ vi.mock("@/hooks/queries", async () => {
 vi.mock("@/pages/dashboard/DashboardPage", () => ({
   DashboardPage: () => <div data-testid="dashboard-stub" />,
 }));
+vi.mock("@/pages/detail/traceModel", () => ({
+  headlineStats: () => ({
+    dropTempC: null,
+    developmentPercent: null,
+    totalSeconds: null,
+    firstCrackSeconds: null,
+    firstCrackTempC: null,
+    dropSeconds: null,
+  }),
+  toCurvePoints: () => [],
+  toCurveMarkers: () => [],
+}));
+vi.mock("@/components/shared", async () => {
+  const actual = await vi.importActual<typeof import("@/components/shared")>("@/components/shared");
+  return {
+    ...actual,
+    LiveCurve: () => <div data-testid="live-curve-stub" />,
+  };
+});
 
 // Stub StartRoastForm with a minimal form that fires onStart on submit.
 const startRoastMock = vi.hoisted(() => vi.fn(async () => ({ id: "run-new" })));
@@ -78,7 +100,7 @@ beforeEach(() => {
 function renderPage(initialPath = "/live") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const refetchSpy = vi.spyOn(client, "refetchQueries");
-  const wrapper = (children: ReactNode) => (
+  const Wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[initialPath]}>
         <Routes>
@@ -88,11 +110,23 @@ function renderPage(initialPath = "/live") {
       </MemoryRouter>
     </QueryClientProvider>
   );
-  render(wrapper(<LivePage />));
-  return { client, refetchSpy };
+  const result = render(
+    <Wrapper>
+      <LivePage />
+    </Wrapper>,
+  );
+  /** Force a re-render of LivePage (e.g. after mutating `healthState`). */
+  function rerender() {
+    result.rerender(
+      <Wrapper>
+        <LivePage />
+      </Wrapper>,
+    );
+  }
+  return { client, refetchSpy, rerender };
 }
 
-describe("LivePage (#403) — loading hold", () => {
+describe("LivePage — loading hold", () => {
   it("renders the loading placeholder until health resolves", () => {
     healthState.isSuccess = false;
     healthState.data = undefined;
@@ -103,7 +137,7 @@ describe("LivePage (#403) — loading hold", () => {
   });
 });
 
-describe("LivePage (#403) — active run", () => {
+describe("LivePage — active run", () => {
   it("shows the dashboard when the server reports an active run", () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-42" };
@@ -114,53 +148,28 @@ describe("LivePage (#403) — active run", () => {
   });
 
   it("is reload-safe: a fresh render with an active run shows the dashboard (no flash)", () => {
-    // The reload-safe guarantee: loading /live with an active run in server state
-    // shows the dashboard after health resolves — no intermediate idle flash.
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-99" };
     renderPage();
-    // The loading placeholder is gone once health has resolved.
     expect(screen.queryByTestId("live-page-loading")).toBeNull();
-    // The start form must not appear even for a frame.
     expect(screen.queryByTestId("live-start-view")).toBeNull();
     expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
   });
 });
 
-describe("LivePage (#403) — no active run (idle / post-completion)", () => {
-  it("shows the start-roast view when the server reports no active run", () => {
-    // Idle (no run has ever been started) or after a run ends.
+describe("LivePage — no active run, no sticky (idle / fresh session)", () => {
+  it("shows the start-roast view when the server reports no active run and no prior run this session", () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: null };
     renderPage();
     expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
     expect(screen.queryByTestId("live-page-loading")).toBeNull();
-  });
-
-  it("stays on /live with the start form after a roast ends (not redirected to home hub)", () => {
-    // Call #3: after a roast completes (active_run_id → null), /live shows the
-    // start form directly — NOT the home hub's two-tile landing at /. The operator
-    // can immediately begin the next roast without navigating away from /live.
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: null };
-    const { client } = renderPage();
-    expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
-
-    // Simulate a completed run's state change — /live must NOT redirect anywhere.
-    client.setQueryData(roastKeys.health, {
-      status: "ok",
-      version: "t",
-      mcp_child: "running",
-      active_run_id: null,
-    });
-    // Still on /live showing the start form, not the home hub.
-    expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
-    expect(screen.queryByTestId("home-landing")).toBeNull();
+    // The sticky summary should NOT appear on a fresh /live with no prior run.
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
 
   it("falls back to the start-roast view when the health fetch errors", () => {
-    // Error state: active run unknown — treat as idle (same as HomeGate's fallback).
     healthState.isSuccess = false;
     healthState.isError = true;
     healthState.data = undefined;
@@ -171,24 +180,77 @@ describe("LivePage (#403) — no active run (idle / post-completion)", () => {
   });
 });
 
-describe("LivePage (#403) — start-roast flow", () => {
+describe("LivePage — sticky finished-run summary (#423)", () => {
+  it("shows LiveFinishedView when active_run_id transitions from non-null to null in the same session", async () => {
+    // Start with an active run so LivePage records the run id in prevRunIdRef.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42" };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+
+    // Simulate the run ending: update healthState then force a re-render so the
+    // mocked useHealth returns the new value and the useEffect fires.
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    // LiveFinishedView should appear instead of the start form.
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("live-start-view")).toBeNull();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+
+  it("'Start next roast' clears the sticky and returns to the start form", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-55" };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+
+    // Run ends.
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+
+    // Operator clicks "Start next roast".
+    fireEvent.click(screen.getByTestId("live-finished-start-next"));
+
+    // Should now show the start form, not the summary.
+    await waitFor(() =>
+      expect(screen.getByTestId("live-start-view")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
+  });
+
+  it("a reload (fresh render with null active_run_id) shows the start form, not the summary", () => {
+    // Reload: healthState already null — no prior run in this render session.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: null };
+    renderPage();
+    // Fresh session: no sticky, so we show the start form.
+    expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
+  });
+});
+
+describe("LivePage — start-roast flow", () => {
   it("POSTs, refetches health, and stays on /live after starting a roast", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: null };
     const { refetchSpy } = renderPage();
     expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
 
-    // Simulate form submit (the stubbed form calls onStart on submit).
     fireEvent.submit(screen.getByTestId("start-roast-form-stub"));
     await waitFor(() => expect(startRoastMock).toHaveBeenCalledTimes(1));
 
-    // Render-from-server: start AWAITS a health refetch before the page re-evaluates.
     await waitFor(() =>
       expect(refetchSpy).toHaveBeenCalledWith({ queryKey: roastKeys.health }),
     );
 
-    // We stay on /live (the stable live-roast URL) — NOT navigating away to /.
-    // (The home-landing would only appear if navigate("/") were called.)
+    // We stay on /live — NOT navigating away to /.
     expect(screen.queryByTestId("home-landing")).toBeNull();
   });
 });

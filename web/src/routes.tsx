@@ -87,11 +87,13 @@ const ConfigPage = lazy(() =>
 
 export const routes: RouteObject[] = [
   // Operator-facing routes nest under RootLayout → the persistent nav (#324) is
-  // mounted above each page. `/` is state-aware (HomeGate): active run → live
-  // dashboard, idle → home hub. `/start` is the Start-Roast form (reached from the
-  // home hub or the idle redirect). `/live` is the stable reload-safe live-roast
-  // route (#403). Phase is never inferred client-side — the active-run decision
-  // reads the server's `/health` snapshot.
+  // mounted above each page. `/` is a PURE launcher (always `HomePage`, D81 /
+  // #423) — no server-state read, no branching. `/live` is the SINGLE live-roast
+  // home with three server-state-driven states: active → DashboardPage, just-
+  // finished this session → LiveFinishedView, idle → LiveStartView (the start
+  // form). `/start` is kept as an alias entry from the old home tile; it routes
+  // to `/live` after a start POST (#403). Phase is never inferred client-side —
+  // all active-run decisions read the server's `/health` snapshot.
   {
     element: <RootLayout />,
     children: [
