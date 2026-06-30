@@ -2091,9 +2091,11 @@ async def get_config(request: Request) -> AppConfigSnapshot:
     A malformed saved-config file returns 500 — the operator must fix the YAML
     before the Config UI can render.
     """
+    # load_app_config and load_saved_raw do sync file I/O; run in a thread
+    # to avoid blocking the async event loop on disk reads.
     try:
-        effective, injected_keys = load_app_config()
-        saved_raw = load_saved_raw()
+        effective, injected_keys = await asyncio.to_thread(load_app_config)
+        saved_raw = await asyncio.to_thread(load_saved_raw)
     except ConfigFileError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return build_config_snapshot(effective, saved_raw, injected_keys)
@@ -2115,15 +2117,18 @@ async def put_config(edit: AppConfigEdit, request: Request) -> AppConfigSnapshot
     The change takes effect for the *next* roast — the running agent's in-memory
     config is not patched.  The FE should note this in the UI (plan §D78).
     """
+    # persist_config_edit does sync file I/O (read + lock + write); run it in
+    # a thread so the async event loop is not blocked during the write.
     try:
-        persist_config_edit(edit)
+        await asyncio.to_thread(persist_config_edit, edit)
     except ConfigFileError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     # Re-read effective config + saved raw after write so the response reflects
-    # the just-written state, not a stale snapshot.
+    # the just-written state, not a stale snapshot.  load_app_config also does
+    # file I/O (saved-config read + env injection); run it in a thread too.
     try:
-        effective, injected_keys = load_app_config()
-        saved_raw = load_saved_raw()
+        effective, injected_keys = await asyncio.to_thread(load_app_config)
+        saved_raw = await asyncio.to_thread(load_saved_raw)
     except ConfigFileError as exc:  # pragma: no cover — written successfully one line above
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return build_config_snapshot(effective, saved_raw, injected_keys)
