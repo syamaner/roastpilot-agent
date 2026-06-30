@@ -1364,18 +1364,24 @@ class RoastService:
                     "start_roast: reloaded config (advisor_model_slug=%r)",
                     fresh_config.advisor.model_slug,
                 )
-                self._config = fresh_config
                 # Safety is always env-resolved; rebuild so self._safety matches
                 # self._config (the file injector skips ROASTPILOT_SAFETY__ so the
                 # SafetyLimits field values are identical to the startup values,
                 # but rebuilding keeps the pairing explicit and invariant-safe).
-                self._safety = SafetyPolicy(fresh_config.safety)
+                fresh_safety = SafetyPolicy(fresh_config.safety)
                 # Rebuild the advisor from the fresh config so model/prompt changes
                 # apply next-roast (D78).  build_advisor handles a missing API key
                 # gracefully (logs a warning, returns None → advisory-paused).
+                # Import lazily: live.py imports RoastService from api.py.
                 from roastpilot_agent.live import build_advisor  # lazy: live.py imports api
 
-                self._advisor = build_advisor(fresh_config)
+                fresh_advisor = build_advisor(fresh_config)
+                # Commit all three atomically so the trio is always consistent
+                # (guards against a future raising build_advisor leaving _config
+                # ahead of _advisor).
+                self._config = fresh_config
+                self._safety = fresh_safety
+                self._advisor = fresh_advisor
             run_id = uuid.uuid4().hex
             await self._store.create_run(
                 run_id=run_id,
