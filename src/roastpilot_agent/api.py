@@ -1336,10 +1336,13 @@ class RoastService:
         a POSSIBLY-ACTIVE run; this is a deliberate between-roast respawn where
         the agent owns the full lifecycle and knows the state is idle.
 
-        Fail-closed: if the stop or re-start raises, the exception propagates
-        out of :meth:`start_roast`, surfacing as a 500 to the operator.  The MCP
-        child is left in whatever state the failure produced (stopped or
-        partially started); the operator should retry or restart the agent.
+        Fail-closed: if stop or re-start raises, the exception propagates out
+        of :meth:`start_roast`, surfacing as a 500 to the operator.  The
+        baseline is invalidated (``None``) before the stop/start sequence so
+        that a failed respawn does NOT leave a stale match: on the next
+        ``start_roast`` the reverted config is compared against ``None`` →
+        drift is re-detected → respawn is re-attempted automatically.  Only a
+        successful start records the new baseline.
 
         Args:
             new_device_config: The new device config to render into the MCP yaml
@@ -1351,10 +1354,18 @@ class RoastService:
             "mcp_device config changed since last spawn — respawning MCP child"
             " with new device config"
         )
+        # Invalidate the baseline BEFORE touching the child so any failure
+        # (stop or start) leaves _spawned_mcp_device=None.  On the next
+        # start_roast the None baseline forces a re-detect and re-attempt,
+        # avoiding the "reverted config matches stale baseline → child
+        # silently dead" trap.
+        self._spawned_mcp_device = None
+        # stop() bypasses record_child_stop_unconfirmed intentionally: there
+        # is no active run to key a marker to, and start() resets the flag.
         await self._mcp.stop()
         self._mcp.set_device_config(new_device_config)
         await self._mcp.start()
-        self._spawned_mcp_device = new_device_config
+        self._spawned_mcp_device = new_device_config  # success → new baseline
         _log.info("MCP child respawned successfully with updated device config")
 
     async def health(self) -> HealthResponse:
@@ -1459,16 +1470,23 @@ class RoastService:
                 # so hardware changes (serial port, driver, audio input, FC mode,
                 # etc.) take effect next-roast without an agent restart.
                 #
-                # Guard: _spawned_mcp_device is None until the live-serve path
-                # records a successful initial spawn via set_spawned_mcp_device(),
-                # so an unset baseline never triggers a spurious respawn.  The
-                # between-roasts timing guarantee is upheld here: the active_run()
-                # check above (under _start_lock) confirms no roast is active
-                # before this block runs — no respawn ever fires mid-roast.
-                if (
-                    self._mcp is not None
-                    and self._spawned_mcp_device is not None
-                    and fresh_config.mcp_device != self._spawned_mcp_device
+                # MCP is only wired (non-None) in live-serve mode
+                # (build_live_service), so _mcp is not None is already the
+                # live-mode guard.  The baseline (_spawned_mcp_device) is
+                # None in two cases:
+                #   1. Before the first roast: build_live_service calls
+                #      set_spawned_mcp_device() right after spawn, so this
+                #      is only reachable if the caller skips that step — which
+                #      production never does.  A None baseline with a live _mcp
+                #      is treated conservatively as "respawn needed".
+                #   2. After a failed respawn: _respawn_mcp_for_device_config
+                #      invalidates the baseline so a stuck child is re-attempted
+                #      next start rather than silently skipped.
+                # Between-roasts guarantee: the active_run() check above (under
+                # _start_lock) confirms no roast is active before this block.
+                if self._mcp is not None and (
+                    self._spawned_mcp_device is None
+                    or fresh_config.mcp_device != self._spawned_mcp_device
                 ):
                     await self._respawn_mcp_for_device_config(fresh_config.mcp_device)
             run_id = uuid.uuid4().hex

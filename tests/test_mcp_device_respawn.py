@@ -230,15 +230,24 @@ async def test_no_respawn_when_mcp_device_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_no_respawn_before_spawned_baseline_is_set(
+async def test_none_baseline_triggers_respawn(
     store: RoastStore,
     config_file: Path,
 ) -> None:
-    """No respawn fires when _spawned_mcp_device has not yet been set.
+    """A None _spawned_mcp_device baseline with a live _mcp triggers a respawn.
 
-    Without a recorded baseline there is nothing to compare against; the
-    guard must not perform a spurious respawn on the first roast start after
-    startup (or in API-only mode where no MCP was ever spawned).
+    None baseline has two sources in production:
+      1. A failed respawn (the fix in #431): _respawn_mcp_for_device_config
+         invalidates the baseline before stop/start so a stuck child is
+         re-attempted next start rather than silently skipped.
+      2. build_live_service omits set_spawned_mcp_device (should not happen
+         in production, but the conservative guard handles it safely).
+
+    In both cases the correct behaviour is to attempt a respawn — "child state
+    unknown, respawn to be safe" — rather than skip and hit a dead child.
+
+    Protection against spurious respawns in API-only / replay mode comes from
+    the outer ``self._mcp is not None`` guard: those modes pass mcp=None.
     """
     # Deliberately skip set_spawned_mcp_device — baseline stays None.
     fake_mcp = FakeMCPProcess(device_config=MCPDeviceConfig())
@@ -247,14 +256,14 @@ async def test_no_respawn_before_spawned_baseline_is_set(
         mcp=fake_mcp,  # type: ignore[arg-type]
         live_serve_mode=True,
     )
-    # _spawned_mcp_device is None at this point (no set_spawned_mcp_device call).
-
-    persist_config_edit(AppConfigEdit(mcp_device=MCPDeviceConfigEdit(serial_port="/dev/ttyUSB9")))
+    # _spawned_mcp_device is None — respawn must fire conservatively.
 
     await svc.start_roast(RoastProfile(**_profile()))
 
-    # No respawn — no baseline to compare against.
-    assert fake_mcp.calls == []
+    # Respawn fires: stop → set_device_config → start (child state was unknown).
+    assert fake_mcp.calls == ["stop", "set_device_config", "start"]
+    # Baseline is set to the freshly-loaded config after success.
+    assert svc._spawned_mcp_device is not None  # pyright: ignore[reportPrivateUsage]
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +380,68 @@ async def test_respawn_does_not_auto_resume_heat_fan(
     # The controller is wired but has no roaster (_roaster=None in this test),
     # so start_session and set_targets are not invoked either.
     assert set(fake_mcp.calls).issubset({"stop", "set_device_config", "start"})
+
+
+# ---------------------------------------------------------------------------
+# Respawn failure: baseline invalidated, retry succeeds
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_failed_respawn_clears_baseline_and_retry_succeeds(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """A respawn whose start() raises clears _spawned_mcp_device to None.
+
+    Scenario:
+    1. Operator saves a bad serial port (new config != spawned baseline).
+    2. start_roast detects drift and calls _respawn_mcp_for_device_config.
+    3. stop() succeeds; start() raises (bad port, driver not found, etc.).
+    4. _spawned_mcp_device must be None afterward — the stale old value must
+       NOT be restored.
+    5. Operator reverts to the original (working) config.
+    6. The NEXT start_roast sees fresh.mcp_device != None (since None != any
+       config) → drift re-detected → respawn re-attempted → succeeds.
+
+    Without the fix, step 4 would leave _spawned_mcp_device at the original
+    value; step 5's revert would make fresh == old → drift NOT detected →
+    _begin_live_run would hit a stopped child → stuck until agent restart.
+    """
+    original_device = MCPDeviceConfig(serial_port="/dev/ttyUSB0")
+    bad_device_port = "/dev/ttyUSB_bad"
+
+    start_call_count = 0
+
+    class FailOnceStartMCP(FakeMCPProcess):
+        async def start(self) -> None:
+            nonlocal start_call_count
+            start_call_count += 1
+            if start_call_count == 1:
+                # Simulate a failed spawn (bad port / driver error).
+                raise OSError(f"cannot open port {bad_device_port}")
+            await super().start()
+
+    fake_mcp = FailOnceStartMCP(device_config=original_device)
+    svc = _live_service_with_fake_mcp(store, fake_mcp, original_device)
+
+    # --- Attempt 1: save a bad serial port, start_roast should raise. ---
+    persist_config_edit(AppConfigEdit(mcp_device=MCPDeviceConfigEdit(serial_port=bad_device_port)))
+    with pytest.raises(OSError):
+        await svc.start_roast(RoastProfile(**_profile()))
+
+    # Baseline must be None after the failed start — not the old value.
+    assert svc._spawned_mcp_device is None  # pyright: ignore[reportPrivateUsage]
+
+    # --- Attempt 2: retry with the same (bad) config, but start() now succeeds. ---
+    # _spawned_mcp_device is None → the None-baseline guard fires → respawn
+    # re-attempted regardless of whether the saved config changed.  start()
+    # succeeds on the second call (start_call_count == 2).
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    # Second start succeeded; baseline is now set to the freshly-loaded config.
+    assert svc._spawned_mcp_device is not None  # pyright: ignore[reportPrivateUsage]
+    assert start_call_count == 2  # first attempt raised, second succeeded
 
 
 # ---------------------------------------------------------------------------
