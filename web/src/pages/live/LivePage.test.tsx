@@ -1,16 +1,19 @@
 /**
  * LivePage (#403 / #423 D81): single live-roast home at /live.
  *
- * Four server-state-driven branches tested here:
+ * Branches tested:
  * 1. Loading hold  — neither the start form nor the dashboard appears until health resolves.
  * 2. Active run    — DashboardPage; reload-safe guarantee.
- * 3. Sticky summary (#423) — when active_run_id transitions non-null → null in the
- *    SAME session, LiveFinishedView appears (not the start form).
+ * 3. Sticky summary (#423) — active_run_id non-null → null this session → LiveFinishedView.
+ *    a. Gate: correct view appears after the transition.
+ *    b. Outcome content: stat tiles, detail link href (MEDIUM 1).
+ *    c. "Start next roast" clears sticky → start form.
+ *    d. Reload (fresh null) → start form (sticky is session-only).
+ *    e. Navigate-away / remount → sticky does NOT persist (LOW 4).
  * 4. No run, no sticky — LiveStartView (idle / fresh session).
  * 5. Start-roast flow — POSTs, refetches health, stays on /live.
  *
- * Phase is never inferred: the only server-state read here is active_run_id.
- * DashboardPage + StartRoastForm bodies are stubbed to isolate the gate logic.
+ * Phase is never inferred: the only server-state read is active_run_id.
  */
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -21,6 +24,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { roastKeys } from "@/hooks/queries";
 import { LivePage } from "./LivePage";
+import {
+  FIXTURE_FINISHED_DETAIL,
+  FIXTURE_FINISHED_RUN_ID,
+  FIXTURE_FINISHED_STATS,
+  FIXTURE_FINISHED_TELEMETRY,
+} from "./liveFinishedFixture";
 
 // --- Mutable health stub. ---
 const healthState: {
@@ -29,6 +38,11 @@ const healthState: {
   isError: boolean;
 } = { data: undefined, isSuccess: false, isError: false };
 
+// Mutable stubs for useRoast / useTelemetry — defaulting to null/undefined so
+// gate-only tests don't see real data; the content-assertion tests override them.
+const roastState: { data: unknown } = { data: null };
+const telemetryState: { data: unknown } = { data: undefined };
+
 vi.mock("@/hooks/queries", async () => {
   const actual = await vi.importActual<typeof import("@/hooks/queries")>("@/hooks/queries");
   const noopMutation = () => ({ mutateAsync: vi.fn(async () => undefined) });
@@ -36,8 +50,8 @@ vi.mock("@/hooks/queries", async () => {
     ...actual,
     useHealth: () => healthState,
     useBeanProfiles: () => ({ data: { profiles: [] }, isLoading: false }),
-    useRoast: () => ({ data: null }),
-    useTelemetry: () => ({ data: undefined }),
+    useRoast: () => roastState,
+    useTelemetry: () => telemetryState,
     useCreateBeanProfile: noopMutation,
     useUpdateBeanProfile: noopMutation,
     useDeleteBeanProfile: noopMutation,
@@ -48,18 +62,25 @@ vi.mock("@/hooks/queries", async () => {
 vi.mock("@/pages/dashboard/DashboardPage", () => ({
   DashboardPage: () => <div data-testid="dashboard-stub" />,
 }));
-vi.mock("@/pages/detail/traceModel", () => ({
-  headlineStats: () => ({
+
+// traceModel is stubbed for gate-only tests; the content tests override with real values.
+// vi.hoisted ensures the refs are available when the hoisted vi.mock factory runs.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type AnyFn = (...args: any[]) => any;
+const traceModelMock = vi.hoisted(() => ({
+  headlineStats: vi.fn<AnyFn>(() => ({
     dropTempC: null,
     developmentPercent: null,
     totalSeconds: null,
     firstCrackSeconds: null,
     firstCrackTempC: null,
     dropSeconds: null,
-  }),
-  toCurvePoints: () => [],
-  toCurveMarkers: () => [],
+  })),
+  toCurvePoints: vi.fn<AnyFn>(() => []),
+  toCurveMarkers: vi.fn<AnyFn>(() => []),
 }));
+vi.mock("@/pages/detail/traceModel", () => traceModelMock);
+
 vi.mock("@/components/shared", async () => {
   const actual = await vi.importActual<typeof import("@/components/shared")>("@/components/shared");
   return {
@@ -95,6 +116,19 @@ beforeEach(() => {
   healthState.isSuccess = false;
   healthState.isError = false;
   startRoastMock.mockClear();
+  // Reset stubs to defaults (null data, no-op traceModel).
+  roastState.data = null;
+  telemetryState.data = undefined;
+  traceModelMock.headlineStats.mockReturnValue({
+    dropTempC: null,
+    developmentPercent: null,
+    totalSeconds: null,
+    firstCrackSeconds: null,
+    firstCrackTempC: null,
+    dropSeconds: null,
+  });
+  traceModelMock.toCurvePoints.mockReturnValue([]);
+  traceModelMock.toCurveMarkers.mockReturnValue([]);
 });
 
 function renderPage(initialPath = "/live") {
@@ -106,6 +140,8 @@ function renderPage(initialPath = "/live") {
         <Routes>
           <Route path="/live" element={children} />
           <Route path="/" element={<div data-testid="home-landing" />} />
+          <Route path="/roasts" element={<div data-testid="history-landing" />} />
+          <Route path="/roasts/:runId" element={<div data-testid="detail-landing" />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>
@@ -115,7 +151,7 @@ function renderPage(initialPath = "/live") {
       <LivePage />
     </Wrapper>,
   );
-  /** Force a re-render of LivePage (e.g. after mutating `healthState`). */
+  /** Force a re-render of LivePage (e.g. after mutating healthState). */
   function rerender() {
     result.rerender(
       <Wrapper>
@@ -123,7 +159,16 @@ function renderPage(initialPath = "/live") {
       </Wrapper>,
     );
   }
-  return { client, refetchSpy, rerender };
+  /** Remount a FRESH LivePage instance (simulates navigate away + back). */
+  function remount() {
+    result.unmount();
+    render(
+      <Wrapper>
+        <LivePage />
+      </Wrapper>,
+    );
+  }
+  return { client, refetchSpy, rerender, remount };
 }
 
 describe("LivePage — loading hold", () => {
@@ -165,7 +210,6 @@ describe("LivePage — no active run, no sticky (idle / fresh session)", () => {
     expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
     expect(screen.queryByTestId("live-page-loading")).toBeNull();
-    // The sticky summary should NOT appear on a fresh /live with no prior run.
     expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
 
@@ -182,18 +226,15 @@ describe("LivePage — no active run, no sticky (idle / fresh session)", () => {
 
 describe("LivePage — sticky finished-run summary (#423)", () => {
   it("shows LiveFinishedView when active_run_id transitions from non-null to null in the same session", async () => {
-    // Start with an active run so LivePage records the run id in prevRunIdRef.
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-42" };
     const { rerender } = renderPage();
     expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
 
-    // Simulate the run ending: update healthState then force a re-render so the
-    // mocked useHealth returns the new value and the useEffect fires.
+    // Run ends — update stub then trigger re-render.
     healthState.data = { active_run_id: null };
     rerender();
 
-    // LiveFinishedView should appear instead of the start form.
     await waitFor(() =>
       expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
     );
@@ -201,9 +242,20 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
   });
 
-  it("'Start next roast' clears the sticky and returns to the start form", async () => {
+  it("renders stat tiles and detail link with real roast + headlineStats data (MEDIUM 1)", async () => {
+    // Inject real-shaped data so the rendered tile text is verifiable.
+    roastState.data = FIXTURE_FINISHED_DETAIL;
+    telemetryState.data = FIXTURE_FINISHED_TELEMETRY;
+    // Use real headlineStats derivation from the fixture telemetry.
+    const { headlineStats, toCurvePoints, toCurveMarkers } = await vi.importActual<
+      typeof import("@/pages/detail/traceModel")
+    >("@/pages/detail/traceModel");
+    traceModelMock.headlineStats.mockImplementation(headlineStats);
+    traceModelMock.toCurvePoints.mockImplementation(toCurvePoints);
+    traceModelMock.toCurveMarkers.mockImplementation(toCurveMarkers);
+
     healthState.isSuccess = true;
-    healthState.data = { active_run_id: "run-55" };
+    healthState.data = { active_run_id: FIXTURE_FINISHED_RUN_ID };
     const { rerender } = renderPage();
     expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
 
@@ -215,10 +267,41 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
       expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
     );
 
-    // Operator clicks "Start next roast".
+    // Stat tiles render the fixture-derived values.
+    expect(screen.getByTestId("stat-drop-temp")).toHaveTextContent(
+      FIXTURE_FINISHED_STATS.dropTempDisplay,
+    );
+    expect(screen.getByTestId("stat-dev-percent")).toHaveTextContent(
+      FIXTURE_FINISHED_STATS.devPercentDisplay,
+    );
+    expect(screen.getByTestId("stat-total-time")).toHaveTextContent(
+      FIXTURE_FINISHED_STATS.totalTimeDisplay,
+    );
+    // Weight-loss comes from roast.data, not headlineStats.
+    expect(screen.getByTestId("stat-weight-loss")).toHaveTextContent("14.8 %");
+
+    // "View full detail" href must be the fixture run's detail route.
+    expect(screen.getByTestId("live-finished-view-detail")).toHaveAttribute(
+      "href",
+      `/roasts/${FIXTURE_FINISHED_RUN_ID}`,
+    );
+  });
+
+  it("'Start next roast' clears the sticky and returns to the start form", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-55" };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+
     fireEvent.click(screen.getByTestId("live-finished-start-next"));
 
-    // Should now show the start form, not the summary.
     await waitFor(() =>
       expect(screen.getByTestId("live-start-view")).toBeInTheDocument(),
     );
@@ -226,12 +309,35 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
   });
 
   it("a reload (fresh render with null active_run_id) shows the start form, not the summary", () => {
-    // Reload: healthState already null — no prior run in this render session.
     healthState.isSuccess = true;
     healthState.data = { active_run_id: null };
     renderPage();
-    // Fresh session: no sticky, so we show the start form.
     expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
+  });
+
+  it("navigate away + remount (new LivePage instance) resets sticky — finished view does not persist (LOW 4)", async () => {
+    // First session: run starts and ends, sticky latch fires.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-77" };
+    const { rerender, remount } = renderPage();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+
+    // Simulate the operator navigating away then back (unmount + fresh mount).
+    // The new LivePage instance has no prior session state — sticky is gone.
+    remount();
+
+    // Post-remount: health still reports no active run; fresh session → start form.
+    await waitFor(() =>
+      expect(screen.getByTestId("live-start-view")).toBeInTheDocument(),
+    );
     expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
 });
@@ -250,7 +356,6 @@ describe("LivePage — start-roast flow", () => {
       expect(refetchSpy).toHaveBeenCalledWith({ queryKey: roastKeys.health }),
     );
 
-    // We stay on /live — NOT navigating away to /.
     expect(screen.queryByTestId("home-landing")).toBeNull();
   });
 });

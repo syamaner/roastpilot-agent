@@ -80,6 +80,13 @@ const HomeHarnessPage = lazy(() =>
 const LivePage = lazy(() =>
   import("@/pages/live/LivePage").then((m) => ({ default: m.LivePage })),
 );
+// #423: LiveFinishedView state snapshot harness — deterministic finished-roast
+// data seeded into the QueryClient, nav + the view over the fixture.
+const LiveFinishedHarnessPage = lazy(() =>
+  import("@/pages/live/LiveFinishedHarnessPage").then((m) => ({
+    default: m.LiveFinishedHarnessPage,
+  })),
+);
 // #419: /config view — config snapshot from GET /api/config + save model.
 const ConfigPage = lazy(() =>
   import("@/pages/config/ConfigPage").then((m) => ({ default: m.ConfigPage })),
@@ -125,4 +132,7 @@ export const routes: RouteObject[] = [
   { path: "/__start-roast-harness", element: <StartRoastHarnessPage /> },
   // __home-harness: persistent nav + landing hub over a seeded idle health snapshot.
   { path: "/__home-harness", element: <HomeHarnessPage /> },
+  // __live-finished-harness: persistent nav + LiveFinishedView over a seeded
+  // just-completed run (#423 snapshot target, D26).
+  { path: "/__live-finished-harness", element: <LiveFinishedHarnessPage /> },
 ];

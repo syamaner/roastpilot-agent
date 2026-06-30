@@ -68,7 +68,7 @@ export function LivePage(): React.JSX.Element {
 
   // Health error: active run unknown — treat as idle (fall through to no-run state).
   if (health.isError) {
-    return <LiveStartView onRunStarted={() => undefined} />;
+    return <LiveStartView />;
   }
 
   // Hold until health resolves so the start form doesn't flash before the active-run
@@ -98,7 +98,7 @@ export function LivePage(): React.JSX.Element {
   }
 
   // Idle / fresh session: show the start-roast form.
-  return <LiveStartView onRunStarted={() => undefined} />;
+  return <LiveStartView />;
 }
 
 // --- LiveFinishedView: sticky post-roast summary for the just-completed run. ---
@@ -159,10 +159,12 @@ function LiveFinishedView({ runId, onStartNext }: LiveFinishedViewProps): React.
           data-testid="live-finished-stats"
         >
           <StatTile
+            testId="stat-drop-temp"
             label="Drop temp"
             value={stats.dropTempC !== null ? `${Math.round(stats.dropTempC)} °C` : "—"}
           />
           <StatTile
+            testId="stat-dev-percent"
             label="Dev %"
             value={
               stats.developmentPercent !== null
@@ -171,10 +173,12 @@ function LiveFinishedView({ runId, onStartNext }: LiveFinishedViewProps): React.
             }
           />
           <StatTile
+            testId="stat-total-time"
             label="Total time"
             value={stats.totalSeconds !== null ? formatDuration(stats.totalSeconds) : "—"}
           />
           <StatTile
+            testId="stat-weight-loss"
             label="Weight loss"
             value={
               roast.data?.weight_loss_percent != null
@@ -215,9 +219,20 @@ function LiveFinishedView({ runId, onStartNext }: LiveFinishedViewProps): React.
 }
 
 /** A single headline-stat card. */
-function StatTile({ label, value }: { label: string; value: string }): React.JSX.Element {
+function StatTile({
+  label,
+  value,
+  testId,
+}: {
+  label: string;
+  value: string;
+  testId: string;
+}): React.JSX.Element {
   return (
-    <div className="flex flex-col gap-1 rounded-lg border border-border bg-card px-4 py-3">
+    <div
+      className="flex flex-col gap-1 rounded-lg border border-border bg-card px-4 py-3"
+      data-testid={testId}
+    >
       <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
         {label}
       </span>
@@ -235,12 +250,7 @@ function formatDuration(totalSeconds: number): string {
 
 // --- LiveStartView: start-roast form shown at /live when no run is active. ---
 
-interface LiveStartViewProps {
-  /** Called immediately after a successful start POST (before the health refetch). */
-  onRunStarted: () => void;
-}
-
-function LiveStartView({ onRunStarted: _onRunStarted }: LiveStartViewProps): React.JSX.Element {
+function LiveStartView(): React.JSX.Element {
   const queryClient = useQueryClient();
 
   const beanProfiles = useBeanProfiles();
