@@ -328,16 +328,51 @@ describe("dashboardReducer", () => {
   });
 
   it("sets t0ElapsedSeconds + the T0 marker to the serve-elapsed at charge (#326)", () => {
-    // t0ElapsedSeconds is null before T0 fires; on t0_detected it (and the T0
-    // marker) take the latest plotted point's serve-elapsed — the charge moment —
-    // so LiveCurve can re-label the axis to roast time (0:00 = charge, preheat
-    // negative) without moving any point.
+    // t0ElapsedSeconds is set by the first post-charge telemetry frame via
+    // withRecoveredOrigin (elapsed − charge_elapsed). The T0 marker anchors at the
+    // recovered charge serve-elapsed so the axis reads 0:00 = charge. t0_detected
+    // updates the detection record only; it does not move the marker or the origin.
     let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 480, charge_elapsed_seconds: null, bean_temp_c: 90, env_temp_c: 180 }));
     expect(s.t0ElapsedSeconds).toBeNull();
     s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 540, charge_elapsed_seconds: 0, bean_temp_c: 160, env_temp_c: 200 }));
     s = dashboardReducer(s, ev("t0_detected", { bean_temp_c: 160 }));
     expect(s.t0ElapsedSeconds).toBe(540);
     expect(s.markers.find((m) => m.kind === "t0")).toEqual({ kind: "t0", t: 540, label: "T0" });
+  });
+
+  it("anchors the T0 marker at the charge tick even when t0_detected fires before the first post-charge telemetry (#404)", () => {
+    // Regression guard for the roast-7 / roast-8 bug: the t0_detected event fires
+    // after a debounce (~11 s post-charge). In the production SSE delivery order,
+    // t0_detected arrives in the same tick-batch as — or just before — the first
+    // telemetry frame carrying charge_elapsed_seconds. If t0_detected is dispatched
+    // first (t0ElapsedSeconds still null), using the latest preheat point's t would
+    // place the marker at the thermal dip (~153 °C) instead of the charge peak
+    // (~170-181 °C).
+    //
+    // The fix: t0_detected only records the detection. withRecoveredOrigin on the
+    // first post-charge telemetry frame sets the authoritative charge serve-elapsed
+    // via elapsed − charge_elapsed (= 551 − 11 = 540 here), and that is where the
+    // T0 marker is placed.
+    let s = initialDashboardViewModel;
+    // Preheat frames — charge has not happened yet.
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 530, charge_elapsed_seconds: null, bean_temp_c: 175, env_temp_c: 220 }));
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 540, charge_elapsed_seconds: null, bean_temp_c: 181, env_temp_c: 222 }));
+    // t0_detected fires before the server has emitted the first post-charge telemetry.
+    s = dashboardReducer(s, ev("t0_detected", { bean_temp_c: 153, debounce_ticks: 11 }));
+    // t0 detection is recorded; origin and marker are deferred to the telemetry path.
+    expect(s.t0).not.toBeNull();
+    expect(s.t0ElapsedSeconds).toBeNull();
+    expect(s.markers.some((m) => m.kind === "t0")).toBe(false);
+    // Post-charge frames arrive — first one has charge_elapsed_seconds non-null.
+    // elapsed − charge_elapsed = 551 − 11 = 540 = the actual charge serve-elapsed.
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 551, charge_elapsed_seconds: 11, bean_temp_c: 153, env_temp_c: 218 }));
+    // T0 marker must be at the CHARGE serve-elapsed (540), not the detection tick (551).
+    expect(s.t0ElapsedSeconds).toBe(540);
+    expect(s.markers.find((m) => m.kind === "t0")).toEqual({ kind: "t0", t: 540, label: "T0" });
+    // Later telemetry must not move the established origin/marker.
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 561, charge_elapsed_seconds: 21, bean_temp_c: 150, env_temp_c: 215 }));
+    expect(s.t0ElapsedSeconds).toBe(540);
+    expect(s.markers.filter((m) => m.kind === "t0")).toHaveLength(1);
   });
 
   it("recovers the T0 origin from a live post-charge telemetry frame on reload (no t0_detected, #326)", () => {
@@ -394,22 +429,25 @@ describe("dashboardReducer", () => {
     expect(s.markers.some((m) => m.kind === "t0")).toBe(false);
   });
 
-  it("a recovered origin already set is not overwritten by a later seed/frame (#326)", () => {
-    // Live t0_detected established the origin; a later reconnect re-seed with a
-    // different recovered origin must NOT move it (existing origin wins).
+  it("a telemetry-derived origin is not overwritten by a later seed/frame (#326)", () => {
+    // withRecoveredOrigin sets the origin on the first post-charge telemetry frame
+    // (charge_elapsed_seconds: 0 → elapsed − 0 = 540). A subsequent reconnect
+    // re-seed with a different recovered origin must NOT move the established value
+    // (existing origin wins — withRecoveredOrigin is a no-op once t0ElapsedSeconds
+    // is non-null). t0_detected does not touch t0ElapsedSeconds (#404).
     let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 540, charge_elapsed_seconds: 0, bean_temp_c: 160, env_temp_c: 200 }));
+    expect(s.t0ElapsedSeconds).toBe(540); // set by withRecoveredOrigin
     s = dashboardReducer(s, ev("t0_detected", { bean_temp_c: 160 }));
-    expect(s.t0ElapsedSeconds).toBe(540);
+    expect(s.t0ElapsedSeconds).toBe(540); // t0_detected is a no-op for t0ElapsedSeconds
     s = dashboardReducer(s, { kind: "seed", origin: 999, points: [{ t: 600, bean: 170, env: 205, ror: 16, heat: 70, fan: 40 }] });
-    expect(s.t0ElapsedSeconds).toBe(540); // unchanged
+    expect(s.t0ElapsedSeconds).toBe(540); // unchanged — first-wins on the established origin
   });
 
-  it("t0_detected does NOT overwrite an already-derived t0ElapsedSeconds (first-wins, #326)", () => {
-    // A reconnect/late-join derived the canonical origin from the server's clocks
-    // (elapsed − charge_elapsed). A subsequent t0_detected must KEEP that value, not
-    // clobber it with the latest-point heuristic — consistent first-wins with the
-    // recovery path. Here the recovered origin (520) differs from the latest plotted
-    // point's t (600) to prove the derived value wins.
+  it("t0_detected does NOT overwrite an already-derived t0ElapsedSeconds (#326/#404)", () => {
+    // The canonical origin is derived by withRecoveredOrigin from the first post-charge
+    // telemetry frame (elapsed − charge_elapsed). t0_detected only records the
+    // detection; it does not touch t0ElapsedSeconds or the markers, so the established
+    // origin (520) is unchanged regardless of what the latest plotted point's t is (600).
     let s = dashboardReducer(
       initialDashboardViewModel,
       ev("telemetry", { elapsed_seconds: 580, charge_elapsed_seconds: 60, bean_temp_c: 165, env_temp_c: 205 }),
@@ -417,7 +455,7 @@ describe("dashboardReducer", () => {
     expect(s.t0ElapsedSeconds).toBe(520); // derived: 580 − 60
     s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 600, charge_elapsed_seconds: 80, bean_temp_c: 170, env_temp_c: 206 }));
     s = dashboardReducer(s, ev("t0_detected", { bean_temp_c: 165 }));
-    expect(s.t0ElapsedSeconds).toBe(520); // unchanged — the derived origin wins over 600
+    expect(s.t0ElapsedSeconds).toBe(520); // unchanged — telemetry origin wins
     expect(s.t0).not.toBeNull();
   });
 

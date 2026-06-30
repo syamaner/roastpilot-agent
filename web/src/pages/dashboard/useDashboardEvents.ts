@@ -238,9 +238,11 @@ function originFromClocks(
 }
 
 /** Fold a recovered T0 origin into the view-model iff it isn't already known —
- *  setting `t0ElapsedSeconds` and placing the T0 marker at that serve-elapsed (the
- *  reload path; the live `t0_detected` handler owns the streamed case). A no-op once
- *  the origin is set, so a later frame never moves an established origin/marker. */
+ *  setting `t0ElapsedSeconds` and placing the T0 marker at that serve-elapsed. This
+ *  is the SOLE place the T0 marker is placed (#404): both the live-stream path (first
+ *  post-charge telemetry frame via `originFromClocks`) and the reload/seed path call
+ *  through here. `t0_detected` no longer sets the origin or marker. A no-op once the
+ *  origin is set, so a later frame never moves an established origin/marker. */
 function withRecoveredOrigin(state: DashboardViewModel, origin: number | null): DashboardViewModel {
   if (origin === null || state.t0ElapsedSeconds !== null) return state;
   return {
@@ -428,33 +430,35 @@ export function dashboardReducer(
     }
     case "t0_detected": {
       const data = event.data as unknown as T0DetectedData;
-      // The charge moment's SERVE-elapsed is the latest plotted point's t (#326) —
-      // the same value the FC/drop markers use, and the origin the LiveCurve display
-      // subtracts to read roast time (0:00 here, preheat negative). The T0 marker
-      // sits at this serve-elapsed t so it lands on the charge tick of the serve-
-      // referenced curve.
+      // Record the detection. The T0 marker x and t0ElapsedSeconds are set by
+      // withRecoveredOrigin on the first post-charge telemetry frame
+      // (charge_elapsed_seconds non-null), which derives the ACTUAL charge
+      // serve-elapsed via `elapsed − charge_elapsed` (#404).
       //
-      // Guard an EMPTY buffer: with no plotted point we have no serve-elapsed for
-      // charge, so leave `t0ElapsedSeconds` null (and place no marker) — the
-      // telemetry-derive path sets it correctly once the first post-charge frame
-      // lands. Defaulting to 0 here would mislabel every preheat tick as a large
-      // positive roast-time. Always record the T0 detection itself.
-      if (state.points.length === 0) {
-        return { ...state, t0: data };
-      }
-      const at = state.points[state.points.length - 1].t;
-      return {
-        ...state,
-        t0: data,
-        // FIRST-WINS, consistent with the telemetry/seed recovery path: if a
-        // reconnect/late-join already DERIVED the origin from the server's own clocks
-        // (elapsed − charge_elapsed, the canonical value), keep it — a re-fired
-        // t0_detected must not clobber it with the latest-point heuristic. They agree
-        // in practice (both reference the T0-detection tick), so this only set it when
-        // still null. The marker dedupes via withMarker.
-        t0ElapsedSeconds: state.t0ElapsedSeconds ?? at,
-        markers: withMarker(state.markers, { kind: "t0", t: at, label: "T0" }),
-      };
+      // Why NOT use the latest-point heuristic here: the t0_detected event fires
+      // after a debounce period (~11 s post-charge). If it arrives before the first
+      // post-charge telemetry, the latest buffered point is a preheat frame (lower
+      // temp, wrong serve-elapsed) — placing the marker there draws it at the thermal
+      // dip instead of the charge peak. The telemetry path's `withRecoveredOrigin`
+      // is the authoritative anchor because it subtracts the server's own clocks:
+      // `originFromClocks(elapsed_seconds, charge_elapsed_seconds)`, which resolves
+      // to the serve-elapsed of the ACTUAL charge tick, not the detection tick.
+      //
+      // If withRecoveredOrigin already fired (a post-charge telemetry arrived first),
+      // t0ElapsedSeconds and the T0 marker are already correct; this is just a
+      // detection-record update. If it has not yet fired, withRecoveredOrigin will
+      // set both correctly on the next post-charge telemetry frame. Always record the
+      // T0 detection itself.
+      //
+      // known-gap (#404): if t0_detected fires, the connection drops before the first
+      // post-charge telemetry frame arrives, and the reconnect seed also has no
+      // post-charge rows yet, the T0 marker is briefly absent on the reconnected
+      // client. It appears correctly anchored (~1 s later) once the first post-charge
+      // telemetry frame arrives via withRecoveredOrigin. This is intentional and
+      // accepted: a correctly-placed marker appearing ~1 s late is preferable to an
+      // immediately-visible marker drawn at the wrong position (the thermal dip, not
+      // the charge peak). The gap is bounded by the controller tick rate (1 s).
+      return { ...state, t0: data };
     }
     case "drying_end": {
       // The pre-FC drying-end landmark (#351) — a SUBORDINATE marker, server-
