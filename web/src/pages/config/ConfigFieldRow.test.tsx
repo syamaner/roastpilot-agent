@@ -14,12 +14,35 @@
  *     at <900px (control stacks below description).
  */
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ConfigFieldMeta } from "@/lib/types";
 import type { ConfigFieldDef } from "./configSchema";
 import { ConfigFieldRow } from "./ConfigFieldRow";
+
+// ---------------------------------------------------------------------------
+// Mock useDevices — needed only by the deviceSelect allowClear test (#439).
+// ---------------------------------------------------------------------------
+
+vi.mock("@/hooks/queries", () => ({
+  useDevices: vi.fn(() => ({
+    data: {
+      serial: [{ value: "/dev/cu.usbserial-ABC", label: "/dev/cu.usbserial-ABC", note: "Hottop · FT232R" }],
+      serial_error: null,
+      audio_input: [],
+      audio_input_error: null,
+    },
+    isPending: false,
+    isRefetching: false,
+    isError: false,
+    error: null,
+    refetch: vi.fn(),
+  })),
+  useConfig: vi.fn(),
+  useSaveConfig: vi.fn(),
+}));
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -275,5 +298,59 @@ describe("ConfigFieldRow — responsive layout", () => {
     const row = screen.getByTestId(`config-field-${NUMBER_FIELD.key}`);
     expect(row.className).toContain("grid-cols-[minmax(0,1fr)_384px]");
     expect(row.className).toContain("max-[900px]:grid-cols-1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deviceSelect allowClear adapter (#439 — bug fix #2)
+// ---------------------------------------------------------------------------
+
+// mcp_device serial device field — the ConfigFieldRow adapter passes allowClear
+// to DeviceSelect and converts "" → null so clearing calls onChange(null).
+const SERIAL_PORT_FIELD: ConfigFieldDef = {
+  key: "mcp_device.serial_port",
+  label: "Serial port",
+  hint: "USB serial port the Hottop is connected to.",
+  type: "deviceSelect",
+  deviceSource: "serial",
+  envVar: "ROASTPILOT_MCP_DEVICE__SERIAL_PORT",
+  editKey: "serial_port",
+  category: "Hardware",
+  readOnlyStatic: false,
+};
+
+describe("ConfigFieldRow — deviceSelect allowClear → onChange(null) (#439)", () => {
+  it("selecting 'Inherit from yaml' calls parent onChange with null, not empty string", async () => {
+    // ConfigFieldRow passes allowClear to DeviceSelect, which prepends an
+    // "Inherit from yaml" option (value = ""). The adapter in ConfigFieldRow
+    // converts "" → null so the parent receives null (clear to inherit), not "".
+    const onChange = vi.fn();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ConfigFieldRow
+          fieldDef={SERIAL_PORT_FIELD}
+          meta={makeFieldMeta({ effective_value: "/dev/cu.usbserial-ABC", default: null })}
+          value="/dev/cu.usbserial-ABC"
+          isLast={false}
+          onChange={onChange}
+          onReset={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    // Open the popover.
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+
+    // "Inherit from yaml" option must be present (allowClear=true).
+    const inheritOption = await waitFor(() =>
+      screen.getByTestId("device-option-"),
+    );
+    expect(inheritOption).toBeInTheDocument();
+
+    // Click it — the adapter must call onChange(null), not onChange("").
+    fireEvent.click(inheritOption);
+    expect(onChange).toHaveBeenCalledWith(null);
+    expect(onChange).not.toHaveBeenCalledWith("");
   });
 });

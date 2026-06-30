@@ -1194,3 +1194,20 @@ def test_apply_config_edit_mcp_device_boolean_round_trip() -> None:
     )
     saved2 = apply_config_edit(edit2, saved1)
     assert "recording_enabled" not in saved2.get("mcp_device", {})
+
+
+def test_apply_config_edit_mcp_device_recording_devices_clear_to_inherit() -> None:
+    """recording_devices explicit-null clears the saved key (clear to inherit).
+
+    The backend stores recording_devices as a list in the YAML.  When the
+    operator explicitly sets it to null in the PUT body, the saved key must
+    be deleted so the hand-authored MCP yaml governs it on the next spawn.
+    """
+    existing: dict[str, Any] = {
+        "mcp_device": {"recording_devices": ["USB PnP Sound Device", "ATR2100x-USB"]}
+    }
+    # Simulate the FE sending null for recording_devices (clear to inherit).
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit.model_validate({"recording_devices": None}))
+    result = apply_config_edit(edit, existing)
+    # Key must be deleted — inherit from hand-authored MCP yaml.
+    assert "recording_devices" not in result.get("mcp_device", {})
