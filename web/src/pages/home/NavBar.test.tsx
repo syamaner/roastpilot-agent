@@ -1,7 +1,8 @@
 /**
- * Persistent nav (#324): Home + History are always present; the "Live roast" link
- * appears ONLY when the server reports an active run; clicking a link navigates.
- * Active-run presence is read from `useHealth` (server state) — never inferred.
+ * Persistent nav (#324, updated #403): Home + History are always present; the
+ * "Live roast" link appears ONLY when the server reports an active run and points
+ * to `/live` (the stable reload-safe route, #403). Active-run presence is read
+ * from `useHealth` (server state) — never inferred.
  */
 
 import { cleanup, render, screen } from "@testing-library/react";
@@ -25,6 +26,7 @@ function renderNav(initialPath = "/") {
       <NavBar />
       <Routes>
         <Route path="/" element={<div data-testid="home-landing" />} />
+        <Route path="/live" element={<div data-testid="live-landing" />} />
         <Route path="/roasts" element={<div data-testid="history-landing" />} />
       </Routes>
     </MemoryRouter>,
@@ -33,7 +35,7 @@ function renderNav(initialPath = "/") {
 
 afterEach(cleanup);
 
-describe("NavBar (#324)", () => {
+describe("NavBar (#324 / #403)", () => {
   it("shows Home (not Live roast) + History when the server reports no active run", () => {
     healthState.data = { active_run_id: null };
     renderNav();
@@ -43,18 +45,27 @@ describe("NavBar (#324)", () => {
     expect(screen.queryByTestId("nav-live-roast")).toBeNull();
   });
 
-  it("swaps the first slot to Live roast (→ /, not Home) when a run is active", () => {
+  it("swaps the first slot to Live roast (→ /live, not Home or /) when a run is active (#403)", () => {
     healthState.data = { active_run_id: "run-42" };
     renderNav("/roasts");
     const live = screen.getByTestId("nav-live-roast");
-    expect(live).toHaveAttribute("href", "/");
-    // The first slot's label tracks server state, so `/` is never claimed by two
-    // active links at once — Home is not also rendered while a run is active.
+    // #403: the stable live-roast URL is /live, not /. This means the active-link
+    // highlight is never ambiguous between the home hub and the live roast.
+    expect(live).toHaveAttribute("href", "/live");
+    // Home is not also rendered while a run is active.
     expect(screen.queryByTestId("nav-home")).toBeNull();
     expect(screen.getByTestId("nav-history")).toHaveAttribute("href", "/roasts");
   });
 
-  it("navigates when a link is clicked", async () => {
+  it("navigates to /live when the Live roast link is clicked", async () => {
+    healthState.data = { active_run_id: "run-42" };
+    renderNav("/");
+    expect(screen.getByTestId("home-landing")).toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("nav-live-roast"));
+    expect(screen.getByTestId("live-landing")).toBeInTheDocument();
+  });
+
+  it("navigates to /roasts when the History link is clicked", async () => {
     healthState.data = { active_run_id: null };
     renderNav("/");
     expect(screen.getByTestId("home-landing")).toBeInTheDocument();
