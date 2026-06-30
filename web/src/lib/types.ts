@@ -590,3 +590,23 @@ export interface AppConfigSnapshot {
 // AppConfigEdit is not mirrored here — the SPA sends a raw partial object built
 // from the form's dirty values. Only controller + advisor fields are accepted;
 // safety fields are never sent. The server validates the shape via Pydantic.
+
+// --- Device enumeration (GET /api/config/devices, D78 PR(c), #418) -----------
+// Hand-mirror of the Python DeviceOption / DevicesSnapshot models in api.py.
+// `value` is the machine id stored in config (a serial port path, or a
+// sounddevice index cast to string). `note` is secondary display detail.
+
+/** One enumerated device returned by GET /api/config/devices. */
+export interface DeviceOption {
+  value: string;
+  label: string;
+  note: string;
+}
+
+/** GET /api/config/devices response body (DevicesSnapshot in Python). */
+export interface DevicesSnapshot {
+  serial: DeviceOption[];
+  serial_error: string | null;
+  audio_input: DeviceOption[];
+  audio_input_error: string | null;
+}
