@@ -45,17 +45,23 @@
 // ---------------------------------------------------------------------------
 
 export type FieldType =
-  | "text"        // arbitrary string
-  | "number"      // numeric input (integer or float)
-  | "boolean"     // toggle / checkbox
-  | "select"      // closed-set enum — `options` must be provided
-  | "masked";     // like text but value masked (api key)
+  | "text"              // arbitrary string
+  | "number"            // numeric input (integer or float)
+  | "boolean"           // toggle / checkbox
+  | "select"            // closed-set enum — `options` must be provided
+  | "masked"            // like text but value masked (api key)
+  | "deviceSelect"      // single-select from GET /api/config/devices
+  | "deviceMultiSelect" // multi-select from GET /api/config/devices (recording_devices)
+  | "micTestButton";    // placeholder action button (M1: "not available")
 
 export type FieldCategory =
   | "Advisor"
   | "Pre-FC Control"
   | "Late-Maillard Trim"
-  | "Safety";
+  | "Safety"
+  | "Hardware"
+  | "Audio"
+  | "FC-Detection";
 
 export interface FieldOption {
   value: string;
@@ -111,10 +117,18 @@ export interface ConfigFieldDef {
   step?: number;
 
   /**
-   * The name of the backing env-var. Shown in the env-overridden badge
-   * (PR3). Corresponds to ConfigFieldMeta.env_var from the API response.
+   * The name of the backing env-var. Shown in the env-overridden badge.
+   * Corresponds to ConfigFieldMeta.env_var from the API response.
    */
   envVar: string | null;
+
+  /**
+   * Which device list from GET /api/config/devices to show in the dropdown.
+   * Only set for `deviceSelect` and `deviceMultiSelect` fields.
+   * - "serial"      → DevicesSnapshot.serial + serial_error
+   * - "audio_input" → DevicesSnapshot.audio_input + audio_input_error
+   */
+  deviceSource?: "serial" | "audio_input";
 
   /**
    * Dot-path key used when building the PUT /api/config body (AppConfigEdit).
@@ -132,6 +146,17 @@ export interface ConfigFieldDef {
 
   /** Category this field belongs to, used to group rows in the rail. */
   category: FieldCategory;
+
+  /**
+   * Conditional reveal: only render this field when another field in the form
+   * matches a given value. Used for dependent fields (e.g.
+   * auto_t0_drop_threshold_c only shown when auto_t0_detection_enabled = true).
+   *
+   * `key` is the FLAT form key of the controlling field (e.g.
+   * "mcp_device.auto_t0_detection_enabled"). The field is hidden — not
+   * rendered — when `values[key] !== equals`; its value stays in form state.
+   */
+  revealWhen?: { key: string; equals: unknown };
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +597,157 @@ const SAFETY_FIELDS: ConfigFieldDef[] = [
   },
 ];
 
+// --- Hardware ----------------------------------------------------------------
+// Managed MCP device fields rendered into coffee-roaster-mcp.yaml (#429).
+// `roaster_driver` is a free-text field (driver names are MCP constants;
+// not enumerated at runtime). `serial_port` uses the serial device list.
+
+const HARDWARE_FIELDS: ConfigFieldDef[] = [
+  {
+    key:            "mcp_device.serial_port",
+    label:          "Serial port",
+    hint:           "Serial port path for the Hottop roaster (e.g. /dev/cu.usbserial-XXXXX on macOS, /dev/ttyUSB0 on Linux). Maps to roaster.port in the MCP yaml.",
+    type:           "deviceSelect",
+    deviceSource:   "serial",
+    envVar:         "ROASTPILOT_MCP_DEVICE__SERIAL_PORT",
+    editKey:        "serial_port",
+    category:       "Hardware",
+    readOnlyStatic: false,
+  },
+  {
+    key:            "mcp_device.roaster_driver",
+    label:          "Roaster driver",
+    hint:           "coffee-roaster-mcp driver name. Use 'hottop_kn8828b_2k_plus' for the real roaster or 'mock' for development. Maps to roaster.driver in the MCP yaml.",
+    type:           "text",
+    envVar:         "ROASTPILOT_MCP_DEVICE__ROASTER_DRIVER",
+    editKey:        "roaster_driver",
+    category:       "Hardware",
+    readOnlyStatic: false,
+  },
+];
+
+// --- Audio -------------------------------------------------------------------
+// Audio device configuration + mic test placeholder.
+// `audio_input_device` is a single-select; `recording_devices` is a
+// multi-select (ordered list of device substrings for the recorder).
+
+const AUDIO_FIELDS: ConfigFieldDef[] = [
+  {
+    key:            "mcp_device.audio_input_device",
+    label:          "Audio input device",
+    hint:           "PortAudio input device name substring matched case-insensitively (e.g. 'USB PnP'). Used for FC detection. Maps to audio.input_device in the MCP yaml.",
+    type:           "deviceSelect",
+    deviceSource:   "audio_input",
+    envVar:         "ROASTPILOT_MCP_DEVICE__AUDIO_INPUT_DEVICE",
+    editKey:        "audio_input_device",
+    category:       "Audio",
+    readOnlyStatic: false,
+  },
+  {
+    key:            "mcp_device.recording_enabled",
+    label:          "Recording enabled",
+    hint:           "Whether the MCP audio recorder is active. Maps to recording.enabled in the MCP yaml.",
+    type:           "boolean",
+    envVar:         "ROASTPILOT_MCP_DEVICE__RECORDING_ENABLED",
+    editKey:        "recording_enabled",
+    category:       "Audio",
+    readOnlyStatic: false,
+  },
+  {
+    key:            "mcp_device.recording_autocapture",
+    label:          "Auto-capture",
+    hint:           "Start recording automatically at the beginning of each roast session. Maps to recording.autocapture in the MCP yaml.",
+    type:           "boolean",
+    envVar:         "ROASTPILOT_MCP_DEVICE__RECORDING_AUTOCAPTURE",
+    editKey:        "recording_autocapture",
+    category:       "Audio",
+    readOnlyStatic: false,
+  },
+  {
+    key:            "mcp_device.recording_devices",
+    label:          "Recording devices",
+    hint:           "Ordered list of capture device-name substrings. First entry is the FC detector's device; additional entries are independent capture streams. Maps to recording.devices in the MCP yaml.",
+    type:           "deviceMultiSelect",
+    deviceSource:   "audio_input",
+    envVar:         "ROASTPILOT_MCP_DEVICE__RECORDING_DEVICES",
+    editKey:        "recording_devices",
+    category:       "Audio",
+    readOnlyStatic: false,
+  },
+  {
+    key:            "mcp_device._mic_test",
+    label:          "Test microphone",
+    hint:           "Sample briefly from the configured audio input device and display the captured level. Not available in M1 — the backend sample endpoint is deferred.",
+    type:           "micTestButton",
+    envVar:         null,
+    editKey:        null,   // not a saveable value; renders a button only
+    category:       "Audio",
+    readOnlyStatic: true,
+  },
+];
+
+// --- FC-Detection ------------------------------------------------------------
+// First-crack detection mode, confidence threshold, and auto-T0 settings.
+
+const FC_DETECTION_OPTIONS = [
+  { value: "disabled", label: "Disabled" },
+  { value: "audio",    label: "Audio (PortAudio, live)" },
+  { value: "manual",   label: "Manual (operator-triggered only)" },
+];
+
+const FC_DETECTION_FIELDS: ConfigFieldDef[] = [
+  {
+    key:            "mcp_device.fc_mode",
+    label:          "FC detection mode",
+    hint:           "How first crack is detected. 'audio' uses the configured PortAudio device; 'manual' requires the operator to mark FC explicitly. Maps to first_crack.mode in the MCP yaml.",
+    type:           "select",
+    options:        FC_DETECTION_OPTIONS,
+    envVar:         "ROASTPILOT_MCP_DEVICE__FC_MODE",
+    editKey:        "fc_mode",
+    category:       "FC-Detection",
+    readOnlyStatic: false,
+  },
+  {
+    key:            "mcp_device.fc_confidence_threshold",
+    label:          "Confidence threshold",
+    hint:           "Detector confidence threshold [0, 1]. Events below this score are suppressed. Default 0.5. Maps to first_crack.confidence_threshold in the MCP yaml.",
+    type:           "number",
+    min:            0,
+    max:            1,
+    step:           0.05,
+    envVar:         "ROASTPILOT_MCP_DEVICE__FC_CONFIDENCE_THRESHOLD",
+    editKey:        "fc_confidence_threshold",
+    category:       "FC-Detection",
+    readOnlyStatic: false,
+  },
+  {
+    key:            "mcp_device.auto_t0_detection_enabled",
+    label:          "Auto-T0 detection",
+    hint:           "Whether the MCP auto-detects the charge-drop (T0) from the bean-temperature drop. Maps to session.auto_t0_detection_enabled in the MCP yaml.",
+    type:           "boolean",
+    envVar:         "ROASTPILOT_MCP_DEVICE__AUTO_T0_DETECTION_ENABLED",
+    editKey:        "auto_t0_detection_enabled",
+    category:       "FC-Detection",
+    readOnlyStatic: false,
+  },
+  {
+    key:            "mcp_device.auto_t0_drop_threshold_c",
+    label:          "T0 drop threshold",
+    hint:           "Bean-temperature drop (°C) that triggers automatic T0 detection. Maps to session.auto_t0_drop_threshold_c in the MCP yaml.",
+    type:           "number",
+    unit:           "°C",
+    min:            0.1,
+    step:           0.5,
+    envVar:         "ROASTPILOT_MCP_DEVICE__AUTO_T0_DROP_THRESHOLD_C",
+    editKey:        "auto_t0_drop_threshold_c",
+    category:       "FC-Detection",
+    readOnlyStatic: false,
+    // Only shown when auto-T0 detection is enabled — no point configuring the
+    // threshold when the detector is off.
+    revealWhen:     { key: "mcp_device.auto_t0_detection_enabled", equals: true },
+  },
+];
+
 // ---------------------------------------------------------------------------
 // Category ordering
 // ---------------------------------------------------------------------------
@@ -588,8 +764,8 @@ export interface ConfigCategory {
 
 /**
  * Ordered list of config categories for the /config view rail.
- * "First-Crack Detection" is deferred to S3 (MCP yaml passthrough-merge).
- * "Hardware" is deferred to S3 (driver/serial/baud live in MCP yaml, not AppConfig).
+ * Hardware / Audio / FC-Detection are backed by the mcp_device snapshot
+ * section added in S3 (#429) and wired by PR3 of #419 (slice 3c).
  */
 export const CONFIG_CATEGORIES: ConfigCategory[] = [
   {
@@ -615,6 +791,24 @@ export const CONFIG_CATEGORIES: ConfigCategory[] = [
     label:       "Safety",
     description: "Safety limits — displayed for reference. All read-only in M1.",
     fields:      SAFETY_FIELDS,
+  },
+  {
+    id:          "Hardware",
+    label:       "Hardware",
+    description: "Serial port and roaster driver rendered into the MCP yaml on each spawn.",
+    fields:      HARDWARE_FIELDS,
+  },
+  {
+    id:          "Audio",
+    label:       "Audio",
+    description: "Audio input device and recording settings for the MCP child process.",
+    fields:      AUDIO_FIELDS,
+  },
+  {
+    id:          "FC-Detection",
+    label:       "FC detection",
+    description: "First-crack detection mode, confidence threshold, and auto-T0 settings.",
+    fields:      FC_DETECTION_FIELDS,
   },
 ];
 

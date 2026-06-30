@@ -85,6 +85,18 @@ function makeSnapshot(overrides?: {
       bitter_ceiling_temp_c: makeFieldMeta({ effective_value: 196, default: 196, read_only: true }),
       emergency_drop_temp_c: makeFieldMeta({ effective_value: 198, default: 198, read_only: true }),
     },
+    mcp_device: {
+      serial_port: makeFieldMeta({ effective_value: null, default: null }),
+      roaster_driver: makeFieldMeta({ effective_value: null, default: null }),
+      audio_input_device: makeFieldMeta({ effective_value: null, default: null }),
+      recording_enabled: makeFieldMeta({ effective_value: null, default: null }),
+      recording_autocapture: makeFieldMeta({ effective_value: null, default: null }),
+      recording_devices: makeFieldMeta({ effective_value: null, default: null }),
+      fc_mode: makeFieldMeta({ effective_value: null, default: null }),
+      fc_confidence_threshold: makeFieldMeta({ effective_value: null, default: null }),
+      auto_t0_detection_enabled: makeFieldMeta({ effective_value: null, default: null }),
+      auto_t0_drop_threshold_c: makeFieldMeta({ effective_value: null, default: null }),
+    },
   };
 }
 
@@ -94,6 +106,9 @@ function makeSnapshot(overrides?: {
 
 const configMock = vi.hoisted(() => vi.fn<() => Promise<AppConfigSnapshot>>());
 const saveConfigMock = vi.hoisted(() => vi.fn<(edit: unknown) => Promise<AppConfigSnapshot>>());
+const devicesMock = vi.hoisted(() =>
+  vi.fn<() => Promise<import("@/lib/types").DevicesSnapshot>>(),
+);
 
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
@@ -103,6 +118,7 @@ vi.mock("@/lib/api", async () => {
       ...actual.api,
       config: configMock,
       saveConfig: saveConfigMock,
+      devices: devicesMock,
     },
   };
 });
@@ -131,6 +147,12 @@ afterEach(() => {
 beforeEach(() => {
   configMock.mockResolvedValue(makeSnapshot());
   saveConfigMock.mockResolvedValue(makeSnapshot());
+  devicesMock.mockResolvedValue({
+    serial: [{ value: "/dev/ttyUSB0", label: "USB Serial", note: "" }],
+    serial_error: null,
+    audio_input: [{ value: "USB PnP", label: "USB PnP Sound Device", note: "" }],
+    audio_input_error: null,
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -383,5 +405,341 @@ describe("ConfigPage — PUT body nesting", () => {
       },
     });
     expect(body).not.toHaveProperty("safety");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Hardware / Audio / FC-Detection categories (slice 3c, #419)
+// ---------------------------------------------------------------------------
+
+describe("ConfigPage — Hardware category", () => {
+  it("renders Hardware, Audio, FC-Detection rail items", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    expect(screen.getByTestId("rail-item-Hardware")).toBeInTheDocument();
+    expect(screen.getByTestId("rail-item-Audio")).toBeInTheDocument();
+    expect(screen.getByTestId("rail-item-FC-Detection")).toBeInTheDocument();
+  });
+
+  it("switches to the Hardware pane when its rail item is clicked", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+    // Serial port and roaster driver fields must be rendered
+    expect(screen.getByTestId("config-field-mcp_device.serial_port")).toBeInTheDocument();
+    expect(screen.getByTestId("config-field-mcp_device.roaster_driver")).toBeInTheDocument();
+  });
+
+  it("renders the roaster_driver field as a text input (editable)", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+    const driverField = screen.getByTestId("config-field-mcp_device.roaster_driver");
+    // Text input
+    expect(driverField.querySelector("input[type='text']")).not.toBeNull();
+    expect(driverField.querySelector("input[type='text']")).not.toBeDisabled();
+  });
+
+  it("sends mcp_device section in PUT body when a Hardware field is changed", async () => {
+    saveConfigMock.mockResolvedValue(makeSnapshot());
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+    const driverInput = screen
+      .getByTestId("config-field-mcp_device.roaster_driver")
+      .querySelector("input");
+    fireEvent.change(driverInput!, { target: { value: "mock" } });
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    const body = saveConfigMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(body).toHaveProperty("mcp_device");
+    expect((body.mcp_device as Record<string, unknown>).roaster_driver).toBe("mock");
+    // Safety must not appear
+    expect(body).not.toHaveProperty("safety");
+  });
+});
+
+describe("ConfigPage — Audio category", () => {
+  it("switches to the Audio pane and shows the mic test button placeholder", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Audio"));
+    await waitFor(() => screen.getByTestId("config-pane-Audio"));
+    // Mic test button is present and disabled
+    expect(screen.getByTestId("mic-test-button")).toBeInTheDocument();
+    expect(screen.getByTestId("mic-test-button")).toBeDisabled();
+  });
+
+  it("renders recording_enabled as a boolean toggle in Audio", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Audio"));
+    await waitFor(() => screen.getByTestId("config-pane-Audio"));
+    const toggleField = screen.getByTestId("config-field-mcp_device.recording_enabled");
+    // BooleanControl renders a button[role=switch]
+    expect(toggleField.querySelector("[role='switch']")).not.toBeNull();
+  });
+});
+
+describe("ConfigPage — FC-Detection category", () => {
+  it("switches to the FC-Detection pane and shows fc_mode and fc_confidence_threshold", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+    expect(screen.getByTestId("config-field-mcp_device.fc_mode")).toBeInTheDocument();
+    expect(screen.getByTestId("config-field-mcp_device.fc_confidence_threshold")).toBeInTheDocument();
+  });
+
+  it("sends fc_mode in the mcp_device section when changed", async () => {
+    saveConfigMock.mockResolvedValue(makeSnapshot());
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+    const fcModeSelect = screen
+      .getByTestId("config-field-mcp_device.fc_mode")
+      .querySelector("select");
+    // Default value is null; change to "audio"
+    fireEvent.change(fcModeSelect!, { target: { value: "audio" } });
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    const body = saveConfigMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect((body.mcp_device as Record<string, unknown>).fc_mode).toBe("audio");
+  });
+
+  it("shows auto_t0_detection_enabled toggle and auto_t0_drop_threshold_c field", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+    expect(screen.getByTestId("config-field-mcp_device.auto_t0_detection_enabled")).toBeInTheDocument();
+    // auto_t0_drop_threshold_c is hidden by default (auto_t0_detection_enabled = null → falsy)
+    expect(screen.queryByTestId("config-field-mcp_device.auto_t0_drop_threshold_c")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QA must-fix: field reveal for auto_t0_drop_threshold_c (#437 qa)
+// ---------------------------------------------------------------------------
+
+describe("ConfigPage — revealWhen: auto_t0_drop_threshold_c", () => {
+  it("hides auto_t0_drop_threshold_c when auto_t0_detection_enabled is false/null", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+    // Default effective_value is null → revealWhen(equals: true) → hidden
+    expect(screen.queryByTestId("config-field-mcp_device.auto_t0_drop_threshold_c")).toBeNull();
+  });
+
+  it("reveals auto_t0_drop_threshold_c after enabling auto_t0_detection_enabled", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+
+    // Toggle auto_t0_detection_enabled ON
+    const toggle = screen
+      .getByTestId("config-field-mcp_device.auto_t0_detection_enabled")
+      .querySelector("[role='switch']");
+    expect(toggle).not.toBeNull();
+    fireEvent.click(toggle!);
+
+    // Now the threshold field must appear
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("config-field-mcp_device.auto_t0_drop_threshold_c"),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("hides auto_t0_drop_threshold_c again after disabling auto_t0_detection_enabled", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+
+    const toggle = screen
+      .getByTestId("config-field-mcp_device.auto_t0_detection_enabled")
+      .querySelector("[role='switch']");
+    // Enable then disable
+    fireEvent.click(toggle!);
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("config-field-mcp_device.auto_t0_drop_threshold_c"),
+      ).toBeInTheDocument(),
+    );
+    fireEvent.click(toggle!);
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("config-field-mcp_device.auto_t0_drop_threshold_c"),
+      ).toBeNull(),
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QA must-fix: DeviceSelect / DeviceMultiSelect control-type assertions (#437 qa)
+// ---------------------------------------------------------------------------
+
+describe("ConfigPage — device field control types (never free-text)", () => {
+  it("Hardware: serial_port renders a DeviceSelect, not a plain text input", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+
+    const serialField = screen.getByTestId("config-field-mcp_device.serial_port");
+    // DeviceSelect trigger must be present
+    expect(serialField.querySelector("[data-testid='device-select-trigger']")).not.toBeNull();
+    // Must NOT have a plain text input
+    expect(serialField.querySelector("input[type='text']")).toBeNull();
+  });
+
+  it("Audio: audio_input_device renders a DeviceSelect, not a plain text input", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Audio"));
+    await waitFor(() => screen.getByTestId("config-pane-Audio"));
+
+    const audioField = screen.getByTestId("config-field-mcp_device.audio_input_device");
+    expect(audioField.querySelector("[data-testid='device-select-trigger']")).not.toBeNull();
+    expect(audioField.querySelector("input[type='text']")).toBeNull();
+  });
+
+  it("Audio: recording_devices renders a DeviceMultiSelect trigger, not a plain text input", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Audio"));
+    await waitFor(() => screen.getByTestId("config-pane-Audio"));
+
+    const recDevField = screen.getByTestId("config-field-mcp_device.recording_devices");
+    // DeviceMultiSelect renders a trigger button, not a text input
+    expect(recDevField.querySelector("[data-testid='device-multi-select-trigger']")).not.toBeNull();
+    expect(recDevField.querySelector("input[type='text']")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QA must-fix: recording_devices array equality (no false-positive dirty) (#437 qa)
+// ---------------------------------------------------------------------------
+
+describe("ConfigPage — recording_devices array dirty detection", () => {
+  it("does NOT show dirty dot / save bar when recording_devices content is unchanged", async () => {
+    // Snapshot has recording_devices = ["USB PnP"]; toggling a device OFF then
+    // ON again should leave no dirty state because valuesEqual detects same content.
+    configMock.mockResolvedValue(
+      (() => {
+        const snap = makeSnapshot();
+        snap.mcp_device.recording_devices = {
+          saved_value: ["USB PnP"],
+          effective_value: ["USB PnP"],
+          default: null,
+          env_overridden: false,
+          read_only: false,
+          description: "",
+        };
+        return snap;
+      })(),
+    );
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Audio"));
+    await waitFor(() => screen.getByTestId("config-pane-Audio"));
+
+    const recDevField = screen.getByTestId("config-field-mcp_device.recording_devices");
+
+    // Open the multi-select popover so the rows are rendered
+    const trigger = recDevField.querySelector("[data-testid='device-multi-select-trigger']");
+    expect(trigger).not.toBeNull();
+    fireEvent.click(trigger!);
+
+    // The USB PnP row is rendered; aria-selected=true (initially selected)
+    const usbRow = await waitFor(() =>
+      screen.getByTestId("device-multi-option-USB PnP"),
+    );
+    expect(usbRow).toHaveAttribute("aria-selected", "true");
+
+    // Deselect then re-select — content returns to its original state
+    fireEvent.click(usbRow);
+    fireEvent.click(usbRow);
+
+    // Save bar must NOT appear — same content, not dirty
+    expect(screen.queryByTestId("config-save-bar")).toBeNull();
+    expect(screen.queryByTestId("rail-dirty-Audio")).toBeNull();
+  });
+
+  it("DOES show dirty dot / save bar when recording_devices content differs", async () => {
+    // Snapshot has recording_devices = ["USB PnP"]; deselecting → content = [] → dirty
+    configMock.mockResolvedValue(
+      (() => {
+        const snap = makeSnapshot();
+        snap.mcp_device.recording_devices = {
+          saved_value: ["USB PnP"],
+          effective_value: ["USB PnP"],
+          default: null,
+          env_overridden: false,
+          read_only: false,
+          description: "",
+        };
+        return snap;
+      })(),
+    );
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Audio"));
+    await waitFor(() => screen.getByTestId("config-pane-Audio"));
+
+    const recDevField = screen.getByTestId("config-field-mcp_device.recording_devices");
+
+    // Open the multi-select popover
+    const trigger = recDevField.querySelector("[data-testid='device-multi-select-trigger']");
+    expect(trigger).not.toBeNull();
+    fireEvent.click(trigger!);
+
+    const usbRow = await waitFor(() =>
+      screen.getByTestId("device-multi-option-USB PnP"),
+    );
+    expect(usbRow).toHaveAttribute("aria-selected", "true");
+
+    // Deselect — content now [] vs saved ["USB PnP"] → dirty
+    fireEvent.click(usbRow);
+    expect(screen.getByTestId("config-save-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("rail-dirty-Audio")).toBeInTheDocument();
+  });
+
+  it("sends correct recording_devices array in PUT body after selecting a device", async () => {
+    // Start with no recording_devices (null); select "USB PnP" → PUT body has the array.
+    saveConfigMock.mockResolvedValue(makeSnapshot());
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Audio"));
+    await waitFor(() => screen.getByTestId("config-pane-Audio"));
+
+    const recDevField = screen.getByTestId("config-field-mcp_device.recording_devices");
+
+    // Open the multi-select popover (initial value = null/empty)
+    const trigger = recDevField.querySelector("[data-testid='device-multi-select-trigger']");
+    expect(trigger).not.toBeNull();
+    fireEvent.click(trigger!);
+
+    const usbRow = await waitFor(() =>
+      screen.getByTestId("device-multi-option-USB PnP"),
+    );
+    expect(usbRow).toHaveAttribute("aria-selected", "false");
+
+    // Select it — adds "USB PnP" to the array
+    fireEvent.click(usbRow);
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    const body = saveConfigMock.mock.calls[0]![0] as Record<string, unknown>;
+    const recDevices = (body.mcp_device as Record<string, unknown>)?.recording_devices;
+    expect(Array.isArray(recDevices)).toBe(true);
+    expect(recDevices).toContain("USB PnP");
   });
 });

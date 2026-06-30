@@ -1,9 +1,10 @@
 /**
- * Per-field row in the config view (#419, PR2).
+ * Per-field row in the config view (#419, PR3).
  *
  * 2-column grid: left = label + description; right = control + meta line.
- * Control types rendered here: text, number, boolean (toggle), select, masked.
- * The `deviceSelect` type (PR3) is rendered as a disabled text placeholder.
+ * Control types rendered here: text, number, boolean (toggle), select, masked,
+ * deviceSelect (single-select dropdown), deviceMultiSelect (checkable list),
+ * micTestButton (placeholder — not available in M1).
  *
  * Per-field "Reset to default" appears only when the value differs from the
  * field's schema default and the field is editable. Masked fields show
@@ -12,11 +13,16 @@
  * Safety fields receive a `Guarded` chip and a disabled control in M1 —
  * the edit-gate dialog is deferred to a later slice (D78 decision 2 = all
  * safety read-only in M1, no dialog needed).
+ *
+ * deviceSelect / deviceMultiSelect fields receive the pre-fetched
+ * `devicesSnapshot` from ConfigPage (fetched once, passed to each row).
  */
 
 import type { ConfigFieldMeta } from "@/lib/types";
 import { cn } from "@/lib/cn";
 import type { ConfigFieldDef } from "./configSchema";
+import { DeviceSelect } from "./DeviceSelect";
+import { DeviceMultiSelect } from "./DeviceMultiSelect";
 
 // ---------------------------------------------------------------------------
 // Field-level controls
@@ -144,6 +150,30 @@ function SelectControl({ fieldDef, value, disabled, onChange }: ControlProps): R
 }
 
 // ---------------------------------------------------------------------------
+// Mic test button (placeholder — not available in M1)
+// ---------------------------------------------------------------------------
+
+/** Rendered for fieldDef.type === "micTestButton". */
+function MicTestButtonControl(): React.JSX.Element {
+  return (
+    <div className="flex items-center gap-3">
+      <button
+        type="button"
+        disabled
+        className="flex h-11 items-center gap-2 rounded-[9px] border border-input bg-input px-4 text-sm font-medium text-muted-foreground/50 cursor-not-allowed"
+        aria-label="Test microphone — not available in M1"
+        data-testid="mic-test-button"
+      >
+        Test input
+      </button>
+      <span className="text-xs text-muted-foreground/50">
+        Not available in M1 — the backend sample endpoint is deferred.
+      </span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Guarded chip (safety read-only in M1)
 // ---------------------------------------------------------------------------
 
@@ -255,6 +285,41 @@ export function ConfigFieldRow({
     case "select":
       control = <SelectControl {...controlProps} />;
       break;
+    case "deviceSelect": {
+      // DeviceSelect fetches via useDevices() internally (shared query cache).
+      // `deviceKind` picks the right list from DevicesSnapshot.
+      const deviceKind = fieldDef.deviceSource ?? "serial";
+      control = (
+        <DeviceSelect
+          label={fieldDef.label}
+          deviceKind={deviceKind}
+          value={typeof value === "string" ? value : ""}
+          disabled={isReadOnly}
+          onChange={(v) => onChange(v)}
+        />
+      );
+      break;
+    }
+    case "deviceMultiSelect": {
+      // DeviceMultiSelect fetches via useDevices() internally (shared query cache).
+      // The saved value is stored as a tuple of strings (server) or a string[]
+      // (local edit). Normalise to string[].
+      const multiValue = Array.isArray(value)
+        ? (value as unknown[]).filter((v): v is string => typeof v === "string")
+        : [];
+      control = (
+        <DeviceMultiSelect
+          label={fieldDef.label}
+          values={multiValue}
+          disabled={isReadOnly}
+          onChange={(vs) => onChange(vs)}
+        />
+      );
+      break;
+    }
+    case "micTestButton":
+      control = <MicTestButtonControl />;
+      break;
     default:
       control = <TextControl {...controlProps} />;
   }
@@ -301,10 +366,13 @@ export function ConfigFieldRow({
           </p>
         )}
 
-        {/* Default + reset-to-default */}
+        {/* Default + reset-to-default (suppressed for action-only field types) */}
         <div className="flex items-center justify-between">
           {fieldDef.type === "masked" ? (
             <span className="text-xs text-muted-foreground/50">Managed via env-var</span>
+          ) : fieldDef.type === "micTestButton" ? (
+            // No default line for the mic-test placeholder.
+            <span />
           ) : (
             <span className="font-mono text-xs tabular-nums text-muted-foreground/50">
               Default {String(meta.default ?? "—")}

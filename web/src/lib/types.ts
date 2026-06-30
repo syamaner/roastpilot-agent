@@ -580,16 +580,31 @@ export interface SafetyLimitsSnapshot {
   emergency_drop_temp_c: ConfigFieldMeta;
 }
 
+/** Managed MCP device fields (MCPDeviceConfigSnapshot in Python, #429). */
+export interface MCPDeviceConfigSnapshot {
+  serial_port: ConfigFieldMeta;
+  roaster_driver: ConfigFieldMeta;
+  audio_input_device: ConfigFieldMeta;
+  recording_enabled: ConfigFieldMeta;
+  recording_autocapture: ConfigFieldMeta;
+  recording_devices: ConfigFieldMeta;
+  fc_mode: ConfigFieldMeta;
+  fc_confidence_threshold: ConfigFieldMeta;
+  auto_t0_detection_enabled: ConfigFieldMeta;
+  auto_t0_drop_threshold_c: ConfigFieldMeta;
+}
+
 /** GET /api/config response body (AppConfigSnapshot in Python). */
 export interface AppConfigSnapshot {
   controller: ControllerConfigSnapshot;
   advisor: AdvisorConfigSnapshot;
   safety: SafetyLimitsSnapshot;
+  mcp_device: MCPDeviceConfigSnapshot;
 }
 
 // AppConfigEdit is not mirrored here — the SPA sends a raw partial object built
-// from the form's dirty values. Only controller + advisor fields are accepted;
-// safety fields are never sent. The server validates the shape via Pydantic.
+// from the form's dirty values. Only controller + advisor + mcp_device fields
+// are accepted; safety fields are never sent. The server validates via Pydantic.
 
 // --- Device enumeration (GET /api/config/devices, D78 PR(c), #418) -----------
 // Hand-mirror of the Python DeviceOption / DevicesSnapshot models in api.py.
