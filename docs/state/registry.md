@@ -102,7 +102,44 @@
 
 ## Active Context
 
-**30 Jun 2026 (latest) — CONFIG UI (#413) FUNCTIONALLY COMPLETE. The agent now owns one unified
+**30 Jun 2026 (latest) — CONFIG UI (#413) IS DONE. The device-selection UI shipped and saved
+device/hardware config now applies next-roast; the Config UI epic is complete.** A second
+lead-plus-subagents session closed out the remaining PR3 + S4 work (the block below was the
+"functionally complete for the agent-settings path" state; device selection + hardware
+apply-next-roast were still pending then). Nine PRs merged this session:
+
+- **#433 (#431)** — respawn the MCP child when saved `mcp_device` config changes, so DEVICE/hardware
+  config (serial port, driver, audio input, recording, FC detection) applies next-roast via a safe
+  **between-roasts** respawn (under `_start_lock`, behind the active-run guard; **never** auto-resumes
+  heat/fan). Independent safety-reviewer PASS — but **Codex then caught two real P1s the Opus safety
+  review passed**: a stale force-terminate hook that would SIGKILL a recycled pid after a respawn, and
+  an unconfirmed-stop being masked. Both fixed + re-verified. Closes #431.
+- **#434 / #435 / #436 / #437 (#419 PR3)** — DeviceSelect (single) + `/api/config/devices` wiring,
+  DeviceMultiSelect (recording devices), the env-override badge, and the Hardware/Audio/First-Crack
+  category panels + mic-test "not available in M1" placeholder. Backend-enumerated dropdowns (never
+  free-text), wired to `mcp_device` via PUT. **#419 closed.**
+- **#438** — device endpoint emits the audio device **NAME** (not the sounddevice index) as the
+  selectable value, so a picked mic saves the name substring the MCP yaml matches (Codex P2 catch).
+- **#440 / #441 (#421 S4)** — a11y (arrow-key listbox nav + trigger accessible-name + open-to-list
+  focus), group subheadings, category reorder, responsive `<900px` (outer + per-row single-column),
+  `valuesEqual` array dirty-guard, help-copy accuracy. **#421 closed.**
+
+**Deferred follow-up filed: #439** — the `mcp_device` tri-state inherit/override semantics
+(null = keep the hand-authored MCP yaml / value = override) are not yet modelled in the UI (booleans
+collapse null→off; can't clear an override back to inherit; blank `roaster_driver` → `driver:""`).
+All non-safety; device selection itself works. Earlier-deferred follow-ups still open: **#426**
+(top-level-JSON env shadow), **#423** (sticky `/live` summary), an on-demand mic-test backend sample.
+
+**Process notes (this session):** the layered review kept earning its keep — Codex caught P1 safety
+bugs no other lens did, and `qa` caught real test-quality + a11y gaps (a malformed `checkbox`-in-`listbox`
+role nesting; smoke-tests-masquerading-as-behaviour). Ran FE + BE tracks in parallel via **explicit
+git worktrees** (one per track, per the runbook) after an initial shared-checkout collision was caught
+and untangled with no work lost. **This does not change roast priorities — #405 (deterministic post-FC
+heat floor) remains the top control priority.**
+
+---
+
+**30 Jun 2026 — CONFIG UI (#413) FUNCTIONALLY COMPLETE for the agent-settings path. The agent now owns one unified
 config and renders the MCP yaml from it (D76/D78), and saved settings drive the next roast. Plan
 decision D79 (`roastpilot-plan` `fb59c10`).** A single long lead-plus-subagents session built the
 operator's settings surface end to end. Seven PRs on `main`:
