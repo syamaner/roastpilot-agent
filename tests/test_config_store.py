@@ -16,10 +16,12 @@ from pydantic import BaseModel
 
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.config_store import (
+    _NEVER_INJECT_ENV_KEYS,  # pyright: ignore[reportPrivateUsage]
     DEFAULT_CONFIG_FILE_PATH,
     AdvisorConfigEdit,
     AdvisorConfigSnapshot,
     AppConfigEdit,
+    ConfigFileError,
     ControllerConfigEdit,
     ControllerConfigSnapshot,
     LateMaillardTrimEdit,
@@ -31,6 +33,7 @@ from roastpilot_agent.config_store import (
     _write_saved_config,  # pyright: ignore[reportPrivateUsage]
     apply_config_edit,
     build_config_snapshot,
+    load_app_config,
     load_saved_raw,
     persist_config_edit,
 )
@@ -104,10 +107,19 @@ def test_write_saved_config_creates_parent_dirs(tmp_path: Path) -> None:
 
 
 def test_load_saved_config_rejects_non_mapping(tmp_path: Path) -> None:
-    """A YAML file that is a list (not a mapping) raises ValueError."""
+    """A YAML file that is a list (not a mapping) raises ConfigFileError."""
     path = tmp_path / "bad.yaml"
     path.write_text("- item1\n- item2\n")
-    with pytest.raises(ValueError, match="must be a YAML mapping"):
+    with pytest.raises(ConfigFileError, match="must be a YAML mapping"):
+        _load_saved_config(path)
+
+
+def test_load_saved_config_invalid_yaml_raises_config_file_error(tmp_path: Path) -> None:
+    """A file with invalid YAML raises ConfigFileError with path + parse reason."""
+    path = tmp_path / "broken.yaml"
+    # Deliberately malformed YAML (unclosed bracket).
+    path.write_text("advisor:\n  model_slug: [unclosed\n")
+    with pytest.raises(ConfigFileError, match=str(path)):
         _load_saved_config(path)
 
 
@@ -454,24 +466,324 @@ def test_saved_file_safety_section_not_injected(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A hand-edited saved file with a 'safety' section must NOT weaken limits.
+    """A hand-edited saved file with a lowercase 'safety' section must not weaken limits.
 
-    _inject_saved_as_env skips the 'safety' section so that even a hand-edited
-    YAML file cannot silently lower a safety limit (D78 constraint 2).
+    _inject_saved_as_env skips safety env keys listed in _NEVER_INJECT_ENV_KEYS
+    so that even a hand-edited YAML cannot silently lower a safety limit (D78-2).
+    Uses setenv+delenv to ensure monkeypatch tracks the advisor key for cleanup;
+    the safety key is never set so no cleanup is needed for it.
     """
     monkeypatch.delenv("ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C", raising=False)
+    # setenv+delenv pattern: ensures monkeypatch tracks MODEL_SLUG for cleanup
+    # even though it didn't exist before this test.
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__MODEL_SLUG", "__sentinel__")
+    monkeypatch.delenv("ROASTPILOT_ADVISOR__MODEL_SLUG")
 
     # Simulate a hand-edited saved file with a lowered safety limit.
     saved_raw_with_safety: dict[str, Any] = {
         "safety": {"max_bean_temp_c": 180.0},
         "advisor": {"model_slug": "openai/gpt-4o-mini"},
     }
-    _inject_saved_as_env(saved_raw_with_safety)
+    injected = _inject_saved_as_env(saved_raw_with_safety)
 
     # The safety section must NOT have been injected.
     assert "ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C" not in os.environ
+    assert "ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C" not in injected
     # The non-safety section IS injected.
     assert os.environ.get("ROASTPILOT_ADVISOR__MODEL_SLUG") == "openai/gpt-4o-mini"
+    assert "ROASTPILOT_ADVISOR__MODEL_SLUG" in injected
+    # Teardown: monkeypatch restores MODEL_SLUG to absent (state after delenv above).
 
-    # Clean up the injected var.
+
+def test_saved_file_capital_safety_section_not_injected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A capitalised 'Safety:' block bypasses the old string-compare guard.
+
+    _inject_saved_as_env normalises section names via .upper() so any
+    capitalisation of 'safety' is caught by _NEVER_INJECT_ENV_KEYS.
+    Regression test for the BLOCKER 1 casing vector.
+    """
+    monkeypatch.delenv("ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C", raising=False)
+
+    # Capital-S capitalisation — would bypass a naive `section == "safety"` check.
+    injected = _inject_saved_as_env({"Safety": {"max_bean_temp_c": 300.0}})
+
+    assert "ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C" not in os.environ
+    assert "ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C" not in injected
+    # Effective limit must remain at the schema default (230), not 300.
+    effective = AppConfig()
+    assert effective.safety.max_bean_temp_c == 230.0
+
+
+def test_saved_file_allcaps_safety_section_not_injected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An all-caps 'SAFETY:' block is also rejected by the normalised guard."""
+    monkeypatch.delenv("ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C", raising=False)
+
+    injected = _inject_saved_as_env({"SAFETY": {"max_bean_temp_c": 300.0}})
+
+    assert "ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C" not in os.environ
+    assert "ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C" not in injected
+
+
+def test_saved_file_tick_interval_not_injected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hand-edited 'tick_interval_seconds' in the controller section is not injected.
+
+    controller tick is hardware-pinned and read-only (D78 constraint 2).
+    """
+    monkeypatch.delenv("ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS", raising=False)
+
+    injected = _inject_saved_as_env({"controller": {"tick_interval_seconds": 0.1}})
+
+    assert "ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS" not in os.environ
+    assert "ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS" not in injected
+
+
+def test_never_inject_env_keys_covers_all_safety_fields() -> None:
+    """_NEVER_INJECT_ENV_KEYS includes all 7 SafetyLimits env-var names."""
+    safety_prefix = "ROASTPILOT_SAFETY__"
+    safety_keys = {k for k in _NEVER_INJECT_ENV_KEYS if k.startswith(safety_prefix)}
+    # Must cover all 7 SafetyLimitsSnapshot fields.
+    assert len(safety_keys) == len(SafetyLimitsSnapshot.model_fields)
+
+
+# ---------------------------------------------------------------------------
+# env_overridden false-positive fix (MEDIUM 3)
+# ---------------------------------------------------------------------------
+
+
+def test_env_overridden_false_for_saved_file_value(
+    monkeypatch: pytest.MonkeyPatch,
+    config_file: Path,
+) -> None:
+    """A value that came from the saved file must NOT show env_overridden=True.
+
+    When _inject_saved_as_env injects a saved value as a ROASTPILOT_* env var
+    and load_app_config threads the injected_keys to build_config_snapshot,
+    env_overridden must be False for that field — the env var was set ON BEHALF
+    of the saved value, not by the operator.
+    """
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_") and key != "ROASTPILOT_CONFIG_FILE":
+            monkeypatch.delenv(key, raising=False)
+
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4o-mini")))
+
+    effective, injected_keys = load_app_config()
+    saved_raw = load_saved_raw()
+    snapshot = build_config_snapshot(effective, saved_raw, injected_keys)
+
+    # model_slug came from the saved file, not from an operator env var.
+    assert snapshot.advisor.model_slug.saved_value == "openai/gpt-4o-mini"
+    assert snapshot.advisor.model_slug.effective_value == "openai/gpt-4o-mini"
+    assert snapshot.advisor.model_slug.env_overridden is False
+
+
+def test_env_overridden_true_for_real_env_var(
+    monkeypatch: pytest.MonkeyPatch,
+    config_file: Path,
+) -> None:
+    """A value set by the operator via a real ROASTPILOT_* env var is env_overridden."""
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_") and key != "ROASTPILOT_CONFIG_FILE":
+            monkeypatch.delenv(key, raising=False)
+
+    # Saved file has model_slug; a real env var also overrides it.
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4o-mini")))
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__MODEL_SLUG", "openai/gpt-4.1-mini")
+
+    effective, injected_keys = load_app_config()
+    saved_raw = load_saved_raw()
+    snapshot = build_config_snapshot(effective, saved_raw, injected_keys)
+
+    # The env var won over the saved value.
+    assert snapshot.advisor.model_slug.effective_value == "openai/gpt-4.1-mini"
+    # env_overridden must be True — the env var is an operator override.
+    assert snapshot.advisor.model_slug.env_overridden is True
+
+
+# ---------------------------------------------------------------------------
+# load_app_config integration test (MEDIUM 4)
+# ---------------------------------------------------------------------------
+
+
+def test_load_app_config_integration(
+    monkeypatch: pytest.MonkeyPatch,
+    config_file: Path,
+) -> None:
+    """load_app_config: saved file value reflected; conflicting env var wins (D78-1).
+
+    This is the end-to-end integration test for the env-overrides-file
+    resolution: write a saved config, call load_app_config(), verify the
+    effective config reflects it, then add a real env var and verify it wins.
+    """
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_") and key != "ROASTPILOT_CONFIG_FILE":
+            monkeypatch.delenv(key, raising=False)
+
+    # Write a saved config with a non-default advisor model.
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4o-mini")))
+
+    # load_app_config() should reflect the saved value.
+    effective, injected_keys = load_app_config()
+    assert effective.advisor.model_slug == "openai/gpt-4o-mini"
+    assert "ROASTPILOT_ADVISOR__MODEL_SLUG" in injected_keys
+
+    # A real env var overrides the saved value (env-overrides-file, D78-1).
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__MODEL_SLUG", "openai/gpt-4.1")
+    effective2, injected_keys2 = load_app_config()
+    assert effective2.advisor.model_slug == "openai/gpt-4.1"
+    # The env var was NOT in the injected set (it was already in the environment).
+    assert "ROASTPILOT_ADVISOR__MODEL_SLUG" not in injected_keys2
+
+
+# ---------------------------------------------------------------------------
+# base_trim field (MEDIUM 5)
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_has_base_trim_field() -> None:
+    """ControllerConfigSnapshot exposes late_maillard_trim_base_trim (MEDIUM 5)."""
+    effective = AppConfig()
+    snapshot = build_config_snapshot(effective, {})
+    # Default base_trim = 65.
+    assert snapshot.controller.late_maillard_trim_base_trim.effective_value == 65
+    assert snapshot.controller.late_maillard_trim_base_trim.read_only is False
+    assert snapshot.controller.late_maillard_trim_base_trim.description
+
+
+def test_apply_config_edit_base_trim() -> None:
+    """Editing base_trim writes the correct nested structure (MEDIUM 5)."""
+    edit = AppConfigEdit(
+        controller=ControllerConfigEdit(
+            pre_first_crack_levers=PreFirstCrackLeversEdit(
+                late_maillard_trim=LateMaillardTrimEdit(base_trim=60)
+            )
+        )
+    )
+    result = apply_config_edit(edit, {})
+    assert result["controller"]["pre_first_crack_levers"]["late_maillard_trim"]["base_trim"] == 60
+
+
+def test_snapshot_base_trim_from_saved_file() -> None:
+    """A base_trim in the saved file appears as saved_value in the snapshot."""
+    saved_raw: dict[str, Any] = {
+        "controller": {"pre_first_crack_levers": {"late_maillard_trim": {"base_trim": 55}}}
+    }
+    effective = AppConfig()
+    snapshot = build_config_snapshot(effective, saved_raw)
+    assert snapshot.controller.late_maillard_trim_base_trim.saved_value == 55
+
+
+# ---------------------------------------------------------------------------
+# Coverage: _inject_section edge cases
+# ---------------------------------------------------------------------------
+
+
+def test_inject_section_non_dict_value_already_in_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When an env var is already set, the saved value does NOT override it."""
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__TIMEOUT_SECONDS", "30.0")
+    # Saved file has a different value.
+    injected = _inject_saved_as_env({"advisor": {"timeout_seconds": 99.0}})
+    # The existing env var must win.
+    assert os.environ["ROASTPILOT_ADVISOR__TIMEOUT_SECONDS"] == "30.0"
+    # The key is NOT in the injected set (we did not write it).
+    assert "ROASTPILOT_ADVISOR__TIMEOUT_SECONDS" not in injected
+
+
+def test_inject_saved_as_env_non_dict_section_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A top-level section value that is not a dict is silently skipped."""
     monkeypatch.delenv("ROASTPILOT_ADVISOR__MODEL_SLUG", raising=False)
+    # 'advisor' maps to a scalar (invalid YAML structure) — must not crash.
+    injected = _inject_saved_as_env({"advisor": "should_be_a_dict"})
+    assert "ROASTPILOT_ADVISOR__MODEL_SLUG" not in os.environ
+    assert not injected
+
+
+# ---------------------------------------------------------------------------
+# Coverage: apply_config_edit branching
+# ---------------------------------------------------------------------------
+
+
+def test_apply_config_edit_controller_no_levers() -> None:
+    """ControllerConfigEdit with no levers set is a no-op for controller section."""
+    edit = AppConfigEdit(controller=ControllerConfigEdit())
+    result = apply_config_edit(edit, {})
+    # An empty controller edit still creates the controller key but no levers.
+    assert "controller" in result
+    assert "pre_first_crack_levers" not in result.get("controller", {})
+
+
+def test_apply_config_edit_fan_target_only() -> None:
+    """Only fan_target_percent set — heat_target_percent branch not taken."""
+    # fan_target_percent must stay at or below fan_ceiling_percent (default 30).
+    # Use 20 (below the 30 ceiling) to exercise the fan branch without the
+    # heat branch.
+    edit = AppConfigEdit(
+        controller=ControllerConfigEdit(
+            pre_first_crack_levers=PreFirstCrackLeversEdit(fan_target_percent=20)
+        )
+    )
+    result = apply_config_edit(edit, {})
+    levers = result["controller"]["pre_first_crack_levers"]
+    assert levers["fan_target_percent"] == 20
+    assert "heat_target_percent" not in levers
+
+
+def test_inject_section_nested_dict_recursion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_inject_section recurses into nested dicts (e.g. controller.pre_first_crack_levers).
+
+    Covers the recursive _inject_section call branch in config_store.py.
+    Uses monkeypatch.setenv with a sentinel first so monkeypatch tracks the key
+    and restores/removes it on teardown — avoids the pytest delenv-when-absent
+    limitation (monkeypatch.delenv is a no-op when the key doesn't yet exist).
+    """
+    key = "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__HEAT_TARGET_PERCENT"
+    # Setting a sentinel via monkeypatch ensures monkeypatch TRACKS this key
+    # and will DELETE it (restore to absent) if we then delete it, or restore
+    # to the sentinel if we don't explicitly delete.  We delete it next so that
+    # _inject_saved_as_env sees a clean slate AND monkeypatch will restore-to-absent
+    # on teardown.
+    monkeypatch.setenv(key, "__sentinel__")
+    monkeypatch.delenv(key)
+
+    # Simulate a saved file with a nested controller section.
+    injected = _inject_saved_as_env(
+        {"controller": {"pre_first_crack_levers": {"heat_target_percent": 90}}}
+    )
+
+    assert os.environ.get(key) == "90"
+    assert key in injected
+    # Teardown: monkeypatch restores "key absent" (the state after delenv above).
+
+
+def test_inject_section_bool_value_serialised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Boolean values are serialised to 'true'/'false' for pydantic-settings coercion.
+
+    Covers the bool branch inside _inject_section in config_store.py.
+    Uses the same sentinel-then-delenv pattern as
+    test_inject_section_nested_dict_recursion to ensure cleanup.
+    """
+    bool_env_key = "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ENABLED"
+    monkeypatch.setenv(bool_env_key, "__sentinel__")
+    monkeypatch.delenv(bool_env_key)
+
+    injected = _inject_saved_as_env(
+        {"controller": {"pre_first_crack_levers": {"late_maillard_trim": {"enabled": False}}}}
+    )
+
+    assert os.environ.get(bool_env_key) == "false"
+    assert bool_env_key in injected
+    # Teardown: monkeypatch restores "key absent" (the state after delenv above).

@@ -36,6 +36,19 @@ defaults path and is never redundantly mirrored here.
   requires PortAudio linkage, which is a heavy optional dep and is most
   accurately reported by the MCP process that owns the audio hardware anyway.
   This decision is noted here; the endpoint is implemented in PR (c).
+
+**TODO (PR b) — file-lock around persist_config_edit:** Add a ``filelock``
+(or ``fcntl.flock``) around the read-modify-write in :func:`persist_config_edit`
+before the PUT endpoint goes live; the current code has a TOCTOU window between
+:func:`_load_saved_config` and :func:`_write_saved_config`.
+
+**TODO (PR b) — _DEFAULT_CONFIG import-time env bleed:** ``_DEFAULT_CONFIG =
+AppConfig()`` at module import time reads the current ``os.environ``, so the
+``default`` field in each :class:`ConfigFieldMeta` will reflect any
+``ROASTPILOT_*`` env var that happens to be set when the module is first
+imported (e.g. in ``roast-live.sh``). Fix by deriving ``default`` from
+``AppConfig.model_fields`` field defaults directly, rather than from a
+pre-constructed instance.
 """
 
 from __future__ import annotations
@@ -53,8 +66,23 @@ from roastpilot_agent.config import (
     PreFirstCrackLevers,
 )
 
+
+class ConfigFileError(ValueError):
+    """Raised when the saved-config file exists but cannot be parsed.
+
+    Wraps :class:`yaml.YAMLError` with a human-readable message that includes
+    the file path and parse reason so that startup fails loud and actionably
+    rather than on a raw traceback.  Also raised for a well-formed YAML file
+    whose top-level value is not a mapping.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Defaults — a single frozen instance, so we compare without re-constructing.
+# TODO (PR b): _DEFAULT_CONFIG reads os.environ at import time — any ROASTPILOT_*
+#   env var set when the module is first imported will bleed into the `default`
+#   field of every ConfigFieldMeta.  Fix by deriving defaults from model_fields
+#   directly rather than from a pre-constructed AppConfig() instance.
 # ---------------------------------------------------------------------------
 _DEFAULT_CONFIG = AppConfig()
 
@@ -62,6 +90,34 @@ _DEFAULT_CONFIG = AppConfig()
 #: the user's home directory so it survives agent upgrades and does not litter
 #: the working directory.  Override via ``ROASTPILOT_CONFIG_FILE=<path>``.
 DEFAULT_CONFIG_FILE_PATH = Path.home() / ".roastpilot" / "config.yaml"
+
+# ---------------------------------------------------------------------------
+# Read-only env-key guard
+# ---------------------------------------------------------------------------
+
+# Set of ROASTPILOT_* environment variable names that must NEVER be injected
+# from the saved-config file.  These correspond to fields with read_only=True
+# in the snapshot; they include all SafetyLimits and the hardware-pinned
+# controller tick.  The guard operates on the normalised (uppercased) env key
+# so that a hand-edited YAML with 'Safety:', 'SAFETY:', or 'SaFeTy:' cannot
+# bypass it (the key is derived via section.upper() in _inject_saved_as_env).
+#
+# Driven by metadata — not a single hardcoded section name.  If a new read-only
+# field is added to a snapshot, its env-var name must be added here as well.
+_NEVER_INJECT_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        # All SafetyLimits fields (read-only in M1, D78 constraint 2).
+        "ROASTPILOT_SAFETY__MAX_BEAN_TEMP_C",
+        "ROASTPILOT_SAFETY__MAX_ENV_TEMP_C",
+        "ROASTPILOT_SAFETY__BITTER_CEILING_TEMP_C",
+        "ROASTPILOT_SAFETY__EMERGENCY_DROP_TEMP_C",
+        "ROASTPILOT_SAFETY__MIN_SECONDS_BETWEEN_COMMANDS",
+        "ROASTPILOT_SAFETY__MAX_CONSECUTIVE_MCP_FAILURES",
+        "ROASTPILOT_SAFETY__MAX_CONSECUTIVE_ADVISOR_FAILURES",
+        # Hardware-pinned controller tick (read-only in M1).
+        "ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS",
+    }
+)
 
 
 def _config_file_path() -> Path:
@@ -134,6 +190,7 @@ class ControllerConfigSnapshot(BaseModel, frozen=True):
     late_maillard_trim_window_fc_eta_seconds: ConfigFieldMeta
     late_maillard_trim_min_bean_temp_c: ConfigFieldMeta
     late_maillard_trim_adaptive_depth_enabled: ConfigFieldMeta
+    late_maillard_trim_base_trim: ConfigFieldMeta
     late_maillard_trim_k_ror: ConfigFieldMeta
     late_maillard_trim_k_eta: ConfigFieldMeta
     late_maillard_trim_ror_ref: ConfigFieldMeta
@@ -197,6 +254,7 @@ class LateMaillardTrimEdit(BaseModel):
     window_fc_eta_seconds: float | None = Field(default=None, gt=0)
     min_bean_temp_c: float | None = Field(default=None, gt=0)
     adaptive_depth_enabled: bool | None = None
+    base_trim: int | None = Field(default=None, ge=10, le=100)
     k_ror: float | None = Field(default=None, ge=0.0)
     k_eta: float | None = Field(default=None, ge=0.0)
     ror_ref: float | None = Field(default=None, ge=0.0)
@@ -270,18 +328,28 @@ def _load_saved_config(path: Path) -> _RawSavedConfig:
         not exist or is empty.
 
     Raises:
-        yaml.YAMLError: If the file exists but cannot be parsed as YAML.
+        ConfigFileError: If the file exists but cannot be parsed as valid YAML,
+            or if the top-level YAML value is not a mapping.  The error message
+            includes the file path and the underlying parse reason so the
+            operator can locate and fix the file.
         OSError: If the file exists but cannot be read.
     """
     if not path.exists():
         return {}
-    with path.open("r", encoding="utf-8") as fh:
-        loaded = yaml.safe_load(fh)
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            loaded = yaml.safe_load(fh)
+    except yaml.YAMLError as exc:
+        raise ConfigFileError(
+            f"Saved config at {path!s} could not be parsed as YAML: {exc}."
+            " Fix or remove the file to start the agent."
+        ) from exc
     if loaded is None:
         return {}
     if not isinstance(loaded, dict):
-        raise ValueError(
-            f"Saved config at {path} must be a YAML mapping; got {type(loaded).__name__}"
+        raise ConfigFileError(
+            f"Saved config at {path!s} must be a YAML mapping (got"
+            f" {type(loaded).__name__!r}). Fix or remove the file to start the agent."
         )
     return loaded  # type: ignore[return-value]
 
@@ -327,6 +395,7 @@ def _make_field_meta(
     env_var: str | None,
     read_only: bool,
     description: str,
+    injected_keys: frozenset[str] | None = None,
 ) -> ConfigFieldMeta:
     """Construct a :class:`ConfigFieldMeta` for one managed field.
 
@@ -338,11 +407,19 @@ def _make_field_meta(
             when no single env var maps to it (e.g. nested dict fields).
         read_only: Whether this field appears in the PUT surface.
         description: Human-readable label for the Config UI.
+        injected_keys: The set of env-var keys that were injected from the saved
+            file by :func:`_inject_saved_as_env`.  A field whose env var is in
+            this set is NOT considered env-overridden — the env var was set by
+            the injection mechanism on behalf of the saved value, not by an
+            operator-supplied env var.  Pass ``None`` (the default) when
+            building a snapshot outside of :func:`load_app_config` context
+            (e.g. in tests that construct :class:`AppConfig` manually).
 
     Returns:
         A frozen :class:`ConfigFieldMeta` instance.
     """
-    env_overridden = bool(env_var and _env_is_set(env_var))
+    injected = injected_keys or frozenset()
+    env_overridden = bool(env_var and _env_is_set(env_var) and env_var not in injected)
     return ConfigFieldMeta(
         saved_value=saved_value,
         effective_value=effective_value,
@@ -378,6 +455,7 @@ def _raw_section(raw: _RawSavedConfig, key: str) -> _RawSavedConfig:
 def build_config_snapshot(
     effective: AppConfig,
     saved_raw: _RawSavedConfig,
+    injected_keys: frozenset[str] | None = None,
 ) -> AppConfigSnapshot:
     """Build the full :class:`AppConfigSnapshot` for ``GET /api/config``.
 
@@ -386,6 +464,12 @@ def build_config_snapshot(
             as the running agent sees it — env vars already applied (this is
             what :func:`load_app_config` returns from the env).
         saved_raw: The raw dict loaded from the saved-config YAML file.
+        injected_keys: The set of env-var keys injected from the saved file by
+            :func:`_inject_saved_as_env`.  Pass the value returned by
+            :func:`load_app_config` (via :func:`_inject_saved_as_env`) so that
+            ``env_overridden`` correctly distinguishes operator-set env vars
+            from values injected from the saved file on behalf of the operator.
+            Defaults to ``None`` (treated as an empty set) for standalone use.
 
     Returns:
         An :class:`AppConfigSnapshot` with per-field metadata for every managed
@@ -409,6 +493,7 @@ def build_config_snapshot(
             env_var=env_var,
             read_only=read_only,
             description=description,
+            injected_keys=injected_keys,
         )
 
     # --- controller section ------------------------------------------------
@@ -505,6 +590,18 @@ def build_config_snapshot(
             description=(
                 "Enable adaptive trim depth (#386). When enabled, the trim deepens"
                 " on hotter approaches (high RoR, short FC-ETA). Default off."
+            ),
+        ),
+        late_maillard_trim_base_trim=_meta(
+            trim_saved.get("base_trim"),
+            trim.base_trim,
+            trim_def.base_trim,
+            None,
+            description=(
+                "Adaptive-depth baseline trim (%). The formula produces this depth"
+                " when both RoR and ETA gain terms are zero. Default 65 — equal to"
+                " the fixed trim_heat_percent so enabling adaptive mode without"
+                " tuning reproduces the proven fixed depth exactly."
             ),
         ),
         late_maillard_trim_k_ror=_meta(
@@ -794,6 +891,7 @@ def apply_config_edit(
                         "window_fc_eta_seconds": t.window_fc_eta_seconds,
                         "min_bean_temp_c": t.min_bean_temp_c,
                         "adaptive_depth_enabled": t.adaptive_depth_enabled,
+                        "base_trim": t.base_trim,
                         "k_ror": t.k_ror,
                         "k_eta": t.k_eta,
                         "ror_ref": t.ror_ref,
@@ -850,21 +948,17 @@ def _validate_merged_config(saved_raw: _RawSavedConfig) -> None:
     Raises:
         pydantic.ValidationError: If the merged values violate the schema.
     """
-    import pydantic
+    from pydantic import TypeAdapter
 
     # Build from defaults, then overlay the saved dict.
     default_dict = _DEFAULT_CONFIG.model_dump()
     _deep_merge(default_dict, saved_raw)
-    try:
-        # Construct without env (to check the file values in isolation from any
-        # current env that might override).  We use model_validate on a plain
-        # model, not BaseSettings, to avoid env re-injection.
-        from pydantic import TypeAdapter
-
-        ta: TypeAdapter[AppConfig] = TypeAdapter(AppConfig)
-        ta.validate_python(default_dict)
-    except pydantic.ValidationError:
-        raise
+    # Construct without env (to check the file values in isolation from any
+    # current env that might override).  We use model_validate on a plain
+    # model, not BaseSettings, to avoid env re-injection.  Raises
+    # pydantic.ValidationError on schema violations — let it propagate.
+    ta: TypeAdapter[AppConfig] = TypeAdapter(AppConfig)
+    ta.validate_python(default_dict)
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> None:
@@ -886,7 +980,7 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def load_app_config() -> AppConfig:
+def load_app_config() -> tuple[AppConfig, frozenset[str]]:
     """Load the effective :class:`~roastpilot_agent.config.AppConfig`.
 
     This is the single entry point for the running agent to obtain its
@@ -897,10 +991,17 @@ def load_app_config() -> AppConfig:
     3. ``ROASTPILOT_*`` environment variables (win; parsed by BaseSettings).
 
     Returns:
-        The fully-resolved :class:`~roastpilot_agent.config.AppConfig`.
+        A tuple of:
+
+        - The fully-resolved :class:`~roastpilot_agent.config.AppConfig`.
+        - A frozenset of env-var keys that were injected from the saved-config
+          file by :func:`_inject_saved_as_env`.  Pass this to
+          :func:`build_config_snapshot` so that ``env_overridden`` in each
+          :class:`ConfigFieldMeta` correctly distinguishes operator-set env
+          vars from values the injection mechanism set on their behalf.
 
     Raises:
-        yaml.YAMLError: If the saved-config file exists but is malformed.
+        ConfigFileError: If the saved-config file exists but is malformed.
         OSError: If the saved-config file exists but cannot be read.
     """
     # Step 2: load the saved file into a flat env-like dict that BaseSettings
@@ -910,54 +1011,68 @@ def load_app_config() -> AppConfig:
     # wins because os.environ takes precedence — we only inject for keys that
     # are absent from the real environment.
     saved_raw = _load_saved_config(_config_file_path())
-    _inject_saved_as_env(saved_raw)
-    return AppConfig()
+    injected_keys = _inject_saved_as_env(saved_raw)
+    return AppConfig(), injected_keys
 
 
-def _inject_saved_as_env(saved_raw: _RawSavedConfig) -> None:
+def _inject_saved_as_env(saved_raw: _RawSavedConfig) -> frozenset[str]:
     """Inject saved-config values into ``os.environ`` as ``ROASTPILOT_*`` vars.
 
     Only keys NOT already present in the environment are injected, so real
     env-var overrides still win (env-overrides-file precedence, D78).
 
-    **Safety guard:** the ``safety`` section is never injected from the saved
-    file. :class:`SafetyLimits` are read-only in M1 — no PUT path writes them
-    (``AppConfigEdit`` has no ``safety`` field), but a hand-edited YAML could
-    contain a ``safety:`` block. Skipping it here ensures the saved file can
-    never weaken a safety limit, even via hand-edit. The environment can still
-    override :class:`SafetyLimits` via explicit ``ROASTPILOT_SAFETY__*`` vars;
-    that is a deliberate operator choice, not a silent file path.
+    **Read-only guard:** fields listed in :data:`_NEVER_INJECT_ENV_KEYS` are
+    never injected, regardless of which YAML section they appear in.  The guard
+    is driven by the snapshot metadata (the frozenset mirrors each field marked
+    ``read_only=True`` that has a known env-var name) and operates on the
+    uppercased env-key form, so a hand-edited ``Safety:``, ``SAFETY:``, or
+    ``SaFeTy:`` section name cannot bypass it.  The environment can still
+    override these fields via explicit ``ROASTPILOT_SAFETY__*`` vars — that is a
+    deliberate operator choice, not a silent file path.
 
     Args:
         saved_raw: The raw dict loaded from the saved-config YAML file.
+
+    Returns:
+        The frozenset of environment-variable names that were injected.  Pass
+        this to :func:`build_config_snapshot` so that ``env_overridden`` in each
+        :class:`ConfigFieldMeta` correctly reflects operator-set env vars rather
+        than values injected from the saved file on the operator's behalf.
     """
+    injected: set[str] = set()
     for section, section_val in saved_raw.items():
-        if section == "safety":
-            # Never inject safety values from the saved file — read-only in M1
-            # (D78 constraint 2). A hand-edited yaml cannot weaken safety limits.
-            continue
         if not isinstance(section_val, dict):
             continue
+        # Normalise to uppercase for the env-key prefix so that any YAML
+        # capitalisation of a section name (e.g. 'Safety', 'SAFETY') maps to
+        # the same prefix and is caught by _NEVER_INJECT_ENV_KEYS.
         prefix = f"ROASTPILOT_{section.upper()}__"
-        _inject_section(cast("dict[str, Any]", section_val), prefix)
+        _inject_section(cast("dict[str, Any]", section_val), prefix, injected)
+    return frozenset(injected)
 
 
 def _inject_section(
     section_dict: dict[str, Any],
     prefix: str,
+    injected: set[str],
 ) -> None:
     """Recursively inject a section of the saved config as env vars.
 
     Args:
         section_dict: The section's value dict from the saved-config YAML.
-        prefix: The env-var prefix accumulated so far.
+        prefix: The env-var prefix accumulated so far (already uppercased).
+        injected: Mutable set to record every env-var key that is written.
     """
     import json
 
     for key, val in section_dict.items():
         env_key = f"{prefix}{key.upper()}"
+        if env_key in _NEVER_INJECT_ENV_KEYS:
+            # This field is read-only in the snapshot — never override it from
+            # a saved file, even if the file was hand-edited.
+            continue
         if isinstance(val, dict):
-            _inject_section(cast("dict[str, Any]", val), f"{env_key}__")
+            _inject_section(cast("dict[str, Any]", val), f"{env_key}__", injected)
         elif env_key not in os.environ:
             # Scalar — serialise to a JSON-compatible string so pydantic-settings
             # can coerce it back (bool → "true"/"false", int/float → numeric str).
@@ -965,6 +1080,7 @@ def _inject_section(
                 os.environ[env_key] = "true" if val else "false"
             else:
                 os.environ[env_key] = json.dumps(val) if not isinstance(val, str) else val
+            injected.add(env_key)
 
 
 def load_saved_raw() -> _RawSavedConfig:
@@ -978,7 +1094,7 @@ def load_saved_raw() -> _RawSavedConfig:
         The raw saved-config dict, or ``{}`` if the file is absent.
 
     Raises:
-        yaml.YAMLError: If the file exists but is malformed.
+        ConfigFileError: If the file exists but is malformed.
         OSError: If the file exists but cannot be read.
     """
     return _load_saved_config(_config_file_path())
@@ -997,7 +1113,7 @@ def persist_config_edit(edit: AppConfigEdit) -> None:
 
     Raises:
         pydantic.ValidationError: If the merged config violates the schema.
-        yaml.YAMLError: If the existing file is malformed (read phase).
+        ConfigFileError: If the existing file is malformed (read phase).
         OSError: If the file cannot be written.
     """
     path = _config_file_path()
