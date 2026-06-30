@@ -566,6 +566,9 @@ async def _serve_live(args: argparse.Namespace) -> int:
     except ValidationError as exc:
         print(f"error: saved-config file has invalid values — {exc}")
         return 1
+    except OSError as exc:
+        print(f"error: saved-config file is unreadable — {exc}")
+        return 1
     # Let the operator configure the Hottop with plain `export COFFEE_…`.
     forward_coffee_env(config)
 
@@ -717,6 +720,9 @@ async def _serve_replay(args: argparse.Namespace) -> int:
         return 1
     except _ValErr as exc:
         print(f"error: saved-config file has invalid values — {exc}")
+        return 1
+    except OSError as exc:
+        print(f"error: saved-config file is unreadable — {exc}")
         return 1
     log_level, access_log = _configure_access_log(args, _cfg.logging)
 

@@ -888,6 +888,66 @@ def test_replay_config_error_does_not_allocate_replay_resources(
     assert "malformed" in out or "error" in out
 
 
+def test_serve_live_returns_error_on_unreadable_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``serve`` returns exit-code 1 with a clear message when the saved-config
+    file exists but cannot be read (``OSError`` from ``load_app_config``).
+
+    Distinct from the malformed/schema-invalid cases: the file is syntactically
+    valid but unreadable (e.g. permissions).  All three error classes must
+    produce a clean fail-closed startup error rather than a raw traceback
+    (claude-review low, PR #425).
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("advisor:\n  model_slug: openai/gpt-4o\n", encoding="utf-8")
+    cfg_path.chmod(0o000)  # remove all permissions → OSError on open
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    import roastpilot_agent.live as _live
+
+    def _should_not_be_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("build_live_service must not be called on config error")
+
+    monkeypatch.setattr(_live, "build_live_service", _should_not_be_called)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+    try:
+        result = cli.main()
+    finally:
+        cfg_path.chmod(0o644)  # restore so tmp_path cleanup can delete it
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "unreadable" in out or "error" in out
+
+
+def test_replay_returns_error_on_unreadable_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--replay`` returns exit-code 1 with a clear message when the saved-config
+    file is unreadable (``OSError`` from ``load_app_config``).
+
+    Mirrors ``test_serve_live_returns_error_on_unreadable_config_file`` for the
+    replay path (claude-review low, PR #425).
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("advisor:\n  model_slug: openai/gpt-4o\n", encoding="utf-8")
+    cfg_path.chmod(0o000)
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--step", "--port", "0"],
+    )
+    try:
+        result = cli.main()
+    finally:
+        cfg_path.chmod(0o644)
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "unreadable" in out or "error" in out
+
+
 @pytest.mark.usefixtures("no_serve")
 def test_replay_passes_saved_config_to_create_replay_app(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

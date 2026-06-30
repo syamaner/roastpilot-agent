@@ -131,7 +131,7 @@ def test_write_saved_config_cleans_temp_on_failure(
     """_write_saved_config removes the temp file when os.replace raises.
 
     Simulates a disk/rename error after the temp file is written to verify
-    the cleanup path in the except BaseException block.
+    the cleanup path in the except BaseException block (tmp_path is not None).
     """
     import os as _os
 
@@ -155,6 +155,34 @@ def test_write_saved_config_cleans_temp_on_failure(
     # The temp file must have been cleaned up.
     leftover = list(tmp_path.glob(".config-tmp-*.yaml"))
     assert leftover == [], f"temp file not cleaned up after failure: {leftover}"
+
+
+def test_write_saved_config_cleans_nothing_when_tempfile_creation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_write_saved_config propagates the error when NamedTemporaryFile itself raises.
+
+    When NamedTemporaryFile raises (e.g. no space left, permissions), tmp_path
+    is still None and the except block takes the False branch — nothing to
+    clean up.  Verifies the if tmp_path is not None False branch (the branch
+    removed from # pragma: no branch by claude-review low, PR #425).
+    """
+    import tempfile as _tempfile
+
+    path = tmp_path / "config.yaml"
+
+    def _failing_ntf(**_kwargs: object) -> None:
+        raise OSError("simulated no space left on device")
+
+    monkeypatch.setattr(_tempfile, "NamedTemporaryFile", _failing_ntf)
+
+    with pytest.raises(OSError, match="simulated no space left"):
+        _write_saved_config(path, {"advisor": {"model_slug": "openai/gpt-4o"}})
+
+    # Nothing was written and no temp file was created.
+    assert not path.exists()
+    leftover = list(tmp_path.glob(".config-tmp-*.yaml"))
+    assert leftover == []
 
 
 def test_load_saved_config_rejects_non_mapping(tmp_path: Path) -> None:

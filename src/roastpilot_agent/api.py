@@ -2096,7 +2096,7 @@ async def get_config(request: Request) -> AppConfigSnapshot:
     try:
         effective, injected_keys = await asyncio.to_thread(load_app_config)
         saved_raw = await asyncio.to_thread(load_saved_raw)
-    except ConfigFileError as exc:
+    except (ConfigFileError, ValidationError, OSError) as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return build_config_snapshot(effective, saved_raw, injected_keys)
 

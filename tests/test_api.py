@@ -2883,6 +2883,29 @@ async def test_get_config_500_on_malformed_file(
 
 
 @pytest.mark.asyncio
+async def test_get_config_500_on_schema_invalid_file(
+    client: AsyncClient,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _isolated_roastpilot_env: None,
+) -> None:
+    """GET /api/config returns 500 when the saved-config is valid YAML but
+    violates the schema (``ValidationError`` from ``load_app_config``).
+
+    Mirrors ``test_get_config_500_on_malformed_file`` for the schema-invalid
+    case — both must produce a clean HTTPException(500), not a raw traceback
+    (claude-review low, PR #425).
+    """
+    cfg_path = tmp_path / "config.yaml"
+    # Valid YAML but advisor.timeout_seconds must be a float — a non-numeric
+    # string is a schema violation that raises ValidationError.
+    cfg_path.write_text("advisor:\n  timeout_seconds: 'not_a_number'\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+    response = await client.get("/api/config")
+    assert response.status_code == 500
+
+
+@pytest.mark.asyncio
 async def test_put_config_writes_and_returns_snapshot(
     client: AsyncClient,
     tmp_path: Path,

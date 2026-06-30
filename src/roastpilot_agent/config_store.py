@@ -440,7 +440,7 @@ def _write_saved_config(path: Path, data: _RawSavedConfig) -> None:
         # Atomic rename: readers never see a partial file.
         os.replace(tmp_path, path)
     except BaseException:
-        if tmp_path is not None:  # pragma: no branch
+        if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
         raise
 
