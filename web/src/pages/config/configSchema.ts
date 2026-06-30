@@ -146,6 +146,17 @@ export interface ConfigFieldDef {
 
   /** Category this field belongs to, used to group rows in the rail. */
   category: FieldCategory;
+
+  /**
+   * Conditional reveal: only render this field when another field in the form
+   * matches a given value. Used for dependent fields (e.g.
+   * auto_t0_drop_threshold_c only shown when auto_t0_detection_enabled = true).
+   *
+   * `key` is the FLAT form key of the controlling field (e.g.
+   * "mcp_device.auto_t0_detection_enabled"). The field is hidden — not
+   * rendered — when `values[key] !== equals`; its value stays in form state.
+   */
+  revealWhen?: { key: string; equals: unknown };
 }
 
 // ---------------------------------------------------------------------------
@@ -731,6 +742,9 @@ const FC_DETECTION_FIELDS: ConfigFieldDef[] = [
     editKey:        "auto_t0_drop_threshold_c",
     category:       "FC-Detection",
     readOnlyStatic: false,
+    // Only shown when auto-T0 detection is enabled — no point configuring the
+    // threshold when the detector is off.
+    revealWhen:     { key: "mcp_device.auto_t0_detection_enabled", equals: true },
   },
 ];
 

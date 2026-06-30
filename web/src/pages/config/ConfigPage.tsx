@@ -32,6 +32,7 @@ import { ConfigFieldRow } from "./ConfigFieldRow";
 import {
   buildEditFromDirty,
   buildValuesFromSnapshot,
+  valuesEqual,
   type ConfigValues,
 } from "./configState";
 
@@ -287,10 +288,13 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
   const saveConfig = useSaveConfig();
 
   // Dirty tracking per category + global count.
+  // Uses valuesEqual so array fields (recording_devices) don't produce false
+  // positives when a DeviceMultiSelect toggle creates a new array with the
+  // same contents.
   const dirtyKeys = useMemo(
     () =>
       Object.keys(state.values).filter(
-        (k) => state.values[k] !== state.saved[k],
+        (k) => !valuesEqual(state.values[k], state.saved[k]),
       ),
     [state.values, state.saved],
   );
@@ -357,7 +361,14 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
           </header>
 
           <div className="flex flex-col">
-            {activeCategory.fields.map((fieldDef, idx) => {
+            {activeCategory.fields
+              // Respect revealWhen — hide dependent fields whose controlling
+              // field doesn't match the required value.
+              .filter((fieldDef) =>
+                fieldDef.revealWhen === undefined ||
+                state.values[fieldDef.revealWhen.key] === fieldDef.revealWhen.equals,
+              )
+              .map((fieldDef, idx, visible) => {
               const meta =
                 fieldDef.key
                   .split(".")
@@ -397,7 +408,7 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
                   fieldDef={fieldDef}
                   meta={meta as unknown as import("@/lib/types").ConfigFieldMeta}
                   value={state.values[fieldDef.key] ?? null}
-                  isLast={idx === activeCategory.fields.length - 1}
+                  isLast={idx === visible.length - 1}
                   onChange={(v) =>
                     dispatch({ type: "SET_VALUE", key: fieldDef.key, value: v })
                   }

@@ -16,7 +16,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { AppConfigSnapshot, ConfigFieldMeta } from "@/lib/types";
-import { buildEditFromDirty, buildValuesFromSnapshot } from "./configState";
+import { buildEditFromDirty, buildValuesFromSnapshot, valuesEqual } from "./configState";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -213,5 +213,84 @@ describe("buildEditFromDirty — mcp_device section", () => {
     const edit = buildEditFromDirty(values, saved, snapshot);
     // Should not include recording_enabled because the server says read_only.
     expect(edit.mcp_device).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — valuesEqual
+// ---------------------------------------------------------------------------
+
+describe("valuesEqual", () => {
+  it("returns true for identical scalars (===)", () => {
+    expect(valuesEqual(42, 42)).toBe(true);
+    expect(valuesEqual("USB PnP", "USB PnP")).toBe(true);
+    expect(valuesEqual(null, null)).toBe(true);
+    expect(valuesEqual(true, true)).toBe(true);
+  });
+
+  it("returns false for different scalars", () => {
+    expect(valuesEqual(42, 43)).toBe(false);
+    expect(valuesEqual("USB PnP", "Built-in Mic")).toBe(false);
+    expect(valuesEqual(null, "USB PnP")).toBe(false);
+    expect(valuesEqual(true, false)).toBe(false);
+  });
+
+  it("returns true for two arrays with identical element-wise content", () => {
+    expect(valuesEqual(["USB PnP"], ["USB PnP"])).toBe(true);
+    expect(valuesEqual(["USB PnP", "ATR2100"], ["USB PnP", "ATR2100"])).toBe(true);
+    expect(valuesEqual([], [])).toBe(true);
+  });
+
+  it("returns false for arrays with different content", () => {
+    expect(valuesEqual(["USB PnP"], ["ATR2100"])).toBe(false);
+    expect(valuesEqual(["USB PnP", "ATR2100"], ["USB PnP"])).toBe(false);
+    expect(valuesEqual([], ["USB PnP"])).toBe(false);
+  });
+
+  it("returns false for arrays with the same elements in different order", () => {
+    // Element-wise means order matters.
+    expect(valuesEqual(["A", "B"], ["B", "A"])).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — recording_devices array reference-equality in buildEditFromDirty
+// ---------------------------------------------------------------------------
+
+describe("buildEditFromDirty — recording_devices array equality", () => {
+  it("does NOT include recording_devices when saved and current have same content (new array reference)", () => {
+    // This guards the reference-equality false-positive: React state toggles
+    // produce a new array reference even when content is unchanged.
+    const snapshot = makeSnapshot({ recording_devices: ["USB PnP"] });
+    const saved = buildValuesFromSnapshot(snapshot);
+    // Simulate React state creating a new array with the same content.
+    const values = { ...saved, "mcp_device.recording_devices": ["USB PnP"] };
+
+    const edit = buildEditFromDirty(values, saved, snapshot);
+    // Not dirty (same content) → mcp_device section must be absent.
+    expect(edit.mcp_device).toBeUndefined();
+  });
+
+  it("DOES include recording_devices when content actually differs", () => {
+    const snapshot = makeSnapshot({ recording_devices: ["USB PnP"] });
+    const saved = buildValuesFromSnapshot(snapshot);
+    const values = {
+      ...saved,
+      "mcp_device.recording_devices": ["USB PnP", "ATR2100"],
+    };
+
+    const edit = buildEditFromDirty(values, saved, snapshot);
+    expect((edit.mcp_device as Record<string, unknown>)?.recording_devices)
+      .toEqual(["USB PnP", "ATR2100"]);
+  });
+
+  it("includes recording_devices when toggling from null to an array", () => {
+    const snapshot = makeSnapshot({ recording_devices: null });
+    const saved = buildValuesFromSnapshot(snapshot);
+    const values = { ...saved, "mcp_device.recording_devices": ["USB PnP"] };
+
+    const edit = buildEditFromDirty(values, saved, snapshot);
+    expect((edit.mcp_device as Record<string, unknown>)?.recording_devices)
+      .toEqual(["USB PnP"]);
   });
 });

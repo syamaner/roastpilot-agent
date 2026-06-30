@@ -1,5 +1,5 @@
 /**
- * Config save-model helpers (#419, PR2).
+ * Config save-model helpers (#419, PR2 + PR3).
  *
  * Pure functions — no React, no side effects. Consumed by ConfigPage's
  * useReducer and by the PUT body builder.
@@ -8,6 +8,10 @@
  * (D78 decision 2 + the server enforces this via AppConfigEdit which has no
  * safety key). The `buildEditFromDirty` function enforces this on the FE side
  * too: it skips any field with `editKey: null` (read-only or safety).
+ *
+ * Array values (recording_devices) require element-wise equality rather than
+ * reference equality. `valuesEqual` centralises this so dirty detection is
+ * consistent across buildEditFromDirty, the save-bar count, and dirty-dot logic.
  */
 
 import type { AppConfigSnapshot, ConfigFieldMeta } from "@/lib/types";
@@ -51,6 +55,27 @@ export function resolveFieldMeta(
   const sectionObj = (snapshot as unknown as Record<string, Section>)[section!];
   if (!sectionObj) return null;
   return sectionObj[fieldName] ?? null;
+}
+
+/**
+ * Deep-equality for config values.
+ *
+ * String arrays (recording_devices) are equal when they have the same length
+ * and identical element-wise content. All other values fall back to `===`.
+ *
+ * This is intentionally narrow — the config schema only produces scalars and
+ * string arrays; we don't need a generic deep-equal.
+ */
+export function valuesEqual(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 // Segments that could mutate Object.prototype — never present in our hardcoded
@@ -122,7 +147,7 @@ export function buildEditFromDirty(
   const mcp_device: Record<string, unknown> = {};
 
   for (const [key, current] of Object.entries(values)) {
-    if (current === saved[key]) continue;          // not dirty
+    if (valuesEqual(current, saved[key])) continue;  // not dirty (array-aware)
     const def = CONFIG_FIELD_MAP[key];
     if (!def || def.editKey === null) continue;    // read-only or safety — never send
     const meta = resolveFieldMeta(snapshot, key);
