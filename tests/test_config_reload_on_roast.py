@@ -93,7 +93,7 @@ async def test_saved_advisor_model_reflected_in_next_roast_service_config(
     the new value.  Verifies the D78 apply-next-roast guarantee for the advisor
     config path.
     """
-    svc = RoastService(store, advisor_from_config=True, config_from_env=True)
+    svc = RoastService(store, live_serve_mode=True)
     initial_model = svc._config.advisor.model_slug  # pyright: ignore[reportPrivateUsage]
 
     # Persist a change to the advisor model slug via the same write path as PUT /api/config.
@@ -120,7 +120,7 @@ async def test_saved_controller_field_reflected_in_next_roast_service_config(
     heat/fan targets, etc.) that the operator may tune between roasts via
     PUT /api/config.
     """
-    svc = RoastService(store, advisor_from_config=True, config_from_env=True)
+    svc = RoastService(store, live_serve_mode=True)
     default_heat = svc._config.controller.pre_first_crack_levers.heat_target_percent  # pyright: ignore[reportPrivateUsage]
 
     # Write a non-default pre-FC heat target (must differ from the default of 100).
@@ -155,7 +155,7 @@ async def test_second_roast_picks_up_second_save(
     """
     from roastpilot_agent.models import RoastPhase
 
-    svc = RoastService(store, advisor_from_config=True, config_from_env=True)
+    svc = RoastService(store, live_serve_mode=True)
 
     # First roast with first saved model.
     persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4o-mini")))
@@ -215,7 +215,7 @@ async def test_safety_limits_unaffected_by_saved_config(
         encoding="utf-8",
     )
 
-    svc = RoastService(store, advisor_from_config=True, config_from_env=True)
+    svc = RoastService(store, live_serve_mode=True)
     default_max_bean = svc._config.safety.max_bean_temp_c  # pyright: ignore[reportPrivateUsage]
 
     await svc.start_roast(RoastProfile(**_profile()))
@@ -239,7 +239,7 @@ async def test_safety_policy_rebuilt_from_reloaded_config(
     object reference must be fresh so it pairs with the new config instance.
     """
 
-    svc = RoastService(store, advisor_from_config=True, config_from_env=True)
+    svc = RoastService(store, live_serve_mode=True)
     original_safety = svc._safety  # pyright: ignore[reportPrivateUsage]
 
     # Write a benign (non-safety) saved change to trigger a meaningful reload.
@@ -274,7 +274,7 @@ async def test_config_not_reloaded_while_roast_active(
     """
     from roastpilot_agent.api import RoastRunConflictError
 
-    svc = RoastService(store, advisor_from_config=True, config_from_env=True)
+    svc = RoastService(store, live_serve_mode=True)
 
     persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4o-mini")))
     await svc.start_roast(RoastProfile(**_profile()))
@@ -302,7 +302,7 @@ async def test_http_start_roast_with_save_applies_next_roast(
     Uses the full HTTP stack (test client) to verify the apply-next-roast
     behaviour is visible at the API boundary, not just at the service layer.
     """
-    svc = RoastService(store, advisor_from_config=True, config_from_env=True)
+    svc = RoastService(store, live_serve_mode=True)
     app = create_app(svc)
     transport = ASGITransport(app=app)
 
@@ -318,3 +318,52 @@ async def test_http_start_roast_with_save_applies_next_roast(
 
     # Verify via the service object (not just HTTP status).
     assert svc._config.advisor.model_slug == "openai/gpt-4-turbo"  # pyright: ignore[reportPrivateUsage]
+
+
+# ---------------------------------------------------------------------------
+# Gate: live_serve_mode=False (default) never reloads
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_default_service_does_not_reload_on_start_roast(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A default RoastService (live_serve_mode=False) does not reload on start_roast.
+
+    Verifies that the reload path is gated correctly: a caller that does not
+    pass ``live_serve_mode=True`` keeps its injected config/advisor untouched
+    even when a saved config file with a different value is present.  Guards the
+    gate against regression — if the guard is accidentally removed, a test
+    double's injected config would be silently replaced.
+    """
+    from roastpilot_agent.config import AdvisorConfig, AppConfig
+
+    # Wire an explicit config with a distinctive model slug — this simulates a
+    # test double or replay caller injecting its own config.
+    sentinel_slug = "sentinel/injected-model"
+    injected_config = AppConfig(advisor=AdvisorConfig(model_slug=sentinel_slug))
+
+    # Write a saved config file with a different slug that would be picked up
+    # by reload if the gate were missing.
+    import yaml
+
+    config_file = tmp_path / "roastpilot-config.yaml"
+    config_file.write_text(
+        yaml.safe_dump({"advisor": {"model_slug": "openai/should-not-appear"}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(config_file))
+
+    db = RoastStore(tmp_path / "test.db")
+    await db.initialize()
+    try:
+        # live_serve_mode defaults to False — reload must be skipped.
+        svc = RoastService(db, config=injected_config)
+        await svc.start_roast(RoastProfile(**_profile()))
+
+        # The injected sentinel slug must be unchanged.
+        assert svc._config.advisor.model_slug == sentinel_slug  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await db.close()

@@ -1203,8 +1203,7 @@ class RoastService:
         sse_heartbeat_seconds: float = 15.0,
         roaster: RoasterControl | None = None,
         advisor: RoastAdvisor | None = None,
-        advisor_from_config: bool = False,
-        config_from_env: bool = False,
+        live_serve_mode: bool = False,
         exporter: LogExporter | None = None,
         raw_state: RawStateSource | None = None,
         run_loop: bool = True,
@@ -1218,12 +1217,14 @@ class RoastService:
         #: ``starting`` row but no controller loop drives them.
         self._roaster = roaster
         self._advisor = advisor
-        # True when both the config AND the advisor were produced by the live serve
-        # path (``build_live_service``), meaning both should be refreshed from the
-        # reloaded config at each ``start_roast`` (D78 apply-next-roast guarantee).
-        # False (default) when the caller injected explicit values (test doubles,
-        # replay's custom config + no-advisor None) — never replace them on reload.
-        self._live_serve_mode = advisor_from_config and config_from_env
+        # True only when set by ``build_live_service`` in ``live.py``, meaning both
+        # the config and the advisor were produced by the live-serve path and should
+        # be refreshed from the reloaded config at each ``start_roast`` (D78
+        # apply-next-roast guarantee).  False (default) when the caller injected
+        # explicit values — test doubles, replay's custom config + no-advisor None —
+        # which must never be replaced on reload.  A single boolean avoids the
+        # partial-set footgun of two separate flags (setting one without the other).
+        self._live_serve_mode = live_serve_mode
         #: The most recent advisor reachability probe (issue #168), set at
         #: ``serve`` startup via :meth:`set_advisor_health` and surfaced on
         #: ``GET /api/health`` so the dashboard can render an ADVISOR-OFFLINE
@@ -1372,8 +1373,12 @@ class RoastService:
                 # Rebuild the advisor from the fresh config so model/prompt changes
                 # apply next-roast (D78).  build_advisor handles a missing API key
                 # gracefully (logs a warning, returns None → advisory-paused).
-                # Import lazily: live.py imports RoastService from api.py.
-                from roastpilot_agent.live import build_advisor  # lazy: live.py imports api
+                # Imported lazily to break the circular dependency: live.py imports
+                # RoastService from api.py at module level, so a top-level import of
+                # build_advisor here would form a cycle (api → live → api).
+                from roastpilot_agent.live import (
+                    build_advisor,  # noqa: PLC0415 (deliberate lazy import — circular dependency)
+                )
 
                 fresh_advisor = build_advisor(fresh_config)
                 # Commit all three atomically so the trio is always consistent
