@@ -198,6 +198,10 @@ async def build_live_service(
         mcp=mcp,
         roaster=adapter,
         advisor=advisor,
+        # Enable config+advisor reload at each start_roast (D78).  Only the live
+        # serve path sets this — test doubles and replay inject explicit values
+        # that must not be replaced on reload.
+        live_serve_mode=True,
         exporter=adapter,
         raw_state=adapter,
     )
