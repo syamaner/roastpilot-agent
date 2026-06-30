@@ -308,6 +308,17 @@ does not disrupt it (the dashboard re-hydrates from `/telemetry` + SSE). A new
 `/__home-harness` snapshot route + `home.spec.ts` add the `home` baseline (CI-Docker
 owned via `web-snapshots-update.yml`).
 
+Post-E10 routing follow-up (not an E10 story): **#403 — stable reload-safe `/live`
+route** (operator, 28 Jun; surfaced mid-roast-7 when an accidental browser refresh
+dropped the live view). Before this, reloading `/` showed the home page rather than
+the running roast. This PR adds a dedicated `/live` route (`LivePage`) that is always
+reload-safe — refreshing it re-renders the current live roast (active run → dashboard)
+or the start-roast / profile-selection view (no run → ready to begin). The `NavBar`'s
+"Live roast" link now points to `/live` rather than `/`, so the active-link highlight
+is unambiguous between the home hub and the live roast. `StartRoastView` and
+`LivePage`'s inline start view both navigate to `/live` after a successful start (not
+`/`). A `/config` route placeholder is added for the upcoming Config FE (#419 S2).
+
 ### E10 follow-ups — closed (15–16 Jun 2026)
 
 The S1–S6 review-deferred follow-ups and contract/observability fast-follows are

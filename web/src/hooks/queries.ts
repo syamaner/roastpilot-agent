@@ -24,6 +24,11 @@ export const roastKeys = {
     ["roasts", runId, "telemetry", downsample] as const,
 };
 
+/** Query keys for the config surface (#419, D78). */
+export const configKeys = {
+  snapshot: ["config"] as const,
+};
+
 /** Query keys for the bean-profile library (#303). */
 export const beanProfileKeys = {
   all: ["bean-profiles"] as const,
@@ -99,5 +104,34 @@ export function useDeleteBeanProfile() {
     mutationFn: (id: string) => api.deleteBeanProfile(id),
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: beanProfileKeys.all }),
+  });
+}
+
+// --- Config (#419, D78) ---
+
+/**
+ * GET /api/config — the full config snapshot with per-field metadata.
+ * Stale time: 30 s (config changes only on PUT; no background polling needed).
+ */
+export function useConfig() {
+  return useQuery({
+    queryKey: configKeys.snapshot,
+    queryFn: api.config,
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * PUT /api/config — persist a partial edit (controller + advisor only).
+ * On success the cache is updated to the server's response (the authoritative
+ * effective snapshot post-save), so the UI immediately reflects saved values
+ * without a second GET.
+ */
+export function useSaveConfig() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (edit: Record<string, unknown>) => api.saveConfig(edit),
+    onSuccess: (snapshot) =>
+      queryClient.setQueryData(configKeys.snapshot, snapshot),
   });
 }

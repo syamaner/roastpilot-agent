@@ -7,6 +7,7 @@
  */
 
 import type {
+  AppConfigSnapshot,
   BeanProfile,
   BeanProfileDeleteResult,
   BeanProfileInput,
@@ -149,5 +150,21 @@ export const api = {
   deleteBeanProfile: (id: string) =>
     request<BeanProfileDeleteResult>(`/api/bean-profiles/${id}`, {
       method: "DELETE",
+    }),
+
+  // --- Config (#419, D78) ---
+
+  /** `GET /api/config` — full config snapshot with per-field metadata. */
+  config: () => request<AppConfigSnapshot>("/api/config"),
+
+  /**
+   * `PUT /api/config` — partial update (controller + advisor only; safety is
+   * read-only). The body is a partial nested object matching `AppConfigEdit`
+   * on the server. Returns the updated `AppConfigSnapshot`.
+   */
+  saveConfig: (edit: Record<string, unknown>) =>
+    request<AppConfigSnapshot>("/api/config", {
+      method: "PUT",
+      body: JSON.stringify(edit),
     }),
 };

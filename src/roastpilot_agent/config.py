@@ -7,6 +7,7 @@ deliberately conservative software ceilings pending supervised hardware
 validation at E12 (E12-S1).
 """
 
+from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -815,6 +816,69 @@ class SafetyLimits(BaseModel):
         return self
 
 
+class MCPDeviceConfig(BaseModel):
+    """Device-level MCP child configuration managed by the Config UI (D78-4, #420).
+
+    These fields are rendered into the ``coffee-roaster-mcp.yaml`` via a
+    passthrough-merge on every (re)spawn (see
+    :mod:`roastpilot_agent.mcp_yaml`).  Only non-``None`` fields are written
+    — a ``None`` value means "keep whatever the operator's hand-authored yaml
+    says" so that unmanaged tuning (pinned model revision, Mac ``onnx_threads``,
+    Pi-vs-Mac profile) survives a render unchanged.
+
+    Temperature values are Celsius everywhere; the MCP child's
+    ``temperature_unit`` setting is not managed here (it is fixed
+    per-installation in the hand-authored yaml).
+
+    Attributes:
+        serial_port: The serial port device path for the Hottop roaster
+            (e.g. ``/dev/cu.usbserial-XXXXXXXX`` on macOS,
+            ``/dev/ttyUSB0`` on Linux). Maps to ``roaster.port`` in the
+            MCP yaml.
+        roaster_driver: The coffee-roaster-mcp driver name
+            (e.g. ``hottop_kn8828b_2k_plus`` or ``mock``). Maps to
+            ``roaster.driver`` in the MCP yaml.
+        audio_input_device: PortAudio input device name substring (matched
+            case-insensitively; e.g. ``"USB PnP"``). Maps to
+            ``audio.input_device`` in the MCP yaml.
+        recording_enabled: Whether the MCP audio recorder is active.  Maps
+            to ``recording.enabled``.
+        recording_autocapture: Whether recording starts automatically with
+            each roast session.  Maps to ``recording.autocapture``.
+        recording_devices: Optional ordered list of capture device-name
+            substrings.  The first entry is the FC detector's device (teed,
+            no second open); additional entries are independent capture
+            streams.  Maps to ``recording.devices`` in the MCP yaml.
+        fc_mode: First-crack detection mode: ``"disabled"``, ``"audio"``,
+            or ``"manual"``.  Maps to ``first_crack.mode``.
+        fc_confidence_threshold: Detector confidence threshold in ``[0, 1]``.
+            Maps to ``first_crack.confidence_threshold``.
+        auto_t0_detection_enabled: Whether the MCP's automatic charge-drop
+            (T0) detection is active.  Maps to
+            ``session.auto_t0_detection_enabled``.
+        auto_t0_drop_threshold_c: The bean-temperature drop (°C) that
+            triggers automatic T0 detection.  Maps to
+            ``session.auto_t0_drop_threshold_c``.
+        mcp_yaml_source_path: Path to the operator's hand-authored
+            ``coffee-roaster-mcp.yaml``.  When set, the passthrough-merge
+            reads this file as the base before overlaying the managed fields.
+            When ``None``, only the managed fields are written (the MCP child
+            fills the rest from its own defaults).
+    """
+
+    serial_port: str | None = None
+    roaster_driver: str | None = None
+    audio_input_device: str | None = None
+    recording_enabled: bool | None = None
+    recording_autocapture: bool | None = None
+    recording_devices: tuple[str, ...] | None = None
+    fc_mode: Literal["disabled", "audio", "manual"] | None = None
+    fc_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    auto_t0_detection_enabled: bool | None = None
+    auto_t0_drop_threshold_c: float | None = Field(default=None, gt=0)
+    mcp_yaml_source_path: Path | None = None
+
+
 #: The bare console-script name of the coffee-roaster-mcp child (the default
 #: ``MCPConfig.command``). It is a *constant*, not just a Field default, so the
 #: spawn-hardening in ``mcp_client.build_server_parameters`` can recognise the
@@ -935,4 +999,5 @@ class AppConfig(BaseSettings):
     advisor: AdvisorConfig = Field(default_factory=AdvisorConfig)
     safety: SafetyLimits = Field(default_factory=SafetyLimits)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
+    mcp_device: MCPDeviceConfig = Field(default_factory=MCPDeviceConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)

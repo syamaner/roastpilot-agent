@@ -29,7 +29,7 @@ from typing import Annotated, Any, Literal, Protocol, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import (
@@ -39,6 +39,15 @@ from roastpilot_agent.advisor import (
     RoastDecision,
 )
 from roastpilot_agent.config import AppConfig
+from roastpilot_agent.config_store import (
+    AppConfigEdit,
+    AppConfigSnapshot,
+    ConfigFileError,
+    build_config_snapshot,
+    load_app_config,
+    load_saved_raw,
+    persist_config_edit,
+)
 from roastpilot_agent.controller import (
     TRANSITION_TABLE,
     CommandExecutor,
@@ -1194,6 +1203,7 @@ class RoastService:
         sse_heartbeat_seconds: float = 15.0,
         roaster: RoasterControl | None = None,
         advisor: RoastAdvisor | None = None,
+        live_serve_mode: bool = False,
         exporter: LogExporter | None = None,
         raw_state: RawStateSource | None = None,
         run_loop: bool = True,
@@ -1207,6 +1217,14 @@ class RoastService:
         #: ``starting`` row but no controller loop drives them.
         self._roaster = roaster
         self._advisor = advisor
+        # True only when set by ``build_live_service`` in ``live.py``, meaning both
+        # the config and the advisor were produced by the live-serve path and should
+        # be refreshed from the reloaded config at each ``start_roast`` (D78
+        # apply-next-roast guarantee).  False (default) when the caller injected
+        # explicit values — test doubles, replay's custom config + no-advisor None —
+        # which must never be replaced on reload.  A single boolean avoids the
+        # partial-set footgun of two separate flags (setting one without the other).
+        self._live_serve_mode = live_serve_mode
         #: The most recent advisor reachability probe (issue #168), set at
         #: ``serve`` startup via :meth:`set_advisor_health` and surfaced on
         #: ``GET /api/health`` so the dashboard can render an ADVISOR-OFFLINE
@@ -1297,7 +1315,21 @@ class RoastService:
         )
 
     async def start_roast(self, profile: RoastProfile) -> RoastDetail:
-        """Start a roast: persist the run record, claim it as active (plan §6).
+        """Start a roast: reload saved config, persist the run record, claim it as active.
+
+        **Config reload (D76/D78 apply-next-roast guarantee):** the saved config
+        is re-read from disk at the start of every roast so that a ``PUT
+        /api/config`` made between roasts (to a pre-FC heat/fan target, the
+        advisor model, or a device setting) drives the *next* roast without
+        requiring an agent restart.  The reload happens inside ``_start_lock``
+        and only when no run is active, so a running roast's config is never
+        mutated mid-loop.
+
+        Safety limits are **env-resolved** by :func:`load_app_config` — the
+        :func:`~roastpilot_agent.config_store._inject_saved_as_env` injector
+        skips the ``ROASTPILOT_SAFETY__`` prefix unconditionally, so no saved
+        config file can change a safety limit.  The :class:`SafetyPolicy` is
+        always rebuilt from the reloaded (env-wins) :class:`AppConfig`.
 
         Returns 409 (``RoastRunConflictError``) when a run is already active —
         the API-level guard the controller's idle-only ``start_run`` transition
@@ -1313,6 +1345,48 @@ class RoastService:
                     f"a roast is already active (run {active.run_id}, phase "
                     f"{active.agent_phase.value}); end it before starting another"
                 )
+            # Reload effective config from the saved file + env (D76/D78).
+            # Only in live-serve mode (``_live_serve_mode=True``, set by
+            # ``build_live_service`` in live.py): both the config and the advisor
+            # were produced from ``load_app_config`` / ``build_advisor`` at startup
+            # and should be refreshed from the saved file + env at each roast start
+            # so a PUT /api/config made between roasts takes effect without a
+            # restart.
+            #
+            # Skipped for test doubles, API-only mode, and the replay harness,
+            # where the caller passed explicit values that must not be replaced.
+            if self._live_serve_mode:
+                # Run in a thread: load_app_config does sync file I/O + env
+                # snapshot/restore under _ENV_INJECTION_LOCK.  Drop the
+                # injected_keys return value (only needed by build_config_snapshot
+                # for the env-badge UI).
+                fresh_config, _ = await asyncio.to_thread(load_app_config)
+                _log.debug(
+                    "start_roast: reloaded config (advisor_model_slug=%r)",
+                    fresh_config.advisor.model_slug,
+                )
+                # Safety is always env-resolved; rebuild so self._safety matches
+                # self._config (the file injector skips ROASTPILOT_SAFETY__ so the
+                # SafetyLimits field values are identical to the startup values,
+                # but rebuilding keeps the pairing explicit and invariant-safe).
+                fresh_safety = SafetyPolicy(fresh_config.safety)
+                # Rebuild the advisor from the fresh config so model/prompt changes
+                # apply next-roast (D78).  build_advisor handles a missing API key
+                # gracefully (logs a warning, returns None → advisory-paused).
+                # Imported lazily to break the circular dependency: live.py imports
+                # RoastService from api.py at module level, so a top-level import of
+                # build_advisor here would form a cycle (api → live → api).
+                from roastpilot_agent.live import (
+                    build_advisor,  # noqa: PLC0415 (deliberate lazy import — circular dependency)
+                )
+
+                fresh_advisor = build_advisor(fresh_config)
+                # Commit all three atomically so the trio is always consistent
+                # (guards against a future raising build_advisor leaving _config
+                # ahead of _advisor).
+                self._config = fresh_config
+                self._safety = fresh_safety
+                self._advisor = fresh_advisor
             run_id = uuid.uuid4().hex
             await self._store.create_run(
                 run_id=run_id,
@@ -2063,6 +2137,249 @@ async def delete_bean_profile(profile_id: str, service: ServiceDep) -> dict[str,
     return {"id": profile_id, "result": "archived"}
 
 
+CONFIG_PATH = "/api/config"
+
+
+async def get_config(request: Request) -> AppConfigSnapshot:
+    """``GET /api/config`` — per-field config snapshot (D78, #418).
+
+    Returns the full :class:`~roastpilot_agent.config_store.AppConfigSnapshot`
+    for the Config UI: each managed field carries its saved value, effective
+    value, schema default, ``env_overridden`` flag, and ``read_only`` flag.
+
+    The effective config is read fresh from disk and env on every request so
+    the UI reflects the current operator state.  The live :class:`RoastService`
+    holds a snapshot baked at startup; this route reflects *current* env and
+    file state, which may differ during a live roast if the operator has edited
+    the file without restarting.
+
+    A malformed saved-config file returns 500 — the operator must fix the YAML
+    before the Config UI can render.
+    """
+    # load_app_config and load_saved_raw do sync file I/O; run in a thread
+    # to avoid blocking the async event loop on disk reads.
+    try:
+        effective, injected_keys = await asyncio.to_thread(load_app_config)
+        saved_raw = await asyncio.to_thread(load_saved_raw)
+    except (ConfigFileError, ValidationError, OSError) as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return build_config_snapshot(effective, saved_raw, injected_keys)
+
+
+async def put_config(edit: AppConfigEdit, request: Request) -> AppConfigSnapshot:
+    """``PUT /api/config`` — write editable managed fields (D78, #418).
+
+    Accepts an :class:`~roastpilot_agent.config_store.AppConfigEdit` body
+    (controller + advisor only; safety is excluded by the type), merges it into
+    the saved-config file, and returns the updated
+    :class:`~roastpilot_agent.config_store.AppConfigSnapshot`.
+
+    Out-of-range field values are rejected by Pydantic field validators on the
+    *edit* body (FastAPI returns 422 automatically).  Schema violations caught
+    only after merging (cross-field constraints) raise 422 from
+    ``pydantic.ValidationError``; a malformed existing file raises 500.
+
+    The change takes effect for the *next* roast — the running agent's in-memory
+    config is not patched.  The FE should note this in the UI (plan §D78).
+    """
+    # persist_config_edit does sync file I/O (read + lock + write); run it in
+    # a thread so the async event loop is not blocked during the write.
+    try:
+        await asyncio.to_thread(persist_config_edit, edit)
+    except ValidationError as exc:
+        # Cross-field constraints (e.g. min_trim > max_trim) are only caught
+        # after merging the edit with the existing saved config.  Map to 422
+        # so the client knows to fix the request body, not retry unchanged.
+        # Use str() rather than exc.errors(): the pydantic v2 error ctx dict can
+        # include non-JSON-serialisable objects (e.g. ValueError instances from
+        # model validators), so .errors() may raise TypeError during serialisation.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ConfigFileError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    # Re-read effective config + saved raw after write so the response reflects
+    # the just-written state, not a stale snapshot.  load_app_config also does
+    # file I/O (saved-config read + env injection); run it in a thread too.
+    try:
+        effective, injected_keys = await asyncio.to_thread(load_app_config)
+        saved_raw = await asyncio.to_thread(load_saved_raw)
+    except ConfigFileError as exc:  # pragma: no cover — written successfully one line above
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return build_config_snapshot(effective, saved_raw, injected_keys)
+
+
+# ---------------------------------------------------------------------------
+# Device enumeration — GET /api/config/devices (D78 PR(c), #418)
+# ---------------------------------------------------------------------------
+
+
+class DeviceOption(BaseModel):
+    """One enumerated device entry returned by ``GET /api/config/devices``.
+
+    Attributes:
+        value: The machine-readable identifier to store in the config (e.g.
+            a serial port path such as ``/dev/tty.usbmodem14101``, or an
+            integer sounddevice index cast to ``str``).
+        label: Human-readable display name for the Config UI dropdown.
+        note: Extra detail shown as secondary text (port description / HW id
+            for serial; channel count + sample rate for audio input).
+    """
+
+    value: str
+    label: str
+    note: str
+
+
+class DevicesSnapshot(BaseModel):
+    """Response body for ``GET /api/config/devices`` (D78 PR(c), #418).
+
+    Each source (serial / audio_input) is enumerated independently so a
+    failure in one source (e.g. PortAudio unavailable) never prevents the
+    other from returning results.
+
+    Attributes:
+        serial: Enumerated serial port devices, ordered by port path.
+        serial_error: Non-``None`` when serial enumeration failed; the value
+            is the exception message for operator diagnostics.
+        audio_input: Enumerated audio input devices, ordered by device index.
+        audio_input_error: Non-``None`` when audio enumeration failed; the
+            value is the exception message for operator diagnostics.
+    """
+
+    serial: list[DeviceOption]
+    serial_error: str | None
+    audio_input: list[DeviceOption]
+    audio_input_error: str | None
+
+
+def _enumerate_serial() -> tuple[list[DeviceOption], str | None]:
+    """List available serial ports via pyserial (blocking, run in a thread).
+
+    Device enumeration is a between-roasts action. Calling this during an
+    active MCP session is safe — ``comports()`` only reads the OS port list
+    and does not open any port.
+
+    The import of ``serial.tools.list_ports`` is deferred to this function so
+    that a missing or unimportable pyserial wheel never crashes server startup
+    — the error is returned as ``serial_error`` instead.
+
+    Returns:
+        A 2-tuple of ``(devices, error)``.  ``devices`` is empty on failure;
+        ``error`` is ``None`` on success or the exception message on failure.
+    """
+    try:
+        import serial.tools.list_ports as _lp  # noqa: PLC0415
+
+        ports = _lp.comports()
+        return (
+            [
+                DeviceOption(
+                    value=p.device,
+                    label=p.device,
+                    note=p.description or p.hwid or "",
+                )
+                for p in sorted(ports, key=lambda p: p.device)
+            ],
+            None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("Serial port enumeration failed: %s", exc)
+        return [], str(exc)
+
+
+def _enumerate_audio_inputs() -> tuple[list[DeviceOption], str | None]:
+    """List audio input devices via sounddevice (blocking, run in a thread).
+
+    Filters to devices with at least one input channel. The call only queries
+    PortAudio device metadata — no audio stream is opened. Device enumeration
+    is intended as a between-roasts action; calling it while the MCP child
+    holds an open audio stream is safe (PortAudio supports concurrent device
+    queries), but the operator should not reconfigure audio mid-capture.
+
+    The import of ``sounddevice`` is deferred to this function so that a
+    missing native PortAudio library (common in headless / CI environments)
+    never crashes server startup — the ``ImportError`` is caught by the broad
+    ``except`` and returned as ``audio_input_error`` instead.
+
+    Returns:
+        A 2-tuple of ``(devices, error)``.  ``devices`` is empty on failure;
+        ``error`` is ``None`` on success or the exception message on failure.
+    """
+    try:
+        import sounddevice as _sd  # type: ignore[import-untyped]  # noqa: PLC0415
+
+        raw: object = _sd.query_devices()  # type: ignore[reportUnknownMemberType]
+        # query_devices() returns a DeviceList (iterable of dicts) when called
+        # with no arguments.  Explicitly cast to list[dict[str, object]] for
+        # pyright; the runtime type is sounddevice.DeviceList which iterates
+        # as dicts.
+        all_devices: list[dict[str, object]] = list(raw)  # type: ignore[arg-type]
+        options: list[DeviceOption] = []
+        for idx, dev in enumerate(all_devices):
+            max_in = dev.get("max_input_channels", 0)
+            if not isinstance(max_in, int) or max_in <= 0:
+                continue
+            name = str(dev.get("name", f"Device {idx}"))
+            rate = dev.get("default_samplerate", 0)
+            rate_str = f"{int(rate):,}" if isinstance(rate, (int, float)) else "?"
+            options.append(
+                DeviceOption(
+                    value=str(idx),
+                    label=name,
+                    note=f"Input · {max_in} ch · {rate_str} Hz",
+                )
+            )
+        return options, None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("Audio input enumeration failed: %s", exc)
+        return [], str(exc)
+
+
+DEVICES_PATH = "/api/config/devices"
+
+
+async def get_devices(request: Request) -> DevicesSnapshot:
+    """``GET /api/config/devices`` — read-only device enumeration (D78 PR(c), #418).
+
+    Returns the available serial ports and audio input devices so the Config
+    UI can populate its device-selection dropdowns.  Each source is wrapped in
+    its own try/except so a PortAudio failure (common in headless CI) never
+    prevents serial ports from being returned, and vice versa.
+
+    This is a **read-only** endpoint — it opens no ports and starts no streams.
+    It is intended for use **between roasts**.  Calling it during an active
+    MCP capture session is safe (``comports()`` and ``query_devices()`` are
+    non-destructive read-only queries), but device lists may be stale if the
+    OS enumerates hardware asynchronously after the call returns.
+
+    Both enumeration calls are blocking (native OS / PortAudio calls) and are
+    dispatched to a thread via ``asyncio.to_thread`` to avoid blocking the
+    async event loop.
+
+    Args:
+        request: Injected by FastAPI; unused but required for the route
+            decorator signature.
+
+    Returns:
+        A :class:`DevicesSnapshot` with per-source device lists and error
+        strings.  The response is always 200 — errors are surfaced in the
+        ``*_error`` fields rather than as HTTP error codes.
+    """
+    del request  # unused
+    # Both enumerations are blocking (native OS / PortAudio calls with no
+    # ordering dependency) — run them in parallel via asyncio.gather so the
+    # combined latency is max(serial, audio) rather than serial + audio.
+    (serial_devices, serial_error), (audio_devices, audio_error) = await asyncio.gather(
+        asyncio.to_thread(_enumerate_serial),
+        asyncio.to_thread(_enumerate_audio_inputs),
+    )
+    return DevicesSnapshot(
+        serial=serial_devices,
+        serial_error=serial_error,
+        audio_input=audio_devices,
+        audio_input_error=audio_error,
+    )
+
+
 def _parse_last_event_id(raw: str | None) -> int | None:
     """Parse the SSE ``Last-Event-ID`` header into a sequence int (#339).
 
@@ -2206,6 +2523,9 @@ def create_app(
     )
     app.state.service = service
     app.get(HEALTH_PATH)(health)
+    app.get(CONFIG_PATH)(get_config)
+    app.put(CONFIG_PATH)(put_config)
+    app.get(DEVICES_PATH)(get_devices)
     app.post("/api/roasts", status_code=201)(start_roast)
     app.get("/api/roasts")(list_roasts)
     app.get("/api/roasts/{run_id}")(get_roast)

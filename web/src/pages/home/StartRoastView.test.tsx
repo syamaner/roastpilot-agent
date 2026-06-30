@@ -1,7 +1,8 @@
 /**
- * Start-roast route (#324): renders the reused Start form, and a successful start
- * POSTs then navigates to `/` (where HomeGate shows the live dashboard). No local
- * run state is fabricated — the start path refetches health (render from server).
+ * Start-roast route (#324, updated #403): renders the reused Start form, and a
+ * successful start POSTs then navigates to `/live` (the stable reload-safe
+ * live-roast route, #403). No local run state is fabricated — the start path
+ * refetches health (render from server).
  */
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -39,14 +40,16 @@ vi.mock("@/hooks/queries", async () => {
 function renderView() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   // Spy on the awaited health refetch — the render-from-server enforcement point:
-  // start must refresh the active-run snapshot before routing to `/`.
+  // start must refresh the active-run snapshot before routing to `/live`.
   const refetchSpy = vi.spyOn(client, "refetchQueries");
   const wrapper = (children: ReactNode) => (
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={["/start"]}>
         <Routes>
           <Route path="/start" element={children} />
-          <Route path="/" element={<div data-testid="home-or-dashboard" />} />
+          {/* #403: StartRoastView now routes to /live, not /. */}
+          <Route path="/live" element={<div data-testid="live-page" />} />
+          <Route path="/" element={<div data-testid="home-landing" />} />
         </Routes>
       </MemoryRouter>
     </QueryClientProvider>
@@ -81,19 +84,22 @@ describe("StartRoastView (#324)", () => {
     expect(screen.getByTestId("bean-profile-picker")).toBeInTheDocument();
   });
 
-  it("POSTs, refetches health, then navigates to `/` on success", async () => {
+  it("POSTs, refetches health, then navigates to `/live` on success (#403)", async () => {
     const { refetchSpy } = renderView();
     fillMinimum();
     fireEvent.submit(screen.getByTestId("start-roast-form"));
     await waitFor(() => expect(startRoastMock).toHaveBeenCalledTimes(1));
     // Render-from-server: start AWAITS a health refetch (the active-run snapshot)
-    // before routing, so `/` resolves to the dashboard with no idle-hub flash.
+    // before routing, so `/live` resolves to the dashboard with no start-form flash.
     await waitFor(() =>
       expect(refetchSpy).toHaveBeenCalledWith({ queryKey: roastKeys.health }),
     );
-    // On success we route to `/` (HomeGate → live dashboard once health refetches).
+    // #403: On success we route to `/live` (the stable reload-safe live-roast URL),
+    // not `/`. LivePage then shows the dashboard once health reports the new run.
     await waitFor(() =>
-      expect(screen.getByTestId("home-or-dashboard")).toBeInTheDocument(),
+      expect(screen.getByTestId("live-page")).toBeInTheDocument(),
     );
+    // We must NOT land on the home hub.
+    expect(screen.queryByTestId("home-landing")).toBeNull();
   });
 });

@@ -742,3 +742,272 @@ async def test_emit_advisor_readout_unreachable_does_not_block(
     out = capsys.readouterr().out
     assert "⚠️" in out
     assert "402 Payment Required" in out
+
+
+def test_serve_live_returns_error_on_malformed_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``serve`` returns exit-code 1 and prints an error when the saved-config
+    file is malformed (``ConfigFileError`` from ``load_app_config``).
+
+    The MCP child must NOT be started — ``load_app_config`` runs before
+    ``build_live_service``, so a bad config file is a fail-closed startup error.
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(": broken: yaml\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    # Ensure build_live_service is never called (would need a real MCP child).
+    import roastpilot_agent.live as _live
+
+    def _should_not_be_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("build_live_service must not be called on config error")
+
+    monkeypatch.setattr(_live, "build_live_service", _should_not_be_called)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+    assert cli.main() == 1
+    out = capsys.readouterr().out
+    assert "malformed" in out or "error" in out
+
+
+def test_replay_returns_error_on_malformed_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--replay`` returns exit-code 1 with a clear message when the saved-config
+    file is malformed (``ConfigFileError`` from ``load_app_config``).
+
+    After the resource-leak fix (Codex P2, PR #425), config is loaded BEFORE
+    ``create_replay_app`` so the aiosqlite worker / ReplaySource are never
+    allocated on a bad config — verified by the companion test
+    ``test_replay_config_error_does_not_allocate_replay_resources``.
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(": broken: yaml\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--step", "--port", "0"],
+    )
+    assert cli.main() == 1
+    out = capsys.readouterr().out
+    assert "malformed" in out or "error" in out
+
+
+def test_serve_live_returns_error_on_schema_invalid_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``serve`` returns exit-code 1 with an error message when the saved-config
+    file is valid YAML but violates the schema (``ValidationError``).
+
+    Distinct from the malformed-YAML case: the file parses as YAML but Pydantic
+    rejects the value (e.g. a string where a number is required).  Both
+    ``ConfigFileError`` and ``pydantic.ValidationError`` must produce a clean
+    error message rather than a raw traceback (Codex P2 finding, PR #425).
+    """
+    cfg_path = tmp_path / "config.yaml"
+    # Valid YAML structure, but tick_interval_seconds must be a float — a string
+    # that cannot be coerced is a schema violation raising ValidationError, not
+    # ConfigFileError.
+    cfg_path.write_text(
+        "advisor:\n  timeout_seconds: 'not_a_number'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    import roastpilot_agent.live as _live
+
+    def _should_not_be_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("build_live_service must not be called on config error")
+
+    monkeypatch.setattr(_live, "build_live_service", _should_not_be_called)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+    assert cli.main() == 1
+    out = capsys.readouterr().out
+    assert "invalid" in out or "error" in out
+
+
+def test_replay_returns_error_on_schema_invalid_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--replay`` returns exit-code 1 with a clear message when the saved-config
+    file is valid YAML but fails schema validation (``ValidationError``).
+
+    Mirrors the live-serve case for the replay path (Codex P2 finding, PR #425).
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(
+        "advisor:\n  timeout_seconds: 'not_a_number'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--step", "--port", "0"],
+    )
+    assert cli.main() == 1
+    out = capsys.readouterr().out
+    assert "invalid" in out or "error" in out
+
+
+def test_replay_config_error_does_not_allocate_replay_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bad saved-config file in ``--replay`` returns 1 without ever calling
+    ``create_replay_app``.
+
+    Before the resource-leak fix (Codex P2, PR #425), config was loaded AFTER
+    ``create_replay_app`` so aiosqlite + ReplaySource were allocated even on a
+    bad config.  After the fix, config is loaded first and a bad config
+    short-circuits before any replay resource is allocated.
+
+    The test patches ``create_replay_app`` to raise ``AssertionError`` if
+    called, proving the allocation never happens.
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(": broken: yaml\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    import roastpilot_agent.replay as _replay
+
+    def _must_not_be_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("create_replay_app must not be called when config fails")
+
+    monkeypatch.setattr(_replay, "create_replay_app", _must_not_be_called)
+
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--step", "--port", "0"],
+    )
+    assert cli.main() == 1
+    out = capsys.readouterr().out
+    assert "malformed" in out or "error" in out
+
+
+def test_serve_live_returns_error_on_unreadable_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``serve`` returns exit-code 1 with a clear message when the saved-config
+    file exists but cannot be read (``OSError`` from ``load_app_config``).
+
+    Distinct from the malformed/schema-invalid cases: the file is syntactically
+    valid but unreadable (e.g. permissions).  All three error classes must
+    produce a clean fail-closed startup error rather than a raw traceback
+    (claude-review low, PR #425).
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("advisor:\n  model_slug: openai/gpt-4o\n", encoding="utf-8")
+    cfg_path.chmod(0o000)  # remove all permissions → OSError on open
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    import roastpilot_agent.live as _live
+
+    def _should_not_be_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("build_live_service must not be called on config error")
+
+    monkeypatch.setattr(_live, "build_live_service", _should_not_be_called)
+    monkeypatch.setattr("sys.argv", ["roastpilot-agent", "serve", "--port", "0"])
+    try:
+        result = cli.main()
+    finally:
+        cfg_path.chmod(0o644)  # restore so tmp_path cleanup can delete it
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "unreadable" in out or "error" in out
+
+
+def test_replay_returns_error_on_unreadable_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``--replay`` returns exit-code 1 with a clear message when the saved-config
+    file is unreadable (``OSError`` from ``load_app_config``).
+
+    Mirrors ``test_serve_live_returns_error_on_unreadable_config_file`` for the
+    replay path (claude-review low, PR #425).
+    """
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("advisor:\n  model_slug: openai/gpt-4o\n", encoding="utf-8")
+    cfg_path.chmod(0o000)
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--step", "--port", "0"],
+    )
+    try:
+        result = cli.main()
+    finally:
+        cfg_path.chmod(0o644)
+    assert result == 1
+    out = capsys.readouterr().out
+    assert "unreadable" in out or "error" in out
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_replay_passes_saved_config_to_create_replay_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--replay`` passes the loaded saved-config to ``create_replay_app``.
+
+    Before the fix, ``_cfg`` was loaded above ``create_replay_app`` (to close
+    the resource-leak) but the ``config=`` kwarg was never forwarded — so
+    ``build_replay_service`` fell back to ``AppConfig()`` (schema defaults),
+    and the replay service ran on different config than ``GET /api/config``
+    showed (saved values diverged from the running service).
+
+    The test spies on ``create_replay_app`` to capture the ``config=`` kwarg
+    and asserts it reflects the non-default advisor model_slug written to the
+    saved-config file (claude-review medium, PR #425).
+    """
+    import roastpilot_agent.replay as _replay
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.config_store import (
+        AdvisorConfigEdit,
+        AppConfigEdit,
+        persist_config_edit,
+    )
+
+    # Write a saved config with a recognisable non-default value.
+    cfg_path = tmp_path / "config.yaml"
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+    # Clear any stray ROASTPILOT_ADVISOR__MODEL_SLUG env var so env does not win.
+    monkeypatch.delenv("ROASTPILOT_ADVISOR__MODEL_SLUG", raising=False)
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4o-mini")))
+
+    captured: list[AppConfig] = []
+    _real_create_replay_app = _replay.create_replay_app
+
+    async def _spy_create_replay_app(
+        export_dir: Path,
+        store_path: Path,
+        *,
+        config: AppConfig | None = None,
+        **kwargs: object,
+    ) -> object:
+        captured.append(config)  # type: ignore[arg-type]
+        return await _real_create_replay_app(
+            export_dir,
+            store_path,
+            config=config,
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    monkeypatch.setattr(_replay, "create_replay_app", _spy_create_replay_app)
+
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--step", "--port", "0"],
+    )
+    assert cli.main() == 0
+
+    assert len(captured) == 1, "create_replay_app must have been called exactly once"
+    assert captured[0] is not None, "config= kwarg must not be None"
+    assert captured[0].advisor.model_slug == "openai/gpt-4o-mini", (
+        "replay service must use the saved-file config value, not the schema default"
+    )
