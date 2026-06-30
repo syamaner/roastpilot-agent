@@ -27,6 +27,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, cast
 
+import serial.tools.list_ports as _list_ports
+import sounddevice as _sounddevice  # type: ignore[import-untyped]
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
@@ -2142,6 +2144,161 @@ async def put_config(edit: AppConfigEdit, request: Request) -> AppConfigSnapshot
     return build_config_snapshot(effective, saved_raw, injected_keys)
 
 
+# ---------------------------------------------------------------------------
+# Device enumeration — GET /api/config/devices (D78 PR(c), #418)
+# ---------------------------------------------------------------------------
+
+
+class DeviceOption(BaseModel):
+    """One enumerated device entry returned by ``GET /api/config/devices``.
+
+    Attributes:
+        value: The machine-readable identifier to store in the config (e.g.
+            a serial port path such as ``/dev/tty.usbmodem14101``, or an
+            integer sounddevice index cast to ``str``).
+        label: Human-readable display name for the Config UI dropdown.
+        note: Extra detail shown as secondary text (port description / HW id
+            for serial; channel count + sample rate for audio input).
+    """
+
+    value: str
+    label: str
+    note: str
+
+
+class DevicesSnapshot(BaseModel):
+    """Response body for ``GET /api/config/devices`` (D78 PR(c), #418).
+
+    Each source (serial / audio_input) is enumerated independently so a
+    failure in one source (e.g. PortAudio unavailable) never prevents the
+    other from returning results.
+
+    Attributes:
+        serial: Enumerated serial port devices, ordered by port path.
+        serial_error: Non-``None`` when serial enumeration failed; the value
+            is the exception message for operator diagnostics.
+        audio_input: Enumerated audio input devices, ordered by device index.
+        audio_input_error: Non-``None`` when audio enumeration failed; the
+            value is the exception message for operator diagnostics.
+    """
+
+    serial: list[DeviceOption]
+    serial_error: str | None
+    audio_input: list[DeviceOption]
+    audio_input_error: str | None
+
+
+def _enumerate_serial() -> tuple[list[DeviceOption], str | None]:
+    """List available serial ports via pyserial (blocking, run in a thread).
+
+    Device enumeration is a between-roasts action. Calling this during an
+    active MCP session is safe — ``comports()`` only reads the OS port list
+    and does not open any port.
+
+    Returns:
+        A 2-tuple of ``(devices, error)``.  ``devices`` is empty on failure;
+        ``error`` is ``None`` on success or the exception message on failure.
+    """
+    try:
+        ports = _list_ports.comports()
+        return (
+            [
+                DeviceOption(
+                    value=p.device,
+                    label=p.device,
+                    note=p.description or p.hwid or "",
+                )
+                for p in sorted(ports, key=lambda p: p.device)
+            ],
+            None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("Serial port enumeration failed: %s", exc)
+        return [], str(exc)
+
+
+def _enumerate_audio_inputs() -> tuple[list[DeviceOption], str | None]:
+    """List audio input devices via sounddevice (blocking, run in a thread).
+
+    Filters to devices with at least one input channel. The call only queries
+    PortAudio device metadata — no audio stream is opened. Device enumeration
+    is intended as a between-roasts action; calling it while the MCP child
+    holds an open audio stream is safe (PortAudio supports concurrent device
+    queries), but the operator should not reconfigure audio mid-capture.
+
+    Returns:
+        A 2-tuple of ``(devices, error)``.  ``devices`` is empty on failure;
+        ``error`` is ``None`` on success or the exception message on failure.
+    """
+    try:
+        raw: object = _sounddevice.query_devices()  # type: ignore[reportUnknownMemberType]
+        # query_devices() returns a DeviceList (iterable of dicts) when called
+        # with no arguments.  Explicitly cast to list[dict[str, object]] for
+        # pyright; the runtime type is sounddevice.DeviceList which iterates
+        # as dicts.
+        all_devices: list[dict[str, object]] = list(raw)  # type: ignore[arg-type]
+        options: list[DeviceOption] = []
+        for idx, dev in enumerate(all_devices):
+            max_in = dev.get("max_input_channels", 0)
+            if not isinstance(max_in, int) or max_in <= 0:
+                continue
+            name = str(dev.get("name", f"Device {idx}"))
+            rate = dev.get("default_samplerate", 0)
+            rate_str = f"{int(rate):,}" if isinstance(rate, (int, float)) else "?"
+            options.append(
+                DeviceOption(
+                    value=str(idx),
+                    label=name,
+                    note=f"Input · {max_in} ch · {rate_str} Hz",
+                )
+            )
+        return options, None
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("Audio input enumeration failed: %s", exc)
+        return [], str(exc)
+
+
+DEVICES_PATH = "/api/config/devices"
+
+
+async def get_devices(request: Request) -> DevicesSnapshot:
+    """``GET /api/config/devices`` — read-only device enumeration (D78 PR(c), #418).
+
+    Returns the available serial ports and audio input devices so the Config
+    UI can populate its device-selection dropdowns.  Each source is wrapped in
+    its own try/except so a PortAudio failure (common in headless CI) never
+    prevents serial ports from being returned, and vice versa.
+
+    This is a **read-only** endpoint — it opens no ports and starts no streams.
+    It is intended for use **between roasts**.  Calling it during an active
+    MCP capture session is safe (``comports()`` and ``query_devices()`` are
+    non-destructive read-only queries), but device lists may be stale if the
+    OS enumerates hardware asynchronously after the call returns.
+
+    Both enumeration calls are blocking (native OS / PortAudio calls) and are
+    dispatched to a thread via ``asyncio.to_thread`` to avoid blocking the
+    async event loop.
+
+    Args:
+        request: Injected by FastAPI; unused but required for the route
+            decorator signature.
+
+    Returns:
+        A :class:`DevicesSnapshot` with per-source device lists and error
+        strings.  The response is always 200 — errors are surfaced in the
+        ``*_error`` fields rather than as HTTP error codes.
+    """
+    del request  # unused
+    serial_devices, serial_error = await asyncio.to_thread(_enumerate_serial)
+    audio_devices, audio_error = await asyncio.to_thread(_enumerate_audio_inputs)
+    return DevicesSnapshot(
+        serial=serial_devices,
+        serial_error=serial_error,
+        audio_input=audio_devices,
+        audio_input_error=audio_error,
+    )
+
+
 def _parse_last_event_id(raw: str | None) -> int | None:
     """Parse the SSE ``Last-Event-ID`` header into a sequence int (#339).
 
@@ -2287,6 +2444,7 @@ def create_app(
     app.get(HEALTH_PATH)(health)
     app.get(CONFIG_PATH)(get_config)
     app.put(CONFIG_PATH)(put_config)
+    app.get(DEVICES_PATH)(get_devices)
     app.post("/api/roasts", status_code=201)(start_roast)
     app.get("/api/roasts")(list_roasts)
     app.get("/api/roasts/{run_id}")(get_roast)

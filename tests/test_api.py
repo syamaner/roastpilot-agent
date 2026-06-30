@@ -32,7 +32,7 @@ from roastpilot_agent.api import (
     RoastRunGoneError,
     RoastRunner,
     RoastService,
-    _parse_last_event_id,  # pyright: ignore[reportPrivateUsage]
+    _parse_last_event_id,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     create_app,
     stream_events,
 )
@@ -1250,14 +1250,14 @@ def test_parse_last_event_id_parses_clean_int(raw: str, expected: int) -> None:
 def test_backdated_charge_utc_returns_none_for_invalid_elapsed(elapsed: float | None) -> None:
     """#337: a missing / non-finite charge-elapsed defers to the store's own
     ``now`` (None) rather than fabricating a garbage backdated instant."""
-    assert RoastRunner._backdated_charge_utc(elapsed) is None  # pyright: ignore[reportPrivateUsage]
+    assert RoastRunner._backdated_charge_utc(elapsed) is None  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
 
 
 def test_backdated_charge_utc_backdates_by_elapsed() -> None:
     """#337: a finite charge-elapsed yields ``now - elapsed`` as an ISO-8601 UTC
     string in the PAST (the recovery breadcrumb matches the live backdated clock)."""
     before = datetime.now(UTC)
-    result = RoastRunner._backdated_charge_utc(120.0)  # pyright: ignore[reportPrivateUsage]
+    result = RoastRunner._backdated_charge_utc(120.0)  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     assert result is not None
     charged_at = datetime.fromisoformat(result)
     # ~120 s before now (allow a little slack for test execution time).
@@ -1972,7 +1972,7 @@ async def test_recover_faulted_then_acknowledge_preserves_fault_reason(
         clock=clock,
     )
     # Build the runner + re-enter operable-faulted directly (the in-session path).
-    runner = service._build_runner("run-fault-reason")  # pyright: ignore[reportPrivateUsage]
+    runner = service._build_runner("run-fault-reason")  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     assert runner is not None
     service.active_run_id = "run-fault-reason"
     await runner.recover_faulted(_profile())
@@ -3143,3 +3143,174 @@ async def test_put_config_422_on_cross_field_violation(
     }
     r2 = await client.put("/api/config", json=bad_body)
     assert r2.status_code == 422
+
+
+# --- GET /api/config/devices ---
+#
+# Tests patch at the underlying library level (_list_ports.comports /
+# _sounddevice.query_devices) so the actual _enumerate_* implementation code
+# is exercised and counted toward patch coverage — not bypassed.
+
+
+class _FakePort:
+    """Minimal stand-in for a ``serial.tools.list_ports_common.ListPortInfo``."""
+
+    def __init__(self, device: str, description: str, hwid: str) -> None:
+        self.device = device
+        self.description = description
+        self.hwid = hwid
+
+
+@pytest.mark.asyncio
+async def test_get_devices_happy_path(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/config/devices returns serial + audio results from fake listers.
+
+    Patches ``_list_ports.comports`` and ``_sounddevice.query_devices`` at the
+    library level so the real _enumerate_* code runs (full patch coverage) while
+    the test stays hardware-free and deterministic.
+    """
+    import roastpilot_agent.api as _api_mod
+
+    fake_ports = [
+        _FakePort("/dev/tty.usbmodem1401", "Hottop Roaster", "USB VID:PID=04D8:000A"),
+    ]
+    fake_devices = [
+        {
+            "name": "USB PnP Sound Device",
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 48000.0,
+        },
+        # Output-only device: must be filtered out.
+        {
+            "name": "Built-in Output",
+            "max_input_channels": 0,
+            "max_output_channels": 2,
+            "default_samplerate": 44100.0,
+        },
+    ]
+
+    monkeypatch.setattr(_api_mod._list_ports, "comports", lambda: fake_ports)  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+    monkeypatch.setattr(_api_mod._sounddevice, "query_devices", lambda: fake_devices)  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+
+    response = await client.get("/api/config/devices")
+    assert response.status_code == 200
+    body = response.json()
+
+    # Both top-level keys must be present.
+    assert "serial" in body
+    assert "audio_input" in body
+    assert body["serial_error"] is None
+    assert body["audio_input_error"] is None
+
+    # Serial: one port, correctly mapped.
+    assert len(body["serial"]) == 1
+    assert body["serial"][0]["value"] == "/dev/tty.usbmodem1401"
+    assert body["serial"][0]["label"] == "/dev/tty.usbmodem1401"
+    assert body["serial"][0]["note"] == "Hottop Roaster"
+
+    # Audio: only the input-capable device survives the filter.
+    assert len(body["audio_input"]) == 1
+    assert body["audio_input"][0]["value"] == "0"
+    assert body["audio_input"][0]["label"] == "USB PnP Sound Device"
+    assert body["audio_input"][0]["note"] == "Input · 1 ch · 48,000 Hz"
+
+
+@pytest.mark.asyncio
+async def test_get_devices_serial_error_is_soft(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/config/devices returns 200 with serial_error when serial fails.
+
+    Fail-soft: a serial enumeration error must never 500 the endpoint; it must
+    surface as an empty serial list + a non-None serial_error string, while the
+    audio source is unaffected.
+    """
+    import roastpilot_agent.api as _api_mod
+
+    def _boom_serial() -> list[object]:
+        raise OSError("serial: permission denied")
+
+    fake_devices = [
+        {
+            "name": "Built-in Mic",
+            "max_input_channels": 1,
+            "max_output_channels": 0,
+            "default_samplerate": 44100.0,
+        }
+    ]
+    monkeypatch.setattr(_api_mod._list_ports, "comports", _boom_serial)  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+    monkeypatch.setattr(_api_mod._sounddevice, "query_devices", lambda: fake_devices)  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+
+    response = await client.get("/api/config/devices")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert body["serial"] == []
+    assert "serial: permission denied" in body["serial_error"]
+    assert len(body["audio_input"]) == 1
+    assert body["audio_input_error"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_devices_audio_error_is_soft(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/config/devices returns 200 with audio_input_error when PortAudio fails.
+
+    Fail-soft: a PortAudio failure (common in headless CI) must not prevent serial
+    ports from being returned.  The audio source degrades to an empty list with a
+    non-None audio_input_error string.
+    """
+    import roastpilot_agent.api as _api_mod
+
+    def _boom_audio() -> list[object]:
+        raise RuntimeError("PortAudio not found")
+
+    fake_ports = [_FakePort("/dev/ttyUSB0", "USB Serial", "USB VID:PID=1A86:7523")]
+    monkeypatch.setattr(_api_mod._list_ports, "comports", lambda: fake_ports)  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+    monkeypatch.setattr(_api_mod._sounddevice, "query_devices", _boom_audio)  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+
+    response = await client.get("/api/config/devices")
+    assert response.status_code == 200
+    body = response.json()
+
+    assert len(body["serial"]) == 1
+    assert body["serial_error"] is None
+    assert body["audio_input"] == []
+    assert "PortAudio not found" in body["audio_input_error"]
+
+
+@pytest.mark.asyncio
+async def test_get_devices_both_empty_is_valid(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GET /api/config/devices returns 200 with empty lists when no devices found.
+
+    An environment with no serial ports and no audio inputs (e.g. a minimal CI
+    container) must return a valid 200 response with empty lists and no errors.
+    """
+    import roastpilot_agent.api as _api_mod
+
+    def _no_ports() -> list[object]:
+        return []
+
+    def _no_audio() -> list[object]:
+        return []
+
+    monkeypatch.setattr(_api_mod._list_ports, "comports", _no_ports)  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+    monkeypatch.setattr(_api_mod._sounddevice, "query_devices", _no_audio)  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+
+    response = await client.get("/api/config/devices")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["serial"] == []
+    assert body["serial_error"] is None
+    assert body["audio_input"] == []
+    assert body["audio_input_error"] is None

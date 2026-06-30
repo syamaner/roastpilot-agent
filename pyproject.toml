@@ -55,6 +55,11 @@ dependencies = [
   # runtime deps (not transitive) so we declare them explicitly.
   "filelock>=3.16,<4",
   "pyyaml>=6.0,<7",
+  # D78 PR(c): device enumeration for GET /api/config/devices. Both were
+  # previously transitive (via coffee-roaster-mcp); now imported directly in
+  # api.py so they must be declared as explicit runtime deps.
+  "pyserial>=3.5",
+  "sounddevice>=0.5,<1",
   "uvicorn>=0.34,<1"
 ]
 
