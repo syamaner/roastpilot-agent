@@ -44,13 +44,34 @@ interface MultiOptionRowProps {
 }
 
 function MultiOptionRow({ option, isChecked, isUnavailable, onToggle }: MultiOptionRowProps): React.JSX.Element {
+  function handleKeyDown(e: React.KeyboardEvent<HTMLDivElement>): void {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      onToggle();
+      return;
+    }
+    // Arrow-key roving focus: move to the adjacent option row inside the listbox.
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      const listbox = e.currentTarget.closest("[role='listbox']");
+      if (!listbox) return;
+      const rows = Array.from(listbox.querySelectorAll<HTMLElement>("[role='option']"));
+      const idx = rows.indexOf(e.currentTarget);
+      if (e.key === "ArrowDown") {
+        rows[idx + 1]?.focus();
+      } else {
+        rows[idx - 1]?.focus();
+      }
+    }
+  }
+
   return (
     <div
       role="option"
       aria-selected={isChecked}
       tabIndex={0}
       onClick={onToggle}
-      onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onToggle(); } }}
+      onKeyDown={handleKeyDown}
       data-testid={`device-multi-option-${option.value}`}
       className={cn(
         "flex cursor-pointer items-center gap-3 px-3 py-2.5 text-sm transition-colors",
@@ -263,7 +284,6 @@ export function DeviceMultiSelect({
           aria-haspopup="listbox"
           aria-multiselectable="true"
           aria-expanded={open}
-          aria-label={label}
           disabled={disabled}
           onClick={() => !disabled && setOpen((o) => !o)}
           data-testid={`${testId}-trigger`}

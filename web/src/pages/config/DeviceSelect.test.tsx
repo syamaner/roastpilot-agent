@@ -238,6 +238,62 @@ describe("DeviceSelect — trigger ARIA + no free-text invariant", () => {
     fireEvent.click(screen.getByTestId("device-select-trigger"));
     expect(screen.queryByRole("textbox")).toBeNull();
   });
+
+  it("trigger accessible name comes from the label+id association, not aria-label override", () => {
+    // aria-label on the trigger was overriding the visible text (e.g. the selected device name)
+    // so AT users heard only the field label, not the current state. Removing aria-label lets
+    // the button's visible text participate in the accessible name via the label[for]/id pairing.
+    renderSelect({ value: SERIAL_DEVICES[0]!.value });
+    const trigger = screen.getByTestId("device-select-trigger");
+    // The trigger must NOT have an aria-label attribute that would shadow the visible text.
+    expect(trigger).not.toHaveAttribute("aria-label");
+    // The trigger text must reflect the selected device name (visible + announced).
+    expect(trigger.textContent).toContain(SERIAL_DEVICES[0]!.label);
+  });
+});
+
+describe("DeviceSelect — arrow-key listbox navigation", () => {
+  beforeEach(() => defaultMockState());
+
+  it("ArrowDown moves focus from the first option to the second", () => {
+    renderSelect();
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    const row0 = screen.getByTestId(`device-option-${SERIAL_DEVICES[0]!.value}`);
+    const row1 = screen.getByTestId(`device-option-${SERIAL_DEVICES[1]!.value}`);
+    row0.focus();
+    fireEvent.keyDown(row0, { key: "ArrowDown" });
+    expect(row1).toHaveFocus();
+  });
+
+  it("ArrowUp moves focus from the second option back to the first", () => {
+    renderSelect();
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    const row0 = screen.getByTestId(`device-option-${SERIAL_DEVICES[0]!.value}`);
+    const row1 = screen.getByTestId(`device-option-${SERIAL_DEVICES[1]!.value}`);
+    row1.focus();
+    fireEvent.keyDown(row1, { key: "ArrowUp" });
+    expect(row0).toHaveFocus();
+  });
+
+  it("ArrowDown on the last option does not move focus (no wrap)", () => {
+    renderSelect();
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    const lastRow = screen.getByTestId(`device-option-${SERIAL_DEVICES[SERIAL_DEVICES.length - 1]!.value}`);
+    lastRow.focus();
+    fireEvent.keyDown(lastRow, { key: "ArrowDown" });
+    // Focus stays on the last row (no wrap)
+    expect(lastRow).toHaveFocus();
+  });
+
+  it("ArrowUp on the first option does not move focus (no wrap)", () => {
+    renderSelect();
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    const firstRow = screen.getByTestId(`device-option-${SERIAL_DEVICES[0]!.value}`);
+    firstRow.focus();
+    fireEvent.keyDown(firstRow, { key: "ArrowUp" });
+    // Focus stays on the first row
+    expect(firstRow).toHaveFocus();
+  });
 });
 
 describe("DeviceSelect — loading state", () => {

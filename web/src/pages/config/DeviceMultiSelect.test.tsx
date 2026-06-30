@@ -253,6 +253,58 @@ describe("DeviceMultiSelect — trigger ARIA + no free-text invariant", () => {
     fireEvent.click(screen.getByTestId("device-multi-select-trigger"));
     expect(screen.queryByRole("textbox")).toBeNull();
   });
+
+  it("trigger accessible name comes from the label+id association, not aria-label override", () => {
+    // Removing aria-label allows AT users to hear both the field label
+    // (via label[for]) and the current selection state (trigger text).
+    renderMultiSelect({ values: [AUDIO_DEVICES[0]!.value] });
+    const trigger = screen.getByTestId("device-multi-select-trigger");
+    expect(trigger).not.toHaveAttribute("aria-label");
+    // The trigger text must reflect the selected device (visible + announced).
+    expect(trigger.textContent).toContain(AUDIO_DEVICES[0]!.label);
+  });
+});
+
+describe("DeviceMultiSelect — arrow-key listbox navigation", () => {
+  beforeEach(() => defaultMockState());
+
+  it("ArrowDown moves focus from the first option to the second", () => {
+    renderMultiSelect();
+    fireEvent.click(screen.getByTestId("device-multi-select-trigger"));
+    const row0 = screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[0]!.value}`);
+    const row1 = screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[1]!.value}`);
+    row0.focus();
+    fireEvent.keyDown(row0, { key: "ArrowDown" });
+    expect(row1).toHaveFocus();
+  });
+
+  it("ArrowUp moves focus from the second option back to the first", () => {
+    renderMultiSelect();
+    fireEvent.click(screen.getByTestId("device-multi-select-trigger"));
+    const row0 = screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[0]!.value}`);
+    const row1 = screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[1]!.value}`);
+    row1.focus();
+    fireEvent.keyDown(row1, { key: "ArrowUp" });
+    expect(row0).toHaveFocus();
+  });
+
+  it("ArrowDown on the last option does not move focus (no wrap)", () => {
+    renderMultiSelect();
+    fireEvent.click(screen.getByTestId("device-multi-select-trigger"));
+    const lastRow = screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[AUDIO_DEVICES.length - 1]!.value}`);
+    lastRow.focus();
+    fireEvent.keyDown(lastRow, { key: "ArrowDown" });
+    expect(lastRow).toHaveFocus();
+  });
+
+  it("ArrowUp on the first option does not move focus (no wrap)", () => {
+    renderMultiSelect();
+    fireEvent.click(screen.getByTestId("device-multi-select-trigger"));
+    const firstRow = screen.getByTestId(`device-multi-option-${AUDIO_DEVICES[0]!.value}`);
+    firstRow.focus();
+    fireEvent.keyDown(firstRow, { key: "ArrowUp" });
+    expect(firstRow).toHaveFocus();
+  });
 });
 
 describe("DeviceMultiSelect — loading state", () => {
