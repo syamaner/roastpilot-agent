@@ -266,21 +266,30 @@ checklist before you open.
 
 ## Code Review Rubric
 
-**The PR review roster (operator, 28 Jun 2026): `Claude Code Review` + any human
-reviewer.** The automated **Claude Code Review**
-(`.github/workflows/claude-code-review.yml`, running `/code-review --comment`) and
-any human reviewer follow this rubric. **No review bots other than Claude Code Review
-are in the roster — the Augment Code trial ENDED (28 Jun 2026), and the ChatGPT/OpenAI
-Codex connector and CodeRabbit were disabled (15 Jun 2026).** Codex was removed because
-its push-triggered re-reviews re-posted the same findings on every commit and churned the
-conversation-resolution merge gate (each `update-branch`/push re-opened threads, blocking
-auto-merge with no new signal); the roster is kept lean rather than a pile-on. If an
-out-of-roster bot still posts (Augment until its GitHub App access lapses, or a disabled
-connector), its comments are **out-of-roster and non-authoritative**: triage may resolve
-them by pointing at the roster rule, and they never block a merge on their own. (A lean
-roster is not "fewer eyes" — an out-of-roster bot can still surface a real finding; the
-constraint it must satisfy is *not re-litigating resolved threads on every push under
-`required_conversation_resolution`*.)
+**The PR review roster (operator, 30 Jun 2026): `Claude Code Review` + `Codex`
+(advisory-but-triaged) + any human reviewer.** The automated **Claude Code Review**
+(`.github/workflows/claude-code-review.yml`, running `/code-review --comment`), the
+**Codex** connector, and any human reviewer follow this rubric. **CodeRabbit stays
+disabled (15 Jun) and the Augment Code trial ENDED (28 Jun).**
+
+**Codex (`chatgpt-codex-connector[bot]`) was RE-ENABLED 30 Jun** after its 15-Jun
+disable, because on real PRs it catches bugs the other lenses miss (on the Config UI
+build it found a roast-breaking config regression that the Opus `safety-reviewer`
+PASSed twice, plus a credential-redirection hole and a cross-request `os.environ`
+mutation). But it is **ADVISORY-BUT-TRIAGED, NOT a required gate, and never an
+auto-blocker**: it re-reviews the whole diff from scratch and re-posts already-fixed
+findings as new inline threads, which would deadlock `required_conversation_resolution`
+if its threads gated merge. **So the planned `review-gate` "flip-on-BOTH-reviews" wiring
+is CANCELLED — do not make Codex a required check.** Operating rule (the lead, per D23 —
+the author never self-triages): Codex auto-reviews at PR creation; **re-trigger it with a
+`codex review` comment only ONCE, on the final commit**, not on every push; the lead
+verifies each finding against the *current* code, folds the real ones, and **resolves the
+stale re-posts by hand** (GraphQL `resolveReviewThread`). Its signal type is a
+`pull_request_review` with inline threads, which DO block via conversation-resolution, so
+the lead must clear them consciously. A lean roster is not "fewer eyes": a diverse lens
+catches what a strong single lens misses; the constraint Codex must satisfy is *not
+re-litigating resolved threads on every push*, which the once-on-final-commit discipline
+enforces. (Memory: `claude-review-not-a-required-check`.)
 
 **Inline PR comments are MERGE-BLOCKING** — `main` requires every conversation
 resolved (branch protection). So calibrate where findings go:

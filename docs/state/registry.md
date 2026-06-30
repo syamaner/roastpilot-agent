@@ -102,7 +102,47 @@
 
 ## Active Context
 
-**28 Jun 2026 (latest) — ROAST 8 + the c5/c6 control prompts. Roast 8 = the FIRST fully
+**30 Jun 2026 (latest) — CONFIG UI (#413) FUNCTIONALLY COMPLETE. The agent now owns one unified
+config and renders the MCP yaml from it (D76/D78), and saved settings drive the next roast. Plan
+decision D79 (`roastpilot-plan` `fb59c10`).** A single long lead-plus-subagents session built the
+operator's settings surface end to end. Seven PRs on `main`:
+
+- **#422** routing shell — reload-safe `/live` + home launcher + `/config` route (also fixed the
+  roast-7 reload-loses-the-live-roast bug). **Closes #403.**
+- **#424 / #425 / #427 (S1)** — unified config model + env-overrides-file persistence + per-field
+  metadata; `GET`/`PUT /api/config` (PUT excludes safety); read-only `/api/config/devices`
+  (agent-direct `pyserial` + `sounddevice`). Two Opus-safety BLOCKERS caught + fixed in #424 (a
+  `Safety:` casing bypass + a 3-field coverage hole → a wholesale `ROASTPILOT_SAFETY__` prefix skip).
+- **#429 (S3)** — MCP-yaml passthrough-merge + `mcp_device` through `/api/config` + apply-on-respawn;
+  preserves the pinned model `revision` / `onnx_threads` / profile **by construction**.
+- **#430** — reload `load_app_config()` at `start_roast` so AGENT settings (advisor model/prompt,
+  pre-FC levers, trim) apply next-roast (the D78 apply-next-roast guarantee).
+- **#428 (S2)** — the `/config` view: category rail + per-field validation + save model; Safety read-only.
+
+**Apply-next-roast is SPLIT:** AGENT config applies next-roast now (#430); DEVICE config (serial/audio/FC
+→ MCP yaml) still needs an MCP respawn → **DEFERRED to #431.** **Slice status:** S1 (#418) ✅ closed ·
+S3 (#420) ✅ closed · reload (#430) ✅ · S2 view (#428) ✅. **REMAINING:** S2 **PR3** (env badges + device
+dropdowns + the Hardware/Audio/FC categories now backed by #429 + a mic-test "not available in M1"
+placeholder, under **#419**) and **S4** polish (**#421**). Other deferred follow-ups: **#426**
+(top-level-JSON env shadow), **#423** (sticky `/live` summary), an on-demand mic-test backend sample
+endpoint.
+
+**Governance — Codex earned its review seat (reverses the 15-Jun D37 disable).** Re-enabled 30 Jun, and
+on its first real outing it caught a run of bugs the Opus safety-reviewer (PASSed twice), the contract
+checker, and the author all missed: a roast-breaking render-source regression (a normal `roast-live.sh`
+roast would spawn the MCP on defaults, dropping the Hottop config), a credential-redirection hole, a
+cross-request `os.environ` mutation, and the apply-next-roast gap itself. **Operator decision (30 Jun): Codex is ADVISORY-BUT-TRIAGED, NOT a required gate — the
+planned `review-gate` flip-on-BOTH-reviews wiring is CANCELLED** (its re-post-on-every-trigger
+churn would deadlock conversation-resolution if its inline threads gated merge). Operating rule:
+auto-reviews at PR creation, re-trigger with `codex review` only ONCE on the final commit; the lead
+verifies each finding vs current code, folds the real ones, resolves the stale re-posts by hand
+(D23 — author never self-triages). AGENTS.md roster updated to match (this PR). Memories:
+`agent-config-ui-story`, `claude-review-not-a-required-check`. **This does not change roast priorities —
+#405 (deterministic post-FC heat floor) remains the top control priority; the block below is unchanged.**
+
+---
+
+**28 Jun 2026 — ROAST 8 + the c5/c6 control prompts. Roast 8 = the FIRST fully
 autonomous LLM-driven drop on this stack that landed a proper roast. c5/c6 prompts merged
 (selectable; c3 stays default). The deterministic post-FC heat floor (#405) is now the
 ACTIVE PRIORITY (In Progress).** Plan decisions **D72/D73/D74** (`roastpilot-plan`).
