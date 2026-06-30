@@ -725,6 +725,7 @@ async def _serve_replay(args: argparse.Namespace) -> int:
         app, _service, source = await create_replay_app(
             export_dir,
             store_path,
+            config=_cfg,
             step_mode=args.step,
             speed=args.speed,
             spa_dir=_resolve_spa_dir(args),

@@ -886,3 +886,59 @@ def test_replay_config_error_does_not_allocate_replay_resources(
     assert cli.main() == 1
     out = capsys.readouterr().out
     assert "malformed" in out or "error" in out
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_replay_passes_saved_config_to_create_replay_app(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--replay`` passes the loaded saved-config to ``create_replay_app``.
+
+    Before the fix, ``_cfg`` was loaded above ``create_replay_app`` (to close
+    the resource-leak) but the ``config=`` kwarg was never forwarded — so
+    ``build_replay_service`` fell back to ``AppConfig()`` (schema defaults),
+    and the replay service ran on different config than ``GET /api/config``
+    showed (saved values diverged from the running service).
+
+    The test spies on ``create_replay_app`` to capture the ``config=`` kwarg
+    and asserts it reflects the non-default advisor model_slug written to the
+    saved-config file (claude-review medium, PR #425).
+    """
+    import roastpilot_agent.replay as _replay
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.config_store import (
+        AdvisorConfigEdit,
+        AppConfigEdit,
+        persist_config_edit,
+    )
+
+    # Write a saved config with a recognisable non-default value.
+    cfg_path = tmp_path / "config.yaml"
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_path))
+    # Clear any stray ROASTPILOT_ADVISOR__MODEL_SLUG env var so env does not win.
+    monkeypatch.delenv("ROASTPILOT_ADVISOR__MODEL_SLUG", raising=False)
+    persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(model_slug="openai/gpt-4o-mini")))
+
+    captured: list[AppConfig] = []
+    _real_create_replay_app = _replay.create_replay_app
+
+    async def _spy_create_replay_app(
+        *args: object, config: AppConfig | None = None, **kwargs: object
+    ) -> object:
+        captured.append(config)  # type: ignore[arg-type]
+        return await _real_create_replay_app(*args, config=config, **kwargs)
+
+    monkeypatch.setattr(_replay, "create_replay_app", _spy_create_replay_app)
+
+    fixture = Path(__file__).parent / "fixtures" / "replay" / "session-2"
+    monkeypatch.setattr(
+        "sys.argv",
+        ["roastpilot-agent", "--replay", str(fixture), "--step", "--port", "0"],
+    )
+    assert cli.main() == 0
+
+    assert len(captured) == 1, "create_replay_app must have been called exactly once"
+    assert captured[0] is not None, "config= kwarg must not be None"
+    assert captured[0].advisor.model_slug == "openai/gpt-4o-mini", (
+        "replay service must use the saved-file config value, not the schema default"
+    )
