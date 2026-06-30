@@ -254,6 +254,71 @@ describe("valuesEqual", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Tests — tri-state inherit/override (#439): null = inherit in mcp_device
+// ---------------------------------------------------------------------------
+
+describe("buildEditFromDirty — tri-state null = inherit for mcp_device", () => {
+  it("includes explicit null in the PUT body when a field is cleared from a value to null (inherit)", () => {
+    // Operator had serial_port set, then cleared it back to inherit.
+    const snapshot = makeSnapshot({ serial_port: "/dev/ttyUSB0" });
+    const saved = buildValuesFromSnapshot(snapshot);
+    // Current value: null (operator cleared the field)
+    const values = { ...saved, "mcp_device.serial_port": null };
+
+    const edit = buildEditFromDirty(values, saved, snapshot);
+    // mcp_device section must be present with serial_port explicitly null.
+    expect(edit.mcp_device).toBeDefined();
+    expect((edit.mcp_device as Record<string, unknown>)?.serial_port).toBeNull();
+  });
+
+  it("includes explicit null for a boolean field cleared to inherit", () => {
+    const snapshot = makeSnapshot();
+    // Simulate snapshot where recording_enabled was true (saved).
+    (snapshot.mcp_device.recording_enabled as import("@/lib/types").ConfigFieldMeta) = {
+      saved_value: true,
+      effective_value: true,
+      default: null,
+      env_overridden: false,
+      read_only: false,
+      description: "",
+    };
+    const saved = buildValuesFromSnapshot(snapshot);
+    // Operator cleared it back to null (inherit).
+    const values = { ...saved, "mcp_device.recording_enabled": null };
+
+    const edit = buildEditFromDirty(values, saved, snapshot);
+    expect(edit.mcp_device).toBeDefined();
+    expect((edit.mcp_device as Record<string, unknown>)?.recording_enabled).toBeNull();
+  });
+
+  it("does NOT send mcp_device if the only change is null→null (already inherited)", () => {
+    // Value was null, still null — not dirty.
+    const snapshot = makeSnapshot({ serial_port: null });
+    const saved = buildValuesFromSnapshot(snapshot);
+    const values = { ...saved };  // unchanged
+
+    const edit = buildEditFromDirty(values, saved, snapshot);
+    expect(edit.mcp_device).toBeUndefined();
+  });
+
+  it("null→value round-trip: sets then clears in two separate edits", () => {
+    const snapshot = makeSnapshot({ serial_port: null });
+    const saved = buildValuesFromSnapshot(snapshot);
+
+    // First edit: set a value (override).
+    const values1 = { ...saved, "mcp_device.serial_port": "/dev/ttyUSB0" };
+    const edit1 = buildEditFromDirty(values1, saved, snapshot);
+    expect((edit1.mcp_device as Record<string, unknown>)?.serial_port).toBe("/dev/ttyUSB0");
+
+    // Second edit (from the new "saved" baseline after first save): clear back to null.
+    const saved2 = { ...saved, "mcp_device.serial_port": "/dev/ttyUSB0" };
+    const values2 = { ...saved2, "mcp_device.serial_port": null };
+    const edit2 = buildEditFromDirty(values2, saved2, snapshot);
+    expect((edit2.mcp_device as Record<string, unknown>)?.serial_port).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Tests — recording_devices array reference-equality in buildEditFromDirty
 // ---------------------------------------------------------------------------
 

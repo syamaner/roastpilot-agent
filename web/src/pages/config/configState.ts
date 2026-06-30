@@ -136,6 +136,14 @@ function setPath(
  *
  * Only sections with dirty writable fields are included: if only advisor
  * fields changed, the controller key is omitted from the result.
+ *
+ * **Tri-state inherit/override (#439):** `mcp_device.*` fields support
+ * `null` as a first-class value meaning "inherit from hand-authored yaml".
+ * When a field is cleared from a value back to `null`, an explicit `null` is
+ * included in the PUT body so the backend knows to delete the saved key and
+ * stop overriding the hand-authored yaml. The backend uses
+ * `model_fields_set` to distinguish explicitly-null (clear) from absent
+ * (skip). Non-null values are written as overrides as before.
  */
 export function buildEditFromDirty(
   values: ConfigValues,
@@ -144,7 +152,11 @@ export function buildEditFromDirty(
 ): Record<string, unknown> {
   const controller: Record<string, unknown> = {};
   const advisor: Record<string, unknown> = {};
+  // mcp_device uses explicit null for "clear to inherit" (#439): track which
+  // keys were explicitly set (even when null) so the backend can distinguish
+  // "operator cleared this field" from "field was not touched".
   const mcp_device: Record<string, unknown> = {};
+  let mcpDeviceHasDirty = false;
 
   for (const [key, current] of Object.entries(values)) {
     if (valuesEqual(current, saved[key])) continue;  // not dirty (array-aware)
@@ -159,7 +171,12 @@ export function buildEditFromDirty(
     } else if (section === "advisor") {
       setPath(advisor, def.editKey, current);
     } else if (section === "mcp_device") {
-      setPath(mcp_device, def.editKey, current);
+      // Include null explicitly: null means "clear back to inherit from yaml"
+      // (#439). setPath on a null value with a simple (non-nested) editKey
+      // writes the null into the mcp_device object so it appears in the
+      // JSON PUT body and the backend can honour it via model_fields_set.
+      setPath(mcp_device, def.editKey, current ?? null);
+      mcpDeviceHasDirty = true;
     }
     // "safety" is intentionally omitted (editKey is null for all safety fields)
     // "mcp_device._mic_test" is omitted (editKey is null; button is not a field)
@@ -168,6 +185,6 @@ export function buildEditFromDirty(
   const edit: Record<string, unknown> = {};
   if (Object.keys(controller).length > 0) edit.controller = controller;
   if (Object.keys(advisor).length > 0) edit.advisor = advisor;
-  if (Object.keys(mcp_device).length > 0) edit.mcp_device = mcp_device;
+  if (mcpDeviceHasDirty) edit.mcp_device = mcp_device;
   return edit;
 }
