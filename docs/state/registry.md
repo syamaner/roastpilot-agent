@@ -102,7 +102,56 @@
 
 ## Active Context
 
-**30 Jun 2026 (latest) — CONFIG UI (#413) IS DONE. The device-selection UI shipped and saved
+**1 Jul 2026 (latest) — TIER-1 AUTONOMOUS FIX BATCH COMPLETE. All 7 follow-up issues merged
+(#404, #439, #426, #423, #412, #409, #443) across two parallel tracks — config cluster (Track A)
+and live-view (Track B) — each in its own git worktree, lead-plus-subagents.** One PR per issue,
+domain reviewer + qa run on the branch BEFORE opening (shift-left), codex advisory-but-triaged
+post-open. What merged:
+
+- **#404 (PR #444)** — T0 chart marker anchors to the telemetry-recovered charge origin
+  (`elapsed − charge_elapsed`), not the detection-fire frame; fixes the roast-7/8 wrong-position bug.
+- **#439 (PR #445)** — `/config` `mcp_device` tri-state inherit/override (null = keep hand-authored
+  yaml / value = override); fixes boolean null→off collapse, un-clearable overrides, blank-driver
+  writing `driver:""`. Codex caught 2 real P2s post-open (override unclearable on device-enumeration
+  error; blank-`""`→yaml crash class on `serial_port`/`audio_input_device`, same class on the API surface).
+- **#426 (PR #447)** — a saved-file value no longer shadows a top-level JSON-section env var
+  (`ROASTPILOT_ADVISOR='{...}'`); PER-FIELD injection so a PARTIAL blob keeps the other saved fields
+  (qa caught the whole-section-skip regression pre-open; codex caught uppercase-key + nested-blob P2s).
+- **#423 (PR #446)** — `/live` is the single live-roast home (control view → sticky last-roast summary
+  on finalise, NOT snap-to-start) and `/` collapses to a pure launcher (revises #403 → plan **D81**).
+  Codex caught 4 real finished-view data-flow P2s (health not refetched on completion so the summary
+  never triggered; "Roast complete" shown for FAULTED runs; stale in-progress snapshot; stats from
+  lossy downsampled telemetry) — all folded to drive the view from the terminal server-outcome record.
+- **#412 (PR #448)** — deterministic deadband+slew damping for the #386 adaptive-trim thrash; opt-in,
+  OFF by default (byte-for-byte the fixed 65% cut). **KEYSTONE / control-path**: the first cut bounded
+  only the RETURNED trim value; codex caught (and the Opus safety-reviewer CONFIRMED on re-examination)
+  that the ACTUATED roaster command was NOT bounded — the safety box floor was built from the undamped
+  target (clamped the damped value back UP on the heat-up leg, 12pp jump) and state advanced on
+  rate-limited/rejected ticks (2×slew between real commands). Reworked to feed the damped depth into the
+  box floor+target and advance state only after an accepted write; tests now assert on the actuated MCP
+  command stream. qa AND the first safety pass both missed it because the tests asserted the returned
+  value — the layered/independent review is what caught it.
+- **#409 (PR #449)** — turning-point (post-charge bean-temp minimum) landmark event + chart marker,
+  mirroring drying_end (new `RoastEventKind.TURNING_POINT`, store schema V8 with a data-preservation
+  test, live + detail markers, FE contract parity same PR). Observability-only, threshold OUT of
+  `/config`. Codex caught 3 clock/correctness P2s (marker one tick early — the same class as the #404
+  T0 fix, reintroduced; timeline showing the debounce-relative clock; false landmark on first-sample-≥0
+  RoR) — all folded (payload-anchored marker, charge-referenced timeline clock, negative-RoR witness gate).
+- **#443 (PR #450)** — exposes the #412 damping knobs (deadband/slew) in the `/config` Late-Maillard
+  Trim category (revealed when adaptive depth is on); removes the "not in schema" note. Server enforces
+  the `deadband < slew` cross-field constraint (422 + hint).
+
+**Process notes:** Codex earned its seat hard — it caught real defects on nearly every PR that qa +
+the Opus domain reviewers missed, most notably the #412 actuated-command control bug. Independent
+triage held throughout (author never self-adjudicated; the lead + safety-reviewer + codex as separate
+lenses). One process slip (a teammate started the #443 dependency early, causing a worktree branch
+switch mid-review) was caught and untangled with zero work lost. Shift-left worked: most rework was
+folded pre-open; the post-open rework that remained was healthy (real codex catches). **This does not
+change roast priorities — #405 (deterministic post-FC heat floor) remains the top control priority.**
+
+---
+
+**30 Jun 2026 — CONFIG UI (#413) IS DONE. The device-selection UI shipped and saved
 device/hardware config now applies next-roast; the Config UI epic is complete.** A second
 lead-plus-subagents session closed out the remaining PR3 + S4 work (the block below was the
 "functionally complete for the agent-settings path" state; device selection + hardware
