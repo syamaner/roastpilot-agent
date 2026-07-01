@@ -52,6 +52,70 @@ still being created — no telemetry exists yet); ``idle``/``complete``/
 """
 
 
+class RoastStyle(Enum):
+    """Operator-facing roast-degree vocabulary (#405, D82).
+
+    Plain ``Enum`` (D15): a string comparison against a member must stay a
+    pyright strict error (``reportUnnecessaryComparison``), matching every
+    other shared enum in this module (e.g. :class:`RoastPhase`,
+    :class:`MicHealth`). Purely additive data modelling in this slice — it is
+    not yet wired into any control law or the drop decision (Slice C of #405
+    decides that precedence); see :data:`ROAST_STYLE_TARGETS` for the seeded
+    corpus targets each style maps to.
+    """
+
+    LIGHT = "light"
+    MEDIUM = "medium"
+    DARK = "dark"
+
+
+class RoastStyleTarget(BaseModel):
+    """The canonical drop target for a :class:`RoastStyle` (#405, D82).
+
+    A small Celsius/percent pair: the drop bean temperature and the
+    development-time-ratio (DTR) target a style implies. These are corpus-seeded
+    defaults (washed high-grown reference curves); a profile's own explicit
+    ``target_drop_temp_c`` / ``target_development_percent`` may still override
+    them per bean — Slice C of #405 wires the precedence into the deterministic
+    drop control law. This model carries no control logic itself.
+    """
+
+    drop_temp_c: float = Field(gt=0)
+    dtr_target: float = Field(gt=0, lt=100)
+
+
+# Corpus-seeded (washed high-grown) drop targets per roast style (#405, D82).
+# The 195-196 °C bitter cap holds regardless of style — that ceiling is
+# enforced in safety.py (the pre-drop safety bound), not here; these are seed
+# defaults a per-profile explicit target may still override (Slice C decides
+# precedence when wiring the deterministic drop).
+ROAST_STYLE_TARGETS: dict[RoastStyle, RoastStyleTarget] = {
+    RoastStyle.LIGHT: RoastStyleTarget(drop_temp_c=188.0, dtr_target=15.0),
+    RoastStyle.MEDIUM: RoastStyleTarget(drop_temp_c=193.0, dtr_target=18.0),
+    RoastStyle.DARK: RoastStyleTarget(drop_temp_c=196.0, dtr_target=20.0),
+}
+
+#: The default roast style for profile creation / the UI (#405, D82). The
+#: stored ``roast_style`` field on a profile itself defaults to ``None`` (not
+#: this value) so every pre-#405 frozen ``profile_json`` / saved template still
+#: round-trips unchanged; ``DEFAULT_ROAST_STYLE`` is only the UI/creation-time
+#: seed for a NEW profile.
+DEFAULT_ROAST_STYLE: RoastStyle = RoastStyle.MEDIUM
+
+
+def roast_style_target(style: RoastStyle) -> RoastStyleTarget:
+    """Look up the corpus-seeded drop target for a roast style.
+
+    Args:
+        style: The roast style to resolve.
+
+    Returns:
+        The :class:`RoastStyleTarget` (drop temperature + DTR) seeded for that
+        style (#405, D82).
+    """
+    return ROAST_STYLE_TARGETS[style]
+
+
 class RoastCommand(Enum):
     """MCP write commands the agent can issue (component plan §2 tool surface,
     writes only). The command×phase validity matrix in safety.py (E3-S5,
@@ -370,6 +434,15 @@ class _BeanProfileFieldsBase(BaseModel):
     config-blind profile model."""
     target_drop_temp_c: float = Field(gt=0)
     target_development_percent: float = Field(gt=0, lt=100)
+    roast_style: RoastStyle | None = None
+    """The roast-style dimension (#405, D82): light / medium / dark. Optional /
+    defaulted ``None`` for back-compat so every frozen ``profile_json`` and
+    saved template from before #405 still deserializes unchanged. When ``None``
+    the profile's explicit ``target_drop_temp_c`` / ``target_development_percent``
+    remain authoritative — Slice C of #405 decides the precedence once a style
+    is wired into the deterministic drop control law. The creation/UI default
+    for a NEW profile is :data:`DEFAULT_ROAST_STYLE` (``MEDIUM``), but the stored
+    field itself defaults ``None`` so old profiles round-trip without it."""
 
     @field_validator("name", "bean_origin", "bean_varietal")
     @classmethod

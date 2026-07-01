@@ -11,6 +11,8 @@ import pydantic
 import pytest
 
 from roastpilot_agent.models import (
+    DEFAULT_ROAST_STYLE,
+    ROAST_STYLE_TARGETS,
     BeanProfile,
     BeanProfileInput,
     MicHealth,
@@ -21,6 +23,9 @@ from roastpilot_agent.models import (
     RoastEventSource,
     RoastPhase,
     RoastProfile,
+    RoastStyle,
+    RoastStyleTarget,
+    roast_style_target,
     weight_loss_percent,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
@@ -32,6 +37,7 @@ ALL_SHARED_ENUMS: list[type[Enum]] = [
     RoastEventSource,
     SafetyVerdict,
     MicHealth,
+    RoastStyle,
 ]
 
 
@@ -598,6 +604,92 @@ def test_roast_profile_rejects_nonsense(overrides: dict[str, object]) -> None:
         RoastProfile.model_validate(_profile(**overrides))
 
 
+# --- #405/D82: roast-style vocabulary (additive, Slice A) ---
+
+
+def test_roast_style_targets_has_exactly_three_seeded_styles() -> None:
+    """ROAST_STYLE_TARGETS carries exactly the three styles with the exact
+    corpus-seeded (washed high-grown) values from D82."""
+    assert set(ROAST_STYLE_TARGETS) == {RoastStyle.LIGHT, RoastStyle.MEDIUM, RoastStyle.DARK}
+    assert ROAST_STYLE_TARGETS[RoastStyle.LIGHT] == RoastStyleTarget(
+        drop_temp_c=188.0, dtr_target=15.0
+    )
+    assert ROAST_STYLE_TARGETS[RoastStyle.MEDIUM] == RoastStyleTarget(
+        drop_temp_c=193.0, dtr_target=18.0
+    )
+    assert ROAST_STYLE_TARGETS[RoastStyle.DARK] == RoastStyleTarget(
+        drop_temp_c=196.0, dtr_target=20.0
+    )
+
+
+def test_roast_style_target_helper_and_default() -> None:
+    """roast_style_target() resolves the mapping; DEFAULT_ROAST_STYLE is MEDIUM."""
+    target = roast_style_target(RoastStyle.MEDIUM)
+    assert target.drop_temp_c == 193.0
+    assert target.dtr_target == 18.0
+    assert DEFAULT_ROAST_STYLE is RoastStyle.MEDIUM
+
+
+@pytest.mark.parametrize(("bad_drop", "bad_dtr"), [(0, 18.0), (-5.0, 18.0)])
+def test_roast_style_target_rejects_non_positive_drop_temp(bad_drop: float, bad_dtr: float) -> None:
+    """RoastStyleTarget.drop_temp_c must be > 0."""
+    with pytest.raises(pydantic.ValidationError):
+        RoastStyleTarget(drop_temp_c=bad_drop, dtr_target=bad_dtr)
+
+
+@pytest.mark.parametrize("bad_dtr", [0, 100, -1.0, 150.0])
+def test_roast_style_target_rejects_out_of_range_dtr(bad_dtr: float) -> None:
+    """RoastStyleTarget.dtr_target must be strictly between 0 and 100."""
+    with pytest.raises(pydantic.ValidationError):
+        RoastStyleTarget(drop_temp_c=193.0, dtr_target=bad_dtr)
+
+
+def test_roast_profile_roast_style_defaults_to_none() -> None:
+    """#405/D82: roast_style defaults to unset so a minimal profile (the
+    pre-#405 shape) is valid unchanged."""
+    profile = RoastProfile.model_validate(_profile())
+    assert profile.roast_style is None
+
+
+@pytest.mark.parametrize("style", [RoastStyle.LIGHT, RoastStyle.MEDIUM, RoastStyle.DARK])
+def test_roast_profile_roast_style_round_trips(style: RoastStyle) -> None:
+    """A RoastProfile with an explicit roast_style survives a JSON round trip."""
+    profile = RoastProfile.model_validate(_profile(roast_style=style))
+    assert profile.roast_style is style
+    restored = RoastProfile.model_validate_json(profile.model_dump_json())
+    assert restored.roast_style is style
+
+
+def test_roast_profile_pre_405_json_back_compat() -> None:
+    """A frozen ``roast_runs.profile_json`` from before #405 (no roast_style)
+    still deserializes with roast_style unset — completed runs are immutable,
+    so this must never break."""
+    pre_405_json = json.dumps(
+        {
+            "name": "Ethiopia light",
+            "bean_origin": "Ethiopia",
+            "bean_varietal": "Heirloom",
+            "bean_weight_grams": 250.0,
+            "charge_guidance_min_c": 170.0,
+            "charge_guidance_max_c": 200.0,
+            "initial_heat_percent": 70,
+            "initial_fan_percent": 40,
+            "target_drop_temp_c": 205.0,
+            "target_development_percent": 20.0,
+        }
+    )
+    profile = RoastProfile.model_validate_json(pre_405_json)
+    assert profile.bean_origin == "Ethiopia"
+    # The #405 addition takes its back-compat default.
+    assert profile.roast_style is None
+
+
+def test_roast_profile_rejects_unknown_roast_style() -> None:
+    """roast_style is a constrained Enum — an unknown value is rejected."""
+    with pytest.raises(pydantic.ValidationError):
+        RoastProfile.model_validate(_profile(roast_style="extra_dark"))
+
+
 def test_roast_profile_json_round_trip() -> None:
     profile = RoastProfile.model_validate(
         _profile(
@@ -702,6 +794,7 @@ def test_bean_profile_to_roast_profile_copies_shared_fields() -> None:
             altitude_m=1885,
             pre_fc_heat=90,
             pre_fc_fan=20,
+            roast_style=RoastStyle.LIGHT,
             default_bean_weight_grams=250.0,
         )
     )
@@ -711,6 +804,8 @@ def test_bean_profile_to_roast_profile_copies_shared_fields() -> None:
     # The D59 per-bean pre-FC targets carry through to the per-roast profile.
     assert roast.pre_fc_heat == 90
     assert roast.pre_fc_fan == 20
+    # #405/D82: roast_style carries through too (a shared field, not excluded).
+    assert roast.roast_style is RoastStyle.LIGHT
     # Every shared field copied verbatim.
     for field in set(RoastProfile.model_fields) - {"bean_weight_grams"}:
         assert getattr(roast, field) == getattr(bean, field)
