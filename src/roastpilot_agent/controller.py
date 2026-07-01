@@ -1352,11 +1352,13 @@ class RoastController:
             # Rebuild the control box with floor==target==damped_heat (#412 Fix 1).
             # The policy-built box has heat_floor_percent==raw undamped depth, so
             # passing it to evaluate_command would CLAMP a slew-UP step back up to
-            # the raw floor, bypassing the slew limit.  Lowering the floor to the
-            # damped depth is safe: the damped value is always <= the raw depth
-            # (depth_for already clamps to [min_trim, max_trim], and slew/deadband
-            # only move TOWARD raw_depth, never above it), so we only ever make
-            # the trim floor cooler, never hotter.  The original ceiling is kept.
+            # the raw floor, bypassing the slew limit on the heat-UP leg.  Setting
+            # the floor to damped_heat is safe because damped_heat ∈ [min_trim,
+            # max_trim] ⊆ [0, ceiling], so the floor stays within the original
+            # safety ceiling and we never raise the floor above a prior actuated
+            # value on a downward ramp (slew may hold damped_heat above raw_depth
+            # during ramp-down, but it is always ≤ the last accepted write — the
+            # anchor — and therefore ≤ the ceiling).  The original ceiling is kept.
             box = box.model_copy(
                 update={
                     "heat_floor_percent": damped_heat,
