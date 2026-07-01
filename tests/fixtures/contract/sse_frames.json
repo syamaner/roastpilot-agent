@@ -66,6 +66,14 @@
     },
     {
       "data": {
+        "bean_temp_c": 142.0,
+        "elapsed_since_charge_seconds": 45.0
+      },
+      "event": "turning_point",
+      "id": 0
+    },
+    {
+      "data": {
         "bean_temp_c": 151.0,
         "threshold_c": 150.0
       },
