@@ -359,6 +359,7 @@ const SSE_EVENT_TYPES: SseEvent["event"][] = [
   "phase_changed",
   "charge_guidance",
   "t0_detected",
+  "turning_point",
   "drying_end",
   "first_crack",
   "advisory",

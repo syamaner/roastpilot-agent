@@ -32,6 +32,7 @@ export type SseEventType =
   | "phase_changed"
   | "charge_guidance"
   | "t0_detected"
+  | "turning_point"
   | "drying_end"
   | "first_crack"
   | "advisory"
@@ -395,6 +396,11 @@ export type RoastEventKind =
   | "phase_changed"
   | "charge_guidance"
   | "t0_detected"
+  // The post-charge bean-temp minimum landmark (#409): the tick the bean RoR first
+  // crosses zero after the charge dip. Persisted to the timeline so the detail page
+  // re-hydrates its chart marker on reload. Payload: {bean_temp_c,
+  // elapsed_since_charge_seconds}; no tick (not a tick-keyed trace record).
+  | "turning_point"
   // The pre-FC drying→browning landmark (#351), persisted to the timeline so the
   // detail page re-hydrates its chart marker on reload. Payload: {bean_temp_c,
   // threshold_c}; no tick (it is not a tick-keyed trace record).

@@ -18,6 +18,7 @@ const MILESTONE_LABELS: Partial<Record<RoastEventKind, string>> = {
   run_started: "Run started",
   charge_guidance: "Charge zone reached",
   t0_detected: "Beans added (T0)",
+  turning_point: "Turning point",
   drying_end: "Drying end",
   first_crack: "First crack",
   recovery_required: "Operator recovery required",
@@ -74,14 +75,22 @@ export function EventTimeline({
           event.monotonic_seconds !== null && t0Monotonic !== null
             ? event.monotonic_seconds - t0Monotonic
             : null;
+        // `turning_point` uses its payload's charge-referenced clock directly (#409).
+        // The generic monotonic-minus-T0 would show the debounce-offset time (often
+        // 00:00 when the TP fires on the debounce-backdated T0 tick), not the true
+        // roast elapsed. `elapsed_since_charge_seconds` IS the since-T0 clock —
+        // it is the server's charge-elapsed at the RoR-zero cross, already 0:00-based.
         const seconds =
           event.kind === "t0_detected"
             ? 0
-            : sinceT0 !== null && sinceT0 >= 0
-              ? sinceT0
-              : tick === null
-                ? null
-                : tickToSeconds(tick);
+            : event.kind === "turning_point" &&
+                typeof event.payload?.elapsed_since_charge_seconds === "number"
+              ? event.payload.elapsed_since_charge_seconds
+              : sinceT0 !== null && sinceT0 >= 0
+                ? sinceT0
+                : tick === null
+                  ? null
+                  : tickToSeconds(tick);
         const confidence =
           typeof event.payload?.confidence === "number" ? event.payload.confidence : null;
         const source = typeof event.payload?.source === "string" ? event.payload.source : null;

@@ -60,4 +60,27 @@ describe("EventTimeline milestone clocks (#379)", () => {
 
     expect(clockOf(container, "first_crack")).toBe("05:00"); // tickToSeconds(5) = 300 s
   });
+
+  it("renders turning_point (#409) as a milestone row with the 'Turning point' label", () => {
+    // turning_point is a pre-FC observability landmark mirroring drying_end (#351).
+    // It must appear in the timeline strip with a human label and a clock.
+    const { container } = render(
+      <EventTimeline
+        tickToSeconds={() => null}
+        timeline={timelineOf([
+          event("t0_detected", 1000, { bean_temp_c: 168 }),
+          event("turning_point", 1045, { bean_temp_c: 142, elapsed_since_charge_seconds: 45 }),
+        ])}
+      />,
+    );
+
+    // The row exists with the expected kind attribute.
+    expect(container.querySelector('[data-kind="turning_point"]')).not.toBeNull();
+    // The label reads "Turning point" (the <span className="font-medium"> cell).
+    expect(
+      container.querySelector('[data-kind="turning_point"] .font-medium')?.textContent,
+    ).toBe("Turning point");
+    // Clock: 1045 − 1000 (T0 monotonic) = 45 s = 00:45.
+    expect(clockOf(container, "turning_point")).toBe("00:45");
+  });
 });

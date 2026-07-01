@@ -293,6 +293,9 @@ def _gap_fill_frames() -> list[SseEvent]:
     controller emit-site dicts — never hand-authored. Each payload mirrors a real
     controller emit site:
 
+    * ``turning_point`` — controller.py ``_arm_pre_fc_milestones`` emit dict
+      (``{"bean_temp_c": ..., "elapsed_since_charge_seconds": ...}``, the #409
+      post-charge minimum marker).
     * ``drying_end`` — controller.py ``_maybe_emit_drying_end`` dict
       (``{"bean_temp_c": ..., "threshold_c": ...}``, the #351 pre-FC marker).
     * ``safety_alert`` — controller.py operator-timeout alert dict.
@@ -317,6 +320,13 @@ def _gap_fill_frames() -> list[SseEvent]:
         adjusted_heat=None,
         adjusted_fan=None,
         reason="operator did not confirm charge within the allowed window",
+    )
+    # controller.py _arm_pre_fc_milestones emit site shape (#409): the post-charge
+    # bean-temp minimum marker. bean_temp_c is the temperature at the turning tick;
+    # elapsed_since_charge_seconds is the charge-referenced clock at that tick.
+    broadcaster.emit(
+        RoastEventKind.TURNING_POINT,
+        {"bean_temp_c": 142.0, "elapsed_since_charge_seconds": 45.0},
     )
     # controller.py _maybe_emit_drying_end emit site shape (#351): the pre-FC
     # drying-end marker carries the bean temp at the cross + the configured

@@ -13,8 +13,10 @@
  *                        from the telemetry's `development` / `cooling` phase
  *                        transitions (the controller's FC/drop events carry no
  *                        tick or time — server-derived phase is the reliable axis);
- *                        plus dry-end (#351) placed from the persisted `drying_end`
- *                        timeline event's server threshold (see `dryEndSeconds`).
+ *                        plus turning-point (#409) from the persisted `turning_point`
+ *                        event's charge-clock (see `turningPointSeconds`), and
+ *                        dry-end (#351) from the persisted `drying_end` event's
+ *                        server threshold (see `dryEndSeconds`).
  *   - `toTraceRows`    : safety evaluations joined by `tick` to their advisor
  *                        decision + executed command → the decision-trace table.
  *   - `headlineStats`  : title-block stats derived from the same telemetry phases.
@@ -133,6 +135,9 @@ export function toCurveMarkers(
   const hasT0 = (timeline?.events ?? []).some((e) => e.kind === "t0_detected");
   if (hasT0) markers.push({ kind: "t0", t: 0, label: "T0" });
 
+  const tp = turningPointSeconds(timeline, series);
+  if (tp !== null) markers.push({ kind: "turning_point", t: tp, label: "TURN" });
+
   const dryEnd = dryEndSeconds(timeline, series);
   if (dryEnd !== null) markers.push({ kind: "dry_end", t: dryEnd, label: "DRY END" });
 
@@ -143,6 +148,38 @@ export function toCurveMarkers(
   if (drop !== null) markers.push({ kind: "drop", t: drop, label: "DROP" });
 
   return markers;
+}
+
+/**
+ * `elapsed_seconds` of the turning-point landmark for the persisted detail curve
+ * (#409), or null when the roast never recorded one.
+ *
+ * The pre-FC `turning_point` timeline event carries `{bean_temp_c,
+ * elapsed_since_charge_seconds}` — the charge-referenced clock at the tick RoR first
+ * crossed zero. Its x is placed by scanning the persisted telemetry for the first
+ * point whose `charge_elapsed_seconds` reaches the event's
+ * `elapsed_since_charge_seconds`, then returning that point's serve-referenced
+ * `elapsed_seconds` (the detail curve's x-axis). The event's presence is the gate;
+ * nothing is inferred client-side. Mirrors the `dryEndSeconds` pattern (#351).
+ */
+function turningPointSeconds(
+  timeline: RoastTimeline | undefined,
+  series: TelemetrySeries | undefined,
+): number | null {
+  const event = (timeline?.events ?? []).find((e) => e.kind === "turning_point");
+  if (!event || !series) return null;
+  const chargeElapsed = event.payload?.elapsed_since_charge_seconds;
+  if (typeof chargeElapsed !== "number") return null;
+  for (const p of series.points) {
+    if (
+      p.charge_elapsed_seconds !== null &&
+      p.charge_elapsed_seconds >= chargeElapsed &&
+      p.elapsed_seconds !== null
+    ) {
+      return p.elapsed_seconds;
+    }
+  }
+  return null;
 }
 
 /**

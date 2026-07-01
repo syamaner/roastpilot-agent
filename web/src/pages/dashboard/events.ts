@@ -79,6 +79,18 @@ export interface FirstCrackData {
   bean_temp_c?: number;
 }
 
+/** The `turning_point` payload (#409) — the post-charge bean-temp minimum. Carries
+ *  the bean temp at the RoR-zero cross + the charge-referenced elapsed clock at that
+ *  tick; the clock IS the authoritative marker x (unlike `drying_end`, which has no
+ *  clock and rides the latest-point heuristic). `elapsed_since_charge_seconds` is the
+ *  server's charge clock — the same field `turningPointSeconds()` uses on the detail
+ *  page. The serve-elapsed position for the live marker is
+ *  `t0ElapsedSeconds + elapsed_since_charge_seconds`. */
+export interface TurningPointData {
+  bean_temp_c?: number;
+  elapsed_since_charge_seconds: number;
+}
+
 /** The `drying_end` payload (#351) — the pre-FC drying→browning landmark. Carries
  *  the bean temp at the cross + the server threshold that fired it; like
  *  `first_crack` it carries NO clock, so the marker's x is derived from the latest

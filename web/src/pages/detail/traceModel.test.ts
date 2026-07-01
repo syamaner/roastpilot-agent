@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { RoastTimeline, SafetyVerdict, TelemetrySeries } from "@/lib/types";
-import { FIXTURE_TELEMETRY, FIXTURE_TIMELINE } from "./fixture";
+import { FIXTURE_TELEMETRY, FIXTURE_TIMELINE, FIXTURE_TIMELINE_TURNING_POINT } from "./fixture";
 import {
   headlineStats,
   tickToSeconds,
@@ -66,6 +66,46 @@ describe("toCurveMarkers", () => {
     };
     const markers = toCurveMarkers(FIXTURE_TIMELINE, series);
     expect(markers.map((m) => m.kind)).toEqual(["t0"]);
+  });
+
+  it("places turning-point (#409) at the first telemetry point reaching the event's charge-elapsed", () => {
+    // The persisted turning_point timeline event carries elapsed_since_charge_seconds
+    // (the charge-referenced clock at the RoR-zero cross) but no tick. Its x is the
+    // first telemetry point whose charge_elapsed_seconds >= that value.
+    // FIXTURE_TELEMETRY has charge_elapsed_seconds === elapsed_seconds = i*30.
+    // elapsed_since_charge_seconds: 90 → first point with charge_elapsed >= 90 is
+    // tick 3 at elapsed_seconds 90. monotonic_seconds 888 is distinct — confirms we
+    // are NOT returning the event's own monotonic (the scan-for-cross is the logic).
+    const markers = toCurveMarkers(FIXTURE_TIMELINE_TURNING_POINT, FIXTURE_TELEMETRY);
+    expect(markers.find((m) => m.kind === "turning_point")).toEqual({
+      kind: "turning_point",
+      t: 90, // charge_elapsed 90 → elapsed_seconds 90 (NOT monotonic 888)
+      label: "TURN",
+    });
+  });
+
+  it("omits turning-point when no turning_point event is on the timeline", () => {
+    // FIXTURE_TIMELINE has no turning_point event → no marker (event presence is the gate).
+    const markers = toCurveMarkers(FIXTURE_TIMELINE, FIXTURE_TELEMETRY);
+    expect(markers.some((m) => m.kind === "turning_point")).toBe(false);
+  });
+
+  it("omits turning-point when the event carries no numeric elapsed_since_charge_seconds", () => {
+    const timeline: RoastTimeline = {
+      ...FIXTURE_TIMELINE,
+      events: [
+        ...FIXTURE_TIMELINE.events,
+        {
+          kind: "turning_point",
+          source: "controller",
+          monotonic_seconds: 90,
+          recorded_at_utc: "2026-06-07T09:13:30Z",
+          payload: { bean_temp_c: 116.6 }, // elapsed_since_charge_seconds absent
+        },
+      ],
+    };
+    const markers = toCurveMarkers(timeline, FIXTURE_TELEMETRY);
+    expect(markers.some((m) => m.kind === "turning_point")).toBe(false);
   });
 
   it("places dry-end (#351) at the first telemetry point reaching the event's server threshold", () => {
