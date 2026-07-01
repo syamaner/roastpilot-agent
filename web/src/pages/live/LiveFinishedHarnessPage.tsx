@@ -44,8 +44,15 @@ queryClient.setQueryData(
   ["roasts", FIXTURE_FINISHED_RUN_ID],
   FIXTURE_FINISHED_DETAIL,
 );
+// Full-resolution series (downsample=1) — used by LiveFinishedView for headline
+// stats (P2-2: ensures the drop/terminal row is included regardless of stride).
 queryClient.setQueryData(
-  ["roasts", FIXTURE_FINISHED_RUN_ID, "telemetry", 5],
+  roastKeys.telemetry(FIXTURE_FINISHED_RUN_ID, 1),
+  FIXTURE_FINISHED_TELEMETRY,
+);
+// Downsampled series (downsample=5) — used by LiveFinishedView for the mini curve.
+queryClient.setQueryData(
+  roastKeys.telemetry(FIXTURE_FINISHED_RUN_ID, 5),
   FIXTURE_FINISHED_TELEMETRY,
 );
 
@@ -60,11 +67,14 @@ import { Link } from "react-router-dom";
 
 function LiveFinishedHarnessView(): React.JSX.Element {
   const roast = useRoast(FIXTURE_FINISHED_RUN_ID);
-  const telemetry = useTelemetry(FIXTURE_FINISHED_RUN_ID, 5);
+  // Full-resolution for stats (P2-2: guarantees drop/terminal row is present).
+  const telemetryFull = useTelemetry(FIXTURE_FINISHED_RUN_ID, 1);
+  // Downsampled for the mini curve only.
+  const telemetryCurve = useTelemetry(FIXTURE_FINISHED_RUN_ID, 5);
 
-  const stats = headlineStats(undefined, telemetry.data);
-  const points = toCurvePoints(telemetry.data);
-  const markers = toCurveMarkers(undefined, telemetry.data);
+  const stats = headlineStats(undefined, telemetryFull.data);
+  const points = toCurvePoints(telemetryCurve.data);
+  const markers = toCurveMarkers(undefined, telemetryCurve.data);
 
   const beanOrigin = roast.data?.profile.bean_origin ?? null;
   const outcome = roast.data?.outcome ?? null;

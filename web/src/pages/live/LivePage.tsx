@@ -25,7 +25,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 
 import { AppFrame, LiveCurve } from "@/components/shared";
 import {
@@ -44,27 +44,67 @@ import { DashboardPage } from "@/pages/dashboard/DashboardPage";
 import { StartRoastForm } from "@/pages/dashboard/StartRoastForm";
 import { headlineStats, toCurveMarkers, toCurvePoints } from "@/pages/detail/traceModel";
 
+/**
+ * Fetch the terminal RoastDetail snapshot for a just-ended run and return its
+ * outcome. Always re-fetches (staleTime: 0) so the cache reflects the server's
+ * FINAL state, not the stale in-progress snapshot that had `outcome: null` while
+ * the run was live (P2-3). Populates the TanStack Query cache so a subsequent
+ * `useRoast(runId)` in LiveFinishedView resolves synchronously from the fresh data.
+ * Returns `null` on any network error (safe no-op: the finished summary is silently
+ * suppressed and the operator lands on the start form instead).
+ */
+async function fetchTerminalOutcome(
+  queryClient: QueryClient,
+  runId: string,
+): Promise<string | null> {
+  try {
+    const detail = await queryClient.fetchQuery({
+      queryKey: roastKeys.detail(runId),
+      queryFn: () => api.roast(runId),
+      staleTime: 0,
+    });
+    return detail.outcome ?? null;
+  } catch {
+    return null;
+  }
+}
+
 export function LivePage(): React.JSX.Element {
   const health = useHealth();
   const activeRunId = health.data?.active_run_id ?? null;
+  const queryClient = useQueryClient();
 
   // Track the most recent non-null active_run_id across renders. When the id
-  // transitions non-null → null we latch it as the just-finished run so
-  // LiveFinishedView can fetch and display the outcome.
+  // transitions non-null → null we fetch the terminal run snapshot to determine
+  // the outcome:
+  //   - `completed`: latch as stickyCompletedRunId → LiveFinishedView.
+  //   - anything else (faulted, aborted): do NOT latch — the fault flow in
+  //     DashboardPage owns that path (P2-4 / P2-3 / #423).
+  //
+  // Fetching with staleTime:0 ensures we get the SERVER'S TERMINAL snapshot, not
+  // the stale in-progress cache that had outcome:null while the run was live (P2-3).
   const prevRunIdRef = useRef<string | null>(null);
   const [stickyCompletedRunId, setStickyCompletedRunId] = useState<string | null>(null);
 
   useEffect(() => {
     if (activeRunId !== null) {
-      // A run is active — remember it and clear any stale sticky from an older run.
+      // A run is active — remember it.
       prevRunIdRef.current = activeRunId;
-      // Don't clear a sticky while a new run is still in progress; wait for it to end.
     } else if (prevRunIdRef.current !== null) {
-      // Transition: active_run_id was non-null, is now null — latch the finished run.
-      setStickyCompletedRunId(prevRunIdRef.current);
+      // Transition: active_run_id was non-null, is now null. Fetch the terminal
+      // snapshot to gate on outcome (P2-3 + P2-4). fetchQuery populates the cache
+      // so LiveFinishedView's useRoast sees the terminal data immediately on mount.
+      const finishedId = prevRunIdRef.current;
       prevRunIdRef.current = null;
+      void fetchTerminalOutcome(queryClient, finishedId).then((outcome) => {
+        if (outcome === "completed") {
+          setStickyCompletedRunId(finishedId);
+        }
+        // Non-completed outcomes (faulted, aborted, null) don't show the summary.
+        // DashboardPage retains the faulted run via stickyFaultedRunId for ack.
+      });
     }
-  }, [activeRunId]);
+  }, [activeRunId, queryClient]);
 
   // Health error: active run unknown — treat as idle (fall through to no-run state).
   if (health.isError) {
@@ -113,18 +153,29 @@ interface LiveFinishedViewProps {
 /**
  * Summary shown at `/live` immediately after a roast ends in the current session.
  *
- * Fetches the RoastDetail snapshot + the telemetry series (downsampled to 5)
- * and renders a mini curve + headline stats. 'Start next roast' clears the
- * sticky and returns to the start form. Reload always bypasses this view
- * (stickyCompletedRunId is session-only; reload → LiveStartView).
+ * The RoastDetail snapshot was already fetched (with staleTime:0) by LivePage's
+ * `fetchTerminalOutcome` call before this view mounts, so `useRoast` resolves
+ * synchronously from the cache — the terminal snapshot with the final outcome (P2-3).
+ *
+ * Headline stats (drop temp / dev% / total time) come from the FULL-RESOLUTION
+ * telemetry series (`downsample=1`), guaranteeing that the drop/terminal rows are
+ * included regardless of stride position (P2-2). The mini curve uses the
+ * downsampled series (`downsample=5`) to keep the fetch lightweight.
+ *
+ * 'Start next roast' clears the sticky and returns to the start form. Reload always
+ * bypasses this view (stickyCompletedRunId is session-only; reload → LiveStartView).
  */
 function LiveFinishedView({ runId, onStartNext }: LiveFinishedViewProps): React.JSX.Element {
   const roast = useRoast(runId);
-  const telemetry = useTelemetry(runId, 5);
+  // Full-resolution telemetry for accurate headline stats (P2-2): downsample=1
+  // ensures the drop/terminal rows are included regardless of stride position.
+  const telemetryFull = useTelemetry(runId, 1);
+  // Downsampled telemetry for the mini curve only — lightweight fetch for display.
+  const telemetryCurve = useTelemetry(runId, 5);
 
-  const stats = headlineStats(undefined, telemetry.data);
-  const points = toCurvePoints(telemetry.data);
-  const markers = toCurveMarkers(undefined, telemetry.data);
+  const stats = headlineStats(undefined, telemetryFull.data);
+  const points = toCurvePoints(telemetryCurve.data);
+  const markers = toCurveMarkers(undefined, telemetryCurve.data);
 
   const beanOrigin = roast.data?.profile.bean_origin ?? null;
   const outcome = roast.data?.outcome ?? null;

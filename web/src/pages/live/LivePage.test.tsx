@@ -5,13 +5,15 @@
  * 1. Loading hold  — neither the start form nor the dashboard appears until health resolves.
  * 2. Active run    — DashboardPage; reload-safe guarantee.
  * 3. Sticky summary (#423) — active_run_id non-null → null this session → LiveFinishedView.
- *    a. Gate: correct view appears after the transition.
- *    b. Outcome content: stat tiles, detail link href (MEDIUM 1).
+ *    a. Gate: correct view appears after a COMPLETED transition (P2-4).
+ *    b. Outcome content: stat tiles + detail link href; stats from full-res telemetry (P2-2).
  *    c. "Start next roast" clears sticky → start form.
  *    d. Reload (fresh null) → start form (sticky is session-only).
  *    e. Navigate-away / remount → sticky does NOT persist (LOW 4).
+ *    f. Faulted run: active_run_id→null does NOT show finished summary (P2-4).
  * 4. No run, no sticky — LiveStartView (idle / fresh session).
  * 5. Start-roast flow — POSTs, refetches health, stays on /live.
+ * 6. P2-3: terminal snapshot is fetched (staleTime:0) so outcome/stats come from final state.
  *
  * Phase is never inferred: the only server-state read is active_run_id.
  */
@@ -23,6 +25,7 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { roastKeys } from "@/hooks/queries";
+import type { RoastDetail, TelemetrySeries } from "@/lib/types";
 import { LivePage } from "./LivePage";
 import {
   FIXTURE_FINISHED_DETAIL,
@@ -41,7 +44,10 @@ const healthState: {
 // Mutable stubs for useRoast / useTelemetry — defaulting to null/undefined so
 // gate-only tests don't see real data; the content-assertion tests override them.
 const roastState: { data: unknown } = { data: null };
-const telemetryState: { data: unknown } = { data: undefined };
+// useTelemetry is now called twice (downsample=1 for stats, downsample=5 for curve).
+// Separate stubs so tests can control each independently.
+const telemetryFullState: { data: TelemetrySeries | undefined } = { data: undefined };
+const telemetryCurveState: { data: TelemetrySeries | undefined } = { data: undefined };
 
 vi.mock("@/hooks/queries", async () => {
   const actual = await vi.importActual<typeof import("@/hooks/queries")>("@/hooks/queries");
@@ -51,7 +57,9 @@ vi.mock("@/hooks/queries", async () => {
     useHealth: () => healthState,
     useBeanProfiles: () => ({ data: { profiles: [] }, isLoading: false }),
     useRoast: () => roastState,
-    useTelemetry: () => telemetryState,
+    // Return full-res stub for downsample=1 (stats), curve stub for downsample=5.
+    useTelemetry: (_runId: string | null, downsample = 1) =>
+      downsample === 1 ? telemetryFullState : telemetryCurveState,
     useCreateBeanProfile: noopMutation,
     useUpdateBeanProfile: noopMutation,
     useDeleteBeanProfile: noopMutation,
@@ -89,11 +97,18 @@ vi.mock("@/components/shared", async () => {
   };
 });
 
-// Stub StartRoastForm with a minimal form that fires onStart on submit.
+// `api.roast` is called by fetchTerminalOutcome (the outcome gate, P2-3/P2-4) and
+// `api.startRoast` by the start-roast flow. Both are stubbed here.
+const roastApiMock = vi.hoisted(() =>
+  vi.fn(async (): Promise<RoastDetail> => ({
+    ...(FIXTURE_FINISHED_DETAIL as RoastDetail),
+    outcome: "completed",
+  })),
+);
 const startRoastMock = vi.hoisted(() => vi.fn(async () => ({ id: "run-new" })));
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
-  return { ...actual, api: { ...actual.api, startRoast: startRoastMock } };
+  return { ...actual, api: { ...actual.api, startRoast: startRoastMock, roast: roastApiMock } };
 });
 
 vi.mock("@/pages/dashboard/StartRoastForm", () => ({
@@ -116,9 +131,11 @@ beforeEach(() => {
   healthState.isSuccess = false;
   healthState.isError = false;
   startRoastMock.mockClear();
+  roastApiMock.mockClear();
   // Reset stubs to defaults (null data, no-op traceModel).
   roastState.data = null;
-  telemetryState.data = undefined;
+  telemetryFullState.data = undefined;
+  telemetryCurveState.data = undefined;
   traceModelMock.headlineStats.mockReturnValue({
     dropTempC: null,
     developmentPercent: null,
@@ -225,7 +242,8 @@ describe("LivePage — no active run, no sticky (idle / fresh session)", () => {
 });
 
 describe("LivePage — sticky finished-run summary (#423)", () => {
-  it("shows LiveFinishedView when active_run_id transitions from non-null to null in the same session", async () => {
+  it("shows LiveFinishedView when active_run_id transitions non-null → null and outcome is completed (P2-4 gate)", async () => {
+    // roastApiMock defaults to outcome: "completed" (set in beforeEach default).
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-42" };
     const { rerender } = renderPage();
@@ -235,6 +253,7 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
     healthState.data = { active_run_id: null };
     rerender();
 
+    // The latch fires only after api.roast resolves (async fetchTerminalOutcome).
     await waitFor(() =>
       expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
     );
@@ -242,10 +261,13 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
   });
 
-  it("renders stat tiles and detail link with real roast + headlineStats data (MEDIUM 1)", async () => {
-    // Inject real-shaped data so the rendered tile text is verifiable.
+  it("renders stat tiles using full-resolution telemetry (P2-2) and detail link (MEDIUM 1)", async () => {
+    // Both telemetry stubs carry the fixture data; the test checks the rendered tiles.
+    // headlineStats is called with the FULL-RES series (downsample=1 stub); the curve
+    // uses the downsample=5 stub. Both are set to the same fixture here for simplicity.
     roastState.data = FIXTURE_FINISHED_DETAIL;
-    telemetryState.data = FIXTURE_FINISHED_TELEMETRY;
+    telemetryFullState.data = FIXTURE_FINISHED_TELEMETRY;
+    telemetryCurveState.data = FIXTURE_FINISHED_TELEMETRY;
     // Use real headlineStats derivation from the fixture telemetry.
     const { headlineStats, toCurvePoints, toCurveMarkers } = await vi.importActual<
       typeof import("@/pages/detail/traceModel")
@@ -267,7 +289,7 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
       expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
     );
 
-    // Stat tiles render the fixture-derived values.
+    // Stat tiles render the fixture-derived values (from the full-res telemetry, P2-2).
     expect(screen.getByTestId("stat-drop-temp")).toHaveTextContent(
       FIXTURE_FINISHED_STATS.dropTempDisplay,
     );
@@ -285,6 +307,87 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
       "href",
       `/roasts/${FIXTURE_FINISHED_RUN_ID}`,
     );
+  });
+
+  it("stats are sourced from downsample=1 telemetry even when the drop row is absent in downsample=5 (P2-2)", async () => {
+    // Simulate a roast where the drop row (cooling phase) is NOT in the stride-5
+    // sample but IS in the full-res series. headlineStats called with the full-res
+    // stub must surface drop stats; called with the curve stub it would miss them.
+    // Construct a minimal full-res series that includes the drop row:
+    const fullResSeries: TelemetrySeries = {
+      ...FIXTURE_FINISHED_TELEMETRY,
+      downsample: 1,
+      // Include all fixture points (one of which is the cooling/drop row at tick 13).
+      points: FIXTURE_FINISHED_TELEMETRY.points,
+    };
+    // Curve series omits the drop row (simulating stride-5 miss):
+    const curveSeriesNoDrop: TelemetrySeries = {
+      ...FIXTURE_FINISHED_TELEMETRY,
+      downsample: 5,
+      points: FIXTURE_FINISHED_TELEMETRY.points.filter((p) => p.agent_phase !== "cooling"),
+    };
+    roastState.data = FIXTURE_FINISHED_DETAIL;
+    telemetryFullState.data = fullResSeries;
+    telemetryCurveState.data = curveSeriesNoDrop;
+    const { headlineStats } = await vi.importActual<
+      typeof import("@/pages/detail/traceModel")
+    >("@/pages/detail/traceModel");
+    traceModelMock.headlineStats.mockImplementation(headlineStats);
+
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-p2-2" };
+    const { rerender } = renderPage();
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+    // Drop temp and dev% must be present (derived from full-res series which has the cooling row).
+    expect(screen.getByTestId("stat-drop-temp")).toHaveTextContent("191 °C");
+    expect(screen.getByTestId("stat-dev-percent")).toHaveTextContent("18.7 %");
+  });
+
+  it("P2-3: fetches the terminal run snapshot (staleTime:0) to get the final outcome on transition", async () => {
+    // The in-progress detail cache has outcome:null (stale snapshot while running).
+    // fetchTerminalOutcome must call api.roast with staleTime:0 to get the FINAL state.
+    // Assert that api.roast was called (not just the stale cache used).
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-p2-3" };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+    // api.roast must have been called to determine the final outcome.
+    expect(roastApiMock).toHaveBeenCalledWith("run-p2-3");
+  });
+
+  it("P2-4: a faulted run's active_run_id→null does NOT show the finished summary — start form instead", async () => {
+    // A fault finalises the run (active_run_id → null) but the outcome is "faulted",
+    // not "completed". The finished summary must NOT appear. DashboardPage owns the
+    // fault-ack flow via stickyFaultedRunId (separate mechanism, not tested here).
+    roastApiMock.mockResolvedValueOnce({ ...FIXTURE_FINISHED_DETAIL, outcome: "faulted" });
+
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-faulted" };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    // Wait for api.roast to resolve (async gate) — the finished view must NOT appear.
+    await waitFor(() => expect(roastApiMock).toHaveBeenCalledWith("run-faulted"));
+    // After the gate resolves with a non-completed outcome, the start form shows.
+    await waitFor(() =>
+      expect(screen.getByTestId("live-start-view")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
 
   it("'Start next roast' clears the sticky and returns to the start form", async () => {

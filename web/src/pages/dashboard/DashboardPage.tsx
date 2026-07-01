@@ -30,7 +30,7 @@ import {
   useUpdateBeanProfile,
 } from "@/hooks/queries";
 import type { BeanProfileInput } from "@/lib/types";
-import { useRoastStream } from "@/hooks/useRoastStream";
+import { useFrameDrain, useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
 import { smoothCurveForDisplay } from "@/lib/rorSmoothing";
 import type { OperatorAction } from "@/lib/types";
@@ -78,6 +78,21 @@ export function DashboardPage(): React.JSX.Element {
   // (re)connect — keyed on `status` — so a late-joining or reconnecting device shows
   // the full roast curve, not just the frames it personally witnessed (#153).
   const view = useDashboardEvents(frames, frameCount, runId, status);
+
+  // P2-1 (#423): a normal roast completion emits `run_completed` on the SSE stream.
+  // `useHealth` is not refetched by default on this path (health invalidation lives
+  // at start + fault-ack only), so `active_run_id` stays non-null in the cache and
+  // LivePage never sees the transition → the finished summary never fires. Drain the
+  // non-lossy frame buffer for `run_completed` and invalidate health so the cache
+  // flips to null promptly. `useFrameDrain` is the established non-lossy drain
+  // pattern (#122); fire-once via an early-exit in the callback (the event is
+  // one-shot per run; re-delivering it on a reconnect is a no-op via invalidation).
+  const queryClientForCompletion = useQueryClient();
+  useFrameDrain(frames, frameCount, (frame) => {
+    if (frame.event === "run_completed") {
+      void queryClientForCompletion.invalidateQueries({ queryKey: roastKeys.health });
+    }
+  });
 
   // The run snapshot (profile name + initial enabled actions before the first
   // phase_changed). Read-only REST snapshot, hydrated by TanStack Query.

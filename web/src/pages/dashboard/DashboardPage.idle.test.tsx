@@ -94,6 +94,11 @@ const streamState: {
 
 vi.mock("@/hooks/useRoastStream", () => ({
   useRoastStream: () => streamState,
+  // useFrameDrain is used by DashboardPage for the P2-1 run_completed → health
+  // invalidation. In this wiring test the frame buffer is empty (frameCount:0),
+  // so a real useFrameDrain would never fire; stub it as a no-op so the module
+  // resolves without importing the real hook's timer/effect dependencies.
+  useFrameDrain: () => undefined,
 }));
 
 // The view-model folds frames; for this wiring test an empty view is enough.
