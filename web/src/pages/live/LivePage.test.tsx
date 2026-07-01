@@ -390,6 +390,27 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
     expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
 
+  it("an aborted run's active_run_id→null does NOT show the finished summary — start form instead", async () => {
+    // Mirrors the faulted-gate test (P2-4) for the aborted outcome. Both "faulted"
+    // and "aborted" are non-completed outcomes that must fall through to LiveStartView
+    // rather than surfacing the finished summary (which is reserved for "completed").
+    roastApiMock.mockResolvedValueOnce({ ...FIXTURE_FINISHED_DETAIL, outcome: "aborted" });
+
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-aborted" };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    await waitFor(() => expect(roastApiMock).toHaveBeenCalledWith("run-aborted"));
+    await waitFor(() =>
+      expect(screen.getByTestId("live-start-view")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
+  });
+
   it("'Start next roast' clears the sticky and returns to the start form", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-55" };
