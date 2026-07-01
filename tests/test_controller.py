@@ -1241,6 +1241,16 @@ def test_damp_trim_depth_unit_deadband_and_slew() -> None:
     assert damp(55, trim) == 56
     assert ctrl._trim_depth_applied == 56  # pyright: ignore[reportPrivateUsage]
 
+    # Slew-UP: a large positive jump (56→75) is also capped to prev+slew=56+3=59.
+    # |59-56|=3 > deadband 2 → commits.  Verifies the min(raw, prev+slew) branch.
+    assert damp(75, trim) == 59
+    assert ctrl._trim_depth_applied == 59  # pyright: ignore[reportPrivateUsage]
+    # Another slew-UP tick: 59→62, still short of 75.
+    assert damp(75, trim) == 62
+    # Within-deadband slew-UP: target 63 → slew min(63,62+3)=63; |63-62|=1 ≤ 2 → hold.
+    assert damp(63, trim) == 62
+    assert ctrl._trim_depth_applied == 62  # pyright: ignore[reportPrivateUsage]
+
 
 @pytest.mark.asyncio
 async def test_adaptive_depth_damping_bounds_jittery_ror_series() -> None:
@@ -1296,6 +1306,13 @@ async def test_adaptive_depth_damping_bounds_jittery_ror_series() -> None:
                     f"tick-to-tick swing {delta} pp exceeds slew cap "
                     f"{trim.trim_depth_slew_pp_per_tick} pp; heats so far: {heats}"
                 )
+
+    # Guard: if the trim never engaged, the slew-bound assertion above never ran —
+    # which means a regression silently breaking trim engagement would pass vacuously.
+    assert first_trim_heat is not None, (
+        "trim never engaged during the jittery-RoR loop; the slew-bound assertion "
+        "never executed — check bean temp, ETA, or window config"
+    )
 
 
 @pytest.mark.asyncio
