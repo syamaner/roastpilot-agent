@@ -239,6 +239,8 @@ class ControllerConfigSnapshot(BaseModel, frozen=True):
     late_maillard_trim_eta_ref: ConfigFieldMeta
     late_maillard_trim_min_trim: ConfigFieldMeta
     late_maillard_trim_max_trim: ConfigFieldMeta
+    late_maillard_trim_trim_depth_deadband_pp: ConfigFieldMeta
+    late_maillard_trim_trim_depth_slew_pp_per_tick: ConfigFieldMeta
 
 
 class AdvisorConfigSnapshot(BaseModel, frozen=True):
@@ -334,6 +336,8 @@ class LateMaillardTrimEdit(BaseModel):
     eta_ref: float | None = Field(default=None, gt=0)
     min_trim: int | None = Field(default=None, ge=10, le=100)
     max_trim: int | None = Field(default=None, ge=10, le=100)
+    trim_depth_deadband_pp: int | None = Field(default=None, ge=0, le=20)
+    trim_depth_slew_pp_per_tick: int | None = Field(default=None, ge=1, le=20)
 
 
 class PreFirstCrackLeversEdit(BaseModel):
@@ -819,6 +823,29 @@ def build_config_snapshot(
                 " this (adaptive depth is always a reduction). Default 75."
             ),
         ),
+        late_maillard_trim_trim_depth_deadband_pp=_meta(
+            trim_saved.get("trim_depth_deadband_pp"),
+            trim.trim_depth_deadband_pp,
+            trim_def.trim_depth_deadband_pp,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__TRIM_DEPTH_DEADBAND_PP",
+            description=(
+                "Adaptive-depth tick-to-tick deadband (pp). Changes smaller than"
+                " this are suppressed to avoid noise-driven micro-adjustments."
+                " Must be strictly less than trim_depth_slew_pp_per_tick. Default 2."
+            ),
+        ),
+        late_maillard_trim_trim_depth_slew_pp_per_tick=_meta(
+            trim_saved.get("trim_depth_slew_pp_per_tick"),
+            trim.trim_depth_slew_pp_per_tick,
+            trim_def.trim_depth_slew_pp_per_tick,
+            "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__TRIM_DEPTH_SLEW_PP_PER_TICK",
+            description=(
+                "Adaptive-depth maximum change per accepted write (pp). Limits how"
+                " fast the trim depth can move between consecutive accepted MCP"
+                " writes, damping thrash from jittery RoR. Must be strictly greater"
+                " than trim_depth_deadband_pp. Default 3."
+            ),
+        ),
     )
 
     # --- advisor section ---------------------------------------------------
@@ -1205,6 +1232,8 @@ def apply_config_edit(
                         "eta_ref": t.eta_ref,
                         "min_trim": t.min_trim,
                         "max_trim": t.max_trim,
+                        "trim_depth_deadband_pp": t.trim_depth_deadband_pp,
+                        "trim_depth_slew_pp_per_tick": t.trim_depth_slew_pp_per_tick,
                     },
                 )
 
