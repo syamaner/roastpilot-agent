@@ -33,6 +33,7 @@ from roastpilot_agent.config_store import (
     _config_file_path,  # pyright: ignore[reportPrivateUsage]
     _inject_saved_as_env,  # pyright: ignore[reportPrivateUsage]
     _load_saved_config,  # pyright: ignore[reportPrivateUsage]
+    _make_field_meta,  # pyright: ignore[reportPrivateUsage]
     _merge_device_fields,  # pyright: ignore[reportPrivateUsage]
     _write_saved_config,  # pyright: ignore[reportPrivateUsage]
     apply_config_edit,
@@ -1428,3 +1429,71 @@ def test_malformed_json_blob_inject_saved_as_env_does_not_crash(
     # Full section skip on malformed blob — no advisor scalars injected.
     assert not any("ROASTPILOT_ADVISOR__" in k for k in injected)
     assert "ROASTPILOT_ADVISOR__MODEL_SLUG" not in os.environ
+
+
+def test_non_dict_json_blob_in_inject_saved_as_env_skips_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A syntactically valid JSON blob that is NOT a dict (e.g. '[]') triggers the
+    non-dict fallback in _inject_saved_as_env: the section is skipped entirely
+    (same as a malformed blob — safe, no competing scalars injected).
+
+    Covers the `else: continue` branch at the non-dict path (line 1487).
+    """
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", "[]")  # valid JSON, not a dict
+
+    injected = _inject_saved_as_env(
+        {"advisor": {"model_slug": "saved-model", "timeout_seconds": 30.0}}
+    )
+
+    # Non-dict blob → full section skip → no advisor scalars injected.
+    assert not any("ROASTPILOT_ADVISOR__" in k for k in injected)
+    assert "ROASTPILOT_ADVISOR__MODEL_SLUG" not in os.environ
+
+
+def test_non_dict_json_blob_in_make_field_meta_leaves_blob_overridden_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-dict JSON blob (e.g. '[]') for a section env var leaves blob_overridden=False
+    in _make_field_meta — the isinstance(parsed, dict) branch is False.
+
+    Covers the branch-not-taken path at line 564→569 in _make_field_meta.
+    """
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", "[]")  # valid JSON, not a dict
+
+    meta = _make_field_meta(
+        saved_value="saved-model",
+        effective_value="saved-model",
+        default_value="openai/gpt-4o",
+        env_var="ROASTPILOT_ADVISOR__MODEL_SLUG",
+        read_only=False,
+        description="test",
+        injected_keys=frozenset(),
+    )
+
+    # Non-dict blob: blob_overridden=False; scalar var not set → env_overridden=False.
+    assert meta.env_overridden is False
+
+
+def test_malformed_json_blob_in_make_field_meta_leaves_blob_overridden_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed JSON blob (e.g. 'not json') for a section env var leaves
+    blob_overridden=False in _make_field_meta — the ValueError path is hit.
+
+    Covers lines 567-568 (except ValueError/TypeError → pass) in _make_field_meta.
+    """
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", "not json")
+
+    meta = _make_field_meta(
+        saved_value="saved-model",
+        effective_value="saved-model",
+        default_value="openai/gpt-4o",
+        env_var="ROASTPILOT_ADVISOR__MODEL_SLUG",
+        read_only=False,
+        description="test",
+        injected_keys=frozenset(),
+    )
+
+    # Malformed blob: blob_overridden=False; scalar var not set → env_overridden=False.
+    assert meta.env_overridden is False
