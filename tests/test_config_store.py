@@ -27,11 +27,13 @@ from roastpilot_agent.config_store import (
     ControllerConfigEdit,
     ControllerConfigSnapshot,
     LateMaillardTrimEdit,
+    MCPDeviceConfigEdit,
     PreFirstCrackLeversEdit,
     SafetyLimitsSnapshot,
     _config_file_path,  # pyright: ignore[reportPrivateUsage]
     _inject_saved_as_env,  # pyright: ignore[reportPrivateUsage]
     _load_saved_config,  # pyright: ignore[reportPrivateUsage]
+    _merge_device_fields,  # pyright: ignore[reportPrivateUsage]
     _write_saved_config,  # pyright: ignore[reportPrivateUsage]
     apply_config_edit,
     build_config_snapshot,
@@ -1076,3 +1078,162 @@ def test_persist_config_edit_creates_parent_dir_on_first_run(
 
     saved = yaml.safe_load(nested_cfg.read_text(encoding="utf-8"))
     assert saved["advisor"]["model_slug"] == "openai/gpt-4o"
+
+
+# ---------------------------------------------------------------------------
+# mcp_device tri-state inherit/override (#439)
+# ---------------------------------------------------------------------------
+
+
+def test_merge_device_fields_skip_absent_from_put_body() -> None:
+    """Fields absent from model_fields_set are skipped — the saved section is
+    unchanged (neither written nor cleared)."""
+    target: dict[str, Any] = {"serial_port": "/dev/ttyUSB0"}
+    # Only "audio_input_device" was explicitly set in the PUT body.
+    _merge_device_fields(
+        target,
+        {"serial_port": "/dev/ttyUSB1", "audio_input_device": "USB PnP"},
+        {"audio_input_device"},
+    )
+    # serial_port is absent from explicitly_set → unchanged.
+    assert target["serial_port"] == "/dev/ttyUSB0"
+    # audio_input_device is explicitly set and non-None → written.
+    assert target["audio_input_device"] == "USB PnP"
+
+
+def test_merge_device_fields_explicit_null_clears_saved_key() -> None:
+    """Explicit null (field in model_fields_set, value None) deletes the key from
+    the saved section — the operator is clearing the override back to inherit."""
+    target: dict[str, Any] = {"serial_port": "/dev/ttyUSB0", "roaster_driver": "mock"}
+    _merge_device_fields(
+        target,
+        {"serial_port": None, "roaster_driver": "mock"},
+        {"serial_port"},  # serial_port explicitly set to null
+    )
+    # serial_port removed — back to inherit.
+    assert "serial_port" not in target
+    # roaster_driver not in explicitly_set → untouched.
+    assert target["roaster_driver"] == "mock"
+
+
+def test_merge_device_fields_explicit_null_on_absent_key_is_noop() -> None:
+    """Clearing a key that was not in the saved section is a no-op (no KeyError)."""
+    target: dict[str, Any] = {}
+    _merge_device_fields(target, {"serial_port": None}, {"serial_port"})
+    assert target == {}
+
+
+def test_merge_device_fields_non_none_value_writes() -> None:
+    """Explicitly set non-None value overwrites any existing saved key."""
+    target: dict[str, Any] = {"serial_port": "/dev/ttyUSB0"}
+    _merge_device_fields(
+        target,
+        {"serial_port": "/dev/ttyUSB1"},
+        {"serial_port"},
+    )
+    assert target["serial_port"] == "/dev/ttyUSB1"
+
+
+def test_apply_config_edit_mcp_device_set_override() -> None:
+    """Setting an mcp_device field writes it into the saved section."""
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit(serial_port="/dev/ttyUSB0"))
+    result = apply_config_edit(edit, {})
+    assert result["mcp_device"]["serial_port"] == "/dev/ttyUSB0"
+
+
+def test_apply_config_edit_mcp_device_clear_back_to_inherit() -> None:
+    """Explicitly setting an mcp_device field to null removes it from the saved
+    section — the hand-authored MCP yaml governs the field on the next spawn."""
+    existing: dict[str, Any] = {"mcp_device": {"serial_port": "/dev/ttyUSB0"}}
+    # Build the edit with serial_port explicitly set to None (clear).
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit.model_validate({"serial_port": None}))
+    result = apply_config_edit(edit, existing)
+    # Key must be deleted — not left as null in the YAML.
+    assert "serial_port" not in result.get("mcp_device", {})
+
+
+def test_apply_config_edit_mcp_device_unset_field_is_unchanged() -> None:
+    """An mcp_device field absent from the PUT body leaves the saved value intact."""
+    existing: dict[str, Any] = {
+        "mcp_device": {"serial_port": "/dev/ttyUSB0", "roaster_driver": "mock"}
+    }
+    # Only fc_mode is explicitly set; serial_port and roaster_driver are not in body.
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit(fc_mode="audio"))
+    result = apply_config_edit(edit, existing)
+    # Untouched fields remain.
+    assert result["mcp_device"]["serial_port"] == "/dev/ttyUSB0"
+    assert result["mcp_device"]["roaster_driver"] == "mock"
+    assert result["mcp_device"]["fc_mode"] == "audio"
+
+
+def test_apply_config_edit_blank_roaster_driver_treated_as_inherit() -> None:
+    """A blank roaster_driver string is treated as null — it must NOT write
+    ``driver: ''`` into the MCP yaml as that would crash the next spawn."""
+    existing: dict[str, Any] = {"mcp_device": {"roaster_driver": "hottop_kn8828b_2k_plus"}}
+    # Simulate the FE sending "" for roaster_driver (operator cleared the text field).
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit.model_validate({"roaster_driver": ""}))
+    result = apply_config_edit(edit, existing)
+    # Blank string → null → cleared (inherit from yaml).
+    assert "roaster_driver" not in result.get("mcp_device", {})
+
+
+def test_apply_config_edit_mcp_device_boolean_round_trip() -> None:
+    """Boolean mcp_device fields can be set to True/False/None (tri-state round-trip).
+
+    - Set True → written.
+    - Clear to None (inherit) → deleted from saved section.
+    """
+    # Step 1: set recording_enabled = True.
+    edit1 = AppConfigEdit(mcp_device=MCPDeviceConfigEdit(recording_enabled=True))
+    saved1 = apply_config_edit(edit1, {})
+    assert saved1["mcp_device"]["recording_enabled"] is True
+
+    # Step 2: clear back to inherit (explicit None).
+    edit2 = AppConfigEdit(
+        mcp_device=MCPDeviceConfigEdit.model_validate({"recording_enabled": None})
+    )
+    saved2 = apply_config_edit(edit2, saved1)
+    assert "recording_enabled" not in saved2.get("mcp_device", {})
+
+
+def test_apply_config_edit_mcp_device_recording_devices_clear_to_inherit() -> None:
+    """recording_devices explicit-null clears the saved key (clear to inherit).
+
+    The backend stores recording_devices as a list in the YAML.  When the
+    operator explicitly sets it to null in the PUT body, the saved key must
+    be deleted so the hand-authored MCP yaml governs it on the next spawn.
+    """
+    existing: dict[str, Any] = {
+        "mcp_device": {"recording_devices": ["USB PnP Sound Device", "ATR2100x-USB"]}
+    }
+    # Simulate the FE sending null for recording_devices (clear to inherit).
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit.model_validate({"recording_devices": None}))
+    result = apply_config_edit(edit, existing)
+    # Key must be deleted — inherit from hand-authored MCP yaml.
+    assert "recording_devices" not in result.get("mcp_device", {})
+
+
+def test_apply_config_edit_blank_serial_port_treated_as_inherit() -> None:
+    """A blank serial_port string must NOT write port:'' to the MCP yaml.
+
+    An empty string is not a valid serial port path; the blank-string guard
+    must convert it to None so the key is deleted (inherit from yaml) (#439
+    review fix — extends the guard to all three string device fields).
+    """
+    existing: dict[str, Any] = {"mcp_device": {"serial_port": "/dev/ttyUSB0"}}
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit.model_validate({"serial_port": ""}))
+    result = apply_config_edit(edit, existing)
+    assert "serial_port" not in result.get("mcp_device", {})
+
+
+def test_apply_config_edit_blank_audio_input_device_treated_as_inherit() -> None:
+    """A blank audio_input_device string must NOT write input_device:'' to the MCP yaml.
+
+    An empty string is not a valid audio device name; the blank-string guard
+    must convert it to None so the key is deleted (inherit from yaml) (#439
+    review fix — extends the guard to all three string device fields).
+    """
+    existing: dict[str, Any] = {"mcp_device": {"audio_input_device": "USB PnP Sound Device"}}
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit.model_validate({"audio_input_device": ""}))
+    result = apply_config_edit(edit, existing)
+    assert "audio_input_device" not in result.get("mcp_device", {})

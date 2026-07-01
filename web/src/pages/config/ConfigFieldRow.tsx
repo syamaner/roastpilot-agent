@@ -126,6 +126,64 @@ function BooleanControl({ fieldDef, value, disabled, onChange }: ControlProps): 
   );
 }
 
+/**
+ * Tri-state boolean control for nullable mcp_device fields (#439).
+ *
+ * Three states: `null` = Inherit (from hand-authored yaml), `true` = On,
+ * `false` = Off. Used for `mcp_device.*` boolean fields where `null` means
+ * "keep whatever the operator's hand-authored coffee-roaster-mcp.yaml says".
+ * Rendered as a three-segment radio group so all three states are visible and
+ * the current state is always unambiguous (unlike a two-state toggle where
+ * `null` and `false` would look identical).
+ */
+function NullableBooleanControl({ fieldDef, value, disabled, onChange }: ControlProps): React.JSX.Element {
+  const segments: Array<{ label: string; val: boolean | null }> = [
+    { label: "Inherit", val: null },
+    { label: "On",      val: true },
+    { label: "Off",     val: false },
+  ];
+  const current = value === null || value === undefined ? null : Boolean(value);
+
+  return (
+    <div
+      role="radiogroup"
+      aria-label={fieldDef.label}
+      data-testid={`nullable-bool-${fieldDef.key}`}
+      className="flex h-11 overflow-hidden rounded-[9px] border border-input"
+    >
+      {segments.map(({ label, val }) => {
+        const isSelected = current === val;
+        return (
+          <button
+            key={String(val)}
+            type="button"
+            role="radio"
+            aria-checked={isSelected}
+            disabled={disabled}
+            onClick={() => onChange(val)}
+            data-testid={`nullable-bool-${fieldDef.key}-${String(val)}`}
+            className={cn(
+              "flex flex-1 items-center justify-center text-xs font-medium transition-colors",
+              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset",
+              "border-r border-input last:border-r-0",
+              isSelected
+                ? val === null
+                  ? "bg-secondary text-foreground"
+                  : val
+                    ? "bg-roast-nominal text-foreground"
+                    : "bg-input text-muted-foreground"
+                : "bg-transparent text-muted-foreground/70 hover:bg-white/[.04] hover:text-foreground",
+              disabled && "cursor-not-allowed opacity-50",
+            )}
+          >
+            {label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function SelectControl({ fieldDef, value, disabled, onChange }: ControlProps): React.JSX.Element {
   return (
     <select
@@ -277,7 +335,15 @@ export function ConfigFieldRow({
       control = <MaskedControl {...controlProps} />;
       break;
     case "boolean":
-      control = <BooleanControl {...controlProps} />;
+      // mcp_device boolean fields use the tri-state control (#439): null = inherit
+      // from the hand-authored yaml, true = on, false = off. Other boolean fields
+      // (controller, advisor) only have two states (true/false), so they keep the
+      // simple toggle — their defaults are non-null and they never need "inherit".
+      // Keyed off fieldDef.key prefix, not category, so renaming a category never
+      // silently reintroduces the null→off collapse (#439 review fix).
+      control = fieldDef.key.startsWith("mcp_device.")
+        ? <NullableBooleanControl {...controlProps} />
+        : <BooleanControl {...controlProps} />;
       break;
     case "number":
       control = <NumberControl {...controlProps} />;
@@ -288,6 +354,9 @@ export function ConfigFieldRow({
     case "deviceSelect": {
       // DeviceSelect fetches via useDevices() internally (shared query cache).
       // `deviceKind` picks the right list from DevicesSnapshot.
+      // allowClear enables the "Inherit from yaml" option (#439): when selected
+      // it calls onChange(null), clearing the override so the hand-authored
+      // MCP yaml governs the device field on the next spawn.
       const deviceKind = fieldDef.deviceSource ?? "serial";
       control = (
         <DeviceSelect
@@ -295,7 +364,8 @@ export function ConfigFieldRow({
           deviceKind={deviceKind}
           value={typeof value === "string" ? value : ""}
           disabled={isReadOnly}
-          onChange={(v) => onChange(v)}
+          onChange={(v) => onChange(v !== "" ? v : null)}
+          allowClear
         />
       );
       break;

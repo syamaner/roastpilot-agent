@@ -494,14 +494,16 @@ describe("ConfigPage — Audio category", () => {
     expect(screen.getByTestId("mic-test-button")).toBeDisabled();
   });
 
-  it("renders recording_enabled as a boolean toggle in Audio", async () => {
+  it("renders recording_enabled as a tri-state control in Audio (#439)", async () => {
     renderPage();
     await waitFor(() => screen.getByTestId("config-layout"));
     fireEvent.click(screen.getByTestId("rail-item-Audio"));
     await waitFor(() => screen.getByTestId("config-pane-Audio"));
+    // mcp_device booleans use NullableBooleanControl (tri-state radio group),
+    // not the two-state BooleanControl (role=switch).
     const toggleField = screen.getByTestId("config-field-mcp_device.recording_enabled");
-    // BooleanControl renders a button[role=switch]
-    expect(toggleField.querySelector("[role='switch']")).not.toBeNull();
+    expect(toggleField.querySelector("[role='radiogroup']")).not.toBeNull();
+    expect(toggleField.querySelector("[role='switch']")).toBeNull();
   });
 });
 
@@ -563,12 +565,11 @@ describe("ConfigPage — revealWhen: auto_t0_drop_threshold_c", () => {
     fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
     await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
 
-    // Toggle auto_t0_detection_enabled ON
-    const toggle = screen
-      .getByTestId("config-field-mcp_device.auto_t0_detection_enabled")
-      .querySelector("[role='switch']");
-    expect(toggle).not.toBeNull();
-    fireEvent.click(toggle!);
+    // auto_t0_detection_enabled is an mcp_device boolean — rendered as a tri-state
+    // NullableBooleanControl (Inherit / On / Off); click the "On" segment to set true.
+    const onRadio = screen.getByTestId("nullable-bool-mcp_device.auto_t0_detection_enabled-true");
+    expect(onRadio).not.toBeNull();
+    fireEvent.click(onRadio!);
 
     // Now the threshold field must appear
     await waitFor(() =>
@@ -584,17 +585,17 @@ describe("ConfigPage — revealWhen: auto_t0_drop_threshold_c", () => {
     fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
     await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
 
-    const toggle = screen
-      .getByTestId("config-field-mcp_device.auto_t0_detection_enabled")
-      .querySelector("[role='switch']");
-    // Enable then disable
-    fireEvent.click(toggle!);
+    // Enable: click On segment
+    const onRadio = screen.getByTestId("nullable-bool-mcp_device.auto_t0_detection_enabled-true");
+    fireEvent.click(onRadio!);
     await waitFor(() =>
       expect(
         screen.queryByTestId("config-field-mcp_device.auto_t0_drop_threshold_c"),
       ).toBeInTheDocument(),
     );
-    fireEvent.click(toggle!);
+    // Disable: click Inherit (clears back to null, which is falsy → hides threshold)
+    const inheritRadio = screen.getByTestId("nullable-bool-mcp_device.auto_t0_detection_enabled-null");
+    fireEvent.click(inheritRadio!);
     await waitFor(() =>
       expect(
         screen.queryByTestId("config-field-mcp_device.auto_t0_drop_threshold_c"),

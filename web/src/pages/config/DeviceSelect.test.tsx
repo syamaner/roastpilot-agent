@@ -459,3 +459,58 @@ describe("DeviceSelect — disabled", () => {
     expect(screen.queryByTestId(`device-option-${SERIAL_DEVICES[0]!.value}`)).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// DeviceSelect — allowClear in error states (#439 review fix)
+// Clearing an override back to "inherit from yaml" does NOT require a live
+// device list — the "Inherit from yaml" row must be present even when
+// GET /api/config/devices fails or returns an enumeration error, so an
+// operator with a stale override can still clear it when hardware is unplugged.
+// ---------------------------------------------------------------------------
+
+describe("DeviceSelect — allowClear still rendered in error states (#439)", () => {
+  it("shows 'Inherit from yaml' in the query-error state when allowClear=true", () => {
+    defaultMockState({
+      data: undefined,
+      isError: true,
+      error: new Error("500 Internal Server Error"),
+    });
+    const { onChange } = renderSelect({ allowClear: true, value: "/dev/cu.usbserial-ABC" });
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    // Error state renders — but "Inherit from yaml" must still appear.
+    expect(screen.getByTestId("device-list-query-error")).toBeInTheDocument();
+    const inheritRow = screen.getByTestId("device-option-");
+    expect(inheritRow).toBeInTheDocument();
+    // Clicking it fires onChange("") — the caller adapter converts "" → null.
+    fireEvent.click(inheritRow);
+    expect(onChange).toHaveBeenCalledWith("");
+  });
+
+  it("shows 'Inherit from yaml' in the device-enumeration-error state when allowClear=true", () => {
+    defaultMockState({
+      data: {
+        ...EMPTY_SNAPSHOT,
+        serial_error: "No module named 'serial.tools.list_ports'",
+      },
+    });
+    const { onChange } = renderSelect({ allowClear: true, value: "/dev/cu.usbserial-ABC" });
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    // Enumeration error renders — "Inherit from yaml" must still appear.
+    expect(screen.getByTestId("device-list-error")).toBeInTheDocument();
+    const inheritRow = screen.getByTestId("device-option-");
+    expect(inheritRow).toBeInTheDocument();
+    fireEvent.click(inheritRow);
+    expect(onChange).toHaveBeenCalledWith("");
+  });
+
+  it("does NOT show 'Inherit from yaml' in error states when allowClear=false (default)", () => {
+    defaultMockState({
+      data: undefined,
+      isError: true,
+      error: new Error("500 Internal Server Error"),
+    });
+    renderSelect({ allowClear: false, value: "/dev/cu.usbserial-ABC" });
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+    expect(screen.queryByTestId("device-option-")).toBeNull();
+  });
+});

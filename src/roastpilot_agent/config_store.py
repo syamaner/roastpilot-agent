@@ -1202,21 +1202,31 @@ def apply_config_edit(
         recording_devices_val: tuple[str, ...] | None = (
             tuple(d.recording_devices) if d.recording_devices is not None else None
         )
-        _merge_non_none(
-            dev_section,
-            {
-                "serial_port": d.serial_port,
-                "roaster_driver": d.roaster_driver,
-                "audio_input_device": d.audio_input_device,
-                "recording_enabled": d.recording_enabled,
-                "recording_autocapture": d.recording_autocapture,
-                "recording_devices": recording_devices_val,
-                "fc_mode": d.fc_mode,
-                "fc_confidence_threshold": d.fc_confidence_threshold,
-                "auto_t0_detection_enabled": d.auto_t0_detection_enabled,
-                "auto_t0_drop_threshold_c": d.auto_t0_drop_threshold_c,
-            },
-        )
+        # Tri-state inherit/override (#439): use model_fields_set to distinguish
+        # "explicitly set to None" (clear → inherit) from "not provided" (skip).
+        # A field set to None in the PUT body means "clear back to inherit" — delete
+        # the key from the saved section so the hand-authored MCP yaml governs it.
+        # A field absent from the PUT body (not in model_fields_set) is skipped.
+        # A field set to a non-None value is written as before.
+        #
+        # Blank-string guard: an empty string for any string device field is not a
+        # valid device path/name and would write port:""/driver:""/input_device:""
+        # into the MCP yaml — crashing the child on the next spawn.  Treat "" as
+        # None (clear → inherit from hand-authored yaml) for all three (#439).
+        dev_fields: dict[str, Any] = {
+            "serial_port": d.serial_port or None,
+            "roaster_driver": d.roaster_driver or None,
+            "audio_input_device": d.audio_input_device or None,
+            "recording_enabled": d.recording_enabled,
+            "recording_autocapture": d.recording_autocapture,
+            "recording_devices": recording_devices_val,
+            "fc_mode": d.fc_mode,
+            "fc_confidence_threshold": d.fc_confidence_threshold,
+            "auto_t0_detection_enabled": d.auto_t0_detection_enabled,
+            "auto_t0_drop_threshold_c": d.auto_t0_drop_threshold_c,
+        }
+        explicitly_set = d.model_fields_set
+        _merge_device_fields(dev_section, dev_fields, explicitly_set)
 
     # Validate by constructing AppConfig from the merged saved dict.  We
     # do this before writing so that an invalid edit is rejected at the API
@@ -1235,6 +1245,45 @@ def _merge_non_none(target: dict[str, Any], updates: dict[str, Any]) -> None:
     """
     for key, val in updates.items():
         if val is not None:
+            target[key] = val
+
+
+def _merge_device_fields(
+    target: dict[str, Any],
+    fields: dict[str, Any],
+    explicitly_set: set[str],
+) -> None:
+    """Merge MCP device fields with tri-state inherit/override semantics (#439).
+
+    Three outcomes per field:
+
+    - **Not in ``explicitly_set``**: field was absent from the PUT body — skip
+      it; whatever is already in the saved section is unchanged.
+    - **In ``explicitly_set`` and value is ``None``**: the operator cleared the
+      field back to "inherit from hand-authored yaml" — delete the key from
+      the saved section so the hand-authored value governs it again.
+    - **In ``explicitly_set`` and value is non-``None``**: write the new value
+      as an override.
+
+    Args:
+        target: The ``mcp_device`` section dict from the saved config, modified
+            in-place.
+        fields: Mapping of canonical saved-dict key → resolved value (already
+            processed, e.g. ``recording_devices`` converted to a tuple, blank
+            ``roaster_driver`` replaced with ``None``).
+        explicitly_set: The ``model_fields_set`` from the
+            :class:`MCPDeviceConfigEdit` Pydantic model — the set of field
+            names that were present in the PUT body (even when ``None``).
+    """
+    for key, val in fields.items():
+        if key not in explicitly_set:
+            # Absent from the PUT body — leave the saved section unchanged.
+            continue
+        if val is None:
+            # Explicit null → clear: remove from the saved section so the
+            # hand-authored MCP yaml (or MCP defaults) governs this field.
+            target.pop(key, None)
+        else:
             target[key] = val
 
 

@@ -139,6 +139,11 @@ interface DeviceListBodyProps {
   onSelect: (value: string) => void;
   isRescanning: boolean;
   onRescan: () => void;
+  /**
+   * When true, prepends an "Inherit from yaml" option at the top of the list
+   * that calls `onSelect("")` — the caller converts "" to null (#439).
+   */
+  allowClear?: boolean;
 }
 
 export function DeviceListBody({
@@ -150,6 +155,7 @@ export function DeviceListBody({
   onSelect,
   isRescanning,
   onRescan,
+  allowClear = false,
 }: DeviceListBodyProps): React.JSX.Element {
   if (isLoading) {
     return (
@@ -163,6 +169,16 @@ export function DeviceListBody({
   if (queryError) {
     return (
       <div data-testid="device-list-query-error">
+        {/* Clearing back to inherit does NOT require the device list — always
+            render the row even when enumeration fails (#439 fix). */}
+        {allowClear && (
+          <OptionRow
+            option={{ value: "", label: "Inherit from yaml", note: "Use value from hand-authored coffee-roaster-mcp.yaml" }}
+            isSelected={selectedValue === ""}
+            isUnavailable={false}
+            onSelect={() => onSelect("")}
+          />
+        )}
         <div className="px-3 py-4">
           <p className="text-sm font-medium text-roast-fault">Couldn't load devices</p>
           <p className="mt-0.5 font-mono text-xs text-muted-foreground/70">{queryError}</p>
@@ -175,6 +191,16 @@ export function DeviceListBody({
   if (error) {
     return (
       <div data-testid="device-list-error">
+        {/* Clearing back to inherit does NOT require the device list — always
+            render the row even when enumeration fails (#439 fix). */}
+        {allowClear && (
+          <OptionRow
+            option={{ value: "", label: "Inherit from yaml", note: "Use value from hand-authored coffee-roaster-mcp.yaml" }}
+            isSelected={selectedValue === ""}
+            isUnavailable={false}
+            onSelect={() => onSelect("")}
+          />
+        )}
         <div className="px-3 py-4">
           <p className="text-sm font-medium text-roast-fault">Device enumeration failed</p>
           <p className="mt-0.5 font-mono text-xs text-muted-foreground/70">{error}</p>
@@ -192,7 +218,7 @@ export function DeviceListBody({
       : null;
   const allOptions = ghostOption ? [...devices, ghostOption] : devices;
 
-  if (allOptions.length === 0) {
+  if (allOptions.length === 0 && !allowClear) {
     return (
       <div data-testid="device-list-empty">
         <div className="px-3 py-4">
@@ -209,6 +235,23 @@ export function DeviceListBody({
   return (
     <>
       <div role="listbox" className="max-h-60 overflow-y-auto py-1">
+        {/* "Inherit from yaml" option — always first when allowClear (#439).
+            Selecting it clears the override; the hand-authored MCP yaml governs
+            the field on the next spawn. Value "" is the sentinel the caller
+            converts to null in the onChange handler. */}
+        {allowClear && (
+          <OptionRow
+            option={{ value: "", label: "Inherit from yaml", note: "Use value from hand-authored coffee-roaster-mcp.yaml" }}
+            isSelected={selectedValue === ""}
+            isUnavailable={false}
+            onSelect={() => onSelect("")}
+          />
+        )}
+        {allOptions.length === 0 && allowClear && (
+          <div className="px-3 py-3 text-xs text-muted-foreground/70">
+            No devices found — connect the roaster and rescan.
+          </div>
+        )}
         {allOptions.map((opt) => (
           <OptionRow
             key={opt.value}
@@ -285,12 +328,20 @@ export interface DeviceSelectProps {
    * "audio_input" → DevicesSnapshot.audio_input + audio_input_error.
    */
   deviceKind: "serial" | "audio_input";
-  /** Called with the new machine-id value when the operator picks a device. */
+  /** Called with the new machine-id value when the operator picks a device.
+   *  Passes "" when the operator selects "Inherit from yaml" (allowClear). */
   onChange: (value: string) => void;
   /** When true the control is read-only and cannot be opened. */
   disabled?: boolean;
   /** Optional data-testid prefix (defaults to "device-select"). */
   testId?: string;
+  /**
+   * When true, prepends an "Inherit from yaml" option at the top of the list
+   * (#439 tri-state). Selecting it calls `onChange("")` — the caller converts
+   * "" to `null` to signal "clear the override and let the hand-authored MCP
+   * yaml govern this field on the next spawn".
+   */
+  allowClear?: boolean;
 }
 
 /**
@@ -307,6 +358,7 @@ export function DeviceSelect({
   onChange,
   disabled = false,
   testId = "device-select",
+  allowClear = false,
 }: DeviceSelectProps): React.JSX.Element {
   const [open, setOpen] = useState(false);
   const id = useId();
@@ -326,6 +378,9 @@ export function DeviceSelect({
   const triggerBusy = isPending || isRefetching;
 
   const selectedDevice = devices.find((d) => d.value === value);
+  // When allowClear is true and no device is selected (value=""), the trigger
+  // shows "Inherit from yaml" — the tri-state inherit state (#439). An empty
+  // value without allowClear is "not yet configured", so it shows "Select a device…".
   const triggerLabel =
     triggerBusy
       ? "Scanning for devices…"
@@ -333,7 +388,9 @@ export function DeviceSelect({
         ? selectedDevice.label
         : value
           ? value          // ghost: show raw configured value
-          : "Select a device…";
+          : allowClear
+            ? "Inherit from yaml"
+            : "Select a device…";
 
   // Ref for the wrapper div so the trigger's ArrowDown handler can query the
   // rendered listbox options without coupling to DevicePopover's internals.
@@ -437,6 +494,7 @@ export function DeviceSelect({
             onSelect={handleSelect}
             isRescanning={isRefetching}
             onRescan={handleRescan}
+            allowClear={allowClear}
           />
         </DevicePopover>
       </div>

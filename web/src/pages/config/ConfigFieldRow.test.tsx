@@ -14,12 +14,35 @@
  *     at <900px (control stacks below description).
  */
 
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ConfigFieldMeta } from "@/lib/types";
 import type { ConfigFieldDef } from "./configSchema";
 import { ConfigFieldRow } from "./ConfigFieldRow";
+
+// ---------------------------------------------------------------------------
+// Mock useDevices — needed only by the deviceSelect allowClear test (#439).
+// ---------------------------------------------------------------------------
+
+vi.mock("@/hooks/queries", () => ({
+  useDevices: vi.fn(() => ({
+    data: {
+      serial: [{ value: "/dev/cu.usbserial-ABC", label: "/dev/cu.usbserial-ABC", note: "Hottop · FT232R" }],
+      serial_error: null,
+      audio_input: [],
+      audio_input_error: null,
+    },
+    isPending: false,
+    isRefetching: false,
+    isError: false,
+    error: null,
+    refetch: vi.fn(),
+  })),
+  useConfig: vi.fn(),
+  useSaveConfig: vi.fn(),
+}));
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -73,6 +96,18 @@ const SAFETY_FIELD: ConfigFieldDef = {
   editKey: null,
   category: "Safety",
   readOnlyStatic: true,
+};
+
+// mcp_device boolean field — tri-state control (#439).
+const NULLABLE_BOOL_FIELD: ConfigFieldDef = {
+  key: "mcp_device.recording_enabled",
+  label: "Recording enabled",
+  hint: "Whether the MCP audio recorder is active.",
+  type: "boolean",
+  envVar: "ROASTPILOT_MCP_DEVICE__RECORDING_ENABLED",
+  editKey: "recording_enabled",
+  category: "Audio",
+  readOnlyStatic: false,
 };
 
 // ---------------------------------------------------------------------------
@@ -160,6 +195,100 @@ describe("ConfigFieldRow — env-override badge", () => {
   });
 });
 
+describe("ConfigFieldRow — NullableBooleanControl (mcp_device boolean, #439)", () => {
+  it("renders a tri-state radio group with Inherit / On / Off segments", () => {
+    renderRow(NULLABLE_BOOL_FIELD, makeFieldMeta({ effective_value: null, default: null }), null);
+    // The three segments must be present as radio buttons.
+    expect(screen.getByRole("radio", { name: "Inherit" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "On" })).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: "Off" })).toBeInTheDocument();
+  });
+
+  it("Inherit segment is checked when value is null", () => {
+    renderRow(NULLABLE_BOOL_FIELD, makeFieldMeta({ effective_value: null, default: null }), null);
+    const inheritBtn = screen.getByRole("radio", { name: "Inherit" });
+    expect(inheritBtn).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("radio", { name: "On" })).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByRole("radio", { name: "Off" })).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("On segment is checked when value is true", () => {
+    renderRow(NULLABLE_BOOL_FIELD, makeFieldMeta({ effective_value: true, default: null }), true);
+    expect(screen.getByRole("radio", { name: "On" })).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByRole("radio", { name: "Inherit" })).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("Off segment is checked when value is false", () => {
+    renderRow(NULLABLE_BOOL_FIELD, makeFieldMeta({ effective_value: false, default: null }), false);
+    expect(screen.getByRole("radio", { name: "Off" })).toHaveAttribute("aria-checked", "true");
+  });
+
+  it("clicking Inherit calls onChange with null", () => {
+    const onChange = vi.fn();
+    render(
+      <ConfigFieldRow
+        fieldDef={NULLABLE_BOOL_FIELD}
+        meta={makeFieldMeta({ effective_value: true, default: null })}
+        value={true}
+        isLast={false}
+        onChange={onChange}
+        onReset={vi.fn()}
+      />,
+    );
+    screen.getByRole("radio", { name: "Inherit" }).click();
+    expect(onChange).toHaveBeenCalledWith(null);
+  });
+
+  it("clicking On calls onChange with true", () => {
+    const onChange = vi.fn();
+    render(
+      <ConfigFieldRow
+        fieldDef={NULLABLE_BOOL_FIELD}
+        meta={makeFieldMeta({ effective_value: null, default: null })}
+        value={null}
+        isLast={false}
+        onChange={onChange}
+        onReset={vi.fn()}
+      />,
+    );
+    screen.getByRole("radio", { name: "On" }).click();
+    expect(onChange).toHaveBeenCalledWith(true);
+  });
+
+  it("clicking Off calls onChange with false", () => {
+    const onChange = vi.fn();
+    render(
+      <ConfigFieldRow
+        fieldDef={NULLABLE_BOOL_FIELD}
+        meta={makeFieldMeta({ effective_value: null, default: null })}
+        value={null}
+        isLast={false}
+        onChange={onChange}
+        onReset={vi.fn()}
+      />,
+    );
+    screen.getByRole("radio", { name: "Off" }).click();
+    expect(onChange).toHaveBeenCalledWith(false);
+  });
+
+  it("non-mcp_device boolean field still uses the two-state toggle (not tri-state)", () => {
+    const TRIM_BOOL_FIELD: ConfigFieldDef = {
+      key: "controller.late_maillard_trim_enabled",
+      label: "Trim enabled",
+      hint: "Enable the anticipatory heat trim.",
+      type: "boolean",
+      envVar: "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ENABLED",
+      editKey: "pre_first_crack_levers.late_maillard_trim.enabled",
+      category: "Late-Maillard Trim",
+      readOnlyStatic: false,
+    };
+    renderRow(TRIM_BOOL_FIELD, makeFieldMeta({ effective_value: true, default: true }), true);
+    // Two-state toggle: role="switch", no radio group.
+    expect(screen.getByRole("switch")).toBeInTheDocument();
+    expect(screen.queryByRole("radiogroup")).toBeNull();
+  });
+});
+
 describe("ConfigFieldRow — responsive layout", () => {
   it("field row carries the two-column grid class and the <900px single-column override", () => {
     // Asserts the inline-style→Tailwind migration: the row must use Tailwind classes
@@ -169,5 +298,59 @@ describe("ConfigFieldRow — responsive layout", () => {
     const row = screen.getByTestId(`config-field-${NUMBER_FIELD.key}`);
     expect(row.className).toContain("grid-cols-[minmax(0,1fr)_384px]");
     expect(row.className).toContain("max-[900px]:grid-cols-1");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// deviceSelect allowClear adapter (#439 — bug fix #2)
+// ---------------------------------------------------------------------------
+
+// mcp_device serial device field — the ConfigFieldRow adapter passes allowClear
+// to DeviceSelect and converts "" → null so clearing calls onChange(null).
+const SERIAL_PORT_FIELD: ConfigFieldDef = {
+  key: "mcp_device.serial_port",
+  label: "Serial port",
+  hint: "USB serial port the Hottop is connected to.",
+  type: "deviceSelect",
+  deviceSource: "serial",
+  envVar: "ROASTPILOT_MCP_DEVICE__SERIAL_PORT",
+  editKey: "serial_port",
+  category: "Hardware",
+  readOnlyStatic: false,
+};
+
+describe("ConfigFieldRow — deviceSelect allowClear → onChange(null) (#439)", () => {
+  it("selecting 'Inherit from yaml' calls parent onChange with null, not empty string", async () => {
+    // ConfigFieldRow passes allowClear to DeviceSelect, which prepends an
+    // "Inherit from yaml" option (value = ""). The adapter in ConfigFieldRow
+    // converts "" → null so the parent receives null (clear to inherit), not "".
+    const onChange = vi.fn();
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <ConfigFieldRow
+          fieldDef={SERIAL_PORT_FIELD}
+          meta={makeFieldMeta({ effective_value: "/dev/cu.usbserial-ABC", default: null })}
+          value="/dev/cu.usbserial-ABC"
+          isLast={false}
+          onChange={onChange}
+          onReset={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+
+    // Open the popover.
+    fireEvent.click(screen.getByTestId("device-select-trigger"));
+
+    // "Inherit from yaml" option must be present (allowClear=true).
+    const inheritOption = await waitFor(() =>
+      screen.getByTestId("device-option-"),
+    );
+    expect(inheritOption).toBeInTheDocument();
+
+    // Click it — the adapter must call onChange(null), not onChange("").
+    fireEvent.click(inheritOption);
+    expect(onChange).toHaveBeenCalledWith(null);
+    expect(onChange).not.toHaveBeenCalledWith("");
   });
 });
