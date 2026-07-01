@@ -1195,6 +1195,177 @@ async def test_trim_latch_clears_on_recovery_resume_straight_into_pre_fc() -> No
     assert harness.controller._trim_latched is False  # pyright: ignore[reportPrivateUsage]
 
 
+# ---------------------------------------------------------------------------
+# Adaptive-depth damping (#412)
+# ---------------------------------------------------------------------------
+
+
+def test_damp_trim_depth_unit_deadband_and_slew() -> None:
+    """``_damp_trim_depth`` applies slew-rate then deadband in isolation (#412).
+
+    Exercises the three outcomes in sequence on a single controller:
+    - First call (no prior depth): commits unconditionally.
+    - Subsequent call within deadband: holds the prior value (no-op).
+    - Move larger than deadband but slew-limited: steps by slew_pp_per_tick.
+    - Sustained large move: accumulates across multiple ticks.
+    """
+    trim = LateMaillardTrim(
+        adaptive_depth_enabled=True,
+        trim_depth_deadband_pp=2,
+        trim_depth_slew_pp_per_tick=3,
+    )
+    harness = make_harness()
+    ctrl = harness.controller
+    damp = ctrl._damp_trim_depth  # pyright: ignore[reportPrivateUsage]
+
+    # First call — no prior history, commits unconditionally.
+    assert damp(65, trim) == 65
+    assert ctrl._trim_depth_applied == 65  # pyright: ignore[reportPrivateUsage]
+
+    # Within deadband (|59 - 65| = 6 → after slew: 65-3=62; |62-65|=3 > deadband 2
+    # → commits).  Let's use a tiny move: target 66 → slew gives min(66,65+3)=66;
+    # |66-65|=1 ≤ deadband 2 → HOLD.
+    assert damp(66, trim) == 65  # deadband suppresses 1pp move
+    assert ctrl._trim_depth_applied == 65  # pyright: ignore[reportPrivateUsage]
+
+    # Move of 10pp (65→55): slew caps to 65-3=62; |62-65|=3 > deadband 2 → commit.
+    assert damp(55, trim) == 62
+    assert ctrl._trim_depth_applied == 62  # pyright: ignore[reportPrivateUsage]
+
+    # Next tick: target still 55; slew 62-3=59; |59-62|=3 > deadband → commit.
+    assert damp(55, trim) == 59
+    # Next tick: slew 59-3=56; |56-59|=3 > deadband → commit.
+    assert damp(55, trim) == 56
+    # Final step: slew 56-3=53 → candidate=max(55,53)=55; |55-56|=1 ≤ deadband 2
+    # → deadband holds at 56 (sub-threshold residual is suppressed).
+    assert damp(55, trim) == 56
+    assert ctrl._trim_depth_applied == 56  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_adaptive_depth_damping_bounds_jittery_ror_series() -> None:
+    """Replaying a jittery RoR series (simulating roast-7 thrash) with adaptive
+    depth ON produces a depth sequence whose tick-to-tick change never exceeds
+    ``trim_depth_slew_pp_per_tick`` — no >3 pp oscillation per tick (#412).
+
+    The raw ``depth_for`` output for a ±4 °C/min RoR jitter (around 12 °C/min)
+    at k_ror=1.5 swings ±6 pp per tick — the roast-7 symptom. The damped heat
+    sequence must stay within the slew cap.
+    """
+    trim = LateMaillardTrim(
+        adaptive_depth_enabled=True,
+        base_trim=65,
+        k_ror=1.5,
+        ror_ref=8.0,
+        k_eta=0.0,  # ETA term off so RoR jitter is the only driver
+        min_trim=45,
+        max_trim=75,
+        trim_depth_deadband_pp=2,
+        trim_depth_slew_pp_per_tick=3,
+    )
+    config = ControllerConfig(pre_first_crack_levers=PreFirstCrackLevers(late_maillard_trim=trim))
+    harness = make_harness(config=config)
+    await _charge_into_pre_fc(harness)
+
+    # Jittery RoR alternating 8 and 16 °C/min — raw depth_for gives:
+    #   ror=8:  65 - 1.5*(8-8) = 65 → clamped to max_trim=75 → 65
+    #   ror=16: 65 - 1.5*(16-8) = 65-12 = 53 → 53
+    # That is a 12 pp swing every tick — the roast-7 thrash.
+    ror_jitter = [8.0, 16.0] * 10  # 20 ticks of alternating RoR
+    bean = 162.0
+    first_trim_heat: int | None = None  # heat at first trim engagement (unconditional commit)
+    heats: list[int] = []
+
+    for ror in ror_jitter:
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=ror)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean += 0.3
+        heat = harness.controller.snapshot().current_heat
+        heats.append(heat)
+        if heat < 95:
+            # Trim is engaged (heat below the flat 100 floor).
+            if first_trim_heat is None:
+                # First trim tick commits unconditionally — no slew applies.
+                first_trim_heat = heat
+            else:
+                # Subsequent trim ticks: tick-to-tick change must be ≤ slew cap.
+                last_trim_heat = heats[-2]
+                delta = abs(heat - last_trim_heat)
+                assert delta <= trim.trim_depth_slew_pp_per_tick, (
+                    f"tick-to-tick swing {delta} pp exceeds slew cap "
+                    f"{trim.trim_depth_slew_pp_per_tick} pp; heats so far: {heats}"
+                )
+
+
+@pytest.mark.asyncio
+async def test_adaptive_depth_off_resolved_trim_equals_trim_heat_percent_exactly() -> None:
+    """When ``adaptive_depth_enabled=False`` (the default), the trim resolves to
+    exactly ``trim_heat_percent`` — byte-for-byte the proven roast-6 behaviour.
+    No damping state is involved; the non-adaptive path is completely unaffected.
+    """
+    trim = LateMaillardTrim(
+        adaptive_depth_enabled=False,
+        trim_heat_percent=65,
+        # Deliberately non-default damping coefficients — must be ignored.
+        trim_depth_deadband_pp=10,
+        trim_depth_slew_pp_per_tick=1,
+    )
+    config = ControllerConfig(pre_first_crack_levers=PreFirstCrackLevers(late_maillard_trim=trim))
+    harness = make_harness(config=config)
+    await _charge_into_pre_fc(harness)
+
+    # Drive into the late-Maillard window with a warming slope.
+    bean = 162.0
+    for _ in range(6):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=30.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean += 0.5
+
+    # Trim engaged (latch set), adaptive OFF → heat must equal exactly trim_heat_percent.
+    assert harness.controller._trim_latched is True  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller.snapshot().current_heat == trim.trim_heat_percent
+    # Damping state is None — the non-adaptive path never touches it.
+    assert harness.controller._trim_depth_applied is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_damp_trim_depth_state_resets_on_pre_fc_entry() -> None:
+    """The damping state resets when the controller re-enters pre-FC (#412).
+
+    After a fault/recovery resume into pre-FC, ``_trim_depth_applied`` must be
+    ``None`` so the first adaptive tick commits unconditionally (no stale anchor
+    from the prior pre-FC entry biasing the deadband).
+    """
+    trim = LateMaillardTrim(
+        adaptive_depth_enabled=True,
+        trim_depth_deadband_pp=2,
+        trim_depth_slew_pp_per_tick=3,
+    )
+    config = ControllerConfig(pre_first_crack_levers=PreFirstCrackLevers(late_maillard_trim=trim))
+    harness = make_harness(config=config)
+    await _charge_into_pre_fc(harness)
+
+    # Engage the trim + accumulate damping state.
+    bean = 162.0
+    for _ in range(6):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=30.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean += 0.5
+
+    assert harness.controller._trim_latched is True  # pyright: ignore[reportPrivateUsage]
+
+    # Fault, then recovery → pre-FC resume.
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+
+    # Both the latch and the damping state are cleared.
+    assert harness.controller._trim_latched is False  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._trim_depth_applied is None  # pyright: ignore[reportPrivateUsage]
+
+
 @pytest.mark.asyncio
 async def test_safety_evaluated_before_advisory_and_blocks_it() -> None:
     """A hard-ceiling breach e-stops and faults before the advisor is ever

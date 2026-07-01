@@ -34,7 +34,7 @@ from roastpilot_agent.coherence import (
     LeverDirection,
     evaluate_lever_coherence,
 )
-from roastpilot_agent.config import ControllerConfig
+from roastpilot_agent.config import ControllerConfig, LateMaillardTrim
 from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy, TrimSignal
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
@@ -682,6 +682,12 @@ class RoastController:
         # 100↔trim↔100 (the #218 lever-thrash). Reset on each new run/preheat; the
         # trim ends naturally when FC moves the phase out of pre-FC.
         self._trim_latched = False
+        # Adaptive-depth damping STATE (#412): the last depth the controller
+        # committed to the roaster after deadband + slew damping. ``None`` means
+        # "no depth applied yet this pre-FC phase" — the first tick commits
+        # unconditionally (no history to compare against). Reset alongside
+        # ``_trim_latched`` so a new run / phase entry always starts fresh.
+        self._trim_depth_applied: int | None = None
         self._last_command_monotonic: float | None = None
         self._t0_streak = 0
         self._t0_confirmed = False
@@ -1065,11 +1071,12 @@ class RoastController:
             # post-FC move of the new roast.
             self._heat_direction = LeverDirection.NONE
             self._fan_direction = LeverDirection.NONE
-            # A new run/preheat clears the anticipatory trim latch (#327): a fresh
-            # roast has not yet opened the late-Maillard window, so the trim must
-            # re-arm from the flat floor and only re-engage on this roast's own
-            # clean FC-ETA signal — never inherit a prior roast's latch.
+            # A new run/preheat clears the anticipatory trim latch (#327) and
+            # the adaptive-depth damping state (#412): a fresh roast has not
+            # yet opened the late-Maillard window, so both must re-arm from
+            # scratch — never inherit a prior roast's latch or applied depth.
             self._trim_latched = False
+            self._trim_depth_applied = None
         if target is RoastPhase.ROASTING_PRE_FIRST_CRACK:
             # Clear the trim latch on EVERY entry into pre-FC, not just the
             # new-run/preheat path above (#327, safety-reviewer low on the latch
@@ -1086,6 +1093,10 @@ class RoastController:
             # edge. The restart-never-auto-resumes invariant is untouched — this
             # clears a flag, it does not actuate heat/fan.)
             self._trim_latched = False
+            # Reset damping state (#412) alongside the latch so the depth
+            # history from a prior pre-FC entry never anchors the deadband on
+            # a recovery resume.
+            self._trim_depth_applied = None
         if target is RoastPhase.COOLING and self._drop_monotonic is None:
             # The drop instant (#239): every drop path lands in COOLING (the
             # advisor drop, the operator drop, and the pre-FC early-abort drop),
@@ -1323,6 +1334,15 @@ class RoastController:
         assert box.fan_target_percent is not None  # noqa: S101 (validator invariant)
         target_heat = box.heat_target_percent
         target_fan = box.fan_target_percent
+        # Adaptive-depth damping (#412): when the adaptive path is active (flag
+        # ON and trim engaged this tick), smooth the resolved depth through a
+        # deadband + slew filter so raw RoR noise doesn't oscillate the trim
+        # heat every tick.  The non-adaptive path (``adaptive_depth_enabled``
+        # False, or trim not yet latched) skips this entirely — byte-for-byte
+        # the proven roast-6 behaviour.
+        trim_cfg = self._config.pre_first_crack_levers.late_maillard_trim
+        if trim_cfg.adaptive_depth_enabled and self._trim_latched:
+            target_heat = self._damp_trim_depth(target_heat, trim_cfg)
         if self._current_heat == target_heat and self._current_fan == target_fan:
             # Already at the deterministic target — no write (avoids rate-limit
             # churn and redundant serial writes; the target is constant pre-FC).
@@ -2812,6 +2832,63 @@ class RoastController:
             latched=True,
             bean_ror_c_per_min=trim_signal.bean_ror_c_per_min,
         )
+
+    def _damp_trim_depth(self, raw_depth: int, trim: LateMaillardTrim) -> int:
+        """Apply deadband + slew-rate damping to the adaptive trim depth (#412).
+
+        Prevents the ~12 pp/tick thrash observed on roast 7 when adaptive
+        depth is enabled: raw RoR is noisy tick-to-tick, so ``depth_for``
+        oscillates even though the underlying signal is stable.
+
+        Two layers of damping (both deterministic, unit-testable):
+
+        - **Slew-rate limit** — the depth can move at most
+          ``trim.trim_depth_slew_pp_per_tick`` pp toward the target each
+          tick.  A sustained signal change accumulates across ticks and
+          arrives in full; a single-tick spike is capped.
+        - **Deadband** — after the slew step, if the slew-limited candidate
+          still differs from the last applied depth by no more than
+          ``trim.trim_depth_deadband_pp`` pp, the old value is kept (no
+          write).  This eliminates sub-threshold bounce without hiding real
+          moves.
+
+        Order: slew first (limits step size), then deadband (suppresses
+        residual jitter on the slew output).  The result is always an integer
+        in the caller's ``[min_trim, max_trim]`` range because slew moves
+        toward ``raw_depth`` (already clamped) and deadband either holds the
+        last value (already in range) or accepts the slew output (also in
+        range).
+
+        **Only called when** ``adaptive_depth_enabled`` is ``True`` and the
+        trim is engaged — the non-adaptive path is unaffected, preserving the
+        default-off byte-for-byte guarantee.
+
+        Mutates ``self._trim_depth_applied`` on each committed depth.
+
+        Args:
+            raw_depth: The un-damped adaptive depth from ``depth_for()``,
+                already clamped to ``[min_trim, max_trim]``.
+            trim: The active ``LateMaillardTrim`` config (coefficients).
+
+        Returns:
+            The damped depth to apply this tick.
+        """
+        prev = self._trim_depth_applied
+        if prev is None:
+            # First tick in this pre-FC phase: commit unconditionally.
+            self._trim_depth_applied = raw_depth
+            return raw_depth
+
+        # Slew: move at most slew_pp_per_tick toward raw_depth.
+        slew = trim.trim_depth_slew_pp_per_tick
+        candidate = max(raw_depth, prev - slew) if raw_depth < prev else min(raw_depth, prev + slew)
+
+        # Deadband: suppress sub-threshold residual jitter.
+        if abs(candidate - prev) <= trim.trim_depth_deadband_pp:
+            return prev  # hold — no state mutation; the committed depth is unchanged
+
+        self._trim_depth_applied = candidate
+        return candidate
 
     def _record_curve_history(self, telemetry: RoastTelemetry | None) -> None:
         """Record this tick's curve sample and arm curve milestones (#275).
