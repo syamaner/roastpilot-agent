@@ -537,6 +537,20 @@ describe("dashboardReducer", () => {
     expect(s.markers).toHaveLength(0);
   });
 
+  it("adds the turning-point marker at the latest point's serve-elapsed on turning_point, once (#409)", () => {
+    // The post-charge bean-temp minimum landmark (#409) is server-sourced (the
+    // controller's RoR-zero cross → the turning_point SSE event). Like drying_end
+    // its payload carries no clock, so the marker rides the latest plotted point's
+    // serve-elapsed (the same #326 axis) and fires exactly once via withMarker.
+    let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 510, charge_elapsed_seconds: 0, bean_temp_c: 180, env_temp_c: 200 }));
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 555, charge_elapsed_seconds: 45, bean_temp_c: 142, env_temp_c: 195 }));
+    s = dashboardReducer(s, ev("turning_point", { bean_temp_c: 142, elapsed_since_charge_seconds: 45 }));
+    // Re-deliver turning_point — must not duplicate the marker.
+    s = dashboardReducer(s, ev("turning_point", { bean_temp_c: 142, elapsed_since_charge_seconds: 45 }));
+    expect(s.markers.filter((m) => m.kind === "turning_point")).toHaveLength(1);
+    expect(s.markers.find((m) => m.kind === "turning_point")).toEqual({ kind: "turning_point", t: 555, label: "TURN" });
+  });
+
   it("adds the dry-end marker at the latest point's serve-elapsed on drying_end, once (#351)", () => {
     // The pre-FC drying-end landmark (#351) is server-sourced (the controller's
     // bean-temp threshold cross → the drying_end SSE event). Like FC its payload
@@ -551,12 +565,14 @@ describe("dashboardReducer", () => {
     expect(s.markers.find((m) => m.kind === "dry_end")).toEqual({ kind: "dry_end", t: 870, label: "DRY END" });
   });
 
-  it("renders the full server-sourced marker set: charge/T0, dry-end, FC, drop, cooling (#309/#351)", () => {
+  it("renders the full server-sourced marker set: charge/T0, turning-point, dry-end, FC, drop, cooling (#309/#351/#409)", () => {
     // Every marker from its own server signal, all riding the same serve-elapsed
-    // axis (#326). Dry-end (#351) now has a server signal (the drying_end event),
-    // so it joins the four #309 markers in roast order.
+    // axis (#326). Turning-point (#409) and dry-end (#351) each now have a server
+    // signal, so they join the four #309 markers in roast order.
     let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 510, charge_elapsed_seconds: 0, bean_temp_c: 160, env_temp_c: 200 }));
     s = dashboardReducer(s, ev("t0_detected", { bean_temp_c: 160 }));
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 555, charge_elapsed_seconds: 45, bean_temp_c: 142, env_temp_c: 195 }));
+    s = dashboardReducer(s, ev("turning_point", { bean_temp_c: 142, elapsed_since_charge_seconds: 45 }));
     s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 870, charge_elapsed_seconds: 360, bean_temp_c: 151, env_temp_c: 205 }));
     s = dashboardReducer(s, ev("drying_end", { bean_temp_c: 151, threshold_c: 150 }));
     s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 1010, charge_elapsed_seconds: 500, bean_temp_c: 201, env_temp_c: 215 }));
@@ -565,7 +581,7 @@ describe("dashboardReducer", () => {
     s = dashboardReducer(s, ev("command_executed", { command: "drop_beans", source: "operator" }));
     s = dashboardReducer(s, ev("phase_changed", { phase: "cooling" }));
     const byKind = Object.fromEntries(s.markers.map((m) => [m.kind, m.t]));
-    expect(byKind).toEqual({ t0: 510, dry_end: 870, first_crack: 1010, drop: 1100, cooling: 1100 });
+    expect(byKind).toEqual({ t0: 510, turning_point: 555, dry_end: 870, first_crack: 1010, drop: 1100, cooling: 1100 });
   });
 
   it("resets to the initial view-model", () => {

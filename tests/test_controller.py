@@ -1070,6 +1070,103 @@ async def test_drying_end_re_arms_on_a_new_run() -> None:
     assert len(_drying_end_payloads(harness)) == 1  # the new run's own signal
 
 
+# --- #409: post-charge bean-temp minimum — turning-point SSE event (observability) ---
+
+
+def _turning_point_payloads(harness: Harness) -> list[dict[str, object]]:
+    """Every TURNING_POINT event payload emitted on ``harness``, in order."""
+    return [
+        cast(dict[str, object], p)
+        for k, p in harness.events.events
+        if k is RoastEventKind.TURNING_POINT
+    ]
+
+
+@pytest.mark.asyncio
+async def test_turning_point_emits_once_on_ror_zero_cross() -> None:
+    """#409: the TURNING_POINT event fires exactly once, the tick the bean RoR first
+    turns non-negative after the post-charge crash (the curve minimum), carrying
+    bean_temp_c + elapsed_since_charge_seconds. A one-way latch: subsequent ticks
+    do NOT re-emit it."""
+    harness = make_harness()
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING
+        harness.controller.transition_to(step)
+    # Charge into pre-FC with a FALLING bean (no turning point yet).
+    t0 = reading(bean=165.0, t0_detected=True, bean_ror_c_per_min=-15.0)
+    harness.reader.readings = [t0]
+    for _ in range(3):
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    harness.events.events.clear()
+    # Still falling: no turning-point event.
+    harness.reader.readings = [reading(bean=140.0, bean_ror_c_per_min=-5.0)]
+    await harness.controller.tick()
+    assert _turning_point_payloads(harness) == []
+    # RoR first crosses zero (the minimum): one event with the real payload.
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=141.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+    payloads = _turning_point_payloads(harness)
+    assert len(payloads) == 1
+    assert payloads[0]["bean_temp_c"] == 141.0
+    assert isinstance(payloads[0]["elapsed_since_charge_seconds"], float)
+    # Latched: a subsequent above-zero-RoR tick emits no second event.
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=144.0, bean_ror_c_per_min=8.0)]
+    await harness.controller.tick()
+    assert _turning_point_payloads(harness) == payloads  # unchanged — exactly one
+
+
+@pytest.mark.asyncio
+async def test_turning_point_is_observability_only_not_an_advisor_milestone() -> None:
+    """#409 invariant: the turning-point SSE event is observability-only — the
+    TURNING_POINT *milestone* (already tracked internally for the noise-robust
+    drying-end gate) is unchanged; this test confirms the SSE event fires without
+    adding a SECOND milestone entry or disturbing the advisor path."""
+    harness = make_harness()
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:
+        harness.controller.transition_to(step)
+    t0 = reading(bean=165.0, t0_detected=True, bean_ror_c_per_min=-10.0)
+    harness.reader.readings = [t0]
+    for _ in range(3):
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    harness.events.events.clear()
+    # Cross the turning point.
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=142.0, bean_ror_c_per_min=0.5)]
+    await harness.controller.tick()
+    assert _turning_point_payloads(harness), "expected a TURNING_POINT event"
+    # Exactly one TURNING_POINT milestone is recorded — the same one that was always
+    # tracked for the drying-end noise-robust gate.
+    history = harness.controller._history  # pyright: ignore[reportPrivateUsage]
+    assert history.has_milestone(RoastMilestoneKind.TURNING_POINT)
+    tp_milestones = [m for m in history.milestones() if m.kind is RoastMilestoneKind.TURNING_POINT]
+    assert len(tp_milestones) == 1, "must record the milestone exactly once"
+
+
+@pytest.mark.asyncio
+async def test_turning_point_does_not_fire_after_first_crack() -> None:
+    """#409: the turning-point window is pre-FC only. Once the run is in development
+    (post-FC) the RoR history check is bypassed; a rising-RoR reading there emits
+    nothing (the branch exits before reaching the check)."""
+    harness = make_harness()
+    await _charge_into_pre_fc_below_drying_end(harness)
+    # Cross FC into development (the turning-point window closes at FC).
+    harness.reader.readings = [reading(bean=178.0, first_crack_detected=True)]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    harness.events.events.clear()
+    # Post-FC reading with positive RoR: no turning-point event.
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=10.0)]
+    await harness.controller.tick()
+    assert _turning_point_payloads(harness) == []
+
+
 @pytest.mark.asyncio
 async def test_trim_signal_keys_on_last_curve_sample_when_read_fails() -> None:
     """#327: on a tolerated FAILED read (telemetry None) the trim signal keys the

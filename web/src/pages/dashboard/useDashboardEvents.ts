@@ -460,6 +460,19 @@ export function dashboardReducer(
       // the charge peak). The gap is bounded by the controller tick rate (1 s).
       return { ...state, t0: data };
     }
+    case "turning_point": {
+      // The post-charge bean-temp minimum landmark (#409) — a SUBORDINATE marker,
+      // server-sourced (the controller's RoR-zero cross), never inferred here.
+      // Like drying_end the SSE payload carries no clock, so the marker's x is
+      // the latest plotted point's serve-elapsed (the buffer axis is serve-elapsed
+      // seconds, #326; the roast-time re-label is a display transform in LiveCurve).
+      // Fire-once via withMarker; the payload isn't needed to place the marker.
+      const at = state.points.length > 0 ? state.points[state.points.length - 1].t : 0;
+      return {
+        ...state,
+        markers: withMarker(state.markers, { kind: "turning_point", t: at, label: "TURN" }),
+      };
+    }
     case "drying_end": {
       // The pre-FC drying-end landmark (#351) — a SUBORDINATE marker, server-
       // sourced (the controller's bean-temp threshold cross), never inferred here.

@@ -315,6 +315,37 @@ ALTER TABLE roast_runs ADD COLUMN roasted_weight_grams REAL
   CHECK (roasted_weight_grams IS NULL OR roasted_weight_grams > 0);
 """
 
+SCHEMA_V8_TURNING_POINT_EVENT = """
+-- #409: add the pre-FC 'turning_point' event kind (the post-charge bean-temp minimum,
+-- the tick RoR first crosses zero after the charge dip) to the roast_events.kind
+-- CHECK. Mirrors the drying_end landmark (V6). SQLite cannot ALTER a CHECK in place,
+-- so rebuild with the same create-copy-drop-rename pattern. Observability-only event
+-- (SSE marker + persisted timeline); never fed to the advisor or safety/control path.
+CREATE TABLE roast_events_new (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES roast_runs(id),
+  kind TEXT NOT NULL CHECK (kind IN (
+    'run_started', 'phase_changed', 'charge_guidance', 't0_detected',
+    'turning_point', 'drying_end', 'first_crack', 'advisory',
+    'command_executed', 'command_failed', 'safety_alert', 'fault',
+    'recovery_required', 'recovery_acknowledged',
+    'logs_exported', 'run_completed')),       -- models.RoastEventKind.value
+  source TEXT NOT NULL CHECK (source IN (
+    'controller', 'mcp', 'operator', 'advisor', 'safety')),
+                                              -- models.RoastEventSource.value
+  monotonic_seconds REAL,
+  recorded_at_utc TEXT NOT NULL,
+  payload_json TEXT
+);
+INSERT INTO roast_events_new
+  (id, run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json)
+  SELECT id, run_id, kind, source, monotonic_seconds, recorded_at_utc, payload_json
+  FROM roast_events;
+DROP TABLE roast_events;
+ALTER TABLE roast_events_new RENAME TO roast_events;
+CREATE INDEX idx_roast_events_run_kind ON roast_events(run_id, kind);
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
@@ -326,6 +357,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V5_CHARGE_ELAPSED,
     SCHEMA_V6_DRYING_END_EVENT,
     SCHEMA_V7_ROASTED_WEIGHT,
+    SCHEMA_V8_TURNING_POINT_EVENT,
 )
 
 

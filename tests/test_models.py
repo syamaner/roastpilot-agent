@@ -68,6 +68,7 @@ def test_event_kinds_match_plan() -> None:
         "phase_changed",
         "charge_guidance",
         "t0_detected",
+        "turning_point",
         "drying_end",
         "first_crack",
         "advisory",

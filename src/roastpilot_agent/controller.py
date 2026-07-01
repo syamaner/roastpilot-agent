@@ -2855,6 +2855,9 @@ class RoastController:
           the bean RoR turns from falling to rising (the curve has bottomed out).
           Carried as a DISPLAY-ONLY landmark: #229 found it is a charge-temperature
           proxy (corr 0.979), so it is shown, never used as a control predictor.
+          Also emits a :class:`RoastEventKind.TURNING_POINT` SSE event (#409) so
+          the live chart marker fires — observability-only (same contract as
+          DRYING_END: event + timeline, never an advisor-facing milestone).
         - RECOVERY: the bean RoR at the first reading after the turning point — the
           one turning-point-family metric that survived the #229 confound check
           (a charge-independent early-pace signal), kept cautiously.
@@ -2888,6 +2891,16 @@ class RoastController:
                         elapsed_since_charge_seconds=elapsed,
                         bean_temp_c=telemetry.bean_temp_c,
                     )
+                )
+                # #409: emit as an SSE event + persisted timeline landmark so
+                # the live chart marker fires. Mirrors drying_end (#351):
+                # observability-only — NOT a RoastMilestone the advisor reads.
+                self._events.emit(
+                    RoastEventKind.TURNING_POINT,
+                    {
+                        "bean_temp_c": telemetry.bean_temp_c,
+                        "elapsed_since_charge_seconds": elapsed,
+                    },
                 )
             return
         if not self._history.has_milestone(RoastMilestoneKind.RECOVERY):
