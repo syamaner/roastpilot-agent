@@ -946,20 +946,26 @@ async def _charge_into_pre_fc_below_drying_end(harness: Harness) -> None:
     """Charge into pre-FC with the turning point recorded and the bean BELOW the
     drying-end threshold, so a later rising cross is a clean first crossing (#351).
 
-    Charges via a debounced T0 at a sub-threshold bean with a non-negative RoR, so
-    ``_charge_monotonic`` is stamped and the turning point arms — the noise-robust
-    gate the drying-end signal sits behind — while the bean is still well under
-    150 °C.
+    Charges via a debounced T0 with an initially NEGATIVE RoR (post-charge crash),
+    then crosses to positive so the P2-3 witness gate is satisfied and the turning
+    point milestone is recorded — the noise-robust gate the drying-end signal sits
+    behind — while the bean is still well under 150 °C.  Without the negative
+    sample the witness gate prevents the milestone from ever recording (#409 P2-3).
     """
     harness.controller.load_profile(PROFILE)
     for step in NORMAL_PATH[:2]:  # …→ PREHEATING
         harness.controller.transition_to(step)
-    t0 = reading(bean=120.0, t0_detected=True, bean_ror_c_per_min=15.0)
+    t0 = reading(bean=120.0, t0_detected=True, bean_ror_c_per_min=-10.0)
     harness.reader.readings = [t0]
-    for _ in range(3):  # debounce → pre-FC; arms the turning point post-charge
+    for _ in range(3):  # debounce → pre-FC; begins with negative RoR (crash phase)
         await harness.controller.tick()
         harness.clock.advance(1.0)
     assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    # Now cross the RoR from negative to positive — satisfies the witness gate and
+    # records the turning-point milestone (required for drying_end to fire).
+    harness.reader.readings = [reading(bean=122.0, bean_ror_c_per_min=5.0)]
+    await harness.controller.tick()
+    harness.clock.advance(1.0)
     harness.log.clear()
     harness.events.events.clear()
 
@@ -1165,6 +1171,61 @@ async def test_turning_point_does_not_fire_after_first_crack() -> None:
     harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=10.0)]
     await harness.controller.tick()
     assert _turning_point_payloads(harness) == []
+
+
+@pytest.mark.asyncio
+async def test_turning_point_requires_prior_negative_ror() -> None:
+    """#409 P2-3: a first post-charge sample with RoR already ≥ 0 (no dip observed)
+    must NOT fire the turning_point event — emitting on a first-sample-already-≥0
+    tick would be a false landmark with no actual bean-temp minimum in the data.
+
+    Two scenarios:
+      A) First post-charge sample has RoR ≥ 0 with no prior negative → NO event.
+      B) A prior negative sample followed by ≥ 0 → event fires exactly once (the
+         real dip, already covered by test_turning_point_emits_once_on_ror_zero_cross;
+         repeated here for contrast and to assert the gate does not over-suppress).
+    """
+    # Scenario A — no prior negative: straight-to-positive RoR after charge.
+    harness = make_harness()
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:
+        harness.controller.transition_to(step)
+    # Charge into pre-FC with RoR already non-negative on the first sample.
+    t0 = reading(bean=165.0, t0_detected=True, bean_ror_c_per_min=1.0)
+    harness.reader.readings = [t0]
+    for _ in range(3):
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    harness.events.events.clear()
+    # Positive RoR on every subsequent tick — still no turning-point (no dip ever).
+    for _ in range(3):
+        harness.clock.advance(1.0)
+        harness.reader.readings = [reading(bean=167.0, bean_ror_c_per_min=2.0)]
+        await harness.controller.tick()
+    assert _turning_point_payloads(harness) == [], (
+        "no turning_point event when first post-charge sample is already ≥ 0 (no dip)"
+    )
+
+    # Scenario B — witness gate does NOT over-suppress a real dip.
+    harness2 = make_harness()
+    harness2.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:
+        harness2.controller.transition_to(step)
+    t0b = reading(bean=165.0, t0_detected=True, bean_ror_c_per_min=-10.0)
+    harness2.reader.readings = [t0b]
+    for _ in range(3):
+        await harness2.controller.tick()
+        harness2.clock.advance(1.0)
+    harness2.events.events.clear()
+    harness2.reader.readings = [reading(bean=140.0, bean_ror_c_per_min=-3.0)]
+    await harness2.controller.tick()  # negative — witnesses the dip
+    harness2.clock.advance(1.0)
+    harness2.reader.readings = [reading(bean=142.0, bean_ror_c_per_min=2.0)]
+    await harness2.controller.tick()  # cross: must fire exactly once
+    payloads = _turning_point_payloads(harness2)
+    assert len(payloads) == 1, "turning_point must fire on a real negative→≥0 cross"
+    assert payloads[0]["bean_temp_c"] == 142.0
 
 
 @pytest.mark.asyncio

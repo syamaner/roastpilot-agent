@@ -26,6 +26,7 @@ import type {
   FirstCrackData,
   SafetyEvaluationData,
   T0DetectedData,
+  TurningPointData,
 } from "./events";
 
 /** One advisory recommendation rendered in the panel / decision history. */
@@ -87,6 +88,14 @@ export interface DashboardViewModel {
    *  buffer stays serve-keyed (so preheat plots live). Null before T0 → the chart
    *  shows serve-elapsed. */
   t0ElapsedSeconds: number | null;
+  /** Deferred turning-point placement (#409): the payload's
+   *  `elapsed_since_charge_seconds` if the `turning_point` SSE frame arrives before
+   *  `t0ElapsedSeconds` has been recovered (e.g. a reload where the `turning_point`
+   *  is replayed before the first post-charge telemetry frame). Flushed by
+   *  `withRecoveredOrigin` the moment T0 is established, placing the marker at
+   *  `t0ElapsedSeconds + pendingTurningPointChargeSeconds`. Null once placed or
+   *  if the frame never arrived. */
+  pendingTurningPointChargeSeconds: number | null;
   /** Event markers for the curve (T0 / first crack / drop / cooling), x in
    *  SERVE-elapsed seconds (#326) — the same axis the points are keyed on. The T0
    *  marker sits at the serve-elapsed of the charge moment, so it lands at the
@@ -114,6 +123,7 @@ export const initialDashboardViewModel: DashboardViewModel = {
   firstCrack: null,
   t0: null,
   t0ElapsedSeconds: null,
+  pendingTurningPointChargeSeconds: null,
   markers: [],
   points: [],
   advisorySeq: 0,
@@ -238,17 +248,32 @@ function originFromClocks(
 }
 
 /** Fold a recovered T0 origin into the view-model iff it isn't already known —
- *  setting `t0ElapsedSeconds` and placing the T0 marker at that serve-elapsed. This
- *  is the SOLE place the T0 marker is placed (#404): both the live-stream path (first
- *  post-charge telemetry frame via `originFromClocks`) and the reload/seed path call
- *  through here. `t0_detected` no longer sets the origin or marker. A no-op once the
- *  origin is set, so a later frame never moves an established origin/marker. */
+ *  setting `t0ElapsedSeconds`, placing the T0 marker at that serve-elapsed, and
+ *  flushing any deferred turning-point marker. This is the SOLE place the T0 marker
+ *  is placed (#404): both the live-stream path (first post-charge telemetry frame via
+ *  `originFromClocks`) and the reload/seed path call through here. `t0_detected` no
+ *  longer sets the origin or marker. A no-op once the origin is set, so a later frame
+ *  never moves an established origin/marker.
+ *
+ *  Flush path: if the `turning_point` SSE event arrived before T0 was recovered
+ *  (e.g. a reload scenario), its `elapsed_since_charge_seconds` is stashed as
+ *  `pendingTurningPointChargeSeconds`. The moment we recover the origin, we can
+ *  derive the correct serve-elapsed for the TURN marker: `origin +
+ *  pendingTurningPointChargeSeconds`. This mirrors how the detail-page's
+ *  `turningPointSeconds()` anchors the marker from the same payload field (#409). */
 function withRecoveredOrigin(state: DashboardViewModel, origin: number | null): DashboardViewModel {
   if (origin === null || state.t0ElapsedSeconds !== null) return state;
+  let markers = withMarker(state.markers, { kind: "t0", t: origin, label: "T0" });
+  let pending = state.pendingTurningPointChargeSeconds;
+  if (pending !== null) {
+    markers = withMarker(markers, { kind: "turning_point", t: origin + pending, label: "TURN" });
+    pending = null;
+  }
   return {
     ...state,
     t0ElapsedSeconds: origin,
-    markers: withMarker(state.markers, { kind: "t0", t: origin, label: "T0" }),
+    pendingTurningPointChargeSeconds: pending,
+    markers,
   };
 }
 
@@ -463,15 +488,42 @@ export function dashboardReducer(
     case "turning_point": {
       // The post-charge bean-temp minimum landmark (#409) — a SUBORDINATE marker,
       // server-sourced (the controller's RoR-zero cross), never inferred here.
-      // Like drying_end the SSE payload carries no clock, so the marker's x is
-      // the latest plotted point's serve-elapsed (the buffer axis is serve-elapsed
-      // seconds, #326; the roast-time re-label is a display transform in LiveCurve).
-      // Fire-once via withMarker; the payload isn't needed to place the marker.
-      const at = state.points.length > 0 ? state.points[state.points.length - 1].t : 0;
-      return {
-        ...state,
-        markers: withMarker(state.markers, { kind: "turning_point", t: at, label: "TURN" }),
-      };
+      //
+      // The payload carries `elapsed_since_charge_seconds` — the server's charge-
+      // referenced clock at the RoR-zero cross. This is the authoritative axis for
+      // the marker (the same field the detail-page `turningPointSeconds()` uses).
+      // The serve-elapsed position is `t0ElapsedSeconds + elapsed_since_charge_seconds`,
+      // because `t0ElapsedSeconds` is the serve-elapsed at the charge moment (the x=0
+      // of the charge clock).
+      //
+      // WHY NOT latest-point (the old approach): the controller flushes events BEFORE
+      // the tick's telemetry frame — the same ordering bug that caused #404 for T0.
+      // At the turning-point tick the latest buffered point is the PREVIOUS tick's
+      // reading, so `state.points[last].t` is one tick early. Using the payload
+      // directly (and the already-correct `t0ElapsedSeconds`) places the marker exactly
+      // at the RoR-zero cross tick.
+      //
+      // If `t0ElapsedSeconds` is not yet recovered (an edge case where a reload
+      // replays this event before the first post-charge telemetry arrives), stash
+      // `elapsed_since_charge_seconds` as `pendingTurningPointChargeSeconds`; it will
+      // be flushed by `withRecoveredOrigin` the moment the origin is established.
+      // Fire-once via withMarker (the stash is also only ever set once — once placed
+      // it stays placed and the stash is cleared).
+      const data = event.data as unknown as TurningPointData;
+      const chargeElapsed = typeof data.elapsed_since_charge_seconds === "number" ? data.elapsed_since_charge_seconds : null;
+      if (chargeElapsed === null) return state;
+      if (state.t0ElapsedSeconds !== null) {
+        return {
+          ...state,
+          markers: withMarker(state.markers, {
+            kind: "turning_point",
+            t: state.t0ElapsedSeconds + chargeElapsed,
+            label: "TURN",
+          }),
+        };
+      }
+      // T0 not yet recovered — stash for deferred placement.
+      return { ...state, pendingTurningPointChargeSeconds: chargeElapsed };
     }
     case "drying_end": {
       // The pre-FC drying-end landmark (#351) — a SUBORDINATE marker, server-

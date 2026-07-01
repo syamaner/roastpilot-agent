@@ -537,18 +537,56 @@ describe("dashboardReducer", () => {
     expect(s.markers).toHaveLength(0);
   });
 
-  it("adds the turning-point marker at the latest point's serve-elapsed on turning_point, once (#409)", () => {
-    // The post-charge bean-temp minimum landmark (#409) is server-sourced (the
-    // controller's RoR-zero cross → the turning_point SSE event). Like drying_end
-    // its payload carries no clock, so the marker rides the latest plotted point's
-    // serve-elapsed (the same #326 axis) and fires exactly once via withMarker.
-    let s = dashboardReducer(initialDashboardViewModel, ev("telemetry", { elapsed_seconds: 510, charge_elapsed_seconds: 0, bean_temp_c: 180, env_temp_c: 200 }));
-    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 555, charge_elapsed_seconds: 45, bean_temp_c: 142, env_temp_c: 195 }));
+  it("places the turning-point marker via payload's charge-clock, not the latest-point heuristic (#409 P2-1)", () => {
+    // The `turning_point` SSE payload carries `elapsed_since_charge_seconds` — the
+    // server's charge-referenced clock at the RoR-zero cross. The marker x is
+    // `t0ElapsedSeconds + elapsed_since_charge_seconds`, NOT latest-point.t (#404
+    // reintroduced for turning_point in the original impl). The controller flushes
+    // events BEFORE the tick's telemetry, so the latest-buffered point at event
+    // receipt is the PRIOR tick's reading — one tick early. Using the payload
+    // avoids that skew and mirrors how the detail-page turningPointSeconds() anchors.
+    //
+    // Here: t0ElapsedSeconds = 510 − 0 = 510 (charge at elapsed=510, charge_elapsed=0).
+    // turning_point payload elapsed_since_charge_seconds = 45 → marker t = 510 + 45 = 555.
+    // The latest buffered point at turning_point receipt has t = 550 (one tick behind)
+    // — this proves the marker t=555 is NOT 550 (latest point) but 555 (payload-derived).
+    let s = dashboardReducer(
+      initialDashboardViewModel,
+      ev("telemetry", { elapsed_seconds: 510, charge_elapsed_seconds: 0, bean_temp_c: 180, env_temp_c: 200 }),
+    );
+    // Latest point is at t=550 (the "previous tick" when turning_point fires).
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 550, charge_elapsed_seconds: 40, bean_temp_c: 141, env_temp_c: 198 }));
     s = dashboardReducer(s, ev("turning_point", { bean_temp_c: 142, elapsed_since_charge_seconds: 45 }));
     // Re-deliver turning_point — must not duplicate the marker.
     s = dashboardReducer(s, ev("turning_point", { bean_temp_c: 142, elapsed_since_charge_seconds: 45 }));
     expect(s.markers.filter((m) => m.kind === "turning_point")).toHaveLength(1);
-    expect(s.markers.find((m) => m.kind === "turning_point")).toEqual({ kind: "turning_point", t: 555, label: "TURN" });
+    // Must be 555 (payload-derived), NOT 550 (latest-point — one tick early).
+    expect(s.markers.find((m) => m.kind === "turning_point")).toEqual({
+      kind: "turning_point",
+      t: 555, // 510 (t0ElapsedSeconds) + 45 (elapsed_since_charge_seconds)
+      label: "TURN",
+    });
+  });
+
+  it("defers turning-point placement until T0 is recovered when turning_point arrives before the first post-charge telemetry (#409 P2-1)", () => {
+    // Edge case: on a reload the `turning_point` event may be replayed before the
+    // first post-charge telemetry frame that would establish `t0ElapsedSeconds`. In
+    // that case the reducer stashes the charge-elapsed and flushes the marker via
+    // `withRecoveredOrigin` when the origin is recovered. The marker x is still the
+    // payload-derived value, not a heuristic.
+    let s = dashboardReducer(initialDashboardViewModel, ev("turning_point", { bean_temp_c: 142, elapsed_since_charge_seconds: 45 }));
+    // turning_point arrived before T0 — marker NOT yet placed, pending stashed.
+    expect(s.markers.some((m) => m.kind === "turning_point")).toBe(false);
+    expect(s.pendingTurningPointChargeSeconds).toBe(45);
+    // First post-charge telemetry arrives — T0 recovered, pending flushed.
+    s = dashboardReducer(s, ev("telemetry", { elapsed_seconds: 510, charge_elapsed_seconds: 0, bean_temp_c: 180, env_temp_c: 200 }));
+    expect(s.t0ElapsedSeconds).toBe(510);
+    expect(s.pendingTurningPointChargeSeconds).toBeNull();
+    expect(s.markers.find((m) => m.kind === "turning_point")).toEqual({
+      kind: "turning_point",
+      t: 555, // 510 + 45
+      label: "TURN",
+    });
   });
 
   it("adds the dry-end marker at the latest point's serve-elapsed on drying_end, once (#351)", () => {

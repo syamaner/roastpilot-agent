@@ -697,6 +697,12 @@ class RoastController:
         # point, so the DRYING_END event/marker fires exactly once and never
         # re-arms within a run. Reset on each new run/preheat. Observability only.
         self._drying_end_emitted = False
+        # #409: one-way witness latch set when `_arm_pre_fc_milestones` observes a
+        # negative bean RoR after charge. Required before the `turning_point` SSE
+        # event may fire: without a prior negative sample the first ≥0 RoR reading
+        # after charge would be a false landmark (no dip actually observed). Reset
+        # on each new run/preheat alongside `_drying_end_emitted`.
+        self._seen_negative_ror_after_charge = False
         self._operator_state_entered: float | None = None
         self._operator_timeout_alerted = False
         # #332: set once the operator has acknowledged the fault (the runner's
@@ -1039,6 +1045,10 @@ class RoastController:
             # A new run/preheat re-arms the one-way drying-end latch (#351) so the
             # next roast can emit its own DRYING_END signal. Observability only.
             self._drying_end_emitted = False
+            # A new run/preheat re-arms the negative-RoR witness (#409) so a fresh
+            # roast can detect its own turning-point dip. Cleared here alongside
+            # _drying_end_emitted — both are per-run observability latches.
+            self._seen_negative_ror_after_charge = False
             # A new run/preheat clears the fault-acknowledged teardown flag (#332):
             # a fresh roast has no acknowledged fault, so the escalation re-read is
             # fully armed again.
@@ -2992,9 +3002,16 @@ class RoastController:
             return
         if not self._history.has_milestone(RoastMilestoneKind.TURNING_POINT):
             # The turning point is the bean-temp minimum: RoR crosses from
-            # negative (post-charge crash) up through zero. Arm on the first
-            # non-negative RoR after charge.
-            if ror >= 0.0:
+            # negative (post-charge crash) up through zero. Track negative
+            # samples as evidence that the dip actually occurred, then arm on
+            # the first non-negative RoR that follows a witnessed negative (#409).
+            # Without the witness gate, a first post-charge sample that is already
+            # ≥0 (noisy RoR / smoothed kernel / very fast recovery) would fire a
+            # false user-visible landmark with no real dip in the observed data.
+            if ror < 0.0:
+                self._seen_negative_ror_after_charge = True
+                return
+            if ror >= 0.0 and self._seen_negative_ror_after_charge:
                 self._history.record_milestone(
                     RoastMilestone(
                         kind=RoastMilestoneKind.TURNING_POINT,
