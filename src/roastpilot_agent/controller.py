@@ -1341,8 +1341,28 @@ class RoastController:
         # False, or trim not yet latched) skips this entirely — byte-for-byte
         # the proven roast-6 behaviour.
         trim_cfg = self._config.pre_first_crack_levers.late_maillard_trim
-        if trim_cfg.adaptive_depth_enabled and self._trim_latched:
-            target_heat = self._damp_trim_depth(target_heat, trim_cfg)
+        damping_active = trim_cfg.adaptive_depth_enabled and self._trim_latched
+        if damping_active:
+            # _damp_trim_depth is PURE: it returns the candidate WITHOUT mutating
+            # _trim_depth_applied.  State is advanced below, only after an
+            # ACCEPTED write, so rate-limited REJECT ticks do not consume slew
+            # budget (#412 Fix 2).
+            damped_heat = self._damp_trim_depth(target_heat, trim_cfg)
+            target_heat = damped_heat
+            # Rebuild the control box with floor==target==damped_heat (#412 Fix 1).
+            # The policy-built box has heat_floor_percent==raw undamped depth, so
+            # passing it to evaluate_command would CLAMP a slew-UP step back up to
+            # the raw floor, bypassing the slew limit.  Lowering the floor to the
+            # damped depth is safe: the damped value is always <= the raw depth
+            # (depth_for already clamps to [min_trim, max_trim], and slew/deadband
+            # only move TOWARD raw_depth, never above it), so we only ever make
+            # the trim floor cooler, never hotter.  The original ceiling is kept.
+            box = box.model_copy(
+                update={
+                    "heat_floor_percent": damped_heat,
+                    "heat_target_percent": damped_heat,
+                }
+            )
         if self._current_heat == target_heat and self._current_fan == target_fan:
             # Already at the deterministic target — no write (avoids rate-limit
             # churn and redundant serial writes; the target is constant pre-FC).
@@ -1369,6 +1389,15 @@ class RoastController:
         )
         await self._snapshots.persist_evaluation(evaluation)
         await self._execute_targets(evaluation)
+        # Advance damping state only after an ACCEPTED write (#412 Fix 2).
+        # REJECT (rate-limited) ticks must not consume slew budget — the anchor
+        # stays at the last ACTUALLY EXECUTED depth.  On ALLOW/CLAMP the adjusted
+        # value is what hit the roaster; on REJECT _trim_depth_applied is unchanged.
+        if damping_active and evaluation.verdict in (
+            SafetyVerdict.ALLOW,
+            SafetyVerdict.CLAMP,
+        ):
+            self._trim_depth_applied = evaluation.adjusted_heat
 
     async def _apply_phase_rules(self, telemetry: RoastTelemetry | None) -> None:
         """MCP-driven phase rules: preheating (E4-S3) and roasting (E4-S4).
@@ -2834,18 +2863,22 @@ class RoastController:
         )
 
     def _damp_trim_depth(self, raw_depth: int, trim: LateMaillardTrim) -> int:
-        """Apply deadband + slew-rate damping to the adaptive trim depth (#412).
+        """Compute the deadband + slew-damped trim depth for this tick (#412).
 
-        Prevents the ~12 pp/tick thrash observed on roast 7 when adaptive
-        depth is enabled: raw RoR is noisy tick-to-tick, so ``depth_for``
-        oscillates even though the underlying signal is stable.
+        Pure function: reads ``self._trim_depth_applied`` but does NOT mutate
+        it.  The caller (``_apply_deterministic_pre_fc_levers``) advances
+        ``_trim_depth_applied`` only after an ACCEPTED write (ALLOW/CLAMP) so
+        that a rate-limited REJECT tick does not consume slew budget — a tick
+        rejected at the min_seconds_between_commands gate must not shift the
+        anchor, otherwise the NEXT accepted tick sees the intermediate value as
+        "already committed" and skips the step (#412 Fix 2).
 
         Two layers of damping (both deterministic, unit-testable):
 
         - **Slew-rate limit** — the depth can move at most
           ``trim.trim_depth_slew_pp_per_tick`` pp toward the target each
-          tick.  A sustained signal change accumulates across ticks and
-          arrives in full; a single-tick spike is capped.
+          tick.  A sustained signal change accumulates across accepted ticks
+          and arrives in full; a single-tick spike is capped.
         - **Deadband** — after the slew step, if the slew-limited candidate
           still differs from the last applied depth by no more than
           ``trim.trim_depth_deadband_pp`` pp, the old value is kept (no
@@ -2863,20 +2896,19 @@ class RoastController:
         trim is engaged — the non-adaptive path is unaffected, preserving the
         default-off byte-for-byte guarantee.
 
-        Mutates ``self._trim_depth_applied`` on each committed depth.
-
         Args:
             raw_depth: The un-damped adaptive depth from ``depth_for()``,
                 already clamped to ``[min_trim, max_trim]``.
             trim: The active ``LateMaillardTrim`` config (coefficients).
 
         Returns:
-            The damped depth to apply this tick.
+            The damped depth candidate for this tick.  The caller is
+            responsible for advancing ``_trim_depth_applied`` to this value
+            after a successful write.
         """
         prev = self._trim_depth_applied
         if prev is None:
             # First tick in this pre-FC phase: commit unconditionally.
-            self._trim_depth_applied = raw_depth
             return raw_depth
 
         # Slew: move at most slew_pp_per_tick toward raw_depth.
@@ -2885,9 +2917,8 @@ class RoastController:
 
         # Deadband: suppress sub-threshold residual jitter.
         if abs(candidate - prev) <= trim.trim_depth_deadband_pp:
-            return prev  # hold — no state mutation; the committed depth is unchanged
+            return prev  # hold — caller advances nothing (depth unchanged)
 
-        self._trim_depth_applied = candidate
         return candidate
 
     def _record_curve_history(self, telemetry: RoastTelemetry | None) -> None:

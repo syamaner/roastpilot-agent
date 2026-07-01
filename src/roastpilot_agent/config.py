@@ -276,6 +276,18 @@ class LateMaillardTrim(BaseModel):
             raise ValueError(
                 f"min_trim must not exceed max_trim ({self.min_trim} > {self.max_trim})"
             )
+        # Damping cross-field: deadband must be strictly less than slew (#412).
+        # When deadband >= slew, every slew candidate is within deadband of the
+        # previous value (|candidate - prev| <= slew <= deadband), so the
+        # deadband hold ALWAYS fires after the first tick — adaptive movement
+        # is silently disabled.  The defaults (2 < 3) are valid.
+        if self.trim_depth_deadband_pp >= self.trim_depth_slew_pp_per_tick:
+            raise ValueError(
+                "trim_depth_deadband_pp must be strictly less than "
+                "trim_depth_slew_pp_per_tick to avoid silently disabling adaptive "
+                f"movement ({self.trim_depth_deadband_pp} >= "
+                f"{self.trim_depth_slew_pp_per_tick})"
+            )
         return self
 
     def depth_for(
