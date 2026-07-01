@@ -212,6 +212,30 @@ class LateMaillardTrim(BaseModel):
     #: strict reduction even at its shallowest.
     max_trim: int = Field(default=75, ge=10, le=100)
 
+    # ------------------------------------------------------------------
+    # Adaptive-depth damping coefficients (#412) — applied in the
+    # controller's trim path to suppress tick-to-tick RoR noise.
+    # These are COEFFICIENTS only; the damping STATE (last applied depth)
+    # lives in the controller so the config model stays pure/stateless.
+    # Both coefficients are active only when ``adaptive_depth_enabled``
+    # is ``True`` — the non-adaptive path is unaffected.
+    # ------------------------------------------------------------------
+
+    #: Deadband half-width (percentage points). The controller only commits
+    #: a new adaptive depth if it differs from the last applied depth by
+    #: more than this threshold.  Default 2 — absorbs the ~1–2 pp tick-to-
+    #: tick RoR noise without hiding genuine signal; the roast-7 thrash was
+    #: ~12 pp so a 2 pp deadband eliminates jitter while letting real
+    #: run-ups through.  0 disables deadband (no hysteresis).
+    trim_depth_deadband_pp: int = Field(default=2, ge=0, le=20)
+    #: Maximum depth change per tick (percentage points).  The controller
+    #: caps the per-tick move to this many pp so the trim ramps to a new
+    #: level rather than stepping in one tick.  Default 3 — at the 1 s
+    #: tick rate a sustained 9 pp run-up takes 3 ticks (~3 s), which is
+    #: fast enough to track the genuine pre-FC acceleration and slow enough
+    #: to suppress the ~12 pp/tick thrash observed on roast 7.
+    trim_depth_slew_pp_per_tick: int = Field(default=3, ge=1, le=20)
+
     @model_validator(mode="after")
     def _check_adaptive_range(self) -> "LateMaillardTrim":
         """The adaptive depth range must be internally consistent (#386).
@@ -251,6 +275,18 @@ class LateMaillardTrim(BaseModel):
         if self.min_trim > self.max_trim:  # pragma: no cover - unreachable (min<=base<=max)
             raise ValueError(
                 f"min_trim must not exceed max_trim ({self.min_trim} > {self.max_trim})"
+            )
+        # Damping cross-field: deadband must be strictly less than slew (#412).
+        # When deadband >= slew, every slew candidate is within deadband of the
+        # previous value (|candidate - prev| <= slew <= deadband), so the
+        # deadband hold ALWAYS fires after the first tick — adaptive movement
+        # is silently disabled.  The defaults (2 < 3) are valid.
+        if self.trim_depth_deadband_pp >= self.trim_depth_slew_pp_per_tick:
+            raise ValueError(
+                "trim_depth_deadband_pp must be strictly less than "
+                "trim_depth_slew_pp_per_tick to avoid silently disabling adaptive "
+                f"movement ({self.trim_depth_deadband_pp} >= "
+                f"{self.trim_depth_slew_pp_per_tick})"
             )
         return self
 
