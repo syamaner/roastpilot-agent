@@ -46,6 +46,7 @@ from roastpilot_agent.models import (
     RoastTelemetry,
     recording_origin_slug,
 )
+from roastpilot_agent.post_fc_control import PostFcRorController
 from roastpilot_agent.roast_history import (
     DecisionTraceEntry,
     RoastCurveSample,
@@ -688,6 +689,44 @@ class RoastController:
         # unconditionally (no history to compare against). Reset alongside
         # ``_trim_latched`` so a new run / phase entry always starts fresh.
         self._trim_depth_applied: int | None = None
+        # D82/D83 (#405 Slice B2): the deterministic post-FC RoR-target PI loop.
+        # Constructed unconditionally (cheap, pure, side-effect free) but only
+        # ever consulted/actuated when ``config.post_first_crack_control.enabled``
+        # is True — see ``_apply_deterministic_post_fc_levers``. Flag OFF leaves
+        # this instance permanently untouched: today's advisor-driven post-FC
+        # regime is byte-for-byte unchanged.
+        self._post_fc_controller = PostFcRorController(config.post_first_crack_control)
+        # Monotonic time of the last post-FC loop ACTUATION (an accepted
+        # ALLOW/CLAMP write), or ``None`` before the first one this DEVELOPMENT
+        # engagement. Reset at the FC->DEVELOPMENT handoff (bumpless transfer)
+        # and on every new run/preheat, mirroring ``_trim_depth_applied``'s reset
+        # discipline. Advanced ONLY on an accepted write (#412 told==enforced
+        # rule extended to a stateful loop) — a REJECTed tick must not consume
+        # cadence budget.
+        self._post_fc_last_actuation_monotonic: float | None = None
+        # Safety-review fix (post-B2, Opus finding, MEDIUM): whether the post-FC
+        # PI loop is ENGAGED for the current DEVELOPMENT dwell. ``DEVELOPMENT``
+        # is reachable by two distinct edges — the true first-crack transition
+        # (``ROASTING_PRE_FIRST_CRACK -> DEVELOPMENT``, where the loop is
+        # bumpless-handoff-seeded from the real actuated pre-FC heat) AND an
+        # operator resume out of recovery (``operator_recovery_required ->
+        # DEVELOPMENT``, where NO seeding happens — the loop's integrator/EMA
+        # would otherwise still hold whatever state a prior engagement left it
+        # in, or the ``__init__`` default zero state after a cross-process
+        # restart). Gating only on ``phase is DEVELOPMENT`` (the original B2
+        # guard) could not tell these two edges apart, so a restart ->
+        # recovery -> operator-resume sequence could engage the loop from a
+        # PHANTOM (non-bumpless) PI state — a heat command disconnected from
+        # the roaster's real level. This flag makes that distinction explicit:
+        # ``True`` iff the CURRENT DEVELOPMENT dwell was entered via the true
+        # FC edge; set ``True`` only at that edge (``transition_to``) and
+        # cleared on every other transition (mirroring how ``_trim_latched``
+        # tracks a narrower per-phase engagement). When ``False`` — e.g. the
+        # operator-resume edge — ``_apply_deterministic_post_fc_levers`` stays
+        # fully inert and the advisor resumes driving post-FC heat/fan, exactly
+        # the pre-B2 fallback behaviour (see ``_run_advisory``'s
+        # ``post_fc_loop_active`` gate).
+        self._post_fc_engaged: bool = False
         self._last_command_monotonic: float | None = None
         self._t0_streak = 0
         self._t0_confirmed = False
@@ -1023,6 +1062,20 @@ class RoastController:
             raise InvalidTransitionError(self._phase, target)
         previous = self._phase
         self._phase = target
+        # Safety-review fix (post-B2, Opus finding, MEDIUM): ``_post_fc_engaged``
+        # is True IFF the current DEVELOPMENT dwell was entered via the TRUE
+        # first-crack edge (``ROASTING_PRE_FIRST_CRACK -> DEVELOPMENT``) — set
+        # unconditionally here, on EVERY transition, so it can never carry a
+        # stale True from a previous DEVELOPMENT engagement into a later one
+        # reached by a different edge (e.g. an operator resume out of
+        # recovery). Set True only in the FC-edge branch below (alongside the
+        # bumpless-handoff seed); every other transition — including
+        # DEVELOPMENT -> COOLING/FAULTED/OPERATOR_RECOVERY_REQUIRED and an
+        # ``operator_recovery_required -> DEVELOPMENT`` resume — lands here
+        # first and clears it. This is deliberately unconditional (not scoped
+        # to "only when leaving DEVELOPMENT") so the flag's truth is a pure
+        # function of "was THIS transition the FC edge", never of history.
+        self._post_fc_engaged = False
         if previous in TERMINAL_LATCH_PHASES and target not in TERMINAL_LATCH_PHASES:
             # Leaving a terminal HOLD phase is an EXPLICIT operator action
             # (acknowledge → idle, resume, start cooling): the operator now owns
@@ -1087,6 +1140,13 @@ class RoastController:
             # scratch — never inherit a prior roast's latch or applied depth.
             self._trim_latched = False
             self._trim_depth_applied = None
+            # A new run/preheat clears the post-FC PI loop's cadence timer
+            # (#405 Slice B2): a fresh roast has not yet reached first crack, so
+            # there is no prior actuation to pace against. The loop's internal
+            # integrator/EMA state is re-seeded at the FC->DEVELOPMENT handoff
+            # below via ``reset(initial_heat_percent=...)``, not here — this
+            # phase never re-enters DEVELOPMENT directly.
+            self._post_fc_last_actuation_monotonic = None
         if target is RoastPhase.ROASTING_PRE_FIRST_CRACK:
             # Clear the trim latch on EVERY entry into pre-FC, not just the
             # new-run/preheat path above (#327, safety-reviewer low on the latch
@@ -1145,6 +1205,41 @@ class RoastController:
                         bean_temp_c=self._last_telemetry.bean_temp_c,
                     )
                 )
+            # D82/D83 (#405 Slice B2): bumpless handoff for the deterministic
+            # post-FC RoR-target PI loop. Seed it from the ACTUATED pre-FC heat
+            # (``self._current_heat`` — the last commanded value, never an
+            # unbounded target) so a zero-error first compute reproduces exactly
+            # that level: no heat dip or jump at the tick the loop takes over.
+            # This branch is the TRUE first-crack edge ONLY — it never fires on
+            # an ``operator_recovery_required -> development`` resume, which is
+            # a distinct transition and lands on the unconditional
+            # ``self._post_fc_engaged = False`` above instead. Constructed and
+            # reset unconditionally (cheap, pure): whether it is ever actually
+            # consulted is gated on the ``enabled`` flag (and, per the fix
+            # below, ``_post_fc_engaged``) in ``_apply_deterministic_post_fc_levers``.
+            self._post_fc_controller.reset(initial_heat_percent=self._current_heat)
+            # Reset the cadence timer too, so the very first DEVELOPMENT control
+            # tick actuates immediately rather than waiting a full
+            # ``control_interval_seconds`` after an arbitrary FC instant.
+            self._post_fc_last_actuation_monotonic = None
+            # Safety-review fix (post-B2, Opus finding, MEDIUM): ENGAGE the loop
+            # only for a DEVELOPMENT dwell reached via this true FC edge. A
+            # restart -> recovery -> operator-resume sequence also reaches
+            # DEVELOPMENT (``operator_recovery_required -> DEVELOPMENT``, the
+            # ``operator_resume`` path) but does NOT run this branch (its
+            # ``previous`` is ``OPERATOR_RECOVERY_REQUIRED``, not
+            # ``ROASTING_PRE_FIRST_CRACK``) — so it inherits ``False`` from the
+            # unconditional clear above, and the loop's phase guard alone
+            # (``phase is DEVELOPMENT``) is NOT sufficient to prevent it from
+            # actuating there from a PHANTOM (non-bumpless-seeded) PI state.
+            # ``_post_fc_engaged`` closes that gap: gating
+            # ``_apply_deterministic_post_fc_levers`` on it (in addition to
+            # ``phase is DEVELOPMENT``) keeps the loop inert on the resume
+            # edge, and the advisor resumes driving post-FC heat/fan there
+            # instead (the pre-B2 fallback — see ``_run_advisory``'s
+            # ``post_fc_loop_active`` gate), so post-FC heat control is never
+            # silently absent after a resume.
+            self._post_fc_engaged = True
         if target in UNIVERSAL_TARGETS:
             # D16 operator-timeout tracking starts on entering a true
             # operator-required state — never in normal phases.
@@ -1218,6 +1313,17 @@ class RoastController:
         # lever, and a tick that just hit FC does NOT (it falls to the advisor).
         # The advisory step below is a no-op in these phases (gated out).
         await self._apply_deterministic_pre_fc_levers(telemetry)
+        # D82/D83 (#405 Slice B2): the deterministic post-FC RoR-target PI
+        # loop, called immediately AFTER the pre-FC lever step for the same
+        # reason the pre-FC comment documents its own ordering — a tick that
+        # JUST hit first crack this tick (ROASTING_PRE_FIRST_CRACK →
+        # DEVELOPMENT, via ``_apply_phase_rules`` above) must not double-
+        # actuate: ``_apply_deterministic_pre_fc_levers`` no-ops the moment the
+        # phase is DEVELOPMENT (no deterministic target there), and this call
+        # picks the loop up in the SAME tick the phase flips. No-op entirely
+        # unless ``post_first_crack_control.enabled`` is True (default False —
+        # today's advisor-driven post-FC path is unaffected).
+        await self._apply_deterministic_post_fc_levers(telemetry)
         # D40.3 (#275): accumulate the roast-so-far curve + milestones for the
         # per-tick control-loop context AFTER the phase rules + deterministic
         # pre-FC levers have run, so the sample captures the charge tick itself
@@ -1400,16 +1506,245 @@ class RoastController:
             bounds=box,
         )
         await self._snapshots.persist_evaluation(evaluation)
-        await self._execute_targets(evaluation)
-        # Advance damping state only after an ACCEPTED write (#412 Fix 2).
-        # REJECT (rate-limited) ticks must not consume slew budget — the anchor
-        # stays at the last ACTUALLY EXECUTED depth.  On ALLOW/CLAMP the adjusted
-        # value is what hit the roaster; on REJECT _trim_depth_applied is unchanged.
-        if damping_active and evaluation.verdict in (
-            SafetyVerdict.ALLOW,
-            SafetyVerdict.CLAMP,
-        ):
+        executed = await self._execute_targets(evaluation)
+        # Advance damping state only after an ACTUALLY EXECUTED write (#412 Fix
+        # 2; sharpened by the Codex actuator-failure finding, #405 Slice B2
+        # fix round 2): key on ``executed`` — ``_execute_targets``'s own report
+        # of whether the write reached the roaster — NOT on
+        # ``evaluation.verdict`` alone. A REJECT (rate-limited) tick never
+        # even attempts the write, so it was already correctly excluded by the
+        # old verdict check; but an ALLOW/CLAMP verdict whose ``set_targets``
+        # call then raises (a transient actuator/serial failure) is NOT an
+        # executed command either — the old verdict-only check would have
+        # advanced ``_trim_depth_applied`` there anyway (a phantom advance:
+        # the roaster's real heat is unchanged, but the anchor moved as if it
+        # had). ``executed`` is exactly "did the roaster's real heat/fan
+        # change to match this evaluation", so gating on it folds the REJECT
+        # case and the actuator-failure case into one correct check.
+        if damping_active and executed:
             self._trim_depth_applied = evaluation.adjusted_heat
+
+    async def _apply_deterministic_post_fc_levers(self, telemetry: RoastTelemetry | None) -> None:
+        """Deterministically hold a target RoR post-FC via the PI loop (D82/D83, #405 Slice B2).
+
+        Gated end-to-end on ``self._config.post_first_crack_control.enabled``
+        (default ``False``): when the flag is off this method is a pure no-op on
+        every path, so the flag-off behaviour is byte-for-byte identical to
+        before this slice — the advisor's ``target_heat``/``target_fan`` keep
+        actuating post-FC exactly as they do today (``_run_advisory`` /
+        ``_execute_advisor_levers``).
+
+        **Invariants held (unchanged by this method):**
+
+        * Every write this method issues passes the SAME safety path as every
+          other roaster write — the command×phase matrix
+          (``evaluate_command_phase``) then ``evaluate_command`` with a single-
+          source :class:`~roastpilot_agent.control_policy.PhaseControlLimits`
+          box (told == enforced, #273/#412) — so CLAMP/REJECT are honoured
+          exactly as they are for the advisor and the pre-FC lever.
+        * The 196 °C bitter ceiling and the emergency-drop bound are NOT
+          reasoned about here at all — they live in ``SafetyPolicy``'s
+          temperature rules (``_evaluate_safety``), which run earlier in
+          ``tick()`` and already fail-closed (heat off) independently of
+          whether this loop is engaged. This method can only ever narrow the
+          DEVELOPMENT heat/fan box the gate already enforces; it cannot loosen
+          it.
+        * Emergency stop remains reachable from every phase (unaffected: this
+          method issues SET_HEAT/SET_FAN only, never touches the e-stop path).
+        * A restart never auto-resumes this loop: ``recover_from_restart``
+          always lands a possibly-active run in ``operator_recovery_required``,
+          never directly in ``DEVELOPMENT``. But ``DEVELOPMENT`` itself is
+          reachable by TWO distinct edges — the true FC edge
+          (``ROASTING_PRE_FIRST_CRACK -> DEVELOPMENT``, bumpless-handoff seeded)
+          and an operator resume out of recovery
+          (``operator_recovery_required -> DEVELOPMENT``, NOT seeded) — and
+          ``phase is DEVELOPMENT`` alone cannot distinguish them. This method
+          therefore ALSO gates on ``self._post_fc_engaged`` (safety-review fix,
+          post-B2), which ``transition_to`` sets ``True`` only on the true FC
+          edge and clears on every other transition (including the resume
+          edge): the loop can actuate only in a DEVELOPMENT dwell reached via a
+          normally-progressing FC, never from the phantom (non-bumpless) PI
+          state a resume would otherwise expose it to. On a resume the advisor
+          resumes driving post-FC heat/fan instead (see ``_run_advisory``'s
+          ``post_fc_loop_active`` gate) — post-FC control is never silently
+          absent.
+        * Temperatures stay Celsius throughout (RoR is °C/min); the advisor
+          never receives MCP write tools (unchanged — this method has no
+          advisor in its call graph at all).
+
+        **Fail-closed on missing RoR:** if telemetry is absent or carries no
+        ``bean_ror_c_per_min`` this tick, the loop does NOT actuate — heat is
+        left exactly where it is. A stale/undamped PI output computed from a
+        RoR the caller cannot trust would violate the #412 told==enforced
+        rule at its source, so the safest choice is simply not to compute at
+        all rather than compute and then decide not to use the result.
+
+        **Cadence:** the loop actuates roughly every
+        ``control_interval_seconds`` (default 5 s, matching the post-FC
+        advisory cadence), not every 1 s tick — RoR is a derivative signal and
+        chasing it every tick would fight thermocouple noise (the same
+        reasoning ``ror_smoothing_alpha`` encodes inside the loop itself).
+
+        **The #412 told==enforced rule, extended to a stateful loop:** the
+        safety box's heat floor/target is built from the loop's ACTUATED
+        output (never an unbounded pre-clamp value), and the loop's internal
+        PI state (integrator, EMA, bias) advances ONLY when
+        :meth:`_execute_targets` reports the write ACTUALLY REACHED the
+        roaster (its ``bool`` return) — never on ``evaluation.verdict`` alone.
+        Two distinct cases mean "the write did not land", and both are folded
+        into that one check (fix round 2, a Codex finding): a REJECTed safety
+        verdict (e.g. a rate-limited tick, or the defensive phase-matrix
+        branch) never even attempts ``set_targets``; a TRANSIENT ACTUATOR
+        FAILURE is an ALLOW/CLAMP verdict whose ``set_targets`` call then
+        raises — an outcome the verdict alone cannot distinguish from success,
+        but ``_execute_targets``'s ``False`` return catches it. In BOTH cases
+        the roaster's real heat/fan is unchanged from before this tick. A
+        snapshot is taken via
+        :meth:`~roastpilot_agent.post_fc_control.PostFcRorController.snapshot_state`
+        immediately before :meth:`~roastpilot_agent.post_fc_control.PostFcRorController.compute`;
+        when the write did not land that snapshot is restored, so the
+        tentative step is fully undone and the NEXT accepted-and-executed
+        write is computed from the same pre-step state — exactly the
+        discipline ``_apply_deterministic_pre_fc_levers`` applies to
+        ``_trim_depth_applied`` (#412 Fix 2, likewise keyed on
+        :meth:`_execute_targets`'s return since fix round 2). The cadence
+        timer (``_post_fc_last_actuation_monotonic``) is likewise NOT advanced
+        when the write did not land, so the next tick retries at the same
+        elapsed-time budget rather than losing a full cadence interval to a
+        command that never reached the roaster. The one case that is
+        DELIBERATELY NOT a restore — the idempotent "already at this target"
+        no-write skip — is documented in-line at that branch below: it is
+        treated as accepted because the roaster's real state already equals
+        the computed output, so there is no state/reality gap to protect
+        against, and restoring there would wrongly freeze the EMA/integrator
+        on the loop's own steady-state (deadband-holding) case.
+
+        Args:
+            telemetry: The reading this tick consumed, or ``None`` on a
+                failed/sessionless read (the loop does not actuate either way).
+        """
+        config = self._config.post_first_crack_control
+        if (
+            not config.enabled
+            or self._profile is None
+            or self._phase is not RoastPhase.DEVELOPMENT
+            or not self._post_fc_engaged
+            or telemetry is None
+            or telemetry.bean_ror_c_per_min is None
+        ):
+            return
+        now = self._clock()
+        if self._post_fc_last_actuation_monotonic is not None:
+            elapsed = now - self._post_fc_last_actuation_monotonic
+            if elapsed < config.control_interval_seconds:
+                return
+            dt_seconds = elapsed
+        else:
+            # First DEVELOPMENT control tick since the bumpless-handoff reset
+            # (``transition_to``): no prior actuation to measure elapsed time
+            # against, so feed the loop its own configured cadence as a sane
+            # dt rather than an arbitrary/zero value.
+            dt_seconds = config.control_interval_seconds
+        # dt_seconds is always > 0 here: control_interval_seconds is validated
+        # `gt=0` on the config model, and `elapsed` above is only used when it
+        # already cleared the `>= control_interval_seconds` (itself > 0) gate.
+        pre_compute_state = self._post_fc_controller.snapshot_state()
+        output = self._post_fc_controller.compute(
+            measured_ror_c_per_min=telemetry.bean_ror_c_per_min, dt_seconds=dt_seconds
+        )
+        # Build the DEVELOPMENT box from the ACTUATED PI output (#412
+        # told==enforced): start from the full DEVELOPMENT box (heat/fan
+        # 0-100, the profile-aware temperature ceilings), then narrow heat's
+        # floor AND target to the loop's output — never an undamped/pre-clamp
+        # value — and pin fan to the single configured deterministic value
+        # (floor == ceiling == target), so the advisor's fan is structurally
+        # unable to oppose the loop (D83 call (6): the roast-7 over-brake was
+        # heat AND fan moving together).
+        box = self._control_limits().model_copy(
+            update={
+                "heat_floor_percent": output.heat_percent,
+                "heat_target_percent": output.heat_percent,
+                "fan_floor_percent": config.fan_percent,
+                "fan_ceiling_percent": config.fan_percent,
+                "fan_target_percent": config.fan_percent,
+            }
+        )
+        if self._current_heat == output.heat_percent and self._current_fan == config.fan_percent:
+            # Already at the loop's computed target — no MCP write is issued
+            # (mirrors the pre-FC idempotence guard: avoids rate-limit churn
+            # and redundant serial writes).
+            #
+            # DELIBERATE DECISION on the #412 "state advances only on accepted
+            # write" rule for THIS idempotent case: the PI state (integrator +
+            # EMA, already advanced by the `compute()` call above) is KEPT, and
+            # the cadence timer DOES advance — this counts as accepted, not
+            # rejected. Reasoning: `self._current_heat`/`self._current_fan`
+            # ARE the last value the roaster actually holds, and it already
+            # equals `output.heat_percent`/`config.fan_percent` by this
+            # branch's own condition — so there is no gap between "what the
+            # loop computed" and "what the roaster is actually doing" for the
+            # state to race ahead of. This is UNLIKE a REJECT (rate limit) or a
+            # phase-matrix REJECT, where the roaster's real state is UNCHANGED
+            # from before this tick while the integrator/EMA would have
+            # advanced as if the new command had taken effect — THAT mismatch
+            # is what the restore-on-reject rule exists to prevent (a "phantom
+            # advance"). Restoring state here instead would freeze the
+            # integrator and the RoR EMA every steady-state (deadband-holding)
+            # tick — precisely the loop's expected common case — breaking both
+            # the EMA's cross-tick smoothing (#386/#412 lesson: it must keep
+            # tracking the live RoR every cadence tick) and the integrator's
+            # ability to keep accumulating a small deadband-adjacent error
+            # toward the next real move.
+            self._post_fc_last_actuation_monotonic = now
+            return
+        # Matrix gate first (SET_HEAT is valid in DEVELOPMENT — no change to
+        # COMMAND_PHASE_MATRIX was needed for this slice; see the safety.py
+        # row), then the bounds/rate-limit clamp — the identical two-step gate
+        # the pre-FC lever and the advisor path both go through.
+        phase_validity = self._safety.evaluate_command_phase(
+            command=RoastCommand.SET_HEAT, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(phase_validity)
+        if phase_validity.verdict is not SafetyVerdict.ALLOW:  # pragma: no cover — DEVELOPMENT
+            # is in the SET_HEAT matrix row; unreachable defensive guard (mirrors
+            # the identical pre-FC guard above).
+            self._post_fc_controller.restore_state(pre_compute_state)
+            return
+        evaluation = self._safety.evaluate_command(
+            requested_heat=output.heat_percent,
+            requested_fan=config.fan_percent,
+            seconds_since_last_command=self._seconds_since_last_command(),
+            bounds=box,
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        executed = await self._execute_targets(evaluation)
+        # Key state-advance on ``executed`` — ``_execute_targets``'s own report
+        # of whether the write actually reached the roaster — NOT on
+        # ``evaluation.verdict`` alone (Codex actuator-failure finding, #405
+        # Slice B2 fix round 2). A REJECT (rate-limited) tick is one way
+        # ``executed`` comes back False; a TRANSIENT ACTUATOR FAILURE — an
+        # ALLOW/CLAMP verdict whose ``set_targets`` call then raises — is the
+        # other, and the old verdict-only check could not tell them apart from
+        # "the write landed": it would have kept the tentative `compute` state
+        # AND advanced the cadence timer on an actuator failure, a phantom
+        # advance (the roaster's real heat is unchanged, but the loop's
+        # internal state raced ahead as if the command had applied).
+        if executed:
+            # Accepted AND actually executed: the loop's PI state (already
+            # advanced by the `compute` call above) stands, and the cadence
+            # timer advances so the NEXT actuation is paced from THIS
+            # confirmed instant.
+            self._post_fc_last_actuation_monotonic = now
+        else:
+            # NOT executed — REJECTed (e.g. rate-limited) OR an actuator
+            # failure: undo the tentative `compute` step entirely so the
+            # integrator/EMA/bias are exactly as they were before this tick
+            # ran it (#412 told==enforced extended to a stateful loop — see
+            # the method docstring). The cadence timer is NOT advanced either,
+            # so the next tick retries at the same elapsed-time budget rather
+            # than losing a full cadence interval to a write that never
+            # reached the roaster.
+            self._post_fc_controller.restore_state(pre_compute_state)
 
     async def _apply_phase_rules(self, telemetry: RoastTelemetry | None) -> None:
         """MCP-driven phase rules: preheating (E4-S3) and roasting (E4-S4).
@@ -1989,8 +2324,39 @@ class RoastController:
                 "evaluation": evaluation.model_dump(mode="json"),
             },
         )
+        # D82/D83 (#405 Slice B2): when the deterministic post-FC RoR loop is
+        # ENGAGED (flag on AND this is the post-FC DEVELOPMENT phase AND
+        # ``self._post_fc_engaged`` — the pre-FC phases never reach this far,
+        # they are gated out of advice entirely), the loop OWNS heat and fan is
+        # pinned to its configured value — the advisor must never fight it
+        # (the roast-7 lesson: fan ramped in step with the heat cut, so a
+        # heat-only fix that left fan free to move would reintroduce the same
+        # over-brake). The advisor's heat/fan recommendation is still traced
+        # above (ADVISORY event, decision trace, persisted decision) for
+        # observability — it is simply not actuated. Slice C (#405) formalises
+        # this by narrowing the advisor's role/prompt to drop-only judgment
+        # when the loop is active; this slice only stops ACTUATING its levers,
+        # so the flag-off path (the ``else`` below) stays byte-for-byte the
+        # pre-existing behaviour.
+        #
+        # ``_post_fc_engaged`` (safety-review fix, post-B2, MEDIUM): DEVELOPMENT
+        # is reachable both via the true FC edge (loop-eligible) and an
+        # operator resume out of recovery (NOT loop-eligible — no bumpless
+        # seed happened). Without this third condition the loop's phase-only
+        # gate would ALSO have suppressed the advisor here on a resume, with
+        # NEITHER the loop nor the advisor driving post-FC heat — a silent
+        # control gap. Requiring ``_post_fc_engaged`` here means a resume into
+        # DEVELOPMENT falls through to the advisor path below exactly as it
+        # did before this slice (the pre-B2 fallback), matching the loop's own
+        # non-actuation on that edge (``_apply_deterministic_post_fc_levers``).
+        post_fc_loop_active = (
+            self._config.post_first_crack_control.enabled
+            and self._phase is RoastPhase.DEVELOPMENT
+            and self._post_fc_engaged
+        )
         if (
-            evaluation.verdict in (SafetyVerdict.ALLOW, SafetyVerdict.CLAMP)
+            not post_fc_loop_active
+            and evaluation.verdict in (SafetyVerdict.ALLOW, SafetyVerdict.CLAMP)
             and evaluation.adjusted_heat is not None
             and evaluation.adjusted_fan is not None
         ):
@@ -2359,14 +2725,36 @@ class RoastController:
         await self._snapshots.persist_evaluation(evaluation)
         await self._execute_targets(evaluation)
 
-    async def _execute_targets(self, evaluation: SafetyEvaluation) -> None:
-        """Execute an ALLOW/CLAMP heat/fan evaluation; surface failures."""
+    async def _execute_targets(self, evaluation: SafetyEvaluation) -> bool:
+        """Execute an ALLOW/CLAMP heat/fan evaluation; surface failures.
+
+        Returns:
+            ``True`` only when the write actually reached the roaster — i.e.
+            ``evaluation`` was ALLOW/CLAMP with both adjusted values present,
+            AND ``self._executor.set_targets`` completed without raising (so
+            ``self._current_heat``/``self._current_fan``/
+            ``self._last_command_monotonic`` were updated to match). ``False``
+            on the not-executable verdict (REJECT/RECOVERY/FAULT/
+            EMERGENCY_STOP, or a missing adjusted value) AND ``False`` on a
+            transient actuator failure (``set_targets`` raised) — in BOTH
+            cases the roaster's real heat/fan is unchanged from before this
+            call. Callers that hold their own control-loop state keyed on
+            "did this write actually land" (e.g.
+            :meth:`_apply_deterministic_post_fc_levers`'s PI integrator/EMA,
+            :meth:`_apply_deterministic_pre_fc_levers`'s ``_trim_depth_applied``)
+            MUST advance that state on this return value, never on
+            ``evaluation.verdict`` alone — the #412 told==enforced rule
+            extended to the actuator-failure case: an ALLOW verdict whose
+            ``set_targets`` call then raises is NOT an executed command, and
+            state that advances anyway is a phantom advance (the roaster
+            never actually moved).
+        """
         if (
             evaluation.verdict not in (SafetyVerdict.ALLOW, SafetyVerdict.CLAMP)
             or evaluation.adjusted_heat is None
             or evaluation.adjusted_fan is None
         ):
-            return
+            return False
         try:
             await self._executor.set_targets(
                 heat_percent=evaluation.adjusted_heat,
@@ -2374,7 +2762,7 @@ class RoastController:
             )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "set_targets"})
-            return
+            return False
         self._current_heat = evaluation.adjusted_heat
         self._current_fan = evaluation.adjusted_fan
         self._last_command_monotonic = self._clock()
@@ -2382,6 +2770,7 @@ class RoastController:
             RoastEventKind.COMMAND_EXECUTED,
             {"heat_percent": evaluation.adjusted_heat, "fan_percent": evaluation.adjusted_fan},
         )
+        return True
 
     def restore_charge_clock(self, t0_detected_at_utc: str) -> None:
         """Restore the charge-referenced DTR clock after a restart (#235).

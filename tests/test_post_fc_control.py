@@ -61,6 +61,60 @@ def test_post_first_crack_control_heat_floor_ge_one() -> None:
 
 
 # ---------------------------------------------------------------------------
+# dt_seconds contract (Slice B2 review note, #405)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("dt_seconds", [0.0, -1.0, -0.001])
+def test_compute_rejects_non_positive_dt_seconds(dt_seconds: float) -> None:
+    """A zero or negative ``dt_seconds`` would freeze or reverse the
+    integrator's accumulated direction — never a valid tick duration. The
+    caller (Slice B2's controller wiring) is responsible for supplying a sane
+    value; this is the loop's own defensive contract."""
+    controller = PostFcRorController(_config())
+    controller.reset(initial_heat_percent=50)
+    with pytest.raises(ValueError, match="dt_seconds must be > 0"):
+        controller.compute(measured_ror_c_per_min=8.0, dt_seconds=dt_seconds)
+
+
+# ---------------------------------------------------------------------------
+# State snapshot/restore (Slice B2, #405: the #412 told==enforced rule
+# extended to this stateful loop — the caller restores a pre-compute snapshot
+# on any non-actuated write so the integrator/EMA never advance on a rejected
+# command)
+# ---------------------------------------------------------------------------
+
+
+def test_restore_state_undoes_a_compute_step() -> None:
+    config = _config(target_ror_c_per_min=8.0, ror_smoothing_alpha=0.4)
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=50)
+
+    before = controller.snapshot_state()
+    output_before = controller.compute(measured_ror_c_per_min=20.0, dt_seconds=5.0)
+    controller.restore_state(before)
+
+    # Recomputing from the restored state must reproduce the exact same output
+    # as the undone step — proof the snapshot/restore round-trips cleanly.
+    output_after_restore = controller.compute(measured_ror_c_per_min=20.0, dt_seconds=5.0)
+    assert output_after_restore == output_before
+
+
+def test_snapshot_state_is_immutable_and_independent_of_later_mutation() -> None:
+    config = _config(target_ror_c_per_min=8.0, ror_smoothing_alpha=0.4)
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=50)
+    snapshot = controller.snapshot_state()
+
+    controller.compute(measured_ror_c_per_min=20.0, dt_seconds=5.0)
+    controller.compute(measured_ror_c_per_min=25.0, dt_seconds=5.0)
+    # The earlier snapshot's fields must be unaffected by the later computes.
+    assert snapshot.integrator == pytest.approx(50.0 / config.ki_percent_per_ror_second)
+    assert snapshot.bias_percent == 0.0
+    assert snapshot.ema is None
+
+
+# ---------------------------------------------------------------------------
 # Sign correctness
 # ---------------------------------------------------------------------------
 
