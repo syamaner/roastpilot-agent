@@ -33,6 +33,7 @@ from roastpilot_agent.config_store import (
     _config_file_path,  # pyright: ignore[reportPrivateUsage]
     _inject_saved_as_env,  # pyright: ignore[reportPrivateUsage]
     _load_saved_config,  # pyright: ignore[reportPrivateUsage]
+    _make_field_meta,  # pyright: ignore[reportPrivateUsage]
     _merge_device_fields,  # pyright: ignore[reportPrivateUsage]
     _write_saved_config,  # pyright: ignore[reportPrivateUsage]
     apply_config_edit,
@@ -1237,3 +1238,355 @@ def test_apply_config_edit_blank_audio_input_device_treated_as_inherit() -> None
     edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit.model_validate({"audio_input_device": ""}))
     result = apply_config_edit(edit, existing)
     assert "audio_input_device" not in result.get("mcp_device", {})
+
+
+# ---------------------------------------------------------------------------
+# #426 — JSON-blob section env var precedence + env_overridden flag
+# ---------------------------------------------------------------------------
+
+
+def test_json_blob_env_var_beats_saved_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A top-level JSON-blob env var for a section (e.g. ROASTPILOT_ADVISOR='{"model_slug":"..."}')
+    takes precedence over saved-file values for the fields it sets (#426).
+
+    Before the fix, _inject_saved_as_env injected ROASTPILOT_ADVISOR__MODEL_SLUG
+    from the saved file, which pydantic-settings used as the effective value even
+    when ROASTPILOT_ADVISOR='{"model_slug":"json-blob-model"}' was also set,
+    because scalar nested env vars win over the JSON blob in pydantic-settings'
+    resolution order.  The fix skips injection for the whole section when a
+    section-level JSON blob key is already set in the environment.
+    """
+    import json
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("advisor:\n  model_slug: saved-file-model\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_file))
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", json.dumps({"model_slug": "json-blob-model"}))
+
+    effective, injected = load_app_config()
+
+    # JSON blob must win over the saved file.
+    assert effective.advisor.model_slug == "json-blob-model"
+    # No ROASTPILOT_ADVISOR__* keys should have been injected for this section.
+    assert not any("ROASTPILOT_ADVISOR__" in k for k in injected)
+
+
+def test_json_blob_env_var_sets_env_overridden_true(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fields set by a top-level JSON-blob env var report env_overridden=True (#426).
+
+    Before the fix, env_overridden was False for these fields because the check
+    only looked for the per-field scalar env var (ROASTPILOT_ADVISOR__MODEL_SLUG),
+    which is absent from os.environ when a JSON blob covers the section.
+    """
+    import json
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text("advisor:\n  model_slug: saved-file-model\n", encoding="utf-8")
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_file))
+    monkeypatch.setenv(
+        "ROASTPILOT_ADVISOR",
+        json.dumps({"model_slug": "json-blob-model", "temperature": 0.7}),
+    )
+
+    effective, injected = load_app_config()
+    saved_raw = _load_saved_config(cfg_file)
+    snap = build_config_snapshot(effective, saved_raw, injected)
+
+    # Both fields set in the JSON blob must be flagged env_overridden.
+    assert snap.advisor.model_slug.env_overridden is True
+    assert snap.advisor.temperature.env_overridden is True
+    # saved_value is still the file value (the badge shows what's saved vs effective).
+    assert snap.advisor.model_slug.saved_value == "saved-file-model"
+    assert snap.advisor.model_slug.effective_value == "json-blob-model"
+
+
+def test_scalar_env_var_precedence_unaffected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scalar env vars (ROASTPILOT_ADVISOR__MODEL_SLUG) still win over the saved file
+    and still report env_overridden=True — the JSON-blob fix must not regress them.
+    Fields NOT shadowed by any env var retain env_overridden=False.
+    """
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "advisor:\n  model_slug: saved-model\n  temperature: 0.3\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_file))
+    monkeypatch.setenv("ROASTPILOT_ADVISOR__MODEL_SLUG", "scalar-env-model")
+
+    effective, injected = load_app_config()
+    saved_raw = _load_saved_config(cfg_file)
+    snap = build_config_snapshot(effective, saved_raw, injected)
+
+    # Scalar env var wins for model_slug.
+    assert effective.advisor.model_slug == "scalar-env-model"
+    assert snap.advisor.model_slug.env_overridden is True
+
+    # temperature comes from the saved file (injected) — not env_overridden.
+    assert effective.advisor.temperature == 0.3
+    assert snap.advisor.temperature.env_overridden is False
+
+
+def test_json_blob_env_var_does_not_affect_other_sections(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A JSON-blob env var for ROASTPILOT_ADVISOR only skips advisor injection;
+    other sections (e.g. controller) continue to be injected from the saved file.
+    """
+    import json
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "advisor:\n  model_slug: saved-advisor-model\n"
+        "controller:\n  pre_first_crack_levers:\n    heat_target_percent: 80\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_file))
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", json.dumps({"model_slug": "json-blob-model"}))
+
+    effective, injected = load_app_config()
+    saved_raw = _load_saved_config(cfg_file)
+    snap = build_config_snapshot(effective, saved_raw, injected)
+
+    # Advisor: JSON blob governs.
+    assert effective.advisor.model_slug == "json-blob-model"
+    assert snap.advisor.model_slug.env_overridden is True
+
+    # Controller: saved-file injection still works.
+    assert effective.controller.pre_first_crack_levers.heat_target_percent == 80
+    assert snap.controller.pre_fc_heat_target_percent.env_overridden is False
+
+
+def test_partial_json_blob_keeps_non_blob_saved_fields(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A partial JSON blob (only some fields) must not revert non-blob fields to defaults.
+
+    The bug (#426 blocker): a whole-section skip dropped all saved-file injection
+    for a section, causing non-blob fields to silently fall back to code defaults
+    (e.g. saved timeout_seconds=99.0 reverting to default 10.0).
+
+    Fix: inject saved-file scalars only for fields NOT present in the blob.
+    pydantic-settings scalar nested env vars beat the section JSON blob, so
+    injecting a scalar for a non-blob field does not compete with the blob.
+    """
+    import json
+
+    cfg_file = tmp_path / "config.yaml"
+    cfg_file.write_text(
+        "advisor:\n  model_slug: saved-model\n  timeout_seconds: 99.0\n  temperature: 0.8\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ROASTPILOT_CONFIG_FILE", str(cfg_file))
+    # Partial blob: only model_slug — timeout_seconds and temperature are NOT in the blob.
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", json.dumps({"model_slug": "blob-model"}))
+
+    effective, injected = load_app_config()
+    saved_raw = _load_saved_config(cfg_file)
+    snap = build_config_snapshot(effective, saved_raw, injected)
+
+    # Blob field wins.
+    assert effective.advisor.model_slug == "blob-model"
+    assert snap.advisor.model_slug.env_overridden is True
+
+    # Non-blob fields keep their saved values (NOT code defaults).
+    assert effective.advisor.timeout_seconds == 99.0, (
+        "timeout_seconds must use the saved value (99.0), not the code default (10.0)"
+    )
+    assert effective.advisor.temperature == 0.8, (
+        "temperature must use the saved value (0.8), not the code default (0.0)"
+    )
+    assert snap.advisor.timeout_seconds.env_overridden is False
+    assert snap.advisor.temperature.env_overridden is False
+
+
+def test_malformed_json_blob_inject_saved_as_env_does_not_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed JSON-blob section env var must not crash _inject_saved_as_env.
+
+    The safe fallback is to skip the entire section (no saved-file injection for
+    it), which avoids both a crash and the original shadow bug.  The test covers
+    _inject_saved_as_env directly because AppConfig() itself raises
+    SettingsError for a malformed blob (pydantic-settings' own validation).
+    """
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", "not json")
+
+    # Must not raise.
+    injected = _inject_saved_as_env(
+        {"advisor": {"model_slug": "saved-model", "timeout_seconds": 55.0}}
+    )
+
+    # Full section skip on malformed blob — no advisor scalars injected.
+    assert not any("ROASTPILOT_ADVISOR__" in k for k in injected)
+    assert "ROASTPILOT_ADVISOR__MODEL_SLUG" not in os.environ
+
+
+def test_non_dict_json_blob_in_inject_saved_as_env_skips_section(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A syntactically valid JSON blob that is NOT a dict (e.g. '[]') triggers the
+    non-dict fallback in _inject_saved_as_env: the section is skipped entirely
+    (same as a malformed blob — safe, no competing scalars injected).
+
+    Covers the `else: continue` branch at the non-dict path (line 1487).
+    """
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", "[]")  # valid JSON, not a dict
+
+    injected = _inject_saved_as_env(
+        {"advisor": {"model_slug": "saved-model", "timeout_seconds": 30.0}}
+    )
+
+    # Non-dict blob → full section skip → no advisor scalars injected.
+    assert not any("ROASTPILOT_ADVISOR__" in k for k in injected)
+    assert "ROASTPILOT_ADVISOR__MODEL_SLUG" not in os.environ
+
+
+def test_non_dict_json_blob_in_make_field_meta_leaves_blob_overridden_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-dict JSON blob (e.g. '[]') for a section env var leaves blob_overridden=False
+    in _make_field_meta — the isinstance(parsed, dict) branch is False.
+
+    Covers the branch-not-taken path at line 564→569 in _make_field_meta.
+    """
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", "[]")  # valid JSON, not a dict
+
+    meta = _make_field_meta(
+        saved_value="saved-model",
+        effective_value="saved-model",
+        default_value="openai/gpt-4o",
+        env_var="ROASTPILOT_ADVISOR__MODEL_SLUG",
+        read_only=False,
+        description="test",
+        injected_keys=frozenset(),
+    )
+
+    # Non-dict blob: blob_overridden=False; scalar var not set → env_overridden=False.
+    assert meta.env_overridden is False
+
+
+def test_malformed_json_blob_in_make_field_meta_leaves_blob_overridden_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A malformed JSON blob (e.g. 'not json') for a section env var leaves
+    blob_overridden=False in _make_field_meta — the ValueError path is hit.
+
+    Covers lines 567-568 (except ValueError/TypeError → pass) in _make_field_meta.
+    """
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", "not json")
+
+    meta = _make_field_meta(
+        saved_value="saved-model",
+        effective_value="saved-model",
+        default_value="openai/gpt-4o",
+        env_var="ROASTPILOT_ADVISOR__MODEL_SLUG",
+        read_only=False,
+        description="test",
+        injected_keys=frozenset(),
+    )
+
+    # Malformed blob: blob_overridden=False; scalar var not set → env_overridden=False.
+    assert meta.env_overridden is False
+
+
+# ---------------------------------------------------------------------------
+# P2-B: uppercase blob keys must NOT cause saved-value skip (#426 P2-B)
+# ---------------------------------------------------------------------------
+
+
+def test_uppercase_blob_key_does_not_skip_saved_value_injection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A JSON blob with an uppercase key (e.g. "MODEL_SLUG") must NOT skip
+    injection of the saved model_slug value.
+
+    pydantic-settings only consumes snake_case field keys.  An uppercase blob
+    key like MODEL_SLUG is silently ignored by pydantic, so injecting the
+    saved scalar is correct — the field must resolve to the saved value, not
+    the schema default (#426 P2-B).
+    """
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", '{"MODEL_SLUG": "bad-uppercase-key"}')
+    # Simulate a clean env (no per-field scalar set by the operator).
+    monkeypatch.delenv("ROASTPILOT_ADVISOR__MODEL_SLUG", raising=False)
+
+    injected = _inject_saved_as_env(
+        {"advisor": {"model_slug": "saved-model", "timeout_seconds": 30.0}}
+    )
+
+    # The uppercase blob key must NOT suppress injection of the saved scalar.
+    assert "ROASTPILOT_ADVISOR__MODEL_SLUG" in injected
+    assert os.environ.get("ROASTPILOT_ADVISOR__MODEL_SLUG") == "saved-model"
+
+
+def test_uppercase_blob_key_leaves_blob_overridden_false_in_make_field_meta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A JSON blob key in uppercase (e.g. MODEL_SLUG) must NOT set
+    blob_overridden=True for the matching snake_case field.
+
+    pydantic ignores the uppercase key so the field's effective value does not
+    come from the blob — blob_overridden should be False (#426 P2-B).
+    """
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", '{"MODEL_SLUG": "bad-uppercase-key"}')
+    monkeypatch.delenv("ROASTPILOT_ADVISOR__MODEL_SLUG", raising=False)
+
+    meta = _make_field_meta(
+        saved_value="saved-model",
+        effective_value="saved-model",
+        default_value="openai/gpt-4o",
+        env_var="ROASTPILOT_ADVISOR__MODEL_SLUG",
+        read_only=False,
+        description="test",
+        injected_keys=frozenset(),
+    )
+
+    # Uppercase blob key: pydantic ignores it → env_overridden must be False.
+    assert meta.env_overridden is False
+
+
+# ---------------------------------------------------------------------------
+# P2-A: nested JSON blob must cover nested scalar fields (#426 P2-A)
+# ---------------------------------------------------------------------------
+
+
+def test_nested_json_blob_does_not_shadow_nested_saved_scalar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A JSON blob covering a nested sub-section must prevent injection of
+    saved scalars for fields present in that nested blob dict.
+
+    E.g. ROASTPILOT_CONTROLLER='{"pre_first_crack_levers":{"heat_target_percent":80}}'
+    must not inject ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__HEAT_TARGET_PERCENT
+    from the saved config, because the nested blob value should win (#426 P2-A).
+    """
+    blob = '{"pre_first_crack_levers": {"heat_target_percent": 80}}'
+    monkeypatch.setenv("ROASTPILOT_CONTROLLER", blob)
+    nested_key = "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__HEAT_TARGET_PERCENT"
+    monkeypatch.delenv(nested_key, raising=False)
+
+    saved = {
+        "controller": {
+            "pre_first_crack_levers": {"heat_target_percent": 55, "fan_target_percent": 30}
+        }
+    }
+    injected = _inject_saved_as_env(saved)
+
+    fan_key = "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__FAN_TARGET_PERCENT"
+
+    # heat_target_percent is in the blob → must NOT be injected (blob wins).
+    assert nested_key not in injected
+    assert os.environ.get(nested_key) is None
+
+    # fan_target_percent is NOT in the blob → saved value must be injected.
+    assert fan_key in injected
+    assert os.environ.get(fan_key) == "30"
