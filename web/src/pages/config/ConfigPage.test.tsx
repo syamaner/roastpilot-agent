@@ -63,6 +63,8 @@ function makeSnapshot(overrides?: {
       late_maillard_trim_eta_ref: makeFieldMeta({ effective_value: 60.0, default: 60.0 }),
       late_maillard_trim_min_trim: makeFieldMeta({ effective_value: 45, default: 45 }),
       late_maillard_trim_max_trim: makeFieldMeta({ effective_value: 75, default: 75 }),
+      late_maillard_trim_trim_depth_deadband_pp: makeFieldMeta({ effective_value: 2, default: 2 }),
+      late_maillard_trim_trim_depth_slew_pp_per_tick: makeFieldMeta({ effective_value: 3, default: 3 }),
     },
     advisor: {
       model_slug: makeFieldMeta({ effective_value: o.model_slug, default: "openai/gpt-4o" }),

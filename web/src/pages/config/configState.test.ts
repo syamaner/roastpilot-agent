@@ -69,6 +69,8 @@ function makeSnapshot(overrides?: {
       late_maillard_trim_eta_ref: makeFieldMeta({ effective_value: 60.0, default: 60.0 }),
       late_maillard_trim_min_trim: makeFieldMeta({ effective_value: 45, default: 45 }),
       late_maillard_trim_max_trim: makeFieldMeta({ effective_value: 75, default: 75 }),
+      late_maillard_trim_trim_depth_deadband_pp: makeFieldMeta({ effective_value: 2, default: 2 }),
+      late_maillard_trim_trim_depth_slew_pp_per_tick: makeFieldMeta({ effective_value: 3, default: 3 }),
     },
     advisor: {
       model_slug: makeFieldMeta({ effective_value: "openai/gpt-4o", default: "openai/gpt-4o" }),
@@ -357,5 +359,66 @@ describe("buildEditFromDirty — recording_devices array equality", () => {
     const edit = buildEditFromDirty(values, saved, snapshot);
     expect((edit.mcp_device as Record<string, unknown>)?.recording_devices)
       .toEqual(["USB PnP"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Tests — #412 damping knobs exposed via configSchema (#443)
+// ---------------------------------------------------------------------------
+
+describe("buildValuesFromSnapshot — #412 damping fields (#443)", () => {
+  it("extracts effective_value for trim_depth_deadband_pp (default 2)", () => {
+    const snapshot = makeSnapshot();
+    const values = buildValuesFromSnapshot(snapshot);
+    expect(values["controller.late_maillard_trim_trim_depth_deadband_pp"]).toBe(2);
+  });
+
+  it("extracts effective_value for trim_depth_slew_pp_per_tick (default 3)", () => {
+    const snapshot = makeSnapshot();
+    const values = buildValuesFromSnapshot(snapshot);
+    expect(values["controller.late_maillard_trim_trim_depth_slew_pp_per_tick"]).toBe(3);
+  });
+});
+
+describe("buildEditFromDirty — #412 damping fields (#443)", () => {
+  it("includes trim_depth_deadband_pp in the controller edit when dirty", () => {
+    const snapshot = makeSnapshot();
+    const saved = buildValuesFromSnapshot(snapshot);
+    const values = { ...saved, "controller.late_maillard_trim_trim_depth_deadband_pp": 4 };
+
+    const edit = buildEditFromDirty(values, saved, snapshot);
+    const trim = (edit as Record<string, unknown>)?.controller as Record<string, unknown> | undefined;
+    expect(trim?.pre_first_crack_levers).toBeDefined();
+    const lmt = (trim?.pre_first_crack_levers as Record<string, unknown>)?.late_maillard_trim as Record<string, unknown>;
+    expect(lmt?.trim_depth_deadband_pp).toBe(4);
+  });
+
+  it("includes trim_depth_slew_pp_per_tick in the controller edit when dirty", () => {
+    const snapshot = makeSnapshot();
+    const saved = buildValuesFromSnapshot(snapshot);
+    const values = { ...saved, "controller.late_maillard_trim_trim_depth_slew_pp_per_tick": 5 };
+
+    const edit = buildEditFromDirty(values, saved, snapshot);
+    const trim = (edit as Record<string, unknown>)?.controller as Record<string, unknown> | undefined;
+    expect(trim?.pre_first_crack_levers).toBeDefined();
+    const lmt = (trim?.pre_first_crack_levers as Record<string, unknown>)?.late_maillard_trim as Record<string, unknown>;
+    expect(lmt?.trim_depth_slew_pp_per_tick).toBe(5);
+  });
+
+  it("omits both damping fields when not dirty", () => {
+    const snapshot = makeSnapshot();
+    const saved = buildValuesFromSnapshot(snapshot);
+    const values = { ...saved };  // unchanged
+
+    const edit = buildEditFromDirty(values, saved, snapshot);
+    const ctrl = (edit as Record<string, unknown>)?.controller as Record<string, unknown> | undefined;
+    // If controller section is absent, damping fields are implicitly not sent.
+    // If present (some other controller field was dirty), trim must not contain
+    // damping keys.
+    if (ctrl?.pre_first_crack_levers) {
+      const lmt = (ctrl.pre_first_crack_levers as Record<string, unknown>)?.late_maillard_trim as Record<string, unknown> | undefined;
+      expect(lmt?.trim_depth_deadband_pp).toBeUndefined();
+      expect(lmt?.trim_depth_slew_pp_per_tick).toBeUndefined();
+    }
   });
 });

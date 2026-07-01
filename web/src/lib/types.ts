@@ -553,6 +553,8 @@ export interface ControllerConfigSnapshot {
   late_maillard_trim_eta_ref: ConfigFieldMeta;
   late_maillard_trim_min_trim: ConfigFieldMeta;
   late_maillard_trim_max_trim: ConfigFieldMeta;
+  late_maillard_trim_trim_depth_deadband_pp: ConfigFieldMeta;
+  late_maillard_trim_trim_depth_slew_pp_per_tick: ConfigFieldMeta;
 }
 
 export interface AdvisorConfigSnapshot {
