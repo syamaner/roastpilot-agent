@@ -63,6 +63,8 @@ function makeSnapshot(overrides?: {
       late_maillard_trim_eta_ref: makeFieldMeta({ effective_value: 60.0, default: 60.0 }),
       late_maillard_trim_min_trim: makeFieldMeta({ effective_value: 45, default: 45 }),
       late_maillard_trim_max_trim: makeFieldMeta({ effective_value: 75, default: 75 }),
+      late_maillard_trim_trim_depth_deadband_pp: makeFieldMeta({ effective_value: 2, default: 2 }),
+      late_maillard_trim_trim_depth_slew_pp_per_tick: makeFieldMeta({ effective_value: 3, default: 3 }),
     },
     advisor: {
       model_slug: makeFieldMeta({ effective_value: o.model_slug, default: "openai/gpt-4o" }),
@@ -601,6 +603,69 @@ describe("ConfigPage — revealWhen: auto_t0_drop_threshold_c", () => {
         screen.queryByTestId("config-field-mcp_device.auto_t0_drop_threshold_c"),
       ).toBeNull(),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// QA must-fix: revealWhen for trim damping knobs (#443)
+// ---------------------------------------------------------------------------
+
+describe("ConfigPage — revealWhen: trim_depth_deadband_pp / trim_depth_slew_pp_per_tick", () => {
+  it("hides both damping fields when adaptive_depth_enabled is false", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Late-Maillard Trim"));
+    await waitFor(() => screen.getByTestId("config-pane-Late-Maillard Trim"));
+    // adaptive_depth_enabled defaults to false → revealWhen(equals: true) → hidden
+    expect(screen.queryByTestId("config-field-controller.late_maillard_trim_trim_depth_deadband_pp")).toBeNull();
+    expect(screen.queryByTestId("config-field-controller.late_maillard_trim_trim_depth_slew_pp_per_tick")).toBeNull();
+  });
+
+  it("reveals both damping fields after enabling adaptive_depth_enabled", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Late-Maillard Trim"));
+    await waitFor(() => screen.getByTestId("config-pane-Late-Maillard Trim"));
+
+    // Click the adaptive_depth_enabled toggle (boolean field, aria-role="switch")
+    const adaptiveToggle = screen.getByTestId("toggle-controller.late_maillard_trim_adaptive_depth_enabled");
+    fireEvent.click(adaptiveToggle);
+
+    // Both damping fields must now appear
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("config-field-controller.late_maillard_trim_trim_depth_deadband_pp"),
+      ).toBeInTheDocument(),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("config-field-controller.late_maillard_trim_trim_depth_slew_pp_per_tick"),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("hides both damping fields again after reverting adaptive_depth_enabled", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Late-Maillard Trim"));
+    await waitFor(() => screen.getByTestId("config-pane-Late-Maillard Trim"));
+
+    const adaptiveToggle = screen.getByTestId("toggle-controller.late_maillard_trim_adaptive_depth_enabled");
+    // Enable
+    fireEvent.click(adaptiveToggle);
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("config-field-controller.late_maillard_trim_trim_depth_deadband_pp"),
+      ).toBeInTheDocument(),
+    );
+    // Revert (click again to set back to false/default)
+    fireEvent.click(adaptiveToggle);
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("config-field-controller.late_maillard_trim_trim_depth_deadband_pp"),
+      ).toBeNull(),
+    );
+    expect(screen.queryByTestId("config-field-controller.late_maillard_trim_trim_depth_slew_pp_per_tick")).toBeNull();
   });
 });
 

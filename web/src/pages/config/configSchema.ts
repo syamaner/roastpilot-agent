@@ -16,7 +16,7 @@
  *       0–100 bounds; no SafetyLimits fields)
  *  5. "adaptive gain/damping" → real late_maillard_trim coefficients:
  *       k_ror / k_eta / ror_ref / eta_ref / min_trim / max_trim
- *       ("damping" = unbuilt #412 thrash-fix; not in schema)
+ *       + trim_depth_deadband_pp / trim_depth_slew_pp_per_tick (#412, #443)
  *  6. "API key" → masked read-only; label shows `api_key_env` env-var name
  *  7. "controller tick" → read-only 1.0 s (hardware-pinned)
  *  8. Hardware (driver/serialPort/baud) → NOT in AppConfigSnapshot;
@@ -476,6 +476,36 @@ const TRIM_FIELDS: ConfigFieldDef[] = [
     editKey:        "pre_first_crack_levers.late_maillard_trim.max_trim",
     category:       "Late-Maillard Trim",
     readOnlyStatic: false,
+  },
+  {
+    key:            "controller.late_maillard_trim_trim_depth_deadband_pp",
+    label:          "Depth deadband",
+    hint:           "Tick-to-tick deadband (pp). Changes smaller than this are suppressed to avoid noise-driven micro-adjustments. Must be < slew limit. Default 2.",
+    type:           "number",
+    unit:           "pp",
+    min:            0,    // ge=0 in LateMaillardTrimEdit
+    max:            20,   // le=20 in LateMaillardTrimEdit
+    step:           1,
+    envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__TRIM_DEPTH_DEADBAND_PP",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.trim_depth_deadband_pp",
+    category:       "Late-Maillard Trim",
+    readOnlyStatic: false,
+    revealWhen:     { key: "controller.late_maillard_trim_adaptive_depth_enabled", equals: true },
+  },
+  {
+    key:            "controller.late_maillard_trim_trim_depth_slew_pp_per_tick",
+    label:          "Depth slew limit",
+    hint:           "Maximum trim-depth change per accepted write (pp). Limits how fast the depth can move between consecutive MCP writes, damping thrash from jittery RoR. Must be > deadband. Default 3.",
+    type:           "number",
+    unit:           "pp",
+    min:            1,    // ge=1 in LateMaillardTrimEdit
+    max:            20,   // le=20 in LateMaillardTrimEdit
+    step:           1,
+    envVar:         "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__TRIM_DEPTH_SLEW_PP_PER_TICK",
+    editKey:        "pre_first_crack_levers.late_maillard_trim.trim_depth_slew_pp_per_tick",
+    category:       "Late-Maillard Trim",
+    readOnlyStatic: false,
+    revealWhen:     { key: "controller.late_maillard_trim_adaptive_depth_enabled", equals: true },
   },
 ];
 
