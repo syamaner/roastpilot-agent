@@ -912,6 +912,33 @@ def test_snapshot_trim_depth_damping_from_saved_file() -> None:
     assert snapshot.controller.late_maillard_trim_trim_depth_slew_pp_per_tick.saved_value == 5
 
 
+def test_apply_config_edit_deadband_gte_slew_raises_validation_error() -> None:
+    """apply_config_edit raises ValidationError when deadband >= slew after merge (#443).
+
+    Both values are individually in-range (ge/le on the Edit model passes), but
+    the cross-field LateMaillardTrim validator in config.py rejects deadband >=
+    slew because it silently disables adaptive movement after the first tick.
+    The _validate_merged_config path constructs AppConfig from the merged dict
+    and lets Pydantic surface the violation before any write reaches disk.
+    """
+    edit = AppConfigEdit(
+        controller=ControllerConfigEdit(
+            pre_first_crack_levers=PreFirstCrackLeversEdit(
+                late_maillard_trim=LateMaillardTrimEdit(
+                    trim_depth_deadband_pp=5,  # in [0, 20] — single-field OK
+                    trim_depth_slew_pp_per_tick=3,  # in [1, 20] — single-field OK
+                    # but 5 >= 3 → cross-field violation
+                )
+            )
+        )
+    )
+    with pytest.raises(
+        pydantic.ValidationError,
+        match="trim_depth_deadband_pp must be strictly less",
+    ):
+        apply_config_edit(edit, {})
+
+
 # ---------------------------------------------------------------------------
 # Coverage: _inject_section edge cases
 # ---------------------------------------------------------------------------
