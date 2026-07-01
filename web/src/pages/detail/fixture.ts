@@ -181,6 +181,30 @@ export const FIXTURE_TIMELINE: RoastTimeline = {
   ],
 };
 
+// --- Turning-point fixture (#409) --------------------------------------------
+//
+// FIXTURE_TIMELINE plus a persisted `turning_point` timeline event (the post-charge
+// bean-temp minimum), so the detail-page reload path can be exercised for the new
+// landmark. Kept as a SEPARATE export — the base FIXTURE_TIMELINE (and its committed
+// `roast-detail` snapshot) stay untouched. The event carries
+// elapsed_since_charge_seconds: 90 (the charge-clock at the turn tick). The fixture
+// telemetry has charge_elapsed_seconds === elapsed_seconds (both = i*30), so the
+// first point reaching charge_elapsed >= 90 is tick 3 at elapsed 90 s.
+// monotonic_seconds is an arbitrary server wall-clock, NOT the curve x.
+export const FIXTURE_TIMELINE_TURNING_POINT: RoastTimeline = {
+  ...FIXTURE_TIMELINE,
+  events: [
+    ...FIXTURE_TIMELINE.events,
+    {
+      kind: "turning_point",
+      source: "controller",
+      monotonic_seconds: 888,
+      recorded_at_utc: "2026-06-07T09:13:30Z",
+      payload: { bean_temp_c: 116.6, elapsed_since_charge_seconds: 90 },
+    },
+  ],
+};
+
 // --- Dry-end fixture (#351) ---------------------------------------------------
 //
 // FIXTURE_TIMELINE plus a persisted `drying_end` timeline event (the pre-FC

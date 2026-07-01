@@ -18,6 +18,7 @@ const MILESTONE_LABELS: Partial<Record<RoastEventKind, string>> = {
   run_started: "Run started",
   charge_guidance: "Charge zone reached",
   t0_detected: "Beans added (T0)",
+  turning_point: "Turning point",
   drying_end: "Drying end",
   first_crack: "First crack",
   recovery_required: "Operator recovery required",

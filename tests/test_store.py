@@ -178,6 +178,56 @@ async def test_v6_rebuild_preserves_existing_roast_events(
 
 
 @pytest.mark.asyncio
+async def test_v8_rebuild_preserves_existing_roast_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#409: the v8 roast_events rebuild (to widen the kind CHECK to include
+    ``turning_point``) must COPY every existing row, not just recreate an empty
+    table — the risky part of a CHECK-altering table swap. Stop a store at v7,
+    write a ``drying_end`` event (a pre-existing kind), then upgrade to the real
+    (v8-including) MIGRATIONS and assert the old row survived AND the new
+    ``turning_point`` kind is now accepted."""
+    pre_v8 = MIGRATIONS[:7]  # V1..V7 (before the turning_point CHECK widening)
+    assert len(pre_v8) == 7
+    db_path = tmp_path / "v8upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", pre_v8)
+    old = RoastStore(db_path=db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 7
+        await seeded_store(old)
+        await old.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.DRYING_END,
+            source=RoastEventSource.CONTROLLER,
+            payload={"bean_temp_c": 151.0, "threshold_c": 150.0},
+        )
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path=db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == len(MIGRATIONS)
+        timeline = await upgraded.read_timeline("run-1")
+        kinds = [e.kind for e in timeline.events]
+        # The pre-v8 event survived the rebuild's INSERT...SELECT copy.
+        assert RoastEventKind.DRYING_END in kinds
+        # And the widened CHECK now accepts the new observability kind.
+        await upgraded.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.TURNING_POINT,
+            source=RoastEventSource.CONTROLLER,
+            payload={"bean_temp_c": 142.0, "elapsed_since_charge_seconds": 45.0},
+        )
+        after = await upgraded.read_timeline("run-1")
+        assert RoastEventKind.TURNING_POINT in [e.kind for e in after.events]
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
 async def test_foreign_keys_are_enforced(tmp_store: RoastStore) -> None:
     await tmp_store.initialize()
     try:
