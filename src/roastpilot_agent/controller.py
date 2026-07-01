@@ -697,6 +697,12 @@ class RoastController:
         # point, so the DRYING_END event/marker fires exactly once and never
         # re-arms within a run. Reset on each new run/preheat. Observability only.
         self._drying_end_emitted = False
+        # #409: one-way witness latch set when `_arm_pre_fc_milestones` observes a
+        # negative bean RoR after charge. Required before the `turning_point` SSE
+        # event may fire: without a prior negative sample the first ≥0 RoR reading
+        # after charge would be a false landmark (no dip actually observed). Reset
+        # on each new run/preheat alongside `_drying_end_emitted`.
+        self._seen_negative_ror_after_charge = False
         self._operator_state_entered: float | None = None
         self._operator_timeout_alerted = False
         # #332: set once the operator has acknowledged the fault (the runner's
@@ -1039,6 +1045,10 @@ class RoastController:
             # A new run/preheat re-arms the one-way drying-end latch (#351) so the
             # next roast can emit its own DRYING_END signal. Observability only.
             self._drying_end_emitted = False
+            # A new run/preheat re-arms the negative-RoR witness (#409) so a fresh
+            # roast can detect its own turning-point dip. Cleared here alongside
+            # _drying_end_emitted — both are per-run observability latches.
+            self._seen_negative_ror_after_charge = False
             # A new run/preheat clears the fault-acknowledged teardown flag (#332):
             # a fresh roast has no acknowledged fault, so the escalation re-read is
             # fully armed again.
@@ -2965,6 +2975,9 @@ class RoastController:
           the bean RoR turns from falling to rising (the curve has bottomed out).
           Carried as a DISPLAY-ONLY landmark: #229 found it is a charge-temperature
           proxy (corr 0.979), so it is shown, never used as a control predictor.
+          Also emits a :class:`RoastEventKind.TURNING_POINT` SSE event (#409) so
+          the live chart marker fires — observability-only (same contract as
+          DRYING_END: event + timeline, never an advisor-facing milestone).
         - RECOVERY: the bean RoR at the first reading after the turning point — the
           one turning-point-family metric that survived the #229 confound check
           (a charge-independent early-pace signal), kept cautiously.
@@ -2989,15 +3002,32 @@ class RoastController:
             return
         if not self._history.has_milestone(RoastMilestoneKind.TURNING_POINT):
             # The turning point is the bean-temp minimum: RoR crosses from
-            # negative (post-charge crash) up through zero. Arm on the first
-            # non-negative RoR after charge.
-            if ror >= 0.0:
+            # negative (post-charge crash) up through zero. Track negative
+            # samples as evidence that the dip actually occurred, then arm on
+            # the first non-negative RoR that follows a witnessed negative (#409).
+            # Without the witness gate, a first post-charge sample that is already
+            # ≥0 (noisy RoR / smoothed kernel / very fast recovery) would fire a
+            # false user-visible landmark with no real dip in the observed data.
+            if ror < 0.0:
+                self._seen_negative_ror_after_charge = True
+                return
+            if ror >= 0.0 and self._seen_negative_ror_after_charge:
                 self._history.record_milestone(
                     RoastMilestone(
                         kind=RoastMilestoneKind.TURNING_POINT,
                         elapsed_since_charge_seconds=elapsed,
                         bean_temp_c=telemetry.bean_temp_c,
                     )
+                )
+                # #409: emit as an SSE event + persisted timeline landmark so
+                # the live chart marker fires. Mirrors drying_end (#351):
+                # observability-only — NOT a RoastMilestone the advisor reads.
+                self._events.emit(
+                    RoastEventKind.TURNING_POINT,
+                    {
+                        "bean_temp_c": telemetry.bean_temp_c,
+                        "elapsed_since_charge_seconds": elapsed,
+                    },
                 )
             return
         if not self._history.has_milestone(RoastMilestoneKind.RECOVERY):
