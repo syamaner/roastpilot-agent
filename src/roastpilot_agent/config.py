@@ -346,6 +346,115 @@ class LateMaillardTrim(BaseModel):
         return max(self.min_trim, min(self.max_trim, round(raw)))
 
 
+class PostFirstCrackControl(BaseModel):
+    """Deterministic post-FC RoR-target PI control-loop parameters (D82/D83, #405 Slice B).
+
+    D35 originally reserved DEVELOPMENT (post-first-crack) for the free-form
+    advisor: the controller drove pre-FC deterministically, but post-FC heat/fan
+    actuated straight from the advisor's ``target_heat``/``target_fan`` through
+    the safety box. Roasts 7 and 8 showed that regime over-braking — a coherent
+    *rationale* (cut heat, ramp fan, hold for the drop DTR) executed without the
+    judgment to hold a heat floor to the drop temperature, landing an
+    under-temp/under-developed drop (roast 7: 188 °C / 15.86 % DTR). D82 replaces
+    the advisor-driven post-FC lever with a **deterministic RoR-target closed
+    loop**; D83 is the concrete control-law spec this model encodes: a PI
+    controller holding a target rate-of-rise band (default 8 ± 1 °C/min) by
+    adjusting heat, with conditional-integration anti-windup and a smoothed
+    (EMA) RoR input so 1 s thermocouple noise cannot thrash the lever (the
+    #386/#412 lesson, mirrored from :class:`LateMaillardTrim`'s pre-FC damping).
+
+    **This config model is inert on its own (#405 Slice B1).** It is consumed by
+    :class:`~roastpilot_agent.post_fc_control.PostFcRorController`, which no
+    controller/safety code path calls yet — Slice B2 wires the controller to
+    build limits from the loop's output (per the #412 told==enforced control-path
+    rule: the DEVELOPMENT safety box is built FROM the actuated PI output, never
+    an undamped target) and to route every write through the existing safety
+    gate. Nothing here talks to ``mcp_client`` directly, and nothing here
+    replaces the safety box's hard ceilings (the 196 °C bitter / 198 °C
+    emergency-drop bounds keep clamping the loop's output exactly as they clamp
+    the advisor today).
+
+    ``enabled`` (the ``post_fc_ror_loop`` master flag) defaults ``False`` —
+    today's advisor-driven post-FC regime is unchanged until a supervised
+    hardware roast validates the loop and an operator flips the flag in a
+    separately reviewed change (D83). All temperatures are Celsius; RoR is
+    °C/min; heat/fan are percentages.
+    """
+
+    #: The master flag (``post_fc_ror_loop``). ``False`` (default) keeps
+    #: today's advisor-driven post-FC heat/fan actuation byte-for-byte
+    #: unchanged; Slice B2 must read this flag before routing DEVELOPMENT
+    #: heat through the PI loop instead of the advisor.
+    enabled: bool = Field(default=False)
+    #: The RoR band centre (°C/min) the loop holds. Default 8.0 — the D83
+    #: operator-chosen band (7–9 °C/min via the deadband below): from FC
+    #: ~178 °C this reaches a ~193 °C MEDIUM drop in ~1.9 min at the seeded
+    #: 18 % DTR, clear of the 196 °C bitter ceiling, with no stall.
+    target_ror_c_per_min: float = Field(default=8.0, gt=0)
+    #: Half-width (°C/min) of the no-action band around the target. Default
+    #: 1.0 (band 7–9 °C/min). Within ``±ror_deadband_c_per_min`` of target the
+    #: loop HOLDS — no proportional push, no integral accumulation — so tick-
+    #: to-tick RoR noise cannot thrash the heat lever (the #386/#412 lesson:
+    #: a deadband that also freezes the integrator, not just the P term).
+    ror_deadband_c_per_min: float = Field(default=1.0, ge=0)
+    #: Proportional gain: %heat per (°C/min) of RoR error. Default 3.0 — a
+    #: conservative starting value; MUST be tuned on hardware (D83: a replay
+    #: validates a drop decision on a fixed trajectory, never a closed loop
+    #: that changes the trajectory).
+    kp_percent_per_ror: float = Field(default=3.0, ge=0)
+    #: Integral gain: %heat per (°C/min·second) of accumulated RoR error.
+    #: Default 0.1 — conservative; tuned on hardware alongside ``kp``.
+    ki_percent_per_ror_second: float = Field(default=0.1, ge=0)
+    #: The minimum post-FC heat the loop may command. Default 25, ``ge=1`` —
+    #: deliberately > 0 so a crash-to-0 heat command (the roast-7 failure: the
+    #: advisor cut heat to 0 at FC) is STRUCTURALLY IMPOSSIBLE from this loop,
+    #: mirroring ``LateMaillardTrim.trim_heat_percent``'s ``ge=10`` floor
+    #: guarantee for the pre-FC trim.
+    heat_floor_percent: int = Field(default=25, ge=1, le=100)
+    #: The maximum post-FC heat the loop may command. Default 100.
+    heat_ceiling_percent: int = Field(default=100, ge=1, le=100)
+    #: The deterministic post-FC fan level (percentage). D83 call (6): when the
+    #: loop is enabled the controller pins fan to this single config value
+    #: post-FC — the advisor's fan output is IGNORED — because the roast-7
+    #: over-brake was heat AND fan (fan ramped 50→100 as heat cut to 0); a
+    #: heat-only fix that left the advisor's fan free to oppose the loop would
+    #: reintroduce the same thrash. Default 40 — a moderate post-FC airflow,
+    #: conservative pending hardware tuning.
+    fan_percent: int = Field(default=40, ge=0, le=100)
+    #: The control-loop cadence in seconds. Default 5.0 — matches
+    #: ``ControllerConfig.post_fc_min_consult_interval_seconds`` and the D36
+    #: post-FC advisory cadence, so the loop judges RoR trajectory across a
+    #: deliberate dwell rather than chasing per-tick (1 s) thermocouple noise.
+    control_interval_seconds: float = Field(default=5.0, gt=0)
+    #: The EMA smoothing weight applied to the newest RoR sample (0 < α ≤ 1).
+    #: Default 0.4 — a moderate smoothing factor; α=1.0 disables smoothing
+    #: (each sample fully replaces the estimate), used as the no-smoothing
+    #: comparison case in tests. Lower values smooth harder but lag more.
+    ror_smoothing_alpha: float = Field(default=0.4, gt=0, le=1.0)
+
+    @model_validator(mode="after")
+    def _check_heat_range(self) -> "PostFirstCrackControl":
+        """The heat floor must not exceed the heat ceiling.
+
+        A floor above its ceiling would be an empty box — no heat value could
+        ever satisfy both bounds, so the loop's output clamp
+        (:meth:`~roastpilot_agent.post_fc_control.PostFcRorController.compute`)
+        would have no valid range to clamp into.
+
+        Returns:
+            The validated control-parameters instance.
+
+        Raises:
+            ValueError: If ``heat_floor_percent`` exceeds ``heat_ceiling_percent``.
+        """
+        if self.heat_floor_percent > self.heat_ceiling_percent:
+            raise ValueError(
+                "heat_floor_percent must not exceed heat_ceiling_percent "
+                f"({self.heat_floor_percent} > {self.heat_ceiling_percent})"
+            )
+        return self
+
+
 class PreFirstCrackLevers(BaseModel):
     """Deterministic pre-first-crack heat/fan lever parameters (D35 §3/§4-A, #222).
 
@@ -509,6 +618,14 @@ class ControllerConfig(BaseModel):
     # plan (D42 §7.1) can supply a different ramp. (Parameterized factory, not a
     # bare model default, per the repo's pyright-strict typed-default idiom.)
     pre_first_crack_levers: PreFirstCrackLevers = Field(default_factory=PreFirstCrackLevers)
+    # Deterministic post-first-crack RoR-target PI control-loop parameters
+    # (D82/D83, #405 Slice B). INERT today (#405 Slice B1): nothing in
+    # controller.py / safety.py / control_policy.py reads this yet — Slice B2
+    # wires it in behind the ``enabled`` flag (default False, byte-for-byte
+    # today's advisor-driven post-FC behaviour unchanged). Parameterised
+    # factory, not a bare model default, per the repo's pyright-strict
+    # typed-default idiom (mirrors ``pre_first_crack_levers`` above).
+    post_first_crack_control: PostFirstCrackControl = Field(default_factory=PostFirstCrackControl)
     # D40.3 / D40.5 (#275): per-tick control-loop CONTEXT payload bounds. The
     # context builder (roast_history.RoastHistory) keeps the roast-so-far curve
     # as a bounded recent FULL-RESOLUTION window plus a milestone summary, and the
