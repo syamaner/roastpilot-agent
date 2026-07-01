@@ -236,7 +236,11 @@ checklist before you open.
   self-inflicted rework. Fix lows pre-open, or defer/dismiss them in-thread.
 - **Kill avoidable churn.** Gates before opening (no post-open lint/format
   commits); flakes are P1 (fix, don't re-run); never add a junk "re-trigger CI"
-  commit — re-push cleanly if a push didn't fire CI.
+  commit — re-push cleanly if a push didn't fire CI. Two `pr-preflight` levers close
+  the specific misses the Tier-1 retro found: run `pytest --cov-report=term-missing`
+  pre-open and cover every changed line (no post-open `codecov/patch` gap, #452), and
+  check the diff against `docs/recent-fixes.md` so a batch doesn't reintroduce a
+  sibling PR's just-fixed bug (#453, the #409-reintroduced-#404 class).
 - **What "good" looks like (the KPI).** Judge hygiene by **avoidable churn → ~0**
   (rebase / CI-retrigger / flake / lint), **preventable post-open rework → ~0**
   (contract drift, low folds, fixture regens), and **findings caught pre-open**

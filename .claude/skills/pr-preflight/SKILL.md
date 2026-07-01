@@ -21,6 +21,12 @@ commit is exactly the rework we are cutting, so run them HERE.
 
 - **Python** (`src/` or `tests/` changed):
   `python -m ruff check . && python -m ruff format --check . && python -m pyright && python -m pytest`
+- **Coverage — run `pytest` with missing-line reporting and read the CHANGED lines (#452).**
+  `python -m pytest --cov=roastpilot_agent --cov-report=term-missing`. Every line your diff ADDS
+  or CHANGES must be covered — an uncovered changed line is exactly what `codecov/patch` fails on
+  *post*-open, so catch it HERE. Cover it, or tag it `# pragma: no cover` **with a reason** (repo
+  convention — see `store.py` / `mcp_client.py`) now. (On #426 a malformed-env-blob branch shipped
+  uncovered because term-missing was run only after the PR opened.)
 - **Web** (`web/` changed), from `web/`:
   `npm run lint && npm run typecheck && npm test && npm run build`
 - **Cross-boundary contract — if the diff touches the contract surface, run BOTH sides'
@@ -63,6 +69,13 @@ Read your own diff as a hostile reviewer would. Check:
 - edge cases + failure modes the change introduces;
 - new behaviour has tests that assert **real behaviour, not smoke**;
 - observability gaps, dead code, leftover debug;
+- **cross-issue regression guard — don't reintroduce a sibling PR's just-fixed bug (#453).**
+  Each branch in a batch is written fresh-context and can reintroduce a class of bug a sibling
+  PR *just* fixed (on the Tier-1 batch, #409 reintroduced #404's "chart marker one tick early"
+  anti-pattern). Before opening, check the diff against **`docs/recent-fixes.md`** (one line per
+  recently-fixed anti-pattern + a grep signature); if your diff matches a signature, apply the
+  same fix. **When you fix a CLASS of bug, ADD an entry** so the next sibling PR is warned — this
+  is how the agent team externalises the shared memory it otherwise lacks;
 - every **Architecture Invariant** the diff could touch (AGENTS.md): safety policy
   on every roaster write; controller owns the loop (advisor never gets MCP write
   tools); restart never auto-resumes heat/fan; Celsius only; plain `Enum` not
