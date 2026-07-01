@@ -33,7 +33,8 @@ import { WEB_URLS } from "./urls";
 test("mic-green — capture-alive OK mic renders the green icon (real replay, server-derived)", async ({
   page,
 }) => {
-  await page.goto(WEB_URLS.session2);
+  // #423: / is now a pure launcher; the live dashboard lives at /live.
+  await page.goto(`${WEB_URLS.session2}/live`);
   await expect(page.getByTestId("connection-indicator")).toHaveAttribute("data-status", "live", {
     timeout: 15_000,
   });
@@ -85,7 +86,8 @@ test("mic-error — a faulted capture pipeline renders the red icon (snapshot-mo
     await route.fulfill({ response, json: detail });
   });
 
-  await page.goto(WEB_URLS.session2);
+  // #423: / is now a pure launcher; the live dashboard lives at /live.
+  await page.goto(`${WEB_URLS.session2}/live`);
   await expect(page.getByTestId("connection-indicator")).toHaveAttribute("data-status", "live", {
     timeout: 15_000,
   });

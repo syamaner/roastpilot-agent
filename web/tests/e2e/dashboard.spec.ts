@@ -27,7 +27,7 @@ import { WEB_URLS } from "./urls";
 test("dashboard-live — preheating with the charge band, full-page snapshot (canvas un-masked)", async ({
   page,
 }) => {
-  await page.goto(WEB_URLS.session2);
+  await page.goto(`${WEB_URLS.session2}/live`);
 
   // Phase + telemetry come from the server: wait until the stream is live.
   await expect(page.getByTestId("connection-indicator")).toHaveAttribute("data-status", "live", {
@@ -103,7 +103,7 @@ test("dashboard-fault — real env-ceiling fault renders the fault banner + trai
   // session-1 carries a real 242 °C env reading > the agent's 240 °C ceiling, so
   // the REAL SafetyPolicy trips EMERGENCY_STOP → faulted (a faithful replay, not a
   // mock). Load the preview backed by the session-1 agent.
-  await page.goto(WEB_URLS.session1);
+  await page.goto(`${WEB_URLS.session1}/live`);
   await expect(page.getByTestId("connection-indicator")).toHaveAttribute("data-status", "live", {
     timeout: 15_000,
   });
@@ -165,7 +165,7 @@ test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery mo
   // fault-pre-t0 drives the real SafetyPolicy past the pre-T0 bound → the default
   // RECOVERY verdict → operator_recovery_required (the SPA RecoveryModal). Load the
   // preview backed by the fault-pre-t0 agent.
-  await page.goto(WEB_URLS.faultPreT0);
+  await page.goto(`${WEB_URLS.faultPreT0}/live`);
   await expect(page.getByTestId("connection-indicator")).toHaveAttribute("data-status", "live", {
     timeout: 15_000,
   });
@@ -214,7 +214,7 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   // FC marker, on its OWN session-2 agent (advance-to is monotonic-forward per agent).
   // Post-#128 the stepped `elapsed_seconds` is sim-time, so the curve spreads across
   // the real roast duration (~1031 s) instead of collapsing onto one x.
-  await page.goto(WEB_URLS.session2Developed);
+  await page.goto(`${WEB_URLS.session2Developed}/live`);
   await expect(page.getByTestId("connection-indicator")).toHaveAttribute("data-status", "live", {
     timeout: 15_000,
   });
@@ -324,7 +324,7 @@ test("dashboard-charge-window — preheating + bean in the charge band shows the
   // state proves the PERSISTENT ChargeBanner: still in the server's `preheating`
   // phase (beans NOT yet added → no T0), but the bean has risen INTO the profile's
   // 170–200 °C charge band, so the unmissable "CHARGE NOW" banner is on screen.
-  await page.goto(WEB_URLS.session2ChargeWindow);
+  await page.goto(`${WEB_URLS.session2ChargeWindow}/live`);
   await expect(page.getByTestId("connection-indicator")).toHaveAttribute("data-status", "live", {
     timeout: 15_000,
   });
