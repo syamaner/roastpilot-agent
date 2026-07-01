@@ -12,6 +12,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ConnectionStatus } from "@/hooks/useRoastStream";
+import { roastKeys } from "@/hooks/queries";
 import { DashboardPage } from "./DashboardPage";
 
 // Spy on the typed REST client so the acknowledge-fault POST can be asserted (#206).
@@ -92,8 +93,22 @@ const streamState: {
   frameCount: 0,
 };
 
+// `useFrameDrain` is called twice by DashboardPage:
+//   1. useDashboardEvents (via the real impl, already mocked below)
+//   2. The P2-1 run_completed → health invalidation drain (the one being tested here)
+// We stub it so:
+//   a. The common wiring tests get a no-op (frameCount is 0; the callback never fires).
+//   b. TEST 1 can capture the registered callback and invoke it to assert the invalidation.
+type DrainCb = (frame: { event: string }) => void;
+let capturedDrainCallback: DrainCb | null = null;
 vi.mock("@/hooks/useRoastStream", () => ({
   useRoastStream: () => streamState,
+  useFrameDrain: (_frames: unknown, _frameCount: unknown, cb: DrainCb) => {
+    // Capture the LAST registered callback. DashboardPage calls this hook once for
+    // the P2-1 health-drain; useDashboardEvents' internal call is already stubbed
+    // out above (useDashboardEvents mock), so only the P2-1 call reaches this stub.
+    capturedDrainCallback = cb;
+  },
 }));
 
 // The view-model folds frames; for this wiring test an empty view is enough.
@@ -122,13 +137,14 @@ vi.mock("./useDashboardEvents", async () => {
 
 function renderPage() {
   const client = new QueryClient();
-  return render(
+  const result = render(
     <QueryClientProvider client={client}>
       <MemoryRouter>
         <DashboardPage />
       </MemoryRouter>
     </QueryClientProvider>,
   );
+  return { ...result, client };
 }
 
 afterEach(cleanup);
@@ -139,6 +155,7 @@ beforeEach(() => {
   viewState.fault = null;
   streamState.enabledActions = null;
   streamState.phase = null;
+  capturedDrainCallback = null;
   operatorActionMock.mockClear();
 });
 
@@ -316,5 +333,35 @@ describe("DashboardPage restored/reloaded fault (#329)", () => {
     renderPage();
     expect(screen.getByTestId("dashboard")).toBeInTheDocument();
     expect(screen.queryByTestId("fault-banner")).toBeNull();
+  });
+});
+
+describe("DashboardPage P2-1 drain callback — run_completed → health invalidation (#423)", () => {
+  it("invoking the drain callback with run_completed invalidates roastKeys.health", async () => {
+    // DashboardPage registers a useFrameDrain callback for the P2-1 health-invalidation.
+    // The stub above captures it; here we invoke it directly to assert the behaviour,
+    // bypassing the SSE buffer so the test is deterministic regardless of frame-buffer
+    // timing. This tests the CAUSAL TRIGGER — the link that the two endpoint-level tests
+    // (run_completed on the SSE side; sticky latch on LivePage side) don't cover.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-drain-test" };
+    const { client } = renderPage();
+    expect(screen.getByTestId("dashboard")).toBeInTheDocument();
+
+    // The drain callback must have been registered during render.
+    expect(capturedDrainCallback).not.toBeNull();
+
+    const invalidateSpy = vi.spyOn(client, "invalidateQueries");
+
+    // A non-terminal frame must NOT trigger invalidation.
+    capturedDrainCallback!({ event: "phase_changed" });
+    expect(invalidateSpy).not.toHaveBeenCalled();
+
+    // A run_completed frame MUST trigger health invalidation.
+    capturedDrainCallback!({ event: "run_completed" });
+    await waitFor(() =>
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: roastKeys.health }),
+    );
+    expect(invalidateSpy).toHaveBeenCalledTimes(1);
   });
 });

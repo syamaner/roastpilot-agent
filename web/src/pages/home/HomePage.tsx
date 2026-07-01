@@ -1,11 +1,11 @@
 /**
- * Home / landing hub (#324) — the idle navigation centre.
+ * Home / landing hub (#324, updated #423 D81) — the idle navigation centre.
  *
- * Shown at `/` when the server reports NO active run (`HomeGate` decides; phase is
- * never inferred client-side). Two clear entry points, matching the device-console
- * styling: Start a new roast (→ the existing Start-Roast form at `/start`) and
- * View / rate roasts (→ the history list at `/roasts`, where the detail page's
- * RoastRating widget lives). Pure navigation — no roaster data, no SSE, no MCP.
+ * Shown at `/` always (`HomeGate` is now a pure pass-through; see D81). Two
+ * clear entry points: Start a new roast (→ `/live`, which shows the start form
+ * when idle and takes the operator directly to the dashboard on a running roast)
+ * and View / rate roasts (→ the history list at `/roasts`). Pure navigation —
+ * no roaster data, no SSE, no MCP. Phase is never inferred here.
  */
 
 import { Link } from "react-router-dom";
@@ -54,7 +54,7 @@ export function HomePage(): React.JSX.Element {
 
         <div className="grid gap-4 sm:grid-cols-2">
           <HubTile
-            to="/start"
+            to="/live"
             testId="home-start-roast"
             title="Start a new roast"
             description="Set up the bean profile and roast targets, then begin preheating."

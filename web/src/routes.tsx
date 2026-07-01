@@ -80,6 +80,13 @@ const HomeHarnessPage = lazy(() =>
 const LivePage = lazy(() =>
   import("@/pages/live/LivePage").then((m) => ({ default: m.LivePage })),
 );
+// #423: LiveFinishedView state snapshot harness — deterministic finished-roast
+// data seeded into the QueryClient, nav + the view over the fixture.
+const LiveFinishedHarnessPage = lazy(() =>
+  import("@/pages/live/LiveFinishedHarnessPage").then((m) => ({
+    default: m.LiveFinishedHarnessPage,
+  })),
+);
 // #419: /config view — config snapshot from GET /api/config + save model.
 const ConfigPage = lazy(() =>
   import("@/pages/config/ConfigPage").then((m) => ({ default: m.ConfigPage })),
@@ -87,11 +94,13 @@ const ConfigPage = lazy(() =>
 
 export const routes: RouteObject[] = [
   // Operator-facing routes nest under RootLayout → the persistent nav (#324) is
-  // mounted above each page. `/` is state-aware (HomeGate): active run → live
-  // dashboard, idle → home hub. `/start` is the Start-Roast form (reached from the
-  // home hub or the idle redirect). `/live` is the stable reload-safe live-roast
-  // route (#403). Phase is never inferred client-side — the active-run decision
-  // reads the server's `/health` snapshot.
+  // mounted above each page. `/` is a PURE launcher (always `HomePage`, D81 /
+  // #423) — no server-state read, no branching. `/live` is the SINGLE live-roast
+  // home with three server-state-driven states: active → DashboardPage, just-
+  // finished this session → LiveFinishedView, idle → LiveStartView (the start
+  // form). `/start` is kept as an alias entry from the old home tile; it routes
+  // to `/live` after a start POST (#403). Phase is never inferred client-side —
+  // all active-run decisions read the server's `/health` snapshot.
   {
     element: <RootLayout />,
     children: [
@@ -123,4 +132,7 @@ export const routes: RouteObject[] = [
   { path: "/__start-roast-harness", element: <StartRoastHarnessPage /> },
   // __home-harness: persistent nav + landing hub over a seeded idle health snapshot.
   { path: "/__home-harness", element: <HomeHarnessPage /> },
+  // __live-finished-harness: persistent nav + LiveFinishedView over a seeded
+  // just-completed run (#423 snapshot target, D26).
+  { path: "/__live-finished-harness", element: <LiveFinishedHarnessPage /> },
 ];
