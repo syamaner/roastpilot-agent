@@ -1635,6 +1635,76 @@ async def test_damp_trim_depth_state_resets_on_pre_fc_entry() -> None:
     assert harness.controller._trim_depth_applied is None  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.asyncio
+async def test_damp_trim_depth_state_does_not_advance_on_actuator_failure() -> None:
+    """Codex finding (fix round 2, #405 Slice B2): ``_trim_depth_applied`` must
+    advance only when the write ACTUALLY REACHED the roaster
+    (``_execute_targets``'s return), not merely on an ALLOW/CLAMP verdict. A
+    transient actuator failure (``set_targets`` raises) must leave
+    ``_trim_depth_applied`` exactly as it was before the failed tick — the
+    same principle the post-FC PI loop's fix applies, extended to the sibling
+    pre-FC deterministic path.
+
+    Drives a jittery RoR series (mirrors
+    ``test_adaptive_depth_damping_bounds_jittery_ror_series``) so consecutive
+    ticks resolve genuinely DIFFERENT depth candidates (not a deadband hold),
+    with the clock advanced 3 s between ticks to clear the 2 s rate limit —
+    otherwise every second write is REJECTed before ``set_targets`` is even
+    attempted, which would not exercise the actuator-failure path at all.
+    """
+    trim = LateMaillardTrim(
+        adaptive_depth_enabled=True,
+        base_trim=65,
+        k_ror=1.5,
+        ror_ref=8.0,
+        k_eta=0.0,
+        min_trim=45,
+        max_trim=75,
+        trim_depth_deadband_pp=2,
+        trim_depth_slew_pp_per_tick=3,
+    )
+    config = ControllerConfig(pre_first_crack_levers=PreFirstCrackLevers(late_maillard_trim=trim))
+    log: list[str] = []
+    flaky_executor = _ArmableFlakySetTargetsExecutor(log)
+    harness = make_harness(config=config, executor=flaky_executor)
+    await _charge_into_pre_fc(harness)
+
+    # Engage the trim + accumulate real damping state via a normal (non-flaky)
+    # jittery-RoR sequence first, so there is a genuine prior anchor to
+    # protect (and the SAME jitter continues below, so the armed tick resolves
+    # a genuinely different candidate, not a deadband hold).
+    bean = 162.0
+    ror_jitter = [8.0, 16.0] * 3
+    for ror in ror_jitter:
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=ror)]
+        await harness.controller.tick()
+        harness.clock.advance(3.0)  # clear the 2 s rate limit each tick
+        bean += 0.5
+    assert harness.controller._trim_latched is True  # pyright: ignore[reportPrivateUsage]
+    applied_before_failure = harness.controller._trim_depth_applied  # pyright: ignore[reportPrivateUsage]
+    assert applied_before_failure is not None
+
+    # Arm exactly one failure, then continue the SAME jitter (the opposite RoR
+    # from the last tick, a genuine new candidate) so the method reaches the
+    # `set_targets` call and it raises.
+    flaky_executor.arm_next_failure()
+    next_ror = 8.0 if ror_jitter[-1] == 16.0 else 16.0
+    harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=next_ror)]
+    await harness.controller.tick()
+    assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+    # The anchor is UNCHANGED — the failed write never advanced it.
+    assert harness.controller._trim_depth_applied == applied_before_failure  # pyright: ignore[reportPrivateUsage]
+
+    # The next tick's write succeeds; the resulting depth is computed from the
+    # SAME anchor the failed tick should have left in place — proof no
+    # phantom advance leaked through.
+    harness.clock.advance(3.0)
+    harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=next_ror)]
+    await harness.controller.tick()
+    assert harness.controller._trim_depth_applied is not None  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._trim_depth_applied != applied_before_failure  # pyright: ignore[reportPrivateUsage]
+
+
 def test_damping_deadband_gte_slew_rejected_at_construction() -> None:
     """``LateMaillardTrim`` must reject ``deadband >= slew`` at construction (#412 Fix 3).
 
@@ -4551,6 +4621,80 @@ async def test_rejected_initial_targets_are_not_written() -> None:
     assert harness.executor.targets == []  # REJECT: _execute_targets skips
 
 
+# --- Direct unit tests for _execute_targets's bool return (Codex finding,
+# fix round 2, #405 Slice B2): callers with their own control-loop state must
+# key state-advance on this return value, not on ``evaluation.verdict`` alone
+# (an ALLOW/CLAMP verdict whose ``set_targets`` call then raises is NOT an
+# executed command). These tests exercise the method directly, isolating its
+# return contract from any calling context. ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_execute_targets_returns_true_on_success() -> None:
+    harness = make_harness()
+    evaluation = SafetyEvaluation(
+        rule="all_clear",
+        verdict=SafetyVerdict.ALLOW,
+        adjusted_heat=70,
+        adjusted_fan=50,
+        reason="test",
+    )
+    executed = await harness.controller._execute_targets(evaluation)  # pyright: ignore[reportPrivateUsage]
+    assert executed is True
+    assert harness.executor.targets == [(70, 50)]
+    assert harness.controller.snapshot().current_heat == 70
+    assert harness.controller.snapshot().current_fan == 50
+    assert RoastEventKind.COMMAND_EXECUTED in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_execute_targets_returns_false_on_non_executable_verdict() -> None:
+    """REJECT (and any verdict other than ALLOW/CLAMP, or a missing adjusted
+    value) never attempts ``set_targets`` — no write, no state change."""
+    harness = make_harness()
+    evaluation = SafetyEvaluation(
+        rule="command_rate_limited",
+        verdict=SafetyVerdict.REJECT,
+        reason="test",
+    )
+    executed = await harness.controller._execute_targets(evaluation)  # pyright: ignore[reportPrivateUsage]
+    assert executed is False
+    assert harness.executor.targets == []
+    assert harness.controller.snapshot().current_heat == 0  # unchanged
+    assert RoastEventKind.COMMAND_EXECUTED not in harness.events.kinds()
+    assert RoastEventKind.COMMAND_FAILED not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_execute_targets_returns_false_when_set_targets_raises() -> None:
+    """The core case this fix round adds: an ALLOW/CLAMP verdict whose
+    ``set_targets`` call raises (a transient actuator/serial failure) returns
+    ``False`` — the write never reached the roaster, so
+    ``current_heat``/``current_fan``/``_last_command_monotonic`` all stay
+    unchanged, even though the verdict itself was ALLOW."""
+
+    class RaisingExecutor(RecordingExecutor):
+        async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+            raise RuntimeError("serial write dropped")
+
+    harness = make_harness(executor=RaisingExecutor())
+    evaluation = SafetyEvaluation(
+        rule="all_clear",
+        verdict=SafetyVerdict.ALLOW,
+        adjusted_heat=70,
+        adjusted_fan=50,
+        reason="test",
+    )
+    executed = await harness.controller._execute_targets(evaluation)  # pyright: ignore[reportPrivateUsage]
+    assert executed is False
+    assert harness.executor.targets == []  # never actually written
+    assert harness.controller.snapshot().current_heat == 0  # unchanged, NOT 70
+    assert harness.controller.snapshot().current_fan == 0  # unchanged, NOT 50
+    assert harness.controller._last_command_monotonic is None  # pyright: ignore[reportPrivateUsage]
+    assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+    assert RoastEventKind.COMMAND_EXECUTED not in harness.events.kinds()
+
+
 class FaultWithoutValuesPolicy(SafetyPolicy):
     def evaluate_telemetry(
         self, *, phase: RoastPhase, bean_temp_c: float, env_temp_c: float, t0_confirmed: bool
@@ -5732,6 +5876,95 @@ async def test_post_fc_loop_rejected_write_does_not_advance_integrator_or_cadenc
     # rejected tick's state was fully undone, this next accepted write must
     # equal the control scenario's FIRST accepted write exactly.
     harness.clock.advance(100.0)
+    harness.reader.readings = [ror_reading]
+    await harness.controller.tick()
+    assert len(harness.executor.targets) == 1
+    assert harness.executor.targets[0][0] == first_accepted_heat
+
+
+class _ArmableFlakySetTargetsExecutor(RecordingExecutor):
+    """A ``RecordingExecutor`` whose ``set_targets`` raises exactly once per
+    ``arm_next_failure()`` call, then delegates normally (mirrors the
+    established ``FlakyExecutor``/``FailingTargetsExecutor`` patterns already
+    used elsewhere in this module for actuator-failure tests).
+
+    Armed explicitly (rather than a fixed ``fail_first`` call count) so a test
+    can drive the harness through an arbitrary number of PRIOR writes (e.g. the
+    pre-FC lever's retry-until-success writes inside ``_charge_through_fc``)
+    without those consuming the scripted failure — only the tick AFTER
+    ``arm_next_failure()`` fails.
+    """
+
+    def __init__(self, log: list[str]) -> None:
+        super().__init__(log)
+        self._armed = False
+
+    def arm_next_failure(self) -> None:
+        """The NEXT ``set_targets`` call raises; every other call succeeds."""
+        self._armed = True
+
+    async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+        if self._armed:
+            self._armed = False
+            raise RuntimeError("serial write dropped")
+        await super().set_targets(heat_percent=heat_percent, fan_percent=fan_percent)
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_actuator_failure_does_not_advance_integrator_or_cadence() -> None:
+    """Codex finding (fix round 2, #405 Slice B2): an ALLOW/CLAMP verdict whose
+    ``set_targets`` call then raises (a transient actuator/serial failure)
+    must NOT advance the PI integrator/EMA or the cadence timer — exactly like
+    a REJECT. Proven the same way as the reject test: the accepted write AFTER
+    the actuator failure must equal a normal (never-interrupted) scenario's
+    first accepted write exactly, proving no phantom advance leaked through."""
+    post_fc_kwargs: dict[str, object] = {
+        "control_interval_seconds": 5.0,
+        "kp_percent_per_ror": 1.0,
+        "ki_percent_per_ror_second": 0.02,
+    }
+    ror_reading = reading(bean=185.0, bean_ror_c_per_min=12.0)
+
+    # --- Control: a normal, never-failed cadence sequence. ---
+    normal_config = _post_fc_config(**post_fc_kwargs)
+    normal_harness = make_harness(config=normal_config)
+    await _charge_through_fc(normal_harness)
+    normal_harness.reader.readings = [ror_reading]
+    await normal_harness.controller.tick()
+    assert len(normal_harness.executor.targets) == 1
+    first_accepted_heat = normal_harness.executor.targets[0][0]
+
+    # --- Scenario under test: the SAME sequence, but the first cadence tick's
+    # set_targets call raises (a transient actuator failure) — the verdict is
+    # still ALLOW/CLAMP (never REJECT), so this exercises the NEW `executed`
+    # check, not the pre-existing REJECT branch. ---
+    config = _post_fc_config(**post_fc_kwargs)
+    log: list[str] = []
+    flaky_executor = _ArmableFlakySetTargetsExecutor(log)
+    harness = make_harness(config=config, executor=flaky_executor)
+    await _charge_through_fc(harness)  # the pre-FC lever write succeeds (not yet armed)
+    # Seed a fresh rate-limit baseline explicitly via the harness clock (mirrors
+    # the reject test): the pre-FC lever write already set
+    # ``_last_command_monotonic``, so this keeps the intended tick's rate-limit
+    # check independent of the pre-FC dwell length.
+    harness.controller._last_command_monotonic = harness.clock.now  # pyright: ignore[reportPrivateUsage]
+    flaky_executor.arm_next_failure()  # ONLY the upcoming DEVELOPMENT write fails
+    harness.reader.readings = [ror_reading]
+    harness.clock.advance(5.0)  # cadence elapsed
+    await harness.controller.tick()
+    assert harness.executor.targets == []  # the write never reached the roaster
+    assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+    cadence_after_failure = harness.controller._post_fc_last_actuation_monotonic  # pyright: ignore[reportPrivateUsage]
+    assert cadence_after_failure is None  # never advanced past the bumpless-reset None
+    integrator_after_failure = harness.controller._post_fc_controller._integrator  # pyright: ignore[reportPrivateUsage]
+    assert integrator_after_failure == pytest.approx(100.0 / 0.02)  # restored: handoff seed only
+
+    # The NEXT tick's set_targets call succeeds (the one-shot arm was
+    # consumed); since the failed tick's state was fully undone, this accepted
+    # write must equal the control scenario's FIRST accepted write exactly —
+    # proving the loop retries from the un-advanced state, not a
+    # phantom-advanced one.
+    harness.clock.advance(100.0)  # clear of both the rate limit and the cadence
     harness.reader.readings = [ror_reading]
     await harness.controller.tick()
     assert len(harness.executor.targets) == 1

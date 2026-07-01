@@ -1506,15 +1506,22 @@ class RoastController:
             bounds=box,
         )
         await self._snapshots.persist_evaluation(evaluation)
-        await self._execute_targets(evaluation)
-        # Advance damping state only after an ACCEPTED write (#412 Fix 2).
-        # REJECT (rate-limited) ticks must not consume slew budget — the anchor
-        # stays at the last ACTUALLY EXECUTED depth.  On ALLOW/CLAMP the adjusted
-        # value is what hit the roaster; on REJECT _trim_depth_applied is unchanged.
-        if damping_active and evaluation.verdict in (
-            SafetyVerdict.ALLOW,
-            SafetyVerdict.CLAMP,
-        ):
+        executed = await self._execute_targets(evaluation)
+        # Advance damping state only after an ACTUALLY EXECUTED write (#412 Fix
+        # 2; sharpened by the Codex actuator-failure finding, #405 Slice B2
+        # fix round 2): key on ``executed`` — ``_execute_targets``'s own report
+        # of whether the write reached the roaster — NOT on
+        # ``evaluation.verdict`` alone. A REJECT (rate-limited) tick never
+        # even attempts the write, so it was already correctly excluded by the
+        # old verdict check; but an ALLOW/CLAMP verdict whose ``set_targets``
+        # call then raises (a transient actuator/serial failure) is NOT an
+        # executed command either — the old verdict-only check would have
+        # advanced ``_trim_depth_applied`` there anyway (a phantom advance:
+        # the roaster's real heat is unchanged, but the anchor moved as if it
+        # had). ``executed`` is exactly "did the roaster's real heat/fan
+        # change to match this evaluation", so gating on it folds the REJECT
+        # case and the actuator-failure case into one correct check.
+        if damping_active and executed:
             self._trim_depth_applied = evaluation.adjusted_heat
 
     async def _apply_deterministic_post_fc_levers(self, telemetry: RoastTelemetry | None) -> None:
@@ -1581,26 +1588,36 @@ class RoastController:
         **The #412 told==enforced rule, extended to a stateful loop:** the
         safety box's heat floor/target is built from the loop's ACTUATED
         output (never an unbounded pre-clamp value), and the loop's internal
-        PI state (integrator, EMA, bias) advances ONLY when the resulting
-        command actually reaches (or already matches) the roaster — never when
-        a computed command is rejected while the roaster's real state stays
-        unchanged from before this tick. A snapshot is taken via
+        PI state (integrator, EMA, bias) advances ONLY when
+        :meth:`_execute_targets` reports the write ACTUALLY REACHED the
+        roaster (its ``bool`` return) — never on ``evaluation.verdict`` alone.
+        Two distinct cases mean "the write did not land", and both are folded
+        into that one check (fix round 2, a Codex finding): a REJECTed safety
+        verdict (e.g. a rate-limited tick, or the defensive phase-matrix
+        branch) never even attempts ``set_targets``; a TRANSIENT ACTUATOR
+        FAILURE is an ALLOW/CLAMP verdict whose ``set_targets`` call then
+        raises — an outcome the verdict alone cannot distinguish from success,
+        but ``_execute_targets``'s ``False`` return catches it. In BOTH cases
+        the roaster's real heat/fan is unchanged from before this tick. A
+        snapshot is taken via
         :meth:`~roastpilot_agent.post_fc_control.PostFcRorController.snapshot_state`
         immediately before :meth:`~roastpilot_agent.post_fc_control.PostFcRorController.compute`;
-        on a REJECTed safety verdict (e.g. a rate-limited tick, or the
-        defensive phase-matrix branch) that snapshot is restored, so the
-        tentative step is fully undone and the NEXT accepted write is computed
-        from the same pre-step state — exactly the discipline
-        ``_apply_deterministic_pre_fc_levers`` applies to
-        ``_trim_depth_applied`` (#412 Fix 2). The cadence timer
-        (``_post_fc_last_actuation_monotonic``) is likewise NOT advanced on a
-        REJECT, so a rejected tick does not consume cadence budget either.
-        The one case that is DELIBERATELY NOT a restore — the idempotent
-        "already at this target" no-write skip — is documented in-line at that
-        branch below: it is treated as accepted because the roaster's real
-        state already equals the computed output, so there is no state/reality
-        gap to protect against, and restoring there would wrongly freeze the
-        EMA/integrator on the loop's own steady-state (deadband-holding) case.
+        when the write did not land that snapshot is restored, so the
+        tentative step is fully undone and the NEXT accepted-and-executed
+        write is computed from the same pre-step state — exactly the
+        discipline ``_apply_deterministic_pre_fc_levers`` applies to
+        ``_trim_depth_applied`` (#412 Fix 2, likewise keyed on
+        :meth:`_execute_targets`'s return since fix round 2). The cadence
+        timer (``_post_fc_last_actuation_monotonic``) is likewise NOT advanced
+        when the write did not land, so the next tick retries at the same
+        elapsed-time budget rather than losing a full cadence interval to a
+        command that never reached the roaster. The one case that is
+        DELIBERATELY NOT a restore — the idempotent "already at this target"
+        no-write skip — is documented in-line at that branch below: it is
+        treated as accepted because the roaster's real state already equals
+        the computed output, so there is no state/reality gap to protect
+        against, and restoring there would wrongly freeze the EMA/integrator
+        on the loop's own steady-state (deadband-holding) case.
 
         Args:
             telemetry: The reading this tick consumed, or ``None`` on a
@@ -1700,20 +1717,33 @@ class RoastController:
             bounds=box,
         )
         await self._snapshots.persist_evaluation(evaluation)
-        await self._execute_targets(evaluation)
-        if evaluation.verdict in (SafetyVerdict.ALLOW, SafetyVerdict.CLAMP):
-            # Accepted write: the loop's PI state (already advanced by the
-            # `compute` call above) stands, and the cadence timer advances so
-            # the NEXT actuation is paced from THIS accepted instant.
+        executed = await self._execute_targets(evaluation)
+        # Key state-advance on ``executed`` — ``_execute_targets``'s own report
+        # of whether the write actually reached the roaster — NOT on
+        # ``evaluation.verdict`` alone (Codex actuator-failure finding, #405
+        # Slice B2 fix round 2). A REJECT (rate-limited) tick is one way
+        # ``executed`` comes back False; a TRANSIENT ACTUATOR FAILURE — an
+        # ALLOW/CLAMP verdict whose ``set_targets`` call then raises — is the
+        # other, and the old verdict-only check could not tell them apart from
+        # "the write landed": it would have kept the tentative `compute` state
+        # AND advanced the cadence timer on an actuator failure, a phantom
+        # advance (the roaster's real heat is unchanged, but the loop's
+        # internal state raced ahead as if the command had applied).
+        if executed:
+            # Accepted AND actually executed: the loop's PI state (already
+            # advanced by the `compute` call above) stands, and the cadence
+            # timer advances so the NEXT actuation is paced from THIS
+            # confirmed instant.
             self._post_fc_last_actuation_monotonic = now
         else:
-            # REJECTed (e.g. rate-limited): undo the tentative `compute` step
-            # entirely so the integrator/EMA/bias are exactly as they were
-            # before this tick ran it (#412 told==enforced extended to a
-            # stateful loop — see the method docstring). The cadence timer is
-            # NOT advanced either, so the next tick retries at the same
-            # elapsed-time budget rather than losing a full cadence interval
-            # to a rejected write.
+            # NOT executed — REJECTed (e.g. rate-limited) OR an actuator
+            # failure: undo the tentative `compute` step entirely so the
+            # integrator/EMA/bias are exactly as they were before this tick
+            # ran it (#412 told==enforced extended to a stateful loop — see
+            # the method docstring). The cadence timer is NOT advanced either,
+            # so the next tick retries at the same elapsed-time budget rather
+            # than losing a full cadence interval to a write that never
+            # reached the roaster.
             self._post_fc_controller.restore_state(pre_compute_state)
 
     async def _apply_phase_rules(self, telemetry: RoastTelemetry | None) -> None:
@@ -2695,14 +2725,36 @@ class RoastController:
         await self._snapshots.persist_evaluation(evaluation)
         await self._execute_targets(evaluation)
 
-    async def _execute_targets(self, evaluation: SafetyEvaluation) -> None:
-        """Execute an ALLOW/CLAMP heat/fan evaluation; surface failures."""
+    async def _execute_targets(self, evaluation: SafetyEvaluation) -> bool:
+        """Execute an ALLOW/CLAMP heat/fan evaluation; surface failures.
+
+        Returns:
+            ``True`` only when the write actually reached the roaster — i.e.
+            ``evaluation`` was ALLOW/CLAMP with both adjusted values present,
+            AND ``self._executor.set_targets`` completed without raising (so
+            ``self._current_heat``/``self._current_fan``/
+            ``self._last_command_monotonic`` were updated to match). ``False``
+            on the not-executable verdict (REJECT/RECOVERY/FAULT/
+            EMERGENCY_STOP, or a missing adjusted value) AND ``False`` on a
+            transient actuator failure (``set_targets`` raised) — in BOTH
+            cases the roaster's real heat/fan is unchanged from before this
+            call. Callers that hold their own control-loop state keyed on
+            "did this write actually land" (e.g.
+            :meth:`_apply_deterministic_post_fc_levers`'s PI integrator/EMA,
+            :meth:`_apply_deterministic_pre_fc_levers`'s ``_trim_depth_applied``)
+            MUST advance that state on this return value, never on
+            ``evaluation.verdict`` alone — the #412 told==enforced rule
+            extended to the actuator-failure case: an ALLOW verdict whose
+            ``set_targets`` call then raises is NOT an executed command, and
+            state that advances anyway is a phantom advance (the roaster
+            never actually moved).
+        """
         if (
             evaluation.verdict not in (SafetyVerdict.ALLOW, SafetyVerdict.CLAMP)
             or evaluation.adjusted_heat is None
             or evaluation.adjusted_fan is None
         ):
-            return
+            return False
         try:
             await self._executor.set_targets(
                 heat_percent=evaluation.adjusted_heat,
@@ -2710,7 +2762,7 @@ class RoastController:
             )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "set_targets"})
-            return
+            return False
         self._current_heat = evaluation.adjusted_heat
         self._current_fan = evaluation.adjusted_fan
         self._last_command_monotonic = self._clock()
@@ -2718,6 +2770,7 @@ class RoastController:
             RoastEventKind.COMMAND_EXECUTED,
             {"heat_percent": evaluation.adjusted_heat, "fan_percent": evaluation.adjusted_fan},
         )
+        return True
 
     def restore_charge_clock(self, t0_detected_at_utc: str) -> None:
         """Restore the charge-referenced DTR clock after a restart (#235).
