@@ -1497,3 +1497,96 @@ def test_malformed_json_blob_in_make_field_meta_leaves_blob_overridden_false(
 
     # Malformed blob: blob_overridden=False; scalar var not set → env_overridden=False.
     assert meta.env_overridden is False
+
+
+# ---------------------------------------------------------------------------
+# P2-B: uppercase blob keys must NOT cause saved-value skip (#426 P2-B)
+# ---------------------------------------------------------------------------
+
+
+def test_uppercase_blob_key_does_not_skip_saved_value_injection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A JSON blob with an uppercase key (e.g. "MODEL_SLUG") must NOT skip
+    injection of the saved model_slug value.
+
+    pydantic-settings only consumes snake_case field keys.  An uppercase blob
+    key like MODEL_SLUG is silently ignored by pydantic, so injecting the
+    saved scalar is correct — the field must resolve to the saved value, not
+    the schema default (#426 P2-B).
+    """
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", '{"MODEL_SLUG": "bad-uppercase-key"}')
+    # Simulate a clean env (no per-field scalar set by the operator).
+    monkeypatch.delenv("ROASTPILOT_ADVISOR__MODEL_SLUG", raising=False)
+
+    injected = _inject_saved_as_env(
+        {"advisor": {"model_slug": "saved-model", "timeout_seconds": 30.0}}
+    )
+
+    # The uppercase blob key must NOT suppress injection of the saved scalar.
+    assert "ROASTPILOT_ADVISOR__MODEL_SLUG" in injected
+    assert os.environ.get("ROASTPILOT_ADVISOR__MODEL_SLUG") == "saved-model"
+
+
+def test_uppercase_blob_key_leaves_blob_overridden_false_in_make_field_meta(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A JSON blob key in uppercase (e.g. MODEL_SLUG) must NOT set
+    blob_overridden=True for the matching snake_case field.
+
+    pydantic ignores the uppercase key so the field's effective value does not
+    come from the blob — blob_overridden should be False (#426 P2-B).
+    """
+    monkeypatch.setenv("ROASTPILOT_ADVISOR", '{"MODEL_SLUG": "bad-uppercase-key"}')
+    monkeypatch.delenv("ROASTPILOT_ADVISOR__MODEL_SLUG", raising=False)
+
+    meta = _make_field_meta(
+        saved_value="saved-model",
+        effective_value="saved-model",
+        default_value="openai/gpt-4o",
+        env_var="ROASTPILOT_ADVISOR__MODEL_SLUG",
+        read_only=False,
+        description="test",
+        injected_keys=frozenset(),
+    )
+
+    # Uppercase blob key: pydantic ignores it → env_overridden must be False.
+    assert meta.env_overridden is False
+
+
+# ---------------------------------------------------------------------------
+# P2-A: nested JSON blob must cover nested scalar fields (#426 P2-A)
+# ---------------------------------------------------------------------------
+
+
+def test_nested_json_blob_does_not_shadow_nested_saved_scalar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A JSON blob covering a nested sub-section must prevent injection of
+    saved scalars for fields present in that nested blob dict.
+
+    E.g. ROASTPILOT_CONTROLLER='{"pre_first_crack_levers":{"heat_target_percent":80}}'
+    must not inject ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__HEAT_TARGET_PERCENT
+    from the saved config, because the nested blob value should win (#426 P2-A).
+    """
+    blob = '{"pre_first_crack_levers": {"heat_target_percent": 80}}'
+    monkeypatch.setenv("ROASTPILOT_CONTROLLER", blob)
+    nested_key = "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__HEAT_TARGET_PERCENT"
+    monkeypatch.delenv(nested_key, raising=False)
+
+    saved = {
+        "controller": {
+            "pre_first_crack_levers": {"heat_target_percent": 55, "fan_target_percent": 30}
+        }
+    }
+    injected = _inject_saved_as_env(saved)
+
+    fan_key = "ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__FAN_TARGET_PERCENT"
+
+    # heat_target_percent is in the blob → must NOT be injected (blob wins).
+    assert nested_key not in injected
+    assert os.environ.get(nested_key) is None
+
+    # fan_target_percent is NOT in the blob → saved value must be injected.
+    assert fan_key in injected
+    assert os.environ.get(fan_key) == "30"
