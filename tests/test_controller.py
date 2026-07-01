@@ -25,6 +25,7 @@ from roastpilot_agent.coherence import LeverDirection
 from roastpilot_agent.config import (
     ControllerConfig,
     LateMaillardTrim,
+    PostFirstCrackControl,
     PreFirstCrackLevers,
     SafetyLimits,
 )
@@ -46,12 +47,14 @@ from roastpilot_agent.models import (
     AdvisorHealth,
     AdvisorHealthStatus,
     OperatorAction,
+    RoastCommand,
     RoastEventKind,
     RoastProfile,
     RoastTelemetry,
 )
 from roastpilot_agent.roast_history import DecisionTraceEntry, RoastMilestoneKind
 from roastpilot_agent.safety import (
+    COMMAND_PHASE_MATRIX,
     OPERATOR_ACTION_COMMAND,
     SafetyEvaluation,
     SafetyPolicy,
@@ -5479,3 +5482,371 @@ async def test_post_fc_lever_direction_resets_on_a_new_run() -> None:
     harness.controller.transition_to(RoastPhase.STARTING)
     assert harness.controller._heat_direction is LeverDirection.NONE  # pyright: ignore[reportPrivateUsage]
     assert harness.controller._fan_direction is LeverDirection.NONE  # pyright: ignore[reportPrivateUsage]
+
+
+# --- D82/D83 (#405 Slice B2): deterministic post-FC RoR-target PI loop wiring ---
+
+
+async def _charge_through_fc(harness: Harness, *, fc_bean_temp_c: float = 178.0) -> None:
+    """Drive ``harness`` from PREHEATING through a real (ticked) pre-FC lever
+    actuation into DEVELOPMENT, via first-crack MCP detection.
+
+    Unlike ``harness_in_development`` (which walks ``transition_to`` directly
+    and leaves ``current_heat`` at 0), this ticks through pre-FC so
+    ``current_heat`` is a real ACTUATED value (100, the deterministic pre-FC
+    lever's default target) at the moment first crack fires — the precondition
+    the bumpless-handoff test needs.
+    """
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING
+        harness.controller.transition_to(step)
+    t0 = reading(bean=150.0, t0_detected=True, bean_ror_c_per_min=20.0)
+    harness.reader.readings = [t0]
+    for _ in range(3):  # three consecutive T0 ticks debounce → pre-FC
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert harness.controller.snapshot().current_heat == 100  # the actuated pre-FC lever
+    harness.reader.readings = [reading(bean=fc_bean_temp_c, first_crack_detected=True)]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    harness.log.clear()
+    harness.events.events.clear()
+    harness.sink.evaluations.clear()
+    # Clear the pre-FC writes accumulated so far: every test using this helper
+    # asserts on writes issued FROM the DEVELOPMENT phase onward only.
+    harness.executor.targets.clear()
+
+
+def _post_fc_config(**overrides: object) -> ControllerConfig:
+    """A ``ControllerConfig`` with the post-FC PI loop ENABLED (defaults
+    ``False`` — this helper is only used by tests that want it on;
+    flag-off tests construct ``ControllerConfig()`` directly)."""
+    overrides.setdefault("enabled", True)
+    return ControllerConfig(
+        post_first_crack_control=PostFirstCrackControl(**overrides)  # type: ignore[arg-type]
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_flag_off_is_byte_for_byte_unchanged() -> None:
+    """Flag OFF (default): the advisor's levers still actuate post-FC, and the
+    PI loop never writes — a regression test pinning today's behaviour."""
+    advisor = FakeAdvisor([decision(heat=70, fan=55)])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    assert harness.controller._config.post_first_crack_control.enabled is False  # pyright: ignore[reportPrivateUsage]
+    await harness.controller.tick()
+    assert advisor.contexts, "the advisor should have been consulted"
+    assert harness.executor.targets == [(70, 55)]
+    assert harness.controller.snapshot().current_heat == 70
+    assert harness.controller.snapshot().current_fan == 55
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_enabled_actuates_heat_and_pins_fan_advisor_not_actuated() -> None:
+    """Flag ON, DEVELOPMENT: the PI loop writes heat, fan is pinned to
+    ``fan_percent``, and the advisor's levers are NOT actuated (the loop owns
+    heat, fan is deterministically pinned so the advisor cannot fight it)."""
+    config = _post_fc_config(fan_percent=45, control_interval_seconds=5.0)
+    advisor = FakeAdvisor([decision(heat=99, fan=10)], default_decision=decision(heat=99, fan=10))
+    harness = make_harness(config=config, advisor=advisor)
+    await _charge_through_fc(harness)
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    # The loop wrote — heat raised above the 100% handoff (RoR 4 < target 8 ⇒
+    # positive error ⇒ MORE heat), clamped at the ceiling (100), fan pinned 45.
+    assert harness.executor.targets == [(100, 45)]
+    assert harness.controller.snapshot().current_fan == 45
+    # The advisor WAS consulted (still traced) but its 99/10 recommendation was
+    # never actuated — the loop's write is the only one on the wire.
+    assert advisor.contexts, "the advisor is still consulted (traced, not actuated)"
+    assert (99, 10) not in harness.executor.targets
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_enabled_should_drop_still_honored() -> None:
+    """Flag ON: the loop owns heat/fan, but the advisor's ``should_drop`` drop
+    coherence path is UNCHANGED — a coherent drop still fires the drop."""
+    config = _post_fc_config()
+    advisor = FakeAdvisor(
+        [decision(heat=50, fan=40, drop=True)],
+        default_decision=decision(heat=50, fan=40, drop=True),
+    )
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=25.0, advisor=advisor, config=config
+    )
+    harness.reader.readings = [reading(bean_ror_c_per_min=8.0)]
+    await harness.controller.tick()
+    assert "drop_beans" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.COOLING
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_bumpless_handoff_holds_pre_fc_heat() -> None:
+    """Bumpless handoff: heat at the first DEVELOPMENT control tick equals the
+    pre-FC actuated heat (100) — no dip or jump — when RoR sits at the loop's
+    target (zero-error case)."""
+    config = _post_fc_config(target_ror_c_per_min=8.0, ror_smoothing_alpha=1.0)
+    harness = make_harness(config=config)
+    await _charge_through_fc(harness)
+    assert harness.controller.snapshot().current_heat == 100  # unchanged going INTO the tick
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=8.0)]
+    await harness.controller.tick()
+    # Zero error at the handoff heat (100) => the loop holds exactly 100 (no
+    # dip/jump), even though 100 is also the pre-FC value — this proves the
+    # SEEDED loop reproduces it, not merely "heat never changed".
+    assert harness.controller.snapshot().current_heat == 100
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_bumpless_handoff_from_a_lower_pre_fc_heat() -> None:
+    """Bumpless handoff, non-trivial case: pre-FC heat trimmed below 100 (the
+    late-Maillard trim) still hands off with no dip/jump at zero error."""
+    config = _post_fc_config(target_ror_c_per_min=8.0, ror_smoothing_alpha=1.0)
+    harness = make_harness(config=config)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:
+        harness.controller.transition_to(step)
+    t0 = reading(bean=150.0, t0_detected=True, bean_ror_c_per_min=20.0)
+    harness.reader.readings = [t0]
+    for _ in range(3):
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    # Warm into the late-Maillard trim window so pre-FC heat trims below 100.
+    bean = 162.0
+    for _ in range(6):
+        harness.reader.readings = [reading(bean=bean, bean_ror_c_per_min=30.0)]
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+        bean += 0.5
+    handoff_heat = harness.controller.snapshot().current_heat
+    assert 0 < handoff_heat < 100  # the trim engaged: a genuine non-100 handoff value
+    harness.reader.readings = [reading(bean=178.0, first_crack_detected=True)]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    harness.log.clear()
+    harness.events.events.clear()
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=8.0)]
+    await harness.controller.tick()
+    assert harness.controller.snapshot().current_heat == handoff_heat
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_never_crashes_below_configured_floor() -> None:
+    """No crash-to-0 (the roast-7 failure): even when RoR runs far hotter than
+    target for a sustained post-FC sequence, commanded heat never drops below
+    the configured floor (>= 1, default 25)."""
+    config = _post_fc_config(heat_floor_percent=25, control_interval_seconds=5.0)
+    harness = make_harness(config=config)
+    await _charge_through_fc(harness)
+    heats: list[int] = []
+    for _ in range(10):
+        harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=40.0)]
+        await harness.controller.tick()
+        harness.clock.advance(5.0)  # exactly the control cadence each step
+        heats.append(harness.controller.snapshot().current_heat)
+    assert all(h >= 25 for h in heats), heats
+    assert all(h != 0 for h in heats), heats
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_cadence_actuates_every_control_interval_not_every_tick() -> None:
+    """The loop actuates roughly every ``control_interval_seconds`` (5 s
+    default), not every 1 s controller tick. RoR is held moderately ABOVE
+    target throughout, so the loop keeps easing heat down a little at each
+    cadence tick — never saturating — which makes each new cadence actuation
+    produce a genuinely DIFFERENT (not merely idempotent-repeat) command."""
+    config = _post_fc_config(
+        control_interval_seconds=5.0, kp_percent_per_ror=1.0, ki_percent_per_ror_second=0.02
+    )
+    harness = make_harness(config=config)
+    await _charge_through_fc(harness)
+    assert harness.executor.targets == []  # nothing written yet this DEVELOPMENT phase
+    # First DEVELOPMENT tick actuates immediately (no prior actuation to pace
+    # against).
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=12.0)]
+    await harness.controller.tick()
+    assert len(harness.executor.targets) == 1
+    # Ticks at 1 s, 2 s, 3 s, 4 s after that (< the 5 s cadence): no new writes.
+    for _ in range(4):
+        harness.clock.advance(1.0)
+        harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=12.0)]
+        await harness.controller.tick()
+    assert len(harness.executor.targets) == 1  # still just the first
+    # The 5th second crosses the cadence: a new (lower) write is issued.
+    harness.clock.advance(1.0)
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=12.0)]
+    await harness.controller.tick()
+    assert len(harness.executor.targets) == 2
+    assert harness.executor.targets[1][0] < harness.executor.targets[0][0]
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_rejected_write_does_not_advance_integrator_or_cadence() -> None:
+    """State-advance-only-on-accepted-write: a REJECTed (rate-limited) tick does
+    NOT advance the integrator/EMA or the cadence timer — the NEXT accepted
+    write is computed from the SAME pre-reject state, so it produces the exact
+    output a normal (non-interrupted) cadence sequence would have produced at
+    its OWN first actuation (proven below by running both scenarios and
+    comparing the resulting command)."""
+    post_fc_kwargs: dict[str, object] = {
+        "control_interval_seconds": 5.0,
+        "kp_percent_per_ror": 1.0,
+        "ki_percent_per_ror_second": 0.02,
+    }
+    ror_reading = reading(bean=185.0, bean_ror_c_per_min=12.0)
+
+    # --- Control: a normal, never-rejected cadence sequence. ---
+    normal_config = _post_fc_config(**post_fc_kwargs)
+    normal_harness = make_harness(config=normal_config)
+    await _charge_through_fc(normal_harness)
+    normal_harness.reader.readings = [ror_reading]
+    await normal_harness.controller.tick()
+    assert len(normal_harness.executor.targets) == 1
+    first_accepted_heat = normal_harness.executor.targets[0][0]
+
+    # --- Scenario under test: the SAME sequence, but the first cadence tick
+    # is REJECTed (rate-limited) before the loop ever gets an accepted write. ---
+    config = _post_fc_config(**post_fc_kwargs)
+    limits = SafetyLimits(min_seconds_between_commands=100.0)  # force a rate-limit REJECT
+    harness = make_harness(config=config, limits=limits)
+    await _charge_through_fc(harness)
+    # Seed a fresh rate-limit baseline explicitly via the harness clock (the
+    # pre-FC lever writes already set ``_last_command_monotonic``, so this
+    # keeps the REJECT deterministic regardless of the pre-FC dwell length).
+    harness.controller._last_command_monotonic = harness.clock.now  # pyright: ignore[reportPrivateUsage]
+    harness.reader.readings = [ror_reading]
+    harness.clock.advance(5.0)  # cadence elapsed
+    await harness.controller.tick()
+    assert len(harness.executor.targets) == 0  # command_rate_limited REJECT: no write
+    rejects = [e for e in harness.sink.evaluations if e.verdict is SafetyVerdict.REJECT]
+    assert rejects and rejects[-1].rule == "command_rate_limited"
+    cadence_after_reject = harness.controller._post_fc_last_actuation_monotonic  # pyright: ignore[reportPrivateUsage]
+    assert cadence_after_reject is None  # never advanced past the bumpless-reset None
+    integrator_after_reject = harness.controller._post_fc_controller._integrator  # pyright: ignore[reportPrivateUsage]
+    assert integrator_after_reject == pytest.approx(100.0 / 0.02)  # restored: handoff seed only
+
+    # Advance past the rate limit and repeat the SAME reading: since the
+    # rejected tick's state was fully undone, this next accepted write must
+    # equal the control scenario's FIRST accepted write exactly.
+    harness.clock.advance(100.0)
+    harness.reader.readings = [ror_reading]
+    await harness.controller.tick()
+    assert len(harness.executor.targets) == 1
+    assert harness.executor.targets[0][0] == first_accepted_heat
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_ror_unavailable_does_not_actuate() -> None:
+    """RoR unavailable (``bean_ror_c_per_min is None``): the loop fails closed —
+    it does not actuate, heat stays wherever it was."""
+    config = _post_fc_config()
+    harness = make_harness(config=config)
+    await _charge_through_fc(harness)
+    handoff_heat = harness.controller.snapshot().current_heat
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=None)]
+    await harness.controller.tick()
+    assert harness.executor.targets == []  # no write at all
+    assert harness.controller.snapshot().current_heat == handoff_heat
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_cannot_actuate_in_operator_recovery_required() -> None:
+    """Restart/recovery: the loop cannot actuate in ``operator_recovery_required``
+    — a restart never auto-resumes heat/fan, and the phase guard means the loop
+    is inert there regardless of the flag."""
+    config = _post_fc_config()
+    harness = make_harness(readings=[reading(bean_ror_c_per_min=5.0)], config=config)
+    harness.controller.load_profile(PROFILE)
+    await harness.controller.recover_from_restart(RoastPhase.DEVELOPMENT)
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    await harness.controller._apply_deterministic_post_fc_levers(  # pyright: ignore[reportPrivateUsage]
+        reading(bean_ror_c_per_min=5.0)
+    )
+    assert harness.executor.targets == []
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_cannot_actuate_in_faulted() -> None:
+    """Restart/recovery: the loop cannot actuate in ``faulted`` either."""
+    config = _post_fc_config()
+    harness = make_harness(readings=[reading(bean_ror_c_per_min=5.0)], config=config)
+    harness.controller.load_profile(PROFILE)
+    await harness.controller.recover_into_faulted(RoastPhase.FAULTED)
+    assert harness.controller.phase is RoastPhase.FAULTED
+    await harness.controller._apply_deterministic_post_fc_levers(  # pyright: ignore[reportPrivateUsage]
+        reading(bean_ror_c_per_min=5.0)
+    )
+    assert harness.executor.targets == []
+
+
+def test_set_heat_already_valid_in_development_no_matrix_change_needed() -> None:
+    """The command×phase matrix already allows SET_HEAT in DEVELOPMENT (the
+    advisor has always actuated heat there) — Slice B2 needs no change to
+    ``COMMAND_PHASE_MATRIX``. This test pins that precondition so a future
+    matrix edit cannot silently break the post-FC loop's ability to write."""
+    assert RoastPhase.DEVELOPMENT in COMMAND_PHASE_MATRIX[RoastCommand.SET_HEAT]
+
+
+# --- Safety-review fix (post-B2, Opus finding, MEDIUM): the loop must not
+# engage from a phantom (non-bumpless) PI state on an
+# ``operator_recovery_required -> DEVELOPMENT`` operator-resume edge; the
+# advisor must resume driving post-FC heat/fan there instead. ---------------
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_true_fc_edge_engages_the_loop() -> None:
+    """A normal FC-edge DEVELOPMENT dwell sets ``_post_fc_engaged`` True — the
+    precondition every other loop-actuation test in this module relies on."""
+    config = _post_fc_config()
+    harness = make_harness(config=config)
+    await _charge_through_fc(harness)
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.controller._post_fc_engaged is True  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_post_fc_engaged_clears_on_development_to_cooling() -> None:
+    """``_post_fc_engaged`` does not survive past the DEVELOPMENT dwell it was
+    set for — it clears the moment the phase leaves DEVELOPMENT (COOLING)."""
+    config = _post_fc_config()
+    harness = make_harness(config=config)
+    await _charge_through_fc(harness)
+    assert harness.controller._post_fc_engaged is True  # pyright: ignore[reportPrivateUsage]
+    harness.controller.transition_to(RoastPhase.COOLING)
+    assert harness.controller._post_fc_engaged is False  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_does_not_engage_on_operator_resume_into_development() -> None:
+    """The MEDIUM finding this fixes: a restart -> recovery -> operator-resume
+    sequence also reaches DEVELOPMENT, but NOT via the true FC edge — no
+    bumpless seed ran, so the loop must NOT engage from that phantom PI state.
+    Instead the advisor resumes driving post-FC heat/fan (the pre-B2
+    fallback), so post-FC control is never silently absent after a resume."""
+    config = _post_fc_config()
+    advisor = FakeAdvisor([decision(heat=61, fan=52)], default_decision=decision(heat=61, fan=52))
+    harness = make_harness(config=config, advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+
+    await harness.controller.recover_from_restart(RoastPhase.DEVELOPMENT)
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    harness.controller.operator_resume(RoastPhase.DEVELOPMENT)
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.controller._post_fc_engaged is False  # pyright: ignore[reportPrivateUsage]
+    assert harness.executor.targets == []  # resume itself never writes hardware
+
+    harness.log.clear()
+    harness.events.events.clear()
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=5.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    # The PI loop did NOT write (engaged False, regardless of the flag being on).
+    # The advisor's levers DID actuate — the resume fallback is restored.
+    assert advisor.contexts, "the advisor should have been consulted on resume"
+    assert harness.executor.targets == [(61, 52)]
+    assert harness.controller.snapshot().current_heat == 61
+    assert harness.controller.snapshot().current_fan == 52

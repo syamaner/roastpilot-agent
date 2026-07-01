@@ -2,16 +2,18 @@
 
 This module implements the **algorithm only** — a pure, stateful, side-effect
 free PI controller that holds a target bean rate-of-rise (RoR) band post-first-
-crack by adjusting the heat lever. It is #405 Slice B1: it does not call
-:mod:`roastpilot_agent.controller`, :mod:`roastpilot_agent.safety`, or
-:mod:`roastpilot_agent.control_policy`, and nothing in those modules calls it
-yet. Slice B2 wires :class:`PostFcRorController` into the controller's
-DEVELOPMENT-phase tick, builds the safety box from its actuated output (never
-an undamped target — the #412 told==enforced control-path rule), and routes
-every resulting heat command through the existing safety gate exactly like the
-advisor's commands are routed today. **Nothing in this module writes to a
-roaster.** ``PostFcRorController`` never imports :mod:`roastpilot_agent.mcp_client`
-and must never be wired to it directly.
+crack by adjusting the heat lever. #405 Slice B1 built the algorithm: it does
+not call :mod:`roastpilot_agent.controller`, :mod:`roastpilot_agent.safety`, or
+:mod:`roastpilot_agent.control_policy`. Slice B2
+(:meth:`roastpilot_agent.controller.RoastController._apply_deterministic_post_fc_levers`)
+wires :class:`PostFcRorController` into the controller's DEVELOPMENT-phase
+tick, builds the safety box from its actuated output (never an undamped target
+— the #412 told==enforced control-path rule), and routes every resulting heat
+command through the existing safety gate exactly like the advisor's commands
+are routed today, all behind the ``PostFirstCrackControl.enabled`` flag
+(default ``False``). **Nothing in this module writes to a roaster.**
+``PostFcRorController`` never imports :mod:`roastpilot_agent.mcp_client` and
+must never be wired to it directly.
 
 Design (D83): a PI controller (proportional + integral, no derivative term) on
 a smoothed (EMA) RoR signal, with conditional-integration anti-windup. The
@@ -31,9 +33,33 @@ up past the value that already holds the output at the rail, and can leave the
 rail promptly once the error direction reverses (see :meth:`PostFcRorController.compute`).
 """
 
+from dataclasses import dataclass
+
 from pydantic import BaseModel
 
 from roastpilot_agent.config import PostFirstCrackControl
+
+
+@dataclass(frozen=True)
+class PostFcControllerState:
+    """An immutable snapshot of :class:`PostFcRorController`'s mutable state.
+
+    Slice B2 (#405) needs this for the #412 told==enforced control-path rule
+    applied to a *stateful* loop: the integrator/EMA must advance only after an
+    ACCEPTED safety-gated write (ALLOW/CLAMP), never on a REJECT (e.g. a
+    rate-limited tick) or any other non-actuated path. The caller takes a
+    snapshot with :meth:`PostFcRorController.snapshot_state` **before** calling
+    :meth:`PostFcRorController.compute`, and — only when the resulting command
+    was rejected — restores it with :meth:`PostFcRorController.restore_state`
+    so the tentative step is fully undone, as if ``compute`` had never run.
+
+    Immutable and side-effect free: holding one of these carries no reference
+    to the controller and cannot itself mutate it.
+    """
+
+    integrator: float
+    bias_percent: float
+    ema: float | None
 
 
 class PostFcControlOutput(BaseModel, frozen=True):
@@ -165,6 +191,36 @@ class PostFcRorController:
             self._integrator = 0.0
             self._bias_percent = float(initial_heat_percent)
 
+    def snapshot_state(self) -> PostFcControllerState:
+        """Capture the loop's mutable state before a tentative :meth:`compute` step.
+
+        Slice B2 (#405) calls this immediately before ``compute`` so a REJECTed
+        (e.g. rate-limited) safety verdict can undo the tentative step with
+        :meth:`restore_state` — the loop's integrator/EMA must advance only on
+        an ACCEPTED (ALLOW/CLAMP) write, mirroring the pre-FC adaptive-trim
+        "advance state only on accepted write" rule (#412).
+
+        Returns:
+            An immutable :class:`PostFcControllerState` capturing the current
+            integrator, bias, and EMA.
+        """
+        return PostFcControllerState(
+            integrator=self._integrator,
+            bias_percent=self._bias_percent,
+            ema=self._ema,
+        )
+
+    def restore_state(self, state: PostFcControllerState) -> None:
+        """Restore a previously captured state, undoing a tentative ``compute`` step.
+
+        Args:
+            state: A snapshot from :meth:`snapshot_state`, taken before the
+                :meth:`compute` call being undone.
+        """
+        self._integrator = state.integrator
+        self._bias_percent = state.bias_percent
+        self._ema = state.ema
+
     def compute(self, *, measured_ror_c_per_min: float, dt_seconds: float) -> PostFcControlOutput:
         """Run one PI control step and return the commanded heat + diagnostics.
 
@@ -212,13 +268,24 @@ class PostFcRorController:
             dt_seconds: The elapsed seconds since the previous call to
                 :meth:`compute` (or since :meth:`reset`, for the first call).
                 Passed in by the caller rather than read from a clock, so this
-                method stays deterministic and replay-safe.
+                method stays deterministic and replay-safe. Must be strictly
+                positive (Slice B2 review note): a zero or negative ``dt``
+                would either freeze or reverse the integrator's accumulated
+                direction, which is never a valid tick duration — the caller
+                is responsible for supplying a sane value (e.g. the configured
+                ``control_interval_seconds`` on the very first post-handoff
+                tick).
 
         Returns:
             The :class:`PostFcControlOutput` for this step: the clamped
             integer heat percentage plus the smoothed RoR, the error, the
             post-step integrator value, and whether this step saturated.
+
+        Raises:
+            ValueError: If ``dt_seconds`` is not strictly positive.
         """
+        if dt_seconds <= 0.0:
+            raise ValueError(f"dt_seconds must be > 0 ({dt_seconds})")
         config = self._config
         alpha = config.ror_smoothing_alpha
         ema = (
