@@ -432,6 +432,7 @@ def _development_harness_with_dev_percent(
     system_dev_percent: float,
     advisor: RoastAdvisor | None = None,
     config: ControllerConfig | None = None,
+    executor: RecordingExecutor | None = None,
 ) -> Harness:
     """A DEVELOPMENT harness whose SYSTEM development percent is a known value.
 
@@ -440,8 +441,12 @@ def _development_harness_with_dev_percent(
     ``system_dev_percent`` exactly: development time / charge-referenced roast
     time = the requested fraction. Used to drive the deterministic drop coherence
     guard (#312) from a precisely-known ground-truth development figure.
+
+    ``executor`` is an optional command-executor override (e.g. a subclass that
+    raises on ``drop_beans``) — defaults to the standard recording fake so
+    existing callers are unaffected (#405 Slice C).
     """
-    harness = make_harness(readings=[reading()], advisor=advisor, config=config)
+    harness = make_harness(readings=[reading()], advisor=advisor, config=config, executor=executor)
     controller = harness.controller
     controller.load_profile(PROFILE)
     controller.transition_to(RoastPhase.STARTING)
@@ -6083,3 +6088,230 @@ async def test_post_fc_loop_does_not_engage_on_operator_resume_into_development(
     assert harness.executor.targets == [(61, 52)]
     assert harness.controller.snapshot().current_heat == 61
     assert harness.controller.snapshot().current_fan == 52
+
+
+# --- D84 (#405 Slice C): deterministic drop anchor + LLM-earlier-only ---
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_anchor_flag_off_is_a_regression_guard() -> None:
+    """Flag OFF (default): the anchor never fires — a run reaching
+    bean >= target_drop AND dev% >= target with the advisor SILENT does NOT
+    auto-drop (today's fully advisor-only drop is unaffected)."""
+    advisor = FakeAdvisor([decision(heat=60, fan=50, drop=False)])
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent, advisor=advisor
+    )
+    assert harness.controller._config.post_first_crack_control.enabled is False  # pyright: ignore[reportPrivateUsage]
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=5.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_anchor_fires_with_advisor_silent() -> None:
+    """Flag ON + engaged, advisor SILENT (``should_drop=False``): the anchor
+    fires ``drop_beans`` and transitions to COOLING once
+    bean_temp >= target_drop_temp_c AND system_dev% >= target_development_percent."""
+    config = _post_fc_config()
+    advisor = FakeAdvisor([decision(heat=60, fan=50, drop=False)])
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent, advisor=advisor, config=config
+    )
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=5.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert harness.executor.commands.count("drop_beans") == 1
+    assert harness.controller.phase is RoastPhase.COOLING
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {"command": "drop_beans", "source": "policy"} in executed
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_anchor_does_not_fire_on_temp_alone() -> None:
+    """Temp >= target but dev% < target: the anchor does NOT fire (both
+    conditions are required)."""
+    config = _post_fc_config()
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent - 5.0, config=config
+    )
+    harness.reader.readings = [
+        reading(bean=PROFILE.target_drop_temp_c + 5.0, bean_ror_c_per_min=5.0)
+    ]
+    await harness.controller.tick()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_anchor_does_not_fire_on_dev_percent_alone() -> None:
+    """Dev% >= target but temp < target: the anchor does NOT fire (both
+    conditions are required)."""
+    config = _post_fc_config()
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent + 5.0, config=config
+    )
+    harness.reader.readings = [
+        reading(bean=PROFILE.target_drop_temp_c - 5.0, bean_ror_c_per_min=5.0)
+    ]
+    await harness.controller.tick()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_anchor_uses_system_dev_percent_not_advisor_claim() -> None:
+    """The anchor uses the SYSTEM dev% (:meth:`_development_percent`), never the
+    advisor's claimed number: an advisor claiming a high dev% while the
+    SYSTEM's real dev% is below target does not trigger the anchor."""
+    config = _post_fc_config()
+    advisor = FakeAdvisor(
+        [decision(heat=60, fan=50, drop=False)],
+        default_decision=decision(heat=60, fan=50, drop=False),
+    )
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent - 5.0,
+        advisor=advisor,
+        config=config,
+    )
+    # Bean temp is at/above target, so temp alone would satisfy the anchor —
+    # only the (below-target) SYSTEM dev% should block it, regardless of
+    # anything an advisor might claim about its own view of development.
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=5.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_anchor_llm_earlier_only_advisor_drops_first() -> None:
+    """LLM-earlier still works: with the flag ON, an advisor ``should_drop=True``
+    at dev% within [target - margin, target) drops EARLIER than the anchor —
+    the existing #313 coherence path is intact and unmodified."""
+    config = _post_fc_config()
+    margin = ControllerConfig().drop_dev_margin_percent
+    within_margin_dev_percent = PROFILE.target_development_percent - margin / 2.0
+    advisor = FakeAdvisor(
+        [decision(heat=60, fan=50, drop=True)],
+        default_decision=decision(heat=60, fan=50, drop=True),
+    )
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=within_margin_dev_percent, advisor=advisor, config=config
+    )
+    # Bean temp is BELOW target_drop_temp_c, so the anchor itself could not
+    # have fired this tick — only the advisor's earlier-drop coherence path
+    # can produce the drop here.
+    harness.reader.readings = [
+        reading(bean=PROFILE.target_drop_temp_c - 10.0, bean_ror_c_per_min=5.0)
+    ]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert harness.executor.commands.count("drop_beans") == 1
+    assert harness.controller.phase is RoastPhase.COOLING
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {"command": "drop_beans", "source": "advisor"} in executed
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_anchor_does_not_fire_when_not_engaged() -> None:
+    """``_post_fc_engaged`` False with BOTH eligibility conditions otherwise
+    met (a non-``None`` system dev% at/above target, bean temp at/above
+    target): the anchor does NOT fire — the advisor drives post-FC instead,
+    consistent with the RoR loop's own gate.
+
+    Isolates the ``not self._post_fc_engaged`` clause specifically (qa
+    mutation finding): the harness first drives a normal run to DEVELOPMENT
+    via the TRUE FC edge (``_development_harness_with_dev_percent``), which
+    stamps the charge/FC clocks — so ``_development_percent()`` is genuinely
+    non-``None`` and at target here, unlike the operator-resume path (which
+    never stamps those clocks and would trip the SEPARATE None-dev fail-closed
+    branch instead, masking this guard). ``_post_fc_engaged`` is then poked
+    directly to ``False`` (the same private-poke style the None-dev test uses
+    on ``_charge_monotonic``) so this test exercises ONLY the engaged check:
+    deleting the ``not self._post_fc_engaged`` clause from the guard makes
+    this test fail.
+    """
+    config = _post_fc_config()
+    advisor = FakeAdvisor([decision(heat=60, fan=50, drop=False)])
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent, advisor=advisor, config=config
+    )
+    harness.controller._post_fc_engaged = False  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._development_percent() == pytest.approx(  # pyright: ignore[reportPrivateUsage]
+        PROFILE.target_development_percent
+    )
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=5.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_anchor_no_op_when_development_percent_is_none() -> None:
+    """``_development_percent()`` returning ``None`` ⇒ no anchor drop — fail
+    safe, never drop on unknown development.
+
+    This guard is defensive: in a normally-progressing engaged DEVELOPMENT
+    dwell ``_development_percent()`` is never ``None`` (the charge/FC clocks
+    are always stamped together by the true FC edge that sets
+    ``_post_fc_engaged``). The unreachable-by-normal-transitions precondition
+    (``_charge_monotonic`` cleared) is forced directly, mirroring the existing
+    test-harness pattern of poking the charge clock (see
+    ``_development_harness_with_dev_percent``), to prove the guard itself
+    fails closed rather than assuming it.
+    """
+    config = _post_fc_config()
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent, config=config
+    )
+    harness.controller._charge_monotonic = None  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._development_percent() is None  # pyright: ignore[reportPrivateUsage]
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=5.0)]
+    await harness.controller.tick()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+
+@pytest.mark.asyncio
+async def test_operator_drop_beans_still_works_unmodified_in_development() -> None:
+    """Manual ``operator_drop_beans`` stays un-gated in DEVELOPMENT — the
+    backstop is unaffected by the deterministic anchor, flag on or off."""
+    config = _post_fc_config()
+    harness = _development_harness_with_dev_percent(system_dev_percent=1.0, config=config)
+    # Neither anchor condition is met (dev% far below target, bean temp at the
+    # harness default), yet the manual drop still executes immediately.
+    await harness.controller.operator_drop_beans()
+    assert "drop_beans" in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.COOLING
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {"command": "drop_beans", "source": "operator"} in executed
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_anchor_emits_command_failed_on_actuator_failure() -> None:
+    """A transient actuator failure (``drop_beans`` raises) emits
+    ``COMMAND_FAILED`` and does NOT transition to COOLING — mirroring the
+    advisor-drop and operator-drop failure handling exactly (fail closed, no
+    FSM/hardware divergence)."""
+
+    class RaisingDropExecutor(RecordingExecutor):
+        async def drop_beans(self) -> None:
+            raise RuntimeError("serial write dropped")
+
+    config = _post_fc_config()
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent,
+        config=config,
+        executor=RaisingDropExecutor(),
+    )
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=5.0)]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {"command": "drop_beans", "source": "policy"} in failed
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {"command": "drop_beans", "source": "policy"} not in executed
