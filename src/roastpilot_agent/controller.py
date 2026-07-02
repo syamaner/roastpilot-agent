@@ -1324,6 +1324,22 @@ class RoastController:
         # unless ``post_first_crack_control.enabled`` is True (default False —
         # today's advisor-driven post-FC path is unaffected).
         await self._apply_deterministic_post_fc_levers(telemetry)
+        # D84 (#405 Slice C): the deterministic drop anchor, called immediately
+        # AFTER the post-FC RoR loop step and BEFORE the advisory consult below.
+        # Ordering decision: this must run after the loop's heat/fan write (a
+        # drop that fires this tick should do so using the freshest possible
+        # bean-temp/dev% read, and firing after the loop step means a tick that
+        # both actuates a heat trim AND crosses the drop threshold still drops
+        # the same tick rather than waiting one more). It must run BEFORE
+        # ``_maybe_run_advisory`` so that once the anchor fires and transitions
+        # the phase to COOLING, the SAME tick's advisory consult below is a
+        # clean no-op: ``_maybe_run_advisory`` only consults in the advisory
+        # phases (COOLING is not one), so there is no risk of the advisor ALSO
+        # recommending/executing a second drop_beans() the same tick — the
+        # anchor and the advisor drop path can never both fire in one tick.
+        # No-op entirely unless ``post_first_crack_control.enabled`` is True
+        # (default False — today's fully advisor-driven drop is unaffected).
+        await self._maybe_deterministic_drop(telemetry)
         # D40.3 (#275): accumulate the roast-so-far curve + milestones for the
         # per-tick control-loop context AFTER the phase rules + deterministic
         # pre-FC levers have run, so the sample captures the charge tick itself
@@ -1745,6 +1761,121 @@ class RoastController:
             # than losing a full cadence interval to a write that never
             # reached the roaster.
             self._post_fc_controller.restore_state(pre_compute_state)
+
+    async def _maybe_deterministic_drop(self, telemetry: RoastTelemetry | None) -> None:
+        """Deterministic drop anchor: guarantees the drop lands at target (D84, #405 Slice C).
+
+        Gated end-to-end on the SAME bundle as the post-FC RoR loop
+        (``post_first_crack_control.enabled`` AND ``self._post_fc_engaged`` AND
+        phase DEVELOPMENT) — when the flag is off, or DEVELOPMENT was reached via
+        an operator resume rather than the true FC edge, this method is a pure
+        no-op on every path, so flag-off behaviour is byte-for-byte identical to
+        today's fully advisor-driven drop.
+
+        **Precedence (D84):** a profile's explicit ``target_drop_temp_c`` /
+        ``target_development_percent`` are AUTHORITATIVE for the drop.
+        ``roast_style`` (Slice A) does NOT drive the drop at runtime — those two
+        fields are required on every profile, so this method reads them
+        directly and never consults ``roast_style``.
+
+        **Eligibility (fires the instant BOTH hold):**
+
+            ``telemetry.bean_temp_c >= profile.target_drop_temp_c``
+            AND
+            ``system_dev_percent >= profile.target_development_percent``
+
+        where ``system_dev_percent`` is :meth:`_development_percent` — the
+        charge/FC-referenced SYSTEM value the #313 coherence guard uses — NEVER
+        the advisor's claimed development percent (the first supervised roast
+        showed that number can be fabricated). ``None`` (development not yet
+        computable) fails closed to no-op, never to a drop.
+
+        **LLM-earlier-only:** this method does not change or remove the
+        existing advisor ``should_drop`` path in :meth:`_run_advisory` (the
+        #313-coherence-gated earlier window, ``dev% >= target -
+        drop_dev_margin_percent``). Together the drop fires at
+        ``min(advisor-earlier-within-margin, this-anchor)`` — the advisor can
+        only pull the drop earlier, never delay it past target.
+
+        **One-shot event, not rate-limited:** unlike the pre-FC/post-FC levers
+        (idempotent per-tick writes gated on a control cadence), a drop is a
+        single irreversible action, so this runs on EVERY DEVELOPMENT tick with
+        no cadence gate — the drop must fire the instant it is eligible, not
+        wait for the next 5 s control tick.
+
+        **Same command path as every other drop:** ``evaluate_drop_recommendation``
+        (ALLOWs unconditionally in DEVELOPMENT) then ``self._executor.drop_beans()``
+        in a try/except (``COMMAND_FAILED`` + return on a transient actuator
+        failure, mirroring the advisor-drop and operator-drop paths exactly), then
+        ``COMMAND_EXECUTED`` and ``transition_to(COOLING)``. The evaluation is
+        persisted like every other drop path (#167 trace parity).
+
+        **Invariants held (unchanged by this method):** the operator's manual
+        DROP BEANS stays UN-gated (the backstop, ``operator_drop_beans``,
+        unaffected); the 196 °C bitter ceiling / emergency-drop bound / e-stop
+        live in ``SafetyPolicy``'s temperature rules (``_evaluate_safety``),
+        which run earlier in ``tick()`` and are untouched here; the drop routes
+        through the existing ``evaluate_drop_recommendation`` + executor path,
+        not a new one; emergency stop remains reachable from every phase (this
+        method issues ``drop_beans`` only, never touches e-stop); a restart
+        never auto-resumes into this path (``recover_from_restart`` always
+        lands in ``operator_recovery_required``, and an operator resume into
+        DEVELOPMENT leaves ``_post_fc_engaged`` False, so this method stays
+        inert there — the advisor-only drop path is the resume fallback,
+        exactly as it is for the RoR loop).
+
+        Args:
+            telemetry: The reading this tick consumed, or ``None`` on a
+                failed/sessionless read (the anchor does not fire either way —
+                bean temperature is unknown).
+        """
+        config = self._config.post_first_crack_control
+        if (
+            not config.enabled
+            or not self._post_fc_engaged
+            or self._phase is not RoastPhase.DEVELOPMENT
+            or self._profile is None
+            or telemetry is None
+        ):
+            return
+        system_dev_percent = self._development_percent()
+        if system_dev_percent is None:
+            # Fail safe: never drop on unknown development. Mirrors the
+            # coherence guard's fail-OPEN-for-the-advisor / fail-CLOSED-for-
+            # this-anchor asymmetry — the advisor path fails open (lets the
+            # model's drop through) when development is unknown because the
+            # safety box still owns the phase boundary there, but THIS anchor
+            # only ever produces a drop, never blocks one, so failing closed
+            # (no-op) is the safe direction.
+            return
+        if (
+            telemetry.bean_temp_c < self._profile.target_drop_temp_c
+            or system_dev_percent < self._profile.target_development_percent
+        ):
+            return
+        drop = self._safety.evaluate_drop_recommendation(phase=self._phase)
+        await self._snapshots.persist_evaluation(drop)
+        # evaluate_drop_recommendation ALLOWs unconditionally in DEVELOPMENT (the
+        # sole phase this method actuates in) — the REJECT/false branch here is
+        # unreachable today. Kept (not collapsed) as the safety boundary if a
+        # future phase becomes reachable by this anchor; the un-taken branch is
+        # pragma'd, not the guard logic (mirrors the identical advisor-drop
+        # pattern in ``_run_advisory``).
+        if drop.verdict is not SafetyVerdict.ALLOW:  # pragma: no cover — see above
+            return
+        try:
+            await self._executor.drop_beans()
+        except Exception:
+            self._events.emit(
+                RoastEventKind.COMMAND_FAILED,
+                {"command": "drop_beans", "source": "policy"},
+            )
+            return
+        self._events.emit(
+            RoastEventKind.COMMAND_EXECUTED,
+            {"command": "drop_beans", "source": "policy"},
+        )
+        self.transition_to(RoastPhase.COOLING)
 
     async def _apply_phase_rules(self, telemetry: RoastTelemetry | None) -> None:
         """MCP-driven phase rules: preheating (E4-S3) and roasting (E4-S4).
