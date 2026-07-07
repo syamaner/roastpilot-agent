@@ -102,7 +102,49 @@
 
 ## Active Context
 
-**1 Jul 2026 (latest) — TIER-1 AUTONOMOUS FIX BATCH COMPLETE. All 7 follow-up issues merged
+**2 Jul 2026 (latest) — #405 POST-FC CONTROL REDESIGN: BUILD COMPLETE, behind a flag (default OFF).
+All four slices merged; the only remaining step is the ENABLE-FLIP, which is gated on a supervised
+hardware roast. Design is plan-repo D82/D83/D84.** (registry synced 7 Jul.) #405 replaces the
+advisor-driven post-FC brake (which over-cut in roasts 7/8 → under-temp drops) with a deterministic
+post-FC control regime, all gated behind `controller.post_first_crack_control.enabled` (**default
+`False` = byte-for-byte today's fully-advisor post-FC — nothing is live**). What merged to `main`:
+
+- **Slice A (#455)** — `RoastStyle` roast-style vocabulary (plain `Enum` LIGHT/MEDIUM/DARK →
+  drop_temp_c/dtr_target seeds; optional `roast_style` profile field). Additive, back-compat.
+- **Slice B1 (#456)** — the pure PI RoR-target controller (`post_fc_control.py`): EMA-smoothed RoR,
+  deadband, conditional-integration anti-windup, bumpless-transfer reset, clamp `[floor≥1, ceiling]`
+  (crash-to-0 structurally impossible), deterministic (dt passed in). INERT until B2.
+- **Slice B2 (#457)** — wires the loop into the DEVELOPMENT tick: the controller owns heat (PI loop) +
+  fan (pinned), the advisor's post-FC levers are gated off when the loop is active (`should_drop`
+  still honored), safety box floor/target built FROM the actuated PI output (#412 told==enforced),
+  loop state advances only on an actually-executed write, bumpless `reset()` at the true FC edge.
+- **Slice C (#458)** — the deterministic drop anchor: fires `drop_beans` when
+  `bean_temp ≥ target_drop_temp_c AND system_dev% ≥ target_development_percent` (the SYSTEM
+  development %, never the advisor's claimed number), gated behind the same flag+engaged bundle.
+  Precedence (D84): the profile's EXPLICIT drop targets are authoritative; `roast_style` is a UI
+  seed/fallback, so existing profiles are unchanged. LLM-earlier-only: the advisor `should_drop` +
+  #313 coherence path is the earlier window; the anchor caps the drop at target, so the LLM can only
+  pull the drop earlier, never delay.
+
+**Remaining (the sole open #405 work): the ENABLE-FLIP** — flip `post_first_crack_control.enabled`
+default → `True` and tune the conservative PI gains (kp 3.0 / ki 0.1 / target 8 °C·min⁻¹ / floor 25 /
+fan 40) on real thermal response. **Gated on a supervised hardware roast** — a replay/bake-off cannot
+validate a closed loop that changes the trajectory (D34/D35a), so hardware is the tuning + sign-off
+gate. Tracked as its own issue; #405 stays **In Progress** until the flip lands and validates. Route
+the flip PR through safety-reviewer (Opus) + the full roster. A non-blocking follow-up noted on #457:
+under a misconfigured `min_seconds_between_commands > control_interval_seconds` the loop retries +
+re-persists a REJECT every 1 s (DB-write volume only, not reachable with defaults).
+
+**Process note — the layered review earned its keep:** the independent roster caught a real
+control-path bug on 3 of the 4 slices, each the told≠enforced/#412 class, all fixed pre-merge, each
+missed by the *other* lenses (B1: safety-reviewer fuzzed a mislabeled `# pragma: no cover`; B2:
+safety-reviewer caught a resume-edge phantom seed + false-invariant docstring; B2: **Codex** caught an
+actuator-failure phantom advance that safety-reviewer + qa + sim + Claude-review all missed). Run the
+same full roster on the enable-flip (the riskiest step). **This does not change other priorities.**
+
+---
+
+**1 Jul 2026 — TIER-1 AUTONOMOUS FIX BATCH COMPLETE. All 7 follow-up issues merged
 (#404, #439, #426, #423, #412, #409, #443) across two parallel tracks — config cluster (Track A)
 and live-view (Track B) — each in its own git worktree, lead-plus-subagents.** One PR per issue,
 domain reviewer + qa run on the branch BEFORE opening (shift-left), codex advisory-but-triaged
