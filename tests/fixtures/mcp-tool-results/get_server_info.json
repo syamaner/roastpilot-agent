@@ -12,7 +12,8 @@
     "start_cooling",
     "stop_cooling",
     "export_roast_log",
-    "emergency_stop"
+    "emergency_stop",
+    "set_recording_metadata"
   ],
   "bootstrap_safe": true,
   "current_phase": "bootstrap",
@@ -20,7 +21,7 @@
   "package_name": "coffee-roaster-mcp",
   "product_name": "RoastPilot",
   "roaster_driver": "mock",
-  "started_at_utc": "2026-06-07T15:08:32.442749+00:00",
+  "started_at_utc": "2026-07-07T12:47:52.123971+00:00",
   "transport": "stdio",
-  "version": "0.1.3"
+  "version": "0.1.12"
 }
