@@ -106,6 +106,21 @@ SESSION_STATE_PAYLOAD: dict[str, object] = {
         "dropped_window_count": 0,
         "processed_window_count": 311,
     },
+    # #342 (D85): the 0.1.12 ambient triad. The 7 Jun 2026 fixture predates
+    # ambient (0.1.11-era export); this key is added so the fixture validates
+    # against the current (0.1.12) required RoastSessionState shape — it is not
+    # part of the original live-roast capture. A hardware-representative "ok"
+    # reading (matching the live validation read: 28.49 C / 38.6% / 1008.56 hPa).
+    "ambient_status": {
+        "mode": "yoctopuce",
+        "status": "ok",
+        "reason": None,
+        "ambient_running": True,
+        "temperature_c": 28.49,
+        "humidity_percent": 38.6,
+        "pressure_hpa": 1008.56,
+        "last_reading_monotonic_seconds": 1200.0,
+    },
     "events": [
         {
             "kind": "beans_added",
@@ -304,6 +319,37 @@ def test_session_state_mirror_round_trips() -> None:
     assert state.t0_status.status == "detected"
     assert state.first_crack_status.emitted_window_count == 311
     assert state.development_percent == 3.6  # passed through, not recomputed
+    # #342 (D85): the ambient triad mirrors the MCP's 0.1.12 wire shape byte-for-byte.
+    assert state.ambient_status.mode == "yoctopuce"
+    assert state.ambient_status.status == "ok"
+    assert state.ambient_status.temperature_c == 28.49
+    assert state.ambient_status.humidity_percent == 38.6
+    assert state.ambient_status.pressure_hpa == 1008.56
+
+
+def test_ambient_status_mirror_round_trips_unavailable() -> None:
+    """#342: an unavailable/disabled MCP ambient config round-trips with every
+    numeric field null and a human-readable ``reason`` — the fail-soft contract."""
+    payload = _state_payload(
+        0.0,
+        ambient_status={
+            "mode": "disabled",
+            "status": "disabled",
+            "reason": "Ambient sensing is disabled by configuration.",
+            "ambient_running": False,
+            "temperature_c": None,
+            "humidity_percent": None,
+            "pressure_hpa": None,
+            "last_reading_monotonic_seconds": None,
+        },
+    )
+    state = RoastSessionState.model_validate(payload)
+    assert state.ambient_status.mode == "disabled"
+    assert state.ambient_status.status == "disabled"
+    assert state.ambient_status.reason == "Ambient sensing is disabled by configuration."
+    assert state.ambient_status.temperature_c is None
+    assert state.ambient_status.humidity_percent is None
+    assert state.ambient_status.pressure_hpa is None
 
 
 def test_mirrors_tolerate_new_upstream_fields() -> None:

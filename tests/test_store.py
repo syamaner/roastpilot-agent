@@ -228,6 +228,105 @@ async def test_v8_rebuild_preserves_existing_roast_events(
 
 
 @pytest.mark.asyncio
+async def test_v9_migration_adds_nullable_ambient_columns_back_compat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#342 (D85): a pre-v9 run upgrades cleanly and reads back NULL ambient
+    (back-compat) until :meth:`RoastStore.set_ambient` is called."""
+    pre_v9 = MIGRATIONS[:8]  # V1..V8 (before the ambient columns)
+    assert len(pre_v9) == 8
+    db_path = tmp_path / "v9upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", pre_v9)
+    old = RoastStore(db_path=db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 8
+        await seeded_store(old)
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path=db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == len(MIGRATIONS)
+        # The pre-existing row reads back NULL ambient (back-compat).
+        detail = await upgraded.read_run("run-1")
+        assert detail is not None
+        assert detail.ambient_temp_c is None
+        assert detail.ambient_humidity_pct is None
+        assert detail.ambient_pressure_hpa is None
+        summaries = await upgraded.list_runs()
+        summary = next(s for s in summaries if s.id == "run-1")
+        assert summary.ambient_temp_c is None
+        assert summary.ambient_humidity_pct is None
+        assert summary.ambient_pressure_hpa is None
+        # And the new column now accepts a write.
+        await upgraded.set_ambient(
+            "run-1", temperature_c=28.49, humidity_percent=38.6, pressure_hpa=1008.56
+        )
+        after = await upgraded.read_run("run-1")
+        assert after is not None
+        assert after.ambient_temp_c == pytest.approx(28.49)
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_set_ambient_persists_and_reads_back(tmp_store: RoastStore) -> None:
+    """#342: the ambient triad round-trips through both the detail and summary
+    read paths."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.set_ambient(
+            "run-1", temperature_c=28.49, humidity_percent=38.6, pressure_hpa=1008.56
+        )
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.ambient_temp_c == pytest.approx(28.49)
+        assert detail.ambient_humidity_pct == pytest.approx(38.6)
+        assert detail.ambient_pressure_hpa == pytest.approx(1008.56)
+
+        summaries = await tmp_store.list_runs()
+        summary = next(s for s in summaries if s.id == "run-1")
+        assert summary.ambient_temp_c == pytest.approx(28.49)
+        assert summary.ambient_humidity_pct == pytest.approx(38.6)
+        assert summary.ambient_pressure_hpa == pytest.approx(1008.56)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_ambient_persists_nulls_when_unavailable(tmp_store: RoastStore) -> None:
+    """#342: an unavailable/disabled MCP ambient config persists nulls, never
+    raises — the fail-soft contract, store-side."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.set_ambient(
+            "run-1", temperature_c=None, humidity_percent=None, pressure_hpa=None
+        )
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.ambient_temp_c is None
+        assert detail.ambient_humidity_pct is None
+        assert detail.ambient_pressure_hpa is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_ambient_on_unknown_run_raises(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no roast_run"):
+            await tmp_store.set_ambient(
+                "ghost-run", temperature_c=28.49, humidity_percent=38.6, pressure_hpa=1008.56
+            )
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_foreign_keys_are_enforced(tmp_store: RoastStore) -> None:
     await tmp_store.initialize()
     try:

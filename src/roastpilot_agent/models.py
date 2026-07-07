@@ -817,6 +817,14 @@ class RoastSummary(BaseModel):
     advisor_failed: int = 0
     """Of this run's consults, how many did NOT return a usable decision (#184) —
     a ``timeout`` / ``malformed`` / ``provider_error`` status. ``0`` when none."""
+    ambient_temp_c: float | None = None
+    """Ambient temperature in Celsius, captured once at charge (#342, D85), or
+    ``None`` when never captured. See :attr:`RoastDetail.ambient_temp_c`."""
+    ambient_humidity_pct: float | None = None
+    """Ambient relative humidity percentage at charge (#342, D85), or ``None``."""
+    ambient_pressure_hpa: float | None = None
+    """Ambient barometric pressure in hectopascals at charge (#342, D85), or
+    ``None``."""
 
 
 class RoastHistory(BaseModel):
@@ -901,6 +909,17 @@ class RoastDetail(BaseModel):
     read-only to render the mic icon. Populated only for the *active* run from
     the live MCP first-crack status; ``None`` for historical runs read from the
     store (the capture-alive status is transient, not persisted)."""
+    ambient_temp_c: float | None = None
+    """Ambient temperature in Celsius, captured once at charge (#342, D85), or
+    ``None`` when never captured (an ambient-disabled/unavailable MCP config, a
+    pre-charge run, or a pre-#342 row). Read-only corpus metadata: the MCP owns
+    ambient, no safety gate or control path reads this field."""
+    ambient_humidity_pct: float | None = None
+    """Ambient relative humidity percentage at charge (#342, D85), or ``None``
+    — same capture/back-compat rules as :attr:`ambient_temp_c`."""
+    ambient_pressure_hpa: float | None = None
+    """Ambient barometric pressure in hectopascals at charge (#342, D85), or
+    ``None`` — same capture/back-compat rules as :attr:`ambient_temp_c`."""
 
 
 class TelemetryPoint(BaseModel):
