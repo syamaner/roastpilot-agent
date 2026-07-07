@@ -563,6 +563,14 @@ class RoastRunner:
         # clock stamped, so a later restart→resume can restore the advisory DTR
         # clock. A restore on recovery seeds this True so it is never re-stamped.
         self._t0_persisted = False
+        # Whether the ambient (temperature/humidity/pressure) reading has been
+        # persisted for this run (#342, D85). Written once, the same tick as
+        # ``_t0_persisted`` first goes True (the debounced charge transition) —
+        # mirrors that latch's lifecycle exactly, but is its own flag because a
+        # `None` ambient reading (probe disabled/unavailable) is itself a valid
+        # persisted value and so cannot double as a "not yet written" sentinel
+        # the way ``t0_detected_at_utc IS NULL`` does for the T0 write-once guard.
+        self._ambient_persisted = False
         self._scheduler: TickScheduler | None = None
 
     async def start(self, profile: RoastProfile, *, recording_roast_num: int | None = None) -> None:
@@ -588,6 +596,7 @@ class RoastRunner:
         persisted_phase: RoastPhase,
         *,
         t0_detected_at_utc: str | None = None,
+        ambient_captured: bool = False,
     ) -> None:
         """Restart into recovery: classify the persisted run into
         ``operator_recovery_required`` without resuming heat or fan, persist the
@@ -600,11 +609,21 @@ class RoastRunner:
         later operator-resume into pre-FC/development keeps a non-zero
         seconds-since-charge denominator. The restore seeds ``_t0_persisted`` so
         the live tick never re-stamps it, and is advisory/display-only — it
-        touches no transition, verdict, or hardware write."""
+        touches no transition, verdict, or hardware write.
+
+        ``ambient_captured`` (#342, D85) mirrors that seeding for the ambient
+        triad: restoring the charge clock makes ``snapshot.charge_detected``
+        true again on the very next tick, which would otherwise re-fire the
+        once-only ambient capture and potentially overwrite a good pre-restart
+        corpus reading with a transient post-restart probe hiccup. Seeding
+        ``_ambient_persisted`` from the persisted run's already-captured state
+        keeps the capture genuinely once-per-run across a restart."""
         self._controller.load_profile(profile)
         if t0_detected_at_utc is not None:
             self._controller.restore_charge_clock(t0_detected_at_utc)
             self._t0_persisted = True
+        if ambient_captured:
+            self._ambient_persisted = True
         await self._controller.recover_from_restart(persisted_phase)
         await self._flush_events()
         await self._persist_phase_if_changed()
@@ -1066,6 +1085,45 @@ class RoastRunner:
             return
         self._t0_persisted = True
 
+    async def _persist_ambient_if_charged(self, snapshot: ControllerSnapshot) -> None:
+        """Persist the MCP-owned ambient reading once, at charge (#342, D85).
+
+        Mirrors :meth:`_persist_t0_if_charged` exactly: fires the same tick the
+        controller first reports its charge clock stamped, reads the ambient
+        triad off the *already-available* raw MCP state (``self._raw_state``,
+        the same ``RoastSessionState`` :meth:`_live_mic_status` projects
+        ``mic_status`` from — no redundant extra MCP round-trip), and swallows
+        any store error so a bad write never crashes the safety tick. Read-only
+        corpus metadata: no safety gate, transition, or advisor context ever
+        reads the persisted columns, so the only cost of a failure here is a
+        run's ambient triad reading back ``None``.
+
+        Only a ``status == "ok"`` reading persists real values; a
+        ``"disabled"``/``"unavailable"`` MCP ambient config persists nulls (the
+        MCP's own fail-soft contract — never a fault or a recovery)."""
+        if self._ambient_persisted or not snapshot.charge_detected:
+            return
+        state = None if self._raw_state is None else self._raw_state.last_state
+        if state is None:
+            return
+        ambient = state.ambient_status
+        temperature_c = ambient.temperature_c if ambient.status == "ok" else None
+        humidity_percent = ambient.humidity_percent if ambient.status == "ok" else None
+        pressure_hpa = ambient.pressure_hpa if ambient.status == "ok" else None
+        try:
+            await self._store.set_ambient(
+                self._run_id,
+                temperature_c=temperature_c,
+                humidity_percent=humidity_percent,
+                pressure_hpa=pressure_hpa,
+            )
+        except Exception:
+            # Fail-safe: a store error on this corpus-only breadcrumb must never
+            # crash the safety tick; the only cost is this run's ambient triad
+            # reading back None (see test_ambient_capture_is_fail_soft_on_store_error).
+            return
+        self._ambient_persisted = True
+
     @staticmethod
     def _backdated_charge_utc(charge_elapsed_seconds: float | None) -> str | None:
         """Reconstruct the backdated charge UTC from the charge-referenced clock.
@@ -1108,6 +1166,7 @@ class RoastRunner:
     async def _publish_and_persist_telemetry(self) -> None:
         snapshot = self._controller.snapshot()
         await self._persist_t0_if_charged(snapshot)
+        await self._persist_ambient_if_charged(snapshot)
         telemetry = snapshot.telemetry
         raw = None if self._raw_state is None else self._raw_state.last_state
         if telemetry is not None:
@@ -1662,6 +1721,7 @@ class RoastService:
             persisted.profile,
             persisted.agent_phase,
             t0_detected_at_utc=persisted.t0_detected_at_utc,
+            ambient_captured=persisted.ambient_captured,
         )
         if self._run_loop:
             self._loop_task = asyncio.create_task(runner.run())

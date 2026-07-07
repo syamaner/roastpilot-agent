@@ -1,6 +1,9 @@
 {
   "roast_detail": {
     "agent_phase": "complete",
+    "ambient_humidity_pct": null,
+    "ambient_pressure_hpa": null,
+    "ambient_temp_c": null,
     "completed_at_utc": "2026-01-01T00:00:00+00:00",
     "enabled_actions": [
       "pause_advisory",
@@ -57,6 +60,9 @@
     "advisor_rejected": 0,
     "agent_phase": "complete",
     "altitude_m": null,
+    "ambient_humidity_pct": null,
+    "ambient_pressure_hpa": null,
+    "ambient_temp_c": null,
     "bean_origin": "Replay (recorded roast)",
     "bean_species": null,
     "bean_varietal": null,

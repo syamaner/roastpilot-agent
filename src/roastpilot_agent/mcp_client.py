@@ -11,7 +11,10 @@ mcp-contract-checker confirmed) and validated against the
 7 Jun 2026 live-roast exports. The mirrors use ``extra="ignore"`` so new optional
 upstream fields never break the agent — drift is detected by the
 mcp-contract-checker sub-agent and the contract fixtures (E5-S3), not by
-runtime crashes.
+runtime crashes. v0.1.12 adds ``ambient_status`` to ``get_roast_state``'s
+session state (#342, D85 — read-only corpus metadata: temperature/humidity/
+pressure from an optional Yoctopuce probe; no tool-surface change, hardware-
+validated on a live read).
 
 E5-S2 adds the transport: the client owns the MCP child process (D6 —
 spawn `coffee-roaster-mcp serve`, health, per-call timeouts,
@@ -67,6 +70,11 @@ FirstCrackRuntimeStatus = Literal[
 ]
 T0RuntimeStatus = Literal["disabled", "pending", "detected", "unavailable"]
 EventPayloadValue = str | int | float | bool | None
+
+#: #342 (D85): ambient is MCP-owned corpus metadata — the agent only mirrors and
+#: stores the reading, never gates on it.
+AmbientMode = Literal["disabled", "yoctopuce"]
+AmbientRuntimeStatus = Literal["disabled", "unavailable", "ok"]
 
 
 class MCPMirror(BaseModel):
@@ -148,6 +156,30 @@ class T0Status(MCPMirror):
     reason: str | None = None
 
 
+class AmbientStatus(MCPMirror):
+    """Mirror of mcp_server.AmbientStatus (#342, D85 — 0.1.12).
+
+    Ambient (temperature/humidity/pressure) is MCP-owned corpus metadata: a
+    read-only projection the agent mirrors byte-for-byte and, once per run at
+    charge, persists onto ``roast_runs`` (:meth:`RoastStore.set_ambient`). It
+    carries no safety or control significance — no safety gate, transition, or
+    advisor context reads it — so a probe fault degrades to ``"unavailable"``
+    and the agent fails soft (nulls persisted, roast unaffected), never a fault
+    or a recovery.
+
+    Hardware-validated on a live Yoctopuce Yocto-Meteo-V2-C read (28.49 °C /
+    38.6 % / 1008.56 hPa)."""
+
+    mode: AmbientMode
+    status: AmbientRuntimeStatus
+    reason: str | None = None
+    ambient_running: bool = False
+    temperature_c: float | None = None
+    humidity_percent: float | None = None
+    pressure_hpa: float | None = None
+    last_reading_monotonic_seconds: float | None = None
+
+
 class RoastSessionState(MCPMirror):
     """Mirror of mcp_server.RoastSessionState — the get_roast_state result
     the controller's tick consumes (via RoastTelemetry projection)."""
@@ -183,6 +215,7 @@ class RoastSessionState(MCPMirror):
     device_state: RoasterDeviceState | None
     t0_status: T0Status
     first_crack_status: FirstCrackStatus
+    ambient_status: AmbientStatus
     events: tuple[EventSnapshot, ...]
     log_dir: str | None
 

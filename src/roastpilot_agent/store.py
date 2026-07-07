@@ -346,6 +346,21 @@ ALTER TABLE roast_events_new RENAME TO roast_events;
 CREATE INDEX idx_roast_events_run_kind ON roast_events(run_id, kind);
 """
 
+SCHEMA_V9_AMBIENT = """
+-- #342 (D85): mirror + store the MCP-owned ambient reading (temperature/
+-- humidity/pressure from an optional Yoctopuce probe) captured ONCE at charge
+-- (api._persist_ambient_if_charged). Read-only corpus metadata — nullable,
+-- advisory/display-only: no safety gate, transition, or advisor context reads
+-- these columns. NULL for a pre-existing row, an ambient-disabled/unavailable
+-- MCP config, or a run that never charged. Written on an ACTIVE (not-yet-
+-- completed) run, exactly once — like t0_detected_at_utc (SCHEMA_V3) — so it is
+-- intentionally OUTSIDE the v2 completed-run immutability set: the immutability
+-- trigger never needs to guard it.
+ALTER TABLE roast_runs ADD COLUMN ambient_temp_c REAL;
+ALTER TABLE roast_runs ADD COLUMN ambient_humidity_pct REAL;
+ALTER TABLE roast_runs ADD COLUMN ambient_pressure_hpa REAL;
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
@@ -358,6 +373,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V6_DRYING_END_EVENT,
     SCHEMA_V7_ROASTED_WEIGHT,
     SCHEMA_V8_TURNING_POINT_EVENT,
+    SCHEMA_V9_AMBIENT,
 )
 
 
@@ -386,6 +402,13 @@ class PersistedRun(BaseModel):
     #: ``None`` when the run never charged or predates the v3 column. Recovery
     #: restores the advisory DTR clock from it; nothing safety-gating reads it.
     t0_detected_at_utc: str | None = None
+    #: Whether the ambient triad was already persisted for this run pre-restart
+    #: (#342, D85) — ``True`` iff ``ambient_temp_c`` is non-NULL. Recovery seeds
+    #: the runner's once-only latch from this so a resumed already-charged run
+    #: never re-captures (and potentially overwrites a good corpus reading with
+    #: a transient post-restart probe hiccup). Corpus-only; nothing
+    #: safety-gating reads it.
+    ambient_captured: bool = False
 
 
 class RoastStore:
@@ -632,6 +655,49 @@ class RoastStore:
             if row is None:
                 raise RuntimeError(f"no roast_run with id {run_id!r}")
 
+    async def set_ambient(
+        self,
+        run_id: str,
+        *,
+        temperature_c: float | None,
+        humidity_percent: float | None,
+        pressure_hpa: float | None,
+    ) -> None:
+        """Persist the ambient reading captured once at charge (#342, D85).
+
+        The MCP owns ambient (temperature/humidity/pressure, an optional
+        Yoctopuce probe); this stores a single reading snapshot on
+        ``roast_runs`` for the corpus. Read-only corpus metadata — no safety
+        gate, transition, or advisor context ever reads these columns (fail-soft
+        by design, mirroring the MCP's own ``AmbientStatus``: an unavailable /
+        disabled probe persists ``None`` for all three fields rather than
+        raising).
+
+        Written once, on the ACTIVE run, the first tick the runner observes the
+        charge/T0 transition (mirroring :meth:`record_t0_detected_at`'s
+        lifecycle) — the *caller* (``api._persist_ambient_if_charged``) owns the
+        once-only latch, since a ``None`` reading is itself a valid persisted
+        value and so cannot double as a "not yet written" sentinel the way
+        ``t0_detected_at_utc IS NULL`` does. A missing run is a programming
+        error and raises, like :meth:`record_t0_detected_at`.
+
+        Args:
+            run_id: The active run whose ambient reading is being stamped.
+            temperature_c: Ambient temperature in Celsius, or ``None`` when the
+                probe is unavailable/disabled.
+            humidity_percent: Ambient relative humidity percentage, or ``None``.
+            pressure_hpa: Ambient barometric pressure in hectopascals, or
+                ``None``.
+        """
+        cursor = await self.connection.execute(
+            "UPDATE roast_runs SET ambient_temp_c = ?, ambient_humidity_pct = ?,"
+            " ambient_pressure_hpa = ?, updated_at_utc = ? WHERE id = ?",
+            (temperature_c, humidity_percent, pressure_hpa, _utc_now(), run_id),
+        )
+        await self.connection.commit()
+        if cursor.rowcount == 0:
+            raise RuntimeError(f"no roast_run with id {run_id!r}")
+
     async def record_event(
         self,
         *,
@@ -842,6 +908,15 @@ class RoastStore:
     def _dump(model: BaseModel) -> dict[str, object]:
         return model.model_dump(mode="json")
 
+    @staticmethod
+    def _optional_float(value: object) -> float | None:
+        """Read a nullable numeric SQLite column as ``float | None``.
+
+        Shared by every optional REAL projection (roasted weight, ambient
+        triad, #342) so a ``None`` row value stays ``None`` rather than
+        coercing to ``0.0``."""
+        return None if value is None else float(cast("float", value))
+
     # --- E6-S3: recovery reads, run completion, immutability exceptions ---
 
     async def read_latest_run(self) -> PersistedRun | None:
@@ -850,7 +925,7 @@ class RoastStore:
         fresh database."""
         async with self.connection.execute(
             "SELECT id, agent_phase, outcome, started_at_utc, completed_at_utc,"
-            " t0_detected_at_utc, profile_json FROM roast_runs"
+            " t0_detected_at_utc, ambient_temp_c, profile_json FROM roast_runs"
             " ORDER BY started_at_utc DESC, rowid DESC LIMIT 1"
         ) as cursor:
             row = await cursor.fetchone()
@@ -867,6 +942,7 @@ class RoastStore:
             t0_detected_at_utc=None
             if row["t0_detected_at_utc"] is None
             else str(row["t0_detected_at_utc"]),
+            ambient_captured=row["ambient_temp_c"] is not None,
             profile=RoastProfile.model_validate_json(str(row["profile_json"])),
         )
 
@@ -1053,6 +1129,7 @@ class RoastStore:
         async with self.connection.execute(
             "SELECT r.id, r.started_at_utc, r.completed_at_utc, r.agent_phase,"
             " r.outcome, r.profile_json, r.operator_rating, r.roasted_weight_grams,"
+            " r.ambient_temp_c, r.ambient_humidity_pct, r.ambient_pressure_hpa,"
             " (SELECT t.development_percent FROM telemetry_snapshots t"
             "  WHERE t.run_id = r.id AND t.development_percent IS NOT NULL"
             "  ORDER BY t.tick DESC LIMIT 1) AS dev_pct,"
@@ -1081,9 +1158,7 @@ class RoastStore:
         summaries: list[RoastSummary] = []
         for row in rows:
             profile = RoastProfile.model_validate_json(str(row["profile_json"]))
-            roasted_weight = (
-                None if row["roasted_weight_grams"] is None else float(row["roasted_weight_grams"])
-            )
+            roasted_weight = self._optional_float(row["roasted_weight_grams"])
             summaries.append(
                 RoastSummary(
                     id=str(row["id"]),
@@ -1112,6 +1187,9 @@ class RoastStore:
                     advisor_failed=int(row["advisor_failed"]),
                     advisor_clamped=int(row["advisor_clamped"]),
                     advisor_rejected=int(row["advisor_rejected"]),
+                    ambient_temp_c=self._optional_float(row["ambient_temp_c"]),
+                    ambient_humidity_pct=self._optional_float(row["ambient_humidity_pct"]),
+                    ambient_pressure_hpa=self._optional_float(row["ambient_pressure_hpa"]),
                 )
             )
         return summaries
@@ -1122,7 +1200,8 @@ class RoastStore:
         async with self.connection.execute(
             "SELECT id, agent_phase, profile_json, outcome, started_at_utc,"
             " completed_at_utc, fault_reason, operator_rating, operator_notes,"
-            " roasted_weight_grams, export_manifest_json FROM roast_runs WHERE id = ?",
+            " roasted_weight_grams, ambient_temp_c, ambient_humidity_pct,"
+            " ambient_pressure_hpa, export_manifest_json FROM roast_runs WHERE id = ?",
             (run_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -1135,9 +1214,7 @@ class RoastStore:
         )
         agent_phase = RoastPhase(str(row["agent_phase"]))
         profile = RoastProfile.model_validate_json(str(row["profile_json"]))
-        roasted_weight = (
-            None if row["roasted_weight_grams"] is None else float(row["roasted_weight_grams"])
-        )
+        roasted_weight = self._optional_float(row["roasted_weight_grams"])
         return RoastDetail(
             id=str(row["id"]),
             agent_phase=agent_phase,
@@ -1159,6 +1236,9 @@ class RoastStore:
             # Derived read-only from the phase (E10 option (a)): the SPA's action
             # bar mirrors this set; the live SSE phase_changed frame re-sends it.
             enabled_actions=enabled_operator_actions(agent_phase),
+            ambient_temp_c=self._optional_float(row["ambient_temp_c"]),
+            ambient_humidity_pct=self._optional_float(row["ambient_humidity_pct"]),
+            ambient_pressure_hpa=self._optional_float(row["ambient_pressure_hpa"]),
         )
 
     async def read_telemetry_points(

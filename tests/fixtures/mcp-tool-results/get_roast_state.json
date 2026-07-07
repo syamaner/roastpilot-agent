@@ -1,9 +1,19 @@
 {
   "active": true,
+  "ambient_status": {
+    "ambient_running": false,
+    "humidity_percent": null,
+    "last_reading_monotonic_seconds": null,
+    "mode": "disabled",
+    "pressure_hpa": null,
+    "reason": "Ambient sensing is disabled by configuration.",
+    "status": "disabled",
+    "temperature_c": null
+  },
   "bean_ror_c_per_min": null,
   "bean_temp_delta_60s_c": null,
-  "beans_added_at_utc": "2026-06-07T15:08:32.499461+00:00",
-  "beans_added_monotonic_seconds": 0.038010125019354746,
+  "beans_added_at_utc": "2026-07-07T12:47:52.192447+00:00",
+  "beans_added_monotonic_seconds": 0.04832733306102455,
   "beans_dropped_at_utc": null,
   "beans_dropped_monotonic_seconds": null,
   "cooling_on": false,
@@ -11,7 +21,7 @@
   "cooling_started_monotonic_seconds": null,
   "cooling_stopped_at_utc": null,
   "cooling_stopped_monotonic_seconds": null,
-  "created_at_utc": "2026-06-07T15:08:32.461453+00:00",
+  "created_at_utc": "2026-07-07T12:47:52.144118+00:00",
   "development_percent": null,
   "development_time_seconds": null,
   "device_state": {
@@ -28,15 +38,15 @@
       "telemetry_model": "fixed_step_thermal_v1"
     }
   },
-  "elapsed_monotonic_seconds": 0.043,
+  "elapsed_monotonic_seconds": 0.054,
   "env_ror_c_per_min": null,
   "env_temp_delta_60s_c": null,
   "events": [
     {
       "kind": "beans_added",
-      "monotonic_seconds": 0.038010125019354746,
+      "monotonic_seconds": 0.04832733306102455,
       "payload": {},
-      "recorded_at_utc": "2026-06-07T15:08:32.499461+00:00"
+      "recorded_at_utc": "2026-07-07T12:47:52.192447+00:00"
     }
   ],
   "fan_level_percent": 40,
@@ -51,6 +61,8 @@
     "detected_monotonic_seconds": null,
     "dropped_window_count": 0,
     "emitted_window_count": 0,
+    "mic_peak_dbfs": null,
+    "mic_rms_dbfs": null,
     "mode": "disabled",
     "processed_window_count": 0,
     "queued_window_count": 0,
@@ -58,10 +70,10 @@
     "status": "disabled"
   },
   "heat_level_percent": 70,
-  "log_dir": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpmsfxwelh/logs/roasts/fc2f682b89344ab58437fbfc007f7f3b",
+  "log_dir": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpagyg2obs/logs/roasts/70b1961904854371b791292b1f8e452d",
   "phase": "roasting",
-  "roast_elapsed_seconds": 0.005,
-  "session_id": "fc2f682b89344ab58437fbfc007f7f3b",
+  "roast_elapsed_seconds": 0.006,
+  "session_id": "70b1961904854371b791292b1f8e452d",
   "stopped_at_utc": null,
   "t0_status": {
     "auto_detection_enabled": false,

@@ -135,11 +135,16 @@ dev = [
   # series + the negative-class training data are captured) — and adds live
   # in-session mic peak/RMS dBFS on the FirstCrackStatus readout (#178). Both
   # are agent-tolerated (the new mic_*_dbfs fields are extra="ignore" in the
-  # mirror; 14-tool surface unchanged). It pulls
+  # mirror; 14-tool surface unchanged). 0.1.12 adds `ambient_status` to
+  # `get_roast_state`'s session state (#342, D85) — read-only corpus metadata
+  # (temperature_c/humidity_percent/pressure_hpa from an optional Yoctopuce
+  # probe), mirrored byte-for-byte in mcp_client.AmbientStatus; no tool-surface
+  # change, hardware-validated on a live read (28.49 C / 38.6% / 1008.56 hPa).
+  # It pulls
   # heavy ML/audio deps
   # (transformers/onnxruntime/sounddevice) that mock mode never activates;
   # CI installs libportaudio2 for sounddevice's import.
-  "coffee-roaster-mcp==0.1.11",
+  "coffee-roaster-mcp==0.1.12",
   # Analysis-harness numeric core (scripts/curve_feature_eval.py, #229). numpy
   # is already present transitively (via the MCP server's ML stack), but the
   # curve-feature analysis imports it directly, so declare it explicitly here:

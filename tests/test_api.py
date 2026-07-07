@@ -37,7 +37,12 @@ from roastpilot_agent.api import (
     stream_events,
 )
 from roastpilot_agent.config import AppConfig, ControllerConfig
-from roastpilot_agent.mcp_client import FirstCrackStatus, MCPServerProcess, RoastSessionState
+from roastpilot_agent.mcp_client import (
+    AmbientStatus,
+    FirstCrackStatus,
+    MCPServerProcess,
+    RoastSessionState,
+)
 from roastpilot_agent.models import (
     MicHealth,
     OperatorAction,
@@ -1436,7 +1441,11 @@ def _live_decision() -> RoastDecision:
 
 
 async def _live_service(
-    store: RoastStore, *, mcp: FakeMCPClient, clock: FakeClock
+    store: RoastStore,
+    *,
+    mcp: FakeMCPClient,
+    clock: FakeClock,
+    raw_state: "_FakeRawState | None" = None,
 ) -> tuple[RoastService, str]:
     """Start a live (run_loop=False) service into preheating; return it + run id."""
     config = AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0))
@@ -1448,6 +1457,7 @@ async def _live_service(
         exporter=mcp,
         run_loop=False,
         clock=clock,
+        raw_state=raw_state,
     )
     detail = await service.start_roast(_profile())
     return service, detail.id
@@ -1509,8 +1519,40 @@ async def test_recording_roast_num_is_store_derived_per_origin(
     assert _start_session_roast_nums(mcp2) == [2]
 
 
-def _session_state(*, fc_status: str, audio_running: bool) -> RoastSessionState:
-    """A minimal valid ``RoastSessionState`` with the first-crack status set (#197)."""
+def _ambient_status(
+    *,
+    status: str = "ok",
+    temperature_c: float | None = 28.49,
+    humidity_percent: float | None = 38.6,
+    pressure_hpa: float | None = 1008.56,
+    reason: str | None = None,
+) -> AmbientStatus:
+    """An ``AmbientStatus`` mirror instance (#342, D85).
+
+    Defaults to an ``"ok"`` reading matching the hardware-validated live read
+    (28.49 C / 38.6% / 1008.56 hPa). Pass ``status="unavailable"`` (or
+    ``"disabled"``) with the numeric fields left ``None`` to exercise the
+    fail-soft no-reading case."""
+    return AmbientStatus(
+        mode="yoctopuce",
+        status=status,  # type: ignore[arg-type]  # parametrized over the Literal
+        reason=reason,
+        ambient_running=status == "ok",
+        temperature_c=temperature_c,
+        humidity_percent=humidity_percent,
+        pressure_hpa=pressure_hpa,
+        last_reading_monotonic_seconds=10.0 if status == "ok" else None,
+    )
+
+
+def _session_state(
+    *,
+    fc_status: str,
+    audio_running: bool,
+    ambient_status: AmbientStatus | None = None,
+) -> RoastSessionState:
+    """A minimal valid ``RoastSessionState`` with the first-crack status set (#197)
+    and the ambient status set (#342, D85; defaults to an ``"ok"`` reading)."""
     fc = FirstCrackStatus(
         mode="audio",
         status=fc_status,  # type: ignore[arg-type]  # parametrized over the Literal
@@ -1558,6 +1600,7 @@ def _session_state(*, fc_status: str, audio_running: bool) -> RoastSessionState:
             "detected_bean_temperature_c": None,
         },
         first_crack_status=fc,
+        ambient_status=ambient_status or _ambient_status(),
         events=(),
         log_dir=None,
     )
@@ -1572,6 +1615,10 @@ class _FakeRawState:
     @property
     def last_state(self) -> RoastSessionState | None:
         return self._state
+
+    def set_state(self, state: RoastSessionState | None) -> None:
+        """Swap the raw state a later tick observes (#342 once-only-latch test)."""
+        self._state = state
 
 
 @pytest.mark.asyncio
@@ -1880,6 +1927,117 @@ async def test_live_run_persists_t0_detected_at_on_charge(store: RoastStore) -> 
 
 
 @pytest.mark.asyncio
+async def test_live_run_persists_ambient_on_charge_when_ok(store: RoastStore) -> None:
+    """#342 (D85): the live runner persists the ambient triad once the controller
+    stamps its charge clock — mirroring the T0 capture (#235) — reading it off the
+    already-available raw MCP state (the same state ``mic_status`` projects from,
+    no extra MCP round-trip). A ``status == "ok"`` reading persists the real
+    values."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    raw_state = _FakeRawState(_session_state(fc_status="pending", audio_running=False))
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    # Not charged yet: no ambient persisted.
+    not_yet = await store.read_run(run_id)
+    assert not_yet is not None
+    assert not_yet.ambient_temp_c is None
+    # Debounce T0 into pre-first-crack (stamps the charge clock).
+    mcp.frames = [_reading(bean=178.0, env=185.0, t0_detected=True)]
+    for _ in range(ControllerConfig().t0_debounce_ticks + 1):
+        await _tick(service, clock)
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.agent_phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert detail.ambient_temp_c == pytest.approx(28.49)
+    assert detail.ambient_humidity_pct == pytest.approx(38.6)
+    assert detail.ambient_pressure_hpa == pytest.approx(1008.56)
+
+
+@pytest.mark.asyncio
+async def test_live_run_persists_null_ambient_when_unavailable(store: RoastStore) -> None:
+    """#342: an ``"unavailable"``/``"disabled"`` MCP ambient config persists nulls,
+    never raises, and the roast continues normally — the MCP's own fail-soft
+    contract, mirrored agent-side."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    unavailable = _ambient_status(
+        status="unavailable", temperature_c=None, humidity_percent=None, pressure_hpa=None
+    )
+    raw_state = _FakeRawState(
+        _session_state(fc_status="pending", audio_running=False, ambient_status=unavailable)
+    )
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    mcp.frames = [_reading(bean=178.0, env=185.0, t0_detected=True)]
+    for _ in range(ControllerConfig().t0_debounce_ticks + 1):
+        await _tick(service, clock)
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.agent_phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert detail.ambient_temp_c is None
+    assert detail.ambient_humidity_pct is None
+    assert detail.ambient_pressure_hpa is None
+
+
+@pytest.mark.asyncio
+async def test_ambient_capture_is_fail_soft_on_store_error(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#342: a ``set_ambient`` store failure never crashes the safety tick (mirrors
+    the ``_persist_t0_if_charged`` swallow behaviour) — the roast keeps advancing
+    and the run's ambient triad simply reads back ``None``."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    raw_state = _FakeRawState(_session_state(fc_status="pending", audio_running=False))
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+
+    async def _boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(store, "set_ambient", _boom)
+    mcp.frames = [_reading(bean=178.0, env=185.0, t0_detected=True)]
+    for _ in range(ControllerConfig().t0_debounce_ticks + 1):
+        finalized = await _tick(service, clock)
+        assert not finalized  # the tick keeps advancing, never crashes
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.agent_phase is RoastPhase.ROASTING_PRE_FIRST_CRACK  # roast unaffected
+    assert detail.ambient_temp_c is None  # the failed write never landed
+
+
+@pytest.mark.asyncio
+async def test_ambient_capture_runs_once_not_every_tick(store: RoastStore) -> None:
+    """#342: the ambient capture is latched — it persists once at charge, not on
+    every subsequent tick, even though the raw MCP state keeps reporting an "ok"
+    reading every tick thereafter."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(bean=178.0, env=185.0)])
+    raw_state = _FakeRawState(_session_state(fc_status="pending", audio_running=False))
+    service, run_id = await _live_service(store, mcp=mcp, clock=clock, raw_state=raw_state)
+    mcp.frames = [_reading(bean=178.0, env=185.0, t0_detected=True)]
+    for _ in range(ControllerConfig().t0_debounce_ticks + 1):
+        await _tick(service, clock)
+    assert service.runner is not None
+    assert service.runner._ambient_persisted is True  # pyright: ignore[reportPrivateUsage]
+
+    # A later ambient READING change (e.g. the probe now unavailable) must never
+    # overwrite the already-latched charge-time capture.
+    raw_state.set_state(
+        _session_state(
+            fc_status="pending",
+            audio_running=False,
+            ambient_status=_ambient_status(
+                status="unavailable", temperature_c=None, humidity_percent=None, pressure_hpa=None
+            ),
+        )
+    )
+    mcp.frames = [_reading(bean=182.0, env=190.0)]
+    await _tick(service, clock)
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.ambient_temp_c == pytest.approx(28.49)  # unchanged — latched
+
+
+@pytest.mark.asyncio
 async def test_restart_restores_charge_clock_so_resumed_dtr_survives(store: RoastStore) -> None:
     """#235 end to end: a persisted charge instant restores the advisory DTR clock
     across a restart→operator-resume, so the advisor context's charge-referenced
@@ -1939,6 +2097,64 @@ async def test_restart_restores_charge_clock_so_resumed_dtr_survives(store: Roas
     # The DTR denominator is the restored charge clock — non-zero, ≈120 s, NOT 0.0.
     assert ctx.roast_elapsed_seconds > 0.0
     assert ctx.roast_elapsed_seconds == pytest.approx(120.0, abs=10.0)
+
+
+@pytest.mark.asyncio
+async def test_restart_seeds_ambient_latch_so_resume_never_reclobbers(store: RoastStore) -> None:
+    """#342: a run whose ambient triad was already captured pre-restart must NOT
+    re-capture on the post-restart resume tick — ``recover()`` seeds
+    ``_ambient_persisted`` from the persisted ``ambient_captured`` flag (mirroring
+    the T0 clock restore), so a transient post-restart probe reading (e.g. now
+    unavailable) can never overwrite the good pre-restart corpus value."""
+    await store.create_run(
+        run_id="run-resume-ambient",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+    await store.set_ambient(
+        "run-resume-ambient", temperature_c=28.49, humidity_percent=38.6, pressure_hpa=1008.56
+    )
+
+    clock = FakeClock()
+    mcp = FakeMCPClient()
+    # Post-restart the probe now reads unavailable — must not clobber the capture.
+    raw_state = _FakeRawState(
+        _session_state(
+            fc_status="pending",
+            audio_running=False,
+            ambient_status=_ambient_status(
+                status="unavailable", temperature_c=None, humidity_percent=None, pressure_hpa=None
+            ),
+        )
+    )
+    service = RoastService(
+        store,
+        config=AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0)),
+        roaster=mcp,
+        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        run_loop=False,
+        clock=clock,
+        raw_state=raw_state,
+    )
+    await service.recover_on_start()
+    assert service.runner is not None
+    # Seeded from the persisted ambient_captured flag.
+    assert service.runner._ambient_persisted is True  # pyright: ignore[reportPrivateUsage]
+
+    await service.submit_operator_action(
+        "run-resume-ambient",
+        OperatorActionRequest(
+            action=OperatorAction.ACKNOWLEDGE_RECOVERY,
+            payload={"resume_to": "roasting_pre_first_crack"},
+        ),
+    )
+    mcp.frames = [_reading(bean=150.0, env=185.0, bean_ror_c_per_min=4.0)]
+    await _tick(service, clock)
+
+    detail = await store.read_run("run-resume-ambient")
+    assert detail is not None
+    assert detail.ambient_temp_c == pytest.approx(28.49)  # unchanged — never re-captured
 
 
 @pytest.mark.asyncio
