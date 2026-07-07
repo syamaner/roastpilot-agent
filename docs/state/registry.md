@@ -102,7 +102,37 @@
 
 ## Active Context
 
-**2 Jul 2026 (latest) — #405 POST-FC CONTROL REDESIGN: BUILD COMPLETE, behind a flag (default OFF).
+**7 Jul 2026 (latest) — #342 AMBIENT PROBE SHIPPED, both repos, hardware-validated. The Yoctopuce
+Yocto-Meteo-V2-C (temp/humidity/pressure) is now captured per-roast as corpus metadata. On the
+operator's re-raised architecture question the integration home moved from agent-direct to
+MCP-OWNED (plan D85 revises D60) — the MCP owns the roaster rig's other USB sensor (the FC mic), so
+ambient follows the same pattern and the agent stays hardware-free.** Two-repo build, both merged:
+
+- **coffee-roaster-mcp 0.1.12 (PR #186, PUBLISHED to PyPI + MCP Registry)** — reads the Yocto-Meteo
+  over USB (new `yoctopuce` dep, lazy-loaded), fail-soft `AmbientSessionRuntime` (absent/erroring
+  probe → `unavailable`, never blocks a roast) with a staleness cache (USB read ≤ once per
+  `poll_interval_seconds`, default 30 s, never on the 1 Hz state read), exposing the triad as
+  `ambient_status` on `get_roast_state` — mirroring the FC-mic pipeline, riding existing state (no
+  new tool). Default `mode: disabled` ⇒ zero change for existing configs. 31 tests, qa PASS.
+- **roastpilot-agent (#342, PR #461, merged `699883b`)** — `AmbientStatus(MCPMirror)` (byte-for-byte
+  the MCP dataclass) + pin bump 0.1.11→0.1.12; `roast_run` schema V9 (3 nullable columns, outside the
+  completion-immutability trigger); capture-at-charge via `_persist_ambient_if_charged` (a fail-soft,
+  once-latched, restart-latch-restored sibling of `_persist_t0_if_charged` — reads the already-mirrored
+  raw MCP state, **no controller/safety surface**); optional fields on RoastDetail/RoastSummary.
+  mcp-contract-checker + qa + Claude-review all PASS.
+
+**Hardware-validated end-to-end** against the plugged-in probe through the real production factory
+path: **29.7 °C / 41.2 % / 1008.3 hPa**. **To enable on the next roast:** set `ambient.mode: yoctopuce`
+in the MCP yaml (see `docs/examples/coffee-roaster-mcp.known-good.yaml`); the final live-roast
+confirmation (agent spawns MCP mode=yoctopuce → charge → triad on the `roast_run`) happens naturally
+at the next supervised roast — non-blocking, default-off corpus metadata. Two noted non-blocking
+follow-ups: `ambient_captured` derives from `temp IS NOT NULL` (a status=ok-with-null-temp is not
+constructible per the MCP contract); the plan §2 "13-tool" baseline is stale (14 since 0.1.9). **This
+does not change #405 — the enable-flip (#460) still awaits its supervised hardware roast.**
+
+---
+
+**2 Jul 2026 — #405 POST-FC CONTROL REDESIGN: BUILD COMPLETE, behind a flag (default OFF).
 All four slices merged; the only remaining step is the ENABLE-FLIP, which is gated on a supervised
 hardware roast. Design is plan-repo D82/D83/D84.** (registry synced 7 Jul.) #405 replaces the
 advisor-driven post-FC brake (which over-cut in roasts 7/8 → under-temp drops) with a deterministic

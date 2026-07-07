@@ -51,6 +51,19 @@ audio:
   overlap: 0.7                       # 3 s hop (Mac); the Pi profile uses 0.3 (7 s hop)
   hop_seconds: null
 
+ambient:
+  # Ambient environmental probe (#185 / #342, D85): a Yoctopuce Yocto-Meteo-V2-C
+  # USB sensor logging the Artisan triad (temperature / humidity / pressure) as
+  # per-roast CORPUS METADATA — read-only, no control-loop or safety involvement.
+  # Default `disabled`. Set `yoctopuce` to enable; the agent mirrors the reading
+  # and stores ambient_temp_c / ambient_humidity_pct / ambient_pressure_hpa on the
+  # roast_run at charge. Fail-soft: an absent/unplugged probe reports `unavailable`
+  # with null readings and never blocks or faults a roast. Requires coffee-roaster-mcp
+  # >= 0.1.12. Validated live: 29.7 °C / 41.2 % / 1008.3 hPa.
+  mode: yoctopuce                    # `disabled` (default) or `yoctopuce`
+  device: null                       # null = first-found Yocto-Meteo; else its serial
+  poll_interval_seconds: 30.0        # USB read at most this often (never on the 1 Hz tick)
+
 logging:
   log_dir: ./logs                    # was an absolute path on the roast machine
   sample_interval_seconds: 5.0
