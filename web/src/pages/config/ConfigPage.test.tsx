@@ -98,6 +98,9 @@ function makeSnapshot(overrides?: {
       fc_confidence_threshold: makeFieldMeta({ effective_value: null, default: null }),
       auto_t0_detection_enabled: makeFieldMeta({ effective_value: null, default: null }),
       auto_t0_drop_threshold_c: makeFieldMeta({ effective_value: null, default: null }),
+      ambient_mode: makeFieldMeta({ effective_value: null, default: null }),
+      ambient_device: makeFieldMeta({ effective_value: null, default: null }),
+      ambient_poll_interval_seconds: makeFieldMeta({ effective_value: null, default: null }),
     },
   };
 }
@@ -482,6 +485,156 @@ describe("ConfigPage — Hardware category", () => {
     expect((body.mcp_device as Record<string, unknown>).roaster_driver).toBe("mock");
     // Safety must not appear
     expect(body).not.toHaveProperty("safety");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ambient / environment fields (#474) — same Hardware pane, "Ambient /
+// environment" group. Reuses the #439 tri-state inherit/override mechanism;
+// no new mechanism is exercised here, only that the three fields are wired
+// through it correctly.
+// ---------------------------------------------------------------------------
+
+describe("ConfigPage — Ambient / environment fields (#474)", () => {
+  it("renders all three ambient fields in the Hardware pane", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+    expect(screen.getByTestId("config-field-mcp_device.ambient_mode")).toBeInTheDocument();
+    expect(screen.getByTestId("config-field-mcp_device.ambient_device")).toBeInTheDocument();
+    expect(
+      screen.getByTestId("config-field-mcp_device.ambient_poll_interval_seconds"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders ambient_mode as a select with disabled + yoctopuce options", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+    const select = screen
+      .getByTestId("config-field-mcp_device.ambient_mode")
+      .querySelector("select");
+    expect(select).not.toBeNull();
+    expect(select).not.toBeDisabled();
+    const optionValues = Array.from(select!.querySelectorAll("option")).map((o) => o.getAttribute("value"));
+    expect(optionValues).toEqual(["disabled", "yoctopuce"]);
+  });
+
+  it("renders ambient_device as an editable text input", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+    const deviceField = screen.getByTestId("config-field-mcp_device.ambient_device");
+    const input = deviceField.querySelector("input[type='text']");
+    expect(input).not.toBeNull();
+    expect(input).not.toBeDisabled();
+  });
+
+  it("renders ambient_poll_interval_seconds as an editable number input", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+    const pollField = screen.getByTestId("config-field-mcp_device.ambient_poll_interval_seconds");
+    const input = pollField.querySelector("input[type='number']");
+    expect(input).not.toBeNull();
+    expect(input).not.toBeDisabled();
+  });
+
+  it("dirty-tracks ambient fields and nests them under mcp_device in the PUT body", async () => {
+    saveConfigMock.mockResolvedValue(makeSnapshot());
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+
+    // Dirty dot should not be visible before any edit.
+    expect(screen.queryByTestId("rail-dirty-Hardware")).toBeNull();
+
+    const modeSelect = screen
+      .getByTestId("config-field-mcp_device.ambient_mode")
+      .querySelector("select");
+    fireEvent.change(modeSelect!, { target: { value: "yoctopuce" } });
+
+    const deviceInput = screen
+      .getByTestId("config-field-mcp_device.ambient_device")
+      .querySelector("input");
+    fireEvent.change(deviceInput!, { target: { value: "METEOMK2-123456" } });
+
+    const pollInput = screen
+      .getByTestId("config-field-mcp_device.ambient_poll_interval_seconds")
+      .querySelector("input");
+    fireEvent.change(pollInput!, { target: { value: "45" } });
+
+    // Editing marks the category dirty.
+    await waitFor(() =>
+      expect(screen.queryByTestId("rail-dirty-Hardware")).not.toBeNull(),
+    );
+
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    const body = saveConfigMock.mock.calls[0]![0] as Record<string, unknown>;
+    const mcpDevice = body.mcp_device as Record<string, unknown>;
+    expect(mcpDevice.ambient_mode).toBe("yoctopuce");
+    expect(mcpDevice.ambient_device).toBe("METEOMK2-123456");
+    expect(mcpDevice.ambient_poll_interval_seconds).toBe(45);
+    // Safety must never appear.
+    expect(body).not.toHaveProperty("safety");
+  });
+
+  it("clears ambient_mode back to Inherit (null) in the PUT body (#439 tri-state)", async () => {
+    // Start from an overridden value so there is something to clear.
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.ambient_mode = makeFieldMeta({
+      effective_value: "yoctopuce",
+      saved_value: "yoctopuce",
+      default: null,
+    });
+    configMock.mockResolvedValue(snapshot);
+    saveConfigMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+
+    const modeSelect = screen
+      .getByTestId("config-field-mcp_device.ambient_mode")
+      .querySelector("select") as HTMLSelectElement;
+    expect(modeSelect.value).toBe("yoctopuce");
+
+    // Reset-to-default restores the schema default, which is null (inherit)
+    // for this tri-state field — the same affordance already used by the
+    // other optional mcp_device fields (#439).
+    fireEvent.click(screen.getByTestId("reset-mcp_device.ambient_mode"));
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    const body = saveConfigMock.mock.calls[0]![0] as Record<string, unknown>;
+    const mcpDevice = body.mcp_device as Record<string, unknown>;
+    expect(mcpDevice).toHaveProperty("ambient_mode");
+    expect(mcpDevice.ambient_mode).toBeNull();
+  });
+
+  it("does not treat ambient fields as read-only / safety-guarded (device config is editable, #474)", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+
+    for (const key of [
+      "mcp_device.ambient_mode",
+      "mcp_device.ambient_device",
+      "mcp_device.ambient_poll_interval_seconds",
+    ]) {
+      const field = screen.getByTestId(`config-field-${key}`);
+      // No "Guarded" chip (that's the safety-only affordance).
+      expect(field.textContent).not.toMatch(/Guarded/);
+      const control = field.querySelector("input, select");
+      expect(control).not.toBeNull();
+      expect(control).not.toBeDisabled();
+    }
   });
 });
 

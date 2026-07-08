@@ -42,6 +42,9 @@ function makeSnapshot(overrides?: {
   fc_mode?: string | null;
   fc_confidence_threshold?: number | null;
   roaster_driver?: string | null;
+  ambient_mode?: string | null;
+  ambient_device?: string | null;
+  ambient_poll_interval_seconds?: number | null;
 }): AppConfigSnapshot {
   const o = {
     serial_port: null,
@@ -50,6 +53,9 @@ function makeSnapshot(overrides?: {
     fc_mode: null,
     fc_confidence_threshold: null,
     roaster_driver: null,
+    ambient_mode: null,
+    ambient_device: null,
+    ambient_poll_interval_seconds: null,
     ...overrides,
   };
   return {
@@ -104,6 +110,12 @@ function makeSnapshot(overrides?: {
       fc_confidence_threshold: makeFieldMeta({ effective_value: o.fc_confidence_threshold, default: null }),
       auto_t0_detection_enabled: makeFieldMeta({ effective_value: null, default: null }),
       auto_t0_drop_threshold_c: makeFieldMeta({ effective_value: null, default: null }),
+      ambient_mode: makeFieldMeta({ effective_value: o.ambient_mode, default: null }),
+      ambient_device: makeFieldMeta({ effective_value: o.ambient_device, default: null }),
+      ambient_poll_interval_seconds: makeFieldMeta({
+        effective_value: o.ambient_poll_interval_seconds,
+        default: null,
+      }),
     },
   };
 }
@@ -131,6 +143,25 @@ describe("buildValuesFromSnapshot", () => {
     // falls back to null.
     const values = buildValuesFromSnapshot(makeSnapshot());
     expect(values["mcp_device._mic_test"]).toBeNull();
+  });
+
+  it("extracts effective_value for the three ambient fields (#474)", () => {
+    const snapshot = makeSnapshot({
+      ambient_mode: "yoctopuce",
+      ambient_device: "METEOMK2-123456",
+      ambient_poll_interval_seconds: 45,
+    });
+    const values = buildValuesFromSnapshot(snapshot);
+    expect(values["mcp_device.ambient_mode"]).toBe("yoctopuce");
+    expect(values["mcp_device.ambient_device"]).toBe("METEOMK2-123456");
+    expect(values["mcp_device.ambient_poll_interval_seconds"]).toBe(45);
+  });
+
+  it("stores null for unset ambient fields (tri-state inherit, #474)", () => {
+    const values = buildValuesFromSnapshot(makeSnapshot());
+    expect(values["mcp_device.ambient_mode"]).toBeNull();
+    expect(values["mcp_device.ambient_device"]).toBeNull();
+    expect(values["mcp_device.ambient_poll_interval_seconds"]).toBeNull();
   });
 });
 
@@ -215,6 +246,53 @@ describe("buildEditFromDirty — mcp_device section", () => {
     const edit = buildEditFromDirty(values, saved, snapshot);
     // Should not include recording_enabled because the server says read_only.
     expect(edit.mcp_device).toBeUndefined();
+  });
+
+  it("nests all three ambient fields under mcp_device when dirty (#474)", () => {
+    const snapshot = makeSnapshot();
+    const saved = buildValuesFromSnapshot(snapshot);
+    const values = {
+      ...saved,
+      "mcp_device.ambient_mode": "yoctopuce",
+      "mcp_device.ambient_device": "METEOMK2-123456",
+      "mcp_device.ambient_poll_interval_seconds": 45,
+    };
+
+    const edit = buildEditFromDirty(values, saved, snapshot);
+    expect(edit.mcp_device).toEqual({
+      ambient_mode: "yoctopuce",
+      ambient_device: "METEOMK2-123456",
+      ambient_poll_interval_seconds: 45,
+    });
+  });
+
+  it("sends explicit null for ambient_mode when cleared back to Inherit (#439 tri-state, #474)", () => {
+    // Start from an overridden value (as if a previous save had set it).
+    const snapshot = makeSnapshot({ ambient_mode: "yoctopuce" });
+    const saved = buildValuesFromSnapshot(snapshot);
+    const values = { ...saved, "mcp_device.ambient_mode": null };
+
+    const edit = buildEditFromDirty(values, saved, snapshot);
+    const mcpDevice = edit.mcp_device as Record<string, unknown>;
+    expect(mcpDevice).toHaveProperty("ambient_mode");
+    expect(mcpDevice.ambient_mode).toBeNull();
+  });
+
+  it("ambient fields are NOT part of the safety read-only set — editable like other device fields (#474)", () => {
+    // ambient_device has no server read_only flag (default false from makeFieldMeta),
+    // matching every other mcp_device field's editable-by-default behaviour —
+    // unlike SafetyLimitsSnapshot fields, which are always read_only: true.
+    const snapshot = makeSnapshot();
+    expect(snapshot.mcp_device.ambient_mode.read_only).toBe(false);
+    expect(snapshot.mcp_device.ambient_device.read_only).toBe(false);
+    expect(snapshot.mcp_device.ambient_poll_interval_seconds.read_only).toBe(false);
+
+    const saved = buildValuesFromSnapshot(snapshot);
+    const values = { ...saved, "mcp_device.ambient_device": "METEOMK2-999" };
+    const edit = buildEditFromDirty(values, saved, snapshot);
+    // Confirms the field actually flows through to the PUT body (not silently
+    // skipped the way a read_only or safety field would be).
+    expect((edit.mcp_device as Record<string, unknown>)?.ambient_device).toBe("METEOMK2-999");
   });
 });
 
