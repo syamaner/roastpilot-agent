@@ -1542,7 +1542,8 @@ class RoastService:
                 # MCP device respawn (#431): when the reloaded mcp_device differs
                 # from what the child was spawned with, stop and restart the child
                 # so hardware changes (serial port, driver, audio input, FC mode,
-                # etc.) take effect next-roast without an agent restart.
+                # ambient sensor mode/device/poll interval (D85, #474), etc.)
+                # take effect next-roast without an agent restart.
                 #
                 # MCP is only wired (non-None) in live-serve mode
                 # (build_live_service), so _mcp is not None is already the

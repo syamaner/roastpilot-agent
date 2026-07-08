@@ -1689,3 +1689,96 @@ def test_nested_json_blob_does_not_shadow_nested_saved_scalar(
     # fan_target_percent is NOT in the blob → saved value must be injected.
     assert fan_key in injected
     assert os.environ.get(fan_key) == "30"
+
+
+# ---------------------------------------------------------------------------
+# Ambient environmental sensor fields (D85, #342/#474)
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_exposes_ambient_fields() -> None:
+    """MCPDeviceConfigSnapshot exposes ambient_mode/device/poll_interval_seconds (#474).
+
+    The schema default is ``None`` for all three — "not managed", matching the
+    tri-state inherit/override convention for the other optional device fields
+    (#439): the MCP's own ``AmbientConfig`` default (mode=disabled, poll=30.0)
+    governs until an operator override is saved.
+    """
+    effective = AppConfig()
+    snapshot = build_config_snapshot(effective, {})
+    assert snapshot.mcp_device.ambient_mode.default is None
+    assert snapshot.mcp_device.ambient_device.default is None
+    assert snapshot.mcp_device.ambient_poll_interval_seconds.default is None
+    # Device/hardware config, not safety — editable (D78 excludes only SafetyLimits).
+    assert snapshot.mcp_device.ambient_mode.read_only is False
+    assert snapshot.mcp_device.ambient_device.read_only is False
+    assert snapshot.mcp_device.ambient_poll_interval_seconds.read_only is False
+
+
+def test_ambient_round_trip_disabled_to_yoctopuce(
+    monkeypatch: pytest.MonkeyPatch,
+    config_file: Path,
+) -> None:
+    """PUT ambient_mode disabled→yoctopuce + device + poll persists and GET reflects it
+    (env-overrides-file, #474 acceptance criterion)."""
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_") and key != "ROASTPILOT_CONFIG_FILE":
+            monkeypatch.delenv(key, raising=False)
+
+    persist_config_edit(
+        AppConfigEdit(
+            mcp_device=MCPDeviceConfigEdit(
+                ambient_mode="yoctopuce",
+                ambient_device="METEOMK2-1",
+                ambient_poll_interval_seconds=15.0,
+            )
+        )
+    )
+
+    effective, injected_keys = load_app_config()
+    saved_raw = load_saved_raw()
+    snapshot = build_config_snapshot(effective, saved_raw, injected_keys)
+
+    assert effective.mcp_device.ambient_mode == "yoctopuce"
+    assert effective.mcp_device.ambient_device == "METEOMK2-1"
+    assert effective.mcp_device.ambient_poll_interval_seconds == 15.0
+
+    assert snapshot.mcp_device.ambient_mode.saved_value == "yoctopuce"
+    assert snapshot.mcp_device.ambient_mode.effective_value == "yoctopuce"
+    assert snapshot.mcp_device.ambient_mode.env_overridden is False
+    assert snapshot.mcp_device.ambient_device.saved_value == "METEOMK2-1"
+    assert snapshot.mcp_device.ambient_poll_interval_seconds.saved_value == 15.0
+
+    # A real operator env var overrides the saved value (env-overrides-file).
+    monkeypatch.setenv("ROASTPILOT_MCP_DEVICE__AMBIENT_MODE", "disabled")
+    effective2, injected_keys2 = load_app_config()
+    saved_raw2 = load_saved_raw()
+    snapshot2 = build_config_snapshot(effective2, saved_raw2, injected_keys2)
+    assert snapshot2.mcp_device.ambient_mode.effective_value == "disabled"
+    assert snapshot2.mcp_device.ambient_mode.env_overridden is True
+    # The saved file value is unaffected by the env override.
+    assert snapshot2.mcp_device.ambient_mode.saved_value == "yoctopuce"
+
+
+def test_ambient_all_none_default_no_saved_section(
+    monkeypatch: pytest.MonkeyPatch,
+    config_file: Path,
+) -> None:
+    """Back-compat: an unedited ambient config (all None) writes no ambient_* keys
+    and the effective values stay at the MCP-matching defaults (#474)."""
+    for key in list(os.environ):
+        if key.startswith("ROASTPILOT_") and key != "ROASTPILOT_CONFIG_FILE":
+            monkeypatch.delenv(key, raising=False)
+
+    # An edit that touches only a non-ambient device field.
+    persist_config_edit(AppConfigEdit(mcp_device=MCPDeviceConfigEdit(serial_port="/dev/ttyUSB0")))
+
+    saved_raw = load_saved_raw()
+    assert "ambient_mode" not in saved_raw.get("mcp_device", {})
+    assert "ambient_device" not in saved_raw.get("mcp_device", {})
+    assert "ambient_poll_interval_seconds" not in saved_raw.get("mcp_device", {})
+
+    effective, _ = load_app_config()
+    assert effective.mcp_device.ambient_mode is None
+    assert effective.mcp_device.ambient_device is None
+    assert effective.mcp_device.ambient_poll_interval_seconds is None

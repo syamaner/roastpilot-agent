@@ -135,6 +135,17 @@ def _device_config_to_overlay(cfg: MCPDeviceConfig) -> dict[str, Any]:
     if session:
         overlay["session"] = session
 
+    # --- ambient section (D85, #342/#474) ---
+    ambient: dict[str, Any] = {}
+    if cfg.ambient_mode is not None:
+        ambient["mode"] = cfg.ambient_mode
+    if cfg.ambient_device is not None:
+        ambient["device"] = cfg.ambient_device
+    if cfg.ambient_poll_interval_seconds is not None:
+        ambient["poll_interval_seconds"] = cfg.ambient_poll_interval_seconds
+    if ambient:
+        overlay["ambient"] = ambient
+
     return overlay
 
 

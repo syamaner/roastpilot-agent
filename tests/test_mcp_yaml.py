@@ -151,6 +151,36 @@ def test_overlay_auto_t0() -> None:
     }
 
 
+def test_overlay_ambient_fields() -> None:
+    """ambient_mode/ambient_device/ambient_poll_interval_seconds → ambient section (D85, #474)."""
+    cfg = MCPDeviceConfig(
+        ambient_mode="yoctopuce", ambient_device="METEOMK2-1", ambient_poll_interval_seconds=15.0
+    )
+    overlay = _device_config_to_overlay(cfg)
+    assert overlay == {
+        "ambient": {
+            "mode": "yoctopuce",
+            "device": "METEOMK2-1",
+            "poll_interval_seconds": 15.0,
+        }
+    }
+
+
+def test_overlay_ambient_partial_fields_only_non_none() -> None:
+    """A partially-set ambient config only writes the non-None ambient keys."""
+    cfg = MCPDeviceConfig(ambient_mode="disabled")
+    overlay = _device_config_to_overlay(cfg)
+    assert overlay == {"ambient": {"mode": "disabled"}}
+
+
+def test_overlay_all_none_ambient_omits_section() -> None:
+    """All-None ambient fields (the default) produce no ambient key in the overlay
+    (back-compat: does not disturb an existing yaml's ambient block, D85/#474)."""
+    cfg = MCPDeviceConfig(serial_port="/dev/ttyUSB0")  # ambient_* left at default None
+    overlay = _device_config_to_overlay(cfg)
+    assert "ambient" not in overlay
+
+
 def test_overlay_none_fields_absent() -> None:
     """A partially-set config only writes the non-None fields."""
     cfg = MCPDeviceConfig(serial_port="/dev/ttyUSB0")  # all other fields None
@@ -226,6 +256,9 @@ def test_render_known_good_passthrough_unmanaged_keys(tmp_path: Path) -> None:
         fc_confidence_threshold=0.8,
         auto_t0_detection_enabled=True,
         auto_t0_drop_threshold_c=20.0,
+        ambient_mode="disabled",
+        ambient_device="METEOMK2-NEW",
+        ambient_poll_interval_seconds=10.0,
     )
     render_mcp_yaml(cfg, source_path=_KNOWN_GOOD, dest_path=dest)
 
@@ -245,6 +278,68 @@ def test_render_known_good_passthrough_unmanaged_keys(tmp_path: Path) -> None:
     assert result["audio"]["input_device"] == "Test Mic"
     assert result["first_crack"]["mode"] == "audio"
     assert result["first_crack"]["confidence_threshold"] == 0.8
+    # Ambient (D85, #474): the known-good yaml's hand-authored ambient: block
+    # (mode: yoctopuce, device: null, poll_interval_seconds: 30.0) is fully
+    # overlaid here since all three managed keys are set.
+    assert result["ambient"]["mode"] == "disabled"
+    assert result["ambient"]["device"] == "METEOMK2-NEW"
+    assert result["ambient"]["poll_interval_seconds"] == 10.0
+
+
+def test_render_ambient_overlay_onto_hand_authored_block(tmp_path: Path) -> None:
+    """Passthrough-merge: an ambient field managed by MCPDeviceConfig overwrites only
+    that key; a hand-authored ambient key NOT managed here survives (D85, #474).
+
+    The MCP's AmbientConfig has exactly mode/device/poll_interval_seconds — all
+    three are managed here, so this test uses a 4th, made-up key to prove the
+    merge is key-level (not section-replace), matching the roaster/audio/session
+    overlay behaviour exactly.
+    """
+    src = tmp_path / "source.yaml"
+    src.write_text(
+        "ambient:\n"
+        "  mode: yoctopuce\n"
+        "  device: OLD-SERIAL\n"
+        "  poll_interval_seconds: 30.0\n"
+        "  future_unmanaged_key: keep-me\n",
+        encoding="utf-8",
+    )
+    dest = tmp_path / "rendered.yaml"
+
+    render_mcp_yaml(
+        MCPDeviceConfig(ambient_device="NEW-SERIAL"),
+        source_path=src,
+        dest_path=dest,
+    )
+
+    result = yaml.safe_load(dest.read_text(encoding="utf-8"))
+    # Managed key overwritten.
+    assert result["ambient"]["device"] == "NEW-SERIAL"
+    # Unmanaged fields in the same section (and mode, not touched by this edit)
+    # survive byte-for-byte — the passthrough-merge invariant.
+    assert result["ambient"]["mode"] == "yoctopuce"
+    assert result["ambient"]["poll_interval_seconds"] == 30.0
+    assert result["ambient"]["future_unmanaged_key"] == "keep-me"
+
+
+def test_render_all_none_ambient_preserves_hand_authored_block(tmp_path: Path) -> None:
+    """Back-compat: an all-None ambient device config leaves an existing
+    hand-authored ambient: block in the source yaml entirely unchanged (D85, #474)."""
+    src = tmp_path / "source.yaml"
+    src.write_text(
+        "ambient:\n  mode: yoctopuce\n  device: METEOMK2-1\n  poll_interval_seconds: 45.0\n",
+        encoding="utf-8",
+    )
+    dest = tmp_path / "rendered.yaml"
+
+    render_mcp_yaml(MCPDeviceConfig(), source_path=src, dest_path=dest)
+
+    result = yaml.safe_load(dest.read_text(encoding="utf-8"))
+    assert result["ambient"] == {
+        "mode": "yoctopuce",
+        "device": "METEOMK2-1",
+        "poll_interval_seconds": 45.0,
+    }
 
 
 def test_render_missing_source_raises(tmp_path: Path) -> None:
@@ -560,6 +655,9 @@ def test_apply_config_edit_mcp_device_all_fields(tmp_path: Path) -> None:
         fc_confidence_threshold=0.75,
         auto_t0_detection_enabled=True,
         auto_t0_drop_threshold_c=18.0,
+        ambient_mode="yoctopuce",
+        ambient_device="METEOMK2-1",
+        ambient_poll_interval_seconds=15.0,
     )
     from roastpilot_agent.config_store import AppConfigEdit
 
@@ -577,6 +675,9 @@ def test_apply_config_edit_mcp_device_all_fields(tmp_path: Path) -> None:
     assert dev["fc_confidence_threshold"] == 0.75
     assert dev["auto_t0_detection_enabled"] is True
     assert dev["auto_t0_drop_threshold_c"] == 18.0
+    assert dev["ambient_mode"] == "yoctopuce"
+    assert dev["ambient_device"] == "METEOMK2-1"
+    assert dev["ambient_poll_interval_seconds"] == 15.0
 
 
 def test_apply_config_edit_mcp_device_none_fields_skipped(tmp_path: Path) -> None:
@@ -589,6 +690,66 @@ def test_apply_config_edit_mcp_device_none_fields_skipped(tmp_path: Path) -> Non
     dev = result["mcp_device"]
     assert dev["serial_port"] == "/dev/new"
     assert dev["fc_mode"] == "disabled"  # untouched
+
+
+# ---------------------------------------------------------------------------
+# config_store: apply_config_edit ambient fields (D85, #474)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_config_edit_ambient_mode_disabled_to_yoctopuce() -> None:
+    """PUT ambient_mode disabled→yoctopuce persists into the saved section (#474)."""
+    from roastpilot_agent.config_store import AppConfigEdit, MCPDeviceConfigEdit, apply_config_edit
+
+    existing = {"mcp_device": {"ambient_mode": "disabled"}}
+    edit = AppConfigEdit(
+        mcp_device=MCPDeviceConfigEdit(
+            ambient_mode="yoctopuce",
+            ambient_device="METEOMK2-1",
+            ambient_poll_interval_seconds=15.0,
+        )
+    )
+    result = apply_config_edit(edit, existing_saved=existing)
+    dev = result["mcp_device"]
+    assert dev["ambient_mode"] == "yoctopuce"
+    assert dev["ambient_device"] == "METEOMK2-1"
+    assert dev["ambient_poll_interval_seconds"] == 15.0
+
+
+def test_apply_config_edit_ambient_clear_back_to_inherit() -> None:
+    """Explicit null for an ambient field clears the saved key (tri-state, #439 pattern)."""
+    from roastpilot_agent.config_store import AppConfigEdit, MCPDeviceConfigEdit, apply_config_edit
+
+    existing = {"mcp_device": {"ambient_mode": "yoctopuce", "ambient_device": "METEOMK2-1"}}
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit.model_validate({"ambient_mode": None}))
+    result = apply_config_edit(edit, existing_saved=existing)
+    dev = result["mcp_device"]
+    assert "ambient_mode" not in dev
+    # Untouched field (not in the PUT body) survives.
+    assert dev["ambient_device"] == "METEOMK2-1"
+
+
+def test_apply_config_edit_ambient_blank_device_treated_as_inherit() -> None:
+    """A blank ambient_device string must not write device:'' to the MCP yaml."""
+    from roastpilot_agent.config_store import AppConfigEdit, MCPDeviceConfigEdit, apply_config_edit
+
+    existing = {"mcp_device": {"ambient_device": "METEOMK2-1"}}
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit.model_validate({"ambient_device": ""}))
+    result = apply_config_edit(edit, existing_saved=existing)
+    assert "ambient_device" not in result.get("mcp_device", {})
+
+
+def test_apply_config_edit_ambient_unset_field_is_unchanged() -> None:
+    """An ambient field absent from the PUT body leaves the saved value intact."""
+    from roastpilot_agent.config_store import AppConfigEdit, MCPDeviceConfigEdit, apply_config_edit
+
+    existing = {"mcp_device": {"ambient_mode": "yoctopuce", "ambient_poll_interval_seconds": 30.0}}
+    edit = AppConfigEdit(mcp_device=MCPDeviceConfigEdit(ambient_device="METEOMK2-1"))
+    result = apply_config_edit(edit, existing_saved=existing)
+    dev = result["mcp_device"]
+    assert dev["ambient_mode"] == "yoctopuce"
+    assert dev["ambient_poll_interval_seconds"] == 30.0
+    assert dev["ambient_device"] == "METEOMK2-1"
 
 
 # ---------------------------------------------------------------------------

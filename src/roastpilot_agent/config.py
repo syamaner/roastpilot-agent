@@ -1017,6 +1017,22 @@ class MCPDeviceConfig(BaseModel):
             reads this file as the base before overlaying the managed fields.
             When ``None``, only the managed fields are written (the MCP child
             fills the rest from its own defaults).
+        ambient_mode: Ambient environmental sensor mode: ``"disabled"`` or
+            ``"yoctopuce"`` (D85, #342/#474). Maps to ``ambient.mode`` in the
+            MCP yaml. ``None`` (default) means "not managed" — inherit
+            whatever the hand-authored yaml says (or the MCP's own
+            ``disabled`` default). Applies next-roast via the between-roasts
+            MCP respawn, same as the serial/audio/FC device fields.
+        ambient_device: Optional Yoctopuce module serial number or logical
+            name to target a specific probe. Maps to ``ambient.device`` in
+            the MCP yaml. ``None`` means "not managed / inherit" (tri-state,
+            matching the #439 inherit-vs-override convention for the other
+            optional string device fields); an empty string is treated the
+            same as ``None`` at the PUT/merge layer (the blank-string guard).
+        ambient_poll_interval_seconds: Minimum seconds between ambient USB
+            reads. Maps to ``ambient.poll_interval_seconds`` in the MCP yaml.
+            ``None`` means "not managed / inherit" — the MCP's own default
+            (30.0 s) or the hand-authored yaml's value governs.
     """
 
     serial_port: str | None = None
@@ -1030,6 +1046,16 @@ class MCPDeviceConfig(BaseModel):
     auto_t0_detection_enabled: bool | None = None
     auto_t0_drop_threshold_c: float | None = Field(default=None, gt=0)
     mcp_yaml_source_path: Path | None = None
+    # Ambient environmental sensor fields (D85, #342/#474). Device/hardware
+    # config, not safety — editable via PUT /api/config (D78 excludes only
+    # SafetyLimits). Rendered into the MCP yaml's ``ambient:`` section by
+    # mcp_yaml.py::_device_config_to_overlay; applied next-roast via the
+    # existing _respawn_mcp_for_device_config drift check (api.py), which
+    # compares the whole MCPDeviceConfig by equality so these fields are
+    # covered automatically.
+    ambient_mode: Literal["disabled", "yoctopuce"] | None = None
+    ambient_device: str | None = None
+    ambient_poll_interval_seconds: float | None = Field(default=None, gt=0)
 
 
 #: The bare console-script name of the coffee-roaster-mcp child (the default
