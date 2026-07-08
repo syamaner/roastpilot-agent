@@ -1,0 +1,87 @@
+- generic [ref=f2e3]:
+  - navigation [ref=f2e4]:
+    - link "Live roast" [ref=f2e5] [cursor=pointer]:
+      - /url: /live
+    - link "History" [ref=f2e6] [cursor=pointer]:
+      - /url: /roasts
+  - generic [ref=f2e7]:
+    - banner [ref=f2e8]:
+      - generic [ref=f2e9]:
+        - generic [ref=f2e10]: RoastPilot
+        - generic [ref=f2e11]: device console
+      - generic [ref=f2e13]: Live
+    - main [ref=f2e15]:
+      - generic [ref=f2e16]:
+        - generic [ref=f2e17]:
+          - generic [ref=f2e18]:
+            - generic [ref=f2e19]: PREHEATING
+            - generic [ref=f2e20]:
+              - generic [ref=f2e21]: Roast Time
+              - generic [ref=f2e22]: 00:00
+            - generic [ref=f2e23]:
+              - generic [ref=f2e24]: Preheat
+              - generic [ref=f2e25]: "--:--"
+            - generic [ref=f2e26]:
+              - generic [ref=f2e27]: RoR (bean)
+              - generic [ref=f2e28]: — °C/min
+          - generic [ref=f2e29]:
+            - generic [ref=f2e30]:
+              - generic [ref=f2e31]: Profile
+              - generic [ref=f2e32]: session-1
+            - generic [ref=f2e33]: "FC: —"
+            - generic [ref=f2e35]:
+              - 'status "Mic idle: no capture session" [ref=f2e36]':
+                - img [ref=f2e37]
+                - generic [ref=f2e40]: Mic idle
+              - generic:
+                - paragraph: Mic idle
+                - paragraph: No active capture session.
+            - generic "Latest room/ambient reading — not the bean probe" [ref=f2e41]:
+              - generic [ref=f2e42]: Room
+              - generic [ref=f2e43]: — °C
+              - generic [ref=f2e44]: ·
+              - generic [ref=f2e45]: — % RH
+              - generic [ref=f2e46]: ·
+              - generic [ref=f2e47]: — hPa
+            - generic [ref=f2e48]: Roaster n/a
+            - button "Diagnostics" [ref=f2e51] [cursor=pointer]
+        - generic [ref=f2e53]:
+          - generic [ref=f2e54]: 10:31
+          - button "Bean 148.0 °C" [pressed] [ref=f2e55] [cursor=pointer]:
+            - generic [ref=f2e57]: Bean
+            - generic [ref=f2e58]: 148.0 °C
+          - button "Env 223.0 °C" [pressed] [ref=f2e59] [cursor=pointer]:
+            - generic [ref=f2e61]: Env
+            - generic [ref=f2e62]: 223.0 °C
+          - button "RoR —" [pressed] [ref=f2e63] [cursor=pointer]:
+            - generic [ref=f2e65]: RoR
+            - generic [ref=f2e66]: —
+          - button "Heat 100 %" [pressed] [ref=f2e67] [cursor=pointer]:
+            - generic [ref=f2e69]: Heat
+            - generic [ref=f2e70]: 100 %
+          - button "Fan 30 %" [pressed] [ref=f2e71] [cursor=pointer]:
+            - generic [ref=f2e73]: Fan
+            - generic [ref=f2e74]: 30 %
+        - generic [ref=f2e85]:
+          - generic [ref=f2e86]:
+            - generic [ref=f2e87]:
+              - generic [ref=f2e88]: Heat
+              - generic [ref=f2e89]: — %
+            - paragraph [ref=f2e90]: Controller-driven (read-out)
+          - generic [ref=f2e91]:
+            - generic [ref=f2e92]:
+              - generic [ref=f2e93]: Fan
+              - generic [ref=f2e94]: — %
+            - paragraph [ref=f2e95]: Controller-driven (read-out)
+        - generic [ref=f2e96]:
+          - heading "LLM Advisory" [level=2] [ref=f2e98]
+          - paragraph [ref=f2e99]: Awaiting first recommendation…
+      - generic [ref=f2e101]:
+        - button "EMERGENCY STOP" [ref=f2e102] [cursor=pointer]
+        - button "DROP BEANS" [disabled] [ref=f2e103]
+        - button "MARK FIRST CRACK" [disabled] [ref=f2e104]
+        - button "MARK BEANS ADDED" [ref=f2e105] [cursor=pointer]
+        - button "PAUSE ADVISOR" [ref=f2e106] [cursor=pointer]
+        - button "RESUME ADVISOR" [ref=f2e107] [cursor=pointer]
+        - button "START COOLING" [disabled] [ref=f2e108]
+        - button "STOP COOLING" [disabled] [ref=f2e109]

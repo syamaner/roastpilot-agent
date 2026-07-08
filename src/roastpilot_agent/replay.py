@@ -19,8 +19,8 @@ inferred from the export), and ``GET /api/roasts/{id}`` / ``/timeline`` /
 ``/telemetry`` are populated from the same store writes a live roast makes.
 Temperatures are Celsius throughout — the source exports already are.
 
-Two things in the export do not exist on the wire a live roast produces, and
-are **synthesized** here, clearly labelled:
+Three things in the export do not exist on the wire a live roast produces,
+and are **synthesized** here, clearly labelled:
 
 - **The advisory CLAMP key frame.** The recorded exports carry no advisory or
   safety-verdict records, and a genuine CLAMP can only arise from an
@@ -42,6 +42,15 @@ are **synthesized** here, clearly labelled:
   bean temperature past the bound. The fault + ``recovery_required`` it
   produces are emitted by the **real** ``SafetyPolicy`` through the real
   controller — only the telemetry track is synthetic.
+
+- **The ambient temp/humidity/pressure triad.** The recorded exports predate
+  the #342 ambient probe and the live agent only mirrors the MCP's *current*
+  ambient reading each tick (no per-tick history is persisted), so there is no
+  real ambient value in an export to read back. ``_telemetry_from_record``
+  sets a fixed, representative ``(21.0 °C, 45 %, 1013 hPa)`` reading on every
+  frame — see :func:`_synthesized_ambient` — so the dashboard's "Room" readout
+  renders a populated state in replay/demo mode rather than the honest-but-
+  empty em-dash a ``None`` would force.
 """
 
 import asyncio
@@ -203,6 +212,35 @@ def _synthesized_mic_status(*, first_crack: bool) -> MicStatus:
     )
 
 
+#: The synthesized ambient triad :func:`_synthesized_ambient` returns —
+#: a plausible indoor roastery reading (Celsius; #467). Fixed module-level
+#: constants so the value is documented once and trivially greppable.
+_SYNTHESIZED_AMBIENT_TEMP_C = 21.0
+_SYNTHESIZED_AMBIENT_HUMIDITY_PCT = 45.0
+_SYNTHESIZED_AMBIENT_PRESSURE_HPA = 1013.0
+
+
+def _synthesized_ambient() -> tuple[float, float, float]:
+    """A plausible ambient (temp °C, humidity %, pressure hPa) triad for replay (#467).
+
+    Recorded exports predate the #342 Yoctopuce ambient probe, and the live
+    agent only mirrors the MCP's *current* ambient reading each tick — it never
+    persists a per-tick ambient history — so there is no real ambient value
+    anywhere in a recorded export to read back. Like :func:`_synthesized_mic_status`,
+    replay synthesizes a fixed, representative reading instead: a believable
+    indoor roastery condition (21.0 °C / 45 % RH / 1013 hPa), constant across
+    every frame. This is what lets the "Room" readout render real values in
+    replay/demo mode (and the ``dashboard-live`` Playwright baseline show a
+    populated state) instead of the honest-but-unpopulated em-dash a `None`
+    would otherwise force — it is not a claim that a live sensor was read.
+    """
+    return (
+        _SYNTHESIZED_AMBIENT_TEMP_C,
+        _SYNTHESIZED_AMBIENT_HUMIDITY_PCT,
+        _SYNTHESIZED_AMBIENT_PRESSURE_HPA,
+    )
+
+
 def _telemetry_from_record(
     record: dict[str, Any], *, t0: bool, first_crack: bool
 ) -> RoastTelemetry:
@@ -212,7 +250,10 @@ def _telemetry_from_record(
     the recording it stays true), mirroring the real MCP status fields rather
     than the raw per-frame export, which carries no detection flags. The
     capture-alive ``mic_status`` (#197) is synthesized the same way — see
-    :func:`_synthesized_mic_status`."""
+    :func:`_synthesized_mic_status`. The ambient triad (#467) is synthesized
+    identically — see :func:`_synthesized_ambient` — since exports carry no
+    ambient reading either."""
+    ambient_temp_c, ambient_humidity_pct, ambient_pressure_hpa = _synthesized_ambient()
     return RoastTelemetry(
         bean_temp_c=float(record["bean_temp_c"]),
         env_temp_c=float(record["env_temp_c"]),
@@ -222,6 +263,9 @@ def _telemetry_from_record(
         first_crack_detected=first_crack,
         cooling_on=bool(record.get("cooling_on", False)),
         mic_status=_synthesized_mic_status(first_crack=first_crack),
+        ambient_temp_c=ambient_temp_c,
+        ambient_humidity_pct=ambient_humidity_pct,
+        ambient_pressure_hpa=ambient_pressure_hpa,
     )
 
 
