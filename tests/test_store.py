@@ -273,6 +273,135 @@ async def test_v9_migration_adds_nullable_ambient_columns_back_compat(
 
 
 @pytest.mark.asyncio
+async def test_v10_migration_adds_explicit_ambient_captured_latch_back_compat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#463: a REAL pre-v10 row (written on the pre-v10 schema, no
+    ``ambient_captured`` column yet — the old implicit ``ambient_temp_c IS NOT
+    NULL`` derivation was live for this row) upgrades cleanly through a genuine
+    migration round-trip, and its ``ambient_captured`` flag reads back
+    ``False`` (default 0) post-migration — #463 is a new explicit tracking
+    mechanism going forward, not a data backfill of historical captures."""
+    pre_v10 = MIGRATIONS[:9]  # V1..V9 (before the explicit capture latch)
+    assert len(pre_v10) == 9
+    db_path = tmp_path / "v10upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", pre_v10)
+    old = RoastStore(db_path=db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 9
+        await seeded_store(old)
+        # A pre-v10 row that already captured ambient the OLD way (a non-null
+        # reading, written directly against the v9-shaped table — no
+        # ``ambient_captured`` column exists yet on this schema, so the real
+        # ``set_ambient`` [which now also writes that column] cannot run here).
+        await old.connection.execute(
+            "UPDATE roast_runs SET ambient_temp_c = ?, ambient_humidity_pct = ?,"
+            " ambient_pressure_hpa = ? WHERE id = 'run-1'",
+            (28.49, 38.6, 1008.56),
+        )
+        await old.connection.commit()
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path=db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == len(MIGRATIONS)
+        row = await fetch_one(
+            upgraded, "SELECT ambient_captured FROM roast_runs WHERE id = 'run-1'"
+        )
+        assert row == (0,)
+        persisted = await upgraded.read_latest_run()
+        assert persisted is not None
+        assert persisted.ambient_captured is False
+        # The pre-existing ambient reading itself is untouched by the migration.
+        detail = await upgraded.read_run("run-1")
+        assert detail is not None
+        assert detail.ambient_temp_c == pytest.approx(28.49)
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_store_is_v10(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v10) schema version."""
+    await tmp_store.initialize()
+    try:
+        assert await tmp_store.schema_version() == 10 == len(MIGRATIONS)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_ambient_sets_the_explicit_captured_flag(tmp_store: RoastStore) -> None:
+    """#463: a real reading marks the explicit ``ambient_captured`` flag, and
+    ``PersistedRun.ambient_captured`` (the recovery read) reflects it — not the
+    old ``ambient_temp_c IS NOT NULL`` derivation."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.set_ambient(
+            "run-1", temperature_c=28.49, humidity_percent=38.6, pressure_hpa=1008.56
+        )
+        row = await fetch_one(
+            tmp_store, "SELECT ambient_captured FROM roast_runs WHERE id = 'run-1'"
+        )
+        assert row == (1,)
+        persisted = await tmp_store.read_latest_run()
+        assert persisted is not None
+        assert persisted.ambient_captured is True
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_ambient_with_null_reading_still_sets_the_captured_flag(
+    tmp_store: RoastStore,
+) -> None:
+    """#463 (the fix's whole point): a ``status='ok'``-with-null-temperature (or
+    an unavailable/disabled probe) capture still latches — ``ambient_captured``
+    is ``True`` even though every triad field reads back ``None``. This is the
+    exact edge the old ``ambient_temp_c IS NOT NULL`` derivation got wrong (it
+    would have read back ``False`` here and could re-fire post-restart)."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.set_ambient(
+            "run-1", temperature_c=None, humidity_percent=None, pressure_hpa=None
+        )
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.ambient_temp_c is None  # the reading itself is null
+
+        row = await fetch_one(
+            tmp_store, "SELECT ambient_captured FROM roast_runs WHERE id = 'run-1'"
+        )
+        assert row == (1,)  # but the capture RAN — the flag still latches
+
+        persisted = await tmp_store.read_latest_run()
+        assert persisted is not None
+        assert persisted.ambient_captured is True
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_ambient_captured_false_for_a_run_that_never_captured(
+    tmp_store: RoastStore,
+) -> None:
+    """#463: a run that never charged / never ran the capture (pre-#342, or a
+    #342-era run that simply hasn't charged yet) reads ``ambient_captured`` as
+    ``False`` — the default-0 back-compat baseline this fix must preserve."""
+    await seeded_store(tmp_store)
+    try:
+        persisted = await tmp_store.read_latest_run()
+        assert persisted is not None
+        assert persisted.ambient_captured is False
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_set_ambient_persists_and_reads_back(tmp_store: RoastStore) -> None:
     """#342: the ambient triad round-trips through both the detail and summary
     read paths."""
@@ -405,6 +534,10 @@ async def test_enum_check_constraints_reject_invalid_values(
         with pytest.raises(aiosqlite_module.IntegrityError):
             await tmp_store.connection.execute(
                 "UPDATE roast_runs SET agent_phase = 'warming_up' WHERE id = 'run-1'"
+            )
+        with pytest.raises(aiosqlite_module.IntegrityError):
+            await tmp_store.connection.execute(
+                "UPDATE roast_runs SET ambient_captured = 2 WHERE id = 'run-1'"
             )
     finally:
         await tmp_store.close()
