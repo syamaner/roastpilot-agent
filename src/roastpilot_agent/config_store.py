@@ -300,6 +300,9 @@ class MCPDeviceConfigSnapshot(BaseModel, frozen=True):
     fc_confidence_threshold: ConfigFieldMeta
     auto_t0_detection_enabled: ConfigFieldMeta
     auto_t0_drop_threshold_c: ConfigFieldMeta
+    ambient_mode: ConfigFieldMeta
+    ambient_device: ConfigFieldMeta
+    ambient_poll_interval_seconds: ConfigFieldMeta
 
 
 class AppConfigSnapshot(BaseModel, frozen=True):
@@ -393,6 +396,13 @@ class MCPDeviceConfigEdit(BaseModel):
     fc_confidence_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
     auto_t0_detection_enabled: bool | None = None
     auto_t0_drop_threshold_c: float | None = Field(default=None, gt=0)
+    # Ambient environmental sensor fields (D85, #342/#474). Tri-state
+    # inherit/override, same as the other optional device fields (#439):
+    # absent from the PUT body → unchanged; explicit null → clear back to
+    # inherit from the hand-authored yaml; non-null → override.
+    ambient_mode: Literal["disabled", "yoctopuce"] | None = None
+    ambient_device: str | None = None
+    ambient_poll_interval_seconds: float | None = Field(default=None, gt=0)
 
 
 class AppConfigEdit(BaseModel):
@@ -1163,6 +1173,37 @@ def build_config_snapshot(
                 " Rendered to session.auto_t0_drop_threshold_c in the MCP yaml."
             ),
         ),
+        ambient_mode=_meta(
+            dev_saved.get("ambient_mode"),
+            dev.ambient_mode,
+            dev_def.ambient_mode,
+            "ROASTPILOT_MCP_DEVICE__AMBIENT_MODE",
+            description=(
+                "Ambient environmental sensor mode: disabled or yoctopuce (D85)."
+                " Rendered to ambient.mode in the MCP yaml."
+            ),
+        ),
+        ambient_device=_meta(
+            dev_saved.get("ambient_device"),
+            dev.ambient_device,
+            dev_def.ambient_device,
+            "ROASTPILOT_MCP_DEVICE__AMBIENT_DEVICE",
+            description=(
+                "Optional Yoctopuce module serial number or logical name to target"
+                " a specific ambient probe. Rendered to ambient.device in the MCP"
+                " yaml. When unset, the first detected Yocto Meteo device is used."
+            ),
+        ),
+        ambient_poll_interval_seconds=_meta(
+            dev_saved.get("ambient_poll_interval_seconds"),
+            dev.ambient_poll_interval_seconds,
+            dev_def.ambient_poll_interval_seconds,
+            "ROASTPILOT_MCP_DEVICE__AMBIENT_POLL_INTERVAL_SECONDS",
+            description=(
+                "Minimum seconds between ambient USB reads. Rendered to"
+                " ambient.poll_interval_seconds in the MCP yaml. Default 30.0 s."
+            ),
+        ),
     )
 
     return AppConfigSnapshot(
@@ -1284,6 +1325,14 @@ def apply_config_edit(
             "fc_confidence_threshold": d.fc_confidence_threshold,
             "auto_t0_detection_enabled": d.auto_t0_detection_enabled,
             "auto_t0_drop_threshold_c": d.auto_t0_drop_threshold_c,
+            # Ambient environmental sensor fields (D85, #342/#474). The blank-
+            # string guard (#439) applies to ambient_device the same as the
+            # other optional string device fields — an empty string is not a
+            # valid Yoctopuce serial/logical name and must clear to inherit
+            # rather than write device:'' into the MCP yaml.
+            "ambient_mode": d.ambient_mode,
+            "ambient_device": d.ambient_device or None,
+            "ambient_poll_interval_seconds": d.ambient_poll_interval_seconds,
         }
         explicitly_set = d.model_fields_set
         _merge_device_fields(dev_section, dev_fields, explicitly_set)

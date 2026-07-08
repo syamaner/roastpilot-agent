@@ -196,6 +196,39 @@ async def test_respawn_fires_when_mcp_device_changes(
     assert svc._spawned_mcp_device.serial_port == "/dev/ttyUSB1"  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.asyncio
+async def test_respawn_fires_when_ambient_config_changes(
+    store: RoastStore,
+    config_file: Path,
+) -> None:
+    """Changing an ambient field (D85, #474) is detected as device-config drift
+    and triggers a between-roast respawn, exactly like serial/audio/FC fields."""
+    fake_mcp = FakeMCPProcess(device_config=MCPDeviceConfig())
+    svc = _live_service_with_fake_mcp(store, fake_mcp, MCPDeviceConfig())
+
+    persist_config_edit(
+        AppConfigEdit(
+            mcp_device=MCPDeviceConfigEdit(
+                ambient_mode="yoctopuce",
+                ambient_device="METEOMK2-1",
+                ambient_poll_interval_seconds=15.0,
+            )
+        )
+    )
+
+    await svc.start_roast(RoastProfile(**_profile()))
+
+    assert fake_mcp.calls == ["stop", "set_device_config", "start"]
+    assert len(fake_mcp.set_device_config_args) == 1
+    new_device = fake_mcp.set_device_config_args[0]
+    assert new_device.ambient_mode == "yoctopuce"
+    assert new_device.ambient_device == "METEOMK2-1"
+    assert new_device.ambient_poll_interval_seconds == 15.0
+
+    assert svc._spawned_mcp_device is not None  # pyright: ignore[reportPrivateUsage]
+    assert svc._spawned_mcp_device.ambient_mode == "yoctopuce"  # pyright: ignore[reportPrivateUsage]
+
+
 # ---------------------------------------------------------------------------
 # No respawn when device config unchanged
 # ---------------------------------------------------------------------------

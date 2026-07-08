@@ -622,6 +622,11 @@ export interface MCPDeviceConfigSnapshot {
   fc_confidence_threshold: ConfigFieldMeta;
   auto_t0_detection_enabled: ConfigFieldMeta;
   auto_t0_drop_threshold_c: ConfigFieldMeta;
+  /** Ambient environmental sensor config (D85, #342/#474). Tri-state — see
+   *  serial_port/fc_mode above for the same inherit/override semantics. */
+  ambient_mode: ConfigFieldMeta;
+  ambient_device: ConfigFieldMeta;
+  ambient_poll_interval_seconds: ConfigFieldMeta;
 }
 
 /** GET /api/config response body (AppConfigSnapshot in Python). */

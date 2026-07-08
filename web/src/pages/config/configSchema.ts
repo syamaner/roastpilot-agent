@@ -656,6 +656,55 @@ const HARDWARE_FIELDS: ConfigFieldDef[] = [
   },
 ];
 
+// --- Ambient / environment (#342, #474) ---------------------------------------
+// Ambient environmental sensor (Yoctopuce Yocto-Meteo) config, rendered into
+// the MCP yaml's `ambient.*` section. Same tri-state inherit/override
+// semantics as the other mcp_device fields (#439) — null = inherit from the
+// hand-authored yaml. `ambient_mode` is the primary toggle; device + poll
+// interval are advanced/optional overrides.
+
+const AMBIENT_MODE_OPTIONS: FieldOption[] = [
+  { value: "disabled",  label: "Disabled" },
+  { value: "yoctopuce", label: "Yoctopuce (Yocto-Meteo USB probe)" },
+];
+
+const AMBIENT_FIELDS: ConfigFieldDef[] = [
+  {
+    key:            "mcp_device.ambient_mode",
+    label:          "Ambient sensor mode",
+    hint:           "Whether an ambient temp/humidity/pressure probe is read each roast. 'yoctopuce' reads a Yocto-Meteo USB probe; 'disabled' turns ambient capture off. Maps to ambient.mode in the MCP yaml.",
+    type:           "select",
+    options:        AMBIENT_MODE_OPTIONS,
+    envVar:         "ROASTPILOT_MCP_DEVICE__AMBIENT_MODE",
+    editKey:        "ambient_mode",
+    category:       "Hardware",
+    readOnlyStatic: false,
+  },
+  {
+    key:            "mcp_device.ambient_device",
+    label:          "Ambient probe device",
+    hint:           "Leave blank to auto-detect the first Yoctopuce Yocto-Meteo device. Set a serial number or logical name to pin a specific probe. Maps to ambient.device in the MCP yaml.",
+    type:           "text",
+    envVar:         "ROASTPILOT_MCP_DEVICE__AMBIENT_DEVICE",
+    editKey:        "ambient_device",
+    category:       "Hardware",
+    readOnlyStatic: false,
+  },
+  {
+    key:            "mcp_device.ambient_poll_interval_seconds",
+    label:          "Ambient poll interval",
+    hint:           "Minimum seconds between ambient USB reads. Leave blank to inherit the MCP default (30 s). Maps to ambient.poll_interval_seconds in the MCP yaml.",
+    type:           "number",
+    unit:           "s",
+    min:            0.1,  // gt=0 (exclusive) in MCPDeviceConfigEdit
+    step:           1,
+    envVar:         "ROASTPILOT_MCP_DEVICE__AMBIENT_POLL_INTERVAL_SECONDS",
+    editKey:        "ambient_poll_interval_seconds",
+    category:       "Hardware",
+    readOnlyStatic: false,
+  },
+];
+
 // --- Audio -------------------------------------------------------------------
 // Audio device configuration + mic test placeholder.
 // `audio_input_device` is a single-select; `recording_devices` is a
@@ -823,14 +872,18 @@ export const CONFIG_CATEGORIES: ConfigCategory[] = [
   {
     id:          "Hardware",
     label:       "Hardware",
-    description: "Serial port and roaster driver rendered into the MCP yaml on each spawn.",
+    description: "Serial port, roaster driver, and ambient sensor rendered into the MCP yaml on each spawn.",
     groups: [
       {
         title:  "Roaster",
         fields: HARDWARE_FIELDS,
       },
+      {
+        title:  "Ambient / environment",
+        fields: AMBIENT_FIELDS,
+      },
     ],
-    fields:      HARDWARE_FIELDS,
+    fields:      [...HARDWARE_FIELDS, ...AMBIENT_FIELDS],
   },
   {
     id:          "Audio",
