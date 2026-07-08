@@ -93,6 +93,21 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   await expect(page.getByTestId("control-heat-readout-note")).toBeVisible();
   await expect(page.getByTestId("control-fan-readout-note")).toBeVisible();
 
+  // #464 structural guard: the live "Room" ambient readout renders, hard-failing
+  // on a missing/renamed element regardless of pixel tolerance. This asserts the
+  // HONEST em-dash state, not a populated one: session-2's recorded export
+  // predates #342 (no ambient probe captured) and `replay.py`'s
+  // `_telemetry_from_record` — the SHARED foundation file that projects a
+  // recorded record into `RoastTelemetry`, mirroring how `mic_status` is
+  // synthesized rather than read off the flat export — never sets the ambient
+  // fields, so they are genuinely `None` on every replay frame today. Populating
+  // this state end-to-end needs a `replay.py` change (out of this FE-only
+  // story's scope; noted as a follow-up for whoever owns the replay harness).
+  await expect(page.getByTestId("ambient-conditions")).toBeVisible();
+  await expect(page.getByTestId("ambient-temp")).toHaveText("— °C");
+  await expect(page.getByTestId("ambient-humidity")).toHaveText("— % RH");
+  await expect(page.getByTestId("ambient-pressure")).toHaveText("— hPa");
+
   await settle(page);
   await expect(page).toHaveScreenshot("dashboard-live.png");
 });

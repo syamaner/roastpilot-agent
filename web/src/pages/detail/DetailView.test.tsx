@@ -116,6 +116,25 @@ describe("DetailView composition", () => {
     expect(fc).toHaveTextContent("audio_model");
     expect(fc).toHaveTextContent("0.91");
   });
+
+  it("renders the charge-time 'Roast conditions' widget from RoastDetail's ambient triad (#464)", () => {
+    renderView();
+    expect(screen.getByTestId("roast-conditions-temp")).toHaveTextContent("29.7 °C");
+    expect(screen.getByTestId("roast-conditions-humidity")).toHaveTextContent("41 %");
+    expect(screen.getByTestId("roast-conditions-pressure")).toHaveTextContent("1008 hPa");
+  });
+
+  it("shows the uncaptured note when a run has no ambient triad (back-compat)", () => {
+    render(
+      <DetailView
+        detail={{ ...FIXTURE_DETAIL, ambient_temp_c: null, ambient_humidity_pct: null, ambient_pressure_hpa: null }}
+        telemetry={FIXTURE_TELEMETRY}
+        timeline={FIXTURE_TIMELINE}
+      />,
+      { wrapper: wrapper() },
+    );
+    expect(screen.getByTestId("roast-conditions-uncaptured")).toBeInTheDocument();
+  });
 });
 
 function renderLongView() {

@@ -7,6 +7,7 @@ import {
   beanLabel,
   EMPTY_FILTERS,
   filterRuns,
+  formatAmbientCell,
   formatDevPercent,
   formatFcTime,
   formatStartedAt,
@@ -83,6 +84,25 @@ describe("formatWeightLoss", () => {
   it("renders an em dash for null/undefined (un-weighed)", () => {
     expect(formatWeightLoss(null)).toBe("—");
     expect(formatWeightLoss(undefined)).toBe("—");
+  });
+});
+
+describe("formatAmbientCell (#464 — charge-time ambient, history column)", () => {
+  it("joins temp and humidity with units when both are present", () => {
+    expect(formatAmbientCell(22.4, 41)).toBe("22.4°C · 41%");
+  });
+
+  it("renders temp-only when humidity is null (a partial-null real state, #463)", () => {
+    expect(formatAmbientCell(22.4, null)).toBe("22.4°C");
+  });
+
+  it("renders humidity-only when temp is null", () => {
+    expect(formatAmbientCell(null, 41)).toBe("41%");
+  });
+
+  it("renders an em dash when neither field was captured", () => {
+    expect(formatAmbientCell(null, null)).toBe("—");
+    expect(formatAmbientCell(undefined, undefined)).toBe("—");
   });
 });
 

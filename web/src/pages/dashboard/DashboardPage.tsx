@@ -378,6 +378,13 @@ export function DashboardPage(): React.JSX.Element {
           // present (its null = idle passes through, not the stale snapshot); the
           // snapshot only paints on hydrate before the first frame. Server-derived.
           micStatus={resolveMicStatus(telemetry, detail.data?.mic_status)}
+          // #464: the live "Room" conditions readout — the LATEST ambient triad,
+          // read directly off the telemetry frame (no snapshot fallback: unlike
+          // mic_status there is no pre-frame ambient signal on RoastDetail to
+          // paint from; the readout simply shows "—" until the first frame).
+          ambientTempC={telemetry?.ambient_temp_c ?? null}
+          ambientHumidityPct={telemetry?.ambient_humidity_pct ?? null}
+          ambientPressureHpa={telemetry?.ambient_pressure_hpa ?? null}
         />
 
         {/* Persistent charge-window banner (#211): replaces the easily-missed

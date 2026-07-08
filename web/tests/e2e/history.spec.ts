@@ -35,7 +35,17 @@ import type { RoastSummary } from "../../src/lib/types";
 // populated-state test asserts the live header row matches this EXACTLY, so a
 // column added or dropped fails structurally even if the pixel diff stays under
 // tolerance — closing the #241 blind spot at the DOM layer, not just the image.
-const EXPECTED_COLUMNS = ["Date", "Bean", "Outcome", "Advisor", "FC", "Dev %", "Loss %", "Rating"] as const;
+const EXPECTED_COLUMNS = [
+  "Date",
+  "Bean",
+  "Outcome",
+  "Advisor",
+  "FC",
+  "Dev %",
+  "Loss %",
+  "Ambient",
+  "Rating",
+] as const;
 
 // A fixed, hand-authored history payload typed to the FULL `RoastSummary`
 // contract (web/src/lib/types.ts) so the snapshot exercises EVERY populated
@@ -45,6 +55,11 @@ const EXPECTED_COLUMNS = ["Date", "Bean", "Outcome", "Advisor", "FC", "Dev %", "
 //   - (#111) an FC time AND a run that never reached first crack (`null`);
 //   - (#184) the three distinct Advisor-cell states — consults with a clamp +
 //     reject, consults "all allowed", and zero consults ("no advice").
+//   - (#464) the Ambient column populated for run-a/run-b (a real captured
+//     charge-time triad) and left absent on run-c — the exact #241 anti-pattern
+//     this file's own docstring warns against otherwise: leaving EVERY fixture
+//     row's ambient null would render the whole column from `undefined`/"—" and
+//     the populated baseline would test nothing for the captured state.
 // The advisor_* fields are REQUIRED by `RoastSummary`; the prior fixture omitted
 // them, so the Advisor cell rendered from `undefined` and the column tested
 // nothing. Typing `HISTORY` to the contract makes a future field rename a
@@ -66,6 +81,10 @@ const HISTORY: { runs: RoastSummary[] } = {
       advisor_clamped: 3,
       advisor_rejected: 1,
       advisor_failed: 0,
+      // #464: a real captured charge-time ambient triad.
+      ambient_temp_c: 22.4,
+      ambient_humidity_pct: 41,
+      ambient_pressure_hpa: 1013,
     },
     {
       id: "run-b",
@@ -82,6 +101,11 @@ const HISTORY: { runs: RoastSummary[] } = {
       advisor_clamped: 0,
       advisor_rejected: 0,
       advisor_failed: 0,
+      // #464: a second real ambient reading, a different value from run-a so the
+      // column isn't accidentally testing a single repeated constant.
+      ambient_temp_c: 26.8,
+      ambient_humidity_pct: 55,
+      ambient_pressure_hpa: 1009,
     },
     {
       id: "run-c",
@@ -98,6 +122,9 @@ const HISTORY: { runs: RoastSummary[] } = {
       advisor_clamped: 0,
       advisor_rejected: 0,
       advisor_failed: 0,
+      // #464: deliberately OMITTED (undefined) — the empty-state contrast, so
+      // the populated baseline shows both a real "22.4°C · 41%" reading AND the
+      // em-dash back-compat state in the same screenshot.
     },
   ],
 };
@@ -130,6 +157,12 @@ test("history — populated table", async ({ page }) => {
   await expect(page.locator("[data-testid='history-table'] thead th")).toHaveText([
     ...EXPECTED_COLUMNS,
   ]);
+  // #464 structural guard: the Ambient cells render REAL captured values for
+  // run-a/run-b, and the "—" back-compat state for run-c (undefined ambient) —
+  // hard-fails on a dropped/renamed cell even when the pixel diff stays under
+  // tolerance, and proves the populated baseline isn't the #241 all-null trap.
+  const ambientCells = page.getByTestId("history-ambient");
+  await expect(ambientCells).toHaveText(["22.4°C · 41%", "26.8°C · 55%", "—"]);
   await settle(page);
   await expect(page).toHaveScreenshot("history.png");
 });

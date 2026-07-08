@@ -73,6 +73,27 @@ export function formatWeightLoss(value: number | null | undefined): string {
 }
 
 /**
+ * Format the charge-time ambient reading (#342/#464) for the compact history
+ * column — `"22.4°C · 41%"` when both fields are captured, temp-only or
+ * humidity-only when just one is (a partial-null real state, #463), or an em
+ * dash when neither was captured (pre-#342 run, or an ambient-disabled/
+ * unavailable MCP config). Pressure is omitted here — it's the least
+ * decision-relevant of the triad for a compact column; the full triad is on the
+ * detail page's "Roast conditions" widget.
+ */
+export function formatAmbientCell(
+  ambientTempC: number | null | undefined,
+  ambientHumidityPct: number | null | undefined,
+): string {
+  const parts: string[] = [];
+  if (ambientTempC !== null && ambientTempC !== undefined) parts.push(`${ambientTempC.toFixed(1)}°C`);
+  if (ambientHumidityPct !== null && ambientHumidityPct !== undefined) {
+    parts.push(`${Math.round(ambientHumidityPct)}%`);
+  }
+  return parts.length === 0 ? "—" : parts.join(" · ");
+}
+
+/**
  * Format the first-crack timestamp (#111) as a UTC time-of-day `HH:MM` for the
  * FC-time column, or an em dash when no first crack was recorded for the run.
  *

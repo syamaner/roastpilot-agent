@@ -49,6 +49,29 @@ export function formatConfidence(value: number | null | undefined): string {
   return value.toFixed(2);
 }
 
+/** `29.7 °C` from a (possibly null) ambient Celsius reading; `— °C` when
+ *  unknown (#464 — the live "Conditions" readout, mirroring `formatTempC`'s
+ *  precision). Kept distinct from the bean-probe formatter so it stays
+ *  self-contained (this is corpus/context, never the bean-probe signal). */
+export function formatAmbientTempC(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "— °C";
+  return `${value.toFixed(1)} °C`;
+}
+
+/** `41 % RH` from a (possibly null) relative-humidity percent; `— % RH` when
+ *  unknown (#464). Whole-number %, "RH" suffix disambiguates from DTR/heat%. */
+export function formatAmbientHumidity(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "— % RH";
+  return `${Math.round(value)} % RH`;
+}
+
+/** `1008 hPa` from a (possibly null) barometric-pressure reading; `— hPa` when
+ *  unknown (#464). Whole-number hectopascals. */
+export function formatAmbientPressure(value: number | null | undefined): string {
+  if (value == null || !Number.isFinite(value)) return "— hPa";
+  return `${Math.round(value)} hPa`;
+}
+
 /** Human label for each phase — the header badge text (operator-facing truth). */
 export const PHASE_LABEL: Record<RoastPhase, string> = {
   idle: "IDLE",

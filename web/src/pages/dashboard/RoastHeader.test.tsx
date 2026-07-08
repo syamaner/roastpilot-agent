@@ -244,4 +244,25 @@ describe("RoastHeader", () => {
     expect(drawer).toHaveTextContent("development");
     expect(drawer).toHaveTextContent("running");
   });
+
+  it("renders the live ambient 'Room' readout from the server ambient triad (#464)", () => {
+    render(
+      <RoastHeader
+        {...BASE}
+        ambientTempC={29.7}
+        ambientHumidityPct={41}
+        ambientPressureHpa={1008}
+      />,
+    );
+    expect(screen.getByTestId("ambient-temp")).toHaveTextContent("29.7 °C");
+    expect(screen.getByTestId("ambient-humidity")).toHaveTextContent("41 % RH");
+    expect(screen.getByTestId("ambient-pressure")).toHaveTextContent("1008 hPa");
+  });
+
+  it("renders the ambient readout as em dashes when absent (undefined props, #464)", () => {
+    render(<RoastHeader {...BASE} />);
+    expect(screen.getByTestId("ambient-temp")).toHaveTextContent("— °C");
+    expect(screen.getByTestId("ambient-humidity")).toHaveTextContent("— % RH");
+    expect(screen.getByTestId("ambient-pressure")).toHaveTextContent("— hPa");
+  });
 });

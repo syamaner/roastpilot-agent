@@ -16,6 +16,7 @@ import type { RoastSummary } from "@/lib/types";
 
 import {
   beanLabel,
+  formatAmbientCell,
   formatDevPercent,
   formatFcTime,
   formatStartedAt,
@@ -51,6 +52,7 @@ export function HistoryTable({ runs }: HistoryTableProps): React.JSX.Element {
               <th className={HEAD_CELL}>FC</th>
               <th className={HEAD_CELL}>Dev %</th>
               <th className={HEAD_CELL}>Loss %</th>
+              <th className={HEAD_CELL}>Ambient</th>
               <th className={HEAD_CELL}>Rating</th>
             </tr>
           </thead>
@@ -128,6 +130,18 @@ export function HistoryTable({ runs }: HistoryTableProps): React.JSX.Element {
                   )}
                 >
                   {formatWeightLoss(run.weight_loss_percent)}
+                </td>
+                <td
+                  data-testid="history-ambient"
+                  className={cn(
+                    BODY_CELL,
+                    "whitespace-nowrap font-mono text-sm",
+                    run.ambient_temp_c === null || run.ambient_temp_c === undefined
+                      ? "text-muted-foreground"
+                      : "text-foreground",
+                  )}
+                >
+                  {formatAmbientCell(run.ambient_temp_c, run.ambient_humidity_pct)}
                 </td>
                 <td className={BODY_CELL}>
                   <StarRating rating={run.rating} />
