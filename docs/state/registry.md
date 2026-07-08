@@ -102,18 +102,28 @@
 
 ## Active Context
 
-**8 Jul 2026 (latest) — AUTONOMOUS HOUSEKEEPING BATCH + the ambient-UI gap → new story #464 (In
-Progress). Everything not gated on the hardware roast is now done and consistent across all three
-repos.** Two threads this session:
+**8 Jul 2026 (latest) — AMBIENT-UI SHIPPED (#464 + follow-ups #467/#463, D86) + an AUTONOMOUS
+HOUSEKEEPING BATCH. Everything not gated on the hardware roast is now done and consistent across all
+three repos.** Two threads this session:
 
-- **Ambient probe: shipped end-to-end but NOT in the UI → #464.** #342 captures/stores the triad and
-  exposes it on `RoastDetail`/`RoastSummary`, but the frontend renders none of it (grep of `web/src`
-  = zero refs). Ambient is deliberately NOT on the live SSE frame (D85 — corpus metadata, read once
-  at charge, not per-tick). **#464** (FE-only, no backend/release) surfaces it: a "Roast conditions"
-  readout on the detail page, a charge-time chip on the live dashboard (read from `RoastDetail`, not
-  SSE), and optionally history. Degrades to "—" when uncaptured/disabled. Being built autonomously
-  (engineer-fe). Low-pri follow-up **#463** (derive the ambient capture-latch from an explicit flag,
-  not `temp IS NOT NULL` — a non-constructible edge) also filed + boarded.
+- **Ambient probe now SHOWN in the UI (#464/D86 — closed) + both follow-ups closed.** #342 captured/
+  stored the triad and exposed it on `RoastDetail`/`RoastSummary`, but the frontend rendered none of
+  it (grep of `web/src` = zero refs) and it was deliberately off the SSE frame (D85 — corpus-only).
+  Operator asked "are we showing this when roasting?" → we weren't. **D86 revises D85's SSE-exclusion
+  point** (operator chose live=latest, option A): the readout rides the SSE telemetry frame, mirroring
+  `mic_status` 1:1 — **no MCP change** (the MCP already ~30s-caches + reports `ambient_status`; the
+  agent already mirrors it per tick). Shipped: **#466** (BE — `project_live_ambient` → `RoastTelemetry`
+  → `TelemetryEventData`, built in api.py not the controller → no safety surface) + **#468** (FE —
+  live "Room" readout on the dashboard, charge-time card on detail, history column; null→"—"). Two
+  follow-ups also DONE: **#467** (replay SYNTHESIZES a representative ambient — 21/45/1013 via
+  `_synthesized_ambient`, mirroring `_synthesized_mic_status`, since exports carry no ambient — so
+  `dashboard-live` + demos show real values not "—") and **#463** (explicit `ambient_captured`
+  store-V10 latch replaces the `temp IS NOT NULL` inference so a status=ok-with-null-temp capture
+  never re-fires post-restart). Review roster earned its keep: `qa` caught the #241 "fixtures test
+  nothing" anti-pattern + the baseline-regen Playwright run caught a testid-on-container bug (unit
+  tests don't run `.spec.ts`) + Codex caught a `formatAmbientCell` non-finite gap and a
+  `.playwright-mcp/` artifact sweep-in. CI-plumbing lesson captured: the `web-snapshots-update`
+  `[skip ci]` re-trigger trap (memory `baseline-regen-skip-ci-retrigger`).
 - **Cross-repo autonomous batch (sibling repos, all merged):** `coffee-first-crack-detection` went
   from ZERO CI to full CI (#57 gates + torch-free-import guard, #59 ruff/format/pyright cleanup +
   wire), gained `record_mics.py` streaming disk writes + verify (#49), an HF card/Space **sync
