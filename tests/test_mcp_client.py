@@ -39,6 +39,7 @@ from roastpilot_agent.mcp_client import (
     event_backdate_seconds,
     force_terminate_process_group,
     parse_tool_result,
+    project_live_ambient,
     project_mic_status,
     project_session_state,
     resolve_mcp_command,
@@ -1272,6 +1273,71 @@ def test_project_session_state_carries_mic_status() -> None:
     assert telemetry is not None
     assert telemetry.mic_status is not None
     assert telemetry.mic_status.mic_health is MicHealth.OK
+
+
+def test_project_live_ambient_ok_status_passes_through_triad() -> None:
+    """#464 (D86): an ``"ok"`` ambient status yields the live triad verbatim."""
+    state = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
+    assert project_live_ambient(state.ambient_status) == (28.49, 38.6, 1008.56)
+
+
+def test_project_live_ambient_non_ok_status_is_none() -> None:
+    """#464 (D86): disabled/unavailable ambient degrades to an all-None triad,
+    mirroring the MCP's own fail-soft contract (#342, D85) — never a fault."""
+    disabled_payload = _state_payload(
+        100.0,
+        ambient_status={
+            "mode": "disabled",
+            "status": "disabled",
+            "reason": "Ambient sensing is disabled by configuration.",
+            "ambient_running": False,
+        },
+    )
+    disabled = RoastSessionState.model_validate(disabled_payload)
+    assert project_live_ambient(disabled.ambient_status) == (None, None, None)
+
+    unavailable_payload = _state_payload(
+        100.0,
+        ambient_status={
+            "mode": "yoctopuce",
+            "status": "unavailable",
+            "reason": "Yoctopuce probe not detected.",
+            "ambient_running": False,
+        },
+    )
+    unavailable = RoastSessionState.model_validate(unavailable_payload)
+    assert project_live_ambient(unavailable.ambient_status) == (None, None, None)
+
+
+def test_project_session_state_carries_live_ambient_when_ok() -> None:
+    """#464 (D86): the telemetry projection rides the live ambient triad
+    alongside mic_status, mirroring the same precedent (#197)."""
+    state = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
+    telemetry = project_session_state(state, age_seconds=0.0)
+    assert telemetry is not None
+    assert telemetry.ambient_temp_c == 28.49
+    assert telemetry.ambient_humidity_pct == 38.6
+    assert telemetry.ambient_pressure_hpa == 1008.56
+
+
+def test_project_session_state_ambient_none_when_disabled() -> None:
+    """#464 (D86): a disabled/unavailable ambient config projects to None on
+    RoastTelemetry — fail-soft, never a crash or a fault."""
+    payload = _state_payload(
+        100.0,
+        ambient_status={
+            "mode": "disabled",
+            "status": "disabled",
+            "reason": "Ambient sensing is disabled by configuration.",
+            "ambient_running": False,
+        },
+    )
+    state = RoastSessionState.model_validate(payload)
+    telemetry = project_session_state(state, age_seconds=0.0)
+    assert telemetry is not None
+    assert telemetry.ambient_temp_c is None
+    assert telemetry.ambient_humidity_pct is None
+    assert telemetry.ambient_pressure_hpa is None
 
 
 @pytest.mark.asyncio

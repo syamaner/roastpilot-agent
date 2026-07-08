@@ -2447,6 +2447,66 @@ async def test_telemetry_frame_surfaces_development_time_and_dtr(store: RoastSto
     assert post_fc.development_percent != post_fc.development_elapsed_seconds
 
 
+@pytest.mark.asyncio
+async def test_telemetry_frame_carries_live_ambient_triad(store: RoastStore) -> None:
+    """#464 (D86): the live SSE telemetry frame mirrors the MCP's latest
+    ambient triad every tick — the same live/observability path as
+    ``mic_status`` (#197), distinct from the one-time charge-instant capture
+    (#342, D85, untouched by this)."""
+    clock = FakeClock()
+    mcp = FakeMCPClient(
+        [
+            _reading(
+                178.0,
+                185.0,
+                ambient_temp_c=21.4,
+                ambient_humidity_pct=45.2,
+                ambient_pressure_hpa=1013.1,
+            )
+        ]
+    )
+    service, _run_id = await _live_service(store, mcp=mcp, clock=clock)
+    queue = service.events.subscribe()
+
+    def latest_telemetry() -> TelemetryEventData:
+        frames = [
+            f
+            for f in _drain_queue(queue)
+            if f.event is SseEventType.TELEMETRY and f.data.get("bean_temp_c") is not None
+        ]
+        assert frames, "no telemetry frame published"
+        return TelemetryEventData.model_validate(frames[-1].data)
+
+    await _tick(service, clock)
+    frame = latest_telemetry()
+    assert frame.ambient_temp_c == 21.4
+    assert frame.ambient_humidity_pct == 45.2
+    assert frame.ambient_pressure_hpa == 1013.1
+
+
+@pytest.mark.asyncio
+async def test_telemetry_frame_ambient_none_when_unavailable(store: RoastStore) -> None:
+    """#464 (D86): no ambient reading this tick (disabled/unavailable MCP
+    config, or an older MCP with no ambient support) → the SSE frame carries
+    None for the whole triad, fail-soft — never a crash or a fault."""
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    service, _run_id = await _live_service(store, mcp=mcp, clock=clock)
+    queue = service.events.subscribe()
+
+    await _tick(service, clock)
+    frames = [
+        f
+        for f in _drain_queue(queue)
+        if f.event is SseEventType.TELEMETRY and f.data.get("bean_temp_c") is not None
+    ]
+    assert frames, "no telemetry frame published"
+    frame = TelemetryEventData.model_validate(frames[-1].data)
+    assert frame.ambient_temp_c is None
+    assert frame.ambient_humidity_pct is None
+    assert frame.ambient_pressure_hpa is None
+
+
 def _drain_queue(queue: "asyncio.Queue[SseEvent]") -> list[SseEvent]:
     frames: list[SseEvent] = []
     while True:
