@@ -1,8 +1,9 @@
 /**
- * Persistent nav (#324, updated #403): Home + History are always present; the
- * "Live roast" link appears ONLY when the server reports an active run and points
- * to `/live` (the stable reload-safe route, #403). Active-run presence is read
- * from `useHealth` (server state) — never inferred.
+ * Persistent nav (#324, updated #403, #473): Home + History + Settings are always
+ * present; the "Live roast" link appears ONLY when the server reports an active
+ * run and points to `/live` (the stable reload-safe route, #403). Active-run
+ * presence is read from `useHealth` (server state) — never inferred. Settings
+ * (#473) is a static link to `/config` — not server-state-dependent.
  */
 
 import { cleanup, render, screen } from "@testing-library/react";
@@ -28,6 +29,7 @@ function renderNav(initialPath = "/") {
         <Route path="/" element={<div data-testid="home-landing" />} />
         <Route path="/live" element={<div data-testid="live-landing" />} />
         <Route path="/roasts" element={<div data-testid="history-landing" />} />
+        <Route path="/config" element={<div data-testid="config-landing" />} />
       </Routes>
     </MemoryRouter>,
   );
@@ -35,12 +37,15 @@ function renderNav(initialPath = "/") {
 
 afterEach(cleanup);
 
-describe("NavBar (#324 / #403)", () => {
-  it("shows Home (not Live roast) + History when the server reports no active run", () => {
+describe("NavBar (#324 / #403 / #473)", () => {
+  it("shows Home (not Live roast) + History + Settings when the server reports no active run", () => {
     healthState.data = { active_run_id: null };
     renderNav();
     expect(screen.getByTestId("nav-home")).toHaveAttribute("href", "/");
     expect(screen.getByTestId("nav-history")).toHaveAttribute("href", "/roasts");
+    // #473: Settings is always present, idle or active — a static link, not
+    // server-state-dependent like the Home/Live-roast slot.
+    expect(screen.getByTestId("nav-settings")).toHaveAttribute("href", "/config");
     // The first slot is Home when idle — the Live-roast label is not shown.
     expect(screen.queryByTestId("nav-live-roast")).toBeNull();
   });
@@ -55,6 +60,17 @@ describe("NavBar (#324 / #403)", () => {
     // Home is not also rendered while a run is active.
     expect(screen.queryByTestId("nav-home")).toBeNull();
     expect(screen.getByTestId("nav-history")).toHaveAttribute("href", "/roasts");
+    // #473: Settings stays reachable even mid-roast — the config page only ever
+    // edits next-roast defaults, never the live loop.
+    expect(screen.getByTestId("nav-settings")).toHaveAttribute("href", "/config");
+  });
+
+  it("navigates to /config when the Settings link is clicked (#473)", async () => {
+    healthState.data = { active_run_id: null };
+    renderNav("/");
+    expect(screen.getByTestId("home-landing")).toBeInTheDocument();
+    await userEvent.click(screen.getByTestId("nav-settings"));
+    expect(screen.getByTestId("config-landing")).toBeInTheDocument();
   });
 
   it("navigates to /live when the Live roast link is clicked", async () => {
