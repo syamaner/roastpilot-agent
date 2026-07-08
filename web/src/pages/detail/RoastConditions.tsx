@@ -38,19 +38,21 @@ export function RoastConditions({
       </h3>
 
       <dl className="flex flex-wrap gap-x-6 gap-y-2">
-        <div className="flex flex-col" data-testid="roast-conditions-temp">
+        <div className="flex flex-col">
           <dt className="text-xs text-muted-foreground">Ambient temp</dt>
-          <dd className="numeric text-sm font-medium">{formatAmbientTemp(ambientTempC ?? null)}</dd>
+          <dd className="numeric text-sm font-medium" data-testid="roast-conditions-temp">
+            {formatAmbientTemp(ambientTempC ?? null)}
+          </dd>
         </div>
-        <div className="flex flex-col" data-testid="roast-conditions-humidity">
+        <div className="flex flex-col">
           <dt className="text-xs text-muted-foreground">Humidity</dt>
-          <dd className="numeric text-sm font-medium">
+          <dd className="numeric text-sm font-medium" data-testid="roast-conditions-humidity">
             {formatAmbientHumidity(ambientHumidityPct ?? null)}
           </dd>
         </div>
-        <div className="flex flex-col" data-testid="roast-conditions-pressure">
+        <div className="flex flex-col">
           <dt className="text-xs text-muted-foreground">Pressure</dt>
-          <dd className="numeric text-sm font-medium">
+          <dd className="numeric text-sm font-medium" data-testid="roast-conditions-pressure">
             {formatAmbientPressure(ambientPressureHpa ?? null)}
           </dd>
         </div>
