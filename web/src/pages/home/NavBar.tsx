@@ -1,10 +1,10 @@
 /**
- * Persistent device-console navigation (#324, updated #403).
+ * Persistent device-console navigation (#324, updated #403, #473).
  *
  * A slim header strip rendered by `RootLayout` above every routed page, so Home /
- * History / the live roast are reachable from anywhere — including mid-roast. The
- * shared `AppFrame` header (brand + connection indicator) stays below it; this bar
- * owns cross-page navigation only.
+ * History / Settings / the live roast are reachable from anywhere — including
+ * mid-roast. The shared `AppFrame` header (brand + connection indicator) stays
+ * below it; this bar owns cross-page navigation only.
  *
  * The first nav slot adapts to server state:
  *   - Idle (no active run): "Home" → `/` (the landing hub).
@@ -14,6 +14,9 @@
  * highlight at the same time, and the operator can always see which page they are on.
  * Active-run presence is SERVER state (`useHealth().active_run_id`); we never infer
  * roast phase locally (architecture invariant).
+ *
+ * "Settings" (→ `/config`, #473) is always present, including mid-roast — the
+ * config page itself only ever edits next-roast defaults, never the live loop.
  */
 
 import { NavLink } from "react-router-dom";
@@ -56,6 +59,9 @@ export function NavBar(): React.JSX.Element {
       )}
       <NavLink to="/roasts" className={navLinkClass} data-testid="nav-history">
         History
+      </NavLink>
+      <NavLink to="/config" className={navLinkClass} data-testid="nav-settings">
+        Settings
       </NavLink>
     </nav>
   );
