@@ -78,11 +78,53 @@ def test_load_export_parses_session2_frames_and_markers() -> None:
     assert not script.frames[0].telemetry.t0_detected
     assert script.frames[-1].telemetry.t0_detected
     assert script.frames[-1].telemetry.first_crack_detected
-    # #464 (D86): the pre-#342 export carries no ambient reading — the live
-    # ambient triad stays None throughout, back-compat with no crash.
-    assert all(f.telemetry.ambient_temp_c is None for f in script.frames)
-    assert all(f.telemetry.ambient_humidity_pct is None for f in script.frames)
-    assert all(f.telemetry.ambient_pressure_hpa is None for f in script.frames)
+    # #467 (revises #464/D86): the pre-#342 export carries no ambient reading,
+    # so replay synthesizes a fixed, representative triad on every frame —
+    # mirroring how `mic_status` is synthesized rather than read off the flat
+    # export — so the "Room" readout renders real values in replay/demo mode.
+    assert all(f.telemetry.ambient_temp_c == 21.0 for f in script.frames)
+    assert all(f.telemetry.ambient_humidity_pct == 45.0 for f in script.frames)
+    assert all(f.telemetry.ambient_pressure_hpa == 1013.0 for f in script.frames)
+
+
+def test_synthesized_ambient_returns_fixed_representative_triad() -> None:
+    """``_synthesized_ambient`` returns a fixed, plausible indoor roastery triad.
+
+    Recorded exports predate #342 and the live agent persists no per-tick
+    ambient history, so replay has no real ambient value to read back (#467) —
+    it synthesizes one instead, mirroring `_synthesized_mic_status`."""
+    from roastpilot_agent.replay import (
+        _synthesized_ambient,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+    )
+
+    temp_c, humidity_pct, pressure_hpa = _synthesized_ambient()
+    assert temp_c == 21.0
+    assert humidity_pct == 45.0
+    assert pressure_hpa == 1013.0
+    # Deterministic: repeated calls return the identical representative triad.
+    assert _synthesized_ambient() == (temp_c, humidity_pct, pressure_hpa)
+
+
+def test_telemetry_from_record_carries_synthesized_ambient() -> None:
+    """``_telemetry_from_record`` sets the synthesized ambient triad (#467).
+
+    Directly exercises the projection function (not just the parsed export),
+    so a regression here fails at the unit boundary, not only end-to-end."""
+    from roastpilot_agent.replay import (
+        _telemetry_from_record,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+    )
+
+    record = {
+        "bean_temp_c": 150.0,
+        "env_temp_c": 160.0,
+        "bean_ror_c_per_min": None,
+        "env_ror_c_per_min": None,
+        "cooling_on": False,
+    }
+    telemetry = _telemetry_from_record(record, t0=True, first_crack=False)
+    assert telemetry.ambient_temp_c == 21.0
+    assert telemetry.ambient_humidity_pct == 45.0
+    assert telemetry.ambient_pressure_hpa == 1013.0
 
 
 def test_load_export_missing_jsonl_raises(tmp_path: Path) -> None:
