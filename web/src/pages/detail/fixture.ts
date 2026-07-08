@@ -75,6 +75,11 @@ export const FIXTURE_DETAIL: RoastDetail = {
   fault_reason: null,
   rating: 4,
   notes: "Good body, slightly bright.",
+  // Charge-time ambient triad (#342/#464) — a real captured reading, so the
+  // "Roast conditions" widget's captured state is the default detail snapshot.
+  ambient_temp_c: 29.7,
+  ambient_humidity_pct: 41.2,
+  ambient_pressure_hpa: 1008.3,
   export_manifest: {
     log_dir: "/var/roastpilot/logs/detail-fixture-001",
     jsonl_path: "/var/roastpilot/logs/detail-fixture-001/roast.jsonl",

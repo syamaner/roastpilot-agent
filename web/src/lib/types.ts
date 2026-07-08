@@ -125,6 +125,15 @@ export interface TelemetryEventData {
   // Capture-alive mic / first-crack health (#197); nullable — null = no active
   // session / no info, which the icon renders as idle (NOT error/red).
   mic_status: MicStatus | null;
+  // Live/latest ambient triad (#464, D86), mirrored each tick from the MCP's
+  // ~30 s-cached ambient status — the SAME mirror-and-render pattern as
+  // `mic_status` above. `null` per-field when ambient is uncaptured, disabled,
+  // or unavailable this tick. DISTINCT from `RoastDetail.ambient_temp_c` (a
+  // one-time charge-instant capture, #342/D85); this is the live/current
+  // reading. Pure observability — never read by any safety gate or control path.
+  ambient_temp_c: number | null;
+  ambient_humidity_pct: number | null;
+  ambient_pressure_hpa: number | null;
 }
 
 /**
@@ -333,6 +342,14 @@ export interface RoastSummary {
   advisor_clamped: number;
   advisor_rejected: number;
   advisor_failed: number;
+  // Ambient triad captured ONCE at charge (#342, D85) — the "Roast conditions"
+  // read the history/detail pages render. Optional/nullable for back-compat
+  // (a pre-#342 run, or an ambient-disabled/unavailable MCP config). DISTINCT
+  // from the live/latest `TelemetryEventData.ambient_temp_c` (#464), which is
+  // the current-reading mirror on the SSE frame, not the charge-time capture.
+  ambient_temp_c?: number | null;
+  ambient_humidity_pct?: number | null;
+  ambient_pressure_hpa?: number | null;
 }
 
 export interface RoastHistory {
@@ -362,6 +379,11 @@ export interface RoastDetail {
   // for the *active* run (the live MCP state); historical runs carry null. Lets the
   // header paint the mic icon on first paint, before the first telemetry frame.
   mic_status?: MicStatus | null;
+  // Ambient triad captured ONCE at charge (#342, D85) — see `RoastSummary`'s
+  // fields above for the back-compat / distinct-from-live notes; identical here.
+  ambient_temp_c?: number | null;
+  ambient_humidity_pct?: number | null;
+  ambient_pressure_hpa?: number | null;
 }
 
 export interface TelemetryPoint {

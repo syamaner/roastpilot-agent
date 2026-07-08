@@ -38,6 +38,7 @@ import {
   PHASE_LABEL,
   phaseAccentVar,
 } from "./format";
+import { AmbientConditions } from "./AmbientConditions";
 import type { FirstCrackData } from "./events";
 import { MicStatusIcon } from "./MicStatusIcon";
 import { useFrozenElapsed } from "./preheatClock";
@@ -94,6 +95,15 @@ export interface RoastHeaderProps {
    * renders the icon as idle — no info, NOT a fault.
    */
   micStatus?: MicStatus | null;
+  /**
+   * Latest ambient triad from the live telemetry frame (#464, D86) — the "Room"
+   * conditions readout. Each field null when ambient is uncaptured/disabled/
+   * unavailable this tick; the readout then shows "—" per field rather than
+   * hiding (kept unobtrusive: context, not a control, D25/kickoff §1).
+   */
+  ambientTempC?: number | null;
+  ambientHumidityPct?: number | null;
+  ambientPressureHpa?: number | null;
 }
 
 export function RoastHeader({
@@ -107,6 +117,9 @@ export function RoastHeader({
   firstCrack,
   mcpChild,
   micStatus,
+  ambientTempC,
+  ambientHumidityPct,
+  ambientPressureHpa,
 }: RoastHeaderProps): React.JSX.Element {
   const accent = phaseAccentVar(phase);
   // #330: freeze the serve-referenced clock at its last LIVE value once the server
@@ -193,6 +206,14 @@ export function RoastHeader({
         </div>
         <FirstCrackStatus phase={phase} firstCrack={firstCrack} />
         <MicStatusIcon micStatus={micStatus} />
+        {/* #464: the live "Room" conditions readout — context, not a control, so it
+            sits alongside the other passive status chips rather than the primary
+            bean-temp/RoR/heat-fan surface. Renders "—" per field, never hides. */}
+        <AmbientConditions
+          ambientTempC={ambientTempC}
+          ambientHumidityPct={ambientHumidityPct}
+          ambientPressureHpa={ambientPressureHpa}
+        />
         <RoasterLink status={mcpChild} />
         <DiagnosticsDrawer
           phase={phase}

@@ -195,6 +195,12 @@ describe("telemetry — every field the SPA renders is present", () => {
       "first_crack_detected",
       // #197: the capture-alive mic status rides the telemetry frame.
       "mic_status",
+      // #464: the live/latest ambient triad rides the telemetry frame too —
+      // mirroring the mic_status precedent exactly (server-derived, observed
+      // read-only). A dropped/renamed field here is caught the same way.
+      "ambient_temp_c",
+      "ambient_humidity_pct",
+      "ambient_pressure_hpa",
     ]);
     expect(typeof t.bean_temp_c).toBe("number");
     expect(PHASES).toContain(t.agent_phase);
@@ -413,6 +419,12 @@ describe("REST snapshot contract", () => {
       "weight_loss_percent",
       "export_manifest",
       "enabled_actions",
+      // #464/#342: the charge-time ambient triad the detail page's "Roast
+      // conditions" widget reads — a dropped/renamed field here is caught the
+      // same way as the mic_status guard above.
+      "ambient_temp_c",
+      "ambient_humidity_pct",
+      "ambient_pressure_hpa",
     ]);
     // #197: the active-run snapshot carries the capture-alive mic status the
     // header paints the icon from before the first telemetry frame.
@@ -461,6 +473,10 @@ describe("REST snapshot contract", () => {
       "advisor_clamped",
       "advisor_rejected",
       "advisor_failed",
+      // #464/#342: the charge-time ambient triad the history column reads.
+      "ambient_temp_c",
+      "ambient_humidity_pct",
+      "ambient_pressure_hpa",
     ]);
   });
 

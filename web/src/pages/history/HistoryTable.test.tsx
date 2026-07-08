@@ -86,3 +86,22 @@ describe("HistoryTable weight loss % (#388)", () => {
     expect(screen.getByTestId("history-weight-loss")).toHaveTextContent("—");
   });
 });
+
+describe("HistoryTable ambient (#464)", () => {
+  it("renders an Ambient column header", () => {
+    renderTable([summary()]);
+    expect(screen.getByRole("columnheader", { name: "Ambient" })).toBeInTheDocument();
+  });
+
+  it("shows the charge-time temp + humidity when captured", () => {
+    renderTable([
+      summary({ id: "amb", ambient_temp_c: 22.4, ambient_humidity_pct: 41, ambient_pressure_hpa: 1013 }),
+    ]);
+    expect(screen.getByTestId("history-ambient")).toHaveTextContent("22.4°C · 41%");
+  });
+
+  it("shows an em-dash when ambient was never captured (pre-#342 / disabled)", () => {
+    renderTable([summary({ id: "no-amb" })]);
+    expect(screen.getByTestId("history-ambient")).toHaveTextContent("—");
+  });
+});

@@ -50,6 +50,15 @@ test("roast-detail — full-page snapshot of the detail page (canvas un-masked)"
   await expect(page.locator("[data-testid='decision-trace-table'] thead th")).toHaveText([
     ...EXPECTED_TRACE_COLUMNS,
   ]);
+  // #464 structural guard: the "Roast conditions" widget renders the fixture's
+  // REAL captured charge-time triad (29.7 °C / 41 % / 1008 hPa), not the "—"
+  // empty state — hard-fails on a missing/renamed element regardless of pixel
+  // tolerance, and proves the populated baseline isn't the #241 all-null trap.
+  const conditions = page.getByTestId("roast-conditions");
+  await expect(conditions).toBeVisible();
+  await expect(page.getByTestId("roast-conditions-temp")).toHaveText("29.7 °C");
+  await expect(page.getByTestId("roast-conditions-humidity")).toHaveText("41 %");
+  await expect(page.getByTestId("roast-conditions-pressure")).toHaveText("1008 hPa");
   await expect(page).toHaveScreenshot("roast-detail.png");
 });
 

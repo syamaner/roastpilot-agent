@@ -29,6 +29,7 @@ import { CappedList } from "./CappedList";
 import { DecisionTraceTable } from "./DecisionTraceTable";
 import { EventTimeline } from "./EventTimeline";
 import { ExportOptions } from "./ExportOptions";
+import { RoastConditions } from "./RoastConditions";
 import { RoastRating } from "./RoastRating";
 import { RoastedWeight } from "./RoastedWeight";
 import { TitleBlock } from "./TitleBlock";
@@ -144,6 +145,11 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
             chargeWeightGrams={detail.profile.bean_weight_grams}
             roastedWeightGrams={detail.roasted_weight_grams ?? null}
             weightLossPercent={detail.weight_loss_percent ?? null}
+          />
+          <RoastConditions
+            ambientTempC={detail.ambient_temp_c}
+            ambientHumidityPct={detail.ambient_humidity_pct}
+            ambientPressureHpa={detail.ambient_pressure_hpa}
           />
           <ExportOptions runId={detail.id} manifest={detail.export_manifest} />
         </div>
