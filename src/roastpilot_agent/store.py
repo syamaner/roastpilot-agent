@@ -361,6 +361,27 @@ ALTER TABLE roast_runs ADD COLUMN ambient_humidity_pct REAL;
 ALTER TABLE roast_runs ADD COLUMN ambient_pressure_hpa REAL;
 """
 
+SCHEMA_V10_AMBIENT_CAPTURED_LATCH = """
+-- #463: derive the ambient charge-time capture latch from an EXPLICIT flag
+-- rather than inferring "already captured" from ``ambient_temp_c IS NOT
+-- NULL`` (SCHEMA_V9). That derivation has a narrow edge: a ``status='ok'``
+-- MCP reading with a NULL temperature (not constructible today per the MCP
+-- contract, but not ruled out either) would read back as "never captured"
+-- and could re-fire the once-only capture post-restart, clobbering a good
+-- corpus row. The explicit flag records that the capture WRITE ran, wholly
+-- independent of whether the reading itself was null.
+--
+-- Written in the SAME statement as the ambient triad (``set_ambient``, the
+-- single charge-time capture write) — set to 1 whenever the capture runs,
+-- regardless of the reading. Existing rows default to 0 (never captured;
+-- back-compat, same as a pre-existing NULL ambient_temp_c). Like the V9
+-- ambient columns, this is written on an ACTIVE (not-yet-completed) run
+-- exactly once, so it stays OUTSIDE the v2 completed-run immutability set —
+-- the immutability trigger never needs to guard it.
+ALTER TABLE roast_runs ADD COLUMN ambient_captured INTEGER NOT NULL DEFAULT 0
+  CHECK (ambient_captured IN (0, 1));
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
@@ -374,6 +395,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V7_ROASTED_WEIGHT,
     SCHEMA_V8_TURNING_POINT_EVENT,
     SCHEMA_V9_AMBIENT,
+    SCHEMA_V10_AMBIENT_CAPTURED_LATCH,
 )
 
 
@@ -403,11 +425,13 @@ class PersistedRun(BaseModel):
     #: restores the advisory DTR clock from it; nothing safety-gating reads it.
     t0_detected_at_utc: str | None = None
     #: Whether the ambient triad was already persisted for this run pre-restart
-    #: (#342, D85) — ``True`` iff ``ambient_temp_c`` is non-NULL. Recovery seeds
-    #: the runner's once-only latch from this so a resumed already-charged run
-    #: never re-captures (and potentially overwrites a good corpus reading with
-    #: a transient post-restart probe hiccup). Corpus-only; nothing
-    #: safety-gating reads it.
+    #: (#342, D85; explicit-flag fix #463) — ``True`` iff the ``ambient_captured``
+    #: column is set, NOT derived from ``ambient_temp_c IS NOT NULL`` (a
+    #: status='ok'-with-null-temperature capture must still latch). Recovery
+    #: seeds the runner's once-only latch from this so a resumed
+    #: already-charged run never re-captures (and potentially overwrites a good
+    #: corpus reading with a transient post-restart probe hiccup). Corpus-only;
+    #: nothing safety-gating reads it.
     ambient_captured: bool = False
 
 
@@ -676,10 +700,14 @@ class RoastStore:
         Written once, on the ACTIVE run, the first tick the runner observes the
         charge/T0 transition (mirroring :meth:`record_t0_detected_at`'s
         lifecycle) — the *caller* (``api._persist_ambient_if_charged``) owns the
-        once-only latch, since a ``None`` reading is itself a valid persisted
-        value and so cannot double as a "not yet written" sentinel the way
-        ``t0_detected_at_utc IS NULL`` does. A missing run is a programming
-        error and raises, like :meth:`record_t0_detected_at`.
+        once-only latch. In the same statement this also sets the explicit
+        ``ambient_captured`` flag (SCHEMA_V10, #463) to ``1`` — the capture RAN,
+        regardless of whether the reading itself is null, so a
+        ``status='ok'``-with-null-temperature capture still latches and cannot
+        re-fire post-restart. (``ambient_temp_c IS NOT NULL`` alone cannot serve
+        as that "already captured" sentinel, since a null reading is itself a
+        valid persisted value.) A missing run is a programming error and
+        raises, like :meth:`record_t0_detected_at`.
 
         Args:
             run_id: The active run whose ambient reading is being stamped.
@@ -691,7 +719,8 @@ class RoastStore:
         """
         cursor = await self.connection.execute(
             "UPDATE roast_runs SET ambient_temp_c = ?, ambient_humidity_pct = ?,"
-            " ambient_pressure_hpa = ?, updated_at_utc = ? WHERE id = ?",
+            " ambient_pressure_hpa = ?, ambient_captured = 1, updated_at_utc = ?"
+            " WHERE id = ?",
             (temperature_c, humidity_percent, pressure_hpa, _utc_now(), run_id),
         )
         await self.connection.commit()
@@ -925,7 +954,7 @@ class RoastStore:
         fresh database."""
         async with self.connection.execute(
             "SELECT id, agent_phase, outcome, started_at_utc, completed_at_utc,"
-            " t0_detected_at_utc, ambient_temp_c, profile_json FROM roast_runs"
+            " t0_detected_at_utc, ambient_captured, profile_json FROM roast_runs"
             " ORDER BY started_at_utc DESC, rowid DESC LIMIT 1"
         ) as cursor:
             row = await cursor.fetchone()
@@ -942,7 +971,9 @@ class RoastStore:
             t0_detected_at_utc=None
             if row["t0_detected_at_utc"] is None
             else str(row["t0_detected_at_utc"]),
-            ambient_captured=row["ambient_temp_c"] is not None,
+            # #463: the explicit flag (SCHEMA_V10), not ``ambient_temp_c IS NOT
+            # NULL`` — a captured-but-null reading must still latch.
+            ambient_captured=bool(row["ambient_captured"]),
             profile=RoastProfile.model_validate_json(str(row["profile_json"])),
         )
 
