@@ -104,6 +104,13 @@ describe("formatAmbientCell (#464 — charge-time ambient, history column)", () 
     expect(formatAmbientCell(null, null)).toBe("—");
     expect(formatAmbientCell(undefined, undefined)).toBe("—");
   });
+
+  it("treats non-finite readings as absent (no 'Infinity°C'/'NaN%' leak, matching the sibling formatters)", () => {
+    expect(formatAmbientCell(Infinity, 41)).toBe("41%");
+    expect(formatAmbientCell(22.4, Number.NaN)).toBe("22.4°C");
+    expect(formatAmbientCell(Infinity, Number.NaN)).toBe("—");
+    expect(formatAmbientCell(-Infinity, -Infinity)).toBe("—");
+  });
 });
 
 describe("formatFcTime", () => {

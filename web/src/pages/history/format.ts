@@ -86,8 +86,10 @@ export function formatAmbientCell(
   ambientHumidityPct: number | null | undefined,
 ): string {
   const parts: string[] = [];
-  if (ambientTempC !== null && ambientTempC !== undefined) parts.push(`${ambientTempC.toFixed(1)}°C`);
-  if (ambientHumidityPct !== null && ambientHumidityPct !== undefined) {
+  if (ambientTempC != null && Number.isFinite(ambientTempC)) {
+    parts.push(`${ambientTempC.toFixed(1)}°C`);
+  }
+  if (ambientHumidityPct != null && Number.isFinite(ambientHumidityPct)) {
     parts.push(`${Math.round(ambientHumidityPct)}%`);
   }
   return parts.length === 0 ? "—" : parts.join(" · ");
