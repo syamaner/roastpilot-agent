@@ -102,7 +102,36 @@
 
 ## Active Context
 
-**7 Jul 2026 (latest) — #342 AMBIENT PROBE SHIPPED, both repos, hardware-validated. The Yoctopuce
+**8 Jul 2026 (latest) — AUTONOMOUS HOUSEKEEPING BATCH + the ambient-UI gap → new story #464 (In
+Progress). Everything not gated on the hardware roast is now done and consistent across all three
+repos.** Two threads this session:
+
+- **Ambient probe: shipped end-to-end but NOT in the UI → #464.** #342 captures/stores the triad and
+  exposes it on `RoastDetail`/`RoastSummary`, but the frontend renders none of it (grep of `web/src`
+  = zero refs). Ambient is deliberately NOT on the live SSE frame (D85 — corpus metadata, read once
+  at charge, not per-tick). **#464** (FE-only, no backend/release) surfaces it: a "Roast conditions"
+  readout on the detail page, a charge-time chip on the live dashboard (read from `RoastDetail`, not
+  SSE), and optionally history. Degrades to "—" when uncaptured/disabled. Being built autonomously
+  (engineer-fe). Low-pri follow-up **#463** (derive the ambient capture-latch from an explicit flag,
+  not `temp IS NOT NULL` — a non-constructible edge) also filed + boarded.
+- **Cross-repo autonomous batch (sibling repos, all merged):** `coffee-first-crack-detection` went
+  from ZERO CI to full CI (#57 gates + torch-free-import guard, #59 ruff/format/pyright cleanup +
+  wire), gained `record_mics.py` streaming disk writes + verify (#49), an HF card/Space **sync
+  workflow** (#34 — secret-gated; operator added `HF_TOKEN`, so it's LIVE and validated end-to-end on
+  a real card change), and a **model-card correctness fix** (#63 — Pi/ONNX examples updated to the
+  D27 torch-free API, proven runnable; an INT8-parity overclaim corrected: the mel-diff test proves
+  FRONT-END equivalence, not full/quantized-model parity). #55 precision analysis posted (the "4 FP"
+  headline is unreproducible from committed data; saved matrices show 5–6; the `pi_inference` 0.90 +
+  confirmation gate is the likely near-free fix; sweep on request). `coffee-roaster-mcp` gained the
+  pre-open logic-churn size-check discipline (#187/#188).
+
+**Unchanged:** the **supervised hardware roast** is still the one high-leverage unlock — it flips on
+the #405 post-FC RoR loop (#460) and lights up #323 (ceiling-drop) + #380 (FC-lag, deferred) tuning.
+MCP #157 (D27 Phase 2) needs a Pi 5. #396 (advisor A/B) is available on request (paid).
+
+---
+
+**7 Jul 2026 — #342 AMBIENT PROBE SHIPPED, both repos, hardware-validated. The Yoctopuce
 Yocto-Meteo-V2-C (temp/humidity/pressure) is now captured per-roast as corpus metadata. On the
 operator's re-raised architecture question the integration home moved from agent-direct to
 MCP-OWNED (plan D85 revises D60) — the MCP owns the roaster rig's other USB sensor (the FC mic), so
