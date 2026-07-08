@@ -78,6 +78,11 @@ def test_load_export_parses_session2_frames_and_markers() -> None:
     assert not script.frames[0].telemetry.t0_detected
     assert script.frames[-1].telemetry.t0_detected
     assert script.frames[-1].telemetry.first_crack_detected
+    # #464 (D86): the pre-#342 export carries no ambient reading — the live
+    # ambient triad stays None throughout, back-compat with no crash.
+    assert all(f.telemetry.ambient_temp_c is None for f in script.frames)
+    assert all(f.telemetry.ambient_humidity_pct is None for f in script.frames)
+    assert all(f.telemetry.ambient_pressure_hpa is None for f in script.frames)
 
 
 def test_load_export_missing_jsonl_raises(tmp_path: Path) -> None:

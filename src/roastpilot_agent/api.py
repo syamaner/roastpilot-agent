@@ -1187,6 +1187,9 @@ class RoastRunner:
                     t0_detected=telemetry.t0_detected,
                     first_crack_detected=telemetry.first_crack_detected,
                     mic_status=telemetry.mic_status,
+                    ambient_temp_c=telemetry.ambient_temp_c,
+                    ambient_humidity_pct=telemetry.ambient_humidity_pct,
+                    ambient_pressure_hpa=telemetry.ambient_pressure_hpa,
                 )
             )
         await self._store.record_telemetry(

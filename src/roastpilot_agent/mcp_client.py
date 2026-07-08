@@ -14,7 +14,11 @@ mcp-contract-checker sub-agent and the contract fixtures (E5-S3), not by
 runtime crashes. v0.1.12 adds ``ambient_status`` to ``get_roast_state``'s
 session state (#342, D85 — read-only corpus metadata: temperature/humidity/
 pressure from an optional Yoctopuce probe; no tool-surface change, hardware-
-validated on a live read).
+validated on a live read). #464 (D86, revises D85) additionally projects the
+LATEST ambient triad onto ``RoastTelemetry`` every tick (mirroring
+``mic_status``) so the live SSE dashboard can show it updating — still no
+control/safety coupling, and the one-time charge-instant capture (#342) is
+untouched.
 
 E5-S2 adds the transport: the client owns the MCP child process (D6 —
 spawn `coffee-roaster-mcp serve`, health, per-call timeouts,
@@ -419,6 +423,30 @@ def project_mic_status(status: FirstCrackStatus) -> MicStatus:
     )
 
 
+def project_live_ambient(status: AmbientStatus) -> tuple[float | None, float | None, float | None]:
+    """Project an MCP ``AmbientStatus`` into the live ambient triad (#464, D86).
+
+    A pure, read-only observability projection — no safety logic, no MCP
+    write — mirroring :func:`project_mic_status`'s precedent exactly: it
+    forwards the MCP's own already-computed ``status`` gate rather than
+    re-deriving anything. This is the LATEST/live reading, refreshed every
+    tick — distinct from the one-time charge-instant capture
+    :meth:`RoastStore.set_ambient` persists (#342, D85), which this function
+    does not touch.
+
+    Args:
+        status: The MCP ambient status from ``RoastSessionState``.
+
+    Returns:
+        The ``(temperature_c, humidity_percent, pressure_hpa)`` triad when
+        ``status.status == "ok"``, else ``(None, None, None)`` — the MCP's own
+        fail-soft contract for a disabled/unavailable probe.
+    """
+    if status.status != "ok":
+        return None, None, None
+    return status.temperature_c, status.humidity_percent, status.pressure_hpa
+
+
 def _payload_float(payload: dict[str, EventPayloadValue], key: str) -> float | None:
     """Read a finite numeric payload field as a float, or ``None``.
 
@@ -510,6 +538,9 @@ def project_session_state(state: RoastSessionState, *, age_seconds: float) -> Ro
     device = state.device_state
     if device is None or device.bean_temp_c is None or device.env_temp_c is None:
         return None
+    ambient_temp_c, ambient_humidity_pct, ambient_pressure_hpa = project_live_ambient(
+        state.ambient_status
+    )
     return RoastTelemetry(
         bean_temp_c=device.bean_temp_c,
         env_temp_c=device.env_temp_c,
@@ -530,6 +561,9 @@ def project_session_state(state: RoastSessionState, *, age_seconds: float) -> Ro
             kind="first_crack_detected",
             onset_key="detected_at_monotonic_seconds",
         ),
+        ambient_temp_c=ambient_temp_c,
+        ambient_humidity_pct=ambient_humidity_pct,
+        ambient_pressure_hpa=ambient_pressure_hpa,
     )
 
 

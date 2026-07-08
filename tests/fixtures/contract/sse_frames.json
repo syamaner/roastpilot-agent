@@ -195,6 +195,9 @@
     {
       "data": {
         "agent_phase": "preheating",
+        "ambient_humidity_pct": null,
+        "ambient_pressure_hpa": null,
+        "ambient_temp_c": null,
         "bean_ror_c_per_min": null,
         "bean_temp_c": 38.0,
         "charge_elapsed_seconds": null,

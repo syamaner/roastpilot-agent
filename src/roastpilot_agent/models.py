@@ -303,6 +303,18 @@ class RoastTelemetry(BaseModel):
     onset. ``None`` when the source carries no backdated event (a manual mark, an
     older payload, or no such event yet) — the controller then stamps at
     receive-tick, the pre-0.1.7 behaviour.
+
+    ``ambient_temp_c`` / ``ambient_humidity_pct`` / ``ambient_pressure_hpa``
+    carry the LATEST ambient reading (#464, D86 — revises D85), mirroring
+    ``mic_status``'s precedent exactly: a pure observability projection off the
+    MCP's ``ambient_status`` (mode/status + the ~30 s-cached triad), refreshed
+    every tick. ``None`` when the MCP ambient status is not ``"ok"``
+    (disabled/unavailable) or the source state carries no ambient status at all
+    (an older MCP / replay export). Distinct from the ONE-TIME charge-instant
+    value :meth:`RoastStore.set_ambient` persists onto ``roast_runs`` (#342,
+    D85) — that capture path is untouched; these fields are the live/current
+    reading for the SSE dashboard, never read by any safety gate or control
+    path.
     """
 
     bean_temp_c: float
@@ -316,6 +328,9 @@ class RoastTelemetry(BaseModel):
     mic_status: MicStatus | None = None
     t0_backdate_seconds: float | None = None
     first_crack_backdate_seconds: float | None = None
+    ambient_temp_c: float | None = None
+    ambient_humidity_pct: float | None = None
+    ambient_pressure_hpa: float | None = None
 
 
 # Bean species (botanical) — a constrained ``Literal`` deliberately, NOT a
@@ -1190,6 +1205,20 @@ class TelemetryEventData(BaseModel):
     """Capture-alive mic / first-crack health (#197), server-derived and
     read-only on the SPA — mirrors the ``enabled_actions`` precedent (D25).
     ``None`` when no first-crack status is available this tick."""
+    ambient_temp_c: float | None = None
+    """Live/latest ambient temperature in Celsius (#464, D86), mirrored each
+    tick from the MCP's ~30 s-cached ``ambient_status`` — DISTINCT from the
+    charge-time ``RoastDetail.ambient_temp_c`` (#342, D85), which is a one-time
+    capture persisted at charge. ``None`` when ambient is uncaptured, disabled,
+    or unavailable this tick. Observability-only: no safety gate or control
+    path reads this field."""
+    ambient_humidity_pct: float | None = None
+    """Live/latest ambient relative humidity percentage (#464, D86) — same
+    mirrored-each-tick / observability-only rules as :attr:`ambient_temp_c`."""
+    ambient_pressure_hpa: float | None = None
+    """Live/latest ambient barometric pressure in hectopascals (#464, D86) —
+    same mirrored-each-tick / observability-only rules as
+    :attr:`ambient_temp_c`."""
 
 
 class SseEvent(BaseModel):
