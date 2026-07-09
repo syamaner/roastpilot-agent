@@ -75,8 +75,26 @@ In this environment it silently no-op'd. Create worktrees explicitly and verify
 `git worktree list`. Treat the flag as unproven until a `git worktree list` check
 says otherwise.
 
+## Reviewers in a shared worktree (added 9 Jul 2026, after a live incident)
+
+During the 9 Jul batch a reviewer ran `git checkout -- <file>` in a teammate's
+worktree to undo a one-line hypothesis edit — and wiped the teammate's ENTIRE
+uncommitted 200-line diff for that file. It was recovered only because the
+reviewer had captured the full diff text earlier (then verified line-by-line by
+the author). Two binding rules fell out:
+
+1. **The lead safety-commits the worktree state BEFORE reviews run on it.**
+   A local `wip` commit costs nothing (squash/amend at PR time) and makes any
+   destructive slip recoverable. Uncommitted work under review is fragile.
+2. **Mutation-testing protocol for reviewers:** before ANY hypothesis edit,
+   `cp` the target file to the scratchpad; restore by `cp`-ing the snapshot
+   back. **Never run tree-mutating git commands (`git checkout --`,
+   `git restore`, `git stash`, `git reset`) in a worktree you don't own.**
+   Mutation tests are encouraged — they caught real test gaps all night — but
+   the revert mechanism must be file-scoped, never git-scoped.
+
 ---
 
 *Provenance: E10 agent-team experiment. Failure + recovery narrated in the blog
 source `career/.../blog-sources/05-when-not-to-fan-out.md`; smoke-test validation
-9 Jun 2026.*
+9 Jun 2026. Reviewer rules: the 9 Jul 2026 overnight batch incident.*
