@@ -1234,21 +1234,25 @@ class MCPServerProcess:
                     await self.call_tool("get_server_info", {})
                 except Exception as exc:  # startup failure: unwind + report to start()
                     self._session = None
-                    if not ready.done():
-                        ready.set_exception(exc)
+                    # First (and only) resolution on this path — ready is still
+                    # pending here (nothing else resolves it), so set directly; a
+                    # hypothetical double-set would raise InvalidStateError, which
+                    # the outer BaseException guard + the finally backstop catch.
+                    ready.set_exception(exc)
                     return  # exits the `async with` here, in THIS task
                 # Startup succeeded: hand the session to start() and park until stop.
-                if not ready.done():
-                    ready.set_result(session)
+                ready.set_result(session)
                 await stop_requested.wait()
                 # Falls out of the `async with` → stack.aclose() runs IN THIS TASK,
                 # so the stdio_client cancel scope exits where it was entered.
         except BaseException as exc:  # noqa: BLE001 — ready must never dangle
             # Any exit path that reaches here (a raise before/after the inner
             # try, a cancellation, an aclose error) MUST resolve ``ready`` or
-            # ``start``'s ``await ready`` hangs forever. Only meaningful while
-            # ready is still pending — the success/failure paths above already
-            # resolved it, so this is the last-resort guard, not the common case.
+            # ``start``'s ``await ready`` hangs forever. The inner success/failure
+            # paths already resolved it on the common paths, so guard against a
+            # double-set here — this fires only when the raise happened BEFORE the
+            # inner resolution (e.g. the stop_requested-None guard, or a spawn that
+            # raised a BaseException in __aenter__).
             if not ready.done():
                 ready.set_exception(
                     exc

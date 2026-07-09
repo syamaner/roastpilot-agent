@@ -944,6 +944,33 @@ async def test_clean_stop_does_not_force_terminate() -> None:
     assert calls == []  # force-terminate never reached
 
 
+@pytest.mark.asyncio
+async def test_stop_with_owner_but_no_stop_event_still_reaps() -> None:
+    """Defensive-arm coverage (#492 codecov): ``stop()`` guards ``_stop_requested``
+    with ``if stop_requested is not None`` before signalling. ``start()`` always
+    sets both the owner task and the event together, so the ``is None`` arm is
+    unreachable in normal flow — but it must still reap the owner cleanly if some
+    future path ever leaves the event unset. Drive the arm directly: an owner task
+    that is already complete + ``_stop_requested = None`` → ``stop()`` skips the
+    ``.set()``, awaits the (done) owner, and returns a clean, cleared state."""
+
+    async def _finished_owner() -> None:
+        return None
+
+    process = MCPServerProcess()
+    owner = asyncio.create_task(_finished_owner())
+    await owner  # ensure it is DONE so the reap await returns immediately
+    process._owner_task = owner  # pyright: ignore[reportPrivateUsage]
+    process._stop_requested = None  # pyright: ignore[reportPrivateUsage] — the arm under test
+
+    await process.stop()
+
+    # Clean reap: no force-terminate, not unconfirmed, per-spawn state cleared.
+    assert process.stop_unconfirmed is False
+    assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
+    assert not process.running
+
+
 class WedgedContext:
     """A session context whose teardown blocks forever — models a wedged MCP
     child whose graceful ``aclose`` never returns (#212)."""
