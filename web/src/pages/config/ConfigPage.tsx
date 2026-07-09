@@ -268,11 +268,12 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
   // no unsaved edits. Background refetches and reconnect snapshots must not
   // silently clobber dirty edits the operator hasn't saved yet.
   //
-  // The save flow is safe: handleSave awaits mutateAsync, which on success calls
-  // setQueryData (new snapshot reference) → this component re-renders with the
-  // server-confirmed snapshot. By the time that snapshot arrives, the save has
-  // completed and state.values === state.saved (both rebuilt by the last INIT
-  // from the previous snapshot), so the dirty guard is false and re-init fires.
+  // This guard is for snapshots that arrive OUTSIDE the save flow (background
+  // refetch, SSE-triggered invalidation, reconnect). The save flow itself
+  // rebaselines synchronously in handleSave below — by the time the mutation's
+  // setQueryData causes this effect to see a new snapshot, values === saved
+  // already, so isDirty is false and this is a no-op re-confirmation, not the
+  // mechanism that clears dirty state.
   const snapshotRef = useRef(snapshot);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -314,12 +315,30 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
     return map;
   }, [dirtyKeys]);
 
-  // On success: the mutation's onSuccess calls setQueryData with the server's
-  // confirmed snapshot → the parent ConfigInner receives a new snapshot prop →
-  // the useEffect above dispatches INIT, re-syncing values and saved baseline.
+  // On success: rebaseline directly from the PUT response snapshot (the
+  // server's authoritative post-save effective values), rather than relying
+  // on the prop-change effect above. The mutation's onSuccess also calls
+  // setQueryData so the snapshot prop updates in the background, but that
+  // update alone never rebaselines — the effect's dirty-guard sees the
+  // still-dirty `values` vs. the old `saved` baseline and correctly refuses
+  // to clobber it, which used to leave the save bar and dirty dots stuck on
+  // after a successful save (#483). Dispatching INIT with the response
+  // snapshot here sets values === saved from the just-saved values, clearing
+  // the dirty state and establishing the new baseline in one step.
+  //
+  // A rejected PUT throws out of mutateAsync before this dispatch runs, so a
+  // failed save leaves the operator's edits and dirty state untouched. The
+  // mutation object already tracks the failure (saveConfig.isError/.error,
+  // rendered as saveError below) — swallow the rejection here so it doesn't
+  // surface as an unhandled promise rejection; SaveBar reads the error state.
   const handleSave = useCallback(async () => {
     const edit = buildEditFromDirty(state.values, state.saved, snapshot);
-    await saveConfig.mutateAsync(edit);
+    try {
+      const saved = await saveConfig.mutateAsync(edit);
+      dispatch({ type: "INIT", snapshot: saved });
+    } catch {
+      // Already recorded on saveConfig.error; nothing further to do here.
+    }
   }, [state.values, state.saved, snapshot, saveConfig]);
 
   const handleDiscard = useCallback(() => dispatch({ type: "DISCARD" }), []);
@@ -386,6 +405,7 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
                 }
                 dynMin={dynMin}
                 dynMax={dynMax}
+                saving={saveConfig.isPending}
               />
             );
           })}
@@ -443,6 +463,7 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
               }
               dynMin={dynMin}
               dynMax={dynMax}
+              saving={saveConfig.isPending}
             />
           );
         })}

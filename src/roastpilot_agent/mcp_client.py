@@ -1091,32 +1091,25 @@ class MCPServerProcess:
         from roastpilot_agent.mcp_yaml import (  # noqa: PLC0415
             _device_config_to_overlay,  # pyright: ignore[reportPrivateUsage]
             render_mcp_yaml,
+            resolve_mcp_yaml_source_path,
         )
 
         # Start from the MCPConfig.env overrides (E9-S2 mock-driver path).
         extra_env: dict[str, str] = dict(self._config.env)
 
         if self._device_config is not None:
-            # Resolve the source yaml in priority order:
+            # Resolve the source yaml in priority order (#482: extracted into
+            # resolve_mcp_yaml_source_path so GET /api/config's read-only yaml
+            # lookup resolves the identical source file — one precedence
+            # implementation, not two that could drift):
             #   1. explicit mcp_yaml_source_path
             #   2. COFFEE_ROASTER_MCP_CONFIG from MCPConfig.env (forward_coffee_env)
             #   3. COFFEE_ROASTER_MCP_CONFIG from os.environ
             #   4. ./coffee-roaster-mcp.yaml (the MCP's own CWD default — only if it exists)
-            # Steps 1-3 pass the path to render_mcp_yaml which raises FileNotFoundError
-            # when the file is missing (fail closed). Step 4 is checked for existence
-            # before use so a fresh install without the CWD file is silently a None source.
-            source: Path | None = self._device_config.mcp_yaml_source_path
-            if source is None:
-                raw = extra_env.get("COFFEE_ROASTER_MCP_CONFIG") or os.environ.get(
-                    "COFFEE_ROASTER_MCP_CONFIG"
-                )
-                if raw:
-                    source = Path(raw)
-            if source is None:
-                # Step 4: MCP's own CWD default — use only when the file is present.
-                cwd_default = Path("coffee-roaster-mcp.yaml")
-                if cwd_default.exists():
-                    source = cwd_default
+            # render_mcp_yaml raises FileNotFoundError when a resolved (non-None)
+            # source is missing (fail closed) — resolve_mcp_yaml_source_path itself
+            # does not raise; it only resolves the candidate path.
+            source = resolve_mcp_yaml_source_path(self._device_config, extra_env)
 
             # Build the overlay to decide whether we need to render at all.
             overlay = _device_config_to_overlay(self._device_config)

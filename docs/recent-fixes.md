@@ -93,3 +93,25 @@ Format: one entry per anti-pattern.
   debounce-relative clock.
 - **Guarded by:** the #404 marker-position test + the #409 payload-anchored-marker
   test. Add a marker-placement assertion for any NEW marker.
+
+---
+
+## Post-FC control-loop setpoints must anchor to MEASURED values, never a fixed band
+*(fixed by #405 D88, 9 Jul 2026)*
+
+- **Signature:** a closed-loop setpoint/target constant chosen ahead of time (a
+  fixed `target_*` config default) that a PI/PID loop chases, especially post-FC
+  heat/RoR control — grep for a new fixed numeric target field on a control-loop
+  config (`PostFirstCrackControl` or similar) that isn't derived from a live
+  reading at engagement.
+- **Wrong:** a fixed RoR-band target (D83's `target_ror_c_per_min=8.0`) that sat
+  ABOVE the measured post-FC engagement RoR (6.1 °C/min) — the loop read "too
+  slow" from tick one and actuated a runaway heat climb (72→91 %) while the
+  advisor recommended 0 %, fully policy-legal (every safety verdict was ALLOW).
+- **Right:** anchor the setpoint to the MEASURED value at engagement and taper
+  DOWN over a fixed duration (D88); clamp the loop's output so it can never
+  exceed the heat/lever value the roast held at the moment of engagement (the
+  never-add-heat-beyond-entry clamp, maxed with a 1 % anti-stall floor so a
+  0-value handoff cannot pin the loop at a stall).
+- **Guarded by:** `test_roast2_runaway_is_structurally_impossible` and the B1/B2/C1
+  ratification tests in `tests/test_post_fc_control.py`.
