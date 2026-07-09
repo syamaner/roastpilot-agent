@@ -312,6 +312,170 @@ describe("ConfigPage — save model", () => {
     });
     expect(screen.getByTestId("config-save-bar")).toBeInTheDocument();
   });
+
+  it("clears the save bar and dirty dot after a successful save, and rebaselines to the response snapshot (#483)", async () => {
+    // Before the fix: a successful PUT persisted server-side but the FE never
+    // rebaselined, so the save bar and dirty dot stayed on indefinitely.
+    saveConfigMock.mockResolvedValue(makeSnapshot({ model_slug: "anthropic/claude-3-5-sonnet" }));
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
+    const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
+    fireEvent.change(modelInput!, { target: { value: "anthropic/claude-3-5-sonnet" } });
+    expect(screen.getByTestId("rail-dirty-Advisor")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+
+    // Banner and dirty dot clear once the save resolves.
+    await waitFor(() => expect(screen.queryByTestId("config-save-bar")).toBeNull());
+    expect(screen.queryByTestId("rail-dirty-Advisor")).toBeNull();
+    expect(modelInput!.value).toBe("anthropic/claude-3-5-sonnet");
+  });
+
+  it("rebaselines to the saved value: editing back to the pre-save value shows dirty again", async () => {
+    // Proves the baseline actually moved to the just-saved value, not just
+    // that the banner happened to clear. Edit → save → edit back to the
+    // ORIGINAL (pre-save) value must be dirty relative to the NEW baseline.
+    saveConfigMock.mockResolvedValue(makeSnapshot({ model_slug: "anthropic/claude-3-5-sonnet" }));
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
+    const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
+
+    fireEvent.change(modelInput!, { target: { value: "anthropic/claude-3-5-sonnet" } });
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByTestId("config-save-bar")).toBeNull());
+
+    // Edit back to the value that was the baseline BEFORE this save
+    // ("openai/gpt-4o"). If the baseline correctly moved to
+    // "anthropic/claude-3-5-sonnet", this must show dirty again.
+    fireEvent.change(modelInput!, { target: { value: "openai/gpt-4o" } });
+    expect(screen.getByTestId("config-save-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("rail-dirty-Advisor")).toBeInTheDocument();
+  });
+
+  it("disables the field control and Save/Discard while the save is pending (#483 fix round, Codex finding 1)", async () => {
+    // Before the fix: fields stayed enabled during a pending save, so an edit
+    // made after clicking Save but before the PUT resolved was silently
+    // clobbered by the unconditional post-save INIT. Disabling the controls
+    // (and the buttons) while pending makes that edit impossible rather than
+    // something to reconcile.
+    let resolveSave!: (snapshot: ReturnType<typeof makeSnapshot>) => void;
+    saveConfigMock.mockReturnValue(
+      new Promise((resolve) => {
+        resolveSave = resolve;
+      }),
+    );
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
+    const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input")!;
+    fireEvent.change(modelInput, { target: { value: "anthropic/claude-3-5-sonnet" } });
+
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+
+    // While the PUT is in flight: field disabled, Save/Discard disabled. A
+    // real browser refuses keyboard/pointer input on a disabled control —
+    // the `disabled` attribute is the gate under test here (jsdom's
+    // fireEvent.change bypasses that gate at the DOM level, so it isn't a
+    // faithful way to simulate "the operator tried to type"; asserting
+    // `disabled` is what actually protects against the mid-save race).
+    await waitFor(() => expect(modelInput).toBeDisabled());
+    expect(screen.getByTestId("config-save-btn")).toBeDisabled();
+    expect(screen.getByTestId("config-discard-btn")).toBeDisabled();
+
+    // Resolve the save — controls re-enable and rebaseline as before.
+    resolveSave(makeSnapshot({ model_slug: "anthropic/claude-3-5-sonnet" }));
+    await waitFor(() => expect(screen.queryByTestId("config-save-bar")).toBeNull());
+    expect(modelInput).not.toBeDisabled();
+  });
+
+  it("a stale background refetch resolving after save does not overwrite the rebaselined values (#483 fix round, Codex finding 2)", async () => {
+    // Simulates: a background GET /api/config was already in flight when the
+    // operator clicked Save; the PUT resolves and rebaselines first, then the
+    // stale GET resolves with the OLDER (pre-save) snapshot. Without
+    // cancelling the in-flight query in useSaveConfig's onSuccess, that stale
+    // response would land in the cache after the PUT's, silently reverting
+    // the just-cleared dirty state and displayed value.
+    let resolveStaleGet!: (snapshot: ReturnType<typeof makeSnapshot>) => void;
+    const staleGetPromise = new Promise<ReturnType<typeof makeSnapshot>>((resolve) => {
+      resolveStaleGet = resolve;
+    });
+    // First GET (initial load) resolves immediately with the baseline snapshot.
+    configMock.mockResolvedValueOnce(makeSnapshot());
+    // Second GET (the "background refetch" already in flight) hangs until we
+    // resolve it by hand, after the save has completed.
+    configMock.mockReturnValueOnce(staleGetPromise);
+    saveConfigMock.mockResolvedValue(makeSnapshot({ model_slug: "anthropic/claude-3-5-sonnet" }));
+
+    const { client } = renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
+    const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input")!;
+
+    // Kick off the "background refetch" that will hang on staleGetPromise, and
+    // wait for it to genuinely register as an in-flight fetch on the query
+    // (fetchStatus: "fetching") before proceeding — otherwise the save could
+    // race ahead of the refetch actually starting and the test would prove
+    // nothing.
+    void client.refetchQueries({ queryKey: ["config"] });
+    await waitFor(() =>
+      expect(client.getQueryState(["config"])?.fetchStatus).toBe("fetching"),
+    );
+
+    // Operator edits and saves while that refetch is still in flight.
+    fireEvent.change(modelInput, { target: { value: "anthropic/claude-3-5-sonnet" } });
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByTestId("config-save-bar")).toBeNull());
+    expect(modelInput.value).toBe("anthropic/claude-3-5-sonnet");
+
+    // NOW the stale background GET resolves with the OLD pre-save snapshot.
+    resolveStaleGet(makeSnapshot({ model_slug: "openai/gpt-4o" }));
+    // Give the resolved promise's continuation (and any resulting cache
+    // write / re-render) a chance to run before asserting.
+    await waitFor(() => expect(client.getQueryState(["config"])?.fetchStatus).toBe("idle"));
+
+    // The query cache itself must still hold the just-saved value — the
+    // stale response must never have been written (it was cancelled).
+    const cached = client.getQueryData(["config"]) as ReturnType<typeof makeSnapshot>;
+    expect(cached.advisor.model_slug.effective_value).toBe("anthropic/claude-3-5-sonnet");
+
+    // The rebaselined value and clean state must survive on screen too.
+    await waitFor(() => {
+      expect(modelInput.value).toBe("anthropic/claude-3-5-sonnet");
+    });
+    expect(screen.queryByTestId("config-save-bar")).toBeNull();
+    expect(screen.queryByTestId("rail-dirty-Advisor")).toBeNull();
+  });
+
+  it("does not clear dirty state when the PUT rejects", async () => {
+    // A failed save must leave the operator's edits and the unsaved-changes
+    // banner intact — only a successful PUT rebaselines.
+    saveConfigMock.mockRejectedValue(new Error("Internal Server Error"));
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
+    const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
+    fireEvent.change(modelInput!, { target: { value: "anthropic/claude-3-5-sonnet" } });
+
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+
+    // Banner stays, error surfaces, dirty dot stays, edit is untouched.
+    await waitFor(() => expect(screen.getByTestId("config-save-error")).toBeInTheDocument());
+    expect(screen.getByTestId("config-save-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("rail-dirty-Advisor")).toBeInTheDocument();
+    expect(modelInput!.value).toBe("anthropic/claude-3-5-sonnet");
+  });
 });
 
 describe("ConfigPage — field controls", () => {
