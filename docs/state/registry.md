@@ -102,7 +102,30 @@
 
 ## Active Context
 
-**9 Jul 2026 (latest) — CONFIG-SCREEN audit → 2 gaps closed (#473/#474 merged), 1 filed (#475).**
+**9 Jul 2026 (evening, latest) — FIRST SUPERVISED HARDWARE A/B of #405. The A/B did its job: it
+CAUGHT A REAL #405 DESIGN FLAW. #460 STAYS OFF (plan D87).** Guatemala El Durazno (White Honey),
+2×250 g, baseline (advisor-driven) vs #405 deterministic post-FC loop.
+- **Roast 1 baseline (#405 OFF, `bf85c77a`):** clean, on-target — drop 189 °C, **DTR 13.6 %**, advisor
+  ramped fan + called the drop at 189/13.1 %.
+- **Roast 2 #405 ON (`a4299aea`):** the flaw. Post-FC RoR declined to ~5 °C/min; the loop's fixed
+  ~8 °C/min target made it **crank heat to 89 %** to chase the band → bean racing the 196 ceiling →
+  **potential overroast**. The advisor CORRECTLY wanted heat 0 (brake) but was overridden. Operator
+  caught it + manually dropped ~193. **Both extremes fail** (loop over-heats / a hard-0 advisor
+  over-brakes) → **post-FC needs a DECLINING-RoR taper + a hard ceiling-guard drop** (drop on bean ≥
+  ceiling regardless of dev %). Plan **D87** supersedes D83's fixed-band; #405 has the full brief.
+- **Big validation night:** ambient probe end-to-end (Yocto → MCP → agent → **live UI triad** + on
+  both roast_run rows), the Guatemala seed, `POST_FC_LOOP=1` toggle + banner, accurate T0, weight
+  entry, dual-mic recording — all proven on real hardware in one session.
+- **Bugs surfaced live:** **#484 (HIGH)** — changing a `/config` device setting MID-SESSION crashes
+  the app (the respawn's anyio cancel-scope bug on the real stdio child; only tested vs a fake MCP
+  before). Workaround: set config then RESTART, never mid-session. Plus **#482/#483** (config UI
+  inherit-render + stuck save-warning). Ratings pending (taste tomorrow) → full trace+taste A/B then.
+- **Next priorities:** (1) rework #405 post-FC (declining-RoR taper + ceiling-guard) → then re-A/B;
+  (2) fix #484; (3) #482/#483. Memory `roast9-10-postfc-ab-hardware`.
+
+---
+
+**9 Jul 2026 (daytime) — CONFIG-SCREEN audit → 2 gaps closed (#473/#474 merged), 1 filed (#475).**
 Operator asked: is `/config` functional, where's the link, are temp-sensor settings exposed? Audit
 (read-only investigation): **functional YES** for its scope (real GET/PUT round-trip, safety
 read-only, applies-next-roast via MCP respawn, strong component tests); **link = NONE** (URL-only —
