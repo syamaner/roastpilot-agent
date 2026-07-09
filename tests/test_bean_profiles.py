@@ -19,6 +19,8 @@ from roastpilot_agent.seed import (
     COLOMBIA_HUILA_SEED,
     ETHIOPIA_KOKE_ID,
     ETHIOPIA_KOKE_SEED,
+    GUATEMALA_EL_DURAZNO_ID,
+    GUATEMALA_EL_DURAZNO_SEED,
     SEED_BEAN_PROFILES,
 )
 from roastpilot_agent.store import BeanProfileNotFoundError, RoastStore
@@ -324,6 +326,36 @@ def test_colombia_huila_seed_values() -> None:
     assert s.default_bean_weight_grams == 250.0  # 1 kg / 4 batches
 
 
+def test_guatemala_el_durazno_seed_values() -> None:
+    """The locked Guatemala El Durazno (White Honey) seed values (first-roast de-risk)."""
+    s = GUATEMALA_EL_DURAZNO_SEED
+    assert s.id == GUATEMALA_EL_DURAZNO_ID
+    assert s.name == "Guatemala El Durazno (White Honey)"
+    assert s.bean_origin == "Guatemala"
+    assert s.country == "Guatemala"
+    assert s.farm == "Finca El Durazno (Ventura family), San Pedro Pinula, Jalapa"
+    assert s.bean_varietal == "Bourbon"
+    assert s.bean_species == "arabica"
+    assert s.is_blend is False
+    assert s.processing == "honey"
+    assert s.altitude_m == 1750
+    assert (
+        s.source_url
+        == "https://www.redber.co.uk/products/guatemala-el-durazno-white-honey-process-green-coffee-beans"
+    )
+    assert s.charge_guidance_min_c == 170.0
+    assert s.charge_guidance_max_c == 200.0
+    assert s.initial_heat_percent == 100
+    assert s.initial_fan_percent == 30
+    assert s.target_drop_temp_c == 195.0  # operator's proven known-good drop line (bitter > 196)
+    assert s.target_development_percent == 13.0  # first-roast de-risk on a new bean
+    assert s.default_bean_weight_grams == 250.0
+
+
 def test_seed_bean_profiles_collection() -> None:
-    """The built-in seed set is the Koke natural + the Colombia Huila washed."""
-    assert SEED_BEAN_PROFILES == (ETHIOPIA_KOKE_SEED, COLOMBIA_HUILA_SEED)
+    """The built-in seed set: Koke natural + Colombia Huila washed + Guatemala El Durazno honey."""
+    assert SEED_BEAN_PROFILES == (
+        ETHIOPIA_KOKE_SEED,
+        COLOMBIA_HUILA_SEED,
+        GUATEMALA_EL_DURAZNO_SEED,
+    )
