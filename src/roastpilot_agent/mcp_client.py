@@ -1310,15 +1310,22 @@ class MCPServerProcess:
             # Bound the wait: _run_session resolves ``ready`` on success, on
             # startup failure, and via its own last-resort guards — but a bound
             # here means even a pathological owner that never reports readiness
-            # becomes a clean startup failure instead of an unbounded hang. The
-            # inner initialize() already carries startup_timeout_seconds, so this
-            # outer bound only trips on a wholly-unresponsive owner; the small
-            # margin keeps it from racing the inner timeout on a slow spawn.
+            # becomes a clean startup failure instead of an unbounded hang.
+            #
+            # The bound must COVER how the owner composes its own inner bounds
+            # before it resolves ``ready`` (Codex #492-2): the owner runs
+            # ``initialize()`` (bounded by startup_timeout_seconds) THEN the
+            # ``get_server_info`` health check (bounded by call_timeout_seconds),
+            # sequentially, so the worst-case time-to-ready is their SUM. Using
+            # only startup_timeout_seconds would fire a FALSE startup failure on a
+            # deployment with a large call_timeout_seconds. Add both inner bounds
+            # plus a small margin so this outer bound only trips on a wholly
+            # unresponsive owner, never on a merely-slow-but-progressing one.
             # shield: a wait_for timeout must not cancel ``ready`` out from under
             # the owner — _await_owner_finished reaps the owner on every failure.
             await asyncio.wait_for(
                 asyncio.shield(ready),
-                timeout=self._config.startup_timeout_seconds + _READY_TIMEOUT_MARGIN_SECONDS,
+                timeout=self._ready_timeout_seconds(),
             )
         except MCPConnectionError:
             await self._await_owner_finished()
@@ -1333,41 +1340,70 @@ class MCPServerProcess:
             await self._await_owner_finished()
             raise
 
-    async def _await_owner_finished(self) -> None:
-        """Cancel + reap + clear the owner task after a start failure.
+    def _ready_timeout_seconds(self) -> float:
+        """Outer bound for ``start()``'s ``await ready`` (Codex #492-2).
 
-        On the normal startup-failure path :meth:`_run_session` has already
-        exited its context stack in its own task and is about to return, so the
-        cancel is a harmless no-op and the reap drains the task cleanly. But when
-        ``start()`` itself is cancelled mid-spawn (Ctrl-C during a slow spawn),
-        the owner may still be blocked INSIDE the factory context (``__aenter__``
-        never returned), so a bare await would hang forever — the cancel unblocks
-        it, and the unwind still runs in the owner's own task (the same-task
-        invariant holds). ``gather(..., return_exceptions=True)`` collects the
-        owner's outcome (of ANY type — already delivered via ``ready``) without
-        re-raising. Bounded by ``stop_timeout_seconds`` so a wedged native child
-        during a startup abort can never block exit; on overrun the force-kill
-        hook (if armed) reaps the child group, mirroring :meth:`stop`.
+        ``_run_session`` resolves ``ready`` only after running ``initialize()``
+        (bounded by ``startup_timeout_seconds``) and THEN the ``get_server_info``
+        health check (bounded by ``call_timeout_seconds``) in sequence, so the
+        worst-case time-to-ready is their SUM. Bounding only on
+        ``startup_timeout_seconds`` would fire a false startup failure whenever
+        ``call_timeout_seconds`` is configured large. The margin keeps this outer
+        bound from racing a merely-slow-but-progressing spawn.
+
+        Returns:
+            The ``await ready`` timeout in seconds:
+            ``startup_timeout_seconds + call_timeout_seconds + margin``.
+        """
+        return (
+            self._config.startup_timeout_seconds
+            + self._config.call_timeout_seconds
+            + _READY_TIMEOUT_MARGIN_SECONDS
+        )
+
+    async def _await_owner_finished(self) -> None:
+        """Reap + clear the owner task after a start failure — natural first.
+
+        Ordering matters (Codex #492-1): on the normal startup-failure path
+        (``initialize()`` timeout / ``get_server_info`` failure) the owner has
+        ALREADY entered the session context and resolved ``ready`` exceptionally
+        while its ``async with`` stack is still exiting IN ITS OWN TASK. Cancelling
+        it there could abort that in-task child cleanup and orphan the child. So we
+        **await the owner's natural completion FIRST, bounded**, and only
+        ``cancel()`` if that bound overruns — which is the genuinely-stuck case
+        (blocked in the factory ``__aenter__`` after a ``start()`` cancelled
+        mid-spawn, where a bare await would hang forever). ``gather(...,
+        return_exceptions=True)`` collects the owner's outcome (of ANY type —
+        already delivered via ``ready``) without re-raising. Bounded by
+        ``stop_timeout_seconds`` so a wedged native child during a startup abort
+        can never block exit; on overrun the force-kill hook (if armed) reaps the
+        child group, mirroring :meth:`stop`.
         """
         owner = self._owner_task
         self._owner_task = None
         self._stop_requested = None
         if owner is None:  # pragma: no cover - defensive: start() always set it
             return
+        # Natural completion first: an already-tearing-down owner must be let
+        # finish its in-task child cleanup, not cancelled mid-unwind. ``wait``
+        # (not wait_for) does NOT cancel the owner on timeout — it just reports
+        # whether it finished — so a still-progressing teardown is never aborted.
+        done, _pending = await asyncio.wait({owner}, timeout=self._config.stop_timeout_seconds)
+        if owner in done:
+            # Completed on its own. Drain the stored exception (of ANY type — it
+            # was already delivered to start() via ``ready``) so it is retrieved,
+            # never re-raised out of this best-effort reap.
+            with contextlib.suppress(BaseException):
+                owner.result()
+            return
+        # Did NOT complete in time — genuinely stuck (blocked in __aenter__ after
+        # a cancelled start, or a wedged native child). NOW cancel to unblock it,
+        # fail closed (force-kill + unconfirmed), and bounded-reap; a startup
+        # teardown must never block exit, so any reap outcome is swallowed.
+        self._fail_closed_teardown("MCP child did not unwind after start failure")
         owner.cancel()
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(owner, return_exceptions=True),
-                timeout=self._config.stop_timeout_seconds,
-            )
-        except TimeoutError:  # pragma: no cover - wedged child during startup abort
-            # The owner's cancel did not unwind in time (a wedged native child).
-            # Force-kill the process group if we captured its pid, then move on —
-            # a startup teardown must never block exit.
-            self._stop_unconfirmed = True
-            if self._force_terminate is not None:
-                with contextlib.suppress(Exception):
-                    self._force_terminate()
+        with contextlib.suppress(TimeoutError, BaseException):
+            await asyncio.wait_for(owner, timeout=self._config.stop_timeout_seconds)
 
     async def stop(self) -> None:
         """Shut the child down, bounded by ``stop_timeout_seconds`` (#212).
@@ -1428,6 +1464,15 @@ class MCPServerProcess:
             owner.cancel()
             with contextlib.suppress(TimeoutError, asyncio.CancelledError, Exception):
                 await asyncio.wait_for(owner, timeout=self._config.stop_timeout_seconds)
+        except asyncio.CancelledError:
+            # stop()'s OWN task was cancelled mid-wait (Codex #492-3). A
+            # cancellation is a BaseException, so it would bypass the handlers
+            # below and the finally would wipe our state with the child possibly
+            # still alive and NO fail-closed marking — a stop we could not confirm
+            # silently recorded as clean. Mark unconfirmed + force-kill first, then
+            # RE-RAISE: a cancellation must always propagate, never be swallowed.
+            self._fail_closed_teardown("MCP child stop was cancelled mid-teardown")
+            raise
         except Exception as exc:
             # The owner's aclose RAISED (a broken-pipe teardown after a child
             # segfault, roast 2 — a NORMAL event on this rig, not an unreachable
