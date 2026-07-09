@@ -15,6 +15,7 @@ from roastpilot_agent.config import (
     AdvisorConfig,
     AppConfig,
     ControllerConfig,
+    PostFirstCrackControl,
     SafetyLimits,
 )
 from roastpilot_agent.models import RoastPhase
@@ -278,3 +279,65 @@ def test_app_config_rejects_invalid_env_value(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("ROASTPILOT_CONTROLLER__TICK_INTERVAL_SECONDS", "0")
     with pytest.raises(pydantic.ValidationError):
         AppConfig()
+
+
+# --- D88 amendment A1: the post-FC ceiling guard must sit within the ---
+# --- safety-owned bounds it anchors to (a cross-SECTION check on AppConfig) ---
+
+
+def test_ceiling_guard_defaults_are_valid() -> None:
+    """The default 196.0 guard sits below the default 198.0 emergency-drop
+    bound and at (not above) the default 196.0 bitter ceiling — constructs
+    cleanly with no overrides."""
+    config = AppConfig()
+    assert config.controller.post_first_crack_control.ceiling_guard_temp_c == 196.0
+    assert config.controller.post_first_crack_control.ceiling_guard_drop_enabled is False
+
+
+def test_ceiling_guard_at_or_above_emergency_drop_temp_is_rejected() -> None:
+    """A guard AT the emergency-drop bound (never fires before the hard net
+    already forces the issue) is rejected — the cross-field check is a
+    strict ``<``, not ``<=``."""
+    with pytest.raises(pydantic.ValidationError, match="ceiling_guard_temp_c must be below"):
+        AppConfig(
+            controller=ControllerConfig(
+                post_first_crack_control=PostFirstCrackControl(ceiling_guard_temp_c=198.0)
+            ),
+            safety=SafetyLimits(bitter_ceiling_temp_c=196.0, emergency_drop_temp_c=198.0),
+        )
+
+
+def test_ceiling_guard_above_emergency_drop_temp_is_rejected() -> None:
+    with pytest.raises(pydantic.ValidationError, match="ceiling_guard_temp_c must be below"):
+        AppConfig(
+            controller=ControllerConfig(
+                post_first_crack_control=PostFirstCrackControl(ceiling_guard_temp_c=199.0)
+            ),
+            safety=SafetyLimits(bitter_ceiling_temp_c=196.0, emergency_drop_temp_c=198.0),
+        )
+
+
+def test_ceiling_guard_above_bitter_ceiling_temp_is_rejected() -> None:
+    """A guard ABOVE the bitter ceiling would let the roast run hotter than
+    the very bitter-line boundary it is meant to anchor before the guard
+    even engages."""
+    with pytest.raises(pydantic.ValidationError, match="ceiling_guard_temp_c must not exceed"):
+        AppConfig(
+            controller=ControllerConfig(
+                post_first_crack_control=PostFirstCrackControl(ceiling_guard_temp_c=197.0)
+            ),
+            safety=SafetyLimits(bitter_ceiling_temp_c=196.0, emergency_drop_temp_c=198.0),
+        )
+
+
+def test_ceiling_guard_equal_to_bitter_ceiling_temp_is_valid() -> None:
+    """Exactly AT the bitter ceiling is valid — the cross-field check on the
+    bitter-ceiling leg is ``<=``, not a strict ``<`` (mirrors the D88 row's
+    own wording: "``ceiling_guard_temp_c`` ... ``<= bitter_ceiling_temp_c``")."""
+    config = AppConfig(
+        controller=ControllerConfig(
+            post_first_crack_control=PostFirstCrackControl(ceiling_guard_temp_c=196.0)
+        ),
+        safety=SafetyLimits(bitter_ceiling_temp_c=196.0, emergency_drop_temp_c=198.0),
+    )
+    assert config.controller.post_first_crack_control.ceiling_guard_temp_c == 196.0

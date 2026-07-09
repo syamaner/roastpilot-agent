@@ -169,6 +169,32 @@ class RoastEventSource(Enum):
     SAFETY = "safety"
 
 
+class DropReason(Enum):
+    """Which deterministic drop path fired (#405 Slice C/D88 amendment A1).
+
+    Two policy-driven ``drop_beans`` paths share the same ``"policy"``
+    command-trace source (D84's dev%/temp anchor and D88's decoupled ceiling
+    guard — see ``CommandTraceSource`` in this module) — this typed value
+    distinguishes WHICH one fired, carried as ``.value`` in the
+    ``COMMAND_EXECUTED``/``COMMAND_FAILED`` event payload's ``reason`` key
+    (observability only: no controller/safety code path branches on it, so it
+    is never a string comparison in core logic, D15 — it exists purely so a
+    trace reader, or a test, can tell the two apart without re-deriving it
+    from bean temperature and dev% after the fact).
+    """
+
+    #: D84's deterministic anchor: ``bean_temp_c >= target_drop_temp_c`` AND
+    #: ``dev_percent >= target_development_percent``, gated on the RoR-taper
+    #: loop's own ``enabled``/``_post_fc_engaged`` bundle.
+    DEVELOPMENT_TARGET = "development_target"
+    #: D88 amendment A1's decoupled ceiling guard: ``bean_temp_c >=
+    #: ceiling_guard_temp_c``, gated ONLY on its own
+    #: ``ceiling_guard_drop_enabled`` flag + DEVELOPMENT phase — fires
+    #: regardless of the RoR-taper loop's flag or engagement (the safety
+    #: anchor every roast needs, not a taper feature).
+    CEILING_GUARD = "ceiling_guard"
+
+
 # --- #197: microphone / first-crack capture-alive health (observability) ---
 #
 # The MCP audio first-crack pipeline reports a rich liveness status
