@@ -7,6 +7,7 @@ source and validated here against the 7 Jun 2026 live-roast exports.
 
 import asyncio
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+from anyio import BrokenResourceError, ClosedResourceError
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
 from roastpilot_agent.mcp_client import (
@@ -728,6 +730,184 @@ async def test_start_unwinds_on_failed_health_check() -> None:
     assert probe.exited
 
 
+class _OwnerAbort(BaseException):
+    """A non-``Exception`` used to model an owner-task abort before ready.
+
+    A plain ``BaseException`` subclass (not ``KeyboardInterrupt``, which pytest
+    hijacks) slips past ``_run_session``'s inner ``except Exception`` and thus
+    past ``start()``'s ``except Exception`` — exercising the #484 backstop that
+    resolves ``ready`` and reaps the owner so ``start()`` never hangs.
+    """
+
+
+class _BaseExceptionAtEnterFactory:
+    """A session factory whose context ``__aenter__`` raises a BaseException."""
+
+    class _Context:
+        async def __aenter__(self) -> FakeInitializableSession:
+            raise _OwnerAbort("spawn aborted before ready")
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            return None
+
+    def __call__(self, params: object) -> "_BaseExceptionAtEnterFactory._Context":
+        return _BaseExceptionAtEnterFactory._Context()
+
+
+@pytest.mark.asyncio
+async def test_start_does_not_hang_when_owner_dies_before_ready() -> None:
+    """#484 Low-1: an owner task that exits without the normal startup-failure
+    path must still resolve ``ready`` — ``start()`` fails closed within the bound
+    rather than hanging forever, the owner is reaped, and the process is left
+    not-running.
+
+    The ``_run_session`` backstop resolves ``ready`` for ANY exit path; a
+    non-``Exception`` abort (like this ``_OwnerAbort``) is normalised to a clean
+    ``MCPConnectionError`` so the operator gets a fail-closed startup error, not a
+    raw ``BaseException`` or a hang.
+    """
+    process = MCPServerProcess(session_factory=_BaseExceptionAtEnterFactory())
+    # Bound the whole call so a regression to an unbounded await fails loudly (a
+    # wait_for TimeoutError), not hangs — proving start() actually returned.
+    with pytest.raises(MCPConnectionError):
+        await asyncio.wait_for(process.start(), timeout=1.0)
+    assert not process.running
+    # The owner task was reaped, not orphaned (no leftover per-spawn state).
+    assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
+    assert process._stop_requested is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_start_bounds_an_owner_that_never_reports_ready() -> None:
+    """#484 Low-1: the outer ``await ready`` is bounded, so an owner wedged
+    before it can report readiness becomes a clean startup failure, not a hang."""
+    session = FakeInitializableSession(info_result(), init_hangs=True)
+    probe = FactoryProbe(session)
+    # Tiny startup timeout so the inner initialize() bound (and thus the outer
+    # ready bound = startup + margin) trips fast; the outer wait_for guards
+    # against a hang if the inner bound were ever removed.
+    process = MCPServerProcess(MCPConfig(startup_timeout_seconds=0.05), session_factory=probe)
+    with pytest.raises(MCPConnectionError):
+        await asyncio.wait_for(process.start(), timeout=1.0)
+    assert not process.running
+
+
+class _BlockingEnterFactory:
+    """A factory whose context ``__aenter__`` blocks forever, so ``start()``
+    parks on ``await ready`` — lets a test cancel ``start()`` mid-flight."""
+
+    def __init__(self) -> None:
+        self.exited = False
+
+    def __call__(self, params: object) -> "_BlockingEnterFactory._Context":
+        return _BlockingEnterFactory._Context(self)
+
+    class _Context:
+        def __init__(self, probe: "_BlockingEnterFactory") -> None:
+            self._probe = probe
+
+        async def __aenter__(self) -> FakeInitializableSession:
+            await asyncio.Event().wait()  # never returns
+            raise AssertionError("unreachable")  # pragma: no cover
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            self._probe.exited = True
+
+
+@pytest.mark.asyncio
+async def test_start_cancelled_mid_flight_reaps_the_owner() -> None:
+    """#484 Low-1: cancelling ``start()`` while it awaits ``ready`` (e.g. Ctrl-C
+    during a slow spawn) must reap the owner task and clear per-spawn state, not
+    orphan it. Exercises ``start()``'s ``except BaseException`` reap path."""
+    factory = _BlockingEnterFactory()
+    process = MCPServerProcess(session_factory=factory)
+    start_task = asyncio.create_task(process.start())
+    # Let start() reach its `await ready` (the owner is blocked in __aenter__).
+    await asyncio.sleep(0.05)
+    start_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await start_task
+    # The owner was reaped and per-spawn state cleared — nothing orphaned.
+    assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
+    assert process._stop_requested is None  # pyright: ignore[reportPrivateUsage]
+    assert not process.running
+
+
+class _SlowExitOnHealthFailFactory:
+    """A factory whose ``__aenter__`` SUCCEEDS but the health check fails, and
+    whose ``__aexit__`` is SLOW (models an in-task child cleanup mid-unwind).
+
+    The session's ``get_server_info`` raises → ``_run_session`` unwinds its
+    ``async with`` (running this slow ``__aexit__`` IN THE OWNER TASK) after
+    resolving ``ready`` exceptionally. The reap must let that exit COMPLETE, not
+    cancel it mid-way (Codex #492-1). ``exit_completed`` records that it did."""
+
+    def __init__(self, exit_delay: float) -> None:
+        self._exit_delay = exit_delay
+        self.exit_started = False
+        self.exit_completed = False
+
+    def __call__(self, params: object) -> "_SlowExitOnHealthFailFactory._Context":
+        return _SlowExitOnHealthFailFactory._Context(self)
+
+    class _Context:
+        def __init__(self, probe: "_SlowExitOnHealthFailFactory") -> None:
+            self._probe = probe
+
+        async def __aenter__(self) -> FakeInitializableSession:
+            # health check (get_server_info) raises → startup failure after enter.
+            return FakeInitializableSession(RuntimeError("health check fails"))
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            self._probe.exit_started = True
+            await asyncio.sleep(self._probe._exit_delay)  # in-task cleanup
+            self._probe.exit_completed = True
+
+
+@pytest.mark.asyncio
+async def test_start_failure_lets_owner_teardown_complete_not_cancelled() -> None:
+    """#484 Codex-P1: when startup fails AFTER the context is entered, the owner
+    is mid-teardown (aclose running in its own task). The reap must AWAIT its
+    natural completion, not cancel it — cancelling mid-unwind could abort the
+    in-task child cleanup and orphan the child.
+
+    A slow ``__aexit__`` (0.1 s) models that cleanup; the reap's
+    ``stop_timeout_seconds`` bound is comfortably larger, so the exit must run to
+    completion. ``start()`` still raises a clean ``MCPConnectionError``."""
+    factory = _SlowExitOnHealthFailFactory(exit_delay=0.1)
+    # stop_timeout_seconds (the reap bound) >> exit_delay so natural completion wins.
+    process = MCPServerProcess(MCPConfig(stop_timeout_seconds=5.0), session_factory=factory)
+    with pytest.raises(MCPConnectionError):
+        await asyncio.wait_for(process.start(), timeout=2.0)
+    assert factory.exit_started
+    # The load-bearing assertion: the owner's teardown COMPLETED (was not
+    # cancelled mid-unwind by the reap).
+    assert factory.exit_completed, "owner teardown was cancelled mid-unwind (orphan risk)"
+    assert not process.running
+    assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
+    # A clean startup failure never force-terminates (the teardown completed).
+    assert process.stop_unconfirmed is False
+
+
+@pytest.mark.asyncio
+async def test_ready_timeout_bound_includes_call_timeout() -> None:
+    """#484 Codex-P2: the ``await ready`` bound must cover BOTH inner bounds the
+    owner composes before resolving ready — ``initialize()`` (startup_timeout) and
+    ``get_server_info`` (call_timeout) run in sequence, so the bound is at least
+    their sum. Bounding on startup_timeout alone would false-fail a large
+    call_timeout deployment."""
+    process = MCPServerProcess(MCPConfig(startup_timeout_seconds=15.0, call_timeout_seconds=30.0))
+    bound = process._ready_timeout_seconds()  # pyright: ignore[reportPrivateUsage]
+    # The bound must cover BOTH inner bounds (their sum), plus a non-negative margin.
+    assert bound >= 15.0 + 30.0
+
+    # Raising ONLY call_timeout must widen the bound by exactly that delta — proof
+    # the call timeout is a term of the sum, the regression Codex flagged.
+    wider = MCPServerProcess(MCPConfig(startup_timeout_seconds=15.0, call_timeout_seconds=120.0))
+    wider_bound = wider._ready_timeout_seconds()  # pyright: ignore[reportPrivateUsage]
+    assert wider_bound - bound == pytest.approx(120.0 - 30.0)
+
+
 @pytest.mark.asyncio
 async def test_start_with_injected_session_is_a_noop() -> None:
     process = MCPServerProcess(session=FakeSession(info_result()))
@@ -762,6 +942,33 @@ async def test_clean_stop_does_not_force_terminate() -> None:
     assert probe.exited  # graceful teardown ran
     assert process.stop_unconfirmed is False
     assert calls == []  # force-terminate never reached
+
+
+@pytest.mark.asyncio
+async def test_stop_with_owner_but_no_stop_event_still_reaps() -> None:
+    """Defensive-arm coverage (#492 codecov): ``stop()`` guards ``_stop_requested``
+    with ``if stop_requested is not None`` before signalling. ``start()`` always
+    sets both the owner task and the event together, so the ``is None`` arm is
+    unreachable in normal flow — but it must still reap the owner cleanly if some
+    future path ever leaves the event unset. Drive the arm directly: an owner task
+    that is already complete + ``_stop_requested = None`` → ``stop()`` skips the
+    ``.set()``, awaits the (done) owner, and returns a clean, cleared state."""
+
+    async def _finished_owner() -> None:
+        return None
+
+    process = MCPServerProcess()
+    owner = asyncio.create_task(_finished_owner())
+    await owner  # ensure it is DONE so the reap await returns immediately
+    process._owner_task = owner  # pyright: ignore[reportPrivateUsage]
+    process._stop_requested = None  # pyright: ignore[reportPrivateUsage] — the arm under test
+
+    await process.stop()
+
+    # Clean reap: no force-terminate, not unconfirmed, per-spawn state cleared.
+    assert process.stop_unconfirmed is False
+    assert process._owner_task is None  # pyright: ignore[reportPrivateUsage]
+    assert not process.running
 
 
 class WedgedContext:
@@ -817,6 +1024,111 @@ async def test_stop_bounds_a_wedged_child_and_force_terminates() -> None:
     assert process.stop_unconfirmed is True
     assert calls == [1]  # force-terminate invoked exactly once
     assert not process.running  # state cleared even on the timeout path
+
+
+class RaisingExitContext:
+    """A session context whose ``aclose`` RAISES — models a broken-pipe teardown
+    after a child segfault (roast 2): ``stack.aclose()`` re-raises
+    ``BrokenResourceError`` / ``ClosedResourceError`` / ``RuntimeError`` rather
+    than returning cleanly. A NORMAL event on this rig, not an unreachable one."""
+
+    def __init__(self, probe: "RaisingExitFactoryProbe") -> None:
+        self._probe = probe
+
+    async def __aenter__(self) -> FakeInitializableSession:
+        return self._probe.session
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self._probe.exited = True
+        raise self._probe.exit_error
+
+
+class RaisingExitFactoryProbe:
+    """A session factory that hands back a :class:`RaisingExitContext`."""
+
+    def __init__(self, session: FakeInitializableSession, exit_error: BaseException) -> None:
+        self.session = session
+        self.exit_error = exit_error
+        self.exited = False
+
+    def __call__(self, params: object) -> RaisingExitContext:
+        return RaisingExitContext(self)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exit_error",
+    [
+        pytest.param(BrokenResourceError(), id="broken-resource"),
+        pytest.param(ClosedResourceError(), id="closed-resource"),
+        pytest.param(RuntimeError("aclose blew up"), id="runtime-error"),
+    ],
+)
+async def test_stop_fails_closed_when_aclose_raises(
+    exit_error: BaseException, caplog: pytest.LogCaptureFixture
+) -> None:
+    """#484 MEDIUM: a RAISING ``aclose`` (broken pipes after a child segfault) is
+    an UNCONFIRMED stop, not a clean one — stop() must fail closed exactly like
+    the wedged-child timeout: force-terminate the child group, set
+    ``stop_unconfirmed = True``, log the error, and still return without raising.
+
+    Recording it as a confirmed clean stop (the old ``except Exception: log``
+    behaviour) would let a subsequent respawn sail past the #431 unconfirmed-stop
+    guard and let a restart skip ``operator_recovery_required``."""
+    calls: list[int] = []
+
+    def force_terminate() -> bool:
+        calls.append(1)
+        return True
+
+    session = FakeInitializableSession(info_result())
+    probe = RaisingExitFactoryProbe(session, exit_error)
+    process = MCPServerProcess(session_factory=probe, force_terminate=force_terminate)
+    await process.start()
+    with caplog.at_level(logging.ERROR, logger="roastpilot_agent.mcp_client"):
+        # Bound so a regression that re-raises would fail loudly, not hang.
+        await asyncio.wait_for(process.stop(), timeout=1.0)
+    assert probe.exited  # the raising aclose actually ran
+    # Fail closed: unconfirmed + force-terminated exactly once.
+    assert process.stop_unconfirmed is True
+    assert calls == [1]
+    assert not process.running
+    # The teardown error is logged for post-roast diagnosis.
+    assert any("stop raised during teardown" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_stop_cancelled_mid_wait_fails_closed_and_reraises() -> None:
+    """#484 Codex-P3: if stop()'s OWN task is cancelled during the shielded wait,
+    the CancelledError (a BaseException) must NOT silently wipe state with the
+    child possibly alive. stop() must fail closed first — force-terminate +
+    ``stop_unconfirmed = True`` — and then RE-RAISE the cancellation (mark then
+    propagate; a cancellation is never swallowed)."""
+    calls: list[int] = []
+
+    def force_terminate() -> bool:
+        calls.append(1)
+        return True
+
+    session = FakeInitializableSession(info_result())
+    # A wedged __aexit__ (sleeps 100 s) keeps stop() parked on the shielded wait
+    # long enough for the test to cancel it mid-wait.
+    probe = WedgedFactoryProbe(session)
+    process = MCPServerProcess(session_factory=probe, force_terminate=force_terminate)
+    await process.start()
+
+    stop_task = asyncio.create_task(process.stop())
+    # Let stop() reach its shielded `await` (the owner is wedged in __aexit__).
+    await asyncio.sleep(0.05)
+    stop_task.cancel()
+    # The cancellation must PROPAGATE to the caller — never be swallowed.
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+
+    # ...but first it failed closed: force-terminate fired, unconfirmed marked.
+    assert calls == [1], "cancelled stop() did not force-terminate the child"
+    assert process.stop_unconfirmed is True
+    assert not process.running
 
 
 @pytest.mark.asyncio

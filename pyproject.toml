@@ -40,6 +40,13 @@ classifiers = [
 ]
 dependencies = [
   "aiosqlite>=0.22,<1",
+  # #484: the MCP stdio transport (mcp / stdio_client) is built on anyio, and
+  # the fail-closed stop() teardown contract is validated against anyio's
+  # BrokenResourceError / ClosedResourceError (a raising aclose after a child
+  # segfault). Previously transitive via mcp; now referenced directly in the
+  # teardown tests, so declare it explicitly (mirrors the pyserial/sounddevice
+  # transitive-turned-direct precedent below).
+  "anyio>=4.0,<5",
   "fastapi>=0.136,<1",
   "httpx>=0.28,<1",
   "mcp>=1.0.0,<2",
@@ -164,6 +171,9 @@ addopts = "-q"
 pythonpath = ["src", "scripts"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "slow: spawns a real subprocess / initialises a real MCP session (still hardware-free)",
+]
 
 [tool.coverage.run]
 branch = true
