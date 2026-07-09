@@ -28,9 +28,12 @@ import yaml
 
 from roastpilot_agent.config import MCPConfig, MCPDeviceConfig
 from roastpilot_agent.mcp_yaml import (
+    MANAGED_YAML_PATHS,
     _deep_merge,  # pyright: ignore[reportPrivateUsage]
     _device_config_to_overlay,  # pyright: ignore[reportPrivateUsage]
+    read_yaml_value,
     render_mcp_yaml,
+    resolve_mcp_yaml_source_path,
 )
 
 # ---------------------------------------------------------------------------
@@ -891,3 +894,180 @@ def test_build_server_parameters_no_cwd_default_fresh_install(
                 shutil.rmtree(proc._rendered_yaml_dir, ignore_errors=True)  # pyright: ignore[reportPrivateUsage]
     finally:
         os.chdir(original_cwd)
+
+
+# ---------------------------------------------------------------------------
+# resolve_mcp_yaml_source_path (#482) — extracted precedence, shared with
+# GET /api/config's read-only yaml lookup.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_source_path_explicit_wins() -> None:
+    """mcp_yaml_source_path takes priority over everything else."""
+    cfg = MCPDeviceConfig(mcp_yaml_source_path=Path("/explicit/path.yaml"))
+    result = resolve_mcp_yaml_source_path(
+        cfg, mcp_env={"COFFEE_ROASTER_MCP_CONFIG": "/env/path.yaml"}
+    )
+    assert result == Path("/explicit/path.yaml")
+
+
+def test_resolve_source_path_mcp_env_wins_over_os_environ(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """COFFEE_ROASTER_MCP_CONFIG from mcp_env wins over os.environ (forward_coffee_env path)."""
+    monkeypatch.setenv("COFFEE_ROASTER_MCP_CONFIG", "/ambient/path.yaml")
+    cfg = MCPDeviceConfig()
+    result = resolve_mcp_yaml_source_path(
+        cfg, mcp_env={"COFFEE_ROASTER_MCP_CONFIG": "/mcp-env/path.yaml"}
+    )
+    assert result == Path("/mcp-env/path.yaml")
+
+
+def test_resolve_source_path_os_environ_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With no explicit path and no mcp_env, os.environ's COFFEE_ROASTER_MCP_CONFIG is used."""
+    monkeypatch.setenv("COFFEE_ROASTER_MCP_CONFIG", "/ambient/path.yaml")
+    cfg = MCPDeviceConfig()
+    result = resolve_mcp_yaml_source_path(cfg, mcp_env=None)
+    assert result == Path("/ambient/path.yaml")
+
+
+def test_resolve_source_path_cwd_default_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With nothing else set, the CWD default is used only if it exists."""
+    import os
+
+    monkeypatch.delenv("COFFEE_ROASTER_MCP_CONFIG", raising=False)
+    cwd_yaml = tmp_path / "coffee-roaster-mcp.yaml"
+    cwd_yaml.write_text("roaster:\n  driver: hottop\n", encoding="utf-8")
+    original_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        result = resolve_mcp_yaml_source_path(MCPDeviceConfig(), mcp_env=None)
+        assert result == Path("coffee-roaster-mcp.yaml")
+    finally:
+        os.chdir(original_cwd)
+
+
+def test_resolve_source_path_none_when_nothing_resolvable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No explicit path, no env var, no CWD default → None."""
+    import os
+
+    monkeypatch.delenv("COFFEE_ROASTER_MCP_CONFIG", raising=False)
+    original_cwd = os.getcwd()
+    os.chdir(tmp_path)  # empty tmp_path, no coffee-roaster-mcp.yaml
+    try:
+        result = resolve_mcp_yaml_source_path(MCPDeviceConfig(), mcp_env=None)
+        assert result is None
+    finally:
+        os.chdir(original_cwd)
+
+
+# ---------------------------------------------------------------------------
+# read_yaml_value (#482) — best-effort read backing ConfigFieldMeta.yaml_value.
+# ---------------------------------------------------------------------------
+
+
+def test_read_yaml_value_returns_present_key(tmp_path: Path) -> None:
+    """A key present in the yaml is returned for its managed field name."""
+    src = tmp_path / "source.yaml"
+    src.write_text("first_crack:\n  mode: audio\n", encoding="utf-8")
+    assert read_yaml_value(src, "fc_mode") == "audio"
+
+
+def test_read_yaml_value_every_managed_path(tmp_path: Path) -> None:
+    """Every entry in MANAGED_YAML_PATHS resolves against its own section/key."""
+    src = tmp_path / "source.yaml"
+    src.write_text(
+        "roaster:\n  port: /dev/ttyUSB0\n  driver: hottop\n"
+        "audio:\n  input_device: USB PnP\n"
+        "recording:\n  enabled: true\n  autocapture: false\n  devices: [USB PnP]\n"
+        "first_crack:\n  mode: audio\n  confidence_threshold: 0.6\n"
+        "session:\n  auto_t0_detection_enabled: true\n  auto_t0_drop_threshold_c: 12.0\n"
+        "ambient:\n  mode: yoctopuce\n  device: METEOMK2-1\n  poll_interval_seconds: 30.0\n",
+        encoding="utf-8",
+    )
+    expected = {
+        "serial_port": "/dev/ttyUSB0",
+        "roaster_driver": "hottop",
+        "audio_input_device": "USB PnP",
+        "recording_enabled": True,
+        "recording_autocapture": False,
+        "recording_devices": ["USB PnP"],
+        "fc_mode": "audio",
+        "fc_confidence_threshold": 0.6,
+        "auto_t0_detection_enabled": True,
+        "auto_t0_drop_threshold_c": 12.0,
+        "ambient_mode": "yoctopuce",
+        "ambient_device": "METEOMK2-1",
+        "ambient_poll_interval_seconds": 30.0,
+    }
+    assert set(expected.keys()) == set(MANAGED_YAML_PATHS.keys())
+    for field_name, expected_value in expected.items():
+        assert read_yaml_value(src, field_name) == expected_value
+
+
+def test_read_yaml_value_absent_key_is_none(tmp_path: Path) -> None:
+    """A key absent from the yaml (but its section present) returns None."""
+    src = tmp_path / "source.yaml"
+    src.write_text("roaster:\n  driver: hottop\n", encoding="utf-8")
+    assert read_yaml_value(src, "serial_port") is None
+
+
+def test_read_yaml_value_absent_section_is_none(tmp_path: Path) -> None:
+    """A yaml with no matching section at all returns None."""
+    src = tmp_path / "source.yaml"
+    src.write_text("roaster:\n  driver: hottop\n", encoding="utf-8")
+    assert read_yaml_value(src, "fc_mode") is None
+
+
+def test_read_yaml_value_none_source_path_is_none() -> None:
+    """source_path=None (no yaml resolvable) fails soft to None."""
+    assert read_yaml_value(None, "fc_mode") is None
+
+
+def test_read_yaml_value_unknown_field_name_is_none(tmp_path: Path) -> None:
+    """A field name not in MANAGED_YAML_PATHS fails soft to None."""
+    src = tmp_path / "source.yaml"
+    src.write_text("roaster:\n  driver: hottop\n", encoding="utf-8")
+    assert read_yaml_value(src, "not_a_real_field") is None
+
+
+def test_read_yaml_value_missing_file_is_none(tmp_path: Path) -> None:
+    """A resolved path that does not exist on disk fails soft to None (never raises)."""
+    missing = tmp_path / "does_not_exist.yaml"
+    assert read_yaml_value(missing, "fc_mode") is None
+
+
+def test_read_yaml_value_unparseable_yaml_is_none(tmp_path: Path) -> None:
+    """Invalid YAML syntax fails soft to None rather than propagating YAMLError."""
+    src = tmp_path / "bad.yaml"
+    src.write_text("roaster: [unterminated\n", encoding="utf-8")
+    assert read_yaml_value(src, "fc_mode") is None
+
+
+def test_read_yaml_value_non_mapping_yaml_is_none(tmp_path: Path) -> None:
+    """A valid-YAML-but-non-mapping source (list) fails soft to None."""
+    src = tmp_path / "list.yaml"
+    src.write_text("- item1\n- item2\n", encoding="utf-8")
+    assert read_yaml_value(src, "fc_mode") is None
+
+
+def test_read_yaml_value_non_mapping_section_is_none(tmp_path: Path) -> None:
+    """A section whose value is not a mapping (e.g. a scalar) fails soft to None."""
+    src = tmp_path / "scalar-section.yaml"
+    src.write_text("first_crack: audio\n", encoding="utf-8")
+    assert read_yaml_value(src, "fc_mode") is None
+
+
+def test_read_yaml_value_known_good_fc_mode() -> None:
+    """Against the real known-good yaml, fc_mode resolves to its actual audio value.
+
+    This is the exact scenario from #482: fc_mode is unconfigured at the agent's
+    own config layer (effective_value=None) but the hand-authored yaml says
+    "audio" — read_yaml_value must surface that real value.
+    """
+    assert read_yaml_value(_KNOWN_GOOD, "fc_mode") == "audio"
+    assert read_yaml_value(_KNOWN_GOOD, "fc_confidence_threshold") == 0.6

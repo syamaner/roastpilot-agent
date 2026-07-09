@@ -39,14 +39,32 @@ interface ControlProps {
   /** Dynamic upper bound for number fields — overrides the static schema `max`.
    *  Used for cross-field constraints: fan ≤ effective fan_ceiling_percent. */
   dynMax?: number;
+  /**
+   * The value currently in the hand-authored MCP yaml for this field (#482),
+   * or `null` when not an `mcp_device` field / no yaml value is resolvable.
+   * Used to render the true inherit state ("Inherit from yaml (audio)")
+   * instead of a bogus concrete default when the field is unconfigured
+   * (`value === null`).
+   */
+  yamlValue?: unknown;
 }
 
-function TextControl({ fieldDef, value, disabled, onChange }: ControlProps): React.JSX.Element {
+function TextControl({ fieldDef, value, disabled, onChange, yamlValue }: ControlProps): React.JSX.Element {
+  // mcp_device text fields are tri-state (#439/#482): null already renders as
+  // a blank input (no bogus concrete value), but the placeholder shows what
+  // the hand-authored yaml actually has so a blank field doesn't read as
+  // "nothing configured anywhere" when it's really "inheriting a real value".
+  const isInheritField = fieldDef.key.startsWith("mcp_device.");
+  const placeholder =
+    isInheritField && value === null && typeof yamlValue === "string" && yamlValue
+      ? `${yamlValue} (from yaml)`
+      : undefined;
   return (
     <input
       type="text"
       id={fieldDef.key}
       value={typeof value === "string" ? value : String(value ?? "")}
+      placeholder={placeholder}
       disabled={disabled}
       onChange={(e) => onChange(e.target.value)}
       className={cn(
@@ -74,8 +92,26 @@ function MaskedControl({ fieldDef, value, disabled }: Omit<ControlProps, "onChan
   );
 }
 
-function NumberControl({ fieldDef, value, disabled, onChange, dynMin, dynMax }: ControlProps): React.JSX.Element {
-  const numVal = typeof value === "number" ? value : Number(value ?? 0);
+function NumberControl({
+  fieldDef,
+  value,
+  disabled,
+  onChange,
+  dynMin,
+  dynMax,
+  yamlValue,
+}: ControlProps): React.JSX.Element {
+  // mcp_device number fields are tri-state (#439/#482): null means "inherit
+  // from the hand-authored yaml", not "0". Coercing null to Number(null ?? 0)
+  // rendered a real-looking "0" in the input — the #482 scare for
+  // ambient_poll_interval_seconds / fc_confidence_threshold. When inherited,
+  // render a BLANK input (not a fabricated 0) with a placeholder showing the
+  // real yaml value when known.
+  const isInheritField = fieldDef.key.startsWith("mcp_device.");
+  const isInherited = isInheritField && value === null;
+  const numVal = typeof value === "number" ? value : isInherited ? "" : Number(value ?? 0);
+  const placeholder =
+    isInherited && typeof yamlValue === "number" ? `${yamlValue} (from yaml)` : undefined;
   const minVal = dynMin !== undefined ? dynMin : fieldDef.min;
   const maxVal = dynMax !== undefined ? dynMax : fieldDef.max;
   return (
@@ -83,11 +119,12 @@ function NumberControl({ fieldDef, value, disabled, onChange, dynMin, dynMax }: 
       type="number"
       id={fieldDef.key}
       value={numVal}
+      placeholder={placeholder}
       min={minVal}
       max={maxVal}
       step={fieldDef.step ?? 1}
       disabled={disabled}
-      onChange={(e) => onChange(Number(e.target.value))}
+      onChange={(e) => onChange(e.target.value === "" ? null : Number(e.target.value))}
       className={cn(
         "h-11 w-full rounded-[9px] border border-input bg-input px-3 font-mono text-sm text-foreground tabular-nums transition-colors",
         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
@@ -184,13 +221,33 @@ function NullableBooleanControl({ fieldDef, value, disabled, onChange }: Control
   );
 }
 
-function SelectControl({ fieldDef, value, disabled, onChange }: ControlProps): React.JSX.Element {
+function SelectControl({
+  fieldDef,
+  value,
+  disabled,
+  onChange,
+  yamlValue,
+}: ControlProps): React.JSX.Element {
+  // mcp_device select fields are tri-state (#439/#482): null means "inherit
+  // from the hand-authored yaml", not "the first enum option". Rendering an
+  // inherited fc_mode as the native <select>'s first option (previously
+  // "disabled") falsely told the operator FC detection was off when the yaml
+  // actually said "audio" — the #482 scare. When null, inject an explicit
+  // inherit option carrying the real yaml value (when known) so the operator
+  // sees what will actually govern, never a fabricated concrete choice.
+  const isInheritField = fieldDef.key.startsWith("mcp_device.");
+  const isInherited = isInheritField && value === null;
+  const inheritLabel =
+    typeof yamlValue === "string" || typeof yamlValue === "number"
+      ? `Inherit from yaml (${yamlValue})`
+      : "Inherit from yaml";
+
   return (
     <select
       id={fieldDef.key}
-      value={typeof value === "string" ? value : String(value ?? "")}
+      value={isInherited ? "" : typeof value === "string" ? value : String(value ?? "")}
       disabled={disabled}
-      onChange={(e) => onChange(e.target.value)}
+      onChange={(e) => onChange(e.target.value === "" ? null : e.target.value)}
       className={cn(
         "h-11 w-full rounded-[9px] border border-input bg-input px-3 text-sm text-foreground transition-colors",
         "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2",
@@ -198,6 +255,7 @@ function SelectControl({ fieldDef, value, disabled, onChange }: ControlProps): R
       )}
       aria-label={fieldDef.label}
     >
+      {isInheritField && <option value="">{inheritLabel}</option>}
       {(fieldDef.options ?? []).map((opt) => (
         <option key={opt.value} value={opt.value}>
           {opt.label}
@@ -323,6 +381,13 @@ export function ConfigFieldRow({
   const isReadOnly = fieldDef.readOnlyStatic || meta.read_only || saving;
   const isSafetyField = fieldDef.category === "Safety";
   const isDirtyFromDefault = value !== meta.default;
+  // mcp_device fields are tri-state (#439): schema default is always null
+  // (inherit); the operator-relevant baseline is the hand-authored yaml's
+  // current value (#482), so the "Default" line and reset-button copy differ
+  // for this field class. Keyed off the key prefix (not category) so a
+  // category rename never silently drops the distinction (mirrors the
+  // #439 boolean-control convention above).
+  const isMcpDeviceField = fieldDef.key.startsWith("mcp_device.");
 
   // Effective bounds: dynamic override > static schema value
   const effectiveMin = dynMin !== undefined ? dynMin : fieldDef.min;
@@ -335,6 +400,7 @@ export function ConfigFieldRow({
     onChange,
     dynMin,
     dynMax,
+    yamlValue: meta.yaml_value,
   };
 
   let control: React.JSX.Element;
@@ -451,6 +517,14 @@ export function ConfigFieldRow({
           ) : fieldDef.type === "micTestButton" ? (
             // No default line for the mic-test placeholder.
             <span />
+          ) : isMcpDeviceField && meta.yaml_value !== null && meta.yaml_value !== undefined ? (
+            // mcp_device fields have no meaningful schema default (it's always
+            // null, per D78-4) — the operator-relevant baseline is the
+            // hand-authored yaml's current value (#482), not "Default —".
+            <span className="font-mono text-xs tabular-nums text-muted-foreground/50">
+              From yaml: {String(meta.yaml_value)}
+              {fieldDef.unit ? ` ${fieldDef.unit}` : ""}
+            </span>
           ) : (
             <span className="font-mono text-xs tabular-nums text-muted-foreground/50">
               Default {String(meta.default ?? "—")}
@@ -465,7 +539,7 @@ export function ConfigFieldRow({
               className="text-xs text-muted-foreground/70 transition-colors hover:text-foreground"
               data-testid={`reset-${fieldDef.key}`}
             >
-              ↺ Reset to default
+              {isMcpDeviceField ? "↺ Restore to yaml" : "↺ Reset to default"}
             </button>
           )}
         </div>

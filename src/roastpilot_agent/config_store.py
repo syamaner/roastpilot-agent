@@ -67,6 +67,7 @@ from roastpilot_agent.config import (
     PreFirstCrackLevers,
     SafetyLimits,
 )
+from roastpilot_agent.mcp_yaml import read_yaml_value, resolve_mcp_yaml_source_path
 
 
 class ConfigFileError(ValueError):
@@ -214,6 +215,15 @@ class ConfigFieldMeta(BaseModel, frozen=True):
     read_only: bool
     #: Human-readable description shown in the Config UI.
     description: str
+    #: The value currently in the hand-authored ``coffee-roaster-mcp.yaml``
+    #: (#482). Populated only for ``mcp_device`` fields — the agent's own
+    #: config layer defaults every such field to ``None``, so
+    #: ``effective_value`` alone cannot tell an operator what the MCP will
+    #: actually use when the field is unconfigured. ``None`` when the field
+    #: is not an ``mcp_device`` field, no hand-authored yaml is resolvable, or
+    #: the key is simply absent from it (fails soft — see
+    #: :func:`~roastpilot_agent.mcp_yaml.read_yaml_value`).
+    yaml_value: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +540,7 @@ def _make_field_meta(
     read_only: bool,
     description: str,
     injected_keys: frozenset[str] | None = None,
+    yaml_value: Any = None,
 ) -> ConfigFieldMeta:
     """Construct a :class:`ConfigFieldMeta` for one managed field.
 
@@ -548,6 +559,9 @@ def _make_field_meta(
             operator-supplied env var.  Pass ``None`` (the default) when
             building a snapshot outside of :func:`load_app_config` context
             (e.g. in tests that construct :class:`AppConfig` manually).
+        yaml_value: The value currently in the hand-authored MCP yaml for this
+            field (#482), or ``None`` for non-``mcp_device`` fields and fields
+            where no yaml value is resolvable.
 
     Returns:
         A frozen :class:`ConfigFieldMeta` instance.
@@ -592,6 +606,7 @@ def _make_field_meta(
         env_overridden=env_overridden,
         read_only=read_only,
         description=description,
+        yaml_value=yaml_value,
     )
 
 
@@ -650,6 +665,7 @@ def build_config_snapshot(
         *,
         read_only: bool = False,
         description: str = "",
+        yaml_value: Any = None,
     ) -> ConfigFieldMeta:
         return _make_field_meta(
             saved_value=saved,
@@ -659,6 +675,7 @@ def build_config_snapshot(
             read_only=read_only,
             description=description,
             injected_keys=injected_keys,
+            yaml_value=yaml_value,
         )
 
     # --- controller section ------------------------------------------------
@@ -1066,6 +1083,32 @@ def build_config_snapshot(
     dev_def = defaults.mcp_device
     dev_saved = _raw_section(saved_raw, "mcp_device")
 
+    # Resolve the hand-authored MCP yaml's current values (#482): the agent's
+    # own MCPDeviceConfig defaults every field to None, so effective_value
+    # alone cannot tell the operator what the MCP will actually use when a
+    # field is unconfigured (e.g. fc_mode=None does NOT mean "FC detection is
+    # off" — it means "the yaml's first_crack.mode governs"). Best-effort: any
+    # failure (missing file, bad yaml, absent key) yields yaml_value=None for
+    # that field — this must never turn into a GET /api/config 500 (that's
+    # load_app_config's job, and it already fails closed there).
+    #
+    # This mirrors mcp_client.py's spawn-time source-path precedence for
+    # steps 1/3/4 (same shared function), but NOT step 2: step 2 reads
+    # COFFEE_ROASTER_MCP_CONFIG from MCPConfig.env, the live MCPServerProcess's
+    # own spawn-time env overrides (the forward_coffee_env / roast-live.sh
+    # path) — a runtime construct this request-scoped snapshot builder has no
+    # handle on, so mcp_env=None below is not "not yet wired," it is
+    # structurally unreachable from GET /api/config. In that one corner (the
+    # operator relies on step 2 rather than exporting the same
+    # COFFEE_ROASTER_MCP_CONFIG into the ambient os.environ, which step 3
+    # would still catch) yaml_value degrades to whatever step 3/4 resolve, or
+    # None — never a 500, and never a value that silently pretends to be
+    # fresher than it is.
+    _yaml_source = resolve_mcp_yaml_source_path(dev, mcp_env=None)
+
+    def _dev_yaml(field_name: str) -> Any:
+        return read_yaml_value(_yaml_source, field_name)
+
     mcp_device_snapshot = MCPDeviceConfigSnapshot(
         serial_port=_meta(
             dev_saved.get("serial_port"),
@@ -1078,6 +1121,7 @@ def build_config_snapshot(
                 " /dev/ttyUSB0 on Linux). Rendered to roaster.port in the"
                 " MCP yaml on each spawn."
             ),
+            yaml_value=_dev_yaml("serial_port"),
         ),
         roaster_driver=_meta(
             dev_saved.get("roaster_driver"),
@@ -1089,6 +1133,7 @@ def build_config_snapshot(
                 " (e.g. hottop_kn8828b_2k_plus or mock). Rendered to"
                 " roaster.driver in the MCP yaml."
             ),
+            yaml_value=_dev_yaml("roaster_driver"),
         ),
         audio_input_device=_meta(
             dev_saved.get("audio_input_device"),
@@ -1100,6 +1145,7 @@ def build_config_snapshot(
                 " (case-insensitive match, e.g. 'USB PnP'). Rendered to"
                 " audio.input_device in the MCP yaml."
             ),
+            yaml_value=_dev_yaml("audio_input_device"),
         ),
         recording_enabled=_meta(
             dev_saved.get("recording_enabled"),
@@ -1110,6 +1156,7 @@ def build_config_snapshot(
                 "Whether the MCP audio recorder is active. Rendered to"
                 " recording.enabled in the MCP yaml."
             ),
+            yaml_value=_dev_yaml("recording_enabled"),
         ),
         recording_autocapture=_meta(
             dev_saved.get("recording_autocapture"),
@@ -1120,6 +1167,7 @@ def build_config_snapshot(
                 "Whether recording starts automatically with each roast session."
                 " Rendered to recording.autocapture in the MCP yaml."
             ),
+            yaml_value=_dev_yaml("recording_autocapture"),
         ),
         recording_devices=_meta(
             dev_saved.get("recording_devices"),
@@ -1131,6 +1179,7 @@ def build_config_snapshot(
                 " is used by the FC detector (teed); additional entries are"
                 " independent capture streams. Rendered to recording.devices."
             ),
+            yaml_value=_dev_yaml("recording_devices"),
         ),
         fc_mode=_meta(
             dev_saved.get("fc_mode"),
@@ -1141,6 +1190,7 @@ def build_config_snapshot(
                 "First-crack detection mode: disabled, audio, or manual. Rendered"
                 " to first_crack.mode in the MCP yaml."
             ),
+            yaml_value=_dev_yaml("fc_mode"),
         ),
         fc_confidence_threshold=_meta(
             dev_saved.get("fc_confidence_threshold"),
@@ -1152,6 +1202,7 @@ def build_config_snapshot(
                 " 0.6 is the proven library default. Rendered to"
                 " first_crack.confidence_threshold in the MCP yaml."
             ),
+            yaml_value=_dev_yaml("fc_confidence_threshold"),
         ),
         auto_t0_detection_enabled=_meta(
             dev_saved.get("auto_t0_detection_enabled"),
@@ -1162,6 +1213,7 @@ def build_config_snapshot(
                 "Whether the MCP's automatic charge-drop (T0) detection is active."
                 " Rendered to session.auto_t0_detection_enabled in the MCP yaml."
             ),
+            yaml_value=_dev_yaml("auto_t0_detection_enabled"),
         ),
         auto_t0_drop_threshold_c=_meta(
             dev_saved.get("auto_t0_drop_threshold_c"),
@@ -1172,6 +1224,7 @@ def build_config_snapshot(
                 "Bean-temperature drop (°C) that triggers automatic T0 detection."
                 " Rendered to session.auto_t0_drop_threshold_c in the MCP yaml."
             ),
+            yaml_value=_dev_yaml("auto_t0_drop_threshold_c"),
         ),
         ambient_mode=_meta(
             dev_saved.get("ambient_mode"),
@@ -1182,6 +1235,7 @@ def build_config_snapshot(
                 "Ambient environmental sensor mode: disabled or yoctopuce (D85)."
                 " Rendered to ambient.mode in the MCP yaml."
             ),
+            yaml_value=_dev_yaml("ambient_mode"),
         ),
         ambient_device=_meta(
             dev_saved.get("ambient_device"),
@@ -1193,6 +1247,7 @@ def build_config_snapshot(
                 " a specific ambient probe. Rendered to ambient.device in the MCP"
                 " yaml. When unset, the first detected Yocto Meteo device is used."
             ),
+            yaml_value=_dev_yaml("ambient_device"),
         ),
         ambient_poll_interval_seconds=_meta(
             dev_saved.get("ambient_poll_interval_seconds"),
@@ -1203,6 +1258,7 @@ def build_config_snapshot(
                 "Minimum seconds between ambient USB reads. Rendered to"
                 " ambient.poll_interval_seconds in the MCP yaml. Default 30.0 s."
             ),
+            yaml_value=_dev_yaml("ambient_poll_interval_seconds"),
         ),
     )
 

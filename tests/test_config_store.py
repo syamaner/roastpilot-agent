@@ -14,7 +14,7 @@ import pydantic
 import pytest
 from pydantic import BaseModel
 
-from roastpilot_agent.config import AppConfig, SafetyLimits
+from roastpilot_agent.config import AppConfig, MCPDeviceConfig, SafetyLimits
 from roastpilot_agent.config_store import (
     _ALL_SAFETY_ENV_KEYS,  # pyright: ignore[reportPrivateUsage]
     _NEVER_INJECT_NON_SAFETY_KEYS,  # pyright: ignore[reportPrivateUsage]
@@ -1782,3 +1782,145 @@ def test_ambient_all_none_default_no_saved_section(
     assert effective.mcp_device.ambient_mode is None
     assert effective.mcp_device.ambient_device is None
     assert effective.mcp_device.ambient_poll_interval_seconds is None
+
+
+# ---------------------------------------------------------------------------
+# ConfigFieldMeta.yaml_value (#482) — the mcp_device snapshot mirrors the
+# hand-authored MCP yaml's current value for each managed field.
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_yaml_value_populated_from_source_yaml(tmp_path: Path) -> None:
+    """A managed key present in the hand-authored yaml appears as yaml_value.
+
+    This is the exact #482 scenario: fc_mode is unconfigured at the agent's own
+    config layer (saved=None, effective=None) but the hand-authored yaml says
+    "audio" — the snapshot must surface that real value so the FE never renders
+    a bogus concrete option in its place.
+    """
+    yaml_path = tmp_path / "coffee-roaster-mcp.yaml"
+    yaml_path.write_text("first_crack:\n  mode: audio\n", encoding="utf-8")
+    effective = AppConfig(mcp_device=MCPDeviceConfig(mcp_yaml_source_path=yaml_path))
+    snapshot = build_config_snapshot(effective, {})
+
+    fc_mode_meta = snapshot.mcp_device.fc_mode
+    assert fc_mode_meta.saved_value is None
+    assert fc_mode_meta.effective_value is None
+    assert fc_mode_meta.yaml_value == "audio"
+
+
+def test_snapshot_yaml_value_none_when_no_source_yaml() -> None:
+    """With no hand-authored yaml resolvable, yaml_value fails soft to None."""
+    effective = AppConfig()  # default MCPDeviceConfig: no mcp_yaml_source_path
+    snapshot = build_config_snapshot(effective, {})
+    assert snapshot.mcp_device.fc_mode.yaml_value is None
+    assert snapshot.mcp_device.serial_port.yaml_value is None
+
+
+def test_snapshot_yaml_value_none_when_source_yaml_missing(tmp_path: Path) -> None:
+    """A configured but nonexistent yaml path fails soft to yaml_value=None
+    (never a GET /api/config 500 — that's load_app_config's job)."""
+    missing = tmp_path / "does_not_exist.yaml"
+    effective = AppConfig(mcp_device=MCPDeviceConfig(mcp_yaml_source_path=missing))
+    snapshot = build_config_snapshot(effective, {})
+    assert snapshot.mcp_device.fc_mode.yaml_value is None
+
+
+def test_snapshot_yaml_value_absent_from_non_mcp_device_fields() -> None:
+    """yaml_value defaults to None for controller/advisor/safety fields — the
+    concept only applies to mcp_device (the agent has no "yaml" for those)."""
+    effective = AppConfig()
+    snapshot = build_config_snapshot(effective, {})
+    assert snapshot.controller.pre_fc_heat_target_percent.yaml_value is None
+    assert snapshot.advisor.model_slug.yaml_value is None
+    assert snapshot.safety.max_bean_temp_c.yaml_value is None
+
+
+def test_snapshot_yaml_value_every_mcp_device_field_populated(tmp_path: Path) -> None:
+    """Every mcp_device field in the snapshot resolves its own yaml section/key —
+    not just fc_mode. Guards against a copy-paste miss on one of the 13 fields."""
+    yaml_path = tmp_path / "coffee-roaster-mcp.yaml"
+    yaml_path.write_text(
+        "roaster:\n  port: /dev/ttyUSB0\n  driver: hottop\n"
+        "audio:\n  input_device: USB PnP\n"
+        "recording:\n  enabled: true\n  autocapture: false\n  devices: [USB PnP]\n"
+        "first_crack:\n  mode: audio\n  confidence_threshold: 0.6\n"
+        "session:\n  auto_t0_detection_enabled: true\n  auto_t0_drop_threshold_c: 12.0\n"
+        "ambient:\n  mode: yoctopuce\n  device: METEOMK2-1\n  poll_interval_seconds: 30.0\n",
+        encoding="utf-8",
+    )
+    effective = AppConfig(mcp_device=MCPDeviceConfig(mcp_yaml_source_path=yaml_path))
+    snapshot = build_config_snapshot(effective, {})
+    dev = snapshot.mcp_device
+
+    assert dev.serial_port.yaml_value == "/dev/ttyUSB0"
+    assert dev.roaster_driver.yaml_value == "hottop"
+    assert dev.audio_input_device.yaml_value == "USB PnP"
+    assert dev.recording_enabled.yaml_value is True
+    assert dev.recording_autocapture.yaml_value is False
+    assert dev.recording_devices.yaml_value == ["USB PnP"]
+    assert dev.fc_mode.yaml_value == "audio"
+    assert dev.fc_confidence_threshold.yaml_value == 0.6
+    assert dev.auto_t0_detection_enabled.yaml_value is True
+    assert dev.auto_t0_drop_threshold_c.yaml_value == 12.0
+    assert dev.ambient_mode.yaml_value == "yoctopuce"
+    assert dev.ambient_device.yaml_value == "METEOMK2-1"
+    assert dev.ambient_poll_interval_seconds.yaml_value == 30.0
+
+
+def test_snapshot_yaml_value_explicit_override_still_shown_alongside(tmp_path: Path) -> None:
+    """An operator override (saved_value set) does not suppress yaml_value —
+    the FE decides what to render; the snapshot always carries both."""
+    yaml_path = tmp_path / "coffee-roaster-mcp.yaml"
+    yaml_path.write_text("first_crack:\n  mode: audio\n", encoding="utf-8")
+    effective = AppConfig(
+        mcp_device=MCPDeviceConfig(mcp_yaml_source_path=yaml_path, fc_mode="manual")
+    )
+    saved_raw = {"mcp_device": {"fc_mode": "manual"}}
+    snapshot = build_config_snapshot(effective, saved_raw)
+
+    fc_mode_meta = snapshot.mcp_device.fc_mode
+    assert fc_mode_meta.saved_value == "manual"
+    assert fc_mode_meta.effective_value == "manual"
+    # yaml_value still reflects the hand-authored yaml's own value, independent
+    # of the operator's override.
+    assert fc_mode_meta.yaml_value == "audio"
+
+
+def test_snapshot_yaml_value_degrades_safely_when_only_mcp_env_carries_the_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """qa gap 2: the MCPConfig.env forwarding step (precedence step 2 in
+    resolve_mcp_yaml_source_path) is structurally unreachable from
+    GET /api/config — build_config_snapshot has no parameter carrying a live
+    MCPConfig.env, so passing mcp_env=None there always skips straight from
+    step 1 to step 3 (os.environ). This proves the degradation is safe: an
+    operator who relies ONLY on step 2 (rare; MCPConfig.env is a runtime
+    spawn-time construct, not exported to the ambient environment) gets
+    yaml_value=None here, not a crash and not a stale value pretending to be
+    fresh. The realistic path (the same yaml also exported into os.environ,
+    step 3 — what roast-live.sh actually does) is asserted separately below
+    as the "this is what actually works" contrast.
+    """
+    yaml_path = tmp_path / "coffee-roaster-mcp.yaml"
+    yaml_path.write_text("first_crack:\n  mode: audio\n", encoding="utf-8")
+
+    # Nothing in os.environ, no explicit mcp_yaml_source_path — only a
+    # hypothetical "step 2" carrier exists, which build_config_snapshot has no
+    # way to thread through (it calls resolve_mcp_yaml_source_path(dev,
+    # mcp_env=None) unconditionally).
+    monkeypatch.delenv("COFFEE_ROASTER_MCP_CONFIG", raising=False)
+    effective = AppConfig(mcp_device=MCPDeviceConfig())
+
+    # GET /api/config's real call path (via get_config -> build_config_snapshot)
+    # never 500s here — the snapshot still builds successfully.
+    snapshot = build_config_snapshot(effective, {})
+    assert snapshot.mcp_device.fc_mode.yaml_value is None
+
+    # Contrast: exporting the SAME yaml into os.environ (step 3 — the
+    # realistic roast-live.sh path) is picked up correctly, proving the
+    # degradation above is specific to the unreachable step 2, not a general
+    # resolver bug.
+    monkeypatch.setenv("COFFEE_ROASTER_MCP_CONFIG", str(yaml_path))
+    snapshot_via_step3 = build_config_snapshot(effective, {})
+    assert snapshot_via_step3.mcp_device.fc_mode.yaml_value == "audio"

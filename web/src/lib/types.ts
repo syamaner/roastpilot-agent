@@ -563,6 +563,18 @@ export interface ConfigFieldMeta {
   read_only: boolean;
   /** One-sentence description shown in the field's left column. */
   description: string;
+  /**
+   * The value currently in the hand-authored coffee-roaster-mcp.yaml (#482).
+   * Populated only for `mcp_device` fields — the agent's own config layer
+   * defaults every such field to `null`, so `effective_value` alone cannot
+   * tell the operator what the MCP will actually use when the field is
+   * unconfigured (e.g. `fc_mode: null` does NOT mean "FC detection is off" —
+   * it means "the yaml's first_crack.mode governs"). `null` for
+   * non-`mcp_device` fields, when no hand-authored yaml is resolvable, or
+   * when the key is simply absent from it (server fails soft — never a
+   * reason for GET /api/config to 500).
+   */
+  yaml_value: unknown;
 }
 
 export interface ControllerConfigSnapshot {

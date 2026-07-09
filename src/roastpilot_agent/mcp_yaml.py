@@ -74,6 +74,127 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
     return merged
 
 
+#: Maps each managed :class:`MCPDeviceConfig` field name to its
+#: ``(yaml_section, yaml_key)`` location, mirroring :func:`_device_config_to_overlay`'s
+#: nesting exactly. Single source of truth for :func:`read_yaml_value` (#482) so the
+#: read-side dot-path never drifts from the write-side overlay mapping above.
+MANAGED_YAML_PATHS: dict[str, tuple[str, str]] = {
+    "serial_port": ("roaster", "port"),
+    "roaster_driver": ("roaster", "driver"),
+    "audio_input_device": ("audio", "input_device"),
+    "recording_enabled": ("recording", "enabled"),
+    "recording_autocapture": ("recording", "autocapture"),
+    "recording_devices": ("recording", "devices"),
+    "fc_mode": ("first_crack", "mode"),
+    "fc_confidence_threshold": ("first_crack", "confidence_threshold"),
+    "auto_t0_detection_enabled": ("session", "auto_t0_detection_enabled"),
+    "auto_t0_drop_threshold_c": ("session", "auto_t0_drop_threshold_c"),
+    "ambient_mode": ("ambient", "mode"),
+    "ambient_device": ("ambient", "device"),
+    "ambient_poll_interval_seconds": ("ambient", "poll_interval_seconds"),
+}
+
+
+def resolve_mcp_yaml_source_path(
+    device_config: MCPDeviceConfig,
+    mcp_env: dict[str, str] | None = None,
+) -> Path | None:
+    """Resolve the hand-authored MCP yaml path using the same precedence as spawn.
+
+    Extracted from :meth:`~roastpilot_agent.mcp_client.MCPServerProcess.build_server_parameters`
+    (#482) so the read-only ``GET /api/config`` path (:func:`read_yaml_value`) and
+    the spawn-time render path resolve the identical source file — a single
+    precedence implementation, not two that could drift.
+
+    Priority order:
+
+    1. ``device_config.mcp_yaml_source_path`` — explicit path wins.
+    2. ``COFFEE_ROASTER_MCP_CONFIG`` from *mcp_env* (the value forwarded by
+       ``forward_coffee_env`` from ``roast-live.sh``, i.e. ``MCPConfig.env``).
+    3. ``COFFEE_ROASTER_MCP_CONFIG`` from ``os.environ`` — the ambient operator
+       environment.
+    4. ``coffee-roaster-mcp.yaml`` in the current working directory — the MCP's
+       own default fallback. Only used if the file actually exists.
+    5. ``None`` — no existing yaml is resolvable.
+
+    Unlike the spawn-time caller, this function does **not** raise when a
+    resolved path is missing — callers that need fail-closed spawn semantics
+    (:meth:`MCPServerProcess.build_server_parameters`) check existence
+    themselves via :func:`render_mcp_yaml`. This function is also used for a
+    best-effort *read* (:func:`read_yaml_value`) where a missing file should
+    resolve to "no yaml value available", not an error.
+
+    Args:
+        device_config: The agent-side device config; its
+            ``mcp_yaml_source_path`` is step 1.
+        mcp_env: The ``MCPConfig.env`` overrides dict, or ``None``. Step 2 reads
+            ``COFFEE_ROASTER_MCP_CONFIG`` from this dict if provided.
+
+    Returns:
+        The resolved path (which may or may not exist on disk), or ``None`` if
+        no source is resolvable at any step.
+    """
+    source: Path | None = device_config.mcp_yaml_source_path
+    if source is None:
+        raw = (mcp_env or {}).get("COFFEE_ROASTER_MCP_CONFIG") or os.environ.get(
+            "COFFEE_ROASTER_MCP_CONFIG"
+        )
+        if raw:
+            source = Path(raw)
+    if source is None:
+        cwd_default = Path("coffee-roaster-mcp.yaml")
+        if cwd_default.exists():
+            source = cwd_default
+    return source
+
+
+def read_yaml_value(source_path: Path | None, field_name: str) -> Any:
+    """Best-effort read of the hand-authored yaml's current value for *field_name*.
+
+    Used by ``GET /api/config`` (#482) to populate ``ConfigFieldMeta.yaml_value``
+    for ``mcp_device`` fields: when the operator has not overridden a field via
+    the Config UI (``saved_value``/``effective_value`` are both ``None``), the FE
+    still needs to show what the hand-authored yaml actually says (e.g. "Inherit
+    from yaml (audio)") rather than a bogus schema default.
+
+    Fails soft on every error path — a missing file, an unparseable yaml, an
+    absent section, or a non-mapping value at any level all resolve to ``None``.
+    This function backs a **display-only** read; it must never turn a config
+    file problem into a ``GET /api/config`` 500 (that's ``load_app_config``'s
+    job, and it already fails closed there).
+
+    Args:
+        source_path: The resolved hand-authored yaml path (see
+            :func:`resolve_mcp_yaml_source_path`), or ``None`` if no source is
+            resolvable.
+        field_name: The :class:`~roastpilot_agent.config.MCPDeviceConfig`
+            field name (e.g. ``"fc_mode"``) — looked up in
+            :data:`MANAGED_YAML_PATHS` for its yaml section/key.
+
+    Returns:
+        The raw yaml value at that section/key, or ``None`` if the field is
+        unknown, the file is missing/unreadable/unparseable, or the value is
+        simply absent from the yaml.
+    """
+    if source_path is None or field_name not in MANAGED_YAML_PATHS:
+        return None
+    section, key = MANAGED_YAML_PATHS[field_name]
+    try:
+        if not source_path.exists():
+            return None
+        with source_path.open("r", encoding="utf-8") as fh:
+            loaded: Any = yaml.safe_load(fh)
+    except (OSError, yaml.YAMLError):
+        return None
+    if not isinstance(loaded, dict):
+        return None
+    loaded_dict = cast("dict[str, Any]", loaded)
+    section_val = loaded_dict.get(section)
+    if not isinstance(section_val, dict):
+        return None
+    return cast("dict[str, Any]", section_val).get(key)
+
+
 def _device_config_to_overlay(cfg: MCPDeviceConfig) -> dict[str, Any]:
     """Convert *cfg* to a sparse overlay dict for passthrough-merge.
 
