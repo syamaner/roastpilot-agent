@@ -21,12 +21,16 @@ commit is exactly the rework we are cutting, so run them HERE.
 
 - **Python** (`src/` or `tests/` changed):
   `python -m ruff check . && python -m ruff format --check . && python -m pyright && python -m pytest`
-- **Coverage — run `pytest` with missing-line reporting and read the CHANGED lines (#452).**
-  `python -m pytest --cov=roastpilot_agent --cov-report=term-missing`. Every line your diff ADDS
-  or CHANGES must be covered — an uncovered changed line is exactly what `codecov/patch` fails on
-  *post*-open, so catch it HERE. Cover it, or tag it `# pragma: no cover` **with a reason** (repo
-  convention — see `store.py` / `mcp_client.py`) now. (On #426 a malformed-env-blob branch shipped
-  uncovered because term-missing was run only after the PR opened.)
+- **Coverage — run `pytest` with BRANCH coverage + missing-line reporting and read the CHANGED lines (#452, refined 9 Jul).**
+  `python -m pytest --cov=roastpilot_agent --cov-branch --cov-report=term-missing`. Every line your
+  diff ADDS or CHANGES must be covered — **and every BRANCH arm too**: `codecov/patch` counts
+  partial branches (`x->y` arrows) against the patch, so a "0 missed lines" run can still fail the
+  gate. Cover it, or tag it `# pragma: no cover` **with a reason** (repo convention — see
+  `store.py` / `mcp_client.py`) now. Prefer a test over a pragma for "defensive" arms — two false
+  "unreachable" pragmas were disproven on 9 Jul; if an arm is provably dead, DELETE it rather than
+  suppress it. (On #426 a malformed-env-blob branch shipped uncovered because term-missing ran only
+  after the PR opened; on #492 three DIFF branch-partials failed `codecov/patch` post-open because
+  the pre-open run lacked `--cov-branch`.)
 - **Web** (`web/` changed), from `web/`:
   `npm run lint && npm run typecheck && npm test && npm run build`
 - **Cross-boundary contract — if the diff touches the contract surface, run BOTH sides'

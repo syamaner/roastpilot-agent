@@ -102,7 +102,52 @@
 
 ## Active Context
 
-**9 Jul 2026 (evening, latest) — FIRST SUPERVISED HARDWARE A/B of #405. The A/B did its job: it
+**9–10 Jul 2026 (overnight, latest) — AUTONOMOUS BATCH COMPLETE: 7 PRs merged, the roast-night
+findings all actioned. #405 REWORKED per D88 (both flags OFF), #484 fixed with real-child tests,
+the config-UI trio closed.** One lead + 4 worktree tracks + a persistent review roster; operator
+away (MCP release approval delegated — none needed).
+
+- **#405 rework (PRs #490/#493, plan D88 — supersedes D83's law):** trace analysis of the A/B
+  (`docs/analysis/2026-07-09-roast9-10-postfc-ab.md`, PR #487) measured the flaw exactly — the
+  fixed 8.0 target sat ABOVE the measured 6.1 engagement RoR; the loop actuated 72→91 % from the
+  FIRST post-FC tick while the advisor said 0; ALL verdicts ALLOW (a control-law gap, not a safety
+  gap). **Corrected record: roast 2's drop was ADVISOR-triggered at 194 °C / 16.51 % — the
+  earlier-only authority WORKED and ended the runaway.** The D88 law (safety-reviewer ratified
+  with 7 amendments, then verified the implementation incl. mutation tests): setpoint tapers from
+  the MEASURED engagement RoR (clamped [end, start-max]) down to 4.0 over 90 s; output can NEVER
+  exceed heat-at-engagement (the 1 % anti-stall floor wins); taper clock on the actuation clock
+  with gap-resume dt capped (a Codex catch — the integrator was also exposed); PLUS a DECOUPLED
+  196 °C ceiling-guard drop on its OWN flag (fires regardless of the loop flag and after
+  recovery-resume; the first cross-section AppConfig validator; typed `DropReason`). **Both flags
+  default OFF — the flip is the operator's conscious decision at the validation roast (D88/A2).**
+- **#484 fixed (PR #492):** the stdio session lives in ONE owner task (respawn = a request, never a
+  cross-task teardown); the fail-closed surface covers EVERY exit — wedged-timeout, raising aclose
+  (a safety-reviewer-DISPROVEN "unreachable" pragma → policy: force-terminate +
+  `stop_unconfirmed=True`), cancelled stop (mark-then-re-raise), startup-abort overrun. NEW
+  real-child (mock-driver) respawn suite incl. the exact operator repro — both tests fail pre-fix.
+  The fake-only respawn coverage gap that let the crash through is closed.
+- **Config-UI trio closed:** #483 (PR #486 — save rebaselines from the PUT response; + 2 Codex race
+  fixes: disable-while-pending, cancelQueries-before-setQueryData), #482 (PR #491 — inherit fields
+  show the SOURCE-yaml value "Inherit from yaml (audio)", never a bogus "Disabled"/"0";
+  restore-to-yaml; shared resolver so the GET + spawn paths can't drift; ui-reviewer drove the UI
+  to confirm the scare dead).
+- **Review-system ledger:** Codex 7 real catches (2 save races, sibling-pressure on a pragma, the
+  taper gap-swallow incl. the integrator, 3 lifecycle-cancellation bugs) — every one in code the
+  other lenses had passed. safety-reviewer EMPIRICALLY disproved a second false "unreachable"
+  pragma (the night's recurring class: 4 comments/docstrings-that-LIE caught + fixed). qa
+  mutation-testing killed 4 weak tests. **Incident:** a reviewer's `git checkout --` wiped
+  uncommitted work in a shared worktree → recovered from its captured diff + author line-by-line
+  verification → the worktree runbook now mandates lead safety-commits before reviews + a
+  cp-snapshot mutation protocol (no tree-mutating git in shared worktrees). **pr-preflight
+  refined:** the coverage check now runs `--cov-branch` (#492's patch failure was 3 diff
+  branch-partials that line-coverage missed).
+- **Next:** the beans (ratings feed the corpus + the taste verdict); the NEXT supervised roast
+  validates D88 (flip taper + ceiling-guard consciously, re-A/B); then #323/#380 tuning. E11/E12
+  remain the post-validation arc.
+
+---
+
+**9 Jul 2026 (evening) — FIRST SUPERVISED HARDWARE A/B of #405. The A/B did its job: it
 CAUGHT A REAL #405 DESIGN FLAW. #460 STAYS OFF (plan D87).** Guatemala El Durazno (White Honey),
 2×250 g, baseline (advisor-driven) vs #405 deterministic post-FC loop.
 - **Roast 1 baseline (#405 OFF, `bf85c77a`):** clean, on-target — drop 189 °C, **DTR 13.6 %**, advisor
