@@ -19,9 +19,10 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
@@ -473,9 +474,14 @@ async def test_stop_cleans_up_rendered_yaml_dir() -> None:
     tmp_dir = proc._rendered_yaml_dir  # pyright: ignore[reportPrivateUsage]
     assert tmp_dir is not None and tmp_dir.exists(), "temp dir must be created"
 
-    # Inject a no-op session so stop() doesn't require a real MCP child.
-    mock_stack = AsyncMock()
-    proc._stack = mock_stack  # pyright: ignore[reportPrivateUsage]
+    # Simulate a live spawn without a real MCP child: an already-finished owner
+    # task + a stop-request event so stop() proceeds past its owner-None early
+    # return straight to the temp-dir cleanup (the owner-task lifecycle, #484).
+    async def _noop_owner() -> None:
+        return None
+
+    proc._owner_task = asyncio.create_task(_noop_owner())  # pyright: ignore[reportPrivateUsage]
+    proc._stop_requested = asyncio.Event()  # pyright: ignore[reportPrivateUsage]
     proc._session = MagicMock()  # pyright: ignore[reportPrivateUsage]
 
     await proc.stop()

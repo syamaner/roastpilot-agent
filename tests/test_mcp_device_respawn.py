@@ -20,11 +20,14 @@ and an isolated config file.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import Any
 
 import pytest
 import pytest_asyncio
+from mcp import StdioServerParameters
 
 from roastpilot_agent.api import RoastService
 from roastpilot_agent.config import MCPDeviceConfig
@@ -33,6 +36,7 @@ from roastpilot_agent.config_store import (
     MCPDeviceConfigEdit,
     persist_config_edit,
 )
+from roastpilot_agent.mcp_client import InitializableSession, MCPServerProcess
 from roastpilot_agent.models import RoastProfile
 from roastpilot_agent.store import RoastStore
 
@@ -625,57 +629,132 @@ async def test_unconfirmed_stop_aborts_respawn(
 # ---------------------------------------------------------------------------
 
 
-def test_force_terminate_hook_rearmed_on_respawn() -> None:
-    """The auto-registered force-terminate hook is cleared before each spawn.
+@dataclass
+class _StubToolResult:
+    """A minimal CallToolResult-shaped stub for the get_server_info health check.
 
-    _force_terminate_injected=False (the production path): start() must clear
-    _force_terminate to None before spawning so _register_force_terminate
-    re-registers with the new pid, not the previous one.
-
-    _force_terminate_injected=True (test seam): start() must NOT clear the
-    injected hook.
-
-    Tested without real I/O by inspecting the hook value before/after the
-    re-arm step using MCPServerProcess with an injected session.
+    A 2-key ``structuredContent`` parses cleanly (not the scalar wrapper), so a
+    real ``start()`` health-checks without a child process.
     """
-    from roastpilot_agent.mcp_client import MCPServerProcess
 
-    sentinel_hook: list[str] = []
+    structuredContent: dict[str, object] = dataclass_field(  # noqa: N815 (mirrors SDK)
+        default_factory=lambda: {"product_name": "stub", "package_name": "stub"}
+    )
+    content: list[object] = dataclass_field(default_factory=list[object])
+    isError: bool = False  # noqa: N815
 
-    def fake_hook_pid1() -> bool:
-        sentinel_hook.append("pid1")
+
+class _StubInitSession:
+    """An InitializableSession stub whose calls succeed without a child."""
+
+    async def call_tool(self, name: str, arguments: dict[str, Any] | None = None) -> object:
+        return _StubToolResult()
+
+    async def initialize(self) -> object:
+        return {}
+
+
+class _PidRegisteringFactory:
+    """A session factory that mimics the real spawn's ``on_spawn`` pid seam.
+
+    The production default factory calls ``process._register_force_terminate(pid)``
+    for each spawned child (via :func:`_spawn_stdio_session`'s ``on_spawn``). This
+    fake reproduces exactly that call with a per-spawn, incrementing pid, so a test
+    can drive the REAL ``start()`` / ``stop()`` and observe that the re-arm logic
+    inside ``start()`` re-registers the hook against the NEW pid — catching a
+    deletion of the re-arm lines, which the old inline-simulation test could not.
+
+    ``process`` is wired after construction (the process needs the factory at its
+    own construction time, so the reference is circular) via :meth:`bind`.
+    """
+
+    def __init__(self) -> None:
+        self._process: MCPServerProcess | None = None
+        self._next_pid = 1000
+        #: pid handed to _register_force_terminate on each spawn, in order.
+        self.spawn_pids: list[int] = []
+
+    def bind(self, process: MCPServerProcess) -> None:
+        self._process = process
+
+    def __call__(self, params: StdioServerParameters) -> _PidRegisteringContext:
+        assert self._process is not None, "factory used before bind(process)"
+        self._next_pid += 1
+        pid = self._next_pid
+        self.spawn_pids.append(pid)
+        # Mirror the real on_spawn seam: register a force-terminate hook for pid.
+        self._process._register_force_terminate(pid)  # pyright: ignore[reportPrivateUsage]
+        return _PidRegisteringContext()
+
+
+class _PidRegisteringContext:
+    """The async context the factory hands back — yields a stub session."""
+
+    async def __aenter__(self) -> InitializableSession:
+        return _StubInitSession()
+
+    async def __aexit__(self, *exc_info: object) -> bool | None:
+        return None
+
+
+@pytest.mark.asyncio
+async def test_force_terminate_hook_rearmed_on_respawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The auto-registered force-terminate hook re-arms to the NEW pid on respawn.
+
+    Drives the REAL ``start()`` / ``stop()`` / ``start()`` cycle (not an inline
+    re-implementation) so a deletion of the re-arm lines in ``start()`` — which
+    clear ``_force_terminate`` before each spawn so ``_register_force_terminate``
+    captures the new pid — would fail this test. The force-terminate hook records
+    which pid it would kill; after a respawn it must target the SECOND pid, never
+    the first.
+
+    Also verifies the injected-hook path: an injected ``force_terminate`` (test
+    seam) is preserved across a real respawn, never cleared.
+    """
+    # --- Non-injected (production) path: hook re-arms to the new pid. ---
+    killed: list[int] = []
+
+    def _recording_ft(pid: int) -> bool:
+        # Record which pid the auto-registered hook would kill, no real process.
+        killed.append(pid)
         return True
 
-    # --- Non-injected path: hook is cleared before each spawn. ---
-    mcp_auto = MCPServerProcess()
-    # Manually set a "previous pid's" hook as if a prior spawn registered it.
-    mcp_auto._force_terminate = fake_hook_pid1  # pyright: ignore[reportPrivateUsage]
-    assert not mcp_auto._force_terminate_injected  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr("roastpilot_agent.mcp_client.force_terminate_process_group", _recording_ft)
 
-    # Simulate the re-arm step (the lines added to start() before the spawn).
-    if not mcp_auto._force_terminate_injected:  # pyright: ignore[reportPrivateUsage]
-        mcp_auto._force_terminate = None  # pyright: ignore[reportPrivateUsage]
+    factory = _PidRegisteringFactory()
+    mcp_auto = MCPServerProcess(session_factory=factory)
+    factory.bind(mcp_auto)
 
-    # Hook must be None now — ready for _register_force_terminate(new_pid).
-    assert mcp_auto._force_terminate is None  # pyright: ignore[reportPrivateUsage]
+    await mcp_auto.start()
+    first_pid = factory.spawn_pids[0]
+    await mcp_auto.stop()
+    await mcp_auto.start()
+    second_pid = factory.spawn_pids[1]
+    assert second_pid != first_pid
 
-    # Simulate _register_force_terminate registering the new pid's hook.
-    mcp_auto._register_force_terminate(9999)  # pyright: ignore[reportPrivateUsage]
-    assert mcp_auto._force_terminate is not None  # pyright: ignore[reportPrivateUsage]
-    # The old pid1 hook is gone; calling the new hook should not append "pid1".
-    mcp_auto._force_terminate()  # pyright: ignore[reportPrivateUsage]
-    assert "pid1" not in sentinel_hook  # hook was replaced, not stacked
+    # The live hook must kill the SECOND pid — proving start() cleared the first
+    # pid's closure and _register_force_terminate re-armed with the new pid.
+    hook = mcp_auto._force_terminate  # pyright: ignore[reportPrivateUsage]
+    assert hook is not None
+    hook()
+    assert killed == [second_pid], "hook still targets the stale first pid — re-arm broke"
+    await mcp_auto.stop()
 
-    # --- Injected path: hook is preserved across respawn. ---
+    # --- Injected path: the seam hook is preserved across a real respawn. ---
     def injected_hook() -> bool:
         return True
 
-    mcp_injected = MCPServerProcess(force_terminate=injected_hook)
+    inj_factory = _PidRegisteringFactory()
+    mcp_injected = MCPServerProcess(force_terminate=injected_hook, session_factory=inj_factory)
+    inj_factory.bind(mcp_injected)
     assert mcp_injected._force_terminate_injected  # pyright: ignore[reportPrivateUsage]
 
-    # Simulate the re-arm step: injected flag is True → hook must NOT be cleared.
-    if not mcp_injected._force_terminate_injected:  # pyright: ignore[reportPrivateUsage]
-        mcp_injected._force_terminate = None  # pyright: ignore[reportPrivateUsage]
-
-    # Hook is still the injected one.
+    await mcp_injected.start()
+    await mcp_injected.stop()
+    await mcp_injected.start()
+    # Across a real respawn the injected hook must be untouched (never cleared,
+    # never replaced by the spawned-pid hook).
     assert mcp_injected._force_terminate is injected_hook  # pyright: ignore[reportPrivateUsage]
+    await mcp_injected.stop()
