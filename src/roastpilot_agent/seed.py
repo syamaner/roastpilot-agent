@@ -125,5 +125,70 @@ COLOMBIA_HUILA_SEED = BeanProfile(
     ),
 )
 
+#: Stable id for the Guatemala El Durazno (White Honey) seed (Redber
+#: GRE-GUED-BE250). Fixed so the idempotent ``seed_bean_profile`` insert is a
+#: no-op after the first boot and an operator edit to the seeded row is never
+#: clobbered.
+GUATEMALA_EL_DURAZNO_ID = "seed-guatemala-el-durazno-white-honey"
+
+#: The Guatemala El Durazno (White Honey) seed profile — a high-grown Bourbon
+#: from San Pedro Pinula, Jalapa (Finca El Durazno, the Ventura family). The
+#: white honey process leaves only a little mucilage, so it cups clean/bright
+#: (closer to a washed than a natural). Because this is a FIRST roast on a new
+#: bean, the development target sits at the conservative de-risk of 13 % — the
+#: same starting point the Colombia washed used before it stepped to 16 % once
+#: roast 6 landed clean. Go light, taste, then step toward the ~16–18 % medium
+#: this clean high-grown bean can carry (the flavour notes — milk chocolate /
+#: toasted pecan — deepen with development, but the red-apple brightness + white
+#: honey clarity are lost if pushed too far). Drop guide stays at the operator's
+#: proven 195 °C known-good line (bitter > 196 °C); audio FC lags ~30 s so true
+#: development runs ~30 s longer than the number, and the operator's manual drop
+#: is the un-gated backstop. All temperatures are Celsius.
+GUATEMALA_EL_DURAZNO_SEED = BeanProfile(
+    id=GUATEMALA_EL_DURAZNO_ID,
+    created_at=_SEED_TIMESTAMP,
+    updated_at=_SEED_TIMESTAMP,
+    name="Guatemala El Durazno (White Honey)",
+    bean_origin="Guatemala",
+    country="Guatemala",
+    farm="Finca El Durazno (Ventura family), San Pedro Pinula, Jalapa",
+    bean_varietal="Bourbon",
+    bean_species="arabica",
+    is_blend=False,
+    processing="honey",
+    # Grows 1,500–2,000 m; 1750 m is a representative central value for the single
+    # ``altitude_m`` axis (the full range is in ``description``).
+    altitude_m=1750,
+    source_url="https://www.redber.co.uk/products/guatemala-el-durazno-white-honey-process-green-coffee-beans",
+    charge_guidance_min_c=170.0,
+    charge_guidance_max_c=200.0,
+    initial_heat_percent=100,
+    initial_fan_percent=30,
+    # 195 °C = the operator's proven known-good drop line (bitter > 196 °C); a
+    # conservative ceiling for the first roast on this bean.
+    target_drop_temp_c=195.0,
+    # 13 % dev = the first-roast de-risk on a new bean (light → taste → go darker).
+    # This clean high-grown white-honey can likely carry ~16–18 % eventually (like
+    # the Colombia washed's trajectory), but step there only after a clean roast.
+    # With the default 3 pp margin the advisor releases the drop in a ~10–13 %
+    # window; the operator's manual drop is un-gated. Audio FC lags ~30 s, so true
+    # development runs ~30 s longer than the number.
+    target_development_percent=13.0,
+    default_bean_weight_grams=250.0,
+    description=(
+        "San Pedro Pinula, Jalapa. Bourbon, white honey process (light mucilage — "
+        "clean/bright, leaning washed); grown 1,500–2,000 m by the Ventura family "
+        "(Finca El Durazno, five generations). Red apple / milk chocolate / light "
+        "toasted pecan; smooth medium body, bright but mellow acidity, clean "
+        "finish. Balanced Central American — roast to a medium for chocolate + nut "
+        "while keeping the apple brightness. Targets are a conservative first-roast "
+        "de-risk (13 % dev); step toward ~16–18 % after tasting. Edit to taste."
+    ),
+)
+
 #: Every built-in seed profile, inserted idempotently at startup (#303).
-SEED_BEAN_PROFILES: tuple[BeanProfile, ...] = (ETHIOPIA_KOKE_SEED, COLOMBIA_HUILA_SEED)
+SEED_BEAN_PROFILES: tuple[BeanProfile, ...] = (
+    ETHIOPIA_KOKE_SEED,
+    COLOMBIA_HUILA_SEED,
+    GUATEMALA_EL_DURAZNO_SEED,
+)
