@@ -1205,11 +1205,22 @@ class RoastController:
                         bean_temp_c=self._last_telemetry.bean_temp_c,
                     )
                 )
-            # D82/D83 (#405 Slice B2): bumpless handoff for the deterministic
-            # post-FC RoR-target PI loop. Seed it from the ACTUATED pre-FC heat
+            # D82/D88 (#405 Slice B2): bumpless handoff for the deterministic
+            # post-FC RoR-taper PI loop. Seed it from the ACTUATED pre-FC heat
             # (``self._current_heat`` — the last commanded value, never an
             # unbounded target) so a zero-error first compute reproduces exactly
-            # that level: no heat dip or jump at the tick the loop takes over.
+            # that level: no heat dip or jump at the tick the loop takes over
+            # (see the PostFcRorController.reset docstring for the one case
+            # where this is not exact). The taper's r0 anchors to the RoR THIS
+            # SAME tick measured (D88) — the true FC edge always has a fresh
+            # telemetry reading (it is the reading that fired the transition),
+            # but its RoR can still legitimately be unavailable (e.g. not
+            # enough history yet) or read a degenerate low/negative value (a
+            # post-charge-crash FC); either way the loop's own r0 clamp floors
+            # at ``taper_end_ror_c_per_min``, so feeding that same value
+            # through when a RoR sample is unavailable is not a separate
+            # special case — it lands on the identical floor the clamp would
+            # apply to a genuinely low reading.
             # This branch is the TRUE first-crack edge ONLY — it never fires on
             # an ``operator_recovery_required -> development`` resume, which is
             # a distinct transition and lands on the unconditional
@@ -1217,7 +1228,16 @@ class RoastController:
             # reset unconditionally (cheap, pure): whether it is ever actually
             # consulted is gated on the ``enabled`` flag (and, per the fix
             # below, ``_post_fc_engaged``) in ``_apply_deterministic_post_fc_levers``.
-            self._post_fc_controller.reset(initial_heat_percent=self._current_heat)
+            ror_at_engagement = (
+                self._last_telemetry.bean_ror_c_per_min
+                if self._last_telemetry is not None
+                and self._last_telemetry.bean_ror_c_per_min is not None
+                else self._config.post_first_crack_control.taper_end_ror_c_per_min
+            )
+            self._post_fc_controller.reset(
+                initial_heat_percent=self._current_heat,
+                ror_at_engagement_c_per_min=ror_at_engagement,
+            )
             # Reset the cadence timer too, so the very first DEVELOPMENT control
             # tick actuates immediately rather than waiting a full
             # ``control_interval_seconds`` after an arbitrary FC instant.
