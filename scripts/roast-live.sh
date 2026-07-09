@@ -16,6 +16,10 @@
 #          ADAPTIVE_TRIM=1  enable the #386 RoR-keyed ADAPTIVE late-Maillard trim
 #            depth (default off = the proven fixed 65% cut). Interim opt-in until
 #            the config UI lands; e.g. ADAPTIVE_TRIM=1 ./scripts/roast-live.sh
+#          POST_FC_LOOP=1  enable the #405 deterministic post-FC RoR-target heat
+#            loop + deterministic drop (default off = fully advisor-driven post-FC,
+#            the roast-1..8 behaviour). Interim opt-in until it's promoted to the
+#            default; e.g. POST_FC_LOOP=1 ./scripts/roast-live.sh
 #          ROASTPILOT_ADVISOR__MODEL_SLUG / ROASTPILOT_ADVISOR__PROMPT_VERSION
 #            override the advisor model + control-teaching prompt (defaults
 #            openai/gpt-4o + c3). The banner prints the resolved pair and tags it
@@ -43,6 +47,14 @@ export ROASTPILOT_DB
 # Interim toggle until the agent config UI lands.
 if [ "${ADAPTIVE_TRIM:-0}" = "1" ]; then
   export ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ADAPTIVE_DEPTH_ENABLED=true
+fi
+
+# Opt-in (#405): the deterministic post-FC RoR-target heat loop + deterministic
+# drop. Default OFF — fully advisor-driven post-FC (the roast-1..8 behaviour)
+# stays the checked-in default; this only flips it when the operator asks.
+# Interim toggle until it's promoted to the default.
+if [ "${POST_FC_LOOP:-0}" = "1" ]; then
+  export ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__ENABLED=true
 fi
 
 if [ ! -f "$COFFEE_ROASTER_MCP_CONFIG" ]; then
