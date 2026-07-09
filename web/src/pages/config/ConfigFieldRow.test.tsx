@@ -56,6 +56,7 @@ function makeFieldMeta(overrides?: Partial<ConfigFieldMeta>): ConfigFieldMeta {
     env_overridden: false,
     read_only: false,
     description: "Test field description",
+    yaml_value: null,
     ...overrides,
   };
 }

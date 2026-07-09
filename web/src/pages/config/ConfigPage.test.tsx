@@ -34,6 +34,7 @@ function makeFieldMeta(overrides?: Partial<ConfigFieldMeta>): ConfigFieldMeta {
     env_overridden: false,
     read_only: false,
     description: "",
+    yaml_value: null,
     ...overrides,
   };
 }
@@ -672,7 +673,7 @@ describe("ConfigPage — Ambient / environment fields (#474)", () => {
     ).toBeInTheDocument();
   });
 
-  it("renders ambient_mode as a select with disabled + yoctopuce options", async () => {
+  it("renders ambient_mode as a select with an inherit option + disabled + yoctopuce (#482)", async () => {
     renderPage();
     await waitFor(() => screen.getByTestId("config-layout"));
     fireEvent.click(screen.getByTestId("rail-item-Hardware"));
@@ -683,7 +684,10 @@ describe("ConfigPage — Ambient / environment fields (#474)", () => {
     expect(select).not.toBeNull();
     expect(select).not.toBeDisabled();
     const optionValues = Array.from(select!.querySelectorAll("option")).map((o) => o.getAttribute("value"));
-    expect(optionValues).toEqual(["disabled", "yoctopuce"]);
+    // The fixture's ambient_mode is null (unconfigured) — a leading inherit
+    // option ("") is required so the tri-state default never falls back to
+    // the first real option (the #482 "Disabled" scare).
+    expect(optionValues).toEqual(["", "disabled", "yoctopuce"]);
   });
 
   it("renders ambient_device as an editable text input", async () => {
@@ -706,6 +710,43 @@ describe("ConfigPage — Ambient / environment fields (#474)", () => {
     const input = pollField.querySelector("input[type='number']");
     expect(input).not.toBeNull();
     expect(input).not.toBeDisabled();
+  });
+
+  it("shows the yaml value in ambient_mode's inherit option and ambient_poll_interval_seconds' placeholder (#482)", async () => {
+    // The lead's "0 poll-interval scare" scenario — ambient_mode and
+    // ambient_poll_interval_seconds are the same mcp_device class as fc_mode
+    // and must get identical inherit-state treatment.
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.ambient_mode = makeFieldMeta({
+      saved_value: null,
+      effective_value: null,
+      default: null,
+      yaml_value: "yoctopuce",
+    });
+    snapshot.mcp_device.ambient_poll_interval_seconds = makeFieldMeta({
+      saved_value: null,
+      effective_value: null,
+      default: null,
+      yaml_value: 30,
+    });
+    configMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+
+    const modeSelect = screen
+      .getByTestId("config-field-mcp_device.ambient_mode")
+      .querySelector("select") as HTMLSelectElement;
+    expect(modeSelect.value).toBe("");
+    const selectedOption = modeSelect.querySelector("option:checked") as HTMLOptionElement;
+    expect(selectedOption.textContent).toBe("Inherit from yaml (yoctopuce)");
+
+    const pollInput = screen
+      .getByTestId("config-field-mcp_device.ambient_poll_interval_seconds")
+      .querySelector("input") as HTMLInputElement;
+    expect(pollInput.value).toBe("");
+    expect(pollInput.placeholder).toBe("30 (from yaml)");
   });
 
   it("dirty-tracks ambient fields and nests them under mcp_device in the PUT body", async () => {
@@ -861,6 +902,346 @@ describe("ConfigPage — FC-Detection category", () => {
     expect(screen.getByTestId("config-field-mcp_device.auto_t0_detection_enabled")).toBeInTheDocument();
     // auto_t0_drop_threshold_c is hidden by default (auto_t0_detection_enabled = null → falsy)
     expect(screen.queryByTestId("config-field-mcp_device.auto_t0_drop_threshold_c")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #482: inherit-state rendering — never a bogus concrete value for a null
+// (unconfigured) mcp_device field; restore-to-inherit clears back to null.
+// ---------------------------------------------------------------------------
+
+describe("ConfigPage — #482 inherit-state rendering (fc_mode select)", () => {
+  it("shows an 'Inherit from yaml (<value>)' option, never a bogus concrete option, when fc_mode is unconfigured", async () => {
+    // The exact #482 scare: fc_mode is null (unconfigured) but the yaml says
+    // "audio" — the select must show the real yaml value as the inherit
+    // option's label and select IT, never fall back to the first hardcoded
+    // option ("disabled"), which used to read as "FC detection is off".
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.fc_mode = makeFieldMeta({
+      saved_value: null,
+      effective_value: null,
+      default: null,
+      yaml_value: "audio",
+    });
+    configMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+
+    const select = screen
+      .getByTestId("config-field-mcp_device.fc_mode")
+      .querySelector("select") as HTMLSelectElement;
+    // The selected option is the inherit option (value ""), not "disabled".
+    expect(select.value).toBe("");
+    const selectedOption = select.querySelector("option:checked") as HTMLOptionElement;
+    expect(selectedOption.textContent).toBe("Inherit from yaml (audio)");
+    // "Disabled" must NOT be the rendered/selected state.
+    expect(selectedOption.textContent).not.toMatch(/^Disabled$/);
+  });
+
+  it("shows a plain 'Inherit from yaml' label when no yaml value is known", async () => {
+    // yaml_value: null (no hand-authored yaml resolvable) — still must not
+    // fabricate a concrete option; falls back to the unparameterised label.
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.fc_mode = makeFieldMeta({
+      saved_value: null,
+      effective_value: null,
+      default: null,
+      yaml_value: null,
+    });
+    configMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+
+    const select = screen
+      .getByTestId("config-field-mcp_device.fc_mode")
+      .querySelector("select") as HTMLSelectElement;
+    expect(select.value).toBe("");
+    const selectedOption = select.querySelector("option:checked") as HTMLOptionElement;
+    expect(selectedOption.textContent).toBe("Inherit from yaml");
+  });
+
+  it("shows the 'From yaml: <value>' baseline line instead of 'Default —' when yaml_value is known", async () => {
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.fc_mode = makeFieldMeta({
+      saved_value: null,
+      effective_value: null,
+      default: null,
+      yaml_value: "audio",
+    });
+    configMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+
+    const field = screen.getByTestId("config-field-mcp_device.fc_mode");
+    expect(field.textContent).toMatch(/From yaml: audio/);
+    expect(field.textContent).not.toMatch(/Default —/);
+  });
+
+  it("selecting a concrete option overrides the inherit state and sends it in the PUT body", async () => {
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.fc_mode = makeFieldMeta({
+      saved_value: null,
+      effective_value: null,
+      default: null,
+      yaml_value: "audio",
+    });
+    configMock.mockResolvedValue(snapshot);
+    saveConfigMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+
+    const select = screen
+      .getByTestId("config-field-mcp_device.fc_mode")
+      .querySelector("select") as HTMLSelectElement;
+    fireEvent.change(select, { target: { value: "manual" } });
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    const body = saveConfigMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect((body.mcp_device as Record<string, unknown>).fc_mode).toBe("manual");
+  });
+
+  it("restore-to-inherit clears an overridden fc_mode back to null in the PUT body", async () => {
+    // Start from an explicit override (saved_value set) — the reset button
+    // must be labelled for the yaml semantics and clear back to null.
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.fc_mode = makeFieldMeta({
+      saved_value: "manual",
+      effective_value: "manual",
+      default: null,
+      yaml_value: "audio",
+    });
+    configMock.mockResolvedValue(snapshot);
+    saveConfigMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+
+    const restoreBtn = screen.getByTestId("reset-mcp_device.fc_mode");
+    expect(restoreBtn.textContent).toMatch(/Restore to yaml/);
+    fireEvent.click(restoreBtn);
+
+    const select = screen
+      .getByTestId("config-field-mcp_device.fc_mode")
+      .querySelector("select") as HTMLSelectElement;
+    expect(select.value).toBe("");
+
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    const body = saveConfigMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(body.mcp_device).toHaveProperty("fc_mode");
+    expect((body.mcp_device as Record<string, unknown>).fc_mode).toBeNull();
+  });
+});
+
+describe("ConfigPage — #482 inherit-state rendering (number fields)", () => {
+  it("renders a blank input with a 'from yaml' placeholder, never a literal 0, for an inherited number field", async () => {
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.ambient_poll_interval_seconds = makeFieldMeta({
+      saved_value: null,
+      effective_value: null,
+      default: null,
+      yaml_value: 30,
+    });
+    configMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+
+    const input = screen
+      .getByTestId("config-field-mcp_device.ambient_poll_interval_seconds")
+      .querySelector("input") as HTMLInputElement;
+    // Blank, not "0" — the #482 scare.
+    expect(input.value).toBe("");
+    expect(input.placeholder).toBe("30 (from yaml)");
+  });
+
+  it("shows the 'From yaml: <value>' baseline for an inherited number field", async () => {
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.fc_confidence_threshold = makeFieldMeta({
+      saved_value: null,
+      effective_value: null,
+      default: null,
+      yaml_value: 0.6,
+    });
+    configMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-FC-Detection"));
+    await waitFor(() => screen.getByTestId("config-pane-FC-Detection"));
+
+    const field = screen.getByTestId("config-field-mcp_device.fc_confidence_threshold");
+    expect(field.textContent).toMatch(/From yaml: 0\.6/);
+  });
+
+  it("typing a value overrides the inherit state and sends it as a number in the PUT body", async () => {
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.ambient_poll_interval_seconds = makeFieldMeta({
+      saved_value: null,
+      effective_value: null,
+      default: null,
+      yaml_value: 30,
+    });
+    configMock.mockResolvedValue(snapshot);
+    saveConfigMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+
+    const input = screen
+      .getByTestId("config-field-mcp_device.ambient_poll_interval_seconds")
+      .querySelector("input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "45" } });
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    const body = saveConfigMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect((body.mcp_device as Record<string, unknown>).ambient_poll_interval_seconds).toBe(45);
+  });
+
+  it("restore-to-inherit clears an overridden number field back to null in the PUT body", async () => {
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.ambient_poll_interval_seconds = makeFieldMeta({
+      saved_value: 45,
+      effective_value: 45,
+      default: null,
+      yaml_value: 30,
+    });
+    configMock.mockResolvedValue(snapshot);
+    saveConfigMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+
+    const restoreBtn = screen.getByTestId("reset-mcp_device.ambient_poll_interval_seconds");
+    expect(restoreBtn.textContent).toMatch(/Restore to yaml/);
+    fireEvent.click(restoreBtn);
+
+    const input = screen
+      .getByTestId("config-field-mcp_device.ambient_poll_interval_seconds")
+      .querySelector("input") as HTMLInputElement;
+    expect(input.value).toBe("");
+
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    const body = saveConfigMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(body.mcp_device).toHaveProperty("ambient_poll_interval_seconds");
+    expect((body.mcp_device as Record<string, unknown>).ambient_poll_interval_seconds).toBeNull();
+  });
+});
+
+describe("ConfigPage — #482 inherit-state rendering (text fields)", () => {
+  it("renders a blank input with a 'from yaml' placeholder, never a bogus concrete value, for an inherited text field", async () => {
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.ambient_device = makeFieldMeta({
+      saved_value: null,
+      effective_value: null,
+      default: null,
+      yaml_value: "METEOMK2-999999",
+    });
+    configMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+
+    const input = screen
+      .getByTestId("config-field-mcp_device.ambient_device")
+      .querySelector("input") as HTMLInputElement;
+    // Blank, not the bare value with no context — the placeholder carries it.
+    expect(input.value).toBe("");
+    expect(input.placeholder).toBe("METEOMK2-999999 (from yaml)");
+  });
+
+  it("shows the 'From yaml: <value>' baseline for an inherited text field", async () => {
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.ambient_device = makeFieldMeta({
+      saved_value: null,
+      effective_value: null,
+      default: null,
+      yaml_value: "METEOMK2-999999",
+    });
+    configMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+
+    const field = screen.getByTestId("config-field-mcp_device.ambient_device");
+    expect(field.textContent).toMatch(/From yaml: METEOMK2-999999/);
+  });
+
+  it("restore-to-inherit clears an overridden text field back to null in the PUT body", async () => {
+    const snapshot = makeSnapshot();
+    snapshot.mcp_device.ambient_device = makeFieldMeta({
+      saved_value: "METEOMK2-OVERRIDE",
+      effective_value: "METEOMK2-OVERRIDE",
+      default: null,
+      yaml_value: "METEOMK2-999999",
+    });
+    configMock.mockResolvedValue(snapshot);
+    saveConfigMock.mockResolvedValue(snapshot);
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Hardware"));
+    await waitFor(() => screen.getByTestId("config-pane-Hardware"));
+
+    const restoreBtn = screen.getByTestId("reset-mcp_device.ambient_device");
+    expect(restoreBtn.textContent).toMatch(/Restore to yaml/);
+    fireEvent.click(restoreBtn);
+
+    const input = screen
+      .getByTestId("config-field-mcp_device.ambient_device")
+      .querySelector("input") as HTMLInputElement;
+    expect(input.value).toBe("");
+
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    const body = saveConfigMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect(body.mcp_device).toHaveProperty("ambient_device");
+    expect((body.mcp_device as Record<string, unknown>).ambient_device).toBeNull();
+  });
+});
+
+describe("ConfigPage — #482 non-mcp_device fields are unaffected", () => {
+  it("a controller number field still uses the plain 'Default <value>' line and label", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Pre-FC Control"));
+    await waitFor(() => screen.getByTestId("config-pane-Pre-FC Control"));
+    const field = screen.getByTestId("config-field-controller.pre_fc_heat_target_percent");
+    expect(field.textContent).toMatch(/Default 100/);
+
+    const input = field.querySelector("input") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "80" } });
+    const resetBtn = screen.getByTestId("reset-controller.pre_fc_heat_target_percent");
+    expect(resetBtn.textContent).toMatch(/Reset to default/);
+    expect(resetBtn.textContent).not.toMatch(/Restore to yaml/);
+  });
+
+  it("a controller/advisor select field is unaffected by the mcp_device inherit-option logic", async () => {
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
+    const select = screen
+      .getByTestId("config-field-advisor.prompt_version")
+      .querySelector("select") as HTMLSelectElement;
+    const optionValues = Array.from(select.querySelectorAll("option")).map((o) =>
+      o.getAttribute("value"),
+    );
+    // No leading empty-value inherit option injected for a non-mcp_device select.
+    expect(optionValues).not.toContain("");
   });
 });
 
@@ -1046,6 +1427,7 @@ describe("ConfigPage — recording_devices array dirty detection", () => {
           env_overridden: false,
           read_only: false,
           description: "",
+          yaml_value: null,
         };
         return snap;
       })(),
@@ -1089,6 +1471,7 @@ describe("ConfigPage — recording_devices array dirty detection", () => {
           env_overridden: false,
           read_only: false,
           description: "",
+          yaml_value: null,
         };
         return snap;
       })(),

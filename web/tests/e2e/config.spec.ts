@@ -46,6 +46,7 @@ function meta(overrides: Partial<AppConfigSnapshot["controller"]["tick_interval_
     env_overridden: false,
     read_only: false,
     description: "",
+    yaml_value: null,
     ...overrides,
   };
 }
@@ -114,8 +115,11 @@ const CONFIG_SNAPSHOT: AppConfigSnapshot = {
     recording_enabled: meta({ effective_value: true, default: null }),
     recording_autocapture: meta({ effective_value: true, default: null }),
     recording_devices: meta({ effective_value: ["USB PnP"], default: null }),
-    fc_mode: meta({ effective_value: "audio", default: null }),
-    fc_confidence_threshold: meta({ effective_value: 0.5, default: null }),
+    // fc_mode / fc_confidence_threshold: the exact #482 scenario — genuinely
+    // unconfigured (saved/effective both null) but the hand-authored yaml has
+    // a real value the operator needs to see (never a bogus "Disabled"/"0").
+    fc_mode: meta({ effective_value: null, default: null, yaml_value: "audio" }),
+    fc_confidence_threshold: meta({ effective_value: null, default: null, yaml_value: 0.5 }),
     auto_t0_detection_enabled: meta({ effective_value: true, default: null }),
     auto_t0_drop_threshold_c: meta({ effective_value: 5.0, default: null }),
     // #474 ambient / environment group — a real overridden mode so the e2e
@@ -243,4 +247,34 @@ test("config-safety — Safety pane shows a read-only/Guarded field, full-page s
 
   await settle(page);
   await expect(page).toHaveScreenshot("config-safety.png");
+});
+
+test("config-fc-detection — fc_mode renders the real yaml value as its inherit option, never a bogus concrete option (#482)", async ({
+  page,
+}) => {
+  // Browser-level guard for the #482 scare: fc_mode unconfigured (null) but
+  // the hand-authored yaml says "audio" must never render as if FC detection
+  // were "Disabled" — data-assert only, no new pixel baseline (this proves
+  // the DOM/value contract; config.png / config-safety.png already cover the
+  // visual regression surface for /config).
+  await mockConfigBackend(page);
+  await page.goto("/config");
+  await expect(page.getByTestId("config-rail")).toBeVisible();
+
+  await page.getByTestId("rail-item-FC-Detection").click();
+  await expect(page.getByTestId("config-pane-FC-Detection")).toBeVisible();
+
+  const fcModeField = page.getByTestId("config-field-mcp_device.fc_mode");
+  await expect(fcModeField).toBeVisible();
+  const select = fcModeField.locator("select");
+  // The fixture's fc_mode is unconfigured (saved/effective both null) with
+  // yaml_value="audio" — the select must show and select the inherit option
+  // carrying that real value, not fall back to the first hardcoded option.
+  await expect(select).toHaveValue("");
+  const selectedOptionText = await select.locator("option:checked").textContent();
+  expect(selectedOptionText).toBe("Inherit from yaml (audio)");
+  expect(selectedOptionText).not.toBe("Disabled");
+
+  // The baseline line reflects the yaml value, not a meaningless "Default —".
+  await expect(fcModeField).toContainText("From yaml: audio");
 });
