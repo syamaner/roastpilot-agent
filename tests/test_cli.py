@@ -698,6 +698,28 @@ def test_format_advisor_readout_not_configured() -> None:
     assert "advisory-paused" in text
 
 
+def test_format_post_fc_loop_readout_enabled() -> None:
+    """Enabled prints a can't-miss ⚠️ line naming #405 (issue #460)."""
+    lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
+        enabled=True
+    )
+    text = "\n".join(lines)
+    assert "⚠️" in text
+    assert "POST-FC RoR LOOP: ENABLED" in text
+    assert "#405" in text
+
+
+def test_format_post_fc_loop_readout_disabled() -> None:
+    """Disabled (the default) prints a quiet, non-alarming confirmation line."""
+    lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
+        enabled=False
+    )
+    text = "\n".join(lines)
+    assert "⚠️" not in text
+    assert "post-FC RoR loop: disabled" in text
+    assert "advisor-driven post-FC" in text
+
+
 @pytest.mark.asyncio
 async def test_emit_advisor_readout_records_health_and_prints(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]

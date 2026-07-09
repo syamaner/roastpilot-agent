@@ -542,6 +542,32 @@ async def _emit_advisor_readout(service: "RoastService") -> "AdvisorHealth":
     return health
 
 
+def _format_post_fc_loop_readout(*, enabled: bool) -> list[str]:
+    """Render the operator-facing #405 post-FC RoR-loop flag readout (issue #460).
+
+    Prints the resolved ``controller.post_first_crack_control.enabled`` value
+    as a can't-miss console line — as prominent as the mock-driver ``⚠️`` /
+    advisor-experiment tag — so an operator running a baseline-vs-treatment A/B
+    can *confirm* which roast is which before charging beans. A silent typo in
+    the raw nested env var
+    (``ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__ENABLED``) would
+    otherwise leave the flag at its default ``False`` and quietly turn the
+    "treatment" roast into a second baseline. Read-only and informational
+    — this never blocks startup, the same contract as
+    :func:`_format_advisor_readout`.
+
+    Args:
+        enabled: The resolved ``post_first_crack_control.enabled`` value from
+            the loaded :class:`~roastpilot_agent.config.AppConfig`.
+
+    Returns:
+        The console lines to print, in order.
+    """
+    if enabled:
+        return ["⚠️  POST-FC RoR LOOP: ENABLED (#405 — deterministic post-FC heat + drop)"]
+    return ["  post-FC RoR loop: disabled (advisor-driven post-FC)"]
+
+
 async def _serve_live(args: argparse.Namespace) -> int:
     """Build and serve the live roast app, then clean up the MCP child.
 
@@ -614,6 +640,14 @@ async def _serve_live(args: argparse.Namespace) -> int:
         # non-blocking — an unreachable advisor warns loudly but serve proceeds
         # (advisory-paused is valid); the result is exposed on /api/health.
         await _emit_advisor_readout(service)
+
+        # #405 post-FC RoR-loop flag readout (issue #460): read straight off the
+        # already-loaded `config` (no re-load) so it can never drift from what
+        # actually serves. Read-only/informational — never blocks startup.
+        for line in _format_post_fc_loop_readout(
+            enabled=config.controller.post_first_crack_control.enabled
+        ):
+            print(line)
 
         # Access-log verbosity (#267): resolve CLI > env > config and install the
         # quiet filter on uvicorn.access. Logging-only — nothing about the API
