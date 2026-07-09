@@ -102,7 +102,25 @@
 
 ## Active Context
 
-**8 Jul 2026 (latest) — AMBIENT-UI SHIPPED (#464 + follow-ups #467/#463, D86) + an AUTONOMOUS
+**9 Jul 2026 (latest) — CONFIG-SCREEN audit → 2 gaps closed (#473/#474 merged), 1 filed (#475).**
+Operator asked: is `/config` functional, where's the link, are temp-sensor settings exposed? Audit
+(read-only investigation): **functional YES** for its scope (real GET/PUT round-trip, safety
+read-only, applies-next-roast via MCP respawn, strong component tests); **link = NONE** (URL-only —
+no home tile, no nav link); **temp-sensor = NOT exposed** (ambient shipped after the Config UI, so
+`ambient.mode`/`device`/`poll` had zero representation in the config model/overlay/schema). Shipped:
+**#473** (Settings home tile + nav link — the screen was built but unreachable; the "data-complete is
+not done / last-mile" class, memory `data-complete-is-not-done-last-mile`) + **#474** (ambient/
+temp-sensor mode/device/poll editable in `/config`, extends the D78/D80 MCP-device pattern 1:1 —
+tri-state inherit, passthrough-merge overlay matching the MCP `AmbientConfig` keys, applies next-roast
+via respawn). Both `qa`-PASS pre-open, merged CLEAN. **#475** (config Playwright e2e) filed, low-pri
+Todo. Context: a GitHub Actions `pull_request`-trigger outage mid-session blocked CI for ~1h (repo
+workflows didn't fire, only managed CodeQL) — the #472 registry PR needed a one-off operator
+admin-override (enforce_admins toggled + RESTORED); CI recovered and #473/#474 merged normally. See
+memory `baseline-regen-skip-ci-retrigger` for the `[skip ci]` re-trigger gotcha.
+
+---
+
+**8 Jul 2026 — AMBIENT-UI SHIPPED (#464 + follow-ups #467/#463, D86) + an AUTONOMOUS
 HOUSEKEEPING BATCH. Everything not gated on the hardware roast is now done and consistent across all
 three repos.** Two threads this session:
 
