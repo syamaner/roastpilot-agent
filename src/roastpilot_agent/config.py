@@ -347,7 +347,7 @@ class LateMaillardTrim(BaseModel):
 
 
 class PostFirstCrackControl(BaseModel):
-    """Deterministic post-FC RoR-target PI control-loop parameters (D82/D83, #405 Slice B).
+    """Deterministic post-FC RoR-taper PI control-loop parameters (D82/D88, #405 Slice B).
 
     D35 originally reserved DEVELOPMENT (post-first-crack) for the free-form
     advisor: the controller drove pre-FC deterministically, but post-FC heat/fan
@@ -356,29 +356,38 @@ class PostFirstCrackControl(BaseModel):
     *rationale* (cut heat, ramp fan, hold for the drop DTR) executed without the
     judgment to hold a heat floor to the drop temperature, landing an
     under-temp/under-developed drop (roast 7: 188 °C / 15.86 % DTR). D82 replaces
-    the advisor-driven post-FC lever with a **deterministic RoR-target closed
-    loop**; D83 is the concrete control-law spec this model encodes: a PI
-    controller holding a target rate-of-rise band (default 8 ± 1 °C/min) by
-    adjusting heat, with conditional-integration anti-windup and a smoothed
-    (EMA) RoR input so 1 s thermocouple noise cannot thrash the lever (the
-    #386/#412 lesson, mirrored from :class:`LateMaillardTrim`'s pre-FC damping).
+    the advisor-driven post-FC lever with a **deterministic closed loop**.
+
+    D83's first control law (a fixed RoR-band target) was superseded after a
+    hardware A/B (roasts 9/10, `docs/analysis/2026-07-09-roast9-10-postfc-ab.md`):
+    a fixed 8.0 °C/min target sat ABOVE the measured post-FC engagement RoR
+    (6.1 °C/min), so the loop read "too slow" from tick one and actuated heat
+    72→91 % while the advisor recommended 0 % — a policy-legal runaway toward
+    the bitter ceiling. **D88 is the current law**: the setpoint anchors to the
+    MEASURED RoR at engagement and tapers DOWN to a lower end value over a fixed
+    duration, and the loop's output can never exceed the heat the roast entered
+    first crack with (the never-add-heat-beyond-entry clamp). This model encodes
+    D88's parameters; the algorithm lives in
+    :class:`~roastpilot_agent.post_fc_control.PostFcRorController`.
 
     **This config model is inert on its own (#405 Slice B1).** It is consumed by
-    :class:`~roastpilot_agent.post_fc_control.PostFcRorController`, which no
-    controller/safety code path calls yet — Slice B2 wires the controller to
-    build limits from the loop's output (per the #412 told==enforced control-path
-    rule: the DEVELOPMENT safety box is built FROM the actuated PI output, never
-    an undamped target) and to route every write through the existing safety
-    gate. Nothing here talks to ``mcp_client`` directly, and nothing here
-    replaces the safety box's hard ceilings (the 196 °C bitter / 198 °C
-    emergency-drop bounds keep clamping the loop's output exactly as they clamp
-    the advisor today).
+    :class:`~roastpilot_agent.post_fc_control.PostFcRorController`, wired into
+    the controller's DEVELOPMENT-phase tick (Slice B2) which builds the safety
+    box from the loop's ACTUATED output (per the #412 told==enforced control-path
+    rule: never an undamped setpoint) and routes every write through the
+    existing safety gate. Nothing here talks to ``mcp_client`` directly, and
+    nothing here replaces the safety box's hard ceilings (the 196 °C bitter /
+    198 °C emergency-drop bounds keep clamping the loop's output exactly as
+    they clamp the advisor today).
 
     ``enabled`` (the ``post_fc_ror_loop`` master flag) defaults ``False`` —
     today's advisor-driven post-FC regime is unchanged until a supervised
     hardware roast validates the loop and an operator flips the flag in a
-    separately reviewed change (D83). All temperatures are Celsius; RoR is
-    °C/min; heat/fan are percentages.
+    separately reviewed change. **A closed loop changes the trajectory it is
+    steering, so replay cannot validate it — every parameter below is
+    hardware-tuned at the validation roast, not offline-validated (n=2 going
+    into D88).** All temperatures are Celsius; RoR is °C/min; heat/fan are
+    percentages.
     """
 
     #: The master flag (``post_fc_ror_loop``). ``False`` (default) keeps
@@ -386,21 +395,37 @@ class PostFirstCrackControl(BaseModel):
     #: unchanged; Slice B2 must read this flag before routing DEVELOPMENT
     #: heat through the PI loop instead of the advisor.
     enabled: bool = Field(default=False)
-    #: The RoR band centre (°C/min) the loop holds. Default 8.0 — the D83
-    #: operator-chosen band (7–9 °C/min via the deadband below): from FC
-    #: ~178 °C this reaches a ~193 °C MEDIUM drop in ~1.9 min at the seeded
-    #: 18 % DTR, clear of the 196 °C bitter ceiling, with no stall.
-    target_ror_c_per_min: float = Field(default=8.0, gt=0)
-    #: Half-width (°C/min) of the no-action band around the target. Default
-    #: 1.0 (band 7–9 °C/min). Within ``±ror_deadband_c_per_min`` of target the
-    #: loop HOLDS — no proportional push, no integral accumulation — so tick-
-    #: to-tick RoR noise cannot thrash the heat lever (the #386/#412 lesson:
-    #: a deadband that also freezes the integrator, not just the P term).
+    #: The taper's STARTING setpoint cap (°C/min), D88. The setpoint at
+    #: engagement is ``clamp(ror_at_engagement, taper_end_ror_c_per_min,
+    #: taper_start_max_ror_c_per_min)`` — anchored to the MEASURED RoR the
+    #: roast actually had at the FC->DEVELOPMENT handoff, never a fixed value
+    #: chosen ahead of time (D83's mistake). Default 8.0 — measured baseline
+    #: engagement RoR was ~6.1 °C/min (roasts 9/10 A/B), so this cap rarely
+    #: binds in practice; it exists to bound an unusually hot engagement.
+    taper_start_max_ror_c_per_min: float = Field(default=8.0, gt=0)
+    #: The taper's END setpoint (°C/min), D88 — the value the linear taper
+    #: decays to and then holds. Default 4.0 — measured RoR at a clean
+    #: advisor-driven drop (roast 9 baseline). Also the FLOOR the engagement
+    #: setpoint clamp above never goes below: a degenerate low/negative
+    #: engagement RoR (e.g. a post-charge-crash FC) starts the taper AT this
+    #: value rather than under it, so the loop never over-cuts on tick 1.
+    taper_end_ror_c_per_min: float = Field(default=4.0, gt=0)
+    #: How long (seconds) the linear taper from the engagement setpoint down
+    #: to ``taper_end_ror_c_per_min`` takes; held at the end value after.
+    #: Default 90.0 — the measured baseline FC->drop window was 58-83 s across
+    #: two data points (n=2, not a fitted curve); re-validate once more clean
+    #: runs land.
+    taper_duration_seconds: float = Field(default=90.0, gt=0)
+    #: Half-width (°C/min) of the no-action band around the current taper
+    #: setpoint. Default 1.0. Within ``±ror_deadband_c_per_min`` of the
+    #: setpoint the loop HOLDS — no proportional push, no integral
+    #: accumulation — so tick-to-tick RoR noise cannot thrash the heat lever
+    #: (the #386/#412 lesson: a deadband that also freezes the integrator,
+    #: not just the P term).
     ror_deadband_c_per_min: float = Field(default=1.0, ge=0)
     #: Proportional gain: %heat per (°C/min) of RoR error. Default 3.0 — a
-    #: conservative starting value; MUST be tuned on hardware (D83: a replay
-    #: validates a drop decision on a fixed trajectory, never a closed loop
-    #: that changes the trajectory).
+    #: conservative starting value; MUST be tuned on hardware (a closed loop
+    #: changes the trajectory it steers, so replay cannot validate it).
     kp_percent_per_ror: float = Field(default=3.0, ge=0)
     #: Integral gain: %heat per (°C/min·second) of accumulated RoR error.
     #: Default 0.1 — conservative; tuned on hardware alongside ``kp``.
@@ -409,9 +434,15 @@ class PostFirstCrackControl(BaseModel):
     #: deliberately > 0 so a crash-to-0 heat command (the roast-7 failure: the
     #: advisor cut heat to 0 at FC) is STRUCTURALLY IMPOSSIBLE from this loop,
     #: mirroring ``LateMaillardTrim.trim_heat_percent``'s ``ge=10`` floor
-    #: guarantee for the pre-FC trim.
+    #: guarantee for the pre-FC trim. D88's ``effective_ceiling`` (see
+    #: :class:`~roastpilot_agent.post_fc_control.PostFcRorController`) can pull
+    #: the EFFECTIVE box below this static value (never-add-heat-beyond-entry);
+    #: this field remains the outer static bound either way.
     heat_floor_percent: int = Field(default=25, ge=1, le=100)
-    #: The maximum post-FC heat the loop may command. Default 100.
+    #: The maximum post-FC heat the loop may command. Default 100. D88's
+    #: never-add-heat-beyond-entry clamp (``effective_ceiling``) narrows the
+    #: EFFECTIVE ceiling to the heat the roast held at FC engagement whenever
+    #: that is lower than this static value.
     heat_ceiling_percent: int = Field(default=100, ge=1, le=100)
     #: The deterministic post-FC fan level (percentage). D83 call (6): when the
     #: loop is enabled the controller pins fan to this single config value
@@ -451,6 +482,31 @@ class PostFirstCrackControl(BaseModel):
             raise ValueError(
                 "heat_floor_percent must not exceed heat_ceiling_percent "
                 f"({self.heat_floor_percent} > {self.heat_ceiling_percent})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_taper_range(self) -> "PostFirstCrackControl":
+        """The taper's end setpoint must not exceed its start-max cap (D88).
+
+        The taper decays from ``r0 = clamp(ror_at_engagement,
+        taper_end_ror_c_per_min, taper_start_max_ror_c_per_min)`` down to
+        ``taper_end_ror_c_per_min``. If the end value exceeded the start-max
+        cap the clamp would have no valid range to land ``r0`` in — the same
+        empty-box failure :meth:`_check_heat_range` guards against for the
+        heat bounds.
+
+        Returns:
+            The validated control-parameters instance.
+
+        Raises:
+            ValueError: If ``taper_end_ror_c_per_min`` exceeds
+                ``taper_start_max_ror_c_per_min``.
+        """
+        if self.taper_end_ror_c_per_min > self.taper_start_max_ror_c_per_min:
+            raise ValueError(
+                "taper_end_ror_c_per_min must not exceed taper_start_max_ror_c_per_min "
+                f"({self.taper_end_ror_c_per_min} > {self.taper_start_max_ror_c_per_min})"
             )
         return self
 
