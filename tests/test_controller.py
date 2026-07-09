@@ -46,6 +46,7 @@ from roastpilot_agent.controller import (
 from roastpilot_agent.models import (
     AdvisorHealth,
     AdvisorHealthStatus,
+    DropReason,
     OperatorAction,
     RoastCommand,
     RoastEventKind,
@@ -5696,6 +5697,18 @@ def _post_fc_config(**overrides: object) -> ControllerConfig:
     )
 
 
+def _ceiling_guard_config(**overrides: object) -> ControllerConfig:
+    """A ``ControllerConfig`` with the D88 ceiling-guard drop ENABLED (own
+    flag, defaults ``False``) but the RoR-taper loop left at ITS OWN default
+    (``enabled=False``) unless the caller overrides it too — deliberately
+    NOT bundled with :func:`_post_fc_config`, since the guard's whole point
+    (D88 amendment A1) is that it fires independently of the taper flag."""
+    overrides.setdefault("ceiling_guard_drop_enabled", True)
+    return ControllerConfig(
+        post_first_crack_control=PostFirstCrackControl(**overrides)  # type: ignore[arg-type]
+    )
+
+
 @pytest.mark.asyncio
 async def test_post_fc_loop_flag_off_is_byte_for_byte_unchanged() -> None:
     """Flag OFF (default): the advisor's levers still actuate post-FC, and the
@@ -6189,7 +6202,17 @@ async def test_deterministic_drop_anchor_fires_with_advisor_silent() -> None:
     assert harness.executor.commands.count("drop_beans") == 1
     assert harness.controller.phase is RoastPhase.COOLING
     executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
-    assert {"command": "drop_beans", "source": "policy"} in executed
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.DEVELOPMENT_TARGET.value,
+    } in executed
+    # qa finding: the shared drop path must be AUDITABLE — the drop routes
+    # through evaluate_drop_recommendation and the verdict is persisted like
+    # every other roaster write (#167). Pin a real evaluation row exists for
+    # this drop, not merely that the command reached the executor.
+    drop_evals = [e for e in harness.sink.evaluations if e.rule == "drop_eligibility"]
+    assert drop_evals and drop_evals[-1].verdict is SafetyVerdict.ALLOW
 
 
 @pytest.mark.asyncio
@@ -6375,6 +6398,211 @@ async def test_deterministic_drop_anchor_emits_command_failed_on_actuator_failur
     await harness.controller.tick()
     assert harness.controller.phase is RoastPhase.DEVELOPMENT
     failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
-    assert {"command": "drop_beans", "source": "policy"} in failed
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.DEVELOPMENT_TARGET.value,
+    } in failed
     executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
     assert {"command": "drop_beans", "source": "policy"} not in executed
+
+
+# --- D88 amendment A1/A2 (#405 Slice C2): the decoupled ceiling-guard drop ---
+
+
+@pytest.mark.asyncio
+async def test_ceiling_guard_flag_off_is_a_regression_guard() -> None:
+    """Flag OFF (default): the guard never fires — a bean at/above
+    ``ceiling_guard_temp_c`` in DEVELOPMENT does NOT auto-drop (today's fully
+    advisor-owned 196 °C boundary is unaffected)."""
+    advisor = FakeAdvisor([decision(heat=0, fan=80, drop=False)])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    assert harness.controller._config.post_first_crack_control.ceiling_guard_drop_enabled is False  # pyright: ignore[reportPrivateUsage]
+    harness.reader.readings = [reading(bean=199.0, bean_ror_c_per_min=5.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+
+@pytest.mark.asyncio
+async def test_ceiling_guard_fires_with_ror_loop_off() -> None:
+    """The A1 point: the guard fires at bean >= ceiling_guard_temp_c in
+    DEVELOPMENT with the RoR-taper loop OFF (its own flag defaults False) —
+    the decoupling IS the feature. Uses the SAME safety path as every drop
+    (``evaluate_drop_recommendation`` + the executor) and carries the typed
+    ``DropReason.CEILING_GUARD`` (not a bare string) in the event payload."""
+    config = _ceiling_guard_config(ceiling_guard_temp_c=196.0)
+    assert config.post_first_crack_control.enabled is False  # the RoR-taper loop stays OFF
+    advisor = FakeAdvisor([decision(heat=0, fan=80, drop=False)])
+    harness = harness_in_development(readings=[reading()], advisor=advisor, config=config)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=5.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    assert harness.executor.commands.count("drop_beans") == 1
+    assert harness.controller.phase is RoastPhase.COOLING
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in executed
+    # qa finding: the guard shares the SAME safety path as every other drop
+    # (evaluate_drop_recommendation, persisted like every roaster write,
+    # #167) — pin a real evaluation row exists, not just that the command
+    # reached the executor.
+    drop_evals = [e for e in harness.sink.evaluations if e.rule == "drop_eligibility"]
+    assert drop_evals and drop_evals[-1].verdict is SafetyVerdict.ALLOW
+
+
+@pytest.mark.asyncio
+async def test_ceiling_guard_does_not_fire_below_the_ceiling() -> None:
+    """Bean strictly below ``ceiling_guard_temp_c``: the guard does not fire,
+    even with the flag on."""
+    config = _ceiling_guard_config(ceiling_guard_temp_c=196.0)
+    harness = harness_in_development(readings=[reading()], config=config)
+    harness.reader.readings = [reading(bean=195.9, bean_ror_c_per_min=5.0)]
+    await harness.controller.tick()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+
+@pytest.mark.asyncio
+async def test_ceiling_guard_fires_after_a_recovery_resume_into_development() -> None:
+    """The A1 point again, from the other direction: the guard fires even on
+    a restart -> recovery -> operator-resume sequence into DEVELOPMENT, where
+    ``_post_fc_engaged`` is False (mirrors
+    ``test_post_fc_loop_does_not_engage_on_operator_resume_into_development``'s
+    setup) — the guard's own gate never reads ``_post_fc_engaged`` at all, so
+    a post-recovery resume is not a gap in bitter-line protection the way it
+    would be for the RoR-taper loop and the D84 dev%/temp anchor (both
+    deliberately inert on this exact edge)."""
+    config = _ceiling_guard_config(ceiling_guard_temp_c=196.0)
+    advisor = FakeAdvisor(
+        [decision(heat=0, fan=80, drop=False)],
+        default_decision=decision(heat=0, fan=80, drop=False),
+    )
+    harness = make_harness(config=config, advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+
+    await harness.controller.recover_from_restart(RoastPhase.DEVELOPMENT)
+    assert harness.controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    harness.controller.operator_resume(RoastPhase.DEVELOPMENT)
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.controller._post_fc_engaged is False  # pyright: ignore[reportPrivateUsage]
+
+    harness.log.clear()
+    harness.events.events.clear()
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=5.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert harness.executor.commands.count("drop_beans") == 1
+    assert harness.controller.phase is RoastPhase.COOLING
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in executed
+
+
+@pytest.mark.asyncio
+async def test_ceiling_guard_does_not_fire_outside_development() -> None:
+    """The guard is gated on phase DEVELOPMENT — a bean at/above the ceiling
+    in ROASTING_PRE_FIRST_CRACK does not trigger it (the guard is a
+    post-FC/DEVELOPMENT anchor only, matching D88's scope)."""
+    config = _ceiling_guard_config(ceiling_guard_temp_c=196.0)
+    harness = make_harness(config=config)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:  # …→ ROASTING_PRE_FIRST_CRACK
+        harness.controller.transition_to(step)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=5.0)]
+    await harness.controller.tick()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_ceiling_guard_emits_command_failed_on_actuator_failure() -> None:
+    """A transient actuator failure (``drop_beans`` raises) emits
+    ``COMMAND_FAILED`` (with the typed ceiling-guard reason) and does NOT
+    transition to COOLING — mirroring the D84 anchor's failure handling
+    exactly, since both share :meth:`RoastController._execute_deterministic_drop`."""
+
+    class RaisingDropExecutor(RecordingExecutor):
+        async def drop_beans(self) -> None:
+            raise RuntimeError("serial write dropped")
+
+    config = _ceiling_guard_config(ceiling_guard_temp_c=196.0)
+    harness = make_harness(config=config, executor=RaisingDropExecutor())
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:  # …→ DEVELOPMENT
+        harness.controller.transition_to(step)
+    harness.log.clear()
+    harness.events.events.clear()
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=5.0)]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in failed
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {"command": "drop_beans", "source": "policy"} not in executed
+
+
+@pytest.mark.asyncio
+async def test_ceiling_guard_takes_precedence_over_the_dev_percent_anchor_same_tick() -> None:
+    """Both the ceiling guard AND the D84 dev%/temp anchor are eligible the
+    SAME tick (bean above the guard's ceiling, dev% at/above target, both
+    flags on) — the guard runs first each tick (see the ``tick()`` ordering
+    comment), fires, and transitions to COOLING; the anchor's own call the
+    same tick then sees phase is no longer DEVELOPMENT and no-ops. Exactly
+    ONE ``drop_beans`` reaches the executor, tagged with the GUARD's reason,
+    not the anchor's.
+
+    ``enabled=True`` (the RoR-taper/anchor flag) is DELIBERATE here (qa
+    finding): with it False the anchor's own first gate
+    (``not config.enabled``) already short-circuits it before eligibility is
+    ever checked, so the test cannot distinguish "the guard ran first" from
+    "the anchor was never in play at all" — an ordering swap in ``tick()``
+    (guard after the anchor instead of before) would then pass this test
+    for the wrong reason. With the anchor flag True AND
+    ``_development_harness_with_dev_percent`` walking the TRUE FC edge
+    (``_post_fc_engaged`` True) AND dev% stamped at target, the anchor's
+    FULL eligibility bundle is genuinely satisfied this tick, so an ordering
+    swap is caught: the anchor would fire (and transition to COOLING) BEFORE
+    the guard ever runs, tagging the drop ``DEVELOPMENT_TARGET`` instead of
+    ``CEILING_GUARD`` — this test's assertions on the exact reason value
+    catch that."""
+    config = _post_fc_config(
+        ceiling_guard_drop_enabled=True, ceiling_guard_temp_c=196.0, enabled=True
+    )
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent, config=config
+    )
+    harness.reader.readings = [
+        reading(bean=max(196.0, PROFILE.target_drop_temp_c), bean_ror_c_per_min=5.0)
+    ]
+    await harness.controller.tick()
+    assert harness.executor.commands.count("drop_beans") == 1
+    assert harness.controller.phase is RoastPhase.COOLING
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in executed
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.DEVELOPMENT_TARGET.value,
+    } not in executed
+    # qa finding: the shared drop path must be AUDITABLE — pin a real
+    # ALLOW evaluation exists for the drop that actually fired (the guard's),
+    # not just that the reason-tagged event landed.
+    drop_evals = [e for e in harness.sink.evaluations if e.rule == "drop_eligibility"]
+    assert drop_evals and drop_evals[-1].verdict is SafetyVerdict.ALLOW

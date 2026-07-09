@@ -462,6 +462,33 @@ class PostFirstCrackControl(BaseModel):
     #: (each sample fully replaces the estimate), used as the no-smoothing
     #: comparison case in tests. Lower values smooth harder but lag more.
     ror_smoothing_alpha: float = Field(default=0.4, gt=0, le=1.0)
+    #: The ceiling-guard drop's OWN master flag (D88 amendment A2, #405 Slice
+    #: C2) — deliberately SEPARATE from ``enabled`` above (the RoR-taper
+    #: loop's flag). ``False`` (default) keeps today's incumbent behaviour
+    #: byte-for-byte unchanged: the 196 °C boundary is owned solely by the
+    #: advisor's own judgment, as it is today. The guard is a SAFETY ANCHOR,
+    #: not a taper feature (D88 amendment A1) — when this flag is ``True`` it
+    #: fires in DEVELOPMENT regardless of the RoR-taper ``enabled`` flag or
+    #: whether the current DEVELOPMENT dwell was reached via the true FC edge
+    #: (i.e. it also fires after an operator resume out of recovery, where the
+    #: taper loop stays inert) — a taper-gated guard would leave every
+    #: taper-flag-OFF roast, and every post-recovery resume, with NO
+    #: deterministic bitter-line protection. The operator's stated intent is
+    #: to flip this ``True`` at the supervised validation roast — a CONSCIOUS,
+    #: separately reviewed incumbent-behaviour change, never a silent rider
+    #: bundled with the taper flag.
+    ceiling_guard_drop_enabled: bool = Field(default=False)
+    #: The bean-temperature ceiling (Celsius) the guard drops at, D88
+    #: amendment A1. Default 196.0 — the operator's empirical bitter-ceiling
+    #: value (mirrors ``SafetyLimits.bitter_ceiling_temp_c``'s default; kept
+    #: as an independent field here, not a cross-reference, so this model
+    #: stays self-contained and testable without importing ``SafetyLimits``).
+    #: :class:`AppConfig`'s cross-section validator enforces
+    #: ``ceiling_guard_temp_c < safety.emergency_drop_temp_c`` AND
+    #: ``ceiling_guard_temp_c <= safety.bitter_ceiling_temp_c`` — a guard
+    #: configured ABOVE the emergency-drop net, or above the bitter ceiling
+    #: it is meant to anchor, is unconstructible.
+    ceiling_guard_temp_c: float = Field(default=196.0, gt=0)
 
     @model_validator(mode="after")
     def _check_heat_range(self) -> "PostFirstCrackControl":
@@ -1236,3 +1263,49 @@ class AppConfig(BaseSettings):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     mcp_device: MCPDeviceConfig = Field(default_factory=MCPDeviceConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+
+    @model_validator(mode="after")
+    def _check_ceiling_guard_within_safety_bounds(self) -> "AppConfig":
+        """The post-FC ceiling guard must sit under BOTH safety-owned bounds (D88 A1).
+
+        This is the first cross-SECTION validator on :class:`AppConfig` (the
+        per-section validators like :meth:`PostFirstCrackControl._check_taper_range`
+        or :meth:`SafetyLimits._check_drop_ceiling_order` only see their own
+        section's fields; ``ceiling_guard_temp_c`` lives on
+        ``controller.post_first_crack_control`` while the two bounds it must
+        respect live on ``safety``, so the check can only run here, where both
+        sections are visible on ``self``).
+
+        A guard configured AT OR ABOVE ``safety.emergency_drop_temp_c`` would
+        never fire before the hard emergency-drop bound already forced the
+        issue — the guard would be a dead letter, defeating the point of an
+        *earlier*, deterministic bitter-line anchor. A guard configured ABOVE
+        ``safety.bitter_ceiling_temp_c`` would let the roast run hotter than
+        the very bitter ceiling the guard exists to anchor before the guard
+        even engages — silently weakening the incumbent bitter-ceiling
+        protection the moment the flag is flipped on. Both are BLOCKER-class
+        misconfigurations (safety-reviewer ratification) — unconstructible,
+        not merely logged.
+
+        Returns:
+            The validated application config.
+
+        Raises:
+            ValueError: If ``controller.post_first_crack_control.ceiling_guard_temp_c``
+                is not strictly below ``safety.emergency_drop_temp_c``, or
+                exceeds ``safety.bitter_ceiling_temp_c``.
+        """
+        guard_temp_c = self.controller.post_first_crack_control.ceiling_guard_temp_c
+        if guard_temp_c >= self.safety.emergency_drop_temp_c:
+            raise ValueError(
+                "controller.post_first_crack_control.ceiling_guard_temp_c must be below "
+                f"safety.emergency_drop_temp_c ({guard_temp_c} >= "
+                f"{self.safety.emergency_drop_temp_c})"
+            )
+        if guard_temp_c > self.safety.bitter_ceiling_temp_c:
+            raise ValueError(
+                "controller.post_first_crack_control.ceiling_guard_temp_c must not exceed "
+                f"safety.bitter_ceiling_temp_c ({guard_temp_c} > "
+                f"{self.safety.bitter_ceiling_temp_c})"
+            )
+        return self
