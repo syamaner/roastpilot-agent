@@ -188,8 +188,16 @@ def test_r0_capped_at_taper_start_max_for_a_hot_engagement() -> None:
 
 
 def test_taper_decays_linearly_from_r0_to_end_value() -> None:
+    """Exercises the taper interpolation formula directly with a single large
+    ``dt_seconds`` step -- ``control_interval_seconds`` is set generously
+    above that step so the gap-resume cap (below) does not interfere; the cap
+    itself has its own dedicated test,
+    ``test_c1_gap_resume_dt_is_capped_to_one_control_interval``."""
     config = _config(
-        taper_start_max_ror_c_per_min=8.0, taper_end_ror_c_per_min=4.0, taper_duration_seconds=90.0
+        taper_start_max_ror_c_per_min=8.0,
+        taper_end_ror_c_per_min=4.0,
+        taper_duration_seconds=90.0,
+        control_interval_seconds=45.0,
     )
     controller = PostFcRorController(config)
     controller.reset(initial_heat_percent=72, ror_at_engagement_c_per_min=6.1)
@@ -201,8 +209,13 @@ def test_taper_decays_linearly_from_r0_to_end_value() -> None:
 
 
 def test_taper_holds_at_end_value_once_duration_elapses() -> None:
+    """See ``test_taper_decays_linearly_from_r0_to_end_value``'s note on
+    ``control_interval_seconds`` and the gap-resume cap."""
     config = _config(
-        taper_start_max_ror_c_per_min=8.0, taper_end_ror_c_per_min=4.0, taper_duration_seconds=90.0
+        taper_start_max_ror_c_per_min=8.0,
+        taper_end_ror_c_per_min=4.0,
+        taper_duration_seconds=90.0,
+        control_interval_seconds=90.0,
     )
     controller = PostFcRorController(config)
     controller.reset(initial_heat_percent=72, ror_at_engagement_c_per_min=6.1)
@@ -214,9 +227,14 @@ def test_taper_holds_at_end_value_once_duration_elapses() -> None:
 
 def test_taper_setpoint_never_undershoots_the_end_value() -> None:
     """Linear interpolation with a floored r0 cannot overshoot past the end
-    value even arbitrarily far past the taper duration."""
+    value even arbitrarily far past the taper duration. See
+    ``test_taper_decays_linearly_from_r0_to_end_value``'s note on
+    ``control_interval_seconds`` and the gap-resume cap."""
     config = _config(
-        taper_start_max_ror_c_per_min=8.0, taper_end_ror_c_per_min=4.0, taper_duration_seconds=10.0
+        taper_start_max_ror_c_per_min=8.0,
+        taper_end_ror_c_per_min=4.0,
+        taper_duration_seconds=10.0,
+        control_interval_seconds=1000.0,
     )
     controller = PostFcRorController(config)
     controller.reset(initial_heat_percent=72, ror_at_engagement_c_per_min=6.1)
@@ -437,7 +455,15 @@ def test_c1_a_gap_with_no_compute_call_does_not_advance_the_taper() -> None:
     """A caller that skips ``compute`` entirely across a gap (e.g. every tick
     in the gap was REJECTed before ever calling compute) leaves the taper's
     internal clock untouched -- the next compute call's dt_seconds reflects
-    only the ACTUATION-clock elapsed time, never the wall-clock gap."""
+    only the ACTUATION-clock elapsed time, never the wall-clock gap.
+
+    This test covers a gap where ``compute`` is never called at all. Its
+    companion ``test_c1_gap_resume_dt_is_capped_to_one_control_interval``
+    covers the OTHER C1 exposure: a gap where ``compute`` IS eventually
+    called again, but with a ``dt_seconds`` spanning the whole outage (the
+    controller's RoR-unavailable fail-closed path never advances the
+    actuation clock either) -- together they cover both ways a gap can reach
+    this method without silently marching the setpoint down."""
     config = _config(taper_duration_seconds=90.0)
     controller = PostFcRorController(config)
     controller.reset(initial_heat_percent=72, ror_at_engagement_c_per_min=6.1)
@@ -474,6 +500,54 @@ def test_c1_rejected_write_restore_prevents_taper_advance() -> None:
     assert output.setpoint_c_per_min == pytest.approx(expected)
 
 
+def test_c1_gap_resume_dt_is_capped_to_one_control_interval() -> None:
+    """Codex finding (gap-swallow, #405 PR): unlike a rejected/no-compute gap
+    (this test's companion, ``test_c1_a_gap_with_no_compute_call_does_not_advance_the_taper``,
+    covers that case), a RoR-unavailable outage IS eventually followed by a
+    real ``compute`` call once RoR returns -- but the controller's
+    fail-closed guard never advances ``_post_fc_last_actuation_monotonic``
+    while RoR is missing, so that first post-outage call would otherwise
+    receive a ``dt_seconds`` spanning the WHOLE outage. This method must cap
+    what it advances state by to at most one ``control_interval_seconds``,
+    so a 60s outage does not jump the taper (or the integrator) 60s forward
+    in a single step -- only by one interval, matching what a normally-paced
+    tick loop could actually have observed."""
+    config = _config(
+        taper_start_max_ror_c_per_min=8.0,
+        taper_end_ror_c_per_min=4.0,
+        taper_duration_seconds=90.0,
+        control_interval_seconds=5.0,
+        kp_percent_per_ror=3.0,
+        ki_percent_per_ror_second=0.1,
+        ror_smoothing_alpha=1.0,
+    )
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=72, ror_at_engagement_c_per_min=6.1)
+
+    # One normal accepted actuation at the engagement RoR (bumpless hold).
+    first = controller.compute(measured_ror_c_per_min=6.1, dt_seconds=5.0)
+    assert first.heat_percent == 72
+
+    # A 60s RoR outage follows (many ticks with bean_ror_c_per_min is None at
+    # the controller level -- this loop is never even called during them).
+    # The FIRST call after the outage receives dt_seconds=60.0 (the elapsed
+    # time since the last accepted actuation), NOT a value pre-clamped by the
+    # caller -- this method's own clamp must protect it.
+    after_gap = controller.compute(measured_ror_c_per_min=6.1, dt_seconds=60.0)
+
+    # The taper must advance by AT MOST one control_interval_seconds (5s),
+    # not the full 60s outage: total elapsed after this call is (5 + 5) = 10s,
+    # not (5 + 60) = 65s.
+    expected_setpoint = 6.1 + (10.0 / 90.0) * (4.0 - 6.1)
+    assert after_gap.setpoint_c_per_min == pytest.approx(expected_setpoint)
+    # And a setpoint that only advanced by one interval's worth of decay
+    # produces only a negligible move off the bumpless 72% hold -- nowhere
+    # near the 60-point crash an uncapped 60s integration step would cause
+    # (empirically: an uncapped 60s dt on this exact scenario drops heat to
+    # 60%; the capped version must stay far closer to 72).
+    assert after_gap.heat_percent >= 70
+
+
 # ---------------------------------------------------------------------------
 # C2 (ratification): snapshot/restore preserves taper state; a fresh engage
 # re-captures from scratch.
@@ -487,8 +561,12 @@ def test_c2_snapshot_restore_preserves_taper_state_mid_episode() -> None:
     time — not merely agree with another restore of the same snapshot (two
     controllers restored from the same buggy snapshot would "agree" with each
     other while both being wrong; only a comparison against an uninterrupted
-    run proves the snapshot round-trip is faithful to ground truth)."""
-    config = _config()
+    run proves the snapshot round-trip is faithful to ground truth).
+
+    ``control_interval_seconds`` is set to match the 30s step used below so
+    this is a normally-paced cadence, not a gap -- the gap-resume cap has its
+    own dedicated test, ``test_c1_gap_resume_dt_is_capped_to_one_control_interval``."""
+    config = _config(control_interval_seconds=30.0)
 
     # Ground truth: one controller run uninterrupted end-to-end (engage, then
     # 30s + 5s = 35s total elapsed at the comparison tick).

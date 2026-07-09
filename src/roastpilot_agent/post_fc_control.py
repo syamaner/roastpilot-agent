@@ -389,13 +389,19 @@ class PostFcRorController:
 
         Steps (D88):
 
-        1. **Advance the taper clock** by ``dt_seconds`` (see the ``dt_seconds``
-           argument below — D88 amendment C1: the caller passes only ACTUATION
-           time, so a paused/HOLD/rate-limited stretch does not march the
-           taper's setpoint down) and read this step's taper setpoint
-           (:meth:`_taper_setpoint_c_per_min`): linear from ``r0`` down to
-           ``taper_end_ror_c_per_min`` over ``taper_duration_seconds``, held
-           at the end value after.
+        1. **Advance the taper clock** by ``dt_seconds`` **clamped to at most
+           one ``control_interval_seconds``** (see the ``dt_seconds`` argument
+           below — D88 amendment C1: the caller passes only ACTUATION time, so
+           a paused/HOLD/rate-limited stretch does not march the taper's
+           setpoint down; the clamp additionally guards a RESUME after a
+           GAP — a skipped-RoR outage lasting several cadence intervals must
+           not be swallowed into a single oversized taper-clock jump on the
+           first tick after it, which would march the setpoint down by the
+           whole outage in one step rather than by the (at most) one interval
+           the DEVELOPMENT tick loop can actually observe) and read this
+           step's taper setpoint (:meth:`_taper_setpoint_c_per_min`): linear
+           from ``r0`` down to ``taper_end_ror_c_per_min`` over
+           ``taper_duration_seconds``, held at the end value after.
         2. **EMA-smooth** the RoR sample: ``ema = alpha*measured +
            (1-alpha)*prev_ema``, or ``ema = measured`` on the very first call
            (no prior estimate to blend with).
@@ -409,7 +415,14 @@ class PostFcRorController:
            gates the proportional term but keeps integrating would still
            slowly drift the output inside the band).
         5. Otherwise ``error_eff = error`` and the integrator tentatively
-           accumulates ``error_eff * dt_seconds``.
+           accumulates ``error_eff * <the SAME clamped dt>`` from step 1 — the
+           same gap-resume exposure applies here: an uncapped ``dt_seconds``
+           after a long outage would inject a single oversized integration
+           step even on a NON-saturating tick (anti-windup only bounds the
+           integrator while the output is actively saturating in the error's
+           direction; it does not protect a normal in-box step), so the
+           integrator uses the identical clamped value, not the raw
+           ``dt_seconds``.
         6. **Output:** ``bias + ki * integrator + kp * error_eff`` (unclamped).
            For a ``ki > 0`` loop the handoff bias lives entirely in the
            integrator seeded by :meth:`reset` and ``bias`` is 0, so this
@@ -452,12 +465,29 @@ class PostFcRorController:
                 stretch (which never calls ``compute`` in the first place, or
                 calls it but has the tentative step undone by
                 :meth:`restore_state`) cannot silently march the setpoint
-                down. Must be strictly positive: a zero or negative ``dt``
-                would either freeze or reverse the integrator's accumulated
-                direction, which is never a valid tick duration — the caller
-                is responsible for supplying a sane value (e.g. the configured
+                down. **Internally clamped to at most one
+                ``control_interval_seconds`` per call** (gap-resume fix,
+                Codex finding on the #405 PR): the controller's own
+                fail-closed guard skips a tick's actuation entirely when RoR
+                is unavailable that tick (``bean_ror_c_per_min is None``)
+                WITHOUT advancing ``_post_fc_last_actuation_monotonic`` — so
+                after an N-second RoR outage, the first tick with a RoR
+                sample again would otherwise present a single ``dt_seconds``
+                spanning the WHOLE outage, jumping the taper clock (and the
+                integrator's accumulated step) by N seconds in one call
+                instead of by the at most one interval a resuming
+                DEVELOPMENT tick loop can actually observe — exactly the
+                "paused stretch silently marches the setpoint" failure C1
+                exists to prevent, just entered through a gap-resume rather
+                than a rejected write. The RAW ``dt_seconds`` must still be
+                strictly positive: a zero or negative ``dt`` would either
+                freeze or reverse the integrator's accumulated direction,
+                which is never a valid tick duration — the caller is
+                responsible for supplying a sane value (e.g. the configured
                 ``control_interval_seconds`` on the very first post-handoff
-                tick).
+                tick). The clamp is a pure no-op under normal cadence (where
+                ``dt_seconds`` already approximately equals
+                ``control_interval_seconds``).
 
         Returns:
             The :class:`PostFcControlOutput` for this step: the clamped
@@ -471,11 +501,25 @@ class PostFcRorController:
         if dt_seconds <= 0.0:
             raise ValueError(f"dt_seconds must be > 0 ({dt_seconds})")
         config = self._config
+        # Gap-resume fix (Codex finding, #405 PR): clamp the dt this step
+        # actually ADVANCES STATE BY to at most one control_interval_seconds.
+        # The controller skips a tick's actuation entirely (never calls
+        # compute at all) whenever RoR is unavailable that tick, WITHOUT
+        # advancing `_post_fc_last_actuation_monotonic` — so after an
+        # N-second RoR outage, the next successful compute call would
+        # otherwise receive a `dt_seconds` spanning the WHOLE outage, and
+        # swallow it into a single oversized step. Capping here means a gap
+        # advances the taper (and the integrator, below) by at most one
+        # interval's worth, matching what a normally-cadenced tick loop can
+        # actually observe — a pure no-op under normal cadence, where
+        # dt_seconds already approximately equals control_interval_seconds.
+        effective_dt = min(dt_seconds, config.control_interval_seconds)
         # D88 amendment C1: advance the taper's own clock by the SAME
-        # actuation-only dt the integrator/EMA use — see the docstring above.
-        # This is tentative like every other mutation in this method: a
-        # subsequent `restore_state` (rejected/failed write) undoes it too.
-        self._taper_elapsed_seconds += dt_seconds
+        # actuation-only (and now gap-capped) dt the integrator uses — see
+        # the docstring above. This is tentative like every other mutation in
+        # this method: a subsequent `restore_state` (rejected/failed write)
+        # undoes it too.
+        self._taper_elapsed_seconds += effective_dt
         setpoint = self._taper_setpoint_c_per_min()
 
         alpha = config.ror_smoothing_alpha
@@ -491,7 +535,15 @@ class PostFcRorController:
         error_eff = 0.0 if within_deadband else error
 
         pre_step_integrator = self._integrator
-        tentative_integrator = pre_step_integrator + error_eff * dt_seconds
+        # Same gap-cap applies to the integrator's accumulation: anti-windup
+        # (below) only bounds the integrator while the output is ACTIVELY
+        # saturating in the error's direction — it does not protect a normal,
+        # non-saturating in-box step, so an uncapped dt_seconds after a long
+        # outage would still inject a single oversized integration step here
+        # (verified empirically: a 60s gap-swallowed tick moved heat from a
+        # 72% bumpless hold down to 60% in one step, vs. a negligible move on
+        # a normal 5s cadence tick with the same inputs).
+        tentative_integrator = pre_step_integrator + error_eff * effective_dt
 
         unclamped = (
             self._bias_percent
