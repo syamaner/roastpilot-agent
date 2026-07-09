@@ -5636,7 +5636,9 @@ async def test_post_fc_lever_direction_resets_on_a_new_run() -> None:
 # --- D82/D83 (#405 Slice B2): deterministic post-FC RoR-target PI loop wiring ---
 
 
-async def _charge_through_fc(harness: Harness, *, fc_bean_temp_c: float = 178.0) -> None:
+async def _charge_through_fc(
+    harness: Harness, *, fc_bean_temp_c: float = 178.0, fc_ror_c_per_min: float | None = None
+) -> None:
     """Drive ``harness`` from PREHEATING through a real (ticked) pre-FC lever
     actuation into DEVELOPMENT, via first-crack MCP detection.
 
@@ -5645,6 +5647,18 @@ async def _charge_through_fc(harness: Harness, *, fc_bean_temp_c: float = 178.0)
     ``current_heat`` is a real ACTUATED value (100, the deterministic pre-FC
     lever's default target) at the moment first crack fires — the precondition
     the bumpless-handoff test needs.
+
+    Args:
+        harness: The test harness to drive.
+        fc_bean_temp_c: The bean temperature on the FC-detection reading.
+        fc_ror_c_per_min: The ``bean_ror_c_per_min`` on that SAME reading —
+            the D88 taper's engagement anchor (``PostFcRorController.reset``'s
+            ``ror_at_engagement_c_per_min``). ``None`` (default) leaves the FC
+            reading's RoR unset, exercising the controller's own
+            RoR-unavailable-at-engagement fallback (floors to
+            ``taper_end_ror_c_per_min``) — most callers of this helper only
+            care about reaching DEVELOPMENT with a real actuated pre-FC heat,
+            not the taper's exact seed.
     """
     harness.controller.load_profile(PROFILE)
     for step in NORMAL_PATH[:2]:  # …→ PREHEATING
@@ -5656,7 +5670,12 @@ async def _charge_through_fc(harness: Harness, *, fc_bean_temp_c: float = 178.0)
         harness.clock.advance(1.0)
     assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
     assert harness.controller.snapshot().current_heat == 100  # the actuated pre-FC lever
-    harness.reader.readings = [reading(bean=fc_bean_temp_c, first_crack_detected=True)]
+    fc_reading = (
+        reading(bean=fc_bean_temp_c, first_crack_detected=True, bean_ror_c_per_min=fc_ror_c_per_min)
+        if fc_ror_c_per_min is not None
+        else reading(bean=fc_bean_temp_c, first_crack_detected=True)
+    )
+    harness.reader.readings = [fc_reading]
     await harness.controller.tick()
     assert harness.controller.phase is RoastPhase.DEVELOPMENT
     harness.log.clear()
@@ -5703,8 +5722,13 @@ async def test_post_fc_loop_enabled_actuates_heat_and_pins_fan_advisor_not_actua
     harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
     harness.controller.request_advisory()
     await harness.controller.tick()
-    # The loop wrote — heat raised above the 100% handoff (RoR 4 < target 8 ⇒
-    # positive error ⇒ MORE heat), clamped at the ceiling (100), fan pinned 45.
+    # The loop wrote — heat HOLDS at the 100% handoff (a D88 bumpless hold,
+    # not a positive-error climb): this FC edge's reading carries no RoR, so
+    # the engagement RoR falls back to taper_end_ror_c_per_min (4.0), which is
+    # also where r0 floors — the taper setpoint is flat at 4.0. Feeding that
+    # same 4.0 back in here gives zero error, so heat=100 is the seeded
+    # handoff value held exactly (effective_ceiling is 100, so nothing clamps
+    # it down either), fan pinned 45.
     assert harness.executor.targets == [(100, 45)]
     assert harness.controller.snapshot().current_fan == 45
     # The advisor WAS consulted (still traced) but its 99/10 recommendation was
@@ -5734,13 +5758,16 @@ async def test_post_fc_loop_enabled_should_drop_still_honored() -> None:
 @pytest.mark.asyncio
 async def test_post_fc_loop_bumpless_handoff_holds_pre_fc_heat() -> None:
     """Bumpless handoff: heat at the first DEVELOPMENT control tick equals the
-    pre-FC actuated heat (100) — no dip or jump — when RoR sits at the loop's
-    target (zero-error case)."""
-    config = _post_fc_config(target_ror_c_per_min=8.0, ror_smoothing_alpha=1.0)
+    pre-FC actuated heat (100) — no dip or jump — when RoR sits at the D88
+    taper's r0 (anchored to the SAME RoR the FC-edge reading measured, so
+    error is exactly zero at the first control tick)."""
+    config = _post_fc_config(ror_smoothing_alpha=1.0)
     harness = make_harness(config=config)
-    await _charge_through_fc(harness)
+    # r0 = clamp(6.1, 4.0, 8.0) = 6.1 (the engagement RoR, in-range) — feed the
+    # SAME RoR at the FC edge and at the first DEVELOPMENT tick for zero error.
+    await _charge_through_fc(harness, fc_ror_c_per_min=6.1)
     assert harness.controller.snapshot().current_heat == 100  # unchanged going INTO the tick
-    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=8.0)]
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=6.1)]
     await harness.controller.tick()
     # Zero error at the handoff heat (100) => the loop holds exactly 100 (no
     # dip/jump), even though 100 is also the pre-FC value — this proves the
@@ -5752,7 +5779,7 @@ async def test_post_fc_loop_bumpless_handoff_holds_pre_fc_heat() -> None:
 async def test_post_fc_loop_bumpless_handoff_from_a_lower_pre_fc_heat() -> None:
     """Bumpless handoff, non-trivial case: pre-FC heat trimmed below 100 (the
     late-Maillard trim) still hands off with no dip/jump at zero error."""
-    config = _post_fc_config(target_ror_c_per_min=8.0, ror_smoothing_alpha=1.0)
+    config = _post_fc_config(ror_smoothing_alpha=1.0)
     harness = make_harness(config=config)
     harness.controller.load_profile(PROFILE)
     for step in NORMAL_PATH[:2]:
@@ -5772,14 +5799,50 @@ async def test_post_fc_loop_bumpless_handoff_from_a_lower_pre_fc_heat() -> None:
         bean += 0.5
     handoff_heat = harness.controller.snapshot().current_heat
     assert 0 < handoff_heat < 100  # the trim engaged: a genuine non-100 handoff value
-    harness.reader.readings = [reading(bean=178.0, first_crack_detected=True)]
+    # r0 = clamp(6.1, 4.0, 8.0) = 6.1 — feed the SAME RoR at the FC edge and at
+    # the first DEVELOPMENT tick for zero error.
+    harness.reader.readings = [
+        reading(bean=178.0, first_crack_detected=True, bean_ror_c_per_min=6.1)
+    ]
     await harness.controller.tick()
     assert harness.controller.phase is RoastPhase.DEVELOPMENT
     harness.log.clear()
     harness.events.events.clear()
-    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=8.0)]
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=6.1)]
     await harness.controller.tick()
     assert harness.controller.snapshot().current_heat == handoff_heat
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_engagement_ror_unavailable_falls_back_to_taper_end() -> None:
+    """qa gap: the FC-edge reading can legitimately carry no RoR sample (e.g.
+    not enough history yet). ``controller.py``'s fallback (the true-FC-edge
+    branch of ``transition_to``) must seed ``ror_at_engagement_c_per_min``
+    with ``taper_end_ror_c_per_min`` in that case — the same value the loop's
+    own B1 floor would apply to a genuinely degenerate reading, not a
+    separate/looser special case. This was previously exercised only
+    incidentally (several ``_charge_through_fc(harness)`` calls hit this path
+    without an RoR override) with no assertion on the resulting r0/setpoint;
+    this test asserts it directly and proves tick-1 is a bumpless HOLD, not a
+    cut."""
+    config = _post_fc_config(ror_smoothing_alpha=1.0)
+    harness = make_harness(config=config)
+    # No fc_ror_c_per_min override -> the FC-edge reading carries no RoR.
+    await _charge_through_fc(harness)
+    assert harness.controller.snapshot().current_heat == 100  # the actuated pre-FC lever
+
+    snapshot = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+    assert snapshot.taper_r0_c_per_min == pytest.approx(
+        harness.controller._config.post_first_crack_control.taper_end_ror_c_per_min  # pyright: ignore[reportPrivateUsage]
+    )
+    assert snapshot.heat_engage_percent == 100
+
+    # Feeding the SAME fallback RoR (4.0, the default taper_end) back in at
+    # the first DEVELOPMENT tick gives zero error -> a bumpless HOLD at the
+    # 100% handoff, not an instant cut.
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
+    await harness.controller.tick()
+    assert harness.controller.snapshot().current_heat == 100
 
 
 @pytest.mark.asyncio
