@@ -142,12 +142,19 @@ export function useConfig() {
  * On success the cache is updated to the server's response (the authoritative
  * effective snapshot post-save), so the UI immediately reflects saved values
  * without a second GET.
+ *
+ * Cancels any in-flight GET /api/config before writing the response (#483 fix
+ * round): a background refetch that started before the PUT can otherwise
+ * resolve AFTER onSuccess and overwrite the cache with a pre-save snapshot,
+ * silently reverting the just-cleared dirty state and displayed values.
  */
 export function useSaveConfig() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (edit: Record<string, unknown>) => api.saveConfig(edit),
-    onSuccess: (snapshot) =>
-      queryClient.setQueryData(configKeys.snapshot, snapshot),
+    onSuccess: async (snapshot) => {
+      await queryClient.cancelQueries({ queryKey: configKeys.snapshot });
+      queryClient.setQueryData(configKeys.snapshot, snapshot);
+    },
   });
 }

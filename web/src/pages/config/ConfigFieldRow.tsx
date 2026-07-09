@@ -295,6 +295,13 @@ export interface ConfigFieldRowProps {
   /** Dynamic upper bound — overrides the static schema `max` for cross-field
    *  constraints (e.g. fan_target_percent ≤ effective fan_ceiling_percent). */
   dynMax?: number;
+  /**
+   * True while a save PUT is in flight (#483 fix round). Disables the control
+   * regardless of read-only status so a mid-save edit can't race the
+   * unconditional post-save rebaseline (ConfigPage's handleSave INITs from
+   * the response snapshot, which would silently clobber an in-flight edit).
+   */
+  saving?: boolean;
 }
 
 export function ConfigFieldRow({
@@ -306,13 +313,14 @@ export function ConfigFieldRow({
   onReset,
   dynMin,
   dynMax,
+  saving = false,
 }: ConfigFieldRowProps): React.JSX.Element {
   const isEnvOverridden = meta.env_overridden && fieldDef.envVar !== null;
   // env_overridden and read_only are SEPARATE server flags: an env-overridden
   // non-safety field has read_only=false and PUT /api/config accepts it. The badge
   // is purely informational — the operator can save a value that becomes effective
   // once the env var is removed. Only readOnlyStatic and server read_only gate edits.
-  const isReadOnly = fieldDef.readOnlyStatic || meta.read_only;
+  const isReadOnly = fieldDef.readOnlyStatic || meta.read_only || saving;
   const isSafetyField = fieldDef.category === "Safety";
   const isDirtyFromDefault = value !== meta.default;
 

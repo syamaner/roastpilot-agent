@@ -405,6 +405,7 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
                 }
                 dynMin={dynMin}
                 dynMax={dynMax}
+                saving={saveConfig.isPending}
               />
             );
           })}
@@ -462,6 +463,7 @@ function ConfigInner({ snapshot }: ConfigInnerProps): React.JSX.Element {
               }
               dynMin={dynMin}
               dynMax={dynMax}
+              saving={saveConfig.isPending}
             />
           );
         })}
