@@ -312,6 +312,72 @@ describe("ConfigPage — save model", () => {
     });
     expect(screen.getByTestId("config-save-bar")).toBeInTheDocument();
   });
+
+  it("clears the save bar and dirty dot after a successful save, and rebaselines to the response snapshot (#483)", async () => {
+    // Before the fix: a successful PUT persisted server-side but the FE never
+    // rebaselined, so the save bar and dirty dot stayed on indefinitely.
+    saveConfigMock.mockResolvedValue(makeSnapshot({ model_slug: "anthropic/claude-3-5-sonnet" }));
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
+    const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
+    fireEvent.change(modelInput!, { target: { value: "anthropic/claude-3-5-sonnet" } });
+    expect(screen.getByTestId("rail-dirty-Advisor")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+
+    // Banner and dirty dot clear once the save resolves.
+    await waitFor(() => expect(screen.queryByTestId("config-save-bar")).toBeNull());
+    expect(screen.queryByTestId("rail-dirty-Advisor")).toBeNull();
+    expect(modelInput!.value).toBe("anthropic/claude-3-5-sonnet");
+  });
+
+  it("rebaselines to the saved value: editing back to the pre-save value shows dirty again", async () => {
+    // Proves the baseline actually moved to the just-saved value, not just
+    // that the banner happened to clear. Edit → save → edit back to the
+    // ORIGINAL (pre-save) value must be dirty relative to the NEW baseline.
+    saveConfigMock.mockResolvedValue(makeSnapshot({ model_slug: "anthropic/claude-3-5-sonnet" }));
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
+    const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
+
+    fireEvent.change(modelInput!, { target: { value: "anthropic/claude-3-5-sonnet" } });
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByTestId("config-save-bar")).toBeNull());
+
+    // Edit back to the value that was the baseline BEFORE this save
+    // ("openai/gpt-4o"). If the baseline correctly moved to
+    // "anthropic/claude-3-5-sonnet", this must show dirty again.
+    fireEvent.change(modelInput!, { target: { value: "openai/gpt-4o" } });
+    expect(screen.getByTestId("config-save-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("rail-dirty-Advisor")).toBeInTheDocument();
+  });
+
+  it("does not clear dirty state when the PUT rejects", async () => {
+    // A failed save must leave the operator's edits and the unsaved-changes
+    // banner intact — only a successful PUT rebaselines.
+    saveConfigMock.mockRejectedValue(new Error("Internal Server Error"));
+    renderPage();
+    await waitFor(() => screen.getByTestId("config-layout"));
+    fireEvent.click(screen.getByTestId("rail-item-Advisor"));
+    await waitFor(() => screen.getByTestId("config-pane-Advisor"));
+    const modelInput = screen.getByTestId("config-field-advisor.model_slug").querySelector("input");
+    fireEvent.change(modelInput!, { target: { value: "anthropic/claude-3-5-sonnet" } });
+
+    fireEvent.click(screen.getByTestId("config-save-btn"));
+    await waitFor(() => expect(saveConfigMock).toHaveBeenCalledTimes(1));
+
+    // Banner stays, error surfaces, dirty dot stays, edit is untouched.
+    await waitFor(() => expect(screen.getByTestId("config-save-error")).toBeInTheDocument());
+    expect(screen.getByTestId("config-save-bar")).toBeInTheDocument();
+    expect(screen.getByTestId("rail-dirty-Advisor")).toBeInTheDocument();
+    expect(modelInput!.value).toBe("anthropic/claude-3-5-sonnet");
+  });
 });
 
 describe("ConfigPage — field controls", () => {
