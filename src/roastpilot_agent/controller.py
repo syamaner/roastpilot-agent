@@ -728,6 +728,31 @@ class RoastController:
         # the pre-B2 fallback behaviour (see ``_run_advisory``'s
         # ``post_fc_loop_active`` gate).
         self._post_fc_engaged: bool = False
+        # #498 (D89 Tier 1, safety-reviewer BLOCKER-1 fix): the advisor's
+        # safety-evaluated fan TARGET in loop mode — a held desire, never an
+        # actuated value. The advisor consult and the taper's own write both
+        # run every tick (taper first, per ``tick()``'s documented order);
+        # letting each issue its OWN ``set_targets`` collided on
+        # ``min_seconds_between_commands`` (both default 5 s cadences landing
+        # in the SAME tick is the common case), so the taper's heat-moving
+        # write consumed the tick's one rate-limit slot and the advisor's fan
+        # was REJECTed almost every time it mattered. The fix coalesces to
+        # ONE writer: ``_run_advisory`` safety-evaluates the advisor's fan
+        # (bounds-only, ``seconds_since_last_command=None`` — this is a
+        # target computation, not a roaster write, so it never consumes or is
+        # gated by the write cadence) and stores the CLAMPED value here;
+        # ``_apply_deterministic_post_fc_levers`` reads it back and issues the
+        # single per-interval ``set_targets(taper_heat, desired_fan)``, so
+        # exactly one write (and one rate-limit slot) exists per tick in loop
+        # mode. ``None`` until the advisor's first loop-mode consult sets it
+        # (the taper holds fan at ``self._current_fan`` until then — no
+        # change from the pre-#498 startup behaviour). Cleared on every phase
+        # transition (mirroring ``_post_fc_engaged``) and re-armed to ``None``
+        # at the FC edge (mirroring ``_post_fc_last_actuation_monotonic``) so
+        # a later engagement never inherits a stale desired fan from an
+        # earlier one (D88 C2 discipline, restart-never-auto-resumes intact —
+        # this is a target value, never itself a write).
+        self._post_fc_desired_fan_percent: int | None = None
         self._last_command_monotonic: float | None = None
         self._t0_streak = 0
         self._t0_confirmed = False
@@ -1077,6 +1102,13 @@ class RoastController:
         # to "only when leaving DEVELOPMENT") so the flag's truth is a pure
         # function of "was THIS transition the FC edge", never of history.
         self._post_fc_engaged = False
+        # #498: the held desired-fan target is per-engagement state exactly
+        # like ``_post_fc_engaged`` above — clear it unconditionally on every
+        # transition so a later DEVELOPMENT dwell (a fresh FC edge, or an
+        # operator resume where the loop stays inert and the advisor drives
+        # both levers directly) never inherits a stale desired fan from an
+        # earlier engagement.
+        self._post_fc_desired_fan_percent = None
         if previous in TERMINAL_LATCH_PHASES and target not in TERMINAL_LATCH_PHASES:
             # Leaving a terminal HOLD phase is an EXPLICIT operator action
             # (acknowledge → idle, resume, start cooling): the operator now owns
@@ -1587,6 +1619,22 @@ class RoastController:
         actuating post-FC exactly as they do today (``_run_advisory`` /
         ``_execute_advisor_levers``).
 
+        **#498 (D89 Tier 1, safety-reviewer BLOCKER-1 fix): the SOLE writer in
+        loop mode.** Fan is the advisor's lever here (revising D88(5)'s pinned
+        fan), but the advisor's own consult (``_run_advisory``) never writes
+        directly — it only safety-evaluates its fan request and holds the
+        clamped result in ``self._post_fc_desired_fan_percent`` (a target, no
+        actuation). THIS method is the only place ``set_targets`` is called in
+        loop mode, applying ``(this tick's computed heat, the held desired
+        fan)`` together in ONE write — so exactly one write, and one
+        ``min_seconds_between_commands`` rate-limit slot, is consumed per tick.
+        Two independent writers previously collided there: both this loop's
+        cadence and the advisor's default consult cadence are 5 s, so a
+        same-tick collision was the common case, and the loop (which runs
+        FIRST in ``tick()``'s documented order) would consume the tick's one
+        rate-limit slot, REJECTing the advisor's fan write almost every time
+        heat also moved.
+
         **Invariants held (unchanged by this method):**
 
         * Every write this method issues passes the SAME safety path as every
@@ -1711,42 +1759,50 @@ class RoastController:
         # floor AND target to the loop's output — never an undamped/pre-clamp
         # value.
         #
-        # #498 (D89 Tier 1, revises D88(5)): fan is NO LONGER pinned to a
-        # single configured value here. The advisor now actuates fan directly
-        # (``_run_advisory``'s loop-mode branch, through the SAME safety path
-        # as this loop), so THIS write must never re-assert a fan value of its
-        # own — doing so would silently overwrite whatever fan the advisor
-        # just set, one write per tick fighting the other. Instead this loop
-        # HOLDS fan at its current actuated value (floor == ceiling ==
-        # current, so any legacy caller reading this box's fan bounds still
-        # sees a single degenerate point, never a widened range) — this
-        # method is heat-only from here on; fan is the advisor's lever in
-        # loop mode.
+        # #498 (D89 Tier 1, revises D88(5); coalesced to ONE writer per
+        # BLOCKER-1, safety-reviewer): fan is NO LONGER pinned to a single
+        # configured value, and this is now the SOLE write per tick in loop
+        # mode — the advisor's own consult (``_run_advisory``'s loop-mode
+        # branch) never writes; it only safety-evaluates its fan request and
+        # holds the CLAMPED result in ``self._post_fc_desired_fan_percent``
+        # (a target, no actuation). This write applies
+        # ``(taper_heat, desired_fan)`` together: the desired fan defaults to
+        # ``self._current_fan`` (a genuine hold) until the advisor's first
+        # loop-mode consult sets it, mirroring pre-#498 startup behaviour
+        # exactly. The fan box stays the FULL DEVELOPMENT range (0-100, not
+        # narrowed to a point) — the desired fan already passed its OWN
+        # bounds check at the advisor consult, and pinning this box to a
+        # single point would wrongly re-clamp a genuine fan move back down.
+        desired_fan = (
+            self._post_fc_desired_fan_percent
+            if self._post_fc_desired_fan_percent is not None
+            else self._current_fan
+        )
         box = self._control_limits().model_copy(
             update={
                 "heat_floor_percent": output.heat_percent,
                 "heat_target_percent": output.heat_percent,
-                "fan_floor_percent": self._current_fan,
-                "fan_ceiling_percent": self._current_fan,
-                "fan_target_percent": self._current_fan,
             }
         )
-        if self._current_heat == output.heat_percent:
-            # Already at the loop's computed target — no MCP write is issued
-            # (mirrors the pre-FC idempotence guard: avoids rate-limit churn
-            # and redundant serial writes).
+        if self._current_heat == output.heat_percent and self._current_fan == desired_fan:
+            # Already at the loop's computed heat target AND the desired fan:
+            # no MCP write is issued (mirrors the pre-FC idempotence guard:
+            # avoids rate-limit churn and redundant serial writes). Checking
+            # BOTH fields (not heat alone) is the #498 coalesced-writer fix:
+            # a fan-only move (heat idempotent, desired fan changed) must
+            # still fire — a fan move is a real command, and this is the
+            # ONLY write path fan has in loop mode.
             #
             # DELIBERATE DECISION on the #412 "state advances only on accepted
             # write" rule for THIS idempotent case: the PI state (integrator +
             # EMA, already advanced by the `compute()` call above) is KEPT, and
             # the cadence timer DOES advance — this counts as accepted, not
-            # rejected. Reasoning: `self._current_heat` IS the last value the
-            # roaster actually holds, and it already equals `output.heat_percent`
-            # by this branch's own condition (fan is held at `self._current_fan`
-            # by construction, #498 — never re-asserted here) — so there is no
-            # gap between "what the loop computed" and "what the roaster is
-            # actually doing" for the state to race ahead of. This is UNLIKE a
-            # REJECT (rate limit) or a
+            # rejected. Reasoning: `self._current_heat`/`self._current_fan`
+            # ARE the last values the roaster actually holds, and they already
+            # equal `output.heat_percent`/`desired_fan` by this branch's own
+            # condition — so there is no gap between "what was computed/held"
+            # and "what the roaster is actually doing" for the state to race
+            # ahead of. This is UNLIKE a REJECT (rate limit) or a
             # phase-matrix REJECT, where the roaster's real state is UNCHANGED
             # from before this tick while the integrator/EMA would have
             # advanced as if the new command had taken effect — THAT mismatch
@@ -1775,10 +1831,12 @@ class RoastController:
             return
         evaluation = self._safety.evaluate_command(
             requested_heat=output.heat_percent,
-            # #498: hold fan at its current actuated value — never
-            # `config.fan_percent` (that pin is retired for the loop's own
-            # write; fan is the advisor's lever in loop mode now).
-            requested_fan=self._current_fan,
+            # #498: the desired fan the advisor's consult already
+            # safety-evaluated — re-clamped here into the SAME box this
+            # write is evaluated against (told == enforced, #273/#412),
+            # never `config.fan_percent` (that pin is retired for the loop's
+            # own write; fan is the advisor's lever in loop mode now).
+            requested_fan=desired_fan,
             seconds_since_last_command=self._seconds_since_last_command(),
             bounds=box,
         )
@@ -2590,10 +2648,33 @@ class RoastController:
             # gate below). The drop is deliberately NOT evaluated on this path.
             await self._reject_low_confidence(decision, trigger, context, latency_ms, descriptor)
             return
+        # #497/#498: shared with :meth:`_build_advisor_context` (via
+        # :meth:`_post_fc_loop_active`) so the flag the model was TOLD matches
+        # the actuation decision made below by construction, not by two
+        # expressions that happen to agree. Hoisted above the safety
+        # evaluation (BLOCKER-1 fix, safety-reviewer on #498): in loop mode
+        # this consult NEVER writes to the roaster — only the taper's own
+        # per-interval write does (see ``_apply_deterministic_post_fc_levers``)
+        # — so this evaluation must NOT consume or be gated by the write-
+        # cadence rate limit. Two writers sharing one ``min_seconds_between_
+        # commands`` slot per tick is exactly BLOCKER-1: the taper (which runs
+        # FIRST in ``tick()``'s documented order) would consume the slot on
+        # every heat-moving tick, REJECTing the advisor's fan here almost
+        # every time it mattered (both cadences default to the same 5 s
+        # interval, so same-tick collision was the COMMON case, not an edge
+        # case).
+        post_fc_loop_active = self._post_fc_loop_active()
         evaluation = self._safety.evaluate_command(
             requested_heat=decision.target_heat,
             requested_fan=decision.target_fan,
-            seconds_since_last_command=self._seconds_since_last_command(),
+            # None in loop mode: this call is a BOUNDS CHECK deriving the
+            # desired-fan target for the taper's later write, never a write
+            # attempt of its own, so the write-cadence rate limit does not
+            # apply to it (baseline mode is unchanged: it IS the write
+            # attempt, so it keeps the real elapsed time).
+            seconds_since_last_command=(
+                None if post_fc_loop_active else self._seconds_since_last_command()
+            ),
             # The SAME phase-resolved box instance placed in the advisor context
             # (#273): the model is told this range and the gate clamps to it —
             # told == enforced by identity. Today this is the full 0–100 lever
@@ -2627,17 +2708,26 @@ class RoastController:
         # loop OWNS heat — the advisor's heat recommendation is traced above
         # (ADVISORY event, decision trace, persisted decision) for
         # observability but never actuated, exactly as Slice B2 shipped it.
+        #
         # **#498 (D89 Tier 1, division by lever) revises the FAN half of that
-        # rule: fan now actuates in loop mode too**, through the identical
-        # safety-evaluated path as baseline (the SAME ``evaluation`` computed
-        # above from the advisor's own ``target_fan``, against the SAME
-        # phase-resolved box) — the 11 Jul validation evidence showed the
-        # loop-mode advisor's fan judgment (a sensible 60->90 ramp) was sound
-        # while the D88(5) pinned-fan design wasted it. Heat and fan are
+        # rule: fan is the advisor's lever in loop mode too** — but (BLOCKER-1
+        # fix, safety-reviewer) this branch does NOT write directly. Two
+        # writers issuing their own ``set_targets`` every tick (this one, and
+        # the taper's own per-interval write in
+        # ``_apply_deterministic_post_fc_levers``, which runs FIRST per
+        # ``tick()``'s documented order) collided on the single
+        # ``min_seconds_between_commands`` rate-limit slot: with both cadences
+        # defaulting to 5 s, the taper's heat-moving write consumed the slot
+        # on the SAME tick almost every time, REJECTing the advisor's fan
+        # write here. The fix coalesces to ONE writer: this branch only
+        # updates ``self._post_fc_desired_fan_percent`` — a held TARGET, never
+        # itself an MCP write, so it advances regardless of write cadence
+        # (the evaluation above used ``seconds_since_last_command=None`` for
+        # exactly this reason) — and the taper's single write later applies
+        # ``(taper_heat, desired_fan)`` together. Heat and fan are
         # independently clamped fields on one ``SafetyEvaluation`` (#412,
-        # safety.py's ``evaluate_command``), so splitting which field
-        # ACTUATES does not require a second evaluation call or weaken the
-        # box either lever is clamped into.
+        # safety.py's ``evaluate_command``), so deriving the desired fan from
+        # this evaluation's ``adjusted_fan`` needs no second evaluation call.
         #
         # ``_post_fc_engaged`` (safety-review fix, post-B2, MEDIUM): DEVELOPMENT
         # is reachable both via the true FC edge (loop-eligible) and an
@@ -2646,33 +2736,22 @@ class RoastController:
         # gate would ALSO have suppressed the advisor here on a resume, with
         # NEITHER the loop nor the advisor driving post-FC heat/fan — a silent
         # control gap. Requiring ``_post_fc_engaged`` here means a resume into
-        # DEVELOPMENT falls through to the (full-lever, baseline-shaped)
-        # advisor path below exactly as it did before Slice B2 (the pre-B2
-        # fallback), matching the loop's own non-actuation on that edge
-        # (``_apply_deterministic_post_fc_levers``).
-        # #497: shared with :meth:`_build_advisor_context` (via
-        # :meth:`_post_fc_loop_active`) so the flag the model was TOLD matches
-        # the actuation decision made here by construction, not by two
-        # expressions that happen to agree.
-        post_fc_loop_active = self._post_fc_loop_active()
+        # DEVELOPMENT falls through to the (full-lever, baseline-shaped,
+        # directly-actuating) advisor path below exactly as it did before
+        # Slice B2 (the pre-B2 fallback), matching the loop's own
+        # non-actuation on that edge (``_apply_deterministic_post_fc_levers``).
         if (
             evaluation.verdict in (SafetyVerdict.ALLOW, SafetyVerdict.CLAMP)
             and evaluation.adjusted_heat is not None
             and evaluation.adjusted_fan is not None
         ):
             if post_fc_loop_active:
-                # #498: fan actuates at its safety-evaluated value; heat is
-                # requested as ITS OWN CURRENT (taper-actuated) value — never
-                # the advisor's ``evaluation.adjusted_heat`` — so
-                # ``_execute_advisor_levers``'s per-lever coherence gate sees
-                # ``requested == current`` for heat and (by construction,
-                # ``coherence.evaluate_lever_coherence``) ALLOWs a pure hold:
-                # no heat write, no direction-state change, no spurious
-                # COHERENCE_DAMPED note. The write that reaches the roaster is
-                # always exactly the taper's heat + the safety-evaluated fan.
-                await self._execute_advisor_levers(
-                    heat=self._current_heat, fan=evaluation.adjusted_fan
-                )
+                # #498: hold the desired fan for the taper's next write to
+                # apply — no write happens here. A stale desired fan is never
+                # left behind on disengage/a later engagement: cleared in
+                # ``transition_to`` alongside ``_post_fc_engaged`` (D88 C2
+                # discipline).
+                self._post_fc_desired_fan_percent = evaluation.adjusted_fan
             else:
                 await self._execute_advisor_levers(
                     heat=evaluation.adjusted_heat, fan=evaluation.adjusted_fan
@@ -2765,17 +2844,16 @@ class RoastController:
         flip-flop produces no actuation at all. Any executed change emits a
         COHERENCE_DAMPED note for the levers held, for the decision trace.
 
-        **#498 (D89 Tier 1):** in post-FC loop mode the caller passes
-        ``heat=self._current_heat`` (the taper's own actuated value, never
-        ``evaluation.adjusted_heat``) so this method's heat side is always a
-        ``requested == current`` hold — ``evaluate_lever_coherence`` ALLOWs
-        that unconditionally (no reversal, no direction-state change, no
-        COHERENCE_DAMPED note), so heat is provably a no-op write in that
-        regime while ``fan`` still actuates through the same gate as baseline.
+        **#498 (D89 Tier 1):** this method's sole caller is now the
+        BASELINE (post-FC loop NOT active) branch of ``_run_advisory`` — the
+        loop-mode branch never calls it. In loop mode the advisor's heat is
+        traced but never actuated, and its fan only updates a held desired
+        target that the deterministic taper's own single write later applies
+        (see :meth:`_apply_deterministic_post_fc_levers`); this method is
+        byte-for-byte its pre-#498 baseline-only behavior.
 
         Args:
-            heat: The safety-approved heat percent (the gate may hold it), or
-                the loop's own current heat in post-FC loop mode (a hold).
+            heat: The safety-approved heat percent (the gate may hold it).
             fan: The safety-approved fan percent (the gate may hold it).
         """
         threshold = self._config.post_fc_deadband_threshold_percent

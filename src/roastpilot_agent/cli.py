@@ -575,8 +575,8 @@ def _format_post_fc_loop_readout(
     lines: list[str] = []
     if enabled:
         lines.append(
-            "⚠️  POST-FC RoR LOOP: ENABLED (#405/D88 — deterministic taper owns heat; "
-            "#498/D89 — advisor owns fan; drop shared)"
+            "⚠️  POST-FC RoR LOOP: ENABLED (#405/D88 — deterministic taper drives heat; "
+            "#498/D89 — advisor's fan judgment applied by the taper's write; drop shared)"
         )
     else:
         lines.append("  post-FC RoR loop: disabled (advisor-driven post-FC)")

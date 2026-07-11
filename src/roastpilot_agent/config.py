@@ -450,12 +450,17 @@ class PostFirstCrackControl(BaseModel):
     #: over-brake was heat AND fan moving together. The 11 Jul validation A/B
     #: showed the pin wastes a second brake lever the advisor's judgment can
     #: use well (D89: "fan returns to the advisor as an ACTUATED lever in loop
-    #: mode"), so the controller's own post-FC write now HOLDS fan at its
-    #: current actuated value instead of re-asserting this field — fan is the
-    #: advisor's lever in loop mode, same as baseline, still through the same
-    #: safety path. Kept (not removed) so an existing config file/env var
-    #: setting it does not fail validation; a follow-up may retire the field
-    #: outright once the config-UI surface is updated to match.
+    #: mode"), so fan is now the advisor's lever in loop mode, same as
+    #: baseline, still through the same safety path — but the advisor's
+    #: consult never writes fan directly (a safety-reviewer BLOCKER-1 fix,
+    #: #498): it holds a safety-evaluated desired-fan target, and the
+    #: controller's own single per-interval post-FC write applies
+    #: ``(this tick's computed heat, that desired fan)`` together, so exactly
+    #: one write (and one rate-limit slot) is consumed per tick. This field is
+    #: never consulted anywhere in that path. Kept (not removed) so an
+    #: existing config file/env var setting it does not fail validation; a
+    #: follow-up may retire the field outright once the config-UI surface is
+    #: updated to match.
     fan_percent: int = Field(default=40, ge=0, le=100)
     #: The control-loop cadence in seconds. Default 5.0 — matches
     #: ``ControllerConfig.post_fc_min_consult_interval_seconds`` and the D36

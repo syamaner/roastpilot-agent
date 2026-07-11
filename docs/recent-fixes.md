@@ -115,3 +115,40 @@ Format: one entry per anti-pattern.
   0-value handoff cannot pin the loop at a stall).
 - **Guarded by:** `test_roast2_runaway_is_structurally_impossible` and the B1/B2/C1
   ratification tests in `tests/test_post_fc_control.py`.
+
+---
+
+## Two independent per-tick writers to the SAME actuator collide on the rate limit
+*(fixed by #498, 11 Jul 2026)*
+
+- **Signature:** two distinct code paths that can each call
+  `_executor.set_targets` / `evaluate_command` with `seconds_since_last_command
+  =self._seconds_since_last_command()` inside the same `tick()`, especially when
+  both are gated by cadence timers with the SAME default interval (grep for a
+  second call site issuing `set_targets` for a lever a deterministic loop also
+  writes, or a new "advisor also actuates lever X" change touching
+  `_run_advisory`'s post-FC branch).
+- **Wrong:** the deterministic post-FC taper (`_apply_deterministic_post_fc_levers`,
+  runs FIRST in `tick()`'s order) and the advisor's own consult
+  (`_run_advisory`) each independently called `evaluate_command` with the real
+  elapsed time and then wrote directly — both cadences default to 5 s, so a
+  same-tick collision was the COMMON case: the taper's write consumed the
+  tick's ONE `min_seconds_between_commands` slot, and the advisor's write hit
+  `command_rate_limited` REJECT almost every time heat also moved (i.e. almost
+  every tick that mattered).
+- **Right:** coalesce to ONE writer. The non-primary path (the advisor's fan
+  consult) safety-evaluates with `seconds_since_last_command=None` (it is a
+  BOUNDS CHECK deriving a target, not a write attempt, so the rate limit must
+  not gate it) and stores the clamped result in a held target
+  (`self._post_fc_desired_fan_percent`); the SOLE writer
+  (`_apply_deterministic_post_fc_levers`) reads the held target back and
+  applies `(this tick's own computed value, the held target)` together in ONE
+  `set_targets` call, firing whenever EITHER field differs from current (not
+  only when the primary field moves — the held target's own tick-idempotence
+  case still needs a real write). Clear the held target wherever the loop's
+  own per-engagement state clears (`transition_to`, mirroring
+  `_post_fc_engaged`), so a later engagement never inherits a stale one.
+- **Guarded by:**
+  `test_post_fc_loop_taper_heat_move_and_advisor_fan_move_both_land_same_tick`
+  (fails pre-fix — the advisor's fan write REJECTed by the collision; passes
+  post-fix) in `tests/test_controller.py`.
