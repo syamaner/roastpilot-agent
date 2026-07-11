@@ -1043,19 +1043,31 @@ _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
         "for the JOINT objective below (bean temperature AND development "
         "ratio together), not the moment either arrives alone.\n"
         "\n"
+        # Safety-reviewer LOW (#499 Codex follow-up): an earlier draft claimed
+        # the bitter ceiling is "never below the target" — false whenever
+        # target_drop_temp_c is ABOVE the hard bitter ceiling (an unbounded
+        # profile field; RoastControlPolicy._bitter_ceiling_temp_c() only
+        # caps DOWNWARD, `min(hard_ceiling, target)`, so a high-target profile
+        # gets bitter_ceiling_temp_c BELOW its own target — see
+        # test_c1_joint_drop_section_makes_no_false_ceiling_ordering_for_a_
+        # high_target_profile, which renders the real box for a 205 °C-target
+        # profile against the 196 °C default hard ceiling). The text below
+        # makes NO relational (never-below / never-above) claim between the
+        # target and the ceiling for exactly this reason — only that they can
+        # coincide, and that the ceiling is always the law regardless.
         "THE DROP - A JOINT OBJECTIVE, NOT FIRST-PAST-THE-POST\n"
         "- The context gives you drop-relevant numbers with DIFFERENT "
         "MEANINGS - do not conflate them or substitute one for the other in "
         "your rationale, even when two of them happen to share the same "
         "value: target_drop_temp_c is the bean-temperature TARGET this roast "
         "is aiming for; the indicated bitter ceiling is the roast's upper "
-        "drop bound (never below the target - on some profiles it EQUALS "
-        "the target exactly, and the ceiling is still the law there, not a "
-        "separate looser number); the emergency-drop bound is a further, "
-        "always-HIGHER hard stop past which the roast must be dropped "
-        "regardless of development. Name each correctly when you refer to "
-        "it - never assume the target and the ceiling must differ, and "
-        "never call one by the other's meaning.\n"
+        "drop bound - on some profiles it EQUALS the target exactly, and it "
+        "is still the LAW there, never a separate looser number; the "
+        "emergency-drop bound is a further, always-HIGHER hard stop past "
+        "which the roast must be dropped regardless of development. Name "
+        "each correctly when you refer to it - never assume the target and "
+        "the ceiling must differ, and never call one by the other's "
+        "meaning.\n"
         "- Your goal is to satisfy BOTH the bean-temperature target AND the "
         "development-ratio target TOGETHER, not to drop the instant either one "
         "arrives alone. Treat whichever number you hit FIRST as a signal to "

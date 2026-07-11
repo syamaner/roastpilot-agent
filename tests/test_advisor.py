@@ -835,6 +835,40 @@ def test_c1_joint_drop_section_distinguishes_drop_target_from_bitter_ceiling() -
     # emergency-drop bound (never capped by the profile), not the ceiling.
     assert "equals the target" in section or "equal the target" in section
     assert "emergency" in section and "higher" in section
+    # Must NOT claim any fixed ORDERING between the ceiling and the target —
+    # safety-reviewer LOW fold: an earlier draft said the ceiling is "never
+    # below the target", which is false whenever target_drop_temp_c is ABOVE
+    # the hard bitter ceiling (an unbounded profile field — this module's own
+    # PROFILE fixture is target_drop_temp_c=205.0, above the 196 default hard
+    # ceiling, so RoastControlPolicy resolves bitter_ceiling_temp_c=196.0,
+    # BELOW the target). No relational claim survives that a real profile can
+    # falsify either way.
+    assert "never below the target" not in section
+    assert "never above the target" not in section
+
+
+def test_c1_joint_drop_section_makes_no_false_ceiling_ordering_for_a_high_target_profile() -> None:
+    """Safety-reviewer LOW (#499 Codex follow-up): renders the REAL resolved
+    control box for this module's own PROFILE (target_drop_temp_c=205.0,
+    above the 196 °C default hard bitter ceiling) and confirms the actual
+    told bitter_ceiling_temp_c is BELOW the target in this case — the exact
+    scenario that falsified the earlier "(never below the target)" claim.
+    The prompt section must carry no relational claim a profile like this
+    one can falsify."""
+    from roastpilot_agent.config import SafetyLimits as _SafetyLimits
+    from roastpilot_agent.control_policy import RoastControlPolicy
+
+    policy = RoastControlPolicy(_SafetyLimits(), PROFILE)
+    limits = policy.limits_for(RoastPhase.DEVELOPMENT)
+    assert limits.bitter_ceiling_temp_c < PROFILE.target_drop_temp_c, (
+        "this test's premise requires a target ABOVE the hard bitter ceiling"
+    )
+    prompt = control_teaching_prompt("c1")
+    section_start = prompt.index("THE DROP - A JOINT OBJECTIVE")
+    section_end = prompt.index("LEVER STABILITY")
+    section = prompt[section_start:section_end].lower()
+    assert "never below the target" not in section
+    assert "never above the target" not in section
 
 
 def test_c1_joint_drop_section_teaches_window_as_judgment_ceiling_as_law() -> None:
