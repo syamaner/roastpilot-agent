@@ -130,6 +130,20 @@ def test_build_ticks_respects_cadence() -> None:
     assert sum(t.real_should_drop for t in coarse) == 1
 
 
+def test_build_ticks_context_carries_the_real_actuated_heat_fan() -> None:
+    """#497: every replayed context's ``current_heat_percent``/
+    ``current_fan_percent`` equal the REAL roast's actuated levers at that same
+    row (``real_heat_percent``/``real_fan_percent``) — never null, and never a
+    recommendation being scored. ``post_fc_loop_active`` stays False: every
+    fixture predates the deterministic post-FC RoR-taper loop (#405/D88)."""
+    ticks, _ = replay.build_ticks(_S1, cadence_seconds=30.0)
+    assert ticks, "replay must produce ticks"
+    for t in ticks:
+        assert t.context.current_heat_percent == t.real_heat_percent
+        assert t.context.current_fan_percent == t.real_fan_percent
+        assert t.context.post_fc_loop_active is False
+
+
 def test_build_ticks_target_override_replaces_profile_targets() -> None:
     """The target overrides stamp every context with the given profile targets
     (a target-sensitivity replay) without altering the scoring ground truth."""

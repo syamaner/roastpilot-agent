@@ -279,6 +279,17 @@ def build_ticks(
             first_crack_timestamp_seconds=(
                 round(ground.first_crack_seconds - ground.t0_seconds, 3) if fc_detected else None
             ),
+            # #497: the real roast's ACTUATED heat/fan at this row — the same
+            # values ``ReplayTick.real_heat_percent``/``real_fan_percent`` below
+            # score against — so a replayed context matches what the live
+            # controller would have populated (never null, never the
+            # recommendation being scored). ``post_fc_loop_active`` stays the
+            # default False: every recorded fixture predates the deterministic
+            # post-FC RoR-taper loop (#405/D88, still flag-off in production),
+            # so no replayed tick was ever taper-actuated — every lever value
+            # here is either advisor-driven or the deterministic pre-FC lever.
+            current_heat_percent=heat,
+            current_fan_percent=fan,
         )
         ticks.append(
             ReplayTick(

@@ -872,6 +872,12 @@ def _pre_fc_context(fixture: Path) -> tuple[AdvisorContext, float]:
         recent_telemetry_samples=_recent_samples(telemetry, index),
         first_crack_detected=False,
         first_crack_timestamp_seconds=None,
+        # #497: the real roast's ACTUATED heat/fan at the source row.
+        # post_fc_loop_active is False by construction: pre-first-crack the
+        # deterministic loop is never engaged (#405/D88 only ever owns
+        # DEVELOPMENT), so this phase can never have it True.
+        current_heat_percent=int(row["heat_level_percent"]),
+        current_fan_percent=int(row["fan_level_percent"]),
     )
     return context, mono
 
@@ -916,6 +922,12 @@ def _preheat_context(fixture: Path) -> tuple[AdvisorContext, float]:
         recent_telemetry_samples=_recent_samples(telemetry, index),
         first_crack_detected=False,
         first_crack_timestamp_seconds=None,
+        # #497: the real roast's ACTUATED heat/fan at the source row.
+        # post_fc_loop_active is False by construction: preheat is always
+        # before the deterministic loop's DEVELOPMENT-only engagement window
+        # (#405/D88), so this phase can never have it True.
+        current_heat_percent=int(row["heat_level_percent"]),
+        current_fan_percent=int(row["fan_level_percent"]),
     )
     return context, mono
 
