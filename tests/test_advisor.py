@@ -696,6 +696,92 @@ async def test_pydanticai_advisor_logs_context_hash_not_raw_payload(
     assert context.profile_name not in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_rendered_prompt_carries_actuated_heat_fan_and_loop_flag() -> None:
+    """#497: the context JSON the model actually receives (the ``agent.run``
+    user message, i.e. ``context.model_dump_json()``) includes the new
+    actuated-lever fields — no separate template-rendering step to keep in
+    sync, since the context IS the rendered user message."""
+    captured: list[str] = []
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        last = messages[-1]
+        for part in last.parts:
+            text = getattr(part, "content", None)
+            if isinstance(text, str):
+                captured.append(text)
+        tool_name = info.output_tools[0].name
+        return ModelResponse(parts=[ToolCallPart(tool_name, _VALID_OUTPUT)])
+
+    advisor = _advisor_with(FunctionModel(respond))
+    context = _context().model_copy(
+        update={
+            "current_heat_percent": 65,
+            "current_fan_percent": 45,
+            "post_fc_loop_active": True,
+        }
+    )
+    await advisor.get_recommendation(context)
+    assert captured, "the model must have received a user message"
+    rendered = "\n".join(captured)
+    assert '"current_heat_percent":65' in rendered
+    assert '"current_fan_percent":45' in rendered
+    assert '"post_fc_loop_active":true' in rendered
+
+
+@pytest.mark.asyncio
+async def test_rendered_prompt_baseline_mode_carries_loop_flag_false() -> None:
+    """Baseline (loop inactive): the rendered context carries
+    ``post_fc_loop_active: false`` — the model can tell the two regimes apart
+    from the context alone."""
+    captured: list[str] = []
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        last = messages[-1]
+        for part in last.parts:
+            text = getattr(part, "content", None)
+            if isinstance(text, str):
+                captured.append(text)
+        tool_name = info.output_tools[0].name
+        return ModelResponse(parts=[ToolCallPart(tool_name, _VALID_OUTPUT)])
+
+    advisor = _advisor_with(FunctionModel(respond))
+    context = _context().model_copy(update={"current_heat_percent": 65, "current_fan_percent": 45})
+    await advisor.get_recommendation(context)
+    rendered = "\n".join(captured)
+    assert '"post_fc_loop_active":false' in rendered
+
+
+def test_c1_teaches_actuated_levers_are_ground_truth() -> None:
+    """The c1 frame (and every derived control-teaching version, since c2-c6
+    splice into c1) must teach the model that current_heat_percent /
+    current_fan_percent — not its own memory of a prior recommendation — are
+    the real actuated levers, and that in loop mode (post_fc_loop_active) its
+    heat number is advisory-only (#497: the 11 Jul evidence where the advisor
+    reasoned "heat is already at its minimum" while the taper actually held it
+    at 65 %)."""
+    for version in ("c1", "c3", "c6"):
+        prompt = control_teaching_prompt(version)
+        lower = prompt.lower()
+        assert "current_heat_percent" in lower, version
+        assert "current_fan_percent" in lower, version
+        assert "post_fc_loop_active" in lower, version
+        assert "advisory-only" in lower, version
+
+
+def test_c1_actuated_levers_section_names_no_numbers() -> None:
+    """Same #218 two-copies discipline as the rest of c1: the new section
+    teaches the PRINCIPLE (read the actuated fields, don't assume) and names
+    no hardcoded heat/fan duty numbers."""
+    prompt = control_teaching_prompt("c1")
+    section_start = prompt.index("ACTUATED LEVERS")
+    section_end = prompt.index("DEVELOPMENT NUMBERS")
+    section = prompt[section_start:section_end]
+    lower = section.lower()
+    assert re.search(r"\bfan\s+\d+\b", lower) is None
+    assert re.search(r"\bheat\s+\d+\b", lower) is None
+
+
 def test_instructions_for_known_and_unknown_version() -> None:
     assert "coffee roaster" in instructions_for("v0").lower()
     with pytest.raises(ValueError):

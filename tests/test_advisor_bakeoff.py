@@ -204,6 +204,22 @@ def test_enrich_ticks_adds_the_273_limits_and_275_context() -> None:
         assert e.monotonic_seconds == a.monotonic_seconds
 
 
+def test_enrich_ticks_preserves_the_actuated_heat_fan_from_build_ticks() -> None:
+    """#497: enrichment's ``model_copy(update={...})`` only touches the #273/#275
+    fields it lists — the actuated ``current_heat_percent``/``current_fan_percent``
+    (and ``post_fc_loop_active``) that :func:`build_ticks` already stamped onto
+    every context must survive it unchanged, never reset to null."""
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    plain, ground = bakeoff.build_ticks(fixture, cadence_seconds=30.0)
+    enriched = bakeoff.enrich_ticks_with_control_context(plain, ground)
+    for a, e in zip(plain, enriched, strict=True):
+        assert e.context.current_heat_percent == a.context.current_heat_percent
+        assert e.context.current_fan_percent == a.context.current_fan_percent
+        assert e.context.current_heat_percent == a.real_heat_percent
+        assert e.context.current_fan_percent == a.real_fan_percent
+        assert e.context.post_fc_loop_active is False
+
+
 def test_build_control_ticks_enriches_by_default_and_can_opt_out() -> None:
     """build_control_ticks enriches by default; enrich=False keeps the drop-only ctx."""
     fixture = bakeoff.REPLAY_ROASTS[0]
@@ -524,6 +540,14 @@ def test_phase_contexts_are_grounded_and_phase_stamped(
     assert 0.0 < context.current_bean_temp_c < 230.0
     assert mono > 0.0
     assert context.recent_telemetry_samples, "context must carry recent samples"
+    # #497: every per-phase context carries the real roast's actuated heat/fan
+    # (never null); this fixture predates the deterministic post-FC RoR-taper
+    # loop (#405/D88), so post_fc_loop_active is False in every phase.
+    assert context.current_heat_percent is not None
+    assert 0 <= context.current_heat_percent <= 100
+    assert context.current_fan_percent is not None
+    assert 0 <= context.current_fan_percent <= 100
+    assert context.post_fc_loop_active is False
 
 
 def test_preheat_context_supplies_charge_band() -> None:

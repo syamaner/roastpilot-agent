@@ -118,6 +118,16 @@ class AdvisorContext(BaseModel):
     #229 KEEP). All are read-only context with no control authority, default
     empty / ``None`` for callers that build no history, and are assembled by the
     controller from :class:`~roastpilot_agent.roast_history.RoastHistory`.
+
+    ``current_heat_percent`` / ``current_fan_percent`` (#497, D89 Tier 1) carry
+    the ACTUATED heat/fan — never the advisor's own requested values — so the
+    model can tell what is really happening at the roaster instead of assuming
+    its last recommendation applied. ``post_fc_loop_active`` names the regime
+    where that assumption is false: while the deterministic post-FC RoR-taper
+    loop (#405/D88) owns DEVELOPMENT heat, the advisor's ``target_heat`` is
+    traced but never actuated. Both are read-only context with no control
+    authority; default ``None``/``False`` for callers that build no controller
+    (older callers, the drop-only bake-off).
     """
 
     phase: RoastPhase
@@ -181,6 +191,32 @@ class AdvisorContext(BaseModel):
     # KEEP). A pre-FC anticipation trigger only, never a lever move on its own;
     # None once FC is detected or before there is enough curve to project.
     first_crack_eta_seconds: float | None = None
+    # #497 (D89 Tier 1): the ACTUATED heat/fan — the SAME actuated-output
+    # values the told==enforced safety box is built from (#412), never the
+    # advisor's own requested/recommended values. Populated by the controller
+    # from its actuated-lever tracking, updated only once a write reaches the
+    # roaster. Evidence (11 Jul D88 validation roast): with the post-FC loop
+    # engaged, actuated heat was pinned at 65 % by the deterministic taper, yet
+    # the advisor's rationale said "heat is already at its minimum" — it had no
+    # way to see what was really actuating and reasoned from an imagined
+    # heat-0. Read-only context with no control authority; the controller and
+    # safety policy never read these back. Default ``None`` so a context built
+    # without a controller (older callers, the drop-only bake-off) stays valid.
+    current_heat_percent: int | None = Field(default=None, ge=0, le=100)
+    current_fan_percent: int | None = Field(default=None, ge=0, le=100)
+    # #497 (D89 Tier 1): True iff the deterministic post-FC RoR-taper loop
+    # (#405/D88) currently OWNS DEVELOPMENT heat this tick — the same
+    # ``post_fc_loop_active`` predicate the controller already used to decide
+    # whether to actuate the advisor's own heat/fan recommendation
+    # (:meth:`~roastpilot_agent.controller.RoastController._post_fc_loop_active`).
+    # When True the advisor's ``target_heat`` is traced for observability but
+    # never actuated (fan stays pinned too, D88(5)), so the c1 prompt teaches
+    # the model to treat its own heat number as advisory-only in that regime
+    # and read ``current_heat_percent`` as the real, taper-actuated value
+    # instead of reasoning from its last recommendation. Defaults ``False`` so
+    # a context built without the post-FC loop (pre-FC phases, flag-off roasts,
+    # older callers) reads as the byte-for-byte pre-#497 regime.
+    post_fc_loop_active: bool = False
 
 
 class RoastDecision(BaseModel):
@@ -898,6 +934,30 @@ _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
         "temperatures are bean-specific and lower than you would expect. DTR on "
         "this setup runs lower than the textbook 20-25 % - anchor it to the "
         "profile's target, not to a remembered constant.\n"
+        "\n"
+        "ACTUATED LEVERS - WHAT IS REALLY HAPPENING, NOT WHAT YOU LAST SAID\n"
+        "- The context's current_heat_percent and current_fan_percent are the "
+        "ACTUATED levers - the real heat/fan duty at the roaster right now. Do "
+        "NOT assume your previous recommendation is what is running: a "
+        "deterministic controller and a safety policy sit between your advice "
+        "and the machine, and either can hold, clamp, or override it. Read these "
+        "two fields as ground truth for 'where are the levers now', not your own "
+        "memory of what you last recommended.\n"
+        "- When the context's post_fc_loop_active is true, a deterministic "
+        "post-first-crack control loop OWNS heat: it is actuating "
+        "current_heat_percent itself, your target_heat is advisory-only and "
+        "will NOT be actuated, and fan is likewise pinned to a fixed value the "
+        "loop does not let you move. Do not reason as though a heat cut you "
+        "recommend will land, and do not describe the actuated heat as 'your' "
+        "setting or as being 'at its minimum' unless current_heat_percent itself "
+        "says so - state what current_heat_percent actually shows and reason "
+        "about the roast from that real number. Your judgment there still "
+        "matters for the DROP decision (below) and for should_drop timing - it "
+        "is only the heat/fan LEVERS that the loop, not you, is driving.\n"
+        "- When post_fc_loop_active is false (including every phase before "
+        "first crack), your target_heat/target_fan ARE the levers the "
+        "controller will attempt to actuate (subject to the safety box above) - "
+        "reason and recommend exactly as the rest of this document describes.\n"
         "\n"
         "DEVELOPMENT NUMBERS - USE THE CONTEXT, NEVER INVENT\n"
         "- The development time, the development percent / Development Time Ratio "

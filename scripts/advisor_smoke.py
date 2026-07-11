@@ -129,6 +129,13 @@ def build_context(
         ],
         first_crack_detected=True,
         first_crack_timestamp_seconds=round(fc - t0, 3),
+        # #497: the real roast's ACTUATED heat/fan at the source row — never
+        # null. ``post_fc_loop_active`` stays the default False: this fixture
+        # predates the deterministic post-FC RoR-taper loop (#405/D88, still
+        # flag-off in production), so the recorded levers are advisor-driven,
+        # never taper-actuated.
+        current_heat_percent=int(row["heat_level_percent"]),
+        current_fan_percent=int(row["fan_level_percent"]),
     )
     return context, row
 
