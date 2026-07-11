@@ -751,6 +751,76 @@ def test_format_post_fc_loop_readout_both_enabled_two_loud_lines() -> None:
     assert "195.5 °C" in text
 
 
+@pytest.mark.usefixtures("no_serve")
+def test_serve_live_banner_reflects_resolved_d88_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The D88 banner lines come from the RESOLVED config the serving agent
+    loaded — end-to-end through the real ``serve`` path, not the pure readout
+    function (issues #460/#495).
+
+    Sets ONLY the ceiling-guard flag (plus a non-default guard temperature)
+    through the real nested env vars and drives ``cli.main()``: the guard line
+    must be loud with the resolved temperature while the loop line stays quiet.
+    Asymmetric on purpose — the two flags are structurally identical bools, so
+    a swapped-kwarg bug at the ``_serve_live`` call site would flip BOTH
+    assertions; the pure-function tests above can never see that wiring."""
+    from roastpilot_agent import live
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.store import RoastStore
+
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__CEILING_GUARD_DROP_ENABLED",
+        "true",
+    )
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__CEILING_GUARD_TEMP_C",
+        "195.5",
+    )
+
+    spa = tmp_path / "dist"
+    spa.mkdir()
+    (spa / "index.html").write_text("<title>RoastPilot</title>", encoding="utf-8")
+
+    class _FakeMCP:
+        running = True
+        call_tool = staticmethod(_make_call_tool(_runtime_config_payload(roaster_driver="mock")))
+
+        async def stop(self) -> None:
+            return None
+
+    async def _fake_build(
+        config: AppConfig, *, store_path: Path
+    ) -> tuple[RoastService, _FakeMCP, RoastStore]:
+        store = RoastStore(store_path)
+        return RoastService(store), _FakeMCP(), store
+
+    monkeypatch.setattr(live, "build_live_service", _fake_build)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "roastpilot-agent",
+            "serve",
+            "--port",
+            "0",
+            "--spa-dir",
+            str(spa),
+            "--db",
+            str(tmp_path / "trace" / "live.sqlite3"),
+        ],
+    )
+
+    assert cli.main() == 0
+    out = capsys.readouterr().out
+    # Guard ON: its loud line prints with the RESOLVED (non-default) temperature.
+    assert "CEILING-GUARD DROP: ENABLED" in out
+    assert "195.5 °C" in out
+    # Loop OFF: its line stays quiet. Swapped caller wiring fails both checks.
+    assert "post-FC RoR loop: disabled" in out
+    assert "POST-FC RoR LOOP: ENABLED" not in out
+
+
 @pytest.mark.asyncio
 async def test_emit_advisor_readout_records_health_and_prints(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]

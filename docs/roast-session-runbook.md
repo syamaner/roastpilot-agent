@@ -24,8 +24,8 @@
 
 ## Roast 2 — D88 ON (validation)
 1. `POST_FC_LOOP=1 CEILING_GUARD=1 ./scripts/roast-live.sh`
-2. **CONFIRM the banner shows BOTH loud lines** — `⚠️ POST-FC RoR LOOP: ENABLED`
-   AND `⚠️ CEILING-GUARD DROP: ENABLED (… ≥ 196 °C)`. The flags are independent;
+2. **CONFIRM the banner shows BOTH loud lines** — `⚠️  POST-FC RoR LOOP: ENABLED`
+   AND `⚠️  CEILING-GUARD DROP: ENABLED (… ≥ 196 °C)`. The flags are independent;
    each must be confirmed on its own. If either is missing, stop and fix before
    charging.
 3. Quick preflight → charge → watch especially the **post-FC heat behaviour**:
