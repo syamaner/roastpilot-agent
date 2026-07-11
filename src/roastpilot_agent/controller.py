@@ -2632,11 +2632,11 @@ class RoastController:
         # DEVELOPMENT falls through to the advisor path below exactly as it
         # did before this slice (the pre-B2 fallback), matching the loop's own
         # non-actuation on that edge (``_apply_deterministic_post_fc_levers``).
-        post_fc_loop_active = (
-            self._config.post_first_crack_control.enabled
-            and self._phase is RoastPhase.DEVELOPMENT
-            and self._post_fc_engaged
-        )
+        # #497: shared with :meth:`_build_advisor_context` (via
+        # :meth:`_post_fc_loop_active`) so the flag the model was TOLD matches
+        # the actuation decision made here by construction, not by two
+        # expressions that happen to agree.
+        post_fc_loop_active = self._post_fc_loop_active()
         if (
             not post_fc_loop_active
             and evaluation.verdict in (SafetyVerdict.ALLOW, SafetyVerdict.CLAMP)
@@ -3744,6 +3744,30 @@ class RoastController:
             return None
         return percent / 100.0
 
+    def _post_fc_loop_active(self) -> bool:
+        """Whether the deterministic post-FC RoR loop currently OWNS heat (#497/D89).
+
+        ``True`` iff the taper flag is on, the current phase is DEVELOPMENT, and
+        this DEVELOPMENT dwell was entered via the true FC edge
+        (``self._post_fc_engaged`` — never an operator resume, which leaves the
+        loop inert and the advisor driving post-FC heat instead, see
+        :meth:`_apply_deterministic_post_fc_levers`). This is the SAME predicate
+        :meth:`_run_advisory` already used inline (as ``post_fc_loop_active``)
+        to decide whether to actuate the advisor's levers; extracted here so
+        :meth:`_build_advisor_context` can tell the model the same thing it
+        acts on, rather than recomputing an equivalent expression that could
+        drift out of sync (#497 — the advisor was blind to the loop owning
+        heat and reasoned from an imagined heat-0).
+
+        Returns:
+            ``True`` when the PI loop is actuating DEVELOPMENT heat this tick.
+        """
+        return (
+            self._config.post_first_crack_control.enabled
+            and self._phase is RoastPhase.DEVELOPMENT
+            and self._post_fc_engaged
+        )
+
     def _build_advisor_context(
         self, telemetry: RoastTelemetry, limits: PhaseControlLimits
     ) -> AdvisorContext:
@@ -3803,6 +3827,26 @@ class RoastController:
             decision_trace=self._history.decision_trace(),
             development_time_ratio=self._development_time_ratio(),
             first_crack_eta_seconds=self._first_crack_eta_seconds(),
+            # #497 (D89 Tier 1): the ACTUATED heat/fan, never the advisor's own
+            # prior recommendation — ``self._current_heat``/``self._current_fan``
+            # are the SAME actuated-output fields the told==enforced safety box
+            # is built from (#412), updated only after a write reaches the
+            # roaster (evaluation.adjusted_heat/adjusted_fan). Before this the
+            # model had no visibility into whether its last recommendation
+            # actually landed, so in post-FC loop mode (where the deterministic
+            # taper owns heat, #405/D88) it reasoned from an imagined heat-0
+            # instead of the taper's real value (evidence: the 11 Jul validation
+            # roast, actuated heat pinned at 65 % by the taper, advisor rationale
+            # claimed "heat is already at its minimum").
+            current_heat_percent=self._current_heat,
+            current_fan_percent=self._current_fan,
+            # Loop-mode signal: True iff the deterministic post-FC PI loop is
+            # actuating DEVELOPMENT heat THIS tick (see
+            # :meth:`_post_fc_loop_active`) — the SAME predicate
+            # :meth:`_run_advisory` uses to decide whether to actuate the
+            # advisor's own heat/fan recommendation. Tells the model its heat
+            # number is advisory-only in that case (c1 prompt teaching, #497).
+            post_fc_loop_active=self._post_fc_loop_active(),
         )
 
     def _seconds_since_last_command(self) -> float | None:

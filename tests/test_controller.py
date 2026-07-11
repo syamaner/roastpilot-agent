@@ -4182,6 +4182,119 @@ async def test_advisor_charge_clock_resets_on_new_run() -> None:
     assert ctx.roast_elapsed_seconds == 0.0
 
 
+# --- #497 (D89 Tier 1): the advisor context carries the ACTUATED heat/fan
+# (never the advisor's own requested values) plus a loop-mode flag, so the
+# model knows what is really actuating instead of assuming its last
+# recommendation applied.
+
+
+@pytest.mark.asyncio
+async def test_advisor_context_carries_actuated_heat_fan_baseline_mode() -> None:
+    """Baseline (post-FC loop flag off / not engaged): ``current_heat_percent``/
+    ``current_fan_percent`` mirror the controller's actuated-output tracking
+    (``_current_heat``/``_current_fan``) — the SAME fields the told==enforced
+    safety box is built from (#412) — and ``post_fc_loop_active`` is False."""
+    advisor = FakeAdvisor([decision(heat=65, fan=50)])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    ctx = advisor.contexts[-1]
+    # harness_in_development bare-transitions (no ticked pre-FC actuation), so
+    # the actuated levers are still the __init__ zero state going INTO this tick.
+    assert ctx.current_heat_percent == 0
+    assert ctx.current_fan_percent == 0
+    assert ctx.post_fc_loop_active is False
+    # And the actuated state afterward matches this tick's write.
+    assert harness.controller.snapshot().current_heat == 65
+    assert harness.controller.snapshot().current_fan == 50
+
+
+@pytest.mark.asyncio
+async def test_advisor_context_actuated_heat_reflects_prior_write_not_this_ticks_request() -> None:
+    """The context built THIS tick reports the PRIOR tick's actuated value —
+    not the advisor's request for the tick under construction, and not a
+    number the model is merely assumed to have caused. Two sequential
+    consults with distinct requested levers pin the field to the real,
+    already-landed lever state (the #412 told-vs-requested distinction #497
+    depends on), rather than to whatever the advisor is about to ask for."""
+    advisor = FakeAdvisor([decision(heat=65, fan=50), decision(heat=99, fan=20)])
+    harness = harness_in_development(readings=[reading(), reading()], advisor=advisor)
+    harness.controller.request_advisory()
+    await harness.controller.tick()  # heat=65/fan=50 requested and actuated
+    assert harness.controller.snapshot().current_heat == 65
+    assert harness.controller.snapshot().current_fan == 50
+    harness.clock.advance(5.0)  # well past the command rate-limit window
+    harness.controller.request_advisory()
+    await harness.controller.tick()  # this tick's OWN request is heat=99/fan=20
+    ctx = advisor.contexts[-1]
+    # The context built for THIS call still reports the PRIOR tick's actuated
+    # 65/50 — never this tick's own not-yet-actuated 99/20 request.
+    assert ctx.current_heat_percent == 65
+    assert ctx.current_fan_percent == 50
+    assert harness.controller.snapshot().current_heat == 99  # now actuated post-tick
+
+
+@pytest.mark.asyncio
+async def test_advisor_context_post_fc_loop_active_true_when_taper_owns_heat() -> None:
+    """Flag ON + true FC edge: ``post_fc_loop_active`` is True and
+    ``current_heat_percent``/``current_fan_percent`` report the TAPER'S
+    actuated values, never the advisor's own (traced-but-not-actuated)
+    recommendation — the exact #497 evidence (11 Jul validation roast: actuated
+    heat pinned at 65 % by the taper, advisor reasoned as if heat were 0)."""
+    config = _post_fc_config(fan_percent=45, control_interval_seconds=5.0)
+    advisor = FakeAdvisor([decision(heat=99, fan=10)], default_decision=decision(heat=99, fan=10))
+    harness = make_harness(config=config, advisor=advisor)
+    await _charge_through_fc(harness)
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    ctx = advisor.contexts[-1]
+    assert ctx.post_fc_loop_active is True
+    # The taper held the bumpless handoff value (100), fan pinned to 45 — NOT
+    # the advisor's traced 99/10 recommendation.
+    assert ctx.current_heat_percent == 100
+    assert ctx.current_fan_percent == 45
+
+
+@pytest.mark.asyncio
+async def test_advisor_context_post_fc_loop_active_false_on_operator_resume() -> None:
+    """Flag ON but reached DEVELOPMENT via an operator resume (no true FC edge):
+    ``_post_fc_engaged`` is False, so the loop is inert and
+    ``post_fc_loop_active`` must read False — the advisor resumes driving
+    post-FC heat/fan directly (the pre-B2 fallback), so it must be told its
+    numbers ARE the actuated levers in that regime."""
+    config = _post_fc_config()
+    advisor = FakeAdvisor([decision(heat=61, fan=52)], default_decision=decision(heat=61, fan=52))
+    harness = make_harness(config=config, advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    await harness.controller.recover_from_restart(RoastPhase.DEVELOPMENT)
+    harness.controller.operator_resume(RoastPhase.DEVELOPMENT)
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=5.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    ctx = advisor.contexts[-1]
+    assert ctx.post_fc_loop_active is False
+
+
+def test_post_fc_loop_active_helper_matches_run_advisory_gate() -> None:
+    """:meth:`RoastController._post_fc_loop_active` is the single source the
+    context-builder and the advisor-actuation gate in ``_run_advisory`` both
+    read — a regression guard against the two re-diverging into independently
+    maintained (and driftable) boolean expressions."""
+    config = _post_fc_config()
+    harness = make_harness(config=config)
+    harness.controller.load_profile(PROFILE)
+    assert harness.controller._post_fc_loop_active() is False  # pyright: ignore[reportPrivateUsage]
+    harness.controller._post_fc_engaged = True  # pyright: ignore[reportPrivateUsage]
+    harness.controller.transition_to(RoastPhase.STARTING)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    harness.controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    harness.controller._post_fc_engaged = True  # pyright: ignore[reportPrivateUsage]
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    assert harness.controller._post_fc_loop_active() is True  # pyright: ignore[reportPrivateUsage]
+
+
 # --- #220: the snapshot surfaces development time + DTR for the live readouts.
 # Read-only projections of the already-computed advisor clocks; charge-referenced
 # DTR, NOT a chart re-origin (the snapshot roast clock above stays run-referenced).
