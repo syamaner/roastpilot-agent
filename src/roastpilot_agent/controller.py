@@ -3965,6 +3965,22 @@ class RoastController:
             # advisor's own heat/fan recommendation. Tells the model its heat
             # number is advisory-only in that case (c1 prompt teaching, #497).
             post_fc_loop_active=self._post_fc_loop_active(),
+            # #499 (D89 Tier 1): the acceptable DTR window around the
+            # profile's own authoritative target_development_percent, built
+            # from the SAME self._config.drop_dev_margin_percent the
+            # deterministic drop-coherence guard reads (never a copied
+            # constant — told == enforced applied to a margin, #273/#412
+            # discipline extended to a tolerance value). roast_style is
+            # surfaced as qualitative INTENT ONLY (never its reference
+            # numbers) — D84's explicit-wins precedence is unchanged; the c1
+            # prompt states this explicitly.
+            target_development_percent_min=(
+                self._profile.target_development_percent - self._config.drop_dev_margin_percent
+            ),
+            target_development_percent_max=(
+                self._profile.target_development_percent + self._config.drop_dev_margin_percent
+            ),
+            roast_style=self._profile.roast_style,
         )
 
     def _seconds_since_last_command(self) -> float | None:

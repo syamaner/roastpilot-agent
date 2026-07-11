@@ -35,7 +35,7 @@ from pydantic_ai import (
 from pydantic_ai.models import Model
 
 from roastpilot_agent.config import AdvisorConfig
-from roastpilot_agent.models import AdvisorHealth, AdvisorHealthStatus, RoastPhase
+from roastpilot_agent.models import AdvisorHealth, AdvisorHealthStatus, RoastPhase, RoastStyle
 from roastpilot_agent.roast_history import (
     DecisionTraceEntry,
     RoastCurveSample,
@@ -128,6 +128,18 @@ class AdvisorContext(BaseModel):
     traced but never actuated. Both are read-only context with no control
     authority; default ``None``/``False`` for callers that build no controller
     (older callers, the drop-only bake-off).
+
+    ``target_development_percent_min`` / ``_max`` (#499, D89 Tier 1) give the
+    advisor an acceptable DEVELOPMENT-RATIO WINDOW around
+    ``target_development_percent`` instead of a bare point, computed from the
+    SAME ``drop_dev_margin_percent`` the deterministic drop-coherence guard
+    reads (never a copied constant). ``roast_style`` surfaces the profile's
+    qualitative style (light/medium/dark) as INTENT ONLY — never its reference
+    numbers, which never override the profile's own authoritative explicit
+    targets (D84 held). All three are read-only context with no control
+    authority; the deterministic drop anchor and the 196 °C ceiling guard are
+    unchanged by this story. Default ``None`` for callers that build no
+    profile (older callers, the drop-only bake-off).
     """
 
     phase: RoastPhase
@@ -217,6 +229,37 @@ class AdvisorContext(BaseModel):
     # a context built without the post-FC loop (pre-FC phases, flag-off roasts,
     # older callers) reads as the byte-for-byte pre-#497 regime.
     post_fc_loop_active: bool = False
+    # #499 (D89 Tier 1): the acceptable DEVELOPMENT-RATIO WINDOW around
+    # ``target_development_percent`` — ``[target - drop_dev_margin_percent,
+    # target + drop_dev_margin_percent]``, computed by the controller from the
+    # SAME ``config.drop_dev_margin_percent`` the deterministic drop-coherence
+    # guard reads (never a second/copied constant — the told==enforced
+    # pattern applied to a margin, so the tolerance the model reasons with and
+    # the tolerance the deterministic layer enforces can never drift). Fixes
+    # the 11 Jul "first-past-the-post" evidence (#499): roast 11 dropped the
+    # instant DTR hit its single point target, 5 °C short of the drop-temp
+    # target — a window (paired with the c1 joint-objective teaching) gives
+    # the model room to hold a little past the window's low edge while
+    # temperature closes the gap, rather than reading the bare point target
+    # as the finish line. Read-only context with no control authority — the
+    # deterministic drop anchor and the 196 °C ceiling guard are UNCHANGED by
+    # this field (D89: those paths stay exactly as they are). ``None`` when
+    # the context is built without a profile (older callers, the drop-only
+    # bake-off).
+    target_development_percent_min: float | None = None
+    target_development_percent_max: float | None = None
+    # #499 (D89 Tier 1): the profile's qualitative roast-style NAME (e.g.
+    # ``RoastStyle.MEDIUM``), surfaced as INTENT ONLY — never the style's own
+    # reference numbers (:data:`~roastpilot_agent.models.ROAST_STYLE_TARGETS`),
+    # which could contradict the profile's authoritative explicit
+    # ``target_drop_temp_c``/``target_development_percent`` and recreate the
+    # exact confusion #499 exists to fix (D84's explicit-wins precedence is
+    # UNCHANGED — this field never overrides it, and the c1 prompt says so
+    # explicitly). A plain ``Enum`` (D15), matching ``phase: RoastPhase``
+    # above — never string-compared in core logic. ``None`` when the profile
+    # carries no style (pre-#405 profiles) or the context is built without a
+    # profile.
+    roast_style: RoastStyle | None = None
 
 
 class RoastDecision(BaseModel):
@@ -997,9 +1040,48 @@ _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
         "toward the development target; avoid both a crash (RoR diving) and a "
         "flick (RoR kicking back up). Coordinate heat and fan. Decisive moves "
         "are correct here when the reading calls for one. Recommend the DROP "
-        "when bean temperature and DTR are in the target window from the "
-        "context and below the indicated bitter ceiling - a general window, not "
-        "a fixed number; the live limits carry the threshold.\n"
+        "for the JOINT objective below (bean temperature AND development "
+        "ratio together), not the moment either arrives alone.\n"
+        "\n"
+        "THE DROP - A JOINT OBJECTIVE, NOT FIRST-PAST-THE-POST\n"
+        "- The context gives you TWO separate drop-relevant numbers, each with "
+        "its OWN meaning - do not conflate them or substitute one for the "
+        "other in your rationale: target_drop_temp_c is the bean-temperature "
+        "TARGET this roast is aiming for; the indicated bitter/emergency "
+        "ceiling is the HARD upper bound past which the roast turns bitter or "
+        "must be stopped regardless of development. They are DIFFERENT "
+        "numbers for a reason - name each correctly when you refer to it.\n"
+        "- Your goal is to satisfy BOTH the bean-temperature target AND the "
+        "development-ratio target TOGETHER, not to drop the instant either one "
+        "arrives alone. Treat whichever number you hit FIRST as a signal to "
+        "keep steering toward the other, not as the finish line: if "
+        "temperature reaches its target while development is still short, "
+        "hold (do not drop on temperature alone) and let development close "
+        "the gap; if development reaches its target while temperature is "
+        "still short, hold (do not drop on development alone) and let "
+        "temperature close the gap.\n"
+        "- A MODEST OVERSHOOT of one target while closing the other is "
+        "PREFERRED to an early, one-sided drop. Running a little past the "
+        "development target while temperature catches up, or a little past "
+        "the temperature target while development catches up, is the "
+        "correct, patient call - so long as you stay below the indicated "
+        "bitter/emergency ceiling, which is the one number you must never "
+        "cross while waiting.\n"
+        "- The context gives you the acceptable development window around "
+        "your DTR target - the range you may reason inside while pursuing "
+        "the joint objective. Treat the window's edges as JUDGMENT SPACE (a "
+        "little under is fine while temperature closes the gap; a little "
+        "over is fine while development closes it), and treat the bitter/"
+        "emergency ceiling as LAW (never crossed, never a matter of "
+        "judgment). If the context also names a qualitative roast style "
+        "(e.g. light / medium / dark), read it only as INTENT about the "
+        "kind of roast this is - it never overrides the profile's own "
+        "explicit temperature/DTR targets, which stay authoritative.\n"
+        "- Recommend the drop once BOTH targets are satisfied together, OR "
+        "the moment the indicated ceiling forces the call (approaching or at "
+        "the ceiling with either target still short) - the ceiling always "
+        "wins over waiting for the other target. Outside of a ceiling-forced "
+        "call, do not let either target alone talk you into dropping early.\n"
         "\n"
         "LEVER STABILITY - MOVE LIKE A ROASTER, NOT A THERMOSTAT\n"
         "- The FAN is a COARSE lever. A roaster SETS it deliberately at a few "
