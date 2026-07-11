@@ -699,7 +699,10 @@ def test_format_advisor_readout_not_configured() -> None:
 
 
 def test_format_post_fc_loop_readout_enabled() -> None:
-    """Loop enabled prints a can't-miss ⚠️ line naming #405 (issue #460)."""
+    """Loop enabled prints a can't-miss ⚠️ line naming #405 (issue #460), and
+    (#498/D89) is explicit that the division is heat-deterministic/fan-advisor
+    — never implies fan is ALSO pinned/deterministic, which would misdescribe
+    the current actuation split to the operator."""
     lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
         enabled=True, ceiling_guard_enabled=False, ceiling_guard_temp_c=196.0
     )
@@ -707,6 +710,8 @@ def test_format_post_fc_loop_readout_enabled() -> None:
     assert "⚠️" in text
     assert "POST-FC RoR LOOP: ENABLED" in text
     assert "#405" in text
+    assert "#498" in text
+    assert "advisor owns fan" in text
 
 
 def test_format_post_fc_loop_readout_disabled() -> None:

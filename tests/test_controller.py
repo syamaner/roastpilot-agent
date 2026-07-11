@@ -4236,24 +4236,42 @@ async def test_advisor_context_actuated_heat_reflects_prior_write_not_this_ticks
 
 @pytest.mark.asyncio
 async def test_advisor_context_post_fc_loop_active_true_when_taper_owns_heat() -> None:
-    """Flag ON + true FC edge: ``post_fc_loop_active`` is True and
-    ``current_heat_percent``/``current_fan_percent`` report the TAPER'S
-    actuated values, never the advisor's own (traced-but-not-actuated)
-    recommendation — the exact #497 evidence (11 Jul validation roast: actuated
-    heat pinned at 65 % by the taper, advisor reasoned as if heat were 0)."""
-    config = _post_fc_config(fan_percent=45, control_interval_seconds=5.0)
-    advisor = FakeAdvisor([decision(heat=99, fan=10)], default_decision=decision(heat=99, fan=10))
+    """Flag ON + true FC edge: ``post_fc_loop_active`` is True,
+    ``current_heat_percent`` reports the TAPER'S actuated value (never the
+    advisor's own traced-but-not-actuated heat recommendation), and
+    ``current_fan_percent`` reports the advisor's OWN actuated fan (#498:
+    fan is the advisor's lever in loop mode, revising D88(5)'s pinned fan) —
+    the #497 evidence (11 Jul validation roast: actuated heat pinned at 65 %
+    by the taper, advisor reasoned as if heat were 0)."""
+    config = _post_fc_config(control_interval_seconds=5.0)
+    # Two scripted decisions: the FC-edge tick itself already consults the
+    # advisor in loop mode (fan=60 actuates immediately), so a SECOND, distinct
+    # decision on the tick under test proves the context reports THIS tick's
+    # real actuated fan, not a value left over from FC-edge engagement.
+    advisor = FakeAdvisor(
+        [decision(heat=50, fan=60), decision(heat=99, fan=85)],
+        default_decision=decision(heat=99, fan=85),
+    )
     harness = make_harness(config=config, advisor=advisor)
     await _charge_through_fc(harness)
+    assert harness.controller.snapshot().current_fan == 60  # the FC-edge tick's fan actuation
+    harness.clock.advance(5.0)  # past the command rate-limit + post-FC control cadence
     harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
     harness.controller.request_advisory()
     await harness.controller.tick()
     ctx = advisor.contexts[-1]
     assert ctx.post_fc_loop_active is True
-    # The taper held the bumpless handoff value (100), fan pinned to 45 — NOT
-    # the advisor's traced 99/10 recommendation.
+    # The taper held the bumpless handoff value (100) going into this tick —
+    # NOT the advisor's traced 99 heat recommendation.
     assert ctx.current_heat_percent == 100
-    assert ctx.current_fan_percent == 45
+    # Fan going INTO this tick is the PRIOR tick's actuated value (60, the
+    # FC-edge decision) — never the pinned config value (retired by #498).
+    assert ctx.current_fan_percent == 60
+    # And after this tick, the advisor's fan (85) is now actuated while heat
+    # stays exactly at the taper's value.
+    assert harness.executor.targets == [(100, 85)]
+    assert harness.controller.snapshot().current_heat == 100
+    assert harness.controller.snapshot().current_fan == 85
 
 
 @pytest.mark.asyncio
@@ -5837,14 +5855,22 @@ async def test_post_fc_loop_flag_off_is_byte_for_byte_unchanged() -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_fc_loop_enabled_actuates_heat_and_pins_fan_advisor_not_actuated() -> None:
-    """Flag ON, DEVELOPMENT: the PI loop writes heat, fan is pinned to
-    ``fan_percent``, and the advisor's levers are NOT actuated (the loop owns
-    heat, fan is deterministically pinned so the advisor cannot fight it)."""
-    config = _post_fc_config(fan_percent=45, control_interval_seconds=5.0)
-    advisor = FakeAdvisor([decision(heat=99, fan=10)], default_decision=decision(heat=99, fan=10))
+async def test_post_fc_loop_enabled_actuates_heat_deterministically_fan_from_advisor() -> None:
+    """Flag ON, DEVELOPMENT: the PI loop drives heat deterministically (the
+    advisor's heat recommendation is traced but never actuated); the advisor's
+    FAN recommendation DOES actuate (#498, D89 Tier 1 — revises D88(5)'s
+    pinned fan: fan is the advisor's lever in loop mode, same as baseline, both
+    still through the same safety path)."""
+    config = _post_fc_config(control_interval_seconds=5.0)
+    # The FC-edge tick inside _charge_through_fc already consults the advisor
+    # once in loop mode (its first scripted decision, fan=30, actuates
+    # immediately) — a second, distinct fan value on the tick under test proves
+    # THIS tick's advisor fan is what lands, not a stale FC-edge value.
+    advisor = FakeAdvisor([decision(heat=50, fan=30)], default_decision=decision(heat=99, fan=10))
     harness = make_harness(config=config, advisor=advisor)
     await _charge_through_fc(harness)
+    assert harness.controller.snapshot().current_fan == 30  # the FC-edge tick's fan actuation
+    harness.clock.advance(5.0)  # past the command rate-limit + post-FC control cadence
     harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
     harness.controller.request_advisory()
     await harness.controller.tick()
@@ -5854,13 +5880,101 @@ async def test_post_fc_loop_enabled_actuates_heat_and_pins_fan_advisor_not_actua
     # also where r0 floors — the taper setpoint is flat at 4.0. Feeding that
     # same 4.0 back in here gives zero error, so heat=100 is the seeded
     # handoff value held exactly (effective_ceiling is 100, so nothing clamps
-    # it down either), fan pinned 45.
-    assert harness.executor.targets == [(100, 45)]
-    assert harness.controller.snapshot().current_fan == 45
-    # The advisor WAS consulted (still traced) but its 99/10 recommendation was
-    # never actuated — the loop's write is the only one on the wire.
-    assert advisor.contexts, "the advisor is still consulted (traced, not actuated)"
+    # it down either) — the advisor's 99 never lands. Fan actuates the
+    # advisor's OWN 10 (a decisive move from 30, not damped).
+    assert harness.executor.targets == [(100, 10)]
+    assert harness.controller.snapshot().current_heat == 100
+    assert harness.controller.snapshot().current_fan == 10
+    # The advisor WAS consulted (still traced), and only its heat recommendation
+    # (99) never actuated — the write on the wire carries the loop's heat and
+    # the advisor's own fan, never the advisor's 99.
+    assert advisor.contexts, "the advisor is still consulted (traced)"
     assert (99, 10) not in harness.executor.targets
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_enabled_fan_clamp_actuates_clamped_value_heat_still_holds() -> None:
+    """#498: a loop-mode fan CLAMP actuates the CLAMPED value (never the raw
+    request) and records a CLAMP verdict — the SAME safety path as baseline —
+    while heat still holds at the taper's value regardless of the clamp.
+
+    DEVELOPMENT's phase box is [0, 100] for both levers with no config knob to
+    narrow it (control_policy.py), so a fan CLAMP is manufactured the same way
+    the #273 told==enforced proof does it for the pre-FC box
+    (``test_pre_fc_deterministic_box_told_equals_enforced``): resolve the real
+    box, narrow ONLY fan_ceiling_percent, and have the controller hand that box
+    to both the advisor context and the gate for this one consult."""
+    config = _post_fc_config(control_interval_seconds=5.0)
+    advisor = FakeAdvisor([decision(heat=50, fan=30)], default_decision=decision(heat=99, fan=95))
+    harness = make_harness(config=config, advisor=advisor)
+    await _charge_through_fc(harness)
+    assert harness.controller.snapshot().current_fan == 30  # the FC-edge tick's fan actuation
+    narrowed_box = harness.controller._control_limits().model_copy(  # pyright: ignore[reportPrivateUsage]
+        update={"fan_ceiling_percent": 70}
+    )
+    harness.controller._control_limits = lambda *a, **k: narrowed_box  # type: ignore[method-assign] # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    harness.clock.advance(5.0)  # past the command rate-limit + post-FC control cadence
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    command_evals = [
+        e for e in harness.sink.evaluations if e.rule in ("all_clear", "command_bounds")
+    ]
+    assert command_evals[-1].verdict is SafetyVerdict.CLAMP
+    assert command_evals[-1].adjusted_fan == 70  # the CLAMPED value, never the raw 95
+    # The clamped fan is what actually reaches the roaster — heat holds at the
+    # taper's value (100) regardless of the fan clamp.
+    assert harness.executor.targets == [(100, 70)]
+    assert harness.controller.snapshot().current_heat == 100
+    assert harness.controller.snapshot().current_fan == 70
+
+
+@pytest.mark.asyncio
+async def test_post_fc_loop_heat_never_actuates_even_when_fan_does_same_decision() -> None:
+    """#498, isolated minimal case: ONE advisor decision recommending a drastic
+    heat cut (1 %) alongside a drastic fan cut (1 %) — heat must NEVER land
+    (the taper's bumpless-handoff value, 100, is the only thing on the wire for
+    heat) while fan DOES land at the advisor's own 1 %, in that SAME decision.
+    Proves the split is per-lever within one consult, not merely across ticks."""
+    config = _post_fc_config(control_interval_seconds=5.0)
+    advisor = FakeAdvisor([decision(heat=1, fan=1)], default_decision=decision(heat=1, fan=1))
+    harness = make_harness(config=config, advisor=advisor)
+    await _charge_through_fc(harness)  # the FC-edge tick IS this one decision
+    assert harness.controller.snapshot().current_heat == 100  # never the advisor's 1
+    assert harness.controller.snapshot().current_fan == 1  # the advisor's own fan lands
+
+
+async def _post_fc_heat_trajectory(fan_script: list[int]) -> list[int]:
+    """Drive 3 post-FC ticks with rising RoR (so the taper's heat genuinely
+    moves) while the advisor's fan recommendation follows ``fan_script`` —
+    a helper for the #498 heat/fan-decoupling equivalence test below."""
+    config = _post_fc_config(ror_smoothing_alpha=1.0, control_interval_seconds=5.0)
+    decisions = [decision(heat=50, fan=f) for f in fan_script]
+    advisor = FakeAdvisor(decisions, default_decision=decisions[-1])
+    harness = make_harness(config=config, advisor=advisor)
+    await _charge_through_fc(harness, fc_ror_c_per_min=6.1)
+    heats = [harness.controller.snapshot().current_heat]
+    for ror in (9.0, 9.5, 10.0):
+        harness.clock.advance(5.0)  # past the command rate-limit + control cadence
+        harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=ror)]
+        harness.controller.request_advisory()
+        await harness.controller.tick()
+        heats.append(harness.controller.snapshot().current_heat)
+    return heats
+
+
+@pytest.mark.asyncio
+async def test_post_fc_taper_heat_trajectory_unaffected_by_advisor_fan_swings() -> None:
+    """#498: the taper's heat trajectory is IDENTICAL whether the advisor's fan
+    recommendation swings wildly tick to tick or stays constant — the PI loop
+    computes heat purely from measured RoR (``PostFcRorController.compute``
+    takes no fan input at all), so a concurrent advisor fan write can
+    structurally never perturb it. A real, MOVING heat trajectory (not a flat
+    100) makes this equivalence load-bearing rather than vacuous."""
+    varying_fan = await _post_fc_heat_trajectory([10, 90, 20])
+    constant_fan = await _post_fc_heat_trajectory([55, 55, 55])
+    assert varying_fan == constant_fan
+    assert len(set(varying_fan)) > 1, "the heat trajectory must actually move to be meaningful"
 
 
 @pytest.mark.asyncio

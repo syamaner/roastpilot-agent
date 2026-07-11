@@ -444,13 +444,18 @@ class PostFirstCrackControl(BaseModel):
     #: EFFECTIVE ceiling to the heat the roast held at FC engagement whenever
     #: that is lower than this static value.
     heat_ceiling_percent: int = Field(default=100, ge=1, le=100)
-    #: The deterministic post-FC fan level (percentage). D83 call (6): when the
-    #: loop is enabled the controller pins fan to this single config value
-    #: post-FC — the advisor's fan output is IGNORED — because the roast-7
-    #: over-brake was heat AND fan (fan ramped 50→100 as heat cut to 0); a
-    #: heat-only fix that left the advisor's fan free to oppose the loop would
-    #: reintroduce the same thrash. Default 40 — a moderate post-FC airflow,
-    #: conservative pending hardware tuning.
+    #: **VESTIGIAL as of #498 (D89 Tier 1) — no longer read by the controller.**
+    #: D83 call (6) originally had the loop pin fan to this single config value
+    #: post-FC (the advisor's fan output IGNORED), because the roast-7
+    #: over-brake was heat AND fan moving together. The 11 Jul validation A/B
+    #: showed the pin wastes a second brake lever the advisor's judgment can
+    #: use well (D89: "fan returns to the advisor as an ACTUATED lever in loop
+    #: mode"), so the controller's own post-FC write now HOLDS fan at its
+    #: current actuated value instead of re-asserting this field — fan is the
+    #: advisor's lever in loop mode, same as baseline, still through the same
+    #: safety path. Kept (not removed) so an existing config file/env var
+    #: setting it does not fail validation; a follow-up may retire the field
+    #: outright once the config-UI surface is updated to match.
     fan_percent: int = Field(default=40, ge=0, le=100)
     #: The control-loop cadence in seconds. Default 5.0 — matches
     #: ``ControllerConfig.post_fc_min_consult_interval_seconds`` and the D36
