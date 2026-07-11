@@ -1043,14 +1043,31 @@ _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
         "for the JOINT objective below (bean temperature AND development "
         "ratio together), not the moment either arrives alone.\n"
         "\n"
+        # Safety-reviewer LOW (#499 Codex follow-up): an earlier draft claimed
+        # the bitter ceiling is "never below the target" — false whenever
+        # target_drop_temp_c is ABOVE the hard bitter ceiling (an unbounded
+        # profile field; RoastControlPolicy._bitter_ceiling_temp_c() only
+        # caps DOWNWARD, `min(hard_ceiling, target)`, so a high-target profile
+        # gets bitter_ceiling_temp_c BELOW its own target — see
+        # test_c1_joint_drop_section_makes_no_false_ceiling_ordering_for_a_
+        # high_target_profile, which renders the real box for a 205 °C-target
+        # profile against the 196 °C default hard ceiling). The text below
+        # makes NO relational (never-below / never-above) claim between the
+        # target and the ceiling for exactly this reason — only that they can
+        # coincide, and that the ceiling is always the law regardless.
         "THE DROP - A JOINT OBJECTIVE, NOT FIRST-PAST-THE-POST\n"
-        "- The context gives you TWO separate drop-relevant numbers, each with "
-        "its OWN meaning - do not conflate them or substitute one for the "
-        "other in your rationale: target_drop_temp_c is the bean-temperature "
-        "TARGET this roast is aiming for; the indicated bitter/emergency "
-        "ceiling is the HARD upper bound past which the roast turns bitter or "
-        "must be stopped regardless of development. They are DIFFERENT "
-        "numbers for a reason - name each correctly when you refer to it.\n"
+        "- The context gives you drop-relevant numbers with DIFFERENT "
+        "MEANINGS - do not conflate them or substitute one for the other in "
+        "your rationale, even when two of them happen to share the same "
+        "value: target_drop_temp_c is the bean-temperature TARGET this roast "
+        "is aiming for; the indicated bitter ceiling is the roast's upper "
+        "drop bound - on some profiles it EQUALS the target exactly, and it "
+        "is still the LAW there, never a separate looser number; the "
+        "emergency-drop bound is a further, always-HIGHER hard stop past "
+        "which the roast must be dropped regardless of development. Name "
+        "each correctly when you refer to it - never assume the target and "
+        "the ceiling must differ, and never call one by the other's "
+        "meaning.\n"
         "- Your goal is to satisfy BOTH the bean-temperature target AND the "
         "development-ratio target TOGETHER, not to drop the instant either one "
         "arrives alone. Treat whichever number you hit FIRST as a signal to "
@@ -1070,13 +1087,14 @@ _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
         "- The context gives you the acceptable development window around "
         "your DTR target - the range you may reason inside while pursuing "
         "the joint objective. Treat the window's edges as JUDGMENT SPACE (a "
-        "little under is fine while temperature closes the gap; a little "
-        "over is fine while development closes it), and treat the bitter/"
-        "emergency ceiling as LAW (never crossed, never a matter of "
-        "judgment). If the context also names a qualitative roast style "
-        "(e.g. light / medium / dark), read it only as INTENT about the "
-        "kind of roast this is - it never overrides the profile's own "
-        "explicit temperature/DTR targets, which stay authoritative.\n"
+        "little under the window is fine while DEVELOPMENT itself is still "
+        "the gap closing; a little over the window is fine while TEMPERATURE "
+        "is the gap still closing), and treat the bitter/emergency ceiling "
+        "as LAW (never crossed, never a matter of judgment). If the context "
+        "also names a qualitative roast style (e.g. light / medium / dark), "
+        "read it only as INTENT about the kind of roast this is - it never "
+        "overrides the profile's own explicit temperature/DTR targets, "
+        "which stay authoritative.\n"
         "- Recommend the drop once BOTH targets are satisfied together, OR "
         "the moment the indicated ceiling forces the call (approaching or at "
         "the ceiling with either target still short) - the ceiling always "
@@ -1140,11 +1158,13 @@ _C2_DEVELOPMENT_STRETCH_SECTION = (
     "development time and DTR still short of target. If development is behind the "
     "target with bean temperature near the ceiling, you have cut heat too little, "
     "too late - cut it further now rather than accept an under-developed drop.\n"
-    "- NEVER overshoot the drop target. The indicated drop / bitter ceiling in "
-    "the context is the LATEST acceptable drop, not a goal to push past; crossing "
-    "it tips the roast dark and bitter. If the bean is at the ceiling and "
+    "- NEVER cross the indicated bitter ceiling. It is the LAW - never a goal to "
+    "push past, and never a matter of judgment the way the temperature/DTR "
+    "targets are (see THE DROP section: a modest overshoot of ONE of those "
+    "targets, while closing the other, is the correct patient call - it is only "
+    "the ceiling that must never be crossed). If the bean is at the ceiling and "
     "development is at target, recommend the DROP - do not hold for a few more "
-    "seconds of development at the cost of going over.\n"
+    "seconds of development at the cost of crossing it.\n"
     "\n"
 )
 _CONTROL_TEACHING_PROMPTS["c2"] = _CONTROL_TEACHING_PROMPTS["c1"].replace(

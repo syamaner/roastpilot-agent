@@ -814,14 +814,61 @@ def test_c1_joint_drop_section_distinguishes_drop_target_from_bitter_ceiling() -
     """#499: roast 2's final rationale conflated the drop target with the
     bitter ceiling (called it "195" when the profile's drop target was 195
     and the bitter ceiling was 196) — the prompt must explicitly teach the
-    model these are two DIFFERENT numbers, never interchangeable."""
+    model these are DIFFERENT MEANINGS, never interchangeable.
+
+    Codex P2 follow-up: ``RoastControlPolicy._bitter_ceiling_temp_c`` CAPS the
+    told ceiling at the profile's ``target_drop_temp_c`` when that target is
+    lower than the hard bitter ceiling — so the two numbers can legitimately
+    be numerically EQUAL. The teaching must not claim they always differ (a
+    false claim that would recreate the confusion); it must teach that the
+    MEANING differs regardless of whether the values happen to coincide, and
+    anchor the always-distinct claim to the emergency-drop bound instead."""
     prompt = control_teaching_prompt("c1")
     section_start = prompt.index("THE DROP - A JOINT OBJECTIVE")
     section_end = prompt.index("LEVER STABILITY")
     section = prompt[section_start:section_end].lower()
     assert "target_drop_temp_c" in section
     assert "bitter" in section and "ceiling" in section
-    assert "different numbers" in section
+    assert "different meanings" in section
+    # Must NOT claim the target and ceiling always differ in VALUE — only in
+    # meaning. The always-numerically-distinct claim belongs to the
+    # emergency-drop bound (never capped by the profile), not the ceiling.
+    assert "equals the target" in section or "equal the target" in section
+    assert "emergency" in section and "higher" in section
+    # Must NOT claim any fixed ORDERING between the ceiling and the target —
+    # safety-reviewer LOW fold: an earlier draft said the ceiling is "never
+    # below the target", which is false whenever target_drop_temp_c is ABOVE
+    # the hard bitter ceiling (an unbounded profile field — this module's own
+    # PROFILE fixture is target_drop_temp_c=205.0, above the 196 default hard
+    # ceiling, so RoastControlPolicy resolves bitter_ceiling_temp_c=196.0,
+    # BELOW the target). No relational claim survives that a real profile can
+    # falsify either way.
+    assert "never below the target" not in section
+    assert "never above the target" not in section
+
+
+def test_c1_joint_drop_section_makes_no_false_ceiling_ordering_for_a_high_target_profile() -> None:
+    """Safety-reviewer LOW (#499 Codex follow-up): renders the REAL resolved
+    control box for this module's own PROFILE (target_drop_temp_c=205.0,
+    above the 196 °C default hard bitter ceiling) and confirms the actual
+    told bitter_ceiling_temp_c is BELOW the target in this case — the exact
+    scenario that falsified the earlier "(never below the target)" claim.
+    The prompt section must carry no relational claim a profile like this
+    one can falsify."""
+    from roastpilot_agent.config import SafetyLimits as _SafetyLimits
+    from roastpilot_agent.control_policy import RoastControlPolicy
+
+    policy = RoastControlPolicy(_SafetyLimits(), PROFILE)
+    limits = policy.limits_for(RoastPhase.DEVELOPMENT)
+    assert limits.bitter_ceiling_temp_c < PROFILE.target_drop_temp_c, (
+        "this test's premise requires a target ABOVE the hard bitter ceiling"
+    )
+    prompt = control_teaching_prompt("c1")
+    section_start = prompt.index("THE DROP - A JOINT OBJECTIVE")
+    section_end = prompt.index("LEVER STABILITY")
+    section = prompt[section_start:section_end].lower()
+    assert "never below the target" not in section
+    assert "never above the target" not in section
 
 
 def test_c1_joint_drop_section_teaches_window_as_judgment_ceiling_as_law() -> None:
@@ -839,6 +886,25 @@ def test_c1_joint_drop_section_teaches_window_as_judgment_ceiling_as_law() -> No
     assert "law" in section
     assert "never overrides" in section
     assert "authoritative" in section
+
+
+def test_c1_dtr_window_examples_are_not_swapped() -> None:
+    """Codex P2 follow-up (#499): the window-edge examples were originally
+    swapped — the text said "a little under is fine while TEMPERATURE closes
+    the gap" (wrong: under-DTR means DEVELOPMENT is the thing still closing)
+    and "a little over is fine while DEVELOPMENT closes it" (wrong:
+    over-DTR-while-temp-short means TEMPERATURE is the thing still closing).
+    This taught backward boundary reasoning in the exact case #499 exists to
+    fix. Pins the corrected clause order directly."""
+    prompt = control_teaching_prompt("c1")
+    section_start = prompt.index("THE DROP - A JOINT OBJECTIVE")
+    section_end = prompt.index("LEVER STABILITY")
+    section = prompt[section_start:section_end].lower()
+    assert (
+        "a little under the window is fine while development itself is still "
+        "the gap closing" in section
+    )
+    assert "a little over the window is fine while temperature is the gap still closing" in section
 
 
 def test_instructions_for_known_and_unknown_version() -> None:
@@ -929,10 +995,20 @@ def test_c2_extends_c1_with_post_fc_development_stretch() -> None:
     Roast 2 (run c3b84625): the advisor rode a mid heat level post-FC so the bean
     raced to the drop ceiling under-developed. c2 adds the teaching to cut heat
     aggressively at/after first crack to stretch development toward target, never
-    ride a mid level, and never overshoot the drop target — while keeping c1's
+    ride a mid level, and never cross the bitter ceiling — while keeping c1's
     told==enforced grounding (uses context dev% verbatim / never invent) and the
     #218/#274 lever-stability framing. It names NO numbers (the live limits carry
     every threshold).
+
+    Codex P2 follow-up (#499): this section originally said "NEVER overshoot
+    the drop target" / called the ceiling "the LATEST acceptable drop" —
+    directly contradicting #499's later joint-objective section (spliced
+    EARLIER in the assembled text but read as if it were being refined/
+    overridden by this LATER text), which explicitly prefers a modest
+    overshoot of one target while closing the other. Reworded to target the
+    BITTER CEILING specifically (the one number that is genuinely law,
+    unaffected by #499) rather than the drop temperature target (which #499
+    now teaches may be modestly overshot).
     """
     c1 = control_teaching_prompt("c1")
     c2 = control_teaching_prompt("c2")
@@ -948,8 +1024,10 @@ def test_c2_extends_c1_with_post_fc_development_stretch() -> None:
     # Do NOT ride a mid heat level (the explicit roast-2 anti-pattern).
     assert "mid heat level" in lowered
     assert "50 %" in c2  # the concrete anti-pattern example
-    # Never overshoot the drop target.
-    assert "never overshoot the drop target" in lowered
+    # Never cross the bitter ceiling (reworded post-#499 — never the DROP
+    # TARGET, which #499 teaches may be modestly overshot).
+    assert "never cross the indicated bitter ceiling" in lowered
+    assert "never overshoot the drop target" not in lowered
     # Still grounds dev numbers to context (c1's anti-hallucination language kept).
     assert "verbatim" in lowered and "never invent" in lowered
     # The new section names NO fixed drop/dev THRESHOLD numbers of its own
@@ -1112,6 +1190,62 @@ def test_c6_extends_c5_with_recovery() -> None:
     new_section = c6[start : c6.index("THE OBJECTIVE\n", start)]
     for literal in ("188", "195", "16 %", "13 %"):
         assert literal not in new_section, f"c6 recovery section must not bake in {literal!r}"
+
+
+# --- Codex P2 follow-up (#499): assert on the FINAL ASSEMBLED prompt, not
+# just the c1 fragment. The splice chain (c1 -> c2 -> c3 -> c4 -> c5 -> c6)
+# means a section added to c1 can be directly contradicted by a LATER-spliced
+# section from c2+ in the fully assembled text the live model actually
+# receives — a fragment-level test (asserting only against control_teaching_
+# prompt("c1")) is structurally blind to that: c1 alone never contained the
+# contradicting text in the first place. These tests assert on the ASSEMBLED
+# c3 (the live default) and c6 (the newest/most-spliced version) so a future
+# section addition that reintroduces a first-past-the-post phrase downstream
+# of #499's joint-objective section is caught where it actually matters —
+# see docs/recent-fixes.md for the general anti-pattern this class guards.
+
+
+@pytest.mark.parametrize("version", ["c3", "c6"])
+def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
+    version: str,
+) -> None:
+    """The FULLY ASSEMBLED prompt (what the live model receives) must contain
+    #499's joint-objective section and must NOT contain any first-past-the-
+    post phrasing spliced in by a later (c2+) section — the exact defect
+    Codex found: c2's original "NEVER overshoot the drop target" / "LATEST
+    acceptable drop" wording, spliced AFTER #499's section in assembly order,
+    directly contradicted the joint objective's "modest overshoot... is
+    preferred" teaching."""
+    prompt = control_teaching_prompt(version)
+    lowered = prompt.lower()
+    assert "joint objective" in lowered
+    assert "modest overshoot" in lowered
+    # The specific contradiction Codex found must be gone everywhere in the
+    # assembled text, not just absent from the c1 fragment.
+    assert "never overshoot the drop target" not in lowered
+    assert "latest acceptable drop" not in lowered
+
+
+@pytest.mark.parametrize("version", ["c3", "c6"])
+def test_assembled_prompt_joint_objective_precedes_every_later_section(
+    version: str,
+) -> None:
+    """The joint-objective section must appear BEFORE every later-spliced
+    section (c2+) in the assembled text — the ordering Codex's finding
+    depended on (a later section reads as a refinement/override of an
+    earlier one). Pins the STRUCTURE, not just the absence of one known bad
+    phrase, so a differently-worded future contradiction is more likely to be
+    caught by a careful reviewer reading the assembled text in order."""
+    prompt = control_teaching_prompt(version)
+    joint_index = prompt.index("THE DROP - A JOINT OBJECTIVE")
+    for marker in (
+        "POST-FIRST-CRACK: STRETCH DEVELOPMENT",  # c2
+        "POST-FIRST-CRACK: FAN IS AN ACTIVE BRAKE",  # c3
+    ):
+        if marker in prompt:
+            assert prompt.index(marker) > joint_index, (
+                f"{marker!r} must be spliced AFTER the joint-objective section in {version}"
+            )
 
 
 def test_c1_grounds_development_numbers_to_context_no_invention() -> None:

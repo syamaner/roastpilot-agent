@@ -152,3 +152,41 @@ Format: one entry per anti-pattern.
   `test_post_fc_loop_taper_heat_move_and_advisor_fan_move_both_land_same_tick`
   (fails pre-fix — the advisor's fan write REJECTed by the collision; passes
   post-fix) in `tests/test_controller.py`.
+
+---
+
+## A prompt splice chain can contradict itself in the FULLY ASSEMBLED text even when each fragment is individually correct
+*(fixed by #499 Codex follow-up, 11 Jul 2026)*
+
+- **Signature:** a new teaching section added to `advisor.py`'s base `c1`
+  control-teaching prompt (or any versioned prompt others splice onto), tested
+  ONLY against `control_teaching_prompt("c1")` — never against the live
+  default (`c3`) or the most-spliced version (`c6`). Also: a claim in new
+  prompt text that two context fields "always differ" / "are never equal" —
+  grep for `RoastControlPolicy`'s capping logic (`min(hard_ceiling, profile.
+  target)`) before asserting two told numbers can never coincide.
+- **Wrong:** #499 added a joint-drop-objective section to `c1` teaching "a
+  modest overshoot of one target while closing the other is preferred to an
+  early drop." Every fragment-level test (`control_teaching_prompt("c1")`)
+  passed. But `c2` (spliced onto c1, so it lands AFTER the new section in the
+  assembled `c3`/`c6` text) already said "NEVER overshoot the drop target...
+  the LATEST acceptable drop" — a LATER-spliced section directly contradicting
+  an EARLIER one in the text the live model actually receives. Separately, the
+  new section claimed the drop-temp target and the bitter ceiling are
+  "DIFFERENT numbers" — false whenever a profile's `target_drop_temp_c` is at
+  or below the hard bitter ceiling, since the control policy CAPS the told
+  ceiling to the target in that case (`min(196, 195) == 195`), making them
+  numerically identical.
+- **Right:** (1) audit the FULL assembled text of every downstream version
+  (`c2` through the newest, at minimum the live default `c3` and the
+  newest/most-spliced version) for sentences that survive from an earlier
+  splice and contradict a new section — not just the base fragment the new
+  section was added to. (2) Never claim two told numbers always differ in
+  VALUE unless one of them is genuinely uncapped by any profile field (here,
+  `emergency_drop_temp_c` — never capped, and a validator pins it strictly
+  above the bitter ceiling); teach that the MEANING differs regardless of
+  whether the values happen to coincide.
+- **Guarded by:** `test_assembled_prompt_carries_the_joint_objective_and_no_
+  contradiction` and `test_assembled_prompt_joint_objective_precedes_every_
+  later_section` (parametrized over `c3`/`c6`, asserting on the FULLY
+  ASSEMBLED text, not the c1 fragment) in `tests/test_advisor.py`.
