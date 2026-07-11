@@ -1,4 +1,9 @@
-# Roast Session Runbook — 2-roast #405 A/B (baseline vs post-FC RoR loop)
+# Roast Session Runbook — 2-roast D88 A/B (baseline vs post-FC taper + ceiling guard)
+
+> **Updated 11 Jul for the D88 validation session (issue #495).** The treatment
+> arm is no longer the D83 fixed-band RoR loop (falsified 9 Jul, D87) — it is
+> the D88 **measured-anchor taper** plus the **decoupled 196 °C ceiling-guard
+> drop**, each behind its own flag with its own banner line.
 
 **Bean:** Guatemala El Durazno (White Honey) — **2×250 g, same bean both roasts** (a clean A/B needs the same bean; this Hottop runs best at a 250 g load). Select "Guatemala El Durazno (White Honey)" in Start-Roast. Targets: **drop 195 °C, dev 13 %** (first-roast de-risk).
 
@@ -17,14 +22,25 @@
 ## Between roasts
 - **Cool the drum** (physical gate). Stop `roast-live.sh` (Ctrl-C).
 
-## Roast 2 — #405 ON (validation)
-1. `POST_FC_LOOP=1 ./scripts/roast-live.sh`
-2. **CONFIRM the banner shows `⚠️ POST-FC RoR LOOP: ENABLED`** — this is what makes roast 2 the treatment. If it doesn't, stop and fix before charging.
-3. Quick preflight → charge → watch especially the **post-FC heat behaviour**: the deterministic RoR loop now drives heat and the deterministic drop fires when bean ≥ target AND dev ≥ target. Compare against roast 1.
+## Roast 2 — D88 ON (validation)
+1. `POST_FC_LOOP=1 CEILING_GUARD=1 ./scripts/roast-live.sh`
+2. **CONFIRM the banner shows BOTH loud lines** — `⚠️  POST-FC RoR LOOP: ENABLED`
+   AND `⚠️  CEILING-GUARD DROP: ENABLED (… ≥ 196 °C)`. The flags are independent;
+   each must be confirmed on its own. If either is missing, stop and fix before
+   charging.
+3. Quick preflight → charge → watch especially the **post-FC heat behaviour**:
+   - the taper should EASE heat down from its value at FC engagement (setpoint
+     decays from the measured engagement RoR toward 4 °C/min over ~90 s);
+   - heat must **never rise above its value at engagement** (the never-add-heat
+     clamp is law — if you see heat climb post-FC, that is a D88 failure:
+     e-stop and record);
+   - the deterministic drop fires at bean ≥ target AND dev ≥ target; the
+     ceiling guard drops at bean ≥ 196 °C regardless of dev; the advisor keeps
+     drop-earlier-only authority. Compare against roast 1.
 4. End the run.
 
 ## After
 - Run **roast-review** on both. Compare: did the #405 loop hold the RoR + release the drop cleanly vs the advisor-driven baseline? Note DTR, drop temp, and any oscillation.
 
 ## Safety
-- Roast 2 is the **first hardware run of the deterministic post-FC loop** — supervise it. **Emergency stop is available from every phase.** Watch the drop does not overshoot 196 °C and the RoR loop does not oscillate. A restart mid-run enters `operator_recovery_required` (no auto-resume of heat/fan).
+- Roast 2 is the **first hardware run of the D88 taper + ceiling guard** — supervise it. **Emergency stop is available from every phase.** The structural expectations: post-FC heat only ever moves DOWN from its engagement value (72→91 % class runaways are impossible by construction — seeing one is a stop-and-record event), and no drop lands above 196 °C with the guard on. A restart mid-run enters `operator_recovery_required` (no auto-resume of heat/fan).

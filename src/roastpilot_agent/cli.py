@@ -542,30 +542,49 @@ async def _emit_advisor_readout(service: "RoastService") -> "AdvisorHealth":
     return health
 
 
-def _format_post_fc_loop_readout(*, enabled: bool) -> list[str]:
-    """Render the operator-facing #405 post-FC RoR-loop flag readout (issue #460).
+def _format_post_fc_loop_readout(
+    *, enabled: bool, ceiling_guard_enabled: bool, ceiling_guard_temp_c: float
+) -> list[str]:
+    """Render the operator-facing D88 post-FC flag readouts (issues #460, #495).
 
-    Prints the resolved ``controller.post_first_crack_control.enabled`` value
-    as a can't-miss console line — as prominent as the mock-driver ``⚠️`` /
-    advisor-experiment tag — so an operator running a baseline-vs-treatment A/B
-    can *confirm* which roast is which before charging beans. A silent typo in
-    the raw nested env var
-    (``ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__ENABLED``) would
-    otherwise leave the flag at its default ``False`` and quietly turn the
-    "treatment" roast into a second baseline. Read-only and informational
-    — this never blocks startup, the same contract as
+    Prints the resolved ``controller.post_first_crack_control.enabled`` and
+    ``ceiling_guard_drop_enabled`` values as can't-miss console lines — as
+    prominent as the mock-driver ``⚠️`` / advisor-experiment tag — so an
+    operator running a baseline-vs-treatment A/B can *confirm* which roast is
+    which before charging beans. A silent typo in either raw nested env var
+    (``ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__ENABLED`` /
+    ``…__CEILING_GUARD_DROP_ENABLED``) would otherwise leave the flag at its
+    default ``False`` and quietly turn the "treatment" roast into a second
+    baseline. The two flags are independent by design (D88 decoupled the
+    ceiling guard from the taper), so each gets its own line. Read-only and
+    informational — this never blocks startup, the same contract as
     :func:`_format_advisor_readout`.
 
     Args:
         enabled: The resolved ``post_first_crack_control.enabled`` value from
             the loaded :class:`~roastpilot_agent.config.AppConfig`.
+        ceiling_guard_enabled: The resolved
+            ``post_first_crack_control.ceiling_guard_drop_enabled`` value.
+        ceiling_guard_temp_c: The resolved
+            ``post_first_crack_control.ceiling_guard_temp_c`` value, shown so
+            the operator confirms the guard line, not just the flag.
 
     Returns:
         The console lines to print, in order.
     """
+    lines: list[str] = []
     if enabled:
-        return ["⚠️  POST-FC RoR LOOP: ENABLED (#405 — deterministic post-FC heat + drop)"]
-    return ["  post-FC RoR loop: disabled (advisor-driven post-FC)"]
+        lines.append("⚠️  POST-FC RoR LOOP: ENABLED (#405/D88 — deterministic post-FC taper + drop)")
+    else:
+        lines.append("  post-FC RoR loop: disabled (advisor-driven post-FC)")
+    if ceiling_guard_enabled:
+        lines.append(
+            "⚠️  CEILING-GUARD DROP: ENABLED "
+            f"(D88 — deterministic drop at bean ≥ {ceiling_guard_temp_c:g} °C)"
+        )
+    else:
+        lines.append("  ceiling-guard drop: disabled (advisor/operator own the bitter boundary)")
+    return lines
 
 
 async def _serve_live(args: argparse.Namespace) -> int:
@@ -641,11 +660,14 @@ async def _serve_live(args: argparse.Namespace) -> int:
         # (advisory-paused is valid); the result is exposed on /api/health.
         await _emit_advisor_readout(service)
 
-        # #405 post-FC RoR-loop flag readout (issue #460): read straight off the
-        # already-loaded `config` (no re-load) so it can never drift from what
+        # D88 post-FC flag readouts (issues #460, #495): read straight off the
+        # already-loaded `config` (no re-load) so they can never drift from what
         # actually serves. Read-only/informational — never blocks startup.
+        post_fc = config.controller.post_first_crack_control
         for line in _format_post_fc_loop_readout(
-            enabled=config.controller.post_first_crack_control.enabled
+            enabled=post_fc.enabled,
+            ceiling_guard_enabled=post_fc.ceiling_guard_drop_enabled,
+            ceiling_guard_temp_c=post_fc.ceiling_guard_temp_c,
         ):
             print(line)
 

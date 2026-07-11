@@ -699,9 +699,9 @@ def test_format_advisor_readout_not_configured() -> None:
 
 
 def test_format_post_fc_loop_readout_enabled() -> None:
-    """Enabled prints a can't-miss ⚠️ line naming #405 (issue #460)."""
+    """Loop enabled prints a can't-miss ⚠️ line naming #405 (issue #460)."""
     lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
-        enabled=True
+        enabled=True, ceiling_guard_enabled=False, ceiling_guard_temp_c=196.0
     )
     text = "\n".join(lines)
     assert "⚠️" in text
@@ -710,14 +710,115 @@ def test_format_post_fc_loop_readout_enabled() -> None:
 
 
 def test_format_post_fc_loop_readout_disabled() -> None:
-    """Disabled (the default) prints a quiet, non-alarming confirmation line."""
+    """Both flags off (the default) prints quiet, non-alarming lines only."""
     lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
-        enabled=False
+        enabled=False, ceiling_guard_enabled=False, ceiling_guard_temp_c=196.0
     )
     text = "\n".join(lines)
     assert "⚠️" not in text
     assert "post-FC RoR loop: disabled" in text
     assert "advisor-driven post-FC" in text
+    assert "ceiling-guard drop: disabled" in text
+
+
+def test_format_post_fc_loop_readout_ceiling_guard_enabled() -> None:
+    """Guard enabled prints its own ⚠️ line with the RESOLVED guard temperature,
+    independent of the loop flag (D88 decoupling, issue #495)."""
+    lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
+        enabled=False, ceiling_guard_enabled=True, ceiling_guard_temp_c=196.0
+    )
+    text = "\n".join(lines)
+    assert "CEILING-GUARD DROP: ENABLED" in text
+    assert "196 °C" in text
+    # The guard line is loud even while the loop line stays quiet — the flags
+    # are independent and each must be confirmable on its own.
+    assert "post-FC RoR loop: disabled" in text
+    assert text.count("⚠️") == 1
+
+
+def test_format_post_fc_loop_readout_both_enabled_two_loud_lines() -> None:
+    """The full D88 treatment arm (taper + guard) prints TWO ⚠️ lines — one per
+    flag — so the operator confirms each independently before charging beans."""
+    lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
+        enabled=True, ceiling_guard_enabled=True, ceiling_guard_temp_c=195.5
+    )
+    assert len(lines) == 2
+    text = "\n".join(lines)
+    assert text.count("⚠️") == 2
+    assert "POST-FC RoR LOOP: ENABLED" in text
+    assert "CEILING-GUARD DROP: ENABLED" in text
+    # The temperature shown is the resolved value, not a hardcoded default.
+    assert "195.5 °C" in text
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_serve_live_banner_reflects_resolved_d88_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The D88 banner lines come from the RESOLVED config the serving agent
+    loaded — end-to-end through the real ``serve`` path, not the pure readout
+    function (issues #460/#495).
+
+    Sets ONLY the ceiling-guard flag (plus a non-default guard temperature)
+    through the real nested env vars and drives ``cli.main()``: the guard line
+    must be loud with the resolved temperature while the loop line stays quiet.
+    Asymmetric on purpose — the two flags are structurally identical bools, so
+    a swapped-kwarg bug at the ``_serve_live`` call site would flip BOTH
+    assertions; the pure-function tests above can never see that wiring."""
+    from roastpilot_agent import live
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.store import RoastStore
+
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__CEILING_GUARD_DROP_ENABLED",
+        "true",
+    )
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__CEILING_GUARD_TEMP_C",
+        "195.5",
+    )
+
+    spa = tmp_path / "dist"
+    spa.mkdir()
+    (spa / "index.html").write_text("<title>RoastPilot</title>", encoding="utf-8")
+
+    class _FakeMCP:
+        running = True
+        call_tool = staticmethod(_make_call_tool(_runtime_config_payload(roaster_driver="mock")))
+
+        async def stop(self) -> None:
+            return None
+
+    async def _fake_build(
+        config: AppConfig, *, store_path: Path
+    ) -> tuple[RoastService, _FakeMCP, RoastStore]:
+        store = RoastStore(store_path)
+        return RoastService(store), _FakeMCP(), store
+
+    monkeypatch.setattr(live, "build_live_service", _fake_build)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "roastpilot-agent",
+            "serve",
+            "--port",
+            "0",
+            "--spa-dir",
+            str(spa),
+            "--db",
+            str(tmp_path / "trace" / "live.sqlite3"),
+        ],
+    )
+
+    assert cli.main() == 0
+    out = capsys.readouterr().out
+    # Guard ON: its loud line prints with the RESOLVED (non-default) temperature.
+    assert "CEILING-GUARD DROP: ENABLED" in out
+    assert "195.5 °C" in out
+    # Loop OFF: its line stays quiet. Swapped caller wiring fails both checks.
+    assert "post-FC RoR loop: disabled" in out
+    assert "POST-FC RoR LOOP: ENABLED" not in out
 
 
 @pytest.mark.asyncio
