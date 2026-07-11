@@ -102,7 +102,30 @@
 
 ## Active Context
 
-**9–10 Jul 2026 (overnight, latest) — AUTONOMOUS BATCH COMPLETE: 7 PRs merged, the roast-night
+**11 Jul 2026 (latest) — D88 VALIDATION A/B PASSED + D89 MERGED-CONTROL DIRECTION RATIFIED.**
+Roasts 11/12 (runs `d55b0fce` baseline / `edbe9a76` treatment, Guatemala El Durazno 2×250 g,
+dev target 15 %): the D88 taper's first hardware run **held every structural property** — heat
+anchored at its 65 % engagement value and NEVER rose (trace-verified benign: measured RoR
+7.0→5.0 sat at/below the declining setpoint 7→4, so the never-add-heat ceiling was the binding
+constraint; nothing to cut), the 196 °C guard stayed correctly silent, and the convergence
+thesis validated: **treatment dropped 194 °C @ 13.4 % vs baseline 190 °C @ 15.0 %** (the
+baseline's heat-0 over-brake stalled temp while DTR accrued — targets diverged; the taper kept
+them together). Weights 215 g / 218 g. Both drops advisor-called (earlier-only authority).
+**Both flags remain default OFF** — promotion + taper-constant tuning gate on the operator's
+tasting (roasts 9–12). Same-day pre-roast tooling: **PR #496** (CEILING_GUARD launch toggle +
+independent per-flag banner lines; pre-open qa caught the untested call-site wiring — mutation
+kill verified). **Findings filed:** #497 (AdvisorContext carries NO actuated heat/fan — the
+advisor reasoned from an imagined heat-0 in loop mode), #498 (loop-mode fan stayed pinned 40 by
+D88(5) design; operator steer = dynamic fan up to 100 %), #499 (drop decisions are
+first-past-the-post — both arms sacrificed one target, in opposite directions). **D89 ratified
+(plan repo): merged post-FC control — Tier 1 division-by-lever via #497→#498→#499 in order;
+Tier 2 bounded advisor nudge (±1.5 °C/min proposal) on the taper SETPOINT, never the actuator,
+own ratification before code.** Next: operator tasting verdict → the Tier-1 batch. Also this
+session: conference research pack DONE (blog-sources/24-*, 109 verified citations + grounded
+method inventory; pre-submission gate = #495); tracking issue **#495** holds all remaining
+rigour tasks. Memory `roast11-12-d88-validation-ab`.
+
+**9–10 Jul 2026 (overnight) — AUTONOMOUS BATCH COMPLETE: 7 PRs merged, the roast-night
 findings all actioned. #405 REWORKED per D88 (both flags OFF), #484 fixed with real-child tests,
 the config-UI trio closed.** One lead + 4 worktree tracks + a persistent review roster; operator
 away (MCP release approval delegated — none needed).
