@@ -782,6 +782,65 @@ def test_c1_actuated_levers_section_names_no_numbers() -> None:
     assert re.search(r"\bheat\s+\d+\b", lower) is None
 
 
+def test_c1_teaches_the_joint_drop_objective_not_first_past_the_post() -> None:
+    """#499 (D89): the 11 Jul A/B showed the advisor treats whichever drop
+    target arrives first as the finish line (roast 1 dropped on DTR alone at
+    190 °C, 5 °C short; roast 2 dropped on temperature alone at 194 °C, 1.6 pp
+    short of DTR). c1 (and every derived version) must teach the JOINT
+    objective: satisfy both, prefer a modest overshoot of one while closing
+    the other, and let the ceiling (never either target alone) force an early
+    call."""
+    for version in ("c1", "c3", "c6"):
+        prompt = control_teaching_prompt(version)
+        lower = prompt.lower()
+        assert "joint objective" in lower, version
+        assert "first-past-the-post" in lower, version
+        assert "modest overshoot" in lower, version
+        assert "ceiling forces the call" in lower, version
+
+
+def test_c1_joint_drop_section_names_no_numbers() -> None:
+    """Same #218 two-copies discipline: the joint-drop section teaches the
+    PRINCIPLE and names no hardcoded temperature/DTR numbers — those come
+    from context (target_drop_temp_c, the DTR window, the bitter ceiling)."""
+    prompt = control_teaching_prompt("c1")
+    section_start = prompt.index("THE DROP - A JOINT OBJECTIVE")
+    section_end = prompt.index("LEVER STABILITY")
+    section = prompt[section_start:section_end]
+    assert not re.search(r"\d", section)
+
+
+def test_c1_joint_drop_section_distinguishes_drop_target_from_bitter_ceiling() -> None:
+    """#499: roast 2's final rationale conflated the drop target with the
+    bitter ceiling (called it "195" when the profile's drop target was 195
+    and the bitter ceiling was 196) — the prompt must explicitly teach the
+    model these are two DIFFERENT numbers, never interchangeable."""
+    prompt = control_teaching_prompt("c1")
+    section_start = prompt.index("THE DROP - A JOINT OBJECTIVE")
+    section_end = prompt.index("LEVER STABILITY")
+    section = prompt[section_start:section_end].lower()
+    assert "target_drop_temp_c" in section
+    assert "bitter" in section and "ceiling" in section
+    assert "different numbers" in section
+
+
+def test_c1_joint_drop_section_teaches_window_as_judgment_ceiling_as_law() -> None:
+    """#499 (operator riders): the DTR window's edges are JUDGMENT SPACE (a
+    little under/over is fine while the other target closes the gap); the
+    bitter/emergency ceiling is LAW (never a matter of judgment). A
+    qualitative roast style, if present, is read as INTENT only — it never
+    overrides the profile's own authoritative explicit targets (D84 held)."""
+    prompt = control_teaching_prompt("c1")
+    section_start = prompt.index("THE DROP - A JOINT OBJECTIVE")
+    section_end = prompt.index("LEVER STABILITY")
+    section = prompt[section_start:section_end].lower()
+    assert "acceptable development window" in section
+    assert "judgment space" in section
+    assert "law" in section
+    assert "never overrides" in section
+    assert "authoritative" in section
+
+
 def test_instructions_for_known_and_unknown_version() -> None:
     assert "coffee roaster" in instructions_for("v0").lower()
     with pytest.raises(ValueError):

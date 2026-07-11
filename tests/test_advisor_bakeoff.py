@@ -204,6 +204,42 @@ def test_enrich_ticks_adds_the_273_limits_and_275_context() -> None:
         assert e.monotonic_seconds == a.monotonic_seconds
 
 
+def test_enrich_ticks_adds_the_499_dtr_window_from_the_shared_margin_default() -> None:
+    """#499: enrichment stamps the DTR window around each tick's own
+    target_development_percent, using ControllerConfig's OWN default margin
+    (never a hardcoded literal in the test or the harness)."""
+    from roastpilot_agent.config import ControllerConfig
+
+    margin = ControllerConfig().drop_dev_margin_percent
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    plain, ground = bakeoff.build_ticks(fixture, cadence_seconds=30.0)
+    enriched = bakeoff.enrich_ticks_with_control_context(plain, ground)
+    dev = next(t for t in enriched if t.context.first_crack_detected)
+    ctx = dev.context
+    assert ctx.target_development_percent is not None
+    assert ctx.target_development_percent_min == pytest.approx(
+        ctx.target_development_percent - margin
+    )
+    assert ctx.target_development_percent_max == pytest.approx(
+        ctx.target_development_percent + margin
+    )
+    # roast_style stays None: these fixtures carry no RoastProfile (pre-#405).
+    assert ctx.roast_style is None
+
+
+def test_enrich_ticks_dtr_window_accepts_an_explicit_margin_override() -> None:
+    """The margin is overridable (mirrors every other config-driven bake-off
+    parameter) but defaults to ControllerConfig's own value when omitted."""
+    fixture = bakeoff.REPLAY_ROASTS[0]
+    plain, ground = bakeoff.build_ticks(fixture, cadence_seconds=30.0)
+    enriched = bakeoff.enrich_ticks_with_control_context(plain, ground, drop_dev_margin_percent=1.0)
+    dev = next(t for t in enriched if t.context.first_crack_detected)
+    ctx = dev.context
+    assert ctx.target_development_percent is not None
+    assert ctx.target_development_percent_min == pytest.approx(ctx.target_development_percent - 1.0)
+    assert ctx.target_development_percent_max == pytest.approx(ctx.target_development_percent + 1.0)
+
+
 def test_enrich_ticks_preserves_the_actuated_heat_fan_from_build_ticks() -> None:
     """#497: enrichment's ``model_copy(update={...})`` only touches the #273/#275
     fields it lists — the actuated ``current_heat_percent``/``current_fan_percent``
@@ -556,6 +592,20 @@ def test_preheat_context_supplies_charge_band() -> None:
     assert context.charge_guidance_min_c is not None
     assert context.charge_guidance_max_c is not None
     assert context.charge_guidance_min_c < context.charge_guidance_max_c
+
+
+def test_pre_fc_context_carries_the_499_dtr_window_from_shared_margin_default() -> None:
+    """#499: the pre-FC bake-off context's synthetic 20.0 % target gets a
+    window built from ControllerConfig's own default margin — never a
+    hardcoded literal duplicated in this builder."""
+    from roastpilot_agent.config import ControllerConfig
+
+    margin = ControllerConfig().drop_dev_margin_percent
+    context, _ = bakeoff.build_phase_context(
+        bakeoff.DEFAULT_FIXTURE, RoastPhase.ROASTING_PRE_FIRST_CRACK
+    )
+    assert context.target_development_percent_min == pytest.approx(20.0 - margin)
+    assert context.target_development_percent_max == pytest.approx(20.0 + margin)
 
 
 def test_phase_contexts_warm_through_the_roast() -> None:

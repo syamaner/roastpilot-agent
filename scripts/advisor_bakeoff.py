@@ -135,7 +135,7 @@ from roastpilot_agent.advisor import (  # noqa: E402
     RoastDecision,
     control_teaching_prompt,
 )
-from roastpilot_agent.config import AdvisorConfig, SafetyLimits  # noqa: E402
+from roastpilot_agent.config import AdvisorConfig, ControllerConfig, SafetyLimits  # noqa: E402
 from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy  # noqa: E402
 from roastpilot_agent.models import AdvisorHealthStatus, RoastPhase  # noqa: E402
 from roastpilot_agent.roast_history import (  # noqa: E402
@@ -410,6 +410,7 @@ def enrich_ticks_with_control_context(
     policy: RoastControlPolicy | None = None,
     curve_window_samples: int = DEFAULT_CURVE_WINDOW_SAMPLES,
     decision_trace_entries: int = DEFAULT_DECISION_TRACE_ENTRIES,
+    drop_dev_margin_percent: float | None = None,
 ) -> list[ReplayTick]:
     """Re-stamp each tick's context with the #273 limits + #275 control context.
 
@@ -425,6 +426,14 @@ def enrich_ticks_with_control_context(
     first consult of a live roast. The ticks' real-lever / drop labels and
     timestamps are untouched, so the scorers are unaffected.
 
+    #499 (D89 Tier 1): also stamps the acceptable DTR window
+    (``target_development_percent`` ± ``drop_dev_margin_percent``), computed
+    from the SAME config constant the live controller reads (never a copied
+    literal) — ``roast_style`` stays ``None`` here, since these replay
+    fixtures carry no :class:`~roastpilot_agent.models.RoastProfile` at all
+    (pre-#405), matching the field's documented default for callers that
+    build no profile.
+
     Args:
         ticks: The reconstructed ticks from :func:`build_ticks` (ascending time).
         ground: The roast's ground truth.
@@ -433,12 +442,21 @@ def enrich_ticks_with_control_context(
         curve_window_samples: The bounded curve-window size (controller default).
         decision_trace_entries: The decision-trace bound (carried for parity;
             the trace stays empty here).
+        drop_dev_margin_percent: The DTR-window tolerance; defaults to
+            :class:`~roastpilot_agent.config.ControllerConfig`'s own default
+            (never a hardcoded literal here).
 
     Returns:
-        New ticks whose contexts carry the #273 + #275 fields; same order/length.
+        New ticks whose contexts carry the #273 + #275 (+ #499) fields; same
+        order/length.
     """
     _ = decision_trace_entries  # parity with the controller signature; trace empty
     resolved_policy = policy if policy is not None else _control_policy()
+    resolved_margin = (
+        drop_dev_margin_percent
+        if drop_dev_margin_percent is not None
+        else ControllerConfig().drop_dev_margin_percent
+    )
     limits_by_phase: dict[RoastPhase, PhaseControlLimits] = {
         phase: resolved_policy.limits_for(phase) for phase in RoastPhase
     }
@@ -467,6 +485,7 @@ def enrich_ticks_with_control_context(
                 curve_window, fc_target_bean_temp_c=FC_ETA_TARGET_BEAN_TEMP_C
             )
         )
+        dtr_target = context.target_development_percent
         new_context = context.model_copy(
             update={
                 # #273 phase-resolved control box (told == enforced).
@@ -485,6 +504,15 @@ def enrich_ticks_with_control_context(
                 # seconds_since_charge mirrors roast_elapsed once charged (#209).
                 "seconds_since_charge": (
                     context.roast_elapsed_seconds if context.roast_elapsed_seconds >= 0.0 else None
+                ),
+                # #499: the acceptable DTR window around the tick's own
+                # target_development_percent (already stamped by build_ticks),
+                # None when that target is itself None.
+                "target_development_percent_min": (
+                    dtr_target - resolved_margin if dtr_target is not None else None
+                ),
+                "target_development_percent_max": (
+                    dtr_target + resolved_margin if dtr_target is not None else None
                 ),
             }
         )
@@ -868,6 +896,11 @@ def _pre_fc_context(fixture: Path) -> tuple[AdvisorContext, float]:
         env_ror_c_per_min=_ror(telemetry, index, "env_temp_c"),
         target_drop_temp_c=float(drop_row["bean_temp_c"]),
         target_development_percent=20.0,
+        # #499: the acceptable DTR window around the synthetic 20.0 % target
+        # above, using ControllerConfig's own default margin (never a copied
+        # literal).
+        target_development_percent_min=20.0 - ControllerConfig().drop_dev_margin_percent,
+        target_development_percent_max=20.0 + ControllerConfig().drop_dev_margin_percent,
         profile_name=f"{fixture.parent.parent.name}/{fixture.parent.name}",
         recent_telemetry_samples=_recent_samples(telemetry, index),
         first_crack_detected=False,

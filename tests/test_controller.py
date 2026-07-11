@@ -51,6 +51,7 @@ from roastpilot_agent.models import (
     RoastCommand,
     RoastEventKind,
     RoastProfile,
+    RoastStyle,
     RoastTelemetry,
 )
 from roastpilot_agent.roast_history import DecisionTraceEntry, RoastMilestoneKind
@@ -4232,6 +4233,85 @@ async def test_advisor_context_actuated_heat_reflects_prior_write_not_this_ticks
     assert ctx.current_heat_percent == 65
     assert ctx.current_fan_percent == 50
     assert harness.controller.snapshot().current_heat == 99  # now actuated post-tick
+
+
+def test_advisor_context_dtr_window_derives_from_the_shared_margin_config() -> None:
+    """#499: the DTR window is [target - margin, target + margin], computed
+    from the SAME ``config.drop_dev_margin_percent`` the deterministic
+    drop-coherence guard reads (never a second/copied constant) — the
+    told==enforced pattern applied to a margin, so the tolerance the model
+    reasons with and the tolerance the deterministic layer enforces can
+    never drift apart."""
+    config = ControllerConfig(drop_dev_margin_percent=5.0)
+    harness = make_harness(config=config)
+    harness.controller.load_profile(PROFILE)  # target_development_percent=20.0
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+    assert ctx.target_development_percent_min == 15.0
+    assert ctx.target_development_percent_max == 25.0
+
+
+def test_advisor_context_roast_style_is_intent_only_no_style_set() -> None:
+    """A profile with no ``roast_style`` (pre-#405, or a style-agnostic
+    profile) reports ``None`` — the advisor sees no style label, only the
+    profile's own explicit targets."""
+    harness = make_harness()
+    harness.controller.load_profile(PROFILE)  # roast_style defaults to None
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+    assert ctx.roast_style is None
+
+
+def test_advisor_context_roast_style_forwards_the_profiles_style_name() -> None:
+    """#499: when a profile carries a ``roast_style``, the context forwards
+    the STYLE NAME as qualitative intent — never the style's own reference
+    numbers, which stay unread here (the profile's own explicit
+    ``target_development_percent``/``target_drop_temp_c`` remain the sole
+    numeric source, D84's explicit-wins precedence untouched)."""
+    styled_profile = PROFILE.model_copy(update={"roast_style": RoastStyle.LIGHT})
+    harness = make_harness()
+    harness.controller.load_profile(styled_profile)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+    assert ctx.roast_style is RoastStyle.LIGHT
+    # The numeric targets stay the PROFILE's own (20.0), never LIGHT's corpus
+    # reference (15.0, per ROAST_STYLE_TARGETS) — style never overrides.
+    assert ctx.target_development_percent == 20.0
+    assert ctx.target_development_percent_min == 17.0
+    assert ctx.target_development_percent_max == 23.0
+
+
+def test_dtr_window_low_edge_matches_coherence_guard_floor() -> None:
+    """Safety-reviewer LOW (#499): pins the TOLD window's low edge and the
+    ENFORCED drop-coherence floor to move together — not merely that both
+    read the same config constant today, but that the edge value itself is
+    genuinely the guard's permitted boundary. A future change to the guard's
+    inequality (>= -> >) or to either edge expression would desync the taught
+    window from the enforced floor; this test fails the moment that happens,
+    rather than only catching a drifted CONSTANT."""
+    config = ControllerConfig(drop_dev_margin_percent=5.0)
+    harness = make_harness(config=config)
+    harness.controller.load_profile(PROFILE)  # target_development_percent=20.0
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+    edge = ctx.target_development_percent_min
+    assert edge is not None
+    expected_edge = PROFILE.target_development_percent - config.drop_dev_margin_percent
+    assert edge == expected_edge == 15.0
+    # The taught edge is genuinely ALLOWED by the enforced guard (inclusive —
+    # >= not >), and one hundredth of a point below it is genuinely BLOCKED.
+    assert harness.controller._drop_development_is_coherent(edge) is True  # pyright: ignore[reportPrivateUsage]
+    assert (
+        harness.controller._drop_development_is_coherent(edge - 0.01) is False  # pyright: ignore[reportPrivateUsage]
+    )
 
 
 @pytest.mark.asyncio
