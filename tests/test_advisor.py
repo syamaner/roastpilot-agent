@@ -57,7 +57,12 @@ from roastpilot_agent.advisor import (
     reasoning_from_run,
     usage_from_run,
 )
-from roastpilot_agent.config import AdvisorConfig, ControllerConfig, SafetyLimits
+from roastpilot_agent.config import (
+    AdvisorConfig,
+    ControllerConfig,
+    PostFirstCrackControl,
+    SafetyLimits,
+)
 from roastpilot_agent.controller import RoastController, RoastPhase
 from roastpilot_agent.models import (
     AdvisorHealth,
@@ -136,6 +141,20 @@ class Harness:
     log: list[str] = field(default_factory=list[str])
 
 
+#: This module's harness baseline (12 Jul D88/D89 promotion, mirrors
+#: test_controller.py's ``_BASELINE_POST_FC_CONFIG``): every test in this file
+#: predates the promotion and was written to exercise the advisor-driven
+#: baseline post-FC path directly (no deterministic taper, no ceiling-guard
+#: auto-drop) — a bare ``ControllerConfig()`` now defaults BOTH flags True
+#: (#495), which would auto-drop several of these scenarios (e.g. a reading
+#: at/above the default 196 °C ceiling guard) before the advisor consult this
+#: test is actually about ever runs. Pinned here explicitly so a caller who
+#: wants the new default constructs one deliberately instead.
+_BASELINE_POST_FC_CONFIG = ControllerConfig(
+    post_first_crack_control=PostFirstCrackControl(enabled=False, ceiling_guard_drop_enabled=False)
+)
+
+
 def harness_in_development(
     *,
     advisor: RoastAdvisor,
@@ -148,7 +167,7 @@ def harness_in_development(
     sink = RecordingSnapshotSink(log)
     events = EventSink(log)
     controller = RoastController(
-        config=config or ControllerConfig(),
+        config=config or _BASELINE_POST_FC_CONFIG,
         safety=SafetyPolicy(SafetyLimits()),
         state_reader=ScriptedStateReader(readings or [reading()], log),
         command_executor=executor,
@@ -320,7 +339,12 @@ async def test_real_timeout_path_never_blocks_the_tick() -> None:
 
     harness = harness_in_development(
         advisor=NeverAdvisor(),
-        config=ControllerConfig(advisory_timeout_seconds=0.05),
+        config=ControllerConfig(
+            advisory_timeout_seconds=0.05,
+            post_first_crack_control=PostFirstCrackControl(
+                enabled=False, ceiling_guard_drop_enabled=False
+            ),
+        ),
     )
     harness.controller.request_advisory()
     await asyncio.wait_for(harness.controller.tick(), timeout=1.0)

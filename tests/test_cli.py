@@ -768,17 +768,25 @@ def test_serve_live_banner_reflects_resolved_d88_flags(
     loaded — end-to-end through the real ``serve`` path, not the pure readout
     function (issues #460/#495).
 
-    Sets ONLY the ceiling-guard flag (plus a non-default guard temperature)
-    through the real nested env vars and drives ``cli.main()``: the guard line
-    must be loud with the resolved temperature while the loop line stays quiet.
-    Asymmetric on purpose — the two flags are structurally identical bools, so
-    a swapped-kwarg bug at the ``_serve_live`` call site would flip BOTH
-    assertions; the pure-function tests above can never see that wiring."""
+    Sets the ceiling-guard flag ON (plus a non-default guard temperature) and
+    the RoR-taper loop flag explicitly OFF (12 Jul promotion flipped its
+    config-field default to True — a real "baseline arm" run must set this
+    itself, matching the new ``POST_FC_LOOP=0`` toggle in
+    ``scripts/roast-live.sh``) through the real nested env vars, then drives
+    ``cli.main()``: the guard line must be loud with the resolved temperature
+    while the loop line stays quiet. Asymmetric on purpose — the two flags are
+    structurally identical bools, so a swapped-kwarg bug at the
+    ``_serve_live`` call site would flip BOTH assertions; the pure-function
+    tests above can never see that wiring."""
     from roastpilot_agent import live
     from roastpilot_agent.api import RoastService
     from roastpilot_agent.config import AppConfig
     from roastpilot_agent.store import RoastStore
 
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__ENABLED",
+        "false",
+    )
     monkeypatch.setenv(
         "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__CEILING_GUARD_DROP_ENABLED",
         "true",

@@ -97,6 +97,27 @@ PROFILE = RoastProfile(
 )
 
 
+#: The harness's own implicit-config baseline (12 Jul D88/D89 promotion):
+#: ``ControllerConfig()``'s OWN defaults flipped ``post_first_crack_control.
+#: enabled`` / ``ceiling_guard_drop_enabled`` to ``True`` (the operator-ratified
+#: promotion, #495) — but the overwhelming majority of this suite's ~150+
+#: ``make_harness()``/``harness_in_development()`` call sites were written
+#: BEFORE the promotion to deliberately exercise the advisor-driven baseline
+#: path (direct heat/fan actuation, no deterministic taper, no ceiling-guard
+#: auto-drop) and never intended to exercise the taper/guard at all. Rather
+#: than touch every one of those call sites individually (which would either
+#: balloon this diff far beyond reason or silently change what dozens of
+#: unrelated tests exercise), the harness's OWN implicit default is pinned
+#: here to the pre-promotion baseline explicitly — a deliberate test-fixture
+#: choice, not a stale copy of the production default. Every test that DOES
+#: want the new post-promotion default constructs one explicitly (see
+#: :func:`_post_fc_config` / :func:`_ceiling_guard_config`, and any test using
+#: bare ``ControllerConfig()`` directly to assert the NEW production default).
+_BASELINE_POST_FC_CONFIG = ControllerConfig(
+    post_first_crack_control=PostFirstCrackControl(enabled=False, ceiling_guard_drop_enabled=False)
+)
+
+
 def make_harness(
     *,
     readings: list[RoastTelemetry | None | Exception] | None = None,
@@ -112,7 +133,7 @@ def make_harness(
     sink = RecordingSnapshotSink(log)
     events = EventSink(log)
     controller = RoastController(
-        config=config or ControllerConfig(),
+        config=config or _BASELINE_POST_FC_CONFIG,
         safety=SafetyPolicy(limits or SafetyLimits()),
         state_reader=reader,
         command_executor=executor,
@@ -4521,7 +4542,18 @@ async def test_full_mock_roast_with_fake_mcp() -> None:
     advisor = FakeAdvisor([], default_decision=decision(heat=40, fan=60, drop=True), log=log)
     clock = FakeClock()
     controller = RoastController(
-        config=ControllerConfig(),
+        # This capstone is a deliberately advisor-driven scenario (the #312
+        # coherence guard on the ADVISOR's own should_drop), so both post-FC
+        # flags are explicit OFF here — the 12 Jul D88/D89 promotion flipped
+        # their config-field defaults to True, and the ceiling guard would
+        # otherwise auto-drop the instant the FC frame's bean=196.0 reaches
+        # its default ceiling_guard_temp_c, short-circuiting the very
+        # coherence-guard behaviour this test demonstrates.
+        config=ControllerConfig(
+            post_first_crack_control=PostFirstCrackControl(
+                enabled=False, ceiling_guard_drop_enabled=False
+            )
+        ),
         safety=SafetyPolicy(SafetyLimits()),
         state_reader=mcp,
         command_executor=mcp,
@@ -5616,7 +5648,12 @@ async def test_deadband_damps_a_flip_flop_but_allows_a_decisive_move() -> None:
     harness = harness_in_development(
         readings=[reading()],
         advisor=advisor,
-        config=ControllerConfig(post_fc_deadband_threshold_percent=15),
+        config=ControllerConfig(
+            post_fc_deadband_threshold_percent=15,
+            post_first_crack_control=PostFirstCrackControl(
+                enabled=False, ceiling_guard_drop_enabled=False
+            ),
+        ),
     )
     # Consult 1: first move, executed.
     await harness.controller.tick()
@@ -5732,7 +5769,12 @@ async def test_sustained_sub_threshold_cut_actuates_within_two_consults() -> Non
     harness = harness_in_development(
         readings=[reading()],
         advisor=advisor,
-        config=ControllerConfig(post_fc_deadband_threshold_percent=15),
+        config=ControllerConfig(
+            post_fc_deadband_threshold_percent=15,
+            post_first_crack_control=PostFirstCrackControl(
+                enabled=False, ceiling_guard_drop_enabled=False
+            ),
+        ),
     )
     # Consult 1: a decisive first move UP — executed (heat 80).
     await harness.controller.tick()
@@ -5764,7 +5806,12 @@ async def test_mixed_partial_damp_executes_only_the_decisive_lever() -> None:
     harness = harness_in_development(
         readings=[reading()],
         advisor=advisor,
-        config=ControllerConfig(post_fc_deadband_threshold_percent=15),
+        config=ControllerConfig(
+            post_fc_deadband_threshold_percent=15,
+            post_first_crack_control=PostFirstCrackControl(
+                enabled=False, ceiling_guard_drop_enabled=False
+            ),
+        ),
     )
     # Consult 1: first move (heat UP, fan UP) — executed at (70, 50).
     await harness.controller.tick()
@@ -5906,10 +5953,18 @@ async def _charge_through_fc(
 
 
 def _post_fc_config(**overrides: object) -> ControllerConfig:
-    """A ``ControllerConfig`` with the post-FC PI loop ENABLED (defaults
-    ``False`` — this helper is only used by tests that want it on;
-    flag-off tests construct ``ControllerConfig()`` directly)."""
+    """A ``ControllerConfig`` with the post-FC PI loop ENABLED and the
+    ceiling-guard drop explicitly OFF, unless the caller overrides either.
+
+    The guard pin (12 Jul D88/D89 promotion, #495 flipped its OWN default to
+    ``True``) keeps this helper's original isolated-testing intent: exercise
+    the RoR-taper loop ALONE, without the now-default-on ceiling guard also
+    firing and confusing a taper-only assertion (e.g. a drop the test expects
+    NOT to fire, that the guard would otherwise trigger independently — D88
+    amendment A1's whole point is that it fires regardless of the taper
+    flag)."""
     overrides.setdefault("enabled", True)
+    overrides.setdefault("ceiling_guard_drop_enabled", False)
     return ControllerConfig(
         post_first_crack_control=PostFirstCrackControl(**overrides)  # type: ignore[arg-type]
     )
@@ -5917,11 +5972,16 @@ def _post_fc_config(**overrides: object) -> ControllerConfig:
 
 def _ceiling_guard_config(**overrides: object) -> ControllerConfig:
     """A ``ControllerConfig`` with the D88 ceiling-guard drop ENABLED (own
-    flag, defaults ``False``) but the RoR-taper loop left at ITS OWN default
-    (``enabled=False``) unless the caller overrides it too — deliberately
-    NOT bundled with :func:`_post_fc_config`, since the guard's whole point
-    (D88 amendment A1) is that it fires independently of the taper flag."""
+    flag) and the RoR-taper loop explicitly OFF, unless the caller overrides
+    either — deliberately NOT bundled with :func:`_post_fc_config`, since the
+    guard's whole point (D88 amendment A1) is that it fires independently of
+    the taper flag. The taper is pinned OFF here (not left at the config's
+    OWN default) because the 12 Jul D88/D89 promotion flipped that default
+    to ``True`` — this helper's whole test purpose is isolating the guard's
+    behaviour from the taper, which needs an explicit pin now that the two
+    are no longer both-off by construction."""
     overrides.setdefault("ceiling_guard_drop_enabled", True)
+    overrides.setdefault("enabled", False)
     return ControllerConfig(
         post_first_crack_control=PostFirstCrackControl(**overrides)  # type: ignore[arg-type]
     )
