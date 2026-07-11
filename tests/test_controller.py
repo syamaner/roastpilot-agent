@@ -4287,6 +4287,33 @@ def test_advisor_context_roast_style_forwards_the_profiles_style_name() -> None:
     assert ctx.target_development_percent_max == 23.0
 
 
+def test_dtr_window_low_edge_matches_coherence_guard_floor() -> None:
+    """Safety-reviewer LOW (#499): pins the TOLD window's low edge and the
+    ENFORCED drop-coherence floor to move together — not merely that both
+    read the same config constant today, but that the edge value itself is
+    genuinely the guard's permitted boundary. A future change to the guard's
+    inequality (>= -> >) or to either edge expression would desync the taught
+    window from the enforced floor; this test fails the moment that happens,
+    rather than only catching a drifted CONSTANT."""
+    config = ControllerConfig(drop_dev_margin_percent=5.0)
+    harness = make_harness(config=config)
+    harness.controller.load_profile(PROFILE)  # target_development_percent=20.0
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+    edge = ctx.target_development_percent_min
+    assert edge is not None
+    expected_edge = PROFILE.target_development_percent - config.drop_dev_margin_percent
+    assert edge == expected_edge == 15.0
+    # The taught edge is genuinely ALLOWED by the enforced guard (inclusive —
+    # >= not >), and one hundredth of a point below it is genuinely BLOCKED.
+    assert harness.controller._drop_development_is_coherent(edge) is True  # pyright: ignore[reportPrivateUsage]
+    assert (
+        harness.controller._drop_development_is_coherent(edge - 0.01) is False  # pyright: ignore[reportPrivateUsage]
+    )
+
+
 @pytest.mark.asyncio
 async def test_advisor_context_post_fc_loop_active_true_when_taper_owns_heat() -> None:
     """Flag ON + true FC edge: ``post_fc_loop_active`` is True,
