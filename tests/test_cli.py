@@ -699,9 +699,9 @@ def test_format_advisor_readout_not_configured() -> None:
 
 
 def test_format_post_fc_loop_readout_enabled() -> None:
-    """Enabled prints a can't-miss ⚠️ line naming #405 (issue #460)."""
+    """Loop enabled prints a can't-miss ⚠️ line naming #405 (issue #460)."""
     lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
-        enabled=True
+        enabled=True, ceiling_guard_enabled=False, ceiling_guard_temp_c=196.0
     )
     text = "\n".join(lines)
     assert "⚠️" in text
@@ -710,14 +710,45 @@ def test_format_post_fc_loop_readout_enabled() -> None:
 
 
 def test_format_post_fc_loop_readout_disabled() -> None:
-    """Disabled (the default) prints a quiet, non-alarming confirmation line."""
+    """Both flags off (the default) prints quiet, non-alarming lines only."""
     lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
-        enabled=False
+        enabled=False, ceiling_guard_enabled=False, ceiling_guard_temp_c=196.0
     )
     text = "\n".join(lines)
     assert "⚠️" not in text
     assert "post-FC RoR loop: disabled" in text
     assert "advisor-driven post-FC" in text
+    assert "ceiling-guard drop: disabled" in text
+
+
+def test_format_post_fc_loop_readout_ceiling_guard_enabled() -> None:
+    """Guard enabled prints its own ⚠️ line with the RESOLVED guard temperature,
+    independent of the loop flag (D88 decoupling, issue #495)."""
+    lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
+        enabled=False, ceiling_guard_enabled=True, ceiling_guard_temp_c=196.0
+    )
+    text = "\n".join(lines)
+    assert "CEILING-GUARD DROP: ENABLED" in text
+    assert "196 °C" in text
+    # The guard line is loud even while the loop line stays quiet — the flags
+    # are independent and each must be confirmable on its own.
+    assert "post-FC RoR loop: disabled" in text
+    assert text.count("⚠️") == 1
+
+
+def test_format_post_fc_loop_readout_both_enabled_two_loud_lines() -> None:
+    """The full D88 treatment arm (taper + guard) prints TWO ⚠️ lines — one per
+    flag — so the operator confirms each independently before charging beans."""
+    lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
+        enabled=True, ceiling_guard_enabled=True, ceiling_guard_temp_c=195.5
+    )
+    assert len(lines) == 2
+    text = "\n".join(lines)
+    assert text.count("⚠️") == 2
+    assert "POST-FC RoR LOOP: ENABLED" in text
+    assert "CEILING-GUARD DROP: ENABLED" in text
+    # The temperature shown is the resolved value, not a hardcoded default.
+    assert "195.5 °C" in text
 
 
 @pytest.mark.asyncio

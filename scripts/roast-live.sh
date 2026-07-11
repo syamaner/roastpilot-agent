@@ -16,10 +16,16 @@
 #          ADAPTIVE_TRIM=1  enable the #386 RoR-keyed ADAPTIVE late-Maillard trim
 #            depth (default off = the proven fixed 65% cut). Interim opt-in until
 #            the config UI lands; e.g. ADAPTIVE_TRIM=1 ./scripts/roast-live.sh
-#          POST_FC_LOOP=1  enable the #405 deterministic post-FC RoR-target heat
+#          POST_FC_LOOP=1  enable the #405/D88 deterministic post-FC taper heat
 #            loop + deterministic drop (default off = fully advisor-driven post-FC,
 #            the roast-1..8 behaviour). Interim opt-in until it's promoted to the
 #            default; e.g. POST_FC_LOOP=1 ./scripts/roast-live.sh
+#          CEILING_GUARD=1  enable the D88 deterministic ceiling-guard drop
+#            (bean ≥ ceiling_guard_temp_c, default 196 °C → drop through the
+#            normal safety path). Independent of POST_FC_LOOP by design — a
+#            safety anchor, not a taper feature. Default off; the validation
+#            roast flips it consciously (issue #495), e.g.
+#            POST_FC_LOOP=1 CEILING_GUARD=1 ./scripts/roast-live.sh
 #          ROASTPILOT_ADVISOR__MODEL_SLUG / ROASTPILOT_ADVISOR__PROMPT_VERSION
 #            override the advisor model + control-teaching prompt (defaults
 #            openai/gpt-4o + c3). The banner prints the resolved pair and tags it
@@ -55,6 +61,15 @@ fi
 # Interim toggle until it's promoted to the default.
 if [ "${POST_FC_LOOP:-0}" = "1" ]; then
   export ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__ENABLED=true
+fi
+
+# Opt-in (D88, issue #495): the deterministic ceiling-guard drop. Decoupled from
+# POST_FC_LOOP by design (a safety anchor, not a taper feature) — it fires with
+# the taper OFF too. Default OFF this build; the operator flips it consciously
+# at the validation roast. The agent banner prints the resolved state, so a
+# typo here can never silently run a baseline as a treatment arm.
+if [ "${CEILING_GUARD:-0}" = "1" ]; then
+  export ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__CEILING_GUARD_DROP_ENABLED=true
 fi
 
 if [ ! -f "$COFFEE_ROASTER_MCP_CONFIG" ]; then
