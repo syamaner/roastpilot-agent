@@ -48,7 +48,7 @@ from typing import Any, Literal, Protocol, cast
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
 from roastpilot_agent.models import AppliedRoasterState, MicStatus, RoastTelemetry
@@ -528,16 +528,26 @@ def _latest_backdate_seconds(
 
 
 class MalformedCommandResultError(Exception):
-    """An MCP command result's event payload is missing an expected field.
+    """An MCP command result's event payload is missing an expected field, or
+    carries a well-typed but out-of-range one.
 
     Raised by :func:`applied_state_from_event` when ``heat_level_percent`` /
-    ``fan_level_percent`` / ``cooling_on`` are absent or the wrong type — the
-    MCP's own contract guarantees all three on ``beans_dropped`` and ``fault``
-    (`coffee_roaster_mcp.session.complete_reserved_driver_drop_snapshot` /
-    `default_emergency_safety_payload`), so this only fires against a genuinely
-    malformed or out-of-contract payload. The controller treats it exactly like
-    any other executor failure (``COMMAND_FAILED``, mirrors NOT advanced) —
-    never fabricate a guessed applied state from a partial payload.
+    ``fan_level_percent`` / ``cooling_on`` are absent, the wrong type, or (for
+    the two integers) outside the 0-100 percent bound
+    :class:`~roastpilot_agent.models.AppliedRoasterState` enforces — the MCP's
+    own contract guarantees all three, in range, on ``beans_dropped`` and
+    ``fault`` (`coffee_roaster_mcp.session.complete_reserved_driver_drop_snapshot`
+    / `default_emergency_safety_payload`), so this only fires against a
+    genuinely malformed or out-of-contract payload. Every caller of this
+    function (the adapter's ``_applied_state_or_none``, the replay fallback)
+    catches ONLY this one exception type to detect "payload could not be
+    parsed" — so a pydantic ``ValidationError`` from an out-of-range value
+    must never escape this function directly; it is translated into this type
+    (Codex follow-up on #509/#507: an out-of-range value previously escaped as
+    a raw ``ValidationError``, bypassing that single choke point and
+    recreating the exact treat-drop-as-failed divergence the ``None`` design
+    exists to prevent). Never fabricate a guessed applied state from a
+    partial/invalid payload.
     """
 
 
@@ -559,8 +569,8 @@ def applied_state_from_event(event: EventSnapshot) -> AppliedRoasterState:
         The applied roaster state the driver actually set.
 
     Raises:
-        MalformedCommandResultError: A required field is missing or the
-            wrong type.
+        MalformedCommandResultError: A required field is missing, the wrong
+            type, or (heat/fan) outside the 0-100 percent bound.
     """
     heat = event.payload.get("heat_level_percent")
     fan = event.payload.get("fan_level_percent")
@@ -577,11 +587,22 @@ def applied_state_from_event(event: EventSnapshot) -> AppliedRoasterState:
         raise MalformedCommandResultError(
             f"{event.kind!r} event payload missing boolean cooling_on: {cooling_on!r}"
         )
-    return AppliedRoasterState(
-        heat_level_percent=heat,
-        fan_level_percent=fan,
-        cooling_on=cooling_on,
-    )
+    try:
+        return AppliedRoasterState(
+            heat_level_percent=heat,
+            fan_level_percent=fan,
+            cooling_on=cooling_on,
+        )
+    except ValidationError as exc:
+        # A well-typed-but-out-of-range value (e.g. heat=101 or fan=-1) —
+        # AppliedRoasterState's own Field(ge=0, le=100) bounds raise here.
+        # Translated into the ONE exception type every caller catches (see
+        # MalformedCommandResultError's docstring) rather than letting a raw
+        # ValidationError escape this function.
+        raise MalformedCommandResultError(
+            f"{event.kind!r} event payload has an out-of-range applied state "
+            f"(heat_level_percent={heat!r}, fan_level_percent={fan!r}): {exc}"
+        ) from exc
 
 
 def project_session_state(state: RoastSessionState, *, age_seconds: float) -> RoastTelemetry | None:
