@@ -233,3 +233,84 @@ Format: one entry per anti-pattern.
   recording` (the opt-out's drop is `source: policy` / `reason:
   ceiling_guard`, not the fixture's own `source: operator` drop) in
   `tests/test_replay.py`.
+
+---
+
+## A query-cache refetch resolving is not proof the underlying fetch succeeded
+*(fixed by #513, 12 Jul 2026)*
+
+- **Signature:** `await.*refetchQueries` or `await.*invalidateQueries` (TanStack
+  Query, `web/src/**`) where the awaiter treats the call RESOLVING as a success
+  signal for control flow — navigation, a state latch, or the only user-visible
+  feedback of an operation. Also: a code comment claiming a refetch/invalidate
+  "surfaces" or "discovers" new server state before some later step, with no
+  fallback if that refetch itself fails.
+- **Wrong:** `LiveStartView` (`web/src/pages/live/LivePage.tsx`, the operator's
+  actual start-roast path) did `await api.startRoast(profile); await
+  queryClient.refetchQueries({ queryKey: roastKeys.health })` with no
+  `navigate()` call, trusting that a successful health refetch alone would
+  re-render the page into the live dashboard. `refetchQueries()` (and
+  `invalidateQueries()`, which internally calls it) ALWAYS RESOLVES in this
+  TanStack Query version, even when the underlying fetch genuinely failed —
+  confirmed empirically against the raw `QueryClient` (`query.state.error` was
+  populated with the real error; the awaited call still did not reject) — and
+  even with `throwOnError: true` passed to `refetchQueries`. A transient
+  `/health` failure right after a POST (e.g. a restart/MCP-respawn window)
+  therefore left the operator on a silent, untouched-looking form with the
+  roaster live and heating, no navigation, no error message, and no path to
+  the emergency stop. The identical pattern existed on three further call
+  sites: `StartRoastView` (`web/src/pages/home/StartRoastView.tsx`, the
+  legacy `/start` route, still URL-reachable — very likely what the
+  operator's screenshot actually showed, which explains the "Required."
+  field-reset detail that could not be reproduced on `/live`);
+  `DashboardPage`'s own idle branch (`web/src/pages/dashboard/
+  DashboardPage.tsx`, unreachable via the current router but carries its
+  own supported test contract); and `DashboardPage`'s
+  `handleAcknowledgeFault` (same file) — lower severity (the operator keeps
+  the FaultBanner/e-stop/dashboard the whole time this resolves, since heat
+  is already off in `faulted` and stays off; the worst case was a
+  silently-stale banner, not a stranded operator) but fixed anyway for
+  consistency with this very entry and because it is precisely the recovery
+  path an operator exercises on the next restart.
+- **Right:** latch control flow on the PROVEN result of the mutation itself
+  (e.g. the 201 from `api.startRoast`, or the acknowledge POST), never on a
+  subsequent refetch/invalidate resolving. If you need the query cache to
+  reflect a just-proven change, poll the resource directly (`api.health()`)
+  with a bounded retry budget and write successes into the cache with
+  `queryClient.setQueryData` — never rely on
+  `refetchQueries`/`invalidateQueries` to signal failure to its awaiter.
+  Pair with a visible transitional/failure UI state (never silently fall
+  back to what looks like an untouched form, and never leave a control
+  permanently disabled on total failure — re-enable it for a manual retry)
+  and, where a real page navigation is available, a manual fallback action
+  once retries are exhausted. Not every `invalidateQueries` site needs
+  this: a `useMutation`'s `onSuccess: () => invalidateQueries(...)` that is
+  `void`-called (not awaited by the caller), where the caller's own
+  success/failure feedback comes from the mutation's own state, is safe —
+  the worst case is a stale read until the next natural refetch, not
+  stranded control flow (see the bean-profile CRUD hooks in
+  `web/src/hooks/queries.ts`, `RoastRating.tsx`, `RoastedWeight.tsx`, and
+  `DashboardPage`'s `run_completed` health-invalidation drain — audited, no
+  fix needed, the dashboard keeps rendering live from SSE regardless).
+- **Test-isolation trap when fixing this pattern:** a confirm-retry loop
+  with a real (even short) `setTimeout` delay between attempts keeps
+  running in its component closure after the test that triggered it
+  finishes and `cleanup()` unmounts — React does not cancel in-flight
+  promises on unmount. If the next test in the same file configures the
+  SAME shared mock with `mockRejectedValueOnce`/`mockResolvedValueOnce`,
+  the leaked loop from the PREVIOUS test can consume those queued
+  once-values before the next test's own trigger fires, producing a
+  flaky-looking failure that is 100% reproducible in full-file order but
+  passes when the test is run in isolation. Fix: make every test that
+  triggers the retry loop resolve the mock to the loop's actual success
+  condition (or otherwise let it terminate) before the test ends, not just
+  assert on the mocked read-model the render depends on.
+- **Guarded by:** `web/src/pages/live/LiveStartFlow.integration.test.tsx`
+  (real fetch-boundary integration tests — not the mocked-`useHealth`/
+  mocked-`StartRoastForm` style that hid the original bug) +
+  `LivePage.test.tsx`'s "start-roast flow (#513)" suite +
+  `StartRoastView.test.tsx`'s active-run-banner tests +
+  `DashboardPage.idle.test.tsx`'s "#513" tests (idle start flow AND the
+  fault-acknowledge confirm/retry/failure states). All were confirmed to
+  fail against the pre-fix code (`git stash` the source change, rerun)
+  before the fix was restored — not vacuous coverage.

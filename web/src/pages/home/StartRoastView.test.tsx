@@ -1,8 +1,15 @@
 /**
- * Start-roast route (#324, updated #403): renders the reused Start form, and a
- * successful start POSTs then navigates to `/live` (the stable reload-safe
- * live-roast route, #403). No local run state is fabricated — the start path
- * refetches health (render from server).
+ * Start-roast route (#324, updated #403, #513): renders the reused Start
+ * form, and a successful start POSTs then navigates to `/live` (the stable
+ * reload-safe live-roast route, #403) UNCONDITIONALLY on the proven 201 —
+ * never gated on a health refetch, which can itself fail silently (#513;
+ * `LivePage`'s idle state owns confirming the new run with retries). No local
+ * run state is fabricated — the active run is discovered from the server.
+ *
+ * Also covers the two defensive states that replace the bare form: an
+ * already-active run (banner + link to `/live`) and a persistent health
+ * error (status-unknown state) — active-run status genuinely unknown must
+ * never be treated as "no run".
  */
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -11,7 +18,6 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { roastKeys } from "@/hooks/queries";
 import { StartRoastView } from "./StartRoastView";
 
 const startRoastMock = vi.hoisted(() => vi.fn(async () => ({ id: "run-new" })));
@@ -19,6 +25,15 @@ vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return { ...actual, api: { ...actual.api, startRoast: startRoastMock } };
 });
+
+// Mutable health stub — mirrors LivePage.test.tsx's pattern (#513): the active-
+// run banner + status-unknown tests need a controllable `useHealth()` without
+// a real fetch.
+const healthState: {
+  data: { active_run_id: string | null } | undefined;
+  isSuccess: boolean;
+  isError: boolean;
+} = { data: undefined, isSuccess: false, isError: false };
 
 // Bean-profile library hooks stubbed so the form's dropdown wires real fixture data
 // without firing a (failing) jsdom fetch — mirrors the dashboard idle spec (#303).
@@ -30,6 +45,7 @@ vi.mock("@/hooks/queries", async () => {
   const noopMutation = () => ({ mutateAsync: vi.fn(async () => undefined) });
   return {
     ...actual,
+    useHealth: () => healthState,
     useBeanProfiles: () => ({ data: { profiles: FIXTURE_BEAN_PROFILES }, isLoading: false }),
     useCreateBeanProfile: noopMutation,
     useUpdateBeanProfile: noopMutation,
@@ -39,9 +55,6 @@ vi.mock("@/hooks/queries", async () => {
 
 function renderView() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  // Spy on the awaited health refetch — the render-from-server enforcement point:
-  // start must refresh the active-run snapshot before routing to `/live`.
-  const refetchSpy = vi.spyOn(client, "refetchQueries");
   const wrapper = (children: ReactNode) => (
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={["/start"]}>
@@ -55,12 +68,14 @@ function renderView() {
     </QueryClientProvider>
   );
   render(wrapper(<StartRoastView />));
-  return { refetchSpy };
 }
 
 afterEach(cleanup);
 beforeEach(() => {
   startRoastMock.mockClear();
+  healthState.data = { active_run_id: null };
+  healthState.isSuccess = true;
+  healthState.isError = false;
 });
 
 /** Fill the required bean fields + weight; the draft defaults cover the rest. */
@@ -84,22 +99,49 @@ describe("StartRoastView (#324)", () => {
     expect(screen.getByTestId("bean-profile-picker")).toBeInTheDocument();
   });
 
-  it("POSTs, refetches health, then navigates to `/live` on success (#403)", async () => {
-    const { refetchSpy } = renderView();
+  it("POSTs, then navigates to `/live` unconditionally on the proven 201 (#403/#513)", async () => {
+    renderView();
     fillMinimum();
     fireEvent.submit(screen.getByTestId("start-roast-form"));
     await waitFor(() => expect(startRoastMock).toHaveBeenCalledTimes(1));
-    // Render-from-server: start AWAITS a health refetch (the active-run snapshot)
-    // before routing, so `/live` resolves to the dashboard with no start-form flash.
-    await waitFor(() =>
-      expect(refetchSpy).toHaveBeenCalledWith({ queryKey: roastKeys.health }),
-    );
-    // #403: On success we route to `/live` (the stable reload-safe live-roast URL),
-    // not `/`. LivePage then shows the dashboard once health reports the new run.
+    // #513: navigation must NOT be gated on a health refetch (which can itself
+    // fail silently) — it fires as soon as the POST is proven (201). #403: we
+    // route to `/live` (the stable reload-safe live-roast URL), not `/`.
+    // LivePage then owns confirming the new run against `/health`.
     await waitFor(() =>
       expect(screen.getByTestId("live-page")).toBeInTheDocument(),
     );
     // We must NOT land on the home hub.
     expect(screen.queryByTestId("home-landing")).toBeNull();
+  });
+
+  it("#513: shows the active-run banner instead of a bare form when a run is already active", () => {
+    healthState.data = { active_run_id: "run-42" };
+    healthState.isSuccess = true;
+    renderView();
+    expect(screen.getByTestId("start-roast-active-run-banner")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.getByTestId("start-roast-active-run-link")).toHaveAttribute("href", "/live");
+  });
+
+  it("#513: navigating the active-run banner link reaches the live dashboard", () => {
+    healthState.data = { active_run_id: "run-42" };
+    healthState.isSuccess = true;
+    renderView();
+    fireEvent.click(screen.getByTestId("start-roast-active-run-link"));
+    expect(screen.getByTestId("live-page")).toBeInTheDocument();
+  });
+
+  it("#513 medium: shows a neutral status-unknown state (NEVER the bare form) when health persistently errors", () => {
+    // This route (still URL-reachable) is almost certainly what the incident
+    // screenshot was taken on — active-run status unknown must never fall
+    // through to the bare form, the same hazard as the active-run-banner case.
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    healthState.data = undefined;
+    renderView();
+    expect(screen.getByTestId("start-roast-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.queryByTestId("start-roast-active-run-banner")).toBeNull();
   });
 });
