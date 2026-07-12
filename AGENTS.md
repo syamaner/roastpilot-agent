@@ -285,8 +285,8 @@ auto-blocker**: it re-reviews the whole diff from scratch and re-posts already-f
 findings as new inline threads, which would deadlock `required_conversation_resolution`
 if its threads gated merge. **So the planned `review-gate` "flip-on-BOTH-reviews" wiring
 is CANCELLED — do not make Codex a required check.** Operating rule (the lead, per D23 —
-the author never self-triages): Codex auto-reviews at PR creation; **re-trigger it with a
-`codex review` comment only ONCE, on the final commit**, not on every push; the lead
+the author never self-triages): Codex auto-reviews at PR creation; **re-trigger it with an
+`@codex review` comment only ONCE, on the final commit**, not on every push; the lead
 verifies each finding against the *current* code, folds the real ones, and **resolves the
 stale re-posts by hand** (GraphQL `resolveReviewThread`). Its signal type is a
 `pull_request_review` with inline threads, which DO block via conversation-resolution, so
@@ -294,6 +294,17 @@ the lead must clear them consciously. A lean roster is not "fewer eyes": a diver
 catches what a strong single lens misses; the constraint Codex must satisfy is *not
 re-litigating resolved threads on every push*, which the once-on-final-commit discipline
 enforces. (Memory: `claude-review-not-a-required-check`.)
+
+**WAIT for Codex's verdict before merging (operator rule, 12 Jul — the #518 lesson):**
+Codex is often DELAYED relative to CI, and green-CI auto-merge can land a PR before its
+review posts (#518 merged with 3 real P2s in flight → fix-forward #519). Its lifecycle
+signals on the PR are readable: **👀 reaction = review started; a posted review = findings;
+a 👍 reaction (after the 👀) = done, nothing found.** So: do NOT arm auto-merge at open.
+After the final commit + `@codex review`, wait for either the review or the 👍; then triage
+(if findings), resolve, and only then merge/arm auto-merge. If neither signal appears
+~15 min after green CI, re-trigger once more; if still silent, merging is allowed — note
+"Codex silent" in the merge context so a late review is triaged as post-merge follow-up,
+not a surprise.
 
 **Inline PR comments are MERGE-BLOCKING** — `main` requires every conversation
 resolved (branch protection). So calibrate where findings go:
