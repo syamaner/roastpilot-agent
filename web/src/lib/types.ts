@@ -331,6 +331,12 @@ export interface RoastSummary {
   // (charge - roasted) / charge * 100. `null` until weighed; predominantly
   // moisture but also dry-matter loss, so NOT pure water loss.
   roasted_weight_grams?: number | null;
+  // Operator-corrected charge/green weight (#520), or `null` when never
+  // corrected. `profile.bean_weight_grams` stays the FROZEN value the
+  // controller/advisor actually ran with; this is the physical-truth
+  // correction and drives `weight_loss_percent` in its place when present.
+  // Always show BOTH values with which one is driving the % explicit.
+  corrected_charge_grams?: number | null;
   weight_loss_percent?: number | null;
   development_percent: number | null;
   // Advisor stats (#184) aggregated server-side from `advisor_decisions`, so the
@@ -370,6 +376,9 @@ export interface RoastDetail {
   // Operator roasted-out weight (#388) + derived weight-loss %. `null` until
   // weighed. The green/charge weight is `profile.bean_weight_grams`.
   roasted_weight_grams?: number | null;
+  // Operator-corrected charge/green weight (#520), or `null` when never
+  // corrected. See RoastSummary's field doc — same semantics.
+  corrected_charge_grams?: number | null;
   weight_loss_percent?: number | null;
   export_manifest: LogManifest | null;
   // Forward-compatible with the planned E7 `enabled_actions` addition (option
@@ -526,6 +535,11 @@ export interface OperatorRatingRequest {
 /** `POST /api/roasts/{id}/roasted-weight` body (#388). Grams, must be > 0. */
 export interface RoastedWeightRequest {
   roasted_weight_grams: number;
+}
+
+/** `POST /api/roasts/{id}/charge-weight` body (#520). Grams, must be > 0. */
+export interface ChargeWeightRequest {
+  corrected_charge_grams: number;
 }
 
 // --- Tastings (models.RoastTasting / TastingEntryRequest / TastingList, #522, D91) ---

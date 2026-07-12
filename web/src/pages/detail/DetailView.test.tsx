@@ -76,6 +76,12 @@ describe("DetailView trace-row → curve highlight", () => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("DetailView composition", () => {
+  it("mounts ChargeWeight wired to the detail's frozen charge weight (#520) — the data-flows-to-the-render-tree check", () => {
+    renderView();
+    const frozen = screen.getByTestId("charge-weight-frozen");
+    expect(frozen).toHaveTextContent(`${FIXTURE_DETAIL.profile.bean_weight_grams} g`);
+  });
+
   it("mounts RoastTastings wired to the detail's own run id (#522) — the data-flows-to-the-render-tree check: a dropped import or wrong runId prop would pass every other test here", async () => {
     const spy = vi
       .spyOn(api, "tastings")

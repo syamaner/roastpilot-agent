@@ -12,6 +12,7 @@ import type {
   BeanProfileDeleteResult,
   BeanProfileInput,
   BeanProfileList,
+  ChargeWeightRequest,
   DevicesSnapshot,
   HealthResponse,
   OperatorActionRequest,
@@ -102,6 +103,13 @@ export const api = {
   /** `POST /api/roasts/{id}/roasted-weight` — operator roasted-out weight (#388). */
   setRoastedWeight: (runId: string, body: RoastedWeightRequest) =>
     request<RoastDetail>(`/api/roasts/${runId}/roasted-weight`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  /** `POST /api/roasts/{id}/charge-weight` — operator charge-weight correction (#520). */
+  setChargeWeight: (runId: string, body: ChargeWeightRequest) =>
+    request<RoastDetail>(`/api/roasts/${runId}/charge-weight`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

@@ -418,6 +418,24 @@ CREATE TABLE roast_tastings (
 CREATE INDEX idx_roast_tastings_run ON roast_tastings(run_id, id);
 """
 
+SCHEMA_V12_CORRECTED_CHARGE = """
+-- #520: the operator-entered CORRECTED charge/green weight, for the case
+-- where the start-form default was left unedited but the operator actually
+-- weighed a different amount (roast 13: charged 255 g, the form still had
+-- the 250 g seed default). The frozen profile_json.bean_weight_grams stays
+-- frozen — it is what the controller/advisor actually saw and ran with —
+-- so the physical truth gets a NEW column rather than mutating the snapshot.
+-- Same lifecycle as roasted_weight_grams (V7): the v2 completed-run
+-- immutability trigger guards a fixed column allow-list (it ABORTs only on
+-- the enumerated frozen columns), so a NEW column is permitted to change
+-- after completion without editing the shipped trigger. Nullable; read
+-- paths prefer this value over the frozen charge weight when present (see
+-- read_run / list_runs), falling back to profile.bean_weight_grams when
+-- NULL — an uncorrected run's derived weight-loss % is unaffected.
+ALTER TABLE roast_runs ADD COLUMN corrected_charge_grams REAL
+  CHECK (corrected_charge_grams IS NULL OR corrected_charge_grams > 0);
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
@@ -433,6 +451,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V9_AMBIENT,
     SCHEMA_V10_AMBIENT_CAPTURED_LATCH,
     SCHEMA_V11_TASTINGS,
+    SCHEMA_V12_CORRECTED_CHARGE,
 )
 
 
@@ -1120,6 +1139,32 @@ class RoastStore:
         if cursor.rowcount == 0:
             raise RuntimeError(f"no completed roast_run with id {run_id!r}")
 
+    async def set_corrected_charge(self, run_id: str, *, corrected_charge_grams: float) -> None:
+        """Operator-entered CHARGE-weight correction (#520) — completed runs only.
+
+        The same immutability-exception lifecycle as :meth:`set_roasted_weight`:
+        the frozen ``profile_json.bean_weight_grams`` stays untouched (it is what
+        the controller/advisor actually ran with) — the corrected value lands in
+        this separate column instead. Derived weight-loss % on read prefers this
+        value over the frozen charge weight when present (see ``read_run`` /
+        ``list_runs``). Raises when the run is unknown or still in progress.
+
+        Args:
+            run_id: The completed run to update.
+            corrected_charge_grams: The corrected green/charge weight in grams
+                (> 0; the API model enforces the bound, plus the
+                not-below-roasted-weight physical-sanity check, before this is
+                called).
+        """
+        cursor = await self.connection.execute(
+            "UPDATE roast_runs SET corrected_charge_grams = ?, updated_at_utc = ?"
+            " WHERE id = ? AND completed_at_utc IS NOT NULL",
+            (corrected_charge_grams, _utc_now(), run_id),
+        )
+        await self.connection.commit()
+        if cursor.rowcount == 0:
+            raise RuntimeError(f"no completed roast_run with id {run_id!r}")
+
     async def add_tasting(
         self,
         run_id: str,
@@ -1312,6 +1357,7 @@ class RoastStore:
         async with self.connection.execute(
             "SELECT r.id, r.started_at_utc, r.completed_at_utc, r.agent_phase,"
             " r.outcome, r.profile_json, r.operator_rating, r.roasted_weight_grams,"
+            " r.corrected_charge_grams,"
             " r.ambient_temp_c, r.ambient_humidity_pct, r.ambient_pressure_hpa,"
             " (SELECT t.development_percent FROM telemetry_snapshots t"
             "  WHERE t.run_id = r.id AND t.development_percent IS NOT NULL"
@@ -1342,6 +1388,7 @@ class RoastStore:
         for row in rows:
             profile = RoastProfile.model_validate_json(str(row["profile_json"]))
             roasted_weight = self._optional_float(row["roasted_weight_grams"])
+            corrected_charge = self._optional_float(row["corrected_charge_grams"])
             summaries.append(
                 RoastSummary(
                     id=str(row["id"]),
@@ -1361,8 +1408,9 @@ class RoastStore:
                     altitude_m=profile.altitude_m,
                     rating=None if row["operator_rating"] is None else int(row["operator_rating"]),
                     roasted_weight_grams=roasted_weight,
+                    corrected_charge_grams=corrected_charge,
                     weight_loss_percent=weight_loss_percent(
-                        charge_weight_grams=profile.bean_weight_grams,
+                        charge_weight_grams=corrected_charge or profile.bean_weight_grams,
                         roasted_weight_grams=roasted_weight,
                     ),
                     development_percent=None if row["dev_pct"] is None else float(row["dev_pct"]),
@@ -1383,8 +1431,9 @@ class RoastStore:
         async with self.connection.execute(
             "SELECT id, agent_phase, profile_json, outcome, started_at_utc,"
             " completed_at_utc, fault_reason, operator_rating, operator_notes,"
-            " roasted_weight_grams, ambient_temp_c, ambient_humidity_pct,"
-            " ambient_pressure_hpa, export_manifest_json FROM roast_runs WHERE id = ?",
+            " roasted_weight_grams, corrected_charge_grams, ambient_temp_c,"
+            " ambient_humidity_pct, ambient_pressure_hpa, export_manifest_json"
+            " FROM roast_runs WHERE id = ?",
             (run_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -1398,6 +1447,7 @@ class RoastStore:
         agent_phase = RoastPhase(str(row["agent_phase"]))
         profile = RoastProfile.model_validate_json(str(row["profile_json"]))
         roasted_weight = self._optional_float(row["roasted_weight_grams"])
+        corrected_charge = self._optional_float(row["corrected_charge_grams"])
         return RoastDetail(
             id=str(row["id"]),
             agent_phase=agent_phase,
@@ -1411,8 +1461,9 @@ class RoastStore:
             rating=None if row["operator_rating"] is None else int(row["operator_rating"]),
             notes=None if row["operator_notes"] is None else str(row["operator_notes"]),
             roasted_weight_grams=roasted_weight,
+            corrected_charge_grams=corrected_charge,
             weight_loss_percent=weight_loss_percent(
-                charge_weight_grams=profile.bean_weight_grams,
+                charge_weight_grams=corrected_charge or profile.bean_weight_grams,
                 roasted_weight_grams=roasted_weight,
             ),
             export_manifest=manifest,

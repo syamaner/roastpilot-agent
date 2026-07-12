@@ -70,6 +70,7 @@ from roastpilot_agent.models import (
     BeanProfile,
     BeanProfileInput,
     BeanProfileList,
+    ChargeWeightRequest,
     HealthResponse,
     LogManifest,
     MCPChildStatus,
@@ -2039,6 +2040,63 @@ class RoastService:
             raise RuntimeError(f"read_run returned None for weighed run {run_id}")
         return weighed
 
+    async def set_charge_weight(self, run_id: str, request: ChargeWeightRequest) -> RoastDetail:
+        """Record an operator CHARGE-weight correction (#520), or 404/409.
+
+        Mirrors :meth:`set_roasted_weight`: 404 when the run is unknown; 409
+        when it is still in progress — the same completed-run immutability
+        exception lifecycle. The frozen ``profile.bean_weight_grams`` is NEVER
+        mutated (it is what the controller/advisor actually ran with); the
+        corrected value lands in the separate ``corrected_charge_grams``
+        column and drives ``weight_loss_percent`` in its place.
+
+        A corrected charge BELOW the roasted-out weight is physically
+        impossible (the beans cannot weigh more roasted than they weighed
+        green) and is rejected as a 409, mirroring
+        :meth:`set_roasted_weight`'s own bound in the other direction. When no
+        roasted weight has been entered yet there is nothing to bound
+        against, so any positive correction is accepted (the model's own
+        ``gt=0`` already guards non-positive input).
+
+        Records an audit event (``operator_actions``, action
+        ``"charge_weight_correction"``) with the before/after values — the
+        existing free-form ``operator_actions.action`` text column, not a new
+        ``RoastEventKind`` member (no D15/enum-CHECK-rebuild surface for a
+        one-off audit record).
+        """
+        detail = await self._store.read_run(run_id)
+        if detail is None:
+            raise RoastRunNotFoundError(run_id)
+        if detail.completed_at_utc is None:
+            raise RoastRunConflictError(
+                f"run {run_id} is still in progress; correct its charge weight after completion"
+            )
+        if (
+            detail.roasted_weight_grams is not None
+            and request.corrected_charge_grams < detail.roasted_weight_grams
+        ):
+            raise RoastRunConflictError(
+                f"corrected charge weight {request.corrected_charge_grams} g is below the "
+                f"roasted-out weight {detail.roasted_weight_grams} g (physically impossible)"
+            )
+        previous_charge = detail.corrected_charge_grams or detail.profile.bean_weight_grams
+        await self._store.set_corrected_charge(
+            run_id, corrected_charge_grams=request.corrected_charge_grams
+        )
+        await self._store.record_operator_action(
+            action="charge_weight_correction",
+            run_id=run_id,
+            payload={
+                "previous_charge_grams": previous_charge,
+                "corrected_charge_grams": request.corrected_charge_grams,
+            },
+            result="accepted",
+        )
+        corrected = await self._store.read_run(run_id)
+        if corrected is None:  # pragma: no cover — immutable once completed
+            raise RuntimeError(f"read_run returned None for corrected run {run_id}")
+        return corrected
+
     async def add_tasting(self, run_id: str, request: TastingEntryRequest) -> TastingList:
         """Record one tasting entry (#522, D91), or 404/409.
 
@@ -2358,6 +2416,20 @@ async def set_roasted_weight(
     """``POST /api/roasts/{run_id}/roasted-weight`` — operator roasted-out weight (#388)."""
     try:
         return await service.set_roasted_weight(run_id, request)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+async def set_charge_weight(
+    run_id: str,
+    request: ChargeWeightRequest,
+    service: ServiceDep,
+) -> RoastDetail:
+    """``POST /api/roasts/{run_id}/charge-weight`` — operator charge-weight correction (#520)."""
+    try:
+        return await service.set_charge_weight(run_id, request)
     except RoastRunNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RoastRunConflictError as exc:
@@ -2845,6 +2917,7 @@ def create_app(
     app.get("/api/roasts/{run_id}/log/{artifact}")(download_log)
     app.post("/api/roasts/{run_id}/rating")(rate_roast)
     app.post("/api/roasts/{run_id}/roasted-weight")(set_roasted_weight)
+    app.post("/api/roasts/{run_id}/charge-weight")(set_charge_weight)
     app.post("/api/roasts/{run_id}/tastings", status_code=201)(add_tasting)
     app.get("/api/roasts/{run_id}/tastings")(list_tastings)
     app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)

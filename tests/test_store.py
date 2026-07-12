@@ -329,11 +329,11 @@ async def test_v10_migration_adds_explicit_ambient_captured_latch_back_compat(
 
 
 @pytest.mark.asyncio
-async def test_fresh_store_is_v11(tmp_store: RoastStore) -> None:
-    """A brand-new store lands on the current (v11) schema version."""
+async def test_fresh_store_is_v12(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v12) schema version."""
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 11 == len(MIGRATIONS)
+        assert await tmp_store.schema_version() == 12 == len(MIGRATIONS)
     finally:
         await tmp_store.close()
 
@@ -1358,6 +1358,98 @@ async def test_set_roasted_weight_on_active_run_raises(tmp_store: RoastStore) ->
     try:
         with pytest.raises(RuntimeError, match="no completed roast_run"):
             await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=221.0)
+    finally:
+        await tmp_store.close()
+
+
+# --- charge-weight correction (#520) ---
+
+
+@pytest.mark.asyncio
+async def test_set_corrected_charge_persists_and_overrides_weight_loss(
+    tmp_store: RoastStore,
+) -> None:
+    """#520: the operator-corrected charge weight stamps on a completed run and
+    the read paths derive weight-loss % against the CORRECTED charge, not the
+    frozen profile's 250 g default — roast 13's exact worked example (charged
+    255 g against a 250 g form default, roasted 223 g: truth is 12.5%, not the
+    10.8% the frozen 250 g would compute)."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=223.0)
+        await tmp_store.set_corrected_charge("run-1", corrected_charge_grams=255.0)
+
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.corrected_charge_grams == 255.0
+        # The frozen profile is UNTOUCHED — still the 250 g the controller ran with.
+        assert detail.profile.bean_weight_grams == 250.0
+        assert detail.weight_loss_percent == 12.55  # (255 - 223) / 255 * 100
+
+        summaries = await tmp_store.list_runs()
+        summary = next(s for s in summaries if s.id == "run-1")
+        assert summary.corrected_charge_grams == 255.0
+        assert summary.weight_loss_percent == 12.55
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_corrected_charge_is_an_immutability_exception(tmp_store: RoastStore) -> None:
+    """#520: the corrected charge is operator-editable AFTER completion (same
+    lifecycle as roasted weight / rating) — the v2 immutability trigger does
+    not guard the new column."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_corrected_charge("run-1", corrected_charge_grams=255.0)
+        await tmp_store.set_corrected_charge("run-1", corrected_charge_grams=252.0)
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.corrected_charge_grams == 252.0
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_uncorrected_run_derives_weight_loss_from_the_frozen_charge(
+    tmp_store: RoastStore,
+) -> None:
+    """#520: a run with no correction reads back null corrected_charge_grams and
+    the derived weight-loss % is unaffected — falls back to the frozen profile's
+    charge weight exactly as before #520."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=221.0)
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.corrected_charge_grams is None
+        assert detail.weight_loss_percent == 11.6  # (250 - 221) / 250 * 100, unaffected
+
+        summaries = await tmp_store.list_runs()
+        summary = next(s for s in summaries if s.id == "run-1")
+        assert summary.corrected_charge_grams is None
+        assert summary.weight_loss_percent == 11.6
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_corrected_charge_on_active_run_raises(tmp_store: RoastStore) -> None:
+    """#520: completed-only, like the rating/roasted-weight — an in-progress
+    run cannot be stamped."""
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no completed roast_run"):
+            await tmp_store.set_corrected_charge("run-1", corrected_charge_grams=255.0)
     finally:
         await tmp_store.close()
 

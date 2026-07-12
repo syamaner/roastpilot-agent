@@ -5,6 +5,7 @@
     "ambient_pressure_hpa": null,
     "ambient_temp_c": null,
     "completed_at_utc": "2026-01-01T00:00:00+00:00",
+    "corrected_charge_grams": null,
     "enabled_actions": [
       "pause_advisory",
       "resume_advisory",
@@ -67,6 +68,7 @@
     "bean_species": null,
     "bean_varietal": null,
     "completed_at_utc": "2026-01-01T00:00:00+00:00",
+    "corrected_charge_grams": null,
     "country": null,
     "development_percent": 37.5,
     "first_crack_at_utc": "2026-01-01T00:00:00+00:00",

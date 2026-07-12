@@ -860,10 +860,21 @@ class RoastSummary(BaseModel):
     """Operator-entered roasted-out weight in grams (#388), or ``None`` when not
     yet weighed. The green/charge weight lives on the frozen profile
     (``bean_weight_grams``)."""
+    corrected_charge_grams: float | None = None
+    """Operator-entered CORRECTED charge/green weight in grams (#520), or
+    ``None`` when never corrected. The frozen ``profile.bean_weight_grams``
+    stays what the controller/advisor actually ran with (never mutated); this
+    is the physical-truth correction (e.g. the start-form default was left
+    unedited but the operator charged a different amount) — it drives
+    ``weight_loss_percent`` in its place when present. The SPA must show
+    BOTH the frozen and corrected values with which one is driving the
+    percentage explicit, never a silent swap."""
     weight_loss_percent: float | None = None
     """Derived roast weight loss % — ``(charge - roasted) / charge * 100`` (#388),
     ``None`` until the roasted weight is entered. Predominantly moisture but also
-    dry-matter loss (CO₂, volatiles, chaff), so NOT pure water loss."""
+    dry-matter loss (CO₂, volatiles, chaff), so NOT pure water loss. ``charge``
+    is ``corrected_charge_grams`` when present (#520), else the frozen
+    ``profile.bean_weight_grams``."""
     development_percent: float | None = None
     advisor_consults: int = 0
     """Total persisted advisor consults for this run (#184), aggregated
@@ -961,10 +972,19 @@ class RoastDetail(BaseModel):
     roasted_weight_grams: float | None = None
     """Operator-entered roasted-out weight in grams (#388), or ``None`` when not
     yet weighed. The green/charge weight is ``profile.bean_weight_grams``."""
+    corrected_charge_grams: float | None = None
+    """Operator-entered CORRECTED charge/green weight in grams (#520), or
+    ``None`` when never corrected. ``profile.bean_weight_grams`` stays what the
+    controller/advisor actually ran with (never mutated); this is the
+    physical-truth correction and drives ``weight_loss_percent`` in its place
+    when present. The SPA must show BOTH values with which one is driving the
+    percentage explicit, never a silent swap."""
     weight_loss_percent: float | None = None
     """Derived roast weight loss % — ``(charge - roasted) / charge * 100`` (#388),
     ``None`` until the roasted weight is entered. Predominantly moisture but also
-    dry-matter loss (CO₂, volatiles, chaff), so NOT pure water loss."""
+    dry-matter loss (CO₂, volatiles, chaff), so NOT pure water loss. ``charge``
+    is ``corrected_charge_grams`` when present (#520), else
+    ``profile.bean_weight_grams``."""
     export_manifest: LogManifest | None = None
     enabled_actions: list[OperatorAction] = Field(default_factory=_empty_actions)
     mic_status: MicStatus | None = None
@@ -1143,6 +1163,22 @@ class RoastedWeightRequest(BaseModel):
     """
 
     roasted_weight_grams: float = Field(gt=0)
+
+
+class ChargeWeightRequest(BaseModel):
+    """``POST /api/roasts/{id}/charge-weight`` body (#520).
+
+    An operator correction to the CHARGE/green weight, for when the start-form
+    default was left unedited but the operator actually charged a different
+    amount (roast 13: charged 255 g, the form still had the 250 g seed
+    default). Same completion-only lifecycle as the rating/roasted-weight.
+    Must be > 0; the server also rejects a value below the roasted-out weight
+    (physically impossible — the corrected charge cannot be less than what
+    came out) as a 409, mirroring :class:`RoastedWeightRequest`'s own
+    roasted-exceeds-charge check in the other direction.
+    """
+
+    corrected_charge_grams: float = Field(gt=0)
 
 
 # --- #522 (D91): structured tasting entries ---

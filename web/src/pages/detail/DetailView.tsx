@@ -26,6 +26,7 @@ import { AdvisorSummaryChips } from "./AdvisorSummaryChips";
 import { AdvisorTimeline } from "./AdvisorTimeline";
 import { advisorSummary, toAdvisorRows } from "./advisorModel";
 import { CappedList } from "./CappedList";
+import { ChargeWeight } from "./ChargeWeight";
 import { DecisionTraceTable } from "./DecisionTraceTable";
 import { EventTimeline } from "./EventTimeline";
 import { ExportOptions } from "./ExportOptions";
@@ -144,6 +145,13 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
           <RoastedWeight
             runId={detail.id}
             chargeWeightGrams={detail.profile.bean_weight_grams}
+            roastedWeightGrams={detail.roasted_weight_grams ?? null}
+            weightLossPercent={detail.weight_loss_percent ?? null}
+          />
+          <ChargeWeight
+            runId={detail.id}
+            frozenChargeGrams={detail.profile.bean_weight_grams}
+            correctedChargeGrams={detail.corrected_charge_grams ?? null}
             roastedWeightGrams={detail.roasted_weight_grams ?? null}
             weightLossPercent={detail.weight_loss_percent ?? null}
           />
