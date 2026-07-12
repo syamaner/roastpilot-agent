@@ -32,6 +32,7 @@ from roastpilot_agent.api import (
     RoastRunGoneError,
     RoastRunner,
     RoastService,
+    _before_the_minute,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     _parse_last_event_id,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     create_app,
     stream_events,
@@ -1086,7 +1087,11 @@ async def test_add_tasting_rejects_tasted_at_before_completion(
     await store.complete_run(run_id="run-tpc", outcome="completed", agent_phase=RoastPhase.COMPLETE)
     detail = (await client.get("/api/roasts/run-tpc")).json()
     completed_at = datetime.fromisoformat(detail["completed_at_utc"])
-    before = (completed_at - timedelta(seconds=5)).isoformat()
+    # A full 2 minutes earlier — guaranteed to land in an EARLIER minute
+    # regardless of completed_at's own seconds/microseconds component (#522
+    # round 4: the comparison is minute-truncated, so a delta smaller than a
+    # minute could land in the SAME minute and be wrongly accepted).
+    before = (completed_at - timedelta(minutes=2)).isoformat()
 
     response = await client.post(
         "/api/roasts/run-tpc/tastings",
@@ -1113,6 +1118,57 @@ async def test_add_tasting_accepts_tasted_at_exactly_at_completion(
         json={"stars": 3, "tasted_at_utc": detail["completed_at_utc"]},
     )
     assert response.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_accepts_same_minute_as_completion_despite_seconds(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#522 round 4: the FE's datetime-local picker cannot express seconds,
+    so an honest "tasted at the completion minute" entry must NOT 409 just
+    because completed_at_utc itself has a non-zero seconds component. The
+    exact collision case from the thread: completion at some non-zero
+    second, the operator picks that same minute (:00 seconds — all a
+    datetime-local input can express)."""
+    await store.create_run(
+        run_id="run-minute", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(
+        run_id="run-minute", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    detail = (await client.get("/api/roasts/run-minute")).json()
+    completed_at = datetime.fromisoformat(detail["completed_at_utc"])
+    # completed_at_utc is stamped from real "now" (datetime.now(UTC)), which
+    # essentially never lands on exactly :00 seconds — this reproduces the
+    # collision without needing to bypass the completed-run immutability
+    # trigger to pin an exact seconds value.
+    same_minute_no_seconds = completed_at.replace(second=0, microsecond=0).isoformat()
+
+    response = await client.post(
+        "/api/roasts/run-minute/tastings",
+        json={"stars": 4, "tasted_at_utc": same_minute_no_seconds},
+    )
+    assert response.status_code == 201
+
+
+@pytest.mark.parametrize(
+    ("tasted_at", "completed_at", "expected"),
+    [
+        # The exact collision case: completion at :45s, tasted at the same
+        # minute (:00s) — NOT before, despite the raw string being lexically
+        # smaller.
+        ("2026-07-12T18:05:00+00:00", "2026-07-12T18:05:45+00:00", False),
+        # A genuinely earlier minute — still caught.
+        ("2026-07-12T18:04:59+00:00", "2026-07-12T18:05:00+00:00", True),
+        # Same instant.
+        ("2026-07-12T18:05:45+00:00", "2026-07-12T18:05:45+00:00", False),
+        # A later minute.
+        ("2026-07-12T18:06:00+00:00", "2026-07-12T18:05:45+00:00", False),
+    ],
+)
+def test_before_the_minute(tasted_at: str, completed_at: str, expected: bool) -> None:
+    """#522 round 4: unit-level pin of the minute-truncated comparison."""
+    assert _before_the_minute(tasted_at, completed_at) is expected
 
 
 @pytest.mark.asyncio

@@ -58,6 +58,7 @@ import json
 import sqlite3
 import sys
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +129,12 @@ class StoreRoast:
             (a revisit tasting is a SEPARATE entry, not an overwrite). Empty
             list for an untasted roast or a pre-#522 store whose schema
             predates the ``roast_tastings`` table.
+        completed_at_utc: The run's ``roast_runs.completed_at_utc`` (UTC
+            ISO-8601), or ``None`` for the unfinalised roast-2 shape (a run
+            with no ``completed_at_utc`` cannot reach this converter's
+            completed-only default lookup, but an explicit ``--run-id`` can
+            still target one). Used only to derive each tasting's
+            ``degassing_offset_hours`` (#522 round 4) — never a control input.
     """
 
     run_id: str
@@ -141,6 +148,7 @@ class StoreRoast:
     first_crack_seconds: float | None
     drop_seconds: float | None
     tastings: list[dict[str, Any]]
+    completed_at_utc: str | None
 
 
 def _connect_readonly(db_path: Path) -> sqlite3.Connection:
@@ -288,8 +296,8 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
             else "NULL AS roasted_weight_grams"
         )
         run_row = connection.execute(
-            f"SELECT operator_rating, operator_notes, {_weight_col}, profile_json"
-            " FROM roast_runs WHERE id = ?",
+            f"SELECT operator_rating, operator_notes, {_weight_col}, profile_json,"
+            " completed_at_utc FROM roast_runs WHERE id = ?",
             (resolved,),
         ).fetchone()
         telemetry_rows = connection.execute(
@@ -383,6 +391,9 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
             ),
             drop_seconds=_rebase(_drop_time(connection, resolved), run_started),
             tastings=tastings,
+            completed_at_utc=None
+            if run_row is None or run_row["completed_at_utc"] is None
+            else str(run_row["completed_at_utc"]),
         )
     finally:
         connection.close()
@@ -566,9 +577,43 @@ def build_summary(roast: StoreRoast, rows: list[dict[str, Any]]) -> dict[str, An
         # operator_rating/notes alone cannot carry (a revisit tasting is an
         # ADDITIONAL entry, never an overwrite). Empty list for an untasted
         # roast or a pre-#522 store. The .alog adapter has no tasting concept
-        # and always emits an empty list (parity with this key set).
-        "tastings": roast.tastings,
+        # and always emits an empty list (parity with this key set). Each
+        # entry carries a derived degassing_offset_hours (#522 round 4): the
+        # fixture's own clock is roast-relative, so the raw absolute
+        # tasted_at_utc alone gives a downstream reader no way to compute the
+        # degassing offset the field exists to capture — the derived hours
+        # figure is the corpus-usable shape, not the two absolute instants.
+        "tastings": _tastings_with_offset(roast.tastings, roast.completed_at_utc),
     }
+
+
+def _tastings_with_offset(
+    tastings: list[dict[str, Any]], completed_at_utc: str | None
+) -> list[dict[str, Any]]:
+    """Annotate each tasting with its degassing offset from roast completion.
+
+    Args:
+        tastings: The raw persisted tasting entries (``StoreRoast.tastings``).
+        completed_at_utc: The run's completion instant, or ``None`` when
+            unknown (an unfinalised roast-2-shaped run) — every entry then
+            carries a ``None`` offset rather than a fabricated one.
+
+    Returns:
+        The same entries, each with an added ``degassing_offset_hours`` key:
+        hours between ``completed_at_utc`` and the entry's ``tasted_at_utc``,
+        rounded to two decimals, or ``None`` when either instant is absent.
+    """
+    completed = None if completed_at_utc is None else datetime.fromisoformat(completed_at_utc)
+    annotated: list[dict[str, Any]] = []
+    for entry in tastings:
+        offset: float | None = None
+        tasted_at = entry.get("tasted_at_utc")
+        if completed is not None and tasted_at is not None:
+            offset = round(
+                (datetime.fromisoformat(tasted_at) - completed).total_seconds() / 3600.0, 2
+            )
+        annotated.append({**entry, "degassing_offset_hours": offset})
+    return annotated
 
 
 def _weight_loss_percent(

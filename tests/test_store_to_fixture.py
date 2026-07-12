@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -374,6 +375,47 @@ async def test_summary_carries_every_tasting_entry(tmp_path: Path) -> None:
     assert tastings[1]["grind_note"] == "medium-fine"
     assert tastings[1]["attributes"] == ["sweetness"]
     assert tastings[1]["defects"] == ["grassy"]
+
+
+@pytest.mark.asyncio
+async def test_summary_tastings_carry_the_degassing_offset(tmp_path: Path) -> None:
+    """#522 round 4: the fixture's own clock is roast-relative, so the raw
+    absolute tasted_at_utc alone gives a downstream reader no way to compute
+    the degassing offset the field exists to capture — each entry must carry
+    a derived degassing_offset_hours."""
+    db_path = tmp_path / "degassing.sqlite3"
+    store = await _synthetic_store(db_path)
+    completed = s2f.read_store_roast(db_path).completed_at_utc
+    assert completed is not None
+    tasted_same_evening = (datetime.fromisoformat(completed) + timedelta(hours=2)).isoformat()
+    tasted_next_day = (datetime.fromisoformat(completed) + timedelta(hours=20)).isoformat()
+    await store.add_tasting("synthetic-run", stars=2, tasted_at_utc=tasted_same_evening)
+    await store.add_tasting("synthetic-run", stars=4, tasted_at_utc=tasted_next_day)
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    tastings = summary["tastings"]
+    assert tastings[0]["degassing_offset_hours"] == 2.0
+    assert tastings[1]["degassing_offset_hours"] == 20.0
+
+
+@pytest.mark.asyncio
+async def test_summary_tastings_degassing_offset_is_null_without_tasted_at(
+    tmp_path: Path,
+) -> None:
+    """#522 round 4: an entry with no tasted_at_utc (the operator did not
+    supply one) carries a null offset, not a fabricated one."""
+    db_path = tmp_path / "no_tasted_at.sqlite3"
+    store = await _synthetic_store(db_path)
+    await store.add_tasting("synthetic-run", stars=3)  # no tasted_at_utc
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["tastings"][0]["degassing_offset_hours"] is None
 
 
 @pytest.mark.asyncio

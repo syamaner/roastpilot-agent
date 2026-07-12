@@ -383,6 +383,33 @@ class RoastRunGoneError(Exception):
     no hot hardware to act on; the action is gone, not merely conflicting."""
 
 
+def _before_the_minute(tasted_at_utc: str, completed_at_utc: str) -> bool:
+    """Whether ``tasted_at_utc`` is strictly earlier than ``completed_at_utc``
+    at MINUTE precision (#522 round 4).
+
+    The FE's ``datetime-local`` picker cannot express seconds, so comparing
+    the two full-precision ISO-8601 strings would 409 an honest "tasted at
+    the completion minute" entry whenever ``completed_at_utc`` itself has a
+    non-zero seconds/microseconds component (it always does — it is
+    ``datetime.now(UTC).isoformat()``). Truncating both to the minute makes
+    same-minute read as simultaneous, matching what the operator's input can
+    actually express, while still catching any minute-scale (or coarser)
+    negative offset.
+
+    Args:
+        tasted_at_utc: The (already UTC-normalized) operator-supplied tasting
+            instant.
+        completed_at_utc: The run's completion instant.
+
+    Returns:
+        ``True`` iff ``tasted_at_utc`` falls in a minute strictly before
+        ``completed_at_utc``'s minute.
+    """
+    tasted_minute = datetime.fromisoformat(tasted_at_utc).replace(second=0, microsecond=0)
+    completed_minute = datetime.fromisoformat(completed_at_utc).replace(second=0, microsecond=0)
+    return tasted_minute < completed_minute
+
+
 #: Fallback agent-event → source mapping for persisted ``roast_events`` rows.
 #: A ``source`` carried in the event payload (e.g. an operator/MCP first-crack,
 #: an advisor/operator command) wins over this map; it is the default for events
@@ -2032,6 +2059,15 @@ class RoastService:
         tasting timestamped the instant cooling ended is not impossible, just
         unusual, and the >= bound keeps the check simple and symmetric with
         the rest of the completed-run comparisons in this module).
+
+        The comparison is truncated to MINUTE precision (#522 round 4): the
+        FE's ``datetime-local`` picker cannot express seconds, so an honest
+        "tasted at the completion minute" entry would otherwise 409 against
+        ``completed_at_utc``'s own seconds component (e.g. completion at
+        ``:45`` seconds, the operator picks that same minute — a real,
+        non-impossible entry the seconds-precision compare would wrongly
+        reject). Same-minute reads as simultaneous at the input's resolution;
+        the guard still catches any offset a human could actually express.
         """
         detail = await self._store.read_run(run_id)
         if detail is None:
@@ -2040,7 +2076,9 @@ class RoastService:
             raise RoastRunConflictError(
                 f"run {run_id} is still in progress; taste it after completion"
             )
-        if request.tasted_at_utc is not None and request.tasted_at_utc < detail.completed_at_utc:
+        if request.tasted_at_utc is not None and _before_the_minute(
+            request.tasted_at_utc, detail.completed_at_utc
+        ):
             raise RoastRunConflictError(
                 f"tasted_at_utc {request.tasted_at_utc} is before the run completed "
                 f"at {detail.completed_at_utc} (physically impossible)"
