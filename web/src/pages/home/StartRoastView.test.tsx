@@ -6,10 +6,11 @@
  * `LivePage`'s idle state owns confirming the new run with retries). No local
  * run state is fabricated — the active run is discovered from the server.
  *
- * Also covers the two defensive states that replace the bare form: an
- * already-active run (banner + link to `/live`) and a persistent health
- * error (status-unknown state) — active-run status genuinely unknown must
- * never be treated as "no run".
+ * Also covers the three defensive states that replace the bare form: pending
+ * health (loading hold, mirroring `LivePage`'s — post-#514 review), an
+ * already-active run (banner + link to `/live`), and a persistent health
+ * error (status-unknown state) — active-run status genuinely unknown, or not
+ * yet known, must never be treated as "no run".
  */
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -90,6 +91,23 @@ function fillMinimum() {
     target: { value: "250" },
   });
 }
+
+describe("StartRoastView — loading hold (#513 follow-up)", () => {
+  it("renders the loading placeholder until health resolves — NEVER the bare form (mirrors LivePage)", () => {
+    // Pending: neither isSuccess nor isError yet (the initial fetch in
+    // flight). Previously fell through both existing guards straight to the
+    // bare form — a reload of this still-URL-reachable route mid-roast would
+    // show an untouched-looking form for one /health round-trip.
+    healthState.isSuccess = false;
+    healthState.isError = false;
+    healthState.data = undefined;
+    renderView();
+    expect(screen.getByTestId("start-roast-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.queryByTestId("start-roast-active-run-banner")).toBeNull();
+    expect(screen.queryByTestId("start-roast-status-unknown")).toBeNull();
+  });
+});
 
 describe("StartRoastView (#324)", () => {
   it("renders the reused Start-Roast form with the bean-profile library", () => {

@@ -355,12 +355,16 @@ Format: one entry per anti-pattern.
 ---
 
 ## Never treat unknown roaster status as idle
-*(fixed by #513 qa follow-up, 12 Jul 2026)*
+*(fixed by #513 qa follow-up, 12 Jul 2026; extended #513 post-#514 review, 12 Jul 2026)*
 
 - **Signature:** a code comment reading something like "treat as idle" or
   "fall through to no-run state" attached to a `useHealth().isError` (or
-  any other "the read failed" state) branch that renders the SAME view as
-  "no run is active" instead of a distinct unknown-status state.
+  any other "the read failed"/"not yet known" state) branch that renders
+  the SAME view as "no run is active" instead of a distinct explicit
+  state. Also: a start/idle-gated component with an active-run check
+  (`health.isSuccess && ...`) and an error check (`health.isError`) but NO
+  guard for the pending state in between (neither true yet) — it falls
+  through both `if`s to whatever renders last.
 - **Wrong:** `LivePage.tsx` had `if (health.isError) { return
   <LiveStartView />; }` with the comment "Health error: active run unknown
   — treat as idle (fall through to no-run state)." Unknown is not idle: a
@@ -371,13 +375,23 @@ Format: one entry per anti-pattern.
   without a path to the dashboard/emergency stop — the exact hazard class
   the rest of this batch fixes. `StartRoastView.tsx` had the same gap (it
   simply never handled `isError` at all, falling through past its
-  active-run banner to the bare form).
-- **Right:** a persistent read failure for active-run status gets its OWN
-  neutral state (`LiveStatusUnknownView` on `/live`, the equivalent inline
-  block on `/start`) — never the bare form, never silently reused as
-  "idle." Explain what's wrong and offer a reload/retry path.
+  active-run banner to the bare form) — and, caught by the post-merge
+  review of #514, ALSO never handled the PENDING state (the initial
+  `/health` fetch still in flight, before either `isSuccess` or `isError`
+  is true): a reload of `/start` mid-roast showed the bare, untouched-
+  looking form for one round-trip before the active-run banner appeared.
+- **Right:** the rule is now general, not error-only: **a start form
+  renders ONLY when health is resolved-success-and-idle; pending, error,
+  and active-run states each render their own explicit state** — never
+  fall through to the bare form from any state that isn't proven idle.
+  `LivePage.tsx` already had the pending-state hold (`!health.isSuccess`);
+  `StartRoastView.tsx` gained the matching hold, mirroring it exactly.
+  Explain what's wrong (or that it's still loading) and offer a
+  reload/retry path where relevant.
 - **Guarded by:** `LivePage.test.tsx`'s "#513 medium" test (replaces the
   old test that asserted the WRONG behavior — falling through to
   `live-start-view` — with an assertion on `live-status-unknown`) +
-  `StartRoastView.test.tsx`'s "#513 medium" test. Both fail-then-pass
+  `StartRoastView.test.tsx`'s "#513 medium" test + its "loading hold (#513
+  follow-up)" test (asserts the pending state shows `start-roast-loading`,
+  never the bare form or either other explicit state). All fail-then-pass
   verified.

@@ -10,12 +10,18 @@
  *
  * #513: a bare form must never be the only thing an operator can see once a
  * run is active, or when whether one is active is unknown — either leaves no
- * path to the emergency stop. Three layers: (1) if the server ALREADY reports
- * an active run (health snapshot, e.g. this route was opened mid-roast, or
- * reloaded after a start), a banner with a direct link to the live dashboard
- * replaces the form outright. (2) if the health check itself persistently
- * errors (active-run status UNKNOWN, not "no run"), a neutral "can't confirm"
- * state replaces the form too — this is the route the incident screenshot was
+ * path to the emergency stop. A start form renders ONLY when health is
+ * resolved-success-and-idle; every other health state gets its own explicit
+ * view, never the bare form. Four layers: (0) while health is still pending
+ * (the initial fetch in flight — neither `isSuccess` nor `isError` yet), a
+ * neutral loading hold, mirroring `LivePage`'s (post-#514 review: this route
+ * previously fell through to the bare form for one `/health` round-trip on
+ * reload, the same hazard class). (1) if the server ALREADY reports an active
+ * run (health snapshot, e.g. this route was opened mid-roast, or reloaded
+ * after a start), a banner with a direct link to the live dashboard replaces
+ * the form outright. (2) if the health check itself persistently errors
+ * (active-run status UNKNOWN, not "no run"), a neutral "can't confirm" state
+ * replaces the form too — this is the route the incident screenshot was
  * almost certainly taken on, so it gets the same guard as `/live`.
  * (3) on a successful start, `navigate("/live")` fires unconditionally once
  * the POST is proven (201) — never gated on the health refetch actually
@@ -76,6 +82,22 @@ export function StartRoastView(): React.JSX.Element {
     },
     [navigate],
   );
+
+  // #513 follow-up (post-#514 review): hold until health resolves — pending
+  // (isSuccess false, isError false, the initial fetch in flight) fell through
+  // both existing guards straight to the bare form, the SAME hazard class this
+  // whole story fixes: a reload of this still-URL-reachable route mid-roast
+  // showed an untouched-looking form for one /health round-trip before the
+  // active-run banner appeared. Mirrors LivePage's loading hold. A start form
+  // renders ONLY when health is resolved-success-and-idle; pending, error, and
+  // active-run states each get their own explicit state, never the bare form.
+  if (!health.isSuccess && !health.isError) {
+    return (
+      <AppFrame>
+        <div data-testid="start-roast-loading" />
+      </AppFrame>
+    );
+  }
 
   // #513 defensive layer: the server already reports an active run (this route
   // opened mid-roast, or reloaded after a start) — never show the bare form,
