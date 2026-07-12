@@ -194,9 +194,122 @@ GUATEMALA_EL_DURAZNO_SEED = BeanProfile(
     ),
 )
 
+#: Stable id for the El Salvador Diamante (SHG Washed) seed. Fixed so the
+#: idempotent ``seed_bean_profile`` insert is a no-op after the first boot.
+EL_SALVADOR_DIAMANTE_ID = "seed-el-salvador-diamante-washed"
+
+#: The El Salvador Diamante (SHG Washed) seed profile (12 Jul 2026) — the
+#: operator's single-bag Central American washed. Targets follow the
+#: post-D90 washed posture rather than the old 13 % first-roast de-risk:
+#: with only one bag there is no multi-bag ladder, and the 11 Jul evidence
+#: on a comparable washed bean showed 13–15 % cups reading "a bit flat"
+#: while 16 % (as the advisor window centre) cupped 9/10.
+EL_SALVADOR_DIAMANTE_SEED = BeanProfile(
+    id=EL_SALVADOR_DIAMANTE_ID,
+    created_at=_SEED_TIMESTAMP,
+    updated_at=_SEED_TIMESTAMP,
+    name="El Salvador Diamante (SHG Washed)",
+    bean_origin="El Salvador",
+    country="El Salvador",
+    farm="Sierra Apaneca-Ilamatepec; Santa Ana & Izalco volcanoes",
+    bean_varietal="Bourbon, Pacas, Catimor",
+    bean_species="arabica",
+    is_blend=False,
+    processing="washed",
+    # Strictly high grown at 1,350 m — dense, but meaningfully lower than the
+    # 1,750 m El Durazno / Huila seeds: expect slightly faster development and
+    # a touch less heat momentum into first crack.
+    altitude_m=1350,
+    source_url="https://www.redber.co.uk/products/el-salvador-diamante-green-coffee-beans",
+    charge_guidance_min_c=170.0,
+    charge_guidance_max_c=200.0,
+    initial_heat_percent=100,
+    initial_fan_percent=30,
+    # 195 °C = the operator's proven known-good drop line (bitter > 196 °C,
+    # ceiling-guard at 196 by default since D90).
+    target_drop_temp_c=195.0,
+    # 16 % dev: the ratified washed-origin posture (see the El Durazno seed's
+    # 13 → 16 history) applied directly — a single bag cannot ladder up from a
+    # de-risk roast, and the flat-cup risk of under-development outweighs the
+    # over-roast risk, which the drop line + ceiling guard already bound. With
+    # the default 3 pp margin the advisor's judgment window is [13, 19] %.
+    target_development_percent=16.0,
+    default_bean_weight_grams=250.0,
+    description=(
+        "Sierra Apaneca-Ilamatepec highlands (Santa Ana & Izalco volcanoes), "
+        "1,350 m, strictly high grown. Bourbon / Pacas / Catimor mix, washed, "
+        "sun- and mechanically dried; harvest Jan-Mar. Chocolate base with "
+        "orange hints and subtle sweetness; bright acidity, smooth body. "
+        "Roast to a balanced medium: enough development for the chocolate and "
+        "sweetness while keeping the citrus brightness. Single bag - targets "
+        "start at the ratified washed posture (16 % dev / 195 drop); edit to "
+        "taste."
+    ),
+)
+
+#: Stable id for the Sumatra Mandheling G1 seed. Fixed so the idempotent
+#: ``seed_bean_profile`` insert is a no-op after the first boot.
+SUMATRA_MANDHELING_ID = "seed-sumatra-mandheling-g1-wet-hulled"
+
+#: The Sumatra Mandheling G1 seed profile (12 Jul 2026) — the operator's
+#: Indonesian counterpoint to the washed Centrals. Grade 1 is scored on cup
+#: defects, not green appearance; the supplier names a Lake Toba lot.
+SUMATRA_MANDHELING_SEED = BeanProfile(
+    id=SUMATRA_MANDHELING_ID,
+    created_at=_SEED_TIMESTAMP,
+    updated_at=_SEED_TIMESTAMP,
+    name="Sumatra Mandheling G1 (Wet-Hulled)",
+    bean_origin="Indonesia (Sumatra)",
+    country="Indonesia",
+    farm="Lake Toba region smallholders (Mandailing lineage)",
+    # Supplier does not state cultivars; these are the typical Mandheling mix.
+    bean_varietal="Unspecified (typical: Ateng, Tim Tim, Jember)",
+    bean_species="arabica",
+    is_blend=False,
+    # Not stated by the supplier; wet-hulled (giling basah) is the classic
+    # Mandheling process and matches the cup description (earthy, heavy body,
+    # low acidity). Correct via the UI if the bag says otherwise.
+    processing="wet_hulled",
+    # Not stated by the supplier; Lake Toba Mandheling typically grows
+    # 1,100-1,500 m — 1200 is a representative estimate, NOT a datum.
+    altitude_m=1200,
+    source_url="https://www.pennineteaandcoffee.co.uk/collections/green-coffee/products/sumatra-mandheling-gr1-green-coffee-beans-1kg",
+    charge_guidance_min_c=170.0,
+    charge_guidance_max_c=200.0,
+    initial_heat_percent=100,
+    initial_fan_percent=30,
+    # 195 °C = the proven drop line (bitter > 196, ceiling guard default-on).
+    # A Sumatra WANTS the darker end of the operator's range — light
+    # Mandhelings read grassy/vegetal — so the drop target sits at the line
+    # rather than below it.
+    target_drop_temp_c=195.0,
+    # 17 %: a step above the washed posture (16) toward the bittersweet/
+    # chocolate profile this cup is for, but not the full ~20 the style can
+    # take — the 1 kg bag allows laddering darker on later batches, and the
+    # softer low-grown wet-hulled bean develops fast (baked risk if stretched
+    # cold). Advisor window with the 3 pp margin: [14, 20] %.
+    target_development_percent=17.0,
+    default_bean_weight_grams=250.0,
+    description=(
+        "Lake Toba, North Sumatra; Grade 1 (cup-scored). Wet-hulled (assumed "
+        "- classic Mandheling; correct if the bag states otherwise), typical "
+        "growing range 1,100-1,500 m. Powerful body, low/refined acidity; "
+        "bittersweet baker's chocolate, herbal (sage/thyme), cedar/tobacco, "
+        "butterscotch, hints of lime and blackberry. Roast to a solid "
+        "medium-plus: develop the bittersweet body, do not chase brightness. "
+        "NOTE for the operator: Sumatra first cracks are notoriously QUIET "
+        "and uneven - the audio FC detector may fire late or weakly; watch "
+        "bean temp ~175-185 and use MARK FIRST CRACK if the mic misses it. "
+        "Rest 24 h+ after roasting. Targets are a first-roast starting point; "
+        "the 1 kg bag allows laddering darker to taste."
+    ),
+)
+
 #: Every built-in seed profile, inserted idempotently at startup (#303).
 SEED_BEAN_PROFILES: tuple[BeanProfile, ...] = (
     ETHIOPIA_KOKE_SEED,
     COLOMBIA_HUILA_SEED,
     GUATEMALA_EL_DURAZNO_SEED,
+    EL_SALVADOR_DIAMANTE_SEED,
+    SUMATRA_MANDHELING_SEED,
 )

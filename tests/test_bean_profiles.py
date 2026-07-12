@@ -17,11 +17,15 @@ from roastpilot_agent.models import BeanProfile, BeanProfileInput, RoastPhase, R
 from roastpilot_agent.seed import (
     COLOMBIA_HUILA_ID,
     COLOMBIA_HUILA_SEED,
+    EL_SALVADOR_DIAMANTE_ID,
+    EL_SALVADOR_DIAMANTE_SEED,
     ETHIOPIA_KOKE_ID,
     ETHIOPIA_KOKE_SEED,
     GUATEMALA_EL_DURAZNO_ID,
     GUATEMALA_EL_DURAZNO_SEED,
     SEED_BEAN_PROFILES,
+    SUMATRA_MANDHELING_ID,
+    SUMATRA_MANDHELING_SEED,
 )
 from roastpilot_agent.store import BeanProfileNotFoundError, RoastStore
 
@@ -358,10 +362,78 @@ def test_guatemala_el_durazno_seed_values() -> None:
     assert s.default_bean_weight_grams == 250.0
 
 
+def test_el_salvador_diamante_seed_values() -> None:
+    """The locked El Salvador Diamante (SHG Washed) seed values.
+
+    Seeded 12 Jul 2026 at the post-D90 washed posture (16 % dev / 195 drop)
+    rather than the 13 % first-roast de-risk: a single bag cannot ladder up
+    across roasts, the 11 Jul evidence on a comparable washed bean read
+    13-15 % cups as "a bit flat", and the over-roast side is already bounded
+    by the drop line + the default-on 196 ceiling guard."""
+    s = EL_SALVADOR_DIAMANTE_SEED
+    assert s.id == EL_SALVADOR_DIAMANTE_ID
+    assert s.name == "El Salvador Diamante (SHG Washed)"
+    assert s.bean_origin == "El Salvador"
+    assert s.country == "El Salvador"
+    assert s.farm == "Sierra Apaneca-Ilamatepec; Santa Ana & Izalco volcanoes"
+    assert s.bean_varietal == "Bourbon, Pacas, Catimor"
+    assert s.bean_species == "arabica"
+    assert s.is_blend is False
+    assert s.processing == "washed"
+    assert s.altitude_m == 1350
+    assert (
+        s.source_url == "https://www.redber.co.uk/products/el-salvador-diamante-green-coffee-beans"
+    )
+    assert s.charge_guidance_min_c == 170.0
+    assert s.charge_guidance_max_c == 200.0
+    assert s.initial_heat_percent == 100
+    assert s.initial_fan_percent == 30
+    assert s.target_drop_temp_c == 195.0  # proven drop line (bitter > 196, guard default-on)
+    assert s.target_development_percent == 16.0  # ratified washed posture; single-bag, no ladder
+    assert s.default_bean_weight_grams == 250.0
+
+
+def test_sumatra_mandheling_seed_values() -> None:
+    """The locked Sumatra Mandheling G1 (Wet-Hulled) seed values.
+
+    Seeded 12 Jul 2026. Processing and altitude are supplier-unstated:
+    wet_hulled is the classic Mandheling assumption (flagged in the
+    description for UI correction) and 1,200 m is a representative Lake
+    Toba estimate, not a datum. Dev 17 % steps ABOVE the washed posture
+    toward the bittersweet profile (light Sumatras read grassy) while
+    leaving ladder room on the 1 kg bag; drop sits at the proven 195 line."""
+    s = SUMATRA_MANDHELING_SEED
+    assert s.id == SUMATRA_MANDHELING_ID
+    assert s.name == "Sumatra Mandheling G1 (Wet-Hulled)"
+    assert s.bean_origin == "Indonesia (Sumatra)"
+    assert s.country == "Indonesia"
+    assert s.farm == "Lake Toba region smallholders (Mandailing lineage)"
+    assert s.bean_varietal == "Unspecified (typical: Ateng, Tim Tim, Jember)"
+    assert s.bean_species == "arabica"
+    assert s.is_blend is False
+    assert s.processing == "wet_hulled"
+    assert s.altitude_m == 1200
+    assert s.source_url == (
+        "https://www.pennineteaandcoffee.co.uk/collections/green-coffee/"
+        "products/sumatra-mandheling-gr1-green-coffee-beans-1kg"
+    )
+    assert s.charge_guidance_min_c == 170.0
+    assert s.charge_guidance_max_c == 200.0
+    assert s.initial_heat_percent == 100
+    assert s.initial_fan_percent == 30
+    assert s.target_drop_temp_c == 195.0  # Sumatra wants the darker end of the proven range
+    assert s.target_development_percent == 17.0  # above washed posture; ladder room on 1 kg bag
+    assert s.default_bean_weight_grams == 250.0
+    # The quiet-first-crack warning is operator-facing and load-bearing.
+    assert "MARK FIRST CRACK" in (s.description or "")
+
+
 def test_seed_bean_profiles_collection() -> None:
-    """The built-in seed set: Koke natural + Colombia Huila washed + Guatemala El Durazno honey."""
+    """The built-in seed set: Koke + Huila + El Durazno + Diamante + Mandheling."""
     assert SEED_BEAN_PROFILES == (
         ETHIOPIA_KOKE_SEED,
         COLOMBIA_HUILA_SEED,
         GUATEMALA_EL_DURAZNO_SEED,
+        EL_SALVADOR_DIAMANTE_SEED,
+        SUMATRA_MANDHELING_SEED,
     )

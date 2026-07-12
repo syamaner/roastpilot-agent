@@ -3037,12 +3037,14 @@ async def test_delete_unknown_bean_profile_is_404(client: AsyncClient) -> None:
 @pytest.mark.asyncio
 async def test_lifespan_seeds_bean_profiles_idempotently(store: RoastStore) -> None:
     """#303: the app lifespan seeds the built-in bean profiles (each present once
-    after two startups — idempotent). Ordered by name, so Colombia < Ethiopia <
-    Guatemala."""
+    after two startups — idempotent). Ordered by name, so Colombia < El Salvador
+    < Ethiopia < Guatemala."""
     from roastpilot_agent.seed import (
         COLOMBIA_HUILA_ID,
+        EL_SALVADOR_DIAMANTE_ID,
         ETHIOPIA_KOKE_ID,
         GUATEMALA_EL_DURAZNO_ID,
+        SUMATRA_MANDHELING_ID,
     )
 
     service = RoastService(store)
@@ -3051,7 +3053,14 @@ async def test_lifespan_seeds_bean_profiles_idempotently(store: RoastStore) -> N
         first = await store.list_bean_profiles()
     async with app.router.lifespan_context(app):
         second = await store.list_bean_profiles()
-    expected = [COLOMBIA_HUILA_ID, ETHIOPIA_KOKE_ID, GUATEMALA_EL_DURAZNO_ID]
+    # Name-ordered: Colombia < El Salvador < Ethiopia < Guatemala < Sumatra.
+    expected = [
+        COLOMBIA_HUILA_ID,
+        EL_SALVADOR_DIAMANTE_ID,
+        ETHIOPIA_KOKE_ID,
+        GUATEMALA_EL_DURAZNO_ID,
+        SUMATRA_MANDHELING_ID,
+    ]
     assert [p.id for p in first] == expected
     assert [p.id for p in second] == expected  # not double-inserted
 
@@ -3062,8 +3071,10 @@ async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) ->
     Ethiopia Koke profile with its locked values over HTTP (the FE-visible path)."""
     from roastpilot_agent.seed import (
         COLOMBIA_HUILA_ID,
+        EL_SALVADOR_DIAMANTE_ID,
         ETHIOPIA_KOKE_ID,
         GUATEMALA_EL_DURAZNO_ID,
+        SUMATRA_MANDHELING_ID,
     )
 
     service = RoastService(store)
@@ -3077,7 +3088,13 @@ async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) ->
     assert response.status_code == 200
     profiles = response.json()["profiles"]
     by_id = {p["id"]: p for p in profiles}
-    assert set(by_id) == {ETHIOPIA_KOKE_ID, COLOMBIA_HUILA_ID, GUATEMALA_EL_DURAZNO_ID}
+    assert set(by_id) == {
+        ETHIOPIA_KOKE_ID,
+        COLOMBIA_HUILA_ID,
+        GUATEMALA_EL_DURAZNO_ID,
+        EL_SALVADOR_DIAMANTE_ID,
+        SUMATRA_MANDHELING_ID,
+    }
     koke = by_id[ETHIOPIA_KOKE_ID]
     assert koke["name"] == "Ethiopia Yirgacheffe Koke (Natural)"
     assert koke["processing"] == "natural"
