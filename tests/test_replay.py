@@ -217,6 +217,27 @@ def test_drop_applied_state_from_records_falls_back_on_no_events() -> None:
     assert _drop_applied_state_from_records([]) == _FALLBACK_DROP_APPLIED_STATE
 
 
+def test_drop_applied_state_from_records_falls_back_on_out_of_range_payload() -> None:
+    """Codex follow-up: a well-typed but out-of-range recorded payload (a
+    corrupt export, heat > 100) must fall back cleanly, not raise a raw
+    pydantic ``ValidationError`` out of fixture loading — the same
+    MalformedCommandResultError choke point the adapter uses."""
+    from roastpilot_agent.replay import (
+        _FALLBACK_DROP_APPLIED_STATE,  # pyright: ignore[reportPrivateUsage]
+        _drop_applied_state_from_records,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    records: list[dict[str, Any]] = [
+        {
+            "kind": "beans_dropped",
+            "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+            "monotonic_seconds": 68.0,
+            "payload": {"heat_level_percent": 101, "fan_level_percent": 100, "cooling_on": True},
+        }
+    ]
+    assert _drop_applied_state_from_records(records) == _FALLBACK_DROP_APPLIED_STATE
+
+
 @pytest.mark.asyncio
 async def test_replay_roaster_control_drop_beans_returns_loaded_applied_state() -> None:
     """``ReplayRoasterControl.drop_beans()`` returns whatever ``load()`` was

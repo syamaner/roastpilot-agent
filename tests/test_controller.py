@@ -43,6 +43,7 @@ from roastpilot_agent.controller import (
     TickScheduler,
     recording_origin_slug,
 )
+from roastpilot_agent.mcp_client import RoasterControlAdapter, RoasterMCPClient
 from roastpilot_agent.models import (
     AdvisorHealth,
     AdvisorHealthStatus,
@@ -7512,3 +7513,104 @@ async def test_emergency_stop_with_malformed_payload_still_faults() -> None:
     # the raising-exception path, so it must not queue the emergency_stop
     # retry evaluation (LOW-2).
     assert harness.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_advisor_drop_with_out_of_range_payload_still_transitions_and_does_not_refire() -> (
+    None
+):
+    """Codex follow-up on #509/#507, end-to-end through the REAL
+    ``RoasterControlAdapter`` (not the pre-degraded ``drop_applied_state=None``
+    shortcut every other malformed-payload test uses): the MCP's own
+    ``drop_beans`` result carries a well-typed but out-of-range
+    ``heat_level_percent=101``. Proves the full pipeline —
+    ``RoasterMCPClient`` → ``applied_state_from_event`` →
+    ``RoasterControlAdapter._applied_state_or_none`` → the controller's
+    ``except Exception`` around ``self._executor.drop_beans()`` — never sees a
+    raw ``pydantic.ValidationError`` reach the controller: the drop still
+    transitions to COOLING, emits COMMAND_EXECUTED (never COMMAND_FAILED),
+    and does not re-fire on a follow-up tick."""
+
+    drop_beans_calls = 0
+
+    async def caller(tool: str, arguments: dict[str, object]) -> object:
+        nonlocal drop_beans_calls
+        if tool == "drop_beans":
+            drop_beans_calls += 1
+            return {
+                "session_id": "abc",
+                "phase": "dropped",
+                "event": {
+                    "kind": "beans_dropped",
+                    "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+                    "monotonic_seconds": 1228.9,
+                    # Well-typed but out-of-range: the Codex-reported gap.
+                    "payload": {
+                        "heat_level_percent": 101,
+                        "fan_level_percent": 100,
+                        "cooling_on": True,
+                    },
+                },
+                "event_count": 3,
+            }
+        if tool == "set_heat":
+            return {
+                "session_id": "abc",
+                "phase": "development",
+                "heat_level_percent": arguments["heat_level_percent"],
+                "fan_level_percent": 50,
+                "cooling_on": False,
+            }
+        if tool == "set_fan":
+            return {
+                "session_id": "abc",
+                "phase": "development",
+                "heat_level_percent": 65,
+                "fan_level_percent": arguments["fan_level_percent"],
+                "cooling_on": False,
+            }
+        raise AssertionError(f"unexpected tool call in this test: {tool}")
+
+    executor = RoasterControlAdapter(RoasterMCPClient(caller))
+    advisor = FakeAdvisor([decision(heat=65, fan=50, drop=False), decision(drop=True)])
+    log: list[str] = []
+    clock = FakeClock()
+    reader = ScriptedStateReader([reading()], log)
+    sink = RecordingSnapshotSink(log)
+    events = EventSink(log)
+    controller = RoastController(
+        config=_BASELINE_POST_FC_CONFIG,
+        safety=SafetyPolicy(SafetyLimits()),
+        state_reader=reader,
+        command_executor=executor,
+        snapshot_sink=sink,
+        event_emitter=events,
+        advisor=advisor,
+        clock=clock,
+    )
+    controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:  # …→ DEVELOPMENT
+        controller.transition_to(step)
+    events.events.clear()
+
+    controller.request_advisory()
+    await controller.tick()  # pre-drop advisory write: mirrors land at 65/50
+    assert controller.snapshot().current_heat == 65
+    assert controller.snapshot().current_fan == 50
+
+    controller.request_advisory()
+    await controller.tick()  # the drop tick: the real adapter parses heat=101
+    assert controller.phase is RoastPhase.COOLING  # the drop DID happen
+    assert drop_beans_calls == 1
+    executed = [p for k, p in events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {"command": "drop_beans", "source": "advisor"} in executed
+    assert RoastEventKind.COMMAND_FAILED not in [k for k, _ in events.events]
+    # Mirrors held at their pre-drop values (out-of-range → nothing valid to
+    # adopt), never a crash, never a fabricated 101.
+    assert controller.snapshot().current_heat == 65
+    assert controller.snapshot().current_fan == 50
+
+    # A follow-up tick must NOT re-fire drop_beans — any further call to the
+    # scripted tool caller (drop_beans or otherwise) raises AssertionError.
+    await controller.tick()
+    assert drop_beans_calls == 1

@@ -19,6 +19,7 @@ from typing import cast
 
 import pytest
 from anyio import BrokenResourceError, ClosedResourceError
+from pydantic import ValidationError
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
 from roastpilot_agent.mcp_client import (
@@ -1634,6 +1635,45 @@ def test_applied_state_from_event_rejects_non_bool_cooling_on() -> None:
         applied_state_from_event(event)
 
 
+# --- Codex follow-up on #509/#507: a well-typed-but-out-of-range value (int,
+# but outside AppliedRoasterState's 0-100 bound) must translate into
+# MalformedCommandResultError too, not escape as a raw pydantic
+# ValidationError — the single choke point every caller (the adapter,
+# the replay fallback) catches only MalformedCommandResultError.
+
+
+def test_applied_state_from_event_raises_malformed_for_heat_above_100() -> None:
+    event = _drop_event({"heat_level_percent": 101, "fan_level_percent": 100, "cooling_on": True})
+    with pytest.raises(MalformedCommandResultError, match="heat_level_percent"):
+        applied_state_from_event(event)
+
+
+def test_applied_state_from_event_raises_malformed_for_fan_below_0() -> None:
+    event = _drop_event({"heat_level_percent": 0, "fan_level_percent": -1, "cooling_on": True})
+    with pytest.raises(MalformedCommandResultError, match="fan_level_percent"):
+        applied_state_from_event(event)
+
+
+def test_applied_state_from_event_raises_malformed_for_both_out_of_range() -> None:
+    """Both heat and fan out of range together — a single
+    MalformedCommandResultError still fires (pydantic reports both
+    violations; the wrapping error need not enumerate each one, only never
+    let the raw ValidationError itself escape)."""
+    event = _drop_event({"heat_level_percent": 250, "fan_level_percent": -5, "cooling_on": True})
+    with pytest.raises(MalformedCommandResultError):
+        applied_state_from_event(event)
+
+
+def test_applied_state_from_event_out_of_range_error_chains_the_validation_error() -> None:
+    """The translated error keeps the original ``ValidationError`` as its
+    cause (``raise ... from exc``) — never silently swallows the pydantic
+    detail, just re-types it into the one exception callers catch."""
+    event = _drop_event({"heat_level_percent": 101, "fan_level_percent": 100, "cooling_on": True})
+    with pytest.raises(MalformedCommandResultError) as excinfo:
+        applied_state_from_event(event)
+    assert isinstance(excinfo.value.__cause__, ValidationError)
+
+
 # --- #507 safety-review MEDIUM: the adapter degrades a malformed payload to
 # None (never raises) — the hardware command already succeeded by the time
 # this parsing runs, so a payload parse failure must not surface as a
@@ -1728,6 +1768,25 @@ def test_applied_state_or_none_returns_parsed_state_on_a_well_formed_payload() -
     )
     assert result == AppliedRoasterState(
         heat_level_percent=12, fan_level_percent=55, cooling_on=True
+    )
+
+
+def test_applied_state_or_none_degrades_out_of_range_heat_to_none(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Codex follow-up: an out-of-range (but well-typed) heat value must
+    degrade to ``None`` + WARNING through the adapter, exactly like a
+    missing/wrong-type field — never let the pydantic ``ValidationError``
+    escape ``_applied_state_or_none``."""
+    event = _drop_event({"heat_level_percent": 101, "fan_level_percent": 100, "cooling_on": True})
+    with caplog.at_level(logging.WARNING, logger="roastpilot_agent.mcp_client"):
+        result = RoasterControlAdapter._applied_state_or_none(  # pyright: ignore[reportPrivateUsage]
+            event
+        )
+    assert result is None
+    assert any(
+        record.levelno == logging.WARNING and "beans_dropped" in record.getMessage()
+        for record in caplog.records
     )
 
 
