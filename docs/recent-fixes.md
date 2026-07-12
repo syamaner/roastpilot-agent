@@ -314,3 +314,70 @@ Format: one entry per anti-pattern.
   fault-acknowledge confirm/retry/failure states). All were confirmed to
   fail against the pre-fix code (`git stash` the source change, rerun)
   before the fix was restored — not vacuous coverage.
+
+---
+
+## Any confirm/retry loop in a component MUST guard against unmount
+*(fixed by #513 qa follow-up, 12 Jul 2026)*
+
+- **Signature:** a hand-rolled `for`/`while` retry loop inside a component
+  (or its `useCallback`) that awaits an API call and a `setTimeout`-based
+  delay between attempts, with no check of a mounted flag after each
+  `await` — especially one that also calls `queryClient.setQueryData` or a
+  `useState` setter. Grep for a new retry loop that does NOT import
+  `runConfirmRetry` from `web/src/lib/confirmRetry.ts`.
+- **Wrong:** the original #513 confirm-retry fix (the entry above) shipped
+  three hand-rolled loops with no unmount guard. React does not cancel
+  in-flight promises on unmount, so the loop's closure keeps running after
+  `cleanup()`/navigation-away — an orphaned loop's next resolved attempt
+  still calls `setQueryData` on the shared, app-wide query cache. Worse: a
+  REMOUNT that starts its own fresh confirm loop (including this PR's own
+  "Open live dashboard" fallback, which forces a remount) can then race the
+  orphaned loop, both writing the same cache key from two different
+  component instances. qa's probe proved this by unmounting mid-loop and
+  asserting zero further `setQueryData` calls — it failed against the
+  unguarded loops.
+- **Right:** use the shared `runConfirmRetry` helper
+  (`web/src/lib/confirmRetry.ts`) — never hand-roll the loop. It takes an
+  `isMounted: () => boolean` callback checked after EVERY `await` (each
+  attempt and each inter-attempt delay) and short-circuits with a distinct
+  `"unmounted"` result before calling `onResult`/touching component state.
+  Back it with a `mountedRef` set `true` on mount and `false` in a
+  `useEffect` cleanup — plain `useRef(true)`, no library.
+- **Guarded by:** `web/src/lib/confirmRetry.test.ts` (`isMounted` false
+  mid-attempt and mid-delay never call `onResult`) + one component-level
+  unmount test per confirm-loop site (`LiveStartFlow.integration.test.tsx`,
+  `DashboardPage.idle.test.tsx` ×2) that unmounts mid-attempt via a
+  controllably-stalled `api.health()` promise and asserts a `setQueryData`
+  spy was never called. All three were fail-then-pass verified by
+  temporarily hardcoding `isMounted: () => true`.
+
+---
+
+## Never treat unknown roaster status as idle
+*(fixed by #513 qa follow-up, 12 Jul 2026)*
+
+- **Signature:** a code comment reading something like "treat as idle" or
+  "fall through to no-run state" attached to a `useHealth().isError` (or
+  any other "the read failed" state) branch that renders the SAME view as
+  "no run is active" instead of a distinct unknown-status state.
+- **Wrong:** `LivePage.tsx` had `if (health.isError) { return
+  <LiveStartView />; }` with the comment "Health error: active run unknown
+  — treat as idle (fall through to no-run state)." Unknown is not idle: a
+  run could genuinely be active and heating while `/health` is persistently
+  failing (`useHealth`'s own `retry: 1` already absorbs a single blip
+  before `isError` is true, so this is a real persistent failure, not
+  noise), and falling through to the bare start form strands the operator
+  without a path to the dashboard/emergency stop — the exact hazard class
+  the rest of this batch fixes. `StartRoastView.tsx` had the same gap (it
+  simply never handled `isError` at all, falling through past its
+  active-run banner to the bare form).
+- **Right:** a persistent read failure for active-run status gets its OWN
+  neutral state (`LiveStatusUnknownView` on `/live`, the equivalent inline
+  block on `/start`) — never the bare form, never silently reused as
+  "idle." Explain what's wrong and offer a reload/retry path.
+- **Guarded by:** `LivePage.test.tsx`'s "#513 medium" test (replaces the
+  old test that asserted the WRONG behavior — falling through to
+  `live-start-view` — with an assertion on `live-status-unknown`) +
+  `StartRoastView.test.tsx`'s "#513 medium" test. Both fail-then-pass
+  verified.
