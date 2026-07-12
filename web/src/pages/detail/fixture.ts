@@ -14,11 +14,42 @@
 import type {
   RoastDetail,
   RoastTimeline,
+  TastingList,
   TelemetryPoint,
   TelemetrySeries,
 } from "@/lib/types";
 
 export const FIXTURE_RUN_ID = "detail-fixture-001";
+
+/**
+ * A small deterministic tasting list (#522) for a given run id. Every detail
+ * harness page seeds `useTastings`' query cache with this via
+ * `queryClient.setQueryData` (mirroring `HomeHarnessPage`'s health-seeding
+ * convention) — without it, `RoastTastings` fires a REAL `GET
+ * /api/roasts/{fixtureId}/tastings` against a fixture run id that doesn't
+ * exist on any backend the harness routes are served against, 404ing
+ * (Codex round 3: caught only because it's invisible in the snapshot itself,
+ * a separate below-the-fold gap). Deterministic AND makes the widget's
+ * content visible once that capture gap is later closed.
+ */
+export function fixtureTastings(runId: string): TastingList {
+  return {
+    run_id: runId,
+    tastings: [
+      {
+        id: 1,
+        tasted_at_utc: "2026-06-15T18:30:00+00:00",
+        recorded_at_utc: "2026-06-15T18:35:00+00:00",
+        stars: 4,
+        notes: "Sweet, clean, light acidity.",
+        brew_method: "pour_over",
+        grind_note: "medium-fine, 22g/380g",
+        attributes: ["sweetness", "acidity"],
+        defects: [],
+      },
+    ],
+  };
+}
 
 /**
  * A short roast arc, by server-derived phase (the same signal the page reads):

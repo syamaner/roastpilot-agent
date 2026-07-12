@@ -14,7 +14,7 @@ directly into the broadcaster.
 import asyncio
 import json
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 
@@ -876,15 +876,18 @@ async def test_add_tasting_full_payload(client: AsyncClient, store: RoastStore) 
     await store.complete_run(
         run_id="run-full", outcome="completed", agent_phase=RoastPhase.COMPLETE
     )
+    detail = (await client.get("/api/roasts/run-full")).json()
+    completed_at = datetime.fromisoformat(detail["completed_at_utc"])
+    # After completion (the lower bound) but well within the future-clock-skew
+    # tolerance (the upper bound, #522 Codex round 3) — a value that satisfies
+    # BOTH bounds regardless of when the suite runs.
+    tasted_at = (completed_at + timedelta(seconds=5)).isoformat()
     response = await client.post(
         "/api/roasts/run-full/tastings",
         json={
             "stars": 5,
             "notes": "sweet, clean",
-            # Far enough in the future to always be after this test's own
-            # completed_at_utc (stamped to real "now"), regardless of when
-            # the suite runs (#522 Codex P2: tasted_at must be >= completion).
-            "tasted_at_utc": "2099-07-12T20:00:00+00:00",
+            "tasted_at_utc": tasted_at,
             "brew_method": "aeropress",
             "grind_note": "fine",
             "attributes": ["sweetness", "body"],
@@ -893,7 +896,7 @@ async def test_add_tasting_full_payload(client: AsyncClient, store: RoastStore) 
     )
     assert response.status_code == 201
     tasting = response.json()["tastings"][0]
-    assert tasting["tasted_at_utc"] == "2099-07-12T20:00:00+00:00"
+    assert tasting["tasted_at_utc"] == tasted_at
     assert tasting["brew_method"] == "aeropress"
     assert tasting["grind_note"] == "fine"
     assert tasting["attributes"] == ["sweetness", "body"]
@@ -999,24 +1002,33 @@ async def test_add_tasting_normalizes_naive_and_offset_tasted_at(
         run_id="run-tbn", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
     )
     await store.complete_run(run_id="run-tbn", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    detail = (await client.get("/api/roasts/run-tbn")).json()
+    completed_at = datetime.fromisoformat(detail["completed_at_utc"])
+    # A UTC instant after completion (the lower bound) but well within the
+    # future-clock-skew tolerance (the upper bound, #522 Codex round 3) —
+    # satisfies both bounds regardless of when the suite runs, unlike a fixed
+    # literal (which would eventually collide with one bound or the other).
+    base = completed_at + timedelta(seconds=5)
+    expected = base.isoformat()
+    naive_str = base.replace(tzinfo=None).isoformat()
 
-    # Far enough in the future to always be after this test's own
-    # completed_at_utc (stamped to real "now"), regardless of when the suite
-    # runs (#522 Codex P2: tasted_at must be >= completion).
     naive = await client.post(
         "/api/roasts/run-tbn/tastings",
-        json={"stars": 3, "tasted_at_utc": "2099-07-12T18:00:00"},
+        json={"stars": 3, "tasted_at_utc": naive_str},
     )
     assert naive.status_code == 201
-    assert naive.json()["tastings"][0]["tasted_at_utc"] == "2099-07-12T18:00:00+00:00"
+    assert naive.json()["tastings"][0]["tasted_at_utc"] == expected
 
+    # The same UTC instant, expressed with a +02:00 offset (wall-clock time
+    # shifted +2h so the UTC instant is unchanged) — proper tz arithmetic via
+    # astimezone, not string surgery on the ISO text.
+    offset_str = base.astimezone(timezone(timedelta(hours=2))).isoformat()
     offset = await client.post(
         "/api/roasts/run-tbn/tastings",
-        # 20:00+02:00 == 18:00 UTC.
-        json={"stars": 4, "tasted_at_utc": "2099-07-12T20:00:00+02:00"},
+        json={"stars": 4, "tasted_at_utc": offset_str},
     )
     assert offset.status_code == 201
-    assert offset.json()["tastings"][1]["tasted_at_utc"] == "2099-07-12T18:00:00+00:00"
+    assert offset.json()["tastings"][1]["tasted_at_utc"] == expected
 
 
 @pytest.mark.asyncio

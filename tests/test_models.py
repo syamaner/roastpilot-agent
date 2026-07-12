@@ -5,6 +5,7 @@ handshake's JSON round trip, and RoastProfile validation (D7).
 """
 
 import json
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 
 import pydantic
@@ -910,3 +911,27 @@ def test_tasting_entry_dedupe_is_a_noop_on_already_unique_tags() -> None:
     tags — a regression here would silently corrupt every ordinary entry."""
     request = TastingEntryRequest(stars=5, attributes=["sweetness", "acidity", "body"])
     assert request.attributes == ["sweetness", "acidity", "body"]
+
+
+def test_tasting_entry_rejects_materially_future_tasted_at() -> None:
+    """#522 Codex round 3: a tasting cannot happen before it happens — a
+    tasted_at_utc well beyond any honest clock skew must 422."""
+    far_future = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+    with pytest.raises(pydantic.ValidationError, match="future"):
+        TastingEntryRequest(stars=3, tasted_at_utc=far_future)
+
+
+def test_tasting_entry_accepts_tasted_at_within_clock_skew_tolerance() -> None:
+    """#522 Codex round 3: an honest client clock running a little ahead of
+    the server's must NOT 422 — only a materially future value should."""
+    slightly_ahead = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
+    request = TastingEntryRequest(stars=3, tasted_at_utc=slightly_ahead)
+    assert request.tasted_at_utc is not None
+
+
+def test_tasting_entry_accepts_tasted_at_at_the_present_instant() -> None:
+    """#522 Codex round 3: "now" itself (0 skew) must round-trip cleanly —
+    the boundary case just inside the tolerance window, not past it."""
+    now = datetime.now(UTC).isoformat()
+    request = TastingEntryRequest(stars=4, tasted_at_utc=now)
+    assert request.tasted_at_utc is not None

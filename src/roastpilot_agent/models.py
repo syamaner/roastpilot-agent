@@ -11,7 +11,7 @@ invariant. Use ``.value`` at serialization boundaries.
 
 import json
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -1223,6 +1223,13 @@ class TastingEntryRequest(BaseModel):
         return _dedupe_tags(value)
 
 
+#: Clock-skew tolerance for the future-timestamp guard on tasted_at_utc
+#: (#522, Codex round 3): an honest operator client whose clock runs a little
+#: ahead of the server's should not 422 for that alone. Small enough to still
+#: catch a materially-wrong (e.g. wrong-year) future value.
+_TASTED_AT_FUTURE_TOLERANCE = timedelta(minutes=5)
+
+
 def _normalize_tasted_at(value: str | None) -> str | None:
     """Parse and UTC-normalize an operator-supplied tasting timestamp (#522).
 
@@ -1242,11 +1249,13 @@ def _normalize_tasted_at(value: str | None) -> str | None:
         ``None``.
 
     Raises:
-        ValueError: ``value`` is not a parseable ISO-8601 datetime, or is a
-            bare date with no time component — Pydantic turns this into a 422
-            at the API boundary, so a malformed or under-specified instant is
-            rejected rather than persisted as-is and silently poisoning the
-            degassing-offset corpus label this field exists to capture.
+        ValueError: ``value`` is not a parseable ISO-8601 datetime, is a bare
+            date with no time component, or is materially in the future
+            relative to when this request is being validated — Pydantic turns
+            this into a 422 at the API boundary, so a malformed,
+            under-specified, or impossible instant is rejected rather than
+            persisted as-is and silently poisoning the degassing-offset
+            corpus label this field exists to capture.
     """
     if value is None:
         return None
@@ -1266,6 +1275,14 @@ def _normalize_tasted_at(value: str | None) -> str | None:
     except ValueError as exc:
         raise ValueError(f"tasted_at_utc is not a valid ISO-8601 datetime: {value!r}") from exc
     parsed = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    # A tasting materially in the future is physically impossible (the
+    # operator cannot taste beans before tasting them) — reject it, with a
+    # small clock-skew tolerance so an honest client whose clock runs a
+    # little ahead of the server's isn't 422'd for that alone. The lower
+    # bound (vs. the run's own completed_at_utc) is enforced separately at
+    # the API layer, where completed_at_utc is available.
+    if parsed > datetime.now(UTC) + _TASTED_AT_FUTURE_TOLERANCE:
+        raise ValueError(f"tasted_at_utc {value!r} is in the future")
     return parsed.isoformat()
 
 
