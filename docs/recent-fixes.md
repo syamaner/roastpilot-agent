@@ -454,3 +454,29 @@ Format: one entry per anti-pattern.
   primed with a cached idle snapshot via `setQueryData`, then a genuinely
   stalled `fetch` mock — the closest reproduction of the real hazard this
   repo can exercise). All fail-then-pass verified.
+
+## A second listener on the roast port silently hijacks the browser's API traffic — kill by PROCESS FAMILY and verify port absence, never by subcommand pattern
+*(fixed by the roast-live.sh hardening, 12 Jul 2026 — the #513 incident pair's root cause)*
+
+- **Signature:** any `pkill`/cleanup that matches a SUBCOMMAND form (e.g.
+  `pkill -f 'roastpilot-agent serve'`) in a script that then binds a port; any
+  new tool/harness/webServer that starts `roastpilot-agent` in a different
+  invocation form (e.g. `--replay ... --port 8000`, see
+  `web/playwright.config.ts`); any launcher that binds `0.0.0.0:$PORT` without
+  first verifying NOTHING listens on `$PORT`.
+- **Wrong:** assuming a failed bind will surface a port conflict. On macOS a
+  specific `127.0.0.1:$PORT` bind coexists with a `0.0.0.0:$PORT` wildcard bind
+  (SO_REUSEADDR — uvicorn's default) and then receives ALL loopback
+  connections: the browser talks to the impostor (an idle replay/e2e harness
+  answering `/api/health` with `active_run_id: null`) while the real roast
+  server logs only fragments of the traffic. No error anywhere; the operator
+  is stranded on a start form with the machine live (#513, both incidents).
+- **Right:** cleanup kills the whole process family (`pkill -9 -f
+  'roastpilot-agent'`), then the launcher REFUSES to start while `lsof
+  -nP -iTCP:"$PORT" -sTCP:LISTEN` finds anything, printing the offender.
+  Absence of a second listener is verified, not assumed. If a live rig
+  misbehaves while mocks are clean, run the curl + lsof pair WHILE the symptom
+  shows — dead sockets keep no history.
+- **Guarded by:** the hard guard in `scripts/roast-live.sh` (aborts with the
+  offending pid list). No test — shell-launcher behaviour; validated manually
+  12 Jul (clean single-listener launch, roast 13 completed).
