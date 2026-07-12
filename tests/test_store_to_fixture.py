@@ -345,6 +345,72 @@ async def test_summary_weight_loss_is_null_when_unweighed(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_summary_carries_every_tasting_entry(tmp_path: Path) -> None:
+    """#522: multi-entry tastings reach the corpus — the signal
+    operator_rating/notes alone cannot carry (a revisit is an ADDITIONAL
+    entry, never an overwrite)."""
+    db_path = tmp_path / "tasted.sqlite3"
+    store = await _synthetic_store(db_path)
+    await store.add_tasting("synthetic-run", stars=2, notes="flat", defects=["flat"])
+    await store.add_tasting(
+        "synthetic-run",
+        stars=4,
+        notes="grassy note faded",
+        brew_method="pour_over",
+        grind_note="medium-fine",
+        attributes=["sweetness"],
+        defects=["grassy"],
+    )
+    await store.close()
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    tastings = summary["tastings"]
+    assert len(tastings) == 2  # BOTH entries — a revisit never overwrites.
+    assert tastings[0]["stars"] == 2
+    assert tastings[0]["defects"] == ["flat"]
+    assert tastings[1]["stars"] == 4
+    assert tastings[1]["brew_method"] == "pour_over"
+    assert tastings[1]["grind_note"] == "medium-fine"
+    assert tastings[1]["attributes"] == ["sweetness"]
+    assert tastings[1]["defects"] == ["grassy"]
+
+
+@pytest.mark.asyncio
+async def test_summary_tastings_is_empty_for_an_untasted_roast(tmp_path: Path) -> None:
+    """#522: an untasted roast carries an empty tastings list, not a null or
+    a missing key — the bake-off / any downstream reader can always index it."""
+    db_path = tmp_path / "untasted.sqlite3"
+    store = await _synthetic_store(db_path)
+    await store.close()
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["tastings"] == []
+
+
+@pytest.mark.asyncio
+async def test_schema_v10_compat_roast_tastings_table_absent(tmp_path: Path) -> None:
+    """#522: schema v10 stores predate the roast_tastings table (added in v11).
+
+    read_store_roast must not crash when the table is absent; it should fall
+    back to an empty tastings list."""
+    import sqlite3
+
+    db_path = tmp_path / "v10store.sqlite3"
+    store = await _synthetic_store(db_path)
+    await store.close()
+    # Simulate schema v10 by dropping the table added in v11.
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("DROP TABLE roast_tastings")
+    conn.commit()
+    conn.close()
+
+    result = s2f.read_store_roast(db_path)
+    assert result.tastings == []
+
+
+@pytest.mark.asyncio
 async def test_schema_v6_compat_roasted_weight_grams_absent(tmp_path: Path) -> None:
     """#224: schema v6 stores lack the roasted_weight_grams column (added in v7/#388).
 

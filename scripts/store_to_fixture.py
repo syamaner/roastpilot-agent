@@ -120,6 +120,14 @@ class StoreRoast:
         first_crack_seconds: ``first_crack`` time, rebased, or ``None``.
         drop_seconds: The drop instant — the transition into cooling
             (``phase_changed`` with ``phase == "cooling"``) — rebased, or ``None``.
+        tastings: Every persisted tasting entry (#522, D91), oldest first, as
+            plain dicts mirroring ``models.RoastTasting``'s JSON shape
+            (``stars`` / ``notes`` / ``tasted_at_utc`` / ``brew_method`` /
+            ``grind_note`` / ``attributes`` / ``defects``) — the multi-entry
+            corpus signal the operator_rating/notes pair alone cannot carry
+            (a revisit tasting is a SEPARATE entry, not an overwrite). Empty
+            list for an untasted roast or a pre-#522 store whose schema
+            predates the ``roast_tastings`` table.
     """
 
     run_id: str
@@ -132,6 +140,7 @@ class StoreRoast:
     charge_seconds: float | None
     first_crack_seconds: float | None
     drop_seconds: float | None
+    tastings: list[dict[str, Any]]
 
 
 def _connect_readonly(db_path: Path) -> sqlite3.Connection:
@@ -302,6 +311,40 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
             }
             for row in telemetry_rows
         ]
+        # Guard: roast_tastings was added in store schema v11 (#522). A store
+        # predating it (no table at all) has no tastings to read — same
+        # back-compat shape as the v7 roasted_weight_grams column guard above.
+        _tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+        tastings: list[dict[str, Any]] = []
+        if "roast_tastings" in _tables:
+            tasting_rows = connection.execute(
+                "SELECT tasted_at_utc, recorded_at_utc, stars, notes, brew_method,"
+                " grind_note, attributes_json, defects_json FROM roast_tastings"
+                " WHERE run_id = ? ORDER BY id ASC",
+                (resolved,),
+            ).fetchall()
+            tastings = [
+                {
+                    "tasted_at_utc": row["tasted_at_utc"],
+                    "recorded_at_utc": row["recorded_at_utc"],
+                    "stars": int(row["stars"]),
+                    "notes": row["notes"],
+                    "brew_method": row["brew_method"],
+                    "grind_note": row["grind_note"],
+                    "attributes": []
+                    if row["attributes_json"] is None
+                    else json.loads(row["attributes_json"]),
+                    "defects": []
+                    if row["defects_json"] is None
+                    else json.loads(row["defects_json"]),
+                }
+                for row in tasting_rows
+            ]
         # Reconcile the two clocks: roast_events.monotonic_seconds is ABSOLUTE
         # time.monotonic(), telemetry.elapsed_seconds is run-relative. Rebase every
         # event onto the telemetry clock by subtracting the run-start monotonic
@@ -339,6 +382,7 @@ def read_store_roast(db_path: Path, run_id: str | None = None) -> StoreRoast:
                 _event_time(connection, resolved, _FIRST_CRACK_KIND), run_started
             ),
             drop_seconds=_rebase(_drop_time(connection, resolved), run_started),
+            tastings=tastings,
         )
     finally:
         connection.close()
@@ -518,6 +562,12 @@ def build_summary(roast: StoreRoast, rows: list[dict[str, Any]]) -> dict[str, An
         "weight_loss_percent": _weight_loss_percent(
             roast.charge_weight_grams, roast.roasted_weight_grams
         ),
+        # Multi-entry tasting corpus label (#522, D91) — the signal
+        # operator_rating/notes alone cannot carry (a revisit tasting is an
+        # ADDITIONAL entry, never an overwrite). Empty list for an untasted
+        # roast or a pre-#522 store. The .alog adapter has no tasting concept
+        # and always emits an empty list (parity with this key set).
+        "tastings": roast.tastings,
     }
 
 
