@@ -510,4 +510,341 @@ describe("#523 real-integration — /live idle state reads REAL history for the 
     // isn't passing because the stale cache was never even present).
     expect(detailFetchCount).toBeGreaterThan(0);
   });
+
+  it("#532 round 3: invalidates STALE cached telemetry for the history-derived run alongside the detail fetch", async () => {
+    // Round 2 fixed the DETAIL cache; round 3's finding is that the summary's
+    // headline stats + mini curve come from useTelemetry (downsample=1 for
+    // stats, downsample=5 for the curve), which share the app's default 30s
+    // staleTime — a same-session stale telemetry cache entry for this exact
+    // run id could still render outdated numbers alongside a freshly-
+    // verified detail. Seeds BOTH downsample variants stale, asserts the
+    // fresh server values render for both.
+    const HISTORY_RUN_ID = "run-with-stale-telemetry";
+    let telemetryFetchCount = 0;
+    const freshTelemetryPoints = [
+      {
+        tick: 13,
+        elapsed_seconds: 390,
+        charge_elapsed_seconds: 390,
+        agent_phase: "cooling" as const,
+        bean_temp_c: 199.0, // the FRESH drop temp — distinct from the stale value below
+        env_temp_c: 220.0,
+        bean_ror_c_per_min: 4.0,
+        env_ror_c_per_min: 3.5,
+        heat_level_percent: 0,
+        fan_level_percent: 100,
+        cooling_on: true,
+        development_percent: 22.5,
+      },
+    ];
+    const staleTelemetryPoints = [
+      {
+        tick: 6,
+        elapsed_seconds: 180,
+        charge_elapsed_seconds: 180,
+        agent_phase: "roasting_pre_first_crack" as const,
+        bean_temp_c: 185.0, // a STALE, pre-drop mid-roast reading
+        env_temp_c: 210.0,
+        bean_ror_c_per_min: 10.0,
+        env_ror_c_per_min: 8.5,
+        heat_level_percent: 70,
+        fan_level_percent: 60,
+        cooling_on: false,
+        development_percent: null,
+      },
+    ];
+
+    global.fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u === "/api/health") {
+        return new Response(
+          JSON.stringify({ status: "ok", version: "test", mcp_child: "running", active_run_id: null }),
+          { status: 200 },
+        );
+      }
+      if (u === "/api/roasts") {
+        return new Response(
+          JSON.stringify({
+            runs: [
+              {
+                id: HISTORY_RUN_ID,
+                started_at_utc: "2026-07-01T10:00:00Z",
+                completed_at_utc: "2026-07-01T10:06:30Z",
+                first_crack_at_utc: null,
+                agent_phase: "complete",
+                outcome: "completed",
+                bean_origin: "Ethiopia Guji",
+                bean_varietal: null,
+                rating: null,
+                development_percent: 22.5,
+                advisor_consults: 0,
+                advisor_clamped: 0,
+                advisor_rejected: 0,
+                advisor_failed: 0,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (u === `/api/roasts/${HISTORY_RUN_ID}`) {
+        return new Response(
+          JSON.stringify({
+            id: HISTORY_RUN_ID,
+            agent_phase: "complete",
+            profile: {
+              name: "Test",
+              bean_origin: "Ethiopia Guji",
+              bean_varietal: null,
+              bean_weight_grams: 250,
+              charge_guidance_min_c: 170,
+              charge_guidance_max_c: 200,
+              initial_heat_percent: 80,
+              initial_fan_percent: 30,
+              target_drop_temp_c: 195,
+              target_development_percent: 20,
+            },
+            outcome: "completed",
+            started_at_utc: "2026-07-01T10:00:00Z",
+            completed_at_utc: "2026-07-01T10:06:30Z",
+            fault_reason: null,
+            rating: null,
+            notes: null,
+            export_manifest: null,
+          }),
+          { status: 200 },
+        );
+      }
+      if (u.startsWith(`/api/roasts/${HISTORY_RUN_ID}/telemetry`)) {
+        telemetryFetchCount += 1;
+        return new Response(
+          JSON.stringify({
+            run_id: HISTORY_RUN_ID,
+            downsample: u.includes("downsample=5") ? 5 : 1,
+            point_count: freshTelemetryPoints.length,
+            points: freshTelemetryPoints,
+          }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`unexpected fetch ${u} ${init?.method ?? "GET"}`);
+    }) as unknown as typeof fetch;
+
+    // Mirrors the app's REAL QueryClient config (staleTime: 30_000 — see
+    // web/src/lib/queryClient.ts), NOT this file's usual bare
+    // `{ retry: false }` client. `useTelemetry` has no per-call staleTime
+    // override (unlike `fetchHistoryRunDetail`'s explicit `staleTime: 0`),
+    // so it inherits whatever the CLIENT's default is — a bare client
+    // defaults to TanStack's own library staleTime (0, "always stale"),
+    // which would make the seeded cache below look stale regardless of
+    // whether the fix's invalidation call exists, silently defeating this
+    // test's whole premise. Confirmed empirically: this test passed even
+    // with the invalidation call removed until this staleTime was added.
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+    // Seed BOTH downsample variants with a STALE mid-roast series.
+    client.setQueryData(roastKeys.telemetry(HISTORY_RUN_ID, 1), {
+      run_id: HISTORY_RUN_ID,
+      downsample: 1,
+      point_count: staleTelemetryPoints.length,
+      points: staleTelemetryPoints,
+    });
+    client.setQueryData(roastKeys.telemetry(HISTORY_RUN_ID, 5), {
+      run_id: HISTORY_RUN_ID,
+      downsample: 5,
+      point_count: staleTelemetryPoints.length,
+      points: staleTelemetryPoints,
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/live"]}>
+          <Routes>
+            <Route path="/live" element={<LivePage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("live-finished-view")).toBeInTheDocument());
+    // The FRESH drop temp (199 °C) renders — not the stale mid-roast reading.
+    await waitFor(() => expect(screen.getByTestId("stat-drop-temp")).toHaveTextContent("199 °C"));
+    // A real telemetry fetch genuinely happened for this run (proving the
+    // stale seeded cache was actually invalidated, not just never read).
+    expect(telemetryFetchCount).toBeGreaterThan(0);
+  });
+
+  it("#532 round 3: routes to the history-error state (never renders stale data under a 'verified' flag) when a CACHED detail exists but the forced refresh FAILS", async () => {
+    // The fail-open/fail-closed split round 3 asked for: a cached detail
+    // entry already exists for this run id (the stale-mid-roast scenario),
+    // and the forced-fresh refetch FAILS (network/server error) rather than
+    // succeeding. Failing open here would render the stale cached data under
+    // a "freshly verified" flag — worse than the neutral error state, since
+    // it looks trustworthy. Must show LiveHistoryUnknownView instead.
+    const HISTORY_RUN_ID = "run-detail-refresh-fails";
+    global.fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u === "/api/health") {
+        return new Response(
+          JSON.stringify({ status: "ok", version: "test", mcp_child: "running", active_run_id: null }),
+          { status: 200 },
+        );
+      }
+      if (u === "/api/roasts") {
+        return new Response(
+          JSON.stringify({
+            runs: [
+              {
+                id: HISTORY_RUN_ID,
+                started_at_utc: "2026-07-01T10:00:00Z",
+                completed_at_utc: "2026-07-01T10:06:30Z",
+                first_crack_at_utc: null,
+                agent_phase: "complete",
+                outcome: "completed",
+                bean_origin: "Ethiopia Guji",
+                bean_varietal: null,
+                rating: null,
+                development_percent: 18.7,
+                advisor_consults: 0,
+                advisor_clamped: 0,
+                advisor_rejected: 0,
+                advisor_failed: 0,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      // The forced-fresh detail refetch FAILS — genuinely, at the HTTP layer.
+      if (u === `/api/roasts/${HISTORY_RUN_ID}`) {
+        return new Response(JSON.stringify({ detail: "server error" }), { status: 500 });
+      }
+      if (u.startsWith(`/api/roasts/${HISTORY_RUN_ID}/telemetry`)) {
+        return new Response(
+          JSON.stringify({ run_id: HISTORY_RUN_ID, downsample: 1, point_count: 0, points: [] }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`unexpected fetch ${u} ${init?.method ?? "GET"}`);
+    }) as unknown as typeof fetch;
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // A cached detail entry ALREADY exists for this run — the exact
+    // precondition for the fail-CLOSED branch (as opposed to fail-open,
+    // which only applies when NO cache entry exists).
+    client.setQueryData(roastKeys.detail(HISTORY_RUN_ID), {
+      id: HISTORY_RUN_ID,
+      agent_phase: "development",
+      profile: {
+        name: "Test",
+        bean_origin: "STALE — MUST NOT RENDER",
+        bean_varietal: null,
+        bean_weight_grams: 250,
+        charge_guidance_min_c: 170,
+        charge_guidance_max_c: 200,
+        initial_heat_percent: 80,
+        initial_fan_percent: 30,
+        target_drop_temp_c: 195,
+        target_development_percent: 20,
+      },
+      outcome: null,
+      started_at_utc: "2026-07-01T10:00:00Z",
+      completed_at_utc: null,
+      fault_reason: null,
+      rating: null,
+      notes: null,
+      export_manifest: null,
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/live"]}>
+          <Routes>
+            <Route path="/live" element={<LivePage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("live-history-unknown")).toBeInTheDocument());
+    // The stale cached data never renders, under any flag.
+    expect(screen.queryByText("STALE — MUST NOT RENDER")).toBeNull();
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
+  });
+
+  it("#532 round 3: fails OPEN (not closed) when NO cached detail exists and the forced refresh fails — LiveFinishedView's own useRoast gets an independent shot", async () => {
+    // The other half of the fail-open/fail-closed split: no cache entry
+    // existed for this id at all, so there is nothing stale to mislead with.
+    // The verification fetch still fails, but the page must NOT show the
+    // history-error state — it falls through, and LiveFinishedView's own
+    // useRoast() gets its own independent attempt (which also fails here,
+    // rendering the view with "—" placeholders rather than blocking /live
+    // entirely on one transient error).
+    const HISTORY_RUN_ID = "run-no-cache-refresh-fails";
+    global.fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u === "/api/health") {
+        return new Response(
+          JSON.stringify({ status: "ok", version: "test", mcp_child: "running", active_run_id: null }),
+          { status: 200 },
+        );
+      }
+      if (u === "/api/roasts") {
+        return new Response(
+          JSON.stringify({
+            runs: [
+              {
+                id: HISTORY_RUN_ID,
+                started_at_utc: "2026-07-01T10:00:00Z",
+                completed_at_utc: "2026-07-01T10:06:30Z",
+                first_crack_at_utc: null,
+                agent_phase: "complete",
+                outcome: "completed",
+                bean_origin: "Ethiopia Guji",
+                bean_varietal: null,
+                rating: null,
+                development_percent: 18.7,
+                advisor_consults: 0,
+                advisor_clamped: 0,
+                advisor_rejected: 0,
+                advisor_failed: 0,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      // Every detail fetch fails — no cached entry ever existed either.
+      if (u === `/api/roasts/${HISTORY_RUN_ID}`) {
+        return new Response(JSON.stringify({ detail: "server error" }), { status: 500 });
+      }
+      if (u.startsWith(`/api/roasts/${HISTORY_RUN_ID}/telemetry`)) {
+        return new Response(
+          JSON.stringify({ run_id: HISTORY_RUN_ID, downsample: 1, point_count: 0, points: [] }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`unexpected fetch ${u} ${init?.method ?? "GET"}`);
+    }) as unknown as typeof fetch;
+
+    // NO pre-seeded cache entry this time.
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/live"]}>
+          <Routes>
+            <Route path="/live" element={<LivePage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // Falls through to LiveFinishedView (never the history-error state) —
+    // its own useRoast() gets an independent attempt at the same failing
+    // endpoint, so the view renders with placeholders, not a blocked page.
+    await waitFor(() => expect(screen.getByTestId("live-finished-view")).toBeInTheDocument());
+    expect(screen.queryByTestId("live-history-unknown")).toBeNull();
+  });
 });
