@@ -1,18 +1,38 @@
 /**
- * Dashboard idle ↔ active wiring for the Start-roast affordance (#158).
+ * DashboardPage fault-path behaviour (#124 / #206 / #329 / #423 / #513).
  *
- * Asserts the page shows the Start form ONLY when health reports no active run, and
- * the live dashboard once a run is active. The child hooks are mocked to isolate the
- * page's idle-detection branch (the form + the stream hook have their own specs).
+ * Restored from `DashboardPage.idle.test.tsx` (#517/#523) — that file's name
+ * described only ONE of its five describe blocks (the idle/active-wiring
+ * suite, which really was dead and unreachable via the router). Deleting the
+ * whole file alongside that dead branch also deleted four LIVE-behaviour
+ * suites whose code paths still exist and still run in production:
+ *   - the #124 faulted-run sticky banner (a health refetch must not drop the
+ *     fault banner before the operator acknowledges it),
+ *   - the #206/#117/#513 acknowledge_fault flow, including its confirm-retry
+ *     loop (transient failure, exhausted retries, no-double-submit, and the
+ *     unmount-mid-confirm cache-write guard),
+ *   - the #329 restored/reloaded-fault snapshot fallback (booting or
+ *     reloading onto an already-faulted run with no live SSE `fault` frame),
+ *   - the #423 P2-1 `run_completed` → health-invalidation drain callback.
+ * `stickyFaultedRunId`, `handleAcknowledgeFault`, the hydrated-snapshot fault
+ * fallback (`snapshotFault`), and the drain callback all still live in
+ * `DashboardPage.tsx` — only the idle/active-wiring describe (the genuinely
+ * dead ~158-line branch, plus its own bean-profile/start-roast mocks) was
+ * correctly removed.
  *
- * #513: this branch is not reachable via the current router (LivePage only mounts
- * DashboardPage once a run is already active — pages/live/LivePage.tsx owns the
- * primary /live start flow), but it keeps its own supported test contract here, and
- * shares the exact hazard LiveStartView had: a start-roast POST succeeding while the
- * subsequent health confirmation silently fails must never leave the bare,
- * untouched-looking form on screen. Covered below: the form hides the instant the
- * POST is proven (201); a transient api.health() failure retries and confirms; every
- * attempt failing shows the failure state, never the bare form.
+ * ADAPTED from the original, not blind-restored: the pre-#523 assertions
+ * expected acknowledging a fault to "return to idle" — i.e. this component
+ * rendering its OWN start form (`start-roast-form`). That form no longer
+ * exists on this page (#523): `DashboardPage.tsx` has no idle branch of its
+ * own any more and unconditionally renders the dashboard shell; `LivePage`
+ * (the sole mount point) is the one that swaps this component out once
+ * `active_run_id` clears. So the post-acknowledge assertions here check what
+ * THIS component is actually responsible for — the acknowledge action firing,
+ * the confirm loop resolving, and the sticky-faulted pin clearing (so a LATER
+ * `active_run_id`→null resolves `runId` to `null` rather than staying pinned
+ * to the acknowledged run) — not a form this page hasn't shown since #513.
+ * The bean-profile CRUD hooks the idle branch needed are also gone from the
+ * mocks below; nothing here exercises them any more.
  */
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -34,9 +54,6 @@ const operatorActionMock = vi.hoisted(() =>
     queued: true,
   })),
 );
-// #513: startRoast + health for the idle Start form's flow (this branch shares
-// LiveStartView's confirm-with-retry hazard — see pages/live/LivePage.tsx).
-const startRoastMock = vi.hoisted(() => vi.fn(async () => ({ id: "run-new" })));
 const healthApiMock = vi.hoisted(() =>
   vi.fn(async () => ({
     status: "ok" as const,
@@ -52,7 +69,6 @@ vi.mock("@/lib/api", async () => {
     api: {
       ...actual.api,
       operatorAction: operatorActionMock,
-      startRoast: startRoastMock,
       health: healthApiMock,
     },
   };
@@ -84,24 +100,12 @@ const SNAPSHOT_PROFILE = {
   target_development_percent: 20,
 };
 
-// Stub the bean-profile library hooks too (#303): un-stubbed they pass through to
-// the real impl and fire a real (failing) fetch in jsdom that only "passes" by
-// timing luck. The list returns the fixtures so the idle Start form's dropdown is
-// wired with real data; the mutations are no-op resolved mutateAsync stubs. The
-// stub is defined inside the (hoisted) factory so it isn't referenced before init.
 vi.mock("@/hooks/queries", async () => {
   const actual = await vi.importActual<typeof import("@/hooks/queries")>("@/hooks/queries");
-  const { FIXTURE_BEAN_PROFILES } =
-    await vi.importActual<typeof import("./beanProfileFixture")>("./beanProfileFixture");
-  const noopMutation = () => ({ mutateAsync: vi.fn(async () => undefined) });
   return {
     ...actual,
     useHealth: () => healthState,
     useRoast: () => roastState,
-    useBeanProfiles: () => ({ data: { profiles: FIXTURE_BEAN_PROFILES }, isLoading: false }),
-    useCreateBeanProfile: noopMutation,
-    useUpdateBeanProfile: noopMutation,
-    useDeleteBeanProfile: noopMutation,
   };
 });
 
@@ -121,20 +125,16 @@ const streamState: {
   frameCount: 0,
 };
 
-// `useFrameDrain` is called twice by DashboardPage:
-//   1. useDashboardEvents (via the real impl, already mocked below)
-//   2. The P2-1 run_completed → health invalidation drain (the one being tested here)
-// We stub it so:
+// `useFrameDrain` is called once by DashboardPage now (the S2 deletion removed the
+// idle branch's own bean-profile wiring, not this drain hook) — the P2-1
+// run_completed → health invalidation drain (#423). We stub it so:
 //   a. The common wiring tests get a no-op (frameCount is 0; the callback never fires).
-//   b. TEST 1 can capture the registered callback and invoke it to assert the invalidation.
+//   b. The drain-callback test can capture the registered callback and invoke it.
 type DrainCb = (frame: { event: string }) => void;
 let capturedDrainCallback: DrainCb | null = null;
 vi.mock("@/hooks/useRoastStream", () => ({
   useRoastStream: () => streamState,
   useFrameDrain: (_frames: unknown, _frameCount: unknown, cb: DrainCb) => {
-    // Capture the LAST registered callback. DashboardPage calls this hook once for
-    // the P2-1 health-drain; useDashboardEvents' internal call is already stubbed
-    // out above (useDashboardEvents mock), so only the P2-1 call reaches this stub.
     capturedDrainCallback = cb;
   },
 }));
@@ -185,7 +185,6 @@ beforeEach(() => {
   streamState.phase = null;
   capturedDrainCallback = null;
   operatorActionMock.mockClear();
-  startRoastMock.mockClear();
   healthApiMock.mockClear();
   healthApiMock.mockImplementation(async () => ({
     status: "ok" as const,
@@ -193,168 +192,6 @@ beforeEach(() => {
     mcp_child: "connected" as const,
     active_run_id: "run-new",
   }));
-});
-
-describe("DashboardPage idle/active wiring (#158)", () => {
-  it("does not show the Start form before health has resolved", () => {
-    healthState.isSuccess = false;
-    healthState.data = undefined;
-    renderPage();
-    expect(screen.queryByTestId("start-roast-form")).toBeNull();
-  });
-
-  it("shows the Start form when health reports no active run", () => {
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: null };
-    renderPage();
-    expect(screen.getByTestId("dashboard-idle")).toBeInTheDocument();
-    expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
-    // The live dashboard is NOT mounted in the idle branch.
-    expect(screen.queryByTestId("dashboard")).toBeNull();
-    // The idle header shows a neutral label, not the "connecting" stream indicator
-    // (there is no run to connect to) — #160 review item 3.
-    expect(screen.getByTestId("idle-indicator")).toHaveTextContent(/no active roast/i);
-  });
-
-  it("#513: hides the start form the instant the POST is proven (201), independent of health confirming", async () => {
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: null };
-    // api.health() never resolves during this assertion window — the form's
-    // disappearance must not depend on it.
-    healthApiMock.mockImplementation(() => new Promise(() => {}));
-    renderPage();
-    expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
-
-    fireEvent.change(screen.getByTestId("start-roast-name"), { target: { value: "Morning batch" } });
-    fireEvent.change(screen.getByTestId("start-roast-bean_origin"), {
-      target: { value: "Ethiopia Guji" },
-    });
-    fireEvent.change(screen.getByTestId("start-roast-bean_weight_grams"), {
-      target: { value: "250" },
-    });
-    fireEvent.submit(screen.getByTestId("start-roast-form"));
-
-    await waitFor(() => expect(startRoastMock).toHaveBeenCalledTimes(1));
-    await waitFor(() =>
-      expect(screen.getByTestId("dashboard-start-confirming")).toBeInTheDocument(),
-    );
-    expect(screen.queryByTestId("start-roast-form")).toBeNull();
-  });
-
-  it("#513: retries a transient api.health() failure after start, then confirms", async () => {
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: null };
-    healthApiMock
-      .mockRejectedValueOnce(new Error("503 starting up"))
-      .mockResolvedValueOnce({
-        status: "ok",
-        version: "test",
-        mcp_child: "connected",
-        active_run_id: "run-new",
-      });
-    renderPage();
-
-    fireEvent.change(screen.getByTestId("start-roast-name"), { target: { value: "Morning batch" } });
-    fireEvent.change(screen.getByTestId("start-roast-bean_origin"), {
-      target: { value: "Ethiopia Guji" },
-    });
-    fireEvent.change(screen.getByTestId("start-roast-bean_weight_grams"), {
-      target: { value: "250" },
-    });
-    fireEvent.submit(screen.getByTestId("start-roast-form"));
-
-    await waitFor(() => expect(healthApiMock).toHaveBeenCalledTimes(2), { timeout: 5000 });
-    expect(screen.queryByTestId("dashboard-start-confirm-failed")).toBeNull();
-  }, 8000);
-
-  it("#513: shows the failure state (never falls back to the bare form) when every confirm attempt fails", async () => {
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: null };
-    healthApiMock.mockRejectedValue(new Error("still down"));
-    renderPage();
-
-    fireEvent.change(screen.getByTestId("start-roast-name"), { target: { value: "Morning batch" } });
-    fireEvent.change(screen.getByTestId("start-roast-bean_origin"), {
-      target: { value: "Ethiopia Guji" },
-    });
-    fireEvent.change(screen.getByTestId("start-roast-bean_weight_grams"), {
-      target: { value: "250" },
-    });
-    fireEvent.submit(screen.getByTestId("start-roast-form"));
-
-    await waitFor(() =>
-      expect(screen.getByTestId("dashboard-start-confirming")).toBeInTheDocument(),
-    );
-    await waitFor(
-      () => expect(screen.getByTestId("dashboard-start-confirm-failed")).toBeInTheDocument(),
-      { timeout: 10000 },
-    );
-    expect(screen.queryByTestId("start-roast-form")).toBeNull();
-  }, 12000);
-
-  it("#513: unmounting mid-confirm never lets the orphaned start-roast loop write the cache", async () => {
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: null };
-    let resolveHealth: (v: {
-      status: "ok";
-      version: string;
-      mcp_child: "connected";
-      active_run_id: string | null;
-    }) => void = () => {};
-    healthApiMock.mockImplementation(
-      () =>
-        new Promise((resolve) => {
-          resolveHealth = resolve;
-        }),
-    );
-    const { client, unmount } = renderPage();
-    const setQueryDataSpy = vi.spyOn(client, "setQueryData");
-
-    fireEvent.change(screen.getByTestId("start-roast-name"), { target: { value: "Morning batch" } });
-    fireEvent.change(screen.getByTestId("start-roast-bean_origin"), {
-      target: { value: "Ethiopia Guji" },
-    });
-    fireEvent.change(screen.getByTestId("start-roast-bean_weight_grams"), {
-      target: { value: "250" },
-    });
-    fireEvent.submit(screen.getByTestId("start-roast-form"));
-
-    await waitFor(() => expect(startRoastMock).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(healthApiMock).toHaveBeenCalledTimes(1));
-    setQueryDataSpy.mockClear();
-
-    // Unmount WHILE the confirm attempt is still in flight.
-    unmount();
-    resolveHealth({
-      status: "ok",
-      version: "test",
-      mcp_child: "connected",
-      active_run_id: "run-new",
-    });
-    await new Promise((r) => setTimeout(r, 50));
-
-    expect(setQueryDataSpy).not.toHaveBeenCalled();
-  });
-
-  it("wires the bean-profile library into the idle Start form (#303)", () => {
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: null };
-    renderPage();
-    // The page passes useBeanProfiles' list (+ the CRUD mutations) to StartRoastForm,
-    // so the saved-profile dropdown renders with the library — incl. the Koke seed.
-    expect(screen.getByTestId("bean-profile-picker")).toBeInTheDocument();
-    expect(screen.getByTestId("bean-profile-select")).toHaveTextContent(
-      "Ethiopia Yirgacheffe Koke (Natural)",
-    );
-  });
-
-  it("shows the live dashboard (not the form) when a run is active", () => {
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: "run-123", mcp_child: "running" };
-    renderPage();
-    expect(screen.getByTestId("dashboard")).toBeInTheDocument();
-    expect(screen.queryByTestId("start-roast-form")).toBeNull();
-  });
 });
 
 describe("DashboardPage faulted-run sticky banner (#124)", () => {
@@ -365,10 +202,11 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
     viewState.fault = { reason: "env ceiling exceeded" };
     const { rerender } = renderPage();
     expect(screen.getByTestId("dashboard")).toBeInTheDocument();
+    expect(screen.getByTestId("fault-banner")).toBeInTheDocument();
 
     // The fault finalizes the run server-side and a health refetch (reconnect)
-    // reports no active run. The dashboard must NOT collapse to the idle form —
-    // the fault banner stays until the operator acknowledges it (#124).
+    // reports no active run. The dashboard must NOT lose the fault banner —
+    // it stays until the operator acknowledges it (#124) via the sticky pin.
     healthState.data = { active_run_id: null };
     rerender(
       <QueryClientProvider client={new QueryClient()}>
@@ -378,10 +216,10 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
       </QueryClientProvider>,
     );
     expect(screen.getByTestId("dashboard")).toBeInTheDocument();
-    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.getByTestId("fault-banner")).toBeInTheDocument();
   });
 
-  it("acknowledges the fault by POSTing acknowledge_fault, then returns to idle", async () => {
+  it("#523: acknowledges the fault by POSTing acknowledge_fault, then confirms the run cleared — LivePage (not this component) owns the swap away", async () => {
     // Faulted, with a live active run (post-#206 a fault stays operable until ack).
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
@@ -394,7 +232,7 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
     // of spinning through its full retry budget in the background (the default
     // beforeEach mock resolves active_run_id: "run-new", which never satisfies
     // the confirm condition and would leak a live retry loop past this test,
-    // polluting a LATER test's mockRejectedValueOnce/mockResolvedValueOnce
+        // polluting a LATER test's mockRejectedValueOnce/mockResolvedValueOnce
     // queue on the same shared mock).
     healthApiMock.mockResolvedValue({
       status: "ok",
@@ -403,8 +241,6 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
       active_run_id: null,
     });
     renderPage();
-    // The server finalises the run on acknowledgement → health reports no active run.
-    healthState.data = { active_run_id: null };
     fireEvent.click(screen.getByTestId("fault-acknowledge"));
     // #206: the affordance dispatches the genuine acknowledge_fault control action.
     await waitFor(() =>
@@ -412,12 +248,14 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
         action: "acknowledge_fault",
       }),
     );
-    // Acknowledging clears the pin → no active run → idle Start form.
-    expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
-    expect(screen.queryByTestId("dashboard")).toBeNull();
-    // #513: the confirm loop itself must also resolve (not just the mocked
-    // useHealth stub the render assertion above depends on).
+    // #523: DashboardPage has no idle branch of its own any more — it never
+    // shows a start form. What THIS component owns is: the action dispatches,
+    // and the confirm loop resolves against the real api.health(). The swap
+    // away from the dashboard (to LivePage's own idle/summary state) happens
+    // one level up, once LivePage's own `active_run_id` read goes null — out
+    // of scope for a DashboardPage-only render test.
     await waitFor(() => expect(healthApiMock).toHaveBeenCalled());
+    expect(screen.getByTestId("dashboard")).toBeInTheDocument();
   });
 
   it("hides the acknowledge affordance when the server does not enable acknowledge_fault (#117)", () => {
@@ -585,7 +423,7 @@ describe("DashboardPage restored/reloaded fault (#329)", () => {
     expect(screen.getByTestId("fault-acknowledge")).toBeInTheDocument();
   });
 
-  it("acknowledges a snapshot-restored fault (no live frame) via the real acknowledge_fault action", async () => {
+  it("#523: acknowledges a snapshot-restored fault (no live frame) via the real acknowledge_fault action", async () => {
     // The whole point of #329: the restored-fault ACKNOWLEDGE must dispatch the same
     // genuine control action as the live path, clearing the run.
     healthState.isSuccess = true;
@@ -610,14 +448,15 @@ describe("DashboardPage restored/reloaded fault (#329)", () => {
       active_run_id: null,
     });
     renderPage();
-    healthState.data = { active_run_id: null }; // server finalises on ack
     fireEvent.click(screen.getByTestId("fault-acknowledge"));
     await waitFor(() =>
       expect(operatorActionMock).toHaveBeenCalledWith("run-fault", {
         action: "acknowledge_fault",
       }),
     );
-    expect(screen.getByTestId("start-roast-form")).toBeInTheDocument();
+    // #523: as above — this component's responsibility ends at dispatching the
+    // real action and confirming the health transition; it never renders its
+    // own idle form (LivePage owns that swap).
     await waitFor(() => expect(healthApiMock).toHaveBeenCalled());
   });
 
@@ -643,12 +482,18 @@ describe("DashboardPage restored/reloaded fault (#329)", () => {
 });
 
 describe("DashboardPage P2-1 drain callback — run_completed → health invalidation (#423)", () => {
-  it("invoking the drain callback with run_completed invalidates roastKeys.health", async () => {
+  it("invoking the drain callback with run_completed invalidates roastKeys.health and roastKeys.history", async () => {
     // DashboardPage registers a useFrameDrain callback for the P2-1 health-invalidation.
     // The stub above captures it; here we invoke it directly to assert the behaviour,
     // bypassing the SSE buffer so the test is deterministic regardless of frame-buffer
     // timing. This tests the CAUSAL TRIGGER — the link that the two endpoint-level tests
     // (run_completed on the SSE side; sticky latch on LivePage side) don't cover.
+    //
+    // #523: DashboardPage.tsx now ALSO invalidates roastKeys.history alongside
+    // roastKeys.health on this same trigger (LivePage's persistent last-completed
+    // fallback reads useHistory(), whose default 30s staleTime would otherwise
+    // leave the just-finished run out of it) — asserted alongside the pre-existing
+    // health invalidation, not a separate restoration.
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-drain-test" };
     const { client } = renderPage();
@@ -663,11 +508,12 @@ describe("DashboardPage P2-1 drain callback — run_completed → health invalid
     capturedDrainCallback!({ event: "phase_changed" });
     expect(invalidateSpy).not.toHaveBeenCalled();
 
-    // A run_completed frame MUST trigger health invalidation.
+    // A run_completed frame MUST trigger BOTH health and history invalidation.
     capturedDrainCallback!({ event: "run_completed" });
     await waitFor(() =>
       expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: roastKeys.health }),
     );
-    expect(invalidateSpy).toHaveBeenCalledTimes(1);
+    expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: roastKeys.history });
+    expect(invalidateSpy).toHaveBeenCalledTimes(2);
   });
 });
