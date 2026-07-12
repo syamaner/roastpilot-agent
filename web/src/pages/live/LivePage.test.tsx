@@ -384,17 +384,22 @@ describe("LivePage — no active run, no completed run ever (#523)", () => {
 });
 
 describe("LivePage — persistent last-completed summary from history (#523)", () => {
-  it("shows LiveFinishedView sourced from history when idle and a completed run exists, with NO session-sticky state", () => {
+  it("shows LiveFinishedView sourced from history when idle and a completed run exists, with NO session-sticky state", async () => {
+    // #532 round 2: the history-derived id is now verified fresh
+    // (fetchTerminalOutcome, staleTime:0) before LiveFinishedView mounts —
+    // an async gate, so this assertion must wait rather than check synchronously.
     healthState.isSuccess = true;
     healthState.data = { active_run_id: null };
     historyState.data = { runs: [historyRunFixture(FIXTURE_FINISHED_RUN_ID, "completed")] };
     historyState.isFresh = true;
     renderPage();
-    expect(screen.getByTestId("live-finished-view")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
     expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
   });
 
-  it("uses the newest completed run when history has multiple outcomes (newest-first list)", () => {
+  it("uses the newest completed run when history has multiple outcomes (newest-first list)", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: null };
     historyState.data = {
@@ -405,32 +410,38 @@ describe("LivePage — persistent last-completed summary from history (#523)", (
     };
     historyState.isFresh = true;
     renderPage();
-    expect(screen.getByTestId("live-finished-view")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
     expect(screen.getByTestId("live-finished-view-detail")).toHaveAttribute(
       "href",
       `/roasts/${FIXTURE_FINISHED_RUN_ID}`,
     );
   });
 
-  it("a reload (fresh mount, no session state) shows the SAME persistent summary — survives reload (#523)", () => {
+  it("a reload (fresh mount, no session state) shows the SAME persistent summary — survives reload (#523)", async () => {
     // This is the behaviour #523 changes: pre-#523 a reload lost the
     // session-only sticky and fell back to a start form. Now it falls back to
-    // the history-derived id instead.
+    // the history-derived id instead (verified fresh, #532 round 2).
     healthState.isSuccess = true;
     healthState.data = { active_run_id: null };
     historyState.data = { runs: [historyRunFixture(FIXTURE_FINISHED_RUN_ID, "completed")] };
     historyState.isFresh = true;
     renderPage();
-    expect(screen.getByTestId("live-finished-view")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
   });
 
-  it("'Start next roast' links to /start (no local state to clear, #523)", () => {
+  it("'Start next roast' links to /start (no local state to clear, #523)", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: null };
     historyState.data = { runs: [historyRunFixture(FIXTURE_FINISHED_RUN_ID, "completed")] };
     historyState.isFresh = true;
     renderPage();
-    expect(screen.getByTestId("live-finished-start-next")).toHaveAttribute("href", "/start");
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-start-next")).toHaveAttribute("href", "/start"),
+    );
   });
 
   it("shows LiveFinishedView when active_run_id transitions non-null → null and outcome is completed (P2-4 gate, session-sticky path)", async () => {
@@ -609,7 +620,19 @@ describe("LivePage — persistent last-completed summary from history (#523)", (
     // The persistent fallback (#523) is independent of the session-sticky
     // gate: even though THIS run faulted, a genuinely completed run from
     // earlier history still surfaces as the last-completed summary.
-    roastApiMock.mockResolvedValueOnce({ ...FIXTURE_FINISHED_DETAIL, outcome: "faulted" });
+    //
+    // #532 round 2: TWO independent effects now call api.roast — the
+    // session-sticky path (for "run-faulted-2") AND the history-detail
+    // verification (for FIXTURE_FINISHED_RUN_ID, the older run). Their
+    // firing order is not guaranteed, so the mock discriminates by the
+    // run id ARGUMENT rather than by call order (a single
+    // mockResolvedValueOnce would be consumed by whichever call happens
+    // to fire first, which could be either one).
+    roastApiMock.mockImplementation(async (runId: string) =>
+      runId === "run-faulted-2"
+        ? { ...(FIXTURE_FINISHED_DETAIL as RoastDetail), outcome: "faulted" }
+        : { ...(FIXTURE_FINISHED_DETAIL as RoastDetail), outcome: "completed" },
+    );
     historyState.data = { runs: [historyRunFixture(FIXTURE_FINISHED_RUN_ID, "completed")] };
 
     healthState.isSuccess = true;
@@ -780,6 +803,92 @@ describe("LivePage — transition-flash guard (#532 Codex follow-up)", () => {
     expect(screen.getByTestId("live-finished-view-detail")).toHaveAttribute(
       "href",
       "/roasts/run-older-completed-2",
+    );
+  });
+
+  it("#532 round 2: the older run's summary is not in the DOM the INSTANT rerender() returns — checked synchronously, plus an honest note on what this harness can and cannot prove", async () => {
+    // The two tests above prove the FINAL state is correct via `waitFor`
+    // (which only samples the DOM periodically) — that alone doesn't rule
+    // out a single-frame flash between polls. This asserts the DOM state
+    // DIRECTLY, synchronously, the instant `rerender()` returns.
+    //
+    // HONEST LIMITATION, recorded rather than hidden behind a green check:
+    // React Testing Library's `act()` (which every `render`/`rerender` call
+    // is wrapped in) flushes PASSIVE EFFECTS (`useEffect`) SYNCHRONOUSLY in
+    // test mode, before returning control to the test — confirmed
+    // empirically (a probe `console.log` placed immediately after
+    // `rerender()`, with the round-1 `prevRunIdRef` guard removed, still
+    // showed the correct/held state). In a REAL BROWSER, `useEffect` runs
+    // AFTER paint — genuinely later than this test harness's synchronous
+    // `act()` flush — so the fix's `prevRunIdRef.current` check (reading the
+    // ref during RENDER, before that render's own effects have run) is
+    // necessary for the real one-frame gap Codex described, but this
+    // component-test harness cannot reproduce that specific timing to prove
+    // the OLD code was broken in the way described. Tried: a
+    // MutationObserver (microtask-queued, so it also doesn't see an
+    // intermediate commit inside one `act()` flush) and a synchronous
+    // console probe (same result) — both confirmed the harness always
+    // settles past the whole effect chain within one `rerender()`. Verified
+    // manually instead (recorded in the commit message): reverting the
+    // `prevRunIdRef.current !== null ||` half of the guard to leave only
+    // `terminalFetchPending` still passes every test in this file, including
+    // this one — proof this specific assertion does NOT, on its own, gate
+    // merge on the round-1 timing fix. The ref-read is still the objectively
+    // correct fix (state set inside `useEffect` cannot possibly reflect a
+    // render that hasn't committed yet, which is the real hazard in a
+    // browser); kept it and this assertion for the real behaviour it DOES
+    // cover (the composed hold from BOTH mechanisms holds correctly through
+    // a real async transition) rather than delete coverage over a harness
+    // gap, but the two-line accounting above is the honest scope of what a
+    // green run here actually proves.
+    //
+    // Isolating finding #1's fix from finding #2's (the fresh-history-detail
+    // hold) requires the older run's id to already be HISTORY-FRESHNESS-
+    // VERIFIED before the transition under test fires — otherwise finding
+    // #2's own hold (waiting on the history-detail fetch) independently
+    // covers this exact scenario too. So: mount idle with the older run in
+    // history first (letting that verification resolve), THEN start a run
+    // and let it finish.
+    historyState.data = { runs: [historyRunFixture("run-older-preverified", "completed")] };
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: null };
+    const { rerender } = renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view-detail")).toHaveAttribute(
+        "href",
+        "/roasts/run-older-preverified",
+      ),
+    );
+
+    // Now a run starts and finishes — the terminal-outcome fetch for it is
+    // stalled so the test can inspect the DOM mid-transition.
+    let resolveRoast: (detail: RoastDetail) => void = () => {};
+    roastApiMock.mockImplementationOnce(
+      () =>
+        new Promise<RoastDetail>((resolve) => {
+          resolveRoast = resolve;
+        }),
+    );
+    healthState.data = { active_run_id: "run-just-finished-verified" };
+    rerender();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+
+    // Fire the transition — this is the exact commit round-2 fixed.
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    // SYNCHRONOUS check, no await: the older run's summary must already be
+    // gone from the DOM the instant this line runs, not just eventually.
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
+    expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
+
+    resolveRoast({ ...(FIXTURE_FINISHED_DETAIL as RoastDetail), outcome: "completed" });
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("live-finished-view-detail")).toHaveAttribute(
+      "href",
+      "/roasts/run-just-finished-verified",
     );
   });
 });

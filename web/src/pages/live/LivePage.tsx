@@ -8,9 +8,12 @@
  *    fallback) each produce a GENUINELY FRESH read, so nothing flashes before
  *    the active-run status — and the last-completed summary it falls back
  *    to — are known. Also holds while a just-finished run's terminal-outcome
- *    fetch is in flight, so an OLDER completed run's summary never flashes
- *    before the just-finished run's own gate resolves (#523 Codex follow-up
- *    on #532).
+ *    fetch is in flight — including the FIRST COMMITTED RENDER of the
+ *    active→null transition, before the effect that starts that fetch has
+ *    even run — so an OLDER completed run's summary never flashes for even
+ *    one frame before the just-finished run's own gate resolves (#523 Codex
+ *    follow-up on #532, round 2: the naive state-only hold missed exactly
+ *    that first frame, since `useEffect` runs post-paint).
  * 2. Active run — the full live dashboard (DashboardPage). A reload on this
  *    URL re-hydrates from the server snapshot + SSE — the reload-safe guarantee.
  * 3. No active run — the last completed run's summary (`LiveFinishedView`),
@@ -19,12 +22,19 @@
  *    run from THIS session (`stickyCompletedRunId`) is preferred while set —
  *    history can lag the terminal write by a beat — but a reload always falls
  *    through to the same history-derived id, so the summary survives it
- *    (unlike the pre-#523 session-only sticky). If the operator has never
- *    completed a roast, `LiveNoRoastsView` shows a neutral "no roasts yet"
- *    state — still not a form — with a link to `/start`. A persistent history
- *    read failure gets its OWN neutral state (`LiveHistoryUnknownView`) —
- *    never `LiveNoRoastsView`, which would otherwise assert a false "this
- *    roaster has never completed a roast" on a network/server error.
+ *    (unlike the pre-#523 session-only sticky). Before trusting a HISTORY-
+ *    derived id specifically, its detail snapshot is fetched fresh
+ *    (`staleTime: 0`, reusing `fetchTerminalOutcome`) and the render holds
+ *    until that resolves — otherwise `LiveFinishedView` could mount against a
+ *    STALE cached `roastKeys.detail(id)` left over from an earlier same-
+ *    session dashboard view of that same run (#523 Codex follow-up on #532,
+ *    round 2). The session-sticky path already fetches fresh by construction
+ *    and needs no separate gate. If the operator has never completed a
+ *    roast, `LiveNoRoastsView` shows a neutral "no roasts yet" state — still
+ *    not a form — with a link to `/start`. A persistent history read failure
+ *    gets its OWN neutral state (`LiveHistoryUnknownView`) — never
+ *    `LiveNoRoastsView`, which would otherwise assert a false "this roaster
+ *    has never completed a roast" on a network/server error.
  *
  * `/start` (StartRoastView.tsx) is the ONLY start-form surface under the
  * #523 IA; `/live` never renders one.
@@ -152,6 +162,72 @@ export function LivePage(): React.JSX.Element {
     }
   }, [activeRunId, queryClient]);
 
+  // #523 Codex follow-up on #532, round 2: the HISTORY-derived id
+  // (`lastCompletedRunId`) is not automatically fresh the way the session-
+  // sticky path is. `fetchTerminalOutcome`'s `staleTime: 0` fetch only runs
+  // for THIS session's own just-finished run; a history-derived id (e.g. on
+  // a reload, or when the operator lands on /live idle without having just
+  // finished a roast this session) would otherwise hand `LiveFinishedView` a
+  // runId whose `roastKeys.detail(id)` cache entry might be STALE — e.g. a
+  // mid-roast snapshot cached earlier in the same browser session from an
+  // open dashboard/detail view of that same run, with `outcome: null` and
+  // partial stats. Mirror the sticky path: before trusting a history-derived
+  // id, fetch its detail fresh (reusing `fetchTerminalOutcome`, which already
+  // populates the cache with the server's terminal snapshot) and hold the
+  // fallback render until that resolves. Runs only when relevant — i.e. NOT
+  // while the session-sticky path is already supplying the summary (it needs
+  // no separate verification) — and re-fires whenever `lastCompletedRunId`
+  // itself changes (a new run completing elsewhere invalidates history, see
+  // above, which can surface a different id here).
+  const [freshHistoryRunId, setFreshHistoryRunId] = useState<string | null>(null);
+  const [historyDetailPending, setHistoryDetailPending] = useState(false);
+
+  useEffect(() => {
+    if (
+      stickyCompletedRunId !== null ||
+      lastCompletedRunId === null ||
+      // A run just transitioned active→null and its OWN terminal-outcome
+      // fetch is still pending (or hasn't even started this render, per the
+      // synchronous `prevRunIdRef` check above) — the transition hold
+      // already blocks any fallback render regardless, so verifying an
+      // older history-derived id's freshness here would be redundant work
+      // AND would race the sticky path's own `fetchTerminalOutcome` call for
+      // the SAME shared query client / underlying `api.roast`. Skip; this
+      // effect re-runs once the transition settles (`terminalFetchPending`
+      // is a dep below).
+      prevRunIdRef.current !== null ||
+      terminalFetchPending
+    ) {
+      return;
+    }
+    if (freshHistoryRunId === lastCompletedRunId) {
+      // Already verified fresh for this exact id — no need to re-fetch on
+      // every render (this effect's dep array still re-runs it if the id
+      // itself changes, which is the only case that needs a new fetch).
+      return;
+    }
+    let cancelled = false;
+    setHistoryDetailPending(true);
+    // FAIL OPEN, deliberately: `fetchTerminalOutcome` already catches its own
+    // network errors internally and resolves `null` rather than rejecting
+    // (see its doc) — this `.then()` always runs, whether the underlying
+    // fetch succeeded or failed. On a genuine failure the query cache for
+    // this id was never freshly populated, so `LiveFinishedView`'s own
+    // `useRoast(runId)` falls back to running its OWN independent fetch
+    // (default staleTime, no override) — a second, later chance to succeed —
+    // rather than this page holding the idle state open forever on a single
+    // transient error. Mirrors `fetchTerminalOutcome`'s own "never block the
+    // session-sticky path indefinitely on a network blip" design.
+    void fetchTerminalOutcome(queryClient, lastCompletedRunId).then(() => {
+      if (cancelled) return;
+      setFreshHistoryRunId(lastCompletedRunId);
+      setHistoryDetailPending(false);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [stickyCompletedRunId, lastCompletedRunId, freshHistoryRunId, terminalFetchPending, queryClient]);
+
   // Health error (#513 medium): active-run status is UNKNOWN — never fall
   // through to a state that implies "no run" (a run could genuinely be active
   // and the operator would have no path to the dashboard/e-stop, the exact
@@ -191,7 +267,17 @@ export function LivePage(): React.JSX.Element {
   // depend on `stickyCompletedRunId` being null (unlike the history hold
   // below): the fetch itself, not just its outcome, is what must finish
   // before any fallback is allowed to render.
-  if (terminalFetchPending) {
+  //
+  // #523 Codex follow-up on #532, round 2: `terminalFetchPending` ALONE
+  // arrives one frame late — it's set inside the `useEffect` above, which
+  // runs AFTER this component's first commit for the active→null transition,
+  // so that first painted frame would still fall through to the fallback
+  // below before the effect ever fires. `prevRunIdRef.current` is read
+  // SYNCHRONOUSLY during render and is not yet cleared on that exact frame
+  // (the effect that clears it to `null` hasn't run yet either) — checking
+  // it here closes the gap the state-only hold missed. The ref covers the
+  // one pre-effect frame; the state covers the whole fetch duration after.
+  if (prevRunIdRef.current !== null || terminalFetchPending) {
     return (
       <AppFrame>
         <div data-testid="live-page-loading" />
@@ -216,6 +302,27 @@ export function LivePage(): React.JSX.Element {
   // remount must not render a CACHED history list — possibly empty — as
   // proof no roast has ever completed.
   if (stickyCompletedRunId === null && !history.isFresh) {
+    return (
+      <AppFrame>
+        <div data-testid="live-page-loading" />
+      </AppFrame>
+    );
+  }
+
+  // #523 Codex follow-up on #532, round 2: before trusting a HISTORY-derived
+  // id (never the session-sticky one, which is already fetched fresh by
+  // construction — see the effect above), hold while its detail snapshot is
+  // being fetched fresh, and require it to have actually been VERIFIED for
+  // THIS exact id (not a stale `freshHistoryRunId` left over from a
+  // previously-verified, now-superseded id). Composes with the transition
+  // hold above: `lastCompletedRunId` and `freshHistoryRunId` only matter once
+  // the process has settled past the active-run/transition/history-error/
+  // history-staleness gates already checked.
+  if (
+    stickyCompletedRunId === null &&
+    lastCompletedRunId !== null &&
+    (historyDetailPending || freshHistoryRunId !== lastCompletedRunId)
+  ) {
     return (
       <AppFrame>
         <div data-testid="live-page-loading" />
