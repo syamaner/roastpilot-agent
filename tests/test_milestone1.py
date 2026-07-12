@@ -22,7 +22,7 @@ import pytest_asyncio
 
 from roastpilot_agent.advisor import FakeAdvisor, RoastDecision
 from roastpilot_agent.api import RoastService
-from roastpilot_agent.config import AppConfig, ControllerConfig
+from roastpilot_agent.config import AppConfig, ControllerConfig, PostFirstCrackControl
 from roastpilot_agent.mcp_client import ExportRoastLogResult
 from roastpilot_agent.models import (
     OperatorAction,
@@ -36,6 +36,16 @@ from roastpilot_agent.models import (
 )
 from roastpilot_agent.store import RoastStore
 from tests.conftest import FakeClock, FakeMCPClient
+
+#: This module's tests are advisor-driven vertical slices (a FakeAdvisor
+#: returns one decision, checked via the persisted advisor_decisions row) —
+#: they predate the 12 Jul D88/D89 promotion (#495) and were never meant to
+#: exercise the deterministic post-FC taper or the ceiling-guard auto-drop.
+#: Both flags now default True; several of these fixtures read bean=196.0 (at
+#: the default ceiling-guard temperature), which would auto-drop the roast
+#: before the advisor consult these tests are actually about ever runs.
+#: Pinned to the pre-promotion baseline explicitly.
+_BASELINE_POST_FC_CONTROL = PostFirstCrackControl(enabled=False, ceiling_guard_drop_enabled=False)
 
 
 def _profile() -> RoastProfile:
@@ -111,7 +121,12 @@ async def test_twelve_step_vertical_slice_against_fake_mcp(
     clock = FakeClock()
     # A small telemetry-log interval so each advanced tick persists a row;
     # everything else default (the conservative safety + timing config).
-    config = AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0))
+    config = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=1.0,
+            post_first_crack_control=_BASELINE_POST_FC_CONTROL,
+        )
+    )
     preheat = _reading(bean=178.0, env=185.0)  # inside the 170–200 charge band
     mcp = FakeMCPClient([preheat], export_result=_export_result(tmp_path))
     advisor = FakeAdvisor([], default_decision=_decision())
@@ -253,7 +268,12 @@ async def test_provider_error_persists_advisor_row_with_null_decision(
     from roastpilot_agent.advisor import AdvisorFailureMode
 
     clock = FakeClock()
-    config = AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0))
+    config = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=1.0,
+            post_first_crack_control=_BASELINE_POST_FC_CONTROL,
+        )
+    )
     mcp = FakeMCPClient(
         [_reading(bean=205.0, env=210.0, t0_detected=True, first_crack_detected=True)],
         export_result=_export_result(tmp_path),

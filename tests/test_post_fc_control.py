@@ -34,9 +34,14 @@ def _config(**overrides: object) -> PostFirstCrackControl:
 # ---------------------------------------------------------------------------
 
 
-def test_post_first_crack_control_disabled_by_default() -> None:
+def test_post_first_crack_control_enabled_by_default() -> None:
+    """12 Jul D88/D89 promotion (operator-ratified): the RoR-taper loop is now
+    the default — the 11 Jul validation roast passed structurally and the cup
+    scored 9/10. Was ``False`` (advisor-driven post-FC default) before the
+    flip; deliberately updated, not silently passed."""
     config = PostFirstCrackControl()
-    assert config.enabled is False
+    assert config.enabled is True
+    assert config.ceiling_guard_drop_enabled is True
 
 
 def test_post_first_crack_control_defaults() -> None:

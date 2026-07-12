@@ -16,16 +16,25 @@
 #          ADAPTIVE_TRIM=1  enable the #386 RoR-keyed ADAPTIVE late-Maillard trim
 #            depth (default off = the proven fixed 65% cut). Interim opt-in until
 #            the config UI lands; e.g. ADAPTIVE_TRIM=1 ./scripts/roast-live.sh
-#          POST_FC_LOOP=1  enable the #405/D88 deterministic post-FC taper heat
-#            loop + deterministic drop (default off = fully advisor-driven post-FC,
-#            the roast-1..8 behaviour). Interim opt-in until it's promoted to the
-#            default; e.g. POST_FC_LOOP=1 ./scripts/roast-live.sh
-#          CEILING_GUARD=1  enable the D88 deterministic ceiling-guard drop
-#            (bean ≥ ceiling_guard_temp_c, default 196 °C → drop through the
-#            normal safety path). Independent of POST_FC_LOOP by design — a
-#            safety anchor, not a taper feature. Default off; the validation
-#            roast flips it consciously (issue #495), e.g.
-#            POST_FC_LOOP=1 CEILING_GUARD=1 ./scripts/roast-live.sh
+#          POST_FC_LOOP=1  the #405/D88 deterministic post-FC taper heat loop +
+#            deterministic drop is now the DEFAULT (promoted 12 Jul, D88/D89 —
+#            the 11 Jul validation roast passed structurally and the cup scored
+#            9/10). This value is now a no-op affirmation of the default; the
+#            banner still prints resolved state either way.
+#          POST_FC_LOOP=0  BASELINE ARM: disable the taper, back to fully
+#            advisor-driven post-FC (the roast-1..8 behaviour) for an A/B or a
+#            regression check, e.g. POST_FC_LOOP=0 ./scripts/roast-live.sh
+#          CEILING_GUARD=1  the D88 deterministic ceiling-guard drop (bean ≥
+#            ceiling_guard_temp_c, default 196 °C → drop through the normal
+#            safety path) is now the DEFAULT (promoted 12 Jul alongside
+#            POST_FC_LOOP, same validation roast + tasting sign-off).
+#            Independent of POST_FC_LOOP by design — a safety anchor, not a
+#            taper feature; this value is now a no-op affirmation of the
+#            default.
+#          CEILING_GUARD=0  BASELINE ARM: disable the guard — the 196 °C
+#            boundary reverts to the advisor's own judgment alone, e.g.
+#            POST_FC_LOOP=0 CEILING_GUARD=0 ./scripts/roast-live.sh for the
+#            full pre-promotion baseline
 #          ROASTPILOT_ADVISOR__MODEL_SLUG / ROASTPILOT_ADVISOR__PROMPT_VERSION
 #            override the advisor model + control-teaching prompt (defaults
 #            openai/gpt-4o + c3). The banner prints the resolved pair and tags it
@@ -55,20 +64,31 @@ if [ "${ADAPTIVE_TRIM:-0}" = "1" ]; then
   export ROASTPILOT_CONTROLLER__PRE_FIRST_CRACK_LEVERS__LATE_MAILLARD_TRIM__ADAPTIVE_DEPTH_ENABLED=true
 fi
 
-# Opt-in (#405): the deterministic post-FC RoR-target heat loop + deterministic
-# drop. Default OFF — fully advisor-driven post-FC (the roast-1..8 behaviour)
-# stays the checked-in default; this only flips it when the operator asks.
-# Interim toggle until it's promoted to the default.
-if [ "${POST_FC_LOOP:-0}" = "1" ]; then
+# The deterministic post-FC RoR-target heat loop + deterministic drop is now
+# the DEFAULT (promoted 12 Jul, D88/D89 — the 11 Jul validation roast passed
+# structurally and the cup scored 9/10; the config field's own default flipped
+# to True, so leaving this unset already runs the taper). POST_FC_LOOP=1 is a
+# no-op affirmation of that default; POST_FC_LOOP=0 is the BASELINE ARM —
+# explicitly disables the taper for an A/B or a regression check, keeping the
+# fully advisor-driven post-FC path (the roast-1..8 behaviour) one launch-line
+# away.
+if [ "${POST_FC_LOOP:-1}" = "0" ]; then
+  export ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__ENABLED=false
+elif [ "${POST_FC_LOOP:-1}" = "1" ]; then
   export ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__ENABLED=true
 fi
 
-# Opt-in (D88, issue #495): the deterministic ceiling-guard drop. Decoupled from
-# POST_FC_LOOP by design (a safety anchor, not a taper feature) — it fires with
-# the taper OFF too. Default OFF this build; the operator flips it consciously
-# at the validation roast. The agent banner prints the resolved state, so a
-# typo here can never silently run a baseline as a treatment arm.
-if [ "${CEILING_GUARD:-0}" = "1" ]; then
+# The D88 deterministic ceiling-guard drop is now the DEFAULT too (promoted
+# 12 Jul alongside POST_FC_LOOP, same validation roast + tasting sign-off).
+# Decoupled from POST_FC_LOOP by design (a safety anchor, not a taper feature)
+# — it fires with the taper OFF too. CEILING_GUARD=1 is a no-op affirmation of
+# the default; CEILING_GUARD=0 is the BASELINE ARM — the 196 °C boundary
+# reverts to the advisor's own judgment alone. The agent banner prints the
+# resolved state either way, so a typo here can never silently run a baseline
+# as a treatment arm.
+if [ "${CEILING_GUARD:-1}" = "0" ]; then
+  export ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__CEILING_GUARD_DROP_ENABLED=false
+elif [ "${CEILING_GUARD:-1}" = "1" ]; then
   export ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__CEILING_GUARD_DROP_ENABLED=true
 fi
 

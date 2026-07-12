@@ -288,10 +288,13 @@ def test_app_config_rejects_invalid_env_value(monkeypatch: pytest.MonkeyPatch) -
 def test_ceiling_guard_defaults_are_valid() -> None:
     """The default 196.0 guard sits below the default 198.0 emergency-drop
     bound and at (not above) the default 196.0 bitter ceiling — constructs
-    cleanly with no overrides."""
+    cleanly with no overrides. ``ceiling_guard_drop_enabled`` defaults
+    ``True`` as of the 12 Jul D88/D89 promotion (operator-ratified on the
+    11 Jul validation roast + 9/10 tasting) — was ``False`` before the flip;
+    deliberately updated, not silently passed."""
     config = AppConfig()
     assert config.controller.post_first_crack_control.ceiling_guard_temp_c == 196.0
-    assert config.controller.post_first_crack_control.ceiling_guard_drop_enabled is False
+    assert config.controller.post_first_crack_control.ceiling_guard_drop_enabled is True
 
 
 def test_ceiling_guard_at_or_above_emergency_drop_temp_is_rejected() -> None:

@@ -134,10 +134,14 @@ GUATEMALA_EL_DURAZNO_ID = "seed-guatemala-el-durazno-white-honey"
 #: The Guatemala El Durazno (White Honey) seed profile — a high-grown Bourbon
 #: from San Pedro Pinula, Jalapa (Finca El Durazno, the Ventura family). The
 #: white honey process leaves only a little mucilage, so it cups clean/bright
-#: (closer to a washed than a natural). Because this is a FIRST roast on a new
-#: bean, the development target sits at the conservative de-risk of 13 % — the
-#: same starting point the Colombia washed used before it stepped to 16 % once
-#: roast 6 landed clean. Go light, taste, then step toward the ~16–18 % medium
+#: (closer to a washed than a natural). **Stepped 13 % → 16 % (12 Jul, D88/D89
+#: promotion batch)**: the first-roast de-risk landed clean and the 11 Jul D88
+#: validation A/B cupped 9/10 ("like sugar") — the operator's own read is "this
+#: origin needing a bit more; sweetness could be more", so this is the ratified
+#: next step toward the ~18 % eventual (the per-origin prior for washed
+#: high-growns, mirroring the Colombia washed's own 13 % → 16 % trajectory).
+#: With the default 3 pp margin (``drop_dev_margin_percent``) the advisor's
+#: judgment window is [13, 19] — still comfortably inside the 10-20 % range
 #: this clean high-grown bean can carry (the flavour notes — milk chocolate /
 #: toasted pecan — deepen with development, but the red-apple brightness + white
 #: honey clarity are lost if pushed too far). Drop guide stays at the operator's
@@ -167,13 +171,16 @@ GUATEMALA_EL_DURAZNO_SEED = BeanProfile(
     # 195 °C = the operator's proven known-good drop line (bitter > 196 °C); a
     # conservative ceiling for the first roast on this bean.
     target_drop_temp_c=195.0,
-    # 13 % dev = the first-roast de-risk on a new bean (light → taste → go darker).
-    # This clean high-grown white-honey can likely carry ~16–18 % eventually (like
-    # the Colombia washed's trajectory), but step there only after a clean roast.
-    # With the default 3 pp margin the advisor releases the drop in a ~10–13 %
-    # window; the operator's manual drop is un-gated. Audio FC lags ~30 s, so true
-    # development runs ~30 s longer than the number.
-    target_development_percent=13.0,
+    # 16 % dev (12 Jul, D88/D89 promotion): stepped from the 13 % first-roast
+    # de-risk after the 11 Jul validation roast cupped 9/10 ("like sugar") —
+    # the operator's own read ("this origin needing a bit more; sweetness
+    # could be more") ratifies the step toward the ~18 % eventual (the
+    # per-origin prior for washed high-growns), mirroring the Colombia
+    # washed's own 13 % → 16 % trajectory. With the default 3 pp margin the
+    # advisor's judgment window is [13, 19] %; the operator's manual drop is
+    # un-gated. Audio FC lags ~30 s, so true development runs ~30 s longer
+    # than the number.
+    target_development_percent=16.0,
     default_bean_weight_grams=250.0,
     description=(
         "San Pedro Pinula, Jalapa. Bourbon, white honey process (light mucilage — "
@@ -181,8 +188,9 @@ GUATEMALA_EL_DURAZNO_SEED = BeanProfile(
         "(Finca El Durazno, five generations). Red apple / milk chocolate / light "
         "toasted pecan; smooth medium body, bright but mellow acidity, clean "
         "finish. Balanced Central American — roast to a medium for chocolate + nut "
-        "while keeping the apple brightness. Targets are a conservative first-roast "
-        "de-risk (13 % dev); step toward ~16–18 % after tasting. Edit to taste."
+        "while keeping the apple brightness. Targets are a conservative-medium "
+        "starting point (stepped from a first-roast de-risk after a clean cup); "
+        "edit to taste."
     ),
 )
 

@@ -380,21 +380,31 @@ class PostFirstCrackControl(BaseModel):
     198 °C emergency-drop bounds keep clamping the loop's output exactly as
     they clamp the advisor today).
 
-    ``enabled`` (the ``post_fc_ror_loop`` master flag) defaults ``False`` —
-    today's advisor-driven post-FC regime is unchanged until a supervised
-    hardware roast validates the loop and an operator flips the flag in a
-    separately reviewed change. **A closed loop changes the trajectory it is
-    steering, so replay cannot validate it — every parameter below is
-    hardware-tuned at the validation roast, not offline-validated (n=2 going
-    into D88).** All temperatures are Celsius; RoR is °C/min; heat/fan are
-    percentages.
+    ``enabled`` (the ``post_fc_ror_loop`` master flag) **defaults ``True`` as
+    of the 12 Jul promotion (D88/D89, operator-ratified)**: the 11 Jul
+    supervised validation roast (runs `d55b0fce`/`edbe9a76`,
+    `docs/analysis/2026-07-09-roast9-10-postfc-ab.md`) passed structurally —
+    the taper tracked the measured engagement RoR down with no heat rise
+    above heat-at-engagement — and the cup scored 9/10 ("like sugar") on
+    tasting, the operator's explicit sign-off condition. Every new roast now
+    runs the taper by default; a baseline (advisor-driven post-FC) arm still
+    exists one launch-line away (``...__ENABLED=false``,
+    `scripts/roast-live.sh`) for any future A/B. **A closed loop changes the
+    trajectory it is steering, so replay could not validate it — every
+    parameter below was hardware-tuned at the validation roast, not
+    offline-validated (n=2 going into D88), and stays exactly as tuned there
+    through this promotion.** All temperatures are Celsius; RoR is °C/min;
+    heat/fan are percentages.
     """
 
-    #: The master flag (``post_fc_ror_loop``). ``False`` (default) keeps
-    #: today's advisor-driven post-FC heat/fan actuation byte-for-byte
-    #: unchanged; Slice B2 must read this flag before routing DEVELOPMENT
-    #: heat through the PI loop instead of the advisor.
-    enabled: bool = Field(default=False)
+    #: The master flag (``post_fc_ror_loop``). **``True`` as of the 12 Jul
+    #: promotion** (D88/D89, operator-ratified on the 11 Jul validation
+    #: roast + 9/10 tasting) — every new roast runs the deterministic taper
+    #: by default; the advisor-driven post-FC regime from before this flip
+    #: is reachable via ``...__ENABLED=false`` for a baseline arm. Slice B2
+    #: reads this flag before routing DEVELOPMENT heat through the PI loop
+    #: instead of the advisor.
+    enabled: bool = Field(default=True)
     #: The taper's STARTING setpoint cap (°C/min), D88. The setpoint at
     #: engagement is ``clamp(ror_at_engagement, taper_end_ror_c_per_min,
     #: taper_start_max_ror_c_per_min)`` — anchored to the MEASURED RoR the
@@ -474,20 +484,22 @@ class PostFirstCrackControl(BaseModel):
     ror_smoothing_alpha: float = Field(default=0.4, gt=0, le=1.0)
     #: The ceiling-guard drop's OWN master flag (D88 amendment A2, #405 Slice
     #: C2) — deliberately SEPARATE from ``enabled`` above (the RoR-taper
-    #: loop's flag). ``False`` (default) keeps today's incumbent behaviour
-    #: byte-for-byte unchanged: the 196 °C boundary is owned solely by the
-    #: advisor's own judgment, as it is today. The guard is a SAFETY ANCHOR,
-    #: not a taper feature (D88 amendment A1) — when this flag is ``True`` it
-    #: fires in DEVELOPMENT regardless of the RoR-taper ``enabled`` flag or
-    #: whether the current DEVELOPMENT dwell was reached via the true FC edge
-    #: (i.e. it also fires after an operator resume out of recovery, where the
-    #: taper loop stays inert) — a taper-gated guard would leave every
-    #: taper-flag-OFF roast, and every post-recovery resume, with NO
-    #: deterministic bitter-line protection. The operator's stated intent is
-    #: to flip this ``True`` at the supervised validation roast — a CONSCIOUS,
-    #: separately reviewed incumbent-behaviour change, never a silent rider
-    #: bundled with the taper flag.
-    ceiling_guard_drop_enabled: bool = Field(default=False)
+    #: loop's flag). **``True`` as of the 12 Jul promotion** (D88/D89,
+    #: operator-ratified alongside ``enabled`` above on the same 11 Jul
+    #: validation roast + 9/10 tasting sign-off): the 196 °C boundary is now
+    #: a deterministic SAFETY ANCHOR by default, not owned solely by the
+    #: advisor's own judgment. The guard is a SAFETY ANCHOR, not a taper
+    #: feature (D88 amendment A1) — this flag fires in DEVELOPMENT
+    #: regardless of the RoR-taper ``enabled`` flag or whether the current
+    #: DEVELOPMENT dwell was reached via the true FC edge (i.e. it also
+    #: fires after an operator resume out of recovery, where the taper loop
+    #: stays inert) — a taper-gated guard would leave every taper-flag-OFF
+    #: roast, and every post-recovery resume, with NO deterministic
+    #: bitter-line protection. Reachable via ``...__CEILING_GUARD_DROP_
+    #: ENABLED=false`` for a baseline arm alongside ``enabled=false`` above —
+    #: this was a CONSCIOUS, separately reviewed incumbent-behaviour change
+    #: at the flip, never a silent rider bundled with the taper flag.
+    ceiling_guard_drop_enabled: bool = Field(default=True)
     #: The bean-temperature ceiling (Celsius) the guard drops at, D88
     #: amendment A1. Default 196.0 — the operator's empirical bitter-ceiling
     #: value (mirrors ``SafetyLimits.bitter_ceiling_temp_c``'s default; kept

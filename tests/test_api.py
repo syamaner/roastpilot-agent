@@ -2431,10 +2431,15 @@ async def test_telemetry_frame_surfaces_development_time_and_dtr(store: RoastSto
         await _tick(service, clock)
     assert service.runner is not None
     assert service.runner.controller_snapshot().phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-    mcp.frames = [_reading(196.0, 205.0, t0_detected=True, first_crack_detected=True)]
+    # Bean temps stay comfortably below the D88 ceiling-guard default
+    # (196 °C, now on by default post-#495) — this test is about the
+    # telemetry frame's development-time/DTR fields, not the guard, so a
+    # deterministic auto-drop here would end the roast before either
+    # assertion below runs.
+    mcp.frames = [_reading(180.0, 205.0, t0_detected=True, first_crack_detected=True)]
     await _tick(service, clock)  # → development (FC instant: dev elapsed == 0)
     # One more tick so development time has actually elapsed past the FC instant.
-    mcp.frames = [_reading(200.0, 208.0, t0_detected=True, first_crack_detected=True)]
+    mcp.frames = [_reading(185.0, 208.0, t0_detected=True, first_crack_detected=True)]
     await _tick(service, clock)
     post_fc = latest_telemetry()
     assert post_fc.development_elapsed_seconds is not None

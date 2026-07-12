@@ -50,6 +50,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 import pytest_asyncio
 
+from roastpilot_agent.config import AppConfig, ControllerConfig, PostFirstCrackControl
 from roastpilot_agent.models import (
     MicStatus,
     RoastDetail,
@@ -66,6 +67,32 @@ from roastpilot_agent.replay import (
     build_replay_service,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
+
+#: These committed fixtures replay a FIXED recorded trajectory (e.g.
+#: cooling-complete reaches 206 °C) for byte-deterministic contract regression
+#: — their whole value is exact reproducibility, never re-simulation under
+#: whatever the live control-loop default happens to be. The 12 Jul D88/D89
+#: promotion (#495) flipped ``post_first_crack_control``'s defaults to True;
+#: replaying these fixtures through that default would let the NEW
+#: deterministic ceiling-guard drop fire mid-recording (this fixture crosses
+#: 196 °C) and truncate the replay well before its own recorded drop event.
+#:
+#: **Now belt-and-braces, not the primary guard**: the underlying invariant —
+#: replay pins the pre-promotion post-FC baseline UNLESS a caller opts into
+#: ``use_live_post_fc_control=True`` — moved into
+#: :func:`~roastpilot_agent.replay.build_replay_service` itself (the
+#: safety-reviewer's fold, same story), so ``_subscribed_replay`` below would
+#: already get the pinned baseline from a bare ``AppConfig()``. Kept explicit
+#: here anyway: this file's whole purpose is byte-for-byte fixture stability,
+#: so an explicit local pin means this test's contract cannot silently change
+#: even if the *factory's* default invariant is ever revisited.
+_REPLAY_BASELINE_CONFIG = AppConfig(
+    controller=ControllerConfig(
+        post_first_crack_control=PostFirstCrackControl(
+            enabled=False, ceiling_guard_drop_enabled=False
+        )
+    )
+)
 
 if TYPE_CHECKING:
     from roastpilot_agent.api import RoastService
@@ -241,9 +268,13 @@ async def _subscribed_replay(
     Subscribing before :meth:`ReplaySource.start` is what lets us capture the
     ``run_started`` + first ``phase_changed`` frames the start handshake emits
     (the broadcaster fans out only to queues subscribed at emit time). The run is
-    real: the recorded telemetry drives the real controller + safety + emit path.
+    real: the recorded telemetry drives the real controller + safety + emit path
+    — pinned to :data:`_REPLAY_BASELINE_CONFIG` so every fixture reproduces
+    exactly its recorded trajectory regardless of the live default (#495).
     """
-    service, source, store = build_replay_service(export_dir, store_path)
+    service, source, store = build_replay_service(
+        export_dir, store_path, config=_REPLAY_BASELINE_CONFIG
+    )
     await store.initialize()
     queue = service.events.subscribe()
     await source.start()

@@ -327,7 +327,13 @@ def test_colombia_huila_seed_values() -> None:
 
 
 def test_guatemala_el_durazno_seed_values() -> None:
-    """The locked Guatemala El Durazno (White Honey) seed values (first-roast de-risk)."""
+    """The locked Guatemala El Durazno (White Honey) seed values.
+
+    12 Jul (D88/D89 promotion): target_development_percent stepped 13.0 →
+    16.0 after the 11 Jul validation roast cupped 9/10 ("like sugar") —
+    the operator's read ("this origin needing a bit more") ratifies the
+    step toward the ~18 % eventual, mirroring Colombia's own 13 → 16 step
+    (see test_colombia_huila_seed_values above)."""
     s = GUATEMALA_EL_DURAZNO_SEED
     assert s.id == GUATEMALA_EL_DURAZNO_ID
     assert s.name == "Guatemala El Durazno (White Honey)"
@@ -348,7 +354,7 @@ def test_guatemala_el_durazno_seed_values() -> None:
     assert s.initial_heat_percent == 100
     assert s.initial_fan_percent == 30
     assert s.target_drop_temp_c == 195.0  # operator's proven known-good drop line (bitter > 196)
-    assert s.target_development_percent == 13.0  # first-roast de-risk on a new bean
+    assert s.target_development_percent == 16.0  # 16 (was 13) after 11 Jul validation, 9/10 cup
     assert s.default_bean_weight_grams == 250.0
 
 
