@@ -67,7 +67,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from roastpilot_agent.api import QueuedOperatorAction, RoastService, create_app
-from roastpilot_agent.config import AppConfig
+from roastpilot_agent.config import AppConfig, PostFirstCrackControl
 from roastpilot_agent.live import mount_spa
 from roastpilot_agent.models import (
     MicStatus,
@@ -906,6 +906,7 @@ def build_replay_service(
     store_path: Path,
     *,
     config: AppConfig | None = None,
+    use_live_post_fc_control: bool = False,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> tuple[RoastService, ReplaySource, RoastStore]:
     """Wire a real :class:`RoastService` + :class:`ReplaySource` for an export.
@@ -915,13 +916,62 @@ def build_replay_service(
     store too so the caller owns its lifecycle (``initialize`` before serving,
     ``close`` after). Shared by the CLI (``--replay``) and the tests.
 
-    ``sleep`` is the inter-tick delay coroutine the free-running :meth:`ReplaySource.run`
-    awaits; it defaults to :func:`asyncio.sleep`. Tests pass a no-op so the
-    free-running path drives the whole export instantly, with the same event
-    stream — exposed on the public factory so a test never reaches into the
-    source's private ``_sleep`` (#103).
+    **Invariant (#495 promotion follow-up, safety-reviewer MEDIUM): replay
+    reproduces a FIXED recorded trajectory; it never re-simulates under live
+    control defaults.** A recorded export's telemetry drives the REAL
+    controller (the design invariant this module documents at the top), so
+    the deterministic post-FC RoR-taper + ceiling-guard drop
+    (:class:`~roastpilot_agent.config.PostFirstCrackControl`) fires on
+    replayed readings exactly as it would on live ones. The 12 Jul D88/D89
+    promotion (#495) flipped that config's OWN default to ``True`` for LIVE
+    roasts — but a config carrying that default (whether it is the caller's
+    explicit ``AppConfig()``, or the operator's saved config file loaded by
+    the CLI's ``--replay`` path, which always passes one explicitly) would
+    silently let the guard auto-drop a recorded export mid-playback the
+    instant a reading crosses the (now-default) ceiling, diverging from what
+    the export actually recorded (confirmed: the committed
+    ``cooling-complete`` fixture reaches 206 °C — its phase timeline changes
+    from ``development -> cooling -> complete`` to ``pre_first_crack ->
+    cooling -> complete`` with an injected guard drop under a live-default
+    config). So this factory OVERRIDES ``post_first_crack_control`` to OFF
+    (both flags) on whatever ``config`` resolves to — REGARDLESS of whether
+    ``config`` was explicitly supplied — unless ``use_live_post_fc_control``
+    is set, which is the escape hatch for a caller who deliberately wants a
+    live-defaults replay (e.g. to preview how a NEW recording would behave
+    under the current production defaults, not to reproduce history).
+
+    Args:
+        export_dir: The recorded ``roast.jsonl`` export directory to replay.
+        store_path: Where to create the replay's own SQLite store.
+        config: The base config to replay under; defaults to ``AppConfig()``.
+            Its ``post_first_crack_control`` section is overridden per the
+            invariant above unless ``use_live_post_fc_control`` is set.
+        use_live_post_fc_control: Opt OUT of the pinned-baseline invariant —
+            replay under ``config``'s own (possibly live-default) post-FC
+            control settings instead. Default ``False``.
+        sleep: The inter-tick delay coroutine the free-running
+            :meth:`ReplaySource.run` awaits; defaults to :func:`asyncio.sleep`.
+            Tests pass a no-op so the free-running path drives the whole
+            export instantly, with the same event stream — exposed on the
+            public factory so a test never reaches into the source's private
+            ``_sleep`` (#103).
+
+    Returns:
+        ``(service, source, store)``.
     """
     app_config = config or AppConfig()
+    if not use_live_post_fc_control:
+        app_config = app_config.model_copy(
+            update={
+                "controller": app_config.controller.model_copy(
+                    update={
+                        "post_first_crack_control": PostFirstCrackControl(
+                            enabled=False, ceiling_guard_drop_enabled=False
+                        )
+                    }
+                )
+            }
+        )
     control = ReplayRoasterControl()
     safety = SafetyPolicy(app_config.safety)
     store = RoastStore(store_path)
@@ -1025,6 +1075,7 @@ async def create_replay_app(
     store_path: Path,
     *,
     config: AppConfig | None = None,
+    use_live_post_fc_control: bool = False,
     step_mode: bool = False,
     speed: float = 1.0,
     spa_dir: Path | None = None,
@@ -1048,12 +1099,20 @@ async def create_replay_app(
     renders in the real dashboard, mounted after the API routes exactly as the
     live serve path mounts it.
 
+    ``use_live_post_fc_control`` is forwarded to :func:`build_replay_service`
+    — see its docstring for the pinned-baseline replay invariant (#495) this
+    parameter opts out of.
+
     ``sleep`` is the free-running inter-tick delay coroutine (default
     :func:`asyncio.sleep`); a test passes a no-op to drive the export instantly
     without reaching into the source's private ``_sleep`` (#103).
     """
     service, source, store = build_replay_service(
-        export_dir, store_path, config=config, sleep=sleep
+        export_dir,
+        store_path,
+        config=config,
+        use_live_post_fc_control=use_live_post_fc_control,
+        sleep=sleep,
     )
     source.set_speed(speed)
     # Tear down the store (and its aiosqlite worker thread) + the service if

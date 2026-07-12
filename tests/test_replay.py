@@ -684,6 +684,128 @@ async def test_cooling_complete_fixture_stops_cooling_and_completes(tmp_path: Pa
     await source.aclose()
 
 
+async def _phase_timeline(service: RoastService, source: ReplaySource) -> list[str]:
+    """The ordered sequence of distinct agent phases the run passed through,
+    read from the real PHASE_CHANGED events (not inferred from telemetry)."""
+    subscriber = service.events.subscribe()
+    await source.advance_to(ReplayMarker.END)
+    frames = _drain(subscriber)
+    phases = [f.data["phase"] for f in frames if f.event is SseEventType.PHASE_CHANGED]
+    # Collapse consecutive duplicates (a phase can re-emit on some paths); the
+    # TIMELINE (the sequence of distinct phases visited) is what this test
+    # compares, not raw frame counts.
+    timeline: list[str] = []
+    for phase in phases:
+        if not timeline or timeline[-1] != phase:
+            timeline.append(phase)
+    return timeline
+
+
+@pytest.mark.asyncio
+async def test_replay_pins_the_baseline_post_fc_control_by_default(tmp_path: Path) -> None:
+    """Safety-reviewer MEDIUM (#495 D88/D89 promotion follow-up): replaying
+    ``cooling-complete`` (which reaches 206 °C, above the post-promotion
+    default 196 °C ceiling guard) must reproduce the SAME recorded phase
+    timeline whether the caller passes no config at all, or an EXPLICIT
+    ``AppConfig()`` carrying the (now-default-True) live post-FC control
+    settings — because :func:`create_replay_app`/:func:`build_replay_service`
+    pin the pre-promotion baseline unless ``use_live_post_fc_control=True`` is
+    set, REGARDLESS of whether a config was supplied. Without that pin, a bare
+    ``AppConfig()`` (or the operator's saved config file, loaded and passed
+    explicitly by the CLI's ``--replay`` path) would let the ceiling-guard
+    drop fire mid-recording and truncate the replay well short of its own
+    recorded ``development -> cooling -> complete`` history."""
+    from roastpilot_agent.config import AppConfig
+
+    _app1, service1, source1 = await create_replay_app(
+        _COOLING_COMPLETE, tmp_path / "cc_no_config.sqlite3", step_mode=True, speed=60
+    )
+    try:
+        no_config_timeline = await _phase_timeline(service1, source1)
+    finally:
+        await source1.aclose()
+
+    _app2, service2, source2 = await create_replay_app(
+        _COOLING_COMPLETE,
+        tmp_path / "cc_explicit_config.sqlite3",
+        step_mode=True,
+        speed=60,
+        config=AppConfig(),  # the caller's own explicit config, live defaults
+    )
+    try:
+        explicit_config_timeline = await _phase_timeline(service2, source2)
+    finally:
+        await source2.aclose()
+
+    assert no_config_timeline == explicit_config_timeline
+    # The recorded fixture's real trajectory reaches DEVELOPMENT before
+    # cooling — pinning to this exact sequence (not just "no crash") is what
+    # proves the ceiling guard did NOT fire mid-recording.
+    assert "development" in no_config_timeline
+    assert no_config_timeline[-2:] == ["cooling", "complete"]
+
+
+async def _drop_commands(service: RoastService, source: ReplaySource) -> list[dict[str, object]]:
+    """The ordered ``drop_beans`` COMMAND_EXECUTED payloads the run issued."""
+    subscriber = service.events.subscribe()
+    await source.advance_to(ReplayMarker.END)
+    frames = _drain(subscriber)
+    return [
+        f.data
+        for f in frames
+        if f.event is SseEventType.COMMAND_EXECUTED and f.data.get("command") == "drop_beans"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_replay_live_post_fc_control_opt_out_diverges_from_the_recording(
+    tmp_path: Path,
+) -> None:
+    """The escape hatch works, and demonstrates WHY the pin exists.
+
+    The ``cooling-complete`` fixture crosses the post-promotion 196 °C ceiling
+    on the SAME tick its bean temperature enters DEVELOPMENT, so under
+    ``use_live_post_fc_control=True`` the phase NAME sequence still visits
+    ``development`` (the guard evaluates inside that phase) — but the drop
+    that follows is a same-tick, guard-triggered ``source: policy`` drop, not
+    the recorded run's own ``source: operator`` drop 15 s later at 206 °C. The
+    recorded advisory guidance the operator received before dropping never
+    gets a chance to fire either. That substitution — a different actor
+    dropping the beans on a different reading — is the divergence the pin
+    exists to prevent; the phase-name shape alone does not show it (see
+    :func:`test_replay_pins_the_baseline_post_fc_control_by_default` for the
+    pinned-baseline case, where the timeline shape check IS the right axis)."""
+    _app, service, source = await create_replay_app(
+        _COOLING_COMPLETE,
+        tmp_path / "cc_live_opt_out.sqlite3",
+        step_mode=True,
+        speed=60,
+        use_live_post_fc_control=True,
+    )
+    try:
+        drops = await _drop_commands(service, source)
+    finally:
+        await source.aclose()
+
+    assert len(drops) == 1
+    assert drops[0]["source"] == "policy"
+    assert drops[0]["reason"] == "ceiling_guard"
+
+    _app2, service2, source2 = await create_replay_app(
+        _COOLING_COMPLETE, tmp_path / "cc_pinned_baseline.sqlite3", step_mode=True, speed=60
+    )
+    try:
+        pinned_drops = await _drop_commands(service2, source2)
+    finally:
+        await source2.aclose()
+
+    # The pinned-baseline replay reproduces the ORIGINAL recording: the
+    # operator's own drop, not a guard-injected one.
+    assert len(pinned_drops) == 1
+    assert pinned_drops[0]["source"] == "operator"
+    assert "reason" not in pinned_drops[0]
+
+
 # --- HTTP control surface (via the gated routes) ---------------------------
 
 

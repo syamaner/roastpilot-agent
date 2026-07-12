@@ -75,11 +75,17 @@ from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 #: promotion (#495) flipped ``post_first_crack_control``'s defaults to True;
 #: replaying these fixtures through that default would let the NEW
 #: deterministic ceiling-guard drop fire mid-recording (this fixture crosses
-#: 196 °C) and truncate the replay well before its own recorded drop event —
-#: a real divergence a bare ``AppConfig()`` would silently introduce here.
-#: Pinned to the pre-promotion baseline so every replay in this file keeps
-#: reproducing exactly the recorded scenario, regardless of future default
-#: flips.
+#: 196 °C) and truncate the replay well before its own recorded drop event.
+#:
+#: **Now belt-and-braces, not the primary guard**: the underlying invariant —
+#: replay pins the pre-promotion post-FC baseline UNLESS a caller opts into
+#: ``use_live_post_fc_control=True`` — moved into
+#: :func:`~roastpilot_agent.replay.build_replay_service` itself (the
+#: safety-reviewer's fold, same story), so ``_subscribed_replay`` below would
+#: already get the pinned baseline from a bare ``AppConfig()``. Kept explicit
+#: here anyway: this file's whole purpose is byte-for-byte fixture stability,
+#: so an explicit local pin means this test's contract cannot silently change
+#: even if the *factory's* default invariant is ever revisited.
 _REPLAY_BASELINE_CONFIG = AppConfig(
     controller=ControllerConfig(
         post_first_crack_control=PostFirstCrackControl(

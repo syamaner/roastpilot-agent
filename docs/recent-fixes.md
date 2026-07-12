@@ -190,3 +190,46 @@ Format: one entry per anti-pattern.
   contradiction` and `test_assembled_prompt_joint_objective_precedes_every_
   later_section` (parametrized over `c3`/`c6`, asserting on the FULLY
   ASSEMBLED text, not the c1 fragment) in `tests/test_advisor.py`.
+
+---
+
+## Changing a `ControllerConfig` default silently rewrites replayed history unless replay pins its own baseline
+*(fixed by #495 D88/D89 promotion follow-up, 12 Jul 2026)*
+
+- **Signature:** any change to a `ControllerConfig` / `PostFirstCrackControl`
+  field's *default value* (not just adding a field). Also: `replay.py`'s
+  `build_replay_service` / `create_replay_app` taking `config: AppConfig | None
+  = None` and falling through to a bare `AppConfig()` with no note that the
+  fallback is now a moving target; or the CLI's `--replay` path (`cli.py`)
+  passing the *live* resolved config straight into replay.
+- **Wrong:** `ReplaySource` drives recorded telemetry through the REAL
+  `RoastController.tick()` — including `_apply_deterministic_post_fc_levers`
+  and `_maybe_ceiling_guard_drop` — with no "is this replay or live" gate. The
+  #495 promotion flipped `PostFirstCrackControl.enabled` and
+  `ceiling_guard_drop_enabled` from `False` to `True`. Replaying the
+  `cooling-complete` fixture (which reaches 206 °C) under the new bare-default
+  config reinterprets the recording: the ceiling guard fires a same-tick
+  `source: policy` drop the instant the fixture's bean temperature crosses
+  196 °C, pre-empting the fixture's own recorded `source: operator` drop 15 s
+  later and skipping the advisory guidance the operator actually saw. The
+  phase NAME sequence is misleadingly unchanged (`development` is still
+  visited for one tick before the guard fires) — the divergence is in *which
+  actor* issues the drop and *on what reading*, not the phase shape, so a
+  test asserting only on phase-timeline shape can pass by coincidence.
+- **Right:** replay is a fixed-recording player, not a live simulator — it
+  must reproduce a FIXED recorded trajectory regardless of what a config
+  default becomes later. `build_replay_service` / `create_replay_app` now
+  pin the pre-#495 baseline (`enabled=False, ceiling_guard_drop_enabled=
+  False`) INSIDE the factory whenever no caller opts out, via a
+  `use_live_post_fc_control: bool = False` parameter; passing an *explicit*
+  `AppConfig()` no longer matters (the pin applies regardless of whether a
+  config was supplied at all) — only the explicit opt-out flag reaches live
+  defaults. When you flip a config default, check every replay/simulation
+  entry point that re-drives history through the same code path the live
+  controller uses, not just the tests that construct configs directly.
+- **Guarded by:** `test_replay_pins_the_baseline_post_fc_control_by_default`
+  (bare vs. explicit-`AppConfig()` replay produce the IDENTICAL phase
+  timeline) and `test_replay_live_post_fc_control_opt_out_diverges_from_the_
+  recording` (the opt-out's drop is `source: policy` / `reason:
+  ceiling_guard`, not the fixture's own `source: operator` drop) in
+  `tests/test_replay.py`.
