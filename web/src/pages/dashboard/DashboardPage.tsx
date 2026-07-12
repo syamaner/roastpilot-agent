@@ -16,7 +16,7 @@
  * mirrors the server's `enabledActions`, never a hardcoded matrix.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { AppFrame, ConnectionIndicator, LiveCurve } from "@/components/shared";
@@ -32,6 +32,7 @@ import {
 import type { BeanProfileInput } from "@/lib/types";
 import { useFrameDrain, useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
+import { runConfirmRetry } from "@/lib/confirmRetry";
 import { smoothCurveForDisplay } from "@/lib/rorSmoothing";
 import type { OperatorAction } from "@/lib/types";
 import { AdvisoryPanel } from "./AdvisoryPanel";
@@ -48,6 +49,19 @@ import { snapshotFault, useDashboardEvents } from "./useDashboardEvents";
 
 export function DashboardPage(): React.JSX.Element {
   const health = useHealth();
+
+  // #513: both the idle start-roast confirm loop and the fault-acknowledge
+  // confirm loop keep running in this closure after unmount (React does not
+  // cancel in-flight promises) — checked after every await via
+  // `runConfirmRetry`'s `isMounted`, so an orphaned loop never writes state
+  // or the query cache after this component is gone.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
   const serverRunId = health.data?.active_run_id ?? null;
 
   // #124: a fault finalizes the run server-side (`complete_run` stamps
@@ -125,41 +139,93 @@ export function DashboardPage(): React.JSX.Element {
     [deleteBeanProfile],
   );
 
-  // Start a roast from the idle form (#158). On 201 we refetch health so the new
-  // `active_run_id` is discovered and the dashboard swaps to the live view — we do
-  // NOT fabricate a runId here (render from server state). Errors (e.g. 409) are
-  // surfaced inline by the form, which catches the thrown ApiError.
+  // Latches the instant the POST is proven (201) — before anything that can
+  // subsequently fail (#513). Once set, the idle branch never re-shows the bare
+  // form: `invalidateQueries`/`refetchQueries` RESOLVE even when the underlying
+  // fetch failed (confirmed empirically against this TanStack Query version,
+  // `throwOnError` included — see LiveStartView in pages/live/LivePage.tsx,
+  // which owns the primary /live start flow and hits the exact same hazard),
+  // so a caller cannot tell success from failure by awaiting either call. This
+  // branch is not reachable via the current router (LivePage only mounts
+  // DashboardPage when a run is already active) but keeps its own supported
+  // test contract (DashboardPage.idle.test.tsx), so it gets the same fix.
+  const [startConfirming, setStartConfirming] = useState(false);
+  const [startConfirmFailed, setStartConfirmFailed] = useState(false);
+
+  // Start a roast from the idle form (#158). Confirms the new run directly
+  // against `api.health()` (bypassing the query cache's own retry/error
+  // plumbing) with a few retries so a transient post-restart blip self-heals;
+  // errors (e.g. 409) are surfaced inline by the form before this ever runs.
   const handleStartRoast = useCallback(
     async (profile: Parameters<typeof api.startRoast>[0]) => {
       await api.startRoast(profile);
-      await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+      if (!mountedRef.current) return;
+      setStartConfirming(true);
+      setStartConfirmFailed(false);
+
+      const result = await runConfirmRetry({
+        attempt: () => api.health(),
+        isSuccess: (health) => health.active_run_id !== null,
+        onResult: (health) => queryClient.setQueryData(roastKeys.health, health),
+        isMounted: () => mountedRef.current,
+      });
+      if (result === "failed") setStartConfirmFailed(true);
     },
     [queryClient],
   );
+
+  // #513: acknowledge-confirm state. The operator never loses controls while
+  // this resolves (still on the faulted dashboard, heat already off), but a
+  // silently-stale FaultBanner after a real acknowledge is the same class of
+  // bug as the start-roast hazard this PR fixes elsewhere — this is precisely
+  // the recovery path the operator exercises on the very next restart, so it
+  // gets the same treatment for consistency, not just severity.
+  const [acknowledgeConfirming, setAcknowledgeConfirming] = useState(false);
+  const [acknowledgeConfirmFailed, setAcknowledgeConfirmFailed] = useState(false);
 
   // #206: the operator acknowledges a fault by POSTing the `acknowledge_fault`
   // control action. Post-#206 a fault no longer auto-finalises the run — it stays
   // operable (loop alive, heat off) so the operator can still cool the machine —
   // so the run is finalised (outcome `faulted`) only by this acknowledgement.
   // Acknowledging clears `active_run_id` on the server; we then drop the sticky-
-  // faulted pin and re-fetch health, returning the page to the idle Start-roast
-  // form (never trapping the operator on the faulted view, #124). `acknowledge_fault`
-  // issues no roaster command (heat is already off in faulted and stays off).
+  // faulted pin and confirm the transition directly against `api.health()`
+  // (bypassing `invalidateQueries`/`refetchQueries`, which RESOLVE even when the
+  // underlying fetch failed — see LiveStartView, pages/live/LivePage.tsx),
+  // returning the page to the idle Start-roast form (never trapping the operator
+  // on the faulted view, #124). `acknowledge_fault` issues no roaster command
+  // (heat is already off in faulted and stays off) — the operator keeps the
+  // FaultBanner + e-stop the whole time this resolves, but the banner and the
+  // acknowledge control must never go visibly silent on a failed confirm.
   const handleAcknowledgeFault = useCallback(async () => {
     const ackRunId = runId;
     // Drop the sticky-faulted pin optimistically so the page returns to idle as
     // soon as health reports no active run — the acknowledgement is the operator's
     // explicit intent and the server finalisation below makes it authoritative.
     setStickyFaultedRunId(null);
+    setAcknowledgeConfirming(true);
+    setAcknowledgeConfirmFailed(false);
     if (ackRunId !== null) {
       try {
         await api.operatorAction(ackRunId, { action: "acknowledge_fault" });
       } catch {
-        // Best-effort: a failed acknowledge (e.g. transient) still re-fetches
+        // Best-effort: a failed acknowledge (e.g. transient) still confirms
         // health below; the operator can retry from the live view.
       }
+      if (!mountedRef.current) return;
     }
-    await queryClient.invalidateQueries({ queryKey: roastKeys.health });
+
+    const result = await runConfirmRetry({
+      attempt: () => api.health(),
+      isSuccess: (health) => health.active_run_id === null,
+      onResult: (health) => queryClient.setQueryData(roastKeys.health, health),
+      isMounted: () => mountedRef.current,
+    });
+    if (result === "unmounted") return;
+    // Whether confirmed or exhausted, re-enable the button (a manual retry on
+    // failure) alongside the visible failure note; never leave it permanently
+    // disabled.
+    setAcknowledgeConfirming(false);
+    if (result === "failed") setAcknowledgeConfirmFailed(true);
   }, [queryClient, runId]);
 
   const dispatchAction = useCallback(
@@ -296,6 +362,42 @@ export function DashboardPage(): React.JSX.Element {
   // a roast without `curl` (E11 headless appliance). Once a roast is active this
   // branch is not taken and the live dashboard below renders, server-driven.
   if (isIdle) {
+    // #513: once the POST is proven (201), never re-show the bare form — it
+    // must never look untouched after a real roast has begun heating, even if
+    // the health-cache handoff stalls. Mirrors LiveStartView.
+    if (startConfirming) {
+      return (
+        <AppFrame
+          headerRight={
+            <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Starting…
+            </span>
+          }
+        >
+          <div
+            className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-border bg-card p-8 text-center"
+            data-testid="dashboard-start-confirming"
+          >
+            <h2 className="text-lg font-bold uppercase tracking-wide">Roast started</h2>
+            <p className="text-sm text-muted-foreground">
+              The roaster has begun preheating. Connecting to the live dashboard…
+            </p>
+            {startConfirmFailed && (
+              <p
+                role="alert"
+                data-testid="dashboard-start-confirm-failed"
+                className="rounded-md border border-roast-caution/50 bg-roast-caution/10 px-4 py-3 text-sm"
+              >
+                The roast started, but this page could not confirm it automatically.
+                The roaster is live and heating — reload to see status and controls,
+                including emergency stop.
+              </p>
+            )}
+          </div>
+        </AppFrame>
+      );
+    }
+
     // No run to connect to, so the "connecting" stream indicator would be
     // misleading — show a neutral idle label instead (#160 review item 3).
     return (
@@ -346,18 +448,34 @@ export function DashboardPage(): React.JSX.Element {
           // omitted. The genuine `acknowledge_fault` control action (#206)
           // finalises the operable-faulted run server-side (no roaster command —
           // heat is already off), then the page clears the sticky pin (#124) and
-          // re-fetches health → the idle Start form. The label is the operator's
-          // real next step.
+          // confirms against `api.health()` → the idle Start form. The label is
+          // the operator's real next step. #513: while confirming the button is
+          // disabled (no double-submit); if every confirm attempt fails the
+          // button stays enabled for a manual retry and a visible note explains
+          // why the banner hasn't cleared — it never goes silently stale.
           acknowledgeAffordance={
             canAcknowledgeFault ? (
-              <button
-                type="button"
-                onClick={handleAcknowledgeFault}
-                data-testid="fault-acknowledge"
-                className="inline-flex items-center rounded-md border border-roast-fault/60 bg-roast-fault/15 px-4 py-2 text-sm font-semibold uppercase tracking-wide text-roast-fault transition-colors hover:bg-roast-fault/25"
-              >
-                Acknowledge Fault &amp; Start New Roast
-              </button>
+              <div className="flex flex-col items-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => void handleAcknowledgeFault()}
+                  disabled={acknowledgeConfirming}
+                  data-testid="fault-acknowledge"
+                  className="inline-flex items-center rounded-md border border-roast-fault/60 bg-roast-fault/15 px-4 py-2 text-sm font-semibold uppercase tracking-wide text-roast-fault transition-colors hover:bg-roast-fault/25 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {acknowledgeConfirming ? "Acknowledging…" : "Acknowledge Fault & Start New Roast"}
+                </button>
+                {acknowledgeConfirmFailed && (
+                  <p
+                    role="alert"
+                    data-testid="fault-acknowledge-confirm-failed"
+                    className="max-w-xs text-right text-xs text-roast-fault"
+                  >
+                    Acknowledged, but this page could not confirm the run cleared. Heat
+                    stays off. Try again, or reload.
+                  </p>
+                )}
+              </div>
             ) : undefined
           }
         />

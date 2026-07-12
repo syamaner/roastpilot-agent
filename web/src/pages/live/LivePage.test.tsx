@@ -12,7 +12,11 @@
  *    e. Navigate-away / remount → sticky does NOT persist (LOW 4).
  *    f. Faulted run: active_run_id→null does NOT show finished summary (P2-4).
  * 4. No run, no sticky — LiveStartView (idle / fresh session).
- * 5. Start-roast flow — POSTs, refetches health, stays on /live.
+ * 5. Start-roast flow (#513) — the form hides the instant the POST is proven
+ *    (201), independent of health confirming; a successful confirm swaps to
+ *    the dashboard; a transient api.health() failure retries and still
+ *    confirms; every attempt failing shows the manual "Open live dashboard"
+ *    fallback — never falls back to the bare, untouched-looking form.
  * 6. P2-3: terminal snapshot is fetched (staleTime:0) so outcome/stats come from final state.
  *
  * Phase is never inferred: the only server-state read is active_run_id.
@@ -24,7 +28,6 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { roastKeys } from "@/hooks/queries";
 import type { RoastDetail, TelemetrySeries } from "@/lib/types";
 import { LivePage } from "./LivePage";
 import {
@@ -97,8 +100,10 @@ vi.mock("@/components/shared", async () => {
   };
 });
 
-// `api.roast` is called by fetchTerminalOutcome (the outcome gate, P2-3/P2-4) and
-// `api.startRoast` by the start-roast flow. Both are stubbed here.
+// `api.roast` is called by fetchTerminalOutcome (the outcome gate, P2-3/P2-4);
+// `api.startRoast` + `api.health` by the start-roast flow (#513: LiveStartView
+// confirms the new run directly against `api.health`, not the query cache's
+// own `refetchQueries`, which resolves even on a failed underlying fetch).
 const roastApiMock = vi.hoisted(() =>
   vi.fn(async (): Promise<RoastDetail> => ({
     ...(FIXTURE_FINISHED_DETAIL as RoastDetail),
@@ -106,9 +111,20 @@ const roastApiMock = vi.hoisted(() =>
   })),
 );
 const startRoastMock = vi.hoisted(() => vi.fn(async () => ({ id: "run-new" })));
+const healthApiMock = vi.hoisted(() =>
+  vi.fn(async () => ({
+    status: "ok" as const,
+    version: "test",
+    mcp_child: "connected" as const,
+    active_run_id: "run-new",
+  })),
+);
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
-  return { ...actual, api: { ...actual.api, startRoast: startRoastMock, roast: roastApiMock } };
+  return {
+    ...actual,
+    api: { ...actual.api, startRoast: startRoastMock, roast: roastApiMock, health: healthApiMock },
+  };
 });
 
 vi.mock("@/pages/dashboard/StartRoastForm", () => ({
@@ -132,6 +148,13 @@ beforeEach(() => {
   healthState.isError = false;
   startRoastMock.mockClear();
   roastApiMock.mockClear();
+  healthApiMock.mockClear();
+  healthApiMock.mockImplementation(async () => ({
+    status: "ok" as const,
+    version: "test",
+    mcp_child: "connected" as const,
+    active_run_id: "run-new",
+  }));
   // Reset stubs to defaults (null data, no-op traceModel).
   roastState.data = null;
   telemetryFullState.data = undefined;
@@ -150,7 +173,6 @@ beforeEach(() => {
 
 function renderPage(initialPath = "/live") {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  const refetchSpy = vi.spyOn(client, "refetchQueries");
   const Wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[initialPath]}>
@@ -185,7 +207,7 @@ function renderPage(initialPath = "/live") {
       </Wrapper>,
     );
   }
-  return { client, refetchSpy, rerender, remount };
+  return { client, rerender, remount };
 }
 
 describe("LivePage — loading hold", () => {
@@ -230,12 +252,19 @@ describe("LivePage — no active run, no sticky (idle / fresh session)", () => {
     expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
 
-  it("falls back to the start-roast view when the health fetch errors", () => {
+  it("#513 medium: shows a neutral status-unknown state (NEVER the bare start form) when the health fetch errors", () => {
+    // Active-run status is UNKNOWN on a persistent health error (useHealth's
+    // own retry:1 already rode out a single blip) — a run could genuinely be
+    // active and heating, so falling through to the bare start form would
+    // strand the operator without a path to the dashboard/e-stop, the exact
+    // hazard class this file's other tests fix. Previously this fell through
+    // to live-start-view; that was itself the bug qa's medium finding caught.
     healthState.isSuccess = false;
     healthState.isError = true;
     healthState.data = undefined;
     renderPage();
-    expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
+    expect(screen.getByTestId("live-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-start-view")).toBeNull();
     expect(screen.queryByTestId("live-page-loading")).toBeNull();
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
   });
@@ -466,20 +495,81 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
   });
 });
 
-describe("LivePage — start-roast flow", () => {
-  it("POSTs, refetches health, and stays on /live after starting a roast", async () => {
+describe("LivePage — start-roast flow (#513)", () => {
+  it("hides the start form the instant the POST is proven (201) — before health confirms", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: null };
-    const { refetchSpy } = renderPage();
+    // api.health() never resolves during this assertion window — the form's
+    // disappearance must not depend on it.
+    healthApiMock.mockImplementation(() => new Promise(() => {}));
+    renderPage();
     expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
 
     fireEvent.submit(screen.getByTestId("start-roast-form-stub"));
     await waitFor(() => expect(startRoastMock).toHaveBeenCalledTimes(1));
 
+    // #513: this must be unmissable and immediate — the operator can never see
+    // what looks like an untouched idle form after a real 201.
     await waitFor(() =>
-      expect(refetchSpy).toHaveBeenCalledWith({ queryKey: roastKeys.health }),
+      expect(screen.getByTestId("live-start-confirming")).toBeInTheDocument(),
     );
-
+    expect(screen.queryByTestId("live-start-view")).toBeNull();
     expect(screen.queryByTestId("home-landing")).toBeNull();
   });
+
+  it("confirms the new run against api.health and swaps to the dashboard (the actual handoff, not just the refetch call)", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: null };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
+
+    fireEvent.submit(screen.getByTestId("start-roast-form-stub"));
+    await waitFor(() => expect(startRoastMock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(healthApiMock).toHaveBeenCalledTimes(1));
+
+    // Confirmation succeeded — simulate the resulting cache update the way the
+    // sticky-summary tests above do (healthState is a static stub, not backed
+    // by the real query cache the component writes into).
+    healthState.data = { active_run_id: "run-new" };
+    rerender();
+
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-start-confirming")).toBeNull();
+  });
+
+  it("retries api.health on a transient failure and still confirms", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: null };
+    healthApiMock
+      .mockRejectedValueOnce(new Error("503 starting up"))
+      .mockResolvedValueOnce({
+        status: "ok",
+        version: "test",
+        mcp_child: "connected",
+        active_run_id: "run-new",
+      });
+    renderPage();
+
+    fireEvent.submit(screen.getByTestId("start-roast-form-stub"));
+    await waitFor(() => expect(healthApiMock).toHaveBeenCalledTimes(2), { timeout: 5000 });
+    // Never shows the failure banner when a later retry succeeds.
+    expect(screen.queryByTestId("live-start-confirm-failed")).toBeNull();
+  }, 8000);
+
+  it("shows the manual fallback (never the bare form) when every confirm attempt fails", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: null };
+    healthApiMock.mockRejectedValue(new Error("still down"));
+    renderPage();
+
+    fireEvent.submit(screen.getByTestId("start-roast-form-stub"));
+    await waitFor(() => expect(screen.getByTestId("live-start-confirming")).toBeInTheDocument());
+    await waitFor(
+      () => expect(screen.getByTestId("live-start-confirm-failed")).toBeInTheDocument(),
+      { timeout: 10000 },
+    );
+    expect(screen.getByTestId("live-start-open-dashboard")).toBeInTheDocument();
+    // The operator is never returned to the bare, untouched-looking form.
+    expect(screen.queryByTestId("live-start-view")).toBeNull();
+  }, 12000);
 });

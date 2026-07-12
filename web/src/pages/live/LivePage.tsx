@@ -24,7 +24,7 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 
 import { AppFrame, LiveCurve } from "@/components/shared";
@@ -39,6 +39,7 @@ import {
   useUpdateBeanProfile,
 } from "@/hooks/queries";
 import { api } from "@/lib/api";
+import { runConfirmRetry } from "@/lib/confirmRetry";
 import type { BeanProfileInput, RoastProfile } from "@/lib/types";
 import { DashboardPage } from "@/pages/dashboard/DashboardPage";
 import { StartRoastForm } from "@/pages/dashboard/StartRoastForm";
@@ -106,9 +107,14 @@ export function LivePage(): React.JSX.Element {
     }
   }, [activeRunId, queryClient]);
 
-  // Health error: active run unknown — treat as idle (fall through to no-run state).
+  // Health error (#513 medium): active-run status is UNKNOWN — never fall
+  // through to the bare start form (a run could genuinely be active and the
+  // operator would have no path to the dashboard/e-stop, the exact hazard
+  // this PR fixes elsewhere). `useHealth`'s default `retry: 1` already rides
+  // out a single blip before `isError` is true, so this is a persistent
+  // failure, not noise. Show a neutral "can't confirm" state instead.
   if (health.isError) {
-    return <LiveStartView />;
+    return <LiveStatusUnknownView />;
   }
 
   // Hold until health resolves so the start form doesn't flash before the active-run
@@ -139,6 +145,48 @@ export function LivePage(): React.JSX.Element {
 
   // Idle / fresh session: show the start-roast form.
   return <LiveStartView />;
+}
+
+// --- LiveStatusUnknownView: shown at /live when /health persistently errors. ---
+
+/**
+ * Neutral "can't confirm roaster status" state (#513 medium). Shown when
+ * `useHealth()` errors persistently (after its own retry budget) — active-run
+ * status is genuinely UNKNOWN, so this must never fall through to the bare
+ * start form: a run could be active and heating, and the operator would have
+ * no path to the dashboard/emergency stop. `useHealth` is refetched on-focus
+ * disabled but still observed here, so a manual reload or the browser's own
+ * retry is the recovery path; this view offers an explicit reload link too.
+ */
+function LiveStatusUnknownView(): React.JSX.Element {
+  return (
+    <AppFrame
+      headerRight={
+        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          Status unknown
+        </span>
+      }
+    >
+      <div
+        className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
+        data-testid="live-status-unknown"
+      >
+        <h2 className="text-lg font-bold uppercase tracking-wide">Can&apos;t confirm roaster status</h2>
+        <p className="text-sm text-muted-foreground">
+          This page could not reach the agent to check whether a roast is active. If
+          one is running, it is still live and heating — reload to reconnect before
+          assuming it is safe to start a new one.
+        </p>
+        <a
+          href="/live"
+          data-testid="live-status-unknown-reload"
+          className="rounded-md bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
+        >
+          Reload
+        </a>
+      </div>
+    </AppFrame>
+  );
 }
 
 // --- LiveFinishedView: sticky post-roast summary for the just-completed run. ---
@@ -303,11 +351,35 @@ function formatDuration(totalSeconds: number): string {
 
 function LiveStartView(): React.JSX.Element {
   const queryClient = useQueryClient();
+  const navigate = useNavigate();
 
   const beanProfiles = useBeanProfiles();
   const createBeanProfile = useCreateBeanProfile();
   const updateBeanProfile = useUpdateBeanProfile();
   const deleteBeanProfile = useDeleteBeanProfile();
+
+  // Set the instant `api.startRoast` resolves (a proven 201) — BEFORE anything
+  // that can subsequently fail (the health refetch). Once set, the form is
+  // replaced by an unmissable "roast started" state (#513): the operator must
+  // never see what looks like a fresh, untouched idle form after a real roast
+  // has begun heating, even if the health-cache handoff to DashboardPage stalls.
+  const [justStarted, setJustStarted] = useState(false);
+  const [confirmFailed, setConfirmFailed] = useState(false);
+
+  // #513 follow-up: the confirm loop's `for` body keeps running in this
+  // closure after unmount (React does not cancel in-flight promises), so a
+  // navigate-away mid-confirm — including the "Open live dashboard" fallback
+  // below, which forces a remount — could otherwise leave an orphaned loop
+  // still writing `setQueryData` from a component that no longer exists,
+  // racing whatever confirm loop the remount starts. `runConfirmRetry` checks
+  // this after every await and short-circuits before any state write once false.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const handleCreateProfile = useCallback(
     (input: BeanProfileInput) => createBeanProfile.mutateAsync(input),
@@ -322,17 +394,86 @@ function LiveStartView(): React.JSX.Element {
     [deleteBeanProfile],
   );
 
-  // Start a roast: POST, then AWAIT a health refetch so the cache holds the new
-  // active_run_id BEFORE re-evaluating. LiveStartView only ever mounts at /live,
-  // so the health refetch alone re-renders the page into DashboardPage — no
-  // navigate() call needed (which would push a duplicate /live history entry).
+  // Start a roast: POST, then latch `justStarted` on the proven 201 so the form
+  // can never resurface. Then confirm the new run directly against `/health`
+  // (bypassing the query cache's own retry/error plumbing — TanStack Query's
+  // `refetchQueries` always RESOLVES even when the underlying fetch failed and
+  // even with `throwOnError: true`, confirmed empirically; the caller cannot
+  // detect a failed refetch by awaiting it) and write a successful result into
+  // the query cache with `setQueryData` so LivePage's `useHealth()` observer
+  // picks it up and swaps straight into DashboardPage. Retried a few times
+  // (#513: a restart/MCP-respawn window can make `/health` transiently fail or
+  // race). If every attempt fails, `confirmFailed` drives the manual "Open live
+  // dashboard" fallback — the operator always has a path to the e-stop, never a
+  // bare form.
   const handleStartRoast = useCallback(
     async (profile: RoastProfile) => {
       await api.startRoast(profile);
-      await queryClient.refetchQueries({ queryKey: roastKeys.health });
+      if (!mountedRef.current) return;
+      setJustStarted(true);
+      setConfirmFailed(false);
+
+      const result = await runConfirmRetry({
+        attempt: () => api.health(),
+        isSuccess: (health) => health.active_run_id !== null,
+        onResult: (health) => queryClient.setQueryData(roastKeys.health, health),
+        isMounted: () => mountedRef.current,
+      });
+      if (result === "failed") setConfirmFailed(true);
     },
     [queryClient],
   );
+
+  // Manual fallback: a real navigation forces a fresh LivePage mount, which is
+  // reload-safe by design (re-hydrates active-run state from the server, see
+  // the module doc) — the same guarantee a browser reload gives, without
+  // requiring one.
+  const handleOpenDashboard = useCallback(() => {
+    navigate(0);
+  }, [navigate]);
+
+  if (justStarted) {
+    return (
+      <AppFrame
+        headerRight={
+          <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Starting…
+          </span>
+        }
+      >
+        <div
+          className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-border bg-card p-8 text-center"
+          data-testid="live-start-confirming"
+        >
+          <h2 className="text-lg font-bold uppercase tracking-wide">Roast started</h2>
+          <p className="text-sm text-muted-foreground">
+            The roaster has begun preheating. Connecting to the live dashboard…
+          </p>
+          {confirmFailed && (
+            <>
+              <p
+                role="alert"
+                data-testid="live-start-confirm-failed"
+                className="rounded-md border border-roast-caution/50 bg-roast-caution/10 px-4 py-3 text-sm"
+              >
+                The roast started, but this page could not confirm it automatically.
+                The roaster is live and heating — open the live dashboard to see
+                status and controls, including emergency stop.
+              </p>
+              <button
+                type="button"
+                onClick={handleOpenDashboard}
+                data-testid="live-start-open-dashboard"
+                className="rounded-md bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
+              >
+                Open live dashboard
+              </button>
+            </>
+          )}
+        </div>
+      </AppFrame>
+    );
+  }
 
   return (
     <AppFrame
