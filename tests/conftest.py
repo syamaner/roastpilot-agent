@@ -19,9 +19,30 @@ from roastpilot_agent.advisor import (
     RoastDecision,
 )
 from roastpilot_agent.mcp_client import ExportRoastLogResult
-from roastpilot_agent.models import AdvisorTraceStatus, RoastEventKind, RoastTelemetry
+from roastpilot_agent.models import (
+    AdvisorTraceStatus,
+    AppliedRoasterState,
+    RoastEventKind,
+    RoastTelemetry,
+)
 from roastpilot_agent.safety import SafetyEvaluation
 from roastpilot_agent.store import RoastStore
+
+#: The real drivers' (mock + Hottop) documented drop_beans() side effect:
+#: heat 0 %, fan 100 %, cooling engaged (coffee_roaster_mcp.drivers). Used as
+#: the fakes' default so a test that doesn't care about the exact applied
+#: values still gets a realistic one — override per test to check adoption of
+#: a DIFFERENT value (#507).
+DEFAULT_DROP_APPLIED_STATE = AppliedRoasterState(
+    heat_level_percent=0, fan_level_percent=100, cooling_on=True
+)
+
+#: The real driver's documented emergency_stop() side effect: heat 0 %, fan
+#: 100 %, cooling engaged (coffee_roaster_mcp.drivers.EmergencyStopResult /
+#: default_emergency_safety_payload). Same rationale as the drop default above.
+DEFAULT_EMERGENCY_STOP_APPLIED_STATE = AppliedRoasterState(
+    heat_level_percent=0, fan_level_percent=100, cooling_on=True
+)
 
 
 class FakeClock:
@@ -51,11 +72,20 @@ class FakeMCPClient:
         frames: list[RoastTelemetry | None | Exception] | None = None,
         log: list[str] | None = None,
         export_result: ExportRoastLogResult | None = None,
+        drop_applied_state: AppliedRoasterState | None = DEFAULT_DROP_APPLIED_STATE,
+        emergency_stop_applied_state: AppliedRoasterState
+        | None = DEFAULT_EMERGENCY_STOP_APPLIED_STATE,
     ) -> None:
         self.frames: list[RoastTelemetry | None | Exception] = list(frames or [])
         self._log = log if log is not None else []
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.export_result = export_result
+        #: Applied state returned by drop_beans()/emergency_stop() (#507).
+        #: Override per-instance to assert adoption of a NON-default value, or
+        #: set to None to simulate a malformed/out-of-contract MCP payload
+        #: (the RoasterControlAdapter.None-on-malformed-payload contract).
+        self.drop_applied_state = drop_applied_state
+        self.emergency_stop_applied_state = emergency_stop_applied_state
 
     async def read_telemetry(self) -> RoastTelemetry | None:
         self._log.append("read")
@@ -91,9 +121,10 @@ class FakeMCPClient:
         self._log.append("mark_first_crack")
         self.calls.append(("mark_first_crack", {}))
 
-    async def drop_beans(self) -> None:
+    async def drop_beans(self) -> AppliedRoasterState | None:
         self._log.append("drop_beans")
         self.calls.append(("drop_beans", {}))
+        return self.drop_applied_state
 
     async def start_cooling(self) -> None:
         self._log.append("start_cooling")
@@ -103,9 +134,10 @@ class FakeMCPClient:
         self._log.append("stop_cooling")
         self.calls.append(("stop_cooling", {}))
 
-    async def emergency_stop(self, *, reason: str) -> None:
+    async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
         self._log.append("emergency_stop")
         self.calls.append(("emergency_stop", {"reason": reason}))
+        return self.emergency_stop_applied_state
 
     async def export_roast_log(self) -> ExportRoastLogResult:
         self._log.append("export_roast_log")
@@ -147,13 +179,25 @@ class ScriptedStateReader:
 class RecordingExecutor:
     """CommandExecutor protocol fake recording every write."""
 
-    def __init__(self, log: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        log: list[str] | None = None,
+        drop_applied_state: AppliedRoasterState | None = DEFAULT_DROP_APPLIED_STATE,
+        emergency_stop_applied_state: AppliedRoasterState
+        | None = DEFAULT_EMERGENCY_STOP_APPLIED_STATE,
+    ) -> None:
         self._log = log if log is not None else []
         self.targets: list[tuple[int, int]] = []
         self.estop_reasons: list[str] = []
         self.commands: list[str] = []
         #: (recording_origin, recording_roast_num) captured per start_session call.
         self.start_session_metadata: list[tuple[str | None, int | None]] = []
+        #: Applied state returned by drop_beans()/emergency_stop() (#507).
+        #: Override per-instance to assert adoption of a NON-default value, or
+        #: set to None to simulate a malformed/out-of-contract MCP payload
+        #: (the RoasterControlAdapter.None-on-malformed-payload contract).
+        self.drop_applied_state = drop_applied_state
+        self.emergency_stop_applied_state = emergency_stop_applied_state
 
     async def start_session(
         self, *, recording_origin: str | None = None, recording_roast_num: int | None = None
@@ -174,9 +218,10 @@ class RecordingExecutor:
         self._log.append("mark_first_crack")
         self.commands.append("mark_first_crack")
 
-    async def drop_beans(self) -> None:
+    async def drop_beans(self) -> AppliedRoasterState | None:
         self._log.append("drop_beans")
         self.commands.append("drop_beans")
+        return self.drop_applied_state
 
     async def start_cooling(self) -> None:
         self._log.append("start_cooling")
@@ -186,9 +231,10 @@ class RecordingExecutor:
         self._log.append("stop_cooling")
         self.commands.append("stop_cooling")
 
-    async def emergency_stop(self, *, reason: str) -> None:
+    async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
         self._log.append("emergency_stop")
         self.estop_reasons.append(reason)
+        return self.emergency_stop_applied_state
 
 
 @dataclass

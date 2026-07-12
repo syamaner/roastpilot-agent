@@ -51,7 +51,7 @@ from mcp.client.stdio import stdio_client
 from pydantic import BaseModel, ConfigDict
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
-from roastpilot_agent.models import MicStatus, RoastTelemetry
+from roastpilot_agent.models import AppliedRoasterState, MicStatus, RoastTelemetry
 
 _log = logging.getLogger(__name__)
 
@@ -527,6 +527,63 @@ def _latest_backdate_seconds(
     return None
 
 
+class MalformedCommandResultError(Exception):
+    """An MCP command result's event payload is missing an expected field.
+
+    Raised by :func:`applied_state_from_event` when ``heat_level_percent`` /
+    ``fan_level_percent`` / ``cooling_on`` are absent or the wrong type — the
+    MCP's own contract guarantees all three on ``beans_dropped`` and ``fault``
+    (`coffee_roaster_mcp.session.complete_reserved_driver_drop_snapshot` /
+    `default_emergency_safety_payload`), so this only fires against a genuinely
+    malformed or out-of-contract payload. The controller treats it exactly like
+    any other executor failure (``COMMAND_FAILED``, mirrors NOT advanced) —
+    never fabricate a guessed applied state from a partial payload.
+    """
+
+
+def applied_state_from_event(event: EventSnapshot) -> AppliedRoasterState:
+    """Extract the driver's applied heat/fan/cooling state from a command event.
+
+    ``drop_beans`` and ``emergency_stop`` change heat/fan/cooling as a
+    hardware side effect of the MCP command itself (not through a separate
+    ``set_targets`` call), so the applied state has to come from the
+    command's own result rather than a later telemetry poll. The MCP always
+    carries it on the resulting event's payload (``beans_dropped`` /
+    ``fault``) — see :class:`MalformedCommandResultError`.
+
+    Args:
+        event: The ``EventSnapshot`` returned by the drop/emergency-stop tool
+            call (``EventCommandResult.event``).
+
+    Returns:
+        The applied roaster state the driver actually set.
+
+    Raises:
+        MalformedCommandResultError: A required field is missing or the
+            wrong type.
+    """
+    heat = event.payload.get("heat_level_percent")
+    fan = event.payload.get("fan_level_percent")
+    cooling_on = event.payload.get("cooling_on")
+    if isinstance(heat, bool) or not isinstance(heat, int):
+        raise MalformedCommandResultError(
+            f"{event.kind!r} event payload missing integer heat_level_percent: {heat!r}"
+        )
+    if isinstance(fan, bool) or not isinstance(fan, int):
+        raise MalformedCommandResultError(
+            f"{event.kind!r} event payload missing integer fan_level_percent: {fan!r}"
+        )
+    if not isinstance(cooling_on, bool):
+        raise MalformedCommandResultError(
+            f"{event.kind!r} event payload missing boolean cooling_on: {cooling_on!r}"
+        )
+    return AppliedRoasterState(
+        heat_level_percent=heat,
+        fan_level_percent=fan,
+        cooling_on=cooling_on,
+    )
+
+
 def project_session_state(state: RoastSessionState, *, age_seconds: float) -> RoastTelemetry | None:
     """Project an MCP ``RoastSessionState`` into the controller's ``RoastTelemetry``.
 
@@ -681,8 +738,30 @@ class RoasterControlAdapter:
     async def mark_first_crack(self) -> None:
         await self._client.mark_first_crack()
 
-    async def drop_beans(self) -> None:
-        await self._client.drop_beans()
+    async def drop_beans(self) -> AppliedRoasterState | None:
+        """Drop the beans and return the driver's applied post-drop state.
+
+        ``drop_beans`` sets heat/fan/cooling as a hardware side effect of the
+        command itself (mirrors: 0 % heat, 100 % fan, cooling on), so the
+        applied state is read from the ``beans_dropped`` event's own payload
+        (#507) rather than assumed by the controller.
+
+        Returns ``None`` (rather than raising) when the payload is malformed
+        or out-of-contract (#507 safety-review fix): the hardware drop has
+        ALREADY happened by this point — the beans are out — so a payload
+        parse failure must never surface as a caller-side exception. Every
+        drop caller treats an exception as "the write itself failed" (no
+        transition, ``COMMAND_FAILED``, safe to retry next tick); if this
+        raised on a malformed-but-successful drop, the caller would wrongly
+        hold DEVELOPMENT and re-fire ``drop_beans`` on a machine that already
+        dropped — an FSM-vs-physical divergence. ``None`` lets every caller
+        proceed exactly as it does today (transition, ``COMMAND_EXECUTED``)
+        while simply not adopting a value into the commanded-value mirrors —
+        stale-but-honest mirrors, never a fabricated value and never a
+        spurious failure.
+        """
+        result = await self._client.drop_beans()
+        return self._applied_state_or_none(result.event)
 
     async def start_cooling(self) -> None:
         await self._client.start_cooling()
@@ -690,8 +769,41 @@ class RoasterControlAdapter:
     async def stop_cooling(self) -> None:
         await self._client.stop_cooling()
 
-    async def emergency_stop(self, *, reason: str) -> None:
-        await self._client.emergency_stop(reason)
+    async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+        """Fire the MCP emergency stop and return the driver's applied state.
+
+        Mirrors :meth:`drop_beans`: ``emergency_stop`` sets heat/fan/cooling as
+        a hardware side effect (heat 0 %, safe fan, cooling on), read from the
+        resulting ``fault`` event's own payload (#507). Returns ``None`` on a
+        malformed payload for the identical reason ``drop_beans`` does — the
+        hardware stop already happened, so a parse failure must not surface as
+        a caller-side exception (which every e-stop caller would otherwise
+        treat as "the stop itself failed", queuing a needless heat-off retry
+        on a machine that is already safely stopped)."""
+        result = await self._client.emergency_stop(reason)
+        return self._applied_state_or_none(result.event)
+
+    @staticmethod
+    def _applied_state_or_none(event: EventSnapshot) -> AppliedRoasterState | None:
+        """Parse the applied state, degrading a malformed payload to ``None``.
+
+        Logs at WARNING with the malformed payload's keys (never the values —
+        avoid amplifying whatever garbage is in a genuinely malformed
+        payload into the log) so a real MCP contract regression is visible,
+        without ever fabricating a guessed heat/fan/cooling value.
+        """
+        try:
+            return applied_state_from_event(event)
+        except MalformedCommandResultError:
+            _log.warning(
+                "%s event payload missing/malformed applied-state fields "
+                "(keys present: %s); the hardware command already ran — "
+                "proceeding without adopting a value into the commanded mirrors",
+                event.kind,
+                sorted(event.payload.keys()),
+                exc_info=True,
+            )
+            return None
 
     async def export_roast_log(self) -> ExportRoastLogResult:
         """Export the roast log (the runner's completion step — not a control

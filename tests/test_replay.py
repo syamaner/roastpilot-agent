@@ -11,7 +11,7 @@ are exercised here for their *real* downstream verdicts (a genuine CLAMP from
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import pytest
 import pytest_asyncio
@@ -131,6 +131,117 @@ def test_load_export_missing_jsonl_raises(tmp_path: Path) -> None:
     """A directory without roast.jsonl is a clear error, not a silent empty."""
     with pytest.raises(FileNotFoundError):
         load_export(tmp_path)
+
+
+# --- #507 safety-review LOW-1: drop_applied_state read from the export -----
+
+
+def test_load_export_reads_drop_applied_state_from_recorded_event() -> None:
+    """The export's own ``beans_dropped`` event payload is the source, not a
+    hardcoded driver constant — session-2's recorded payload happens to equal
+    the real drivers' 0/100/True, but this asserts it was READ, not assumed
+    (see the malformed/missing-payload fallback tests below for the case
+    where reading it would actually matter)."""
+    from roastpilot_agent.models import AppliedRoasterState
+
+    script = load_export(_SESSION_2)
+    assert script.drop_applied_state == AppliedRoasterState(
+        heat_level_percent=0, fan_level_percent=100, cooling_on=True
+    )
+
+
+def test_load_export_falls_back_when_export_has_no_drop_event() -> None:
+    """``fault-pre-t0`` is a hand-authored telemetry-only fixture with no
+    event records at all (the fault it produces comes from the real
+    SafetyPolicy, not a recorded event) — falls back to the fixed constant
+    rather than crashing fixture loading."""
+    from roastpilot_agent.models import AppliedRoasterState
+    from roastpilot_agent.replay import (
+        _FALLBACK_DROP_APPLIED_STATE,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    script = load_export(_FAULT)
+    assert script.drop_applied_state == _FALLBACK_DROP_APPLIED_STATE
+    assert script.drop_applied_state == AppliedRoasterState(
+        heat_level_percent=0, fan_level_percent=100, cooling_on=True
+    )
+
+
+def test_drop_applied_state_from_records_falls_back_on_malformed_payload() -> None:
+    """A ``beans_dropped`` record present but missing the applied-state keys
+    (an export predating #507) falls back rather than raising."""
+    from roastpilot_agent.replay import (
+        _FALLBACK_DROP_APPLIED_STATE,  # pyright: ignore[reportPrivateUsage]
+        _drop_applied_state_from_records,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    records: list[dict[str, Any]] = [
+        {
+            "kind": "beans_dropped",
+            "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+            "monotonic_seconds": 68.0,
+            "payload": {},  # pre-#507 export: no applied-state fields at all
+        }
+    ]
+    assert _drop_applied_state_from_records(records) == _FALLBACK_DROP_APPLIED_STATE
+
+
+def test_drop_applied_state_from_records_falls_back_on_unparseable_record() -> None:
+    """A ``beans_dropped`` record that fails ``EventSnapshot.model_validate``
+    itself (missing required fields, not just an empty payload — a genuinely
+    corrupt export row) falls back rather than raising."""
+    from roastpilot_agent.replay import (
+        _FALLBACK_DROP_APPLIED_STATE,  # pyright: ignore[reportPrivateUsage]
+        _drop_applied_state_from_records,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    records: list[dict[str, Any]] = [
+        {
+            "kind": "beans_dropped",
+            # monotonic_seconds and recorded_at_utc are both missing —
+            # EventSnapshot.model_validate itself must fail, not just the
+            # downstream applied-state field check.
+            "payload": {"heat_level_percent": 0, "fan_level_percent": 100, "cooling_on": True},
+        }
+    ]
+    assert _drop_applied_state_from_records(records) == _FALLBACK_DROP_APPLIED_STATE
+
+
+def test_drop_applied_state_from_records_falls_back_on_no_events() -> None:
+    """No event records at all (e.g. an empty list) falls back cleanly."""
+    from roastpilot_agent.replay import (
+        _FALLBACK_DROP_APPLIED_STATE,  # pyright: ignore[reportPrivateUsage]
+        _drop_applied_state_from_records,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    assert _drop_applied_state_from_records([]) == _FALLBACK_DROP_APPLIED_STATE
+
+
+@pytest.mark.asyncio
+async def test_replay_roaster_control_drop_beans_returns_loaded_applied_state() -> None:
+    """``ReplayRoasterControl.drop_beans()`` returns whatever ``load()`` was
+    given — proving the control surface actually threads it through, not just
+    that ``load_export`` parses it correctly."""
+    from roastpilot_agent.models import AppliedRoasterState
+    from roastpilot_agent.replay import ReplayRoasterControl
+
+    distinctive = AppliedRoasterState(heat_level_percent=7, fan_level_percent=88, cooling_on=True)
+    control = ReplayRoasterControl()
+    control.load([], drop_applied_state=distinctive)
+    assert await control.drop_beans() == distinctive
+
+
+@pytest.mark.asyncio
+async def test_replay_roaster_control_drop_beans_defaults_to_fallback_before_load() -> None:
+    """Before ``load()`` is ever called, ``drop_beans()`` still returns a
+    valid (fallback) applied state — never ``None`` or an unset attribute."""
+    from roastpilot_agent.replay import (
+        _FALLBACK_DROP_APPLIED_STATE,  # pyright: ignore[reportPrivateUsage]
+        ReplayRoasterControl,
+    )
+
+    control = ReplayRoasterControl()
+    assert await control.drop_beans() == _FALLBACK_DROP_APPLIED_STATE
 
 
 def test_session1_manual_t0_export_parses() -> None:

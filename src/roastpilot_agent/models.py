@@ -359,6 +359,28 @@ class RoastTelemetry(BaseModel):
     ambient_pressure_hpa: float | None = None
 
 
+class AppliedRoasterState(BaseModel):
+    """Post-command roaster state actually applied by the driver (#507).
+
+    Returned by :class:`~roastpilot_agent.controller.CommandExecutor`'s
+    ``drop_beans`` and ``emergency_stop`` — both commands change heat/fan/
+    cooling as a hardware side effect of the command itself, rather than
+    through an explicit ``set_targets`` call. The controller adopts these
+    fields into its own commanded-value mirrors (``_current_heat`` /
+    ``_current_fan``) so a drop or an e-stop is reflected the same tick it
+    lands, instead of leaving those mirrors (and everything downstream —
+    ``telemetry_snapshots`` rows, the SSE telemetry frame, the dashboard
+    readout) holding the last pre-command ``set_targets`` values for the rest
+    of the run. Sourced from the MCP command result's own event payload
+    (``beans_dropped`` / ``fault``), never a hardcoded driver constant — the
+    driver, not the controller, owns what a drop or an e-stop actually sets.
+    """
+
+    heat_level_percent: int = Field(ge=0, le=100)
+    fan_level_percent: int = Field(ge=0, le=100)
+    cooling_on: bool
+
+
 # Bean species (botanical) — a constrained ``Literal`` deliberately, NOT a
 # ``models.py`` ``Enum``: an enum here would trip the safety-reviewer escalation
 # (the rubric routes any ``models.py`` enum change through it) even though bean

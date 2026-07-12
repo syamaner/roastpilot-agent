@@ -69,7 +69,13 @@ from pydantic import BaseModel, Field
 from roastpilot_agent.api import QueuedOperatorAction, RoastService, create_app
 from roastpilot_agent.config import AppConfig, PostFirstCrackControl
 from roastpilot_agent.live import mount_spa
+from roastpilot_agent.mcp_client import (
+    EventSnapshot,
+    MalformedCommandResultError,
+    applied_state_from_event,
+)
 from roastpilot_agent.models import (
+    AppliedRoasterState,
     MicStatus,
     OperatorAction,
     RoastEventKind,
@@ -87,6 +93,18 @@ _log = logging.getLogger(__name__)
 #: 60× the fast development pass. A requested speed is clamped into this band.
 MIN_SPEED = 1.0
 MAX_SPEED = 60.0
+
+#: The real drivers' documented ``drop_beans()`` side effect (heat 0 %, fan
+#: 100 %, cooling on — coffee_roaster_mcp.drivers), used as the fallback when
+#: an export's ``beans_dropped`` event carries no parseable applied-state
+#: payload (an older export predating #507, or a hand-authored fixture with
+#: no event records at all, e.g. ``fault-pre-t0``). Every currently-committed
+#: export with a recorded drop DOES carry this exact payload (#507
+#: safety-review LOW-1) — this is a fallback for fixture staleness, not the
+#: primary source.
+_FALLBACK_DROP_APPLIED_STATE = AppliedRoasterState(
+    heat_level_percent=0, fan_level_percent=100, cooling_on=True
+)
 
 #: The injected, out-of-bounds heat request used to compute the synthesized
 #: CLAMP key frame. 105 % clamps to 100 % through the real safety policy.
@@ -154,11 +172,24 @@ class ReplayScript:
 
     Built by :func:`load_export`. ``clamp_after_marker`` is the marker the
     synthesized CLAMP key frame is emitted right after (``first_crack`` for the
-    demo roast, so it lands on the development-phase advisory panel)."""
+    demo roast, so it lands on the development-phase advisory panel).
+
+    ``drop_applied_state`` is the applied heat/fan/cooling read off the
+    export's own recorded ``beans_dropped`` event payload (#507 safety-review
+    LOW-1) — replay-reproduces-history: :class:`ReplayRoasterControl` returns
+    THIS from ``drop_beans()`` rather than a hardcoded driver constant, so a
+    future export recorded against different driver constants replays
+    faithfully instead of silently diverging. Falls back to
+    :data:`_FALLBACK_DROP_APPLIED_STATE` when the export carries no
+    ``beans_dropped`` event or a malformed payload (an export predating #507,
+    or a hand-authored fixture with no event records at all)."""
 
     frames: list[ReplayFrame]
     profile: RoastProfile
     clamp_after_marker: ReplayMarker | None = field(default=ReplayMarker.FIRST_CRACK)
+    drop_applied_state: AppliedRoasterState = field(
+        default_factory=lambda: _FALLBACK_DROP_APPLIED_STATE
+    )
 
 
 # --- Fixture parsing -------------------------------------------------------
@@ -369,7 +400,11 @@ def load_export(export_dir: Path) -> ReplayScript:
 
     # The last frame ends the run.
     frames[-1] = _with_marker(frames[-1], ReplayMarker.END)
-    return ReplayScript(frames=frames, profile=_profile_for(export_dir.name))
+    return ReplayScript(
+        frames=frames,
+        profile=_profile_for(export_dir.name),
+        drop_applied_state=_drop_applied_state_from_records(event_records),
+    )
 
 
 def _event_monotonic(events: list[dict[str, Any]], kind: str) -> float | None:
@@ -378,6 +413,30 @@ def _event_monotonic(events: list[dict[str, Any]], kind: str) -> float | None:
         if event.get("kind") == kind:
             return float(event["monotonic_seconds"])
     return None
+
+
+def _drop_applied_state_from_records(events: list[dict[str, Any]]) -> AppliedRoasterState:
+    """Read the applied heat/fan/cooling off the export's own ``beans_dropped``
+    event payload (#507 safety-review LOW-1).
+
+    Falls back to :data:`_FALLBACK_DROP_APPLIED_STATE` when the export has no
+    ``beans_dropped`` event (a fixture with no recorded drop, or a
+    hand-authored telemetry-only fixture like ``fault-pre-t0``) or the event's
+    payload does not carry a valid applied state (an export predating #507) —
+    never crashes fixture loading over a missing/older payload shape.
+    """
+    for record in events:
+        if record.get("kind") != "beans_dropped":
+            continue
+        try:
+            event = EventSnapshot.model_validate(record)
+        except Exception:  # noqa: BLE001 - a malformed record falls back, never crashes.
+            return _FALLBACK_DROP_APPLIED_STATE
+        try:
+            return applied_state_from_event(event)
+        except MalformedCommandResultError:
+            return _FALLBACK_DROP_APPLIED_STATE
+    return _FALLBACK_DROP_APPLIED_STATE
 
 
 def _with_marker(frame: ReplayFrame, marker: ReplayMarker) -> ReplayFrame:
@@ -438,11 +497,28 @@ class ReplayRoasterControl:
         self._frames: list[RoastTelemetry] = []
         self._cursor = 0
         self.commands: list[tuple[str, dict[str, object]]] = []
+        #: The applied state ``drop_beans()`` returns (#507 safety-review
+        #: LOW-1) — set by :meth:`load`, sourced from the export's own
+        #: recorded ``beans_dropped`` event payload, falling back to
+        #: :data:`_FALLBACK_DROP_APPLIED_STATE` for an unloaded/older export.
+        self._drop_applied_state: AppliedRoasterState = _FALLBACK_DROP_APPLIED_STATE
 
-    def load(self, frames: list[RoastTelemetry]) -> None:
-        """Install the ordered telemetry frames the reader will yield."""
+    def load(
+        self,
+        frames: list[RoastTelemetry],
+        *,
+        drop_applied_state: AppliedRoasterState = _FALLBACK_DROP_APPLIED_STATE,
+    ) -> None:
+        """Install the ordered telemetry frames the reader will yield.
+
+        Args:
+            frames: The ordered telemetry readings ``read_telemetry`` yields.
+            drop_applied_state: The state ``drop_beans()`` returns (#507),
+                normally the export's own recorded ``beans_dropped`` payload.
+        """
         self._frames = frames
         self._cursor = 0
+        self._drop_applied_state = drop_applied_state
 
     def advance(self) -> None:
         """Step the read cursor to the next frame (clamped at the last)."""
@@ -478,8 +554,15 @@ class ReplayRoasterControl:
     async def mark_first_crack(self) -> None:
         self.commands.append(("mark_first_crack", {}))
 
-    async def drop_beans(self) -> None:
+    async def drop_beans(self) -> AppliedRoasterState:
         self.commands.append(("drop_beans", {}))
+        # Replay never actuates hardware — the recorded roast already
+        # happened — so this returns what the EXPORT itself recorded the
+        # driver as having applied (set by load(), #507 safety-review LOW-1),
+        # not a hardcoded driver constant. Faithful to replay-reproduces-
+        # history: a future export recorded against different driver
+        # constants replays correctly instead of silently diverging.
+        return self._drop_applied_state
 
     async def start_cooling(self) -> None:
         self.commands.append(("start_cooling", {}))
@@ -487,8 +570,18 @@ class ReplayRoasterControl:
     async def stop_cooling(self) -> None:
         self.commands.append(("stop_cooling", {}))
 
-    async def emergency_stop(self, *, reason: str) -> None:
+    async def emergency_stop(self, *, reason: str) -> AppliedRoasterState:
         self.commands.append(("emergency_stop", {"reason": reason}))
+        # Unlike drop_beans, replay never actually calls this: the synthetic
+        # fault fixture (fault-pre-t0) produces its FAULT transition through
+        # the real SafetyPolicy's telemetry-stage evaluation, not by injecting
+        # an e-stop action (there is no ReplayActionKind.EMERGENCY_STOP), and
+        # no committed export carries a recorded "fault" event to read a
+        # payload from. Kept as a fixed, realistic stand-in (matching the real
+        # driver's documented emergency_stop() side effect) purely to satisfy
+        # the CommandExecutor protocol; #507 safety-review LOW-1 only asked
+        # for drop_beans, where a real recorded payload exists to read.
+        return AppliedRoasterState(heat_level_percent=0, fan_level_percent=100, cooling_on=True)
 
 
 # --- Replay step result ----------------------------------------------------
@@ -640,7 +733,10 @@ class ReplaySource:
         """
         if self._started:  # pragma: no cover — guarded by callers
             raise RuntimeError("replay source already started")
-        self._control.load([frame.telemetry for frame in self._script.frames])
+        self._control.load(
+            [frame.telemetry for frame in self._script.frames],
+            drop_applied_state=self._script.drop_applied_state,
+        )
         # Pin the controller's clock to frame 0's recorded sim-time so the run's
         # elapsed baseline (run_started) is captured in sim-time, not wall time.
         self._sim_clock.now = self._script.frames[0].monotonic_seconds
