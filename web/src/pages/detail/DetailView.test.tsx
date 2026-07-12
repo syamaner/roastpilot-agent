@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { api } from "@/lib/api";
 import { DetailView } from "./DetailView";
 import {
   FIXTURE_DETAIL,
@@ -72,7 +73,21 @@ describe("DetailView trace-row → curve highlight", () => {
   });
 });
 
+afterEach(() => vi.restoreAllMocks());
+
 describe("DetailView composition", () => {
+  it("mounts RoastTastings wired to the detail's own run id (#522) — the data-flows-to-the-render-tree check: a dropped import or wrong runId prop would pass every other test here", async () => {
+    const spy = vi
+      .spyOn(api, "tastings")
+      .mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    renderView();
+    expect(screen.getByTestId("roast-tastings")).toBeInTheDocument();
+    // Proves the runId PROP actually reached the mounted widget, not just that
+    // some <RoastTastings> rendered: the query only fires with the fixture's
+    // own run id if DetailView passed detail.id through, not a stale/wrong one.
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(FIXTURE_DETAIL.id));
+  });
+
   it("feeds the full persisted curve to the shared LiveCurve with event markers", () => {
     renderView();
     // Six columns (x + five series), all fixture points present.
