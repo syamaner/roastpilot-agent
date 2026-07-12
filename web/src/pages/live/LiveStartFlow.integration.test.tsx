@@ -369,4 +369,145 @@ describe("#523 real-integration — /live idle state reads REAL history for the 
     expect(screen.queryByTestId("live-finished-view")).toBeNull();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
   });
+
+  it("#532 round 2: does NOT render a STALE cached detail for the history-derived run — fetches it fresh before trusting it", async () => {
+    // The exact hazard round 2 flagged: `roastKeys.detail(id)` might already
+    // hold a MID-ROAST snapshot in the query cache for the same run id — left
+    // over from an earlier dashboard/detail view in this same browser
+    // session, cached with the app's default staleTime (30s), well within
+    // which this render can land. Without the fresh-detail fetch,
+    // `LiveFinishedView`'s `useRoast(runId)` would resolve synchronously from
+    // that STALE cache entry (outcome: null, no drop temp yet) instead of the
+    // server's genuine terminal snapshot.
+    //
+    // Scope note (mutation-tested, not just written and trusted): this DOES
+    // catch removing the fresh-fetch effect entirely (verified — the mutant
+    // renders the stale bean_origin and empty stat tiles). It does NOT catch
+    // removing only the RENDER-TIME hold that waits for that fetch to
+    // resolve (the effect alone still populates the cache before this
+    // harness's synchronous `act()`-flushed render settles — the same
+    // RTL passive-effect-timing limitation documented on the transition-
+    // flash test above). The render-time hold matters for the real,
+    // post-paint `useEffect` timing a browser has; this test proves the
+    // fetch-before-trust DATA correctness, not that specific frame timing.
+    const HISTORY_RUN_ID = "run-with-stale-cache";
+    let detailFetchCount = 0;
+    global.fetch = vi.fn(async (url: string, init?: RequestInit) => {
+      const u = String(url);
+      if (u === "/api/health") {
+        return new Response(
+          JSON.stringify({
+            status: "ok",
+            version: "test",
+            mcp_child: "running",
+            active_run_id: null,
+          }),
+          { status: 200 },
+        );
+      }
+      if (u === "/api/roasts") {
+        return new Response(
+          JSON.stringify({
+            runs: [
+              {
+                id: HISTORY_RUN_ID,
+                started_at_utc: "2026-07-01T10:00:00Z",
+                completed_at_utc: "2026-07-01T10:06:30Z",
+                first_crack_at_utc: null,
+                agent_phase: "complete",
+                outcome: "completed",
+                bean_origin: "Ethiopia Guji",
+                bean_varietal: null,
+                rating: null,
+                development_percent: 18.7,
+                advisor_consults: 0,
+                advisor_clamped: 0,
+                advisor_rejected: 0,
+                advisor_failed: 0,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      if (u === `/api/roasts/${HISTORY_RUN_ID}`) {
+        detailFetchCount += 1;
+        // The REAL server response: a genuine terminal snapshot.
+        return new Response(
+          JSON.stringify({
+            id: HISTORY_RUN_ID,
+            agent_phase: "complete",
+            profile: {
+              name: "Test",
+              bean_origin: "Ethiopia Guji — Fresh From Server",
+              bean_varietal: null,
+              bean_weight_grams: 250,
+              charge_guidance_min_c: 170,
+              charge_guidance_max_c: 200,
+              initial_heat_percent: 80,
+              initial_fan_percent: 30,
+              target_drop_temp_c: 195,
+              target_development_percent: 20,
+            },
+            outcome: "completed",
+            started_at_utc: "2026-07-01T10:00:00Z",
+            completed_at_utc: "2026-07-01T10:06:30Z",
+            fault_reason: null,
+            rating: null,
+            notes: null,
+            export_manifest: null,
+          }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`unexpected fetch ${u} ${init?.method ?? "GET"}`);
+    }) as unknown as typeof fetch;
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // Seed a STALE, mid-roast cache entry for this exact run id — the
+    // scenario an earlier same-session dashboard/detail view would leave
+    // behind. Its bean_origin is deliberately different from the server's
+    // "fresh" response so the test can tell which one actually rendered.
+    client.setQueryData(roastKeys.detail(HISTORY_RUN_ID), {
+      id: HISTORY_RUN_ID,
+      agent_phase: "development",
+      profile: {
+        name: "Test",
+        bean_origin: "STALE MID-ROAST SNAPSHOT",
+        bean_varietal: null,
+        bean_weight_grams: 250,
+        charge_guidance_min_c: 170,
+        charge_guidance_max_c: 200,
+        initial_heat_percent: 80,
+        initial_fan_percent: 30,
+        target_drop_temp_c: 195,
+        target_development_percent: 20,
+      },
+      outcome: null,
+      started_at_utc: "2026-07-01T10:00:00Z",
+      completed_at_utc: null,
+      fault_reason: null,
+      rating: null,
+      notes: null,
+      export_manifest: null,
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/live"]}>
+          <Routes>
+            <Route path="/live" element={<LivePage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("live-finished-view")).toBeInTheDocument());
+    // The fresh server response's bean_origin renders — NOT the stale cache's.
+    expect(screen.getByText("Ethiopia Guji — Fresh From Server")).toBeInTheDocument();
+    expect(screen.queryByText("STALE MID-ROAST SNAPSHOT")).toBeNull();
+    // A real fetch to the detail endpoint genuinely happened (proving this
+    // isn't passing because the stale cache was never even present).
+    expect(detailFetchCount).toBeGreaterThan(0);
+  });
 });
