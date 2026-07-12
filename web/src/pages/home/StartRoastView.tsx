@@ -37,10 +37,19 @@
  * a guard that the MCP child is actually idle/cooled before allowing it, so
  * it can never race a genuinely hot machine); see the in-line note at the
  * stale-session branch below and #523's tracking issue for the gap.
- * (4) on a successful start, `navigate("/live")` fires
- * unconditionally once the POST is proven (201) — never gated on the health
- * refetch actually confirming the new run, since `LivePage` itself (`/live`'s
- * idle state) owns the resilient confirm-with-retry + fallback flow.
+ * (4) on a successful start, `navigate("/live")` fires unconditionally once
+ * the POST is proven (201) — never gated on a health refetch here. The
+ * guarantee chain is: the server COMMITS the run (writes it, on the same
+ * store connection the 201 response depends on) BEFORE it ever returns the
+ * 201, so by the time this handler navigates, the run is already durably
+ * active server-side; `/live` then reads health via `useFreshHealthGate`,
+ * which forces a genuinely fresh fetch on arrival (not a cached read) — so
+ * that arrival read is guaranteed current, no retry loop needed. Worst case
+ * (a persistent `/health` failure on arrival) resolves to `/live`'s own
+ * `LiveStatusUnknownView`, never a bare/stranding state (#523). `/live` has
+ * no start-form or confirm-retry machinery of its own any more — `LiveStartView`
+ * (the pre-#523 idle-state form + retry loop this comment used to describe)
+ * was deleted outright; `/start` is the sole start-form surface.
  */
 
 import { useCallback } from "react";
@@ -109,8 +118,11 @@ export function StartRoastView(): React.JSX.Element {
   // unconditionally, never gated on a health refetch that can itself fail
   // (#513: `refetchQueries` always resolves even when the underlying fetch
   // failed, so awaiting it before navigating left the operator on this form
-  // with no error and no path to the dashboard). `/live`'s idle state owns
-  // confirming the new run against `/health` with retries + a manual fallback.
+  // with no error and no path to the dashboard). Nothing further to confirm
+  // HERE: the server commits the run before it responds 201, and `/live`'s
+  // own arrival read (`useFreshHealthGate`, forced-fresh, not cached) is
+  // what actually confirms it — see the module doc for the full guarantee
+  // chain and the worst-case (persistent health failure) fallback.
   const handleStartRoast = useCallback(
     async (profile: RoastProfile) => {
       await api.startRoast(profile);

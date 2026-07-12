@@ -87,6 +87,44 @@ async function fetchTerminalOutcome(
   }
 }
 
+/**
+ * The history-detail-verification effect's own fetch outcome (#523 Codex
+ * follow-up on #532, round 3) — DISTINCT from `fetchTerminalOutcome`'s
+ * collapsed `string | null`, which cannot tell "genuinely succeeded with a
+ * null outcome" apart from "the fetch itself failed". That collapse is fine
+ * for the session-sticky path (a failure there safely no-ops, #523) but not
+ * here: whether to fail OPEN or fail CLOSED depends on whether a cache entry
+ * existed BEFORE this fetch, which requires knowing success vs failure
+ * unambiguously, plus that pre-fetch cache state.
+ */
+interface HistoryDetailFetchResult {
+  /** Whether the network fetch itself succeeded (not the run's outcome). */
+  succeeded: boolean;
+  /** Whether `roastKeys.detail(runId)` already had a cache entry BEFORE this
+   *  fetch ran — the signal for whether failing open would risk rendering
+   *  stale data (a cache entry existed) vs. having nothing to mislead with
+   *  (no cache entry, `LiveFinishedView`'s own `useRoast` gets a clean shot). */
+  hadCachedDetailBeforeFetch: boolean;
+}
+
+async function fetchHistoryRunDetail(
+  queryClient: QueryClient,
+  runId: string,
+): Promise<HistoryDetailFetchResult> {
+  const hadCachedDetailBeforeFetch =
+    queryClient.getQueryData(roastKeys.detail(runId)) !== undefined;
+  try {
+    await queryClient.fetchQuery({
+      queryKey: roastKeys.detail(runId),
+      queryFn: () => api.roast(runId),
+      staleTime: 0,
+    });
+    return { succeeded: true, hadCachedDetailBeforeFetch };
+  } catch {
+    return { succeeded: false, hadCachedDetailBeforeFetch };
+  }
+}
+
 export function LivePage(): React.JSX.Element {
   // #513 Codex follow-up: `useHealth()`'s shared 30s `staleTime` means a
   // remount within that window would render a CACHED `active_run_id` with
@@ -181,6 +219,13 @@ export function LivePage(): React.JSX.Element {
   // above, which can surface a different id here).
   const [freshHistoryRunId, setFreshHistoryRunId] = useState<string | null>(null);
   const [historyDetailPending, setHistoryDetailPending] = useState(false);
+  // #523 Codex follow-up on #532, round 3: refines the fail-open design
+  // below. Set when the verification fetch FAILED for an id that already
+  // had a cached detail entry (so failing open would risk rendering STALE
+  // data under a "verified" flag) — routes to `LiveHistoryUnknownView`
+  // instead of the summary. Cleared on any successful verification.
+  const [historyDetailFetchFailedWithStaleCache, setHistoryDetailFetchFailedWithStaleCache] =
+    useState(false);
 
   useEffect(() => {
     if (
@@ -208,18 +253,48 @@ export function LivePage(): React.JSX.Element {
     }
     let cancelled = false;
     setHistoryDetailPending(true);
-    // FAIL OPEN, deliberately: `fetchTerminalOutcome` already catches its own
-    // network errors internally and resolves `null` rather than rejecting
-    // (see its doc) — this `.then()` always runs, whether the underlying
-    // fetch succeeded or failed. On a genuine failure the query cache for
-    // this id was never freshly populated, so `LiveFinishedView`'s own
-    // `useRoast(runId)` falls back to running its OWN independent fetch
-    // (default staleTime, no override) — a second, later chance to succeed —
-    // rather than this page holding the idle state open forever on a single
-    // transient error. Mirrors `fetchTerminalOutcome`'s own "never block the
-    // session-sticky path indefinitely on a network blip" design.
-    void fetchTerminalOutcome(queryClient, lastCompletedRunId).then(() => {
+    // Reset the round-3 failure flag as soon as a NEW attempt starts (rather
+    // than only on that attempt's own success) — otherwise a stale `true`
+    // from a PREVIOUS (now-superseded) id would incorrectly route this
+    // brand-new id to the history-error state before its own fetch has even
+    // resolved, since the render-time checks below only gate on
+    // `historyDetailPending`/`freshHistoryRunId`, not on which id the flag
+    // was set for.
+    setHistoryDetailFetchFailedWithStaleCache(false);
+    // #523 Codex follow-up on #532, round 3: refreshing DETAIL alone is not
+    // enough — `LiveFinishedView`'s headline stats and mini curve come from
+    // `useTelemetry(runId, 1)` / `useTelemetry(runId, 5)`, which share the
+    // app's default 30s `staleTime`. A same-session telemetry cache entry
+    // for this exact run id (e.g. from an earlier open dashboard/detail view
+    // in this session) can still be within that window, so a freshly-
+    // verified DETAIL could render alongside a STALE curve/stats. Invalidate
+    // BOTH telemetry variants for this id alongside the detail fetch — a
+    // prefix match on `["roasts", runId, "telemetry"]` catches both the
+    // downsample=1 (stats) and downsample=5 (curve) keys in one call.
+    void Promise.all([
+      fetchHistoryRunDetail(queryClient, lastCompletedRunId),
+      queryClient.invalidateQueries({
+        queryKey: ["roasts", lastCompletedRunId, "telemetry"],
+      }),
+    ]).then(([detailResult]) => {
       if (cancelled) return;
+      // #523 Codex follow-up on #532, round 3: fail OPEN only when there is
+      // NOTHING TO MISLEAD WITH — no cached detail existed before this
+      // fetch, so `LiveFinishedView`'s own `useRoast` starts from a clean
+      // slate and gets an independent shot at succeeding (mirrors
+      // `fetchTerminalOutcome`'s "never block the session-sticky path
+      // indefinitely on one network blip" design). But if a CACHED detail
+      // ALREADY existed and this forced refresh FAILED, failing open would
+      // render that potentially-stale data under a "verified" flag — worse
+      // than the neutral history-error state, since it looks trustworthy
+      // when it might not be. Route that specific case to
+      // `LiveHistoryUnknownView` instead.
+      if (!detailResult.succeeded && detailResult.hadCachedDetailBeforeFetch) {
+        setHistoryDetailFetchFailedWithStaleCache(true);
+        setHistoryDetailPending(false);
+        return;
+      }
+      setHistoryDetailFetchFailedWithStaleCache(false);
       setFreshHistoryRunId(lastCompletedRunId);
       setHistoryDetailPending(false);
     });
@@ -312,22 +387,51 @@ export function LivePage(): React.JSX.Element {
   // #523 Codex follow-up on #532, round 2: before trusting a HISTORY-derived
   // id (never the session-sticky one, which is already fetched fresh by
   // construction — see the effect above), hold while its detail snapshot is
-  // being fetched fresh, and require it to have actually been VERIFIED for
-  // THIS exact id (not a stale `freshHistoryRunId` left over from a
-  // previously-verified, now-superseded id). Composes with the transition
-  // hold above: `lastCompletedRunId` and `freshHistoryRunId` only matter once
-  // the process has settled past the active-run/transition/history-error/
-  // history-staleness gates already checked.
+  // being fetched fresh, and require it to have actually SETTLED for THIS
+  // exact id — either verified fresh (`freshHistoryRunId === lastCompletedRunId`)
+  // OR failed-with-a-stale-cache (`historyDetailFetchFailedWithStaleCache`,
+  // #523 round 3 — that failure is itself a settled, terminal state for this
+  // id; it must fall through to the round-3 branch below, not hold forever
+  // waiting for `freshHistoryRunId` to update, which it deliberately never
+  // does on that path). Composes with the transition hold above:
+  // `lastCompletedRunId` and these two flags only matter once the process has
+  // settled past the active-run/transition/history-error/history-staleness
+  // gates already checked.
   if (
     stickyCompletedRunId === null &&
     lastCompletedRunId !== null &&
-    (historyDetailPending || freshHistoryRunId !== lastCompletedRunId)
+    historyDetailPending
   ) {
     return (
       <AppFrame>
         <div data-testid="live-page-loading" />
       </AppFrame>
     );
+  }
+  if (
+    stickyCompletedRunId === null &&
+    lastCompletedRunId !== null &&
+    freshHistoryRunId !== lastCompletedRunId &&
+    !historyDetailFetchFailedWithStaleCache
+  ) {
+    return (
+      <AppFrame>
+        <div data-testid="live-page-loading" />
+      </AppFrame>
+    );
+  }
+
+  // #523 Codex follow-up on #532, round 3: the verification fetch above
+  // SETTLED (we're past the hold) but failed AND a stale cached detail
+  // already existed for this id — failing open here would render that
+  // potentially-stale data under a "verified" flag, which is worse than the
+  // neutral history-error state (it looks trustworthy when it might not be).
+  // Route to the same `LiveHistoryUnknownView` the history-list read-failure
+  // case uses. Does NOT apply to the session-sticky path (that state is only
+  // ever set by the history-derived effect) or when no cache existed before
+  // the fetch (that case fails open via `freshHistoryRunId` above instead).
+  if (stickyCompletedRunId === null && historyDetailFetchFailedWithStaleCache) {
+    return <LiveHistoryUnknownView />;
   }
 
   const summaryRunId = stickyCompletedRunId ?? lastCompletedRunId;
