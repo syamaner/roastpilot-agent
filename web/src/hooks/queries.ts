@@ -14,7 +14,7 @@ import {
 } from "@tanstack/react-query";
 
 import { api } from "@/lib/api";
-import type { BeanProfileInput } from "@/lib/types";
+import type { BeanProfileInput, TastingEntryRequest } from "@/lib/types";
 
 export const roastKeys = {
   health: ["health"] as const,
@@ -23,6 +23,7 @@ export const roastKeys = {
   timeline: (runId: string) => ["roasts", runId, "timeline"] as const,
   telemetry: (runId: string, downsample: number) =>
     ["roasts", runId, "telemetry", downsample] as const,
+  tastings: (runId: string) => ["roasts", runId, "tastings"] as const,
 };
 
 /** Query keys for the config surface (#419, D78). */
@@ -110,6 +111,28 @@ export function useTelemetry(runId: string | null, downsample = 1) {
   return useQuery({
     queryKey: roastKeys.telemetry(runId ?? "", downsample),
     queryFn: runId === null ? skipToken : () => api.telemetry(runId, downsample),
+  });
+}
+
+/** The run's tasting entries (#522, D91), oldest first. */
+export function useTastings(runId: string | null) {
+  return useQuery({
+    queryKey: roastKeys.tastings(runId ?? ""),
+    queryFn: runId === null ? skipToken : () => api.tastings(runId),
+  });
+}
+
+/** Record a tasting entry (#522, D91); invalidates the tasting list so a
+ *  revisit entry appears without a manual refetch. Renders server truth,
+ *  not local optimistic state — the same pattern as `RoastRating`/
+ *  `RoastedWeight`. */
+export function useAddTasting(runId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (body: TastingEntryRequest) => api.addTasting(runId, body),
+    onSuccess: (list) => {
+      queryClient.setQueryData(roastKeys.tastings(runId), list);
+    },
   });
 }
 

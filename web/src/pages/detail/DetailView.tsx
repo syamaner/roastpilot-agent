@@ -32,6 +32,7 @@ import { ExportOptions } from "./ExportOptions";
 import { RoastConditions } from "./RoastConditions";
 import { RoastRating } from "./RoastRating";
 import { RoastedWeight } from "./RoastedWeight";
+import { RoastTastings } from "./RoastTastings";
 import { TitleBlock } from "./TitleBlock";
 import {
   headlineStats,
@@ -146,6 +147,7 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
             roastedWeightGrams={detail.roasted_weight_grams ?? null}
             weightLossPercent={detail.weight_loss_percent ?? null}
           />
+          <RoastTastings runId={detail.id} />
           <RoastConditions
             ambientTempC={detail.ambient_temp_c}
             ambientHumidityPct={detail.ambient_humidity_pct}

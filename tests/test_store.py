@@ -14,7 +14,8 @@ from roastpilot_agent import store as store_module
 from roastpilot_agent.store import MIGRATIONS, RoastStore
 
 # The full migrated table set: the nine v1 tables plus the additive
-# ``bean_profiles`` table from the v4 migration (#303).
+# ``bean_profiles`` table from the v4 migration (#303) and the additive
+# ``roast_tastings`` table from the v11 migration (#522).
 EXPECTED_TABLES = {
     "roast_runs",
     "roast_events",
@@ -26,6 +27,7 @@ EXPECTED_TABLES = {
     "sync_jobs",
     "reference_roasts",
     "bean_profiles",
+    "roast_tastings",
 }
 
 EXPECTED_INDEXES = {
@@ -36,6 +38,7 @@ EXPECTED_INDEXES = {
     "idx_command_run_tick",
     "idx_roast_runs_sync_status",
     "idx_bean_profiles_archived",
+    "idx_roast_tastings_run",
 }
 
 
@@ -49,7 +52,8 @@ async def fetch_names(store: RoastStore, kind: str) -> set[str]:
 
 @pytest.mark.asyncio
 async def test_migrations_create_all_expected_tables(tmp_store: RoastStore) -> None:
-    """The nine v1 tables plus the additive v4 ``bean_profiles`` table (#303)."""
+    """The nine v1 tables plus the additive v4 ``bean_profiles`` (#303) and
+    v11 ``roast_tastings`` (#522) tables."""
     await tmp_store.initialize()
     try:
         assert await fetch_names(tmp_store, "table") == EXPECTED_TABLES
@@ -325,11 +329,11 @@ async def test_v10_migration_adds_explicit_ambient_captured_latch_back_compat(
 
 
 @pytest.mark.asyncio
-async def test_fresh_store_is_v10(tmp_store: RoastStore) -> None:
-    """A brand-new store lands on the current (v10) schema version."""
+async def test_fresh_store_is_v11(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v11) schema version."""
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 10 == len(MIGRATIONS)
+        assert await tmp_store.schema_version() == 11 == len(MIGRATIONS)
     finally:
         await tmp_store.close()
 
@@ -1356,6 +1360,157 @@ async def test_set_roasted_weight_on_active_run_raises(tmp_store: RoastStore) ->
             await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=221.0)
     finally:
         await tmp_store.close()
+
+
+# --- tastings (#522, D91) ---
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_stars_and_notes_only_is_valid(tmp_store: RoastStore) -> None:
+    """#522: entry friction stays near zero — stars + notes alone, with every
+    other field omitted, must persist and read back cleanly."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        tasting = await tmp_store.add_tasting("run-1", stars=4, notes="good body")
+        assert tasting.stars == 4
+        assert tasting.notes == "good body"
+        assert tasting.tasted_at_utc is None
+        assert tasting.brew_method is None
+        assert tasting.grind_note is None
+        assert tasting.attributes == []
+        assert tasting.defects == []
+        assert tasting.recorded_at_utc  # stamped by the store
+
+        tastings = await tmp_store.list_tastings("run-1")
+        assert len(tastings) == 1
+        assert tastings[0].id == tasting.id
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_persists_every_optional_field(tmp_store: RoastStore) -> None:
+    """#522: brew context + controlled attribute vocabulary round-trip exactly."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        tasting = await tmp_store.add_tasting(
+            "run-1",
+            stars=3,
+            notes="flat immediately after roasting",
+            tasted_at_utc="2026-07-12T18:00:00+00:00",
+            brew_method="pour_over",
+            grind_note="medium-fine, 22g/380g",
+            attributes=["sweetness"],
+            defects=["flat"],
+        )
+        assert tasting.tasted_at_utc == "2026-07-12T18:00:00+00:00"
+        assert tasting.brew_method == "pour_over"
+        assert tasting.grind_note == "medium-fine, 22g/380g"
+        assert tasting.attributes == ["sweetness"]
+        assert tasting.defects == ["flat"]
+
+        [reread] = await tmp_store.list_tastings("run-1")
+        assert reread == tasting
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_revisit_appends_not_overwrites(tmp_store: RoastStore) -> None:
+    """#522, D91: the roast-13 "flat -> grassy" refinement shape — a second
+    tasting is an ADDITIONAL row, never an overwrite of the first."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        first = await tmp_store.add_tasting("run-1", stars=2, defects=["flat"])
+        second = await tmp_store.add_tasting("run-1", stars=4, defects=["grassy"])
+
+        tastings = await tmp_store.list_tastings("run-1")
+        assert [t.id for t in tastings] == [first.id, second.id]  # oldest first
+        assert tastings[0].defects == ["flat"]
+        assert tastings[1].defects == ["grassy"]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_on_unknown_run_raises(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no completed roast_run"):
+            await tmp_store.add_tasting("ghost-run", stars=5)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_on_active_run_raises(tmp_store: RoastStore) -> None:
+    """#522: completed-only, like the rating and roasted weight — an
+    in-progress run cannot be tasted (there is nothing to taste yet)."""
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no completed roast_run"):
+            await tmp_store.add_tasting("run-1", stars=5)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_tastings_empty_for_untasted_run(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        assert await tmp_store.list_tastings("run-1") == []
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_v11_tastings_table_is_a_pure_addition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#522: like V4's bean_profiles, V11 touches no existing table or row —
+    upgrading a pre-v11 store with data preserves it untouched, and the new
+    table starts empty."""
+    pre_v11 = MIGRATIONS[:10]  # V1..V10 (before roast_tastings)
+    assert len(pre_v11) == 10
+    db_path = tmp_path / "v11upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", pre_v11)
+    old = RoastStore(db_path=db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 10
+        await seeded_store(old)
+        await old.complete_run(run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path=db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == len(MIGRATIONS)
+        # Pre-existing run untouched by the additive migration.
+        detail = await upgraded.read_run("run-1")
+        assert detail is not None
+        assert detail.outcome == "completed"
+        # The new table exists and starts empty for that pre-existing run.
+        assert await upgraded.list_tastings("run-1") == []
+        # And it accepts a fresh write post-upgrade.
+        await upgraded.add_tasting("run-1", stars=5)
+        assert len(await upgraded.list_tastings("run-1")) == 1
+    finally:
+        await upgraded.close()
 
 
 @pytest.mark.asyncio

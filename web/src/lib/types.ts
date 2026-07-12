@@ -528,6 +528,56 @@ export interface RoastedWeightRequest {
   roasted_weight_grams: number;
 }
 
+// --- Tastings (models.RoastTasting / TastingEntryRequest / TastingList, #522, D91) ---
+
+export type BrewMethod =
+  | "espresso"
+  | "pour_over"
+  | "french_press"
+  | "aeropress"
+  | "moka_pot"
+  | "drip"
+  | "cupping"
+  | "other";
+
+/** Positive attribute tags (D91 §4). */
+export type TastingAttribute = "sweetness" | "acidity" | "body";
+
+/** Defect tags (D91 §4) — the roast-13 "flat -> grassy" refinement signal. */
+export type TastingDefect = "grassy" | "baked" | "bitter" | "flat";
+
+/** `POST /api/roasts/{id}/tastings` body. Every field beyond `stars` is
+ *  optional — stars alone is a valid tasting entry. Always appends a NEW
+ *  entry; a revisit tasting is never an overwrite. */
+export interface TastingEntryRequest {
+  stars: 1 | 2 | 3 | 4 | 5;
+  notes?: string | null;
+  tasted_at_utc?: string | null;
+  brew_method?: BrewMethod | null;
+  grind_note?: string | null;
+  attributes?: TastingAttribute[];
+  defects?: TastingDefect[];
+}
+
+/** One persisted tasting entry. */
+export interface RoastTasting {
+  id: number;
+  tasted_at_utc: string | null;
+  recorded_at_utc: string;
+  stars: number;
+  notes: string | null;
+  brew_method: BrewMethod | null;
+  grind_note: string | null;
+  attributes: TastingAttribute[];
+  defects: TastingDefect[];
+}
+
+/** `GET /api/roasts/{id}/tastings` and the POST response envelope. */
+export interface TastingList {
+  run_id: string;
+  tastings: RoastTasting[];
+}
+
 // --- Health (models.HealthResponse) ---
 
 export type MCPChildStatus = "running" | "stopped" | "not_configured";

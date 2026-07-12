@@ -1144,6 +1144,88 @@ class RoastedWeightRequest(BaseModel):
     roasted_weight_grams: float = Field(gt=0)
 
 
+# --- #522 (D91): structured tasting entries ---
+#
+# The E14 corpus starts now: every roast without a tasting is a lost label.
+# Constrained ``Literal`` vocabularies (matching ``BeanSpecies`` /
+# ``ProcessingMethod`` above), deliberately NOT ``models.py`` ``Enum``s — tasting
+# attributes are not safety-bearing, and an enum here would trip the
+# safety-reviewer escalation for no reason. ``"other"`` is the escape hatch on
+# ``BrewMethod`` so the value stays a closed set.
+BrewMethod = Literal[
+    "espresso", "pour_over", "french_press", "aeropress", "moka_pot", "drip", "cupping", "other"
+]
+
+#: Positive attribute tags (sweetness/acidity/body — D91 §4). A tasting may tag
+#: zero or more; free-text nuance still lives in ``notes``.
+TastingAttribute = Literal["sweetness", "acidity", "body"]
+
+#: Defect tags (D91 §4) — the roast-13 "flat → grassy" refinement is exactly the
+#: signal this vocabulary makes computable for E14's synthesis.
+TastingDefect = Literal["grassy", "baked", "bitter", "flat"]
+
+
+def _empty_attributes() -> list[TastingAttribute]:
+    """Typed default factory for the optional attribute-tag list fields below
+    (mirrors ``_empty_actions`` — keeps pyright strict from inferring
+    ``list[Unknown]`` off the bare ``list`` builtin)."""
+    return []
+
+
+def _empty_defects() -> list[TastingDefect]:
+    """Typed default factory for the optional defect-tag list fields below."""
+    return []
+
+
+class TastingEntryRequest(BaseModel):
+    """``POST /api/roasts/{id}/tastings`` body (#522, D91).
+
+    A revisit tasting (e.g. the roast-13 same-evening-vs-hours-later
+    refinement) is submitted as an ADDITIONAL entry, never an overwrite — the
+    endpoint always inserts a new ``roast_tastings`` row. Every field beyond
+    ``stars`` is optional so entry friction stays near zero (the operator rates
+    from the phone post-tasting): stars + notes alone is still a valid tasting.
+    """
+
+    stars: Literal[1, 2, 3, 4, 5]
+    notes: str | None = None
+    tasted_at_utc: str | None = None
+    """UTC ISO-8601 timestamp of this tasting, distinct from ``recorded_at_utc``
+    (when the entry was saved) — the degassing offset (roast 13's same-evening
+    "flat" vs. hours-later "grassy") is a real confound, so the roast-relative
+    freshness must be computable from the tasting instant, not the save instant.
+    ``None`` when the operator does not supply one; the server does NOT default
+    it to "now" (see :meth:`RoastStore.add_tasting`) so an unset value stays
+    honestly unknown rather than silently wrong."""
+    brew_method: BrewMethod | None = None
+    grind_note: str | None = None
+    attributes: list[TastingAttribute] = Field(default_factory=_empty_attributes)
+    defects: list[TastingDefect] = Field(default_factory=_empty_defects)
+
+
+class RoastTasting(BaseModel):
+    """One persisted tasting entry (#522, D91 — ``roast_tastings`` row)."""
+
+    id: int
+    tasted_at_utc: str | None = None
+    recorded_at_utc: str
+    stars: int
+    notes: str | None = None
+    brew_method: BrewMethod | None = None
+    grind_note: str | None = None
+    attributes: list[TastingAttribute] = Field(default_factory=_empty_attributes)
+    defects: list[TastingDefect] = Field(default_factory=_empty_defects)
+
+
+class TastingList(BaseModel):
+    """``GET /api/roasts/{id}/tastings`` envelope (#522) — every tasting entry
+    for the run, oldest first (the natural revisit order: first taste, then any
+    later refinement)."""
+
+    run_id: str
+    tastings: list[RoastTasting]
+
+
 # --- E7-S2: operator action queue (component plan §6) ---
 
 

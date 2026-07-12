@@ -89,6 +89,8 @@ from roastpilot_agent.models import (
     RoastTimeline,
     SseEvent,
     SseEventType,
+    TastingEntryRequest,
+    TastingList,
     TelemetryEventData,
     TelemetrySeries,
     recording_origin_slug,
@@ -2010,6 +2012,43 @@ class RoastService:
             raise RuntimeError(f"read_run returned None for weighed run {run_id}")
         return weighed
 
+    async def add_tasting(self, run_id: str, request: TastingEntryRequest) -> TastingList:
+        """Record one tasting entry (#522, D91), or 404/409.
+
+        Mirrors :meth:`rate`: 404 when the run is unknown; 409 when it is still
+        in progress — a tasting is the same completed-only lifecycle as the
+        rating/roasted-weight, so the in-progress case surfaces as a conflict
+        rather than a 500. Unlike :meth:`rate`, this ALWAYS appends a new row
+        (multiple tastings per run is the point — a revisit tasting is an
+        additional entry, never an overwrite), so the response is the full
+        updated :class:`TastingList`, not a single entry.
+        """
+        detail = await self._store.read_run(run_id)
+        if detail is None:
+            raise RoastRunNotFoundError(run_id)
+        if detail.completed_at_utc is None:
+            raise RoastRunConflictError(
+                f"run {run_id} is still in progress; taste it after completion"
+            )
+        await self._store.add_tasting(
+            run_id,
+            stars=request.stars,
+            notes=request.notes,
+            tasted_at_utc=request.tasted_at_utc,
+            brew_method=request.brew_method,
+            grind_note=request.grind_note,
+            attributes=request.attributes,
+            defects=request.defects,
+        )
+        return await self.list_tastings(run_id)
+
+    async def list_tastings(self, run_id: str) -> TastingList:
+        """The run's tasting entries, oldest first (#522), or 404 when unknown."""
+        detail = await self._store.read_run(run_id)
+        if detail is None:
+            raise RoastRunNotFoundError(run_id)
+        return TastingList(run_id=run_id, tastings=await self._store.list_tastings(run_id))
+
     async def submit_operator_action(
         self, run_id: str, request: OperatorActionRequest
     ) -> OperatorActionResult:
@@ -2256,6 +2295,28 @@ async def set_roasted_weight(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RoastRunConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+async def add_tasting(
+    run_id: str,
+    request: TastingEntryRequest,
+    service: ServiceDep,
+) -> TastingList:
+    """``POST /api/roasts/{run_id}/tastings`` — record a tasting entry (#522, D91)."""
+    try:
+        return await service.add_tasting(run_id, request)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+async def list_tastings(run_id: str, service: ServiceDep) -> TastingList:
+    """``GET /api/roasts/{run_id}/tastings`` — the run's tasting entries (#522)."""
+    try:
+        return await service.list_tastings(run_id)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 async def submit_operator_action(
@@ -2717,6 +2778,8 @@ def create_app(
     app.get("/api/roasts/{run_id}/log/{artifact}")(download_log)
     app.post("/api/roasts/{run_id}/rating")(rate_roast)
     app.post("/api/roasts/{run_id}/roasted-weight")(set_roasted_weight)
+    app.post("/api/roasts/{run_id}/tastings", status_code=201)(add_tasting)
+    app.get("/api/roasts/{run_id}/tastings")(list_tastings)
     app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)
     app.get("/api/bean-profiles")(list_bean_profiles)
     app.post("/api/bean-profiles", status_code=201)(create_bean_profile)

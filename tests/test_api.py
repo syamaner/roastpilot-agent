@@ -843,6 +843,165 @@ async def test_set_roasted_weight_rejects_over_charge(
     assert response.status_code == 409
 
 
+# --- tastings (#522, D91) ---
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_stars_and_notes_only(client: AsyncClient, store: RoastStore) -> None:
+    """#522: entry friction stays near zero — stars alone (no notes, no other
+    field) is a valid POST body."""
+    await store.create_run(
+        run_id="run-t", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-t", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post("/api/roasts/run-t/tastings", json={"stars": 4})
+    assert response.status_code == 201
+    body = response.json()
+    assert body["run_id"] == "run-t"
+    assert len(body["tastings"]) == 1
+    tasting = body["tastings"][0]
+    assert tasting["stars"] == 4
+    assert tasting["notes"] is None
+    assert tasting["tasted_at_utc"] is None
+    assert tasting["brew_method"] is None
+    assert tasting["attributes"] == []
+    assert tasting["defects"] == []
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_full_payload(client: AsyncClient, store: RoastStore) -> None:
+    await store.create_run(
+        run_id="run-full", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(
+        run_id="run-full", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    response = await client.post(
+        "/api/roasts/run-full/tastings",
+        json={
+            "stars": 5,
+            "notes": "sweet, clean",
+            "tasted_at_utc": "2026-07-12T20:00:00+00:00",
+            "brew_method": "aeropress",
+            "grind_note": "fine",
+            "attributes": ["sweetness", "body"],
+            "defects": [],
+        },
+    )
+    assert response.status_code == 201
+    tasting = response.json()["tastings"][0]
+    assert tasting["tasted_at_utc"] == "2026-07-12T20:00:00+00:00"
+    assert tasting["brew_method"] == "aeropress"
+    assert tasting["grind_note"] == "fine"
+    assert tasting["attributes"] == ["sweetness", "body"]
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_revisit_appends(client: AsyncClient, store: RoastStore) -> None:
+    """#522, D91: a second POST is an ADDITIONAL tasting, not an overwrite —
+    the roast-13 "flat -> grassy" refinement shape."""
+    await store.create_run(
+        run_id="run-revisit",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-revisit", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    await client.post("/api/roasts/run-revisit/tastings", json={"stars": 2, "defects": ["flat"]})
+    response = await client.post(
+        "/api/roasts/run-revisit/tastings", json={"stars": 4, "defects": ["grassy"]}
+    )
+    assert response.status_code == 201
+    tastings = response.json()["tastings"]
+    assert len(tastings) == 2
+    assert tastings[0]["defects"] == ["flat"]
+    assert tastings[1]["defects"] == ["grassy"]
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_in_progress_run_conflicts(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="run-tip", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.DEVELOPMENT
+    )
+    response = await client.post("/api/roasts/run-tip/tastings", json={"stars": 3})
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_unknown_run_404(client: AsyncClient) -> None:
+    response = await client.post("/api/roasts/nope/tastings", json={"stars": 3})
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_rejects_out_of_range_stars(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="run-tb", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-tb", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post("/api/roasts/run-tb/tastings", json={"stars": 0})
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_rejects_unknown_brew_method(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#522: brew method is a closed controlled vocabulary — an arbitrary
+    string is rejected, not silently accepted as free text."""
+    await store.create_run(
+        run_id="run-tbm", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-tbm", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post(
+        "/api/roasts/run-tbm/tastings", json={"stars": 3, "brew_method": "instant"}
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_list_tastings_empty_for_untasted_completed_run(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="run-empty", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(
+        run_id="run-empty", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    response = await client.get("/api/roasts/run-empty/tastings")
+    assert response.status_code == 200
+    assert response.json() == {"run_id": "run-empty", "tastings": []}
+
+
+@pytest.mark.asyncio
+async def test_list_tastings_unknown_run_404(client: AsyncClient) -> None:
+    response = await client.get("/api/roasts/nope/tastings")
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_list_tastings_reflects_active_run(client: AsyncClient, store: RoastStore) -> None:
+    """GET is not completed-only — reading the (empty) tasting list for an
+    in-progress run is harmless and useful for the detail page to render
+    before the roast finishes."""
+    await store.create_run(
+        run_id="run-active",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.DEVELOPMENT,
+    )
+    response = await client.get("/api/roasts/run-active/tastings")
+    assert response.status_code == 200
+    assert response.json() == {"run_id": "run-active", "tastings": []}
+
+
 # --- operator action queue (E7-S2) ---
 
 

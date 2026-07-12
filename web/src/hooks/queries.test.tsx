@@ -6,9 +6,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
 import {
   roastKeys,
+  useAddTasting,
   useFreshHealthGate,
   useHistory,
   useRoast,
+  useTastings,
   useTelemetry,
   useTimeline,
 } from "./queries";
@@ -81,6 +83,38 @@ describe("useHistory", () => {
       .mockResolvedValue({ runs: [] } as Awaited<ReturnType<typeof api.history>>);
     renderHook(() => useHistory(), { wrapper: wrapper() });
     await waitFor(() => expect(spy).toHaveBeenCalled());
+  });
+});
+
+describe("useTastings (skipToken when runId is null) (#522)", () => {
+  it("does not fetch when runId is null", () => {
+    const spy = vi.spyOn(api, "tastings");
+    const { result } = renderHook(() => useTastings(null), { wrapper: wrapper() });
+    expect(spy).not.toHaveBeenCalled();
+    expect(result.current.fetchStatus).toBe("idle");
+  });
+
+  it("fetches the tasting list for a real id", async () => {
+    const spy = vi
+      .spyOn(api, "tastings")
+      .mockResolvedValue({ run_id: "r1", tastings: [] } as Awaited<ReturnType<typeof api.tastings>>);
+    renderHook(() => useTastings("r1"), { wrapper: wrapper() });
+    await waitFor(() => expect(spy).toHaveBeenCalledWith("r1"));
+  });
+});
+
+describe("useAddTasting (#522)", () => {
+  it("posts the entry and writes the returned list into the tasting query cache", async () => {
+    const updated = { run_id: "r1", tastings: [{ id: 1, stars: 5 }] } as Awaited<
+      ReturnType<typeof api.addTasting>
+    >;
+    vi.spyOn(api, "addTasting").mockResolvedValue(updated);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useAddTasting("r1"), { wrapper: wrapper(client) });
+
+    result.current.mutate({ stars: 5 });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(client.getQueryData(roastKeys.tastings("r1"))).toEqual(updated);
   });
 });
 
