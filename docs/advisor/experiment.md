@@ -152,13 +152,21 @@ the human) — the dev target met at a low drop, the good-roast signature. The D
 drop column also exposes the over-correction directly: v7's −33 s early drops land
 at **13.2 % DTR** — under-developed, not just imprecise.
 
-**v4 wins**, stated precisely (paired tests over the 28 roasts):
+**v4 wins**, stated precisely (paired tests over the 28 roasts, reproducible via
+[`scripts/advisor_significance.py`](../../scripts/advisor_significance.py) against
+the committed
+[`bakeoff-results-prompts-2026-06-14.json`](bakeoff-results-prompts-2026-06-14.json) —
+issue #495 closed the gap where these numbers were session-computed and not
+checked into a script):
 - **Recall win is statistically robust** — v4 calls the drop on 9 roasts v2 missed
-  and misses none v2 caught → exact **McNemar p = 0.0039**.
+  and misses none v2 caught → exact **McNemar p = 0.0039** (reproduced by the
+  script; this is the same figure the original session reported).
 - **F1 gain is real but modest** — per-roast better on 9, worse on 3, tied on 16
-  (mean Δ +0.23). The 3 regressions are one-tick-early FPs on roasts v2 already
-  nailed. Magnitude-weighted (Wilcoxon, W=6) significant; sign test borderline
-  (p=0.15). Not a clean sweep.
+  (mean Δ +0.23, reproduced). The 3 regressions are one-tick-early FPs on roasts
+  v2 already nailed. Magnitude-weighted (Wilcoxon, W=6, reproduced) significant —
+  normal-approx two-sided **p = 0.0098** (newly computed by the script; the
+  original session reported only "significant", no p-value); sign test
+  borderline (**p = 0.146**, reproduced). Not a clean sweep.
 - **Mean precision rises** (0.64 → 0.82) because v4 converts v2's *misses* into
   catches; the anticipatory heat cut holds (0.85).
 
@@ -303,6 +311,10 @@ OPENROUTER_API_KEY=sk-or-... python docs/advisor/bakeoff-run-artisan.py       # 
 OPENROUTER_API_KEY=sk-or-... python docs/advisor/bakeoff-run-prompts.py       # prompt sweep   (Phase 3)
 OPENROUTER_API_KEY=sk-or-... python docs/advisor/bakeoff-holdout-prompts.py   # held-out       (Phase 4)
 OPENROUTER_API_KEY=sk-or-... python docs/advisor/bakeoff-holdout-addendum.py  # target-sensitivity addendum (Phase 5)
+
+# Phase 3's significance claims (McNemar / Wilcoxon / sign test, §3 above), recomputed
+# from the committed artifact — no key, no network:
+python scripts/advisor_significance.py
 ```
 
 The replay + scoring + report layer is fully testable without a key via a fake

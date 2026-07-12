@@ -868,9 +868,12 @@ class AdvisorConfig(BaseModel):
     ~7.5 pp vs ~22 for gemini-3.1-flash-lite and ~31 for gemini-3-flash-preview),
     has the best heat-direction agreement (~0.78), a reliable drop (F1 ~0.86),
     live-viable latency (~2.0 s), and is the proven n8n control model (D40.4).
-    The prompt is ``c1`` (#274 / D39.1): the AS-BUILT control teaching SYSTEM
-    frame, wired live for the post-FC loop (#277) — the per-tick #275 context is
-    the user message. See ``docs/advisor/bakeoff-results-2026-06-21.md``. To run a
+    The prompt is the AS-BUILT control teaching SYSTEM frame (#274 / D39.1),
+    wired live for the post-FC loop (#277) — the per-tick #275 context is
+    the user message; see :attr:`prompt_version`'s field comment for the
+    current default and its A/B history (the #277 bake-off itself was scored
+    under ``c1``, superseded since).
+    See ``docs/advisor/bakeoff-results-2026-06-21.md``. To run a
     model on its native provider (no OpenRouter hop/markup, per D18), set
     ``provider`` + the matching ``api_key_env``. ``OPENROUTER_API_KEY`` must be
     set in the environment at runtime; ``FakeAdvisor`` stays the test/CI default.
