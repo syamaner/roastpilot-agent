@@ -856,9 +856,11 @@ def test_tasting_entry_tasted_at_none_passes_through() -> None:
 def test_tasting_entry_rejects_unparseable_tasted_at() -> None:
     """#522 Codex P2: a malformed tasted_at_utc must fail validation (422 at
     the API boundary) rather than persist verbatim and poison the exact
-    degassing-offset corpus signal #522 exists to capture."""
+    degassing-offset corpus signal #522 exists to capture. A "T" separator IS
+    present (distinct from the bare-date-rejection test below), so this
+    exercises fromisoformat's own parse failure, not the bare-date guard."""
     with pytest.raises(pydantic.ValidationError, match="tasted_at_utc"):
-        TastingEntryRequest(stars=3, tasted_at_utc="not-a-date")
+        TastingEntryRequest(stars=3, tasted_at_utc="2026-07-12Tnot-a-time")
 
 
 @pytest.mark.parametrize(
@@ -879,3 +881,32 @@ def test_tasting_entry_normalizes_tasted_at_to_utc(raw: str, expected: str) -> N
     instant regardless of what offset the operator's client happened to send."""
     request = TastingEntryRequest(stars=3, tasted_at_utc=raw)
     assert request.tasted_at_utc == expected
+
+
+def test_tasting_entry_rejects_bare_date() -> None:
+    """#522 Codex P2: a bare date parses as midnight via fromisoformat, but
+    silently inventing a midnight instant would shift the degassing offset by
+    up to 24h — reject it explicitly rather than accept an under-specified
+    instant."""
+    with pytest.raises(pydantic.ValidationError, match="time component"):
+        TastingEntryRequest(stars=3, tasted_at_utc="2026-07-13")
+
+
+def test_tasting_entry_dedupes_attributes_and_defects() -> None:
+    """#522 Codex P2: a duplicated tag is normalized away (first-occurrence
+    order preserved), not rejected — the corpus never double-counts one
+    signal from a single entry."""
+    request = TastingEntryRequest(
+        stars=4,
+        attributes=["sweetness", "acidity", "sweetness", "body"],
+        defects=["bitter", "bitter", "flat"],
+    )
+    assert request.attributes == ["sweetness", "acidity", "body"]
+    assert request.defects == ["bitter", "flat"]
+
+
+def test_tasting_entry_dedupe_is_a_noop_on_already_unique_tags() -> None:
+    """#522 Codex P2 follow-up: dedup must not reorder or drop already-unique
+    tags — a regression here would silently corrupt every ordinary entry."""
+    request = TastingEntryRequest(stars=5, attributes=["sweetness", "acidity", "body"])
+    assert request.attributes == ["sweetness", "acidity", "body"]

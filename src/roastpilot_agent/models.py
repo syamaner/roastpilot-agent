@@ -1205,12 +1205,22 @@ class TastingEntryRequest(BaseModel):
     brew_method: BrewMethod | None = None
     grind_note: str | None = None
     attributes: list[TastingAttribute] = Field(default_factory=_empty_attributes)
+    """Positive attribute tags. Deduplicated on validation, preserving
+    first-occurrence order (see :func:`_dedupe_tags`) — a repeated tag is
+    friendlier normalized away than rejected, and the corpus never
+    double-counts the same signal from one entry."""
     defects: list[TastingDefect] = Field(default_factory=_empty_defects)
+    """Defect tags, deduplicated the same way as :attr:`attributes`."""
 
     @field_validator("tasted_at_utc")
     @classmethod
     def _validate_tasted_at(cls, value: str | None) -> str | None:
         return _normalize_tasted_at(value)
+
+    @field_validator("attributes", "defects")
+    @classmethod
+    def _dedupe(cls, value: list[str]) -> list[str]:
+        return _dedupe_tags(value)
 
 
 def _normalize_tasted_at(value: str | None) -> str | None:
@@ -1232,19 +1242,56 @@ def _normalize_tasted_at(value: str | None) -> str | None:
         ``None``.
 
     Raises:
-        ValueError: ``value`` is not a parseable ISO-8601 datetime — Pydantic
-            turns this into a 422 at the API boundary, so a malformed instant
-            is rejected rather than persisted as-is and silently poisoning the
+        ValueError: ``value`` is not a parseable ISO-8601 datetime, or is a
+            bare date with no time component — Pydantic turns this into a 422
+            at the API boundary, so a malformed or under-specified instant is
+            rejected rather than persisted as-is and silently poisoning the
             degassing-offset corpus label this field exists to capture.
     """
     if value is None:
         return None
+    # A bare date ("2026-07-13", no "T" separator) is technically a valid
+    # ISO-8601 *date*, and datetime.fromisoformat happily parses it as
+    # midnight — but a silently-invented midnight would shift the degassing
+    # offset by up to 24 hours. Reject it explicitly rather than accept a
+    # value the operator's client never intended as an exact instant; every
+    # real instant carries a "T" time separator (the FE always sends one).
+    if "T" not in value:
+        raise ValueError(
+            f"tasted_at_utc must include a time component (e.g. "
+            f"'2026-07-13T18:00:00'), not a bare date: {value!r}"
+        )
     try:
         parsed = datetime.fromisoformat(value)
     except ValueError as exc:
         raise ValueError(f"tasted_at_utc is not a valid ISO-8601 datetime: {value!r}") from exc
     parsed = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
     return parsed.isoformat()
+
+
+def _dedupe_tags(values: list[str]) -> list[str]:
+    """Deduplicate a tag list, preserving first-occurrence order (#522).
+
+    A repeated tag (e.g. an accidental double-tap on a toggle button) is
+    normalized away here rather than rejected — friendlier for the operator,
+    and it keeps the corpus from double-counting the same signal within one
+    tasting entry.
+
+    Args:
+        values: The raw tag list (``TastingAttribute`` or ``TastingDefect``
+            values, typed as ``str`` here since the validator runs identically
+            over either field).
+
+    Returns:
+        The same values with duplicates removed, in first-occurrence order.
+    """
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            deduped.append(value)
+    return deduped
 
 
 class RoastTasting(BaseModel):

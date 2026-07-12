@@ -2022,6 +2022,16 @@ class RoastService:
         (multiple tastings per run is the point — a revisit tasting is an
         additional entry, never an overwrite), so the response is the full
         updated :class:`TastingList`, not a single entry.
+
+        A ``tasted_at_utc`` earlier than the run's ``completed_at_utc`` is
+        physically impossible (the beans cannot be tasted before the roast
+        that produced them finished) and would yield a NEGATIVE degassing
+        offset — a nonsense corpus label — so it is rejected as a 409 too,
+        the same class of guard as :meth:`set_roasted_weight`'s
+        roasted-exceeds-charge check. Exactly-at-completion is accepted (a
+        tasting timestamped the instant cooling ended is not impossible, just
+        unusual, and the >= bound keeps the check simple and symmetric with
+        the rest of the completed-run comparisons in this module).
         """
         detail = await self._store.read_run(run_id)
         if detail is None:
@@ -2029,6 +2039,11 @@ class RoastService:
         if detail.completed_at_utc is None:
             raise RoastRunConflictError(
                 f"run {run_id} is still in progress; taste it after completion"
+            )
+        if request.tasted_at_utc is not None and request.tasted_at_utc < detail.completed_at_utc:
+            raise RoastRunConflictError(
+                f"tasted_at_utc {request.tasted_at_utc} is before the run completed "
+                f"at {detail.completed_at_utc} (physically impossible)"
             )
         await self._store.add_tasting(
             run_id,
