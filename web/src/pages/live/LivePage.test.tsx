@@ -1,34 +1,51 @@
 /**
- * LivePage (#403 / #423 D81): single live-roast home at /live.
+ * LivePage (#403 / #423 D81, updated #523, #532 Codex follow-up): single
+ * live-roast home at /live. NEVER a form (#523 IA) — the only start-form
+ * surface is /start.
  *
  * Branches tested:
- * 1. Loading hold  — neither the start form nor the dashboard appears until health resolves.
+ * 1. Loading hold  — neither a summary nor the dashboard appears until health
+ *    AND history (the idle path's persistent fallback) each produce a
+ *    GENUINELY FRESH read, and until any in-flight terminal-outcome fetch for
+ *    a just-finished run resolves.
  * 2. Active run    — DashboardPage; reload-safe guarantee.
- * 3. Sticky summary (#423) — active_run_id non-null → null this session → LiveFinishedView.
+ * 3. No active run, a completed run exists — LiveFinishedView, PERSISTENT
+ *    (sourced from history, survives reload):
  *    a. Gate: correct view appears after a COMPLETED transition (P2-4).
  *    b. Outcome content: stat tiles + detail link href; stats from full-res telemetry (P2-2).
- *    c. "Start next roast" clears sticky → start form.
- *    d. Reload (fresh null) → start form (sticky is session-only).
- *    e. Navigate-away / remount → sticky does NOT persist (LOW 4).
- *    f. Faulted run: active_run_id→null does NOT show finished summary (P2-4).
- * 4. No run, no sticky — LiveStartView (idle / fresh session).
- * 5. Start-roast flow (#513) — the form hides the instant the POST is proven
- *    (201), independent of health confirming; a successful confirm swaps to
- *    the dashboard; a transient api.health() failure retries and still
- *    confirms; every attempt failing shows the manual "Open live dashboard"
- *    fallback — never falls back to the bare, untouched-looking form.
- * 6. P2-3: terminal snapshot is fetched (staleTime:0) so outcome/stats come from final state.
+ *    c. "Start next roast" links to /start (never clears local state — there
+ *       is none to clear; a reload shows the same summary, #523).
+ *    d. Reload (fresh mount, no session state) → the SAME summary, sourced
+ *       from history (#523 — this is the behaviour change from the old
+ *       session-only sticky, which fell back to a start form here).
+ *    e. Faulted/aborted run: active_run_id→null does NOT show the finished
+ *       summary from the SESSION-STICKY path (P2-4) — falls through to
+ *       whatever the persistent history-derived state is (a prior completed
+ *       run, or no-roasts).
+ *    f. Transition-flash guard (#532 Codex follow-up): completing a run with
+ *       an OLDER completed run already in history must never flash that
+ *       older run's summary before the just-finished run's own gate resolves.
+ * 4. No active run, no completed run ever — LiveNoRoastsView (neutral, not a
+ *    form), linking to /start.
+ * 5. History error (#532 Codex follow-up) — a persistent history read
+ *    failure gets its OWN neutral state, never the false "no roasts ever"
+ *    claim `LiveNoRoastsView` would otherwise render.
+ * 6. History staleness (#532 Codex follow-up) — history is now gated on
+ *    `useFreshHistoryGate`, the same isSuccess≠current-class treatment health
+ *    already has, so a within-staleTime remount can't render a cached
+ *    (possibly empty or stale) history list as authoritative.
  *
- * Phase is never inferred: the only server-state read is active_run_id.
+ * Phase is never inferred: the only server-state reads are active_run_id and
+ * the roast history list (both from the server).
  */
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { RoastDetail, TelemetrySeries } from "@/lib/types";
+import type { RoastDetail, RoastHistory, TelemetrySeries } from "@/lib/types";
 import { LivePage } from "./LivePage";
 import {
   FIXTURE_FINISHED_DETAIL,
@@ -48,6 +65,16 @@ const healthState: {
   isFresh: boolean;
 } = { data: undefined, isSuccess: false, isError: false, isFresh: false };
 
+// Mutable history stub (#523, updated #532 Codex follow-up): LivePage's
+// persistent idle fallback. `isFresh` models `useFreshHistoryGate` — the same
+// pattern as `healthState.isFresh` above: false while pending OR while a
+// stale-cache read has a genuinely fresh forced refetch still in flight.
+const historyState: {
+  data: RoastHistory | undefined;
+  isError: boolean;
+  isFresh: boolean;
+} = { data: { runs: [] }, isError: false, isFresh: true };
+
 // Mutable stubs for useRoast / useTelemetry — defaulting to null/undefined so
 // gate-only tests don't see real data; the content-assertion tests override them.
 const roastState: { data: unknown } = { data: null };
@@ -58,18 +85,14 @@ const telemetryCurveState: { data: TelemetrySeries | undefined } = { data: undef
 
 vi.mock("@/hooks/queries", async () => {
   const actual = await vi.importActual<typeof import("@/hooks/queries")>("@/hooks/queries");
-  const noopMutation = () => ({ mutateAsync: vi.fn(async () => undefined) });
   return {
     ...actual,
     useFreshHealthGate: () => healthState,
-    useBeanProfiles: () => ({ data: { profiles: [] }, isLoading: false }),
+    useFreshHistoryGate: () => historyState,
     useRoast: () => roastState,
     // Return full-res stub for downsample=1 (stats), curve stub for downsample=5.
     useTelemetry: (_runId: string | null, downsample = 1) =>
       downsample === 1 ? telemetryFullState : telemetryCurveState,
-    useCreateBeanProfile: noopMutation,
-    useUpdateBeanProfile: noopMutation,
-    useDeleteBeanProfile: noopMutation,
   };
 });
 
@@ -104,46 +127,25 @@ vi.mock("@/components/shared", async () => {
   };
 });
 
-// `api.roast` is called by fetchTerminalOutcome (the outcome gate, P2-3/P2-4);
-// `api.startRoast` + `api.health` by the start-roast flow (#513: LiveStartView
-// confirms the new run directly against `api.health`, not the query cache's
-// own `refetchQueries`, which resolves even on a failed underlying fetch).
+// `api.roast` is called by fetchTerminalOutcome (the session-sticky outcome
+// gate, P2-3/P2-4) AND, as of #532 round 2, by the history-detail-freshness
+// effect for a history-derived id. Typed with the real `(runId: string) =>`
+// signature (not a zero-arg default) so `mockImplementation` calls that
+// discriminate by runId — needed once two independent call sites can invoke
+// this mock — type-check against the same signature as the actual `api.roast`.
 const roastApiMock = vi.hoisted(() =>
-  vi.fn(async (): Promise<RoastDetail> => ({
+  vi.fn(async (_runId: string): Promise<RoastDetail> => ({
     ...(FIXTURE_FINISHED_DETAIL as RoastDetail),
     outcome: "completed",
-  })),
-);
-const startRoastMock = vi.hoisted(() => vi.fn(async () => ({ id: "run-new" })));
-const healthApiMock = vi.hoisted(() =>
-  vi.fn(async () => ({
-    status: "ok" as const,
-    version: "test",
-    mcp_child: "connected" as const,
-    active_run_id: "run-new",
   })),
 );
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return {
     ...actual,
-    api: { ...actual.api, startRoast: startRoastMock, roast: roastApiMock, health: healthApiMock },
+    api: { ...actual.api, roast: roastApiMock },
   };
 });
-
-vi.mock("@/pages/dashboard/StartRoastForm", () => ({
-  StartRoastForm: ({ onStart }: { onStart: (p: unknown) => Promise<void> }) => (
-    <form
-      data-testid="start-roast-form-stub"
-      onSubmit={(e) => {
-        e.preventDefault();
-        void onStart({ name: "test", bean_origin: "Ethiopia" });
-      }}
-    >
-      <button type="submit">Start</button>
-    </form>
-  ),
-}));
 
 afterEach(cleanup);
 beforeEach(() => {
@@ -154,15 +156,12 @@ beforeEach(() => {
   // file's tests, which set isSuccess/isError explicitly right after this
   // runs); the loading-hold-specific tests below override isFresh to false.
   healthState.isFresh = true;
-  startRoastMock.mockClear();
+  historyState.data = { runs: [] };
+  historyState.isError = false;
+  // Default to a SETTLED read, mirroring healthState.isFresh's default above;
+  // the loading-hold-specific tests below override it to false.
+  historyState.isFresh = true;
   roastApiMock.mockClear();
-  healthApiMock.mockClear();
-  healthApiMock.mockImplementation(async () => ({
-    status: "ok" as const,
-    version: "test",
-    mcp_child: "connected" as const,
-    active_run_id: "run-new",
-  }));
   // Reset stubs to defaults (null data, no-op traceModel).
   roastState.data = null;
   telemetryFullState.data = undefined;
@@ -186,7 +185,7 @@ function renderPage(initialPath = "/live") {
       <MemoryRouter initialEntries={[initialPath]}>
         <Routes>
           <Route path="/live" element={children} />
-          <Route path="/" element={<div data-testid="home-landing" />} />
+          <Route path="/start" element={<div data-testid="start-landing" />} />
           <Route path="/roasts" element={<div data-testid="history-landing" />} />
           <Route path="/roasts/:runId" element={<div data-testid="detail-landing" />} />
         </Routes>
@@ -218,6 +217,26 @@ function renderPage(initialPath = "/live") {
   return { client, rerender, remount };
 }
 
+/** A minimal completed-run history row for the persistent-fallback tests. */
+function historyRunFixture(id: string, outcome: "completed" | "faulted" | "aborted") {
+  return {
+    id,
+    started_at_utc: "2026-07-01T09:00:00Z",
+    completed_at_utc: "2026-07-01T09:06:00Z",
+    first_crack_at_utc: null,
+    agent_phase: "complete" as const,
+    outcome,
+    bean_origin: "Ethiopia Guji",
+    bean_varietal: null,
+    rating: null,
+    development_percent: 15.0,
+    advisor_consults: 0,
+    advisor_clamped: 0,
+    advisor_rejected: 0,
+    advisor_failed: 0,
+  };
+}
+
 describe("LivePage — loading hold", () => {
   it("renders the loading placeholder until health resolves", () => {
     healthState.isSuccess = false;
@@ -226,16 +245,16 @@ describe("LivePage — loading hold", () => {
     renderPage();
     expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
-    expect(screen.queryByTestId("live-start-view")).toBeNull();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
   });
 
   it("#513 Codex follow-up: holds through a stale-cache remount even though isSuccess is already true", () => {
     // The exact scenario Codex found: useHealth's shared 30s staleTime lets a
     // remount render a CACHED idle snapshot with isSuccess:true while the
     // genuinely fresh forced refetch (useFreshHealthGate) is still in
-    // flight. A naive `!isSuccess` check would render the start form (or
-    // even the dashboard, if the cache happened to hold an active run) here
-    // — isFresh:false is the only signal that catches it.
+    // flight. A naive `!isSuccess` check would render the idle view (or even
+    // the dashboard, if the cache happened to hold an active run) here —
+    // isFresh:false is the only signal that catches it.
     healthState.isSuccess = true;
     healthState.isError = false;
     healthState.isFresh = false;
@@ -243,7 +262,77 @@ describe("LivePage — loading hold", () => {
     renderPage();
     expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
-    expect(screen.queryByTestId("live-start-view")).toBeNull();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
+  });
+
+  it("holds while history is not fresh, even once health is fresh and idle (#523, updated #532)", () => {
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    healthState.isFresh = true;
+    healthState.data = { active_run_id: null };
+    historyState.data = undefined;
+    historyState.isFresh = false;
+    renderPage();
+    expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
+  });
+
+  it("#532 Codex follow-up: holds through a stale-cache history remount even though history.data is already present", () => {
+    // Mirrors the health stale-cache test above: a within-staleTime remount
+    // could render a CACHED (possibly empty) history list with data already
+    // present while the genuinely fresh forced refetch (useFreshHistoryGate)
+    // is still in flight. A naive "data is present" check would render
+    // LiveNoRoastsView here from stale data — isFresh:false is the only
+    // signal that catches it.
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    healthState.isFresh = true;
+    healthState.data = { active_run_id: null };
+    historyState.data = { runs: [] }; // stale cached "no history" value
+    historyState.isFresh = false;
+    renderPage();
+    expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
+  });
+
+  it("holds through health becoming fresh-and-idle WHILE history is still not fresh — proves the history gate is independently reached, not short-circuited by the health gate having just cleared", () => {
+    // The prior two tests each exercise the loading placeholder from a STATIC
+    // initial snapshot: one where health alone is not fresh (history left at
+    // its default, never even evaluated in practice since the health check
+    // returns first), and one where health is ALREADY fresh with history not
+    // fresh. Neither proves the health→history HANDOFF actually happens
+    // within a single component instance — a refactor that accidentally
+    // collapsed the two `if`s into one combined condition (e.g. `if
+    // (!health.isFresh && !history.isFresh)`, a realistic De Morgan's slip)
+    // would still pass both of those in isolation, since each only exercises
+    // one side of a buggy AND. This test starts with BOTH conditions holding
+    // (mirroring the realistic startup case where health and history are both
+    // in-flight together), then RESOLVES health via rerender while history
+    // stays not-fresh — the loading placeholder must persist across that
+    // transition, proving the history gate is reached and evaluated on its
+    // own once health clears, not bypassed because it was "already handled"
+    // by the first render.
+    healthState.isSuccess = false;
+    healthState.isError = false;
+    healthState.isFresh = false;
+    healthState.data = undefined;
+    historyState.data = undefined;
+    historyState.isFresh = false;
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
+
+    // Health resolves fresh-and-idle; history is STILL not fresh.
+    healthState.isSuccess = true;
+    healthState.isFresh = true;
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
 });
 
@@ -253,7 +342,7 @@ describe("LivePage — active run", () => {
     healthState.data = { active_run_id: "run-42" };
     renderPage();
     expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
-    expect(screen.queryByTestId("live-start-view")).toBeNull();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
     expect(screen.queryByTestId("live-page-loading")).toBeNull();
   });
 
@@ -262,42 +351,104 @@ describe("LivePage — active run", () => {
     healthState.data = { active_run_id: "run-99" };
     renderPage();
     expect(screen.queryByTestId("live-page-loading")).toBeNull();
-    expect(screen.queryByTestId("live-start-view")).toBeNull();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
     expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
   });
 });
 
-describe("LivePage — no active run, no sticky (idle / fresh session)", () => {
-  it("shows the start-roast view when the server reports no active run and no prior run this session", () => {
+describe("LivePage — no active run, no completed run ever (#523)", () => {
+  it("shows the neutral no-roasts view, never a form, linking to /start", () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: null };
+    historyState.data = { runs: [] };
+    historyState.isFresh = true;
     renderPage();
-    expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
+    expect(screen.getByTestId("live-no-roasts-view")).toBeInTheDocument();
+    expect(screen.getByTestId("live-no-roasts-start-link")).toHaveAttribute("href", "/start");
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
     expect(screen.queryByTestId("live-page-loading")).toBeNull();
     expect(screen.queryByTestId("live-finished-view")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
   });
 
-  it("#513 medium: shows a neutral status-unknown state (NEVER the bare start form) when the health fetch errors", () => {
+  it("#513 medium: shows a neutral status-unknown state (NEVER a state implying no run) when the health fetch errors", () => {
     // Active-run status is UNKNOWN on a persistent health error (useHealth's
     // own retry:1 already rode out a single blip) — a run could genuinely be
-    // active and heating, so falling through to the bare start form would
-    // strand the operator without a path to the dashboard/e-stop, the exact
-    // hazard class this file's other tests fix. Previously this fell through
-    // to live-start-view; that was itself the bug qa's medium finding caught.
+    // active and heating, so falling through to a state implying no run is
+    // active would strand the operator without a path to the dashboard/e-stop.
     healthState.isSuccess = false;
     healthState.isError = true;
     healthState.data = undefined;
     renderPage();
     expect(screen.getByTestId("live-status-unknown")).toBeInTheDocument();
-    expect(screen.queryByTestId("live-start-view")).toBeNull();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
     expect(screen.queryByTestId("live-page-loading")).toBeNull();
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
   });
 });
 
-describe("LivePage — sticky finished-run summary (#423)", () => {
-  it("shows LiveFinishedView when active_run_id transitions non-null → null and outcome is completed (P2-4 gate)", async () => {
+describe("LivePage — persistent last-completed summary from history (#523)", () => {
+  it("shows LiveFinishedView sourced from history when idle and a completed run exists, with NO session-sticky state", async () => {
+    // #532 round 2: the history-derived id is now verified fresh
+    // (fetchTerminalOutcome, staleTime:0) before LiveFinishedView mounts —
+    // an async gate, so this assertion must wait rather than check synchronously.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: null };
+    historyState.data = { runs: [historyRunFixture(FIXTURE_FINISHED_RUN_ID, "completed")] };
+    historyState.isFresh = true;
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
+  });
+
+  it("uses the newest completed run when history has multiple outcomes (newest-first list)", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: null };
+    historyState.data = {
+      runs: [
+        historyRunFixture("run-most-recent-faulted", "faulted"),
+        historyRunFixture(FIXTURE_FINISHED_RUN_ID, "completed"),
+      ],
+    };
+    historyState.isFresh = true;
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("live-finished-view-detail")).toHaveAttribute(
+      "href",
+      `/roasts/${FIXTURE_FINISHED_RUN_ID}`,
+    );
+  });
+
+  it("a reload (fresh mount, no session state) shows the SAME persistent summary — survives reload (#523)", async () => {
+    // This is the behaviour #523 changes: pre-#523 a reload lost the
+    // session-only sticky and fell back to a start form. Now it falls back to
+    // the history-derived id instead (verified fresh, #532 round 2).
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: null };
+    historyState.data = { runs: [historyRunFixture(FIXTURE_FINISHED_RUN_ID, "completed")] };
+    historyState.isFresh = true;
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+  });
+
+  it("'Start next roast' links to /start (no local state to clear, #523)", async () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: null };
+    historyState.data = { runs: [historyRunFixture(FIXTURE_FINISHED_RUN_ID, "completed")] };
+    historyState.isFresh = true;
+    renderPage();
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-start-next")).toHaveAttribute("href", "/start"),
+    );
+  });
+
+  it("shows LiveFinishedView when active_run_id transitions non-null → null and outcome is completed (P2-4 gate, session-sticky path)", async () => {
     // roastApiMock defaults to outcome: "completed" (set in beforeEach default).
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-42" };
@@ -312,7 +463,7 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
     await waitFor(() =>
       expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
     );
-    expect(screen.queryByTestId("live-start-view")).toBeNull();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
   });
 
@@ -422,10 +573,12 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
     expect(roastApiMock).toHaveBeenCalledWith("run-p2-3");
   });
 
-  it("P2-4: a faulted run's active_run_id→null does NOT show the finished summary — start form instead", async () => {
+  it("P2-4: a faulted run's active_run_id→null does NOT latch the session-sticky summary — falls through to no-roasts", async () => {
     // A fault finalises the run (active_run_id → null) but the outcome is "faulted",
-    // not "completed". The finished summary must NOT appear. DashboardPage owns the
-    // fault-ack flow via stickyFaultedRunId (separate mechanism, not tested here).
+    // not "completed". The session-sticky summary must NOT latch for it. With an
+    // empty history (no prior completed run), the page falls through to the
+    // persistent no-roasts view. DashboardPage owns the fault-ack flow via
+    // stickyFaultedRunId (separate mechanism, not tested here).
     roastApiMock.mockResolvedValueOnce({ ...FIXTURE_FINISHED_DETAIL, outcome: "faulted" });
 
     healthState.isSuccess = true;
@@ -438,17 +591,18 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
 
     // Wait for api.roast to resolve (async gate) — the finished view must NOT appear.
     await waitFor(() => expect(roastApiMock).toHaveBeenCalledWith("run-faulted"));
-    // After the gate resolves with a non-completed outcome, the start form shows.
+    // After the gate resolves with a non-completed outcome and no history
+    // fallback, the no-roasts view shows.
     await waitFor(() =>
-      expect(screen.getByTestId("live-start-view")).toBeInTheDocument(),
+      expect(screen.getByTestId("live-no-roasts-view")).toBeInTheDocument(),
     );
     expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
 
-  it("an aborted run's active_run_id→null does NOT show the finished summary — start form instead", async () => {
+  it("an aborted run's active_run_id→null does NOT latch the session-sticky summary — falls through to no-roasts", async () => {
     // Mirrors the faulted-gate test (P2-4) for the aborted outcome. Both "faulted"
-    // and "aborted" are non-completed outcomes that must fall through to LiveStartView
-    // rather than surfacing the finished summary (which is reserved for "completed").
+    // and "aborted" are non-completed outcomes that must not latch the
+    // session-sticky path (reserved for "completed").
     roastApiMock.mockResolvedValueOnce({ ...FIXTURE_FINISHED_DETAIL, outcome: "aborted" });
 
     healthState.isSuccess = true;
@@ -461,44 +615,52 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
 
     await waitFor(() => expect(roastApiMock).toHaveBeenCalledWith("run-aborted"));
     await waitFor(() =>
-      expect(screen.getByTestId("live-start-view")).toBeInTheDocument(),
+      expect(screen.getByTestId("live-no-roasts-view")).toBeInTheDocument(),
     );
     expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
 
-  it("'Start next roast' clears the sticky and returns to the start form", async () => {
+  it("a faulted run's active_run_id→null still shows the PRIOR completed run's summary if one exists in history", async () => {
+    // The persistent fallback (#523) is independent of the session-sticky
+    // gate: even though THIS run faulted, a genuinely completed run from
+    // earlier history still surfaces as the last-completed summary.
+    //
+    // #532 round 2: TWO independent effects now call api.roast — the
+    // session-sticky path (for "run-faulted-2") AND the history-detail
+    // verification (for FIXTURE_FINISHED_RUN_ID, the older run). Their
+    // firing order is not guaranteed, so the mock discriminates by the
+    // run id ARGUMENT rather than by call order (a single
+    // mockResolvedValueOnce would be consumed by whichever call happens
+    // to fire first, which could be either one).
+    roastApiMock.mockImplementation(async (runId: string) =>
+      runId === "run-faulted-2"
+        ? { ...(FIXTURE_FINISHED_DETAIL as RoastDetail), outcome: "faulted" }
+        : { ...(FIXTURE_FINISHED_DETAIL as RoastDetail), outcome: "completed" },
+    );
+    historyState.data = { runs: [historyRunFixture(FIXTURE_FINISHED_RUN_ID, "completed")] };
+
     healthState.isSuccess = true;
-    healthState.data = { active_run_id: "run-55" };
+    healthState.data = { active_run_id: "run-faulted-2" };
     const { rerender } = renderPage();
-    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
 
     healthState.data = { active_run_id: null };
     rerender();
 
+    await waitFor(() => expect(roastApiMock).toHaveBeenCalledWith("run-faulted-2"));
     await waitFor(() =>
       expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
     );
-
-    fireEvent.click(screen.getByTestId("live-finished-start-next"));
-
-    await waitFor(() =>
-      expect(screen.getByTestId("live-start-view")).toBeInTheDocument(),
+    expect(screen.getByTestId("live-finished-view-detail")).toHaveAttribute(
+      "href",
+      `/roasts/${FIXTURE_FINISHED_RUN_ID}`,
     );
-    expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
 
-  it("a reload (fresh render with null active_run_id) shows the start form, not the summary", () => {
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: null };
-    renderPage();
-    expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
-    expect(screen.queryByTestId("live-finished-view")).toBeNull();
-  });
-
-  it("navigate away + remount (new LivePage instance) resets sticky — finished view does not persist (LOW 4)", async () => {
-    // First session: run starts and ends, sticky latch fires.
+  it("navigate away + remount (new LivePage instance) still shows the persistent summary from history (#523)", async () => {
+    // First session: run starts and ends, session-sticky latch fires.
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-77" };
+    historyState.data = { runs: [historyRunFixture(FIXTURE_FINISHED_RUN_ID, "completed")] };
     const { rerender, remount } = renderPage();
     expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
 
@@ -510,92 +672,227 @@ describe("LivePage — sticky finished-run summary (#423)", () => {
     );
 
     // Simulate the operator navigating away then back (unmount + fresh mount).
-    // The new LivePage instance has no prior session state — sticky is gone.
+    // The new LivePage instance has no session-sticky state — #523: it still
+    // shows the summary, now from the persistent history fallback.
     remount();
 
-    // Post-remount: health still reports no active run; fresh session → start form.
     await waitFor(() =>
-      expect(screen.getByTestId("live-start-view")).toBeInTheDocument(),
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
     );
-    expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
 });
 
-describe("LivePage — start-roast flow (#513)", () => {
-  it("hides the start form the instant the POST is proven (201) — before health confirms", async () => {
+describe("LivePage — history error (#532 Codex follow-up)", () => {
+  it("shows a neutral history-unknown state (NEVER the false 'no roasts ever' claim) when history persistently errors", () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: null };
-    // api.health() never resolves during this assertion window — the form's
-    // disappearance must not depend on it.
-    healthApiMock.mockImplementation(() => new Promise(() => {}));
+    historyState.isError = true;
+    historyState.isFresh = true; // isError implies settled (mirrors health)
+    historyState.data = undefined;
     renderPage();
-    expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
-
-    fireEvent.submit(screen.getByTestId("start-roast-form-stub"));
-    await waitFor(() => expect(startRoastMock).toHaveBeenCalledTimes(1));
-
-    // #513: this must be unmissable and immediate — the operator can never see
-    // what looks like an untouched idle form after a real 201.
-    await waitFor(() =>
-      expect(screen.getByTestId("live-start-confirming")).toBeInTheDocument(),
-    );
-    expect(screen.queryByTestId("live-start-view")).toBeNull();
-    expect(screen.queryByTestId("home-landing")).toBeNull();
+    expect(screen.getByTestId("live-history-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
 
-  it("confirms the new run against api.health and swaps to the dashboard (the actual handoff, not just the refetch call)", async () => {
+  it("still shows the session-sticky summary on a history error — it doesn't depend on history at all", async () => {
+    // A run just finished THIS session (stickyCompletedRunId latches from
+    // fetchTerminalOutcome, independent of the history query). History then
+    // fails — the summary must still render from the session-sticky path.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-sticky" };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+
+    healthState.data = { active_run_id: null };
+    historyState.isError = true;
+    historyState.data = undefined;
+    rerender();
+
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("live-history-unknown")).toBeNull();
+  });
+
+  it("navigating the history-unknown reload link reaches a fresh /live mount", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: null };
+    historyState.isError = true;
+    historyState.isFresh = true;
+    historyState.data = undefined;
+    renderPage();
+    expect(screen.getByTestId("live-history-unknown-reload")).toHaveAttribute("href", "/live");
+  });
+});
+
+describe("LivePage — transition-flash guard (#532 Codex follow-up)", () => {
+  it("does NOT flash an OLDER completed run's summary while the just-finished run's terminal-outcome fetch is still in flight", async () => {
+    // An older completed run already sits in history — lastCompletedRunId
+    // would resolve to it immediately. A NEW run then finishes: the
+    // transition fires fetchTerminalOutcome, which we stall deliberately so
+    // the test can assert the render DURING that window, before stickyCompletedRunId
+    // has a chance to latch.
+    historyState.data = { runs: [historyRunFixture("run-older-completed", "completed")] };
+
+    let resolveRoast: (detail: RoastDetail) => void = () => {};
+    roastApiMock.mockImplementationOnce(
+      () =>
+        new Promise<RoastDetail>((resolve) => {
+          resolveRoast = resolve;
+        }),
+    );
+
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-just-finished" };
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+
+    // The run finishes — active_run_id goes null, firing fetchTerminalOutcome
+    // for run-just-finished (stalled above).
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    // While that fetch is in flight, the page must hold — NEVER render the
+    // older run's summary as an intermediate flash.
+    await waitFor(() => expect(screen.getByTestId("live-page-loading")).toBeInTheDocument());
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
+
+    // Release the stalled fetch with a genuine "completed" outcome.
+    resolveRoast({ ...(FIXTURE_FINISHED_DETAIL as RoastDetail), outcome: "completed" });
+
+    // Now the JUST-FINISHED run's summary shows (session-sticky latches the
+    // run id that just transitioned, "run-just-finished" — NOT the older
+    // history-derived fallback's id, "run-older-completed").
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("live-finished-view-detail")).toHaveAttribute(
+      "href",
+      "/roasts/run-just-finished",
+    );
+  });
+
+  it("falls through cleanly to the older run's summary once the terminal fetch resolves NON-completed — no flash of a WRONG (stale) intermediate either", async () => {
+    // Same setup, but the just-finished run turns out to be faulted — the
+    // page must fall through to the older completed run's summary only
+    // AFTER the fetch resolves, never flashing it mid-fetch (transition-flash
+    // guard applies regardless of the eventual outcome).
+    historyState.data = { runs: [historyRunFixture("run-older-completed-2", "completed")] };
+
+    let resolveRoast: (detail: RoastDetail) => void = () => {};
+    roastApiMock.mockImplementationOnce(
+      () =>
+        new Promise<RoastDetail>((resolve) => {
+          resolveRoast = resolve;
+        }),
+    );
+
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-will-fault" };
+    const { rerender } = renderPage();
+
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    await waitFor(() => expect(screen.getByTestId("live-page-loading")).toBeInTheDocument());
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
+
+    resolveRoast({ ...(FIXTURE_FINISHED_DETAIL as RoastDetail), outcome: "faulted" });
+
+    // Falls through to the persistent (older) fallback only once resolved.
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("live-finished-view-detail")).toHaveAttribute(
+      "href",
+      "/roasts/run-older-completed-2",
+    );
+  });
+
+  it("#532 round 2: the older run's summary is not in the DOM the INSTANT rerender() returns — checked synchronously, plus an honest note on what this harness can and cannot prove", async () => {
+    // The two tests above prove the FINAL state is correct via `waitFor`
+    // (which only samples the DOM periodically) — that alone doesn't rule
+    // out a single-frame flash between polls. This asserts the DOM state
+    // DIRECTLY, synchronously, the instant `rerender()` returns.
+    //
+    // HONEST LIMITATION, recorded rather than hidden behind a green check:
+    // React Testing Library's `act()` (which every `render`/`rerender` call
+    // is wrapped in) flushes PASSIVE EFFECTS (`useEffect`) SYNCHRONOUSLY in
+    // test mode, before returning control to the test — confirmed
+    // empirically (a probe `console.log` placed immediately after
+    // `rerender()`, with the round-1 `prevRunIdRef` guard removed, still
+    // showed the correct/held state). In a REAL BROWSER, `useEffect` runs
+    // AFTER paint — genuinely later than this test harness's synchronous
+    // `act()` flush — so the fix's `prevRunIdRef.current` check (reading the
+    // ref during RENDER, before that render's own effects have run) is
+    // necessary for the real one-frame gap Codex described, but this
+    // component-test harness cannot reproduce that specific timing to prove
+    // the OLD code was broken in the way described. Tried: a
+    // MutationObserver (microtask-queued, so it also doesn't see an
+    // intermediate commit inside one `act()` flush) and a synchronous
+    // console probe (same result) — both confirmed the harness always
+    // settles past the whole effect chain within one `rerender()`. Verified
+    // manually instead (recorded in the commit message): reverting the
+    // `prevRunIdRef.current !== null ||` half of the guard to leave only
+    // `terminalFetchPending` still passes every test in this file, including
+    // this one — proof this specific assertion does NOT, on its own, gate
+    // merge on the round-1 timing fix. The ref-read is still the objectively
+    // correct fix (state set inside `useEffect` cannot possibly reflect a
+    // render that hasn't committed yet, which is the real hazard in a
+    // browser); kept it and this assertion for the real behaviour it DOES
+    // cover (the composed hold from BOTH mechanisms holds correctly through
+    // a real async transition) rather than delete coverage over a harness
+    // gap, but the two-line accounting above is the honest scope of what a
+    // green run here actually proves.
+    //
+    // Isolating finding #1's fix from finding #2's (the fresh-history-detail
+    // hold) requires the older run's id to already be HISTORY-FRESHNESS-
+    // VERIFIED before the transition under test fires — otherwise finding
+    // #2's own hold (waiting on the history-detail fetch) independently
+    // covers this exact scenario too. So: mount idle with the older run in
+    // history first (letting that verification resolve), THEN start a run
+    // and let it finish.
+    historyState.data = { runs: [historyRunFixture("run-older-preverified", "completed")] };
     healthState.isSuccess = true;
     healthState.data = { active_run_id: null };
     const { rerender } = renderPage();
-    expect(screen.getByTestId("live-start-view")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view-detail")).toHaveAttribute(
+        "href",
+        "/roasts/run-older-preverified",
+      ),
+    );
 
-    fireEvent.submit(screen.getByTestId("start-roast-form-stub"));
-    await waitFor(() => expect(startRoastMock).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(healthApiMock).toHaveBeenCalledTimes(1));
+    // Now a run starts and finishes — the terminal-outcome fetch for it is
+    // stalled so the test can inspect the DOM mid-transition.
+    let resolveRoast: (detail: RoastDetail) => void = () => {};
+    roastApiMock.mockImplementationOnce(
+      () =>
+        new Promise<RoastDetail>((resolve) => {
+          resolveRoast = resolve;
+        }),
+    );
+    healthState.data = { active_run_id: "run-just-finished-verified" };
+    rerender();
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
 
-    // Confirmation succeeded — simulate the resulting cache update the way the
-    // sticky-summary tests above do (healthState is a static stub, not backed
-    // by the real query cache the component writes into).
-    healthState.data = { active_run_id: "run-new" };
+    // Fire the transition — this is the exact commit round-2 fixed.
+    healthState.data = { active_run_id: null };
     rerender();
 
-    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
-    expect(screen.queryByTestId("live-start-confirming")).toBeNull();
-  });
+    // SYNCHRONOUS check, no await: the older run's summary must already be
+    // gone from the DOM the instant this line runs, not just eventually.
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
+    expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
 
-  it("retries api.health on a transient failure and still confirms", async () => {
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: null };
-    healthApiMock
-      .mockRejectedValueOnce(new Error("503 starting up"))
-      .mockResolvedValueOnce({
-        status: "ok",
-        version: "test",
-        mcp_child: "connected",
-        active_run_id: "run-new",
-      });
-    renderPage();
-
-    fireEvent.submit(screen.getByTestId("start-roast-form-stub"));
-    await waitFor(() => expect(healthApiMock).toHaveBeenCalledTimes(2), { timeout: 5000 });
-    // Never shows the failure banner when a later retry succeeds.
-    expect(screen.queryByTestId("live-start-confirm-failed")).toBeNull();
-  }, 8000);
-
-  it("shows the manual fallback (never the bare form) when every confirm attempt fails", async () => {
-    healthState.isSuccess = true;
-    healthState.data = { active_run_id: null };
-    healthApiMock.mockRejectedValue(new Error("still down"));
-    renderPage();
-
-    fireEvent.submit(screen.getByTestId("start-roast-form-stub"));
-    await waitFor(() => expect(screen.getByTestId("live-start-confirming")).toBeInTheDocument());
-    await waitFor(
-      () => expect(screen.getByTestId("live-start-confirm-failed")).toBeInTheDocument(),
-      { timeout: 10000 },
+    resolveRoast({ ...(FIXTURE_FINISHED_DETAIL as RoastDetail), outcome: "completed" });
+    await waitFor(() =>
+      expect(screen.getByTestId("live-finished-view")).toBeInTheDocument(),
     );
-    expect(screen.getByTestId("live-start-open-dashboard")).toBeInTheDocument();
-    // The operator is never returned to the bare, untouched-looking form.
-    expect(screen.queryByTestId("live-start-view")).toBeNull();
-  }, 12000);
+    expect(screen.getByTestId("live-finished-view-detail")).toHaveAttribute(
+      "href",
+      "/roasts/run-just-finished-verified",
+    );
+  });
 });

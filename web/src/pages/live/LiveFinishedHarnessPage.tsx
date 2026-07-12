@@ -153,13 +153,13 @@ function LiveFinishedHarnessView(): React.JSX.Element {
           >
             View full detail
           </Link>
-          <button
-            type="button"
+          <Link
+            to="/start"
             className="flex-1 rounded-md bg-primary px-5 py-3 text-center text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
             data-testid="live-finished-start-next"
           >
             Start next roast
-          </button>
+          </Link>
         </div>
       </div>
     </AppFrame>
