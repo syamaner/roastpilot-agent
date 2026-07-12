@@ -844,6 +844,38 @@ async def test_set_roasted_weight_rejects_over_charge(
     assert response.status_code == 409
 
 
+@pytest.mark.asyncio
+async def test_set_roasted_weight_bounds_against_a_prior_charge_correction(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#520 safety review: set_roasted_weight must bound against the EFFECTIVE
+    charge (corrected when present), not just the frozen profile default —
+    otherwise correcting the charge DOWN first, then weighing above the new
+    (but below the old frozen) value, would silently pass the frozen-only
+    check and leave weight_loss_percent null on a run with both values
+    entered. Reproduces the exact ordering from the review: correct charge to
+    200g (accepted, un-weighed) on a 250g-frozen run, then weigh 210g — must
+    409 (210 > the effective 200g charge), not silently pass against 250g."""
+    await store.create_run(
+        run_id="run-order",
+        profile=_profile(),  # bean_weight_grams 250
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-order", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    correction = await client.post(
+        "/api/roasts/run-order/charge-weight", json={"corrected_charge_grams": 200.0}
+    )
+    assert correction.status_code == 200
+
+    response = await client.post(
+        "/api/roasts/run-order/roasted-weight", json={"roasted_weight_grams": 210.0}
+    )
+    assert response.status_code == 409
+
+
 # --- charge-weight correction (#520) ---
 
 

@@ -2015,10 +2015,20 @@ class RoastService:
         progress — the roasted weight is a completed-run immutability exception
         (entered post-weighing), so the in-progress case surfaces as a conflict
         rather than letting the store's RuntimeError escape as a 500. A roasted
-        weight above the charge weight is physically impossible (a tare/scale
-        error) and is rejected as a 409 too, rather than persisted as a row whose
-        derived loss reads as null/"unweighed". The response carries the derived
-        ``weight_loss_percent``.
+        weight above the EFFECTIVE charge weight is physically impossible (a
+        tare/scale error) and is rejected as a 409 too, rather than persisted as
+        a row whose derived loss reads as null/"unweighed". The response carries
+        the derived ``weight_loss_percent``.
+
+        The bound is against ``corrected_charge_grams`` when present, else the
+        frozen ``profile.bean_weight_grams`` (#520 safety review): bounding only
+        against the frozen weight would let a charge correction BELOW the
+        roasted weight slip through if it landed first (correct charge to 200g
+        on an un-weighed run, then weigh 210g — 210 > the frozen 250g default
+        passes, but 210 > the effective 200g charge is impossible) — the same
+        physical-impossibility guard :meth:`set_charge_weight` enforces in the
+        other direction, now symmetric regardless of which correction is
+        entered first.
         """
         detail = await self._store.read_run(run_id)
         if detail is None:
@@ -2027,10 +2037,11 @@ class RoastService:
             raise RoastRunConflictError(
                 f"run {run_id} is still in progress; record its weight after completion"
             )
-        if request.roasted_weight_grams > detail.profile.bean_weight_grams:
+        effective_charge_grams = detail.corrected_charge_grams or detail.profile.bean_weight_grams
+        if request.roasted_weight_grams > effective_charge_grams:
             raise RoastRunConflictError(
                 f"roasted weight {request.roasted_weight_grams} g exceeds the charge "
-                f"weight {detail.profile.bean_weight_grams} g (physically impossible)"
+                f"weight {effective_charge_grams} g (physically impossible)"
             )
         await self._store.set_roasted_weight(
             run_id, roasted_weight_grams=request.roasted_weight_grams
