@@ -5,6 +5,7 @@
  * (`useRoastStream`), not polling. Pages consume these read-only.
  */
 
+import { useRef } from "react";
 import {
   skipToken,
   useMutation,
@@ -37,6 +38,51 @@ export const beanProfileKeys = {
 
 export function useHealth() {
   return useQuery({ queryKey: roastKeys.health, queryFn: api.health });
+}
+
+/**
+ * Health, but for the two views that GATE a start form on active-run status
+ * (`/live`'s `LiveStartView` and `/start`'s `StartRoastView` — #513 Codex
+ * follow-up). `useHealth()`'s shared `staleTime: 30_000` is correct for
+ * every OTHER consumer (the header/nav render stale-then-update, which is
+ * fine — they don't gate a form on it) but wrong here: within that window a
+ * remount renders a CACHED `active_run_id` with `isSuccess: true` and never
+ * even issues a network request (confirmed empirically — TanStack Query
+ * does not refetch on mount while data is still fresh by its own
+ * accounting), so a start form could render from up-to-30s-stale data. A
+ * second roastpilot process (or another tab) could have started a run in
+ * that window; the 409 the real start attempt would hit bounds the damage
+ * but does not prevent the same #513 flash-then-strand risk this whole
+ * story exists to close.
+ *
+ * `refetchOnMount: "always"` alone is NOT enough either: it does force a
+ * fresh network call (confirmed empirically), but `isSuccess` and the
+ * cached (stale) `data` stay true/present for the ENTIRE in-flight window —
+ * a naive `!isSuccess` hold would still let the bare form render from stale
+ * data while the fresh fetch is still in the air.
+ *
+ * `isFresh` tracks whether THIS query, since THIS hook instance mounted, has
+ * ever completed a fetch — the initial `dataUpdatedAt` seen on mount
+ * (possibly `0` with no cache entry, or a past timestamp if cached) is
+ * snapshotted once and never reused; `isFresh` flips true the moment the
+ * live `dataUpdatedAt` advances past that snapshot (confirmed empirically:
+ * `dataUpdatedAt` advances on every settled fetch, even one that resolves
+ * with byte-identical data) OR the query settles into an error state.
+ * Gating views hold their loading state while `!isFresh`.
+ */
+export function useFreshHealthGate() {
+  const query = useQuery({
+    queryKey: roastKeys.health,
+    queryFn: api.health,
+    refetchOnMount: "always",
+  });
+  const initialUpdatedAtRef = useRef<number | null>(null);
+  if (initialUpdatedAtRef.current === null) {
+    initialUpdatedAtRef.current = query.dataUpdatedAt;
+  }
+  const isFresh =
+    query.dataUpdatedAt > initialUpdatedAtRef.current || query.isError;
+  return { ...query, isFresh };
 }
 
 export function useHistory() {

@@ -4,12 +4,19 @@ import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/lib/api";
-import { useHistory, useRoast, useTelemetry, useTimeline } from "./queries";
+import {
+  roastKeys,
+  useFreshHealthGate,
+  useHistory,
+  useRoast,
+  useTelemetry,
+  useTimeline,
+} from "./queries";
 
-function wrapper() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+function wrapper(client?: QueryClient) {
+  const c = client ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return ({ children }: { children: ReactNode }) => (
-    <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    <QueryClientProvider client={c}>{children}</QueryClientProvider>
   );
 }
 
@@ -74,5 +81,98 @@ describe("useHistory", () => {
       .mockResolvedValue({ runs: [] } as Awaited<ReturnType<typeof api.history>>);
     renderHook(() => useHistory(), { wrapper: wrapper() });
     await waitFor(() => expect(spy).toHaveBeenCalled());
+  });
+});
+
+/**
+ * `useFreshHealthGate` (#513 Codex follow-up on #514/#515 review): the two
+ * start-form gating views (`LiveStartView`/`LivePage`, `StartRoastView`) must
+ * hold until a GENUINELY FRESH health read, not just a resolved one — plain
+ * `useHealth`'s shared 30s `staleTime` would otherwise let a remount within
+ * that window render a cached "idle" snapshot with `isSuccess: true` and NO
+ * network request at all.
+ */
+describe("useFreshHealthGate", () => {
+  it("no cache entry: isFresh is false until the first fetch settles, then true", async () => {
+    const healthSpy = vi
+      .spyOn(api, "health")
+      .mockResolvedValue({
+        status: "ok",
+        version: "t",
+        mcp_child: "running",
+        active_run_id: null,
+      } as Awaited<ReturnType<typeof api.health>>);
+    const { result } = renderHook(() => useFreshHealthGate(), { wrapper: wrapper() });
+    expect(result.current.isFresh).toBe(false);
+    await waitFor(() => expect(result.current.isFresh).toBe(true));
+    expect(healthSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("a within-staleTime cached entry: isFresh stays false through the forced refetch even though isSuccess is already true from cache", async () => {
+    let call = 0;
+    let resolveSecond: ((v: Awaited<ReturnType<typeof api.health>>) => void) | null = null;
+    vi.spyOn(api, "health").mockImplementation(async () => {
+      call += 1;
+      if (call === 1) {
+        return {
+          status: "ok",
+          version: "t",
+          mcp_child: "running",
+          active_run_id: null,
+        } as Awaited<ReturnType<typeof api.health>>;
+      }
+      return new Promise((resolve) => {
+        resolveSecond = resolve;
+      });
+    });
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 30_000 } } });
+    // Prime the cache with a fresh-by-staleTime-accounting entry, then unmount
+    // (simulating an earlier real page's health read).
+    const first = renderHook(() => useFreshHealthGate(), { wrapper: wrapper(client) });
+    await waitFor(() => expect(first.result.current.isFresh).toBe(true));
+    first.unmount();
+
+    // Remount within staleTime: isSuccess is instantly true from cache, but
+    // isFresh must stay false until THIS mount's forced refetch resolves.
+    const second = renderHook(() => useFreshHealthGate(), { wrapper: wrapper(client) });
+    await waitFor(() => expect(call).toBe(2)); // the forced refetch is in flight
+    expect(second.result.current.isFresh).toBe(false);
+    expect(second.result.current.isSuccess).toBe(true); // proves a naive isSuccess check is unsafe
+    expect(second.result.current.data?.active_run_id).toBe(null); // still the STALE value
+
+    // Resolve with a DIFFERENT value (a run that started in another tab).
+    resolveSecond!({
+      status: "ok",
+      version: "t",
+      mcp_child: "running",
+      active_run_id: "run-from-another-tab",
+    } as Awaited<ReturnType<typeof api.health>>);
+    await waitFor(() => expect(second.result.current.isFresh).toBe(true));
+    expect(second.result.current.data?.active_run_id).toBe("run-from-another-tab");
+  });
+
+  it("a persistent error settles isFresh to true (never stuck pending)", async () => {
+    vi.spyOn(api, "health").mockRejectedValue(new Error("still down"));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { result } = renderHook(() => useFreshHealthGate(), { wrapper: wrapper(client) });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.isFresh).toBe(true);
+  });
+
+  it("writes to the same query key useHealth reads (roastKeys.health)", async () => {
+    vi.spyOn(api, "health").mockResolvedValue({
+      status: "ok",
+      version: "t",
+      mcp_child: "running",
+      active_run_id: null,
+    } as Awaited<ReturnType<typeof api.health>>);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    renderHook(() => useFreshHealthGate(), { wrapper: wrapper(client) });
+    await waitFor(() =>
+      expect(client.getQueryData(roastKeys.health)).toEqual(
+        expect.objectContaining({ active_run_id: null }),
+      ),
+    );
   });
 });

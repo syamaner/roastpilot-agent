@@ -37,12 +37,16 @@ import {
   FIXTURE_FINISHED_TELEMETRY,
 } from "./liveFinishedFixture";
 
-// --- Mutable health stub. ---
+// --- Mutable health stub. `isFresh` models the #513 Codex follow-up
+// (`useFreshHealthGate`): false while pending OR while `isSuccess` is true
+// only from a stale cache entry with the genuinely fresh refetch still in
+// flight — see StartRoastView.test.tsx's matching stub for the fuller doc. ---
 const healthState: {
   data: { active_run_id: string | null } | undefined;
   isSuccess: boolean;
   isError: boolean;
-} = { data: undefined, isSuccess: false, isError: false };
+  isFresh: boolean;
+} = { data: undefined, isSuccess: false, isError: false, isFresh: false };
 
 // Mutable stubs for useRoast / useTelemetry — defaulting to null/undefined so
 // gate-only tests don't see real data; the content-assertion tests override them.
@@ -57,7 +61,7 @@ vi.mock("@/hooks/queries", async () => {
   const noopMutation = () => ({ mutateAsync: vi.fn(async () => undefined) });
   return {
     ...actual,
-    useHealth: () => healthState,
+    useFreshHealthGate: () => healthState,
     useBeanProfiles: () => ({ data: { profiles: [] }, isLoading: false }),
     useRoast: () => roastState,
     // Return full-res stub for downsample=1 (stats), curve stub for downsample=5.
@@ -146,6 +150,10 @@ beforeEach(() => {
   healthState.data = undefined;
   healthState.isSuccess = false;
   healthState.isError = false;
+  // Default to a SETTLED read (matches the overwhelming majority of this
+  // file's tests, which set isSuccess/isError explicitly right after this
+  // runs); the loading-hold-specific tests below override isFresh to false.
+  healthState.isFresh = true;
   startRoastMock.mockClear();
   roastApiMock.mockClear();
   healthApiMock.mockClear();
@@ -213,7 +221,25 @@ function renderPage(initialPath = "/live") {
 describe("LivePage — loading hold", () => {
   it("renders the loading placeholder until health resolves", () => {
     healthState.isSuccess = false;
+    healthState.isFresh = false;
     healthState.data = undefined;
+    renderPage();
+    expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+    expect(screen.queryByTestId("live-start-view")).toBeNull();
+  });
+
+  it("#513 Codex follow-up: holds through a stale-cache remount even though isSuccess is already true", () => {
+    // The exact scenario Codex found: useHealth's shared 30s staleTime lets a
+    // remount render a CACHED idle snapshot with isSuccess:true while the
+    // genuinely fresh forced refetch (useFreshHealthGate) is still in
+    // flight. A naive `!isSuccess` check would render the start form (or
+    // even the dashboard, if the cache happened to hold an active run) here
+    // — isFresh:false is the only signal that catches it.
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    healthState.isFresh = false;
+    healthState.data = { active_run_id: null }; // stale cached "idle" value
     renderPage();
     expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();

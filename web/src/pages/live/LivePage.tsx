@@ -33,7 +33,7 @@ import {
   useBeanProfiles,
   useCreateBeanProfile,
   useDeleteBeanProfile,
-  useHealth,
+  useFreshHealthGate,
   useRoast,
   useTelemetry,
   useUpdateBeanProfile,
@@ -71,7 +71,15 @@ async function fetchTerminalOutcome(
 }
 
 export function LivePage(): React.JSX.Element {
-  const health = useHealth();
+  // #513 Codex follow-up: `useHealth()`'s shared 30s `staleTime` means a
+  // remount within that window would render a CACHED `active_run_id` with
+  // `isSuccess: true` and no network request at all — a second process/tab
+  // could have started a run in that window, and the bare start form would
+  // flash on stale "idle" data before the gate below ever fires. Gate on
+  // `useFreshHealthGate` instead of `useHealth` here (see its doc for the
+  // full empirically-verified rationale); non-gating consumers elsewhere
+  // (header/nav) keep using plain `useHealth` unchanged.
+  const health = useFreshHealthGate();
   const activeRunId = health.data?.active_run_id ?? null;
   const queryClient = useQueryClient();
 
@@ -117,9 +125,16 @@ export function LivePage(): React.JSX.Element {
     return <LiveStatusUnknownView />;
   }
 
-  // Hold until health resolves so the start form doesn't flash before the active-run
-  // status is known (same pattern as the old HomeGate hold).
-  if (!health.isSuccess) {
+  // Hold until health has produced a GENUINELY FRESH read (same pattern as
+  // the old HomeGate hold, extended #513 Codex follow-up). `health.isFresh`
+  // (`useFreshHealthGate`) is false both while genuinely pending AND while
+  // `isSuccess` is true only from stale cache with a forced refetch still in
+  // flight — a within-staleTime remount would otherwise let a cached "idle"
+  // snapshot render as proof no run is active, when another tab/process
+  // could have started one in the last 30s. The `health.isError` branch
+  // above already handles the persistent-failure case (which `isFresh`
+  // treats as settled, not pending), so this check is a single condition.
+  if (!health.isFresh) {
     return (
       <AppFrame>
         <div data-testid="live-page-loading" />

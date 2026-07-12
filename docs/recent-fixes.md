@@ -395,3 +395,62 @@ Format: one entry per anti-pattern.
   follow-up)" test (asserts the pending state shows `start-roast-loading`,
   never the bare form or either other explicit state). All fail-then-pass
   verified.
+
+---
+
+## `isSuccess: true` does not mean the read is CURRENT — a cached entry within `staleTime` is a silent no-fetch
+*(fixed by #513 Codex follow-up on the #514/#515 review, 12 Jul 2026)*
+
+- **Signature:** a gating component (a start form, an auth check, anything
+  that decides whether to show a bare/default view based on server state)
+  that reads a shared `useQuery`-family hook with a non-zero `staleTime`
+  and branches on `isSuccess`/`isError` alone, with no distinction between
+  "settled from THIS mount's own fetch" and "settled from a cache entry
+  some OTHER mount populated up to `staleTime` ago." Also: `refetchOnMount:
+  "always"` added to "fix" a staleness concern without also gating on
+  something that tracks the NEW fetch settling — `isSuccess` stays `true`
+  (from the stale cached data) for the entire duration of that forced
+  background refetch.
+- **Wrong:** `useHealth()` shares the app's `staleTime: 30_000` (correct
+  for non-gating consumers like the header/nav, which should render
+  stale-then-update). But `LiveStartView`/`LivePage` and `StartRoastView`
+  gated their start form on plain `useHealth()`'s `isSuccess`/`isError` —
+  confirmed empirically: a remount within that 30s window renders a CACHED
+  `active_run_id` with `isSuccess: true` and issues **NO network request
+  at all** (TanStack Query does not refetch on mount while data is still
+  fresh by its own accounting). A second `roastpilot-agent` process (or
+  another tab) starting a run in that window would be invisible to a
+  fresh page load for up to 30s — the bare start form would render as
+  "proof" no run is active from data that was never re-checked. This is
+  the SAME hazard class as the rest of #513 (a start form rendering when
+  it must not), reached via a different mechanism (a cache hit, not a
+  failed refetch) — caught by Codex on the #515 PR, not self-discovered.
+- **Right:** the two start-form gating views use a dedicated
+  `useFreshHealthGate()` (`web/src/hooks/queries.ts`) instead of plain
+  `useHealth()`. It forces `refetchOnMount: "always"` AND tracks
+  `isFresh`: snapshot the `dataUpdatedAt` seen on THIS hook instance's
+  first render (whatever it is — `0` with no cache, or a past timestamp if
+  cached) once into a `useRef`, then `isFresh = dataUpdatedAt >
+  initialSnapshot || isError` — `dataUpdatedAt` advances on every settled
+  fetch even one that resolves with byte-identical data (confirmed
+  empirically), so this is a reliable "this mount's own fetch has
+  completed" signal that a naive `isSuccess`/`isFetching` check is not
+  (both stay `true`/`true` or `true`/`false` in ways that don't
+  distinguish stale-cached from freshly-confirmed). Gating views hold
+  their loading state on `!isFresh`, not `!isSuccess`. Non-gating
+  consumers (header/nav, `DashboardPage`'s idle branch — the last is
+  itself unreachable via the current router and out of scope for this
+  specific fold; flagged, not fixed here) keep plain `useHealth()`
+  unchanged — they are meant to render stale-then-update.
+- **Guarded by:** `queries.test.tsx`'s `useFreshHealthGate` suite (no cache
+  → pending-then-fresh; a within-`staleTime` cached entry → `isFresh`
+  stays `false` through the forced refetch even though `isSuccess` is
+  already `true`, only flipping once the NEW value — a run started
+  elsewhere — resolves; a persistent error settles `isFresh` to `true`,
+  never stuck) + a component-level test per gating view
+  (`LivePage.test.tsx`, `StartRoastView.test.tsx`) + a REAL fetch-boundary
+  integration test per view in `LiveStartFlow.integration.test.tsx` (a
+  real `QueryClient` configured with the app's actual `staleTime: 30_000`,
+  primed with a cached idle snapshot via `setQueryData`, then a genuinely
+  stalled `fetch` mock — the closest reproduction of the real hazard this
+  repo can exercise). All fail-then-pass verified.
