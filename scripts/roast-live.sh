@@ -109,14 +109,19 @@ fi
 # path — if a prior run left the Hottop commanded hot, power it off AT THE
 # MACHINE; this only frees host resources so the new run can start clean.
 echo "→ clearing any wedged/leftover roast processes (local-only safeguard)…"
-# Match ANY roastpilot-agent invocation, not just 'serve': a replay/e2e harness
-# runs as `roastpilot-agent --replay … --host 127.0.0.1 --port 8000` (see
-# web/playwright.config.ts webServer) — no 'serve' token, so the old pattern
-# missed it. On macOS a later specific 127.0.0.1:8000 bind coexists with our
-# 0.0.0.0:8000 (SO_REUSEADDR) and then receives ALL browser loopback traffic,
-# so a survivor here answers /api/health with active_run_id=null while the
-# real roast runs — the 12 Jul "start form after a live 201" incident class.
-pkill -9 -f 'roastpilot-agent'       2>/dev/null || true
+# Match any ENTRYPOINT invocation of the agent, not just the 'serve' form: a
+# replay/e2e harness runs as `roastpilot-agent --replay … --host 127.0.0.1
+# --port 8000` (see web/playwright.config.ts webServer) — no 'serve' token, so
+# a subcommand pattern missed it. On macOS a later specific 127.0.0.1:8000
+# bind coexists with our 0.0.0.0:8000 (SO_REUSEADDR) and then receives ALL
+# browser loopback traffic, so a survivor here answers /api/health with
+# active_run_id=null while the real roast runs — the 12 Jul "start form after
+# a live 201" incident class. The pattern anchors on `bin/roastpilot-agent`
+# (the console-script path every real agent process carries in its cmdline) —
+# a bare 'roastpilot-agent' pattern would also SIGKILL THIS LAUNCHER when it
+# is invoked by absolute path (…/roastpilot-agent/scripts/roast-live.sh), or
+# an editor open on a repo path (Codex P2, PR #518).
+pkill -9 -f 'bin/roastpilot-agent'   2>/dev/null || true
 pkill -9 -f 'coffee-roaster-mcp'     2>/dev/null || true   # agent child (also matches uvx coffee-roaster-mcp)
 pkill -9 -f 'uvx coffee-roaster-mcp'             2>/dev/null || true   # any stray uvx coffee-roaster (belt-and-braces, matches kill-roast.sh)
 sleep 1   # let the OS release the serial port + the :PORT socket
@@ -124,15 +129,25 @@ sleep 1   # let the OS release the serial port + the :PORT socket
 # HARD GUARD: refuse to start while ANYTHING still listens on :$PORT (either
 # address family / any bind address). Coexisting listeners don't fail the bind
 # on macOS — they silently split the traffic — so absence must be verified,
-# not assumed. If this trips, the offender survived the kills above: inspect
-# it before roasting.
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
-  echo "✗ REFUSING TO START — something is still listening on :$PORT:" >&2
-  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2
-  echo "  Kill it (kill -9 <PID>) and re-run. A second listener on :$PORT" >&2
-  echo "  hijacks the browser's health checks mid-roast (12 Jul incident)." >&2
-  exit 1
-fi
+# not assumed. Fail CLOSED if lsof itself is missing: a safety check that
+# can't run must abort, not silently pass (Codex P2, PR #518). Runs twice —
+# here, and again immediately before launch (the venv/SPA build below leaves
+# a window for a harness to bind in between; Codex P2, PR #518).
+assert_port_free() {
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "✗ REFUSING TO START — lsof not found; cannot verify :$PORT is free." >&2
+    echo "  Install lsof (ships with macOS) or check the port by hand." >&2
+    exit 1
+  fi
+  if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "✗ REFUSING TO START — something is listening on :$PORT:" >&2
+    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2
+    echo "  Kill it (kill -9 <PID>) and re-run. A second listener on :$PORT" >&2
+    echo "  hijacks the browser's health checks mid-roast (12 Jul incident)." >&2
+    exit 1
+  fi
+}
+assert_port_free
 
 echo "→ preparing (venv, deps, SPA build)…"
 if [ ! -x .venv/bin/python ]; then
@@ -185,6 +200,9 @@ print(f"{adv.model_slug}  ·  prompt {adv.prompt_version}{tag}")
 
 echo "→ starting agent + spawning MCP child (takes a few seconds — don't Ctrl-C yet)…"
 echo "  MCP config: ${COFFEE_ROASTER_MCP_CONFIG}"
+# Re-check right before launch: the venv install + SPA build above take long
+# enough for a replay/e2e harness to bind :$PORT after the first check.
+assert_port_free
 roastpilot-agent serve --host 0.0.0.0 --port "$PORT" &
 SRV=$!
 trap 'kill "$SRV" 2>/dev/null || true' INT TERM
