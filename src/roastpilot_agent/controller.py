@@ -38,6 +38,7 @@ from roastpilot_agent.config import ControllerConfig, LateMaillardTrim
 from roastpilot_agent.control_policy import PhaseControlLimits, RoastControlPolicy, TrimSignal
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
+    AppliedRoasterState,
     DropReason,
     RoastCommand,
     RoastEventKind,
@@ -219,8 +220,18 @@ class CommandExecutor(Protocol):
         """Record the operator first-crack override with MCP."""
         ...
 
-    async def drop_beans(self) -> None:
-        """Drop the beans (normal drop/cooling transition)."""
+    async def drop_beans(self) -> AppliedRoasterState | None:
+        """Drop the beans (normal drop/cooling transition).
+
+        Returns the driver's applied post-drop heat/fan/cooling state (#507)
+        — a drop changes those as a hardware side effect of the command
+        itself, so the caller adopts this return value into its own
+        commanded-value mirrors rather than assuming a constant. ``None``
+        means the hardware command succeeded but its result payload could not
+        be parsed (a malformed/out-of-contract MCP) — the caller proceeds
+        exactly as on a normal success (the drop already happened), simply
+        without adopting a value into the mirrors this tick.
+        """
         ...
 
     async def start_cooling(self) -> None:
@@ -231,8 +242,12 @@ class CommandExecutor(Protocol):
         """Stop the cooling cycle."""
         ...
 
-    async def emergency_stop(self, *, reason: str) -> None:
-        """Fire the MCP emergency_stop command."""
+    async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+        """Fire the MCP emergency_stop command.
+
+        Returns the driver's applied post-stop heat/fan/cooling state (#507),
+        mirroring :meth:`drop_beans` — including the ``None``-on-malformed-
+        payload contract."""
         ...
 
 
@@ -1918,13 +1933,14 @@ class RoastController:
         if drop.verdict is not SafetyVerdict.ALLOW:  # pragma: no cover — see above
             return False
         try:
-            await self._executor.drop_beans()
+            applied = await self._executor.drop_beans()
         except Exception:
             self._events.emit(
                 RoastEventKind.COMMAND_FAILED,
                 {"command": "drop_beans", "source": "policy", "reason": reason.value},
             )
             return False
+        self._adopt_applied_state(applied)
         self._events.emit(
             RoastEventKind.COMMAND_EXECUTED,
             {"command": "drop_beans", "source": "policy", "reason": reason.value},
@@ -2327,7 +2343,7 @@ class RoastController:
             return False
         if verdict is SafetyVerdict.EMERGENCY_STOP:
             try:
-                await self._executor.emergency_stop(reason=evaluation.reason)
+                applied = await self._executor.emergency_stop(reason=evaluation.reason)
             except Exception:
                 # A raising e-stop must not crash the tick loop or leave
                 # the phase pre-fault: fault anyway and surface the failed
@@ -2343,6 +2359,12 @@ class RoastController:
                 self._pending_fail_safe = self._heat_off_evaluation(
                     source_rule="emergency_stop_retry"
                 )
+            else:
+                # Confirmed on hardware (#507): adopt the applied heat/fan so the
+                # mirrors — and everything downstream reading them — reflect the
+                # e-stop immediately, the same tick, instead of the last pre-stop
+                # set_targets values.
+                self._adopt_applied_state(applied)
             # Emit ONCE, only on entry into FAULTED — never while already
             # latched there (the tick loop short-circuits before reaching here
             # in a terminal phase, but the guard keeps the emit transition-bound
@@ -2408,6 +2430,45 @@ class RoastController:
         self._current_fan = evaluation.adjusted_fan
         # Posture confirmed on hardware: nothing left to retry.
         self._pending_fail_safe = None
+
+    def _adopt_applied_state(self, applied: AppliedRoasterState | None) -> None:
+        """Adopt a command's actually-applied heat/fan into the commanded mirrors (#507).
+
+        ``drop_beans`` and ``emergency_stop`` change heat/fan/cooling as a
+        hardware side effect of the command itself, not through a separate
+        ``set_targets`` write — so unlike every other executed command, the
+        mirrors (``_current_heat`` / ``_current_fan``) are not already told
+        what was requested. Call this ONLY after the executor call has
+        already succeeded (mirrors the ``set_targets``-adjacent call sites'
+        own "assign the mirror after the await, never before" discipline —
+        #412's told==enforced pattern applied to the drop/e-stop path): a
+        failed write must never advance what the controller believes is
+        commanded.
+
+        ``applied`` is ``None`` when the hardware command succeeded but its
+        result payload could not be parsed (a malformed/out-of-contract
+        MCP — see ``mcp_client.RoasterControlAdapter``'s
+        ``_applied_state_or_none``, which already logged a WARNING). This is
+        a genuine no-op, not a failure: the caller has already emitted
+        ``COMMAND_EXECUTED`` and transitioned, because the drop/stop DID
+        happen — only the mirrors stay at their pre-command values
+        (stale-but-honest) rather than adopting a fabricated guess.
+
+        ``cooling_on`` is intentionally NOT mirrored here — the controller has
+        no ``_current_cooling`` field; ``cooling_on`` reaches telemetry
+        exclusively through the live per-tick MCP read
+        (``RoastTelemetry.cooling_on``, see ``mcp_client.project_session_state``),
+        which is already correct and unaffected by this bug.
+
+        Args:
+            applied: The driver's applied state, as returned by the executor's
+                ``drop_beans``/``emergency_stop`` call, or ``None`` on a
+                parse failure against an already-successful hardware command.
+        """
+        if applied is None:
+            return
+        self._current_heat = applied.heat_level_percent
+        self._current_fan = applied.fan_level_percent
 
     def _heat_off_evaluation(self, *, source_rule: str) -> SafetyEvaluation:
         """A synthetic heat-off / overrun-safe-fan fail-safe target (#206).
@@ -2525,13 +2586,17 @@ class RoastController:
                 the escalation (already persisted by the caller).
         """
         try:
-            await self._executor.emergency_stop(reason=evaluation.reason)
+            applied = await self._executor.emergency_stop(reason=evaluation.reason)
         except Exception:
             self._events.emit(
                 RoastEventKind.COMMAND_FAILED,
                 {"command": "emergency_stop", "reason": evaluation.reason},
             )
             self._pending_fail_safe = self._heat_off_evaluation(source_rule="emergency_stop_retry")
+        else:
+            # Confirmed on hardware (#507): adopt the applied heat/fan (see
+            # _act_on_safety's identical comment for the full rationale).
+            self._adopt_applied_state(applied)
         # An emergency stop lands in FAULTED: escalating from operator_recovery_
         # required (the lower-severity RECOVERY latch) crosses the universal
         # `* → faulted` edge; escalating from a FAULT latch is already there.
@@ -2812,13 +2877,14 @@ class RoastController:
             # an advice phase; the un-taken branch is pragma'd, not the guard logic.
             if drop.verdict is SafetyVerdict.ALLOW:  # pragma: no branch — see above
                 try:
-                    await self._executor.drop_beans()
+                    applied = await self._executor.drop_beans()
                 except Exception:
                     self._events.emit(
                         RoastEventKind.COMMAND_FAILED,
                         {"command": "drop_beans", "source": "advisor"},
                     )
                     return
+                self._adopt_applied_state(applied)
                 self._events.emit(
                     RoastEventKind.COMMAND_EXECUTED,
                     {"command": "drop_beans", "source": "advisor"},
@@ -3387,10 +3453,11 @@ class RoastController:
         if will_transition and not self.can_transition(RoastPhase.COOLING):
             raise InvalidTransitionError(self._phase, RoastPhase.COOLING)
         try:
-            await self._executor.drop_beans()
+            applied = await self._executor.drop_beans()
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "drop_beans"})
             return
+        self._adopt_applied_state(applied)
         self._events.emit(
             RoastEventKind.COMMAND_EXECUTED, {"command": "drop_beans", "source": "operator"}
         )

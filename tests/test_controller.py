@@ -46,6 +46,7 @@ from roastpilot_agent.controller import (
 from roastpilot_agent.models import (
     AdvisorHealth,
     AdvisorHealthStatus,
+    AppliedRoasterState,
     DropReason,
     OperatorAction,
     RoastCommand,
@@ -2388,7 +2389,7 @@ async def test_latch_escalation_estop_failure_is_surfaced_and_latches_retry() ->
     FAULT, and re-latches at EMERGENCY_STOP so it does not re-fire."""
 
     class FailingEstopExecutor(RecordingExecutor):
-        async def emergency_stop(self, *, reason: str) -> None:
+        async def emergency_stop(self, *, reason: str) -> AppliedRoasterState:
             raise RuntimeError("serial port dead")
 
     log: list[str] = []
@@ -2499,7 +2500,7 @@ async def test_failed_emergency_stop_still_faults() -> None:
     loop or leave the phase pre-fault."""
 
     class FailingEstopExecutor(RecordingExecutor):
-        async def emergency_stop(self, *, reason: str) -> None:
+        async def emergency_stop(self, *, reason: str) -> AppliedRoasterState:
             raise RuntimeError("serial port dead")
 
     log: list[str] = []
@@ -4645,10 +4646,10 @@ class FailingCommandExecutor(RecordingExecutor):
             raise RuntimeError("write failed")
         await super().mark_first_crack()
 
-    async def drop_beans(self) -> None:
+    async def drop_beans(self) -> AppliedRoasterState | None:
         if "drop_beans" in self._failing:
             raise RuntimeError("write failed")
-        await super().drop_beans()
+        return await super().drop_beans()
 
     async def start_cooling(self) -> None:
         if "start_cooling" in self._failing:
@@ -6862,7 +6863,7 @@ async def test_deterministic_drop_anchor_emits_command_failed_on_actuator_failur
     FSM/hardware divergence)."""
 
     class RaisingDropExecutor(RecordingExecutor):
-        async def drop_beans(self) -> None:
+        async def drop_beans(self) -> AppliedRoasterState:
             raise RuntimeError("serial write dropped")
 
     config = _post_fc_config()
@@ -7008,7 +7009,7 @@ async def test_ceiling_guard_emits_command_failed_on_actuator_failure() -> None:
     exactly, since both share :meth:`RoastController._execute_deterministic_drop`."""
 
     class RaisingDropExecutor(RecordingExecutor):
-        async def drop_beans(self) -> None:
+        async def drop_beans(self) -> AppliedRoasterState:
             raise RuntimeError("serial write dropped")
 
     config = _ceiling_guard_config(ceiling_guard_temp_c=196.0)
@@ -7083,3 +7084,431 @@ async def test_ceiling_guard_takes_precedence_over_the_dev_percent_anchor_same_t
     # not just that the reason-tagged event landed.
     drop_evals = [e for e in harness.sink.evaluations if e.rule == "drop_eligibility"]
     assert drop_evals and drop_evals[-1].verdict is SafetyVerdict.ALLOW
+
+
+# --- #507: drop/emergency_stop adopt the applied heat/fan into the mirrors ---
+#
+# roastpilot-agent#507 (supersedes coffee-roaster-mcp#189, closed wrong-premise):
+# _current_heat/_current_fan — the mirrors ControllerSnapshot.current_heat/
+# current_fan expose, which telemetry_snapshots rows and the SSE frame read —
+# were never updated on ANY drop or emergency_stop path, so they held the last
+# pre-drop set_targets values (91/40 in the roast 12 trace) through all of
+# cooling. The fix adopts the executor's returned AppliedRoasterState (sourced
+# from the MCP command's own event payload) into the mirrors, exactly once,
+# only after the write is confirmed.
+
+#: A deliberately NON-default applied state distinct from every existing
+#: fixture's pre-drop set_targets values (65/50, 100/30, …) and from the
+#: driver's own real 0/100 constant — proves the controller actually ADOPTS
+#: whatever the executor returns rather than a coincidental match or a
+#: hardcoded 0/100 (the #507 direction: "never hardcode the driver's
+#: post-drop constants in the controller").
+_DISTINCTIVE_APPLIED_STATE = AppliedRoasterState(
+    heat_level_percent=7, fan_level_percent=88, cooling_on=True
+)
+
+
+def _development_harness_with_executor(
+    *,
+    readings: list[RoastTelemetry | None | Exception],
+    advisor: RoastAdvisor | None,
+    executor: RecordingExecutor,
+) -> Harness:
+    """A DEVELOPMENT harness with an explicit (non-default) executor.
+
+    Mirrors :func:`harness_in_development` exactly — that helper does not
+    accept an ``executor`` override, so this rebuilds its body via
+    :func:`make_harness` directly, which does."""
+    harness = make_harness(readings=readings, advisor=advisor, executor=executor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:  # …→ DEVELOPMENT
+        harness.controller.transition_to(step)
+    harness.log.clear()
+    harness.events.events.clear()
+    return harness
+
+
+@pytest.mark.asyncio
+async def test_advisor_drop_adopts_applied_state_into_mirrors() -> None:
+    """The roast-12 trace pattern, reproduced and pinned: pre-drop the mirrors
+    hold the last commanded heat/fan (65/50, an ordinary advisory write);
+    after an advisor-triggered drop they must show the DRIVER's applied
+    state, not the stale pre-drop command — the same tick the drop lands,
+    not "a few ticks later". ``cooling_on`` is scripted True on the drop
+    tick's reading (mirroring the real MCP, which reports the fresh
+    post-drop device state the SAME poll the agent reads it — see
+    ``_read_current_driver_state`` + ``get_roast_state`` in mcp_server.py)
+    to reproduce the roast-12 divergence directly: real ``cooling_on`` true
+    alongside the (pre-fix stale / post-fix adopted) heat/fan mirrors."""
+    executor = RecordingExecutor(drop_applied_state=_DISTINCTIVE_APPLIED_STATE)
+    advisor = FakeAdvisor([decision(heat=65, fan=50, drop=False), decision(drop=True)])
+    harness = _development_harness_with_executor(
+        readings=[reading()], advisor=advisor, executor=executor
+    )
+
+    harness.controller.request_advisory()
+    await harness.controller.tick()  # pre-drop: mirrors land at 65/50
+    assert harness.controller.snapshot().current_heat == 65
+    assert harness.controller.snapshot().current_fan == 50
+
+    harness.reader.readings = [reading(cooling_on=True)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()  # the drop tick
+    assert harness.controller.phase is RoastPhase.COOLING
+    assert "drop_beans" in executor.commands
+    # The mirrors now show the DRIVER's applied state (7/88), not the stale
+    # pre-drop 65/50 — proving genuine adoption of a non-default, non-0/100
+    # value, not a hardcoded constant or a coincidental pass-through.
+    assert harness.controller.snapshot().current_heat == 7
+    assert harness.controller.snapshot().current_fan == 88
+    # cooling_on is unaffected (it was already correct pre-fix, sourced live
+    # from the per-tick MCP read, never from the mirrors) — assert it stays
+    # true so a regression there would also be caught here (the roast-12
+    # trace's "cooling_on=1 alongside stale heat/fan" divergence, now closed).
+    telemetry = harness.controller.snapshot().telemetry
+    assert telemetry is not None
+    assert telemetry.cooling_on is True
+
+
+@pytest.mark.asyncio
+async def test_operator_drop_adopts_applied_state_into_mirrors() -> None:
+    """The operator-drop path (:meth:`RoastController.operator_drop_beans`)
+    adopts the applied state exactly like the advisor path — the fix routes
+    through the ONE shared ``_adopt_applied_state`` helper, but this pins
+    that per-path wiring directly rather than relying on the advisor test
+    alone to cover it."""
+    executor = RecordingExecutor(drop_applied_state=_DISTINCTIVE_APPLIED_STATE)
+    harness = _development_harness_with_executor(
+        readings=[reading()], advisor=None, executor=executor
+    )
+    harness.controller.request_advisory()
+    await harness.controller.tick()  # ordinary tick: mirrors land at the profile floor
+    heat_before = harness.controller.snapshot().current_heat
+    fan_before = harness.controller.snapshot().current_fan
+    assert (heat_before, fan_before) != (7, 88)  # sanity: distinct from the applied state
+
+    await harness.controller.operator_drop_beans()
+    assert harness.controller.phase is RoastPhase.COOLING
+    assert harness.controller.snapshot().current_heat == 7
+    assert harness.controller.snapshot().current_fan == 88
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_anchor_adopts_applied_state_into_mirrors() -> None:
+    """The deterministic drop anchor (D84, :meth:`_maybe_deterministic_drop`,
+    shared with the ceiling guard via :meth:`_execute_deterministic_drop`)
+    adopts the applied state exactly like the advisor/operator paths."""
+    executor = RecordingExecutor(drop_applied_state=_DISTINCTIVE_APPLIED_STATE)
+    config = _post_fc_config()
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent,
+        config=config,
+        executor=executor,
+    )
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=5.0)]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.COOLING
+    assert "drop_beans" in executor.commands
+    assert harness.controller.snapshot().current_heat == 7
+    assert harness.controller.snapshot().current_fan == 88
+
+
+@pytest.mark.asyncio
+async def test_ceiling_guard_drop_adopts_applied_state_into_mirrors() -> None:
+    """The decoupled ceiling-guard drop (#405 D88 amendment A1,
+    :meth:`_maybe_ceiling_guard_drop`) adopts the applied state exactly like
+    every other drop path — same shared executor/adoption call."""
+    executor = RecordingExecutor(drop_applied_state=_DISTINCTIVE_APPLIED_STATE)
+    config = _ceiling_guard_config(ceiling_guard_temp_c=196.0)
+    harness = make_harness(config=config, executor=executor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:  # …→ DEVELOPMENT
+        harness.controller.transition_to(step)
+    harness.log.clear()
+    harness.events.events.clear()
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=5.0)]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.COOLING
+    assert "drop_beans" in executor.commands
+    assert harness.controller.snapshot().current_heat == 7
+    assert harness.controller.snapshot().current_fan == 88
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_adopts_applied_state_into_mirrors() -> None:
+    """The direct hard-ceiling e-stop path (:meth:`_act_on_safety`) adopts the
+    applied state into the mirrors — the same #412-shaped gap as the drop
+    paths, on a completely different write (``emergency_stop``, not
+    ``drop_beans``)."""
+    executor = RecordingExecutor(emergency_stop_applied_state=_DISTINCTIVE_APPLIED_STATE)
+    over_ceiling = reading(bean=235.0, env=200.0, age_seconds=0.0)  # > 230 hard ceiling
+    harness = make_harness(readings=[over_ceiling], executor=executor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:  # …→ DEVELOPMENT
+        harness.controller.transition_to(step)
+    harness.log.clear()
+    harness.events.events.clear()
+
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert len(executor.estop_reasons) == 1
+    assert harness.controller.snapshot().current_heat == 7
+    assert harness.controller.snapshot().current_fan == 88
+
+
+@pytest.mark.asyncio
+async def test_escalation_emergency_stop_adopts_applied_state_into_mirrors() -> None:
+    """The latched-escalation e-stop path (:meth:`_escalate_to_emergency_stop`,
+    reached from a FAULT/RECOVERY latch on a strictly-more-severe re-read)
+    adopts the applied state too — the second of the two ``emergency_stop``
+    call sites the fix touches."""
+    executor = RecordingExecutor(emergency_stop_applied_state=_DISTINCTIVE_APPLIED_STATE)
+    stale_low = reading(bean=180.0, env=200.0, age_seconds=10.0)  # stale → FAULT (latched)
+    over_ceiling = reading(bean=235.0, env=200.0, age_seconds=0.0)  # > 230 → escalate
+    harness = make_harness(readings=[stale_low, over_ceiling], executor=executor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:  # …→ DEVELOPMENT
+        harness.controller.transition_to(step)
+    harness.log.clear()
+    harness.events.events.clear()
+
+    await harness.controller.tick()  # entry: stale FAULT → FAULTED (latched FAULT)
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert executor.estop_reasons == []  # no hardware e-stop yet (heat-off via set_targets)
+
+    await harness.controller.tick()  # escalation: hard-ceiling breach → e-stop
+    assert len(executor.estop_reasons) == 1
+    assert harness.controller.snapshot().current_heat == 7
+    assert harness.controller.snapshot().current_fan == 88
+
+
+# --- #507 / #412 discipline: a FAILED write must NOT advance the mirrors ---
+
+
+@pytest.mark.asyncio
+async def test_failed_advisor_drop_does_not_advance_mirrors() -> None:
+    """A ``drop_beans`` write that raises must leave the mirrors exactly where
+    they were before the attempt — mirrors the #412 told==enforced discipline
+    (a failed write is never treated as if it landed)."""
+    advisor = FakeAdvisor([decision(heat=65, fan=50, drop=False), decision(drop=True)])
+    executor = FailingCommandExecutor({"drop_beans"})
+    harness = _development_harness_with_executor(
+        readings=[reading()], advisor=advisor, executor=executor
+    )
+    harness.controller.request_advisory()
+    await harness.controller.tick()  # pre-drop write lands: mirrors at 65/50
+    assert harness.controller.snapshot().current_heat == 65
+    assert harness.controller.snapshot().current_fan == 50
+
+    harness.controller.request_advisory()
+    await harness.controller.tick()  # the drop attempt raises
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT  # never transitioned
+    assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+    # Mirrors held exactly at their pre-attempt values — not advanced to any
+    # applied/adopted state, and not zeroed either.
+    assert harness.controller.snapshot().current_heat == 65
+    assert harness.controller.snapshot().current_fan == 50
+
+
+@pytest.mark.asyncio
+async def test_failed_operator_drop_does_not_advance_mirrors() -> None:
+    executor = FailingCommandExecutor({"drop_beans"})
+    harness = _development_harness_with_executor(
+        readings=[reading()], advisor=None, executor=executor
+    )
+    harness.controller.request_advisory()
+    await harness.controller.tick()  # ordinary tick lands the profile floor
+    heat_before = harness.controller.snapshot().current_heat
+    fan_before = harness.controller.snapshot().current_fan
+
+    await harness.controller.operator_drop_beans()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT  # never transitioned
+    assert harness.controller.snapshot().current_heat == heat_before
+    assert harness.controller.snapshot().current_fan == fan_before
+
+
+@pytest.mark.asyncio
+async def test_failed_deterministic_drop_anchor_does_not_advance_mirrors() -> None:
+    """Mirrors :func:`test_deterministic_drop_anchor_emits_command_failed_on_actuator_failure`
+    (the pre-existing phase/event coverage) with the #507 mirror assertion added."""
+
+    class RaisingDropExecutor(RecordingExecutor):
+        async def drop_beans(self) -> AppliedRoasterState:
+            raise RuntimeError("serial write dropped")
+
+    config = _post_fc_config()
+    executor = RaisingDropExecutor()
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent,
+        config=config,
+        executor=executor,
+    )
+    heat_before = harness.controller.snapshot().current_heat
+    fan_before = harness.controller.snapshot().current_fan
+
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT  # never transitioned
+    assert harness.controller.snapshot().current_heat == heat_before
+    assert harness.controller.snapshot().current_fan == fan_before
+
+
+@pytest.mark.asyncio
+async def test_failed_emergency_stop_does_not_advance_mirrors() -> None:
+    """Mirrors :func:`test_failed_emergency_stop_still_faults` with the #507
+    mirror assertion added: a raising ``emergency_stop`` still faults closed
+    via the ``set_targets`` fail-safe retry latch, but the mirrors must not
+    ALSO be advanced from the (failed) ``emergency_stop`` call itself."""
+
+    class FailingEstopExecutor(RecordingExecutor):
+        async def emergency_stop(self, *, reason: str) -> AppliedRoasterState:
+            raise RuntimeError("serial port dead")
+
+    over_ceiling = reading(bean=235.0, env=200.0, age_seconds=0.0)
+    executor = FailingEstopExecutor()
+    harness = make_harness(readings=[over_ceiling], executor=executor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:  # …→ DEVELOPMENT
+        harness.controller.transition_to(step)
+    harness.log.clear()
+    harness.events.events.clear()
+
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+    # The failed emergency_stop must not have advanced the mirrors to the
+    # driver's real applied state — only the SEPARATE set_targets fail-safe
+    # retry (heat 0 / safe fan) may do that, on its own successful write.
+    heat_after = harness.controller.snapshot().current_heat
+    fan_after = harness.controller.snapshot().current_fan
+    assert (heat_after, fan_after) != (7, 88)
+
+
+# --- #507 safety-review MEDIUM: a hardware-successful drop/e-stop whose
+# result payload cannot be parsed must NOT diverge the FSM from physical
+# reality. mcp_client.RoasterControlAdapter degrades a malformed payload to
+# ``None`` (never raises) — these tests drive the CONTROLLER side of that
+# contract: a ``None`` applied state is a genuine no-op, indistinguishable
+# from a normal success except that the mirrors are not adopted. The
+# hardware already dropped/stopped, so the caller must transition, emit
+# COMMAND_EXECUTED, and (for drop) NEVER re-fire drop_beans on the next tick.
+
+
+@pytest.mark.asyncio
+async def test_advisor_drop_with_malformed_payload_still_transitions_and_does_not_refire() -> None:
+    """A drop whose result payload is unparseable (``applied=None``) still
+    transitions to COOLING and emits COMMAND_EXECUTED — the drop physically
+    happened — and the mirrors simply stay at their pre-drop values
+    (stale-but-honest) rather than raising or advancing to a fabricated
+    value. A follow-up tick must not re-fire ``drop_beans`` (COOLING is not
+    an advisory phase, so the advisor drop path is naturally inert there —
+    this pins that it stays inert, not just that it happens to today)."""
+    executor = RecordingExecutor(drop_applied_state=None)
+    advisor = FakeAdvisor([decision(heat=65, fan=50, drop=False), decision(drop=True)])
+    harness = _development_harness_with_executor(
+        readings=[reading()], advisor=advisor, executor=executor
+    )
+
+    harness.controller.request_advisory()
+    await harness.controller.tick()  # pre-drop: mirrors land at 65/50
+    assert harness.controller.snapshot().current_heat == 65
+    assert harness.controller.snapshot().current_fan == 50
+
+    harness.controller.request_advisory()
+    await harness.controller.tick()  # the drop tick: applied=None (malformed payload)
+    assert harness.controller.phase is RoastPhase.COOLING  # the drop DID happen
+    assert executor.commands.count("drop_beans") == 1
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {"command": "drop_beans", "source": "advisor"} in executed
+    assert RoastEventKind.COMMAND_FAILED not in harness.events.kinds()
+    # Mirrors held at their pre-drop values — not advanced, not zeroed, not
+    # a crash — because there was nothing valid to adopt.
+    assert harness.controller.snapshot().current_heat == 65
+    assert harness.controller.snapshot().current_fan == 50
+
+    # A follow-up tick must NOT re-fire drop_beans (would be an FSM/hardware
+    # divergence: the machine already dropped).
+    await harness.controller.tick()
+    assert executor.commands.count("drop_beans") == 1
+
+
+@pytest.mark.asyncio
+async def test_operator_drop_with_malformed_payload_still_transitions() -> None:
+    """The operator-drop path handles ``applied=None`` identically to the
+    advisor path — transitions, emits COMMAND_EXECUTED, mirrors unchanged."""
+    executor = RecordingExecutor(drop_applied_state=None)
+    harness = _development_harness_with_executor(
+        readings=[reading()], advisor=None, executor=executor
+    )
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    heat_before = harness.controller.snapshot().current_heat
+    fan_before = harness.controller.snapshot().current_fan
+
+    await harness.controller.operator_drop_beans()
+    assert harness.controller.phase is RoastPhase.COOLING
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {"command": "drop_beans", "source": "operator"} in executed
+    assert RoastEventKind.COMMAND_FAILED not in harness.events.kinds()
+    assert harness.controller.snapshot().current_heat == heat_before
+    assert harness.controller.snapshot().current_fan == fan_before
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_anchor_with_malformed_payload_still_transitions() -> None:
+    """The deterministic drop anchor handles ``applied=None`` identically."""
+    executor = RecordingExecutor(drop_applied_state=None)
+    config = _post_fc_config()
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent,
+        config=config,
+        executor=executor,
+    )
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=5.0)]
+
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.COOLING
+    assert "drop_beans" in executor.commands
+    assert RoastEventKind.COMMAND_FAILED not in harness.events.kinds()
+    # The SAME tick's RoR-loop set_targets write (D82/D84 ordering: the loop
+    # runs BEFORE the anchor) still lands normally — that write is unrelated
+    # to the drop's own applied-state parsing. The mirrors must equal exactly
+    # THAT loop write, proving the drop's None did not additionally zero or
+    # otherwise perturb them beyond what the loop itself set this tick.
+    assert executor.targets, "the RoR loop must have written this tick"
+    loop_heat, loop_fan = executor.targets[-1]
+    assert harness.controller.snapshot().current_heat == loop_heat
+    assert harness.controller.snapshot().current_fan == loop_fan
+
+    # No re-fire on the next tick.
+    drop_count_before = executor.commands.count("drop_beans")
+    await harness.controller.tick()
+    assert executor.commands.count("drop_beans") == drop_count_before
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_with_malformed_payload_still_faults() -> None:
+    """A hardware-successful e-stop whose result payload is unparseable
+    (``applied=None``) still faults closed and emits no COMMAND_FAILED — the
+    stop DID happen; only the mirror adoption is skipped. This dissolves the
+    reviewer's LOW-2 by construction: a malformed-but-successful e-stop no
+    longer queues a needless heat-off retry (the ``except`` branch is never
+    reached — ``emergency_stop`` did not raise, it returned ``None``)."""
+    executor = RecordingExecutor(emergency_stop_applied_state=None)
+    over_ceiling = reading(bean=235.0, env=200.0, age_seconds=0.0)
+    harness = make_harness(readings=[over_ceiling], executor=executor)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:4]:  # …→ DEVELOPMENT
+        harness.controller.transition_to(step)
+    harness.log.clear()
+    harness.events.events.clear()
+
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert len(executor.estop_reasons) == 1
+    # No COMMAND_FAILED: the e-stop write itself succeeded (only its payload
+    # was unparseable), so this must not be treated as a write failure.
+    assert RoastEventKind.COMMAND_FAILED not in harness.events.kinds()
+    # No pending fail-safe retry latched — the malformed-payload path is NOT
+    # the raising-exception path, so it must not queue the emergency_stop
+    # retry evaluation (LOW-2).
+    assert harness.controller._pending_fail_safe is None  # pyright: ignore[reportPrivateUsage]

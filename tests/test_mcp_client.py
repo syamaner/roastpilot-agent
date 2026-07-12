@@ -26,6 +26,7 @@ from roastpilot_agent.mcp_client import (
     EventCommandResult,
     EventSnapshot,
     ExportRoastLogResult,
+    MalformedCommandResultError,
     MCPConnectionError,
     MCPMirror,
     MCPServerProcess,
@@ -38,6 +39,7 @@ from roastpilot_agent.mcp_client import (
     ServerInfo,
     SetRecordingMetadataResult,
     StartRoastSessionResult,
+    applied_state_from_event,
     event_backdate_seconds,
     force_terminate_process_group,
     parse_tool_result,
@@ -46,7 +48,7 @@ from roastpilot_agent.mcp_client import (
     project_session_state,
     resolve_mcp_command,
 )
-from roastpilot_agent.models import MicHealth
+from roastpilot_agent.models import AppliedRoasterState, MicHealth
 
 FIXTURES = Path(__file__).parent / "fixtures" / "live-roast-2026-06-07"
 
@@ -147,6 +149,43 @@ EVENT_RESULT_PAYLOAD: dict[str, object] = {
     "event_count": 2,
 }
 
+#: #507: drop_beans/emergency_stop event payloads always carry the driver's
+#: applied heat/fan/cooling (coffee_roaster_mcp session.py
+#: complete_reserved_driver_drop_snapshot / default_emergency_safety_payload) —
+#: unlike the generic EVENT_RESULT_PAYLOAD above (shaped for mark_first_crack),
+#: RoasterControlAdapter.drop_beans/emergency_stop parse these fields out of the
+#: event, so the canned fixture for those two tools must carry them.
+DROP_EVENT_RESULT_PAYLOAD: dict[str, object] = {
+    "session_id": "abc",
+    "phase": "dropped",
+    "event": {
+        "kind": "beans_dropped",
+        "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+        "monotonic_seconds": 1228.9,
+        "payload": {"heat_level_percent": 0, "fan_level_percent": 100, "cooling_on": True},
+    },
+    "event_count": 3,
+}
+
+EMERGENCY_STOP_EVENT_RESULT_PAYLOAD: dict[str, object] = {
+    "session_id": "abc",
+    "phase": "fault",
+    "event": {
+        "kind": "fault",
+        "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+        "monotonic_seconds": 1228.9,
+        "payload": {
+            "driver": "mock",
+            "driver_safety_method": "emergency_stop",
+            "driver_safety_method_called": True,
+            "heat_level_percent": 0,
+            "fan_level_percent": 100,
+            "cooling_on": True,
+        },
+    },
+    "event_count": 3,
+}
+
 CANNED: dict[str, object] = {
     "get_server_info": {
         "product_name": "RoastPilot",
@@ -194,7 +233,7 @@ CANNED: dict[str, object] = {
     },
     "mark_beans_added": EVENT_RESULT_PAYLOAD,
     "mark_first_crack": EVENT_RESULT_PAYLOAD,
-    "drop_beans": EVENT_RESULT_PAYLOAD,
+    "drop_beans": DROP_EVENT_RESULT_PAYLOAD,
     "start_cooling": EVENT_RESULT_PAYLOAD,
     "stop_cooling": EVENT_RESULT_PAYLOAD,
     "export_roast_log": {
@@ -206,7 +245,7 @@ CANNED: dict[str, object] = {
         "ready": True,
         "note": "export complete",
     },
-    "emergency_stop": EVENT_RESULT_PAYLOAD,
+    "emergency_stop": EMERGENCY_STOP_EVENT_RESULT_PAYLOAD,
     "set_recording_metadata": {"origin": "colombia-huila", "roast_num": 5},
 }
 
@@ -1540,6 +1579,158 @@ def test_project_session_state_backdate_none_for_legacy_empty_payload() -> None:
     assert telemetry.first_crack_backdate_seconds is None
 
 
+# --- #507: applied_state_from_event -----------------------------------------
+
+
+def _drop_event(payload: dict[str, object]) -> EventSnapshot:
+    return EventSnapshot.model_validate(
+        {
+            "kind": "beans_dropped",
+            "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+            "monotonic_seconds": 1228.9,
+            "payload": payload,
+        }
+    )
+
+
+def test_applied_state_from_event_extracts_driver_reported_values() -> None:
+    """The applied state comes from whatever the event payload actually
+    carries — proving the extraction is a real read, not a hardcoded 0/100
+    (#507's "never hardcode the driver's post-drop constants" direction)."""
+    event = _drop_event({"heat_level_percent": 12, "fan_level_percent": 55, "cooling_on": True})
+    assert applied_state_from_event(event) == AppliedRoasterState(
+        heat_level_percent=12, fan_level_percent=55, cooling_on=True
+    )
+
+
+def test_applied_state_from_event_raises_for_missing_heat() -> None:
+    event = _drop_event({"fan_level_percent": 100, "cooling_on": True})
+    with pytest.raises(MalformedCommandResultError, match="heat_level_percent"):
+        applied_state_from_event(event)
+
+
+def test_applied_state_from_event_raises_for_missing_fan() -> None:
+    event = _drop_event({"heat_level_percent": 0, "cooling_on": True})
+    with pytest.raises(MalformedCommandResultError, match="fan_level_percent"):
+        applied_state_from_event(event)
+
+
+def test_applied_state_from_event_raises_for_missing_cooling_on() -> None:
+    event = _drop_event({"heat_level_percent": 0, "fan_level_percent": 100})
+    with pytest.raises(MalformedCommandResultError, match="cooling_on"):
+        applied_state_from_event(event)
+
+
+def test_applied_state_from_event_rejects_bool_heat() -> None:
+    """``bool`` is an ``int`` subclass — must not silently pass as heat."""
+    event = _drop_event({"heat_level_percent": True, "fan_level_percent": 100, "cooling_on": True})
+    with pytest.raises(MalformedCommandResultError, match="heat_level_percent"):
+        applied_state_from_event(event)
+
+
+def test_applied_state_from_event_rejects_non_bool_cooling_on() -> None:
+    event = _drop_event({"heat_level_percent": 0, "fan_level_percent": 100, "cooling_on": "true"})
+    with pytest.raises(MalformedCommandResultError, match="cooling_on"):
+        applied_state_from_event(event)
+
+
+# --- #507 safety-review MEDIUM: the adapter degrades a malformed payload to
+# None (never raises) — the hardware command already succeeded by the time
+# this parsing runs, so a payload parse failure must not surface as a
+# caller-side exception (which every drop/e-stop caller treats as "the write
+# itself failed").
+
+
+@pytest.mark.asyncio
+async def test_adapter_drop_beans_returns_none_on_malformed_payload(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """``RoasterControlAdapter.drop_beans()`` degrades a malformed
+    ``beans_dropped`` payload to ``None`` (never raises) and logs a WARNING
+    naming the malformed event's payload KEYS (never fabricating a value)."""
+    caller = FakeToolCaller()
+    caller_calls_payload = {
+        "session_id": "abc",
+        "phase": "dropped",
+        "event": {
+            "kind": "beans_dropped",
+            "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+            "monotonic_seconds": 1228.9,
+            # Malformed: cooling_on missing entirely.
+            "payload": {"heat_level_percent": 0, "fan_level_percent": 100},
+        },
+        "event_count": 3,
+    }
+
+    async def caller_fn(tool: str, arguments: dict[str, object]) -> object:
+        if tool == "drop_beans":
+            return caller_calls_payload
+        return await caller(tool, arguments)
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller_fn))
+    with caplog.at_level(logging.WARNING, logger="roastpilot_agent.mcp_client"):
+        result = await adapter.drop_beans()
+    assert result is None
+    assert any(
+        "beans_dropped" in record.message and "cooling_on" not in record.message
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ), "WARNING must name the malformed event kind, not fabricate a cooling_on value"
+    # The log carries only PAYLOAD KEYS, never values — the keys present here
+    # are heat_level_percent/fan_level_percent (cooling_on absent).
+    warning_messages = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("fan_level_percent" in m and "heat_level_percent" in m for m in warning_messages)
+
+
+@pytest.mark.asyncio
+async def test_adapter_emergency_stop_returns_none_on_malformed_payload(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mirrors the drop test above for ``emergency_stop`` — a malformed
+    ``fault`` event payload degrades to ``None``, not an exception."""
+
+    async def caller_fn(tool: str, arguments: dict[str, object]) -> object:
+        if tool == "emergency_stop":
+            return {
+                "session_id": "abc",
+                "phase": "fault",
+                "event": {
+                    "kind": "fault",
+                    "recorded_at_utc": "2026-06-07T12:19:00.000000+00:00",
+                    "monotonic_seconds": 1228.9,
+                    # Malformed: heat_level_percent is a bool, not an int.
+                    "payload": {
+                        "heat_level_percent": True,
+                        "fan_level_percent": 100,
+                        "cooling_on": True,
+                    },
+                },
+                "event_count": 3,
+            }
+        raise AssertionError(f"unexpected tool call: {tool}")
+
+    adapter = RoasterControlAdapter(RoasterMCPClient(caller_fn))
+    with caplog.at_level(logging.WARNING, logger="roastpilot_agent.mcp_client"):
+        result = await adapter.emergency_stop(reason="test")
+    assert result is None
+    assert any(
+        record.levelno == logging.WARNING and "fault" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_applied_state_or_none_returns_parsed_state_on_a_well_formed_payload() -> None:
+    """The happy path still returns the real parsed state (not always None) —
+    proves ``_applied_state_or_none`` only degrades on genuine malformation."""
+    event = _drop_event({"heat_level_percent": 12, "fan_level_percent": 55, "cooling_on": True})
+    result = RoasterControlAdapter._applied_state_or_none(  # pyright: ignore[reportPrivateUsage]
+        event
+    )
+    assert result == AppliedRoasterState(
+        heat_level_percent=12, fan_level_percent=55, cooling_on=True
+    )
+
+
 def test_project_mic_status_running_and_detecting_is_ok() -> None:
     """audio_running + pending/detected → OK (green), counters forwarded (#197)."""
     state = _state_with_fc(status="detected", audio_running=True, emitted_window_count=311)
@@ -1705,10 +1896,10 @@ async def test_adapter_passes_through_all_commands() -> None:
     await adapter.start_session()
     await adapter.mark_beans_added()
     await adapter.mark_first_crack()
-    await adapter.drop_beans()
+    drop_applied = await adapter.drop_beans()
     await adapter.start_cooling()
     await adapter.stop_cooling()
-    await adapter.emergency_stop(reason="manual")
+    estop_applied = await adapter.emergency_stop(reason="manual")
     result = await adapter.export_roast_log()
     assert [name for name, _ in caller.calls] == [
         "start_roast_session",
@@ -1721,6 +1912,14 @@ async def test_adapter_passes_through_all_commands() -> None:
         "export_roast_log",
     ]
     assert result.ready is True
+    # #507: drop_beans/emergency_stop return the driver's applied state,
+    # parsed from the command result's own event payload — not a constant.
+    assert drop_applied == AppliedRoasterState(
+        heat_level_percent=0, fan_level_percent=100, cooling_on=True
+    )
+    assert estop_applied == AppliedRoasterState(
+        heat_level_percent=0, fan_level_percent=100, cooling_on=True
+    )
 
 
 @pytest.mark.asyncio

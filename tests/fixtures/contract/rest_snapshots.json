@@ -275,8 +275,8 @@
         "elapsed_seconds": 0.0,
         "env_ror_c_per_min": null,
         "env_temp_c": 235.0,
-        "fan_level_percent": 30,
-        "heat_level_percent": 100,
+        "fan_level_percent": 100,
+        "heat_level_percent": 0,
         "tick": 14
       },
       {
@@ -289,8 +289,8 @@
         "elapsed_seconds": 0.0,
         "env_ror_c_per_min": null,
         "env_temp_c": 150.0,
-        "fan_level_percent": 30,
-        "heat_level_percent": 100,
+        "fan_level_percent": 100,
+        "heat_level_percent": 0,
         "tick": 15
       },
       {
@@ -303,8 +303,8 @@
         "elapsed_seconds": 0.0,
         "env_ror_c_per_min": null,
         "env_temp_c": 110.0,
-        "fan_level_percent": 30,
-        "heat_level_percent": 100,
+        "fan_level_percent": 100,
+        "heat_level_percent": 0,
         "tick": 16
       },
       {
@@ -317,8 +317,8 @@
         "elapsed_seconds": 0.0,
         "env_ror_c_per_min": null,
         "env_temp_c": 80.0,
-        "fan_level_percent": 30,
-        "heat_level_percent": 100,
+        "fan_level_percent": 100,
+        "heat_level_percent": 0,
         "tick": 17
       },
       {
@@ -331,8 +331,8 @@
         "elapsed_seconds": 0.0,
         "env_ror_c_per_min": null,
         "env_temp_c": 60.0,
-        "fan_level_percent": 30,
-        "heat_level_percent": 100,
+        "fan_level_percent": 100,
+        "heat_level_percent": 0,
         "tick": 18
       }
     ],

@@ -25,6 +25,7 @@ from roastpilot_agent.config import AppConfig, ControllerConfig
 from roastpilot_agent.mcp_client import MCPServerProcess
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
+    AppliedRoasterState,
     RoastEventKind,
     RoastEventSource,
     RoastPhase,
@@ -219,8 +220,9 @@ async def test_shutdown_heat_off_is_bounded_and_persists_unconfirmed_marker(
     clock = FakeClock()
 
     class HangingMCP(FakeMCPClient):
-        async def emergency_stop(self, *, reason: str) -> None:
+        async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
             await asyncio.Event().wait()  # never completes — simulates a wedged child
+            raise AssertionError("unreachable — the wait above never returns")
 
     mcp = HangingMCP([_reading(bean=178.0, env=185.0)])
     service = RoastService(
@@ -272,11 +274,11 @@ async def test_shutdown_heat_off_retry_recovers_without_marker(store: RoastStore
             super().__init__(frames)
             self._estop_attempts = 0
 
-        async def emergency_stop(self, *, reason: str) -> None:
+        async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
             self._estop_attempts += 1
             if self._estop_attempts == 1:
                 await asyncio.Event().wait()  # first attempt wedges → times out
-            await super().emergency_stop(reason=reason)  # retry confirms
+            return await super().emergency_stop(reason=reason)  # retry confirms
 
     mcp = TransientHangMCP([_reading(bean=178.0, env=185.0)])
     service = RoastService(
