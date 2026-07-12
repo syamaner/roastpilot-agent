@@ -254,6 +254,44 @@ describe("LivePage — loading hold", () => {
     expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
     expect(screen.queryByTestId("live-finished-view")).toBeNull();
   });
+
+  it("holds through health becoming fresh-and-idle WHILE history is still pending — proves the history gate is independently reached, not short-circuited by the health gate having just cleared", () => {
+    // The prior two tests each exercise the loading placeholder from a STATIC
+    // initial snapshot: one where health alone is not fresh (history left at
+    // its default, never even evaluated in practice since the health check
+    // returns first), and one where health is ALREADY fresh with history
+    // pending. Neither proves the health→history HANDOFF actually happens
+    // within a single component instance — a refactor that accidentally
+    // collapsed the two `if`s into one combined condition (e.g. `if
+    // (!health.isFresh && history.isPending)`, a realistic De Morgan's slip)
+    // would still pass both of those in isolation, since each only exercises
+    // one side of a buggy AND. This test starts with BOTH conditions holding
+    // (mirroring the realistic startup case where health and history are both
+    // in-flight together), then RESOLVES health via rerender while history
+    // stays pending — the loading placeholder must persist across that
+    // transition, proving the history gate is reached and evaluated on its
+    // own once health clears, not bypassed because it was "already handled"
+    // by the first render.
+    healthState.isSuccess = false;
+    healthState.isError = false;
+    healthState.isFresh = false;
+    healthState.data = undefined;
+    historyState.data = undefined;
+    historyState.isPending = true;
+    const { rerender } = renderPage();
+    expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
+
+    // Health resolves fresh-and-idle; history is STILL pending.
+    healthState.isSuccess = true;
+    healthState.isFresh = true;
+    healthState.data = { active_run_id: null };
+    rerender();
+
+    expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+    expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
+    expect(screen.queryByTestId("live-finished-view")).toBeNull();
+  });
 });
 
 describe("LivePage — active run", () => {
