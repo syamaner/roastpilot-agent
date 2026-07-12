@@ -92,4 +92,17 @@ describe("HomePage (#324 / #423 / #473 / #523)", () => {
     expect(screen.getByTestId("home-live-status-chip")).toHaveTextContent(/roast in progress/i);
     expect(screen.getByTestId("home-live-roast")).toHaveTextContent(/view live roast/i);
   });
+
+  it("does NOT show the live-status chip while health is still pending (data: undefined) — never flashes active before the read resolves", () => {
+    // Guards against a future refactor (e.g. deriving hasActiveRun from
+    // isSuccess/isLoading instead of `data?.active_run_id`) accidentally
+    // reading a pending fetch as "active" and flashing the chip. This page
+    // is a non-gating useHealth() consumer by design (unlike /live and
+    // /start's useFreshHealthGate()) — it renders stale-then-update — but
+    // "no data yet" must still resolve to the idle copy, not the active one.
+    healthState.data = undefined;
+    renderHome();
+    expect(screen.queryByTestId("home-live-status-chip")).toBeNull();
+    expect(screen.getByTestId("home-live-roast")).toHaveTextContent(/last roast/i);
+  });
 });
