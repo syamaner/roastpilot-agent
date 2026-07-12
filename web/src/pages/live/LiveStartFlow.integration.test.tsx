@@ -10,15 +10,20 @@
  *
  * Covers: a clean start reaching the dashboard; a transient post-restart
  * `/health` failure recovering via retry; a 409 (double-submit / already-active)
- * leaving the form visible and usable, never silently reset; and the active-run
+ * leaving the form visible and usable, never silently reset; the active-run
  * banner on `/start` (the legacy, still-URL-reachable alias) so a bare form is
- * never the only thing on screen once a run is active.
+ * never the only thing on screen once a run is active; and the Codex follow-up
+ * (#514/#515 review) — a REAL `QueryClient` cache primed with a within-staleTime
+ * "idle" health snapshot must not let the bare form render before the forced
+ * fresh refetch resolves, even when that fresh read reveals a run that started
+ * elsewhere in the last 30s.
  */
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { roastKeys } from "@/hooks/queries";
 import { LivePage } from "@/pages/live/LivePage";
 import { StartRoastView } from "@/pages/home/StartRoastView";
 
@@ -45,7 +50,7 @@ function fakeFetch(opts: {
         JSON.stringify({
           status: "ok",
           version: "test",
-          mcp_child: "connected",
+          mcp_child: "running",
           active_run_id: opts.activeRunId(),
         }),
         { status: 200 },
@@ -157,6 +162,75 @@ describe("#513 real-integration — /live start flow", () => {
     expect(screen.getByTestId("start-roast-submit")).toBeEnabled();
   });
 
+  it("#513 Codex follow-up: a within-staleTime cached idle snapshot never lets the bare form render before a genuinely fresh read", async () => {
+    // Mirrors the app's real QueryClient config (staleTime: 30_000 — see
+    // web/src/lib/queryClient.ts) so this test exercises the actual hazard:
+    // a cache primed by an EARLIER health read (e.g. the home page, or a
+    // prior /live visit) within the last 30s must not let a fresh mount of
+    // /live render the bare start form from that stale "idle" snapshot,
+    // even though `isSuccess` would be true instantly with NO network call
+    // at all under plain `useHealth` semantics.
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+    // Prime the cache exactly as an earlier real fetch would have.
+    client.setQueryData(roastKeys.health, {
+      status: "ok",
+      version: "test",
+      mcp_child: "running",
+      active_run_id: null,
+    });
+
+    let healthCalls = 0;
+    let resolveHealth: () => void = () => {};
+    global.fetch = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u === "/api/health") {
+        healthCalls += 1;
+        // The forced refetch (useFreshHealthGate's refetchOnMount: "always")
+        // stalls until released — giving the test a deterministic window to
+        // assert the hold fires from stale data before the fresh read lands.
+        await new Promise<void>((resolve) => {
+          resolveHealth = resolve;
+        });
+        // Reveals a run that started elsewhere in the stale window — the
+        // scenario Codex flagged, not just a plausible one.
+        return new Response(
+          JSON.stringify({
+            status: "ok",
+            version: "test",
+            mcp_child: "running",
+            active_run_id: "run-from-another-tab",
+          }),
+          { status: 200 },
+        );
+      }
+      throw new Error(`unexpected fetch ${u}`);
+    }) as unknown as typeof fetch;
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/live"]}>
+          <Routes>
+            <Route path="/live" element={<LivePage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // The stale cache alone must never render the bare form or the dashboard.
+    await waitFor(() => expect(healthCalls).toBe(1));
+    expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-start-view")).toBeNull();
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+
+    // Release the fresh read — it reveals the run that started elsewhere.
+    resolveHealth();
+    await waitFor(() => expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument());
+    expect(screen.queryByTestId("live-page-loading")).toBeNull();
+    expect(screen.queryByTestId("live-start-view")).toBeNull();
+  });
+
   it("#513: unmounting mid-confirm never lets the orphaned loop write the cache after unmount", async () => {
     // qa's probe scenario: the component unmounts WHILE the confirm loop is
     // between attempts (e.g. the operator navigates away, or the "Open live
@@ -246,5 +320,66 @@ describe("#513 real-integration — /start (legacy alias) active-run guard", () 
 
     fireEvent.click(screen.getByTestId("start-roast-active-run-link"));
     await waitFor(() => expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument());
+  });
+
+  it("#513 Codex follow-up: a within-staleTime cached idle snapshot never lets the bare form render before a genuinely fresh read", async () => {
+    // Same scenario as the /live version above, on the /start legacy route.
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: 30_000 } },
+    });
+    client.setQueryData(roastKeys.health, {
+      status: "ok",
+      version: "test",
+      mcp_child: "running",
+      active_run_id: null,
+    });
+
+    let healthCalls = 0;
+    let resolveHealth: () => void = () => {};
+    global.fetch = vi.fn(async (url: string) => {
+      const u = String(url);
+      if (u === "/api/health") {
+        healthCalls += 1;
+        await new Promise<void>((resolve) => {
+          resolveHealth = resolve;
+        });
+        return new Response(
+          JSON.stringify({
+            status: "ok",
+            version: "test",
+            mcp_child: "running",
+            active_run_id: "run-from-another-tab",
+          }),
+          { status: 200 },
+        );
+      }
+      if (u === "/api/bean-profiles") {
+        return new Response(JSON.stringify({ profiles: [] }), { status: 200 });
+      }
+      throw new Error(`unexpected fetch ${u}`);
+    }) as unknown as typeof fetch;
+
+    render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter initialEntries={["/start"]}>
+          <Routes>
+            <Route path="/start" element={<StartRoastView />} />
+            <Route path="/live" element={<LivePage />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => expect(healthCalls).toBe(1));
+    expect(screen.getByTestId("start-roast-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.queryByTestId("start-roast-active-run-banner")).toBeNull();
+
+    resolveHealth();
+    await waitFor(() =>
+      expect(screen.getByTestId("start-roast-active-run-banner")).toBeInTheDocument(),
+    );
+    expect(screen.queryByTestId("start-roast-loading")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
   });
 });

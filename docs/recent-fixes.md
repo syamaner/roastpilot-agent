@@ -355,12 +355,16 @@ Format: one entry per anti-pattern.
 ---
 
 ## Never treat unknown roaster status as idle
-*(fixed by #513 qa follow-up, 12 Jul 2026)*
+*(fixed by #513 qa follow-up, 12 Jul 2026; extended #513 post-#514 review, 12 Jul 2026)*
 
 - **Signature:** a code comment reading something like "treat as idle" or
   "fall through to no-run state" attached to a `useHealth().isError` (or
-  any other "the read failed" state) branch that renders the SAME view as
-  "no run is active" instead of a distinct unknown-status state.
+  any other "the read failed"/"not yet known" state) branch that renders
+  the SAME view as "no run is active" instead of a distinct explicit
+  state. Also: a start/idle-gated component with an active-run check
+  (`health.isSuccess && ...`) and an error check (`health.isError`) but NO
+  guard for the pending state in between (neither true yet) — it falls
+  through both `if`s to whatever renders last.
 - **Wrong:** `LivePage.tsx` had `if (health.isError) { return
   <LiveStartView />; }` with the comment "Health error: active run unknown
   — treat as idle (fall through to no-run state)." Unknown is not idle: a
@@ -371,13 +375,82 @@ Format: one entry per anti-pattern.
   without a path to the dashboard/emergency stop — the exact hazard class
   the rest of this batch fixes. `StartRoastView.tsx` had the same gap (it
   simply never handled `isError` at all, falling through past its
-  active-run banner to the bare form).
-- **Right:** a persistent read failure for active-run status gets its OWN
-  neutral state (`LiveStatusUnknownView` on `/live`, the equivalent inline
-  block on `/start`) — never the bare form, never silently reused as
-  "idle." Explain what's wrong and offer a reload/retry path.
+  active-run banner to the bare form) — and, caught by the post-merge
+  review of #514, ALSO never handled the PENDING state (the initial
+  `/health` fetch still in flight, before either `isSuccess` or `isError`
+  is true): a reload of `/start` mid-roast showed the bare, untouched-
+  looking form for one round-trip before the active-run banner appeared.
+- **Right:** the rule is now general, not error-only: **a start form
+  renders ONLY when health is resolved-success-and-idle; pending, error,
+  and active-run states each render their own explicit state** — never
+  fall through to the bare form from any state that isn't proven idle.
+  `LivePage.tsx` already had the pending-state hold (`!health.isSuccess`);
+  `StartRoastView.tsx` gained the matching hold, mirroring it exactly.
+  Explain what's wrong (or that it's still loading) and offer a
+  reload/retry path where relevant.
 - **Guarded by:** `LivePage.test.tsx`'s "#513 medium" test (replaces the
   old test that asserted the WRONG behavior — falling through to
   `live-start-view` — with an assertion on `live-status-unknown`) +
-  `StartRoastView.test.tsx`'s "#513 medium" test. Both fail-then-pass
+  `StartRoastView.test.tsx`'s "#513 medium" test + its "loading hold (#513
+  follow-up)" test (asserts the pending state shows `start-roast-loading`,
+  never the bare form or either other explicit state). All fail-then-pass
   verified.
+
+---
+
+## `isSuccess: true` does not mean the read is CURRENT — a cached entry within `staleTime` is a silent no-fetch
+*(fixed by #513 Codex follow-up on the #514/#515 review, 12 Jul 2026)*
+
+- **Signature:** a gating component (a start form, an auth check, anything
+  that decides whether to show a bare/default view based on server state)
+  that reads a shared `useQuery`-family hook with a non-zero `staleTime`
+  and branches on `isSuccess`/`isError` alone, with no distinction between
+  "settled from THIS mount's own fetch" and "settled from a cache entry
+  some OTHER mount populated up to `staleTime` ago." Also: `refetchOnMount:
+  "always"` added to "fix" a staleness concern without also gating on
+  something that tracks the NEW fetch settling — `isSuccess` stays `true`
+  (from the stale cached data) for the entire duration of that forced
+  background refetch.
+- **Wrong:** `useHealth()` shares the app's `staleTime: 30_000` (correct
+  for non-gating consumers like the header/nav, which should render
+  stale-then-update). But `LiveStartView`/`LivePage` and `StartRoastView`
+  gated their start form on plain `useHealth()`'s `isSuccess`/`isError` —
+  confirmed empirically: a remount within that 30s window renders a CACHED
+  `active_run_id` with `isSuccess: true` and issues **NO network request
+  at all** (TanStack Query does not refetch on mount while data is still
+  fresh by its own accounting). A second `roastpilot-agent` process (or
+  another tab) starting a run in that window would be invisible to a
+  fresh page load for up to 30s — the bare start form would render as
+  "proof" no run is active from data that was never re-checked. This is
+  the SAME hazard class as the rest of #513 (a start form rendering when
+  it must not), reached via a different mechanism (a cache hit, not a
+  failed refetch) — caught by Codex on the #515 PR, not self-discovered.
+- **Right:** the two start-form gating views use a dedicated
+  `useFreshHealthGate()` (`web/src/hooks/queries.ts`) instead of plain
+  `useHealth()`. It forces `refetchOnMount: "always"` AND tracks
+  `isFresh`: snapshot the `dataUpdatedAt` seen on THIS hook instance's
+  first render (whatever it is — `0` with no cache, or a past timestamp if
+  cached) once into a `useRef`, then `isFresh = dataUpdatedAt >
+  initialSnapshot || isError` — `dataUpdatedAt` advances on every settled
+  fetch even one that resolves with byte-identical data (confirmed
+  empirically), so this is a reliable "this mount's own fetch has
+  completed" signal that a naive `isSuccess`/`isFetching` check is not
+  (both stay `true`/`true` or `true`/`false` in ways that don't
+  distinguish stale-cached from freshly-confirmed). Gating views hold
+  their loading state on `!isFresh`, not `!isSuccess`. Non-gating
+  consumers (header/nav, `DashboardPage`'s idle branch — the last is
+  itself unreachable via the current router and out of scope for this
+  specific fold; flagged, not fixed here) keep plain `useHealth()`
+  unchanged — they are meant to render stale-then-update.
+- **Guarded by:** `queries.test.tsx`'s `useFreshHealthGate` suite (no cache
+  → pending-then-fresh; a within-`staleTime` cached entry → `isFresh`
+  stays `false` through the forced refetch even though `isSuccess` is
+  already `true`, only flipping once the NEW value — a run started
+  elsewhere — resolves; a persistent error settles `isFresh` to `true`,
+  never stuck) + a component-level test per gating view
+  (`LivePage.test.tsx`, `StartRoastView.test.tsx`) + a REAL fetch-boundary
+  integration test per view in `LiveStartFlow.integration.test.tsx` (a
+  real `QueryClient` configured with the app's actual `staleTime: 30_000`,
+  primed with a cached idle snapshot via `setQueryData`, then a genuinely
+  stalled `fetch` mock — the closest reproduction of the real hazard this
+  repo can exercise). All fail-then-pass verified.

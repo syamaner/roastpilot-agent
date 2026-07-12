@@ -10,12 +10,22 @@
  *
  * #513: a bare form must never be the only thing an operator can see once a
  * run is active, or when whether one is active is unknown — either leaves no
- * path to the emergency stop. Three layers: (1) if the server ALREADY reports
- * an active run (health snapshot, e.g. this route was opened mid-roast, or
- * reloaded after a start), a banner with a direct link to the live dashboard
- * replaces the form outright. (2) if the health check itself persistently
- * errors (active-run status UNKNOWN, not "no run"), a neutral "can't confirm"
- * state replaces the form too — this is the route the incident screenshot was
+ * path to the emergency stop. A start form renders ONLY when health is
+ * resolved-success-and-idle AND that read is GENUINELY FRESH (`useHealth`'s
+ * shared 30s `staleTime` would otherwise let a remount within that window
+ * render a cached "idle" snapshot with no network request at all — Codex
+ * follow-up on #514/#515; see `useFreshHealthGate`'s doc for the full
+ * empirically-verified rationale). Every other health state gets its own
+ * explicit view, never the bare form. Layers: (0) while health is pending OR
+ * a genuinely fresh read hasn't resolved yet, a neutral loading hold,
+ * mirroring `LivePage`'s (post-#514 review: this route previously fell
+ * through to the bare form for one `/health` round-trip on reload, the same
+ * hazard class). (1) if the server ALREADY reports an active run (health
+ * snapshot, e.g. this route was opened mid-roast, or reloaded after a
+ * start), a banner with a direct link to the live dashboard replaces the
+ * form outright. (2) if the health check itself persistently errors
+ * (active-run status UNKNOWN, not "no run"), a neutral "can't confirm" state
+ * replaces the form too — this is the route the incident screenshot was
  * almost certainly taken on, so it gets the same guard as `/live`.
  * (3) on a successful start, `navigate("/live")` fires unconditionally once
  * the POST is proven (201) — never gated on the health refetch actually
@@ -31,7 +41,7 @@ import {
   useBeanProfiles,
   useCreateBeanProfile,
   useDeleteBeanProfile,
-  useHealth,
+  useFreshHealthGate,
   useUpdateBeanProfile,
 } from "@/hooks/queries";
 import { api } from "@/lib/api";
@@ -41,7 +51,10 @@ import { StartRoastForm } from "@/pages/dashboard/StartRoastForm";
 
 export function StartRoastView(): React.JSX.Element {
   const navigate = useNavigate();
-  const health = useHealth();
+  // #513 Codex follow-up: gate on `useFreshHealthGate`, not plain `useHealth`
+  // — see its doc for the full rationale (a within-staleTime remount must
+  // not render a cached "idle" snapshot as proof no run is active).
+  const health = useFreshHealthGate();
 
   // Bean-profile library (#303): the saved-profile dropdown + add/edit modals.
   // Read-only list + the typed CRUD mutations (each invalidates the list).
@@ -76,6 +89,32 @@ export function StartRoastView(): React.JSX.Element {
     },
     [navigate],
   );
+
+  // #513 follow-up (post-#514/#515 review): hold until health has produced a
+  // GENUINELY FRESH read (`useFreshHealthGate`'s `isFresh` — false while
+  // pending, AND false while `isSuccess` is true only from stale cache with
+  // a forced refetch still in flight, only becoming true once this mount's
+  // own fetch settles, error or success). A single `!health.isFresh` check
+  // is deliberately NOT combined with `!health.isSuccess`: `isFresh` already
+  // implies "settled, one way or another" (`isError` alone makes it true),
+  // so a combined `!isSuccess && !isFresh` would miss the stale-cache case
+  // (isSuccess true, isFresh false) and a combined `!isSuccess || !isFresh`
+  // would wrongly re-hold on a genuine, already-fresh error. Previously
+  // (pre-Codex-follow-up) this route fell through straight to the bare form
+  // both while genuinely pending AND while showing stale-but-cached "idle"
+  // data with a fresher read in flight — a reload, or a remount within the
+  // shared 30s staleTime, could show an untouched-looking form even though
+  // another tab/process started a run in that window. Mirrors LivePage's
+  // loading hold. A start form renders ONLY when health is
+  // resolved-success-and-FRESH-and-idle; pending, error, and active-run
+  // states each get their own explicit state, never the bare form.
+  if (!health.isFresh) {
+    return (
+      <AppFrame>
+        <div data-testid="start-roast-loading" />
+      </AppFrame>
+    );
+  }
 
   // #513 defensive layer: the server already reports an active run (this route
   // opened mid-roast, or reloaded after a start) — never show the bare form,

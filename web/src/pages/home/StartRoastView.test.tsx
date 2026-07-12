@@ -6,10 +6,12 @@
  * `LivePage`'s idle state owns confirming the new run with retries). No local
  * run state is fabricated — the active run is discovered from the server.
  *
- * Also covers the two defensive states that replace the bare form: an
- * already-active run (banner + link to `/live`) and a persistent health
- * error (status-unknown state) — active-run status genuinely unknown must
- * never be treated as "no run".
+ * Also covers the defensive states that replace the bare form: pending
+ * health / a stale-cache read still revalidating (loading hold, mirroring
+ * `LivePage`'s — post-#514/#515 review, `useFreshHealthGate`), an
+ * already-active run (banner + link to `/live`), and a persistent health
+ * error (status-unknown state) — active-run status genuinely unknown, or not
+ * yet known FRESH, must never be treated as "no run".
  */
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -27,13 +29,16 @@ vi.mock("@/lib/api", async () => {
 });
 
 // Mutable health stub — mirrors LivePage.test.tsx's pattern (#513): the active-
-// run banner + status-unknown tests need a controllable `useHealth()` without
-// a real fetch.
+// run banner + status-unknown + loading-hold tests need a controllable
+// `useFreshHealthGate()` without a real fetch. `isFresh` models the Codex
+// follow-up: false while pending OR while `isSuccess` is true only from a
+// stale cache entry with the genuinely fresh refetch still in flight.
 const healthState: {
   data: { active_run_id: string | null } | undefined;
   isSuccess: boolean;
   isError: boolean;
-} = { data: undefined, isSuccess: false, isError: false };
+  isFresh: boolean;
+} = { data: undefined, isSuccess: false, isError: false, isFresh: false };
 
 // Bean-profile library hooks stubbed so the form's dropdown wires real fixture data
 // without firing a (failing) jsdom fetch — mirrors the dashboard idle spec (#303).
@@ -45,7 +50,7 @@ vi.mock("@/hooks/queries", async () => {
   const noopMutation = () => ({ mutateAsync: vi.fn(async () => undefined) });
   return {
     ...actual,
-    useHealth: () => healthState,
+    useFreshHealthGate: () => healthState,
     useBeanProfiles: () => ({ data: { profiles: FIXTURE_BEAN_PROFILES }, isLoading: false }),
     useCreateBeanProfile: noopMutation,
     useUpdateBeanProfile: noopMutation,
@@ -76,6 +81,7 @@ beforeEach(() => {
   healthState.data = { active_run_id: null };
   healthState.isSuccess = true;
   healthState.isError = false;
+  healthState.isFresh = true;
 });
 
 /** Fill the required bean fields + weight; the draft defaults cover the rest. */
@@ -90,6 +96,40 @@ function fillMinimum() {
     target: { value: "250" },
   });
 }
+
+describe("StartRoastView — loading hold (#513 follow-up)", () => {
+  it("renders the loading placeholder until health resolves — NEVER the bare form (mirrors LivePage)", () => {
+    // Pending: neither isSuccess nor isError yet (the initial fetch in
+    // flight). Previously fell through both existing guards straight to the
+    // bare form — a reload of this still-URL-reachable route mid-roast would
+    // show an untouched-looking form for one /health round-trip.
+    healthState.isSuccess = false;
+    healthState.isError = false;
+    healthState.isFresh = false;
+    healthState.data = undefined;
+    renderView();
+    expect(screen.getByTestId("start-roast-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.queryByTestId("start-roast-active-run-banner")).toBeNull();
+    expect(screen.queryByTestId("start-roast-status-unknown")).toBeNull();
+  });
+
+  it("#513 Codex follow-up: holds through a stale-cache remount even though isSuccess is already true", () => {
+    // The exact scenario Codex found: useHealth's shared 30s staleTime lets a
+    // remount render a CACHED idle snapshot with isSuccess:true while the
+    // genuinely fresh forced refetch (useFreshHealthGate) is still in
+    // flight. A naive `!isSuccess` check would render the bare form here —
+    // isFresh:false is the only signal that catches it.
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    healthState.isFresh = false;
+    healthState.data = { active_run_id: null }; // stale cached "idle" value
+    renderView();
+    expect(screen.getByTestId("start-roast-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.queryByTestId("start-roast-active-run-banner")).toBeNull();
+  });
+});
 
 describe("StartRoastView (#324)", () => {
   it("renders the reused Start-Roast form with the bean-profile library", () => {
@@ -138,6 +178,7 @@ describe("StartRoastView (#324)", () => {
     // through to the bare form, the same hazard as the active-run-banner case.
     healthState.isSuccess = false;
     healthState.isError = true;
+    healthState.isFresh = true; // isError implies isFresh (see useFreshHealthGate)
     healthState.data = undefined;
     renderView();
     expect(screen.getByTestId("start-roast-status-unknown")).toBeInTheDocument();
