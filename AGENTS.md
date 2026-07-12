@@ -302,13 +302,18 @@ Codex is often DELAYED relative to CI, and green-CI auto-merge can land a PR bef
 review posts (#518 merged with 3 real P2s in flight → fix-forward #519). Its lifecycle
 signals on the PR are readable: **👀 reaction = review started; a posted review = findings;
 a 👍 reaction (after the 👀) = done, nothing found.** So: do NOT arm auto-merge at open.
-After the final commit + `@codex review`, wait for either the review or the 👍; then triage
-(if findings), resolve, and only then merge/arm auto-merge. **A 👀 reaction without a
-verdict is an IN-PROGRESS review, not silence — keep waiting** (extend in ~10-min
-increments while the 👀 stands). The silent fallback applies only when NO signal at all
-(no 👀, no review, no 👍) has appeared ~15 min after green CI: re-trigger once more on the
-same commit; if still nothing, merging is allowed — note "Codex silent" in the merge
-context so a late review is triaged as post-merge follow-up, not a surprise.
+After the final commit + `@codex review`, wait for either the review or the 👍 — **and the
+signal must postdate the final-commit trigger**: a review posted at PR creation against an
+earlier commit does not satisfy the wait (that stale-verdict reading would reopen the #518
+failure mode). Then triage (if findings), resolve, and only then merge/arm auto-merge.
+**A 👀 reaction without a verdict is an IN-PROGRESS review, not silence — keep waiting**
+(extend in ~10-min increments), **bounded at ~30 min from the 👀**: past that, treat the
+in-progress signal as stuck and the lead may merge with an "in-progress review stalled"
+note, triaging any late review post-merge. The silent fallback applies only when NO signal
+at all (no post-trigger 👀, review, or 👍) has appeared ~15 min after green CI: re-trigger
+once more on the same commit and **wait a full second window (~10 min)**; only if still
+nothing is merging allowed — note "Codex silent" in the merge context so a late review is
+triaged as post-merge follow-up, not a surprise.
 
 **Inline PR comments are MERGE-BLOCKING** — `main` requires every conversation
 resolved (branch protection). So calibrate where findings go:
