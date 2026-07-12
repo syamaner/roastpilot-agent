@@ -2068,6 +2068,15 @@ class RoastService:
         non-impossible entry the seconds-precision compare would wrongly
         reject). Same-minute reads as simultaneous at the input's resolution;
         the guard still catches any offset a human could actually express.
+
+        A same-truncated-minute value that is nonetheless raw-earlier than
+        ``completed_at_utc`` (#522 round 5 — the above example: input ``:00``
+        against a ``:45`` completion) is CLAMPED to ``completed_at_utc``
+        before storage, not stored as given: storing the raw sub-minute-early
+        value would compute a small NEGATIVE ``degassing_offset_hours`` in the
+        corpus export — exactly the garbage this whole guard chain exists to
+        prevent, just shrunk to sub-minute scale. "Same minute" means "at
+        completion," so it is stored as at completion.
         """
         detail = await self._store.read_run(run_id)
         if detail is None:
@@ -2076,18 +2085,23 @@ class RoastService:
             raise RoastRunConflictError(
                 f"run {run_id} is still in progress; taste it after completion"
             )
-        if request.tasted_at_utc is not None and _before_the_minute(
-            request.tasted_at_utc, detail.completed_at_utc
-        ):
-            raise RoastRunConflictError(
-                f"tasted_at_utc {request.tasted_at_utc} is before the run completed "
-                f"at {detail.completed_at_utc} (physically impossible)"
-            )
+        tasted_at_utc = request.tasted_at_utc
+        if tasted_at_utc is not None:
+            if _before_the_minute(tasted_at_utc, detail.completed_at_utc):
+                raise RoastRunConflictError(
+                    f"tasted_at_utc {tasted_at_utc} is before the run completed "
+                    f"at {detail.completed_at_utc} (physically impossible)"
+                )
+            if tasted_at_utc < detail.completed_at_utc:
+                # Admitted only by the minute truncation above: raw-earlier,
+                # same minute. Clamp to completed_at_utc so the stored value
+                # (and the derived degassing offset) is never negative.
+                tasted_at_utc = detail.completed_at_utc
         await self._store.add_tasting(
             run_id,
             stars=request.stars,
             notes=request.notes,
-            tasted_at_utc=request.tasted_at_utc,
+            tasted_at_utc=tasted_at_utc,
             brew_method=request.brew_method,
             grind_note=request.grind_note,
             attributes=request.attributes,

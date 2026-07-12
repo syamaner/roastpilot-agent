@@ -1124,12 +1124,13 @@ async def test_add_tasting_accepts_tasted_at_exactly_at_completion(
 async def test_add_tasting_accepts_same_minute_as_completion_despite_seconds(
     client: AsyncClient, store: RoastStore
 ) -> None:
-    """#522 round 4: the FE's datetime-local picker cannot express seconds,
+    """#522 round 4/5: the FE's datetime-local picker cannot express seconds,
     so an honest "tasted at the completion minute" entry must NOT 409 just
     because completed_at_utc itself has a non-zero seconds component. The
     exact collision case from the thread: completion at some non-zero
     second, the operator picks that same minute (:00 seconds — all a
-    datetime-local input can express)."""
+    datetime-local input can express). The stored value is then CLAMPED to
+    completed_at_utc (round 5), not the raw (sub-minute-earlier) input."""
     await store.create_run(
         run_id="run-minute", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
     )
@@ -1149,6 +1150,11 @@ async def test_add_tasting_accepts_same_minute_as_completion_despite_seconds(
         json={"stars": 4, "tasted_at_utc": same_minute_no_seconds},
     )
     assert response.status_code == 201
+    # #522 round 5: a raw-earlier same-minute value is CLAMPED to
+    # completed_at_utc on storage, not persisted as the truncated input —
+    # storing the raw sub-minute-early value would compute a small NEGATIVE
+    # degassing_offset_hours in the corpus export.
+    assert response.json()["tastings"][0]["tasted_at_utc"] == detail["completed_at_utc"]
 
 
 @pytest.mark.parametrize(

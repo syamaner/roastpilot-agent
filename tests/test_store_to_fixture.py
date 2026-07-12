@@ -402,6 +402,31 @@ async def test_summary_tastings_carry_the_degassing_offset(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_summary_tastings_degassing_offset_is_zero_not_negative_at_completion(
+    tmp_path: Path,
+) -> None:
+    """#522 round 5: a tasting stored exactly AT completion (the API's
+    round-5 clamp for a same-minute-but-raw-earlier entry, per the
+    datetime-local minute-precision guard) must compute a degassing offset
+    of exactly 0.00 — never a small negative value, the exact garbage the
+    validator chain exists to prevent."""
+    db_path = tmp_path / "at_completion.sqlite3"
+    store = await _synthetic_store(db_path)
+    completed = s2f.read_store_roast(db_path).completed_at_utc
+    assert completed is not None
+    # Mirrors RoastService.add_tasting's round-5 clamp: the API stores
+    # completed_at_utc verbatim in this case, never a raw sub-minute-earlier
+    # value.
+    await store.add_tasting("synthetic-run", stars=3, tasted_at_utc=completed)
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["tastings"][0]["degassing_offset_hours"] == 0.0
+
+
+@pytest.mark.asyncio
 async def test_summary_tastings_degassing_offset_is_null_without_tasted_at(
     tmp_path: Path,
 ) -> None:
