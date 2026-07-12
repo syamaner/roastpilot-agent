@@ -147,7 +147,12 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
             roastedWeightGrams={detail.roasted_weight_grams ?? null}
             weightLossPercent={detail.weight_loss_percent ?? null}
           />
-          <RoastTastings runId={detail.id} />
+          {/* key={detail.id}: RoastTastings' draft (unlike RoastRating/
+              RoastedWeight) has no persisted value to re-sync from on a prop
+              change, so without a remount a navigation between two runs would
+              carry run A's unsaved draft into a POST against run B — a wrong
+              corpus label (#522 Codex P2). */}
+          <RoastTastings key={detail.id} runId={detail.id} />
           <RoastConditions
             ambientTempC={detail.ambient_temp_c}
             ambientHumidityPct={detail.ambient_humidity_pct}

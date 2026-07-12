@@ -11,6 +11,7 @@ invariant. Use ``.value`` at serialization boundaries.
 
 import json
 import re
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -1196,11 +1197,54 @@ class TastingEntryRequest(BaseModel):
     freshness must be computable from the tasting instant, not the save instant.
     ``None`` when the operator does not supply one; the server does NOT default
     it to "now" (see :meth:`RoastStore.add_tasting`) so an unset value stays
-    honestly unknown rather than silently wrong."""
+    honestly unknown rather than silently wrong. Validated and normalized to a
+    UTC-offset ISO-8601 string (see :func:`_normalize_tasted_at`) — this field
+    is the exact degassing signal #522 exists to capture, so an unparseable or
+    ambiguous-offset value must fail loudly (422) rather than poison the corpus
+    label silently."""
     brew_method: BrewMethod | None = None
     grind_note: str | None = None
     attributes: list[TastingAttribute] = Field(default_factory=_empty_attributes)
     defects: list[TastingDefect] = Field(default_factory=_empty_defects)
+
+    @field_validator("tasted_at_utc")
+    @classmethod
+    def _validate_tasted_at(cls, value: str | None) -> str | None:
+        return _normalize_tasted_at(value)
+
+
+def _normalize_tasted_at(value: str | None) -> str | None:
+    """Parse and UTC-normalize an operator-supplied tasting timestamp (#522).
+
+    Accepts any ISO-8601 string ``datetime.fromisoformat`` can parse,
+    including a naive (no offset) value or one with a non-UTC offset. A naive
+    value is assumed to already be UTC (rather than silently guessing a local
+    zone the server has no way to know); an offset value is converted to UTC.
+    The result always round-trips through :meth:`datetime.isoformat`, matching
+    the ``_utc_now()`` format every other persisted timestamp in this schema
+    uses.
+
+    Args:
+        value: The raw operator-supplied string, or ``None``.
+
+    Returns:
+        The UTC-normalized ISO-8601 string, or ``None`` when ``value`` is
+        ``None``.
+
+    Raises:
+        ValueError: ``value`` is not a parseable ISO-8601 datetime — Pydantic
+            turns this into a 422 at the API boundary, so a malformed instant
+            is rejected rather than persisted as-is and silently poisoning the
+            degassing-offset corpus label this field exists to capture.
+    """
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"tasted_at_utc is not a valid ISO-8601 datetime: {value!r}") from exc
+    parsed = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    return parsed.isoformat()
 
 
 class RoastTasting(BaseModel):

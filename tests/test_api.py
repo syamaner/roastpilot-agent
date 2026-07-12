@@ -966,6 +966,52 @@ async def test_add_tasting_rejects_unknown_brew_method(
 
 
 @pytest.mark.asyncio
+async def test_add_tasting_rejects_malformed_tasted_at(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#522 Codex P2: tasted_at_utc is the exact degassing-offset corpus
+    signal #522 exists to capture — an unparseable value must 422, not
+    persist verbatim and poison the label silently."""
+    await store.create_run(
+        run_id="run-tba", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-tba", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post(
+        "/api/roasts/run-tba/tastings",
+        json={"stars": 3, "tasted_at_utc": "not-a-date"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_normalizes_naive_and_offset_tasted_at(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#522 Codex P2: a naive (no-offset) timestamp is assumed UTC; a
+    non-UTC-offset timestamp is converted to UTC — both round-trip through
+    the store as a UTC-offset ISO-8601 string, never the raw operator input."""
+    await store.create_run(
+        run_id="run-tbn", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-tbn", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+
+    naive = await client.post(
+        "/api/roasts/run-tbn/tastings",
+        json={"stars": 3, "tasted_at_utc": "2026-07-12T18:00:00"},
+    )
+    assert naive.status_code == 201
+    assert naive.json()["tastings"][0]["tasted_at_utc"] == "2026-07-12T18:00:00+00:00"
+
+    offset = await client.post(
+        "/api/roasts/run-tbn/tastings",
+        # 20:00+02:00 == 18:00 UTC.
+        json={"stars": 4, "tasted_at_utc": "2026-07-12T20:00:00+02:00"},
+    )
+    assert offset.status_code == 201
+    assert offset.json()["tastings"][1]["tasted_at_utc"] == "2026-07-12T18:00:00+00:00"
+
+
+@pytest.mark.asyncio
 async def test_list_tastings_empty_for_untasted_completed_run(
     client: AsyncClient, store: RoastStore
 ) -> None:
