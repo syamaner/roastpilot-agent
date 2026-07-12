@@ -116,6 +116,43 @@ describe("useAddTasting (#522)", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(client.getQueryData(roastKeys.tastings("r1"))).toEqual(updated);
   });
+
+  it("cancels an in-flight initial GET before writing, so a stale GET resolving AFTER the save cannot overwrite the just-saved list (#522 Codex P2, mirrors useSaveConfig's #483 fix)", async () => {
+    type Tastings = Awaited<ReturnType<typeof api.tastings>>;
+    const preSave: Tastings = { run_id: "r1", tastings: [] };
+    const postSave = {
+      run_id: "r1",
+      tastings: [{ id: 1, stars: 5 }],
+    } as Awaited<ReturnType<typeof api.addTasting>>;
+
+    let resolveGet: ((v: Tastings) => void) | null = null;
+    vi.spyOn(api, "tastings").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveGet = resolve;
+        }),
+    );
+    vi.spyOn(api, "addTasting").mockResolvedValue(postSave);
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    // The initial GET (useTastings' own mount fetch) is now in flight and
+    // never resolved yet — the realistic race window: the operator saves
+    // before the page's own initial read has settled.
+    renderHook(() => useTastings("r1"), { wrapper: wrapper(client) });
+    await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+    const { result } = renderHook(() => useAddTasting("r1"), { wrapper: wrapper(client) });
+    result.current.mutate({ stars: 5 });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+    expect(client.getQueryData(roastKeys.tastings("r1"))).toEqual(postSave);
+
+    // NOW the slow initial GET resolves with the PRE-save (stale) snapshot.
+    // Without the cancelQueries fix this overwrites the cache back to
+    // `preSave`, silently hiding the just-saved entry.
+    resolveGet!(preSave);
+    await waitFor(() => expect(api.tastings).toHaveResolvedWith(preSave));
+    expect(client.getQueryData(roastKeys.tastings("r1"))).toEqual(postSave);
+  });
 });
 
 /**

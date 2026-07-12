@@ -122,15 +122,24 @@ export function useTastings(runId: string | null) {
   });
 }
 
-/** Record a tasting entry (#522, D91); invalidates the tasting list so a
- *  revisit entry appears without a manual refetch. Renders server truth,
- *  not local optimistic state — the same pattern as `RoastRating`/
- *  `RoastedWeight`. */
+/** Record a tasting entry (#522, D91); writes the POST's own returned list
+ *  straight into the cache so a revisit entry appears without a manual
+ *  refetch. Renders server truth, not local optimistic state — the same
+ *  pattern as `RoastRating`/`RoastedWeight`.
+ *
+ *  Cancels any in-flight GET for this run's tasting list before writing
+ *  (mirrors `useSaveConfig`'s #483 fix): the initial `useTastings` GET on
+ *  mount can still be in flight when the operator saves quickly, and if that
+ *  GET resolves AFTER this `setQueryData` it would silently replace the
+ *  just-saved list with the pre-save (missing the new entry) snapshot — the
+ *  same stale-write race #483 fixed for config, here landing on the tasting
+ *  corpus instead. */
 export function useAddTasting(runId: string) {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (body: TastingEntryRequest) => api.addTasting(runId, body),
-    onSuccess: (list) => {
+    onSuccess: async (list) => {
+      await queryClient.cancelQueries({ queryKey: roastKeys.tastings(runId) });
       queryClient.setQueryData(roastKeys.tastings(runId), list);
     },
   });

@@ -280,10 +280,14 @@ function TastingEntry({ entry }: { entry: RoastTasting }): React.JSX.Element {
           {[...entry.attributes, ...entry.defects].join(", ")}
         </p>
       )}
-      {entry.brew_method !== null && (
+      {(entry.brew_method !== null || entry.grind_note !== null) && (
         <p className="text-muted-foreground">
-          {entry.brew_method.replace(/_/g, " ")}
-          {entry.grind_note !== null ? ` — ${entry.grind_note}` : ""}
+          {[
+            entry.brew_method !== null ? entry.brew_method.replace(/_/g, " ") : null,
+            entry.grind_note,
+          ]
+            .filter((part): part is string => part !== null)
+            .join(" — ")}
         </p>
       )}
     </li>

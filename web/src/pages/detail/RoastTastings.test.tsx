@@ -53,6 +53,29 @@ describe("RoastTastings", () => {
     expect(screen.getByTestId("tasting-entry-1")).toHaveTextContent("flat");
   });
 
+  it("shows the grind note even when brew_method is null (#522 Codex P2): the two fields render independently, not gated on brew_method alone", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue({
+      run_id: "r1",
+      tastings: [
+        {
+          id: 2,
+          tasted_at_utc: null,
+          recorded_at_utc: "2026-07-12T18:05:00+00:00",
+          stars: 4,
+          notes: null,
+          brew_method: null,
+          grind_note: "medium-fine, 22g/380g",
+          attributes: [],
+          defects: [],
+        },
+      ],
+    });
+    render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+
+    await waitFor(() => expect(screen.getByTestId("tasting-entry-2")).toBeInTheDocument());
+    expect(screen.getByTestId("tasting-entry-2")).toHaveTextContent("medium-fine, 22g/380g");
+  });
+
   it("saves a stars-only entry (every other field optional)", async () => {
     vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
     const addSpy = vi.spyOn(api, "addTasting").mockResolvedValue({
