@@ -1,8 +1,7 @@
 /**
- * Start-a-roast route (#324, updated #403) — the `/start` entry point from the
- * home hub. No longer linked from the UI (the operator's path is `/` →
- * `/live`, D81/#423), but still directly reachable by URL/bookmark, so it
- * keeps the same safety guarantees as `/live`.
+ * Start-a-roast route (#324, updated #403, #523) — under the #523 IA this is
+ * THE ONLY place a start form exists (`/live` never renders one; the home hub
+ * links here for "Start a new roast").
  *
  * Reuses the dashboard's `StartRoastForm` (the same component shown in the
  * dashboard's idle state, #158/#303) rather than re-implementing the form: this
@@ -21,16 +20,27 @@
  * mirroring `LivePage`'s (post-#514 review: this route previously fell
  * through to the bare form for one `/health` round-trip on reload, the same
  * hazard class). (1) if the server ALREADY reports an active run (health
- * snapshot, e.g. this route was opened mid-roast, or reloaded after a
- * start), a banner with a direct link to the live dashboard replaces the
- * form outright. (2) if the health check itself persistently errors
- * (active-run status UNKNOWN, not "no run"), a neutral "can't confirm" state
- * replaces the form too — this is the route the incident screenshot was
- * almost certainly taken on, so it gets the same guard as `/live`.
- * (3) on a successful start, `navigate("/live")` fires unconditionally once
- * the POST is proven (201) — never gated on the health refetch actually
- * confirming the new run, since `LivePage` itself (`/live`'s idle state,
- * `LiveStartView`) owns the resilient confirm-with-retry + fallback flow.
+ * snapshot — this covers `operator_recovery_required` too, since that phase's
+ * run row still has a non-null `active_run_id`), a banner with a direct link
+ * to the live dashboard/recovery flow replaces the form outright. (2) if the
+ * health check itself persistently errors (active-run status UNKNOWN, not "no
+ * run"), a neutral "can't confirm" state replaces the form too — this is the
+ * route the #513 incident screenshot was taken on, so it gets the same guard
+ * as `/live`. (3) STALE SESSION (#523): a history run with `outcome: null`
+ * (still open in the store) that `health.active_run_id` does NOT point to —
+ * the signature of the 12 Jul impostor-listener incident (runs
+ * `99b2e272`/`6300be8f`, docs/recent-fixes.md), where a second process
+ * answered `/health` with `active_run_id: null` while a genuinely stranded run
+ * row sat open. Explains the state and offers a link to `/live`'s recovery
+ * flow; the explicit clear/end-stale-run operator action is OUT OF SCOPE here
+ * — it needs its own safety design (a typed operator action, audit event, and
+ * a guard that the MCP child is actually idle/cooled before allowing it, so
+ * it can never race a genuinely hot machine); see the in-line note at the
+ * stale-session branch below and #523's tracking issue for the gap.
+ * (4) on a successful start, `navigate("/live")` fires
+ * unconditionally once the POST is proven (201) — never gated on the health
+ * refetch actually confirming the new run, since `LivePage` itself (`/live`'s
+ * idle state) owns the resilient confirm-with-retry + fallback flow.
  */
 
 import { useCallback } from "react";
@@ -42,6 +52,7 @@ import {
   useCreateBeanProfile,
   useDeleteBeanProfile,
   useFreshHealthGate,
+  useHistory,
   useUpdateBeanProfile,
 } from "@/hooks/queries";
 import { api } from "@/lib/api";
@@ -55,6 +66,24 @@ export function StartRoastView(): React.JSX.Element {
   // — see its doc for the full rationale (a within-staleTime remount must
   // not render a cached "idle" snapshot as proof no run is active).
   const health = useFreshHealthGate();
+
+  // Stale-session detection (#523): the roast history, read unconditionally
+  // (cheap — the same list `/roasts` already fetches, TanStack Query
+  // dedupes/caches it). A STALE run is a history row with `outcome: null`
+  // (still open — never finalised) whose id the CURRENT health snapshot does
+  // not recognise as the active run. That mismatch is exactly the 12 Jul
+  // incident signature: a second listener answered `/health` with
+  // `active_run_id: null` while the genuine roast server had a run row open
+  // that it never saw finalised. An operator_recovery_required run does NOT
+  // hit this path — its `active_run_id` stays non-null and is caught by the
+  // active-run banner above (layer 1), which is the correct, safer state
+  // (heat/fan locked, recovery actions available) rather than this
+  // explanatory dead-end.
+  const history = useHistory();
+  const staleRun =
+    history.data?.runs.find(
+      (run) => run.outcome === null && run.id !== (health.data?.active_run_id ?? null),
+    ) ?? null;
 
   // Bean-profile library (#303): the saved-profile dropdown + add/edit modals.
   // Read-only list + the typed CRUD mutations (each invalidates the list).
@@ -180,6 +209,64 @@ export function StartRoastView(): React.JSX.Element {
           >
             Reload
           </a>
+        </div>
+      </AppFrame>
+    );
+  }
+
+  // #523: hold briefly for history to settle before falling through to the
+  // form — the stale-session check below needs it, and rendering the form
+  // first (then possibly replacing it a moment later) would itself be a
+  // "form flashes then disappears" hazard of the exact class #513 fixed.
+  if (history.isPending) {
+    return (
+      <AppFrame>
+        <div data-testid="start-roast-loading" />
+      </AppFrame>
+    );
+  }
+
+  // #523 stale session: a run row is open (`outcome: null`) that this
+  // process's health snapshot does not recognise as active — never a form
+  // here either, since starting a new roast on top of an unresolved stranded
+  // run compounds the confusion the 12 Jul incident already caused. Explains
+  // the state and offers the one thing this route CAN safely do: hand off to
+  // `/live`'s recovery flow (resume/drop/cool/end via the existing operator
+  // actions). The dedicated clear/end-stale-run action the spec calls for is
+  // OUT OF SCOPE for this story — it needs its own safety design (a typed
+  // operator action, audit event, and a guard that the MCP child is actually
+  // idle/cooled before allowing it, so it can never race a genuinely hot
+  // machine) — see the module doc and #523's tracking issue for the gap.
+  if (staleRun !== null) {
+    return (
+      <AppFrame
+        headerRight={
+          <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Stale session
+          </span>
+        }
+      >
+        <div
+          className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-caution/50 bg-roast-caution/10 p-8 text-center"
+          data-testid="start-roast-stale-session"
+        >
+          <h2 className="text-lg font-bold uppercase tracking-wide">
+            A previous roast wasn&apos;t finished
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            A run from an earlier session is still open, but this page can&apos;t
+            confirm it as the active roast. If the roaster is hot, don&apos;t start a
+            new one. Open the live view to check its status — if it&apos;s still
+            recognised as active you can resume, drop, cool, or end it there;
+            if not, verify the hardware directly before starting again.
+          </p>
+          <Link
+            to="/live"
+            data-testid="start-roast-stale-session-link"
+            className="rounded-md bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
+          >
+            Open live view
+          </Link>
         </div>
       </AppFrame>
     );
