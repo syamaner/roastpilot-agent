@@ -2,6 +2,10 @@
  * Live roast dashboard — the demo centerpiece (plan §7, ui-prompts Prompt A/B,
  * kickoff §2).
  *
+ * `/live` (LivePage.tsx) is the sole mount point: it only renders this page
+ * once the server's `active_run_id` is non-null (#523, folding #517) — this
+ * component has no idle branch of its own and never shows a start form.
+ *
  * Consumes the shared foundation READ-ONLY: `useHealth` → active run id, the
  * `useRoastStream` SSE hook (phase / telemetry / enabledActions / the non-lossy
  * frame buffer — all server-derived), the shared `LiveCurve`, `ConnectionIndicator`,
@@ -20,16 +24,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { AppFrame, ConnectionIndicator, LiveCurve } from "@/components/shared";
-import {
-  roastKeys,
-  useBeanProfiles,
-  useCreateBeanProfile,
-  useDeleteBeanProfile,
-  useHealth,
-  useRoast,
-  useUpdateBeanProfile,
-} from "@/hooks/queries";
-import type { BeanProfileInput } from "@/lib/types";
+import { roastKeys, useHealth, useRoast } from "@/hooks/queries";
 import { useFrameDrain, useRoastStream } from "@/hooks/useRoastStream";
 import { api } from "@/lib/api";
 import { runConfirmRetry } from "@/lib/confirmRetry";
@@ -44,17 +39,15 @@ import { resolveMicStatus } from "./micStatus";
 import { OperatorActionBar, type OperatorActionResultView } from "./OperatorActionBar";
 import { RecoveryModal } from "./RecoveryModal";
 import { RoastHeader } from "./RoastHeader";
-import { StartRoastForm } from "./StartRoastForm";
 import { snapshotFault, useDashboardEvents } from "./useDashboardEvents";
 
 export function DashboardPage(): React.JSX.Element {
   const health = useHealth();
 
-  // #513: both the idle start-roast confirm loop and the fault-acknowledge
-  // confirm loop keep running in this closure after unmount (React does not
-  // cancel in-flight promises) — checked after every await via
-  // `runConfirmRetry`'s `isMounted`, so an orphaned loop never writes state
-  // or the query cache after this component is gone.
+  // #513: the fault-acknowledge confirm loop keeps running in this closure
+  // after unmount (React does not cancel in-flight promises) — checked after
+  // every await via `runConfirmRetry`'s `isMounted`, so an orphaned loop
+  // never writes state or the query cache after this component is gone.
   const mountedRef = useRef(true);
   useEffect(() => {
     mountedRef.current = true;
@@ -75,15 +68,6 @@ export function DashboardPage(): React.JSX.Element {
   const [stickyFaultedRunId, setStickyFaultedRunId] = useState<string | null>(null);
   const runId = serverRunId ?? stickyFaultedRunId;
 
-  // Idle state (#158): health has loaded and reports NO active run (and no
-  // faulted run is pinned). The dashboard then shows the Start-roast form
-  // instead of the (empty) live view. We render the form only once health has
-  // resolved so it does not flash before the active run is known. The transition
-  // to live is server-driven: on a 201 the next `useHealth` refetch surfaces the
-  // new `active_run_id`, the page re-renders with a runId, and `useRoastStream`
-  // connects — the SPA renders from server state, never fabricated.
-  const isIdle = health.isSuccess && runId === null;
-
   // Live SSE stream — phase/telemetry/enabledActions are server-derived; the
   // page-local reducer folds the NON-LOSSY frame buffer (frames/frameCount) so a
   // burst never drops a fault/recovery/advisory/marker frame (#122).
@@ -98,13 +82,19 @@ export function DashboardPage(): React.JSX.Element {
   // at start + fault-ack only), so `active_run_id` stays non-null in the cache and
   // LivePage never sees the transition → the finished summary never fires. Drain the
   // non-lossy frame buffer for `run_completed` and invalidate health so the cache
-  // flips to null promptly. `useFrameDrain` is the established non-lossy drain
-  // pattern (#122); fire-once via an early-exit in the callback (the event is
-  // one-shot per run; re-delivering it on a reconnect is a no-op via invalidation).
+  // flips to null promptly, AND the history list (#523: LivePage's persistent
+  // last-completed fallback reads `useHistory()`, whose default 30s `staleTime`
+  // would otherwise leave the just-finished run out of it for up to that long on
+  // a fresh mount/reload — the session-sticky id covers the immediate case, but
+  // invalidating here keeps a genuinely fresh reload correct too). `useFrameDrain`
+  // is the established non-lossy drain pattern (#122); fire-once via an early-exit
+  // in the callback (the event is one-shot per run; re-delivering it on a
+  // reconnect is a no-op via invalidation).
   const queryClientForCompletion = useQueryClient();
   useFrameDrain(frames, frameCount, (frame) => {
     if (frame.event === "run_completed") {
       void queryClientForCompletion.invalidateQueries({ queryKey: roastKeys.health });
+      void queryClientForCompletion.invalidateQueries({ queryKey: roastKeys.history });
     }
   });
 
@@ -116,63 +106,6 @@ export function DashboardPage(): React.JSX.Element {
   const [lastResult, setLastResult] = useState<OperatorActionResultView | null>(null);
 
   const queryClient = useQueryClient();
-
-  // Bean-profile library (#303) — the idle Start form's saved-profile dropdown +
-  // add/edit modals. Read-only list + the typed CRUD mutations (each invalidates
-  // the list). The mutations resolve to the saved BeanProfile so the form selects it.
-  const beanProfiles = useBeanProfiles();
-  const createBeanProfile = useCreateBeanProfile();
-  const updateBeanProfile = useUpdateBeanProfile();
-  const deleteBeanProfile = useDeleteBeanProfile();
-
-  const handleCreateProfile = useCallback(
-    (input: BeanProfileInput) => createBeanProfile.mutateAsync(input),
-    [createBeanProfile],
-  );
-  const handleUpdateProfile = useCallback(
-    (id: string, input: BeanProfileInput) =>
-      updateBeanProfile.mutateAsync({ id, input }),
-    [updateBeanProfile],
-  );
-  const handleArchiveProfile = useCallback(
-    (id: string) => deleteBeanProfile.mutateAsync(id),
-    [deleteBeanProfile],
-  );
-
-  // Latches the instant the POST is proven (201) — before anything that can
-  // subsequently fail (#513). Once set, the idle branch never re-shows the bare
-  // form: `invalidateQueries`/`refetchQueries` RESOLVE even when the underlying
-  // fetch failed (confirmed empirically against this TanStack Query version,
-  // `throwOnError` included — see LiveStartView in pages/live/LivePage.tsx,
-  // which owns the primary /live start flow and hits the exact same hazard),
-  // so a caller cannot tell success from failure by awaiting either call. This
-  // branch is not reachable via the current router (LivePage only mounts
-  // DashboardPage when a run is already active) but keeps its own supported
-  // test contract (DashboardPage.idle.test.tsx), so it gets the same fix.
-  const [startConfirming, setStartConfirming] = useState(false);
-  const [startConfirmFailed, setStartConfirmFailed] = useState(false);
-
-  // Start a roast from the idle form (#158). Confirms the new run directly
-  // against `api.health()` (bypassing the query cache's own retry/error
-  // plumbing) with a few retries so a transient post-restart blip self-heals;
-  // errors (e.g. 409) are surfaced inline by the form before this ever runs.
-  const handleStartRoast = useCallback(
-    async (profile: Parameters<typeof api.startRoast>[0]) => {
-      await api.startRoast(profile);
-      if (!mountedRef.current) return;
-      setStartConfirming(true);
-      setStartConfirmFailed(false);
-
-      const result = await runConfirmRetry({
-        attempt: () => api.health(),
-        isSuccess: (health) => health.active_run_id !== null,
-        onResult: (health) => queryClient.setQueryData(roastKeys.health, health),
-        isMounted: () => mountedRef.current,
-      });
-      if (result === "failed") setStartConfirmFailed(true);
-    },
-    [queryClient],
-  );
 
   // #513: acknowledge-confirm state. The operator never loses controls while
   // this resolves (still on the faulted dashboard, heat already off), but a
@@ -190,9 +123,10 @@ export function DashboardPage(): React.JSX.Element {
   // Acknowledging clears `active_run_id` on the server; we then drop the sticky-
   // faulted pin and confirm the transition directly against `api.health()`
   // (bypassing `invalidateQueries`/`refetchQueries`, which RESOLVE even when the
-  // underlying fetch failed — see LiveStartView, pages/live/LivePage.tsx),
-  // returning the page to the idle Start-roast form (never trapping the operator
-  // on the faulted view, #124). `acknowledge_fault` issues no roaster command
+  // underlying fetch failed — see LiveStartView, pages/live/LivePage.tsx). Once
+  // `active_run_id` clears, LivePage (the sole mount point for this page, #523)
+  // swaps this component out for its own idle state (never trapping the
+  // operator on the faulted view, #124). `acknowledge_fault` issues no roaster command
   // (heat is already off in faulted and stays off) — the operator keeps the
   // FaultBanner + e-stop the whole time this resolves, but the banner and the
   // acknowledge control must never go visibly silent on a failed confirm.
@@ -358,73 +292,6 @@ export function DashboardPage(): React.JSX.Element {
     [view.points, view.markers],
   );
 
-  // IDLE: no active run. Show the Start-roast form (#158) so the operator can start
-  // a roast without `curl` (E11 headless appliance). Once a roast is active this
-  // branch is not taken and the live dashboard below renders, server-driven.
-  if (isIdle) {
-    // #513: once the POST is proven (201), never re-show the bare form — it
-    // must never look untouched after a real roast has begun heating, even if
-    // the health-cache handoff stalls. Mirrors LiveStartView.
-    if (startConfirming) {
-      return (
-        <AppFrame
-          headerRight={
-            <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-              Starting…
-            </span>
-          }
-        >
-          <div
-            className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-border bg-card p-8 text-center"
-            data-testid="dashboard-start-confirming"
-          >
-            <h2 className="text-lg font-bold uppercase tracking-wide">Roast started</h2>
-            <p className="text-sm text-muted-foreground">
-              The roaster has begun preheating. Connecting to the live dashboard…
-            </p>
-            {startConfirmFailed && (
-              <p
-                role="alert"
-                data-testid="dashboard-start-confirm-failed"
-                className="rounded-md border border-roast-caution/50 bg-roast-caution/10 px-4 py-3 text-sm"
-              >
-                The roast started, but this page could not confirm it automatically.
-                The roaster is live and heating — reload to see status and controls,
-                including emergency stop.
-              </p>
-            )}
-          </div>
-        </AppFrame>
-      );
-    }
-
-    // No run to connect to, so the "connecting" stream indicator would be
-    // misleading — show a neutral idle label instead (#160 review item 3).
-    return (
-      <AppFrame
-        headerRight={
-          <span
-            data-testid="idle-indicator"
-            className="text-xs font-semibold uppercase tracking-wide text-muted-foreground"
-          >
-            No active roast
-          </span>
-        }
-      >
-        <div className="flex flex-col gap-4" data-testid="dashboard-idle">
-          <StartRoastForm
-            onStart={handleStartRoast}
-            profiles={beanProfiles.data?.profiles ?? []}
-            profilesLoading={beanProfiles.isLoading}
-            onCreateProfile={handleCreateProfile}
-            onUpdateProfile={handleUpdateProfile}
-            onArchiveProfile={handleArchiveProfile}
-          />
-        </div>
-      </AppFrame>
-    );
-  }
-
   return (
     <AppFrame headerRight={<ConnectionIndicator status={status} />}>
       <div className="flex flex-col gap-4" data-testid="dashboard">
@@ -435,9 +302,9 @@ export function DashboardPage(): React.JSX.Element {
             shown only when the server's enabled_actions mirror enables
             acknowledge_fault — dispatches the genuine `acknowledge_fault` action,
             finalising the operable-faulted run server-side, then clears the
-            sticky-faulted pin (#124) and re-fetches health, returning to the idle
-            Start-roast form. `acknowledge_fault` issues no roaster command (heat
-            is already off). */}
+            sticky-faulted pin (#124) and re-fetches health; once `active_run_id`
+            clears, LivePage swaps this page out for its own idle state (#523).
+            `acknowledge_fault` issues no roaster command (heat is already off). */}
         <FaultBanner
           fault={effectiveFault}
           trail={view.safetyTrail}
@@ -448,8 +315,9 @@ export function DashboardPage(): React.JSX.Element {
           // omitted. The genuine `acknowledge_fault` control action (#206)
           // finalises the operable-faulted run server-side (no roaster command —
           // heat is already off), then the page clears the sticky pin (#124) and
-          // confirms against `api.health()` → the idle Start form. The label is
-          // the operator's real next step. #513: while confirming the button is
+          // confirms against `api.health()`, handing off to LivePage's idle state
+          // (#523). The label is the operator's real next step. #513: while
+          // confirming the button is
           // disabled (no double-submit); if every confirm attempt fails the
           // button stays enabled for a manual retry and a visible note explains
           // why the banner hasn't cleared — it never goes silently stale.
