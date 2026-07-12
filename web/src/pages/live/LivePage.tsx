@@ -1,21 +1,26 @@
 /**
- * Single live-roast home at `/live` (#423, D81).
+ * Single live-roast home at `/live` (#423, D81, updated #523).
  *
- * Three server-state-driven states (all phase comes from the server):
+ * `/live` is the state of the roaster, always — NEVER a form (#523 IA). Three
+ * server-state-driven states (all phase comes from the server):
  *
- * 1. Loading   — holds until health resolves so the start form never flashes
- *    before the active-run status is known.
+ * 1. Loading   — holds until health (and, for the idle path, history) resolve,
+ *    so nothing flashes before the active-run status — and the last-completed
+ *    summary it falls back to — are known.
  * 2. Active run — the full live dashboard (DashboardPage). A reload on this
  *    URL re-hydrates from the server snapshot + SSE — the reload-safe guarantee.
- * 3. No active run — one of two sub-states:
- *    a. Just-finalised this session (`stickyCompletedRunId` is set): the
- *       `LiveFinishedView` shows a mini curve + headline stats + links.
- *    b. Idle / no prior run this session: `LiveStartView`, ready to begin.
+ * 3. No active run — the last completed run's summary (`LiveFinishedView`),
+ *    PERSISTENT across reload: sourced from the history API
+ *    (`GET /api/roasts`, newest-first), not session state. The just-finished
+ *    run from THIS session (`stickyCompletedRunId`) is preferred while set —
+ *    history can lag the terminal write by a beat — but a reload always falls
+ *    through to the same history-derived id, so the summary survives it
+ *    (unlike the pre-#523 session-only sticky). If the operator has never
+ *    completed a roast, `LiveNoRoastsView` shows a neutral "no roasts yet"
+ *    state — still not a form — with a link to `/start`.
  *
- * `stickyCompletedRunId` is session-local (`useState`): it is set the moment
- * `active_run_id` transitions from a non-null value to null. A reload always
- * falls through to state 3b — the completed run is accessible via
- * `/roasts/:runId` and the summary was a session convenience, not permanent.
+ * `/start` (StartRoastView.tsx) is the ONLY start-form surface under the
+ * #523 IA; `/live` never renders one.
  *
  * INVARIANTS: active-run presence comes from the SERVER's `/health` snapshot
  * (`active_run_id`) — never inferred client-side (D8). Phase is not read here;
@@ -23,26 +28,14 @@
  * live entirely in DashboardPage.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 
 import { AppFrame, LiveCurve } from "@/components/shared";
-import {
-  roastKeys,
-  useBeanProfiles,
-  useCreateBeanProfile,
-  useDeleteBeanProfile,
-  useFreshHealthGate,
-  useRoast,
-  useTelemetry,
-  useUpdateBeanProfile,
-} from "@/hooks/queries";
+import { roastKeys, useFreshHealthGate, useHistory, useRoast, useTelemetry } from "@/hooks/queries";
 import { api } from "@/lib/api";
-import { runConfirmRetry } from "@/lib/confirmRetry";
-import type { BeanProfileInput, RoastProfile } from "@/lib/types";
 import { DashboardPage } from "@/pages/dashboard/DashboardPage";
-import { StartRoastForm } from "@/pages/dashboard/StartRoastForm";
 import { headlineStats, toCurveMarkers, toCurvePoints } from "@/pages/detail/traceModel";
 
 /**
@@ -51,8 +44,9 @@ import { headlineStats, toCurveMarkers, toCurvePoints } from "@/pages/detail/tra
  * FINAL state, not the stale in-progress snapshot that had `outcome: null` while
  * the run was live (P2-3). Populates the TanStack Query cache so a subsequent
  * `useRoast(runId)` in LiveFinishedView resolves synchronously from the fresh data.
- * Returns `null` on any network error (safe no-op: the finished summary is silently
- * suppressed and the operator lands on the start form instead).
+ * Returns `null` on any network error (safe no-op: the session-sticky summary is
+ * silently suppressed for this transition — the persistent history-derived
+ * fallback, #523, still applies on the next render/reload).
  */
 async function fetchTerminalOutcome(
   queryClient: QueryClient,
@@ -74,8 +68,8 @@ export function LivePage(): React.JSX.Element {
   // #513 Codex follow-up: `useHealth()`'s shared 30s `staleTime` means a
   // remount within that window would render a CACHED `active_run_id` with
   // `isSuccess: true` and no network request at all — a second process/tab
-  // could have started a run in that window, and the bare start form would
-  // flash on stale "idle" data before the gate below ever fires. Gate on
+  // could have started a run in that window, and the summary/no-roasts view
+  // would flash on stale "idle" data before the gate below ever fires. Gate on
   // `useFreshHealthGate` instead of `useHealth` here (see its doc for the
   // full empirically-verified rationale); non-gating consumers elsewhere
   // (header/nav) keep using plain `useHealth` unchanged.
@@ -83,9 +77,22 @@ export function LivePage(): React.JSX.Element {
   const activeRunId = health.data?.active_run_id ?? null;
   const queryClient = useQueryClient();
 
+  // Persistent idle fallback (#523): the roast history, newest-first
+  // (`GET /api/roasts` — store.py orders `started_at_utc DESC`). Read
+  // unconditionally (cheap — the same list `/roasts` already fetches, and
+  // TanStack Query dedupes/caches it) so a reload finds the same last-
+  // completed run this render would, with no session state required.
+  const history = useHistory();
+  const lastCompletedRunId =
+    history.data?.runs.find((run) => run.outcome === "completed")?.id ?? null;
+
   // Track the most recent non-null active_run_id across renders. When the id
-  // transitions non-null → null we fetch the terminal run snapshot to determine
-  // the outcome:
+  // transitions non-null → null we fetch the terminal run snapshot so the
+  // session-sticky summary can show IMMEDIATELY on this render, before the
+  // history list has necessarily caught up (it can lag the terminal write by
+  // a beat). `stickyCompletedRunId` is a same-session convenience layered on
+  // top of `lastCompletedRunId`; a reload always falls back to the latter, so
+  // the summary survives it (unlike the pre-#523 session-only sticky).
   //   - `completed`: latch as stickyCompletedRunId → LiveFinishedView.
   //   - anything else (faulted, aborted): do NOT latch — the fault flow in
   //     DashboardPage owns that path (P2-4 / P2-3 / #423).
@@ -112,14 +119,17 @@ export function LivePage(): React.JSX.Element {
         // Non-completed outcomes (faulted, aborted, null) don't show the summary.
         // DashboardPage retains the faulted run via stickyFaultedRunId for ack.
       });
+      // The history list is also invalidated on `run_completed` /
+      // fault-acknowledge (see queries.ts) so `lastCompletedRunId` picks up
+      // the new run independently of this session-sticky path.
     }
   }, [activeRunId, queryClient]);
 
   // Health error (#513 medium): active-run status is UNKNOWN — never fall
-  // through to the bare start form (a run could genuinely be active and the
-  // operator would have no path to the dashboard/e-stop, the exact hazard
-  // this PR fixes elsewhere). `useHealth`'s default `retry: 1` already rides
-  // out a single blip before `isError` is true, so this is a persistent
+  // through to a state that implies "no run" (a run could genuinely be active
+  // and the operator would have no path to the dashboard/e-stop, the exact
+  // hazard this PR fixes elsewhere). `useHealth`'s default `retry: 1` already
+  // rides out a single blip before `isError` is true, so this is a persistent
   // failure, not noise. Show a neutral "can't confirm" state instead.
   if (health.isError) {
     return <LiveStatusUnknownView />;
@@ -147,19 +157,26 @@ export function LivePage(): React.JSX.Element {
     return <DashboardPage />;
   }
 
-  // No active run: show the just-finished summary if this session produced one,
-  // otherwise the start form.
-  if (stickyCompletedRunId !== null) {
+  // No active run: never a form (#523). Hold briefly for history to settle
+  // too, so a reload doesn't flash "no roasts yet" before the persistent
+  // fallback has had a chance to resolve — the session-sticky id (if any) is
+  // already known synchronously and doesn't need this hold.
+  if (stickyCompletedRunId === null && history.isPending) {
     return (
-      <LiveFinishedView
-        runId={stickyCompletedRunId}
-        onStartNext={() => setStickyCompletedRunId(null)}
-      />
+      <AppFrame>
+        <div data-testid="live-page-loading" />
+      </AppFrame>
     );
   }
 
-  // Idle / fresh session: show the start-roast form.
-  return <LiveStartView />;
+  const summaryRunId = stickyCompletedRunId ?? lastCompletedRunId;
+  if (summaryRunId !== null) {
+    return <LiveFinishedView runId={summaryRunId} />;
+  }
+
+  // No active run, and no completed run exists (ever) — a neutral, still-not-
+  // a-form state pointing to /start, the only start-form surface (#523).
+  return <LiveNoRoastsView />;
 }
 
 // --- LiveStatusUnknownView: shown at /live when /health persistently errors. ---
@@ -167,8 +184,9 @@ export function LivePage(): React.JSX.Element {
 /**
  * Neutral "can't confirm roaster status" state (#513 medium). Shown when
  * `useHealth()` errors persistently (after its own retry budget) — active-run
- * status is genuinely UNKNOWN, so this must never fall through to the bare
- * start form: a run could be active and heating, and the operator would have
+ * status is genuinely UNKNOWN, so this must never fall through to a state
+ * that implies no run is active (the last-completed summary or the no-roasts
+ * view, #523): a run could be active and heating, and the operator would have
  * no path to the dashboard/emergency stop. `useHealth` is refetched on-focus
  * disabled but still observed here, so a manual reload or the browser's own
  * retry is the recovery path; this view offers an explicit reload link too.
@@ -204,31 +222,35 @@ function LiveStatusUnknownView(): React.JSX.Element {
   );
 }
 
-// --- LiveFinishedView: sticky post-roast summary for the just-completed run. ---
+// --- LiveFinishedView: persistent last-completed-run summary at /live. ---
 
 interface LiveFinishedViewProps {
-  /** The run id that just completed in this session. */
+  /** The last completed run's id — either this session's just-finished run
+   *  (session-sticky, immediate) or the history-derived fallback (#523,
+   *  persistent — survives reload). Either way it is a genuine `completed`
+   *  outcome; LivePage never passes a faulted/aborted run here. */
   runId: string;
-  /** Clear the sticky state so the operator can start the next roast. */
-  onStartNext: () => void;
 }
 
 /**
- * Summary shown at `/live` immediately after a roast ends in the current session.
- *
- * The RoastDetail snapshot was already fetched (with staleTime:0) by LivePage's
+ * Persistent "roaster's last completed roast" summary shown at `/live` when no
+ * run is active (#523) — survives reload, sourced from the history API, not
+ * session state. Immediately after a roast ends in the CURRENT session, the
+ * RoastDetail snapshot was already fetched (with staleTime:0) by LivePage's
  * `fetchTerminalOutcome` call before this view mounts, so `useRoast` resolves
- * synchronously from the cache — the terminal snapshot with the final outcome (P2-3).
+ * synchronously from the cache — the terminal snapshot with the final outcome
+ * (P2-3). On a reload, or once `lastCompletedRunId` takes over, `useRoast`
+ * fetches normally.
  *
  * Headline stats (drop temp / dev% / total time) come from the FULL-RESOLUTION
  * telemetry series (`downsample=1`), guaranteeing that the drop/terminal rows are
  * included regardless of stride position (P2-2). The mini curve uses the
  * downsampled series (`downsample=5`) to keep the fetch lightweight.
  *
- * 'Start next roast' clears the sticky and returns to the start form. Reload always
- * bypasses this view (stickyCompletedRunId is session-only; reload → LiveStartView).
+ * 'Start next roast' links to `/start` — the only start-form surface under the
+ * #523 IA. This view itself is never a form.
  */
-function LiveFinishedView({ runId, onStartNext }: LiveFinishedViewProps): React.JSX.Element {
+function LiveFinishedView({ runId }: LiveFinishedViewProps): React.JSX.Element {
   const roast = useRoast(runId);
   // Full-resolution telemetry for accurate headline stats (P2-2): downsample=1
   // ensures the drop/terminal rows are included regardless of stride position.
@@ -318,14 +340,13 @@ function LiveFinishedView({ runId, onStartNext }: LiveFinishedViewProps): React.
           >
             View full detail
           </Link>
-          <button
-            type="button"
-            onClick={onStartNext}
+          <Link
+            to="/start"
             className="flex-1 rounded-md bg-primary px-5 py-3 text-center text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
             data-testid="live-finished-start-next"
           >
             Start next roast
-          </button>
+          </Link>
         </div>
       </div>
     </AppFrame>
@@ -362,151 +383,36 @@ function formatDuration(totalSeconds: number): string {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-// --- LiveStartView: start-roast form shown at /live when no run is active. ---
+// --- LiveNoRoastsView: shown at /live when there is no active run and no
+// completed run has EVER been recorded (a fresh install, or every past run
+// faulted/aborted). Never a form (#523) — a neutral state pointing to /start,
+// the only start-form surface under the new IA. ---
 
-function LiveStartView(): React.JSX.Element {
-  const queryClient = useQueryClient();
-  const navigate = useNavigate();
-
-  const beanProfiles = useBeanProfiles();
-  const createBeanProfile = useCreateBeanProfile();
-  const updateBeanProfile = useUpdateBeanProfile();
-  const deleteBeanProfile = useDeleteBeanProfile();
-
-  // Set the instant `api.startRoast` resolves (a proven 201) — BEFORE anything
-  // that can subsequently fail (the health refetch). Once set, the form is
-  // replaced by an unmissable "roast started" state (#513): the operator must
-  // never see what looks like a fresh, untouched idle form after a real roast
-  // has begun heating, even if the health-cache handoff to DashboardPage stalls.
-  const [justStarted, setJustStarted] = useState(false);
-  const [confirmFailed, setConfirmFailed] = useState(false);
-
-  // #513 follow-up: the confirm loop's `for` body keeps running in this
-  // closure after unmount (React does not cancel in-flight promises), so a
-  // navigate-away mid-confirm — including the "Open live dashboard" fallback
-  // below, which forces a remount — could otherwise leave an orphaned loop
-  // still writing `setQueryData` from a component that no longer exists,
-  // racing whatever confirm loop the remount starts. `runConfirmRetry` checks
-  // this after every await and short-circuits before any state write once false.
-  const mountedRef = useRef(true);
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
-
-  const handleCreateProfile = useCallback(
-    (input: BeanProfileInput) => createBeanProfile.mutateAsync(input),
-    [createBeanProfile],
-  );
-  const handleUpdateProfile = useCallback(
-    (id: string, input: BeanProfileInput) => updateBeanProfile.mutateAsync({ id, input }),
-    [updateBeanProfile],
-  );
-  const handleArchiveProfile = useCallback(
-    (id: string) => deleteBeanProfile.mutateAsync(id),
-    [deleteBeanProfile],
-  );
-
-  // Start a roast: POST, then latch `justStarted` on the proven 201 so the form
-  // can never resurface. Then confirm the new run directly against `/health`
-  // (bypassing the query cache's own retry/error plumbing — TanStack Query's
-  // `refetchQueries` always RESOLVES even when the underlying fetch failed and
-  // even with `throwOnError: true`, confirmed empirically; the caller cannot
-  // detect a failed refetch by awaiting it) and write a successful result into
-  // the query cache with `setQueryData` so LivePage's `useHealth()` observer
-  // picks it up and swaps straight into DashboardPage. Retried a few times
-  // (#513: a restart/MCP-respawn window can make `/health` transiently fail or
-  // race). If every attempt fails, `confirmFailed` drives the manual "Open live
-  // dashboard" fallback — the operator always has a path to the e-stop, never a
-  // bare form.
-  const handleStartRoast = useCallback(
-    async (profile: RoastProfile) => {
-      await api.startRoast(profile);
-      if (!mountedRef.current) return;
-      setJustStarted(true);
-      setConfirmFailed(false);
-
-      const result = await runConfirmRetry({
-        attempt: () => api.health(),
-        isSuccess: (health) => health.active_run_id !== null,
-        onResult: (health) => queryClient.setQueryData(roastKeys.health, health),
-        isMounted: () => mountedRef.current,
-      });
-      if (result === "failed") setConfirmFailed(true);
-    },
-    [queryClient],
-  );
-
-  // Manual fallback: a real navigation forces a fresh LivePage mount, which is
-  // reload-safe by design (re-hydrates active-run state from the server, see
-  // the module doc) — the same guarantee a browser reload gives, without
-  // requiring one.
-  const handleOpenDashboard = useCallback(() => {
-    navigate(0);
-  }, [navigate]);
-
-  if (justStarted) {
-    return (
-      <AppFrame
-        headerRight={
-          <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-            Starting…
-          </span>
-        }
-      >
-        <div
-          className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-border bg-card p-8 text-center"
-          data-testid="live-start-confirming"
-        >
-          <h2 className="text-lg font-bold uppercase tracking-wide">Roast started</h2>
-          <p className="text-sm text-muted-foreground">
-            The roaster has begun preheating. Connecting to the live dashboard…
-          </p>
-          {confirmFailed && (
-            <>
-              <p
-                role="alert"
-                data-testid="live-start-confirm-failed"
-                className="rounded-md border border-roast-caution/50 bg-roast-caution/10 px-4 py-3 text-sm"
-              >
-                The roast started, but this page could not confirm it automatically.
-                The roaster is live and heating — open the live dashboard to see
-                status and controls, including emergency stop.
-              </p>
-              <button
-                type="button"
-                onClick={handleOpenDashboard}
-                data-testid="live-start-open-dashboard"
-                className="rounded-md bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
-              >
-                Open live dashboard
-              </button>
-            </>
-          )}
-        </div>
-      </AppFrame>
-    );
-  }
-
+function LiveNoRoastsView(): React.JSX.Element {
   return (
     <AppFrame
       headerRight={
         <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
-          New roast
+          No roasts yet
         </span>
       }
     >
-      <div className="flex flex-col gap-4" data-testid="live-start-view">
-        <StartRoastForm
-          onStart={handleStartRoast}
-          profiles={beanProfiles.data?.profiles ?? []}
-          profilesLoading={beanProfiles.isLoading}
-          onCreateProfile={handleCreateProfile}
-          onUpdateProfile={handleUpdateProfile}
-          onArchiveProfile={handleArchiveProfile}
-        />
+      <div
+        className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-border bg-card p-8 text-center"
+        data-testid="live-no-roasts-view"
+      >
+        <h2 className="text-lg font-bold uppercase tracking-wide">No roasts yet</h2>
+        <p className="text-sm text-muted-foreground">
+          This roaster hasn&apos;t completed a roast. Start one to see its live status
+          and, afterward, its summary here.
+        </p>
+        <Link
+          to="/start"
+          data-testid="live-no-roasts-start-link"
+          className="rounded-md bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
+        >
+          Start a new roast
+        </Link>
       </div>
     </AppFrame>
   );
