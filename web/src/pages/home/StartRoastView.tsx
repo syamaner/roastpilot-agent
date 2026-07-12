@@ -50,6 +50,17 @@
  * no start-form or confirm-retry machinery of its own any more — `LiveStartView`
  * (the pre-#523 idle-state form + retry loop this comment used to describe)
  * was deleted outright; `/start` is the sole start-form surface.
+ *
+ * History (the stale-session source, layer 3) earns the same freshness-and-
+ * error treatment (Codex follow-up on #535, mirroring the identical triple
+ * `/live` already built for its own history use, #532): gated on
+ * `useFreshHistoryGate`, not plain `useHistory`, so a within-the-shared-30s-
+ * staleTime remount can't render a cached (possibly stale-or-empty) history
+ * list as proof no session is stale; and `history.isError` gets its own
+ * neutral "can't verify" state rather than falling through to the form —
+ * a persistent `/api/roasts` failure means the stale-session source is
+ * UNKNOWN, not "no stale session", exactly the isSuccess≠current hazard
+ * class this whole file already guards for health.
  */
 
 import { useCallback } from "react";
@@ -61,7 +72,7 @@ import {
   useCreateBeanProfile,
   useDeleteBeanProfile,
   useFreshHealthGate,
-  useHistory,
+  useFreshHistoryGate,
   useUpdateBeanProfile,
 } from "@/hooks/queries";
 import { api } from "@/lib/api";
@@ -76,19 +87,27 @@ export function StartRoastView(): React.JSX.Element {
   // not render a cached "idle" snapshot as proof no run is active).
   const health = useFreshHealthGate();
 
-  // Stale-session detection (#523): the roast history, read unconditionally
-  // (cheap — the same list `/roasts` already fetches, TanStack Query
-  // dedupes/caches it). A STALE run is a history row with `outcome: null`
-  // (still open — never finalised) whose id the CURRENT health snapshot does
-  // not recognise as the active run. That mismatch is exactly the 12 Jul
-  // incident signature: a second listener answered `/health` with
-  // `active_run_id: null` while the genuine roast server had a run row open
-  // that it never saw finalised. An operator_recovery_required run does NOT
-  // hit this path — its `active_run_id` stays non-null and is caught by the
-  // active-run banner above (layer 1), which is the correct, safer state
-  // (heat/fan locked, recovery actions available) rather than this
-  // explanatory dead-end.
-  const history = useHistory();
+  // Stale-session detection (#523): the roast history. A STALE run is a
+  // history row with `outcome: null` (still open — never finalised) whose id
+  // the CURRENT health snapshot does not recognise as the active run. That
+  // mismatch is exactly the 12 Jul incident signature: a second listener
+  // answered `/health` with `active_run_id: null` while the genuine roast
+  // server had a run row open that it never saw finalised. An
+  // operator_recovery_required run does NOT hit this path — its
+  // `active_run_id` stays non-null and is caught by the active-run banner
+  // above (layer 1), which is the correct, safer state (heat/fan locked,
+  // recovery actions available) rather than this explanatory dead-end.
+  //
+  // Codex follow-up on #535: gated on `useFreshHistoryGate`, not plain
+  // `useHistory` — this route treats history as the STALE-SESSION
+  // AUTHORITATIVE source, so it earns the same #513/#532-class treatment
+  // `useFreshHealthGate` already gives health and `/live` already gives its
+  // own history use: within the shared 30s `staleTime`, a remount would
+  // otherwise render a CACHED (possibly stale-or-empty) history list with
+  // `isSuccess: true` and no network request at all, silently missing a
+  // stale session that started in that window. See `useFreshHistoryGate`'s
+  // doc for the full empirically-verified rationale.
+  const history = useFreshHistoryGate();
   const staleRun =
     history.data?.runs.find(
       (run) => run.outcome === null && run.id !== (health.data?.active_run_id ?? null),
@@ -226,14 +245,60 @@ export function StartRoastView(): React.JSX.Element {
     );
   }
 
-  // #523: hold briefly for history to settle before falling through to the
-  // form — the stale-session check below needs it, and rendering the form
-  // first (then possibly replacing it a moment later) would itself be a
-  // "form flashes then disappears" hazard of the exact class #513 fixed.
-  if (history.isPending) {
+  // #523: hold while history hasn't produced a GENUINELY FRESH read yet —
+  // the stale-session check below needs it, and rendering the form first
+  // (then possibly replacing it a moment later) would itself be a "form
+  // flashes then disappears" hazard of the exact class #513 fixed. Gated on
+  // `!history.isFresh` (mirrors the `!health.isFresh` hold above and
+  // `/live`'s own `!history.isFresh` hold, #532), not `history.isPending` —
+  // `isFresh` already implies "settled" (`isError` alone makes it true), so
+  // this composes correctly with the error state below rather than holding
+  // forever on an already-fresh error.
+  if (!history.isFresh) {
     return (
       <AppFrame>
         <div data-testid="start-roast-loading" />
+      </AppFrame>
+    );
+  }
+
+  // Codex follow-up on #535: a persistent `/api/roasts` failure leaves
+  // `history.data` undefined, so `staleRun` resolves to `null` below — never
+  // let that fall through to the bare form. The stale-session SOURCE is
+  // UNKNOWN here, not "no stale session"; this is the second source on this
+  // route earning the same "unknown must never look like a clean idle form"
+  // treatment `health.isError` already gets above, and mirrors `/live`'s own
+  // `history.isError` → `LiveHistoryUnknownView` handling (#532).
+  if (history.isError) {
+    return (
+      <AppFrame
+        headerRight={
+          <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Status unknown
+          </span>
+        }
+      >
+        <div
+          className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
+          data-testid="start-roast-history-unknown"
+        >
+          <h2 className="text-lg font-bold uppercase tracking-wide">
+            Can&apos;t verify roast history
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            This page could not reach the agent to check for a stale, unfinished
+            session from an earlier process. This does not mean none exists — if
+            the roaster might be hot, verify its status before starting a new
+            roast. Reload to try again.
+          </p>
+          <a
+            href="/start"
+            data-testid="start-roast-history-unknown-reload"
+            className="rounded-md bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
+          >
+            Reload
+          </a>
+        </div>
       </AppFrame>
     );
   }

@@ -40,11 +40,15 @@ const healthState: {
   isFresh: boolean;
 } = { data: undefined, isSuccess: false, isError: false, isFresh: false };
 
-// Mutable history stub (#523): the stale-session check's data source.
+// Mutable history stub (#523; #535 Codex follow-up: now `useFreshHistoryGate`
+// shaped, mirroring `healthState` above — `isFresh` models the same Codex
+// pattern: false while pending OR while `isSuccess` is true only from a
+// stale cache entry with the genuinely fresh refetch still in flight).
 const historyState: {
   data: { runs: { id: string; outcome: string | null }[] } | undefined;
-  isPending: boolean;
-} = { data: { runs: [] }, isPending: false };
+  isError: boolean;
+  isFresh: boolean;
+} = { data: { runs: [] }, isError: false, isFresh: true };
 
 // Bean-profile library hooks stubbed so the form's dropdown wires real fixture data
 // without firing a (failing) jsdom fetch — mirrors the dashboard idle spec (#303).
@@ -57,7 +61,7 @@ vi.mock("@/hooks/queries", async () => {
   return {
     ...actual,
     useFreshHealthGate: () => healthState,
-    useHistory: () => historyState,
+    useFreshHistoryGate: () => historyState,
     useBeanProfiles: () => ({ data: { profiles: FIXTURE_BEAN_PROFILES }, isLoading: false }),
     useCreateBeanProfile: noopMutation,
     useUpdateBeanProfile: noopMutation,
@@ -90,7 +94,8 @@ beforeEach(() => {
   healthState.isError = false;
   healthState.isFresh = true;
   historyState.data = { runs: [] };
-  historyState.isPending = false;
+  historyState.isError = false;
+  historyState.isFresh = true;
 });
 
 /** Fill the required bean fields + weight; the draft defaults cover the rest. */
@@ -202,11 +207,65 @@ describe("StartRoastView — stale-session detection (#523)", () => {
     healthState.isSuccess = true;
     healthState.isFresh = true;
     historyState.data = undefined;
-    historyState.isPending = true;
+    historyState.isFresh = false;
     renderView();
     expect(screen.getByTestId("start-roast-loading")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-view")).toBeNull();
     expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
+  });
+
+  it("#535 Codex follow-up: holds through a stale-cache history remount even though data is already present", () => {
+    // Mirrors the health equivalent above (line ~131) and /live's own
+    // history-freshness hold (#532): useHistory's shared 30s staleTime lets a
+    // remount render CACHED (possibly stale) history data with data already
+    // present while the genuinely fresh forced refetch (useFreshHistoryGate)
+    // is still in flight. isFresh:false is the only signal that catches it —
+    // a naive "data is defined" check would fall through to the stale-session
+    // evaluation on a cached snapshot that might already be out of date.
+    healthState.data = { active_run_id: null };
+    healthState.isSuccess = true;
+    healthState.isFresh = true;
+    historyState.data = { runs: [] }; // cached, present — but NOT fresh yet
+    historyState.isFresh = false;
+    renderView();
+    expect(screen.getByTestId("start-roast-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-view")).toBeNull();
+    expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
+  });
+
+  it("#535 Codex follow-up: shows a neutral history-unknown state (NEVER the bare form) when history persistently errors", () => {
+    // A persistent /api/roasts failure leaves history.data undefined, so
+    // staleRun would resolve to null — that must NEVER be read as "no stale
+    // session", since the source itself is unknown. Mirrors /live's own
+    // history.isError -> LiveHistoryUnknownView handling (#532) and this
+    // route's existing health.isError -> status-unknown state.
+    healthState.data = { active_run_id: null };
+    healthState.isSuccess = true;
+    healthState.isFresh = true;
+    historyState.data = undefined;
+    historyState.isError = true;
+    historyState.isFresh = true; // isError implies isFresh (see useFreshGate)
+    renderView();
+    expect(screen.getByTestId("start-roast-history-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+    expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
+    expect(screen.queryByTestId("start-roast-loading")).toBeNull();
+  });
+
+  it("#535 Codex follow-up: a history error takes priority over an otherwise-idle health snapshot, never falling through to the form", () => {
+    // Explicit composition check: health is fresh/idle/success (would render
+    // the form on its own), but history — the second, independent
+    // stale-session source on this route — is the one that's unknown here.
+    healthState.data = { active_run_id: null };
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    healthState.isFresh = true;
+    historyState.data = undefined;
+    historyState.isError = true;
+    historyState.isFresh = true;
+    renderView();
+    expect(screen.getByTestId("start-roast-history-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
   });
 
   it("shows the stale-session state when a history run is open (outcome: null) and health doesn't recognise it as active — the 12 Jul incident signature", () => {
@@ -214,7 +273,7 @@ describe("StartRoastView — stale-session detection (#523)", () => {
     healthState.isSuccess = true;
     healthState.isFresh = true;
     historyState.data = { runs: [{ id: "run-stranded", outcome: null }] };
-    historyState.isPending = false;
+    historyState.isFresh = true;
     renderView();
     expect(screen.getByTestId("start-roast-stale-session")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-form")).toBeNull();
@@ -230,7 +289,7 @@ describe("StartRoastView — stale-session detection (#523)", () => {
     healthState.isSuccess = true;
     healthState.isFresh = true;
     historyState.data = { runs: [{ id: "run-active", outcome: null }] };
-    historyState.isPending = false;
+    historyState.isFresh = true;
     renderView();
     expect(screen.getByTestId("start-roast-active-run-banner")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
@@ -249,7 +308,7 @@ describe("StartRoastView — stale-session detection (#523)", () => {
     healthState.isSuccess = true;
     healthState.isFresh = true;
     historyState.data = { runs: [{ id: "run-just-started", outcome: null }] };
-    historyState.isPending = false;
+    historyState.isFresh = true;
     renderView();
     expect(screen.getByTestId("start-roast-active-run-banner")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
@@ -266,7 +325,7 @@ describe("StartRoastView — stale-session detection (#523)", () => {
         { id: "run-2", outcome: "faulted" },
       ],
     };
-    historyState.isPending = false;
+    historyState.isFresh = true;
     renderView();
     expect(screen.getByTestId("start-roast-view")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
@@ -277,7 +336,7 @@ describe("StartRoastView — stale-session detection (#523)", () => {
     healthState.isSuccess = true;
     healthState.isFresh = true;
     historyState.data = { runs: [{ id: "run-stranded", outcome: null }] };
-    historyState.isPending = false;
+    historyState.isFresh = true;
     renderView();
     fireEvent.click(screen.getByTestId("start-roast-stale-session-link"));
     expect(screen.getByTestId("live-page")).toBeInTheDocument();

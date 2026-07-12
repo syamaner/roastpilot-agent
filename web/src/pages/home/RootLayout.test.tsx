@@ -47,10 +47,14 @@ vi.mock("@/hooks/queries", async () => {
     useHealth: () => healthState,
     useFreshHealthGate: () => healthState,
     // #523: StartRoastView's stale-session check reads history too — an
-    // empty, settled list here (no stale run) so this file's assertions
-    // stay focused on the nav-everywhere invariant, not the stale-session
-    // branch (covered by StartRoastView.test.tsx).
-    useHistory: () => ({ data: { runs: [] }, isPending: false }),
+    // empty, ALREADY-FRESH list here (no stale run, and settled — #535
+    // Codex follow-up: StartRoastView now gates on `useFreshHistoryGate`,
+    // not plain `useHistory`, so `isFresh: false` would hold the loading
+    // state forever in this mock, never reaching the page branch this file
+    // actually exercises) so this file's assertions stay focused on the
+    // nav-everywhere invariant, not the stale-session/history-freshness
+    // branches (covered by StartRoastView.test.tsx).
+    useFreshHistoryGate: () => ({ data: { runs: [] }, isError: false, isFresh: true }),
     useBeanProfiles: () => ({ data: { profiles: FIXTURE_BEAN_PROFILES }, isLoading: false }),
     useCreateBeanProfile: noopMutation,
     useUpdateBeanProfile: noopMutation,
