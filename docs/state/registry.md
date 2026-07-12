@@ -102,7 +102,27 @@
 
 ## Active Context
 
-**11 Jul 2026 (latest) — D88 VALIDATION A/B PASSED + D89 MERGED-CONTROL DIRECTION RATIFIED.**
+**12 Jul 2026 (latest) — D89 TIER-1 BATCH COMPLETE + D88 FLAGS PROMOTED (plan D90; PRs #501–#505).**
+Tasting ratified the validation (taper cup 9/10, "like sugar" — the program's best-rated roast;
+the 9/10-Jul cups "a bit flat" → El Durazno seed dev target 13→16 %). Shipped in order: **#497**
+(advisor context carries ACTUATED heat/fan + loop-mode flag via a shared helper the actuation
+gate also calls; Codex extension folded — all four offline builders populate the fields), **#498**
+(advisor fan actuates in loop mode via COALESCED SINGLE-WRITER — pre-open safety review caught a
+BLOCKER before the PR existed: two per-tick writers colliding on the command rate limit silently
+dropped the advisor's fan exactly when heat moved; redesigned, re-verified by the same reviewer
+instance; intended one-tick fan lag documented), **#499** (joint drop-window prompt + DTR window
+[target ± drop_dev_margin_percent] from the SAME constant the drop-coherence guard enforces;
+style NAME only — option A ruling on the #499 thread; 3 post-merge Codex prompt catches fixed in
+#504 incl. the assembled-prompt CONTRADICTION class → new assemble-then-assert test class +
+recent-fixes.md entry), **#505** (both D88 flags default-ON + launch-script `=0` opt-outs +
+runbook + **the replay-pins-baseline invariant**: `build_replay_service` pins post-FC flags OFF
+unless `use_live_post_fc_control=True` — without it the promoted guard default injected a
+policy/ceiling_guard drop into a recorded 206 °C fixture, pre-empting its operator drop;
+measured per-fixture, Playwright baselines unaffected). Next roast runs the merged stack BY
+DEFAULT. Open on **#495**: paper-rigour items, the #499 offline prompt comparison (blocked on
+the .env key refresh), plan-repo Dependabot triage. D89 Tier 2 needs its own ratification.
+
+**11 Jul 2026 — D88 VALIDATION A/B PASSED + D89 MERGED-CONTROL DIRECTION RATIFIED.**
 Roasts 11/12 (runs `d55b0fce` baseline / `edbe9a76` treatment, Guatemala El Durazno 2×250 g,
 dev target 15 %): the D88 taper's first hardware run **held every structural property** — heat
 anchored at its 65 % engagement value and NEVER rose (trace-verified benign: measured RoR
