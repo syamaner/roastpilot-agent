@@ -194,9 +194,63 @@ GUATEMALA_EL_DURAZNO_SEED = BeanProfile(
     ),
 )
 
+#: Stable id for the El Salvador Diamante (SHG Washed) seed. Fixed so the
+#: idempotent ``seed_bean_profile`` insert is a no-op after the first boot.
+EL_SALVADOR_DIAMANTE_ID = "seed-el-salvador-diamante-washed"
+
+#: The El Salvador Diamante (SHG Washed) seed profile (12 Jul 2026) — the
+#: operator's single-bag Central American washed. Targets follow the
+#: post-D90 washed posture rather than the old 13 % first-roast de-risk:
+#: with only one bag there is no multi-bag ladder, and the 11 Jul evidence
+#: on a comparable washed bean showed 13–15 % cups reading "a bit flat"
+#: while 16 % (as the advisor window centre) cupped 9/10.
+EL_SALVADOR_DIAMANTE_SEED = BeanProfile(
+    id=EL_SALVADOR_DIAMANTE_ID,
+    created_at=_SEED_TIMESTAMP,
+    updated_at=_SEED_TIMESTAMP,
+    name="El Salvador Diamante (SHG Washed)",
+    bean_origin="El Salvador",
+    country="El Salvador",
+    farm="Sierra Apaneca-Ilamatepec; Santa Ana & Izalco volcanoes",
+    bean_varietal="Bourbon, Pacas, Catimor",
+    bean_species="arabica",
+    is_blend=False,
+    processing="washed",
+    # Strictly high grown at 1,350 m — dense, but meaningfully lower than the
+    # 1,750 m El Durazno / Huila seeds: expect slightly faster development and
+    # a touch less heat momentum into first crack.
+    altitude_m=1350,
+    source_url="https://www.redber.co.uk/products/el-salvador-diamante-green-coffee-beans",
+    charge_guidance_min_c=170.0,
+    charge_guidance_max_c=200.0,
+    initial_heat_percent=100,
+    initial_fan_percent=30,
+    # 195 °C = the operator's proven known-good drop line (bitter > 196 °C,
+    # ceiling-guard at 196 by default since D90).
+    target_drop_temp_c=195.0,
+    # 16 % dev: the ratified washed-origin posture (see the El Durazno seed's
+    # 13 → 16 history) applied directly — a single bag cannot ladder up from a
+    # de-risk roast, and the flat-cup risk of under-development outweighs the
+    # over-roast risk, which the drop line + ceiling guard already bound. With
+    # the default 3 pp margin the advisor's judgment window is [13, 19] %.
+    target_development_percent=16.0,
+    default_bean_weight_grams=250.0,
+    description=(
+        "Sierra Apaneca-Ilamatepec highlands (Santa Ana & Izalco volcanoes), "
+        "1,350 m, strictly high grown. Bourbon / Pacas / Catimor mix, washed, "
+        "sun- and mechanically dried; harvest Jan-Mar. Chocolate base with "
+        "orange hints and subtle sweetness; bright acidity, smooth body. "
+        "Roast to a balanced medium: enough development for the chocolate and "
+        "sweetness while keeping the citrus brightness. Single bag - targets "
+        "start at the ratified washed posture (16 % dev / 195 drop); edit to "
+        "taste."
+    ),
+)
+
 #: Every built-in seed profile, inserted idempotently at startup (#303).
 SEED_BEAN_PROFILES: tuple[BeanProfile, ...] = (
     ETHIOPIA_KOKE_SEED,
     COLOMBIA_HUILA_SEED,
     GUATEMALA_EL_DURAZNO_SEED,
+    EL_SALVADOR_DIAMANTE_SEED,
 )
