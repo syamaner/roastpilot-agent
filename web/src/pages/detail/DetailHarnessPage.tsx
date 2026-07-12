@@ -11,9 +11,19 @@
  * Mirrors S2's `/__chart-harness` pattern — the single authorized shared route.
  */
 
+import { roastKeys } from "@/hooks/queries";
+import { queryClient } from "@/lib/queryClient";
+
 import { AppFrame } from "@/components/shared";
 import { DetailView } from "./DetailView";
-import { FIXTURE_DETAIL, FIXTURE_TELEMETRY, FIXTURE_TIMELINE } from "./fixture";
+import { FIXTURE_DETAIL, FIXTURE_TELEMETRY, FIXTURE_TIMELINE, fixtureTastings } from "./fixture";
+
+// #522, Codex round 3: DetailView mounts the real RoastTastings, which fires a
+// REAL GET /api/roasts/{id}/tastings on mount — the fixture id has no backing
+// run on any harness backend, so it would 404. Seed the query cache (mirrors
+// HomeHarnessPage's health-seeding convention) so the read resolves
+// deterministically instead of hitting the network.
+queryClient.setQueryData(roastKeys.tastings(FIXTURE_DETAIL.id), fixtureTastings(FIXTURE_DETAIL.id));
 
 export function DetailHarnessPage(): React.JSX.Element {
   return (

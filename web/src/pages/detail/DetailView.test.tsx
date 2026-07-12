@@ -1,8 +1,9 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import type { ReactNode } from "react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { api } from "@/lib/api";
 import { DetailView } from "./DetailView";
 import {
   FIXTURE_DETAIL,
@@ -72,7 +73,53 @@ describe("DetailView trace-row → curve highlight", () => {
   });
 });
 
+afterEach(() => vi.restoreAllMocks());
+
 describe("DetailView composition", () => {
+  it("mounts RoastTastings wired to the detail's own run id (#522) — the data-flows-to-the-render-tree check: a dropped import or wrong runId prop would pass every other test here", async () => {
+    const spy = vi
+      .spyOn(api, "tastings")
+      .mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    renderView();
+    expect(screen.getByTestId("roast-tastings")).toBeInTheDocument();
+    // Proves the runId PROP actually reached the mounted widget, not just that
+    // some <RoastTastings> rendered: the query only fires with the fixture's
+    // own run id if DetailView passed detail.id through, not a stale/wrong one.
+    await waitFor(() => expect(spy).toHaveBeenCalledWith(FIXTURE_DETAIL.id));
+  });
+
+  it("resets the RoastTastings draft when navigating between two different runs (#522 Codex P2): run A's unsaved draft must never leak into a POST against run B", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    const { rerender } = render(
+      <DetailView detail={FIXTURE_DETAIL} telemetry={FIXTURE_TELEMETRY} timeline={FIXTURE_TIMELINE} />,
+      { wrapper: wrapper() },
+    );
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    // Draft an unsaved tasting on run A — never saved.
+    fireEvent.click(screen.getByTestId("tasting-star-4"));
+    fireEvent.change(screen.getByTestId("tasting-notes"), { target: { value: "run A draft" } });
+    expect(screen.getByTestId("tasting-star-4")).toHaveAttribute("data-filled", "true");
+
+    // Simulate a client-side route change to a DIFFERENT run (the same
+    // re-render TanStack Router/React Router performs on a param change —
+    // DetailPage re-renders DetailView with a new `detail` prop, it does not
+    // unmount/remount the page tree itself).
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL_LONG.id, tastings: [] });
+    rerender(
+      <DetailView
+        detail={FIXTURE_DETAIL_LONG}
+        telemetry={FIXTURE_TELEMETRY_LONG}
+        timeline={FIXTURE_TIMELINE_LONG}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+    // The draft must be gone — run A's stars/notes must not survive onto run B.
+    expect(screen.getByTestId("tasting-star-4")).toHaveAttribute("data-filled", "false");
+    expect(screen.getByTestId("tasting-notes")).toHaveValue("");
+  });
+
   it("feeds the full persisted curve to the shared LiveCurve with event markers", () => {
     renderView();
     // Six columns (x + five series), all fixture points present.

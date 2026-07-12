@@ -5,6 +5,7 @@ handshake's JSON round trip, and RoastProfile validation (D7).
 """
 
 import json
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 
 import pydantic
@@ -25,6 +26,7 @@ from roastpilot_agent.models import (
     RoastProfile,
     RoastStyle,
     RoastStyleTarget,
+    TastingEntryRequest,
     roast_style_target,
     weight_loss_percent,
 )
@@ -839,3 +841,97 @@ def test_bean_profile_json_round_trip() -> None:
 def test_weight_loss_percent(charge: float, roasted: float | None, expected: float | None) -> None:
     """#388: weight loss % = (charge - roasted) / charge * 100, None on bad inputs."""
     assert weight_loss_percent(charge_weight_grams=charge, roasted_weight_grams=roasted) == expected
+
+
+def test_tasting_entry_tasted_at_none_passes_through() -> None:
+    """#522: the operator not supplying a tasting instant stays honestly
+    unknown — never defaulted, never rejected."""
+    request = TastingEntryRequest(stars=4)
+    assert request.tasted_at_utc is None
+    # Also cover the field EXPLICITLY passed as None (Pydantic v2 only runs a
+    # field_validator when the field is provided, so the omitted-field case
+    # above alone does not exercise the validator's None branch).
+    assert TastingEntryRequest(stars=4, tasted_at_utc=None).tasted_at_utc is None
+
+
+def test_tasting_entry_rejects_unparseable_tasted_at() -> None:
+    """#522 Codex P2: a malformed tasted_at_utc must fail validation (422 at
+    the API boundary) rather than persist verbatim and poison the exact
+    degassing-offset corpus signal #522 exists to capture. A "T" separator IS
+    present (distinct from the bare-date-rejection test below), so this
+    exercises fromisoformat's own parse failure, not the bare-date guard."""
+    with pytest.raises(pydantic.ValidationError, match="tasted_at_utc"):
+        TastingEntryRequest(stars=3, tasted_at_utc="2026-07-12Tnot-a-time")
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        # Naive (no offset) is assumed already UTC.
+        ("2026-07-12T18:00:00", "2026-07-12T18:00:00+00:00"),
+        # Already UTC-offset round-trips unchanged (in value; format is pinned).
+        ("2026-07-12T18:00:00+00:00", "2026-07-12T18:00:00+00:00"),
+        # A non-UTC offset is converted TO UTC, not stored as given.
+        ("2026-07-12T20:00:00+02:00", "2026-07-12T18:00:00+00:00"),
+        ("2026-07-12T14:00:00-04:00", "2026-07-12T18:00:00+00:00"),
+    ],
+)
+def test_tasting_entry_normalizes_tasted_at_to_utc(raw: str, expected: str) -> None:
+    """#522 Codex P2: naive input is assumed UTC (never a guessed local zone);
+    offset input is converted to UTC — every stored value is the SAME UTC
+    instant regardless of what offset the operator's client happened to send."""
+    request = TastingEntryRequest(stars=3, tasted_at_utc=raw)
+    assert request.tasted_at_utc == expected
+
+
+def test_tasting_entry_rejects_bare_date() -> None:
+    """#522 Codex P2: a bare date parses as midnight via fromisoformat, but
+    silently inventing a midnight instant would shift the degassing offset by
+    up to 24h — reject it explicitly rather than accept an under-specified
+    instant."""
+    with pytest.raises(pydantic.ValidationError, match="time component"):
+        TastingEntryRequest(stars=3, tasted_at_utc="2026-07-13")
+
+
+def test_tasting_entry_dedupes_attributes_and_defects() -> None:
+    """#522 Codex P2: a duplicated tag is normalized away (first-occurrence
+    order preserved), not rejected — the corpus never double-counts one
+    signal from a single entry."""
+    request = TastingEntryRequest(
+        stars=4,
+        attributes=["sweetness", "acidity", "sweetness", "body"],
+        defects=["bitter", "bitter", "flat"],
+    )
+    assert request.attributes == ["sweetness", "acidity", "body"]
+    assert request.defects == ["bitter", "flat"]
+
+
+def test_tasting_entry_dedupe_is_a_noop_on_already_unique_tags() -> None:
+    """#522 Codex P2 follow-up: dedup must not reorder or drop already-unique
+    tags — a regression here would silently corrupt every ordinary entry."""
+    request = TastingEntryRequest(stars=5, attributes=["sweetness", "acidity", "body"])
+    assert request.attributes == ["sweetness", "acidity", "body"]
+
+
+def test_tasting_entry_rejects_materially_future_tasted_at() -> None:
+    """#522 Codex round 3: a tasting cannot happen before it happens — a
+    tasted_at_utc well beyond any honest clock skew must 422."""
+    far_future = (datetime.now(UTC) + timedelta(days=1)).isoformat()
+    with pytest.raises(pydantic.ValidationError, match="future"):
+        TastingEntryRequest(stars=3, tasted_at_utc=far_future)
+
+
+def test_tasting_entry_accepts_tasted_at_within_clock_skew_tolerance() -> None:
+    """#522 Codex round 3: an honest client clock running a little ahead of
+    the server's must NOT 422 — only a materially future value should."""
+    slightly_ahead = (datetime.now(UTC) + timedelta(minutes=1)).isoformat()
+    request = TastingEntryRequest(stars=3, tasted_at_utc=slightly_ahead)
+    assert request.tasted_at_utc is not None
+
+
+def test_tasting_entry_accepts_tasted_at_at_the_present_instant() -> None:
+    """#522 Codex round 3: "now" itself (0 skew) must round-trip cleanly —
+    the boundary case just inside the tolerance window, not past it."""
+    now = datetime.now(UTC).isoformat()
+    request = TastingEntryRequest(stars=4, tasted_at_utc=now)
+    assert request.tasted_at_utc is not None

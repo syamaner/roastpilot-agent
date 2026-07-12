@@ -22,6 +22,8 @@ import type {
   RoastedWeightRequest,
   RoastProfile,
   RoastTimeline,
+  TastingEntryRequest,
+  TastingList,
   TelemetrySeries,
 } from "./types";
 
@@ -100,6 +102,18 @@ export const api = {
   /** `POST /api/roasts/{id}/roasted-weight` — operator roasted-out weight (#388). */
   setRoastedWeight: (runId: string, body: RoastedWeightRequest) =>
     request<RoastDetail>(`/api/roasts/${runId}/roasted-weight`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  /** `GET /api/roasts/{id}/tastings` — the run's tasting entries (#522, D91). */
+  tastings: (runId: string) => request<TastingList>(`/api/roasts/${runId}/tastings`),
+
+  /** `POST /api/roasts/{id}/tastings` — record a tasting entry (#522, D91).
+   *  Always appends a NEW entry (a revisit tasting is never an overwrite);
+   *  returns the full updated list. */
+  addTasting: (runId: string, body: TastingEntryRequest) =>
+    request<TastingList>(`/api/roasts/${runId}/tastings`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

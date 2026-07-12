@@ -8,13 +8,23 @@
  * (#170). Mirrors `DetailHarnessPage`.
  */
 
+import { roastKeys } from "@/hooks/queries";
+import { queryClient } from "@/lib/queryClient";
+
 import { AppFrame } from "@/components/shared";
 import { DetailView } from "./DetailView";
 import {
   FIXTURE_DETAIL_FAILED,
   FIXTURE_TELEMETRY_FAILED,
   FIXTURE_TIMELINE_FAILED,
+  fixtureTastings,
 } from "./fixture";
+
+// #522, Codex round 3: see DetailHarnessPage's identical seed comment.
+queryClient.setQueryData(
+  roastKeys.tastings(FIXTURE_DETAIL_FAILED.id),
+  fixtureTastings(FIXTURE_DETAIL_FAILED.id),
+);
 
 export function DetailHarnessFailedPage(): React.JSX.Element {
   return (

@@ -11,6 +11,7 @@ invariant. Use ``.value`` at serialization boundaries.
 
 import json
 import re
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -1142,6 +1143,195 @@ class RoastedWeightRequest(BaseModel):
     """
 
     roasted_weight_grams: float = Field(gt=0)
+
+
+# --- #522 (D91): structured tasting entries ---
+#
+# The E14 corpus starts now: every roast without a tasting is a lost label.
+# Constrained ``Literal`` vocabularies (matching ``BeanSpecies`` /
+# ``ProcessingMethod`` above), deliberately NOT ``models.py`` ``Enum``s — tasting
+# attributes are not safety-bearing, and an enum here would trip the
+# safety-reviewer escalation for no reason. ``"other"`` is the escape hatch on
+# ``BrewMethod`` so the value stays a closed set.
+BrewMethod = Literal[
+    "espresso", "pour_over", "french_press", "aeropress", "moka_pot", "drip", "cupping", "other"
+]
+
+#: Positive attribute tags (sweetness/acidity/body — D91 §4). A tasting may tag
+#: zero or more; free-text nuance still lives in ``notes``.
+TastingAttribute = Literal["sweetness", "acidity", "body"]
+
+#: Defect tags (D91 §4) — the roast-13 "flat → grassy" refinement is exactly the
+#: signal this vocabulary makes computable for E14's synthesis.
+TastingDefect = Literal["grassy", "baked", "bitter", "flat"]
+
+
+def _empty_attributes() -> list[TastingAttribute]:
+    """Typed default factory for the optional attribute-tag list fields below
+    (mirrors ``_empty_actions`` — keeps pyright strict from inferring
+    ``list[Unknown]`` off the bare ``list`` builtin)."""
+    return []
+
+
+def _empty_defects() -> list[TastingDefect]:
+    """Typed default factory for the optional defect-tag list fields below."""
+    return []
+
+
+class TastingEntryRequest(BaseModel):
+    """``POST /api/roasts/{id}/tastings`` body (#522, D91).
+
+    A revisit tasting (e.g. the roast-13 same-evening-vs-hours-later
+    refinement) is submitted as an ADDITIONAL entry, never an overwrite — the
+    endpoint always inserts a new ``roast_tastings`` row. Every field beyond
+    ``stars`` is optional so entry friction stays near zero (the operator rates
+    from the phone post-tasting): stars + notes alone is still a valid tasting.
+    """
+
+    stars: Literal[1, 2, 3, 4, 5]
+    notes: str | None = None
+    tasted_at_utc: str | None = None
+    """UTC ISO-8601 timestamp of this tasting, distinct from ``recorded_at_utc``
+    (when the entry was saved) — the degassing offset (roast 13's same-evening
+    "flat" vs. hours-later "grassy") is a real confound, so the roast-relative
+    freshness must be computable from the tasting instant, not the save instant.
+    ``None`` when the operator does not supply one; the server does NOT default
+    it to "now" (see :meth:`RoastStore.add_tasting`) so an unset value stays
+    honestly unknown rather than silently wrong. Validated and normalized to a
+    UTC-offset ISO-8601 string (see :func:`_normalize_tasted_at`) — this field
+    is the exact degassing signal #522 exists to capture, so an unparseable or
+    ambiguous-offset value must fail loudly (422) rather than poison the corpus
+    label silently."""
+    brew_method: BrewMethod | None = None
+    grind_note: str | None = None
+    attributes: list[TastingAttribute] = Field(default_factory=_empty_attributes)
+    """Positive attribute tags. Deduplicated on validation, preserving
+    first-occurrence order (see :func:`_dedupe_tags`) — a repeated tag is
+    friendlier normalized away than rejected, and the corpus never
+    double-counts the same signal from one entry."""
+    defects: list[TastingDefect] = Field(default_factory=_empty_defects)
+    """Defect tags, deduplicated the same way as :attr:`attributes`."""
+
+    @field_validator("tasted_at_utc")
+    @classmethod
+    def _validate_tasted_at(cls, value: str | None) -> str | None:
+        return _normalize_tasted_at(value)
+
+    @field_validator("attributes", "defects")
+    @classmethod
+    def _dedupe(cls, value: list[str]) -> list[str]:
+        return _dedupe_tags(value)
+
+
+#: Clock-skew tolerance for the future-timestamp guard on tasted_at_utc
+#: (#522, Codex round 3): an honest operator client whose clock runs a little
+#: ahead of the server's should not 422 for that alone. Small enough to still
+#: catch a materially-wrong (e.g. wrong-year) future value.
+_TASTED_AT_FUTURE_TOLERANCE = timedelta(minutes=5)
+
+
+def _normalize_tasted_at(value: str | None) -> str | None:
+    """Parse and UTC-normalize an operator-supplied tasting timestamp (#522).
+
+    Accepts any ISO-8601 string ``datetime.fromisoformat`` can parse,
+    including a naive (no offset) value or one with a non-UTC offset. A naive
+    value is assumed to already be UTC (rather than silently guessing a local
+    zone the server has no way to know); an offset value is converted to UTC.
+    The result always round-trips through :meth:`datetime.isoformat`, matching
+    the ``_utc_now()`` format every other persisted timestamp in this schema
+    uses.
+
+    Args:
+        value: The raw operator-supplied string, or ``None``.
+
+    Returns:
+        The UTC-normalized ISO-8601 string, or ``None`` when ``value`` is
+        ``None``.
+
+    Raises:
+        ValueError: ``value`` is not a parseable ISO-8601 datetime, is a bare
+            date with no time component, or is materially in the future
+            relative to when this request is being validated — Pydantic turns
+            this into a 422 at the API boundary, so a malformed,
+            under-specified, or impossible instant is rejected rather than
+            persisted as-is and silently poisoning the degassing-offset
+            corpus label this field exists to capture.
+    """
+    if value is None:
+        return None
+    # A bare date ("2026-07-13", no "T" separator) is technically a valid
+    # ISO-8601 *date*, and datetime.fromisoformat happily parses it as
+    # midnight — but a silently-invented midnight would shift the degassing
+    # offset by up to 24 hours. Reject it explicitly rather than accept a
+    # value the operator's client never intended as an exact instant; every
+    # real instant carries a "T" time separator (the FE always sends one).
+    if "T" not in value:
+        raise ValueError(
+            f"tasted_at_utc must include a time component (e.g. "
+            f"'2026-07-13T18:00:00'), not a bare date: {value!r}"
+        )
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"tasted_at_utc is not a valid ISO-8601 datetime: {value!r}") from exc
+    parsed = parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+    # A tasting materially in the future is physically impossible (the
+    # operator cannot taste beans before tasting them) — reject it, with a
+    # small clock-skew tolerance so an honest client whose clock runs a
+    # little ahead of the server's isn't 422'd for that alone. The lower
+    # bound (vs. the run's own completed_at_utc) is enforced separately at
+    # the API layer, where completed_at_utc is available.
+    if parsed > datetime.now(UTC) + _TASTED_AT_FUTURE_TOLERANCE:
+        raise ValueError(f"tasted_at_utc {value!r} is in the future")
+    return parsed.isoformat()
+
+
+def _dedupe_tags(values: list[str]) -> list[str]:
+    """Deduplicate a tag list, preserving first-occurrence order (#522).
+
+    A repeated tag (e.g. an accidental double-tap on a toggle button) is
+    normalized away here rather than rejected — friendlier for the operator,
+    and it keeps the corpus from double-counting the same signal within one
+    tasting entry.
+
+    Args:
+        values: The raw tag list (``TastingAttribute`` or ``TastingDefect``
+            values, typed as ``str`` here since the validator runs identically
+            over either field).
+
+    Returns:
+        The same values with duplicates removed, in first-occurrence order.
+    """
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            deduped.append(value)
+    return deduped
+
+
+class RoastTasting(BaseModel):
+    """One persisted tasting entry (#522, D91 — ``roast_tastings`` row)."""
+
+    id: int
+    tasted_at_utc: str | None = None
+    recorded_at_utc: str
+    stars: int
+    notes: str | None = None
+    brew_method: BrewMethod | None = None
+    grind_note: str | None = None
+    attributes: list[TastingAttribute] = Field(default_factory=_empty_attributes)
+    defects: list[TastingDefect] = Field(default_factory=_empty_defects)
+
+
+class TastingList(BaseModel):
+    """``GET /api/roasts/{id}/tastings`` envelope (#522) — every tasting entry
+    for the run, oldest first (the natural revisit order: first taste, then any
+    later refinement)."""
+
+    run_id: str
+    tastings: list[RoastTasting]
 
 
 # --- E7-S2: operator action queue (component plan §6) ---

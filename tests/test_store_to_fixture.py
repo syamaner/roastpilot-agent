@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -342,6 +343,138 @@ async def test_summary_weight_loss_is_null_when_unweighed(tmp_path: Path) -> Non
     assert summary["charge_weight_grams"] == 250.0
     assert summary["roasted_weight_grams"] is None
     assert summary["weight_loss_percent"] is None
+
+
+@pytest.mark.asyncio
+async def test_summary_carries_every_tasting_entry(tmp_path: Path) -> None:
+    """#522: multi-entry tastings reach the corpus — the signal
+    operator_rating/notes alone cannot carry (a revisit is an ADDITIONAL
+    entry, never an overwrite)."""
+    db_path = tmp_path / "tasted.sqlite3"
+    store = await _synthetic_store(db_path)
+    await store.add_tasting("synthetic-run", stars=2, notes="flat", defects=["flat"])
+    await store.add_tasting(
+        "synthetic-run",
+        stars=4,
+        notes="grassy note faded",
+        brew_method="pour_over",
+        grind_note="medium-fine",
+        attributes=["sweetness"],
+        defects=["grassy"],
+    )
+    await store.close()
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    tastings = summary["tastings"]
+    assert len(tastings) == 2  # BOTH entries — a revisit never overwrites.
+    assert tastings[0]["stars"] == 2
+    assert tastings[0]["defects"] == ["flat"]
+    assert tastings[1]["stars"] == 4
+    assert tastings[1]["brew_method"] == "pour_over"
+    assert tastings[1]["grind_note"] == "medium-fine"
+    assert tastings[1]["attributes"] == ["sweetness"]
+    assert tastings[1]["defects"] == ["grassy"]
+
+
+@pytest.mark.asyncio
+async def test_summary_tastings_carry_the_degassing_offset(tmp_path: Path) -> None:
+    """#522 round 4: the fixture's own clock is roast-relative, so the raw
+    absolute tasted_at_utc alone gives a downstream reader no way to compute
+    the degassing offset the field exists to capture — each entry must carry
+    a derived degassing_offset_hours."""
+    db_path = tmp_path / "degassing.sqlite3"
+    store = await _synthetic_store(db_path)
+    completed = s2f.read_store_roast(db_path).completed_at_utc
+    assert completed is not None
+    tasted_same_evening = (datetime.fromisoformat(completed) + timedelta(hours=2)).isoformat()
+    tasted_next_day = (datetime.fromisoformat(completed) + timedelta(hours=20)).isoformat()
+    await store.add_tasting("synthetic-run", stars=2, tasted_at_utc=tasted_same_evening)
+    await store.add_tasting("synthetic-run", stars=4, tasted_at_utc=tasted_next_day)
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    tastings = summary["tastings"]
+    assert tastings[0]["degassing_offset_hours"] == 2.0
+    assert tastings[1]["degassing_offset_hours"] == 20.0
+
+
+@pytest.mark.asyncio
+async def test_summary_tastings_degassing_offset_is_zero_not_negative_at_completion(
+    tmp_path: Path,
+) -> None:
+    """#522 round 5: a tasting stored exactly AT completion (the API's
+    round-5 clamp for a same-minute-but-raw-earlier entry, per the
+    datetime-local minute-precision guard) must compute a degassing offset
+    of exactly 0.00 — never a small negative value, the exact garbage the
+    validator chain exists to prevent."""
+    db_path = tmp_path / "at_completion.sqlite3"
+    store = await _synthetic_store(db_path)
+    completed = s2f.read_store_roast(db_path).completed_at_utc
+    assert completed is not None
+    # Mirrors RoastService.add_tasting's round-5 clamp: the API stores
+    # completed_at_utc verbatim in this case, never a raw sub-minute-earlier
+    # value.
+    await store.add_tasting("synthetic-run", stars=3, tasted_at_utc=completed)
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["tastings"][0]["degassing_offset_hours"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_summary_tastings_degassing_offset_is_null_without_tasted_at(
+    tmp_path: Path,
+) -> None:
+    """#522 round 4: an entry with no tasted_at_utc (the operator did not
+    supply one) carries a null offset, not a fabricated one."""
+    db_path = tmp_path / "no_tasted_at.sqlite3"
+    store = await _synthetic_store(db_path)
+    await store.add_tasting("synthetic-run", stars=3)  # no tasted_at_utc
+    await store.close()
+
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["tastings"][0]["degassing_offset_hours"] is None
+
+
+@pytest.mark.asyncio
+async def test_summary_tastings_is_empty_for_an_untasted_roast(tmp_path: Path) -> None:
+    """#522: an untasted roast carries an empty tastings list, not a null or
+    a missing key — the bake-off / any downstream reader can always index it."""
+    db_path = tmp_path / "untasted.sqlite3"
+    store = await _synthetic_store(db_path)
+    await store.close()
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["tastings"] == []
+
+
+@pytest.mark.asyncio
+async def test_schema_v10_compat_roast_tastings_table_absent(tmp_path: Path) -> None:
+    """#522: schema v10 stores predate the roast_tastings table (added in v11).
+
+    read_store_roast must not crash when the table is absent; it should fall
+    back to an empty tastings list."""
+    import sqlite3
+
+    db_path = tmp_path / "v10store.sqlite3"
+    store = await _synthetic_store(db_path)
+    await store.close()
+    # Simulate schema v10 by dropping the table added in v11.
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("DROP TABLE roast_tastings")
+    conn.commit()
+    conn.close()
+
+    result = s2f.read_store_roast(db_path)
+    assert result.tastings == []
 
 
 @pytest.mark.asyncio

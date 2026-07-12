@@ -14,7 +14,7 @@ directly into the broadcaster.
 import asyncio
 import json
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 
@@ -32,6 +32,7 @@ from roastpilot_agent.api import (
     RoastRunGoneError,
     RoastRunner,
     RoastService,
+    _before_the_minute,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     _parse_last_event_id,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     create_app,
     stream_events,
@@ -841,6 +842,376 @@ async def test_set_roasted_weight_rejects_over_charge(
         "/api/roasts/run-oc/roasted-weight", json={"roasted_weight_grams": 9999.0}
     )
     assert response.status_code == 409
+
+
+# --- tastings (#522, D91) ---
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_stars_and_notes_only(client: AsyncClient, store: RoastStore) -> None:
+    """#522: entry friction stays near zero — stars alone (no notes, no other
+    field) is a valid POST body."""
+    await store.create_run(
+        run_id="run-t", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-t", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post("/api/roasts/run-t/tastings", json={"stars": 4})
+    assert response.status_code == 201
+    body = response.json()
+    assert body["run_id"] == "run-t"
+    assert len(body["tastings"]) == 1
+    tasting = body["tastings"][0]
+    assert tasting["stars"] == 4
+    assert tasting["notes"] is None
+    assert tasting["tasted_at_utc"] is None
+    assert tasting["brew_method"] is None
+    assert tasting["attributes"] == []
+    assert tasting["defects"] == []
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_full_payload(client: AsyncClient, store: RoastStore) -> None:
+    await store.create_run(
+        run_id="run-full", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(
+        run_id="run-full", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    detail = (await client.get("/api/roasts/run-full")).json()
+    completed_at = datetime.fromisoformat(detail["completed_at_utc"])
+    # After completion (the lower bound) but well within the future-clock-skew
+    # tolerance (the upper bound, #522 Codex round 3) — a value that satisfies
+    # BOTH bounds regardless of when the suite runs.
+    tasted_at = (completed_at + timedelta(seconds=5)).isoformat()
+    response = await client.post(
+        "/api/roasts/run-full/tastings",
+        json={
+            "stars": 5,
+            "notes": "sweet, clean",
+            "tasted_at_utc": tasted_at,
+            "brew_method": "aeropress",
+            "grind_note": "fine",
+            "attributes": ["sweetness", "body"],
+            "defects": [],
+        },
+    )
+    assert response.status_code == 201
+    tasting = response.json()["tastings"][0]
+    assert tasting["tasted_at_utc"] == tasted_at
+    assert tasting["brew_method"] == "aeropress"
+    assert tasting["grind_note"] == "fine"
+    assert tasting["attributes"] == ["sweetness", "body"]
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_revisit_appends(client: AsyncClient, store: RoastStore) -> None:
+    """#522, D91: a second POST is an ADDITIONAL tasting, not an overwrite —
+    the roast-13 "flat -> grassy" refinement shape."""
+    await store.create_run(
+        run_id="run-revisit",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-revisit", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    await client.post("/api/roasts/run-revisit/tastings", json={"stars": 2, "defects": ["flat"]})
+    response = await client.post(
+        "/api/roasts/run-revisit/tastings", json={"stars": 4, "defects": ["grassy"]}
+    )
+    assert response.status_code == 201
+    tastings = response.json()["tastings"]
+    assert len(tastings) == 2
+    assert tastings[0]["defects"] == ["flat"]
+    assert tastings[1]["defects"] == ["grassy"]
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_in_progress_run_conflicts(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="run-tip", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.DEVELOPMENT
+    )
+    response = await client.post("/api/roasts/run-tip/tastings", json={"stars": 3})
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_unknown_run_404(client: AsyncClient) -> None:
+    response = await client.post("/api/roasts/nope/tastings", json={"stars": 3})
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_rejects_out_of_range_stars(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="run-tb", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-tb", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post("/api/roasts/run-tb/tastings", json={"stars": 0})
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_rejects_unknown_brew_method(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#522: brew method is a closed controlled vocabulary — an arbitrary
+    string is rejected, not silently accepted as free text."""
+    await store.create_run(
+        run_id="run-tbm", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-tbm", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post(
+        "/api/roasts/run-tbm/tastings", json={"stars": 3, "brew_method": "instant"}
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_rejects_malformed_tasted_at(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#522 Codex P2: tasted_at_utc is the exact degassing-offset corpus
+    signal #522 exists to capture — an unparseable value must 422, not
+    persist verbatim and poison the label silently."""
+    await store.create_run(
+        run_id="run-tba", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-tba", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post(
+        "/api/roasts/run-tba/tastings",
+        # A "T" separator IS present (distinct from the bare-date-rejection
+        # test below), so this exercises fromisoformat's own parse failure.
+        json={"stars": 3, "tasted_at_utc": "2026-07-12Tnot-a-time"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_normalizes_naive_and_offset_tasted_at(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#522 Codex P2: a naive (no-offset) timestamp is assumed UTC; a
+    non-UTC-offset timestamp is converted to UTC — both round-trip through
+    the store as a UTC-offset ISO-8601 string, never the raw operator input."""
+    await store.create_run(
+        run_id="run-tbn", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-tbn", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    detail = (await client.get("/api/roasts/run-tbn")).json()
+    completed_at = datetime.fromisoformat(detail["completed_at_utc"])
+    # A UTC instant after completion (the lower bound) but well within the
+    # future-clock-skew tolerance (the upper bound, #522 Codex round 3) —
+    # satisfies both bounds regardless of when the suite runs, unlike a fixed
+    # literal (which would eventually collide with one bound or the other).
+    base = completed_at + timedelta(seconds=5)
+    expected = base.isoformat()
+    naive_str = base.replace(tzinfo=None).isoformat()
+
+    naive = await client.post(
+        "/api/roasts/run-tbn/tastings",
+        json={"stars": 3, "tasted_at_utc": naive_str},
+    )
+    assert naive.status_code == 201
+    assert naive.json()["tastings"][0]["tasted_at_utc"] == expected
+
+    # The same UTC instant, expressed with a +02:00 offset (wall-clock time
+    # shifted +2h so the UTC instant is unchanged) — proper tz arithmetic via
+    # astimezone, not string surgery on the ISO text.
+    offset_str = base.astimezone(timezone(timedelta(hours=2))).isoformat()
+    offset = await client.post(
+        "/api/roasts/run-tbn/tastings",
+        json={"stars": 4, "tasted_at_utc": offset_str},
+    )
+    assert offset.status_code == 201
+    assert offset.json()["tastings"][1]["tasted_at_utc"] == expected
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_rejects_bare_date(client: AsyncClient, store: RoastStore) -> None:
+    """#522 Codex P2: a bare date ("2026-07-13") is parseable by
+    datetime.fromisoformat as midnight — but silently inventing a midnight
+    instant would shift the degassing offset by up to 24h. Must 422, not
+    accept it."""
+    await store.create_run(
+        run_id="run-tbd", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-tbd", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post(
+        "/api/roasts/run-tbd/tastings",
+        json={"stars": 3, "tasted_at_utc": "2026-07-13"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_dedupes_duplicate_tags(client: AsyncClient, store: RoastStore) -> None:
+    """#522 Codex P2: a duplicated tag (e.g. an accidental double-tap) is
+    deduplicated on save, preserving first-occurrence order — never rejected,
+    never double-counted in the corpus."""
+    await store.create_run(
+        run_id="run-tdd", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-tdd", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    response = await client.post(
+        "/api/roasts/run-tdd/tastings",
+        json={
+            "stars": 4,
+            "attributes": ["sweetness", "acidity", "sweetness"],
+            "defects": ["bitter", "bitter"],
+        },
+    )
+    assert response.status_code == 201
+    tasting = response.json()["tastings"][0]
+    assert tasting["attributes"] == ["sweetness", "acidity"]
+    assert tasting["defects"] == ["bitter"]
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_rejects_tasted_at_before_completion(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#522 Codex P2: a tasted_at_utc earlier than the run's completed_at_utc
+    is physically impossible (the beans cannot be tasted before the roast
+    that produced them finished) — a negative degassing offset is a nonsense
+    corpus label, so reject it as a 409, mirroring the roasted-exceeds-charge
+    physical-impossibility class."""
+    await store.create_run(
+        run_id="run-tpc", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-tpc", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    detail = (await client.get("/api/roasts/run-tpc")).json()
+    completed_at = datetime.fromisoformat(detail["completed_at_utc"])
+    # A full 2 minutes earlier — guaranteed to land in an EARLIER minute
+    # regardless of completed_at's own seconds/microseconds component (#522
+    # round 4: the comparison is minute-truncated, so a delta smaller than a
+    # minute could land in the SAME minute and be wrongly accepted).
+    before = (completed_at - timedelta(minutes=2)).isoformat()
+
+    response = await client.post(
+        "/api/roasts/run-tpc/tastings",
+        json={"stars": 3, "tasted_at_utc": before},
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_accepts_tasted_at_exactly_at_completion(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#522 Codex P2: exactly-at-completion is accepted (>=, not strictly >)
+    — a tasting timestamped the instant cooling ended is unusual but not
+    physically impossible."""
+    await store.create_run(
+        run_id="run-tec", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(run_id="run-tec", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    detail = (await client.get("/api/roasts/run-tec")).json()
+
+    response = await client.post(
+        "/api/roasts/run-tec/tastings",
+        json={"stars": 3, "tasted_at_utc": detail["completed_at_utc"]},
+    )
+    assert response.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_add_tasting_accepts_same_minute_as_completion_despite_seconds(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#522 round 4/5: the FE's datetime-local picker cannot express seconds,
+    so an honest "tasted at the completion minute" entry must NOT 409 just
+    because completed_at_utc itself has a non-zero seconds component. The
+    exact collision case from the thread: completion at some non-zero
+    second, the operator picks that same minute (:00 seconds — all a
+    datetime-local input can express). The stored value is then CLAMPED to
+    completed_at_utc (round 5), not the raw (sub-minute-earlier) input."""
+    await store.create_run(
+        run_id="run-minute", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(
+        run_id="run-minute", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    detail = (await client.get("/api/roasts/run-minute")).json()
+    completed_at = datetime.fromisoformat(detail["completed_at_utc"])
+    # completed_at_utc is stamped from real "now" (datetime.now(UTC)), which
+    # essentially never lands on exactly :00 seconds — this reproduces the
+    # collision without needing to bypass the completed-run immutability
+    # trigger to pin an exact seconds value.
+    same_minute_no_seconds = completed_at.replace(second=0, microsecond=0).isoformat()
+
+    response = await client.post(
+        "/api/roasts/run-minute/tastings",
+        json={"stars": 4, "tasted_at_utc": same_minute_no_seconds},
+    )
+    assert response.status_code == 201
+    # #522 round 5: a raw-earlier same-minute value is CLAMPED to
+    # completed_at_utc on storage, not persisted as the truncated input —
+    # storing the raw sub-minute-early value would compute a small NEGATIVE
+    # degassing_offset_hours in the corpus export.
+    assert response.json()["tastings"][0]["tasted_at_utc"] == detail["completed_at_utc"]
+
+
+@pytest.mark.parametrize(
+    ("tasted_at", "completed_at", "expected"),
+    [
+        # The exact collision case: completion at :45s, tasted at the same
+        # minute (:00s) — NOT before, despite the raw string being lexically
+        # smaller.
+        ("2026-07-12T18:05:00+00:00", "2026-07-12T18:05:45+00:00", False),
+        # A genuinely earlier minute — still caught.
+        ("2026-07-12T18:04:59+00:00", "2026-07-12T18:05:00+00:00", True),
+        # Same instant.
+        ("2026-07-12T18:05:45+00:00", "2026-07-12T18:05:45+00:00", False),
+        # A later minute.
+        ("2026-07-12T18:06:00+00:00", "2026-07-12T18:05:45+00:00", False),
+    ],
+)
+def test_before_the_minute(tasted_at: str, completed_at: str, expected: bool) -> None:
+    """#522 round 4: unit-level pin of the minute-truncated comparison."""
+    assert _before_the_minute(tasted_at, completed_at) is expected
+
+
+@pytest.mark.asyncio
+async def test_list_tastings_empty_for_untasted_completed_run(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="run-empty", profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.COMPLETE
+    )
+    await store.complete_run(
+        run_id="run-empty", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    response = await client.get("/api/roasts/run-empty/tastings")
+    assert response.status_code == 200
+    assert response.json() == {"run_id": "run-empty", "tastings": []}
+
+
+@pytest.mark.asyncio
+async def test_list_tastings_unknown_run_404(client: AsyncClient) -> None:
+    response = await client.get("/api/roasts/nope/tastings")
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_list_tastings_reflects_active_run(client: AsyncClient, store: RoastStore) -> None:
+    """GET is not completed-only — reading the (empty) tasting list for an
+    in-progress run is harmless and useful for the detail page to render
+    before the roast finishes."""
+    await store.create_run(
+        run_id="run-active",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.DEVELOPMENT,
+    )
+    response = await client.get("/api/roasts/run-active/tastings")
+    assert response.status_code == 200
+    assert response.json() == {"run_id": "run-active", "tastings": []}
 
 
 # --- operator action queue (E7-S2) ---
