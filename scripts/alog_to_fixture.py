@@ -278,6 +278,9 @@ def _summary(profile: dict[str, Any], marks: RoastMarks) -> dict[str, Any]:
         "charge_weight_grams": None,
         "roasted_weight_grams": None,
         "weight_loss_percent": None,
+        # Tasting corpus label (#522): an .alog has no tasting concept — empty
+        # list, kept in the key set for parity with store_to_fixture.
+        "tastings": [],
     }
 
 

@@ -60,4 +60,20 @@ describe("api client", () => {
     await api.telemetry("r1", 5);
     expect(fetch).toHaveBeenCalledWith("/api/roasts/r1/telemetry?downsample=5", expect.any(Object));
   });
+
+  it("GET /tastings returns the typed list (#522)", async () => {
+    mockFetch(200, { run_id: "r1", tastings: [] });
+    const list = await api.tastings("r1");
+    expect(list.run_id).toBe("r1");
+    expect(fetch).toHaveBeenCalledWith("/api/roasts/r1/tastings", expect.any(Object));
+  });
+
+  it("POST /tastings sends the entry body and returns the updated list (#522)", async () => {
+    mockFetch(201, { run_id: "r1", tastings: [{ id: 1, stars: 4 }] });
+    const list = await api.addTasting("r1", { stars: 4 });
+    expect(list.tastings).toHaveLength(1);
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init).toMatchObject({ method: "POST" });
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({ stars: 4 });
+  });
 });

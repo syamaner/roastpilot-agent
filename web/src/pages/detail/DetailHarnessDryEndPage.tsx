@@ -10,9 +10,20 @@
  * Mirrors `DetailHarnessPage` (the authorized shared-route convention).
  */
 
+import { roastKeys } from "@/hooks/queries";
+import { queryClient } from "@/lib/queryClient";
+
 import { AppFrame } from "@/components/shared";
 import { DetailView } from "./DetailView";
-import { FIXTURE_DETAIL, FIXTURE_TELEMETRY, FIXTURE_TIMELINE_DRY_END } from "./fixture";
+import {
+  FIXTURE_DETAIL,
+  FIXTURE_TELEMETRY,
+  FIXTURE_TIMELINE_DRY_END,
+  fixtureTastings,
+} from "./fixture";
+
+// #522, Codex round 3: see DetailHarnessPage's identical seed comment.
+queryClient.setQueryData(roastKeys.tastings(FIXTURE_DETAIL.id), fixtureTastings(FIXTURE_DETAIL.id));
 
 export function DetailHarnessDryEndPage(): React.JSX.Element {
   return (

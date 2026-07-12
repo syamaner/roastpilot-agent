@@ -89,6 +89,8 @@ from roastpilot_agent.models import (
     RoastTimeline,
     SseEvent,
     SseEventType,
+    TastingEntryRequest,
+    TastingList,
     TelemetryEventData,
     TelemetrySeries,
     recording_origin_slug,
@@ -379,6 +381,33 @@ class RoastRunGoneError(Exception):
 
     A completed or faulted run has no live controller loop draining its queue and
     no hot hardware to act on; the action is gone, not merely conflicting."""
+
+
+def _before_the_minute(tasted_at_utc: str, completed_at_utc: str) -> bool:
+    """Whether ``tasted_at_utc`` is strictly earlier than ``completed_at_utc``
+    at MINUTE precision (#522 round 4).
+
+    The FE's ``datetime-local`` picker cannot express seconds, so comparing
+    the two full-precision ISO-8601 strings would 409 an honest "tasted at
+    the completion minute" entry whenever ``completed_at_utc`` itself has a
+    non-zero seconds/microseconds component (it always does — it is
+    ``datetime.now(UTC).isoformat()``). Truncating both to the minute makes
+    same-minute read as simultaneous, matching what the operator's input can
+    actually express, while still catching any minute-scale (or coarser)
+    negative offset.
+
+    Args:
+        tasted_at_utc: The (already UTC-normalized) operator-supplied tasting
+            instant.
+        completed_at_utc: The run's completion instant.
+
+    Returns:
+        ``True`` iff ``tasted_at_utc`` falls in a minute strictly before
+        ``completed_at_utc``'s minute.
+    """
+    tasted_minute = datetime.fromisoformat(tasted_at_utc).replace(second=0, microsecond=0)
+    completed_minute = datetime.fromisoformat(completed_at_utc).replace(second=0, microsecond=0)
+    return tasted_minute < completed_minute
 
 
 #: Fallback agent-event → source mapping for persisted ``roast_events`` rows.
@@ -2010,6 +2039,83 @@ class RoastService:
             raise RuntimeError(f"read_run returned None for weighed run {run_id}")
         return weighed
 
+    async def add_tasting(self, run_id: str, request: TastingEntryRequest) -> TastingList:
+        """Record one tasting entry (#522, D91), or 404/409.
+
+        Mirrors :meth:`rate`: 404 when the run is unknown; 409 when it is still
+        in progress — a tasting is the same completed-only lifecycle as the
+        rating/roasted-weight, so the in-progress case surfaces as a conflict
+        rather than a 500. Unlike :meth:`rate`, this ALWAYS appends a new row
+        (multiple tastings per run is the point — a revisit tasting is an
+        additional entry, never an overwrite), so the response is the full
+        updated :class:`TastingList`, not a single entry.
+
+        A ``tasted_at_utc`` earlier than the run's ``completed_at_utc`` is
+        physically impossible (the beans cannot be tasted before the roast
+        that produced them finished) and would yield a NEGATIVE degassing
+        offset — a nonsense corpus label — so it is rejected as a 409 too,
+        the same class of guard as :meth:`set_roasted_weight`'s
+        roasted-exceeds-charge check. Exactly-at-completion is accepted (a
+        tasting timestamped the instant cooling ended is not impossible, just
+        unusual, and the >= bound keeps the check simple and symmetric with
+        the rest of the completed-run comparisons in this module).
+
+        The comparison is truncated to MINUTE precision (#522 round 4): the
+        FE's ``datetime-local`` picker cannot express seconds, so an honest
+        "tasted at the completion minute" entry would otherwise 409 against
+        ``completed_at_utc``'s own seconds component (e.g. completion at
+        ``:45`` seconds, the operator picks that same minute — a real,
+        non-impossible entry the seconds-precision compare would wrongly
+        reject). Same-minute reads as simultaneous at the input's resolution;
+        the guard still catches any offset a human could actually express.
+
+        A same-truncated-minute value that is nonetheless raw-earlier than
+        ``completed_at_utc`` (#522 round 5 — the above example: input ``:00``
+        against a ``:45`` completion) is CLAMPED to ``completed_at_utc``
+        before storage, not stored as given: storing the raw sub-minute-early
+        value would compute a small NEGATIVE ``degassing_offset_hours`` in the
+        corpus export — exactly the garbage this whole guard chain exists to
+        prevent, just shrunk to sub-minute scale. "Same minute" means "at
+        completion," so it is stored as at completion.
+        """
+        detail = await self._store.read_run(run_id)
+        if detail is None:
+            raise RoastRunNotFoundError(run_id)
+        if detail.completed_at_utc is None:
+            raise RoastRunConflictError(
+                f"run {run_id} is still in progress; taste it after completion"
+            )
+        tasted_at_utc = request.tasted_at_utc
+        if tasted_at_utc is not None:
+            if _before_the_minute(tasted_at_utc, detail.completed_at_utc):
+                raise RoastRunConflictError(
+                    f"tasted_at_utc {tasted_at_utc} is before the run completed "
+                    f"at {detail.completed_at_utc} (physically impossible)"
+                )
+            if tasted_at_utc < detail.completed_at_utc:
+                # Admitted only by the minute truncation above: raw-earlier,
+                # same minute. Clamp to completed_at_utc so the stored value
+                # (and the derived degassing offset) is never negative.
+                tasted_at_utc = detail.completed_at_utc
+        await self._store.add_tasting(
+            run_id,
+            stars=request.stars,
+            notes=request.notes,
+            tasted_at_utc=tasted_at_utc,
+            brew_method=request.brew_method,
+            grind_note=request.grind_note,
+            attributes=request.attributes,
+            defects=request.defects,
+        )
+        return await self.list_tastings(run_id)
+
+    async def list_tastings(self, run_id: str) -> TastingList:
+        """The run's tasting entries, oldest first (#522), or 404 when unknown."""
+        detail = await self._store.read_run(run_id)
+        if detail is None:
+            raise RoastRunNotFoundError(run_id)
+        return TastingList(run_id=run_id, tastings=await self._store.list_tastings(run_id))
+
     async def submit_operator_action(
         self, run_id: str, request: OperatorActionRequest
     ) -> OperatorActionResult:
@@ -2256,6 +2362,28 @@ async def set_roasted_weight(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RoastRunConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+async def add_tasting(
+    run_id: str,
+    request: TastingEntryRequest,
+    service: ServiceDep,
+) -> TastingList:
+    """``POST /api/roasts/{run_id}/tastings`` — record a tasting entry (#522, D91)."""
+    try:
+        return await service.add_tasting(run_id, request)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+async def list_tastings(run_id: str, service: ServiceDep) -> TastingList:
+    """``GET /api/roasts/{run_id}/tastings`` — the run's tasting entries (#522)."""
+    try:
+        return await service.list_tastings(run_id)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 async def submit_operator_action(
@@ -2717,6 +2845,8 @@ def create_app(
     app.get("/api/roasts/{run_id}/log/{artifact}")(download_log)
     app.post("/api/roasts/{run_id}/rating")(rate_roast)
     app.post("/api/roasts/{run_id}/roasted-weight")(set_roasted_weight)
+    app.post("/api/roasts/{run_id}/tastings", status_code=201)(add_tasting)
+    app.get("/api/roasts/{run_id}/tastings")(list_tastings)
     app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)
     app.get("/api/bean-profiles")(list_bean_profiles)
     app.post("/api/bean-profiles", status_code=201)(create_bean_profile)

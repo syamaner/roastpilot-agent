@@ -23,6 +23,7 @@ from roastpilot_agent.models import (
     AdvisorTraceStatus,
     BeanProfile,
     BeanProfileInput,
+    BrewMethod,
     CommandTraceSource,
     CommandTraceStatus,
     LogManifest,
@@ -33,8 +34,11 @@ from roastpilot_agent.models import (
     RoastPhase,
     RoastProfile,
     RoastSummary,
+    RoastTasting,
     RoastTelemetry,
     RoastTimeline,
+    TastingAttribute,
+    TastingDefect,
     TelemetryPoint,
     TimelineAdvisorDecision,
     TimelineCommand,
@@ -382,6 +386,38 @@ ALTER TABLE roast_runs ADD COLUMN ambient_captured INTEGER NOT NULL DEFAULT 0
   CHECK (ambient_captured IN (0, 1));
 """
 
+SCHEMA_V11_TASTINGS = """
+-- #522 (D91): structured tasting entries — the E14 corpus starts now. A NEW
+-- table, like bean_profiles (V4): no existing table or row is touched, so the
+-- frozen roast_runs.profile_json snapshots and corpus integrity are unchanged.
+-- Multiple rows per run are the whole point (a revisit tasting, e.g. roast 13's
+-- same-evening "flat" refined to "grassy" hours later, is an ADDITIONAL row,
+-- never an overwrite) — this is why the field lives in its own table rather
+-- than as two more roast_runs columns on the rating-lifecycle allow-list.
+-- Entirely outside the v2 completed-run immutability trigger: that trigger
+-- guards UPDATE/DELETE on roast_runs only, and a tasting is always a fresh
+-- INSERT into this table, so completed-run immutability is preserved by
+-- construction, not by a trigger exception.
+-- attributes_json / defects_json store the small controlled-vocabulary tag
+-- lists (models.TastingAttribute / TastingDefect) as JSON arrays rather than
+-- a normalized join table — matching the roast_events.payload_json precedent
+-- for small optional structured data that is never queried/filtered on.
+CREATE TABLE roast_tastings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES roast_runs(id),
+  tasted_at_utc TEXT,                        -- operator-supplied; NULL if not given
+  recorded_at_utc TEXT NOT NULL,              -- when this entry was saved
+  stars INTEGER NOT NULL CHECK (stars BETWEEN 1 AND 5),
+  notes TEXT,
+  brew_method TEXT,
+  grind_note TEXT,
+  attributes_json TEXT,
+  defects_json TEXT
+);
+
+CREATE INDEX idx_roast_tastings_run ON roast_tastings(run_id, id);
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
@@ -396,6 +432,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V8_TURNING_POINT_EVENT,
     SCHEMA_V9_AMBIENT,
     SCHEMA_V10_AMBIENT_CAPTURED_LATCH,
+    SCHEMA_V11_TASTINGS,
 )
 
 
@@ -1082,6 +1119,121 @@ class RoastStore:
         await self.connection.commit()
         if cursor.rowcount == 0:
             raise RuntimeError(f"no completed roast_run with id {run_id!r}")
+
+    async def add_tasting(
+        self,
+        run_id: str,
+        *,
+        stars: Literal[1, 2, 3, 4, 5],
+        notes: str | None = None,
+        tasted_at_utc: str | None = None,
+        brew_method: BrewMethod | None = None,
+        grind_note: str | None = None,
+        attributes: list[TastingAttribute] | None = None,
+        defects: list[TastingDefect] | None = None,
+    ) -> RoastTasting:
+        """Append one tasting entry (#522, D91) — completed runs only.
+
+        The same completed-only lifecycle as :meth:`set_operator_rating`, but this
+        table has no immutability-trigger exception to lean on: ``roast_tastings``
+        is a separate append-only table (see ``SCHEMA_V11_TASTINGS``), so the
+        completed-run guard is an explicit existence check here rather than an
+        UPDATE ``rowcount``. A revisit tasting is always a NEW row — this method
+        never updates an existing entry.
+
+        Args:
+            run_id: The completed run this tasting belongs to.
+            stars: 1-5 star rating (mirrors :meth:`set_operator_rating`).
+            notes: Optional free-text tasting notes.
+            tasted_at_utc: Optional UTC ISO-8601 instant the tasting happened
+                (distinct from ``recorded_at_utc``, stamped here). Left ``None``
+                (not defaulted to "now") when the operator does not supply one.
+            brew_method: Optional brew method (``models.BrewMethod``).
+            grind_note: Optional free-text grind note.
+            attributes: Optional positive attribute tags (``models.TastingAttribute``).
+            defects: Optional defect tags (``models.TastingDefect``).
+
+        Returns:
+            The persisted :class:`RoastTasting`, including its assigned id.
+
+        Raises:
+            RuntimeError: The run is unknown or still in progress.
+        """
+        async with self.connection.execute(
+            "SELECT 1 FROM roast_runs WHERE id = ? AND completed_at_utc IS NOT NULL",
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f"no completed roast_run with id {run_id!r}")
+        recorded_at = _utc_now()
+        cursor = await self.connection.execute(
+            "INSERT INTO roast_tastings (run_id, tasted_at_utc, recorded_at_utc, stars,"
+            " notes, brew_method, grind_note, attributes_json, defects_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                tasted_at_utc,
+                recorded_at,
+                stars,
+                notes,
+                brew_method,
+                grind_note,
+                json.dumps(attributes or [], sort_keys=True),
+                json.dumps(defects or [], sort_keys=True),
+            ),
+        )
+        await self.connection.commit()
+        tasting_id = cursor.lastrowid
+        assert tasting_id is not None  # pragma: no cover — AUTOINCREMENT always assigns one
+        return RoastTasting(
+            id=tasting_id,
+            tasted_at_utc=tasted_at_utc,
+            recorded_at_utc=recorded_at,
+            stars=stars,
+            notes=notes,
+            brew_method=brew_method,
+            grind_note=grind_note,
+            attributes=list(attributes) if attributes else [],
+            defects=list(defects) if defects else [],
+        )
+
+    async def list_tastings(self, run_id: str) -> list[RoastTasting]:
+        """Every tasting entry for a run, oldest first (#522) — the natural
+        revisit order (first taste, then any later refinement). Empty list for a
+        run with no tastings yet or an unknown run id (mirrors ``read_run``'s
+        ``None``-for-unknown convention at the collection level: an empty list,
+        not an error, since "no tastings" and "unknown run" both render the
+        same empty state and the caller already 404s on the run itself)."""
+        async with self.connection.execute(
+            "SELECT id, tasted_at_utc, recorded_at_utc, stars, notes, brew_method,"
+            " grind_note, attributes_json, defects_json FROM roast_tastings"
+            " WHERE run_id = ? ORDER BY id ASC",
+            (run_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [
+            RoastTasting(
+                id=int(row["id"]),
+                tasted_at_utc=None if row["tasted_at_utc"] is None else str(row["tasted_at_utc"]),
+                recorded_at_utc=str(row["recorded_at_utc"]),
+                stars=int(row["stars"]),
+                notes=None if row["notes"] is None else str(row["notes"]),
+                brew_method=None
+                if row["brew_method"] is None
+                else cast(BrewMethod, str(row["brew_method"])),
+                grind_note=None if row["grind_note"] is None else str(row["grind_note"]),
+                attributes=cast(
+                    list[TastingAttribute],
+                    [] if row["attributes_json"] is None else json.loads(row["attributes_json"]),
+                ),
+                defects=cast(
+                    list[TastingDefect],
+                    [] if row["defects_json"] is None else json.loads(row["defects_json"]),
+                ),
+            )
+            for row in rows
+        ]
 
     # --- E7-S1: API read paths (component plan §6) ---
     #
