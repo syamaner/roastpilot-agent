@@ -102,7 +102,29 @@
 
 ## Active Context
 
-**12 Jul 2026 (latest) — D89 TIER-1 BATCH COMPLETE + D88 FLAGS PROMOTED (plan D90; PRs #501–#505).**
+**12 Jul 2026 (latest, PM) — PAPER-RIGOUR BATCH COMPLETE: #495 CLOSED (3 parallel tracks, PRs
+agent #508/#509/#510 + FC #64/#65).** Every pre-submission gate item is now committed, reviewed,
+reproducible evidence: **McNemar p=0.0039 REPRODUCED exactly** from the committed bake-off
+artifacts (`scripts/advisor_significance.py`, PR #508; Wilcoxon p=0.0098 explicitly marked
+newly-computed — qa caught the retroactive-embellishment risk against the original D34 commit);
+**FP discrepancy reconciled with forensics** (FC PR #64: README's "6 FP" scored a 13-min-stale
+split — gitignored experiments/ was the systemic cause; the citable number is baseline_v5 int8
+= 91.1 % P / 97.6 % R / F1 0.943 on the current 303-set); **int8 re-benchmarked on the deployed
+checkpoint** (no quality loss — marginally ahead — ~2× latency); **RF+MFCC comparator** (FC PR
+#65: pre-registered protocol, NOT competitive — F1 0.474, recall 42.9 % disqualifying; the
+transparency check itself made reproducible after qa's catch); **plan-repo Dependabot triaged**
+(all 30 alerts = Figma-sketch-only deps, dismissed not_used). **Bonus find: #507** — assigned
+MCP#189, the engineer PROVED it wrong-premise (the agent's controller mirrors, never reset on
+any drop/e-stop path, were the real source of roast-12's stale 91 % readout through cooling)
+→ fixed via typed AppliedRoasterState adoption from the command's own result payload at all
+five call sites (PRs #509+#510; safety review split the verdict with precision — e-stop paths
+correct, drop paths failed closed on observability → Optional-return at one choke point;
+Codex caught the out-of-range ValidationError escape post-merge, closed same-day). FC repo
+process note: NO required status checks there — --auto merges instantly; lead merges manually
+on verified green until the operator decides on protection. Next: paper WRITING (rigour done);
+D89 Tier 2 ratification when wanted; #396 c1-vs-c3 A/B remains the one open experiment thread.
+
+**12 Jul 2026 — D89 TIER-1 BATCH COMPLETE + D88 FLAGS PROMOTED (plan D90; PRs #501–#505).**
 Tasting ratified the validation (taper cup 9/10, "like sugar" — the program's best-rated roast;
 the 9/10-Jul cups "a bit flat" → El Durazno seed dev target 13→16 %). Shipped in order: **#497**
 (advisor context carries ACTUATED heat/fan + loop-mode flag via a shared helper the actuation
