@@ -196,6 +196,13 @@ describe("#523 real-integration — /start start flow, real handoff to /live", (
           { status: 200 },
         );
       }
+      if (u === "/api/roasts") {
+        // #535: StartRoastView now also gates on useFreshHistoryGate (the
+        // stale-session source) — this test's focus is the HEALTH hold, so
+        // history resolves cleanly and immediately with no open runs, never
+        // itself becoming the blocking factor being asserted on here.
+        return new Response(JSON.stringify({ runs: [] }), { status: 200 });
+      }
       if (u === "/api/bean-profiles") {
         return new Response(JSON.stringify({ profiles: [] }), { status: 200 });
       }
@@ -283,6 +290,13 @@ describe("#513 real-integration — /start active-run guard", () => {
           }),
           { status: 200 },
         );
+      }
+      if (u === "/api/roasts") {
+        // #535: StartRoastView now also gates on useFreshHistoryGate (the
+        // stale-session source) — this test's focus is the HEALTH hold, so
+        // history resolves cleanly and immediately with no open runs, never
+        // itself becoming the blocking factor being asserted on here.
+        return new Response(JSON.stringify({ runs: [] }), { status: 200 });
       }
       if (u === "/api/bean-profiles") {
         return new Response(JSON.stringify({ profiles: [] }), { status: 200 });
