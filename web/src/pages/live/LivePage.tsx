@@ -4,9 +4,13 @@
  * `/live` is the state of the roaster, always — NEVER a form (#523 IA). Three
  * server-state-driven states (all phase comes from the server):
  *
- * 1. Loading   — holds until health (and, for the idle path, history) resolve,
- *    so nothing flashes before the active-run status — and the last-completed
- *    summary it falls back to — are known.
+ * 1. Loading   — holds until health AND history (the idle path's persistent
+ *    fallback) each produce a GENUINELY FRESH read, so nothing flashes before
+ *    the active-run status — and the last-completed summary it falls back
+ *    to — are known. Also holds while a just-finished run's terminal-outcome
+ *    fetch is in flight, so an OLDER completed run's summary never flashes
+ *    before the just-finished run's own gate resolves (#523 Codex follow-up
+ *    on #532).
  * 2. Active run — the full live dashboard (DashboardPage). A reload on this
  *    URL re-hydrates from the server snapshot + SSE — the reload-safe guarantee.
  * 3. No active run — the last completed run's summary (`LiveFinishedView`),
@@ -17,7 +21,10 @@
  *    through to the same history-derived id, so the summary survives it
  *    (unlike the pre-#523 session-only sticky). If the operator has never
  *    completed a roast, `LiveNoRoastsView` shows a neutral "no roasts yet"
- *    state — still not a form — with a link to `/start`.
+ *    state — still not a form — with a link to `/start`. A persistent history
+ *    read failure gets its OWN neutral state (`LiveHistoryUnknownView`) —
+ *    never `LiveNoRoastsView`, which would otherwise assert a false "this
+ *    roaster has never completed a roast" on a network/server error.
  *
  * `/start` (StartRoastView.tsx) is the ONLY start-form surface under the
  * #523 IA; `/live` never renders one.
@@ -33,7 +40,13 @@ import { Link } from "react-router-dom";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 
 import { AppFrame, LiveCurve } from "@/components/shared";
-import { roastKeys, useFreshHealthGate, useHistory, useRoast, useTelemetry } from "@/hooks/queries";
+import {
+  roastKeys,
+  useFreshHealthGate,
+  useFreshHistoryGate,
+  useRoast,
+  useTelemetry,
+} from "@/hooks/queries";
 import { api } from "@/lib/api";
 import { DashboardPage } from "@/pages/dashboard/DashboardPage";
 import { headlineStats, toCurveMarkers, toCurvePoints } from "@/pages/detail/traceModel";
@@ -78,11 +91,14 @@ export function LivePage(): React.JSX.Element {
   const queryClient = useQueryClient();
 
   // Persistent idle fallback (#523): the roast history, newest-first
-  // (`GET /api/roasts` — store.py orders `started_at_utc DESC`). Read
-  // unconditionally (cheap — the same list `/roasts` already fetches, and
-  // TanStack Query dedupes/caches it) so a reload finds the same last-
-  // completed run this render would, with no session state required.
-  const history = useHistory();
+  // (`GET /api/roasts` — store.py orders `started_at_utc DESC`). #523 Codex
+  // follow-up on #532: history is now an AUTHORITATIVE source for this idle
+  // state (the persistent last-completed-run fallback), so it earns the same
+  // `useFreshHealthGate`-class treatment health already has — gate on
+  // `useFreshHistoryGate`, not plain `useHistory`, so a within-staleTime
+  // remount can't render a cached (possibly empty) history list as proof the
+  // roaster has never completed a roast.
+  const history = useFreshHistoryGate();
   const lastCompletedRunId =
     history.data?.runs.find((run) => run.outcome === "completed")?.id ?? null;
 
@@ -99,8 +115,17 @@ export function LivePage(): React.JSX.Element {
   //
   // Fetching with staleTime:0 ensures we get the SERVER'S TERMINAL snapshot, not
   // the stale in-progress cache that had outcome:null while the run was live (P2-3).
+  //
+  // #523 Codex follow-up on #532 (transition-flash): while THIS fetch is in
+  // flight, `stickyCompletedRunId` is still `null` — without a guard, the
+  // render in that window would fall through to `lastCompletedRunId`, which
+  // (if an OLDER completed run exists in history) flashes that older run's
+  // summary before swapping to the just-finished one a moment later.
+  // `terminalFetchPending` holds the idle branch through that window, so the
+  // just-finished run's own gate always resolves before ANY summary renders.
   const prevRunIdRef = useRef<string | null>(null);
   const [stickyCompletedRunId, setStickyCompletedRunId] = useState<string | null>(null);
+  const [terminalFetchPending, setTerminalFetchPending] = useState(false);
 
   useEffect(() => {
     if (activeRunId !== null) {
@@ -112,12 +137,14 @@ export function LivePage(): React.JSX.Element {
       // so LiveFinishedView's useRoast sees the terminal data immediately on mount.
       const finishedId = prevRunIdRef.current;
       prevRunIdRef.current = null;
+      setTerminalFetchPending(true);
       void fetchTerminalOutcome(queryClient, finishedId).then((outcome) => {
         if (outcome === "completed") {
           setStickyCompletedRunId(finishedId);
         }
         // Non-completed outcomes (faulted, aborted, null) don't show the summary.
         // DashboardPage retains the faulted run via stickyFaultedRunId for ack.
+        setTerminalFetchPending(false);
       });
       // The history list is also invalidated on `run_completed` /
       // fault-acknowledge (see queries.ts) so `lastCompletedRunId` picks up
@@ -157,11 +184,38 @@ export function LivePage(): React.JSX.Element {
     return <DashboardPage />;
   }
 
+  // No active run: never a form (#523). Hold while a terminal-outcome fetch
+  // for the just-finished run is in flight — see the transition-flash note
+  // above — so an older completed run's summary never renders as a flash
+  // before the just-finished run's own gate resolves. This check does NOT
+  // depend on `stickyCompletedRunId` being null (unlike the history hold
+  // below): the fetch itself, not just its outcome, is what must finish
+  // before any fallback is allowed to render.
+  if (terminalFetchPending) {
+    return (
+      <AppFrame>
+        <div data-testid="live-page-loading" />
+      </AppFrame>
+    );
+  }
+
+  // History error (#523 Codex follow-up on #532): never render
+  // `LiveNoRoastsView` on a history read failure — that would assert a false
+  // "this roaster has never completed a roast" on what might just be a
+  // network/server blip. A session-sticky id (this session's own just-
+  // finished run) does not depend on history at all and may still render.
+  if (history.isError && stickyCompletedRunId === null) {
+    return <LiveHistoryUnknownView />;
+  }
+
   // No active run: never a form (#523). Hold briefly for history to settle
   // too, so a reload doesn't flash "no roasts yet" before the persistent
   // fallback has had a chance to resolve — the session-sticky id (if any) is
-  // already known synchronously and doesn't need this hold.
-  if (stickyCompletedRunId === null && history.isPending) {
+  // already known synchronously and doesn't need this hold. `history.isFresh`
+  // (not `isPending`) closes the #532 staleness gap: a within-staleTime
+  // remount must not render a CACHED history list — possibly empty — as
+  // proof no roast has ever completed.
+  if (stickyCompletedRunId === null && !history.isFresh) {
     return (
       <AppFrame>
         <div data-testid="live-page-loading" />
@@ -213,6 +267,50 @@ function LiveStatusUnknownView(): React.JSX.Element {
         <a
           href="/live"
           data-testid="live-status-unknown-reload"
+          className="rounded-md bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
+        >
+          Reload
+        </a>
+      </div>
+    </AppFrame>
+  );
+}
+
+// --- LiveHistoryUnknownView: shown at /live when history persistently errors. ---
+
+/**
+ * Neutral "can't load roast history" state (#523 Codex follow-up on #532).
+ * Shown when `useFreshHistoryGate()` errors persistently (after its own
+ * retry budget) and no session-sticky summary is available to render
+ * instead. Distinct from `LiveStatusUnknownView`: THIS run's active-run
+ * status is known (health resolved fine, or `activeRunId` is null) — what's
+ * unknown is whether a completed roast exists to summarise. Falling through
+ * to `LiveNoRoastsView` here would assert a false "this roaster has never
+ * completed a roast" on what might be a transient network/server error, the
+ * exact isSuccess≠current hazard class `useFreshHealthGate` already guards
+ * against for health. A manual reload is the recovery path.
+ */
+function LiveHistoryUnknownView(): React.JSX.Element {
+  return (
+    <AppFrame
+      headerRight={
+        <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          History unavailable
+        </span>
+      }
+    >
+      <div
+        className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
+        data-testid="live-history-unknown"
+      >
+        <h2 className="text-lg font-bold uppercase tracking-wide">Can&apos;t load roast history</h2>
+        <p className="text-sm text-muted-foreground">
+          This page could not reach the agent to check for a completed roast to
+          summarise. This does not mean none exists — reload to try again.
+        </p>
+        <a
+          href="/live"
+          data-testid="live-history-unknown-reload"
           className="rounded-md bg-primary px-5 py-3 text-sm font-semibold text-primary-foreground transition-colors hover:bg-primary/90"
         >
           Reload
