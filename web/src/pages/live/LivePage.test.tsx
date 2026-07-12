@@ -128,9 +128,13 @@ vi.mock("@/components/shared", async () => {
 });
 
 // `api.roast` is called by fetchTerminalOutcome (the session-sticky outcome
-// gate, P2-3/P2-4).
+// gate, P2-3/P2-4) AND, as of #532 round 2, by the history-detail-freshness
+// effect for a history-derived id. Typed with the real `(runId: string) =>`
+// signature (not a zero-arg default) so `mockImplementation` calls that
+// discriminate by runId — needed once two independent call sites can invoke
+// this mock — type-check against the same signature as the actual `api.roast`.
 const roastApiMock = vi.hoisted(() =>
-  vi.fn(async (): Promise<RoastDetail> => ({
+  vi.fn(async (_runId: string): Promise<RoastDetail> => ({
     ...(FIXTURE_FINISHED_DETAIL as RoastDetail),
     outcome: "completed",
   })),
