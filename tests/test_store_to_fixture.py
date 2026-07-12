@@ -342,7 +342,46 @@ async def test_summary_weight_loss_is_null_when_unweighed(tmp_path: Path) -> Non
     summary = json.loads((out_dir / "summary.json").read_text())
     assert summary["charge_weight_grams"] == 250.0
     assert summary["roasted_weight_grams"] is None
-    assert summary["weight_loss_percent"] is None
+
+
+@pytest.mark.asyncio
+async def test_summary_charge_weight_grams_is_the_effective_corrected_value(
+    tmp_path: Path,
+) -> None:
+    """#520 round-2 P1: a corrected roast must never feed the corpus the
+    WRONG physical truth — charge_weight_grams exports the EFFECTIVE
+    (corrected) charge, and weight_loss_percent derives from it, not the
+    stale frozen 250 g default. Roast 13's own worked example: 255 g
+    corrected, 223 g out -> 12.55%, never the 10.8% the frozen default alone
+    would compute."""
+    db_path = tmp_path / "corrected.sqlite3"
+    store = await _synthetic_store(db_path, roasted_weight_grams=223.0)
+    await store.set_corrected_charge("synthetic-run", corrected_charge_grams=255.0)
+    await store.close()
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["charge_weight_grams"] == 255.0  # EFFECTIVE, not the 250 g frozen default
+    assert summary["corrected_charge_grams"] == 255.0
+    assert summary["roasted_weight_grams"] == 223.0
+    assert summary["weight_loss_percent"] == 12.55  # (255 - 223) / 255 * 100
+
+
+@pytest.mark.asyncio
+async def test_summary_corrected_charge_grams_is_null_when_never_corrected(
+    tmp_path: Path,
+) -> None:
+    """#520 round-2 P1: an uncorrected roast exports corrected_charge_grams as
+    null and charge_weight_grams as the frozen default, unaffected."""
+    db_path = tmp_path / "uncorrected.sqlite3"
+    store = await _synthetic_store(db_path, roasted_weight_grams=221.0)
+    await store.close()
+    out_dir = tmp_path / "fixture"
+    s2f.convert(db_path, out_dir)
+    summary = json.loads((out_dir / "summary.json").read_text())
+    assert summary["charge_weight_grams"] == 250.0
+    assert summary["corrected_charge_grams"] is None
+    assert summary["weight_loss_percent"] == 11.6  # (250 - 221) / 250 * 100, unaffected
 
 
 @pytest.mark.asyncio
@@ -475,6 +514,30 @@ async def test_schema_v10_compat_roast_tastings_table_absent(tmp_path: Path) -> 
 
     result = s2f.read_store_roast(db_path)
     assert result.tastings == []
+
+
+@pytest.mark.asyncio
+async def test_schema_v11_compat_corrected_charge_grams_absent(tmp_path: Path) -> None:
+    """#520: schema v11 stores predate the corrected_charge_grams column
+    (added in v12).
+
+    read_store_roast must not crash when the column is absent; it should
+    fall back to NULL AS corrected_charge_grams and derive charge_weight_grams
+    from the frozen profile alone."""
+    import sqlite3
+
+    db_path = tmp_path / "v11store.sqlite3"
+    store = await _synthetic_store(db_path)
+    await store.close()
+    # Simulate schema v11 by dropping the column added in v12.
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("ALTER TABLE roast_runs DROP COLUMN corrected_charge_grams")
+    conn.commit()
+    conn.close()
+
+    result = s2f.read_store_roast(db_path)
+    assert result.corrected_charge_grams is None
+    assert result.charge_weight_grams == 250.0  # falls back to the frozen profile
 
 
 @pytest.mark.asyncio

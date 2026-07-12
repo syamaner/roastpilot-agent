@@ -276,6 +276,9 @@ def _summary(profile: dict[str, Any], marks: RoastMarks) -> dict[str, Any]:
         # for parity with store_to_fixture (the bake-off reads both identically).
         # Extracting .alog weight is a separate enhancement.
         "charge_weight_grams": None,
+        # #520: an .alog has no charge-correction concept — null, kept in the
+        # key set for parity with store_to_fixture.
+        "corrected_charge_grams": None,
         "roasted_weight_grams": None,
         "weight_loss_percent": None,
         # Tasting corpus label (#522): an .alog has no tasting concept — empty

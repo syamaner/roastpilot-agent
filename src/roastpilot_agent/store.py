@@ -463,6 +463,19 @@ class BeanProfileNotFoundError(Exception):
     the API maps it to HTTP 404."""
 
 
+class PhysicallyImpossibleWeightError(Exception):
+    """A weight/charge write would violate the roasted<=charge physical
+    invariant (#520 round-2 P3), caught ATOMICALLY at the store layer.
+
+    Raised by :meth:`RoastStore.set_roasted_weight` /
+    :meth:`RoastStore.set_corrected_charge` when the UPDATE's own WHERE
+    clause rejects the write against the CURRENT row (not a value read
+    moments earlier by the caller) — closing the race where two concurrent
+    corrections could each pass an API-layer pre-check against a stale
+    snapshot. The API maps it to HTTP 409, the same status the API-layer
+    pre-check already used."""
+
+
 class PersistedRun(BaseModel):
     """The recovery read (E6-S3): what restart classification needs —
     feeds controller.recover_from_restart and run resumption context.
@@ -1123,21 +1136,40 @@ class RoastStore:
         The same immutability-exception lifecycle as :meth:`set_operator_rating`:
         captured post-roast after weighing, guarded to completed runs so an
         in-progress run cannot be stamped. The weight-loss % is derived on read,
-        never stored. Raises when the run is unknown or still in progress.
+        never stored.
+
+        The roasted weight must not exceed the EFFECTIVE charge (the
+        corrected charge when present, else the frozen profile default) —
+        folded into the UPDATE's own ``WHERE`` clause (#520 round-2 P3) so the
+        bound is checked ATOMICALLY against the row's CURRENT state, not a
+        value the caller read moments earlier: two concurrent corrections
+        (this call and a racing :meth:`set_corrected_charge`) could otherwise
+        each pass an API-layer pre-check against a stale snapshot. A
+        zero-``rowcount`` UPDATE is then disambiguated by a follow-up read —
+        "unknown/in-progress" (:class:`RuntimeError`) vs. "physically
+        impossible against the current row" (:class:`PhysicallyImpossibleWeightError`).
 
         Args:
             run_id: The completed run to update.
             roasted_weight_grams: The roasted-out weight in grams (> 0; the API
-                model enforces the bound before this is called).
+                model enforces the bound before this is called — this is the
+                atomic BACKSTOP, not the primary UX feedback path).
+
+        Raises:
+            RuntimeError: The run is unknown or still in progress.
+            PhysicallyImpossibleWeightError: The write would exceed the
+                run's current effective charge weight.
         """
         cursor = await self.connection.execute(
             "UPDATE roast_runs SET roasted_weight_grams = ?, updated_at_utc = ?"
-            " WHERE id = ? AND completed_at_utc IS NOT NULL",
-            (roasted_weight_grams, _utc_now(), run_id),
+            " WHERE id = ? AND completed_at_utc IS NOT NULL"
+            " AND ? <= COALESCE(corrected_charge_grams,"
+            "   json_extract(profile_json, '$.bean_weight_grams'))",
+            (roasted_weight_grams, _utc_now(), run_id, roasted_weight_grams),
         )
         await self.connection.commit()
         if cursor.rowcount == 0:
-            raise RuntimeError(f"no completed roast_run with id {run_id!r}")
+            await self._raise_disambiguated_weight_error(run_id)
 
     async def set_corrected_charge(self, run_id: str, *, corrected_charge_grams: float) -> None:
         """Operator-entered CHARGE-weight correction (#520) — completed runs only.
@@ -1147,23 +1179,61 @@ class RoastStore:
         the controller/advisor actually ran with) — the corrected value lands in
         this separate column instead. Derived weight-loss % on read prefers this
         value over the frozen charge weight when present (see ``read_run`` /
-        ``list_runs``). Raises when the run is unknown or still in progress.
+        ``list_runs``).
+
+        The correction must not fall below the run's CURRENT
+        ``roasted_weight_grams`` (when one exists) — folded into the UPDATE's
+        own ``WHERE`` clause (#520 round-2 P3), the same atomicity fix as
+        :meth:`set_roasted_weight`'s own bound, closing the identical race in
+        the other direction.
 
         Args:
             run_id: The completed run to update.
             corrected_charge_grams: The corrected green/charge weight in grams
                 (> 0; the API model enforces the bound, plus the
                 not-below-roasted-weight physical-sanity check, before this is
-                called).
+                called — this is the atomic BACKSTOP, not the primary UX
+                feedback path).
+
+        Raises:
+            RuntimeError: The run is unknown or still in progress.
+            PhysicallyImpossibleWeightError: The write would fall below the
+                run's current roasted-out weight.
         """
         cursor = await self.connection.execute(
             "UPDATE roast_runs SET corrected_charge_grams = ?, updated_at_utc = ?"
-            " WHERE id = ? AND completed_at_utc IS NOT NULL",
-            (corrected_charge_grams, _utc_now(), run_id),
+            " WHERE id = ? AND completed_at_utc IS NOT NULL"
+            " AND (roasted_weight_grams IS NULL OR ? >= roasted_weight_grams)",
+            (corrected_charge_grams, _utc_now(), run_id, corrected_charge_grams),
         )
         await self.connection.commit()
         if cursor.rowcount == 0:
+            await self._raise_disambiguated_weight_error(run_id)
+
+    async def _raise_disambiguated_weight_error(self, run_id: str) -> None:
+        """Distinguish a zero-``rowcount`` weight/charge UPDATE's cause (#520
+        round-2 P3): unknown/in-progress run vs. a physically-impossible
+        write against the row's current state. Shared by
+        :meth:`set_roasted_weight` / :meth:`set_corrected_charge` so the two
+        atomic ``WHERE``-clause bounds report the same error shape.
+
+        Raises:
+            RuntimeError: No completed run matches ``run_id``.
+            PhysicallyImpossibleWeightError: The run exists and is completed,
+                so the UPDATE's zero rowcount can only be the cross-value
+                bound.
+        """
+        async with self.connection.execute(
+            "SELECT 1 FROM roast_runs WHERE id = ? AND completed_at_utc IS NOT NULL",
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
             raise RuntimeError(f"no completed roast_run with id {run_id!r}")
+        raise PhysicallyImpossibleWeightError(
+            f"roast_run {run_id!r}: the write is physically impossible against "
+            f"the run's current roasted/charge weights"
+        )
 
     async def add_tasting(
         self,

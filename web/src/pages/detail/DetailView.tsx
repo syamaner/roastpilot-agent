@@ -142,25 +142,41 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
         </section>
         <div className="flex flex-col gap-6">
           <RoastRating runId={detail.id} rating={detail.rating} notes={detail.notes} />
+          {/* #520 round-2 P2: chargeWeightGrams is the EFFECTIVE charge
+              (corrected when present) — the server's own bound moved to match
+              (set_roasted_weight now rejects against the correction, not the
+              stale frozen default), so the widget's client-side bound must
+              match it too, or a value the server accepts could show as
+              invalid here (or vice versa). */}
           <RoastedWeight
             runId={detail.id}
-            chargeWeightGrams={detail.profile.bean_weight_grams}
+            chargeWeightGrams={detail.corrected_charge_grams ?? detail.profile.bean_weight_grams}
             roastedWeightGrams={detail.roasted_weight_grams ?? null}
             weightLossPercent={detail.weight_loss_percent ?? null}
           />
+          {/* key: same class as RoastTastings below — ChargeWeight keeps its
+              own draft input state that isn't re-synced from props, so
+              without a remount a navigation between two runs would carry run
+              A's unsaved correction draft into a POST against run B (#520
+              round-2 P4). Prefixed (not bare detail.id) because it is a
+              SIBLING of RoastTastings' own detail.id-keyed element below —
+              React key uniqueness is scoped per sibling group, and two
+              siblings keyed with the identical bare id would collide. */}
           <ChargeWeight
+            key={`charge-weight-${detail.id}`}
             runId={detail.id}
             frozenChargeGrams={detail.profile.bean_weight_grams}
             correctedChargeGrams={detail.corrected_charge_grams ?? null}
             roastedWeightGrams={detail.roasted_weight_grams ?? null}
             weightLossPercent={detail.weight_loss_percent ?? null}
           />
-          {/* key={detail.id}: RoastTastings' draft (unlike RoastRating/
-              RoastedWeight) has no persisted value to re-sync from on a prop
-              change, so without a remount a navigation between two runs would
-              carry run A's unsaved draft into a POST against run B — a wrong
-              corpus label (#522 Codex P2). */}
-          <RoastTastings key={detail.id} runId={detail.id} />
+          {/* key: RoastTastings' draft (unlike RoastRating/RoastedWeight) has
+              no persisted value to re-sync from on a prop change, so without
+              a remount a navigation between two runs would carry run A's
+              unsaved draft into a POST against run B — a wrong corpus label
+              (#522 Codex P2). Prefixed for the same sibling-key-uniqueness
+              reason as ChargeWeight's key above. */}
+          <RoastTastings key={`roast-tastings-${detail.id}`} runId={detail.id} />
           <RoastConditions
             ambientTempC={detail.ambient_temp_c}
             ambientHumidityPct={detail.ambient_humidity_pct}

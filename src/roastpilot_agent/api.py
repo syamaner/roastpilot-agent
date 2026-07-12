@@ -104,7 +104,11 @@ from roastpilot_agent.safety import (
     enabled_operator_actions,
 )
 from roastpilot_agent.seed import SEED_BEAN_PROFILES
-from roastpilot_agent.store import BeanProfileNotFoundError, RoastStore
+from roastpilot_agent.store import (
+    BeanProfileNotFoundError,
+    PhysicallyImpossibleWeightError,
+    RoastStore,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -2029,6 +2033,15 @@ class RoastService:
         physical-impossibility guard :meth:`set_charge_weight` enforces in the
         other direction, now symmetric regardless of which correction is
         entered first.
+
+        This pre-check reads ``detail`` and then writes moments later — a
+        concurrent :meth:`set_charge_weight` landing in between could move the
+        effective charge out from under it. The store's own UPDATE carries
+        the identical bound in its ``WHERE`` clause (#520 round-2 P3), so a
+        :class:`~roastpilot_agent.store.PhysicallyImpossibleWeightError` from
+        that atomic check is the real backstop; this pre-check exists only to
+        give the common (non-racing) case a precise 409 message instead of
+        the store's generic one.
         """
         detail = await self._store.read_run(run_id)
         if detail is None:
@@ -2043,9 +2056,15 @@ class RoastService:
                 f"roasted weight {request.roasted_weight_grams} g exceeds the charge "
                 f"weight {effective_charge_grams} g (physically impossible)"
             )
-        await self._store.set_roasted_weight(
-            run_id, roasted_weight_grams=request.roasted_weight_grams
-        )
+        try:
+            await self._store.set_roasted_weight(
+                run_id, roasted_weight_grams=request.roasted_weight_grams
+            )
+        except PhysicallyImpossibleWeightError as exc:
+            raise RoastRunConflictError(
+                f"roasted weight {request.roasted_weight_grams} g exceeds run {run_id}'s "
+                f"current charge weight (physically impossible)"
+            ) from exc
         weighed = await self._store.read_run(run_id)
         if weighed is None:  # pragma: no cover — immutable once completed
             raise RuntimeError(f"read_run returned None for weighed run {run_id}")
@@ -2074,6 +2093,12 @@ class RoastService:
         existing free-form ``operator_actions.action`` text column, not a new
         ``RoastEventKind`` member (no D15/enum-CHECK-rebuild surface for a
         one-off audit record).
+
+        Like :meth:`set_roasted_weight`, this pre-check reads ``detail`` and
+        writes moments later — a concurrent :meth:`set_roasted_weight` landing
+        in between could move ``roasted_weight_grams`` out from under it. The
+        store's own UPDATE carries the identical bound in its ``WHERE``
+        clause (#520 round-2 P3) as the real, atomic backstop.
         """
         detail = await self._store.read_run(run_id)
         if detail is None:
@@ -2091,9 +2116,15 @@ class RoastService:
                 f"roasted-out weight {detail.roasted_weight_grams} g (physically impossible)"
             )
         previous_charge = detail.corrected_charge_grams or detail.profile.bean_weight_grams
-        await self._store.set_corrected_charge(
-            run_id, corrected_charge_grams=request.corrected_charge_grams
-        )
+        try:
+            await self._store.set_corrected_charge(
+                run_id, corrected_charge_grams=request.corrected_charge_grams
+            )
+        except PhysicallyImpossibleWeightError as exc:
+            raise RoastRunConflictError(
+                f"corrected charge weight {request.corrected_charge_grams} g is below run "
+                f"{run_id}'s current roasted-out weight (physically impossible)"
+            ) from exc
         await self._store.record_operator_action(
             action="charge_weight_correction",
             run_id=run_id,

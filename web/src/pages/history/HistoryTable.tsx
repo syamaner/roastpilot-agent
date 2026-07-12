@@ -130,6 +130,15 @@ export function HistoryTable({ runs }: HistoryTableProps): React.JSX.Element {
                   )}
                 >
                   {formatWeightLoss(run.weight_loss_percent)}
+                  {run.corrected_charge_grams !== null && run.corrected_charge_grams !== undefined ? (
+                    <span
+                      data-testid="history-weight-loss-corrected"
+                      title={`Charge weight corrected to ${run.corrected_charge_grams} g — Loss % is basis-corrected, not the frozen start-of-roast charge (#520).`}
+                      className="ml-1 cursor-help font-sans text-[10px] font-semibold text-muted-foreground"
+                    >
+                      *
+                    </span>
+                  ) : null}
                 </td>
                 <td
                   data-testid="history-ambient"

@@ -11,7 +11,7 @@ import aiosqlite as aiosqlite_module
 import pytest
 
 from roastpilot_agent import store as store_module
-from roastpilot_agent.store import MIGRATIONS, RoastStore
+from roastpilot_agent.store import MIGRATIONS, PhysicallyImpossibleWeightError, RoastStore
 
 # The full migrated table set: the nine v1 tables plus the additive
 # ``bean_profiles`` table from the v4 migration (#303) and the additive
@@ -1450,6 +1450,136 @@ async def test_set_corrected_charge_on_active_run_raises(tmp_store: RoastStore) 
     try:
         with pytest.raises(RuntimeError, match="no completed roast_run"):
             await tmp_store.set_corrected_charge("run-1", corrected_charge_grams=255.0)
+    finally:
+        await tmp_store.close()
+
+
+# --- atomic cross-value bound (#520 round-2 P3) ---
+#
+# The API layer's own pre-checks (read `detail`, write moments later) leave a
+# race: a concurrent write between the read and the write could invalidate
+# the value the pre-check validated against. These tests exercise the STORE
+# layer directly — bypassing any API-layer pre-check entirely — to prove the
+# UPDATE's own WHERE clause is what actually enforces the bound, atomically,
+# against the row's CURRENT state.
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_atomically_rejects_against_a_prior_correction(
+    tmp_store: RoastStore,
+) -> None:
+    """#520 round-2 P3: set_roasted_weight's own UPDATE — not an API-layer
+    pre-check — rejects a write that exceeds the run's CURRENT effective
+    (corrected) charge weight, raising PhysicallyImpossibleWeightError."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        # Correct the charge down to 200 g (frozen default is 250 g).
+        await tmp_store.set_corrected_charge("run-1", corrected_charge_grams=200.0)
+
+        # 210 g would pass against the frozen 250 g default, but is
+        # physically impossible against the CURRENT effective charge of
+        # 200 g — the atomic bound must reject it even though nothing here
+        # ever re-reads `detail` to check it in Python first.
+        with pytest.raises(PhysicallyImpossibleWeightError):
+            await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=210.0)
+
+        # The rejected write must not have landed.
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.roasted_weight_grams is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_atomic_bound_accepts_within_the_effective_charge(
+    tmp_store: RoastStore,
+) -> None:
+    """#520 round-2 P3: the same atomic bound accepts a write that IS within
+    the current effective (corrected) charge — the WHERE clause is a bound,
+    not an unconditional reject."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_corrected_charge("run-1", corrected_charge_grams=200.0)
+        await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=180.0)
+
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.roasted_weight_grams == 180.0
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_atomic_bound_uses_the_frozen_charge_when_uncorrected(
+    tmp_store: RoastStore,
+) -> None:
+    """#520 round-2 P3: with no correction on record, the atomic bound falls
+    back to the frozen profile.bean_weight_grams (250 g in the fixture) —
+    the COALESCE in the WHERE clause, not just the corrected-charge column."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        with pytest.raises(PhysicallyImpossibleWeightError):
+            await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=260.0)
+
+        await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=240.0)
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.roasted_weight_grams == 240.0
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_corrected_charge_atomically_rejects_against_a_prior_roasted_weight(
+    tmp_store: RoastStore,
+) -> None:
+    """#520 round-2 P3: set_corrected_charge's own UPDATE rejects a
+    correction that falls below the run's CURRENT roasted-out weight,
+    raising PhysicallyImpossibleWeightError — the mirror-direction atomic
+    bound to set_roasted_weight's own."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_roasted_weight("run-1", roasted_weight_grams=223.0)
+
+        with pytest.raises(PhysicallyImpossibleWeightError):
+            await tmp_store.set_corrected_charge("run-1", corrected_charge_grams=200.0)
+
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.corrected_charge_grams is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_corrected_charge_atomic_bound_accepts_no_roasted_weight_yet(
+    tmp_store: RoastStore,
+) -> None:
+    """#520 round-2 P3: with no roasted weight entered yet, the atomic bound
+    has nothing to reject against — any positive correction is accepted (the
+    ``roasted_weight_grams IS NULL`` branch of the WHERE clause)."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_corrected_charge("run-1", corrected_charge_grams=5.0)
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.corrected_charge_grams == 5.0
     finally:
         await tmp_store.close()
 
