@@ -247,10 +247,69 @@ EL_SALVADOR_DIAMANTE_SEED = BeanProfile(
     ),
 )
 
+#: Stable id for the Sumatra Mandheling G1 seed. Fixed so the idempotent
+#: ``seed_bean_profile`` insert is a no-op after the first boot.
+SUMATRA_MANDHELING_ID = "seed-sumatra-mandheling-g1-wet-hulled"
+
+#: The Sumatra Mandheling G1 seed profile (12 Jul 2026) — the operator's
+#: Indonesian counterpoint to the washed Centrals. Grade 1 is scored on cup
+#: defects, not green appearance; the supplier names a Lake Toba lot.
+SUMATRA_MANDHELING_SEED = BeanProfile(
+    id=SUMATRA_MANDHELING_ID,
+    created_at=_SEED_TIMESTAMP,
+    updated_at=_SEED_TIMESTAMP,
+    name="Sumatra Mandheling G1 (Wet-Hulled)",
+    bean_origin="Indonesia (Sumatra)",
+    country="Indonesia",
+    farm="Lake Toba region smallholders (Mandailing lineage)",
+    # Supplier does not state cultivars; these are the typical Mandheling mix.
+    bean_varietal="Unspecified (typical: Ateng, Tim Tim, Jember)",
+    bean_species="arabica",
+    is_blend=False,
+    # Not stated by the supplier; wet-hulled (giling basah) is the classic
+    # Mandheling process and matches the cup description (earthy, heavy body,
+    # low acidity). Correct via the UI if the bag says otherwise.
+    processing="wet_hulled",
+    # Not stated by the supplier; Lake Toba Mandheling typically grows
+    # 1,100-1,500 m — 1200 is a representative estimate, NOT a datum.
+    altitude_m=1200,
+    source_url="https://www.pennineteaandcoffee.co.uk/collections/green-coffee/products/sumatra-mandheling-gr1-green-coffee-beans-1kg",
+    charge_guidance_min_c=170.0,
+    charge_guidance_max_c=200.0,
+    initial_heat_percent=100,
+    initial_fan_percent=30,
+    # 195 °C = the proven drop line (bitter > 196, ceiling guard default-on).
+    # A Sumatra WANTS the darker end of the operator's range — light
+    # Mandhelings read grassy/vegetal — so the drop target sits at the line
+    # rather than below it.
+    target_drop_temp_c=195.0,
+    # 17 %: a step above the washed posture (16) toward the bittersweet/
+    # chocolate profile this cup is for, but not the full ~20 the style can
+    # take — the 1 kg bag allows laddering darker on later batches, and the
+    # softer low-grown wet-hulled bean develops fast (baked risk if stretched
+    # cold). Advisor window with the 3 pp margin: [14, 20] %.
+    target_development_percent=17.0,
+    default_bean_weight_grams=250.0,
+    description=(
+        "Lake Toba, North Sumatra; Grade 1 (cup-scored). Wet-hulled (assumed "
+        "- classic Mandheling; correct if the bag states otherwise), typical "
+        "growing range 1,100-1,500 m. Powerful body, low/refined acidity; "
+        "bittersweet baker's chocolate, herbal (sage/thyme), cedar/tobacco, "
+        "butterscotch, hints of lime and blackberry. Roast to a solid "
+        "medium-plus: develop the bittersweet body, do not chase brightness. "
+        "NOTE for the operator: Sumatra first cracks are notoriously QUIET "
+        "and uneven - the audio FC detector may fire late or weakly; watch "
+        "bean temp ~175-185 and use MARK FIRST CRACK if the mic misses it. "
+        "Rest 24 h+ after roasting. Targets are a first-roast starting point; "
+        "the 1 kg bag allows laddering darker to taste."
+    ),
+)
+
 #: Every built-in seed profile, inserted idempotently at startup (#303).
 SEED_BEAN_PROFILES: tuple[BeanProfile, ...] = (
     ETHIOPIA_KOKE_SEED,
     COLOMBIA_HUILA_SEED,
     GUATEMALA_EL_DURAZNO_SEED,
     EL_SALVADOR_DIAMANTE_SEED,
+    SUMATRA_MANDHELING_SEED,
 )

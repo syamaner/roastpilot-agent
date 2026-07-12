@@ -3044,6 +3044,7 @@ async def test_lifespan_seeds_bean_profiles_idempotently(store: RoastStore) -> N
         EL_SALVADOR_DIAMANTE_ID,
         ETHIOPIA_KOKE_ID,
         GUATEMALA_EL_DURAZNO_ID,
+        SUMATRA_MANDHELING_ID,
     )
 
     service = RoastService(store)
@@ -3052,12 +3053,13 @@ async def test_lifespan_seeds_bean_profiles_idempotently(store: RoastStore) -> N
         first = await store.list_bean_profiles()
     async with app.router.lifespan_context(app):
         second = await store.list_bean_profiles()
-    # Name-ordered: "Colombia…" < "El Salvador…" < "Ethiopia…" < "Guatemala…".
+    # Name-ordered: Colombia < El Salvador < Ethiopia < Guatemala < Sumatra.
     expected = [
         COLOMBIA_HUILA_ID,
         EL_SALVADOR_DIAMANTE_ID,
         ETHIOPIA_KOKE_ID,
         GUATEMALA_EL_DURAZNO_ID,
+        SUMATRA_MANDHELING_ID,
     ]
     assert [p.id for p in first] == expected
     assert [p.id for p in second] == expected  # not double-inserted
@@ -3072,6 +3074,7 @@ async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) ->
         EL_SALVADOR_DIAMANTE_ID,
         ETHIOPIA_KOKE_ID,
         GUATEMALA_EL_DURAZNO_ID,
+        SUMATRA_MANDHELING_ID,
     )
 
     service = RoastService(store)
@@ -3090,6 +3093,7 @@ async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) ->
         COLOMBIA_HUILA_ID,
         GUATEMALA_EL_DURAZNO_ID,
         EL_SALVADOR_DIAMANTE_ID,
+        SUMATRA_MANDHELING_ID,
     }
     koke = by_id[ETHIOPIA_KOKE_ID]
     assert koke["name"] == "Ethiopia Yirgacheffe Koke (Natural)"
