@@ -414,13 +414,16 @@ describe("LivePage — impostor-process defence (#516)", () => {
     // this view exists to carry (expectedInstanceId lives in router state,
     // absent after a reload) — sessionStorage persistence was rejected, so
     // the fix is honest guidance: verify with curl/lsof BEFORE reloading.
+    // Port-agnostic here (see the dedicated PR #544 P2 test below for the
+    // non-default-port interpolation itself) — this test's own concern is
+    // the protocol's PRESENCE and content shape, not a specific port.
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
     renderPage("/live", { expectedInstanceId: "server-a" });
 
     const protocol = screen.getByTestId("live-status-unknown-field-protocol");
-    expect(protocol).toHaveTextContent(/curl localhost:8000\/api\/health/i);
-    expect(protocol).toHaveTextContent(/lsof -nP -iTCP:8000 -sTCP:LISTEN/i);
+    expect(protocol).toHaveTextContent(/curl localhost:\d+\/api\/health/i);
+    expect(protocol).toHaveTextContent(/lsof -nP -iTCP:\d+ -sTCP:LISTEN/i);
     expect(protocol).toHaveTextContent(/launcher/i);
     // The reload affordance stays (no dead end) but must be honestly labelled
     // as clearing the warning, never as resolving the underlying condition.
@@ -430,12 +433,61 @@ describe("LivePage — impostor-process defence (#516)", () => {
     expect(screen.getByTestId("live-status-unknown-reload")).toBeInTheDocument();
   });
 
-  it("#537: the GENERIC health-error variant does NOT show the field protocol — it has no instance-id evidence to lose on reload", () => {
+  it("#537 PR #544 P1 fold: the instance-mismatch view puts the physical safety step FIRST, ahead of the field protocol — a launcher restart force-kills without heat-off", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+
+    const view = screen.getByTestId("live-status-unknown");
+    const safetyStep = screen.getByTestId("live-status-unknown-safety-step");
+    const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+    expect(safetyStep).toHaveTextContent(/physical emergency stop/i);
+    expect(safetyStep).toHaveTextContent(/power switch/i);
+    expect(safetyStep).toHaveTextContent(/force-kills the controller without a heat-off/i);
+    // ORDER matters: the safety step must precede the field protocol in the
+    // rendered DOM, so it reads first regardless of viewport/scroll state.
+    const html = view.innerHTML;
+    expect(html.indexOf('data-testid="live-status-unknown-safety-step"')).toBeLessThan(
+      html.indexOf('data-testid="live-status-unknown-field-protocol"'),
+    );
+    expect(protocol).toHaveTextContent(/launcher/i);
+  });
+
+  it("#537 PR #544 P2 fold: the field-protocol commands interpolate the PAGE'S OWN origin port, not a hardcoded 8000", () => {
+    // The CLI accepts --port and the launcher reads PORT — a hardcoded
+    // localhost:8000 would send the operator to inspect the WRONG socket on
+    // a non-default port, finding nothing, then reloading and destroying
+    // the evidence. jsdom's default test location is localhost:3000; this
+    // test forces a DIFFERENT, clearly-non-default port to prove the
+    // commands genuinely derive from window.location, not a lucky match.
+    const originalLocation = window.location;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...originalLocation, port: "9090" },
+    });
+    try {
+      healthState.isSuccess = true;
+      healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+      renderPage("/live", { expectedInstanceId: "server-a" });
+      const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+      expect(protocol).toHaveTextContent(/curl localhost:9090\/api\/health/i);
+      expect(protocol).toHaveTextContent(/lsof -nP -iTCP:9090 -sTCP:LISTEN/i);
+      expect(protocol).not.toHaveTextContent(/:8000/);
+    } finally {
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: originalLocation,
+      });
+    }
+  });
+
+  it("#537: the GENERIC health-error variant does NOT show the field protocol or the safety step — it has no instance-id evidence to lose on reload", () => {
     healthState.isSuccess = false;
     healthState.isError = true;
     healthState.data = undefined;
     renderPage("/live", { expectedInstanceId: "server-a" });
     expect(screen.queryByTestId("live-status-unknown-field-protocol")).toBeNull();
+    expect(screen.queryByTestId("live-status-unknown-safety-step")).toBeNull();
   });
 
   it("shows the dashboard normally when the instance_id MATCHES", () => {

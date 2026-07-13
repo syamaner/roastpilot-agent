@@ -647,12 +647,34 @@ export function LivePage(): React.JSX.Element {
  * prevents the underlying class at source). Instead the mismatch variant's
  * guidance replaces the bare "Reload" action with the FIELD PROTOCOL
  * (`docs/recent-fixes.md`, "A second listener on the roast port..."): verify
- * with `curl localhost:8000/api/health` + `lsof -nP -iTCP:8000 -sTCP:LISTEN`
- * BEFORE reloading, since a reload clears this warning without resolving
- * whatever a second listener revealed. The reload affordance itself stays
- * (no dead end) but is honestly labelled as clearing the warning, not fixing
- * the underlying condition — the generic health-error variant is unaffected
- * (a plain "can't reach the agent" has no evidence to lose on reload).
+ * with `curl`/`lsof` BEFORE reloading, since a reload clears this warning
+ * without resolving whatever a second listener revealed. The reload
+ * affordance itself stays (no dead end) but is honestly labelled as
+ * clearing the warning, not fixing the underlying condition — the generic
+ * health-error variant is unaffected (a plain "can't reach the agent" has
+ * no evidence to lose on reload).
+ *
+ * PR #544 Codex round 1 — two folds, both verified real against the branch:
+ *
+ * 1. (P1) SAFETY COPY ORDERING: the field protocol's diagnosis steps sent
+ *    the operator to a launcher restart with no physical safety step
+ *    anywhere in the copy — but `scripts/roast-live.sh` force-kills the
+ *    agent + MCP with `pkill -9` WITHOUT running heat-off (its own inline
+ *    comment says so explicitly). In the exact scenario this view targets
+ *    (a mismatch right after a start's 201 — the accepting process may
+ *    still be actively heating), following the diagnosis-then-restart
+ *    order alone could leave the machine heating with the UI down. Fixed
+ *    by putting the physical safety step FIRST, ahead of any UI/launcher
+ *    action, and making the restart step explicitly conditional on it.
+ *
+ * 2. (P2) HARDCODED PORT: the copy hardcoded `localhost:8000` in both
+ *    commands, but the CLI accepts `--port` and the launcher reads `PORT` —
+ *    on a non-default port the operator would inspect the wrong socket,
+ *    find nothing, and reload, destroying the evidence. Fixed by deriving
+ *    the port from `window.location.port` (falling back to `8000` only
+ *    when the browser reports none, e.g. a bare-host URL) — the page is
+ *    served by the same process it is diagnosing, so its own origin's
+ *    port is always the right one to check.
  */
 function LiveStatusUnknownView({
   variant = "health-error",
@@ -660,6 +682,16 @@ function LiveStatusUnknownView({
   variant?: "health-error" | "instance-mismatch";
 } = {}): React.JSX.Element {
   const isMismatch = variant === "instance-mismatch";
+  // PR #544 P2 fold: the CLI accepts `--port` and the launcher reads `PORT`,
+  // so a hardcoded `localhost:8000` would send the operator to inspect the
+  // WRONG socket on a non-default port — finding nothing, then reloading and
+  // destroying the evidence. The page is served by the same process it is
+  // diagnosing, so its own origin's port is always the correct one to check.
+  // `window.location.port` is `""` for a default-port URL (e.g. a bare host
+  // with no explicit port in the address bar) — fall back to 8000 only then.
+  const apiPort = typeof window !== "undefined" && window.location.port !== ""
+    ? window.location.port
+    : "8000";
   return (
     <AppFrame
       headerRight={
@@ -681,24 +713,39 @@ function LiveStatusUnknownView({
               accepted this roast start. Do not trust anything shown here until you
               have verified which process is actually answering.
             </p>
+            {/* PR #544 P1 fold: the physical safety step MUST come first and
+                unconditionally, ahead of any UI/launcher action — the
+                launcher restart later in this list force-kills the agent +
+                MCP without running heat-off, and in exactly this scenario
+                (a mismatch right after a start) the accepting process may
+                still be actively heating. */}
+            <div
+              data-testid="live-status-unknown-safety-step"
+              className="w-full rounded-md border border-roast-fault bg-roast-fault/20 p-3 text-left text-xs font-semibold text-foreground"
+            >
+              If a roast may be live, use the physical emergency stop or the
+              machine&apos;s power switch FIRST — do not rely on this UI or the
+              launcher to stop heating; a launcher restart force-kills the
+              controller without a heat-off.
+            </div>
             <div
               data-testid="live-status-unknown-field-protocol"
               className="w-full rounded-md border border-border bg-background/60 p-3 text-left text-xs"
             >
               <p className="mb-2 font-semibold uppercase tracking-wide text-muted-foreground">
-                Verify before reloading
+                Then verify before reloading
               </p>
               <ol className="flex list-decimal flex-col gap-1.5 pl-4 text-muted-foreground">
                 <li>
                   Check what is actually answering:{" "}
                   <code className="rounded bg-muted px-1 py-0.5 text-foreground">
-                    curl localhost:8000/api/health
+                    curl localhost:{apiPort}/api/health
                   </code>
                 </li>
                 <li>
                   Confirm nothing extra is listening on the port:{" "}
                   <code className="rounded bg-muted px-1 py-0.5 text-foreground">
-                    lsof -nP -iTCP:8000 -sTCP:LISTEN
+                    lsof -nP -iTCP:{apiPort} -sTCP:LISTEN
                   </code>
                 </li>
                 <li>
