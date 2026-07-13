@@ -76,6 +76,18 @@
  * Passive health consumers elsewhere (NavBar, DashboardPage) never read or
  * compare `instance_id` — only this one-shot comparison does, so a normal
  * server RESTART (once this check has disarmed) never false-alarms them.
+ *
+ * RELOAD DROPS THE EVIDENCE (#537, capped #536 finding): `expectedInstanceId`
+ * lives in router state, so a reload (a fresh navigation with no state) has
+ * no mismatch to check — the reloaded page trusts whatever process answers
+ * `/health` next, impostor or not. sessionStorage persistence was
+ * considered and REJECTED (TTL/clearing design outweighs the value: by the
+ * time this matters the operator has already seen the warning — the
+ * feature's actual job — and the launcher's own port guard, #518/#519,
+ * prevents the underlying class at source). Instead
+ * `LiveStatusUnknownView`'s mismatch variant replaces the bare reload
+ * guidance with the FIELD PROTOCOL (verify with `curl`/`lsof`, restart via
+ * the launcher) — see that component's own doc for the full copy rationale.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -623,6 +635,74 @@ export function LivePage(): React.JSX.Element {
  * but the fresh read's `instance_id` does not match the one observed on the
  * start-roast 201. Carries a DISTINCT message from the generic "can't reach
  * the agent" copy, per the issue's explicit requirement.
+ *
+ * #537 (capped #536 finding): a plain reload silently drops the ONLY
+ * evidence this view exists to carry — `expectedInstanceId` lives in router
+ * state, and a reload's fresh navigation has none, so the reloaded page's
+ * fresh-health-gate would trust the very same (possibly impostor) process's
+ * answers with no mismatch check at all. sessionStorage persistence was
+ * considered and REJECTED (TTL/clearing design complexity outweighs the
+ * value here — by this point the operator has already seen the warning,
+ * the feature's actual job, and the launcher's port guard, #518/#519,
+ * prevents the underlying class at source). Instead the mismatch variant's
+ * guidance replaces the bare "Reload" action with the FIELD PROTOCOL
+ * (`docs/recent-fixes.md`, "A second listener on the roast port..."): verify
+ * with `curl`/`lsof` BEFORE reloading, since a reload clears this warning
+ * without resolving whatever a second listener revealed. The reload
+ * affordance itself stays (no dead end) but is honestly labelled as
+ * clearing the warning, not fixing the underlying condition — the generic
+ * health-error variant is unaffected (a plain "can't reach the agent" has
+ * no evidence to lose on reload).
+ *
+ * PR #544 Codex round 1 — two folds, both verified real against the branch:
+ *
+ * 1. (P1) SAFETY COPY ORDERING: the field protocol's diagnosis steps sent
+ *    the operator to a launcher restart with no physical safety step
+ *    anywhere in the copy — but `scripts/roast-live.sh` force-kills the
+ *    agent + MCP with `pkill -9` WITHOUT running heat-off (its own inline
+ *    comment says so explicitly). In the exact scenario this view targets
+ *    (a mismatch right after a start's 201 — the accepting process may
+ *    still be actively heating), following the diagnosis-then-restart
+ *    order alone could leave the machine heating with the UI down. Fixed
+ *    by putting the physical safety step FIRST, ahead of any UI/launcher
+ *    action, and making the restart step explicitly conditional on it.
+ *
+ * 2. (P2) HARDCODED PORT: the copy hardcoded `localhost:8000` in both
+ *    commands, but the CLI accepts `--port` and the launcher reads `PORT` —
+ *    on a non-default port the operator would inspect the wrong socket,
+ *    find nothing, and reload, destroying the evidence. Fixed by deriving
+ *    the port from `window.location.port` (falling back to `8000` only
+ *    when the browser reports none, e.g. a bare-host URL) — the page is
+ *    served by the same process it is diagnosing, so its own origin's
+ *    port is always the right one to check.
+ *
+ * PR #544 Codex round 2 — three copy-precision folds on round 1's fix:
+ *
+ * 1. (P2) LAN-DASHBOARD CONTEXT: the launcher advertises
+ *    `http://<LAN IP>:PORT/` (`scripts/roast-live.sh`), so the operator may
+ *    well be reading this view on a phone/laptop that is NOT the roaster
+ *    host — `curl localhost` there probes the WRONG machine, and `lsof`
+ *    can only ever run ON the roaster host anyway. Fixed with an explicit
+ *    "On the roaster host (the machine running the agent):" locator line
+ *    ahead of both commands; `localhost` inside them stays correct once
+ *    the operator IS on that host.
+ *
+ * 2. (P2) LAUNCHER SAFETY CLAIM WAS WRONG: the copy said the launcher
+ *    "refuses to start over a live one" — but `scripts/roast-live.sh`
+ *    FORCE-KILLS any matching agent/MCP process FIRST (unconditionally, no
+ *    heat-off), and only refuses to start if something ELSE remains
+ *    listening after that kill. It doesn't refuse over a live process; it
+ *    kills it. This directly contradicted the round-1 safety block right
+ *    above it. Reworded to describe what the script actually does.
+ *
+ * 3. (P2) PROXIED SPA PORT: `window.location.port` only equals the agent's
+ *    port in the field deployment (a built SPA served BY the agent).
+ *    Behind a dev/preview proxy (e.g. Vite) the page's origin is the
+ *    proxy's port, not the agent's, and this component cannot reliably
+ *    detect that case. Covered with a copy clause rather than code
+ *    plumbing (proportionate to a dev-only edge case): "(port = this
+ *    page's origin; if you access the dashboard through a proxy,
+ *    substitute the agent's real port)".
  */
 function LiveStatusUnknownView({
   variant = "health-error",
@@ -630,6 +710,24 @@ function LiveStatusUnknownView({
   variant?: "health-error" | "instance-mismatch";
 } = {}): React.JSX.Element {
   const isMismatch = variant === "instance-mismatch";
+  // PR #544 P2 fold: the CLI accepts `--port` and the launcher reads `PORT`,
+  // so a hardcoded `localhost:8000` would send the operator to inspect the
+  // WRONG socket on a non-default port — finding nothing, then reloading and
+  // destroying the evidence. The page is served by the same process it is
+  // diagnosing, so its own origin's port is always the correct one to check.
+  //
+  // PR #544 round-3 fold: `window.location.port` is `""` whenever the
+  // browser is using the SCHEME's default port (80 for http, 443 for
+  // https) — NOT specifically "the agent is on 8000". A field run started
+  // with `--port 80` and accessed as `http://roaster/` (no explicit port in
+  // the URL) would previously render commands for :8000, the WRONG socket.
+  // `window.location.port || <scheme default>` is the origin's true
+  // effective port in every case, matching how the browser itself resolves
+  // the port for an omitted-port URL.
+  const apiPort =
+    typeof window !== "undefined"
+      ? window.location.port || (window.location.protocol === "https:" ? "443" : "80")
+      : "8000";
   return (
     <AppFrame
       headerRight={
@@ -645,11 +743,91 @@ function LiveStatusUnknownView({
       >
         <h2 className="text-lg font-bold uppercase tracking-wide">Can&apos;t confirm roaster status</h2>
         {isMismatch ? (
-          <p className="text-sm text-muted-foreground" data-testid="live-status-unknown-message">
-            Answers are coming from a different server process than the one that
-            accepted this roast start. Reload before trusting anything shown here —
-            if a roast is genuinely running, another process may be unreachable.
-          </p>
+          <>
+            <p className="text-sm text-muted-foreground" data-testid="live-status-unknown-message">
+              Answers are coming from a different server process than the one that
+              accepted this roast start. Do not trust anything shown here until you
+              have verified which process is actually answering.
+            </p>
+            {/* PR #544 P1 fold: the physical safety step MUST come first and
+                unconditionally, ahead of any UI/launcher action — the
+                launcher restart later in this list force-kills the agent +
+                MCP without running heat-off, and in exactly this scenario
+                (a mismatch right after a start) the accepting process may
+                still be actively heating. */}
+            <div
+              data-testid="live-status-unknown-safety-step"
+              className="w-full rounded-md border border-roast-fault bg-roast-fault/20 p-3 text-left text-xs font-semibold text-foreground"
+            >
+              If a roast may be live, use the physical emergency stop or the
+              machine&apos;s power switch FIRST — do not rely on this UI or the
+              launcher to stop heating; a launcher restart force-kills the
+              controller without a heat-off.
+            </div>
+            <div
+              data-testid="live-status-unknown-field-protocol"
+              className="w-full rounded-md border border-border bg-background/60 p-3 text-left text-xs"
+            >
+              <p className="mb-2 font-semibold uppercase tracking-wide text-muted-foreground">
+                Then verify before reloading
+              </p>
+              {/* PR #544 round-2 P2 fold: the launcher's dashboard URL is
+                  http://<LAN IP>:PORT/ (scripts/roast-live.sh), so the
+                  operator may well be reading this on a phone/laptop that
+                  is NOT the roaster host — `curl localhost` there probes
+                  the WRONG machine, and lsof can only ever run ON the
+                  roaster host anyway. Locates both commands explicitly;
+                  `localhost` inside them stays correct once the operator
+                  IS on that host. */}
+              <p
+                data-testid="live-status-unknown-host-locator"
+                className="mb-1.5 text-muted-foreground"
+              >
+                On the roaster host (the machine running the agent):
+              </p>
+              <ol className="flex list-decimal flex-col gap-1.5 pl-4 text-muted-foreground">
+                <li>
+                  Check what is actually answering:{" "}
+                  <code className="rounded bg-muted px-1 py-0.5 text-foreground">
+                    curl localhost:{apiPort}/api/health
+                  </code>
+                  {/* PR #544 round-2 P3 fold: this page's OWN origin port is
+                      only guaranteed to equal the agent's port in the field
+                      deployment (the built SPA served BY the agent). Behind
+                      a dev/preview proxy (e.g. Vite) the origin is the
+                      proxy's port, not the agent's — cover that case with a
+                      copy clause rather than code plumbing, since it's a
+                      dev-only path this component cannot reliably detect. */}
+                  <span className="ml-1 text-muted-foreground/70">
+                    (port = this page&apos;s origin; if you access the dashboard
+                    through a proxy, substitute the agent&apos;s real port)
+                  </span>
+                </li>
+                <li>
+                  Confirm nothing extra is listening on the port:{" "}
+                  <code className="rounded bg-muted px-1 py-0.5 text-foreground">
+                    lsof -nP -iTCP:{apiPort} -sTCP:LISTEN
+                  </code>
+                </li>
+                <li>
+                  {/* PR #544 round-2 P1 fold: the launcher does NOT "refuse
+                      to start over a live one" — scripts/roast-live.sh
+                      force-kills any matching agent/MCP process FIRST
+                      (unconditionally, no heat-off), then only refuses if
+                      something ELSE remains listening after that kill. The
+                      previous wording contradicted the safety block above
+                      it — reworded to describe what actually happens. */}
+                  Only after the machine is physically safe, restart via the
+                  launcher — it force-kills any running agent (no heat-off)
+                  before starting fresh.
+                </li>
+              </ol>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Reloading clears this warning — only do so after you have verified
+              the process above, not as a substitute for it.
+            </p>
+          </>
         ) : (
           <p className="text-sm text-muted-foreground" data-testid="live-status-unknown-message">
             This page could not reach the agent to check whether a roast is active. If

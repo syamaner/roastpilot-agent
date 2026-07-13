@@ -409,6 +409,168 @@ describe("LivePage — impostor-process defence (#516)", () => {
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
   });
 
+  it("#537: the instance-mismatch view shows the field protocol (verify before reloading), not a bare reload affordance", () => {
+    // Capped #536 finding: a plain reload silently drops the only evidence
+    // this view exists to carry (expectedInstanceId lives in router state,
+    // absent after a reload) — sessionStorage persistence was rejected, so
+    // the fix is honest guidance: verify with curl/lsof BEFORE reloading.
+    // Port-agnostic here (see the dedicated PR #544 P2 test below for the
+    // non-default-port interpolation itself) — this test's own concern is
+    // the protocol's PRESENCE and content shape, not a specific port.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+
+    const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+    expect(protocol).toHaveTextContent(/curl localhost:\d+\/api\/health/i);
+    expect(protocol).toHaveTextContent(/lsof -nP -iTCP:\d+ -sTCP:LISTEN/i);
+    expect(protocol).toHaveTextContent(/launcher/i);
+    // The reload affordance stays (no dead end) but must be honestly labelled
+    // as clearing the warning, never as resolving the underlying condition.
+    expect(screen.getByTestId("live-status-unknown")).toHaveTextContent(
+      /reloading clears this warning/i,
+    );
+    expect(screen.getByTestId("live-status-unknown-reload")).toBeInTheDocument();
+  });
+
+  it("#537 PR #544 round-2 P1 fold: the launcher-restart step describes what the script ACTUALLY does (force-kill), never claims it 'refuses to start over a live one'", () => {
+    // scripts/roast-live.sh force-kills any matching agent/MCP process FIRST
+    // (unconditionally, no heat-off) and only refuses to start if something
+    // ELSE remains listening after that kill — it does not refuse over a
+    // live process, it kills it. The old "refuses to start over a live one"
+    // wording contradicted the round-1 safety block right above it.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+
+    const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+    expect(protocol).toHaveTextContent(/physically safe/i);
+    expect(protocol).toHaveTextContent(/force-kills any running agent/i);
+    expect(protocol).toHaveTextContent(/no heat-off/i);
+    expect(protocol).not.toHaveTextContent(/refuses to start over a live one/i);
+  });
+
+  it("#537 PR #544 round-2 P2 fold: the field protocol locates the commands 'On the roaster host' — the launcher's dashboard is a LAN URL, so the reader may not be on the roaster host", () => {
+    // scripts/roast-live.sh advertises http://<LAN IP>:PORT/, so the
+    // operator may be reading this view on a phone/laptop that is NOT the
+    // roaster host — curl localhost there probes the WRONG machine, and
+    // lsof can only ever run ON the roaster host anyway.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+
+    const locator = screen.getByTestId("live-status-unknown-host-locator");
+    expect(locator).toHaveTextContent(/on the roaster host/i);
+    expect(locator).toHaveTextContent(/the machine running the agent/i);
+    // The locator must precede the commands it's introducing.
+    const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+    const html = protocol.innerHTML;
+    expect(html.indexOf('data-testid="live-status-unknown-host-locator"')).toBeLessThan(
+      html.indexOf("curl localhost"),
+    );
+  });
+
+  it("#537 PR #544 round-2 P3 fold: the field protocol notes the proxied-SPA port caveat next to the interpolated command", () => {
+    // window.location.port only equals the agent's port in the field
+    // deployment (a built SPA served BY the agent) — behind a dev/preview
+    // proxy the page's origin is the proxy's port, not the agent's, and
+    // this component cannot reliably detect that case. Covered with a copy
+    // clause rather than code plumbing.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+
+    const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+    expect(protocol).toHaveTextContent(/this page's origin/i);
+    expect(protocol).toHaveTextContent(/proxy/i);
+    expect(protocol).toHaveTextContent(/substitute the agent's real port/i);
+  });
+
+  it("#537 PR #544 P1 fold: the instance-mismatch view puts the physical safety step FIRST, ahead of the field protocol — a launcher restart force-kills without heat-off", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+
+    const view = screen.getByTestId("live-status-unknown");
+    const safetyStep = screen.getByTestId("live-status-unknown-safety-step");
+    const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+    expect(safetyStep).toHaveTextContent(/physical emergency stop/i);
+    expect(safetyStep).toHaveTextContent(/power switch/i);
+    expect(safetyStep).toHaveTextContent(/force-kills the controller without a heat-off/i);
+    // ORDER matters: the safety step must precede the field protocol in the
+    // rendered DOM, so it reads first regardless of viewport/scroll state.
+    const html = view.innerHTML;
+    expect(html.indexOf('data-testid="live-status-unknown-safety-step"')).toBeLessThan(
+      html.indexOf('data-testid="live-status-unknown-field-protocol"'),
+    );
+    expect(protocol).toHaveTextContent(/launcher/i);
+  });
+
+  it("#537 PR #544 P2 fold: the field-protocol commands interpolate the PAGE'S OWN origin port, not a hardcoded 8000", () => {
+    // The CLI accepts --port and the launcher reads PORT — a hardcoded
+    // localhost:8000 would send the operator to inspect the WRONG socket on
+    // a non-default port, finding nothing, then reloading and destroying
+    // the evidence. jsdom's default test location is localhost:3000; this
+    // test forces a DIFFERENT, clearly-non-default port to prove the
+    // commands genuinely derive from window.location, not a lucky match.
+    const originalLocation = window.location;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...originalLocation, port: "9090" },
+    });
+    try {
+      healthState.isSuccess = true;
+      healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+      renderPage("/live", { expectedInstanceId: "server-a" });
+      const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+      expect(protocol).toHaveTextContent(/curl localhost:9090\/api\/health/i);
+      expect(protocol).toHaveTextContent(/lsof -nP -iTCP:9090 -sTCP:LISTEN/i);
+      expect(protocol).not.toHaveTextContent(/:8000/);
+    } finally {
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: originalLocation,
+      });
+    }
+  });
+
+  it("#537 PR #544 round-3 fold: an EMPTY location.port falls back to the SCHEME default (80 for http), never the agent's default 8000", () => {
+    // window.location.port is "" whenever the browser is using the scheme's
+    // OWN default port (80 for http, 443 for https) — NOT specifically "the
+    // agent is on 8000". A field run started with --port 80 and accessed as
+    // http://roaster/ (no explicit port in the URL) would previously render
+    // commands for :8000, the WRONG socket. This forces an empty port +
+    // http: protocol and asserts the commands carry :80, never :8000.
+    const originalLocation = window.location;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...originalLocation, port: "", protocol: "http:" },
+    });
+    try {
+      healthState.isSuccess = true;
+      healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+      renderPage("/live", { expectedInstanceId: "server-a" });
+      const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+      expect(protocol).toHaveTextContent(/curl localhost:80\/api\/health/i);
+      expect(protocol).toHaveTextContent(/lsof -nP -iTCP:80 -sTCP:LISTEN/i);
+      expect(protocol).not.toHaveTextContent(/:8000/);
+    } finally {
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: originalLocation,
+      });
+    }
+  });
+
+  it("#537: the GENERIC health-error variant does NOT show the field protocol or the safety step — it has no instance-id evidence to lose on reload", () => {
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    healthState.data = undefined;
+    renderPage("/live", { expectedInstanceId: "server-a" });
+    expect(screen.queryByTestId("live-status-unknown-field-protocol")).toBeNull();
+    expect(screen.queryByTestId("live-status-unknown-safety-step")).toBeNull();
+  });
+
   it("shows the dashboard normally when the instance_id MATCHES", () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-42", instance_id: "server-a" };
