@@ -274,6 +274,42 @@ export function LivePage(): React.JSX.Element {
   const prevRunIdRef = useRef<string | null>(null);
   const [stickyCompletedRunId, setStickyCompletedRunId] = useState<string | null>(null);
   const [terminalFetchPending, setTerminalFetchPending] = useState(false);
+  // #526: unmount guard for the fetchTerminalOutcome `.then()` below — the
+  // same class as the #514 confirm-loop BLOCKER (docs/recent-fixes.md: "Any
+  // confirm/retry loop in a component MUST guard against unmount"). Plain
+  // `useRef(true)` set `false` in a cleanup, mirroring the repo convention
+  // (no library) — checked after the awaited fetch, before either state
+  // write below.
+  //
+  // NO REGRESSION TEST for this specific guard, deliberately (#526 finding,
+  // recorded on the issue + docs/recent-fixes.md): empirically verified
+  // (five isolated probe components against this exact React 18 + jsdom +
+  // testing-library stack, plain unmount / StrictMode / act()-wrapped
+  // resolve) that a `useState` setter called from an orphaned `.then()`
+  // after unmount produces NO observable signal here — not the classic
+  // "state update on an unmounted component" warning (removed for
+  // hooks-based updates in React 18), not even the more general "not
+  // wrapped in act()" warning. A component-local `useState` write on an
+  // unmounted fiber is an inert no-op with zero cross-instance effect,
+  // unlike the ORIGINAL #514 hazard (a `queryClient.setQueryData` write —
+  // genuinely SHARED state a remount's fresh loop could race). A
+  // console-error-spy test, or an unmount-then-remount cross-instance test,
+  // both pass IDENTICALLY with or without this guard — confirmed by
+  // reverting it and rerunning. Ship the guard anyway: it is the repo's
+  // safe-by-default convention, and its value is FUTURE-PROOFING — the day
+  // this `.then()` grows a `queryClient.setQueryData` or any other
+  // shared-state write (exactly how the original #514 blocker arose), the
+  // guard is already there. Do not add a test here that merely re-asserts
+  // "no console output" — it would prove nothing; see the doc entry above
+  // for what a non-vacuous test for THIS class actually requires (a shared-
+  // state observable, not a local one).
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (activeRunId !== null) {
@@ -287,6 +323,13 @@ export function LivePage(): React.JSX.Element {
       prevRunIdRef.current = null;
       setTerminalFetchPending(true);
       void fetchTerminalOutcome(queryClient, finishedId).then((outcome) => {
+        // #526: bail before any state write if this component has since
+        // unmounted — the query cache write inside fetchTerminalOutcome
+        // itself already happened (harmless/shared — TanStack Query's cache
+        // is meant to be written from anywhere), only the LOCAL state
+        // setters below are guarded. See the guard's own doc above for why
+        // this specific case has no regression test.
+        if (!mountedRef.current) return;
         if (outcome === "completed") {
           setStickyCompletedRunId(finishedId);
         }
