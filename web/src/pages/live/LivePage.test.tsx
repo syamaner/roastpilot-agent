@@ -534,6 +534,34 @@ describe("LivePage — impostor-process defence (#516)", () => {
     }
   });
 
+  it("#537 PR #544 round-3 fold: an EMPTY location.port falls back to the SCHEME default (80 for http), never the agent's default 8000", () => {
+    // window.location.port is "" whenever the browser is using the scheme's
+    // OWN default port (80 for http, 443 for https) — NOT specifically "the
+    // agent is on 8000". A field run started with --port 80 and accessed as
+    // http://roaster/ (no explicit port in the URL) would previously render
+    // commands for :8000, the WRONG socket. This forces an empty port +
+    // http: protocol and asserts the commands carry :80, never :8000.
+    const originalLocation = window.location;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...originalLocation, port: "", protocol: "http:" },
+    });
+    try {
+      healthState.isSuccess = true;
+      healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+      renderPage("/live", { expectedInstanceId: "server-a" });
+      const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+      expect(protocol).toHaveTextContent(/curl localhost:80\/api\/health/i);
+      expect(protocol).toHaveTextContent(/lsof -nP -iTCP:80 -sTCP:LISTEN/i);
+      expect(protocol).not.toHaveTextContent(/:8000/);
+    } finally {
+      Object.defineProperty(window, "location", {
+        configurable: true,
+        value: originalLocation,
+      });
+    }
+  });
+
   it("#537: the GENERIC health-error variant does NOT show the field protocol or the safety step — it has no instance-id evidence to lose on reload", () => {
     healthState.isSuccess = false;
     healthState.isError = true;

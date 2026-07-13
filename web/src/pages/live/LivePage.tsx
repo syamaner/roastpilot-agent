@@ -715,11 +715,19 @@ function LiveStatusUnknownView({
   // WRONG socket on a non-default port — finding nothing, then reloading and
   // destroying the evidence. The page is served by the same process it is
   // diagnosing, so its own origin's port is always the correct one to check.
-  // `window.location.port` is `""` for a default-port URL (e.g. a bare host
-  // with no explicit port in the address bar) — fall back to 8000 only then.
-  const apiPort = typeof window !== "undefined" && window.location.port !== ""
-    ? window.location.port
-    : "8000";
+  //
+  // PR #544 round-3 fold: `window.location.port` is `""` whenever the
+  // browser is using the SCHEME's default port (80 for http, 443 for
+  // https) — NOT specifically "the agent is on 8000". A field run started
+  // with `--port 80` and accessed as `http://roaster/` (no explicit port in
+  // the URL) would previously render commands for :8000, the WRONG socket.
+  // `window.location.port || <scheme default>` is the origin's true
+  // effective port in every case, matching how the browser itself resolves
+  // the port for an omitted-port URL.
+  const apiPort =
+    typeof window !== "undefined"
+      ? window.location.port || (window.location.protocol === "https:" ? "443" : "80")
+      : "8000";
   return (
     <AppFrame
       headerRight={
