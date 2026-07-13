@@ -429,10 +429,21 @@ describe("LivePage — impostor-process defence (#516)", () => {
     expect(screen.queryByTestId("live-status-unknown")).toBeNull();
   });
 
-  it("does not gate on instance_id when the navigation state is present but malformed (defensive narrowing, not a cast)", () => {
+  it("does not gate on instance_id when the navigation state is present but malformed — an unrelated key (defensive narrowing, not a cast)", () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
     renderPage("/live", { someUnrelatedKey: "server-a" });
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+  });
+
+  it("does not gate on instance_id when expectedInstanceId is present but NOT a string (qa nit — the typeof check must reject this, not just an unrelated key)", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    // expectedInstanceId is typed as `string`, but router state is `unknown`
+    // at runtime — a non-string value (e.g. a stray number) must be rejected
+    // by the `typeof ... === "string"` narrowing, not coerced or compared.
+    renderPage("/live", { expectedInstanceId: 12345 });
     expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
     expect(screen.queryByTestId("live-status-unknown")).toBeNull();
   });
