@@ -214,11 +214,14 @@
           "audio_running": true,
           "dropped_window_count": 0,
           "emitted_window_count": 0,
+          "estimated_lost_audio_ms_last_minute": 0.0,
           "fc_status": "pending",
           "mic_health": "ok",
+          "overflow_count_last_minute": 0,
           "processed_window_count": 0,
           "queued_window_count": 0,
-          "reason": null
+          "reason": null,
+          "total_overflow_count": 0
         },
         "t0_detected": false
       },
