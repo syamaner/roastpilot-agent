@@ -433,6 +433,59 @@ describe("LivePage — impostor-process defence (#516)", () => {
     expect(screen.getByTestId("live-status-unknown-reload")).toBeInTheDocument();
   });
 
+  it("#537 PR #544 round-2 P1 fold: the launcher-restart step describes what the script ACTUALLY does (force-kill), never claims it 'refuses to start over a live one'", () => {
+    // scripts/roast-live.sh force-kills any matching agent/MCP process FIRST
+    // (unconditionally, no heat-off) and only refuses to start if something
+    // ELSE remains listening after that kill — it does not refuse over a
+    // live process, it kills it. The old "refuses to start over a live one"
+    // wording contradicted the round-1 safety block right above it.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+
+    const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+    expect(protocol).toHaveTextContent(/physically safe/i);
+    expect(protocol).toHaveTextContent(/force-kills any running agent/i);
+    expect(protocol).toHaveTextContent(/no heat-off/i);
+    expect(protocol).not.toHaveTextContent(/refuses to start over a live one/i);
+  });
+
+  it("#537 PR #544 round-2 P2 fold: the field protocol locates the commands 'On the roaster host' — the launcher's dashboard is a LAN URL, so the reader may not be on the roaster host", () => {
+    // scripts/roast-live.sh advertises http://<LAN IP>:PORT/, so the
+    // operator may be reading this view on a phone/laptop that is NOT the
+    // roaster host — curl localhost there probes the WRONG machine, and
+    // lsof can only ever run ON the roaster host anyway.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+
+    const locator = screen.getByTestId("live-status-unknown-host-locator");
+    expect(locator).toHaveTextContent(/on the roaster host/i);
+    expect(locator).toHaveTextContent(/the machine running the agent/i);
+    // The locator must precede the commands it's introducing.
+    const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+    const html = protocol.innerHTML;
+    expect(html.indexOf('data-testid="live-status-unknown-host-locator"')).toBeLessThan(
+      html.indexOf("curl localhost"),
+    );
+  });
+
+  it("#537 PR #544 round-2 P3 fold: the field protocol notes the proxied-SPA port caveat next to the interpolated command", () => {
+    // window.location.port only equals the agent's port in the field
+    // deployment (a built SPA served BY the agent) — behind a dev/preview
+    // proxy the page's origin is the proxy's port, not the agent's, and
+    // this component cannot reliably detect that case. Covered with a copy
+    // clause rather than code plumbing.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+
+    const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+    expect(protocol).toHaveTextContent(/this page's origin/i);
+    expect(protocol).toHaveTextContent(/proxy/i);
+    expect(protocol).toHaveTextContent(/substitute the agent's real port/i);
+  });
+
   it("#537 PR #544 P1 fold: the instance-mismatch view puts the physical safety step FIRST, ahead of the field protocol — a launcher restart force-kills without heat-off", () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-42", instance_id: "server-b" };

@@ -675,6 +675,34 @@ export function LivePage(): React.JSX.Element {
  *    when the browser reports none, e.g. a bare-host URL) — the page is
  *    served by the same process it is diagnosing, so its own origin's
  *    port is always the right one to check.
+ *
+ * PR #544 Codex round 2 — three copy-precision folds on round 1's fix:
+ *
+ * 1. (P2) LAN-DASHBOARD CONTEXT: the launcher advertises
+ *    `http://<LAN IP>:PORT/` (`scripts/roast-live.sh`), so the operator may
+ *    well be reading this view on a phone/laptop that is NOT the roaster
+ *    host — `curl localhost` there probes the WRONG machine, and `lsof`
+ *    can only ever run ON the roaster host anyway. Fixed with an explicit
+ *    "On the roaster host (the machine running the agent):" locator line
+ *    ahead of both commands; `localhost` inside them stays correct once
+ *    the operator IS on that host.
+ *
+ * 2. (P2) LAUNCHER SAFETY CLAIM WAS WRONG: the copy said the launcher
+ *    "refuses to start over a live one" — but `scripts/roast-live.sh`
+ *    FORCE-KILLS any matching agent/MCP process FIRST (unconditionally, no
+ *    heat-off), and only refuses to start if something ELSE remains
+ *    listening after that kill. It doesn't refuse over a live process; it
+ *    kills it. This directly contradicted the round-1 safety block right
+ *    above it. Reworded to describe what the script actually does.
+ *
+ * 3. (P2) PROXIED SPA PORT: `window.location.port` only equals the agent's
+ *    port in the field deployment (a built SPA served BY the agent).
+ *    Behind a dev/preview proxy (e.g. Vite) the page's origin is the
+ *    proxy's port, not the agent's, and this component cannot reliably
+ *    detect that case. Covered with a copy clause rather than code
+ *    plumbing (proportionate to a dev-only edge case): "(port = this
+ *    page's origin; if you access the dashboard through a proxy,
+ *    substitute the agent's real port)".
  */
 function LiveStatusUnknownView({
   variant = "health-error",
@@ -735,12 +763,37 @@ function LiveStatusUnknownView({
               <p className="mb-2 font-semibold uppercase tracking-wide text-muted-foreground">
                 Then verify before reloading
               </p>
+              {/* PR #544 round-2 P2 fold: the launcher's dashboard URL is
+                  http://<LAN IP>:PORT/ (scripts/roast-live.sh), so the
+                  operator may well be reading this on a phone/laptop that
+                  is NOT the roaster host — `curl localhost` there probes
+                  the WRONG machine, and lsof can only ever run ON the
+                  roaster host anyway. Locates both commands explicitly;
+                  `localhost` inside them stays correct once the operator
+                  IS on that host. */}
+              <p
+                data-testid="live-status-unknown-host-locator"
+                className="mb-1.5 text-muted-foreground"
+              >
+                On the roaster host (the machine running the agent):
+              </p>
               <ol className="flex list-decimal flex-col gap-1.5 pl-4 text-muted-foreground">
                 <li>
                   Check what is actually answering:{" "}
                   <code className="rounded bg-muted px-1 py-0.5 text-foreground">
                     curl localhost:{apiPort}/api/health
                   </code>
+                  {/* PR #544 round-2 P3 fold: this page's OWN origin port is
+                      only guaranteed to equal the agent's port in the field
+                      deployment (the built SPA served BY the agent). Behind
+                      a dev/preview proxy (e.g. Vite) the origin is the
+                      proxy's port, not the agent's — cover that case with a
+                      copy clause rather than code plumbing, since it's a
+                      dev-only path this component cannot reliably detect. */}
+                  <span className="ml-1 text-muted-foreground/70">
+                    (port = this page&apos;s origin; if you access the dashboard
+                    through a proxy, substitute the agent&apos;s real port)
+                  </span>
                 </li>
                 <li>
                   Confirm nothing extra is listening on the port:{" "}
@@ -749,8 +802,16 @@ function LiveStatusUnknownView({
                   </code>
                 </li>
                 <li>
-                  If a second listener is present, restart via the launcher —
-                  it guards the port and refuses to start over a live one.
+                  {/* PR #544 round-2 P1 fold: the launcher does NOT "refuse
+                      to start over a live one" — scripts/roast-live.sh
+                      force-kills any matching agent/MCP process FIRST
+                      (unconditionally, no heat-off), then only refuses if
+                      something ELSE remains listening after that kill. The
+                      previous wording contradicted the safety block above
+                      it — reworded to describe what actually happens. */}
+                  Only after the machine is physically safe, restart via the
+                  launcher — it force-kills any running agent (no heat-off)
+                  before starting fresh.
                 </li>
               </ol>
             </div>
