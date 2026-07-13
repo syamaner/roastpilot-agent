@@ -87,6 +87,31 @@ describe("HistoryTable weight loss % (#388)", () => {
   });
 });
 
+describe("HistoryTable corrected-charge indicator (#520 round-2 P5)", () => {
+  it("marks the Loss % cell when the run's charge weight was corrected, honouring the no-silent-swap principle", () => {
+    renderTable([
+      summary({ id: "corrected", weight_loss_percent: 12.55, corrected_charge_grams: 255 }),
+    ]);
+    const marker = screen.getByTestId("history-weight-loss-corrected");
+    expect(within(screen.getByTestId("history-weight-loss")).getByTestId(
+      "history-weight-loss-corrected",
+    )).toBeInTheDocument();
+    expect(marker).toHaveAttribute("title", expect.stringContaining("255 g"));
+  });
+
+  it("omits the marker for a run whose charge was never corrected", () => {
+    renderTable([
+      summary({ id: "uncorrected", weight_loss_percent: 11.6, corrected_charge_grams: null }),
+    ]);
+    expect(screen.queryByTestId("history-weight-loss-corrected")).not.toBeInTheDocument();
+  });
+
+  it("omits the marker when corrected_charge_grams is absent from the payload (pre-#520 rows)", () => {
+    renderTable([summary({ id: "pre-520", weight_loss_percent: 11.6 })]);
+    expect(screen.queryByTestId("history-weight-loss-corrected")).not.toBeInTheDocument();
+  });
+});
+
 describe("HistoryTable ambient (#464)", () => {
   it("renders an Ambient column header", () => {
     renderTable([summary()]);

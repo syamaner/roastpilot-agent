@@ -17,6 +17,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
+from unittest import mock
 
 import pytest
 import pytest_asyncio
@@ -29,6 +30,7 @@ from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastDecision
 from roastpilot_agent.api import (
     EventBroadcaster,
     QueuedOperatorAction,
+    RoastRunConflictError,
     RoastRunGoneError,
     RoastRunner,
     RoastService,
@@ -45,10 +47,13 @@ from roastpilot_agent.mcp_client import (
     RoastSessionState,
 )
 from roastpilot_agent.models import (
+    ChargeWeightRequest,
     MicHealth,
     OperatorAction,
     OperatorActionRequest,
     RoastCommand,
+    RoastDetail,
+    RoastedWeightRequest,
     RoastEventKind,
     RoastEventSource,
     RoastPhase,
@@ -842,6 +847,323 @@ async def test_set_roasted_weight_rejects_over_charge(
         "/api/roasts/run-oc/roasted-weight", json={"roasted_weight_grams": 9999.0}
     )
     assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_bounds_against_a_prior_charge_correction(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#520 safety review: set_roasted_weight must bound against the EFFECTIVE
+    charge (corrected when present), not just the frozen profile default —
+    otherwise correcting the charge DOWN first, then weighing above the new
+    (but below the old frozen) value, would silently pass the frozen-only
+    check and leave weight_loss_percent null on a run with both values
+    entered. Reproduces the exact ordering from the review: correct charge to
+    200g (accepted, un-weighed) on a 250g-frozen run, then weigh 210g — must
+    409 (210 > the effective 200g charge), not silently pass against 250g."""
+    await store.create_run(
+        run_id="run-order",
+        profile=_profile(),  # bean_weight_grams 250
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-order", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    correction = await client.post(
+        "/api/roasts/run-order/charge-weight", json={"corrected_charge_grams": 200.0}
+    )
+    assert correction.status_code == 200
+
+    response = await client.post(
+        "/api/roasts/run-order/roasted-weight", json={"roasted_weight_grams": 210.0}
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_set_roasted_weight_races_a_concurrent_charge_correction_still_409s(
+    store: RoastStore,
+) -> None:
+    """#520 round-2 P3: the API-layer pre-check reads `detail` then writes
+    moments later — a concurrent set_corrected_charge landing in BETWEEN
+    those two steps would invalidate the value the pre-check validated
+    against. Monkeypatches `store.read_run` to inject exactly that race (the
+    correction lands AFTER the service's pre-check has already read the
+    still-frozen 250 g detail, but BEFORE its own write reaches the store),
+    proving it's the store's atomic WHERE-clause bound — not the pre-check,
+    which by then has already been fooled — that turns this into a 409
+    instead of a silently-wrong write."""
+    await store.create_run(
+        run_id="run-race",
+        profile=_profile(),  # bean_weight_grams 250
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-race", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+
+    real_read_run = store.read_run
+    raced = False
+
+    async def racing_read_run(run_id: str) -> RoastDetail | None:
+        nonlocal raced
+        detail = await real_read_run(run_id)
+        if run_id == "run-race" and not raced:
+            raced = True
+            # The race: a concurrent correction lands here, AFTER the
+            # pre-check above has already read (and validated 210 g against)
+            # the frozen 250 g default it just returned.
+            await store.set_corrected_charge("run-race", corrected_charge_grams=200.0)
+        return detail
+
+    with mock.patch.object(store, "read_run", side_effect=racing_read_run):
+        service = RoastService(store)
+        # 210 g passes the pre-check (still sees the frozen 250 g), but by
+        # the time set_roasted_weight's own UPDATE runs, the effective charge
+        # is 200 g — only the atomic WHERE-clause bound catches this.
+        with pytest.raises(RoastRunConflictError):
+            await service.set_roasted_weight(
+                "run-race", RoastedWeightRequest(roasted_weight_grams=210.0)
+            )
+
+    assert raced
+    # The rejected write must not have landed.
+    final = await store.read_run("run-race")
+    assert final is not None
+    assert final.roasted_weight_grams is None
+
+
+# --- charge-weight correction (#520) ---
+
+
+@pytest.mark.asyncio
+async def test_set_charge_weight_completed_run(client: AsyncClient, store: RoastStore) -> None:
+    """#520: roast 13's exact worked example — charged 255 g against a 250 g
+    form default, roasted 223 g. Truth is 12.55%, not the 10.8% the frozen
+    charge weight alone would compute."""
+    await store.create_run(
+        run_id="run-cc",
+        profile=_profile(),  # bean_weight_grams 250
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(run_id="run-cc", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    await store.set_roasted_weight("run-cc", roasted_weight_grams=223.0)
+
+    response = await client.post(
+        "/api/roasts/run-cc/charge-weight", json={"corrected_charge_grams": 255.0}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["corrected_charge_grams"] == 255.0
+    # The frozen profile is UNTOUCHED — still the 250 g the controller ran with.
+    assert body["profile"]["bean_weight_grams"] == 250.0
+    assert body["weight_loss_percent"] == 12.55  # (255 - 223) / 255 * 100
+
+
+@pytest.mark.asyncio
+async def test_set_charge_weight_without_a_roasted_weight_yet(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#520: correcting the charge weight before the roasted-out weight is
+    entered is valid — nothing to bound against yet, so any positive value
+    is accepted."""
+    await store.create_run(
+        run_id="run-cc-early",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-cc-early", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    response = await client.post(
+        "/api/roasts/run-cc-early/charge-weight", json={"corrected_charge_grams": 255.0}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["corrected_charge_grams"] == 255.0
+    assert body["weight_loss_percent"] is None  # still un-weighed
+
+
+@pytest.mark.asyncio
+async def test_set_charge_weight_races_a_concurrent_roasted_weight_still_409s(
+    store: RoastStore,
+) -> None:
+    """#520 round-2 P3: mirror-direction race to
+    test_set_roasted_weight_races_a_concurrent_charge_correction_still_409s
+    — set_charge_weight's own pre-check reads `detail` (no roasted weight
+    yet) then writes moments later; a concurrent set_roasted_weight landing
+    in between invalidates the "nothing to bound against" the pre-check saw.
+    Proves the store's atomic WHERE-clause bound (not the pre-check, already
+    fooled by then) is what turns this into a 409."""
+    await store.create_run(
+        run_id="run-cc-race",
+        profile=_profile(),  # bean_weight_grams 250
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-cc-race", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+
+    real_read_run = store.read_run
+    raced = False
+
+    async def racing_read_run(run_id: str) -> RoastDetail | None:
+        nonlocal raced
+        detail = await real_read_run(run_id)
+        if run_id == "run-cc-race" and not raced:
+            raced = True
+            # The race: a concurrent weighing lands here, AFTER the
+            # pre-check above has already read (and seen no roasted weight
+            # to bound against) the still-unweighed run.
+            await store.set_roasted_weight("run-cc-race", roasted_weight_grams=240.0)
+        return detail
+
+    with mock.patch.object(store, "read_run", side_effect=racing_read_run):
+        service = RoastService(store)
+        # 200 g is fine against the "nothing to bound against yet" the
+        # pre-check saw, but is impossible against the 240 g roasted weight
+        # the race actually left behind — only the atomic bound catches this.
+        with pytest.raises(RoastRunConflictError):
+            await service.set_charge_weight(
+                "run-cc-race", ChargeWeightRequest(corrected_charge_grams=200.0)
+            )
+
+    assert raced
+    final = await store.read_run("run-cc-race")
+    assert final is not None
+    assert final.corrected_charge_grams is None
+
+
+@pytest.mark.asyncio
+async def test_set_charge_weight_in_progress_conflicts(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="run-cc-ip",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.DEVELOPMENT,
+    )
+    response = await client.post(
+        "/api/roasts/run-cc-ip/charge-weight", json={"corrected_charge_grams": 255.0}
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_set_charge_weight_unknown_run_404(client: AsyncClient) -> None:
+    response = await client.post(
+        "/api/roasts/nope/charge-weight", json={"corrected_charge_grams": 255.0}
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_set_charge_weight_rejects_non_positive(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    await store.create_run(
+        run_id="run-cc-nonpositive",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-cc-nonpositive", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    response = await client.post(
+        "/api/roasts/run-cc-nonpositive/charge-weight", json={"corrected_charge_grams": 0}
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_set_charge_weight_rejects_below_roasted_weight(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#520: a corrected charge below the roasted-out weight is physically
+    impossible (the beans cannot weigh more roasted than green) — 409,
+    mirroring set_roasted_weight's own bound in the other direction."""
+    await store.create_run(
+        run_id="run-cc-under",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-cc-under", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    await store.set_roasted_weight("run-cc-under", roasted_weight_grams=221.0)
+    response = await client.post(
+        "/api/roasts/run-cc-under/charge-weight", json={"corrected_charge_grams": 200.0}
+    )
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_set_charge_weight_records_an_audit_event(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#520: the correction records an operator_actions audit row with the
+    before/after charge values — reuses the existing free-form action column,
+    never a new RoastEventKind."""
+    await store.create_run(
+        run_id="run-cc-audit",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-cc-audit", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    await client.post(
+        "/api/roasts/run-cc-audit/charge-weight", json={"corrected_charge_grams": 255.0}
+    )
+    [action_row] = await _operator_action_rows(store, "run-cc-audit")
+    action, result, payload_json = action_row
+    assert action == "charge_weight_correction"
+    assert result == "accepted"
+    assert payload_json is not None
+    payload = json.loads(payload_json)
+    assert payload["previous_charge_grams"] == 250.0  # the frozen profile default
+    assert payload["corrected_charge_grams"] == 255.0
+
+
+@pytest.mark.asyncio
+async def test_set_charge_weight_twice_audits_the_prior_correction(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#520: a second correction's audit payload records the PREVIOUS
+    correction as its "before" value, not the original frozen default —
+    each correction's audit trail is against what was actually true
+    immediately before it."""
+    await store.create_run(
+        run_id="run-cc-twice",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-cc-twice", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    await client.post(
+        "/api/roasts/run-cc-twice/charge-weight", json={"corrected_charge_grams": 255.0}
+    )
+    await client.post(
+        "/api/roasts/run-cc-twice/charge-weight", json={"corrected_charge_grams": 252.0}
+    )
+    action_rows = await _operator_action_rows(store, "run-cc-twice")
+    assert len(action_rows) == 2
+    _, _, second_payload_json = action_rows[1]
+    assert second_payload_json is not None
+    second_payload = json.loads(second_payload_json)
+    assert second_payload["previous_charge_grams"] == 255.0
+    assert second_payload["corrected_charge_grams"] == 252.0
 
 
 # --- tastings (#522, D91) ---

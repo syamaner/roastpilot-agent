@@ -76,4 +76,15 @@ describe("api client", () => {
     expect(init).toMatchObject({ method: "POST" });
     expect(JSON.parse((init as RequestInit).body as string)).toEqual({ stars: 4 });
   });
+
+  it("POST /charge-weight sends the correction body and returns the detail (#520)", async () => {
+    mockFetch(200, { id: "r1", corrected_charge_grams: 255 });
+    const detail = await api.setChargeWeight("r1", { corrected_charge_grams: 255 });
+    expect(detail.corrected_charge_grams).toBe(255);
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init).toMatchObject({ method: "POST" });
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+      corrected_charge_grams: 255,
+    });
+  });
 });

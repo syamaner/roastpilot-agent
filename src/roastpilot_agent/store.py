@@ -418,6 +418,24 @@ CREATE TABLE roast_tastings (
 CREATE INDEX idx_roast_tastings_run ON roast_tastings(run_id, id);
 """
 
+SCHEMA_V12_CORRECTED_CHARGE = """
+-- #520: the operator-entered CORRECTED charge/green weight, for the case
+-- where the start-form default was left unedited but the operator actually
+-- weighed a different amount (roast 13: charged 255 g, the form still had
+-- the 250 g seed default). The frozen profile_json.bean_weight_grams stays
+-- frozen — it is what the controller/advisor actually saw and ran with —
+-- so the physical truth gets a NEW column rather than mutating the snapshot.
+-- Same lifecycle as roasted_weight_grams (V7): the v2 completed-run
+-- immutability trigger guards a fixed column allow-list (it ABORTs only on
+-- the enumerated frozen columns), so a NEW column is permitted to change
+-- after completion without editing the shipped trigger. Nullable; read
+-- paths prefer this value over the frozen charge weight when present (see
+-- read_run / list_runs), falling back to profile.bean_weight_grams when
+-- NULL — an uncorrected run's derived weight-loss % is unaffected.
+ALTER TABLE roast_runs ADD COLUMN corrected_charge_grams REAL
+  CHECK (corrected_charge_grams IS NULL OR corrected_charge_grams > 0);
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
@@ -433,6 +451,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V9_AMBIENT,
     SCHEMA_V10_AMBIENT_CAPTURED_LATCH,
     SCHEMA_V11_TASTINGS,
+    SCHEMA_V12_CORRECTED_CHARGE,
 )
 
 
@@ -442,6 +461,19 @@ class BeanProfileNotFoundError(Exception):
     Raised by :meth:`RoastStore.update_bean_profile` /
     :meth:`RoastStore.delete_bean_profile` for an unknown or already-archived id;
     the API maps it to HTTP 404."""
+
+
+class PhysicallyImpossibleWeightError(Exception):
+    """A weight/charge write would violate the roasted<=charge physical
+    invariant (#520 round-2 P3), caught ATOMICALLY at the store layer.
+
+    Raised by :meth:`RoastStore.set_roasted_weight` /
+    :meth:`RoastStore.set_corrected_charge` when the UPDATE's own WHERE
+    clause rejects the write against the CURRENT row (not a value read
+    moments earlier by the caller) — closing the race where two concurrent
+    corrections could each pass an API-layer pre-check against a stale
+    snapshot. The API maps it to HTTP 409, the same status the API-layer
+    pre-check already used."""
 
 
 class PersistedRun(BaseModel):
@@ -1104,21 +1136,104 @@ class RoastStore:
         The same immutability-exception lifecycle as :meth:`set_operator_rating`:
         captured post-roast after weighing, guarded to completed runs so an
         in-progress run cannot be stamped. The weight-loss % is derived on read,
-        never stored. Raises when the run is unknown or still in progress.
+        never stored.
+
+        The roasted weight must not exceed the EFFECTIVE charge (the
+        corrected charge when present, else the frozen profile default) —
+        folded into the UPDATE's own ``WHERE`` clause (#520 round-2 P3) so the
+        bound is checked ATOMICALLY against the row's CURRENT state, not a
+        value the caller read moments earlier: two concurrent corrections
+        (this call and a racing :meth:`set_corrected_charge`) could otherwise
+        each pass an API-layer pre-check against a stale snapshot. A
+        zero-``rowcount`` UPDATE is then disambiguated by a follow-up read —
+        "unknown/in-progress" (:class:`RuntimeError`) vs. "physically
+        impossible against the current row" (:class:`PhysicallyImpossibleWeightError`).
 
         Args:
             run_id: The completed run to update.
             roasted_weight_grams: The roasted-out weight in grams (> 0; the API
-                model enforces the bound before this is called).
+                model enforces the bound before this is called — this is the
+                atomic BACKSTOP, not the primary UX feedback path).
+
+        Raises:
+            RuntimeError: The run is unknown or still in progress.
+            PhysicallyImpossibleWeightError: The write would exceed the
+                run's current effective charge weight.
         """
         cursor = await self.connection.execute(
             "UPDATE roast_runs SET roasted_weight_grams = ?, updated_at_utc = ?"
-            " WHERE id = ? AND completed_at_utc IS NOT NULL",
-            (roasted_weight_grams, _utc_now(), run_id),
+            " WHERE id = ? AND completed_at_utc IS NOT NULL"
+            " AND ? <= COALESCE(corrected_charge_grams,"
+            "   json_extract(profile_json, '$.bean_weight_grams'))",
+            (roasted_weight_grams, _utc_now(), run_id, roasted_weight_grams),
         )
         await self.connection.commit()
         if cursor.rowcount == 0:
+            await self._raise_disambiguated_weight_error(run_id)
+
+    async def set_corrected_charge(self, run_id: str, *, corrected_charge_grams: float) -> None:
+        """Operator-entered CHARGE-weight correction (#520) — completed runs only.
+
+        The same immutability-exception lifecycle as :meth:`set_roasted_weight`:
+        the frozen ``profile_json.bean_weight_grams`` stays untouched (it is what
+        the controller/advisor actually ran with) — the corrected value lands in
+        this separate column instead. Derived weight-loss % on read prefers this
+        value over the frozen charge weight when present (see ``read_run`` /
+        ``list_runs``).
+
+        The correction must not fall below the run's CURRENT
+        ``roasted_weight_grams`` (when one exists) — folded into the UPDATE's
+        own ``WHERE`` clause (#520 round-2 P3), the same atomicity fix as
+        :meth:`set_roasted_weight`'s own bound, closing the identical race in
+        the other direction.
+
+        Args:
+            run_id: The completed run to update.
+            corrected_charge_grams: The corrected green/charge weight in grams
+                (> 0; the API model enforces the bound, plus the
+                not-below-roasted-weight physical-sanity check, before this is
+                called — this is the atomic BACKSTOP, not the primary UX
+                feedback path).
+
+        Raises:
+            RuntimeError: The run is unknown or still in progress.
+            PhysicallyImpossibleWeightError: The write would fall below the
+                run's current roasted-out weight.
+        """
+        cursor = await self.connection.execute(
+            "UPDATE roast_runs SET corrected_charge_grams = ?, updated_at_utc = ?"
+            " WHERE id = ? AND completed_at_utc IS NOT NULL"
+            " AND (roasted_weight_grams IS NULL OR ? >= roasted_weight_grams)",
+            (corrected_charge_grams, _utc_now(), run_id, corrected_charge_grams),
+        )
+        await self.connection.commit()
+        if cursor.rowcount == 0:
+            await self._raise_disambiguated_weight_error(run_id)
+
+    async def _raise_disambiguated_weight_error(self, run_id: str) -> None:
+        """Distinguish a zero-``rowcount`` weight/charge UPDATE's cause (#520
+        round-2 P3): unknown/in-progress run vs. a physically-impossible
+        write against the row's current state. Shared by
+        :meth:`set_roasted_weight` / :meth:`set_corrected_charge` so the two
+        atomic ``WHERE``-clause bounds report the same error shape.
+
+        Raises:
+            RuntimeError: No completed run matches ``run_id``.
+            PhysicallyImpossibleWeightError: The run exists and is completed,
+                so the UPDATE's zero rowcount can only be the cross-value
+                bound.
+        """
+        async with self.connection.execute(
+            "SELECT 1 FROM roast_runs WHERE id = ? AND completed_at_utc IS NOT NULL",
+            (run_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
             raise RuntimeError(f"no completed roast_run with id {run_id!r}")
+        raise PhysicallyImpossibleWeightError(
+            f"roast_run {run_id!r}: the write is physically impossible against "
+            f"the run's current roasted/charge weights"
+        )
 
     async def add_tasting(
         self,
@@ -1312,6 +1427,7 @@ class RoastStore:
         async with self.connection.execute(
             "SELECT r.id, r.started_at_utc, r.completed_at_utc, r.agent_phase,"
             " r.outcome, r.profile_json, r.operator_rating, r.roasted_weight_grams,"
+            " r.corrected_charge_grams,"
             " r.ambient_temp_c, r.ambient_humidity_pct, r.ambient_pressure_hpa,"
             " (SELECT t.development_percent FROM telemetry_snapshots t"
             "  WHERE t.run_id = r.id AND t.development_percent IS NOT NULL"
@@ -1342,6 +1458,7 @@ class RoastStore:
         for row in rows:
             profile = RoastProfile.model_validate_json(str(row["profile_json"]))
             roasted_weight = self._optional_float(row["roasted_weight_grams"])
+            corrected_charge = self._optional_float(row["corrected_charge_grams"])
             summaries.append(
                 RoastSummary(
                     id=str(row["id"]),
@@ -1361,8 +1478,9 @@ class RoastStore:
                     altitude_m=profile.altitude_m,
                     rating=None if row["operator_rating"] is None else int(row["operator_rating"]),
                     roasted_weight_grams=roasted_weight,
+                    corrected_charge_grams=corrected_charge,
                     weight_loss_percent=weight_loss_percent(
-                        charge_weight_grams=profile.bean_weight_grams,
+                        charge_weight_grams=corrected_charge or profile.bean_weight_grams,
                         roasted_weight_grams=roasted_weight,
                     ),
                     development_percent=None if row["dev_pct"] is None else float(row["dev_pct"]),
@@ -1383,8 +1501,9 @@ class RoastStore:
         async with self.connection.execute(
             "SELECT id, agent_phase, profile_json, outcome, started_at_utc,"
             " completed_at_utc, fault_reason, operator_rating, operator_notes,"
-            " roasted_weight_grams, ambient_temp_c, ambient_humidity_pct,"
-            " ambient_pressure_hpa, export_manifest_json FROM roast_runs WHERE id = ?",
+            " roasted_weight_grams, corrected_charge_grams, ambient_temp_c,"
+            " ambient_humidity_pct, ambient_pressure_hpa, export_manifest_json"
+            " FROM roast_runs WHERE id = ?",
             (run_id,),
         ) as cursor:
             row = await cursor.fetchone()
@@ -1398,6 +1517,7 @@ class RoastStore:
         agent_phase = RoastPhase(str(row["agent_phase"]))
         profile = RoastProfile.model_validate_json(str(row["profile_json"]))
         roasted_weight = self._optional_float(row["roasted_weight_grams"])
+        corrected_charge = self._optional_float(row["corrected_charge_grams"])
         return RoastDetail(
             id=str(row["id"]),
             agent_phase=agent_phase,
@@ -1411,8 +1531,9 @@ class RoastStore:
             rating=None if row["operator_rating"] is None else int(row["operator_rating"]),
             notes=None if row["operator_notes"] is None else str(row["operator_notes"]),
             roasted_weight_grams=roasted_weight,
+            corrected_charge_grams=corrected_charge,
             weight_loss_percent=weight_loss_percent(
-                charge_weight_grams=profile.bean_weight_grams,
+                charge_weight_grams=corrected_charge or profile.bean_weight_grams,
                 roasted_weight_grams=roasted_weight,
             ),
             export_manifest=manifest,

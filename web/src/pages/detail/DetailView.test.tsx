@@ -76,6 +76,28 @@ describe("DetailView trace-row → curve highlight", () => {
 afterEach(() => vi.restoreAllMocks());
 
 describe("DetailView composition", () => {
+  it("mounts ChargeWeight wired to the detail's frozen charge weight (#520) — the data-flows-to-the-render-tree check", () => {
+    renderView();
+    const frozen = screen.getByTestId("charge-weight-frozen");
+    expect(frozen).toHaveTextContent(`${FIXTURE_DETAIL.profile.bean_weight_grams} g`);
+  });
+
+  it("wires RoastedWeight to the EFFECTIVE charge weight, not the frozen default, when a correction exists (#520 round-2 P2)", () => {
+    // The server's set_roasted_weight bound now checks against the corrected
+    // charge when present (the safety-medium fold), so the widget's own
+    // client-side bound must match — a mismatch would show a value as
+    // client-invalid that the server accepts, or vice versa.
+    render(
+      <DetailView
+        detail={{ ...FIXTURE_DETAIL, corrected_charge_grams: 255 }}
+        telemetry={FIXTURE_TELEMETRY}
+        timeline={FIXTURE_TIMELINE}
+      />,
+      { wrapper: wrapper() },
+    );
+    expect(screen.getByTestId("roasted-weight")).toHaveTextContent("255 g in →");
+  });
+
   it("mounts RoastTastings wired to the detail's own run id (#522) — the data-flows-to-the-render-tree check: a dropped import or wrong runId prop would pass every other test here", async () => {
     const spy = vi
       .spyOn(api, "tastings")
@@ -118,6 +140,33 @@ describe("DetailView composition", () => {
     // The draft must be gone — run A's stars/notes must not survive onto run B.
     expect(screen.getByTestId("tasting-star-4")).toHaveAttribute("data-filled", "false");
     expect(screen.getByTestId("tasting-notes")).toHaveValue("");
+  });
+
+  it("resets the ChargeWeight correction draft when navigating between two different runs (#520 round-2 P4): run A's unsaved draft must never leak into a POST against run B", () => {
+    const { rerender } = render(
+      <DetailView detail={FIXTURE_DETAIL} telemetry={FIXTURE_TELEMETRY} timeline={FIXTURE_TIMELINE} />,
+      { wrapper: wrapper() },
+    );
+
+    // Draft an unsaved correction on run A — never saved. Both fixtures have
+    // `corrected_charge_grams: null`, so the widget's own re-sync effect
+    // (keyed on that prop) would NOT fire on navigation between them — only
+    // the key={detail.id} remount closes this leak.
+    fireEvent.change(screen.getByTestId("charge-weight-input"), { target: { value: "999" } });
+    expect(screen.getByTestId("charge-weight-input")).toHaveValue(999);
+
+    // Simulate a client-side route change to a different run (DetailPage
+    // re-renders DetailView with a new `detail` prop, not a fresh mount).
+    rerender(
+      <DetailView
+        detail={FIXTURE_DETAIL_LONG}
+        telemetry={FIXTURE_TELEMETRY_LONG}
+        timeline={FIXTURE_TIMELINE_LONG}
+      />,
+    );
+
+    // The draft must be gone — run A's unsaved "999" must not survive onto run B.
+    expect(screen.getByTestId("charge-weight-input")).toHaveValue(null);
   });
 
   it("feeds the full persisted curve to the shared LiveCurve with event markers", () => {
