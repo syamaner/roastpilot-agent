@@ -351,6 +351,35 @@ Format: one entry per anti-pattern.
   controllably-stalled `api.health()` promise and asserts a `setQueryData`
   spy was never called. All three were fail-then-pass verified by
   temporarily hardcoding `isMounted: () => true`.
+- **Sharpened nuance (#526, 13 Jul 2026):** the observable hazard this
+  class describes is specifically a write to **shared/external state** —
+  `queryClient.setQueryData`, module-level state, anything reachable from
+  outside the component's own fiber. A guard on a **component-local
+  `useState` setter** (no shared write at all) is NOT provably regression-
+  tested the same way, and attempting one produces a VACUOUS test: five
+  isolated probe components, checked against this repo's actual React 18 +
+  jsdom + `@testing-library/react` stack in every configuration tried
+  (plain unmount, `StrictMode`, `act()`-wrapped resolve), confirmed React 18
+  logs **zero console output** — not the classic "Can't perform a React
+  state update on an unmounted component" warning (removed for hooks-based
+  updates starting React 18), not even the more general "not wrapped in
+  `act()`" warning — for a `useState` setter called from an orphaned
+  `.then()` after unmount. A local setter on an unmounted fiber is simply
+  an inert no-op with zero cross-instance effect; a console-error-spy test
+  or an unmount-then-remount cross-instance test both pass IDENTICALLY
+  with or without such a guard (confirmed by reverting the guard and
+  rerunning). **Still guard local-state confirm/fetch callbacks anyway** —
+  it's the repo's safe-by-default convention and the value is
+  FUTURE-PROOFING: the day a `.then()` like this grows a
+  `queryClient.setQueryData` or any shared-state write (exactly how the
+  original #513/#514 hazard arose), the guard is already in place. Do
+  **not** write a "no console output" test to cover a local-state-only
+  guard — it proves nothing. A non-vacuous regression test for this class
+  requires a genuinely shared-state observable (a `setQueryData` spy, a
+  module-level counter, cross-instance state) — see
+  `LivePage.tsx`'s `fetchTerminalOutcome` effect for the documented example
+  (a `mountedRef` guard kept for convention, with an in-code note
+  explaining why it carries no regression test).
 
 ---
 
