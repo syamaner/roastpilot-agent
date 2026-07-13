@@ -90,6 +90,12 @@ export interface MicStatus {
   dropped_window_count: number;
   processed_window_count: number;
   reason: string | null;
+  // Overflow diagnostics (MCP 0.1.13, coffee-roaster-mcp#190, #539):
+  // capture-side frame-loss visibility, surfaced in the dashboard
+  // diagnostics drawer (plan §7's anticipated audio pipeline counters).
+  overflow_count_last_minute: number;
+  estimated_lost_audio_ms_last_minute: number;
+  total_overflow_count: number;
 }
 
 // --- Per-tick telemetry payload (models.TelemetryEventData). The live reading
