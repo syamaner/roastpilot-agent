@@ -233,6 +233,54 @@ describe("DetailView composition", () => {
   });
 });
 
+describe("DetailView completed-run widget visibility (#533)", () => {
+  // #533 (accepted #527 round-1 gap, repo-wide pass): RoastRating /
+  // RoastedWeight / ChargeWeight / RoastTastings each POST a completed-run-
+  // only endpoint. On an in-progress run's detail view (reachable via a
+  // direct /roasts/:id visit while the roast is still live), rendering
+  // these forms offers 409-doomed saves. ONE gate at DetailView, not four
+  // per-widget checks.
+  it("hides all four completed-run-only widgets on an in-progress run (completed_at_utc: null)", () => {
+    render(
+      <DetailView
+        detail={{ ...FIXTURE_DETAIL, completed_at_utc: null }}
+        telemetry={FIXTURE_TELEMETRY}
+        timeline={FIXTURE_TIMELINE}
+      />,
+      { wrapper: wrapper() },
+    );
+    expect(screen.queryByTestId("roast-rating")).toBeNull();
+    expect(screen.queryByTestId("roasted-weight")).toBeNull();
+    expect(screen.queryByTestId("charge-weight")).toBeNull();
+    expect(screen.queryByTestId("roast-tastings")).toBeNull();
+  });
+
+  it("shows all four completed-run-only widgets on a completed run (completed_at_utc set)", () => {
+    renderView();
+    expect(screen.getByTestId("roast-rating")).toBeInTheDocument();
+    expect(screen.getByTestId("roasted-weight")).toBeInTheDocument();
+    expect(screen.getByTestId("charge-weight")).toBeInTheDocument();
+    expect(screen.getByTestId("roast-tastings")).toBeInTheDocument();
+  });
+
+  it("still renders RoastConditions and ExportOptions on an in-progress run — they are read-outs, not forms", () => {
+    render(
+      <DetailView
+        detail={{ ...FIXTURE_DETAIL, completed_at_utc: null }}
+        telemetry={FIXTURE_TELEMETRY}
+        timeline={FIXTURE_TIMELINE}
+      />,
+      { wrapper: wrapper() },
+    );
+    expect(screen.getByTestId("export-options")).toBeInTheDocument();
+    // RoastConditions renders EITHER the triad or the uncaptured note —
+    // either way it must still be present (not gated by this fix).
+    const hasTriad = screen.queryByTestId("roast-conditions-temp") !== null;
+    const hasUncaptured = screen.queryByTestId("roast-conditions-uncaptured") !== null;
+    expect(hasTriad || hasUncaptured).toBe(true);
+  });
+});
+
 function renderLongView() {
   return render(
     <DetailView

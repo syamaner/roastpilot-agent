@@ -14,6 +14,19 @@
  * every field beyond stars is optional, and the form resets to a fresh blank
  * entry after each save (never pre-fills from a past tasting — that would
  * invite an accidental overwrite-looking edit of history).
+ *
+ * #533 (Codex P3 from #527 round 4): every input is disabled while a save is
+ * in flight (`mutation.isPending`) — not just the save button. Previously
+ * only the button was disabled, so an operator who kept typing during a slow
+ * save had that draft silently wiped when `onSuccess` unconditionally called
+ * `resetForm()`. This form has no persisted value to re-sync a draft FROM
+ * (unlike `RoastRating`, which re-derives its draft from the server's
+ * `rating`/`notes` props on every change and so never had this exposure) —
+ * multiple tastings accumulate as a list, there is no single "the" tasting
+ * to pre-fill a re-sync effect from. Disabling the whole form while pending
+ * is therefore the simplest honest fix available here: the operator sees
+ * the "Saving…" state and cannot lose a draft to a race they have no way
+ * to observe.
  */
 
 import { useState } from "react";
@@ -122,8 +135,9 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
               data-testid={`tasting-star-${value}`}
               data-filled={filled ? "true" : "false"}
               onClick={() => setStars(value)}
+              disabled={mutation.isPending}
               className={cn(
-                "text-2xl leading-none transition-colors",
+                "text-2xl leading-none transition-colors disabled:cursor-not-allowed disabled:opacity-50",
                 filled ? "text-roast-caution" : "text-muted-foreground/40 hover:text-muted-foreground",
               )}
             >
@@ -139,7 +153,8 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
         onChange={(e) => setNotes(e.target.value)}
         placeholder="Tasting notes"
         rows={2}
-        className="w-full resize-y rounded-md border border-border bg-input px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
+        disabled={mutation.isPending}
+        className="w-full resize-y rounded-md border border-border bg-input px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
       />
 
       <div className="flex flex-wrap items-center gap-2">
@@ -150,7 +165,8 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
             data-testid="tasting-tasted-at"
             value={tastedAt}
             onChange={(e) => setTastedAt(e.target.value)}
-            className="rounded-md border border-border bg-input px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+            disabled={mutation.isPending}
+            className="rounded-md border border-border bg-input px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
           />
         </label>
         <label className="flex items-center gap-1 text-xs text-muted-foreground">
@@ -159,7 +175,8 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
             data-testid="tasting-brew-method"
             value={brewMethod}
             onChange={(e) => setBrewMethod(e.target.value as BrewMethod | "")}
-            className="rounded-md border border-border bg-input px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+            disabled={mutation.isPending}
+            className="rounded-md border border-border bg-input px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
           >
             <option value="">—</option>
             {BREW_METHODS.map((method) => (
@@ -175,7 +192,8 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
           value={grindNote}
           onChange={(e) => setGrindNote(e.target.value)}
           placeholder="Grind note"
-          className="min-w-0 flex-1 rounded-md border border-border bg-input px-2 py-1 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
+          disabled={mutation.isPending}
+          className="min-w-0 flex-1 rounded-md border border-border bg-input px-2 py-1 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
         />
       </div>
 
@@ -185,6 +203,7 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
         values={ATTRIBUTES}
         selected={attributes}
         onToggle={(value) => toggle(attributes, value, setAttributes)}
+        disabled={mutation.isPending}
       />
       <TagRow
         label="Defects"
@@ -192,6 +211,7 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
         values={DEFECTS}
         selected={defects}
         onToggle={(value) => toggle(defects, value, setDefects)}
+        disabled={mutation.isPending}
       />
 
       <div className="flex items-center gap-3">
@@ -225,12 +245,16 @@ function TagRow<T extends string>({
   values,
   selected,
   onToggle,
+  disabled = false,
 }: {
   label: string;
   testIdPrefix: string;
   values: T[];
   selected: T[];
   onToggle: (value: T) => void;
+  /** #533: disabled while a save is in flight — see the module doc's
+   *  pending-save-draft-preservation note. */
+  disabled?: boolean;
 }): React.JSX.Element {
   return (
     <div className="flex flex-wrap items-center gap-2">
@@ -244,8 +268,9 @@ function TagRow<T extends string>({
             aria-pressed={active}
             data-testid={`${testIdPrefix}-${value}`}
             onClick={() => onToggle(value)}
+            disabled={disabled}
             className={cn(
-              "rounded-full border px-2 py-0.5 text-xs transition-colors",
+              "rounded-full border px-2 py-0.5 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-50",
               active
                 ? "border-primary bg-primary/10 text-primary"
                 : "border-border text-muted-foreground hover:border-muted-foreground",
