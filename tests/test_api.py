@@ -3111,7 +3111,18 @@ async def test_run_loop_runs_in_background_and_shuts_down(store: RoastStore) -> 
         run_loop=True,  # real background loop
     )
     detail = await service.start_roast(_profile())
-    await asyncio.sleep(0.03)  # let the background loop tick a few times
+
+    # #531: poll for a persisted telemetry point rather than a fixed sleep.
+    # The background loop's wall-clock pace varies under CI runner load, so a
+    # tight `asyncio.sleep(0.03)` was a timing flake (the loop had not yet
+    # ticked far enough to persist a row when asserted on #529's CI). Mirrors
+    # the same poll-until-condition pattern already used for the fault/
+    # finalisation waits below in this file — bounded so a genuine
+    # never-persists regression still fails the test promptly.
+    for _ in range(400):
+        if await store.read_telemetry_points(detail.id):
+            break
+        await asyncio.sleep(0.005)
     await service.shutdown()
     points = await store.read_telemetry_points(detail.id)
     assert points, "the background loop persisted telemetry"
