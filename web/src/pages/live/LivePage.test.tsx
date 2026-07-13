@@ -409,6 +409,35 @@ describe("LivePage — impostor-process defence (#516)", () => {
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
   });
 
+  it("#537: the instance-mismatch view shows the field protocol (verify before reloading), not a bare reload affordance", () => {
+    // Capped #536 finding: a plain reload silently drops the only evidence
+    // this view exists to carry (expectedInstanceId lives in router state,
+    // absent after a reload) — sessionStorage persistence was rejected, so
+    // the fix is honest guidance: verify with curl/lsof BEFORE reloading.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+
+    const protocol = screen.getByTestId("live-status-unknown-field-protocol");
+    expect(protocol).toHaveTextContent(/curl localhost:8000\/api\/health/i);
+    expect(protocol).toHaveTextContent(/lsof -nP -iTCP:8000 -sTCP:LISTEN/i);
+    expect(protocol).toHaveTextContent(/launcher/i);
+    // The reload affordance stays (no dead end) but must be honestly labelled
+    // as clearing the warning, never as resolving the underlying condition.
+    expect(screen.getByTestId("live-status-unknown")).toHaveTextContent(
+      /reloading clears this warning/i,
+    );
+    expect(screen.getByTestId("live-status-unknown-reload")).toBeInTheDocument();
+  });
+
+  it("#537: the GENERIC health-error variant does NOT show the field protocol — it has no instance-id evidence to lose on reload", () => {
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    healthState.data = undefined;
+    renderPage("/live", { expectedInstanceId: "server-a" });
+    expect(screen.queryByTestId("live-status-unknown-field-protocol")).toBeNull();
+  });
+
   it("shows the dashboard normally when the instance_id MATCHES", () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-42", instance_id: "server-a" };

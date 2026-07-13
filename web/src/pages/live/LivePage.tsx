@@ -76,6 +76,18 @@
  * Passive health consumers elsewhere (NavBar, DashboardPage) never read or
  * compare `instance_id` — only this one-shot comparison does, so a normal
  * server RESTART (once this check has disarmed) never false-alarms them.
+ *
+ * RELOAD DROPS THE EVIDENCE (#537, capped #536 finding): `expectedInstanceId`
+ * lives in router state, so a reload (a fresh navigation with no state) has
+ * no mismatch to check — the reloaded page trusts whatever process answers
+ * `/health` next, impostor or not. sessionStorage persistence was
+ * considered and REJECTED (TTL/clearing design outweighs the value: by the
+ * time this matters the operator has already seen the warning — the
+ * feature's actual job — and the launcher's own port guard, #518/#519,
+ * prevents the underlying class at source). Instead
+ * `LiveStatusUnknownView`'s mismatch variant replaces the bare reload
+ * guidance with the FIELD PROTOCOL (verify with `curl`/`lsof`, restart via
+ * the launcher) — see that component's own doc for the full copy rationale.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -623,6 +635,24 @@ export function LivePage(): React.JSX.Element {
  * but the fresh read's `instance_id` does not match the one observed on the
  * start-roast 201. Carries a DISTINCT message from the generic "can't reach
  * the agent" copy, per the issue's explicit requirement.
+ *
+ * #537 (capped #536 finding): a plain reload silently drops the ONLY
+ * evidence this view exists to carry — `expectedInstanceId` lives in router
+ * state, and a reload's fresh navigation has none, so the reloaded page's
+ * fresh-health-gate would trust the very same (possibly impostor) process's
+ * answers with no mismatch check at all. sessionStorage persistence was
+ * considered and REJECTED (TTL/clearing design complexity outweighs the
+ * value here — by this point the operator has already seen the warning,
+ * the feature's actual job, and the launcher's port guard, #518/#519,
+ * prevents the underlying class at source). Instead the mismatch variant's
+ * guidance replaces the bare "Reload" action with the FIELD PROTOCOL
+ * (`docs/recent-fixes.md`, "A second listener on the roast port..."): verify
+ * with `curl localhost:8000/api/health` + `lsof -nP -iTCP:8000 -sTCP:LISTEN`
+ * BEFORE reloading, since a reload clears this warning without resolving
+ * whatever a second listener revealed. The reload affordance itself stays
+ * (no dead end) but is honestly labelled as clearing the warning, not fixing
+ * the underlying condition — the generic health-error variant is unaffected
+ * (a plain "can't reach the agent" has no evidence to lose on reload).
  */
 function LiveStatusUnknownView({
   variant = "health-error",
@@ -645,11 +675,43 @@ function LiveStatusUnknownView({
       >
         <h2 className="text-lg font-bold uppercase tracking-wide">Can&apos;t confirm roaster status</h2>
         {isMismatch ? (
-          <p className="text-sm text-muted-foreground" data-testid="live-status-unknown-message">
-            Answers are coming from a different server process than the one that
-            accepted this roast start. Reload before trusting anything shown here —
-            if a roast is genuinely running, another process may be unreachable.
-          </p>
+          <>
+            <p className="text-sm text-muted-foreground" data-testid="live-status-unknown-message">
+              Answers are coming from a different server process than the one that
+              accepted this roast start. Do not trust anything shown here until you
+              have verified which process is actually answering.
+            </p>
+            <div
+              data-testid="live-status-unknown-field-protocol"
+              className="w-full rounded-md border border-border bg-background/60 p-3 text-left text-xs"
+            >
+              <p className="mb-2 font-semibold uppercase tracking-wide text-muted-foreground">
+                Verify before reloading
+              </p>
+              <ol className="flex list-decimal flex-col gap-1.5 pl-4 text-muted-foreground">
+                <li>
+                  Check what is actually answering:{" "}
+                  <code className="rounded bg-muted px-1 py-0.5 text-foreground">
+                    curl localhost:8000/api/health
+                  </code>
+                </li>
+                <li>
+                  Confirm nothing extra is listening on the port:{" "}
+                  <code className="rounded bg-muted px-1 py-0.5 text-foreground">
+                    lsof -nP -iTCP:8000 -sTCP:LISTEN
+                  </code>
+                </li>
+                <li>
+                  If a second listener is present, restart via the launcher —
+                  it guards the port and refuses to start over a live one.
+                </li>
+              </ol>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              Reloading clears this warning — only do so after you have verified
+              the process above, not as a substitute for it.
+            </p>
+          </>
         ) : (
           <p className="text-sm text-muted-foreground" data-testid="live-status-unknown-message">
             This page could not reach the agent to check whether a roast is active. If
