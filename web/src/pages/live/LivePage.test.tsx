@@ -468,6 +468,44 @@ describe("LivePage — impostor-process defence (#516)", () => {
     expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
     expect(screen.queryByTestId("live-status-unknown")).toBeNull();
   });
+
+  it("round-2 Codex fold: FAILS CLOSED when the fresh health read is missing instance_id entirely (not just a different value) while armed", () => {
+    // The process that genuinely accepted the start always includes
+    // instance_id (this same commit guarantees it on every code path), so an
+    // ABSENT field while armed is itself impostor evidence — an older-code
+    // process that predates this feature, not a benign gap to shrug past.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42" }; // no instance_id at all
+    renderPage("/live", { expectedInstanceId: "server-a" });
+    const view = screen.getByTestId("live-status-unknown");
+    expect(view).toHaveAttribute("data-variant", "instance-mismatch");
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+
+  it("round-2 Codex fold: ONE-SHOT DISARM — a match at one health read must not be re-armed by a DIFFERENT id at a LATER health read (a legitimate restart)", async () => {
+    // Simulates the scenario Codex flagged: location.state persists for the
+    // whole history entry's lifetime, so without a disarm latch a genuine
+    // later restart (a new process id while an active/recovery run exists)
+    // would false-alarm this check indefinitely, blocking the dashboard
+    // exactly when the operator needs it. Restart handling belongs to the
+    // fresh-health-gate/recovery flow, not this one-shot start-confirmation.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-a" };
+    const { rerender } = renderPage("/live", { expectedInstanceId: "server-a" });
+
+    // First read: matches — dashboard renders, and the check disarms.
+    await waitFor(() => expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument());
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+
+    // A LATER health read reports a DIFFERENT instance_id — e.g. a
+    // legitimate agent restart mid-roast. Because the check already
+    // disarmed on the first match, this must NOT be treated as a mismatch.
+    healthState.data = { active_run_id: "run-42", instance_id: "server-c" };
+    rerender();
+
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+  });
 });
 
 describe("LivePage — persistent last-completed summary from history (#523)", () => {

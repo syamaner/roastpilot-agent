@@ -53,17 +53,33 @@
  * param or anything persisted, since it only means anything for the ONE
  * navigation immediately following a start, and correctly disappears on a
  * reload (a reload has no "prior start" to compare against). If the fresh
- * health read on arrival here reports a DIFFERENT `instance_id`, that is
- * surfaced as its own distinct message on `LiveStatusUnknownView` — never
- * silently ignored, and never conflated with the generic "can't confirm"
- * case a `health.isError` would produce. Passive health consumers elsewhere
- * (NavBar, DashboardPage) never read or compare `instance_id` — only this
- * one-shot comparison does, so a normal server RESTART (which legitimately
- * changes the instance id) never false-alarms them.
+ * health read on arrival here reports a DIFFERENT `instance_id` (or NO
+ * `instance_id` at all — round-2 Codex fold: the process that genuinely
+ * accepted the start always includes the field, since this same commit
+ * guarantees it, so an absent field while armed is itself impostor
+ * evidence, not something to shrug off), that is surfaced as its own
+ * distinct message on `LiveStatusUnknownView` — never silently ignored,
+ * and never conflated with the generic "can't confirm" case a
+ * `health.isError` would produce.
+ *
+ * ONE-SHOT DISARM (round-2 Codex fold): the check is armed only until the
+ * FIRST verdict — a match disarms it PERMANENTLY (latched in a ref, plus a
+ * `replace` navigation that strips `expectedInstanceId` out of router state
+ * so even a remount can't re-arm it). Without this, `location.state`
+ * persists for the whole history entry's lifetime, so a LEGITIMATE later
+ * restart (a new process id while an active/recovery run genuinely exists)
+ * would false-alarm this check indefinitely — blocking the dashboard
+ * exactly when the operator needs it most. Restart handling belongs to the
+ * fresh-health-gate / recovery flow already in place, not to this one-shot
+ * start-confirmation check.
+ *
+ * Passive health consumers elsewhere (NavBar, DashboardPage) never read or
+ * compare `instance_id` — only this one-shot comparison does, so a normal
+ * server RESTART (once this check has disarmed) never false-alarms them.
  */
 
 import { useEffect, useRef, useState } from "react";
-import { Link, useLocation } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 
 import { AppFrame, LiveCurve } from "@/components/shared";
@@ -170,6 +186,7 @@ export function LivePage(): React.JSX.Element {
   // cast, since it can be anything (a browser back/forward restore, a direct
   // link, or absent on a reload) and must never be trusted uncritically.
   const location = useLocation();
+  const navigate = useNavigate();
   const expectedInstanceId =
     location.state !== null &&
     typeof location.state === "object" &&
@@ -177,15 +194,49 @@ export function LivePage(): React.JSX.Element {
     typeof (location.state as LiveNavigationState).expectedInstanceId === "string"
       ? (location.state as LiveNavigationState).expectedInstanceId
       : null;
-  // A mismatch is only meaningful once health has produced a genuinely fresh
+
+  // ONE-SHOT DISARM (round-2 Codex fold): `location.state` persists for the
+  // WHOLE lifetime of this history entry, so without a latch the check would
+  // stay armed indefinitely — a LEGITIMATE later restart (a new process id
+  // while an active/recovery run genuinely exists) would then false-alarm
+  // this check exactly when the operator needs the dashboard most. `verified`
+  // becomes `true` PERMANENTLY the first time a fresh health read confirms a
+  // match, and the mismatch check below is skipped forever after — restart
+  // handling belongs to the fresh-health-gate/recovery flow, not here.
+  const [verified, setVerified] = useState(expectedInstanceId === null);
+  const armed = expectedInstanceId !== null && !verified;
+
+  // A verdict is only meaningful once health has produced a genuinely fresh
   // read (health.data could still be the PRE-fetch cached snapshot from an
   // in-flight forced refetch) — the `!health.isFresh` hold below already
-  // covers that ordering, so this comparison is safe to compute unconditionally
-  // here and simply won't be consulted until isFresh is true.
+  // covers that ordering for the RENDER path, but this effect must apply the
+  // same guard itself since effects run independently of the render gates.
+  useEffect(() => {
+    if (!armed || !health.isFresh || health.data === undefined) return;
+    if (health.data.instance_id === expectedInstanceId) {
+      setVerified(true);
+      // Strip expectedInstanceId out of router state via a REPLACE
+      // navigation — belt-and-braces on top of the `verified` latch: even a
+      // remount of this component (which would re-derive `expectedInstanceId`
+      // fresh from `location.state`) can no longer re-arm the check, since
+      // the state itself no longer carries the field.
+      navigate(location.pathname, { replace: true, state: null });
+    }
+    // health.data is intentionally read fresh each run rather than added as
+    // a dependency object (it's a new reference every fetch) — instance_id
+    // and isFresh are the only fields this effect's decision depends on.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [armed, health.isFresh, health.data?.instance_id, expectedInstanceId, navigate, location.pathname]);
+
+  // round-2 Codex fold: FAIL CLOSED on an ABSENT instance_id while armed —
+  // not just a DIFFERENT one. The process that genuinely accepted the start
+  // always includes instance_id in its /health response (this same commit
+  // guarantees the field on every code path), so an armed check seeing NO
+  // field at all is itself impostor evidence (an older-code process that
+  // predates this feature) — never a benign "field not implemented yet" case
+  // to shrug past.
   const instanceMismatch =
-    expectedInstanceId !== null &&
-    health.data?.instance_id !== undefined &&
-    health.data.instance_id !== expectedInstanceId;
+    armed && health.isFresh && health.data?.instance_id !== expectedInstanceId;
 
   // Persistent idle fallback (#523): the roast history, newest-first
   // (`GET /api/roasts` — store.py orders `started_at_utc DESC`). #523 Codex
@@ -379,16 +430,21 @@ export function LivePage(): React.JSX.Element {
     );
   }
 
-  // #516 impostor-process defence: the fresh health read reports a
-  // DIFFERENT instance_id than the one StartRoastView observed on the 201
-  // that led here — a different server process answered than the one that
-  // just accepted the start (the #513 port-impostor signature). This takes
-  // PRECEDENCE over the active-run branch below: if the process itself is
-  // wrong, its active_run_id (even if non-null) cannot be trusted either.
-  // Renders the SAME LiveStatusUnknownView component as the generic
-  // health-error case, with a distinct message — no new page state, per
-  // design (the status-unknown surface already exists for "can't trust what
-  // health just told us").
+  // #516 impostor-process defence: while ARMED (an expectedInstanceId is
+  // present and not yet verified), the fresh health read reports a
+  // DIFFERENT instance_id — or NO instance_id at all (round-2 fold: fail
+  // CLOSED, not just on a different value) — than the one StartRoastView
+  // observed on the 201 that led here. A different/absent server process
+  // answered than the one that just accepted the start (the #513
+  // port-impostor signature). This takes PRECEDENCE over the active-run
+  // branch below: if the process itself is wrong, its active_run_id (even
+  // if non-null) cannot be trusted either. Renders the SAME
+  // LiveStatusUnknownView component as the generic health-error case, with
+  // a distinct message — no new page state, per design (the status-unknown
+  // surface already exists for "can't trust what health just told us").
+  // Once `verified` latches true (see the module doc's ONE-SHOT DISARM
+  // note), `armed` is permanently false and this branch is never reached
+  // again for this history entry, however health subsequently changes.
   if (instanceMismatch) {
     return <LiveStatusUnknownView variant="instance-mismatch" />;
   }
