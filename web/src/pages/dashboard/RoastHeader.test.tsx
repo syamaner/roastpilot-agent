@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { RoastHeader } from "./RoastHeader";
@@ -225,6 +225,9 @@ describe("RoastHeader", () => {
           dropped_window_count: 0,
           processed_window_count: 0,
           reason: null,
+          overflow_count_last_minute: 0,
+          estimated_lost_audio_ms_last_minute: 0,
+          total_overflow_count: 0,
         }}
       />,
     );
@@ -243,6 +246,49 @@ describe("RoastHeader", () => {
     const drawer = screen.getByTestId("diagnostics-drawer");
     expect(drawer).toHaveTextContent("development");
     expect(drawer).toHaveTextContent("running");
+  });
+
+  it("#539: the diagnostics drawer shows the audio pipeline counters (plan §7) from the server mic_status, including the MCP 0.1.13 overflow diagnostics", () => {
+    render(
+      <RoastHeader
+        {...BASE}
+        micStatus={{
+          mic_health: "ok",
+          audio_running: true,
+          fc_status: "pending",
+          queued_window_count: 12,
+          emitted_window_count: 10,
+          dropped_window_count: 1,
+          processed_window_count: 9,
+          reason: null,
+          overflow_count_last_minute: 2,
+          estimated_lost_audio_ms_last_minute: 64.7,
+          total_overflow_count: 5,
+        }}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("diagnostics-toggle"));
+    const drawer = screen.getByTestId("diagnostics-drawer");
+    expect(drawer).toHaveTextContent("Audio pipeline");
+    expect(drawer).toHaveTextContent("12 / 10"); // queued / emitted
+    expect(drawer).toHaveTextContent("9 / 1"); // processed / dropped
+    expect(drawer).toHaveTextContent("Overflows (1 min)");
+    expect(drawer).toHaveTextContent("Lost audio (1 min)");
+    expect(drawer).toHaveTextContent("65 ms");
+    expect(drawer).toHaveTextContent("Overflows (total)");
+    expect(drawer).toHaveTextContent("5");
+  });
+
+  it("#539: the diagnostics drawer's audio pipeline section renders em dashes when mic_status is absent, never hidden", () => {
+    render(<RoastHeader {...BASE} />);
+    fireEvent.click(screen.getByTestId("diagnostics-toggle"));
+    const drawer = screen.getByTestId("diagnostics-drawer");
+    expect(drawer).toHaveTextContent("Audio pipeline");
+    expect(drawer).toHaveTextContent("Overflows (1 min)");
+    // No mic_status at all — every audio-pipeline row reads as an em dash,
+    // never a stale/zeroed number that could misleadingly read as "clean".
+    const rows = within(drawer).getAllByText("—");
+    expect(rows.length).toBeGreaterThanOrEqual(5); // the 5 audio-pipeline rows
   });
 
   it("renders the live ambient 'Room' readout from the server ambient triad (#464)", () => {

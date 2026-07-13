@@ -257,6 +257,13 @@ class MicStatus(BaseModel):
     dropped_window_count: int
     processed_window_count: int
     reason: str | None = None
+    # Overflow diagnostics (MCP 0.1.13, coffee-roaster-mcp#190, #539): capture-
+    # side frame-loss visibility, mirroring `mcp_client.FirstCrackStatus`'s own
+    # trio 1:1. Defaults keep a pre-0.1.13 MCP's payload valid (its
+    # FirstCrackStatus mirror already defaults these to 0/0.0 — see #538).
+    overflow_count_last_minute: int = 0
+    estimated_lost_audio_ms_last_minute: float = 0.0
+    total_overflow_count: int = 0
 
     @classmethod
     def from_first_crack_status(
@@ -269,6 +276,9 @@ class MicStatus(BaseModel):
         dropped_window_count: int,
         processed_window_count: int,
         reason: str | None = None,
+        overflow_count_last_minute: int = 0,
+        estimated_lost_audio_ms_last_minute: float = 0.0,
+        total_overflow_count: int = 0,
     ) -> "MicStatus":
         """Project the MCP first-crack status fields into a :class:`MicStatus`.
 
@@ -285,6 +295,13 @@ class MicStatus(BaseModel):
             dropped_window_count: Windows dropped (backpressure).
             processed_window_count: Windows the detector processed.
             reason: Optional MCP-supplied reason / last-error string.
+            overflow_count_last_minute: Capture-buffer overflow events in the
+                trailing minute (MCP 0.1.13, #539). Defaults to 0 for a
+                pre-0.1.13 MCP.
+            estimated_lost_audio_ms_last_minute: Estimated lost audio in the
+                trailing minute, in milliseconds (MCP 0.1.13, #539).
+            total_overflow_count: Cumulative overflow events for the whole
+                capture session (MCP 0.1.13, #539).
 
         Returns:
             The projected capture-alive status with its derived health.
@@ -304,6 +321,9 @@ class MicStatus(BaseModel):
             dropped_window_count=dropped_window_count,
             processed_window_count=processed_window_count,
             reason=reason,
+            overflow_count_last_minute=overflow_count_last_minute,
+            estimated_lost_audio_ms_last_minute=estimated_lost_audio_ms_last_minute,
+            total_overflow_count=total_overflow_count,
         )
 
 

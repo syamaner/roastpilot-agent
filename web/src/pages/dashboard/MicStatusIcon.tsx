@@ -95,6 +95,25 @@ export function MicStatusIcon({ micStatus }: MicStatusIconProps): React.JSX.Elem
             <TooltipRow label="Emitted" value={String(micStatus.emitted_window_count)} />
             <TooltipRow label="Processed" value={String(micStatus.processed_window_count)} />
             <TooltipRow label="Dropped" value={String(micStatus.dropped_window_count)} />
+            {/* #539: MCP 0.1.13 overflow diagnostics (coffee-roaster-mcp#190)
+                — a capture-buffer overflow means lost audio frames, the #190
+                failure mode this story exists to make operator-visible. Only
+                shown when there's something to report (a fresh/pre-0.1.13
+                session has all-zero counters, which would otherwise clutter
+                the tooltip with rows that never carry information). */}
+            {micStatus.total_overflow_count > 0 && (
+              <>
+                <TooltipRow
+                  label="Overflows (1 min)"
+                  value={String(micStatus.overflow_count_last_minute)}
+                />
+                <TooltipRow
+                  label="Lost audio (1 min)"
+                  value={`${micStatus.estimated_lost_audio_ms_last_minute.toFixed(0)} ms`}
+                />
+                <TooltipRow label="Overflows (total)" value={String(micStatus.total_overflow_count)} />
+              </>
+            )}
             {micStatus.reason != null && micStatus.reason !== "" && (
               <div className="mt-1 border-t border-border pt-1.5">
                 <span className="text-muted-foreground">{micStatus.reason}</span>

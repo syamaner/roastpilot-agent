@@ -220,6 +220,7 @@ export function RoastHeader({
           mcpChild={mcpChild}
           firstCrack={firstCrack}
           elapsedSeconds={displayedElapsedSeconds}
+          micStatus={micStatus}
         />
       </div>
     </header>
@@ -314,11 +315,21 @@ function DiagnosticsDrawer({
   mcpChild,
   firstCrack,
   elapsedSeconds,
+  micStatus,
 }: {
   phase: RoastPhase | null;
   mcpChild?: MCPChildStatus;
   firstCrack: FirstCrackData | null;
   elapsedSeconds: number | null;
+  /** #539 (plan §7): the audio pipeline counters — including the MCP 0.1.13
+   *  overflow diagnostics — belong in this drawer, per the plan's explicit
+   *  "surface these counters in the dashboard's diagnostics drawer"
+   *  instruction. `MicStatusIcon`'s own hover tooltip already shows the
+   *  window counts + overflow trio too (#539) — this is a second,
+   *  always-reachable-via-click surface for the SAME server data, not a
+   *  competing source of truth. `undefined`/`null` → no active session,
+   *  rendered as "—" per row rather than hiding the section outright. */
+  micStatus?: MicStatus | null;
 }): React.JSX.Element {
   const [open, setOpen] = useState(false);
   return (
@@ -346,6 +357,45 @@ function DiagnosticsDrawer({
               value={firstCrack ? `${firstCrack.source} @ ${formatTempC(firstCrack.bean_temp_c ?? null)}` : "not detected"}
             />
           </dl>
+          <div className="mt-2 border-t border-border pt-2">
+            <p className="mb-1.5 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Audio pipeline
+            </p>
+            <dl className="flex flex-col gap-1.5">
+              <DiagRow
+                label="Queued / emitted"
+                value={
+                  micStatus
+                    ? `${micStatus.queued_window_count} / ${micStatus.emitted_window_count}`
+                    : "—"
+                }
+              />
+              <DiagRow
+                label="Processed / dropped"
+                value={
+                  micStatus
+                    ? `${micStatus.processed_window_count} / ${micStatus.dropped_window_count}`
+                    : "—"
+                }
+              />
+              {/* #539: MCP 0.1.13 overflow diagnostics (coffee-roaster-mcp#190)
+                  — a capture-buffer overflow means lost audio frames, the
+                  #190 failure mode this story exists to make operator-visible
+                  during the E11 Pi soak (#194). */}
+              <DiagRow
+                label="Overflows (1 min)"
+                value={micStatus ? String(micStatus.overflow_count_last_minute) : "—"}
+              />
+              <DiagRow
+                label="Lost audio (1 min)"
+                value={micStatus ? `${micStatus.estimated_lost_audio_ms_last_minute.toFixed(0)} ms` : "—"}
+              />
+              <DiagRow
+                label="Overflows (total)"
+                value={micStatus ? String(micStatus.total_overflow_count) : "—"}
+              />
+            </dl>
+          </div>
         </div>
       )}
     </div>

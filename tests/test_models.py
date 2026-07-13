@@ -544,6 +544,40 @@ def test_mic_status_health_mapping(status: str, audio_running: bool, expected: M
     assert (mic.queued_window_count, mic.emitted_window_count) == (1, 2)
 
 
+def test_mic_status_overflow_diagnostics_forwarded_and_default_to_zero() -> None:
+    """#539: from_first_crack_status forwards the MCP 0.1.13 overflow
+    diagnostics trio (coffee-roaster-mcp#190) verbatim when supplied, and
+    defaults to 0/0.0/0 when omitted (a pre-0.1.13 caller)."""
+    mic = MicStatus.from_first_crack_status(
+        status="detected",
+        audio_running=True,
+        queued_window_count=1,
+        emitted_window_count=2,
+        dropped_window_count=0,
+        processed_window_count=2,
+        reason=None,
+        overflow_count_last_minute=5,
+        estimated_lost_audio_ms_last_minute=210.75,
+        total_overflow_count=42,
+    )
+    assert mic.overflow_count_last_minute == 5
+    assert mic.estimated_lost_audio_ms_last_minute == 210.75
+    assert mic.total_overflow_count == 42
+
+    defaulted = MicStatus.from_first_crack_status(
+        status="detected",
+        audio_running=True,
+        queued_window_count=1,
+        emitted_window_count=2,
+        dropped_window_count=0,
+        processed_window_count=2,
+        reason=None,
+    )
+    assert defaulted.overflow_count_last_minute == 0
+    assert defaulted.estimated_lost_audio_ms_last_minute == 0.0
+    assert defaulted.total_overflow_count == 0
+
+
 def test_mic_status_json_round_trip() -> None:
     """MicStatus serializes by enum value and reconstructs (the SSE/REST wire)."""
     mic = MicStatus.from_first_crack_status(

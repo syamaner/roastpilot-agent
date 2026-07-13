@@ -416,8 +416,11 @@ def project_mic_status(status: FirstCrackStatus) -> MicStatus:
 
     A pure, read-only observability projection — no safety logic, no MCP write.
     It forwards only the capture-alive fields the MCP already computes (the Pi
-    performance constraint: no per-window level work, #33) and lets
-    :meth:`MicStatus.from_first_crack_status` derive the health the icon maps to.
+    performance constraint: no per-window level work, #33) — including the
+    overflow diagnostics trio (MCP 0.1.13, coffee-roaster-mcp#190, #539), which
+    were parsed into the ``FirstCrackStatus`` mirror by #538 but dropped here
+    until this fold — and lets :meth:`MicStatus.from_first_crack_status`
+    derive the health the icon maps to.
 
     Args:
         status: The MCP first-crack status from ``RoastSessionState``.
@@ -433,6 +436,9 @@ def project_mic_status(status: FirstCrackStatus) -> MicStatus:
         dropped_window_count=status.dropped_window_count,
         processed_window_count=status.processed_window_count,
         reason=status.reason,
+        overflow_count_last_minute=status.overflow_count_last_minute,
+        estimated_lost_audio_ms_last_minute=status.estimated_lost_audio_ms_last_minute,
+        total_overflow_count=status.total_overflow_count,
     )
 
 

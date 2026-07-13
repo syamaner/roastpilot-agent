@@ -17,6 +17,9 @@ const OK: MicStatus = {
   dropped_window_count: 0,
   processed_window_count: 2,
   reason: null,
+  overflow_count_last_minute: 0,
+  estimated_lost_audio_ms_last_minute: 0,
+  total_overflow_count: 0,
 };
 
 describe("MicStatusIcon", () => {
@@ -78,6 +81,9 @@ describe("MicStatusIcon", () => {
           dropped_window_count: 2,
           processed_window_count: 4,
           reason: "audio device not found",
+          overflow_count_last_minute: 0,
+          estimated_lost_audio_ms_last_minute: 0,
+          total_overflow_count: 0,
         }}
       />,
     );
@@ -90,6 +96,33 @@ describe("MicStatusIcon", () => {
     expect(tooltip.getByText("4")).toBeInTheDocument(); // processed
     expect(tooltip.getByText("2")).toBeInTheDocument(); // dropped
     expect(tooltip.getByText(/audio device not found/i)).toBeInTheDocument();
+  });
+
+  it("#539: omits the overflow rows when total_overflow_count is 0 (a fresh/pre-0.1.13 session)", () => {
+    render(<MicStatusIcon micStatus={OK} />);
+    const tooltip = within(screen.getByTestId("mic-status-tooltip"));
+    expect(tooltip.queryByText(/overflow/i)).toBeNull();
+    expect(tooltip.queryByText(/lost audio/i)).toBeNull();
+  });
+
+  it("#539: shows the overflow diagnostics (MCP 0.1.13, coffee-roaster-mcp#190) when total_overflow_count > 0", () => {
+    render(
+      <MicStatusIcon
+        micStatus={{
+          ...OK,
+          overflow_count_last_minute: 6,
+          estimated_lost_audio_ms_last_minute: 128.4,
+          total_overflow_count: 11,
+        }}
+      />,
+    );
+    const tooltip = within(screen.getByTestId("mic-status-tooltip"));
+    expect(tooltip.getByText(/overflows \(1 min\)/i)).toBeInTheDocument();
+    expect(tooltip.getByText("6")).toBeInTheDocument();
+    expect(tooltip.getByText(/lost audio \(1 min\)/i)).toBeInTheDocument();
+    expect(tooltip.getByText("128 ms")).toBeInTheDocument();
+    expect(tooltip.getByText(/overflows \(total\)/i)).toBeInTheDocument();
+    expect(tooltip.getByText("11")).toBeInTheDocument();
   });
 
   it("omits the reason row when there is no reason", () => {

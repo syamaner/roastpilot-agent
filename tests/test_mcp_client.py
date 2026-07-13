@@ -1843,6 +1843,41 @@ def test_project_session_state_carries_mic_status() -> None:
     assert telemetry.mic_status.mic_health is MicHealth.OK
 
 
+def test_project_mic_status_forwards_the_overflow_diagnostics_trio() -> None:
+    """#539: project_mic_status forwards the MCP 0.1.13 overflow diagnostics
+    (coffee-roaster-mcp#190) 1:1 — this was the exact gap #538 left (the
+    fields were parsed into the FirstCrackStatus mirror but dropped here)."""
+    state = _state_with_fc(
+        status="detected",
+        audio_running=True,
+        overflow_count_last_minute=4,
+        estimated_lost_audio_ms_last_minute=96.5,
+        total_overflow_count=17,
+    )
+    mic = project_mic_status(state.first_crack_status)
+    assert mic.overflow_count_last_minute == 4
+    assert mic.estimated_lost_audio_ms_last_minute == 96.5
+    assert mic.total_overflow_count == 17
+
+
+def test_project_mic_status_overflow_diagnostics_default_to_zero_pre_0_1_13() -> None:
+    """#539: a pre-0.1.13 MCP payload (all-zero overflow fields, the mirror's
+    own defaults — see test_first_crack_status_overflow_fields_default_for_
+    pre_0113_payloads) projects cleanly through to MicStatus's matching
+    defaults, never a validation failure."""
+    state = _state_with_fc(
+        status="detected",
+        audio_running=True,
+        overflow_count_last_minute=0,
+        estimated_lost_audio_ms_last_minute=0.0,
+        total_overflow_count=0,
+    )
+    mic = project_mic_status(state.first_crack_status)
+    assert mic.overflow_count_last_minute == 0
+    assert mic.estimated_lost_audio_ms_last_minute == 0.0
+    assert mic.total_overflow_count == 0
+
+
 def test_project_live_ambient_ok_status_passes_through_triad() -> None:
     """#464 (D86): an ``"ok"`` ambient status yields the live triad verbatim."""
     state = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
