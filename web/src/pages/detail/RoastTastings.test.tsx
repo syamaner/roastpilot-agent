@@ -165,6 +165,39 @@ describe("RoastTastings", () => {
     expect(screen.getByTestId("tasting-save")).toBeDisabled();
   });
 
+  it("#533: disables every input (not just the save button) while a save is in flight, so a mid-save draft cannot be typed then silently wiped", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+    let resolveSave: (() => void) | undefined;
+    vi.spyOn(api, "addTasting").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveSave = () => resolve({ run_id: "r1", tastings: [] });
+        }),
+    );
+    render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+    await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+    fireEvent.click(screen.getByTestId("tasting-star-3"));
+    fireEvent.click(screen.getByTestId("tasting-save"));
+
+    // The save is now in flight (stalled) — every input must be disabled,
+    // not just the save button, so the operator cannot draft a NEW entry
+    // that this save's onSuccess would then silently wipe.
+    await waitFor(() => expect(screen.getByTestId("tasting-save")).toHaveTextContent(/saving/i));
+    expect(screen.getByTestId("tasting-notes")).toBeDisabled();
+    expect(screen.getByTestId("tasting-tasted-at")).toBeDisabled();
+    expect(screen.getByTestId("tasting-brew-method")).toBeDisabled();
+    expect(screen.getByTestId("tasting-grind-note")).toBeDisabled();
+    expect(screen.getByTestId("tasting-star-4")).toBeDisabled();
+    expect(screen.getByTestId("tasting-attribute-sweetness")).toBeDisabled();
+    expect(screen.getByTestId("tasting-defect-bitter")).toBeDisabled();
+
+    resolveSave?.();
+    await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
+    // Once the save settles, the form (now reset) is editable again.
+    expect(screen.getByTestId("tasting-notes")).not.toBeDisabled();
+  });
+
   it("disables save until a star rating is chosen", async () => {
     vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
     render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
