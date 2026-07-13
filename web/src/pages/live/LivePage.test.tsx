@@ -59,7 +59,7 @@ import {
 // only from a stale cache entry with the genuinely fresh refetch still in
 // flight — see StartRoastView.test.tsx's matching stub for the fuller doc. ---
 const healthState: {
-  data: { active_run_id: string | null } | undefined;
+  data: { active_run_id: string | null; instance_id?: string } | undefined;
   isSuccess: boolean;
   isError: boolean;
   isFresh: boolean;
@@ -178,11 +178,18 @@ beforeEach(() => {
   traceModelMock.toCurveMarkers.mockReturnValue([]);
 });
 
-function renderPage(initialPath = "/live") {
+function renderPage(
+  initialPath = "/live",
+  // #516: the router navigation state a StartRoastView-originated navigation
+  // carries (`LiveNavigationState`) — undefined models every OTHER way this
+  // page is reached (direct link, reload, back/forward), where there is
+  // simply no "prior start" to compare against.
+  state?: unknown,
+) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const Wrapper = ({ children }: { children: ReactNode }) => (
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={[initialPath]}>
+      <MemoryRouter initialEntries={[{ pathname: initialPath, state }]}>
         <Routes>
           <Route path="/live" element={children} />
           <Route path="/start" element={<div data-testid="start-landing" />} />
@@ -384,6 +391,120 @@ describe("LivePage — no active run, no completed run ever (#523)", () => {
     expect(screen.queryByTestId("live-no-roasts-view")).toBeNull();
     expect(screen.queryByTestId("live-page-loading")).toBeNull();
     expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+});
+
+describe("LivePage — impostor-process defence (#516)", () => {
+  it("shows the DISTINCT instance-mismatch message when the fresh health read's instance_id differs from the one StartRoastView observed on the 201", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+    const view = screen.getByTestId("live-status-unknown");
+    expect(view).toHaveAttribute("data-variant", "instance-mismatch");
+    expect(screen.getByTestId("live-status-unknown-message")).toHaveTextContent(
+      /different server process/i,
+    );
+    // Takes PRECEDENCE over the active-run branch — a wrong process's
+    // active_run_id cannot be trusted either, so the dashboard must NOT render.
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+
+  it("shows the dashboard normally when the instance_id MATCHES", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-a" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+  });
+
+  it("does not gate on instance_id at all when there is no navigation state (a reload, direct link, or back/forward)", () => {
+    // #516 module doc: router state deliberately does NOT survive a reload —
+    // there is no "prior start" to compare against, so the page must fall
+    // back to its plain fresh-health gate with no mismatch to check, even
+    // though `instance_id` itself is present on the health response.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live"); // no state
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+  });
+
+  it("does not gate on instance_id when the navigation state is present but malformed — an unrelated key (defensive narrowing, not a cast)", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { someUnrelatedKey: "server-a" });
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+  });
+
+  it("does not gate on instance_id when expectedInstanceId is present but NOT a string (qa nit — the typeof check must reject this, not just an unrelated key)", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    // expectedInstanceId is typed as `string`, but router state is `unknown`
+    // at runtime — a non-string value (e.g. a stray number) must be rejected
+    // by the `typeof ... === "string"` narrowing, not coerced or compared.
+    renderPage("/live", { expectedInstanceId: 12345 });
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+  });
+
+  it("shows the ORIGINAL generic message (not the mismatch one) for a genuine persistent health error, even with navigation state present", () => {
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    healthState.data = undefined;
+    renderPage("/live", { expectedInstanceId: "server-a" });
+    const view = screen.getByTestId("live-status-unknown");
+    expect(view).toHaveAttribute("data-variant", "health-error");
+    expect(screen.getByTestId("live-status-unknown-message")).toHaveTextContent(
+      /could not reach the agent/i,
+    );
+  });
+
+  it("holds the loading state (does not gate on instance_id) until health is genuinely fresh", () => {
+    healthState.isSuccess = true;
+    healthState.isFresh = false;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+    renderPage("/live", { expectedInstanceId: "server-a" });
+    expect(screen.getByTestId("live-page-loading")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+  });
+
+  it("round-2 Codex fold: FAILS CLOSED when the fresh health read is missing instance_id entirely (not just a different value) while armed", () => {
+    // The process that genuinely accepted the start always includes
+    // instance_id (this same commit guarantees it on every code path), so an
+    // ABSENT field while armed is itself impostor evidence — an older-code
+    // process that predates this feature, not a benign gap to shrug past.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42" }; // no instance_id at all
+    renderPage("/live", { expectedInstanceId: "server-a" });
+    const view = screen.getByTestId("live-status-unknown");
+    expect(view).toHaveAttribute("data-variant", "instance-mismatch");
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
+  });
+
+  it("round-2 Codex fold: ONE-SHOT DISARM — a match at one health read must not be re-armed by a DIFFERENT id at a LATER health read (a legitimate restart)", async () => {
+    // Simulates the scenario Codex flagged: location.state persists for the
+    // whole history entry's lifetime, so without a disarm latch a genuine
+    // later restart (a new process id while an active/recovery run exists)
+    // would false-alarm this check indefinitely, blocking the dashboard
+    // exactly when the operator needs it. Restart handling belongs to the
+    // fresh-health-gate/recovery flow, not this one-shot start-confirmation.
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-42", instance_id: "server-a" };
+    const { rerender } = renderPage("/live", { expectedInstanceId: "server-a" });
+
+    // First read: matches — dashboard renders, and the check disarms.
+    await waitFor(() => expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument());
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+
+    // A LATER health read reports a DIFFERENT instance_id — e.g. a
+    // legitimate agent restart mid-roast. Because the check already
+    // disarmed on the first match, this must NOT be treated as a mismatch.
+    healthState.data = { active_run_id: "run-42", instance_id: "server-c" };
+    rerender();
+
+    expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+    expect(screen.queryByTestId("live-status-unknown")).toBeNull();
   });
 });
 

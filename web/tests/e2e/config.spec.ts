@@ -145,6 +145,7 @@ const DEVICES_SNAPSHOT: DevicesSnapshot = {
 const IDLE_HEALTH: HealthResponse = {
   status: "ok",
   version: "e2e-fixture",
+  instance_id: "e2e-fixture-instance",
   mcp_child: "running",
   active_run_id: null,
 };

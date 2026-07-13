@@ -202,6 +202,62 @@ async def test_health_works_without_a_service() -> None:
 
 
 @pytest.mark.asyncio
+async def test_health_instance_id_is_present_and_stable_across_requests(
+    client: AsyncClient,
+) -> None:
+    """#516: instance_id is a non-empty string, and the SAME process answers
+    identically across repeated polls (minted once at construction, not
+    re-minted per request — a normal poll must never look like a process
+    change)."""
+    first = (await client.get("/api/health")).json()
+    second = (await client.get("/api/health")).json()
+    assert isinstance(first["instance_id"], str)
+    assert first["instance_id"] != ""
+    assert first["instance_id"] == second["instance_id"]
+
+
+@pytest.mark.asyncio
+async def test_health_instance_id_differs_across_two_service_instances(
+    store: RoastStore,
+) -> None:
+    """#516: two RoastService instances (the shape of two racing processes —
+    or an impostor bound to the same port, #513) mint DIFFERENT instance
+    ids — the whole basis of the confirm-loop's mismatch detection."""
+    service_a = RoastService(store)
+    service_b = RoastService(store)
+    assert service_a.instance_id != service_b.instance_id
+
+
+@pytest.mark.asyncio
+async def test_health_instance_id_present_without_a_service() -> None:
+    """#516: the scaffold-fallback health handler (no RoastService configured)
+    still reports a non-empty instance_id — the field is never absent,
+    matching the issue's explicit "keep the scaffold-fallback handler
+    consistent" requirement."""
+    app = create_app()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as bare:
+        response = await bare.get("/api/health")
+    body = response.json()
+    assert isinstance(body["instance_id"], str)
+    assert body["instance_id"] != ""
+
+
+@pytest.mark.asyncio
+async def test_health_instance_id_stable_across_requests_without_a_service() -> None:
+    """#516: the scaffold-fallback instance_id is minted ONCE at module
+    import, not per request — two bare-app requests (even across separate
+    ASGITransport instances, since it's a module-level constant) see the
+    identical id."""
+    app = create_app()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as bare:
+        first = (await bare.get("/api/health")).json()
+        second = (await bare.get("/api/health")).json()
+    assert first["instance_id"] == second["instance_id"]
+
+
+@pytest.mark.asyncio
 async def test_store_backed_route_503_without_service() -> None:
     app = create_app()
     transport = ASGITransport(app=app)
@@ -223,6 +279,36 @@ async def test_start_roast_creates_an_active_run(client: AsyncClient) -> None:
     run_id = body["id"]
     health = await client.get("/api/health")
     assert health.json()["active_run_id"] == run_id
+
+
+@pytest.mark.asyncio
+async def test_start_roast_response_carries_this_process_instance_id(
+    client: AsyncClient,
+) -> None:
+    """#516: the 201 response's instance_id is the confirm-loop's capture
+    point — it must equal THIS process's own health instance_id, the value a
+    subsequent fresh health read on arrival at /live is compared against."""
+    started = await client.post("/api/roasts", json=_profile().model_dump())
+    assert started.status_code == 201
+    health = await client.get("/api/health")
+    assert started.json()["instance_id"] == health.json()["instance_id"]
+    assert started.json()["instance_id"] != ""
+
+
+@pytest.mark.asyncio
+async def test_get_roast_detail_does_not_carry_instance_id(
+    client: AsyncClient,
+) -> None:
+    """#516: instance_id is scoped to the start-roast confirm point (the 201
+    response), not a general RoastDetail field — GET /api/roasts/{id} (a
+    historical/general read) leaves it null, so the field's presence
+    specifically signals "this is the response to a start you just issued",
+    not "this server is currently live"."""
+    started = await client.post("/api/roasts", json=_profile().model_dump())
+    run_id = started.json()["id"]
+    detail = await client.get(f"/api/roasts/{run_id}")
+    assert detail.status_code == 200
+    assert detail.json()["instance_id"] is None
 
 
 @pytest.mark.asyncio

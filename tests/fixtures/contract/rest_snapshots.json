@@ -14,6 +14,7 @@
     "export_manifest": null,
     "fault_reason": null,
     "id": "00000000000000000000000000000000",
+    "instance_id": null,
     "mic_status": {
       "audio_running": true,
       "dropped_window_count": 0,

@@ -25,6 +25,7 @@ import { NavBar } from "./NavBar";
 const IDLE_HEALTH: HealthResponse = {
   status: "ok",
   version: "harness",
+  instance_id: "harness-instance",
   mcp_child: "running",
   active_run_id: null,
 };

@@ -805,10 +805,25 @@ class HealthResponse(BaseModel):
     ``advisor`` carries the most recent advisor reachability probe (issue
     #168) so the dashboard can render an ADVISOR-OFFLINE state; it is ``None``
     when no probe has run (e.g. the E7 API-only contract path).
+
+    ``instance_id`` is a ``uuid4`` minted ONCE per server process (#516,
+    follow-up to the #513 port-impostor incident — docs/recent-fixes.md, 12
+    Jul) — never persisted, never derived from anything durable. A second
+    process wildcard-bound to the same port (SO_REUSEADDR) answers with a
+    DIFFERENT ``instance_id`` even though every other field can look
+    identical (same version, ``active_run_id: null``). The UI cannot see
+    which process answered a socket, but it CAN notice this identity change:
+    the start-roast confirm path compares the id observed with the 201
+    against a subsequent fresh health read and surfaces "answers are coming
+    from a different server process" distinctly from a generic failure.
+    Passive health consumers (nav chip, dashboard) must NOT compare it —
+    only the confirm-loop's cross-request check does, otherwise a normal
+    server restart would false-alarm every passive consumer.
     """
 
     status: Literal["ok"] = "ok"
     version: str
+    instance_id: str
     mcp_child: MCPChildStatus
     active_run_id: str | None = None
     advisor: AdvisorHealth | None = None
@@ -1004,6 +1019,17 @@ class RoastDetail(BaseModel):
     ambient_pressure_hpa: float | None = None
     """Ambient barometric pressure in hectopascals at charge (#342, D85), or
     ``None`` — same capture/back-compat rules as :attr:`ambient_temp_c`."""
+    instance_id: str | None = None
+    """The server process's ``instance_id`` (#516) at the moment this
+    ``RoastDetail`` was served — mirrors ``HealthResponse.instance_id``, NOT
+    persisted with the run (a live, process-scoped value, populated by
+    :meth:`RoastService`'s response construction, not a store read). The
+    start-roast confirm path captures this from the ``201`` response and
+    compares it against a subsequent fresh ``/api/health`` read on arrival at
+    ``/live`` — a mismatch means a DIFFERENT server process answered than the
+    one that accepted the start, the #513 port-impostor signature. ``None``
+    is a legitimate value (e.g. a pre-#516 fixture) and must never itself be
+    treated as a mismatch."""
 
 
 class TelemetryPoint(BaseModel):
