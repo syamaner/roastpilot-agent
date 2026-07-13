@@ -1,15 +1,15 @@
 {
   "event": {
     "kind": "cooling_started",
-    "monotonic_seconds": 0.10131850000470877,
+    "monotonic_seconds": 0.09698616596870124,
     "payload": {
       "cooling_on": true,
       "fan_level_percent": 100,
       "heat_level_percent": 0
     },
-    "recorded_at_utc": "2026-07-07T12:47:52.245442+00:00"
+    "recorded_at_utc": "2026-07-13T01:47:44.810559+00:00"
   },
   "event_count": 4,
   "phase": "cooling",
-  "session_id": "70b1961904854371b791292b1f8e452d"
+  "session_id": "98bab46622814d04ae6a2e732b5792ee"
 }

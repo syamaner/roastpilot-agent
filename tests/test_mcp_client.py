@@ -111,6 +111,12 @@ SESSION_STATE_PAYLOAD: dict[str, object] = {
         "emitted_window_count": 311,
         "dropped_window_count": 0,
         "processed_window_count": 311,
+        # coffee-roaster-mcp#190 (0.1.13): overflow diagnostics. The 7 Jun
+        # fixture predates them; added so the payload exercises the current
+        # mirror shape (same convention as the ambient_status block below).
+        "overflow_count_last_minute": 0,
+        "estimated_lost_audio_ms_last_minute": 0.0,
+        "total_overflow_count": 3,
     },
     # #342 (D85): the 0.1.12 ambient triad. The 7 Jun 2026 fixture predates
     # ambient (0.1.11-era export); this key is added so the fixture validates
@@ -2033,3 +2039,45 @@ async def test_adapter_recording_metadata_failure_never_blocks_roast() -> None:
     await adapter.start_session(recording_origin="colombia-huila", recording_roast_num=5)
     # The metadata attempt failed but the session still opened.
     assert calls == ["set_recording_metadata", "start_roast_session"]
+
+
+def test_first_crack_status_overflow_fields_default_for_pre_0113_payloads() -> None:
+    """A pre-0.1.13 fc_status payload (no overflow keys) still validates.
+
+    MCP 0.1.13 added the #190 overflow diagnostics; older captures and any
+    not-yet-upgraded server omit them, so the mirror must default rather
+    than reject (the same additive-fields contract the ambient triad used).
+    """
+    from roastpilot_agent.mcp_client import FirstCrackStatus
+
+    legacy = {
+        "mode": "audio",
+        "status": "pending",
+        "detected_at_utc": None,
+        "detected_monotonic_seconds": None,
+        "allow_manual_override": True,
+    }
+    status = FirstCrackStatus.model_validate(legacy)
+    assert status.overflow_count_last_minute == 0
+    assert status.estimated_lost_audio_ms_last_minute == 0.0
+    assert status.total_overflow_count == 0
+
+
+def test_first_crack_status_overflow_fields_round_trip() -> None:
+    """0.1.13 overflow values survive mirror validation verbatim."""
+    from roastpilot_agent.mcp_client import FirstCrackStatus
+
+    payload = {
+        "mode": "audio",
+        "status": "pending",
+        "detected_at_utc": None,
+        "detected_monotonic_seconds": None,
+        "allow_manual_override": True,
+        "overflow_count_last_minute": 4,
+        "estimated_lost_audio_ms_last_minute": 812.5,
+        "total_overflow_count": 19,
+    }
+    status = FirstCrackStatus.model_validate(payload)
+    assert status.overflow_count_last_minute == 4
+    assert status.estimated_lost_audio_ms_last_minute == 812.5
+    assert status.total_overflow_count == 19

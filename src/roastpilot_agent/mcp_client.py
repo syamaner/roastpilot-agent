@@ -154,6 +154,11 @@ class FirstCrackStatus(MCPMirror):
     emitted_window_count: int = 0
     dropped_window_count: int = 0
     processed_window_count: int = 0
+    # Overflow diagnostics (MCP 0.1.13, coffee-roaster-mcp#190): capture-side
+    # frame-loss visibility. Defaults keep pre-0.1.13 payloads valid.
+    overflow_count_last_minute: int = 0
+    estimated_lost_audio_ms_last_minute: float = 0.0
+    total_overflow_count: int = 0
 
 
 class T0Status(MCPMirror):

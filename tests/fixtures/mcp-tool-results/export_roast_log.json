@@ -1,9 +1,9 @@
 {
-  "csv_path": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpagyg2obs/logs/roasts/70b1961904854371b791292b1f8e452d/roast.csv",
-  "jsonl_path": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpagyg2obs/logs/roasts/70b1961904854371b791292b1f8e452d/roast.jsonl",
-  "log_dir": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpagyg2obs/logs/roasts/70b1961904854371b791292b1f8e452d",
+  "csv_path": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpake8es_3/logs/roasts/98bab46622814d04ae6a2e732b5792ee/roast.csv",
+  "jsonl_path": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpake8es_3/logs/roasts/98bab46622814d04ae6a2e732b5792ee/roast.jsonl",
+  "log_dir": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpake8es_3/logs/roasts/98bab46622814d04ae6a2e732b5792ee",
   "note": "Snapshot CSV and summary export written from the current in-process session. JSONL is append-only during the roast.",
   "ready": true,
-  "session_id": "70b1961904854371b791292b1f8e452d",
-  "summary_path": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpagyg2obs/logs/roasts/70b1961904854371b791292b1f8e452d/summary.json"
+  "session_id": "98bab46622814d04ae6a2e732b5792ee",
+  "summary_path": "/private/var/folders/1b/g1kk3f852c9_5srvd67j_r9w0000gn/T/tmpake8es_3/logs/roasts/98bab46622814d04ae6a2e732b5792ee/summary.json"
 }

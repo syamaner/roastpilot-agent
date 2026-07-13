@@ -21,7 +21,7 @@
   "package_name": "coffee-roaster-mcp",
   "product_name": "RoastPilot",
   "roaster_driver": "mock",
-  "started_at_utc": "2026-07-07T12:47:52.123971+00:00",
+  "started_at_utc": "2026-07-13T01:47:44.692876+00:00",
   "transport": "stdio",
-  "version": "0.1.12"
+  "version": "0.1.13"
 }
