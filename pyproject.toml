@@ -151,7 +151,7 @@ dev = [
   # heavy ML/audio deps
   # (transformers/onnxruntime/sounddevice) that mock mode never activates;
   # CI installs libportaudio2 for sounddevice's import.
-  "coffee-roaster-mcp==0.1.12",
+  "coffee-roaster-mcp==0.1.13",
   # Analysis-harness numeric core (scripts/curve_feature_eval.py, #229). numpy
   # is already present transitively (via the MCP server's ML stack), but the
   # curve-feature analysis imports it directly, so declare it explicitly here:

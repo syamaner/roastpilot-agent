@@ -480,3 +480,44 @@ Format: one entry per anti-pattern.
 - **Guarded by:** the hard guard in `scripts/roast-live.sh` (aborts with the
   offending pid list). No test — shell-launcher behaviour; validated manually
   12 Jul (clean single-listener launch, roast 13 completed).
+
+## The gate you ran is not the gate CI runs unless you invoke the project's exact commands
+*(learned twice in one batch, 12 Jul 2026 — #532's tsc miss + #522's venv miss)*
+
+- **Signature:** any gate claim based on a bare tool invocation — `npx tsc --noEmit`
+  (CI runs `npm run typecheck` = `tsc -b --noEmit`, project-reference mode, which
+  catches arity/type errors the bare form misses — reproduced byte-for-byte);
+  plain `python`/`pip` in a worktree (shell-aliased to the global interpreter on
+  this machine, so `pip install -e .` silently lands in global site-packages and
+  pyright resolves the wrong deps — ~20k phantom errors).
+- **Wrong:** "typecheck clean" / "pytest green" from ad-hoc invocations.
+- **Right:** the npm scripts (`npm run typecheck/lint/test/build`) and
+  `.venv/bin/python -m ...` explicitly, verified via `sys.prefix` when in doubt.
+- **Guarded by:** convention only — CI is the backstop, but pre-open claims must
+  use the real commands.
+
+## A bare test QueryClient silently defeats every staleness test
+*(found by #532's fold verification, 12 Jul 2026)*
+
+- **Signature:** `new QueryClient(...)` in a test file whose assertions involve
+  staleTime/freshness/refetch behaviour, without mirroring the app's
+  `queryClient.ts` defaults.
+- **Wrong:** the library default `staleTime: 0` makes every seeded cache entry
+  look stale, so a "stale cache renders wrongly" test passes with or without
+  the fix — vacuous.
+- **Right:** construct test clients with the app's actual cache defaults (or
+  import the shared config); mutation-verify freshness tests against the exact
+  refactor they claim to guard.
+- **Guarded by:** the #532 integration suite does this; new freshness tests must.
+
+## Safety-commit BEFORE any destructive verification step, mutation testing included
+*(the 12 Jul near-miss — a repeat of the 9 Jul reviewer incident, self-inflicted)*
+
+- **Signature:** `git checkout --` used to "restore after" a temporary mutation,
+  scripted edit, or fail-then-pass check on UNCOMMITTED work.
+- **Wrong:** `git checkout -- <file>` restores to the last COMMIT — if the work
+  under test is uncommitted, the restore destroys it (lost a full fold pass).
+- **Right:** commit first (local, no push), or back up to a scratch copy and
+  restore from THAT. The safety-commit protocol applies to every destructive
+  step, not just review handoffs and branch switches.
+- **Guarded by:** protocol; the commit-before-verify habit.
