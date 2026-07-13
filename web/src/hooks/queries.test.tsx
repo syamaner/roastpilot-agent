@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/lib/api";
+import { FIXTURE_DETAIL } from "@/pages/detail/fixture";
 import {
   roastKeys,
   useAddTasting,
@@ -22,7 +23,32 @@ function wrapper(client?: QueryClient) {
   );
 }
 
-afterEach(() => vi.restoreAllMocks());
+// #533 Codex follow-up (PR #543): mirrors the APP's real QueryClient defaults
+// (web/src/lib/queryClient.ts — refetchOnWindowFocus: false, staleTime:
+// 30_000), not the bare `{ retry: false }` client `wrapper()` above uses for
+// every other test in this file. A bare client is the "staleness vacuity
+// trap" this repo's recent-fixes has burned on before: it would let a
+// refetchInterval assertion pass by coincidence (TanStack's default
+// staleTime is 0, so a bare client refetches far more eagerly than the real
+// app ever would) without proving anything about production behaviour.
+function appDefaultsWrapper() {
+  const client = new QueryClient({
+    defaultOptions: {
+      queries: { refetchOnWindowFocus: false, retry: false, staleTime: 30_000 },
+    },
+  });
+  return {
+    Wrapper: ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+    client,
+  };
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  vi.useRealTimers();
+});
 
 describe("useRoast (skipToken when runId is null)", () => {
   it("does not fetch when runId is null", () => {
@@ -39,6 +65,70 @@ describe("useRoast (skipToken when runId is null)", () => {
       .mockResolvedValue({ id: "r1" } as Awaited<ReturnType<typeof api.roast>>);
     renderHook(() => useRoast("r1"), { wrapper: wrapper() });
     await waitFor(() => expect(spy).toHaveBeenCalledWith("r1"));
+  });
+});
+
+describe("useRoast polling while the run is LIVE (#533 Codex follow-up, PR #543)", () => {
+  // Without this, DetailView's completed-run-only widget gate
+  // (completed_at_utc !== null) never refreshes on its own — no interval on
+  // this hook, refetchOnWindowFocus off, no SSE invalidation of roast-detail
+  // queries — so an operator watching a live run's detail page would see it
+  // finish and stay locked out of RoastRating/RoastedWeight/ChargeWeight/
+  // RoastTastings until an unrelated remount.
+  it("polls every 5s while completed_at_utc is null (the run is still live)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const liveDetail = { ...FIXTURE_DETAIL, completed_at_utc: null };
+    const spy = vi.spyOn(api, "roast").mockResolvedValue(liveDetail);
+    const { Wrapper } = appDefaultsWrapper();
+
+    renderHook(() => useRoast(liveDetail.id), { wrapper: Wrapper });
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(2));
+
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(3));
+  });
+
+  it("does NOT poll when completed_at_utc is already set (the completed-run common case)", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const spy = vi.spyOn(api, "roast").mockResolvedValue(FIXTURE_DETAIL); // completed_at_utc set
+    const { Wrapper } = appDefaultsWrapper();
+
+    renderHook(() => useRoast(FIXTURE_DETAIL.id), { wrapper: Wrapper });
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(1));
+
+    // Advance well past several would-be interval ticks — no further fetch.
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops polling once a refetch reports the run has completed — the gate-flip case", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const liveDetail = { ...FIXTURE_DETAIL, completed_at_utc: null };
+    const completedDetail = { ...FIXTURE_DETAIL, completed_at_utc: "2026-07-13T23:00:00Z" };
+    const spy = vi
+      .spyOn(api, "roast")
+      .mockResolvedValueOnce(liveDetail)
+      .mockResolvedValueOnce(completedDetail);
+    const { Wrapper } = appDefaultsWrapper();
+
+    const { result } = renderHook(() => useRoast(liveDetail.id), { wrapper: Wrapper });
+    await vi.waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data?.completed_at_utc).toBeNull();
+
+    // The 5s poll fires and the SECOND mocked response reports completion —
+    // this IS the gate-flip #543's fix restores: DetailView's completed-run-
+    // only widgets become visible within one interval tick of the run ending.
+    await vi.advanceTimersByTimeAsync(5000);
+    await vi.waitFor(() => expect(spy).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(result.current.data?.completed_at_utc).not.toBeNull());
+
+    // No further polling once completed — advancing well past another
+    // interval must not trigger a third fetch.
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(spy).toHaveBeenCalledTimes(2);
   });
 });
 

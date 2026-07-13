@@ -1,8 +1,12 @@
 /**
  * TanStack Query hooks for the REST surface (api.py).
  *
- * Snapshots and post-roast reads only — live telemetry/phase flow over SSE
- * (`useRoastStream`), not polling. Pages consume these read-only.
+ * Snapshots and post-roast reads — live telemetry/phase flow over SSE
+ * (`useRoastStream`), never polling, for every hook here EXCEPT `useRoast`
+ * (#533 Codex follow-up): it self-polls at a slow 5s cadence, but ONLY while
+ * the fetched run is still live, specifically so a passive REST snapshot
+ * consumer (DetailView) has a freshness path for its own gate logic without
+ * needing an SSE subscription of its own. Pages consume these read-only.
  */
 
 import { useRef } from "react";
@@ -135,10 +139,29 @@ export function useFreshHistoryGate() {
 // `skipToken` as the queryFn disables the query when there is no run id — the
 // idiomatic TanStack form. It also narrows `runId` to a non-null string inside
 // the fn (no `as string` cast) and avoids registering a dangling empty-key entry.
+//
+// #533 Codex follow-up (PR #543): polls every 5s while the run is LIVE
+// (`completed_at_utc === null`), stops once it completes. Without this,
+// DetailView's completed-run-only widget gate (RoastRating / RoastedWeight /
+// ChargeWeight / RoastTastings — #533) reads a `completed_at_utc` that never
+// refreshes on its own: this hook has no interval, the app QueryClient sets
+// `refetchOnWindowFocus: false` + `staleTime: 30_000`, and no SSE event
+// invalidates a roast-detail query. An operator who opens /roasts/:id while
+// the roast is still live would watch it finish and stay locked out of the
+// four widgets until an unrelated remount — turning the PRE-fix 409-on-save
+// hazard into a POST-completion dead end, an instance of the batch's
+// "a server-state source rendered authoritatively needs a freshness path"
+// class. The TanStack v5 callback form reads the CURRENT cached data (not a
+// stale closure), so the interval self-cancels the tick immediately after a
+// refetch reports completion — zero ongoing cost on the overwhelmingly common
+// completed-run case (history/detail browsing), the only cost is on an
+// actively-open live detail view, which is rare and short-lived by nature.
 export function useRoast(runId: string | null) {
   return useQuery({
     queryKey: roastKeys.detail(runId ?? ""),
     queryFn: runId === null ? skipToken : () => api.roast(runId),
+    refetchInterval: (query) =>
+      query.state.data !== undefined && query.state.data.completed_at_utc === null ? 5000 : false,
   });
 }
 
