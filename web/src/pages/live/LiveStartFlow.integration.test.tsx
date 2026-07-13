@@ -43,6 +43,11 @@ function fakeFetch(opts: {
   onPost: () => Response | Promise<Response>;
   healthStatus?: () => number;
   history?: () => { runs: unknown[] };
+  // #516: the instance_id THIS fake process's /api/health reports — defaults
+  // to a fixed id so every pre-#516 test in this file keeps its POST's
+  // (implicit, real-server-shaped) instance_id matching health's, unless a
+  // test deliberately overrides it to simulate an impostor process.
+  instanceId?: () => string;
 }): typeof fetch {
   return vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url);
@@ -55,6 +60,7 @@ function fakeFetch(opts: {
         JSON.stringify({
           status: "ok",
           version: "test",
+          instance_id: opts.instanceId?.() ?? "server-a",
           mcp_child: "running",
           active_run_id: opts.activeRunId(),
         }),
@@ -132,6 +138,41 @@ describe("#523 real-integration — /start start flow, real handoff to /live", (
     // reaches the real dashboard.
     await waitFor(() => expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument());
     expect(screen.queryByTestId("start-roast-view")).toBeNull();
+  });
+
+  it("#516: a 201 followed by a DIFFERENT process answering /api/health surfaces the distinct instance-mismatch state, real fetch boundary end-to-end", async () => {
+    // Simulates the #513 port-impostor incident through the real /start → POST
+    // → navigate("/live") → real useFreshHealthGate() chain, not a stubbed
+    // hook: the 201 response reports "server-a" (this fake process's own
+    // instance_id), but by the time /live's forced-fresh health read lands, a
+    // DIFFERENT process ("server-b") answers instead — the exact SO_REUSEADDR
+    // scenario docs/recent-fixes.md describes.
+    let activeRunId: string | null = null;
+    global.fetch = fakeFetch({
+      activeRunId: () => activeRunId,
+      instanceId: () => "server-b",
+      onPost: () => {
+        activeRunId = "run-new";
+        return new Response(
+          JSON.stringify({ id: "run-new", instance_id: "server-a" }),
+          { status: 201 },
+        );
+      },
+    });
+
+    renderStart();
+    await waitFor(() => expect(screen.getByTestId("start-roast-view")).toBeInTheDocument());
+    fillMinimum();
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+
+    await waitFor(() => expect(screen.getByTestId("live-status-unknown")).toBeInTheDocument());
+    expect(screen.getByTestId("live-status-unknown")).toHaveAttribute(
+      "data-variant",
+      "instance-mismatch",
+    );
+    // Never the real dashboard — a wrong process's active_run_id (even
+    // though this fake DOES report one) must not be trusted.
+    expect(screen.queryByTestId("dashboard-stub")).toBeNull();
   });
 
   it("a 409 (double-submit / already active) leaves the form visible, usable, and un-reset", async () => {

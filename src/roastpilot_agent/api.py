@@ -126,6 +126,14 @@ HEALTH_PATH = "/api/health"
 TELEMETRY_PATH = "/api/roasts/{run_id}/telemetry"
 EVENTS_PATH = "/api/roasts/{run_id}/events"
 
+#: The scaffold-fallback ``instance_id`` (#516) — minted once at MODULE IMPORT
+#: (which happens once per process, the same "once per process" guarantee
+#: ``RoastService.instance_id`` gets from its ``__init__``), for the no-service
+#: scaffold app path in :func:`health` below. A per-request mint here would
+#: defeat the whole point: every scaffold-mode health poll would report a
+#: DIFFERENT instance id, making every health read look like a process change.
+_SCAFFOLD_INSTANCE_ID = uuid.uuid4().hex
+
 #: The default access-log quiet-path set (issue #267): the SSE stream, the
 #: per-tick telemetry series, and the health poll — the three paths that flood
 #: the console during a live roast. Sourced from the route constants above so it
@@ -1331,6 +1339,10 @@ class RoastService:
         self._raw_state = raw_state
         self._run_loop = run_loop
         self._clock = clock
+        #: Minted ONCE per process, at construction (#516) — never persisted,
+        #: never re-minted. See ``HealthResponse.instance_id``'s docstring for
+        #: the full port-impostor-defence rationale (#513 follow-up).
+        self.instance_id = uuid.uuid4().hex
         #: The active run's live loop, attached by :meth:`start_roast` once a
         #: roaster is wired; ``None`` between runs and in API-only mode.
         self.runner: RoastRunner | None = None
@@ -1483,11 +1495,15 @@ class RoastService:
         in-memory ``active_run_id`` pointer — a GET must not have a write
         side-effect, and once E9 wires the controller loop that pointer is the
         loop's to own, not a health poll's. ``advisor`` carries the startup
-        reachability probe (issue #168) when one has run.
+        reachability probe (issue #168) when one has run. ``instance_id`` is
+        this process's ``self.instance_id`` (#516), minted once at
+        construction — see :class:`~roastpilot_agent.models.HealthResponse`'s
+        docstring for the port-impostor-defence rationale.
         """
         active = await self._store.active_run()
         return HealthResponse(
             version=__version__,
+            instance_id=self.instance_id,
             mcp_child=self.mcp_child_status(),
             active_run_id=None if active is None else active.run_id,
             advisor=self._advisor_health,
@@ -1611,7 +1627,11 @@ class RoastService:
         detail = await self._store.read_run(run_id)
         if detail is None:  # pragma: no cover — read immediately after create
             raise RuntimeError(f"read_run returned None for just-created run {run_id}")
-        return detail
+        # #516: stamp THIS process's instance_id on the 201 response — the
+        # start-roast confirm loop's capture point (see HealthResponse's
+        # docstring). A store read carries no process identity; the store
+        # layer must stay unaware of this process-scoped value.
+        return detail.model_copy(update={"instance_id": self.instance_id})
 
     async def _begin_live_run(self, profile: RoastProfile, run_id: str) -> None:
         """Construct and start the live controller loop for a run (E9).
@@ -2357,13 +2377,18 @@ async def health(request: Request) -> HealthResponse:
     """``GET /api/health`` — works with or without a configured service.
 
     Without a service (scaffold app) it still reports liveness and version so
-    the probe never depends on a store being wired.
+    the probe never depends on a store being wired. ``instance_id`` (#516)
+    falls back to the module-level ``_SCAFFOLD_INSTANCE_ID`` — minted once at
+    import, not once per request — so the field is never absent, and the
+    scaffold path gets the identical "one id per process" guarantee the
+    service-backed path gets from ``RoastService.instance_id``.
     """
     service = getattr(request.app.state, "service", None)
     if isinstance(service, RoastService):
         return await service.health()
     return HealthResponse(
         version=__version__,
+        instance_id=_SCAFFOLD_INSTANCE_ID,
         mcp_child=MCPChildStatus.NOT_CONFIGURED,
         active_run_id=None,
     )

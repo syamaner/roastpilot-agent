@@ -393,6 +393,10 @@ export interface RoastDetail {
   ambient_temp_c?: number | null;
   ambient_humidity_pct?: number | null;
   ambient_pressure_hpa?: number | null;
+  // The server process's instance_id (#516) at the moment this RoastDetail
+  // was served. Only ever non-null on the start-roast 201 response — the
+  // confirm loop's capture point (see HealthResponse's field doc).
+  instance_id?: string | null;
 }
 
 export interface TelemetryPoint {
@@ -599,6 +603,12 @@ export type MCPChildStatus = "running" | "stopped" | "not_configured";
 export interface HealthResponse {
   status: "ok";
   version: string;
+  // A uuid4 minted once per server process (#516) — never compare this on a
+  // passive read (nav chip, dashboard); only the start-roast confirm loop
+  // does, to detect a DIFFERENT process answering than the one that
+  // accepted the start (the #513 port-impostor signature). See
+  // HealthResponse's Python docstring for the full rationale.
+  instance_id: string;
   mcp_child: MCPChildStatus;
   active_run_id: string | null;
 }

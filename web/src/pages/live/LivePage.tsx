@@ -43,10 +43,27 @@
  * (`active_run_id`) — never inferred client-side (D8). Phase is not read here;
  * DashboardPage owns phase via SSE + snapshot. Operator actions and MCP access
  * live entirely in DashboardPage.
+ *
+ * IMPOSTOR-PROCESS DEFENCE (#516, follow-up to the #513 port-impostor
+ * incident — docs/recent-fixes.md, 12 Jul): a second process wildcard-bound
+ * to the same port can answer `/health` with a plausible-looking idle body
+ * while the real server is elsewhere. `StartRoastView` captures the
+ * `instance_id` from the 201 response and passes it forward as router
+ * navigation STATE (`LiveNavigationState`, below) — deliberately NOT a query
+ * param or anything persisted, since it only means anything for the ONE
+ * navigation immediately following a start, and correctly disappears on a
+ * reload (a reload has no "prior start" to compare against). If the fresh
+ * health read on arrival here reports a DIFFERENT `instance_id`, that is
+ * surfaced as its own distinct message on `LiveStatusUnknownView` — never
+ * silently ignored, and never conflated with the generic "can't confirm"
+ * case a `health.isError` would produce. Passive health consumers elsewhere
+ * (NavBar, DashboardPage) never read or compare `instance_id` — only this
+ * one-shot comparison does, so a normal server RESTART (which legitimately
+ * changes the instance id) never false-alarms them.
  */
 
 import { useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 
 import { AppFrame, LiveCurve } from "@/components/shared";
@@ -60,6 +77,15 @@ import {
 import { api } from "@/lib/api";
 import { DashboardPage } from "@/pages/dashboard/DashboardPage";
 import { headlineStats, toCurveMarkers, toCurvePoints } from "@/pages/detail/traceModel";
+
+/**
+ * Router navigation state `StartRoastView` hands to `/live` on a successful
+ * start (#516) — see the module doc's "IMPOSTOR-PROCESS DEFENCE" note.
+ */
+export interface LiveNavigationState {
+  /** The `instance_id` observed on the start-roast 201 response. */
+  expectedInstanceId: string;
+}
 
 /**
  * Fetch the terminal RoastDetail snapshot for a just-ended run and return its
@@ -137,6 +163,29 @@ export function LivePage(): React.JSX.Element {
   const health = useFreshHealthGate();
   const activeRunId = health.data?.active_run_id ?? null;
   const queryClient = useQueryClient();
+
+  // #516: the instance_id StartRoastView observed on the 201 response, if
+  // this render is the direct result of a start-roast navigation. `state` is
+  // `unknown` by React Router's own typing — narrowed defensively rather than
+  // cast, since it can be anything (a browser back/forward restore, a direct
+  // link, or absent on a reload) and must never be trusted uncritically.
+  const location = useLocation();
+  const expectedInstanceId =
+    location.state !== null &&
+    typeof location.state === "object" &&
+    "expectedInstanceId" in location.state &&
+    typeof (location.state as LiveNavigationState).expectedInstanceId === "string"
+      ? (location.state as LiveNavigationState).expectedInstanceId
+      : null;
+  // A mismatch is only meaningful once health has produced a genuinely fresh
+  // read (health.data could still be the PRE-fetch cached snapshot from an
+  // in-flight forced refetch) — the `!health.isFresh` hold below already
+  // covers that ordering, so this comparison is safe to compute unconditionally
+  // here and simply won't be consulted until isFresh is true.
+  const instanceMismatch =
+    expectedInstanceId !== null &&
+    health.data?.instance_id !== undefined &&
+    health.data.instance_id !== expectedInstanceId;
 
   // Persistent idle fallback (#523): the roast history, newest-first
   // (`GET /api/roasts` — store.py orders `started_at_utc DESC`). #523 Codex
@@ -330,6 +379,20 @@ export function LivePage(): React.JSX.Element {
     );
   }
 
+  // #516 impostor-process defence: the fresh health read reports a
+  // DIFFERENT instance_id than the one StartRoastView observed on the 201
+  // that led here — a different server process answered than the one that
+  // just accepted the start (the #513 port-impostor signature). This takes
+  // PRECEDENCE over the active-run branch below: if the process itself is
+  // wrong, its active_run_id (even if non-null) cannot be trusted either.
+  // Renders the SAME LiveStatusUnknownView component as the generic
+  // health-error case, with a distinct message — no new page state, per
+  // design (the status-unknown surface already exists for "can't trust what
+  // health just told us").
+  if (instanceMismatch) {
+    return <LiveStatusUnknownView variant="instance-mismatch" />;
+  }
+
   // Active run: the full live dashboard.
   if (activeRunId !== null) {
     return <DashboardPage />;
@@ -455,8 +518,19 @@ export function LivePage(): React.JSX.Element {
  * no path to the dashboard/emergency stop. `useHealth` is refetched on-focus
  * disabled but still observed here, so a manual reload or the browser's own
  * retry is the recovery path; this view offers an explicit reload link too.
+ *
+ * `variant="instance-mismatch"` (#516) reuses this same component — no new
+ * page state — for the impostor-process case: health resolved successfully,
+ * but the fresh read's `instance_id` does not match the one observed on the
+ * start-roast 201. Carries a DISTINCT message from the generic "can't reach
+ * the agent" copy, per the issue's explicit requirement.
  */
-function LiveStatusUnknownView(): React.JSX.Element {
+function LiveStatusUnknownView({
+  variant = "health-error",
+}: {
+  variant?: "health-error" | "instance-mismatch";
+} = {}): React.JSX.Element {
+  const isMismatch = variant === "instance-mismatch";
   return (
     <AppFrame
       headerRight={
@@ -468,13 +542,22 @@ function LiveStatusUnknownView(): React.JSX.Element {
       <div
         className="mx-auto flex max-w-xl flex-col items-center gap-4 rounded-lg border border-roast-fault/50 bg-roast-fault/10 p-8 text-center"
         data-testid="live-status-unknown"
+        data-variant={variant}
       >
         <h2 className="text-lg font-bold uppercase tracking-wide">Can&apos;t confirm roaster status</h2>
-        <p className="text-sm text-muted-foreground">
-          This page could not reach the agent to check whether a roast is active. If
-          one is running, it is still live and heating — reload to reconnect before
-          assuming it is safe to start a new one.
-        </p>
+        {isMismatch ? (
+          <p className="text-sm text-muted-foreground" data-testid="live-status-unknown-message">
+            Answers are coming from a different server process than the one that
+            accepted this roast start. Reload before trusting anything shown here —
+            if a roast is genuinely running, another process may be unreachable.
+          </p>
+        ) : (
+          <p className="text-sm text-muted-foreground" data-testid="live-status-unknown-message">
+            This page could not reach the agent to check whether a roast is active. If
+            one is running, it is still live and heating — reload to reconnect before
+            assuming it is safe to start a new one.
+          </p>
+        )}
         <a
           href="/live"
           data-testid="live-status-unknown-reload"

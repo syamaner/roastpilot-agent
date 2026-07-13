@@ -16,13 +16,18 @@
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { StartRoastView } from "./StartRoastView";
 
-const startRoastMock = vi.hoisted(() => vi.fn(async () => ({ id: "run-new" })));
+// #516: instance_id defaults present (matching a real 201 response) so the
+// existing pre-#516 tests below stay representative of real server
+// behaviour; the dedicated #516 describe block below overrides it per test.
+const startRoastMock = vi.hoisted(() =>
+  vi.fn(async () => ({ id: "run-new", instance_id: "server-a" })),
+);
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
   return { ...actual, api: { ...actual.api, startRoast: startRoastMock } };
@@ -69,6 +74,16 @@ vi.mock("@/hooks/queries", async () => {
   };
 });
 
+/** #516: reads the arriving location.state so tests can assert what
+ *  StartRoastView actually handed `navigate("/live", { state })` — a real
+ *  `LivePage` reads this same `useLocation().state` to compare instance ids. */
+function LiveLandingWithState(): React.JSX.Element {
+  const location = useLocation();
+  return (
+    <div data-testid="live-page" data-state={JSON.stringify(location.state ?? null)} />
+  );
+}
+
 function renderView() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   const wrapper = (children: ReactNode) => (
@@ -77,7 +92,7 @@ function renderView() {
         <Routes>
           <Route path="/start" element={children} />
           {/* #403: StartRoastView now routes to /live, not /. */}
-          <Route path="/live" element={<div data-testid="live-page" />} />
+          <Route path="/live" element={<LiveLandingWithState />} />
           <Route path="/" element={<div data-testid="home-landing" />} />
         </Routes>
       </MemoryRouter>
@@ -167,6 +182,26 @@ describe("StartRoastView (#324)", () => {
     );
     // We must NOT land on the home hub.
     expect(screen.queryByTestId("home-landing")).toBeNull();
+  });
+
+  it("#516: passes the 201 response's instance_id forward as router navigation state", async () => {
+    renderView();
+    fillMinimum();
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    await waitFor(() => expect(screen.getByTestId("live-page")).toBeInTheDocument());
+    expect(screen.getByTestId("live-page")).toHaveAttribute(
+      "data-state",
+      JSON.stringify({ expectedInstanceId: "server-a" }),
+    );
+  });
+
+  it("#516: navigates with NO state when the 201 response carries no instance_id (a pre-#516 server, or the field genuinely absent)", async () => {
+    startRoastMock.mockResolvedValueOnce({ id: "run-new" } as never);
+    renderView();
+    fillMinimum();
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    await waitFor(() => expect(screen.getByTestId("live-page")).toBeInTheDocument());
+    expect(screen.getByTestId("live-page")).toHaveAttribute("data-state", "null");
   });
 
   it("#513: shows the active-run banner instead of a bare form when a run is already active", () => {

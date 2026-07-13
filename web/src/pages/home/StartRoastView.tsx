@@ -77,6 +77,7 @@ import {
 } from "@/hooks/queries";
 import { api } from "@/lib/api";
 import type { BeanProfileInput, RoastProfile } from "@/lib/types";
+import type { LiveNavigationState } from "@/pages/live/LivePage";
 
 import { StartRoastForm } from "@/pages/dashboard/StartRoastForm";
 
@@ -142,10 +143,21 @@ export function StartRoastView(): React.JSX.Element {
   // own arrival read (`useFreshHealthGate`, forced-fresh, not cached) is
   // what actually confirms it — see the module doc for the full guarantee
   // chain and the worst-case (persistent health failure) fallback.
+  //
+  // #516: the 201 response's `instance_id` (the process that just accepted
+  // this start) is passed forward as router navigation STATE — never a
+  // query param or persisted anywhere — so `/live`'s arrival health read can
+  // compare against it. Router state is the right tool here specifically
+  // because it does NOT survive a reload: a reload has no "prior start" to
+  // compare against, so there is nothing to carry, and `/live` correctly
+  // falls back to its plain fresh-health gate with no expected id to check.
   const handleStartRoast = useCallback(
     async (profile: RoastProfile) => {
-      await api.startRoast(profile);
-      navigate("/live");
+      const started = await api.startRoast(profile);
+      const state: LiveNavigationState | undefined = started.instance_id
+        ? { expectedInstanceId: started.instance_id }
+        : undefined;
+      navigate("/live", { state });
     },
     [navigate],
   );
