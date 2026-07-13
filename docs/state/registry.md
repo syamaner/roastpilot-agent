@@ -102,8 +102,9 @@
 
 ## Active Context
 
-**12–14 Jul 2026 (latest) — OVERNIGHT TEAM BATCH + FOLLOW-UP BATCH 2 COMPLETE (17 PRs, 3 repos,
-MCP v0.1.13).** Batch 1 (four tracks: fe-523 / be-signals / mcp-audio / fc-docs): the #523 UX/IA
+**12–13 Jul 2026 (latest) — OVERNIGHT TEAM BATCH + FOLLOW-UP BATCH 2 COMPLETE (18 PRs, 3 repos,
+MCP v0.1.13).** Batch 1 (four tracks: fe-523 / be-signals / mcp-audio / fc-docs — 13 PRs: agent
+#524/#527/#528/#529/#532/#534/#535/#536/#538, MCP #192/#193/#195, FC #67): the #523 UX/IA
 restructure (/live = roast state, /start = only start surface, / = links hub, nav always visible;
 PRs #528/#529/#532/#535, closes #517), #522 tasting-signal capture for E14 (#527, SCHEMA_V11),
 #520 charge correction (#534, SCHEMA_V12, atomic cross-endpoint bounds), #516 health instance_id
