@@ -1427,11 +1427,30 @@ async def test_clear_stale_session_shadowed_older_run_is_still_clearable(
 
 
 @pytest.mark.asyncio
-async def test_clear_stale_session_unknown_run_404(client: AsyncClient) -> None:
+async def test_clear_stale_session_unknown_run_404(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#525 PR #548 round-2 P3: an unknown-id clear attempt is still AUDITED
+    (requirement 4: every rejection is recorded) — recorded with
+    ``run_id=None`` (the FK ``operator_actions.run_id REFERENCES
+    roast_runs(id)`` under ``foreign_keys=ON`` would raise if the bogus id
+    were passed directly) and the attempted id captured in the payload."""
     response = await client.post(
         "/api/roasts/nope/clear-stale-session", json={"reason": "does not exist"}
     )
     assert response.status_code == 404
+
+    async with store.connection.execute(
+        "SELECT action, result, payload_json FROM operator_actions WHERE run_id IS NULL"
+        " ORDER BY id DESC LIMIT 1"
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    action, result, payload_json = row
+    assert action == "clear_stale_session"
+    assert result == "rejected"
+    assert payload_json is not None
+    assert json.loads(payload_json)["requested_run_id"] == "nope"
 
 
 @pytest.mark.asyncio

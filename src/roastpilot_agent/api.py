@@ -2244,23 +2244,41 @@ class RoastService:
             stamped ``completed_at_utc``.
 
         Raises:
-            RoastRunNotFoundError: No run matches ``run_id`` (404).
+            RoastRunNotFoundError: No run matches ``run_id`` (404) — still
+                audited (``operator_actions`` with ``run_id=None``, the
+                attempted id in the payload) per requirement 4: every
+                rejection is recorded, not just the ones with a real row.
             RoastRunConflictError: One of: this IS the process's tracked
                 active/recovering run (guard (a)); the run was already
                 finalised (guard (b) race); the run shows recent telemetry —
                 some process is actively driving it (guard (c)) (409).
         """
 
-        async def _reject(message: str) -> None:
+        async def _reject(message: str, *, run_id_for_audit: str | None = run_id) -> None:
             await self._store.record_operator_action(
                 action="clear_stale_session",
-                run_id=run_id,
-                payload={"reason": request.reason, "rejection": message},
+                run_id=run_id_for_audit,
+                payload={
+                    "reason": request.reason,
+                    "rejection": message,
+                    "requested_run_id": run_id,
+                },
                 result="rejected",
             )
 
         detail = await self._store.read_run(run_id)
         if detail is None:
+            # #525 requirement 4 / PR #548 round-2 P3: an unknown run_id has
+            # no FK-valid row to attach the audit to (operator_actions.run_id
+            # is `REFERENCES roast_runs(id)` and foreign_keys=ON — passing
+            # the bogus id directly would raise an IntegrityError, not
+            # record anything). Record with run_id=None (the existing
+            # nullable-run_id lifecycle other pre-run actions like
+            # emergency_stop already use) and the ATTEMPTED id in the
+            # payload, so a 404 clear attempt is still forensically visible
+            # — every rejection is audited, not just the ones with a real row.
+            message = f"run {run_id} is unknown"
+            await _reject(message, run_id_for_audit=None)
             raise RoastRunNotFoundError(run_id)
         if run_id == self.active_run_id:
             message = (
