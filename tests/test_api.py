@@ -1427,9 +1427,7 @@ async def test_clear_stale_session_shadowed_older_run_is_still_clearable(
 
 
 @pytest.mark.asyncio
-async def test_clear_stale_session_unknown_run_404(
-    client: AsyncClient, store: RoastStore
-) -> None:
+async def test_clear_stale_session_unknown_run_404(client: AsyncClient, store: RoastStore) -> None:
     """#525 PR #548 round-2 P3: an unknown-id clear attempt is still AUDITED
     (requirement 4: every rejection is recorded) — recorded with
     ``run_id=None`` (the FK ``operator_actions.run_id REFERENCES

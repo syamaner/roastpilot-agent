@@ -1461,9 +1461,7 @@ async def test_finalize_orphaned_run_uses_the_owning_runs_frozen_interval_not_th
     ACTUAL scenario, not a synthetic parameter."""
     from roastpilot_agent.config import ControllerConfig
 
-    slow_owner_config = AppConfig(
-        controller=ControllerConfig(telemetry_log_interval_seconds=60.0)
-    )
+    slow_owner_config = AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=60.0))
     await tmp_store.initialize()
     long_ago = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
     await tmp_store.create_run(
@@ -1494,7 +1492,8 @@ async def test_finalize_orphaned_run_uses_the_owning_runs_frozen_interval_not_th
             )
 
         row = await fetch_one(
-            tmp_store, "SELECT outcome, completed_at_utc FROM roast_runs WHERE id = 'run-slow-owner'"
+            tmp_store,
+            "SELECT outcome, completed_at_utc FROM roast_runs WHERE id = 'run-slow-owner'",
         )
         assert row[0] is None  # untouched — the wider owner-derived window blocked it
         assert row[1] is None
