@@ -48,6 +48,7 @@ from roastpilot_agent.mcp_client import (
 )
 from roastpilot_agent.models import (
     ChargeWeightRequest,
+    ClearStaleSessionRequest,
     MicHealth,
     OperatorAction,
     OperatorActionRequest,
@@ -1250,6 +1251,229 @@ async def test_set_charge_weight_twice_audits_the_prior_correction(
     second_payload = json.loads(second_payload_json)
     assert second_payload["previous_charge_grams"] == 255.0
     assert second_payload["corrected_charge_grams"] == 252.0
+
+
+# --- clear stale session (#525) ---
+
+
+async def _insert_recent_telemetry(store: RoastStore, run_id: str, *, seconds_ago: float) -> None:
+    """Insert one raw telemetry row at an explicit age (#525 guard (c) tests) —
+    mirrors ``tests/test_store.py``'s ``_insert_telemetry_at`` helper."""
+    recorded_at = (datetime.now(UTC) - timedelta(seconds=seconds_ago)).isoformat()
+    await store.connection.execute(
+        "INSERT INTO telemetry_snapshots (run_id, tick, recorded_at_utc, agent_phase)"
+        " VALUES (?, 1, ?, 'roasting_pre_first_crack')",
+        (run_id, recorded_at),
+    )
+    await store.connection.commit()
+
+
+@pytest.mark.asyncio
+async def test_clear_stale_session_finalizes_an_orphaned_run(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#525: a genuinely stranded run (not this process's active run, no
+    recent telemetry) is finalised ``outcome="aborted"``."""
+    await _make_run(store, "run-stale", RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    response = await client.post(
+        "/api/roasts/run-stale/clear-stale-session", json={"reason": "orphaned after a crash"}
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["run_id"] == "run-stale"
+    assert body["outcome"] == "aborted"
+    assert body["completed_at_utc"] is not None
+
+    row = await _fetch_run_row(store, "run-stale")
+    assert row["outcome"] == "aborted"
+    assert row["agent_phase"] == "operator_recovery_required"  # untouched, per #525 design
+    assert await store.active_run() is None
+
+
+@pytest.mark.asyncio
+async def test_clear_stale_session_blocks_this_processs_own_active_run(
+    client: AsyncClient, service: RoastService, store: RoastStore
+) -> None:
+    """#525 guard (a) — condition 3: this process's own tracked active run
+    (covers BOTH a live run and ``operator_recovery_required``, since both
+    keep ``active_run_id`` set) can NEVER be cleared through this action —
+    the e-stop/recovery path must stay reachable. 409, not a silent no-op."""
+    await _make_run(store, "run-own-active", RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    service.active_run_id = "run-own-active"
+
+    response = await client.post(
+        "/api/roasts/run-own-active/clear-stale-session",
+        json={"reason": "trying to clear my own run"},
+    )
+    assert response.status_code == 409
+    assert "active" in response.json()["detail"].lower()
+
+    # Untouched: still active, no outcome stamped.
+    row = await _fetch_run_row(store, "run-own-active")
+    assert row["outcome"] is None
+    assert row["completed_at_utc"] is None
+    # The REJECTED attempt is still audited (#525 requirement 4).
+    [action_row] = await _operator_action_rows(store, "run-own-active")
+    action, result, payload_json = action_row
+    assert action == "clear_stale_session"
+    assert result == "rejected"
+    assert payload_json is not None
+    assert "trying to clear my own run" == json.loads(payload_json)["reason"]
+
+
+@pytest.mark.asyncio
+async def test_clear_stale_session_blocks_a_run_with_recent_telemetry(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#525 guard (c) — condition 3's cross-process simulation: a run with
+    FRESH telemetry is refused even though it is NOT this process's tracked
+    active run (``service.active_run_id`` stays ``None`` — simulating an
+    impostor/second-process view where guard (a) alone would pass). This is
+    the safety-reviewer's PASS-WITH-CONDITIONS kill chain, closed by shared
+    DB state rather than any one process's self-report."""
+    await _make_run(store, "run-driven-elsewhere", RoastPhase.DEVELOPMENT)
+    await _insert_recent_telemetry(store, "run-driven-elsewhere", seconds_ago=3.0)
+
+    response = await client.post(
+        "/api/roasts/run-driven-elsewhere/clear-stale-session",
+        json={"reason": "thought this was orphaned"},
+    )
+    assert response.status_code == 409
+    detail = response.json()["detail"].lower()
+    assert "actively driven" in detail or "actively driving" in detail
+    assert "already finalized" not in detail  # distinct message, per condition 3
+
+    row = await _fetch_run_row(store, "run-driven-elsewhere")
+    assert row["outcome"] is None  # untouched — still live
+    assert row["completed_at_utc"] is None
+
+
+@pytest.mark.asyncio
+async def test_clear_stale_session_shadowed_older_run_is_still_clearable(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#525 (safety-reviewer non-blocking addition): an OLDER unfinalised run
+    shadowed by a newer one is still clearable via the recency path — its OWN
+    telemetry is stale even though a different, newer run exists."""
+    await _make_run(store, "run-older", RoastPhase.FAULTED)
+    await _insert_recent_telemetry(store, "run-older", seconds_ago=999.0)  # long stale
+    await _make_run(store, "run-newer", RoastPhase.DEVELOPMENT)
+    await _insert_recent_telemetry(store, "run-newer", seconds_ago=3.0)  # actively driven
+
+    response = await client.post(
+        "/api/roasts/run-older/clear-stale-session", json={"reason": "shadowed orphan"}
+    )
+    assert response.status_code == 200
+    assert response.json()["outcome"] == "aborted"
+
+    # The newer, actively-driven run is untouched by clearing the older one.
+    newer_row = await _fetch_run_row(store, "run-newer")
+    assert newer_row["outcome"] is None
+    assert newer_row["completed_at_utc"] is None
+
+
+@pytest.mark.asyncio
+async def test_clear_stale_session_unknown_run_404(client: AsyncClient) -> None:
+    response = await client.post(
+        "/api/roasts/nope/clear-stale-session", json={"reason": "does not exist"}
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_clear_stale_session_rejects_empty_reason(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#525: no silent no-reason clears — a required, non-empty ``reason``."""
+    await _make_run(store, "run-empty-reason", RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    response = await client.post(
+        "/api/roasts/run-empty-reason/clear-stale-session", json={"reason": ""}
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_clear_stale_session_already_finalized_conflicts(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#525 guard (b): a race with a concurrent finalize (or simply an
+    already-completed run) is a clean 409, never a silent no-op, and its
+    message is distinct from the guard (a)/(c) messages."""
+    await store.create_run(
+        run_id="run-already-done",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(
+        run_id="run-already-done", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    response = await client.post(
+        "/api/roasts/run-already-done/clear-stale-session",
+        json={"reason": "already finished"},
+    )
+    assert response.status_code == 409
+    assert "already finalized" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_clear_stale_session_records_accepted_audit_event(
+    client: AsyncClient, store: RoastStore
+) -> None:
+    """#525 requirement 4: a successful clear records the reason and the
+    agent_phase the run was in at the moment of clearing."""
+    await _make_run(store, "run-audit-accept", RoastPhase.FAULTED)
+    await client.post(
+        "/api/roasts/run-audit-accept/clear-stale-session",
+        json={"reason": "confirmed abandoned via SQL inspection"},
+    )
+    [action_row] = await _operator_action_rows(store, "run-audit-accept")
+    action, result, payload_json = action_row
+    assert action == "clear_stale_session"
+    assert result == "accepted"
+    assert payload_json is not None
+    payload = json.loads(payload_json)
+    assert payload["reason"] == "confirmed abandoned via SQL inspection"
+    assert payload["agent_phase_at_clear"] == "faulted"
+
+
+@pytest.mark.asyncio
+async def test_clear_stale_session_issues_zero_mcp_calls(store: RoastStore) -> None:
+    """#525 invariant: this action is a PURE store write. Regardless of
+    outcome (accepted or every rejection path), it must never call ANY
+    method on the MCP child / roaster control surface — there is no
+    controller loop or safety box for a stale row to command through."""
+    await _make_run(store, "run-no-mcp", RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    fake_mcp = mock.Mock()
+    fake_roaster = mock.Mock()
+    service = RoastService(store, mcp=fake_mcp, roaster=fake_roaster)
+
+    result = await service.clear_stale_session(
+        "run-no-mcp", ClearStaleSessionRequest(reason="zero-mcp invariant")
+    )
+
+    assert result.outcome == "aborted"
+    assert fake_mcp.mock_calls == []
+    assert fake_roaster.mock_calls == []
+
+    # Also true on a REJECTED path (guard (a)).
+    await _make_run(store, "run-no-mcp-2", RoastPhase.DEVELOPMENT)
+    service.active_run_id = "run-no-mcp-2"
+    with pytest.raises(RoastRunConflictError):
+        await service.clear_stale_session(
+            "run-no-mcp-2", ClearStaleSessionRequest(reason="zero-mcp invariant rejected")
+        )
+    assert fake_mcp.mock_calls == []
+    assert fake_roaster.mock_calls == []
+
+
+async def _fetch_run_row(store: RoastStore, run_id: str) -> dict[str, object]:
+    async with store.connection.execute(
+        "SELECT outcome, agent_phase, completed_at_utc FROM roast_runs WHERE id = ?", (run_id,)
+    ) as cursor:
+        row = await cursor.fetchone()
+    assert row is not None
+    return {"outcome": row[0], "agent_phase": row[1], "completed_at_utc": row[2]}
 
 
 # --- tastings (#522, D91) ---

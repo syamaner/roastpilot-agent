@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -474,6 +474,22 @@ class PhysicallyImpossibleWeightError(Exception):
     corrections could each pass an API-layer pre-check against a stale
     snapshot. The API maps it to HTTP 409, the same status the API-layer
     pre-check already used."""
+
+
+class RunActivelyDrivenError(Exception):
+    """A :meth:`RoastStore.finalize_orphaned_run` target shows recent telemetry
+    (#525 guard (c)) — some process is still ticking this run right now.
+
+    This is the shared-durable-state liveness check that closes the
+    multi-process gap a single process's own in-memory ``active_run_id``
+    cannot see (a second process's live run can look stale from here, since
+    ``health``/``active_run`` read the newest unfinalised row DB-wide, not any
+    one process's pointer — see :meth:`RoastService.clear_stale_session`'s
+    docstring for the full reasoning). The API maps it to HTTP 409 with a
+    distinct "actively driven, do not clear" message — never the generic
+    "already finalized" conflict, since the two failure modes call for
+    opposite operator responses (already finalized: nothing to do; actively
+    driven: verify the hardware / use emergency stop, do not clear)."""
 
 
 class PersistedRun(BaseModel):
@@ -1113,6 +1129,91 @@ class RoastStore:
         await self.connection.commit()
         if cursor.rowcount == 0:
             raise RuntimeError(f"no unfinalized FAULTED roast_run with id {run_id!r}")
+
+    async def finalize_orphaned_run(self, run_id: str, *, recency_window_seconds: float) -> None:
+        """Terminally finalise an operator-cleared STALE run (#525), or raise.
+
+        Generalises :meth:`finalize_stale_faulted_run` for the OPERATOR-invoked
+        case: any unfinalised phase (not just ``faulted``) that the caller has
+        already established is not its own tracked active run (guard (a), the
+        service layer's ``run_id != self.active_run_id`` check — this method
+        has no visibility into that and does not re-check it). Stamps
+        ``completed_at_utc`` / ``outcome = 'aborted'`` / ``updated_at_utc`` in
+        one instant; ``agent_phase`` and ``fault_reason`` are left UNTOUCHED,
+        mirroring :meth:`finalize_stale_faulted_run`'s preserve-diagnosis
+        rationale — this finalises an already-abandoned run, it does not
+        reclassify what happened during it.
+
+        Two independent atomicity guards, both evaluated against the CURRENT
+        row at the instant of the write (never a value read moments earlier):
+
+        1. ``completed_at_utc IS NULL`` in the UPDATE's own WHERE clause (#525
+           guard (b)) — a concurrent finalize (another clear, a legitimate
+           completion) loses the race cleanly: this call's rowcount is 0 and
+           it raises, never silently re-finalising an already-terminal row.
+        2. A ``NOT EXISTS`` telemetry-recency subquery (#525 guard (c),
+           safety-reviewer PASS-WITH-CONDITIONS) — closes the gap guard (a)
+           structurally cannot: a single process can only ever attest to its
+           OWN active-run pointer, never to whether some OTHER process is
+           live-driving this exact run_id. A live roast persists a telemetry
+           row on every controller tick (throttled only by
+           ``telemetry_log_interval_seconds``, never by phase — confirmed the
+           very first tick of a run always writes), so ANY row within
+           ``recency_window_seconds`` of now is durable, shared-DB evidence
+           that some process is actively ticking this run RIGHT NOW,
+           independent of what any one process's in-memory state claims.
+           This generalises "MCP-state gate: never clear while the machine
+           could be hot" (#525's original ask) into an honest DB-liveness
+           check: an own-process MCP-idle read cannot observe a DIFFERENT
+           process's roaster, so it would be a no-op at best and misleading
+           at worst — recent telemetry is the one signal any process can
+           trust regardless of who is driving the run.
+
+        This is a STORE write only — it resumes nothing, issues no MCP write,
+        and never touches heat/fan (the restart-never-auto-resumes invariant
+        is about actuation, untouched here).
+
+        Args:
+            run_id: The stranded run to finalise.
+            recency_window_seconds: How far back to look for telemetry
+                evidence of a live writer. The caller scales this against the
+                configured ``telemetry_log_interval_seconds`` (never a bare
+                constant) so a long-interval config cannot quietly shrink the
+                safety margin.
+
+        Raises:
+            RuntimeError: No unfinalised run matches ``run_id`` (unknown id,
+                or it was already finalised — guard (b)).
+            RunActivelyDrivenError: A telemetry row exists inside the recency
+                window — guard (c): some process is still driving this run.
+        """
+        threshold = (datetime.now(UTC) - timedelta(seconds=recency_window_seconds)).isoformat()
+        now = _utc_now()  # one instant: completed_at == updated_at at finalisation
+        cursor = await self.connection.execute(
+            "UPDATE roast_runs SET completed_at_utc = ?, outcome = 'aborted',"
+            " updated_at_utc = ? WHERE id = ? AND completed_at_utc IS NULL"
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM telemetry_snapshots"
+            "   WHERE telemetry_snapshots.run_id = roast_runs.id"
+            "   AND telemetry_snapshots.recorded_at_utc > ?"
+            " )",
+            (now, now, run_id, threshold),
+        )
+        await self.connection.commit()
+        if cursor.rowcount == 0:
+            # Disambiguate: already finalized / unknown id (RuntimeError) vs.
+            # blocked by guard (c)'s recency check (RunActivelyDrivenError) —
+            # a follow-up read against the row the WHERE clause actually saw.
+            row_cursor = await self.connection.execute(
+                "SELECT completed_at_utc FROM roast_runs WHERE id = ?", (run_id,)
+            )
+            row = await row_cursor.fetchone()
+            if row is None or row["completed_at_utc"] is not None:
+                raise RuntimeError(f"no unfinalized roast_run with id {run_id!r}")
+            raise RunActivelyDrivenError(
+                f"roast_run {run_id!r} has telemetry within the last "
+                f"{recency_window_seconds:.0f}s — some process is actively driving it"
+            )
 
     async def set_operator_rating(
         self, run_id: str, *, rating: Literal[1, 2, 3, 4, 5], notes: str | None = None

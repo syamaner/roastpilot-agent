@@ -1227,6 +1227,33 @@ class ChargeWeightRequest(BaseModel):
     corrected_charge_grams: float = Field(gt=0)
 
 
+class ClearStaleSessionRequest(BaseModel):
+    """``POST /api/roasts/{id}/clear-stale-session`` body (#525).
+
+    Finalises a prior-session run row that is stranded open (``outcome IS
+    NULL``) but is NOT this process's tracked active run and shows no recent
+    telemetry — see :meth:`~roastpilot_agent.api.RoastService.clear_stale_session`
+    for the full gate. A pure store write: it issues no MCP command and never
+    touches heat, fan, or cooling. ``reason`` is required (no silent
+    no-reason clears) and is recorded verbatim on the ``operator_actions``
+    audit row, whether the request is accepted or rejected.
+    """
+
+    reason: str = Field(min_length=1)
+
+
+class ClearStaleSessionResult(BaseModel):
+    """The outcome of a successful :class:`ClearStaleSessionRequest` (#525).
+
+    Always ``outcome="aborted"`` — this action only ever finalises a
+    stranded row as abandoned; it never reclassifies what happened during
+    the run (``agent_phase``/``fault_reason`` are left untouched)."""
+
+    run_id: str
+    outcome: Literal["aborted"]
+    completed_at_utc: str
+
+
 # --- #522 (D91): structured tasting entries ---
 #
 # The E14 corpus starts now: every roast without a tasting is a lost label.

@@ -71,6 +71,8 @@ from roastpilot_agent.models import (
     BeanProfileInput,
     BeanProfileList,
     ChargeWeightRequest,
+    ClearStaleSessionRequest,
+    ClearStaleSessionResult,
     HealthResponse,
     LogManifest,
     MCPChildStatus,
@@ -108,6 +110,7 @@ from roastpilot_agent.store import (
     BeanProfileNotFoundError,
     PhysicallyImpossibleWeightError,
     RoastStore,
+    RunActivelyDrivenError,
 )
 
 _log = logging.getLogger(__name__)
@@ -2159,6 +2162,145 @@ class RoastService:
             raise RuntimeError(f"read_run returned None for corrected run {run_id}")
         return corrected
 
+    #: Floor on the guard (c) telemetry-recency window (#525), regardless of
+    #: the configured ``telemetry_log_interval_seconds``. Scaled UP by
+    #: ``_stale_session_recency_window_seconds`` for a longer interval, never
+    #: down — a short/default interval still gets a comfortable multi-tick
+    #: margin, and a misconfigured LONG interval cannot quietly shrink the
+    #: safety margin below this floor.
+    STALE_SESSION_RECENCY_FLOOR_SECONDS = 20.0
+
+    def _stale_session_recency_window_seconds(self) -> float:
+        """The guard (c) telemetry-recency window: 4 ticks of margin at the
+        configured logging cadence, floored at
+        :attr:`STALE_SESSION_RECENCY_FLOOR_SECONDS` (#525)."""
+        return max(
+            self.STALE_SESSION_RECENCY_FLOOR_SECONDS,
+            4.0 * self._config.controller.telemetry_log_interval_seconds,
+        )
+
+    async def clear_stale_session(
+        self, run_id: str, request: ClearStaleSessionRequest
+    ) -> ClearStaleSessionResult:
+        """Finalise a stranded STALE run (#525), or 404/409.
+
+        A "stale session" is a run row this process does not recognise as its
+        own tracked active/recovering run (guard (a)) — the FE's own
+        detection is a history row with ``outcome: null`` that the current
+        ``/health`` snapshot's ``active_run_id`` does not match (the 12 Jul
+        impostor-listener incident signature, ``docs/recent-fixes.md``). This
+        is an END/FINALISE action only — never drop, never cool — and issues
+        **zero MCP writes**: by the time guard (a) passes, this process's
+        controller/MCP session is provably not attached to the row, so there
+        is no safety box or live loop for THIS row to command through here.
+
+        **Why no own-process MCP-idle check (#525's original "MCP-state
+        gate" ask, safety-reviewer PASS-WITH-CONDITIONS, Condition 2):**
+        ``health()``/``store.active_run()`` read the newest UNFINALISED run
+        DB-wide, not any one process's in-memory pointer — so a genuinely
+        different, live process's run can look "stale" from here even though
+        it is being actively driven elsewhere. An own-process
+        ``mcp_child_status()`` read cannot observe THAT process's roaster —
+        it would be a no-op (this process's MCP child is unrelated to the
+        stale row) or actively misleading (reading idle here proves nothing
+        about who else might be driving the row). The honest, generalised
+        gate is shared DURABLE state: guard (c), a telemetry-recency check
+        (:meth:`~roastpilot_agent.store.RoastStore.finalize_orphaned_run`) —
+        a live roast persists a telemetry row every controller tick
+        (confirmed: the very first tick of a run always writes, throttled
+        only by ``telemetry_log_interval_seconds``, never by phase), so any
+        row inside the recency window is durable, cross-process proof that
+        SOME process is actively ticking this run right now. "Fail closed on
+        unknown hardware state" is satisfied by refusing anything with recent
+        write evidence; genuine physical verification (is the roaster
+        actually hot) is left to the operator, exactly as the existing
+        stale-session UI copy already says ("if the roaster is hot, don't
+        start a new one... verify the hardware directly").
+
+        Guards, all evaluated atomically against the CURRENT row (never a
+        value read moments earlier):
+        (a) ``run_id != self.active_run_id`` — this process's own tracked
+            run (live OR ``operator_recovery_required``) can NEVER be
+            cleared through this action; that path stays in the recovery
+            flow. Checked here, before any store write.
+        (b) ``completed_at_utc IS NULL`` — the store's own WHERE clause; a
+            race with a concurrent finalize is a clean 409, never a silent
+            no-op.
+        (c) No telemetry within the recency window — the store's own
+            ``NOT EXISTS`` subquery; a run some process is actively driving
+            is refused with a distinct message, never "already finalized".
+
+        Every outcome — success AND every rejection — is recorded as an
+        ``operator_actions`` audit row (#525 requirement 4): a rejected clear
+        attempt against what turns out to be a live/recovering run is itself
+        a forensically significant event, not a silent 409.
+
+        Args:
+            run_id: The stale run to finalise.
+            request: The operator's required ``reason`` for the audit trail.
+
+        Returns:
+            The finalised run's id, outcome (always ``"aborted"``), and the
+            stamped ``completed_at_utc``.
+
+        Raises:
+            RoastRunNotFoundError: No run matches ``run_id`` (404).
+            RoastRunConflictError: One of: this IS the process's tracked
+                active/recovering run (guard (a)); the run was already
+                finalised (guard (b) race); the run shows recent telemetry —
+                some process is actively driving it (guard (c)) (409).
+        """
+
+        async def _reject(message: str) -> None:
+            await self._store.record_operator_action(
+                action="clear_stale_session",
+                run_id=run_id,
+                payload={"reason": request.reason, "rejection": message},
+                result="rejected",
+            )
+
+        detail = await self._store.read_run(run_id)
+        if detail is None:
+            raise RoastRunNotFoundError(run_id)
+        if run_id == self.active_run_id:
+            message = (
+                f"run {run_id} is this process's tracked active/recovering run; "
+                "use the recovery or emergency-stop actions instead"
+            )
+            await _reject(message)
+            raise RoastRunConflictError(message)
+        try:
+            await self._store.finalize_orphaned_run(
+                run_id, recency_window_seconds=self._stale_session_recency_window_seconds()
+            )
+        except RunActivelyDrivenError as exc:
+            message = (
+                f"run {run_id} appears to be actively driven (recent telemetry) — "
+                "verify the hardware / use emergency stop; do not clear"
+            )
+            await _reject(message)
+            raise RoastRunConflictError(message) from exc
+        except RuntimeError as exc:
+            message = f"run {run_id} is already finalized"
+            await _reject(message)
+            raise RoastRunConflictError(message) from exc
+        await self._store.record_operator_action(
+            action="clear_stale_session",
+            run_id=run_id,
+            payload={"reason": request.reason, "agent_phase_at_clear": detail.agent_phase.value},
+            result="accepted",
+        )
+        cleared = await self._store.read_run(run_id)
+        if cleared is None:  # pragma: no cover — immutable once completed
+            raise RuntimeError(f"read_run returned None for cleared run {run_id}")
+        if cleared.completed_at_utc is None:  # pragma: no cover — just stamped above
+            raise RuntimeError(f"cleared run {run_id} has no completed_at_utc")
+        return ClearStaleSessionResult(
+            run_id=run_id,
+            outcome="aborted",
+            completed_at_utc=cleared.completed_at_utc,
+        )
+
     async def add_tasting(self, run_id: str, request: TastingEntryRequest) -> TastingList:
         """Record one tasting entry (#522, D91), or 404/409.
 
@@ -2497,6 +2639,22 @@ async def set_charge_weight(
     """``POST /api/roasts/{run_id}/charge-weight`` — operator charge-weight correction (#520)."""
     try:
         return await service.set_charge_weight(run_id, request)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+async def clear_stale_session(
+    run_id: str,
+    request: ClearStaleSessionRequest,
+    service: ServiceDep,
+) -> ClearStaleSessionResult:
+    """``POST /api/roasts/{run_id}/clear-stale-session`` — finalise a stranded
+    STALE run (#525). See :meth:`RoastService.clear_stale_session` for the
+    full guard/gate design."""
+    try:
+        return await service.clear_stale_session(run_id, request)
     except RoastRunNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RoastRunConflictError as exc:
@@ -2985,6 +3143,7 @@ def create_app(
     app.post("/api/roasts/{run_id}/rating")(rate_roast)
     app.post("/api/roasts/{run_id}/roasted-weight")(set_roasted_weight)
     app.post("/api/roasts/{run_id}/charge-weight")(set_charge_weight)
+    app.post("/api/roasts/{run_id}/clear-stale-session")(clear_stale_session)
     app.post("/api/roasts/{run_id}/tastings", status_code=201)(add_tasting)
     app.get("/api/roasts/{run_id}/tastings")(list_tastings)
     app.post("/api/roasts/{run_id}/operator-actions")(submit_operator_action)
