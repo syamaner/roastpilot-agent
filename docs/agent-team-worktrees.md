@@ -98,3 +98,22 @@ the author). Two binding rules fell out:
 *Provenance: E10 agent-team experiment. Failure + recovery narrated in the blog
 source `career/.../blog-sources/05-when-not-to-fan-out.md`; smoke-test validation
 9 Jun 2026. Reviewer rules: the 9 Jul 2026 overnight batch incident.*
+
+## Branch freeze on PR-open (added 14 Jul 2026, after the third FIFO-lag crossing)
+
+The teammate mailbox delivers FIFO **on idle only**, so the lead and a teammate
+can cross: a ruling arrives after the teammate proceeded, or a teammate's late
+fold arrives after the lead already opened the PR and fired the review trigger
+(PR #547 hit both in one evening — absorbed only because the trigger hadn't
+fired yet).
+
+Rule: **opening the PR is the branch-ownership handoff.**
+
+1. When the lead opens a PR on a teammate's branch, the accompanying message
+   includes an explicit **FREEZE** — no further pushes without a lead
+   go-ahead.
+2. Every teammate "pushed sha X" report re-freezes by default; unfreeze is
+   always an explicit lead instruction naming what to fold.
+3. If a push lands after the review trigger fired, the verdict is stale by
+   definition — the lead re-runs the cycle on the final head and never merges
+   on a verdict predating it (the AGENTS.md codex-wait clause).
