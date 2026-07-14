@@ -1445,6 +1445,98 @@ async def test_finalize_orphaned_run_recency_window_is_config_scaled(
 
 
 @pytest.mark.asyncio
+async def test_finalize_orphaned_run_uses_the_owning_runs_frozen_interval_not_the_callers(
+    tmp_store: RoastStore,
+) -> None:
+    """#525 PR #548 round-2 P1: the effective recency window derives from the
+    TARGET RUN's OWN frozen ``telemetry_log_interval_seconds`` (persisted in
+    ``config_json`` at creation), not just the calling process's window — the
+    exact cross-process case this whole gate exists for. An impostor/default
+    process computing its OWN narrow window (e.g. the default 5s interval ->
+    a 20s floor window) must NOT be able to use that narrower window to clear
+    a run whose OWNER logs at a much slower 60s cadence, where 30s-old
+    telemetry is perfectly normal (well within the owner's own 4x60=240s
+    margin) — NOT evidence of staleness. Taking the LARGER of the two windows
+    (fail-closed) is what the fix does; this test proves it against the
+    ACTUAL scenario, not a synthetic parameter."""
+    from roastpilot_agent.config import ControllerConfig
+
+    slow_owner_config = AppConfig(
+        controller=ControllerConfig(telemetry_log_interval_seconds=60.0)
+    )
+    await tmp_store.initialize()
+    long_ago = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    await tmp_store.create_run(
+        run_id="run-slow-owner",
+        profile=PROFILE,
+        config=slow_owner_config,
+        agent_phase=RoastPhase.DEVELOPMENT,
+        started_at_utc=long_ago,
+    )
+    try:
+        thirty_seconds_ago = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
+        await _insert_telemetry_at(tmp_store, "run-slow-owner", thirty_seconds_ago)
+
+        # The ANSWERING process's own (narrower, default-interval) window —
+        # exactly what RoastService._stale_session_recency_window_seconds()
+        # computes for a default AppConfig() (5s interval -> the 20s floor).
+        answerer_window_seconds = 20.0
+
+        # Against the PRE-FIX behaviour (using the caller's window alone),
+        # 30s-old telemetry is OUTSIDE a bare 20s window, so the clear would
+        # have wrongly succeeded — reproduced explicitly below as the
+        # fail-then-pass baseline. The FIXED method must refuse instead,
+        # because the run's OWN frozen 60s interval implies a 240s window
+        # (4 x 60, well past this 30s-old row).
+        with pytest.raises(RunActivelyDrivenError):
+            await tmp_store.finalize_orphaned_run(
+                "run-slow-owner", recency_window_seconds=answerer_window_seconds
+            )
+
+        row = await fetch_one(
+            tmp_store, "SELECT outcome, completed_at_utc FROM roast_runs WHERE id = 'run-slow-owner'"
+        )
+        assert row[0] is None  # untouched — the wider owner-derived window blocked it
+        assert row[1] is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_finalize_orphaned_run_falls_back_to_callers_window_when_interval_is_absent(
+    tmp_store: RoastStore,
+) -> None:
+    """#525 PR #548 round-2 P1: if the target run's ``config_json`` lacks the
+    ``telemetry_log_interval_seconds`` key (a legacy/malformed row — not
+    reachable in practice since the column is ``NOT NULL`` since schema v1,
+    but the read degrades safely rather than raising), the method falls back
+    to the CALLER's own ``recency_window_seconds`` alone — never crashes on a
+    missing key."""
+    await seeded_store(tmp_store)
+    try:
+        # Corrupt config_json to simulate an absent key (no `controller`
+        # object at all) — the json_extract read must return NULL, not raise.
+        await tmp_store.connection.execute(
+            "UPDATE roast_runs SET config_json = '{}' WHERE id = 'run-1'"
+        )
+        await tmp_store.connection.commit()
+        long_ago = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+        await _backdate_started_at(tmp_store, "run-1", long_ago)
+        stale = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
+        await _insert_telemetry_at(tmp_store, "run-1", stale)
+
+        # 60s-old telemetry is outside the caller's own 20s window, and there
+        # is no owner interval to widen it — the clear succeeds on the
+        # caller's window alone.
+        await tmp_store.finalize_orphaned_run("run-1", recency_window_seconds=20.0)
+
+        row = await fetch_one(tmp_store, "SELECT outcome FROM roast_runs WHERE id = 'run-1'")
+        assert row[0] == "aborted"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_finalize_orphaned_run_ignores_other_runs_telemetry(tmp_store: RoastStore) -> None:
     """#525 guard (c) scoping: the recency check is per-``run_id`` — a fresh
     telemetry row (and a fresh START) for a DIFFERENT run must never block

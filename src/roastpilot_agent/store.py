@@ -1161,9 +1161,12 @@ class RoastStore:
            2a. A ``NOT EXISTS`` telemetry-recency subquery: a live roast
                persists a telemetry row on every controller tick (throttled
                only by ``telemetry_log_interval_seconds``, never by phase),
-               so ANY row within ``recency_window_seconds`` of now is
-               durable, shared-DB evidence that some process is actively
-               ticking this run.
+               so ANY row within the EFFECTIVE window (see ``Args`` — PR
+               #548 round-2 P1: derived from the run's OWN frozen config,
+               never just the answering process's, since the two can
+               genuinely differ in the exact cross-process case this whole
+               gate exists for) of now is durable, shared-DB evidence that
+               some process is actively ticking this run.
            2b. ``started_at_utc <= threshold`` (the P1 fold): clause 2a alone
                has a real hole in the window BEFORE the first tick.
                ``RoastRunner.start()`` drives ``controller.start_run()`` —
@@ -1199,23 +1202,58 @@ class RoastStore:
 
         Args:
             run_id: The stranded run to finalise.
-            recency_window_seconds: How far back to look for telemetry
-                evidence of a live writer, AND how recently the run must NOT
-                have started (the P1 fold's start-recency clause, 2b above,
-                shares this same window rather than its own). The caller
-                scales this against the configured
-                ``telemetry_log_interval_seconds`` (never a bare constant) so
-                a long-interval config cannot quietly shrink the safety
-                margin.
+            recency_window_seconds: The ANSWERING process's own recency
+                window (scaled against ITS configured
+                ``telemetry_log_interval_seconds`` — never a bare constant).
+                This is a fail-closed FLOOR, not necessarily the effective
+                window: PR #548 round-2 P1 — the answering process may not
+                be the run's OWNER, and the two processes' configured
+                ``telemetry_log_interval_seconds`` can genuinely differ (the
+                exact cross-process case this whole gate exists for). The
+                EFFECTIVE window used for both clauses is
+                ``max(recency_window_seconds, the run's OWN frozen interval ×
+                4, 20.0)`` — read from the target run's own frozen
+                ``config_json`` (immutable once written; no race to guard
+                against, unlike ``completed_at_utc``/telemetry). Taking the
+                LARGER of the two is the fail-closed direction: a wider
+                window only makes the clear HARDER, never easier, so an
+                impostor process with a shorter-interval config can never
+                use its own narrower window to slip past an owner's
+                genuinely slower cadence. Falls back to
+                ``recency_window_seconds`` alone if the run predates the
+                ``config_json``/``telemetry_log_interval_seconds`` key (not
+                reachable in practice — the column is ``NOT NULL`` since
+                schema v1 — but a missing key degrades safely rather than
+                raising).
 
         Raises:
             RuntimeError: No unfinalised run matches ``run_id`` (unknown id,
                 or it was already finalised — guard (b)).
-            RunActivelyDrivenError: A telemetry row exists inside the recency
-                window (clause 2a), OR the run started within the recency
-                window (clause 2b, the pre-first-tick P1 fold) — guard (c):
-                some process is still driving this run.
+            RunActivelyDrivenError: A telemetry row exists inside the
+                EFFECTIVE recency window (clause 2a), OR the run started
+                within it (clause 2b, the pre-first-tick P1 fold) — guard
+                (c): some process is still driving this run.
         """
+        row_cursor = await self.connection.execute(
+            "SELECT json_extract(config_json, '$.controller.telemetry_log_interval_seconds')"
+            " FROM roast_runs WHERE id = ?",
+            (run_id,),
+        )
+        interval_row = await row_cursor.fetchone()
+        owner_interval = None if interval_row is None else interval_row[0]
+        # The run's OWN window, mirroring the answering process's own
+        # max(floor, 4x interval) scaling exactly (RoastService's
+        # _stale_session_recency_window_seconds) — computed here so a run
+        # frozen with a slower cadence gets the SAME margin an owning
+        # process would apply to itself, regardless of who is asking.
+        owner_window_seconds = (
+            None if owner_interval is None else max(20.0, 4.0 * float(owner_interval))
+        )
+        effective_window_seconds = (
+            recency_window_seconds
+            if owner_window_seconds is None
+            else max(recency_window_seconds, owner_window_seconds)
+        )
         # Format contract (safety-reviewer note): this must stay
         # datetime.now(UTC).isoformat() (a "+00:00" offset, matching
         # _utc_now()'s telemetry-write format) — a "Z"-suffixed or naive
@@ -1225,7 +1263,7 @@ class RoastStore:
         # roast_runs.started_at_utc — uses this exact form). The SAME
         # threshold string backs both clause 2a and clause 2b (one recency
         # budget, not two independently-drifting windows.
-        threshold = (datetime.now(UTC) - timedelta(seconds=recency_window_seconds)).isoformat()
+        threshold = (datetime.now(UTC) - timedelta(seconds=effective_window_seconds)).isoformat()
         now = _utc_now()  # one instant: completed_at == updated_at at finalisation
         cursor = await self.connection.execute(
             "UPDATE roast_runs SET completed_at_utc = ?, outcome = 'aborted',"
@@ -1246,15 +1284,15 @@ class RoastStore:
             # blocked by guard (c)'s recency check — either clause 2a or 2b
             # (RunActivelyDrivenError) — a follow-up read against the row the
             # WHERE clause actually saw.
-            row_cursor = await self.connection.execute(
+            completed_cursor = await self.connection.execute(
                 "SELECT completed_at_utc FROM roast_runs WHERE id = ?", (run_id,)
             )
-            row = await row_cursor.fetchone()
-            if row is None or row["completed_at_utc"] is not None:
+            completed_row = await completed_cursor.fetchone()
+            if completed_row is None or completed_row["completed_at_utc"] is not None:
                 raise RuntimeError(f"no unfinalized roast_run with id {run_id!r}")
             raise RunActivelyDrivenError(
                 f"roast_run {run_id!r} has telemetry within the last "
-                f"{recency_window_seconds:.0f}s — some process is actively driving it"
+                f"{effective_window_seconds:.0f}s — some process is actively driving it"
             )
 
     async def set_operator_rating(
