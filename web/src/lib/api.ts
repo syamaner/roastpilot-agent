@@ -13,6 +13,8 @@ import type {
   BeanProfileInput,
   BeanProfileList,
   ChargeWeightRequest,
+  ClearStaleSessionRequest,
+  ClearStaleSessionResult,
   DevicesSnapshot,
   HealthResponse,
   OperatorActionRequest,
@@ -110,6 +112,17 @@ export const api = {
   /** `POST /api/roasts/{id}/charge-weight` — operator charge-weight correction (#520). */
   setChargeWeight: (runId: string, body: ChargeWeightRequest) =>
     request<RoastDetail>(`/api/roasts/${runId}/charge-weight`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  /** `POST /api/roasts/{id}/clear-stale-session` — finalise a stranded STALE
+   *  run (#525). A pure store write: issues no MCP command, never touches
+   *  heat/fan/cooling. 404 unknown run; 409 if it's the process's own
+   *  tracked active/recovering run, already finalized, or shows recent
+   *  telemetry (actively driven by some process). */
+  clearStaleSession: (runId: string, body: ClearStaleSessionRequest) =>
+    request<ClearStaleSessionResult>(`/api/roasts/${runId}/clear-stale-session`, {
       method: "POST",
       body: JSON.stringify(body),
     }),

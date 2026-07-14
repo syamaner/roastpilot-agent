@@ -10,7 +10,7 @@ import hashlib
 import json
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -474,6 +474,22 @@ class PhysicallyImpossibleWeightError(Exception):
     corrections could each pass an API-layer pre-check against a stale
     snapshot. The API maps it to HTTP 409, the same status the API-layer
     pre-check already used."""
+
+
+class RunActivelyDrivenError(Exception):
+    """A :meth:`RoastStore.finalize_orphaned_run` target shows recent telemetry
+    (#525 guard (c)) — some process is still ticking this run right now.
+
+    This is the shared-durable-state liveness check that closes the
+    multi-process gap a single process's own in-memory ``active_run_id``
+    cannot see (a second process's live run can look stale from here, since
+    ``health``/``active_run`` read the newest unfinalised row DB-wide, not any
+    one process's pointer — see :meth:`RoastService.clear_stale_session`'s
+    docstring for the full reasoning). The API maps it to HTTP 409 with a
+    distinct "actively driven, do not clear" message — never the generic
+    "already finalized" conflict, since the two failure modes call for
+    opposite operator responses (already finalized: nothing to do; actively
+    driven: verify the hardware / use emergency stop, do not clear)."""
 
 
 class PersistedRun(BaseModel):
@@ -1113,6 +1129,171 @@ class RoastStore:
         await self.connection.commit()
         if cursor.rowcount == 0:
             raise RuntimeError(f"no unfinalized FAULTED roast_run with id {run_id!r}")
+
+    async def finalize_orphaned_run(self, run_id: str, *, recency_window_seconds: float) -> None:
+        """Terminally finalise an operator-cleared STALE run (#525), or raise.
+
+        Generalises :meth:`finalize_stale_faulted_run` for the OPERATOR-invoked
+        case: any unfinalised phase (not just ``faulted``) that the caller has
+        already established is not its own tracked active run (guard (a), the
+        service layer's ``run_id != self.active_run_id`` check — this method
+        has no visibility into that and does not re-check it). Stamps
+        ``completed_at_utc`` / ``outcome = 'aborted'`` / ``updated_at_utc`` in
+        one instant; ``agent_phase`` and ``fault_reason`` are left UNTOUCHED,
+        mirroring :meth:`finalize_stale_faulted_run`'s preserve-diagnosis
+        rationale — this finalises an already-abandoned run, it does not
+        reclassify what happened during it.
+
+        Two independent atomicity guards, both evaluated against the CURRENT
+        row at the instant of the write (never a value read moments earlier):
+
+        1. ``completed_at_utc IS NULL`` in the UPDATE's own WHERE clause (#525
+           guard (b)) — a concurrent finalize (another clear, a legitimate
+           completion) loses the race cleanly: this call's rowcount is 0 and
+           it raises, never silently re-finalising an already-terminal row.
+        2. Guard (c) is a TWO-CLAUSE liveness gate (recent WRITE-recency OR
+           recent START-recency), safety-reviewer PASS-WITH-CONDITIONS +
+           PR #548 round-1 P1 fold — closes the gap guard (a) structurally
+           cannot: a single process can only ever attest to its OWN
+           active-run pointer, never to whether some OTHER process is
+           live-driving this exact run_id.
+
+           2a. A ``NOT EXISTS`` telemetry-recency subquery: a live roast
+               persists a telemetry row on every controller tick (throttled
+               only by ``telemetry_log_interval_seconds``, never by phase),
+               so ANY row within the EFFECTIVE window (see ``Args`` — PR
+               #548 round-2 P1: derived from the run's OWN frozen config,
+               never just the answering process's, since the two can
+               genuinely differ in the exact cross-process case this whole
+               gate exists for) of now is durable, shared-DB evidence that
+               some process is actively ticking this run.
+           2b. ``started_at_utc <= threshold`` (the P1 fold): clause 2a alone
+               has a real hole in the window BEFORE the first tick.
+               ``RoastRunner.start()`` drives ``controller.start_run()`` —
+               which issues the profile's initial heat/fan through the
+               safety policy — and returns BEFORE ``run()``'s scheduler ever
+               calls ``tick_once()`` (the sole caller of
+               ``_publish_and_persist_telemetry``). So a run created moments
+               ago can have heat/fan ACTIVELY COMMANDED with ZERO telemetry
+               rows — clause 2a alone would pass ``NOT EXISTS`` and let an
+               impostor process finalise a row whose hardware is being
+               driven right now. Requiring the run to ALSO be older than the
+               SAME recency window closes this: a genuinely stale orphan is
+               by definition minutes old, so this costs a real orphan
+               nothing, while a just-started run (regardless of whether its
+               first tick has landed yet) is refused with the same
+               ``RunActivelyDrivenError`` / "actively driven" 409 as clause
+               2a. Uses the IDENTICAL ``threshold`` string as 2a (same
+               format-contract constraint applies) — not a separate window,
+               so there is only one recency budget to reason about.
+
+           Together: this generalises "MCP-state gate: never clear while the
+           machine could be hot" (#525's original ask) into an honest
+           DB-liveness check across the run's WHOLE unfinalised lifetime, not
+           just from tick 1 onward — an own-process MCP-idle read cannot
+           observe a DIFFERENT process's roaster, so it would be a no-op at
+           best and misleading at worst; recent telemetry OR a recent start
+           is the one signal any process can trust regardless of who is
+           driving the run.
+
+        This is a STORE write only — it resumes nothing, issues no MCP write,
+        and never touches heat/fan (the restart-never-auto-resumes invariant
+        is about actuation, untouched here).
+
+        Args:
+            run_id: The stranded run to finalise.
+            recency_window_seconds: The ANSWERING process's own recency
+                window (scaled against ITS configured
+                ``telemetry_log_interval_seconds`` — never a bare constant).
+                This is a fail-closed FLOOR, not necessarily the effective
+                window: PR #548 round-2 P1 — the answering process may not
+                be the run's OWNER, and the two processes' configured
+                ``telemetry_log_interval_seconds`` can genuinely differ (the
+                exact cross-process case this whole gate exists for). The
+                EFFECTIVE window used for both clauses is
+                ``max(recency_window_seconds, the run's OWN frozen interval ×
+                4, 20.0)`` — read from the target run's own frozen
+                ``config_json`` (immutable once written; no race to guard
+                against, unlike ``completed_at_utc``/telemetry). Taking the
+                LARGER of the two is the fail-closed direction: a wider
+                window only makes the clear HARDER, never easier, so an
+                impostor process with a shorter-interval config can never
+                use its own narrower window to slip past an owner's
+                genuinely slower cadence. Falls back to
+                ``recency_window_seconds`` alone if the run predates the
+                ``config_json``/``telemetry_log_interval_seconds`` key (not
+                reachable in practice — the column is ``NOT NULL`` since
+                schema v1 — but a missing key degrades safely rather than
+                raising).
+
+        Raises:
+            RuntimeError: No unfinalised run matches ``run_id`` (unknown id,
+                or it was already finalised — guard (b)).
+            RunActivelyDrivenError: A telemetry row exists inside the
+                EFFECTIVE recency window (clause 2a), OR the run started
+                within it (clause 2b, the pre-first-tick P1 fold) — guard
+                (c): some process is still driving this run.
+        """
+        row_cursor = await self.connection.execute(
+            "SELECT json_extract(config_json, '$.controller.telemetry_log_interval_seconds')"
+            " FROM roast_runs WHERE id = ?",
+            (run_id,),
+        )
+        interval_row = await row_cursor.fetchone()
+        owner_interval = None if interval_row is None else interval_row[0]
+        # The run's OWN window, mirroring the answering process's own
+        # max(floor, 4x interval) scaling exactly (RoastService's
+        # _stale_session_recency_window_seconds) — computed here so a run
+        # frozen with a slower cadence gets the SAME margin an owning
+        # process would apply to itself, regardless of who is asking.
+        owner_window_seconds = (
+            None if owner_interval is None else max(20.0, 4.0 * float(owner_interval))
+        )
+        effective_window_seconds = (
+            recency_window_seconds
+            if owner_window_seconds is None
+            else max(recency_window_seconds, owner_window_seconds)
+        )
+        # Format contract (safety-reviewer note): this must stay
+        # datetime.now(UTC).isoformat() (a "+00:00" offset, matching
+        # _utc_now()'s telemetry-write format) — a "Z"-suffixed or naive
+        # datetime would silently break the lexicographic TEXT comparison
+        # below (SQLite has no datetime type; every ">"/"<=" here is a plain
+        # string compare, correct ONLY because every writer — telemetry AND
+        # roast_runs.started_at_utc — uses this exact form). The SAME
+        # threshold string backs both clause 2a and clause 2b (one recency
+        # budget, not two independently-drifting windows.
+        threshold = (datetime.now(UTC) - timedelta(seconds=effective_window_seconds)).isoformat()
+        now = _utc_now()  # one instant: completed_at == updated_at at finalisation
+        cursor = await self.connection.execute(
+            "UPDATE roast_runs SET completed_at_utc = ?, outcome = 'aborted',"
+            " updated_at_utc = ? WHERE id = ? AND completed_at_utc IS NULL"
+            # Clause 2b (P1 fold): a run started WITHIN the recency window is
+            # refused regardless of telemetry — closes the pre-first-tick gap.
+            " AND started_at_utc <= ?"
+            " AND NOT EXISTS ("
+            "   SELECT 1 FROM telemetry_snapshots"
+            "   WHERE telemetry_snapshots.run_id = roast_runs.id"
+            "   AND telemetry_snapshots.recorded_at_utc > ?"
+            " )",
+            (now, now, run_id, threshold, threshold),
+        )
+        await self.connection.commit()
+        if cursor.rowcount == 0:
+            # Disambiguate: already finalized / unknown id (RuntimeError) vs.
+            # blocked by guard (c)'s recency check — either clause 2a or 2b
+            # (RunActivelyDrivenError) — a follow-up read against the row the
+            # WHERE clause actually saw.
+            completed_cursor = await self.connection.execute(
+                "SELECT completed_at_utc FROM roast_runs WHERE id = ?", (run_id,)
+            )
+            completed_row = await completed_cursor.fetchone()
+            if completed_row is None or completed_row["completed_at_utc"] is not None:
+                raise RuntimeError(f"no unfinalized roast_run with id {run_id!r}")
+            raise RunActivelyDrivenError(
+                f"roast_run {run_id!r} has telemetry within the last "
+                f"{effective_window_seconds:.0f}s — some process is actively driving it"
+            )
 
     async def set_operator_rating(
         self, run_id: str, *, rating: Literal[1, 2, 3, 4, 5], notes: str | None = None

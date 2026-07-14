@@ -28,9 +28,16 @@ import { StartRoastView } from "./StartRoastView";
 const startRoastMock = vi.hoisted(() =>
   vi.fn(async () => ({ id: "run-new", instance_id: "server-a" })),
 );
+// #525: the clear-stale-session mutation, mirroring startRoastMock's pattern.
+const clearStaleSessionMock = vi.hoisted(() =>
+  vi.fn(async () => ({ run_id: "run-stranded", outcome: "aborted", completed_at_utc: "now" })),
+);
 vi.mock("@/lib/api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api")>("@/lib/api");
-  return { ...actual, api: { ...actual.api, startRoast: startRoastMock } };
+  return {
+    ...actual,
+    api: { ...actual.api, startRoast: startRoastMock, clearStaleSession: clearStaleSessionMock },
+  };
 });
 
 // Mutable health stub — mirrors LivePage.test.tsx's pattern (#513): the active-
@@ -98,12 +105,24 @@ function renderView() {
       </MemoryRouter>
     </QueryClientProvider>
   );
-  render(wrapper(<StartRoastView />));
+  const result = render(wrapper(<StartRoastView />));
+  /** Force a re-render of StartRoastView (e.g. after mutating historyState —
+   *  #525 P2's staleRun-identity-change test). */
+  function rerender() {
+    result.rerender(wrapper(<StartRoastView />));
+  }
+  return { rerender };
 }
 
 afterEach(cleanup);
 beforeEach(() => {
   startRoastMock.mockClear();
+  clearStaleSessionMock.mockClear();
+  clearStaleSessionMock.mockResolvedValue({
+    run_id: "run-stranded",
+    outcome: "aborted",
+    completed_at_utc: "now",
+  } as never);
   healthState.data = { active_run_id: null };
   healthState.isSuccess = true;
   healthState.isError = false;
@@ -375,5 +394,133 @@ describe("StartRoastView — stale-session detection (#523)", () => {
     renderView();
     fireEvent.click(screen.getByTestId("start-roast-stale-session-link"));
     expect(screen.getByTestId("live-page")).toBeInTheDocument();
+  });
+});
+
+describe("StartRoastView — clear-stale-session action (#525)", () => {
+  function renderStaleSession() {
+    healthState.data = { active_run_id: null };
+    healthState.isSuccess = true;
+    healthState.isFresh = true;
+    historyState.data = { runs: [{ id: "run-stranded", outcome: null }] };
+    historyState.isFresh = true;
+    return renderView();
+  }
+
+  it("the stale-session card renders the clear affordance alongside the existing live-view link", () => {
+    renderStaleSession();
+    expect(screen.getByTestId("start-roast-stale-session-clear-open")).toBeInTheDocument();
+    // The existing #523 link stays — the clear action is additive, not a replacement.
+    expect(screen.getByTestId("start-roast-stale-session-link")).toHaveAttribute("href", "/live");
+  });
+
+  it("opens a confirm step requiring a reason before the clear can be submitted", () => {
+    renderStaleSession();
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-open"));
+    expect(screen.getByTestId("start-roast-stale-session-confirm")).toBeInTheDocument();
+    // Empty reason: the confirm button is disabled — no accidental no-reason clears.
+    expect(screen.getByTestId("start-roast-stale-session-clear-confirm")).toBeDisabled();
+  });
+
+  it("blocks submission on a whitespace-only reason (client-side mirror of the server's required, non-empty reason)", () => {
+    renderStaleSession();
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-open"));
+    fireEvent.change(screen.getByTestId("start-roast-stale-session-reason"), {
+      target: { value: "   " },
+    });
+    expect(screen.getByTestId("start-roast-stale-session-clear-confirm")).toBeDisabled();
+  });
+
+  it("submits the typed reason via api.clearStaleSession and shows the cleared state on success", async () => {
+    renderStaleSession();
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-open"));
+    fireEvent.change(screen.getByTestId("start-roast-stale-session-reason"), {
+      target: { value: "confirmed orphaned via SQL inspection" },
+    });
+    expect(screen.getByTestId("start-roast-stale-session-clear-confirm")).not.toBeDisabled();
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-confirm"));
+
+    await waitFor(() => expect(clearStaleSessionMock).toHaveBeenCalledTimes(1));
+    expect(clearStaleSessionMock).toHaveBeenCalledWith("run-stranded", {
+      reason: "confirmed orphaned via SQL inspection",
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("start-roast-stale-session-cleared")).toBeInTheDocument(),
+    );
+  });
+
+  it("sends the TRIMMED reason — the persisted audit value matches what actually gated the confirm button", async () => {
+    renderStaleSession();
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-open"));
+    fireEvent.change(screen.getByTestId("start-roast-stale-session-reason"), {
+      target: { value: "  padded with whitespace  " },
+    });
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-confirm"));
+
+    await waitFor(() => expect(clearStaleSessionMock).toHaveBeenCalledTimes(1));
+    expect(clearStaleSessionMock).toHaveBeenCalledWith("run-stranded", {
+      reason: "padded with whitespace",
+    });
+  });
+
+  it("cancelling the confirm step discards the typed reason and returns to the plain affordance", () => {
+    renderStaleSession();
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-open"));
+    fireEvent.change(screen.getByTestId("start-roast-stale-session-reason"), {
+      target: { value: "changed my mind" },
+    });
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-cancel"));
+    expect(screen.getByTestId("start-roast-stale-session-clear-open")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-stale-session-confirm")).toBeNull();
+    expect(clearStaleSessionMock).not.toHaveBeenCalled();
+
+    // Reopening starts from a blank reason again (discarded, not just hidden).
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-open"));
+    expect(screen.getByTestId("start-roast-stale-session-reason")).toHaveValue("");
+  });
+
+  it("shows an error state and lets the operator retry when the clear request fails (e.g. the server's guard (a)/(c) 409)", async () => {
+    clearStaleSessionMock.mockRejectedValueOnce(new Error("actively driven — do not clear"));
+    renderStaleSession();
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-open"));
+    fireEvent.change(screen.getByTestId("start-roast-stale-session-reason"), {
+      target: { value: "thought this was mine" },
+    });
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-confirm"));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("start-roast-stale-session-clear-error")).toBeInTheDocument(),
+    );
+    // The confirm step stays open (not silently reset) so the operator can retry.
+    expect(screen.getByTestId("start-roast-stale-session-clear-confirm")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-stale-session-cleared")).toBeNull();
+  });
+
+  it("#525 P2 (PR #548 round-1 Codex): resets confirm/reason state when staleRun's IDENTITY changes (e.g. clearing the newest of two stranded rows exposes the older one)", () => {
+    healthState.data = { active_run_id: null };
+    healthState.isSuccess = true;
+    healthState.isFresh = true;
+    historyState.data = { runs: [{ id: "run-newer-stranded", outcome: null }] };
+    historyState.isFresh = true;
+    const { rerender } = renderView();
+
+    // Open the confirm step and type a reason against the FIRST staleRun.
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-open"));
+    fireEvent.change(screen.getByTestId("start-roast-stale-session-reason"), {
+      target: { value: "this reason belongs to run-newer-stranded" },
+    });
+    expect(screen.getByTestId("start-roast-stale-session-confirm")).toBeInTheDocument();
+
+    // Simulate the newer run having just been cleared server-side: history
+    // now exposes a DIFFERENT stranded run as staleRun (without `key`, the
+    // component instance would persist across this — same runId prop
+    // identity concern, different underlying run).
+    historyState.data = { runs: [{ id: "run-older-stranded", outcome: null }] };
+    rerender();
+
+    // A remounted component starts from the closed, blank-reason state —
+    // never carrying over the PREVIOUS run's typed reason or open confirm step.
+    expect(screen.getByTestId("start-roast-stale-session-clear-open")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-stale-session-confirm")).toBeNull();
   });
 });
