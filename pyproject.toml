@@ -162,6 +162,21 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/roastpilot_agent"]
 
+# E11-S1 (#137): bundle the built SPA (web/dist) into the wheel via a custom
+# build hook rather than committing web/dist to the repo (the plan §11
+# fallback) — see hatch_build.py's module docstring for the full rationale.
+# Editable installs (`pip install -e .`) skip the hook entirely and rely on
+# the source-checkout fallback in live.default_spa_dir.
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
+[tool.hatch.build.targets.sdist]
+# The sdist must carry web/ (source, not the built dist) so a
+# `pip install roastpilot-agent` sdist fallback (no prebuilt wheel for the
+# platform) can still run the build hook.
+include = ["src", "web", "hatch_build.py"]
+exclude = ["web/node_modules", "web/dist"]
+
 [tool.hatch.version]
 path = "src/roastpilot_agent/__init__.py"
 

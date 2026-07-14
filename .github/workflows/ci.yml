@@ -82,6 +82,71 @@ jobs:
           roastpilot-agent --help
           roastpilot-agent --version
 
+  # E11-S1 (#137): build the real wheel (Node must be present so the
+  # hatch_build.py hook can `npm ci && npm run build` web/dist and force-include
+  # it) and prove the artifact in a CLEAN venv — install from the .whl only,
+  # never `pip install -e .`, so this exercises the packaged-data path
+  # (roastpilot_agent/_web_dist via importlib.resources), not the
+  # source-checkout fallback the `checks` job's editable install always takes.
+  package:
+    name: Package (wheel build + clean-venv smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Set up Node (for the SPA build hook)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: web/package-lock.json
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      - name: Install the wheel into a clean venv
+        run: |
+          python -m venv /tmp/wheel-smoke-venv
+          /tmp/wheel-smoke-venv/bin/python -m pip install --upgrade pip
+          /tmp/wheel-smoke-venv/bin/python -m pip install dist/*.whl
+
+      - name: CLI smoke (clean-venv install, no source checkout on the path)
+        run: |
+          /tmp/wheel-smoke-venv/bin/roastpilot-agent --help
+          /tmp/wheel-smoke-venv/bin/roastpilot-agent --version
+
+      - name: SPA-bundled smoke (replay mode, hardware-free, non-8000 port)
+        # Proves the packaged SPA is actually served (not just present in the
+        # wheel): --replay never spawns the MCP child, so this needs no
+        # libportaudio2/sounddevice runtime. Binds a high port; 8000 is never
+        # used in CI but the convention is kept for consistency with the
+        # "never touch 8000" rule (a live hardware server may use it locally).
+        run: |
+          /tmp/wheel-smoke-venv/bin/roastpilot-agent \
+            --replay tests/fixtures/replay/session-1 \
+            --host 127.0.0.1 --port 18234 --speed 60 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:18234/api/health; then
+              break
+            fi
+            sleep 0.5
+          done
+          curl -sf -o /dev/null http://127.0.0.1:18234/api/health
+          index_html="$(curl -sf http://127.0.0.1:18234/)"
+          echo "$index_html" | grep -q '<div id="root">' \
+            || { echo "SPA index.html not served from the packaged wheel"; exit 1; }
+
   # The SPA (web/) lint + typecheck + unit/component tests on a normal runner.
   web:
     name: Web (lint + typecheck + unit)
