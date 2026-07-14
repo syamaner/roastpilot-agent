@@ -1235,11 +1235,27 @@ class ClearStaleSessionRequest(BaseModel):
     telemetry — see :meth:`~roastpilot_agent.api.RoastService.clear_stale_session`
     for the full gate. A pure store write: it issues no MCP command and never
     touches heat, fan, or cooling. ``reason`` is required (no silent
-    no-reason clears) and is recorded verbatim on the ``operator_actions``
-    audit row, whether the request is accepted or rejected.
+    no-reason clears) and is recorded verbatim (post-strip) on the
+    ``operator_actions`` audit row, whether the request is accepted or
+    rejected.
     """
 
     reason: str = Field(min_length=1)
+
+    @field_validator("reason")
+    @classmethod
+    def _strip_and_require_reason(cls, value: str) -> str:
+        """Reject a whitespace-only reason server-side (PR #548 round-1 P3):
+        ``min_length=1`` alone lets a direct API caller (bypassing the FE's
+        own ``.trim()``) send ``"   "`` and pass. This is the audit CONTRACT,
+        not just the UI's convenience gate — a caller that skips the browser
+        entirely must face the same requirement. Stores the STRIPPED value
+        (mirrors :class:`RoastProfile`'s ``_strip_and_require_content``) so a
+        padded reason is never persisted padded."""
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("must not be empty or whitespace-only")
+        return stripped
 
 
 class ClearStaleSessionResult(BaseModel):

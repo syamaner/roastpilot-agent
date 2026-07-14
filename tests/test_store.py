@@ -1216,9 +1216,24 @@ async def _insert_telemetry_at(store: RoastStore, run_id: str, recorded_at_utc: 
     await store.connection.commit()
 
 
+async def _backdate_started_at(store: RoastStore, run_id: str, started_at_utc: str) -> None:
+    """Rewrite a run's ``started_at_utc`` to an EXPLICIT timestamp (#525 P1
+    fold, clause 2b tests) — ``seeded_store`` stamps ``started_at_utc`` at
+    "now" (the test's wall-clock instant), which is exactly what a genuinely
+    stale orphan is NOT (a real orphan started minutes ago). Tests whose
+    intent is "a genuine orphan" backdate via this helper so clause 2b
+    (``started_at_utc <= threshold``) does not spuriously refuse them —
+    mirrors ``_insert_telemetry_at``'s explicit-timestamp pattern."""
+    await store.connection.execute(
+        "UPDATE roast_runs SET started_at_utc = ? WHERE id = ?", (started_at_utc, run_id)
+    )
+    await store.connection.commit()
+
+
 @pytest.mark.asyncio
 async def test_finalize_orphaned_run_terminal_and_preserves_phase(tmp_store: RoastStore) -> None:
-    """#525: a genuinely stranded, unfinalised run (no recent telemetry) is
+    """#525: a genuinely stranded, unfinalised run (no recent telemetry, and
+    started well before the recency window — clause 2b, the P1 fold) is
     finalised ``outcome='aborted'``, ``completed_at_utc`` stamped, and
     ``agent_phase``/``fault_reason`` are left UNTOUCHED (mirrors
     ``finalize_stale_faulted_run``'s preserve-diagnosis rationale) — this
@@ -1230,6 +1245,8 @@ async def test_finalize_orphaned_run_terminal_and_preserves_phase(tmp_store: Roa
             (RoastPhase.OPERATOR_RECOVERY_REQUIRED.value,),
         )
         await tmp_store.connection.commit()
+        long_ago = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+        await _backdate_started_at(tmp_store, "run-1", long_ago)
 
         await tmp_store.finalize_orphaned_run("run-1", recency_window_seconds=20.0)
 
@@ -1293,16 +1310,58 @@ async def test_finalize_orphaned_run_blocked_by_recent_telemetry(tmp_store: Roas
 
 
 @pytest.mark.asyncio
+async def test_finalize_orphaned_run_blocked_by_a_just_started_run_with_no_telemetry_yet(
+    tmp_store: RoastStore,
+) -> None:
+    """#525 guard (c) clause 2b — the P1 fold (PR #548 round-1 Codex): a run
+    started MOMENTS ago has ZERO telemetry rows (``RoastRunner.start()``
+    drives ``controller.start_run()`` — which issues the profile's initial
+    heat/fan through the safety policy — and RETURNS before ``run()``'s
+    scheduler ever calls ``tick_once()``, the sole caller of
+    ``_publish_and_persist_telemetry``). Clause 2a's ``NOT EXISTS`` telemetry
+    check ALONE would pass here (there is no telemetry row at all, recent or
+    otherwise) and let an impostor process finalise a row whose hardware is
+    being actively driven right now — this is the exact P1 reproduction: run
+    it against the PRE-FOLD WHERE clause (no ``started_at_utc`` bound) and it
+    fails to raise. Clause 2b closes it: ``started_at_utc`` (stamped at
+    creation, ``seeded_store``'s default) is "now", inside the SAME recency
+    window as clause 2a, so the clear is refused with the same
+    ``RunActivelyDrivenError`` regardless of the empty telemetry table."""
+    await seeded_store(tmp_store)  # started_at_utc = "now" (the default, unbackdated)
+    try:
+        # Sanity: genuinely NO telemetry for this run — clause 2a's NOT
+        # EXISTS would pass on its own, proving clause 2b is the one doing
+        # the work here, not a coincidental telemetry hit.
+        telemetry_count = await fetch_one(
+            tmp_store, "SELECT COUNT(*) FROM telemetry_snapshots WHERE run_id = 'run-1'"
+        )
+        assert telemetry_count[0] == 0
+
+        with pytest.raises(RunActivelyDrivenError):
+            await tmp_store.finalize_orphaned_run("run-1", recency_window_seconds=20.0)
+
+        row = await fetch_one(
+            tmp_store, "SELECT outcome, completed_at_utc FROM roast_runs WHERE id = 'run-1'"
+        )
+        assert row[0] is None  # untouched — no outcome stamped
+        assert row[1] is None  # still active
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
 async def test_finalize_orphaned_run_succeeds_when_telemetry_is_outside_the_window(
     tmp_store: RoastStore,
 ) -> None:
     """#525 guard (c): telemetry OLDER than the recency window does not block
     the clear — a run that stopped being driven a while ago is genuinely
-    stale, not actively driven."""
+    stale, not actively driven. Also backdates ``started_at_utc`` (clause 2b)
+    since this test's intent is a genuine orphan, not a just-started run."""
     await seeded_store(tmp_store)
     try:
         stale = (datetime.now(UTC) - timedelta(seconds=60)).isoformat()
         await _insert_telemetry_at(tmp_store, "run-1", stale)
+        await _backdate_started_at(tmp_store, "run-1", stale)
 
         await tmp_store.finalize_orphaned_run("run-1", recency_window_seconds=20.0)
 
@@ -1323,11 +1382,15 @@ async def test_finalize_orphaned_run_exact_boundary_is_treated_as_stale(
     than the cutoff to prove a live writer; a row landing exactly at the
     cutoff is the boundary of "old enough to be stale", not "inside the
     window". Pins a fixed instant on both sides (rather than a real
-    ``datetime.now(UTC)`` race) so the boundary is exercised deterministically."""
+    ``datetime.now(UTC)`` race) so the boundary is exercised deterministically.
+    Also backdates ``started_at_utc`` well clear of the window (clause 2b is
+    not what this test is exercising)."""
     await seeded_store(tmp_store)
     try:
         cutoff_instant = datetime.now(UTC)
         window_seconds = 20.0
+        long_ago = (cutoff_instant - timedelta(minutes=10)).isoformat()
+        await _backdate_started_at(tmp_store, "run-1", long_ago)
 
         class _FixedDatetime(datetime):
             @classmethod
@@ -1359,9 +1422,13 @@ async def test_finalize_orphaned_run_recency_window_is_config_scaled(
     against the configured ``telemetry_log_interval_seconds`` — this store
     method just honours whatever window it is given. A telemetry row 30s old
     blocks a 60s window but not a 10s window, proving the window is a live
-    parameter, not a hardcoded constant."""
+    parameter, not a hardcoded constant. Backdates ``started_at_utc`` well
+    clear of both windows so clause 2b never interferes with this test's
+    telemetry-window assertion."""
     await seeded_store(tmp_store)
     try:
+        long_ago = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+        await _backdate_started_at(tmp_store, "run-1", long_ago)
         thirty_seconds_ago = (datetime.now(UTC) - timedelta(seconds=30)).isoformat()
         await _insert_telemetry_at(tmp_store, "run-1", thirty_seconds_ago)
 
@@ -1380,10 +1447,13 @@ async def test_finalize_orphaned_run_recency_window_is_config_scaled(
 @pytest.mark.asyncio
 async def test_finalize_orphaned_run_ignores_other_runs_telemetry(tmp_store: RoastStore) -> None:
     """#525 guard (c) scoping: the recency check is per-``run_id`` — a fresh
-    telemetry row for a DIFFERENT run must never block clearing THIS one
-    (the ``NOT EXISTS`` subquery is correlated on ``run_id``)."""
+    telemetry row (and a fresh START) for a DIFFERENT run must never block
+    clearing THIS one (both the ``NOT EXISTS`` subquery and clause 2b's
+    ``started_at_utc`` bound are scoped to the target row, not the table)."""
     store = await seeded_store(tmp_store)
     try:
+        long_ago = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+        await _backdate_started_at(store, "run-1", long_ago)
         await store.create_run(
             run_id="run-2",
             profile=PROFILE,

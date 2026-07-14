@@ -1151,23 +1151,47 @@ class RoastStore:
            guard (b)) — a concurrent finalize (another clear, a legitimate
            completion) loses the race cleanly: this call's rowcount is 0 and
            it raises, never silently re-finalising an already-terminal row.
-        2. A ``NOT EXISTS`` telemetry-recency subquery (#525 guard (c),
-           safety-reviewer PASS-WITH-CONDITIONS) — closes the gap guard (a)
-           structurally cannot: a single process can only ever attest to its
-           OWN active-run pointer, never to whether some OTHER process is
-           live-driving this exact run_id. A live roast persists a telemetry
-           row on every controller tick (throttled only by
-           ``telemetry_log_interval_seconds``, never by phase — confirmed the
-           very first tick of a run always writes), so ANY row within
-           ``recency_window_seconds`` of now is durable, shared-DB evidence
-           that some process is actively ticking this run RIGHT NOW,
-           independent of what any one process's in-memory state claims.
-           This generalises "MCP-state gate: never clear while the machine
-           could be hot" (#525's original ask) into an honest DB-liveness
-           check: an own-process MCP-idle read cannot observe a DIFFERENT
-           process's roaster, so it would be a no-op at best and misleading
-           at worst — recent telemetry is the one signal any process can
-           trust regardless of who is driving the run.
+        2. Guard (c) is a TWO-CLAUSE liveness gate (recent WRITE-recency OR
+           recent START-recency), safety-reviewer PASS-WITH-CONDITIONS +
+           PR #548 round-1 P1 fold — closes the gap guard (a) structurally
+           cannot: a single process can only ever attest to its OWN
+           active-run pointer, never to whether some OTHER process is
+           live-driving this exact run_id.
+
+           2a. A ``NOT EXISTS`` telemetry-recency subquery: a live roast
+               persists a telemetry row on every controller tick (throttled
+               only by ``telemetry_log_interval_seconds``, never by phase),
+               so ANY row within ``recency_window_seconds`` of now is
+               durable, shared-DB evidence that some process is actively
+               ticking this run.
+           2b. ``started_at_utc <= threshold`` (the P1 fold): clause 2a alone
+               has a real hole in the window BEFORE the first tick.
+               ``RoastRunner.start()`` drives ``controller.start_run()`` —
+               which issues the profile's initial heat/fan through the
+               safety policy — and returns BEFORE ``run()``'s scheduler ever
+               calls ``tick_once()`` (the sole caller of
+               ``_publish_and_persist_telemetry``). So a run created moments
+               ago can have heat/fan ACTIVELY COMMANDED with ZERO telemetry
+               rows — clause 2a alone would pass ``NOT EXISTS`` and let an
+               impostor process finalise a row whose hardware is being
+               driven right now. Requiring the run to ALSO be older than the
+               SAME recency window closes this: a genuinely stale orphan is
+               by definition minutes old, so this costs a real orphan
+               nothing, while a just-started run (regardless of whether its
+               first tick has landed yet) is refused with the same
+               ``RunActivelyDrivenError`` / "actively driven" 409 as clause
+               2a. Uses the IDENTICAL ``threshold`` string as 2a (same
+               format-contract constraint applies) — not a separate window,
+               so there is only one recency budget to reason about.
+
+           Together: this generalises "MCP-state gate: never clear while the
+           machine could be hot" (#525's original ask) into an honest
+           DB-liveness check across the run's WHOLE unfinalised lifetime, not
+           just from tick 1 onward — an own-process MCP-idle read cannot
+           observe a DIFFERENT process's roaster, so it would be a no-op at
+           best and misleading at worst; recent telemetry OR a recent start
+           is the one signal any process can trust regardless of who is
+           driving the run.
 
         This is a STORE write only — it resumes nothing, issues no MCP write,
         and never touches heat/fan (the restart-never-auto-resumes invariant
@@ -1176,40 +1200,52 @@ class RoastStore:
         Args:
             run_id: The stranded run to finalise.
             recency_window_seconds: How far back to look for telemetry
-                evidence of a live writer. The caller scales this against the
-                configured ``telemetry_log_interval_seconds`` (never a bare
-                constant) so a long-interval config cannot quietly shrink the
-                safety margin.
+                evidence of a live writer, AND how recently the run must NOT
+                have started (the P1 fold's start-recency clause, 2b above,
+                shares this same window rather than its own). The caller
+                scales this against the configured
+                ``telemetry_log_interval_seconds`` (never a bare constant) so
+                a long-interval config cannot quietly shrink the safety
+                margin.
 
         Raises:
             RuntimeError: No unfinalised run matches ``run_id`` (unknown id,
                 or it was already finalised — guard (b)).
             RunActivelyDrivenError: A telemetry row exists inside the recency
-                window — guard (c): some process is still driving this run.
+                window (clause 2a), OR the run started within the recency
+                window (clause 2b, the pre-first-tick P1 fold) — guard (c):
+                some process is still driving this run.
         """
         # Format contract (safety-reviewer note): this must stay
         # datetime.now(UTC).isoformat() (a "+00:00" offset, matching
         # _utc_now()'s telemetry-write format) — a "Z"-suffixed or naive
         # datetime would silently break the lexicographic TEXT comparison
-        # below (SQLite has no datetime type; the ">" is a plain string
-        # compare, correct ONLY because every writer uses this exact form).
+        # below (SQLite has no datetime type; every ">"/"<=" here is a plain
+        # string compare, correct ONLY because every writer — telemetry AND
+        # roast_runs.started_at_utc — uses this exact form). The SAME
+        # threshold string backs both clause 2a and clause 2b (one recency
+        # budget, not two independently-drifting windows.
         threshold = (datetime.now(UTC) - timedelta(seconds=recency_window_seconds)).isoformat()
         now = _utc_now()  # one instant: completed_at == updated_at at finalisation
         cursor = await self.connection.execute(
             "UPDATE roast_runs SET completed_at_utc = ?, outcome = 'aborted',"
             " updated_at_utc = ? WHERE id = ? AND completed_at_utc IS NULL"
+            # Clause 2b (P1 fold): a run started WITHIN the recency window is
+            # refused regardless of telemetry — closes the pre-first-tick gap.
+            " AND started_at_utc <= ?"
             " AND NOT EXISTS ("
             "   SELECT 1 FROM telemetry_snapshots"
             "   WHERE telemetry_snapshots.run_id = roast_runs.id"
             "   AND telemetry_snapshots.recorded_at_utc > ?"
             " )",
-            (now, now, run_id, threshold),
+            (now, now, run_id, threshold, threshold),
         )
         await self.connection.commit()
         if cursor.rowcount == 0:
             # Disambiguate: already finalized / unknown id (RuntimeError) vs.
-            # blocked by guard (c)'s recency check (RunActivelyDrivenError) —
-            # a follow-up read against the row the WHERE clause actually saw.
+            # blocked by guard (c)'s recency check — either clause 2a or 2b
+            # (RunActivelyDrivenError) — a follow-up read against the row the
+            # WHERE clause actually saw.
             row_cursor = await self.connection.execute(
                 "SELECT completed_at_utc FROM roast_runs WHERE id = ?", (run_id,)
             )
