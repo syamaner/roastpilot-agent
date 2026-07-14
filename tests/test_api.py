@@ -1318,7 +1318,7 @@ async def test_clear_stale_session_blocks_this_processs_own_active_run(
     assert action == "clear_stale_session"
     assert result == "rejected"
     assert payload_json is not None
-    assert "trying to clear my own run" == json.loads(payload_json)["reason"]
+    assert json.loads(payload_json)["reason"] == "trying to clear my own run"
 
 
 @pytest.mark.asyncio
