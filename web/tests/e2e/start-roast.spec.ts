@@ -33,7 +33,7 @@ test("start-roast — idle form with the saved bean-profile dropdown (full-page 
   await expect(select).toContainText("Ethiopia Yirgacheffe Koke (Natural)");
   await expect(select).toContainText("Colombia Huila (Washed)");
 
-  await expect(page).toHaveScreenshot("start-roast.png");
+  await expect(page).toHaveScreenshot("start-roast.png", { fullPage: true });
 });
 
 test("selecting a saved profile fills the form + pre-fills the per-roast weight (data-assert)", async ({
@@ -62,7 +62,7 @@ test("start-roast-add-modal — the add-profile modal open (full-page snapshot)"
   await expect(page.getByTestId("bean-profile-save")).toBeVisible();
   await page.evaluate(() => document.fonts.ready);
 
-  await expect(page).toHaveScreenshot("start-roast-add-modal.png");
+  await expect(page).toHaveScreenshot("start-roast-add-modal.png", { fullPage: true });
 });
 
 test("the edit pencil opens the edit modal for the selected profile (data-assert)", async ({

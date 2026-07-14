@@ -26,7 +26,7 @@ test("foundation chrome — full-page snapshot with the un-masked canvas", async
   // The DOM chrome (header, connection indicator, verdict badges, legend) AND the
   // rendered curve are the baseline now; correctness is also asserted via the data
   // hook in the tests below.
-  await expect(page).toHaveScreenshot("foundation-chrome.png");
+  await expect(page).toHaveScreenshot("foundation-chrome.png", { fullPage: true });
 });
 
 test("chart data hook exposes the five series + markers (D24)", async ({ page }) => {

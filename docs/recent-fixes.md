@@ -550,3 +550,40 @@ Format: one entry per anti-pattern.
   restore from THAT. The safety-commit protocol applies to every destructive
   step, not just review handoffs and branch switches.
 - **Guarded by:** protocol; the commit-before-verify habit.
+
+## A `devices[...]` spread inside a Playwright project's `use` silently wins over the top-level viewport, and `toHaveScreenshot` defaults `fullPage: false` with no project-wide override available
+*(fixed by #530, 14 Jul 2026)*
+
+- **Signature:** a Playwright project's `use: { ...devices["Some Device"], ... }`
+  spread in `playwright.config.ts` where the top-level `use` also sets its own
+  `viewport` — object-spread precedence is POSITIONAL WITHIN THAT ONE OBJECT
+  LITERAL, not "top-level vs project-level," so a `devices[...]` preset's own
+  `viewport` silently overrides whatever the top-level `use.viewport` says
+  unless re-asserted after the spread. Also: any `expect(page).toHaveScreenshot()`
+  call with no `fullPage` option, on a page whose content can exceed the
+  configured viewport height.
+- **Wrong:** the `chromium` project spread `...devices["Desktop Chrome"]` (whose
+  own `viewport: {1280,720}`) after which nothing re-asserted the intended
+  `{1600,1000}` — every committed baseline was exactly 1280×720 regardless of
+  the top-level config. Separately, even a correctly-applied fixed viewport
+  can't capture a page taller than it; the detail page's real `scrollHeight` is
+  2599px, so the actual "whole page" guarantee has to come from `fullPage:
+  true`, not viewport size. `fullPage` was tried as a project-wide
+  `expect.toHaveScreenshot` default first — `tsc -b` correctly rejects this;
+  Playwright's project-wide config type for that assertion omits `fullPage`, it
+  only exists on the per-call `toHaveScreenshot(name, { fullPage: true })`
+  signature.
+- **Right:** re-assert the intended `viewport` (and any other device field you
+  care about) AFTER the `devices[...]` spread inside the SAME object literal.
+  Set `{ fullPage: true }` explicitly on every `expect(page).toHaveScreenshot()`
+  call site (not the project-wide default) for any suite whose docs/intent
+  claim "whole page" coverage. A locator screenshot (`expect(locator).
+  toHaveScreenshot()`) is unaffected either way — it already captures its full
+  element.
+- **Guarded by:** the regenerated `__screenshots__/**/*-linux.png` baselines
+  (dimensions verified against measured `scrollHeight`, and the previously
+  below-the-fold widgets — ratings, weight, tasting notes, roast conditions,
+  export — visually confirmed present in the COMMITTED images, not just a local
+  darwin run). No dedicated regression test beyond the baseline diff itself;
+  the viewport/`fullPage` config is exercised by every snapshot spec in the
+  suite.

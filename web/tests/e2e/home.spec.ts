@@ -41,5 +41,5 @@ test("home — landing hub with all entry points + persistent nav (full-page sna
   await expect(page.getByTestId("nav-live-roast")).toHaveCount(0);
   await expect(page.getByTestId("home-live-status-chip")).toHaveCount(0);
 
-  await expect(page).toHaveScreenshot("home.png");
+  await expect(page).toHaveScreenshot("home.png", { fullPage: true });
 });

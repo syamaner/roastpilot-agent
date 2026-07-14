@@ -525,8 +525,19 @@ async def test_serve_recovery_resolves_active_run_without_auto_resume(
 # --- default spa-dir resolution -------------------------------------------------
 
 
-def test_default_spa_dir_returns_web_dist_when_present() -> None:
-    """default_spa_dir resolves the repo's web/dist when it has an index.html."""
+def test_default_spa_dir_returns_web_dist_when_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """default_spa_dir resolves the repo's web/dist when it has an index.html.
+
+    No bundled package data exists in this editable/source-checkout test
+    environment, so ``_packaged_spa_dir`` is forced to ``None`` to isolate this
+    test from whether a prior test in the session happens to have built
+    ``web/dist`` under ``_web_dist`` too (it never does today, but this keeps
+    the test asserting the source-checkout branch specifically, which is what
+    its name promises).
+    """
+    monkeypatch.setattr(live, "_packaged_spa_dir", lambda: None)
     resolved = live.default_spa_dir()
     # The repo ships a built web/dist; if present it must point at it.
     expected = Path(live.__file__).resolve().parents[2] / "web" / "dist"
@@ -542,12 +553,81 @@ def test_default_spa_dir_none_when_build_absent(
     """When no built SPA exists at <pkg>/../../web/dist, default_spa_dir is None.
 
     Isolated from repo state: point the module's ``__file__`` three levels under
-    a tmp dir with no ``web/dist`` so ``parents[2]`` resolves there.
+    a tmp dir with no ``web/dist`` so ``parents[2]`` resolves there. Also forces
+    ``_packaged_spa_dir`` to ``None`` so this test isolates the source-checkout
+    fallback branch specifically.
     """
     fake_pkg = tmp_path / "src" / "roastpilot_agent"
     fake_pkg.mkdir(parents=True)
     monkeypatch.setattr(live, "__file__", str(fake_pkg / "live.py"))
+    monkeypatch.setattr(live, "_packaged_spa_dir", lambda: None)
     assert live.default_spa_dir() is None
+
+
+def test_default_spa_dir_prefers_packaged_data_over_source_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A bundled ``_web_dist`` (simulated wheel install) wins over web/dist.
+
+    This is the E11-S1 (#137) precedence: a real wheel install never has a
+    sibling ``web/dist`` source checkout, but the order still matters — the
+    packaged data must be tried first so a wheel install never accidentally
+    picks up a stale/unrelated source-checkout build sitting next to it.
+    """
+    packaged = Path("/fake/site-packages/roastpilot_agent/_web_dist")
+    monkeypatch.setattr(live, "_packaged_spa_dir", lambda: packaged)
+    assert live.default_spa_dir() == packaged
+
+
+def test_packaged_spa_dir_returns_none_when_no_web_dist_package_data() -> None:
+    """_packaged_spa_dir is None in this editable install (no _web_dist data).
+
+    The build hook that creates ``roastpilot_agent/_web_dist`` only runs for a
+    standard (non-editable) wheel build (see ``hatch_build.py``), so a
+    ``pip install -e .`` dev environment — this test environment — never has
+    it.
+    """
+    assert live._packaged_spa_dir() is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+def test_packaged_spa_dir_resolves_real_path_when_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_packaged_spa_dir resolves a real filesystem package-data directory.
+
+    Simulates the pip-installed-as-directory case (what a real wheel install
+    always is) by monkeypatching ``importlib.resources.files`` to return a
+    ``Path`` under ``tmp_path`` holding an ``index.html``.
+    """
+    from importlib import resources
+
+    fake_web_dist = tmp_path / "_web_dist"
+    fake_web_dist.mkdir()
+    (fake_web_dist / "index.html").write_text("<html></html>")
+    fake_package_root = tmp_path
+
+    def _fake_files(package: str) -> Path:
+        assert package == "roastpilot_agent"
+        return fake_package_root
+
+    monkeypatch.setattr(resources, "files", _fake_files)
+    assert live._packaged_spa_dir() == fake_web_dist  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+
+
+def test_packaged_spa_dir_none_when_web_dist_missing_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """_packaged_spa_dir is None when the resolved dir has no index.html."""
+    from importlib import resources
+
+    (tmp_path / "_web_dist").mkdir()  # no index.html inside
+
+    def _fake_files(package: str) -> Path:
+        assert package == "roastpilot_agent"
+        return tmp_path
+
+    monkeypatch.setattr(resources, "files", _fake_files)
+    assert live._packaged_spa_dir() is None  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
 
 
 # --- #308 persistence seam: controller dev% wins over the MCP raw dev% ---------
