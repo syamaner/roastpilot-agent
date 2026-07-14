@@ -468,7 +468,12 @@ export function StartRoastView(): React.JSX.Element {
           >
             Open live view
           </Link>
-          <ClearStaleSessionAction runId={staleRun.id} />
+          {/* #525 P2 (PR #548 round-1 Codex): key on staleRun.id so a
+              staleRun IDENTITY change (e.g. clearing the newest of two
+              stranded rows exposes the older one) forces a fresh mount —
+              without this, the confirm/reason/success state from the JUST-
+              CLEARED run would carry over onto the NEW runId. */}
+          <ClearStaleSessionAction key={staleRun.id} runId={staleRun.id} />
         </div>
       </AppFrame>
     );

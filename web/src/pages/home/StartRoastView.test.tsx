@@ -105,7 +105,13 @@ function renderView() {
       </MemoryRouter>
     </QueryClientProvider>
   );
-  render(wrapper(<StartRoastView />));
+  const result = render(wrapper(<StartRoastView />));
+  /** Force a re-render of StartRoastView (e.g. after mutating historyState —
+   *  #525 P2's staleRun-identity-change test). */
+  function rerender() {
+    result.rerender(wrapper(<StartRoastView />));
+  }
+  return { rerender };
 }
 
 afterEach(cleanup);
@@ -398,7 +404,7 @@ describe("StartRoastView — clear-stale-session action (#525)", () => {
     healthState.isFresh = true;
     historyState.data = { runs: [{ id: "run-stranded", outcome: null }] };
     historyState.isFresh = true;
-    renderView();
+    return renderView();
   }
 
   it("the stale-session card renders the clear affordance alongside the existing live-view link", () => {
@@ -488,5 +494,33 @@ describe("StartRoastView — clear-stale-session action (#525)", () => {
     // The confirm step stays open (not silently reset) so the operator can retry.
     expect(screen.getByTestId("start-roast-stale-session-clear-confirm")).toBeInTheDocument();
     expect(screen.queryByTestId("start-roast-stale-session-cleared")).toBeNull();
+  });
+
+  it("#525 P2 (PR #548 round-1 Codex): resets confirm/reason state when staleRun's IDENTITY changes (e.g. clearing the newest of two stranded rows exposes the older one)", () => {
+    healthState.data = { active_run_id: null };
+    healthState.isSuccess = true;
+    healthState.isFresh = true;
+    historyState.data = { runs: [{ id: "run-newer-stranded", outcome: null }] };
+    historyState.isFresh = true;
+    const { rerender } = renderView();
+
+    // Open the confirm step and type a reason against the FIRST staleRun.
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-open"));
+    fireEvent.change(screen.getByTestId("start-roast-stale-session-reason"), {
+      target: { value: "this reason belongs to run-newer-stranded" },
+    });
+    expect(screen.getByTestId("start-roast-stale-session-confirm")).toBeInTheDocument();
+
+    // Simulate the newer run having just been cleared server-side: history
+    // now exposes a DIFFERENT stranded run as staleRun (without `key`, the
+    // component instance would persist across this — same runId prop
+    // identity concern, different underlying run).
+    historyState.data = { runs: [{ id: "run-older-stranded", outcome: null }] };
+    rerender();
+
+    // A remounted component starts from the closed, blank-reason state —
+    // never carrying over the PREVIOUS run's typed reason or open confirm step.
+    expect(screen.getByTestId("start-roast-stale-session-clear-open")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-stale-session-confirm")).toBeNull();
   });
 });
