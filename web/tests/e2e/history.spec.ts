@@ -164,7 +164,7 @@ test("history — populated table", async ({ page }) => {
   const ambientCells = page.getByTestId("history-ambient");
   await expect(ambientCells).toHaveText(["22.4°C · 41%", "26.8°C · 55%", "—"]);
   await settle(page);
-  await expect(page).toHaveScreenshot("history.png");
+  await expect(page).toHaveScreenshot("history.png", { fullPage: true });
 });
 
 test("history-empty — first-run empty state", async ({ page }) => {
@@ -172,5 +172,5 @@ test("history-empty — first-run empty state", async ({ page }) => {
   await page.goto("/roasts");
   await expect(page.getByTestId("history-empty")).toBeVisible();
   await settle(page);
-  await expect(page).toHaveScreenshot("history-empty.png");
+  await expect(page).toHaveScreenshot("history-empty.png", { fullPage: true });
 });

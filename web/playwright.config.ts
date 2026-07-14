@@ -56,6 +56,11 @@ export default defineConfig({
       // fix determinism (point-count gate / DPR / fonts) instead.
       maxDiffPixelRatio: 0.01,
       animations: "disabled",
+      // #530: NOTE — `fullPage` is NOT a valid key here (Playwright's
+      // `toHaveScreenshot` project-wide default type omits it; it only exists on
+      // the per-call `expect(page).toHaveScreenshot(name, { fullPage: true })`
+      // signature, confirmed by `tsc -b`). Every `expect(page).toHaveScreenshot()`
+      // call site sets it explicitly instead — see each `*.spec.ts` file.
     },
   },
   use: {
@@ -70,7 +75,18 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
-      use: { ...devices["Desktop Chrome"], deviceScaleFactor: 1 },
+      // #530: `devices["Desktop Chrome"]` carries its own `viewport: {1280,720}`,
+      // which — spread INTO this object — wins over the top-level `use.viewport`
+      // (object-spread precedence is by POSITION WITHIN THIS LITERAL, not by
+      // "top-level vs project-level"). Re-assert the intended 1600×1000 AFTER the
+      // spread so the full-page baselines actually capture it instead of silently
+      // clipping to 1280×720 (confirmed empirically: every committed detail
+      // baseline was exactly 1280×720 before this fix).
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 1600, height: 1000 },
+        deviceScaleFactor: 1,
+      },
     },
   ],
   // Per-fixture agent + SPA pairs, all started by Playwright:

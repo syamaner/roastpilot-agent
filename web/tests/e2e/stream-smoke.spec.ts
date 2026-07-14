@@ -60,5 +60,5 @@ test("real-replay smoke — server phase reaches the SPA, chrome snapshot", asyn
   // Phase comes from the server, surfaced by the reducer — assert it landed.
   await expect(page.getByTestId("smoke-phase")).toHaveText("preheating");
   await page.evaluate(() => document.fonts.ready);
-  await expect(page).toHaveScreenshot("stream-smoke-preheating.png");
+  await expect(page).toHaveScreenshot("stream-smoke-preheating.png", { fullPage: true });
 });
