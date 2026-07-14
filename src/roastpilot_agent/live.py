@@ -212,28 +212,66 @@ async def build_live_service(
 
 
 def default_spa_dir() -> Path | None:
-    """Resolve the **source-checkout** built SPA directory (``web/dist``).
+    """Resolve the built SPA directory: bundled package data, else source checkout.
 
-    Resolves ``<repo-root>/web/dist`` relative to this module — i.e. the SPA a
-    developer built locally with ``npm run build`` in a source checkout. Returns
-    it only when it contains an ``index.html``; otherwise ``None`` so the caller
-    mounts nothing (and serves API-only).
+    Tries two locations in order, returning the first that holds an
+    ``index.html`` (otherwise ``None``, so the caller mounts nothing and serves
+    API-only):
 
-    This is **source-checkout only**. From a wheel install
-    (``site-packages/roastpilot_agent/live.py``) ``parents[2]`` is
-    ``site-packages/``, which has no ``web/dist``, so this returns ``None`` —
-    a wheel install must pass ``--spa-dir`` explicitly until the E11-S1 build
-    hook bundles ``web/dist`` as package data. The fallback is graceful (no
-    error, just API-only), so no behavior depends on guessing a wheel layout.
+    1. **Bundled package data** — ``roastpilot_agent/_web_dist`` (E11-S1, #137).
+       A standard wheel install force-includes the SPA built by ``npm run
+       build`` at this path (see ``hatch_build.py``), so ``pip install
+       roastpilot-agent`` serves the SPA with no extra flags.
+    2. **Source-checkout** ``<repo-root>/web/dist`` — the SPA a developer built
+       locally in a source checkout. This is also the path an *editable*
+       install (``pip install -e .``) resolves, since the build hook does not
+       run for editable installs.
 
     Returns:
-        The source-checkout ``web/dist`` path when it holds an ``index.html``,
-        else ``None``.
+        The resolved SPA directory holding an ``index.html``, else ``None``.
     """
+    packaged = _packaged_spa_dir()
+    if packaged is not None:
+        return packaged
+
     # src/roastpilot_agent/live.py -> source-checkout repo root is three parents up.
     candidate = Path(__file__).resolve().parents[2] / "web" / "dist"
     if (candidate / "index.html").is_file():
         return candidate
+    return None
+
+
+def _packaged_spa_dir() -> Path | None:
+    """Resolve the bundled ``roastpilot_agent/_web_dist`` package data, if present.
+
+    Uses :mod:`importlib.resources` and requires the resolved resource to be a
+    real filesystem path (:class:`pathlib.Path`), which is what pip installs
+    are in practice — pip always extracts a wheel to a directory on disk, it
+    never runs a package from inside the ``.whl`` zip. A hypothetical
+    zip-importer install would need ``importlib.resources.as_file``'s
+    extract-to-tempdir path instead; that is out of scope here (StaticFiles
+    needs a stable, long-lived directory for the life of the app, not a
+    context-managed extraction that could be cleaned up mid-request), so this
+    falls back to ``None`` (source-checkout fallback in ``default_spa_dir``)
+    rather than risk serving from a directory that could vanish underneath a
+    request.
+
+    Returns:
+        The bundled ``_web_dist`` directory when it is a real path holding an
+        ``index.html``, else ``None`` (no bundled SPA — e.g. an editable
+        install, where the build hook never ran).
+    """
+    from importlib import resources
+
+    try:
+        traversable = resources.files("roastpilot_agent") / "_web_dist"
+    except ModuleNotFoundError:  # pragma: no cover — package always importable here
+        return None
+
+    if not isinstance(traversable, Path):
+        return None  # pragma: no cover — zip-importer install, not pip's behavior
+    if (traversable / "index.html").is_file():
+        return traversable
     return None
 
 
