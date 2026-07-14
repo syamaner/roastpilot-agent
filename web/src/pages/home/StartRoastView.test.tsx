@@ -443,6 +443,20 @@ describe("StartRoastView — clear-stale-session action (#525)", () => {
     );
   });
 
+  it("sends the TRIMMED reason — the persisted audit value matches what actually gated the confirm button", async () => {
+    renderStaleSession();
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-open"));
+    fireEvent.change(screen.getByTestId("start-roast-stale-session-reason"), {
+      target: { value: "  padded with whitespace  " },
+    });
+    fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-confirm"));
+
+    await waitFor(() => expect(clearStaleSessionMock).toHaveBeenCalledTimes(1));
+    expect(clearStaleSessionMock).toHaveBeenCalledWith("run-stranded", {
+      reason: "padded with whitespace",
+    });
+  });
+
   it("cancelling the confirm step discards the typed reason and returns to the plain affordance", () => {
     renderStaleSession();
     fireEvent.click(screen.getByTestId("start-roast-stale-session-clear-open"));

@@ -112,7 +112,10 @@ function ClearStaleSessionAction({ runId }: { runId: string }): React.JSX.Elemen
   const [reason, setReason] = useState("");
 
   const mutation = useMutation({
-    mutationFn: () => api.clearStaleSession(runId, { reason }),
+    // Send the TRIMMED reason — it must match what actually gated the
+    // confirm button (whitespace-only is blocked below), so the persisted
+    // audit value is never a padded/whitespace-only string.
+    mutationFn: () => api.clearStaleSession(runId, { reason: reason.trim() }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: roastKeys.history });
       void queryClient.invalidateQueries({ queryKey: roastKeys.health });

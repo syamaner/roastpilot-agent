@@ -1187,6 +1187,12 @@ class RoastStore:
             RunActivelyDrivenError: A telemetry row exists inside the recency
                 window — guard (c): some process is still driving this run.
         """
+        # Format contract (safety-reviewer note): this must stay
+        # datetime.now(UTC).isoformat() (a "+00:00" offset, matching
+        # _utc_now()'s telemetry-write format) — a "Z"-suffixed or naive
+        # datetime would silently break the lexicographic TEXT comparison
+        # below (SQLite has no datetime type; the ">" is a plain string
+        # compare, correct ONLY because every writer uses this exact form).
         threshold = (datetime.now(UTC) - timedelta(seconds=recency_window_seconds)).isoformat()
         now = _utc_now()  # one instant: completed_at == updated_at at finalisation
         cursor = await self.connection.execute(

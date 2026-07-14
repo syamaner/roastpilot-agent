@@ -7,6 +7,7 @@ this suite.
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
+from unittest import mock
 
 import aiosqlite as aiosqlite_module
 import pytest
@@ -1307,6 +1308,43 @@ async def test_finalize_orphaned_run_succeeds_when_telemetry_is_outside_the_wind
 
         row = await fetch_one(tmp_store, "SELECT outcome FROM roast_runs WHERE id = 'run-1'")
         assert row[0] == "aborted"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_finalize_orphaned_run_exact_boundary_is_treated_as_stale(
+    tmp_store: RoastStore,
+) -> None:
+    """#525 guard (c) exact-boundary semantics (safety-reviewer note): the SQL
+    uses a STRICT ``>`` against the threshold (``recorded_at_utc > threshold``),
+    so a telemetry row stamped AT-OR-BEFORE the cutoff instant does not count
+    as "recent" — the clear succeeds. Intent: a row must be STRICTLY newer
+    than the cutoff to prove a live writer; a row landing exactly at the
+    cutoff is the boundary of "old enough to be stale", not "inside the
+    window". Pins a fixed instant on both sides (rather than a real
+    ``datetime.now(UTC)`` race) so the boundary is exercised deterministically."""
+    await seeded_store(tmp_store)
+    try:
+        cutoff_instant = datetime.now(UTC)
+        window_seconds = 20.0
+        # A telemetry row stamped EXACTLY at the threshold the store will
+        # compute (now - window_seconds) — the strict boundary itself.
+        with mock.patch(
+            "roastpilot_agent.store.datetime",
+            wraps=datetime,
+            **{"now.return_value": cutoff_instant},
+        ):
+            threshold_instant = cutoff_instant - timedelta(seconds=window_seconds)
+            await _insert_telemetry_at(tmp_store, "run-1", threshold_instant.isoformat())
+
+            # finalize_orphaned_run computes its own threshold as
+            # datetime.now(UTC) - recency_window_seconds — patched to the SAME
+            # cutoff_instant, so it lands on EXACTLY the row's timestamp.
+            await tmp_store.finalize_orphaned_run("run-1", recency_window_seconds=window_seconds)
+
+        row = await fetch_one(tmp_store, "SELECT outcome FROM roast_runs WHERE id = 'run-1'")
+        assert row[0] == "aborted"  # exact-boundary row does NOT block the clear
     finally:
         await tmp_store.close()
 
