@@ -1328,13 +1328,15 @@ async def test_finalize_orphaned_run_exact_boundary_is_treated_as_stale(
     try:
         cutoff_instant = datetime.now(UTC)
         window_seconds = 20.0
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz: object = None) -> datetime:  # noqa: ARG003 - matches datetime.now's signature
+                return cutoff_instant
+
         # A telemetry row stamped EXACTLY at the threshold the store will
         # compute (now - window_seconds) — the strict boundary itself.
-        with mock.patch(
-            "roastpilot_agent.store.datetime",
-            wraps=datetime,
-            **{"now.return_value": cutoff_instant},
-        ):
+        with mock.patch("roastpilot_agent.store.datetime", _FixedDatetime):
             threshold_instant = cutoff_instant - timedelta(seconds=window_seconds)
             await _insert_telemetry_at(tmp_store, "run-1", threshold_instant.isoformat())
 
