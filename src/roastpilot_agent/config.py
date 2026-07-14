@@ -511,6 +511,46 @@ class PostFirstCrackControl(BaseModel):
     #: configured ABOVE the emergency-drop net, or above the bitter ceiling
     #: it is meant to anchor, is unconstructible.
     ceiling_guard_temp_c: float = Field(default=196.0, gt=0)
+    #: The taper's DECISIVE-CUT margin (°C/min), D94 (#521 part 1). When the
+    #: measured engagement RoR exceeds what the remaining dwell budget can
+    #: afford (see :meth:`~roastpilot_agent.controller.RoastController
+    #: ._post_fc_affordability_seed_c_per_min`), the taper's starting setpoint
+    #: seeds at ``measured - k`` instead of anchoring to ``measured`` directly
+    #: (D88's law) — a decisive move away from the measured RoR, not just a
+    #: milder one. Default 1.5 — the operator's decisiveness ask on roast 14
+    #: ("heat reduction can be a bit more decisive"), n=1 hardware evidence,
+    #: same honesty the other D88/D94 fields' docstrings already carry.
+    k_decisive_margin_c_per_min: float = Field(default=1.5, gt=0)
+    #: The Hottop heat->probe thermal lag (seconds) subtracted from the
+    #: profile-derived development-phase time budget before comparing it
+    #: against the measured engagement RoR, D94 (#521 part 1). The controller
+    #: cannot act on the last few seconds of the budget — a heat change takes
+    #: this long to show up on the bean probe — so the AFFORDABLE rate is
+    #: computed against the budget that remains after this allowance, not the
+    #: raw budget. Default 30.0 — the operator's measured Hottop prior
+    #: (~25-35 s), the same physics already anchoring the pre-FC anticipatory
+    #: trim mandate (roast 3's 193->203 coast).
+    thermal_lag_seconds: float = Field(default=30.0, gt=0)
+    #: The D94 affordability comparison's hysteresis margin (°C/min), added by
+    #: operator amendment on ratification (14 Jul 2026, plan commit
+    #: ``aad21e6``). The decisive cut fires only when
+    #: ``measured_ror > affordable_ror + affordability_hysteresis_c_per_min``
+    #: — a STRICT margin beyond the raw affordability comparison, not just
+    #: ``measured > affordable``. Default 0.1: the roast-12 validation
+    #: no-op's corrected margin (0.08 °C/min) sits inside a single clock's
+    #: noise band (an FC-mark timing wobble of only ~5 s moves the affordable
+    #: figure by a comparable amount) — without this margin a small,
+    #: plausible perturbation in the FC-mark clock or the profile's own
+    #: ``target_development_percent`` could flip the programme's best-rated
+    #: roast (roast 12, 9/10 cup) into also taking a decisive cut it never
+    #: needed. ``m=0.1`` was chosen so roast 12 stays a no-op across a ±5 s
+    #: clock perturbation and a 14.5-15 % target-DTR range, while roast 14
+    #: still cuts across the same perturbation range (see
+    #: ``tests/test_controller.py``'s D94 clock-perturbation pair). This is
+    #: NOT part of D94's original ratified formula — it is a same-day
+    #: amendment the operator approved after the safety review's own
+    #: sensitivity probe surfaced the narrow margin.
+    affordability_hysteresis_c_per_min: float = Field(default=0.1, ge=0)
 
     @model_validator(mode="after")
     def _check_heat_range(self) -> "PostFirstCrackControl":

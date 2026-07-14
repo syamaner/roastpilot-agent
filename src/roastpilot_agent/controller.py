@@ -1089,6 +1089,143 @@ class RoastController:
         floor = self._profile.target_development_percent - self._config.drop_dev_margin_percent
         return system_percent >= floor
 
+    def _post_fc_affordability_seed_c_per_min(self, *, measured_ror_c_per_min: float) -> float:
+        """The D94 (#521 part 1) affordability-anchored taper engagement seed.
+
+        D88 anchors the post-FC taper's starting setpoint directly to the
+        measured engagement RoR (clamped by
+        :meth:`~roastpilot_agent.post_fc_control.PostFcRorController.reset`).
+        Offline trace replay of four supervised roasts (D94, plan commit
+        preceding ``aad21e6``) found that anchor structurally never issues a
+        cut — the taper's decline tracks the naturally-falling post-FC RoR
+        inside its own deadband for the whole dwell — and that headroom (the
+        temperature gap alone) cannot discriminate a roast that needs a
+        decisive cut (roast 14, flat cup, time-underdeveloped) from one that
+        must not get one (roast 12, 9/10 cup): both had identical 9 °C
+        headroom and heat-at-engagement. The discriminator D94 ratifies is
+        **affordability** — whether the measured RoR exceeds what the
+        profile's own target development window, minus thermal lag, can
+        absorb.
+
+        **The derivation (D94 §2).** ``target_development_percent`` is DTR —
+        a percentage of the WHOLE roast (:meth:`_development_percent`), not of
+        the development phase alone, so the development phase's own target
+        duration is not a direct percentage of an already-known quantity: it
+        has to be solved for. Let ``C`` = charge-elapsed seconds at this FC
+        engagement, ``D`` = the development phase's target duration in
+        seconds, ``p`` = ``target_development_percent / 100`` (**a fraction,
+        not the raw percent** — Condition 1 of the safety review: feeding the
+        raw percent into ``1 - p`` would go negative and invert the sign of
+        every comparison this method makes, wrongly cutting on EVERY roast).
+        By definition ``p = D / (C + D)``, solved:
+
+            ``D = p * C / (1 - p)``
+
+        Thermal lag (``thermal_lag_seconds``, the Hottop heat->probe delay)
+        then subtracts from ``D`` before the affordability comparison, floored
+        at a small positive epsilon **before the division that follows**
+        (Condition 2): ``remaining = max(D - thermal_lag_seconds, 1e-6)``. This
+        floor is a CORRECTNESS requirement, not merely crash-avoidance — an
+        unfloored negative ``remaining`` (a dev target already exceeded, or a
+        budget shorter than the lag itself) would flip the sign of the
+        division that follows, producing a SMALL or negative
+        ``setpoint_needed`` that could read as "affordable" and SUPPRESS the
+        decisive cut exactly in the tightest-budget roasts where it is most
+        needed. Flooring at a tiny positive value instead makes
+        ``setpoint_needed`` a large finite number (a very low affordable
+        rate), which correctly engages the decisive cut.
+
+        The affordable rate is then
+
+            ``setpoint_needed = (target_drop_temp_c - bean_temp_at_engagement)
+            / (remaining / 60)``
+
+        in °C/min, using the SAME telemetry reading already used one line
+        above for ``measured_ror_c_per_min`` (no new telemetry read, no
+        staleness risk). The decisive cut fires only with a strict margin
+        beyond the raw comparison (Condition 3, the operator's same-day
+        amendment on ratification): ``measured_ror_c_per_min >
+        setpoint_needed + affordability_hysteresis_c_per_min``. Without this
+        margin, the roast-12 validation case's own corrected no-op margin
+        (0.08 °C/min) sits inside a single FC-mark clock's noise band — a
+        small, plausible perturbation could flip the programme's best-rated
+        roast into a cut it never needed. The default ``m=0.1`` keeps roast 12
+        a no-op and roast 14 a real cut across a ±5 s clock perturbation (see
+        the D94 clock-perturbation test pair).
+
+        When the margin is crossed, the seed is ``measured_ror_c_per_min -
+        k_decisive_margin_c_per_min`` (a decisive move away from measured, not
+        a milder one); otherwise the seed is ``measured_ror_c_per_min``
+        unchanged — byte-identical to today's D88 anchor. Either way the
+        returned seed still flows into the EXISTING
+        :meth:`~roastpilot_agent.post_fc_control.PostFcRorController.reset`
+        call, whose own ``clamp(seed, taper_end_ror_c_per_min,
+        taper_start_max_ror_c_per_min)`` applies on top unchanged — a decisive
+        cut can still be floored at the taper's own end value exactly like a
+        degenerate low/negative engagement RoR already is (D88).
+
+        **Charge-elapsed-at-FC origin (Condition 4, safety review).** ``C`` is
+        computed as ``self._first_crack_monotonic - self._charge_monotonic``
+        — both agent-monotonic instants, both already honouring the #337
+        backdate (:meth:`_backdated_now`) — read AFTER
+        ``self._first_crack_monotonic`` is set in the caller's FC-edge branch,
+        NOT via :meth:`_charge_elapsed_seconds` (which reads the RECEIVE-TICK
+        clock, a value that could differ from the backdated FC instant by a
+        meaningful fraction of the ``affordability_hysteresis_c_per_min``
+        budget this method now depends on). ``self._charge_monotonic`` is
+        always set by the time this branch runs (a true FC edge can only
+        follow a charge), so no ``None`` guard is needed here beyond what the
+        type checker already knows from the call site's phase invariant.
+
+        This method commands nothing and writes nothing — it is a pure
+        computation feeding the ONE existing ``reset`` call at the FC->
+        DEVELOPMENT handoff; :class:`~roastpilot_agent.post_fc_control.PostFcRorController`
+        itself is unmodified by D94.
+
+        Args:
+            measured_ror_c_per_min: The smoothed/raw bean RoR (°C/min) the
+                roast measured at this same FC-engagement tick — the value
+                D88's law would otherwise anchor the taper's seed to
+                unconditionally.
+
+        Returns:
+            The RoR (°C/min) to seed the taper's engagement setpoint with:
+            either ``measured_ror_c_per_min`` unchanged (D88's law, the common
+            case) or ``measured_ror_c_per_min - k_decisive_margin_c_per_min``
+            (the D94 decisive cut).
+        """
+        config = self._config.post_first_crack_control
+        if (
+            self._profile is None
+            or self._first_crack_monotonic is None
+            or self._charge_monotonic is None
+            or self._last_telemetry is None
+        ):
+            # Defensive only — a true FC edge cannot reach this branch without
+            # a loaded profile, both clocks armed, and a fresh telemetry
+            # reading (the caller's own phase invariant guarantees all three —
+            # the reading that fires the FC transition is the same one
+            # ``ror_at_engagement`` was already computed from one line above
+            # in the caller). Fall back to D88's unconditional measured-RoR
+            # anchor rather than guess at an affordability figure with no
+            # valid bean-temperature basis to compute one — a fabricated
+            # ``bean_temp_at_engagement`` could bias the comparison in either
+            # direction, which is worse than simply not shaping the seed.
+            return measured_ror_c_per_min  # pragma: no cover - unreachable via a true FC edge
+        charge_elapsed_at_fc = self._first_crack_monotonic - self._charge_monotonic
+        p = self._profile.target_development_percent / 100.0
+        dev_budget_seconds = p * charge_elapsed_at_fc / (1.0 - p)
+        remaining_dwell_budget_seconds = max(dev_budget_seconds - config.thermal_lag_seconds, 1e-6)
+        setpoint_needed_c_per_min = (
+            self._profile.target_drop_temp_c - self._last_telemetry.bean_temp_c
+        ) / (remaining_dwell_budget_seconds / 60.0)
+        if (
+            measured_ror_c_per_min
+            > setpoint_needed_c_per_min + config.affordability_hysteresis_c_per_min
+        ):
+            return measured_ror_c_per_min - config.k_decisive_margin_c_per_min
+        return measured_ror_c_per_min
+
     def can_transition(self, target: RoastPhase) -> bool:
         """Whether ``target`` is a legal next phase from the current one."""
         if target is self._phase:
@@ -1281,6 +1418,16 @@ class RoastController:
                 if self._last_telemetry is not None
                 and self._last_telemetry.bean_ror_c_per_min is not None
                 else self._config.post_first_crack_control.taper_end_ror_c_per_min
+            )
+            # D94 (#521 part 1): shape the taper's engagement seed by what the
+            # remaining dwell budget can AFFORD, not just what the roast
+            # measured — see ``_post_fc_affordability_seed_c_per_min``. This
+            # call must land AFTER ``self._first_crack_monotonic`` is set just
+            # above (Condition 4, safety review): the affordability budget's
+            # charge-elapsed-at-FC input is derived from
+            # ``self._first_crack_monotonic``, not a receive-tick read.
+            ror_at_engagement = self._post_fc_affordability_seed_c_per_min(
+                measured_ror_c_per_min=ror_at_engagement
             )
             self._post_fc_controller.reset(
                 initial_heat_percent=self._current_heat,
