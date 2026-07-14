@@ -22,7 +22,13 @@ What the gate asserts:
 - A **real-replay SSE smoke** (`stream-smoke.spec.ts`): the server-derived phase
   reaches the SPA over the live SSE path against the actual replay backend.
 
-Determinism kit (D26): fixed 1600×1000 viewport, `deviceScaleFactor: 1` (uPlot
+Determinism kit (D26, viewport/full-page fixed by #530): a 1600×1000 viewport,
+`fullPage: true` on every `expect(page).toHaveScreenshot()` (the project's
+`devices["Desktop Chrome"]` spread carries its own 1280×720 viewport, which wins
+over the top-level `use.viewport` unless re-asserted after the spread — see
+`playwright.config.ts`'s `chromium` project — and even a correctly-applied fixed
+viewport can't cover pages taller than it, so `fullPage: true` is the actual
+"whole page" guarantee, not the viewport size), `deviceScaleFactor: 1` (uPlot
 scales its backing store by DPR), the specs wait on the `window.__chart`
 point-count (`waitForChartPoints`) before shooting, `fonts.ready` awaited
 (`settle`), animations disabled, reduced motion, replay-fixed data, and a small

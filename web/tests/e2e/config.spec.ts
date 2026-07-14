@@ -223,7 +223,7 @@ test("config — Hardware pane on load (rail + ambient group), full-page snapsho
   await expect(modeField).not.toContainText("Guarded");
 
   await settle(page);
-  await expect(page).toHaveScreenshot("config.png");
+  await expect(page).toHaveScreenshot("config.png", { fullPage: true });
 });
 
 test("config-safety — Safety pane shows a read-only/Guarded field, full-page snapshot", async ({
@@ -247,7 +247,7 @@ test("config-safety — Safety pane shows a read-only/Guarded field, full-page s
   await expect(input).toHaveValue("230");
 
   await settle(page);
-  await expect(page).toHaveScreenshot("config-safety.png");
+  await expect(page).toHaveScreenshot("config-safety.png", { fullPage: true });
 });
 
 test("config-fc-detection — fc_mode renders the real yaml value as its inherit option, never a bogus concrete option (#482)", async ({

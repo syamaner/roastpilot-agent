@@ -78,5 +78,5 @@ test("live-finished — stat tiles, detail link, curve data-assert + snapshot", 
   expect(Math.max(...xs)).toBeGreaterThan(Math.min(...xs));
 
   // Full-page pixel snapshot (canvas un-masked, D26 — CI Docker only).
-  await expect(page).toHaveScreenshot("live-finished.png");
+  await expect(page).toHaveScreenshot("live-finished.png", { fullPage: true });
 });
