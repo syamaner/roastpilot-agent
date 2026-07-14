@@ -59,7 +59,12 @@ were completely untouched.
     command (the `cd` and the command in one bash call).
 - Read-only peeks at the main repo are fine via `git -C <main repo> ...`; never
   *write* there.
-- Push and open your PR from your worktree — push works normally from one.
+- Push from your worktree (push works normally from one) and REPORT the sha to
+  the lead; by default the LEAD opens the PR and owns the review cycle (see
+  "Branch freeze on PR-open" below). Open the PR yourself only when the lead
+  has explicitly delegated it — and then the freeze rule applies to you: the
+  moment YOUR PR is open, the branch is frozen and further pushes need the
+  cycle-owner's go-ahead.
 
 ## Fallback: serialize
 
@@ -98,3 +103,24 @@ the author). Two binding rules fell out:
 *Provenance: E10 agent-team experiment. Failure + recovery narrated in the blog
 source `career/.../blog-sources/05-when-not-to-fan-out.md`; smoke-test validation
 9 Jun 2026. Reviewer rules: the 9 Jul 2026 overnight batch incident.*
+
+## Branch freeze on PR-open (added 14 Jul 2026, after the third FIFO-lag crossing)
+
+The teammate mailbox delivers FIFO **on idle only**, so the lead and a teammate
+can cross: a ruling arrives after the teammate proceeded, or a teammate's late
+fold arrives after the lead already opened the PR and fired the review trigger
+(PR #547 hit both in one evening — absorbed only because the trigger hadn't
+fired yet).
+
+Rule: **opening the PR is the branch-ownership handoff — WHOEVER opens it.**
+
+1. When the lead opens a PR on a teammate's branch, the accompanying message
+   includes an explicit **FREEZE** — no further pushes without a lead
+   go-ahead. When a teammate opens their own PR (lead-delegated — see the
+   teammate rules above), the same freeze binds them from the moment it opens:
+   the review-cycle owner (the lead) controls all further pushes.
+2. Every teammate "pushed sha X" report re-freezes by default; unfreeze is
+   always an explicit lead instruction naming what to fold.
+3. If a push lands after the review trigger fired, the verdict is stale by
+   definition — the lead re-runs the cycle on the final head and never merges
+   on a verdict predating it (the AGENTS.md codex-wait clause).

@@ -587,3 +587,53 @@ Format: one entry per anti-pattern.
   darwin run). No dedicated regression test beyond the baseline diff itself;
   the viewport/`fullPage` config is exercised by every snapshot spec in the
   suite.
+
+## Codecov can process a report yet never post the `codecov/patch` status — re-run the upload job, don't add commits
+
+- **Date:** 14 Jul 2026 (second occurrence; first seen on PR #542, 13 Jul)
+- **Class:** a PR sits `BLOCKED` with every visible check green because the
+  required `codecov/patch` commit status is simply ABSENT — not failed, not
+  pending, absent. `main` requires it, so the merge box shows "expected"
+  forever.
+- **Wrong:** treating it as a coverage problem (it isn't — nothing failed), or
+  re-triggering with a junk commit (hygiene violation), or waiting it out
+  (30+ min of polling never resolved it).
+- **Right:** diagnose in two reads, then re-run one job. (1) `gh api
+  repos/<owner>/<repo>/commits/<head-sha>/status` — if `codecov/patch` is
+  missing from the statuses list, the notification was lost, not the upload;
+  (2) confirm via codecov's API
+  (`https://api.codecov.io/api/v2/github/<owner>/repos/<repo>/commits/<sha>`)
+  that the report state is `complete` — it typically is. Then re-run the
+  specific job that uploads coverage: `gh run rerun --job <databaseId>`, where
+  the numeric job id comes from
+  `gh run view <run-id> --json jobs --jq '.jobs[] | {name, databaseId}'`
+  (`--job` takes the job's databaseId, not its display name). A fresh upload
+  triggers a fresh notification, and the status lands within minutes. No new
+  commit, no CI-wide re-run.
+- **Guarded by:** nothing automatic — this is infra, not code. The merge
+  watchers poll `mergeStateStatus` and surface the stall; this entry is the
+  runbook for the two-read diagnosis.
+
+## FREEZE a teammate's branch the moment the lead opens its PR — pushes and review triggers race
+
+- **Date:** 14 Jul 2026 (PR #547; the FIFO-on-idle mailbox lag's third crossing)
+- **Class:** teammate mailboxes deliver FIFO on IDLE only, so a lead's ruling
+  can land AFTER the teammate already proceeded — and, worse, a teammate's
+  late fold can land AFTER the lead already opened the PR and started the
+  codex-wait cycle. A push that arrives after the `@codex review` trigger
+  fires makes the review verdict stale against the true head (the exact
+  #518-class failure the wait rule exists to prevent).
+- **Wrong:** treating "I pushed and reported" as the end of a teammate's turn
+  while the lead independently opens/cycles the PR — two async actors, no
+  branch ownership handoff.
+- **Right:** the PR-open is the ownership handoff. The lead's open message
+  MUST include an explicit FREEZE instruction (no further pushes without a
+  lead go-ahead), and every teammate report of "pushed sha X" should
+  re-freeze by default. If a late push does land pre-trigger, the cycle
+  self-corrects (the trigger fires on whatever head CI greens); if it lands
+  post-trigger, the lead re-runs the cycle on the final commit — never merge
+  on a verdict that predates the head.
+- **Guarded by:** process only — the runbook rule in
+  `docs/agent-team-worktrees.md` (§ "Branch freeze on PR-open") and the
+  codex-wait rule's "signal must postdate the final-commit trigger" clause in
+  AGENTS.md.
