@@ -7,6 +7,7 @@ extend this suite.
 """
 
 import asyncio
+import math
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import cast
@@ -6643,6 +6644,355 @@ async def test_post_fc_loop_does_not_engage_on_operator_resume_into_development(
     # never touched — the advisor's fan actuated DIRECTLY above, exactly as
     # baseline, with no desired-fan indirection involved.
     assert harness.controller._post_fc_desired_fan_percent is None  # pyright: ignore[reportPrivateUsage]
+
+
+# --- D94 (#521 part 1): affordability-anchored post-FC setpoint ---
+
+
+async def _charge_through_fc_at(
+    harness: Harness,
+    *,
+    profile: RoastProfile,
+    charge_elapsed_at_fc_seconds: float,
+    fc_bean_temp_c: float,
+    fc_ror_c_per_min: float,
+) -> None:
+    """Drive ``harness`` to the FC->DEVELOPMENT edge with an EXACT, caller-chosen
+    ``charge_elapsed_seconds`` at the engagement instant (D94's ``C``).
+
+    Mirrors ``_charge_through_fc``'s tick-driven approach (so ``_last_telemetry``
+    and the real pre-FC lever actuation are genuine, not hand-set), but stamps
+    ``_charge_monotonic`` directly and advances the fake clock by exactly
+    ``charge_elapsed_at_fc_seconds`` before the FC-detection tick — the same
+    direct-stamp technique ``test_development_percent_is_zero_at_first_crack_and_
+    charge_referenced`` already uses — so the D94 affordability arithmetic's
+    ``C`` input is pinned to a precise, store-derived literal rather than
+    whatever the T0-debounce tick count happens to land on.
+    """
+    harness.controller.load_profile(profile)
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING
+        harness.controller.transition_to(step)
+    harness.controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    harness.controller._charge_monotonic = harness.clock.now  # pyright: ignore[reportPrivateUsage]
+    harness.clock.advance(charge_elapsed_at_fc_seconds)
+    harness.reader.readings = [
+        reading(
+            bean=fc_bean_temp_c,
+            first_crack_detected=True,
+            bean_ror_c_per_min=fc_ror_c_per_min,
+        )
+    ]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    harness.log.clear()
+    harness.events.events.clear()
+    harness.sink.evaluations.clear()
+    harness.executor.targets.clear()
+
+
+#: Roast-14-shaped profile (Sumatra Mandheling wet-hulled, run ``43c84c98``,
+#: D94's decisive-cut case): ``target_development_percent=17``,
+#: ``target_drop_temp_c=195``, store-derived ``charge_elapsed_at_fc=610.2``.
+_ROAST_14_PROFILE = RoastProfile(
+    name="roast14-shaped",
+    bean_origin="Sumatra Mandheling",
+    bean_weight_grams=255.0,
+    initial_heat_percent=100,
+    initial_fan_percent=30,
+    target_drop_temp_c=195.0,
+    target_development_percent=17.0,
+)
+_ROAST_14_CHARGE_ELAPSED_AT_FC = 610.2
+_ROAST_14_BEAN_TEMP_AT_ENGAGEMENT = 186.0
+_ROAST_14_ROR_AT_ENGAGEMENT = 6.0
+
+#: Roast-12-shaped profile (Guatemala El Durazno, run ``edbe9a76``, D94's
+#: validation no-op case — the programme's 9/10 cup): identical bean
+#: temperature and heat-at-engagement to roast 14 (D94's own "identical 9 °C
+#: headroom" finding), but a SHORTER target dwell
+#: (``target_development_percent=15`` vs. roast 14's 17), store-derived
+#: ``charge_elapsed_at_fc=602.2``.
+_ROAST_12_PROFILE = RoastProfile(
+    name="roast12-shaped",
+    bean_origin="Guatemala El Durazno",
+    bean_weight_grams=250.0,
+    initial_heat_percent=100,
+    initial_fan_percent=30,
+    target_drop_temp_c=195.0,
+    target_development_percent=15.0,
+)
+_ROAST_12_CHARGE_ELAPSED_AT_FC = 602.2
+_ROAST_12_BEAN_TEMP_AT_ENGAGEMENT = 186.0
+_ROAST_12_ROR_AT_ENGAGEMENT = 7.0
+
+
+@pytest.mark.asyncio
+async def test_d94_decisive_cut_fires_on_a_roast_14_shaped_engagement() -> None:
+    """D94: measured RoR (6.0) exceeds the affordable rate the profile's own
+    target dwell can absorb (~5.685 °C/min at these store-derived literals),
+    so the taper's engagement seed is DECISIVELY cut — ``measured - k``
+    (6.0 - 1.5 = 4.5), not the D88 unconditional measured-RoR anchor (6.0)."""
+    config = _post_fc_config()
+    harness = make_harness(config=config)
+    await _charge_through_fc_at(
+        harness,
+        profile=_ROAST_14_PROFILE,
+        charge_elapsed_at_fc_seconds=_ROAST_14_CHARGE_ELAPSED_AT_FC,
+        fc_bean_temp_c=_ROAST_14_BEAN_TEMP_AT_ENGAGEMENT,
+        fc_ror_c_per_min=_ROAST_14_ROR_AT_ENGAGEMENT,
+    )
+    r0 = harness.controller._post_fc_controller._taper_r0_c_per_min  # pyright: ignore[reportPrivateUsage]
+    assert r0 == pytest.approx(4.5)
+
+
+@pytest.mark.asyncio
+async def test_d94_near_no_op_on_a_roast_12_shaped_engagement() -> None:
+    """D94: measured RoR (7.0) sits WITHIN what the profile's shorter target
+    dwell can afford (~7.080 °C/min at these store-derived literals) — the
+    validation case D94 must not regress (the programme's 9/10 cup). The
+    taper's engagement seed is UNCHANGED — today's D88 anchor (7.0), not a cut."""
+    config = _post_fc_config()
+    harness = make_harness(config=config)
+    await _charge_through_fc_at(
+        harness,
+        profile=_ROAST_12_PROFILE,
+        charge_elapsed_at_fc_seconds=_ROAST_12_CHARGE_ELAPSED_AT_FC,
+        fc_bean_temp_c=_ROAST_12_BEAN_TEMP_AT_ENGAGEMENT,
+        fc_ror_c_per_min=_ROAST_12_ROR_AT_ENGAGEMENT,
+    )
+    r0 = harness.controller._post_fc_controller._taper_r0_c_per_min  # pyright: ignore[reportPrivateUsage]
+    assert r0 == pytest.approx(7.0)
+
+
+@pytest.mark.parametrize("clock_perturbation_seconds", [-5.0, 5.0])
+@pytest.mark.asyncio
+async def test_d94_hysteresis_survives_a_five_second_clock_perturbation(
+    clock_perturbation_seconds: float,
+) -> None:
+    """Condition 3's whole point: the hysteresis margin (default 0.1) keeps
+    BOTH validation cases from flipping under a +/-5 s FC-mark clock wobble —
+    roast 12 stays a no-op and roast 14 still cuts, at either end of the
+    perturbation."""
+    config = _post_fc_config()
+
+    harness_14 = make_harness(config=config)
+    await _charge_through_fc_at(
+        harness_14,
+        profile=_ROAST_14_PROFILE,
+        charge_elapsed_at_fc_seconds=_ROAST_14_CHARGE_ELAPSED_AT_FC + clock_perturbation_seconds,
+        fc_bean_temp_c=_ROAST_14_BEAN_TEMP_AT_ENGAGEMENT,
+        fc_ror_c_per_min=_ROAST_14_ROR_AT_ENGAGEMENT,
+    )
+    r0_14 = harness_14.controller._post_fc_controller._taper_r0_c_per_min  # pyright: ignore[reportPrivateUsage]
+    assert r0_14 == pytest.approx(4.5)
+
+    harness_12 = make_harness(config=config)
+    await _charge_through_fc_at(
+        harness_12,
+        profile=_ROAST_12_PROFILE,
+        charge_elapsed_at_fc_seconds=_ROAST_12_CHARGE_ELAPSED_AT_FC + clock_perturbation_seconds,
+        fc_bean_temp_c=_ROAST_12_BEAN_TEMP_AT_ENGAGEMENT,
+        fc_ror_c_per_min=_ROAST_12_ROR_AT_ENGAGEMENT,
+    )
+    r0_12 = harness_12.controller._post_fc_controller._taper_r0_c_per_min  # pyright: ignore[reportPrivateUsage]
+    assert r0_12 == pytest.approx(7.0)
+
+
+@pytest.mark.asyncio
+async def test_d94_boundary_measured_equal_to_affordable_plus_margin_does_not_cut() -> None:
+    """The strict '>' comparison (not '>='): at EXACTLY
+    ``measured == affordable + hysteresis`` the decisive cut does NOT fire —
+    mirrors the D88 deadband-boundary-inclusive test's care about the exact
+    edge of a comparison."""
+    config = _post_fc_config()
+    harness = make_harness(config=config)
+    # Solve for the exact measured RoR that lands ON the boundary at the
+    # roast-14-shaped budget: affordable ~= 5.6854 C/min at these literals
+    # (see the D94 design note), plus the default 0.1 C/min margin.
+    profile = RoastProfile(
+        name="boundary",
+        bean_origin="Test",
+        bean_weight_grams=250.0,
+        initial_heat_percent=100,
+        initial_fan_percent=30,
+        target_drop_temp_c=_ROAST_14_PROFILE.target_drop_temp_c,
+        target_development_percent=_ROAST_14_PROFILE.target_development_percent,
+    )
+    p = profile.target_development_percent / 100.0
+    dev_budget = p * _ROAST_14_CHARGE_ELAPSED_AT_FC / (1.0 - p)
+    remaining = dev_budget - config.post_first_crack_control.thermal_lag_seconds
+    affordable = (profile.target_drop_temp_c - _ROAST_14_BEAN_TEMP_AT_ENGAGEMENT) / (
+        remaining / 60.0
+    )
+    hysteresis = config.post_first_crack_control.affordability_hysteresis_c_per_min
+    boundary_measured = affordable + hysteresis
+    await _charge_through_fc_at(
+        harness,
+        profile=profile,
+        charge_elapsed_at_fc_seconds=_ROAST_14_CHARGE_ELAPSED_AT_FC,
+        fc_bean_temp_c=_ROAST_14_BEAN_TEMP_AT_ENGAGEMENT,
+        fc_ror_c_per_min=boundary_measured,
+    )
+    r0 = harness.controller._post_fc_controller._taper_r0_c_per_min  # pyright: ignore[reportPrivateUsage]
+    assert r0 == pytest.approx(boundary_measured)  # NOT boundary_measured - k
+
+
+@pytest.mark.asyncio
+async def test_d94_tight_budget_below_target_does_not_cut_but_stays_finite() -> None:
+    """Condition 2, re-scoped (safety review, post-escalation): a profile
+    whose target dwell is SHORTER than the thermal-lag allowance itself
+    (``dev_budget_seconds <= thermal_lag_seconds``) with the bean still BELOW
+    ``target_drop_temp_c`` produces a finite, sane result — but the sane
+    result here is NO CUT, not a forced cut.
+
+    As ``remaining -> 0`` with the bean still below target, ``setpoint_needed
+    -> +inf`` — no realistic measured RoR exceeds an infinite affordable rate,
+    so the decisive branch does not fire. This is the CORRECT physical
+    direction, not an oversight: with almost no time left and the bean still
+    below target, the roast needed to run FASTER, not slower, and this taper
+    only ever CUTS (D88's never-add-heat-beyond-entry ceiling structurally
+    forbids it from adding heat) — ending the roast's undershoot belongs to
+    the drop paths (DTR / temp / ceiling guard), not to this taper-seed law.
+    The important assertion is still that this stays FINITE (no
+    ZeroDivisionError/inf/nan reaching ``reset``), just not that it forces a
+    cut — an earlier draft of this test asserted the opposite direction and
+    was corrected after a design-note error was traced through safety review."""
+    config = _post_fc_config()
+    harness = make_harness(config=config)
+    # A short charge-elapsed-at-FC (20 s) with a low target dev% makes
+    # dev_budget_seconds << thermal_lag_seconds (30 s default): p*20/(1-p) is
+    # only a few seconds for any small p, so `remaining` floors at 1e-6.
+    profile = RoastProfile(
+        name="tight-budget-below-target",
+        bean_origin="Test",
+        bean_weight_grams=250.0,
+        initial_heat_percent=100,
+        initial_fan_percent=30,
+        target_drop_temp_c=195.0,
+        target_development_percent=5.0,
+    )
+    await _charge_through_fc_at(
+        harness,
+        profile=profile,
+        charge_elapsed_at_fc_seconds=20.0,
+        fc_bean_temp_c=186.0,  # still below the 195 C target
+        fc_ror_c_per_min=6.0,
+    )
+    r0 = harness.controller._post_fc_controller._taper_r0_c_per_min  # pyright: ignore[reportPrivateUsage]
+    assert math.isfinite(r0)
+    # No cut: the seed is the D88 unconditional measured-RoR anchor, unchanged.
+    assert r0 == pytest.approx(6.0)
+
+
+@pytest.mark.asyncio
+async def test_d94_tight_budget_past_target_sign_cancellation_still_cuts_finite() -> None:
+    """Condition 2's actual mechanism (safety review, re-scoped): the
+    sign-cancellation trap this floor exists to prevent needs BOTH a
+    pre-floor-negative ``remaining`` (``dev_budget_seconds <=
+    thermal_lag_seconds``) AND a negative numerator (bean ALREADY past
+    ``target_drop_temp_c``) at once — without the ``max(..., 1e-6)`` floor
+    applied BEFORE the divide, negative-over-negative would cancel signs into
+    a spuriously plausible POSITIVE ``setpoint_needed``, potentially masking
+    the cut exactly when the roast is both out of time AND over its target.
+    With the floor applied first, the numerator stays cleanly negative over a
+    tiny POSITIVE floored denominator, so ``setpoint_needed`` is hugely
+    negative — any positive measured RoR exceeds it, cut fires, and the
+    result is finite (never inf/nan/a crash)."""
+    config = _post_fc_config()
+    harness = make_harness(config=config)
+    profile = RoastProfile(
+        name="tight-budget-past-target",
+        bean_origin="Test",
+        bean_weight_grams=250.0,
+        initial_heat_percent=100,
+        initial_fan_percent=30,
+        target_drop_temp_c=190.0,
+        target_development_percent=5.0,
+    )
+    await _charge_through_fc_at(
+        harness,
+        profile=profile,
+        charge_elapsed_at_fc_seconds=20.0,  # dev_budget << thermal_lag (30s)
+        fc_bean_temp_c=193.0,  # already past the 190 C target
+        fc_ror_c_per_min=7.0,  # comfortably above taper_end + k (5.5) — unclamped
+    )
+    r0 = harness.controller._post_fc_controller._taper_r0_c_per_min  # pyright: ignore[reportPrivateUsage]
+    assert math.isfinite(r0)
+    assert r0 == pytest.approx(7.0 - config.post_first_crack_control.k_decisive_margin_c_per_min)
+
+
+@pytest.mark.asyncio
+async def test_d94_negative_setpoint_needed_when_bean_already_past_target_still_cuts() -> None:
+    """Ruling (a), safety review: when the bean is ALREADY at or past
+    ``target_drop_temp_c`` at engagement, ``setpoint_needed`` goes negative —
+    any positive measured RoR exceeds it, so the decisive cut ALWAYS fires.
+    This is the ratified behaviour (the 196 guard / D84 deterministic drop
+    anchor are the real backstop for an already-over-target bean, not this
+    taper-seed law) — pinned here as an explicit regression guard, not left
+    to fall out of the formula untested."""
+    config = _post_fc_config()
+    harness = make_harness(config=config)
+    profile = RoastProfile(
+        name="already-past-target",
+        bean_origin="Test",
+        bean_weight_grams=250.0,
+        initial_heat_percent=100,
+        initial_fan_percent=30,
+        target_drop_temp_c=190.0,
+        target_development_percent=17.0,
+    )
+    await _charge_through_fc_at(
+        harness,
+        profile=profile,
+        charge_elapsed_at_fc_seconds=_ROAST_14_CHARGE_ELAPSED_AT_FC,
+        fc_bean_temp_c=193.0,  # already past the 190 C target at engagement
+        fc_ror_c_per_min=7.0,  # comfortably above taper_end + k (5.5) — unclamped
+    )
+    r0 = harness.controller._post_fc_controller._taper_r0_c_per_min  # pyright: ignore[reportPrivateUsage]
+    assert r0 == pytest.approx(7.0 - config.post_first_crack_control.k_decisive_margin_c_per_min)
+
+
+@pytest.mark.asyncio
+async def test_d94_decisive_seed_still_floors_at_taper_end_dead_zone() -> None:
+    """The existing D88 floor (``reset``'s own
+    ``clamp(seed, taper_end_ror_c_per_min, taper_start_max_ror_c_per_min)``)
+    still applies to a D94-shaped seed — newly reachable from the DECISIVE-CUT
+    direction, not just a degenerate low/negative engagement RoR. This pins
+    the ACTUAL dead zone: any measured RoR at or below
+    ``taper_end_ror_c_per_min + k_decisive_margin_c_per_min`` (5.5 at the
+    defaults: 4.0 + 1.5) that still crosses the affordability margin has its
+    cut SWALLOWED by the floor at 4.0 — not merely 'a smaller cut fires'.
+
+    Uses an ordinary, non-degenerate budget (a bean close to its drop target
+    with a generous target dwell, NOT the epsilon-floor extreme) so the
+    decisive branch fires from a realistic affordability gap, not a crash-path
+    artifact."""
+    config = _post_fc_config()
+    harness = make_harness(config=config)
+    # affordable ~= 1.58 C/min at these literals (diff=2 C over a ~76 s
+    # remaining budget) — measured=5.4 comfortably crosses affordable + margin
+    # (0.1), so the decisive branch fires, but 5.4 - 1.5 = 3.9 < taper_end
+    # (4.0) — the dead zone.
+    profile = RoastProfile(
+        name="taper-floor-dead-zone",
+        bean_origin="Test",
+        bean_weight_grams=250.0,
+        initial_heat_percent=100,
+        initial_fan_percent=30,
+        target_drop_temp_c=195.0,
+        target_development_percent=15.0,
+    )
+    await _charge_through_fc_at(
+        harness,
+        profile=profile,
+        charge_elapsed_at_fc_seconds=600.0,
+        fc_bean_temp_c=193.0,  # close to the 195 C target — a small, real gap
+        fc_ror_c_per_min=5.4,
+    )
+    r0 = harness.controller._post_fc_controller._taper_r0_c_per_min  # pyright: ignore[reportPrivateUsage]
+    # The unclamped seed (5.4 - 1.5 = 3.9) is BELOW taper_end_ror_c_per_min
+    # (4.0) — reset()'s own clamp floors it there, not at the unclamped 3.9.
+    assert r0 == pytest.approx(config.post_first_crack_control.taper_end_ror_c_per_min)
 
 
 # --- D84 (#405 Slice C): deterministic drop anchor + LLM-earlier-only ---
