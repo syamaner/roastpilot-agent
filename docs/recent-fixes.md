@@ -599,13 +599,17 @@ Format: one entry per anti-pattern.
   re-triggering with a junk commit (hygiene violation), or waiting it out
   (30+ min of polling never resolved it).
 - **Right:** diagnose in two reads, then re-run one job. (1) `gh api
-  repos/<repo>/commits/<head>/status` — if `codecov/patch` is missing from the
-  statuses list, the notification was lost, not the upload; (2) confirm via
-  codecov's API (`https://api.codecov.io/api/v2/github/<owner>/repos/<repo>/commits/<sha>`)
-  that the report state is `complete` — it typically is. Then `gh run rerun
-  --job <the CI job that uploads coverage>`: a fresh upload triggers a fresh
-  notification, and the status lands within minutes. No new commit, no CI-wide
-  re-run.
+  repos/<owner>/<repo>/commits/<head-sha>/status` — if `codecov/patch` is
+  missing from the statuses list, the notification was lost, not the upload;
+  (2) confirm via codecov's API
+  (`https://api.codecov.io/api/v2/github/<owner>/repos/<repo>/commits/<sha>`)
+  that the report state is `complete` — it typically is. Then re-run the
+  specific job that uploads coverage: `gh run rerun --job <databaseId>`, where
+  the numeric job id comes from
+  `gh run view <run-id> --json jobs --jq '.jobs[] | {name, databaseId}'`
+  (`--job` takes the job's databaseId, not its display name). A fresh upload
+  triggers a fresh notification, and the status lands within minutes. No new
+  commit, no CI-wide re-run.
 - **Guarded by:** nothing automatic — this is infra, not code. The merge
   watchers poll `mergeStateStatus` and surface the stall; this entry is the
   runbook for the two-read diagnosis.

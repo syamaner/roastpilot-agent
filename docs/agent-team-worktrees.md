@@ -59,7 +59,12 @@ were completely untouched.
     command (the `cd` and the command in one bash call).
 - Read-only peeks at the main repo are fine via `git -C <main repo> ...`; never
   *write* there.
-- Push and open your PR from your worktree — push works normally from one.
+- Push from your worktree (push works normally from one) and REPORT the sha to
+  the lead; by default the LEAD opens the PR and owns the review cycle (see
+  "Branch freeze on PR-open" below). Open the PR yourself only when the lead
+  has explicitly delegated it — and then the freeze rule applies to you: the
+  moment YOUR PR is open, the branch is frozen and further pushes need the
+  cycle-owner's go-ahead.
 
 ## Fallback: serialize
 
@@ -107,11 +112,13 @@ fold arrives after the lead already opened the PR and fired the review trigger
 (PR #547 hit both in one evening — absorbed only because the trigger hadn't
 fired yet).
 
-Rule: **opening the PR is the branch-ownership handoff.**
+Rule: **opening the PR is the branch-ownership handoff — WHOEVER opens it.**
 
 1. When the lead opens a PR on a teammate's branch, the accompanying message
    includes an explicit **FREEZE** — no further pushes without a lead
-   go-ahead.
+   go-ahead. When a teammate opens their own PR (lead-delegated — see the
+   teammate rules above), the same freeze binds them from the moment it opens:
+   the review-cycle owner (the lead) controls all further pushes.
 2. Every teammate "pushed sha X" report re-freezes by default; unfreeze is
    always an explicit lead instruction naming what to fold.
 3. If a push lands after the review trigger fired, the verdict is stale by
