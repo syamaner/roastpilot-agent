@@ -106,8 +106,10 @@
 Three tracks, three teammates in explicit worktrees. **#548 (#525 stale-session clear, D92):**
 the #523 S4 gap closed as a pure store write behind a three-guard design — (a) own-active-run
 409, (b) atomic unfinalised WHERE, (c) a **two-clause per-run-budgeted liveness gate** (recent
-telemetry OR recent start; threshold `max(20 s, 4× the run's OWN frozen `config_json` interval,
-4× answerer's)`) — with zero MCP writes pinned by a call-count test and audit rows on every
+telemetry OR recent start; effective window = `max(answerer_window, owner_window)` where each
+window is `max(20.0, 4 * telemetry_log_interval_seconds)` — the owner's interval read from the
+target run's frozen `config_json`, the answerer's from its own live config; wider wins,
+fail-closed) — with zero MCP writes pinned by a call-count test and audit rows on every
 path incl. 404s. The full arc: design note → Opus design review PASS-WITH-CONDITIONS (found the
 shadowed-live-run kill chain: a clear could abort a ticking roast AND 410 its API e-stop) → D92
 (the issue's "MCP-idle gate" formally replaced by DB write-recency) → Opus impl review PASS →
