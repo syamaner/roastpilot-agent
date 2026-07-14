@@ -102,7 +102,36 @@
 
 ## Active Context
 
-**12–13 Jul 2026 (latest) — OVERNIGHT TEAM BATCH + FOLLOW-UP BATCH 2 COMPLETE (18 PRs, 3 repos,
+**14 Jul 2026 (latest) — BATCH 3 COMPLETE: #525 + #530 + E11 KICKED OFF (PRs #546–#548).**
+Three tracks, three teammates in explicit worktrees. **#548 (#525 stale-session clear, D92):**
+the #523 S4 gap closed as a pure store write behind a three-guard design — (a) own-active-run
+409, (b) atomic unfinalised WHERE, (c) a **two-clause per-run-budgeted liveness gate** (recent
+telemetry OR recent start; effective window = `max(answerer_window, owner_window)` where each
+window is `max(20.0, 4 * telemetry_log_interval_seconds)` — the owner's interval read from the
+target run's frozen `config_json`, the answerer's from its own live config; wider wins,
+fail-closed) — with zero MCP writes pinned by a call-count test and audit rows on every
+path incl. 404s. The full arc: design note → Opus design review PASS-WITH-CONDITIONS (found the
+shadowed-live-run kill chain: a clear could abort a ticking roast AND 410 its API e-stop) → D92
+(the issue's "MCP-idle gate" formally replaced by DB write-recency) → Opus impl review PASS →
+Codex rounds 1-2 each finding a REAL hole (the pre-first-telemetry actuation window → the
+start-recency clause; answerer-vs-owner window config provenance → per-run json_extract) →
+round 3 silent. Load-bearing facts recorded in code + D92: a same-process bare orphan is
+unreachable by construction (start_roast critical section + recover_on_start's two-bucket
+funnel — the stale card and clear action are inherently multi-process tools);
+`roast_runs.config_json` freezes controller config at creation (per-run provenance pattern).
+**#547 (#137, D93): E11 is now IN PROGRESS** — S1's wheel/SPA half shipped (hatchling build
+hook scoped to the wheel target, rebuild-always-when-npm, package-data resolution + clean-venv
+install proof, CI package job); **the `[pi]` extra is HELD** — coffee-roaster-mcp 0.1.13 still
+hard-requires transformers, so #137 stays open blocked on coffee-roaster-mcp#157 (D27 Phase 2,
+Pi-5-gated); base wheel verified lean. **#546 (#530):** the devices-spread viewport override +
+missing `fullPage` fixed; the bottom third of every page (ratings, weights, tastings, export,
+config safety/recovery pane) is in the visual baselines for the first time. 16 verified review
+findings folded + 1 evidence-based refutation across the batch; zero un-triaged threads.
+Remaining backlog unchanged: #521 (tasting-gated), #396 (credits-gated), #137's extra half +
+MCP#194/#157 (Pi-5-gated), E11-S2/S3, E12 (operator-supervised), #380 (wrong-premise candidate
+vs the fc-detector-lag no-magic-offset decision — flagged, not closed).
+
+**12–13 Jul 2026 — OVERNIGHT TEAM BATCH + FOLLOW-UP BATCH 2 COMPLETE (18 PRs, 3 repos,
 MCP v0.1.13).** Batch 1 (four tracks: fe-523 / be-signals / mcp-audio / fc-docs — 13 PRs: agent
 #524/#527/#528/#529/#532/#534/#535/#536/#538, MCP #192/#193/#195, FC #67): the #523 UX/IA
 restructure (/live = roast state, /start = only start surface, / = links hub, nav always visible;
