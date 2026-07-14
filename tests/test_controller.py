@@ -7035,6 +7035,71 @@ async def test_d94_operator_fc_override_with_no_prior_telemetry_falls_back_to_d8
     assert r0 == pytest.approx(config.post_first_crack_control.taper_end_ror_c_per_min)
 
 
+@pytest.mark.asyncio
+async def test_d94_affordability_numerator_clamps_to_ceiling_guard_when_enabled() -> None:
+    """Codex finding (PR #551 round 1, P2): a profile's ``target_drop_temp_c``
+    (200) sits ABOVE the ceiling guard's own temperature (196, default) — the
+    guard forces the drop at 196 first, so the roast can never actually spend
+    the extra headroom above it. With the guard ENABLED, the affordability
+    numerator clamps to ``min(200, 196) = 196``, giving a SMALLER apparent
+    runway and firing the decisive cut a raw-200 comparison would have missed
+    (conservative direction: a smaller numerator can only make the cut MORE
+    likely, never less)."""
+    config = _post_fc_config(ceiling_guard_drop_enabled=True)
+    harness = make_harness(config=config)
+    profile = RoastProfile(
+        name="above-ceiling-guard",
+        bean_origin="Test",
+        bean_weight_grams=250.0,
+        initial_heat_percent=100,
+        initial_fan_percent=30,
+        target_drop_temp_c=200.0,  # above the 196 C ceiling guard
+        target_development_percent=_ROAST_14_PROFILE.target_development_percent,
+    )
+    await _charge_through_fc_at(
+        harness,
+        profile=profile,
+        charge_elapsed_at_fc_seconds=_ROAST_14_CHARGE_ELAPSED_AT_FC,
+        fc_bean_temp_c=_ROAST_14_BEAN_TEMP_AT_ENGAGEMENT,
+        fc_ror_c_per_min=7.0,
+    )
+    r0 = harness.controller._post_fc_controller._taper_r0_c_per_min  # pyright: ignore[reportPrivateUsage]
+    # Clamped to the guard temp (196): affordable ~= 6.317 C/min, measured 7.0
+    # crosses affordable + margin (0.1) -> decisive cut fires, seed = 7.0-1.5.
+    assert r0 == pytest.approx(7.0 - config.post_first_crack_control.k_decisive_margin_c_per_min)
+
+
+@pytest.mark.asyncio
+async def test_d94_affordability_numerator_uses_raw_target_when_guard_disabled() -> None:
+    """Companion to the clamp test above: with the ceiling guard DISABLED, the
+    affordability numerator uses the raw (unreachable-in-practice)
+    ``target_drop_temp_c`` unchanged — the SAME profile and measured RoR that
+    fires a cut when the guard is enabled does NOT fire here, because the
+    raw 200 C target reads as far more runway than the roast actually has."""
+    config = _post_fc_config(ceiling_guard_drop_enabled=False)
+    harness = make_harness(config=config)
+    profile = RoastProfile(
+        name="above-ceiling-guard-disabled",
+        bean_origin="Test",
+        bean_weight_grams=250.0,
+        initial_heat_percent=100,
+        initial_fan_percent=30,
+        target_drop_temp_c=200.0,
+        target_development_percent=_ROAST_14_PROFILE.target_development_percent,
+    )
+    await _charge_through_fc_at(
+        harness,
+        profile=profile,
+        charge_elapsed_at_fc_seconds=_ROAST_14_CHARGE_ELAPSED_AT_FC,
+        fc_bean_temp_c=_ROAST_14_BEAN_TEMP_AT_ENGAGEMENT,
+        fc_ror_c_per_min=7.0,
+    )
+    r0 = harness.controller._post_fc_controller._taper_r0_c_per_min  # pyright: ignore[reportPrivateUsage]
+    # Raw target (200): affordable ~= 8.844 C/min, measured 7.0 does NOT cross
+    # affordable + margin -> no cut, seed unchanged.
+    assert r0 == pytest.approx(7.0)
+
+
 # --- D84 (#405 Slice C): deterministic drop anchor + LLM-earlier-only ---
 
 

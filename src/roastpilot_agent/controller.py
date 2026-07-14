@@ -1137,12 +1137,26 @@ class RoastController:
 
         The affordable rate is then
 
-            ``setpoint_needed = (target_drop_temp_c - bean_temp_at_engagement)
-            / (remaining / 60)``
+            ``setpoint_needed = (effective_drop_target_c -
+            bean_temp_at_engagement) / (remaining / 60)``
 
         in °C/min, using the SAME telemetry reading already used one line
         above for ``measured_ror_c_per_min`` (no new telemetry read, no
-        staleness risk). The decisive cut fires only with a strict margin
+        staleness risk). ``effective_drop_target_c`` is
+        ``min(target_drop_temp_c, ceiling_guard_temp_c)`` when
+        ``ceiling_guard_drop_enabled`` is True, else the raw profile target
+        unchanged (Codex finding, PR #551 round 1): a profile whose
+        ``target_drop_temp_c`` sits ABOVE the ceiling guard's own temperature
+        can never actually spend that extra headroom — the decoupled guard
+        (:meth:`_maybe_ceiling_guard_drop`, D88 amendment A1) forces the drop
+        at its own temperature first, unconditionally on the taper flag. Using
+        the unreachable raw target would understate the affordability
+        comparison's urgency (a longer apparent runway than the roast can
+        actually use); clamping to the LOWER of the two is the conservative
+        direction — it can only shrink the numerator, which can only make the
+        decisive cut MORE likely to fire, never less.
+
+        The decisive cut fires only with a strict margin
         beyond the raw comparison (Condition 3, the operator's same-day
         amendment on ratification): ``measured_ror_c_per_min >
         setpoint_needed + affordability_hysteresis_c_per_min``. Without this
@@ -1231,9 +1245,31 @@ class RoastController:
         p = self._profile.target_development_percent / 100.0
         dev_budget_seconds = p * charge_elapsed_at_fc / (1.0 - p)
         remaining_dwell_budget_seconds = max(dev_budget_seconds - config.thermal_lag_seconds, 1e-6)
-        setpoint_needed_c_per_min = (
-            self._profile.target_drop_temp_c - self._last_telemetry.bean_temp_c
-        ) / (remaining_dwell_budget_seconds / 60.0)
+        # Codex finding (PR #551 round 1, P2): a profile whose
+        # ``target_drop_temp_c`` sits ABOVE the ceiling guard's own
+        # ``ceiling_guard_temp_c`` can never actually spend that extra
+        # headroom — :meth:`_maybe_ceiling_guard_drop` forces the drop at the
+        # guard temperature first (D88 amendment A1, unconditional on the
+        # taper flag whenever ``ceiling_guard_drop_enabled`` is True). Using
+        # the raw (unreachable) profile target here would UNDERSTATE the
+        # affordability comparison's urgency — a longer apparent runway than
+        # the roast can actually use, making the decisive cut LESS likely to
+        # fire exactly when the guard is about to cap the roast anyway.
+        # Clamping the numerator's target to whichever is LOWER (the guard
+        # temp, when the guard is active) is the conservative direction: a
+        # smaller numerator shrinks ``setpoint_needed``, which can only make
+        # the cut MORE likely to fire (safer, toward the guard's own bitter-
+        # line intent), never less. When the guard is disabled the raw
+        # profile target is used unchanged — byte-identical to the original
+        # D94 law in that configuration.
+        effective_drop_target_c = (
+            min(self._profile.target_drop_temp_c, config.ceiling_guard_temp_c)
+            if config.ceiling_guard_drop_enabled
+            else self._profile.target_drop_temp_c
+        )
+        setpoint_needed_c_per_min = (effective_drop_target_c - self._last_telemetry.bean_temp_c) / (
+            remaining_dwell_budget_seconds / 60.0
+        )
         if (
             measured_ror_c_per_min
             > setpoint_needed_c_per_min + config.affordability_hysteresis_c_per_min
