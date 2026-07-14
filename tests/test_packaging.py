@@ -41,12 +41,11 @@ def built_wheel(tmp_path: Path) -> Path:
     Uses the repo's own build backend (hatchling + ``hatch_build.py``) via
     ``python -m build --wheel``, so this exercises the exact packaging path a
     release does — not a hand-rolled zip that could drift from the real hook.
+    ``build`` is a declared dev dependency (pyproject.toml's ``dev`` group), so
+    this is hermetic after ``pip install -e . --group dev`` — no ad-hoc
+    ``pip install`` inside the test (repo rule: all dev deps declared in
+    ``pyproject.toml``).
     """
-    subprocess.run(  # noqa: S603
-        [sys.executable, "-m", "pip", "install", "--quiet", "build"],
-        cwd=_REPO_ROOT,
-        check=True,
-    )
     out_dir = tmp_path / "dist"
     subprocess.run(  # noqa: S603
         [sys.executable, "-m", "build", "--wheel", "--outdir", str(out_dir)],
@@ -56,6 +55,45 @@ def built_wheel(tmp_path: Path) -> Path:
     wheels = list(out_dir.glob("*.whl"))
     assert len(wheels) == 1, f"expected exactly one wheel, found {wheels}"
     return wheels[0]
+
+
+def test_build_hook_rebuilds_over_a_stale_web_dist(tmp_path: Path) -> None:
+    """A stale leftover web/dist is rebuilt, never shipped as-is, when npm exists.
+
+    ``web/dist`` is gitignored but not necessarily clean between builds (a
+    developer's earlier local ``npm run build``, or a stale artifact from a
+    prior packaging run). Plants a marker file in ``web/dist`` before
+    building, then asserts the marker is ABSENT from the produced wheel — a
+    real ``npm run build`` always empties Vite's output directory first, so
+    the only way the marker could survive is if the hook skipped rebuilding
+    and force-included the stale directory verbatim (the bug this test
+    guards against; Codex catch, PR #547).
+    """
+    dist_dir = _REPO_ROOT / "web" / "dist"
+    marker = dist_dir / "STALE_MARKER_FROM_TEST.txt"
+    dist_dir.mkdir(parents=True, exist_ok=True)
+    marker.write_text("stale build artifact — must not survive a rebuild")
+    try:
+        out_dir = tmp_path / "dist"
+        subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "build", "--wheel", "--outdir", str(out_dir)],
+            cwd=_REPO_ROOT,
+            check=True,
+        )
+        wheels = list(out_dir.glob("*.whl"))
+        assert len(wheels) == 1, f"expected exactly one wheel, found {wheels}"
+        with zipfile.ZipFile(wheels[0]) as archive:
+            names = archive.namelist()
+        assert not any("STALE_MARKER_FROM_TEST" in name for name in names), (
+            f"stale marker survived into the wheel — the hook did not rebuild: {names}"
+        )
+        assert "roastpilot_agent/_web_dist/index.html" in names
+    finally:
+        # web/dist is gitignored/build output, but clean up the marker
+        # explicitly in case a real build did not run (e.g. an unexpected
+        # early failure) and left it behind.
+        if marker.is_file():
+            marker.unlink()
 
 
 def test_wheel_contains_bundled_spa_index_html(built_wheel: Path) -> None:
