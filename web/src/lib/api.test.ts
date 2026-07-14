@@ -87,4 +87,30 @@ describe("api client", () => {
       corrected_charge_grams: 255,
     });
   });
+
+  it("POST /clear-stale-session sends the reason body and returns the typed result (#525)", async () => {
+    mockFetch(200, { run_id: "r1", outcome: "aborted", completed_at_utc: "2026-07-14T00:00:00Z" });
+    const result = await api.clearStaleSession("r1", { reason: "orphaned after a crash" });
+    expect(result.outcome).toBe("aborted");
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/roasts/r1/clear-stale-session",
+      expect.any(Object),
+    );
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init).toMatchObject({ method: "POST" });
+    expect(JSON.parse((init as RequestInit).body as string)).toEqual({
+      reason: "orphaned after a crash",
+    });
+  });
+
+  it("POST /clear-stale-session surfaces the server's 409 detail on a rejected guard (#525)", async () => {
+    mockFetch(409, { detail: "run r1 appears to be actively driven" });
+    await expect(
+      api.clearStaleSession("r1", { reason: "thought this was orphaned" }),
+    ).rejects.toMatchObject({
+      name: "ApiError",
+      status: 409,
+      detail: "run r1 appears to be actively driven",
+    });
+  });
 });
