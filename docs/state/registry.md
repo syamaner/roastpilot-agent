@@ -102,7 +102,31 @@
 
 ## Active Context
 
-**12 Jul 2026 (latest, PM) — PAPER-RIGOUR BATCH COMPLETE: #495 CLOSED (3 parallel tracks, PRs
+**12–13 Jul 2026 (latest) — OVERNIGHT TEAM BATCH + FOLLOW-UP BATCH 2 COMPLETE (18 PRs, 3 repos,
+MCP v0.1.13).** Batch 1 (four tracks: fe-523 / be-signals / mcp-audio / fc-docs — 13 PRs: agent
+#524/#527/#528/#529/#532/#534/#535/#536/#538, MCP #192/#193/#195, FC #67): the #523 UX/IA
+restructure (/live = roast state, /start = only start surface, / = links hub, nav always visible;
+PRs #528/#529/#532/#535, closes #517), #522 tasting-signal capture for E14 (#527, SCHEMA_V11),
+#520 charge correction (#534, SCHEMA_V12, atomic cross-endpoint bounds), #516 health instance_id
+defence for the port-impostor class (#536), the AGENTS.md **Codex-wait rule** (#524 — operator-
+instituted after #518 merged mid-review; the rule prevented a real 11-test coverage regression
+the same night), and the MCP #190/#191 audio-overflow arc (MCP PRs #192/#193/#195: reader-thread
+split, capture-time stamping, milestone recovery with earliest-eligible cutoffs) → **v0.1.13
+released** + agent pin/mirror bump (#538). Batch 2 (operator: "launch the five"; serial
+be-signals track, PRs #540–#544): #531 flake→poll-until-condition, #526 unmount guard (+ the
+React-18 finding: unmount-guard tests on local-state-only paths are PROVABLY vacuous — recorded
+in recent-fixes), #539 overflow diagnostics in MicStatus/drawer, #533 tasting UX debt (+ Codex
+caught the new completed-gate violating the batch's own freshness class → 5s live-only poll),
+#537 mismatch-view field-protocol copy (3 fold rounds incl. a real P1: e-stop-first before the
+launcher-restart step — the launcher force-kills without heat-off). 7 verified findings folded in
+batch 2, zero dismissed, zero un-triaged threads across both batches. Deferred deliberately:
+#525 (stale-session clear — needs its safety design pass), #530 (snapshot viewport story), #521
+(tasting-gated), #396 (credits-gated), MCP#194 Pi-5 soak (hardware-gated). Roasts 13 (El
+Salvador — first merged-stack validation; advisor fan actuation + joint drop 190 °C / 20.9 %)
+and 14 (Sumatra — late FC at 186 °C, dev 15.1 %; operator steer → #521 RoR-aware decisive heat
+cuts) logged same weekend; tastings pending.
+
+**12 Jul 2026 (PM) — PAPER-RIGOUR BATCH COMPLETE: #495 CLOSED (3 parallel tracks, PRs
 agent #508/#509/#510 + FC #64/#65).** Every pre-submission gate item is now committed, reviewed,
 reproducible evidence: **McNemar p=0.0039 REPRODUCED exactly** from the committed bake-off
 artifacts (`scripts/advisor_significance.py`, PR #508; Wilcoxon p=0.0098 explicitly marked
