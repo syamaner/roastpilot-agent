@@ -1277,7 +1277,10 @@ async def _make_stale_run(store: RoastStore, run_id: str, phase: RoastPhase) -> 
     threshold`` bound does not spuriously refuse them."""
     long_ago = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
     await store.create_run(
-        run_id=run_id, profile=_profile(), config=AppConfig(), agent_phase=phase,
+        run_id=run_id,
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=phase,
         started_at_utc=long_ago,
     )
 
@@ -1378,10 +1381,12 @@ async def test_clear_stale_session_blocks_a_just_started_run_with_no_telemetry_y
     ``test_finalize_orphaned_run_blocked_by_a_just_started_run_with_no_telemetry_yet``
     in ``test_store.py``."""
     await _make_run(store, "run-just-started", RoastPhase.PREHEATING)
-    telemetry_count = await store.connection.execute(
+    cursor = await store.connection.execute(
         "SELECT COUNT(*) FROM telemetry_snapshots WHERE run_id = 'run-just-started'"
     )
-    assert (await telemetry_count.fetchone())[0] == 0  # sanity: genuinely no telemetry yet
+    count_row = await cursor.fetchone()
+    assert count_row is not None
+    assert count_row[0] == 0  # sanity: genuinely no telemetry yet
 
     response = await client.post(
         "/api/roasts/run-just-started/clear-stale-session",
