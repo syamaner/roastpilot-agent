@@ -7015,6 +7015,14 @@ async def test_d94_operator_fc_override_with_no_prior_telemetry_falls_back_to_d8
     controller.load_profile(PROFILE)
     for step in NORMAL_PATH[:3]:  # …→ ROASTING_PRE_FIRST_CRACK, via transition_to only
         controller.transition_to(step)
+    # Stamp the charge clock directly (the same direct-stamp technique
+    # ``test_development_percent_is_zero_at_first_crack_and_charge_referenced``
+    # already uses) so this test isolates EXACTLY the condition the safety
+    # review flagged — ``_last_telemetry is None`` at a true FC edge — rather
+    # than accidentally passing because ``_charge_monotonic`` is ALSO None on
+    # this path (the harness's bare ``transition_to`` walk never runs the
+    # real T0-debounce tick flow that stamps it).
+    controller._charge_monotonic = harness.clock.now  # pyright: ignore[reportPrivateUsage]
     assert controller._last_telemetry is None  # pyright: ignore[reportPrivateUsage]
     await controller.operator_mark_first_crack()
     assert controller.phase is RoastPhase.DEVELOPMENT
