@@ -552,6 +552,21 @@ export interface ChargeWeightRequest {
   corrected_charge_grams: number;
 }
 
+/** `POST /api/roasts/{id}/clear-stale-session` body (#525). A required,
+ *  non-empty reason — no silent no-reason clears. */
+export interface ClearStaleSessionRequest {
+  reason: string;
+}
+
+/** The outcome of a successful {@link ClearStaleSessionRequest} (#525).
+ *  Always `outcome: "aborted"` — this action only ever finalises a stranded
+ *  run as abandoned, never reclassifies what happened during it. */
+export interface ClearStaleSessionResult {
+  run_id: string;
+  outcome: "aborted";
+  completed_at_utc: string;
+}
+
 // --- Tastings (models.RoastTasting / TastingEntryRequest / TastingList, #522, D91) ---
 
 export type BrewMethod =

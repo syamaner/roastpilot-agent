@@ -26,17 +26,32 @@
  * health check itself persistently errors (active-run status UNKNOWN, not "no
  * run"), a neutral "can't confirm" state replaces the form too — this is the
  * route the #513 incident screenshot was taken on, so it gets the same guard
- * as `/live`. (3) STALE SESSION (#523): a history run with `outcome: null`
- * (still open in the store) that `health.active_run_id` does NOT point to —
- * the signature of the 12 Jul impostor-listener incident (runs
+ * as `/live`. (3) STALE SESSION (#523/#525): a history run with `outcome:
+ * null` (still open in the store) that `health.active_run_id` does NOT point
+ * to — the signature of the 12 Jul impostor-listener incident (runs
  * `99b2e272`/`6300be8f`, docs/recent-fixes.md), where a second process
  * answered `/health` with `active_run_id: null` while a genuinely stranded run
- * row sat open. Explains the state and offers a link to `/live`'s recovery
- * flow; the explicit clear/end-stale-run operator action is OUT OF SCOPE here
- * — it needs its own safety design (a typed operator action, audit event, and
- * a guard that the MCP child is actually idle/cooled before allowing it, so
- * it can never race a genuinely hot machine); see the in-line note at the
- * stale-session branch below and #523's tracking issue for the gap.
+ * row sat open. This case is inherently multi-process: a SAME-process bare
+ * orphan cannot exist by the time this route is ever polled (restart recovery
+ * always finalises a stale `faulted` row, or promotes any other unfinalised
+ * phase into `operator_recovery_required`, before this process ever serves a
+ * request — that leaves no third "unfinalised, not faulted, not
+ * recovery-required" bucket for a same-process orphan to occupy). Explains the
+ * state and offers the operator BOTH the `/live` recovery-flow link (in case
+ * the health-RECOGNISED case applies to a DIFFERENT run — see #525's #535
+ * follow-up: it does NOT apply to THIS stale row, since `staleRun`'s own
+ * derivation already excludes that) AND the explicit clear/end-stale-run
+ * operator action (#525): a typed, audited, DB-liveness-gated finalize —
+ * never drop/cool, never an MCP write. Per the #525 safety design (routed
+ * through `safety-reviewer`, PASS-WITH-CONDITIONS): an own-process MCP-idle
+ * check cannot observe a DIFFERENT process's roaster (this is the
+ * fundamentally multi-process case), so the server gates on shared DB
+ * evidence instead — recent telemetry for the run, not any one process's
+ * self-report — and refuses with a distinct "actively driven, do not clear"
+ * 409 if that evidence exists. Kept self-contained on `/start` (no `/live`
+ * handoff needed for the clear action itself — the #535 follow-up ruled a
+ * handoff broken anyway for the health-UNRECOGNISED case, since `/live`'s
+ * dashboard only mounts for a non-null `active_run_id`).
  * (4) on a successful start, `navigate("/live")` fires unconditionally once
  * the POST is proven (201) — never gated on a health refetch here. The
  * guarantee chain is: the server COMMITS the run (writes it, on the same
@@ -63,11 +78,13 @@
  * class this whole file already guards for health.
  */
 
-import { useCallback } from "react";
+import { useCallback, useState } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "react-router-dom";
 
 import { AppFrame } from "@/components/shared";
 import {
+  roastKeys,
   useBeanProfiles,
   useCreateBeanProfile,
   useDeleteBeanProfile,
@@ -80,6 +97,98 @@ import type { BeanProfileInput, RoastProfile } from "@/lib/types";
 import type { LiveNavigationState } from "@/pages/live/LivePage";
 
 import { StartRoastForm } from "@/pages/dashboard/StartRoastForm";
+
+/**
+ * The #525 clear/end-stale-run confirm step, embedded in `StartRoastView`'s
+ * stale-session card. A required, non-empty reason (mirrors the server's own
+ * validation) gates the action — no accidental one-click clears. On success,
+ * invalidates BOTH history and health (the two sources `staleRun`'s own
+ * derivation reads) so the stale card disappears and the plain form renders
+ * next render, without a manual reload.
+ */
+function ClearStaleSessionAction({ runId }: { runId: string }): React.JSX.Element {
+  const queryClient = useQueryClient();
+  const [confirming, setConfirming] = useState(false);
+  const [reason, setReason] = useState("");
+
+  const mutation = useMutation({
+    mutationFn: () => api.clearStaleSession(runId, { reason }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: roastKeys.history });
+      void queryClient.invalidateQueries({ queryKey: roastKeys.health });
+    },
+  });
+
+  if (mutation.isSuccess) {
+    // The invalidated queries above will re-render this page past the
+    // stale-session branch shortly; a brief explicit success state avoids a
+    // flash of the confirm UI while that refetch is still in flight.
+    return (
+      <p data-testid="start-roast-stale-session-cleared" className="text-sm text-roast-nominal">
+        Cleared.
+      </p>
+    );
+  }
+
+  if (!confirming) {
+    return (
+      <button
+        type="button"
+        data-testid="start-roast-stale-session-clear-open"
+        onClick={() => setConfirming(true)}
+        className="rounded-md border border-roast-fault/50 px-5 py-3 text-sm font-semibold text-roast-fault transition-colors hover:bg-roast-fault/10"
+      >
+        This isn&apos;t my roast — end it
+      </button>
+    );
+  }
+
+  const trimmedReason = reason.trim();
+
+  return (
+    <div className="flex w-full flex-col items-center gap-2" data-testid="start-roast-stale-session-confirm">
+      <p className="text-xs text-muted-foreground">
+        This only finalises the leftover record — it never touches heat, fan, or cooling.
+      </p>
+      <input
+        type="text"
+        data-testid="start-roast-stale-session-reason"
+        value={reason}
+        onChange={(e) => setReason(e.target.value)}
+        placeholder="Why are you clearing this? (required)"
+        className="w-full rounded-md border border-border bg-input px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
+      />
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          data-testid="start-roast-stale-session-clear-confirm"
+          disabled={trimmedReason.length === 0 || mutation.isPending}
+          onClick={() => mutation.mutate()}
+          className="rounded-md bg-roast-fault px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {mutation.isPending ? "Clearing…" : "Confirm end"}
+        </button>
+        <button
+          type="button"
+          data-testid="start-roast-stale-session-clear-cancel"
+          disabled={mutation.isPending}
+          onClick={() => {
+            setConfirming(false);
+            setReason("");
+          }}
+          className="rounded-md border border-border px-4 py-2 text-sm font-medium text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Cancel
+        </button>
+      </div>
+      {mutation.isError && (
+        <span data-testid="start-roast-stale-session-clear-error" className="text-xs text-roast-fault">
+          {mutation.error instanceof Error ? mutation.error.message : "Could not clear — try again."}
+        </span>
+      )}
+    </div>
+  );
+}
 
 export function StartRoastView(): React.JSX.Element {
   const navigate = useNavigate();
@@ -315,17 +424,18 @@ export function StartRoastView(): React.JSX.Element {
     );
   }
 
-  // #523 stale session: a run row is open (`outcome: null`) that this
+  // #523/#525 stale session: a run row is open (`outcome: null`) that this
   // process's health snapshot does not recognise as active — never a form
   // here either, since starting a new roast on top of an unresolved stranded
-  // run compounds the confusion the 12 Jul incident already caused. Explains
-  // the state and offers the one thing this route CAN safely do: hand off to
-  // `/live`'s recovery flow (resume/drop/cool/end via the existing operator
-  // actions). The dedicated clear/end-stale-run action the spec calls for is
-  // OUT OF SCOPE for this story — it needs its own safety design (a typed
-  // operator action, audit event, and a guard that the MCP child is actually
-  // idle/cooled before allowing it, so it can never race a genuinely hot
-  // machine) — see the module doc and #523's tracking issue for the gap.
+  // run compounds the confusion the 12 Jul incident already caused. This
+  // state is inherently multi-process (see the module doc): `staleRun`'s own
+  // derivation already excludes the case where THIS row is what health
+  // recognises as active, so the copy below never needs a conditional
+  // "if this is actually yours" branch — it isn't, by construction. Offers
+  // BOTH the `/live` recovery-flow link (for the DIFFERENT run health may
+  // recognise, if any) and the explicit #525 clear/end action (self-contained
+  // here — the #535 follow-up ruled a `/live` handoff broken for the clear
+  // itself, since its dashboard only mounts for a health-RECOGNISED run).
   if (staleRun !== null) {
     return (
       <AppFrame
@@ -343,11 +453,10 @@ export function StartRoastView(): React.JSX.Element {
             A previous roast wasn&apos;t finished
           </h2>
           <p className="text-sm text-muted-foreground">
-            A run from an earlier session is still open, but this page can&apos;t
-            confirm it as the active roast. If the roaster is hot, don&apos;t start a
-            new one. Open the live view to check its status — if it&apos;s still
-            recognised as active you can resume, drop, cool, or end it there;
-            if not, verify the hardware directly before starting again.
+            A run from an earlier session is still open, but this is not the
+            roast this page currently recognises as active. If the roaster
+            might still be hot, verify the hardware directly before starting a
+            new one — a software check cannot rule that out on its own.
           </p>
           <Link
             to="/live"
@@ -356,6 +465,7 @@ export function StartRoastView(): React.JSX.Element {
           >
             Open live view
           </Link>
+          <ClearStaleSessionAction runId={staleRun.id} />
         </div>
       </AppFrame>
     );
