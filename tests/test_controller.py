@@ -6995,6 +6995,38 @@ async def test_d94_decisive_seed_still_floors_at_taper_end_dead_zone() -> None:
     assert r0 == pytest.approx(config.post_first_crack_control.taper_end_ror_c_per_min)
 
 
+@pytest.mark.asyncio
+async def test_d94_operator_fc_override_with_no_prior_telemetry_falls_back_to_d88_anchor() -> None:
+    """Safety-review correction: ``_last_telemetry is None`` IS reachable at
+    the FC edge — ``operator_mark_first_crack`` transitions straight to
+    DEVELOPMENT with no telemetry tick of its own, so a bare operator mark
+    from pre-FC (no prior ``tick()`` call) reaches
+    ``_post_fc_affordability_seed_c_per_min`` with no telemetry reading to
+    compute a bean temperature from. The method must fall back to D88's
+    unconditional measured-RoR anchor (unchanged) rather than guess at an
+    affordability figure — the same fallback the incumbent D88
+    ``ror_at_engagement`` computation already takes for this exact condition.
+    An earlier draft of this code excluded this branch from coverage as
+    'unreachable via a true FC edge', which safety review disproved by
+    instrumenting ``test_operator_first_crack_override_stamped_and_gated``."""
+    config = _post_fc_config()
+    harness = make_harness(config=config)
+    controller = harness.controller
+    controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:  # …→ ROASTING_PRE_FIRST_CRACK, via transition_to only
+        controller.transition_to(step)
+    assert controller._last_telemetry is None  # pyright: ignore[reportPrivateUsage]
+    await controller.operator_mark_first_crack()
+    assert controller.phase is RoastPhase.DEVELOPMENT
+    # No telemetry ever ticked, so the taper falls back to the D88
+    # unconditional anchor: ror_at_engagement floors to taper_end_ror_c_per_min
+    # (no RoR sample available either), and the D94 affordability shaping is
+    # a no-op (it returns that same value unchanged) rather than crashing or
+    # guessing at a bean temperature that was never read.
+    r0 = controller._post_fc_controller._taper_r0_c_per_min  # pyright: ignore[reportPrivateUsage]
+    assert r0 == pytest.approx(config.post_first_crack_control.taper_end_ror_c_per_min)
+
+
 # --- D84 (#405 Slice C): deterministic drop anchor + LLM-earlier-only ---
 
 

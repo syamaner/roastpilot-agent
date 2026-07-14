@@ -1172,10 +1172,17 @@ class RoastController:
         NOT via :meth:`_charge_elapsed_seconds` (which reads the RECEIVE-TICK
         clock, a value that could differ from the backdated FC instant by a
         meaningful fraction of the ``affordability_hysteresis_c_per_min``
-        budget this method now depends on). ``self._charge_monotonic`` is
-        always set by the time this branch runs (a true FC edge can only
-        follow a charge), so no ``None`` guard is needed here beyond what the
-        type checker already knows from the call site's phase invariant.
+        budget this method now depends on). ``self._last_telemetry`` IS
+        genuinely reachable as ``None`` at this FC edge, though: the operator
+        FC override (:meth:`operator_mark_first_crack`) calls
+        ``self.transition_to(RoastPhase.DEVELOPMENT)`` directly with no
+        telemetry tick of its own, so a bare operator mark from pre-FC (no
+        prior ``tick()`` call) reaches this branch with ``_last_telemetry``
+        still ``None`` — exactly the reason the INCUMBENT D88 code one line
+        above already guards ``self._last_telemetry is None`` for
+        ``ror_at_engagement`` (an earlier draft of this docstring claimed no
+        guard was needed here, which safety review disproved by instrumenting
+        ``test_operator_first_crack_override_stamped_and_gated``).
 
         This method commands nothing and writes nothing — it is a pure
         computation feeding the ONE existing ``reset`` call at the FC->
@@ -1201,17 +1208,25 @@ class RoastController:
             or self._charge_monotonic is None
             or self._last_telemetry is None
         ):
-            # Defensive only — a true FC edge cannot reach this branch without
-            # a loaded profile, both clocks armed, and a fresh telemetry
-            # reading (the caller's own phase invariant guarantees all three —
-            # the reading that fires the FC transition is the same one
-            # ``ror_at_engagement`` was already computed from one line above
-            # in the caller). Fall back to D88's unconditional measured-RoR
-            # anchor rather than guess at an affordability figure with no
-            # valid bean-temperature basis to compute one — a fabricated
-            # ``bean_temp_at_engagement`` could bias the comparison in either
-            # direction, which is worse than simply not shaping the seed.
-            return measured_ror_c_per_min  # pragma: no cover - unreachable via a true FC edge
+            # ``_last_telemetry is None`` IS reachable here (safety review
+            # correction): the operator FC override
+            # (:meth:`operator_mark_first_crack`) transitions straight to
+            # DEVELOPMENT with no telemetry tick of its own, so a bare
+            # operator mark from pre-FC reaches this branch with no telemetry
+            # reading to compute a bean temperature from — the same reason
+            # the incumbent D88 ``ror_at_engagement`` fallback one line above
+            # already guards this exact condition. The other three guards
+            # (``_profile`` / ``_first_crack_monotonic`` / ``_charge_monotonic``
+            # all ``None``) remain defensive-only — a true FC edge (either
+            # detection path) cannot reach this branch without a loaded
+            # profile and both clocks armed — but are kept in the SAME
+            # condition rather than split out, since falling back to D88's
+            # unconditional measured-RoR anchor is the correct, safe response
+            # to any of the four regardless of which one triggered it: a
+            # fabricated ``bean_temp_at_engagement`` or a guessed clock origin
+            # could bias the affordability comparison in either direction,
+            # which is worse than simply not shaping the seed.
+            return measured_ror_c_per_min
         charge_elapsed_at_fc = self._first_crack_monotonic - self._charge_monotonic
         p = self._profile.target_development_percent / 100.0
         dev_budget_seconds = p * charge_elapsed_at_fc / (1.0 - p)
