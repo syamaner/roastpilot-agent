@@ -107,7 +107,7 @@ test("dashboard-live — preheating with the charge band, full-page snapshot (ca
   await expect(page.getByTestId("ambient-pressure")).toHaveText("1013 hPa");
 
   await settle(page);
-  await expect(page).toHaveScreenshot("dashboard-live.png");
+  await expect(page).toHaveScreenshot("dashboard-live.png", { fullPage: true });
 });
 
 test("dashboard-fault — real env-ceiling fault renders the fault banner + trail (canvas un-masked)", async ({
@@ -169,7 +169,7 @@ test("dashboard-fault — real env-ceiling fault renders the fault banner + trai
   expect((hook.scales.x.max ?? 0) - (hook.scales.x.min ?? 0)).toBeGreaterThan(0);
 
   await settle(page);
-  await expect(page).toHaveScreenshot("dashboard-fault.png");
+  await expect(page).toHaveScreenshot("dashboard-fault.png", { fullPage: true });
 });
 
 test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery modal (canvas un-masked)", async ({
@@ -215,7 +215,7 @@ test("dashboard-recovery — pre-T0 overrun opens the no-auto-resume recovery mo
   expect(hook.scales.pct.max).toBe(100);
 
   await settle(page);
-  await expect(page).toHaveScreenshot("dashboard-recovery.png");
+  await expect(page).toHaveScreenshot("dashboard-recovery.png", { fullPage: true });
 });
 
 test("dashboard-developed — full ramping curve at first crack (canvas un-masked, real shape)", async ({
@@ -326,7 +326,7 @@ test("dashboard-developed — full ramping curve at first crack (canvas un-maske
   await expect(page.getByTestId("control-fan")).toHaveAttribute("data-mode", "interactive");
 
   await settle(page);
-  await expect(page).toHaveScreenshot("dashboard-developed.png");
+  await expect(page).toHaveScreenshot("dashboard-developed.png", { fullPage: true });
 });
 
 test("dashboard-charge-window — preheating + bean in the charge band shows the persistent banner (#211)", async ({
@@ -384,5 +384,5 @@ test("dashboard-charge-window — preheating + bean in the charge band shows the
   expect(hook.scales.pct.max).toBe(100);
 
   await settle(page);
-  await expect(page).toHaveScreenshot("dashboard-charge-window.png");
+  await expect(page).toHaveScreenshot("dashboard-charge-window.png", { fullPage: true });
 });

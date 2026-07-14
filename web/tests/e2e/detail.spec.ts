@@ -59,7 +59,7 @@ test("roast-detail — full-page snapshot of the detail page (canvas un-masked)"
   await expect(page.getByTestId("roast-conditions-temp")).toHaveText("29.7 °C");
   await expect(page.getByTestId("roast-conditions-humidity")).toHaveText("41 %");
   await expect(page.getByTestId("roast-conditions-pressure")).toHaveText("1008 hPa");
-  await expect(page).toHaveScreenshot("roast-detail.png");
+  await expect(page).toHaveScreenshot("roast-detail.png", { fullPage: true });
 });
 
 test("roast-detail-selected — CLAMP row selected highlights the curve", async ({ page }) => {
@@ -160,7 +160,7 @@ test.describe("capped detail lists (#271)", () => {
       ...EXPECTED_TRACE_COLUMNS,
     ]);
 
-    await expect(page).toHaveScreenshot("roast-detail-capped.png");
+    await expect(page).toHaveScreenshot("roast-detail-capped.png", { fullPage: true });
   });
 
   test("'View all' opens the full, scrollable history and Escape closes it", async ({ page }) => {
@@ -196,6 +196,6 @@ test.describe("advisor-failure detail (#170)", () => {
     await expect(page.getByTestId("advisor-status").first()).toHaveText("PROVIDER ERROR");
     await expect(page.getByTestId("advisor-summary-failed")).toHaveText("3 failed");
     await expect(page.getByTestId("advisor-timeline-empty")).toHaveCount(0);
-    await expect(page).toHaveScreenshot("roast-detail-advisor-failed.png");
+    await expect(page).toHaveScreenshot("roast-detail-advisor-failed.png", { fullPage: true });
   });
 });
