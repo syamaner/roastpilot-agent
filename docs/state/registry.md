@@ -102,7 +102,30 @@
 
 ## Active Context
 
-**14 Jul 2026 (latest) — BATCH 3 COMPLETE: #525 + #530 + E11 KICKED OFF (PRs #546–#548).**
+**15 Jul 2026 (latest) — D94 AFFORDABILITY LAW FALSIFIED PRE-MERGE (D95); PR #551 CLOSED
+UNMERGED; D88's VALIDATED STACK STANDS.** The operator's flat-cup verdict on roasts 13/14
+ratified the #521 affordability-anchored post-FC setpoint (D94 + same-day m=0.1 hysteresis
+amendment). It survived an Opus design review, a store-exact literal derivation, an Opus diff
+review, and a 10-case fail-then-pass test matrix — and was then FALSIFIED by a Codex P2:
+the remaining-dwell budget omitted the time already elapsed at the decision instant, a
+near-CONSTANT ~22.0 s (the FC detector's 20 s confirmation window + processing; measured
+21.99-22.02 s across all four D88-era roasts). Corrected, the law fires on NOTHING — its only
+validating cut (roast 14) was a <0.4 °C/min artifact of the omitted term cancelling the
+60 s-window RoR's lag. No corrected form is constructible with current instrumentation (no
+shorter-window RoR exists; pre-crack ramps converge; the 12-vs-14 quality difference lives in
+the BEAN — identical realized drop signatures, opposite cups). Full record: PR #551 (closed,
+branch `feature/521-affordability-anchor` preserved), plan D95, issue #521 (closed,
+`prevented-pre-pr`). **Standing:** D88's hold-at-engagement + never-add-heat + 196 guard (the
+9/10 stack, byte-unchanged). **Proceeding:** #499 part 2 (roast-13's FC-time-aware drop-window
+DTR weighting — mechanism confirmed independent; carries the ~22 s constant as a measured
+design input + the deferred advisor-visibility item). **Enablers filed:** coffee-roaster-mcp#196
+(short-window RoR field), #380 (more motivated — it shrinks this exact error class at the
+source). Durable lessons in D95: validate control-law arithmetic against input CLOCK SEMANTICS
+before ratifying; knife-edge validation margins are the tell; n=2 different-bean evidence fits
+bean identity, not physics (bean-aware laws belong to the E14/D42 corpus trajectory, not the
+controller).
+
+**14 Jul 2026 — BATCH 3 COMPLETE: #525 + #530 + E11 KICKED OFF (PRs #546–#548).**
 Three tracks, three teammates in explicit worktrees. **#548 (#525 stale-session clear, D92):**
 the #523 S4 gap closed as a pure store write behind a three-guard design — (a) own-active-run
 409, (b) atomic unfinalised WHERE, (c) a **two-clause per-run-budgeted liveness gate** (recent
