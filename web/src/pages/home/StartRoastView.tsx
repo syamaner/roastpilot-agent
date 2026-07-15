@@ -221,10 +221,20 @@ export function StartRoastView(): React.JSX.Element {
   // stale session that started in that window. See `useFreshHistoryGate`'s
   // doc for the full empirically-verified rationale.
   const history = useFreshHistoryGate();
+  // #557 field incident: `health.data?.active_run_id ?? null` silently
+  // coalesces an UNRESOLVED health read (data undefined — e.g. the process's
+  // first /health fetch failing against a still-booting server) to "no
+  // active run", which classifies every unfinalized history row — including
+  // THIS process's own active/recovering run — as stale. `staleRun` must be
+  // null unless health has genuinely resolved; an unresolved/errored health
+  // read is handled by its own explicit leg above (health.isError) or the
+  // `!health.isFresh` hold, never an authoritative stale claim here.
   const staleRun =
-    history.data?.runs.find(
-      (run) => run.outcome === null && run.id !== (health.data?.active_run_id ?? null),
-    ) ?? null;
+    health.data === undefined
+      ? null
+      : (history.data?.runs.find(
+          (run) => run.outcome === null && run.id !== health.data.active_run_id,
+        ) ?? null);
 
   // Bean-profile library (#303): the saved-profile dropdown + add/edit modals.
   // Read-only list + the typed CRUD mutations (each invalidates the list).

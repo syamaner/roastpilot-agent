@@ -397,6 +397,65 @@ describe("StartRoastView — stale-session detection (#523)", () => {
   });
 });
 
+describe("StartRoastView — #557: staleRun must never be derived from UNRESOLVED health", () => {
+  it("REGRESSION (fails pre-fix): an unfinalized history run + health that has not yet resolved (data undefined) shows NO stale card — this is the process's own booting-server incident, not a stale session", () => {
+    // The 15 Jul field incident: the SPA's first /health fetch failed against
+    // a still-booting server, so health.data stayed undefined. The old
+    // derivation (`run.id !== (health.data?.active_run_id ?? null)`)
+    // coalesced that to "no active run", classifying the process's OWN
+    // active/recovering run (an unfinalized history row) as stale. This
+    // combination (isFresh true, data undefined, isError false) shouldn't
+    // arise from the real hook today (isFresh implies success-with-data OR
+    // isError) — proven directly against the mocked hook so the guard is
+    // enforced at the derivation site itself, not only by gate ordering
+    // upstream that could silently change later.
+    healthState.data = undefined;
+    healthState.isSuccess = false;
+    healthState.isError = false;
+    healthState.isFresh = true;
+    historyState.data = { runs: [{ id: "run-recovering", outcome: null }] };
+    historyState.isFresh = true;
+    renderView();
+    expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
+  });
+
+  it("no stale card when health resolves with active_run_id EQUAL to the unfinalized run — the correct active-run-banner path, not a stale claim", () => {
+    healthState.data = { active_run_id: "run-recovering" };
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    healthState.isFresh = true;
+    historyState.data = { runs: [{ id: "run-recovering", outcome: null }] };
+    historyState.isFresh = true;
+    renderView();
+    expect(screen.getByTestId("start-roast-active-run-banner")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
+  });
+
+  it("stale card SHOWS when health resolves with active_run_id null/different from the unfinalized run — existing behaviour preserved", () => {
+    healthState.data = { active_run_id: null };
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    healthState.isFresh = true;
+    historyState.data = { runs: [{ id: "run-stranded", outcome: null }] };
+    historyState.isFresh = true;
+    renderView();
+    expect(screen.getByTestId("start-roast-stale-session")).toBeInTheDocument();
+  });
+
+  it("the health-error leg renders its own explicit state, never the stale card, when health persistently errors", () => {
+    healthState.data = undefined;
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    healthState.isFresh = true; // isError implies isFresh (see useFreshGate)
+    historyState.data = { runs: [{ id: "run-recovering", outcome: null }] };
+    historyState.isFresh = true;
+    renderView();
+    expect(screen.getByTestId("start-roast-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+});
+
 describe("StartRoastView — clear-stale-session action (#525)", () => {
   function renderStaleSession() {
     healthState.data = { active_run_id: null };
