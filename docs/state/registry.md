@@ -116,9 +116,14 @@ shorter-window RoR exists; pre-crack ramps converge; the 12-vs-14 quality differ
 the BEAN — identical realized drop signatures, opposite cups). Full record: PR #551 (closed,
 branch `feature/521-affordability-anchor` preserved), plan D95, issue #521 (closed,
 `prevented-pre-pr`). **Standing:** D88's hold-at-engagement + never-add-heat + 196 guard (the
-9/10 stack, byte-unchanged). **Proceeding:** #499 part 2 (roast-13's FC-time-aware drop-window
-DTR weighting — mechanism confirmed independent; carries the ~22 s constant as a measured
-design input + the deferred advisor-visibility item). **Enablers filed:** coffee-roaster-mcp#196
+9/10 stack, byte-unchanged). **SHIPPED same day (constructive follow-through):** #499 part 2 as
+**c7** — the roast-13 fix as prompt TEACHING, not arithmetic (PR #554; selectable, c3 stays
+default; promotion gated on hardware validation per the bar on #499); and the **Sumatra seed
+dev target 17→19** (PR #553 — guard floor 16 now rejects the failed 15.1 % repeat; the first
+proposal's `pre_fc_heat=60` mechanism was ALSO Codex-falsified — the field governs the whole
+pre-FC ramp, so the per-roast momentum lever is the /config late-Maillard trim depth ~60,
+documented in the seed comment; runtime rows corrected operator-side incl. the El Durazno
+13→16 drift). Next-roast recipe: Sumatra + /config trim ~60 + c7 selected. **Enablers filed:** coffee-roaster-mcp#196
 (short-window RoR field), #380 (more motivated — it shrinks this exact error class at the
 source). Durable lessons in D95: validate control-law arithmetic against input CLOCK SEMANTICS
 before ratifying; knife-edge validation margins are the tell; n=2 different-bean evidence fits
