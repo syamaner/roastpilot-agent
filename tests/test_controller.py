@@ -7662,3 +7662,494 @@ async def test_advisor_drop_with_out_of_range_payload_still_transitions_and_does
     # scripted tool caller (drop_beans or otherwise) raises AssertionError.
     await controller.tick()
     assert drop_beans_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# D96 (#559): bounded-bidirectional heat recovery — controller wiring
+# ---------------------------------------------------------------------------
+
+
+def _recovery_config(
+    *, pre_fc_heat_target_percent: int = 100, **overrides: object
+) -> ControllerConfig:
+    """A ``ControllerConfig`` with D96 recovery ENABLED (and the ceiling
+    guard forced on alongside it, the config-level precondition), unless the
+    caller overrides either. Deliberately separate from :func:`_post_fc_config`
+    (whose default is ``ceiling_guard_drop_enabled=False``, incompatible with
+    ``recovery_enabled=True``).
+
+    ``pre_fc_heat_target_percent`` (default 100, the flat pre-FC floor) lets
+    a recovery test lower the FC-ENGAGEMENT heat below the static
+    ``heat_ceiling_percent`` (also 100 by default) — recovery has no headroom
+    to demonstrate a raise if entry heat already sits at the static ceiling
+    (``min(100, 100 + headroom) == 100``, no room above it). 60 mirrors the
+    roast-15 trim-60 recipe (#559) that motivated this law. Use
+    :func:`_charge_through_fc_at_heat` (NOT the shared ``_charge_through_fc``,
+    which hardcodes an ``== 100`` assertion) to drive a harness built with a
+    non-default ``pre_fc_heat_target_percent`` through to DEVELOPMENT."""
+    overrides.setdefault("enabled", True)
+    overrides.setdefault("ceiling_guard_drop_enabled", True)
+    overrides.setdefault("recovery_enabled", True)
+    return ControllerConfig(
+        pre_first_crack_levers=PreFirstCrackLevers(
+            heat_target_percent=pre_fc_heat_target_percent,
+            # LateMaillardTrim's own default trim_heat_percent (65) must not
+            # exceed heat_target_percent (a validator enforces this) — clamp
+            # it down to match whenever the caller lowers heat_target_percent
+            # below 65 (it never engages in these tests anyway, since
+            # _charge_through_fc_at_heat's scripted single T0 reading never
+            # resolves an FC-ETA for the trim's window to open).
+            late_maillard_trim=LateMaillardTrim(
+                trim_heat_percent=min(65, pre_fc_heat_target_percent)
+            ),
+        ),
+        post_first_crack_control=PostFirstCrackControl(**overrides),  # type: ignore[arg-type]
+    )
+
+
+async def _charge_through_fc_at_heat(
+    harness: Harness,
+    *,
+    expected_pre_fc_heat: int,
+    fc_bean_temp_c: float = 183.0,
+    fc_ror_c_per_min: float | None = None,
+) -> None:
+    """Like :func:`_charge_through_fc`, but for a harness whose
+    ``pre_first_crack_levers.heat_target_percent`` is NOT the default 100
+    (D96/#559 recovery tests need engagement heat below the static
+    ``heat_ceiling_percent`` to have any raise headroom at all) —
+    ``_charge_through_fc`` hardcodes ``current_heat == 100`` and must not be
+    weakened for every OTHER caller that legitimately relies on the default.
+    """
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:2]:  # …→ PREHEATING
+        harness.controller.transition_to(step)
+    t0 = reading(bean=150.0, t0_detected=True, bean_ror_c_per_min=20.0)
+    harness.reader.readings = [t0]
+    for _ in range(3):  # three consecutive T0 ticks debounce → pre-FC
+        await harness.controller.tick()
+        harness.clock.advance(1.0)
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert harness.controller.snapshot().current_heat == expected_pre_fc_heat
+    fc_reading = (
+        reading(bean=fc_bean_temp_c, first_crack_detected=True, bean_ror_c_per_min=fc_ror_c_per_min)
+        if fc_ror_c_per_min is not None
+        else reading(bean=fc_bean_temp_c, first_crack_detected=True)
+    )
+    harness.reader.readings = [fc_reading]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    harness.log.clear()
+    harness.events.events.clear()
+    harness.sink.evaluations.clear()
+    harness.executor.targets.clear()
+
+
+@pytest.mark.asyncio
+async def test_recovery_raises_heat_above_entry_end_to_end() -> None:
+    """End-to-end through ``controller.tick()`` (not the algorithm directly,
+    ``test_post_fc_control.py`` already covers that): replay roast 15's
+    crashed-RoR shape through the real controller wiring and confirm heat
+    actually rises above the FC-engagement value via a real ``set_targets``
+    write, not just in the isolated algorithm."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,  # roast-15-shaped: engagement heat well below 100
+        control_interval_seconds=5.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=3,
+        recovery_headroom_percentage_points=15,
+    )
+    harness = make_harness(config=config)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    entry_heat = harness.controller.snapshot().current_heat
+    assert entry_heat == 60  # the actuated pre-FC lever, the roast-15 trim-60 recipe
+
+    # Drive enough ticks with a sustained RoR shortfall for entry to confirm
+    # (3 confirm ticks at the 5s cadence).
+    for ror in [6.0, 5.0, 4.0, 3.0, 3.0, 3.0]:
+        harness.clock.advance(5.0)
+        harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=ror)]
+        await harness.controller.tick()
+
+    assert harness.controller.snapshot().current_heat > entry_heat
+    assert harness.controller.snapshot().current_heat <= entry_heat + 15
+
+
+@pytest.mark.asyncio
+async def test_recovery_stays_inert_when_flag_off_default() -> None:
+    """Regression: with ``recovery_enabled`` left at its default (False), a
+    sustained RoR shortfall through the real controller tick loop must never
+    raise heat above the FC-engagement value — the byte-for-byte D88
+    behaviour, now proven through the SAME code path recovery uses when on."""
+    config = _post_fc_config(control_interval_seconds=5.0)
+    assert config.post_first_crack_control.recovery_enabled is False
+    harness = make_harness(config=config)
+    await _charge_through_fc(harness, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0)
+    entry_heat = harness.controller.snapshot().current_heat
+
+    for ror in [6.0, 5.0, 4.0, 3.0, 3.0, 3.0, 3.0, 3.0]:
+        harness.clock.advance(5.0)
+        harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=ror)]
+        await harness.controller.tick()
+
+    assert harness.controller.snapshot().current_heat <= entry_heat
+
+
+@pytest.mark.asyncio
+async def test_estop_precedence_over_recovery_raise_same_tick() -> None:
+    """A tick whose telemetry qualifies for BOTH a recovery raise (sustained
+    RoR shortfall) AND the hard-ceiling emergency stop (bean > 230 °C, the
+    ``SafetyLimits.max_bean_temp_c`` default) must fire the emergency stop —
+    ``_evaluate_safety``/``_act_on_safety`` run BEFORE
+    ``_apply_deterministic_post_fc_levers`` in ``tick()``'s documented order
+    and return early on a fail-closed verdict, so the recovery law's
+    ``compute`` is never even reached that tick. This is the D96 safety
+    review's mandatory drop/e-stop-precedence test."""
+    config = _recovery_config(pre_fc_heat_target_percent=60, control_interval_seconds=5.0)
+    harness = make_harness(config=config)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+
+    # Build up a sustained shortfall for two ticks (short of the 3-tick
+    # confirm bar) with bean safely below the hard ceiling...
+    for ror in [4.0, 3.0]:
+        harness.clock.advance(5.0)
+        harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=ror)]
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+    # ...then the THIRD tick (which would otherwise confirm recovery entry)
+    # ALSO crosses the hard 230 °C ceiling on the SAME reading.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=235.0, bean_ror_c_per_min=3.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert len(harness.executor.estop_reasons) == 1
+    # No recovery raise reached the wire on the e-stop tick: every non-zero
+    # heat write recorded across the whole test stays within the D96
+    # recovery cap (60 entry + 15 headroom = 75) -- the e-stop path itself
+    # writes heat=0 via the fail-safe, never a SET_HEAT above the cap.
+    heat_writes = [t for t in harness.executor.targets if t[0] != 0]
+    assert not any(h > 75 for h, _ in heat_writes), heat_writes
+
+
+@pytest.mark.asyncio
+async def test_ceiling_guard_drop_takes_precedence_over_recovery_raise_same_tick() -> None:
+    """PR #560 Codex finding (P1, the guard-eligible same-tick raise): a tick
+    whose telemetry qualifies for BOTH a recovery raise AND the 196 °C
+    ceiling-guard drop must NOT let the raise reach hardware at all —
+    ``_apply_deterministic_post_fc_levers`` (this method) runs BEFORE
+    ``_maybe_ceiling_guard_drop`` in ``tick()``'s order, so without an
+    explicit skip the raised/gliding heat command would still be WRITTEN via
+    ``set_targets`` a few lines before the guard's drop fires. The fix skips
+    this tick's write entirely (restoring the tentative ``compute`` step)
+    whenever the ceiling is elevated (RECOVERING or GLIDING) AND the same
+    tick is independently guard-eligible — asserted here by inspecting the
+    FAKE MCP CALL LOG (``harness.executor.targets``) directly, not just the
+    phase outcome (which the drop alone would already satisfy even if a
+    raise write had snuck out moments earlier)."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_confirm_ticks=1,
+    )
+    harness = make_harness(config=config)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    targets_before_the_tick = list(harness.executor.targets)
+
+    # One tick with a shortfall large enough to confirm entry immediately
+    # (recovery_confirm_ticks=1) AND a bean temperature already at the
+    # ceiling-guard threshold.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.COOLING
+    # No heat/fan write reached the roaster this tick at all — the recovery
+    # law's tentative raise was fully suppressed, not merely superseded by a
+    # later drop.
+    assert harness.executor.targets == targets_before_the_tick
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in executed
+
+
+@pytest.mark.asyncio
+async def test_zero_elevation_recovery_does_not_suppress_a_drop_tick_write() -> None:
+    """PR #560 round 3 Codex finding: entry heat ALREADY AT
+    ``heat_ceiling_percent`` (the default 100, via ``_charge_through_fc``'s
+    pre-FC lever) means the recovery ceiling can never actually rise above
+    the D88 base — the entry/exit COUNTERS can still confirm (a genuine
+    sustained RoR shortfall), but ``heat_authority_state`` correctly reports
+    ``HOLDING`` throughout (the round-3 fix), so the guard/drop-eligibility
+    skip in ``_apply_deterministic_post_fc_levers`` (rounds 1/2) must NOT
+    fire on a tick that is ALSO guard-eligible — there is no real elevation
+    to protect the drop from suppressing hardware access for.
+
+    Both heat AND the drop firing look IDENTICAL whether the skip
+    incorrectly fires or not here (heat is pinned at 100 either way by the
+    static ceiling, and the guard's drop is unconditional on bean
+    temperature regardless of the post-FC lever's own skip) — so this test
+    reads ``_post_fc_last_actuation_monotonic`` directly, the one INTERNAL
+    signal that actually distinguishes the two code paths: the skip's
+    ``restore_state`` branch returns WITHOUT ever touching this cadence
+    timer, while the (correct) idempotent-write branch always advances it.
+    Verified this test genuinely catches the round-3 mutant (re-deleting the
+    fix locally reproduces this assertion failing, matching the algorithm-
+    level tests' own fail-then-pass verification)."""
+    config = _recovery_config(
+        ceiling_guard_temp_c=196.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=0,
+    )
+    harness = make_harness(config=config)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=100, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    cadence_before = harness.controller._post_fc_last_actuation_monotonic  # pyright: ignore[reportPrivateUsage]
+
+    # A sustained RoR shortfall confirms entry (recovery_confirm_ticks=1),
+    # AND the same tick's bean temperature is at the ceiling-guard line —
+    # both conditions the round-1/2 skip watches for. With ZERO headroom,
+    # heat_authority_state must stay HOLDING (round-3 fix), so the skip must
+    # not suppress this tick's write.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.COOLING
+    # The guard's drop still fires (unaffected by any of this).
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in executed
+    # THE assertion that actually distinguishes correct behaviour from the
+    # round-3 bug: the cadence timer ADVANCED past its pre-tick value (the
+    # idempotent-write branch ran, meaning the skip did NOT fire) — a
+    # phantom RECOVERING state would have hit the restore-and-return branch
+    # instead, leaving the cadence timer exactly where it was before.
+    cadence_after = harness.controller._post_fc_last_actuation_monotonic  # pyright: ignore[reportPrivateUsage]
+    assert cadence_after != cadence_before
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_takes_precedence_over_recovery_raise_same_tick() -> None:
+    """PR #560 round 2 Codex finding (P2, the same class as round 1's P1 but
+    for the DETERMINISTIC drop anchor): with the guard set safely ABOVE the
+    profile's target_drop_temp_c (so `_maybe_ceiling_guard_drop` never fires
+    here — this test isolates the `_maybe_deterministic_drop` mirror), a tick
+    whose telemetry qualifies for BOTH a recovery raise AND the dev%/temp
+    anchor (bean >= target_drop_temp_c AND system dev% >= target_development_
+    percent) must NOT let the raise reach hardware — the same restore-and-
+    skip this method already applies for the ceiling guard now ALSO covers
+    the deterministic-drop anchor's own eligibility condition."""
+    config = _recovery_config(
+        ceiling_guard_temp_c=220.0,  # safely above PROFILE.target_drop_temp_c (205)
+        recovery_confirm_ticks=1,
+    )
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent, config=config
+    )
+    targets_before_the_tick = list(harness.executor.targets)
+
+    # One tick with a shortfall large enough to confirm entry immediately
+    # (recovery_confirm_ticks=1) AND bean/dev% both at the deterministic
+    # anchor's target — eligible for the anchor, NOT for the (much higher)
+    # guard.
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.COOLING
+    # No heat/fan write reached the roaster this tick at all.
+    assert harness.executor.targets == targets_before_the_tick
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.DEVELOPMENT_TARGET.value,
+    } in executed
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_precedence_holds_even_when_drop_beans_fails() -> None:
+    """The specific failure case PR #560's round-2 finding names: if
+    `drop_beans()` itself then FAILS (a transient actuator failure) on a tick
+    that was ALSO recovery-raise-eligible, the raise must STILL not have been
+    written — otherwise the roast would be left sitting in DEVELOPMENT with
+    recovery-raised heat past the drop's own target point, a strictly WORSE
+    outcome than a raise-then-successful-drop. The skip in
+    `_apply_deterministic_post_fc_levers` fires on ELIGIBILITY alone, before
+    `_maybe_deterministic_drop` ever attempts (and here fails) the actual
+    ``drop_beans()`` call, so this failure mode cannot compound the earlier
+    one."""
+
+    class RaisingDropExecutor(RecordingExecutor):
+        async def drop_beans(self) -> AppliedRoasterState:
+            raise RuntimeError("serial write dropped")
+
+    config = _recovery_config(
+        ceiling_guard_temp_c=220.0,
+        recovery_confirm_ticks=1,
+    )
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent,
+        config=config,
+        executor=RaisingDropExecutor(),
+    )
+    targets_before_the_tick = list(harness.executor.targets)
+
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    # The drop attempt failed (still DEVELOPMENT, a COMMAND_FAILED event) —
+    # but critically, no raise write reached the roaster either.
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.executor.targets == targets_before_the_tick
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.DEVELOPMENT_TARGET.value,
+    } in failed
+
+
+@pytest.mark.asyncio
+async def test_gliding_heat_descends_through_repeated_failed_drops_same_tick() -> None:
+    """PR #560 round 4 Codex finding (P1): the round-3 skip
+    (``heat_authority_state is not HOLDING``) suppressed EVERY write on a
+    drop-eligible tick, including a LOWERING move during the exit/glide
+    tail — inverting the mechanism's own intent (it exists to stop a RAISE
+    landing before a drop, not to freeze already-elevated heat). This test
+    drives the exact "stuck at raised heat" scenario the finding describes:
+    recovery raises heat, exit/glide begins its descent, the SAME ticks are
+    ALSO deterministic-drop-eligible, and ``drop_beans()`` keeps failing
+    across MULTIPLE consecutive ticks — heat writes must still DESCEND with
+    the glide (asserted directly off the fake MCP call log), never freeze at
+    the raised value, while the phase stays DEVELOPMENT with a
+    ``COMMAND_FAILED`` event each tick."""
+
+    class AlwaysFailingDropExecutor(RecordingExecutor):
+        async def drop_beans(self) -> AppliedRoasterState:
+            raise RuntimeError("serial write dropped")
+
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=220.0,  # stay clear of the guard; isolate the anchor
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_exit_margin_c_per_min=0.5,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+        recovery_exit_glide_pp_per_tick=5,
+    )
+    harness = make_harness(config=config, executor=AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    # Back-date the FIRST-CRACK clock (not the charge clock — that would
+    # SHRINK dev%, since dev% = development_elapsed / charge_elapsed and
+    # charge_elapsed is the denominator) so `_development_percent()` reads
+    # comfortably above `PROFILE.target_development_percent` (20) for the
+    # WHOLE test, without needing to hand-tune per-tick timing the way
+    # `_development_harness_with_dev_percent` does for a single stamped tick.
+    fc_monotonic = harness.controller._first_crack_monotonic  # pyright: ignore[reportPrivateUsage]
+    assert fc_monotonic is not None  # set by the FC edge _charge_through_fc_at_heat just drove
+    harness.controller._first_crack_monotonic = fc_monotonic - 10_000.0  # pyright: ignore[reportPrivateUsage]
+
+    # Tick 1: confirm recovery ENTRY (a genuine RoR shortfall well past the
+    # trigger margin, accounting for the EMA's smoothing lag against the FC
+    # engagement's own bumpless-handoff tick) — this tick is NOT yet
+    # drop-eligible (bean below target_drop_temp_c), so the raise writes
+    # normally.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+    entry_heat = harness.controller.snapshot().current_heat
+    assert entry_heat > 60  # a genuine raise landed
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+
+    # Tick 2: confirm recovery EXIT (RoR back within the exit margin) — bean
+    # is now AT target_drop_temp_c, so this tick and every one after it is
+    # drop-eligible. The exit-confirming tick's ceiling has already started
+    # gliding down (D96: ticks_since_exit starts at 1 on the confirming tick
+    # itself).
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=8.0)]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT  # drop failed, stays here
+    heat_after_exit_confirm = harness.controller.snapshot().current_heat
+    assert heat_after_exit_confirm < entry_heat  # the glide's first descending step landed
+
+    # Ticks 3-5: RoR held near the (declining) setpoint so recovery stays in
+    # its exit/glide/settled progression rather than re-triggering entry.
+    # Still drop-eligible every tick, drop_beans() still failing — heat must
+    # keep DESCENDING with the glide, never freeze at the raised (or any
+    # intermediate) value.
+    heats = [heat_after_exit_confirm]
+    for _ in range(3):
+        harness.clock.advance(5.0)
+        harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=6.5)]
+        await harness.controller.tick()
+        assert harness.controller.phase is RoastPhase.DEVELOPMENT
+        heats.append(harness.controller.snapshot().current_heat)
+
+    # Non-increasing throughout (the glide descending, then holding flat at
+    # the D88 base) — never flat at the RAISED value, never climbing back up.
+    assert all(a >= b for a, b in zip(heats, heats[1:], strict=False)), heats
+    assert heats[-1] < entry_heat
+    assert heats[-1] == 60  # settles at the D88 base (heat_engage_percent)
+
+    # COMMAND_FAILED fired every drop-eligible tick (ticks 2 through 5 -- 4
+    # total; tick 1 was not yet drop-eligible).
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    expected_failed_payload = {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.DEVELOPMENT_TARGET.value,
+    }
+    failed_count = failed.count(expected_failed_payload)
+    assert failed_count == 4
+
+
+@pytest.mark.asyncio
+async def test_genuine_raise_on_drop_due_tick_still_suppressed_round4() -> None:
+    """The round-4 fix's OTHER half (the mandate's "unchanged" assertion,
+    made explicit as its own test): a tick whose tentative write IS a
+    genuine RAISE above actuated heat (recovery ENTRY, not exit/glide) and
+    is ALSO drop-eligible must still be suppressed exactly as rounds 1/2
+    established — the round-4 fix only stopped suppressing LOWERING writes,
+    it did not weaken the original raise-suppression at all."""
+    config = _recovery_config(
+        ceiling_guard_temp_c=220.0,
+        recovery_confirm_ticks=1,
+    )
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent, config=config
+    )
+    targets_before_the_tick = list(harness.executor.targets)
+
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.COOLING
+    # No heat/fan write reached the roaster this tick at all -- the genuine
+    # raise was fully suppressed.
+    assert harness.executor.targets == targets_before_the_tick
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.DEVELOPMENT_TARGET.value,
+    } in executed

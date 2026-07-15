@@ -15,12 +15,14 @@ covers the ``PostFirstCrackControl`` config validators and its ``enabled``
 default.
 """
 
+import dataclasses
+
 import pytest
 
 from roastpilot_agent.config import PostFirstCrackControl
 from roastpilot_agent.post_fc_control import (
-    PostFcControllerState,
     PostFcControlOutput,
+    PostFcHeatAuthorityState,
     PostFcRorController,
 )
 
@@ -373,7 +375,16 @@ def test_roast2_runaway_is_structurally_impossible() -> None:
     past the same ceiling) -- together they bound both directions. Deleting
     either one leaves half the clamp unproven (a dropped ceiling that only
     ever matters when recovering from below would slip through this test
-    alone)."""
+    alone).
+
+    **D96 (#559) note:** this config does not set ``recovery_enabled`` and so
+    defaults to ``False`` — the D96 recovery law is completely inert here,
+    and ``effective_ceiling_percent`` is asserted to stay EXACTLY the D88
+    value (72) on every tick, never the recovery ceiling, proving the two
+    laws do not interact when recovery is off (the default) — a future
+    change that accidentally made recovery active by default, or too eager
+    even while nominally off, would break this existing D88 regression test
+    directly rather than only a new D96-specific one."""
     config = _config(
         taper_start_max_ror_c_per_min=8.0,
         taper_end_ror_c_per_min=4.0,
@@ -390,20 +401,28 @@ def test_roast2_runaway_is_structurally_impossible() -> None:
     assert tick1.setpoint_c_per_min == pytest.approx(6.1, abs=0.2)
     assert tick1.heat_percent == 72
     assert tick1.error_c_per_min == pytest.approx(0.0, abs=0.5)
+    assert tick1.effective_ceiling_percent == 72
+    assert tick1.recovery_active is False
 
     # Simulate the measured RoR gently decaying alongside the taper (a
     # roast responding as expected to the held-then-eased heat), roughly
     # tracking the setpoint each tick.
     heats = [tick1.heat_percent]
+    ceilings = [tick1.effective_ceiling_percent]
     ror = 6.1
     for _ in range(16):  # 16 * 5s = 80s, most of the 90s taper
         output = controller.compute(measured_ror_c_per_min=ror, dt_seconds=5.0)
         heats.append(output.heat_percent)
+        ceilings.append(output.effective_ceiling_percent)
         ror = max(4.0, ror - 0.15)  # RoR eases down, tracking the taper
 
     # The 91% runaway is structurally impossible: the ceiling is 72 for the
     # entire engagement.
     assert all(h <= 72 for h in heats), heats
+    # D96: with recovery off, the effective ceiling stays EXACTLY 72 (D88's
+    # never-add-heat-beyond-entry value) on every tick, never a recovery
+    # ceiling.
+    assert all(c == 72 for c in ceilings), ceilings
     # And the output actually eases DOWN over the window (the opposite of
     # the measured climb) -- the last heat is no higher than the first.
     assert heats[-1] <= heats[0]
@@ -420,7 +439,15 @@ def test_roast2_stall_recovery_never_exceeds_heat_at_engagement() -> None:
     past it); its companion ``test_roast2_runaway_is_structurally_impossible``
     pins the ceiling side (output starts pinned at the ceiling and can only
     ease off it, never rise past it) -- together they bound both directions.
-    Deleting either one leaves half the clamp unproven."""
+    Deleting either one leaves half the clamp unproven.
+
+    **D96 (#559) note:** this config does not set ``recovery_enabled`` and so
+    defaults to ``False`` — even though Phase 2's stalled RoR is EXACTLY the
+    kind of persistent below-setpoint shortfall the D96 recovery law would
+    react to, the recovery ceiling must never activate here (this is the
+    RoR-taper's own D88 anti-stall recovery, unrelated to and unaffected by
+    the separately-flagged D96 law) — ``effective_ceiling_percent`` is
+    asserted to stay EXACTLY 72 on every tick of both phases."""
     config = _config(
         taper_start_max_ror_c_per_min=8.0,
         taper_end_ror_c_per_min=4.0,
@@ -435,20 +462,32 @@ def test_roast2_stall_recovery_never_exceeds_heat_at_engagement() -> None:
     # handoff (never above 72 the whole time, since it started right at the
     # ceiling and can only ease off it here).
     phase1_heats: list[int] = []
+    phase1_ceilings: list[int] = []
     for _ in range(10):
         output = controller.compute(measured_ror_c_per_min=12.0, dt_seconds=5.0)
         phase1_heats.append(output.heat_percent)
+        phase1_ceilings.append(output.effective_ceiling_percent)
     assert phase1_heats[-1] < 72  # genuinely eased below the ceiling
+    assert all(c == 72 for c in phase1_ceilings), phase1_ceilings
 
     # Phase 2: RoR collapses (stall) -> the loop recovers (raises heat back
     # up) but never past the never-add-heat-beyond-entry ceiling (72).
     phase2_heats: list[int] = []
+    phase2_ceilings: list[int] = []
+    phase2_recovery_active: list[bool] = []
     for _ in range(20):
         output = controller.compute(measured_ror_c_per_min=2.0, dt_seconds=5.0)  # stalled RoR
         phase2_heats.append(output.heat_percent)
+        phase2_ceilings.append(output.effective_ceiling_percent)
+        phase2_recovery_active.append(output.recovery_active)
 
     assert max(phase2_heats) <= 72
     assert phase2_heats[-1] > phase1_heats[-1]  # recovering, not frozen
+    # D96: recovery-off means the ceiling stays exactly 72 (D88's value) even
+    # through the sustained stall Phase 2 simulates, and recovery_active never
+    # flips True.
+    assert all(c == 72 for c in phase2_ceilings), phase2_ceilings
+    assert all(a is False for a in phase2_recovery_active)
 
 
 # ---------------------------------------------------------------------------
@@ -1021,13 +1060,9 @@ def test_below_floor_with_positive_error_keeps_integrating_toward_floor() -> Non
     # several prior ticks had wound it down) via restore_state.
     controller.reset(initial_heat_percent=50, ror_at_engagement_c_per_min=8.0)
     low_seed = controller.snapshot_state()
-    low_seed = PostFcControllerState(
+    low_seed = dataclasses.replace(
+        low_seed,
         integrator=50.0,  # ki*50 = 5, well below the 30 floor at zero error
-        bias_percent=low_seed.bias_percent,
-        ema=low_seed.ema,
-        taper_elapsed_seconds=low_seed.taper_elapsed_seconds,
-        taper_r0_c_per_min=low_seed.taper_r0_c_per_min,
-        heat_engage_percent=low_seed.heat_engage_percent,
     )
     controller.restore_state(low_seed)
 
@@ -1059,3 +1094,606 @@ def test_saturated_flag_false_when_output_within_box() -> None:
     output = controller.compute(measured_ror_c_per_min=8.0, dt_seconds=5.0)
     assert output.saturated is False
     assert output.heat_percent == 50
+
+
+# ---------------------------------------------------------------------------
+# D96 (#559): bounded-bidirectional heat recovery — config
+# ---------------------------------------------------------------------------
+
+
+def test_recovery_disabled_by_default() -> None:
+    """Hardware-gated promotion posture (identical to D88's own flags before
+    their validation roast): recovery is OFF until an operator consciously
+    flips it."""
+    config = PostFirstCrackControl()
+    assert config.recovery_enabled is False
+
+
+def test_recovery_config_defaults() -> None:
+    config = PostFirstCrackControl()
+    assert config.recovery_trigger_margin_c_per_min == 1.0
+    assert config.recovery_exit_margin_c_per_min == 0.5
+    assert config.recovery_confirm_ticks == 3
+    assert config.recovery_headroom_percentage_points == 15
+    assert config.recovery_exit_glide_pp_per_tick == 5
+
+
+def test_recovery_exit_margin_must_be_strictly_less_than_trigger_margin() -> None:
+    """An equal (or wider) exit margin is limit-cycle-prone (D96 safety
+    review): RoR sitting near a SHARED threshold could cross back and forth
+    on ordinary tick noise, re-triggering entry immediately after an exit."""
+    with pytest.raises(ValueError, match="recovery_exit_margin_c_per_min"):
+        PostFirstCrackControl(
+            recovery_exit_margin_c_per_min=1.0, recovery_trigger_margin_c_per_min=1.0
+        )
+    with pytest.raises(ValueError, match="recovery_exit_margin_c_per_min"):
+        PostFirstCrackControl(
+            recovery_exit_margin_c_per_min=1.5, recovery_trigger_margin_c_per_min=1.0
+        )
+    # Strictly less is fine (the default relationship).
+    PostFirstCrackControl(recovery_exit_margin_c_per_min=0.5, recovery_trigger_margin_c_per_min=1.0)
+
+
+def test_recovery_enabled_requires_ceiling_guard_drop_enabled() -> None:
+    """The blocker finding from the D96 safety review: ``evaluate_command``
+    (the gate every heat write goes through) is temperature-blind, so a law
+    that can raise heat above entry with the ceiling guard OFF would leave
+    the 196 °C bitter line owned solely by the advisor's own judgment."""
+    with pytest.raises(ValueError, match="ceiling_guard_drop_enabled"):
+        PostFirstCrackControl(recovery_enabled=True, ceiling_guard_drop_enabled=False)
+    # The RoR-taper law alone (recovery off) carries no such requirement --
+    # it can only ever LOWER the ceiling relative to entry.
+    PostFirstCrackControl(enabled=True, recovery_enabled=False, ceiling_guard_drop_enabled=False)
+    # Both on together is fine (the only way to construct recovery_enabled=True).
+    PostFirstCrackControl(recovery_enabled=True, ceiling_guard_drop_enabled=True)
+
+
+def test_recovery_enabled_requires_the_ror_taper_master_flag() -> None:
+    """PR #560 round 4 Codex finding (P2): ``recovery_enabled=True`` with
+    the RoR-taper master flag (``enabled``) OFF is a mislabeling hazard --
+    ``_apply_deterministic_post_fc_levers`` gates on ``config.enabled``
+    FIRST, so recovery is completely inert in that combination, yet the CLI
+    launch banner would print "ENABLED" for a mechanism that never runs.
+    The validator's error message names the master flag explicitly (not
+    just "enabled", to disambiguate from ``ceiling_guard_drop_enabled``)."""
+    with pytest.raises(ValueError, match="enabled=True \\(the RoR-taper master flag\\)"):
+        PostFirstCrackControl(recovery_enabled=True, ceiling_guard_drop_enabled=True, enabled=False)
+    # The legal combo (all three prerequisites satisfied) still constructs.
+    PostFirstCrackControl(recovery_enabled=True, ceiling_guard_drop_enabled=True, enabled=True)
+
+
+# ---------------------------------------------------------------------------
+# D96 (#559): bounded-bidirectional heat recovery — the algorithm
+# ---------------------------------------------------------------------------
+
+
+def _recovery_config(**overrides: object) -> PostFirstCrackControl:
+    """A D88-default-shaped config with recovery ENABLED, for the D96 tests."""
+    return _config(recovery_enabled=True, ceiling_guard_drop_enabled=True, **overrides)
+
+
+def test_roast15_recovery_raises_above_entry_bounded() -> None:
+    """Replay roast 15's actual measured development trace (run ``8ac8a5e4``,
+    store-verified) through the recovery law: heat entered DEVELOPMENT at
+    60 % and measured RoR crashed 7.0 -> ~3.0-4.0 °C/min as the advisor pushed
+    fan 30 -> 90 for temperature control, leaving the D88-only loop with ZERO
+    raise authority (the roast-15 failure this law exists to fix). Under D96,
+    heat MUST rise above 60 once the sustained shortfall is confirmed, and
+    must NEVER exceed ``60 + recovery_headroom_percentage_points`` (75 at the
+    default headroom) -- the hard, error-independent cap holds regardless of
+    how far below setpoint RoR falls."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=8.0,
+        taper_end_ror_c_per_min=4.0,
+        taper_duration_seconds=90.0,
+        kp_percent_per_ror=3.0,
+        ki_percent_per_ror_second=0.1,
+        ror_smoothing_alpha=1.0,
+    )
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=7.0)
+
+    # The actual store-verified roast-15 RoR sequence (run 8ac8a5e4,
+    # telemetry ticks 1053/1062/1070/1078/1086/1094/1102/1110/1118/1126/1134,
+    # ~7.7-8.2s apart -- the 5s-cadenced control loop observes this as
+    # successive ~5-8s dt_seconds ticks).
+    rors = [7.0, 6.1, 6.0, 5.0, 4.07, 5.0, 3.01, 4.0, 3.05, 3.05, 3.05]
+    outputs = [controller.compute(measured_ror_c_per_min=r, dt_seconds=7.5) for r in rors]
+
+    heats = [o.heat_percent for o in outputs]
+    ceilings = [o.effective_ceiling_percent for o in outputs]
+    recovery_flags = [o.recovery_active for o in outputs]
+
+    # The hard cap: heat and the ceiling NEVER exceed 60 + 15 = 75, no matter
+    # how far the RoR shortfall grows.
+    assert max(heats) <= 75, heats
+    assert max(ceilings) <= 75, ceilings
+    # Recovery DOES engage on this trace (the whole point of the law) --
+    # heat genuinely rises above the 60 % entry value at some point.
+    assert any(rf for rf in recovery_flags), recovery_flags
+    assert max(heats) > 60, heats
+
+
+def test_roast15_recovery_never_exceeds_cap_under_extended_shortfall() -> None:
+    """Extend roast 15's crash indefinitely (RoR pinned at the crashed value
+    well past where the real roast's trace ends) -- the cap must hold no
+    matter how long the shortfall persists, not just across the ~11 ticks the
+    real trace happens to cover."""
+    config = _recovery_config()
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=7.0)
+
+    heats: list[int] = []
+    for _ in range(100):
+        output = controller.compute(measured_ror_c_per_min=3.0, dt_seconds=5.0)
+        heats.append(output.heat_percent)
+
+    assert max(heats) <= 75, heats
+
+
+def test_roast12_stays_no_raise_under_recovery_law() -> None:
+    """Replay roast 12's actual measured development trace (run
+    ``edbe9a76``, the validated 9/10 cup, store-verified) through the SAME
+    recovery-enabled config: RoR sits at 5.0-7.0 °C/min against a setpoint
+    starting at 7.0 and decaying toward 4.0 -- the shortfall never exceeds
+    the 1.0 °C/min trigger margin for even a single tick on this trace, so
+    recovery must NEVER activate and heat must NEVER rise above the 65 %
+    engagement value. This is D88's validated no-op case, now proven to stay
+    a no-op under the NEW code path, not just the old one."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=8.0,
+        taper_end_ror_c_per_min=4.0,
+        taper_duration_seconds=90.0,
+        kp_percent_per_ror=3.0,
+        ki_percent_per_ror_second=0.1,
+        ror_smoothing_alpha=1.0,
+    )
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=65, ror_at_engagement_c_per_min=7.0)
+
+    # The actual store-verified roast-12 RoR sequence (run edbe9a76,
+    # telemetry ticks 906/914/922/929/937/945/952/960/967, ~7-8s apart).
+    rors = [7.0, 6.1, 6.0, 5.0, 5.0, 5.0, 5.0, 5.0, 5.11]
+    outputs = [controller.compute(measured_ror_c_per_min=r, dt_seconds=7.5) for r in rors]
+
+    heats = [o.heat_percent for o in outputs]
+    recovery_flags = [o.recovery_active for o in outputs]
+
+    assert max(heats) <= 65, heats
+    assert all(rf is False for rf in recovery_flags), recovery_flags
+
+
+def test_recovery_rollback_discipline_ticks_do_not_fake_accumulate() -> None:
+    """A REJECTed/rate-limited tick never even calls ``compute`` in the real
+    controller wiring, but this test proves the SNAPSHOT/RESTORE discipline
+    (#412 told==enforced, extended to D96's counters) directly: a tentative
+    ``compute`` call that gets rolled back via ``restore_state`` must not
+    leave its recovery counter increment behind -- the next real tick must
+    see the SAME counter value as if the rejected tick had never called
+    ``compute`` at all."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=8.0,
+        taper_end_ror_c_per_min=4.0,
+        taper_duration_seconds=9000.0,  # near-static setpoint for this test
+        ki_percent_per_ror_second=0.0,
+        ror_smoothing_alpha=1.0,
+    )
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    # Two real accepted ticks with a sustained shortfall (error > 1.0 margin).
+    controller.compute(measured_ror_c_per_min=3.0, dt_seconds=5.0)
+    controller.compute(measured_ror_c_per_min=3.0, dt_seconds=5.0)
+    snapshot_before_third = controller.snapshot_state()
+    assert snapshot_before_third.recovery_ticks_above_trigger == 2
+
+    # A tentative THIRD tick that gets REJECTed (e.g. rate-limited) -- the
+    # real controller wiring snapshots before compute and restores on
+    # rejection; simulate that here directly.
+    pre_step = controller.snapshot_state()
+    controller.compute(measured_ror_c_per_min=3.0, dt_seconds=5.0)
+    controller.restore_state(pre_step)
+
+    # The counter must be EXACTLY what it was before the rejected tick (2),
+    # not 3 -- the rejected tick's tentative increment must not survive.
+    # Robustness note (D96 diff safety review): round-trip ALL FOUR recovery
+    # fields, not just the entry counter -- the rejected tick's tentative
+    # step could in principle also have touched recovery_active or the
+    # exit-side state if a future change to the ordering inside
+    # _advance_recovery_state ever let entry and exit interact within one
+    # call; asserting all four here catches that class directly rather than
+    # only the one field this specific scenario happens to move.
+    after_restore = controller.snapshot_state()
+    assert after_restore == pre_step
+    assert after_restore.recovery_ticks_above_trigger == 2
+    assert after_restore.recovery_ticks_within_exit == pre_step.recovery_ticks_within_exit
+    assert after_restore.recovery_active == pre_step.recovery_active
+    assert after_restore.recovery_ticks_since_exit == pre_step.recovery_ticks_since_exit
+
+    # The real next accepted tick (the third genuine one) still correctly
+    # confirms entry on ITS OWN third consecutive tick, not a phantom fourth.
+    third = controller.compute(measured_ror_c_per_min=3.0, dt_seconds=5.0)
+    assert third.recovery_active is True
+
+
+def test_reset_clears_recovery_state_from_active_and_mid_glide() -> None:
+    """D96 diff safety review finding (the surviving mutant): ``reset``'s
+    four recovery-field zeroing assignments are otherwise exercised but never
+    directly ASSERTED -- every other recovery test calls ``reset`` exactly
+    once on a FRESH controller, where ``__init__`` already zeroed the fields,
+    so deleting the zeroing lines in ``reset`` itself passed every existing
+    test. This test drives recovery into two DIFFERENT non-fresh states on
+    the SAME controller instance, then calls ``reset`` again (a fresh
+    true-FC-edge engagement, mirroring
+    ``test_c2_fresh_engage_recaptures_and_does_not_inherit_prior_episode``'s
+    taper-state precedent) and asserts the recovery state is fully cleared
+    each time -- the documented invariant (no recovery-state leak from a
+    PRIOR engagement into a new one) is unreachable in today's per-run
+    controller construction (a fresh ``RoastController`` per run, api.py) but
+    is one refactor away, so it is pinned here regardless.
+
+    Fail-then-pass: re-deleting the four zeroing assignments in ``reset``
+    (``post_fc_control.py`` — the lines setting
+    ``recovery_ticks_above_trigger``, ``recovery_ticks_within_exit``,
+    ``recovery_active``, and ``recovery_ticks_since_exit`` to their cleared
+    values) must fail this test."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=6.0,
+        taper_end_ror_c_per_min=6.0,
+        taper_duration_seconds=1.0,  # static setpoint at 6.0
+        ki_percent_per_ror_second=0.0,
+        ror_smoothing_alpha=1.0,
+    )
+    controller = PostFcRorController(config)
+
+    # --- Case 1: reset from a FULLY ACTIVE recovery state. ---
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    for _ in range(3):
+        controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)  # confirm entry
+    active_snapshot = controller.snapshot_state()
+    assert active_snapshot.recovery_active is True  # precondition: genuinely active
+
+    controller.reset(initial_heat_percent=55, ror_at_engagement_c_per_min=6.0)
+    cleared_from_active = controller.snapshot_state()
+    assert cleared_from_active.recovery_ticks_above_trigger == 0
+    assert cleared_from_active.recovery_ticks_within_exit == 0
+    assert cleared_from_active.recovery_active is False
+    assert cleared_from_active.recovery_ticks_since_exit is None
+    # The first post-reset tick computes the D88 BASE ceiling for the NEW
+    # engagement heat (55), never a leaked recovery cap from the old one.
+    first_tick = controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0)
+    assert first_tick.effective_ceiling_percent == 55
+    assert first_tick.recovery_active is False
+
+    # --- Case 2: reset from MID-GLIDE (recovery inactive but not yet fully
+    # settled back to the base -- a DIFFERENT non-fresh state than Case 1,
+    # since ``recovery_ticks_since_exit`` is the field Case 1 never
+    # exercises a non-None value for). ---
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    for _ in range(3):
+        controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)  # confirm entry
+    for _ in range(3):
+        controller.compute(measured_ror_c_per_min=5.6, dt_seconds=5.0)  # confirm exit
+    mid_glide = controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0)
+    assert 60 < mid_glide.effective_ceiling_percent < 75  # genuinely mid-glide
+    mid_glide_snapshot = controller.snapshot_state()
+    assert mid_glide_snapshot.recovery_ticks_since_exit is not None  # precondition
+
+    controller.reset(initial_heat_percent=45, ror_at_engagement_c_per_min=6.0)
+    cleared_from_glide = controller.snapshot_state()
+    assert cleared_from_glide.recovery_ticks_above_trigger == 0
+    assert cleared_from_glide.recovery_ticks_within_exit == 0
+    assert cleared_from_glide.recovery_active is False
+    assert cleared_from_glide.recovery_ticks_since_exit is None
+    second_tick = controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0)
+    assert second_tick.effective_ceiling_percent == 45  # the NEW engagement's D88 base
+    assert second_tick.recovery_active is False
+
+
+def test_zero_headroom_recovering_reports_holding_not_a_phantom_elevation() -> None:
+    """PR #560 round 3 Codex finding: with zero headroom
+    (``recovery_headroom_percentage_points=0``), the entry condition can
+    still CONFIRM (measured RoR persistently below setpoint, the trigger
+    margin exceeded for ``recovery_confirm_ticks`` consecutive ticks) — but
+    ``_recovery_ceiling_percent()`` equals the D88 base exactly
+    (``min(heat_ceiling_percent, heat_engage_percent + 0) ==
+    heat_engage_percent`` whenever ``heat_engage_percent <=
+    heat_ceiling_percent``, always true), so NOTHING actually elevates. The
+    reported state must stay ``HOLDING`` (not the internal counters'
+    ``RECOVERING``) throughout, the ceiling must stay pinned at the D88 base
+    the entire time, and ``recovery_active`` must stay ``False`` — a
+    controller reading this state to decide whether to suppress a drop-tick
+    write must never suppress one for a "recovery" that never actually
+    raised anything."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=6.0,
+        taper_end_ror_c_per_min=6.0,
+        taper_duration_seconds=1.0,
+        ki_percent_per_ror_second=0.0,
+        ror_smoothing_alpha=1.0,
+        recovery_headroom_percentage_points=0,
+        recovery_confirm_ticks=1,
+    )
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    # A sustained shortfall well past the trigger margin -- the entry
+    # condition genuinely confirms every tick.
+    outputs = [controller.compute(measured_ror_c_per_min=4.0, dt_seconds=5.0) for _ in range(10)]
+    assert all(o.heat_authority_state is PostFcHeatAuthorityState.HOLDING for o in outputs), [
+        o.heat_authority_state for o in outputs
+    ]
+    assert all(o.recovery_active is False for o in outputs)
+    assert all(o.effective_ceiling_percent == 60 for o in outputs), [
+        o.effective_ceiling_percent for o in outputs
+    ]
+
+
+def test_entry_at_heat_ceiling_with_headroom_reports_holding_not_recovering() -> None:
+    """PR #560 round 3 Codex finding, the second reachable path to the same
+    bug: entry heat ALREADY AT ``heat_ceiling_percent`` (100 here) means
+    ``_recovery_ceiling_percent()`` (``min(100, 100 + 15) == 100``) equals
+    the D88 base regardless of a NON-zero headroom config -- there is simply
+    no room ABOVE the static ceiling to raise into. Same assertions as the
+    zero-headroom case: the reported state must stay ``HOLDING`` throughout,
+    never a phantom ``RECOVERING``."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=6.0,
+        taper_end_ror_c_per_min=6.0,
+        taper_duration_seconds=1.0,
+        ki_percent_per_ror_second=0.0,
+        ror_smoothing_alpha=1.0,
+        recovery_headroom_percentage_points=15,
+        recovery_confirm_ticks=1,
+        heat_ceiling_percent=100,
+    )
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=100, ror_at_engagement_c_per_min=6.0)
+
+    outputs = [controller.compute(measured_ror_c_per_min=4.0, dt_seconds=5.0) for _ in range(10)]
+    assert all(o.heat_authority_state is PostFcHeatAuthorityState.HOLDING for o in outputs), [
+        o.heat_authority_state for o in outputs
+    ]
+    assert all(o.recovery_active is False for o in outputs)
+    assert all(o.effective_ceiling_percent == 100 for o in outputs), [
+        o.effective_ceiling_percent for o in outputs
+    ]
+
+
+def test_recovery_fuzz_ror_pinned_at_zero_saturates_at_cap_500_ticks() -> None:
+    """Fuzz variant 1 (mandatory): pin measured RoR at 0.0 -- an even more
+    extreme, sustained-forever shortfall than any real roast trace -- for
+    500+ ticks. Heat must saturate at (never exceed)
+    ``min(heat_ceiling_percent, heat_engage_percent +
+    recovery_headroom_percentage_points)`` even under a pathological,
+    indefinitely-sustained worst-case error. This is the closest replicable
+    analogue to what killed roast 9 (an unbounded-forever error against an
+    unbounded-upward ceiling) -- proving the cap holds even there is the
+    direct test of the module docstring's structural-impossibility claim."""
+    config = _recovery_config()
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    heats: list[int] = []
+    for _ in range(500):
+        output = controller.compute(measured_ror_c_per_min=0.0, dt_seconds=5.0)
+        heats.append(output.heat_percent)
+
+    expected_cap = min(config.heat_ceiling_percent, 60 + config.recovery_headroom_percentage_points)
+    assert max(heats) <= expected_cap, (max(heats), expected_cap)
+    # It genuinely saturates AT the cap (not just under it) given long enough.
+    assert heats[-1] == expected_cap
+
+
+def test_recovery_fuzz_oscillating_ror_limit_cycle_stays_bounded() -> None:
+    """Fuzz variant 2 (mandatory): an RoR trace oscillating periodically
+    across BOTH the entry and exit thresholds (a synthetic worst case for the
+    limit-cycle risk the D96 safety review raised) must never cause the
+    ceiling to sawtooth UNBOUNDEDLY -- entries and exits may recur (a bounded,
+    periodic sawtooth between the D88 base and the recovery cap is an
+    accepted, designed-for outcome), but the ceiling must never exceed the
+    recovery cap nor fall below the D88 base ceiling, and the number of
+    state-transitions over a long run must stay proportional to the number of
+    oscillation cycles (not accelerating/diverging)."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=6.0,
+        taper_end_ror_c_per_min=6.0,
+        taper_duration_seconds=1.0,  # static setpoint at 6.0 throughout
+        ki_percent_per_ror_second=0.0,
+        ror_smoothing_alpha=1.0,
+    )
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    base_ceiling = 60
+    recovery_cap = 60 + config.recovery_headroom_percentage_points  # 75
+
+    # RoR oscillates: 3 ticks at 4.9 (error 1.1 > trigger 1.0 -- shortfall),
+    # then 3 ticks at 5.6 (error 0.4 <= exit margin 0.5 -- recovered) --
+    # crosses both thresholds every 6-tick cycle, the sharpest oscillation
+    # this hysteresis gap is designed to survive.
+    cycle = [4.9, 4.9, 4.9, 5.6, 5.6, 5.6]
+    rors = cycle * 30  # 180 ticks, 30 full cycles
+
+    ceilings: list[int] = []
+    actives: list[bool] = []
+    for r in rors:
+        output = controller.compute(measured_ror_c_per_min=r, dt_seconds=5.0)
+        ceilings.append(output.effective_ceiling_percent)
+        actives.append(output.recovery_active)
+
+    # Bounded: never above the recovery cap, never below the D88 base.
+    assert max(ceilings) <= recovery_cap, ceilings
+    assert min(ceilings) >= base_ceiling, ceilings
+
+    # State transitions stay proportional to the 30 forcing cycles -- NOT
+    # accelerating/diverging (a limit cycle "running away" would show far
+    # more transitions than forcing cycles, or a ceiling that never returns
+    # to the base). Count True->False and False->True edges.
+    edges = sum(1 for prev, cur in zip([False, *actives], actives, strict=False) if prev != cur)
+    assert edges <= 2 * len(rors) // 6 + 2, (edges, len(rors))
+    # And it genuinely DOES return to the D88 base ceiling repeatedly (not
+    # stuck at the recovery cap forever) -- the exit half of the law works.
+    assert base_ceiling in ceilings
+
+
+def test_recovery_exit_glides_down_not_snaps() -> None:
+    """The exit glide directly: once recovery exits, the ceiling must
+    descend by at most ``recovery_exit_glide_pp_per_tick`` per tick toward
+    ``heat_engage_percent``, never snap back in one step -- the direct guard
+    against a raise->recover->snap-cut->crash->re-trigger limit cycle."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=6.0,
+        taper_end_ror_c_per_min=6.0,
+        taper_duration_seconds=1.0,  # static setpoint at 6.0
+        ki_percent_per_ror_second=0.0,
+        ror_smoothing_alpha=1.0,
+        recovery_exit_glide_pp_per_tick=5,
+        recovery_confirm_ticks=3,
+    )
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    # Confirm entry: 3 ticks with error 1.1 > trigger margin 1.0.
+    entry_outputs = [
+        controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0) for _ in range(3)
+    ]
+    entry_output = entry_outputs[-1]
+    assert entry_output.heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+    assert entry_output.recovery_active is True
+    assert entry_output.effective_ceiling_percent == 75  # jumps immediately, no glide on entry
+
+    # Confirm exit: 3 ticks with error 0.4 <= exit margin 0.5.
+    exit_outputs = [
+        controller.compute(measured_ror_c_per_min=5.6, dt_seconds=5.0) for _ in range(3)
+    ]
+    ceilings_during_exit = [o.effective_ceiling_percent for o in exit_outputs]
+    # PR #560 Codex finding (diagnostics gap): the ceiling is STILL well
+    # above the D88 base right after exit confirms -- heat_authority_state
+    # correctly reads GLIDING (not HOLDING), and the derived recovery_active
+    # boolean (True for BOTH RECOVERING and GLIDING) reflects that too. The
+    # raw internal _recovery_active flag flips False here, but neither
+    # public field does.
+    assert exit_outputs[-1].heat_authority_state is PostFcHeatAuthorityState.GLIDING
+    assert exit_outputs[-1].recovery_active is True
+
+    # The tick exit is CONFIRMED on already reflects one glide step down
+    # from 75 (per the docstring: ticks_since_exit starts at 1 on the
+    # confirming tick itself, so the glide begins on the same read).
+    assert ceilings_during_exit[-1] == 70  # 75 - 1*5
+
+    # Subsequent ticks continue gliding down by at most 5pp/tick until the
+    # D88 base (60) is reached and held there.
+    post_exit_outputs = [
+        controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0) for _ in range(5)
+    ]
+    post_exit_ceilings = [o.effective_ceiling_percent for o in post_exit_outputs]
+    assert post_exit_ceilings == [65, 60, 60, 60, 60]
+    # heat_authority_state tracks the glide precisely: GLIDING while above
+    # the base, HOLDING once it locks there -- never HOLDING while elevated.
+    assert [o.heat_authority_state for o in post_exit_outputs] == [
+        PostFcHeatAuthorityState.GLIDING,
+        PostFcHeatAuthorityState.HOLDING,
+        PostFcHeatAuthorityState.HOLDING,
+        PostFcHeatAuthorityState.HOLDING,
+        PostFcHeatAuthorityState.HOLDING,
+    ]
+    assert [o.recovery_active for o in post_exit_outputs] == [True, False, False, False, False]
+    # No step in the entire glide ever exceeds the configured per-tick rate.
+    full_sequence = [75, *ceilings_during_exit, *post_exit_ceilings]
+    steps = [a - b for a, b in zip(full_sequence, full_sequence[1:], strict=False)]
+    assert all(step <= config.recovery_exit_glide_pp_per_tick for step in steps), steps
+
+
+def test_recovery_re_entry_during_glide_cancels_the_glide_immediately() -> None:
+    """If RoR crashes again WHILE the ceiling is still gliding down from a
+    prior exit, re-entry must engage from the CURRENT (partially-glided)
+    ceiling state and jump straight back to the full recovery cap -- the
+    glide-state must not persist or interfere with a fresh entry.
+
+    Uses a wider headroom (20, vs the 15 default) and a shorter confirm bar
+    (2 ticks) so the re-crash's SECOND confirm-tick lands WHILE the glide
+    counter is still active (not yet settled to HOLDING) -- exercising the
+    re-entry branch that fires from mid-glide specifically (as opposed to a
+    re-entry that happens to land after the glide has already settled back
+    to the D88 base, a structurally different code path this test does NOT
+    cover on its own)."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=6.0,
+        taper_end_ror_c_per_min=6.0,
+        taper_duration_seconds=1.0,
+        ki_percent_per_ror_second=0.0,
+        ror_smoothing_alpha=1.0,
+        recovery_headroom_percentage_points=20,
+        recovery_confirm_ticks=2,
+    )
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    entry_check = controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)
+    assert entry_check.heat_authority_state is PostFcHeatAuthorityState.HOLDING  # tick 1 of 2
+    entry_confirm = controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)  # tick 2 of 2
+    assert entry_confirm.effective_ceiling_percent == 80  # 60 + 20
+
+    exit_check = controller.compute(measured_ror_c_per_min=5.6, dt_seconds=5.0)
+    assert exit_check.heat_authority_state is PostFcHeatAuthorityState.RECOVERING  # tick 1 of 2
+    exit_confirm = controller.compute(measured_ror_c_per_min=5.6, dt_seconds=5.0)  # tick 2 of 2
+    # PR #560 Codex finding: right at exit confirmation the ceiling is still
+    # gliding down from the recovery cap -- GLIDING, not HOLDING, and
+    # recovery_active (True for both non-holding states) stays True too.
+    assert exit_confirm.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+    assert exit_confirm.recovery_active is True
+    mid_glide = controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0)
+    assert 60 < mid_glide.effective_ceiling_percent < 80  # genuinely mid-glide
+    assert mid_glide.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+
+    # RoR crashes again before the glide reaches the base. The SECOND tick
+    # of this pair is the one that confirms re-entry (recovery_confirm_ticks
+    # =2) while `_recovery_ticks_since_exit` is still non-None -- the
+    # mid-glide re-entry branch, not the settled-to-HOLDING one.
+    re_entry_first = controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)
+    assert re_entry_first.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+    re_entry = controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)
+    assert re_entry.heat_authority_state is PostFcHeatAuthorityState.RECOVERING
+    assert re_entry.recovery_active is True
+    assert re_entry.effective_ceiling_percent == 80  # full cap, not a partial value
+
+
+def test_drop_and_estop_precedence_over_recovery_raise() -> None:
+    """Documents the structural boundary this module's algorithm sits inside
+    (the REAL, mandatory drop/e-stop-precedence assertions are end-to-end
+    controller tests: ``test_controller.py::test_estop_precedence_over_
+    recovery_raise_same_tick`` and ``::test_ceiling_guard_drop_takes_
+    precedence_over_recovery_raise_same_tick``, which drive an actual
+    ``RoastController.tick()`` and assert on the real phase/executor
+    outcome).
+
+    A raised heat command is only ever considered inside DEVELOPMENT, and
+    both the deterministic drop paths (the dev%/temp anchor and the
+    ceiling-guard drop) and the hardware e-stop live entirely OUTSIDE this
+    module's algorithm, in the controller's tick order:
+    ``_evaluate_safety``/``_act_on_safety`` (e-stop) runs BEFORE
+    ``_apply_deterministic_post_fc_levers`` (this module's caller), and
+    ``_maybe_ceiling_guard_drop`` runs immediately AFTER it in the same tick
+    -- so a tick that ALSO qualifies for e-stop or a drop this same tick
+    still lands there, never blocked or delayed by a recovery raise. This
+    module has no drop or e-stop concept at all: it is a pure heat-percentage
+    computation with no MCP/roaster access, so it structurally cannot
+    override or race either path -- the precedence lives entirely in
+    ``controller.tick()``'s call order."""
+    # This module (post_fc_control.py) never imports controller, safety, or
+    # mcp_client (see the module docstring) -- there is no drop/e-stop
+    # concept to construct or race against here. This test documents (the
+    # controller-level tests named above VERIFY end-to-end) that the
+    # precedence is structural: nothing in THIS module's public API can
+    # express a drop or an e-stop, so recovery cannot delay or block one by
+    # construction.
+    config = _recovery_config()
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    output = controller.compute(measured_ror_c_per_min=3.0, dt_seconds=5.0)
+    # The output is purely a heat percentage + diagnostics -- no field here
+    # can suppress a drop or an e-stop; the caller (controller.py) is
+    # unconditionally responsible for running the drop/e-stop checks in its
+    # own tick order regardless of this value.
+    assert isinstance(output.heat_percent, int)

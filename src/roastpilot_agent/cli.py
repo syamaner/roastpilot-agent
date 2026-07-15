@@ -543,22 +543,32 @@ async def _emit_advisor_readout(service: "RoastService") -> "AdvisorHealth":
 
 
 def _format_post_fc_loop_readout(
-    *, enabled: bool, ceiling_guard_enabled: bool, ceiling_guard_temp_c: float
+    *,
+    enabled: bool,
+    ceiling_guard_enabled: bool,
+    ceiling_guard_temp_c: float,
+    recovery_enabled: bool = False,
+    recovery_headroom_percentage_points: int = 0,
 ) -> list[str]:
-    """Render the operator-facing D88 post-FC flag readouts (issues #460, #495).
+    """Render the operator-facing D88/D96 post-FC flag readouts (issues #460,
+    #495, #559/PR #560 round 3).
 
-    Prints the resolved ``controller.post_first_crack_control.enabled`` and
-    ``ceiling_guard_drop_enabled`` values as can't-miss console lines — as
-    prominent as the mock-driver ``⚠️`` / advisor-experiment tag — so an
-    operator running a baseline-vs-treatment A/B can *confirm* which roast is
-    which before charging beans. A silent typo in either raw nested env var
-    (``ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__ENABLED`` /
-    ``…__CEILING_GUARD_DROP_ENABLED``) would otherwise leave the flag at its
-    default ``False`` and quietly turn the "treatment" roast into a second
-    baseline. The two flags are independent by design (D88 decoupled the
-    ceiling guard from the taper), so each gets its own line. Read-only and
-    informational — this never blocks startup, the same contract as
-    :func:`_format_advisor_readout`.
+    Prints the resolved ``controller.post_first_crack_control.enabled``,
+    ``ceiling_guard_drop_enabled``, AND ``recovery_enabled`` values as
+    can't-miss console lines — as prominent as the mock-driver ``⚠️`` /
+    advisor-experiment tag — so an operator running a baseline-vs-treatment
+    A/B can *confirm* which roast is which before charging beans. A silent
+    typo in any raw nested env var (``ROASTPILOT_CONTROLLER__
+    POST_FIRST_CRACK_CONTROL__ENABLED`` / ``…__CEILING_GUARD_DROP_ENABLED`` /
+    ``…__RECOVERY_ENABLED``) would otherwise leave the flag at its default
+    ``False`` and quietly turn the "treatment" roast into a second baseline —
+    or, in the opposite direction, an accidental ``True`` would silently
+    activate the bounded-bidirectional heat relaxation on a roast the
+    operator believed was running the plain D88 never-add-heat law. The
+    THREE flags are independent by design (D88 decoupled the ceiling guard
+    from the taper; D96 layers recovery on top of both), so each gets its
+    own line. Read-only and informational — this never blocks startup, the
+    same contract as :func:`_format_advisor_readout`.
 
     Args:
         enabled: The resolved ``post_first_crack_control.enabled`` value from
@@ -568,6 +578,18 @@ def _format_post_fc_loop_readout(
         ceiling_guard_temp_c: The resolved
             ``post_first_crack_control.ceiling_guard_temp_c`` value, shown so
             the operator confirms the guard line, not just the flag.
+        recovery_enabled: The resolved
+            ``post_first_crack_control.recovery_enabled`` value (D96, #559).
+            Defaults ``False`` so callers that predate this field (there are
+            none left in this codebase, but the default keeps the function
+            signature backward-compatible) still resolve to the pre-D96
+            readout shape.
+        recovery_headroom_percentage_points: The resolved
+            ``post_first_crack_control.recovery_headroom_percentage_points``
+            value, shown alongside the flag so the operator confirms the
+            CAP, not just that recovery is on — the number that actually
+            bounds how far above entry heat the loop may raise. Only
+            rendered when ``recovery_enabled`` is ``True``.
 
     Returns:
         The console lines to print, in order.
@@ -587,6 +609,16 @@ def _format_post_fc_loop_readout(
         )
     else:
         lines.append("  ceiling-guard drop: disabled (advisor/operator own the bitter boundary)")
+    if recovery_enabled:
+        lines.append(
+            "⚠️  BOUNDED-BIDIRECTIONAL HEAT RECOVERY: ENABLED "
+            f"(D96 — the taper may raise heat up to {recovery_headroom_percentage_points:g} pp "
+            "above entry when RoR runs persistently below setpoint)"
+        )
+    else:
+        lines.append(
+            "  bidirectional heat recovery: disabled (D88 never-add-heat-beyond-entry stands)"
+        )
     return lines
 
 
@@ -663,14 +695,17 @@ async def _serve_live(args: argparse.Namespace) -> int:
         # (advisory-paused is valid); the result is exposed on /api/health.
         await _emit_advisor_readout(service)
 
-        # D88 post-FC flag readouts (issues #460, #495): read straight off the
-        # already-loaded `config` (no re-load) so they can never drift from what
-        # actually serves. Read-only/informational — never blocks startup.
+        # D88/D96 post-FC flag readouts (issues #460, #495, #559/PR #560
+        # round 3): read straight off the already-loaded `config` (no
+        # re-load) so they can never drift from what actually serves.
+        # Read-only/informational — never blocks startup.
         post_fc = config.controller.post_first_crack_control
         for line in _format_post_fc_loop_readout(
             enabled=post_fc.enabled,
             ceiling_guard_enabled=post_fc.ceiling_guard_drop_enabled,
             ceiling_guard_temp_c=post_fc.ceiling_guard_temp_c,
+            recovery_enabled=post_fc.recovery_enabled,
+            recovery_headroom_percentage_points=post_fc.recovery_headroom_percentage_points,
         ):
             print(line)
 
