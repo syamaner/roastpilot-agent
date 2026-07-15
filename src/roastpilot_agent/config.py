@@ -375,10 +375,35 @@ class PostFirstCrackControl(BaseModel):
     the controller's DEVELOPMENT-phase tick (Slice B2) which builds the safety
     box from the loop's ACTUATED output (per the #412 told==enforced control-path
     rule: never an undamped setpoint) and routes every write through the
-    existing safety gate. Nothing here talks to ``mcp_client`` directly, and
-    nothing here replaces the safety box's hard ceilings (the 196 °C bitter /
-    198 °C emergency-drop bounds keep clamping the loop's output exactly as
-    they clamp the advisor today).
+    existing safety gate. Nothing here talks to ``mcp_client`` directly.
+
+    **Correction (D96 safety review, 15 Jul): the sentence this replaces
+    ("the 196 °C bitter ceiling keeps clamping the loop's output") was FALSE
+    for the command path and is corrected here rather than left to mislead a
+    future reader.** ``safety.SafetyPolicy.evaluate_command`` (the SET_HEAT/
+    SET_FAN gate every write in this module goes through) is temperature-BLIND
+    — it only checks the command rate limit and the heat/fan box; it never
+    reads ``bitter_ceiling_temp_c`` or ``emergency_drop_temp_c``. Those two
+    values are *told* context only (surfaced in
+    :class:`~roastpilot_agent.control_policy.PhaseControlLimits` /
+    :class:`~roastpilot_agent.advisor.AdvisorContext`) until something
+    ENFORCES them. The only two things that actually stop a bean temperature
+    excursion are: (1) ``SafetyPolicy.evaluate_telemetry``'s hard ceiling,
+    ``SafetyLimits.max_bean_temp_c`` (default 230 °C — well above 196/198,
+    an emergency-stop backstop, not the bitter-line anchor), and (2) THIS
+    module's own ``ceiling_guard_drop_enabled`` path (D88 amendment A1,
+    :meth:`~roastpilot_agent.controller.RoastController._maybe_ceiling_guard_drop`),
+    which is the ONLY code that enforces the 196 °C line as a deterministic
+    drop. **D96's bounded-bidirectional heat law (below) therefore REQUIRES
+    ``ceiling_guard_drop_enabled=True`` whenever ``recovery_enabled=True``** —
+    a cross-field validator on this model rejects the alternative — because a
+    law that can raise heat above entry with no deterministic 196 °C anchor
+    would leave the bitter line owned solely by the advisor's own judgment,
+    exactly the gap D88 already closed once for the taper's steady-state
+    case. This requirement does not apply to the RoR-taper/never-add-heat
+    path (``enabled`` alone): that law can only ever LOWER the ceiling
+    relative to entry, so it never needs the guard to stay safe (though the
+    guard defaults on regardless, per D88/D89's own promotion).
 
     ``enabled`` (the ``post_fc_ror_loop`` master flag) **defaults ``True`` as
     of the 12 Jul promotion (D88/D89, operator-ratified)**: the 11 Jul
@@ -511,6 +536,101 @@ class PostFirstCrackControl(BaseModel):
     #: configured ABOVE the emergency-drop net, or above the bitter ceiling
     #: it is meant to anchor, is unconstructible.
     ceiling_guard_temp_c: float = Field(default=196.0, gt=0)
+    #: The bounded-bidirectional heat RECOVERY law's master flag (D96, #559).
+    #: Default ``False`` — hardware-gated promotion, the identical posture
+    #: D88's ``enabled``/``ceiling_guard_drop_enabled`` had before their own
+    #: validation roast. When ``True``, the loop may raise heat ABOVE
+    #: ``heat_engage_percent`` (relaxing D88's never-add-heat-beyond-entry
+    #: clamp) whenever measured RoR runs persistently below the taper
+    #: setpoint — roast 15's failure (fan 30→90 crashed RoR while heat sat
+    #: ceiling-locked at entry with zero raise authority, dropping 7 °C
+    #: short). See :class:`~roastpilot_agent.post_fc_control.PostFcRorController`
+    #: for the full entry/exit state machine and the structural
+    #: runaway-impossibility argument (the setpoint stays measured-anchored
+    #: and monotonically non-increasing; the raise authority is a hard,
+    #: error-independent cap — see ``recovery_headroom_percentage_points``).
+    #: **REQUIRES ``ceiling_guard_drop_enabled=True``** (a validator below
+    #: enforces this): a law that can raise heat above entry with no
+    #: deterministic 196 °C anchor would leave the bitter line owned solely
+    #: by the advisor's own judgment (see the corrected module docstring
+    #: above) — unlike the RoR-taper's own never-add-heat law, which can
+    #: only ever lower the ceiling and so carries no such requirement.
+    recovery_enabled: bool = Field(default=False)
+    #: The RoR shortfall (°C/min) below the taper setpoint that ENTERS
+    #: recovery, once sustained for ``recovery_confirm_ticks`` consecutive
+    #: computed ticks. Default 1.0 — deliberately the SAME value as
+    #: ``ror_deadband_c_per_min``: recovery engages exactly where the
+    #: existing deadband already stops treating a shortfall as noise, not at
+    #: an independently-chosen threshold that could silently drift out of
+    #: sync with it. **Cross-referenced, not shared as one literal**,
+    #: because the two fields answer different questions (the deadband gates
+    #: the PI's OWN integration; this gates a DIFFERENT law's activation) —
+    #: but a future change to one without considering the other would move
+    #: where recovery starts relative to "this is real signal." Verified
+    #: against roast 12 (run ``edbe9a76``, the validated 9/10 cup): measured
+    #: RoR never falls more than ~0.3 °C/min below its own decaying setpoint
+    #: at any tick, so this trigger has ~0.7 °C/min of margin on that trace —
+    #: not the knife-edge (<0.1 °C/min) margin that falsified D94.
+    recovery_trigger_margin_c_per_min: float = Field(default=1.0, ge=0)
+    #: The RoR shortfall (°C/min) below the taper setpoint at or under which
+    #: recovery EXITS, once sustained for ``recovery_confirm_ticks``
+    #: consecutive computed ticks. Default 0.5 — deliberately SMALLER than
+    #: ``recovery_trigger_margin_c_per_min`` (a validator enforces
+    #: ``exit_margin < trigger_margin``): an EQUAL entry/exit margin
+    #: (symmetric hysteresis at exactly the deadband's own edge) is
+    #: limit-cycle-prone whenever measured RoR sits near the shared
+    #: threshold — a single noisy tick could cross back and forth,
+    #: re-triggering entry immediately after an exit. The asymmetric gap
+    #: (entry 1.0, exit 0.5) means RoR must recover MORE before recovery
+    #: releases than it needed to fall to trigger it, so a trace oscillating
+    #: near either threshold in isolation cannot thrash the state — it must
+    #: cross the WIDER combined gap, which ordinary tick-to-tick RoR noise
+    #: does not span (see the mandatory limit-cycle convergence test in
+    #: ``tests/test_post_fc_control.py``).
+    recovery_exit_margin_c_per_min: float = Field(default=0.5, ge=0)
+    #: Consecutive computed :meth:`~roastpilot_agent.post_fc_control.PostFcRorController.compute`
+    #: ticks the entry or exit condition must hold before the state actually
+    #: changes. Default 3 (≥15 s at the default 5 s cadence) — long enough to
+    #: reject a single noisy RoR sample, short enough that the bean has not
+    #: moved far before the loop reacts. **This is a TICK COUNT, not a
+    #: wall-clock or monotonic-clock duration** (D95 clock-origin discipline,
+    #: #559): it counts consecutive accepted-and-executed
+    #: :meth:`~roastpilot_agent.post_fc_control.PostFcRorController.compute`
+    #: calls, which only ever happen on the caller's actuation-gated cadence
+    #: — never a receive-tick or FC-backdate-derived clock, sidestepping the
+    #: whole D94/D95 falsification class by construction. "3 ticks" and
+    #: "~15 seconds" are the same thing only while cadence holds at
+    #: ``control_interval_seconds``; this field does not itself convert to
+    #: seconds, deliberately, so it cannot silently disagree with a
+    #: seconds-based sibling under a cadence drift.
+    recovery_confirm_ticks: int = Field(default=3, ge=1)
+    #: The maximum percentage points the recovery ceiling may sit ABOVE
+    #: ``heat_engage_percent`` once recovery is active. Default 15 — an
+    #: unvalidated hardware prior (no clean step-response exists in the
+    #: store to measure °C/min-per-%heat plant gain directly; this default
+    #: is a first guess, exactly D88's original kp/ki posture before their
+    #: validation roast, NOT a measured value). The cap is a HARD,
+    #: error-independent bound — never scaled by how far below setpoint RoR
+    #: has fallen — so the worst case is bounded by construction regardless
+    #: of tuning (see the module docstring's structural
+    #: runaway-impossibility argument). Always further bounded by
+    #: ``heat_ceiling_percent`` (the static outer box): the effective
+    #: recovery ceiling is
+    #: ``min(heat_ceiling_percent, heat_engage_percent + recovery_headroom_percentage_points)``.
+    recovery_headroom_percentage_points: int = Field(default=15, ge=0, le=50)
+    #: The maximum percentage points the EFFECTIVE CEILING may fall per tick
+    #: while gliding back down from the recovery ceiling toward
+    #: ``heat_engage_percent`` after recovery exits. Default 5 — deliberately
+    #: SLOWER than entry (which jumps to the recovery ceiling immediately,
+    #: the moment the entry condition is confirmed): entry is time-critical
+    #: (roast 15's failure was the delay itself), a retreat is not, and a
+    #: slow, bounded retreat is the direct structural guard against a
+    #: raise→recover→snap-cut→crash→re-trigger limit cycle. This glides the
+    #: CEILING only — the PI still computes whatever heat it wants each
+    #: tick, clamped into whatever box the (possibly still-gliding) ceiling
+    #: currently allows; there is exactly one box per tick, never two
+    #: independent clamps fighting over the same value.
+    recovery_exit_glide_pp_per_tick: int = Field(default=5, ge=1, le=50)
 
     @model_validator(mode="after")
     def _check_heat_range(self) -> "PostFirstCrackControl":
@@ -556,6 +676,71 @@ class PostFirstCrackControl(BaseModel):
             raise ValueError(
                 "taper_end_ror_c_per_min must not exceed taper_start_max_ror_c_per_min "
                 f"({self.taper_end_ror_c_per_min} > {self.taper_start_max_ror_c_per_min})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_recovery_hysteresis(self) -> "PostFirstCrackControl":
+        """The recovery exit margin must be strictly smaller than the entry margin (D96).
+
+        Symmetric (equal) entry/exit margins are limit-cycle-prone: a trace
+        sitting near the shared threshold could cross back and forth on
+        ordinary tick-to-tick RoR noise, re-entering recovery immediately
+        after exiting it. Requiring
+        ``recovery_exit_margin_c_per_min < recovery_trigger_margin_c_per_min``
+        guarantees a real gap between the two thresholds — RoR must recover
+        further to release recovery than it needed to fall to trigger it —
+        which is what the mandatory limit-cycle convergence test
+        (``tests/test_post_fc_control.py``) exercises.
+
+        Returns:
+            The validated control-parameters instance.
+
+        Raises:
+            ValueError: If ``recovery_exit_margin_c_per_min`` is not strictly
+                less than ``recovery_trigger_margin_c_per_min``.
+        """
+        if self.recovery_exit_margin_c_per_min >= self.recovery_trigger_margin_c_per_min:
+            raise ValueError(
+                "recovery_exit_margin_c_per_min must be strictly less than "
+                "recovery_trigger_margin_c_per_min (an equal or wider exit margin is "
+                "limit-cycle-prone) "
+                f"({self.recovery_exit_margin_c_per_min} >= "
+                f"{self.recovery_trigger_margin_c_per_min})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_recovery_requires_ceiling_guard(self) -> "PostFirstCrackControl":
+        """The bounded-bidirectional heat law requires the 196 °C ceiling guard (D96).
+
+        ``safety.SafetyPolicy.evaluate_command`` — the gate every heat/fan
+        write in this module passes through — is temperature-blind (rate
+        limit + box only); the only two things that ever stop a bean
+        temperature excursion are ``SafetyLimits.max_bean_temp_c`` (an
+        emergency-stop backstop, default 230 °C, well above the 196/198
+        bitter-line pair) and THIS module's own
+        ``ceiling_guard_drop_enabled`` path. A recovery law that can raise
+        heat above entry with the ceiling guard OFF would leave the 196 °C
+        line owned solely by the advisor's own judgment — exactly the gap
+        D88 already closed once for the taper's steady-state case. This
+        requirement does not apply to the RoR-taper/never-add-heat law
+        (``enabled`` alone), which can only ever lower the ceiling relative
+        to entry and so never needs the guard to stay safe.
+
+        Returns:
+            The validated control-parameters instance.
+
+        Raises:
+            ValueError: If ``recovery_enabled`` is ``True`` while
+                ``ceiling_guard_drop_enabled`` is ``False``.
+        """
+        if self.recovery_enabled and not self.ceiling_guard_drop_enabled:
+            raise ValueError(
+                "recovery_enabled requires ceiling_guard_drop_enabled=True — a law that "
+                "can raise heat above entry with no deterministic 196 °C ceiling-guard "
+                "anchor would leave the bitter line owned solely by the advisor's own "
+                "judgment"
             )
         return self
 
