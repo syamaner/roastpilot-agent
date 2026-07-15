@@ -397,6 +397,96 @@ describe("StartRoastView — stale-session detection (#523)", () => {
   });
 });
 
+describe("StartRoastView — #557: staleRun must never be derived from UNRESOLVED health", () => {
+  it("REGRESSION (fails pre-fix): an unfinalized history run + health that has not yet resolved (data undefined) shows NO stale card — this is the process's own booting-server incident, not a stale session", () => {
+    // The 15 Jul field incident: the SPA's first /health fetch failed against
+    // a still-booting server, so health.data stayed undefined. The old
+    // derivation (`run.id !== (health.data?.active_run_id ?? null)`)
+    // coalesced that to "no active run", classifying the process's OWN
+    // active/recovering run (an unfinalized history row) as stale. This
+    // combination (isFresh true, data undefined, isError false) shouldn't
+    // arise from the real hook today (isFresh implies success-with-data OR
+    // isError) — proven directly against the mocked hook so the guard is
+    // enforced at the derivation site itself, not only by gate ordering
+    // upstream that could silently change later.
+    healthState.data = undefined;
+    healthState.isSuccess = false;
+    healthState.isError = false;
+    healthState.isFresh = true;
+    historyState.data = { runs: [{ id: "run-recovering", outcome: null }] };
+    historyState.isFresh = true;
+    renderView();
+    expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
+  });
+
+  it("no stale card when health resolves with active_run_id EQUAL to the unfinalized run — the correct active-run-banner path, not a stale claim", () => {
+    healthState.data = { active_run_id: "run-recovering" };
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    healthState.isFresh = true;
+    historyState.data = { runs: [{ id: "run-recovering", outcome: null }] };
+    historyState.isFresh = true;
+    renderView();
+    expect(screen.getByTestId("start-roast-active-run-banner")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
+  });
+
+  it("stale card SHOWS when health resolves with active_run_id null/different from the unfinalized run — existing behaviour preserved", () => {
+    healthState.data = { active_run_id: null };
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    healthState.isFresh = true;
+    historyState.data = { runs: [{ id: "run-stranded", outcome: null }] };
+    historyState.isFresh = true;
+    renderView();
+    expect(screen.getByTestId("start-roast-stale-session")).toBeInTheDocument();
+  });
+
+  it("the health-error leg renders its own explicit state, never the stale card, when health persistently errors", () => {
+    healthState.data = undefined;
+    healthState.isSuccess = false;
+    healthState.isError = true;
+    healthState.isFresh = true; // isError implies isFresh (see useFreshGate)
+    historyState.data = { runs: [{ id: "run-recovering", outcome: null }] };
+    historyState.isFresh = true;
+    renderView();
+    expect(screen.getByTestId("start-roast-status-unknown")).toBeInTheDocument();
+    expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
+    expect(screen.queryByTestId("start-roast-form")).toBeNull();
+  });
+
+  it("staleRun's own derivation is closed against a resolved-but-NOT-fresh health read too (defense-in-depth, second incident hypothesis) — NO stale card when health.isFresh is false", () => {
+    // Second hypothesis for the 15 Jul incident, alongside the unresolved-
+    // health case above: a tab left open across a start-roast action and a
+    // restart (one long-lived StartRoastView mount) could have `isFresh`
+    // pinned `true` from an EARLIER settle (useFreshGate never re-arms it
+    // for the rest of that mount's lifetime, see hooks/queries.ts) while
+    // `health.data` reflects a STALE cached pre-start snapshot re-served
+    // from the query cache — i.e. `isFresh` alone is not proof this
+    // render's OWN data is current. staleRun is now derived as `null`
+    // whenever `!health.isFresh`, not only when `data === undefined` — the
+    // same defense-in-depth posture as the first guard above, closing the
+    // derivation itself rather than relying on gate ordering upstream.
+    //
+    // NOTE: with THIS component's current gate order, the top-level
+    // `!health.isFresh` hold (rendering `start-roast-loading`) already
+    // intercepts this exact combination before `staleRun` is ever rendered
+    // on — so this assertion doesn't fail against the pre-strengthening
+    // code through the full render tree. It documents and locks the
+    // derivation's own invariant regardless: if that gate order ever
+    // changes, `staleRun` itself still can never resolve non-null from a
+    // not-fresh read.
+    healthState.data = { active_run_id: null }; // stale cached "idle" snapshot
+    healthState.isSuccess = true;
+    healthState.isError = false;
+    healthState.isFresh = false; // NOT this mount's own fresh read
+    historyState.data = { runs: [{ id: "run-recovering", outcome: null }] };
+    historyState.isFresh = true;
+    renderView();
+    expect(screen.queryByTestId("start-roast-stale-session")).toBeNull();
+  });
+});
+
 describe("StartRoastView — clear-stale-session action (#525)", () => {
   function renderStaleSession() {
     healthState.data = { active_run_id: null };

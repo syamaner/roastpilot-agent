@@ -41,7 +41,7 @@
 
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -667,6 +667,146 @@ describe("LivePage — impostor-process defence (#516)", () => {
 
     expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
     expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+  });
+
+  describe("#556: latch-then-strip — a mismatch must not survive a browser reload", () => {
+    it("strips expectedInstanceId out of router state the moment a mismatch is observed, while the warning stays visible on THIS view", async () => {
+      // The router-state mutation itself (not just the rendered view) is the
+      // thing under test here: browsers restore location.state across a
+      // reload, so leaving it in place after a mismatch is the actual bug.
+      // A tiny probe route reads useLocation() to assert on the state
+      // directly, rather than inferring it indirectly.
+      let observedState: unknown = "not-yet-observed";
+      function StateProbe(): null {
+        observedState = useLocation().state;
+        return null;
+      }
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      healthState.isSuccess = true;
+      healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+      render(
+        <QueryClientProvider client={client}>
+          <MemoryRouter initialEntries={[{ pathname: "/live", state: { expectedInstanceId: "server-a" } }]}>
+            <Routes>
+              <Route
+                path="/live"
+                element={
+                  <>
+                    <LivePage />
+                    <StateProbe />
+                  </>
+                }
+              />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+
+      // The warning renders...
+      await waitFor(() => expect(screen.getByTestId("live-status-unknown")).toBeInTheDocument());
+      expect(screen.getByTestId("live-status-unknown")).toHaveAttribute(
+        "data-variant",
+        "instance-mismatch",
+      );
+      // ...and the router state that produced it no longer carries the field —
+      // the strip fires on the SAME mismatch, not only on a later match.
+      await waitFor(() => expect(observedState).toBeNull());
+    });
+
+    it("REGRESSION (fails pre-fix): a remount against whatever router state the strip navigation actually left behind renders the NORMAL view, never the stuck warning", async () => {
+      // This is the #556 field-incident reproduction. `BrowserRouter`'s
+      // `navigate(path, { replace: true, state })` calls
+      // `window.history.replaceState` under the hood, so a REAL reload later
+      // reads whatever state the strip navigation left, not the original
+      // one — that's the actual browser mechanism the field incident
+      // exploited (the pre-fix code never called this on a mismatch, so the
+      // ORIGINAL armed state was what a reload always replayed). The naive
+      // "remount with the same initialEntries" approach can't model this: a
+      // fresh MemoryRouter always replays its own fixed initialEntries
+      // regardless of what a previous instance's navigate() did, so instead
+      // this test CAPTURES the state the strip effect actually produces (via
+      // a probe route reading useLocation()) and remounts a FRESH page
+      // against THAT captured value — the faithful model of "the browser
+      // restores whatever history.state currently holds".
+      let capturedState: unknown = "not-yet-captured";
+      function StateProbe(): null {
+        capturedState = useLocation().state;
+        return null;
+      }
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      function renderWithProbe(state: unknown) {
+        return render(
+          <QueryClientProvider client={client}>
+            <MemoryRouter initialEntries={[{ pathname: "/live", state }]}>
+              <Routes>
+                <Route
+                  path="/live"
+                  element={
+                    <>
+                      <LivePage />
+                      <StateProbe />
+                    </>
+                  }
+                />
+              </Routes>
+            </MemoryRouter>
+          </QueryClientProvider>,
+        );
+      }
+
+      healthState.isSuccess = true;
+      healthState.data = { active_run_id: "run-42", instance_id: "server-b" };
+      const first = renderWithProbe({ expectedInstanceId: "server-a" });
+
+      await waitFor(() => expect(screen.getByTestId("live-status-unknown")).toBeInTheDocument());
+      // The strip fired — router state no longer carries expectedInstanceId.
+      await waitFor(() => expect(capturedState).toBeNull());
+
+      // Now the server this tab talks to is fine — a healthy, DIFFERENT
+      // instance answering normally (e.g. a legitimate restart). A REAL
+      // reload replays whatever `history.state` the strip left (captured
+      // above, `null`) — not the original armed state.
+      first.unmount();
+      healthState.data = { active_run_id: "run-42", instance_id: "server-c" };
+      renderWithProbe(capturedState);
+
+      await waitFor(() => expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument());
+      expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+    });
+
+    it("the MATCH path still verifies and disarms within THIS session exactly as before (existing #516 coverage, re-asserted alongside the #556 fix)", async () => {
+      // Mirrors the pre-existing "ONE-SHOT DISARM" test above: `rerender()`
+      // keeps the SAME router instance, which is what actually exercises the
+      // strip's effect on a live component (unlike `remount()`, whose
+      // MemoryRouter always replays the ORIGINAL `initialEntries` regardless
+      // of any navigate() that happened — the correct model for a real
+      // reload, but not for "does this session stay disarmed after a match").
+      healthState.isSuccess = true;
+      healthState.data = { active_run_id: "run-42", instance_id: "server-a" };
+      const { rerender } = renderPage("/live", { expectedInstanceId: "server-a" });
+
+      await waitFor(() => expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument());
+      expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+
+      // A later health read with a DIFFERENT instance_id (e.g. a legitimate
+      // restart) must not re-arm the check — it already disarmed on match.
+      healthState.data = { active_run_id: "run-42", instance_id: "server-z" };
+      rerender();
+      expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+      expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+    });
+
+    it("a reload with NO router state (the real shape AFTER a match's strip navigation) renders normally, never re-arms", () => {
+      // Once the match path's replace-navigation has run, a real reload
+      // replays the STRIPPED entry (state: null) — modelled directly here,
+      // rather than via `remount()` (which always replays the original
+      // `initialEntries`, not the post-navigate() entry).
+      healthState.isSuccess = true;
+      healthState.data = { active_run_id: "run-42", instance_id: "server-z" };
+      renderPage("/live", null);
+      expect(screen.getByTestId("dashboard-stub")).toBeInTheDocument();
+      expect(screen.queryByTestId("live-status-unknown")).toBeNull();
+    });
   });
 });
 

@@ -77,17 +77,33 @@
  * compare `instance_id` — only this one-shot comparison does, so a normal
  * server RESTART (once this check has disarmed) never false-alarms them.
  *
- * RELOAD DROPS THE EVIDENCE (#537, capped #536 finding): `expectedInstanceId`
- * lives in router state, so a reload (a fresh navigation with no state) has
- * no mismatch to check — the reloaded page trusts whatever process answers
- * `/health` next, impostor or not. sessionStorage persistence was
- * considered and REJECTED (TTL/clearing design outweighs the value: by the
- * time this matters the operator has already seen the warning — the
- * feature's actual job — and the launcher's own port guard, #518/#519,
- * prevents the underlying class at source). Instead
- * `LiveStatusUnknownView`'s mismatch variant replaces the bare reload
- * guidance with the FIELD PROTOCOL (verify with `curl`/`lsof`, restart via
- * the launcher) — see that component's own doc for the full copy rationale.
+ * THE STRIP IS EXPLICIT, NOT A BROWSER BEHAVIOUR (#556, capped #537/#536
+ * findings): the original design assumed a reload's "fresh navigation" drops
+ * `location.state` — that assumption is FALSE. `location.state` rides on the
+ * `history` entry and browsers restore it across reloads, so without an
+ * explicit strip the mismatch stayed armed forever on a tab that ever saw one
+ * (#556 field incident: a healthy, actively-roasting server was undiagnosable
+ * because every reload re-triggered the mismatch view against a NEW server
+ * instance that could never match the stale `expectedInstanceId`). The fix
+ * strips router state via a REPLACE navigation the moment a mismatch is
+ * first observed — not just on a match, as before — and latches the verdict
+ * into component state (`mismatchLatched`) so the warning stays visible for
+ * the CURRENT view even after the state is gone. `mismatchLatched` itself is
+ * plain `useState`, so it does NOT survive a reload/remount — that IS the
+ * intended #537 "reload clears the warning" semantics, now made true by an
+ * explicit action instead of a false assumption about navigation-state
+ * lifetime. sessionStorage persistence was still considered and REJECTED for
+ * the same reason as before (TTL/clearing complexity outweighs the value —
+ * by the time this matters the operator has already seen the warning, the
+ * feature's actual job, and the launcher's own port guard, #518/#519,
+ * prevents the underlying class at source). `LiveStatusUnknownView`'s
+ * mismatch variant still replaces the bare reload guidance with the FIELD
+ * PROTOCOL (verify with `curl`/`lsof`, restart via the launcher) — see that
+ * component's own doc for the full copy rationale. The mismatch view is
+ * therefore one-VIEW evidence BY DESIGN: it is guaranteed to survive exactly
+ * the render(s) between the mismatch firing and the strip taking effect, and
+ * is deliberately discarded after that so a later LEGITIMATE restart is never
+ * blocked by a warning stuck from an earlier tab lifetime.
  */
 
 import { useEffect, useRef, useState } from "react";
@@ -218,6 +234,27 @@ export function LivePage(): React.JSX.Element {
   const [verified, setVerified] = useState(expectedInstanceId === null);
   const armed = expectedInstanceId !== null && !verified;
 
+  // round-2 Codex fold: FAIL CLOSED on an ABSENT instance_id while armed —
+  // not just a DIFFERENT one. The process that genuinely accepted the start
+  // always includes instance_id in its /health response (this same commit
+  // guarantees the field on every code path), so an armed check seeing NO
+  // field at all is itself impostor evidence (an older-code process that
+  // predates this feature) — never a benign "field not implemented yet" case
+  // to shrug past.
+  const instanceMismatch =
+    armed && health.isFresh && health.data?.instance_id !== expectedInstanceId;
+
+  // #556 LATCH-THEN-STRIP: `mismatchLatched` keeps the warning visible for
+  // the rest of THIS component's lifetime once a mismatch is first observed,
+  // even after the effect below strips the router state that produced it
+  // (which would otherwise re-derive `expectedInstanceId`/`armed`/
+  // `instanceMismatch` all back to their disarmed defaults on the very next
+  // render). Plain `useState` — dies on unmount/remount by construction,
+  // which is exactly the desired "reload clears the warning" semantics
+  // (#537), now achieved by an explicit strip instead of the false
+  // assumption that navigation state doesn't survive a reload.
+  const [mismatchLatched, setMismatchLatched] = useState(false);
+
   // A verdict is only meaningful once health has produced a genuinely fresh
   // read (health.data could still be the PRE-fetch cached snapshot from an
   // in-flight forced refetch) — the `!health.isFresh` hold below already
@@ -233,22 +270,27 @@ export function LivePage(): React.JSX.Element {
       // fresh from `location.state`) can no longer re-arm the check, since
       // the state itself no longer carries the field.
       navigate(location.pathname, { replace: true, state: null });
+    } else {
+      // #556: the mismatch case must ALSO strip, not just the match case —
+      // this is the actual field-incident bug. `location.state` rides on the
+      // history entry and browsers restore it across reloads, so leaving it
+      // in place on a mismatch left the tab re-armed against every future
+      // server instance on every future reload, forever. Latch the verdict
+      // into component state FIRST (survives the strip's re-render, since
+      // it's independent of router state) so the warning stays visible on
+      // THIS view — the strip disarms `armed`/`instanceMismatch` on the very
+      // next render, and the latch is what keeps the mismatch view rendering
+      // instead of falling through to whatever the disarmed state resolves
+      // to (e.g. the dashboard, if health.data.active_run_id happens to be
+      // non-null for the new/impostor process).
+      setMismatchLatched(true);
+      navigate(location.pathname, { replace: true, state: null });
     }
     // health.data is intentionally read fresh each run rather than added as
     // a dependency object (it's a new reference every fetch) — instance_id
     // and isFresh are the only fields this effect's decision depends on.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [armed, health.isFresh, health.data?.instance_id, expectedInstanceId, navigate, location.pathname]);
-
-  // round-2 Codex fold: FAIL CLOSED on an ABSENT instance_id while armed —
-  // not just a DIFFERENT one. The process that genuinely accepted the start
-  // always includes instance_id in its /health response (this same commit
-  // guarantees the field on every code path), so an armed check seeing NO
-  // field at all is itself impostor evidence (an older-code process that
-  // predates this feature) — never a benign "field not implemented yet" case
-  // to shrug past.
-  const instanceMismatch =
-    armed && health.isFresh && health.data?.instance_id !== expectedInstanceId;
 
   // Persistent idle fallback (#523): the roast history, newest-first
   // (`GET /api/roasts` — store.py orders `started_at_utc DESC`). #523 Codex
@@ -500,7 +542,16 @@ export function LivePage(): React.JSX.Element {
   // Once `verified` latches true (see the module doc's ONE-SHOT DISARM
   // note), `armed` is permanently false and this branch is never reached
   // again for this history entry, however health subsequently changes.
-  if (instanceMismatch) {
+  //
+  // #556: rendered off `mismatchLatched || instanceMismatch`, not just the
+  // latter. The strip effect above clears router state the SAME render cycle
+  // a mismatch is first observed, which would otherwise disarm
+  // `instanceMismatch` back to `false` on the very next render (no more
+  // `expectedInstanceId` to derive `armed` from) — `mismatchLatched` is what
+  // keeps this view rendering for the rest of THIS component's lifetime. It
+  // is plain `useState`, so a reload/remount starts disarmed again — the
+  // intended #537 semantics, now true by an explicit action.
+  if (mismatchLatched || instanceMismatch) {
     return <LiveStatusUnknownView variant="instance-mismatch" />;
   }
 
