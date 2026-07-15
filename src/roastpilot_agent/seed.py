@@ -254,6 +254,25 @@ SUMATRA_MANDHELING_ID = "seed-sumatra-mandheling-g1-wet-hulled"
 #: The Sumatra Mandheling G1 seed profile (12 Jul 2026) — the operator's
 #: Indonesian counterpoint to the washed Centrals. Grade 1 is scored on cup
 #: defects, not green appearance; the supplier names a Lake Toba lot.
+#:
+#: **Stepped 15 Jul (operator-approved, evidence run 43c84c98 / D95 bean-aware
+#: direction)**: roast 14 landed DTR 15.1 % against the 17 % target with an
+#: 83 s dev window — short of the target and, at the default 3 pp margin, still
+#: inside the old floor (17 − 3 = 14), so the deterministic drop-coherence gate
+#: (``controller.py``, ``development_percent >= target − drop_dev_margin_percent``)
+#: would have ADMITTED a repeat of that same shortfall. ``target_development_percent``
+#: steps to 19.0 so the guard floor (16.0) sits past the failed 15.1 %. This
+#: profile deliberately does NOT touch pre-FC momentum: ``pre_fc_heat`` sets the
+#: deterministic heat held for the *entire* pre-FC phase (``control_policy.py``
+#: ``_pre_fc_heat_target`` → ``base_heat``, which is the heat whenever the
+#: late-Maillard trim isn't engaged, and the trim's ceiling clamp
+#: ``min(depth, base_heat)`` when it is) — a value of 60 would replace the whole
+#: 100 % pre-FC ramp, not shave "5 pp into the crack" (that reading was wrong and
+#: is retracted). The actual per-roast momentum lever is the late-Maillard trim
+#: DEPTH, set operator-side in ``/config`` (the #443 surface) — ~60 before a
+#: Sumatra roast — because no per-bean seed field carries trim depth today (a
+#: possible future per-bean trim-depth field is a candidate, deliberately not
+#: filed yet).
 SUMATRA_MANDHELING_SEED = BeanProfile(
     id=SUMATRA_MANDHELING_ID,
     created_at=_SEED_TIMESTAMP,
@@ -278,17 +297,26 @@ SUMATRA_MANDHELING_SEED = BeanProfile(
     charge_guidance_max_c=200.0,
     initial_heat_percent=100,
     initial_fan_percent=30,
+    # pre_fc_heat intentionally NOT set here (15 Jul correction): it would
+    # replace the ENTIRE pre-FC heat ramp (100 -> N for the whole phase, per
+    # control_policy.py's base_heat), not shave a few points into the crack.
+    # The per-roast momentum lever for this bean is the late-Maillard trim
+    # depth, set in /config (~60 before a Sumatra roast) — no seed field
+    # carries it today.
     # 195 °C = the proven drop line (bitter > 196, ceiling guard default-on).
     # A Sumatra WANTS the darker end of the operator's range — light
     # Mandhelings read grassy/vegetal — so the drop target sits at the line
     # rather than below it.
     target_drop_temp_c=195.0,
-    # 17 %: a step above the washed posture (16) toward the bittersweet/
-    # chocolate profile this cup is for, but not the full ~20 the style can
-    # take — the 1 kg bag allows laddering darker on later batches, and the
-    # softer low-grown wet-hulled bean develops fast (baked risk if stretched
-    # cold). Advisor window with the 3 pp margin: [14, 20] %.
-    target_development_percent=17.0,
+    # 19 % (15 Jul, run 43c84c98): stepped from 17 after roast 14 landed DTR
+    # 15.1 % / 83 s dev. At the default 3 pp margin, 19 puts the drop
+    # coherence guard's floor at 16.0 — past the failed 15.1 %, so a repeat
+    # of that shortfall is actually rejected (18 would floor at 15.0 and
+    # still admit it). Combined with the softer low-grown wet-hulled bean's
+    # fast development (baked risk if stretched cold), this stays short of
+    # the full ~20 the style can take — the 1 kg bag allows laddering darker
+    # on later batches. Advisor window with the 3 pp margin: [16, 22] %.
+    target_development_percent=19.0,
     default_bean_weight_grams=250.0,
     description=(
         "Lake Toba, North Sumatra; Grade 1 (cup-scored). Wet-hulled (assumed "
