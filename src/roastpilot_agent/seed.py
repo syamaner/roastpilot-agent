@@ -254,6 +254,14 @@ SUMATRA_MANDHELING_ID = "seed-sumatra-mandheling-g1-wet-hulled"
 #: The Sumatra Mandheling G1 seed profile (12 Jul 2026) — the operator's
 #: Indonesian counterpoint to the washed Centrals. Grade 1 is scored on cup
 #: defects, not green appearance; the supplier names a Lake Toba lot.
+#:
+#: **Stepped 15 Jul (operator-approved, evidence run 43c84c98 / D95 bean-aware
+#: direction)**: roast 14 landed DTR 15.1 % against the 17 % target with an
+#: 83 s dev window — the deterministic trim only bites below the 65 % it holds
+#: into FC, so ``pre_fc_heat=60`` trims 5 pp of momentum into the crack to
+#: stretch the window, and ``target_development_percent=18.0`` widens the
+#: advisor's judgment window so the drop isn't released early. Operator
+#: verdict on roast 14: "likeable but wants more development".
 SUMATRA_MANDHELING_SEED = BeanProfile(
     id=SUMATRA_MANDHELING_ID,
     created_at=_SEED_TIMESTAMP,
@@ -278,17 +286,25 @@ SUMATRA_MANDHELING_SEED = BeanProfile(
     charge_guidance_max_c=200.0,
     initial_heat_percent=100,
     initial_fan_percent=30,
+    # 60 % (15 Jul, run 43c84c98): roast 14 landed DTR 15.1 % vs the 17 %
+    # target with an 83 s dev window — the deterministic trim only bites
+    # below the 65 % it holds into FC, so pre_fc_heat=60 trims 5 pp of
+    # momentum into the crack to stretch the development window.
+    pre_fc_heat=60,
     # 195 °C = the proven drop line (bitter > 196, ceiling guard default-on).
     # A Sumatra WANTS the darker end of the operator's range — light
     # Mandhelings read grassy/vegetal — so the drop target sits at the line
     # rather than below it.
     target_drop_temp_c=195.0,
-    # 17 %: a step above the washed posture (16) toward the bittersweet/
-    # chocolate profile this cup is for, but not the full ~20 the style can
-    # take — the 1 kg bag allows laddering darker on later batches, and the
-    # softer low-grown wet-hulled bean develops fast (baked risk if stretched
-    # cold). Advisor window with the 3 pp margin: [14, 20] %.
-    target_development_percent=17.0,
+    # 18 % (15 Jul, run 43c84c98): widened from 17 after roast 14 landed
+    # DTR 15.1 % / 83 s dev — the operator's verdict was "likeable but wants
+    # more development", so the advisor's judgment window is widened rather
+    # than only trimming pre-FC heat. Combined with the softer low-grown
+    # wet-hulled bean's fast development (baked risk if stretched cold),
+    # this stays short of the full ~20 the style can take — the 1 kg bag
+    # allows laddering darker on later batches. Advisor window with the
+    # 3 pp margin: [15, 21] %.
+    target_development_percent=18.0,
     default_bean_weight_grams=250.0,
     description=(
         "Lake Toba, North Sumatra; Grade 1 (cup-scored). Wet-hulled (assumed "

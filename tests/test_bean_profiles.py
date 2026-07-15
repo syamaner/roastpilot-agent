@@ -399,9 +399,15 @@ def test_sumatra_mandheling_seed_values() -> None:
     Seeded 12 Jul 2026. Processing and altitude are supplier-unstated:
     wet_hulled is the classic Mandheling assumption (flagged in the
     description for UI correction) and 1,200 m is a representative Lake
-    Toba estimate, not a datum. Dev 17 % steps ABOVE the washed posture
-    toward the bittersweet profile (light Sumatras read grassy) while
-    leaving ladder room on the 1 kg bag; drop sits at the proven 195 line."""
+    Toba estimate, not a datum. Drop sits at the proven 195 line.
+
+    15 Jul (operator-approved, evidence run 43c84c98 / D95): roast 14 landed
+    DTR 15.1 % vs the 17 % target with an 83 s dev window, and the trim only
+    bites below the 65 % it holds into FC — so ``pre_fc_heat=60`` trims 5 pp
+    of momentum into the crack to stretch the window, and
+    ``target_development_percent=18.0`` widens the advisor's judgment window
+    so the drop isn't released early (operator verdict: "likeable but wants
+    more development")."""
     s = SUMATRA_MANDHELING_SEED
     assert s.id == SUMATRA_MANDHELING_ID
     assert s.name == "Sumatra Mandheling G1 (Wet-Hulled)"
@@ -421,8 +427,9 @@ def test_sumatra_mandheling_seed_values() -> None:
     assert s.charge_guidance_max_c == 200.0
     assert s.initial_heat_percent == 100
     assert s.initial_fan_percent == 30
+    assert s.pre_fc_heat == 60  # trims 5pp of momentum into the crack (run 43c84c98)
     assert s.target_drop_temp_c == 195.0  # Sumatra wants the darker end of the proven range
-    assert s.target_development_percent == 17.0  # above washed posture; ladder room on 1 kg bag
+    assert s.target_development_percent == 18.0  # widened after roast 14's 15.1% DTR undershoot
     assert s.default_bean_weight_grams == 250.0
     # The quiet-first-crack warning is operator-facing and load-bearing.
     assert "MARK FIRST CRACK" in (s.description or "")
