@@ -711,9 +711,12 @@ class PostFirstCrackControl(BaseModel):
         return self
 
     @model_validator(mode="after")
-    def _check_recovery_requires_ceiling_guard(self) -> "PostFirstCrackControl":
-        """The bounded-bidirectional heat law requires the 196 °C ceiling guard (D96).
+    def _check_recovery_requires_ceiling_guard_and_master_flag(self) -> "PostFirstCrackControl":
+        """The bounded-bidirectional heat law requires BOTH the RoR-taper
+        master flag AND the 196 °C ceiling guard (D96; the master-flag half
+        added PR #560 round 4, a Codex finding on the launch banner).
 
+        **The ceiling-guard requirement (round 1):**
         ``safety.SafetyPolicy.evaluate_command`` — the gate every heat/fan
         write in this module passes through — is temperature-blind (rate
         limit + box only); the only two things that ever stop a bean
@@ -723,17 +726,36 @@ class PostFirstCrackControl(BaseModel):
         ``ceiling_guard_drop_enabled`` path. A recovery law that can raise
         heat above entry with the ceiling guard OFF would leave the 196 °C
         line owned solely by the advisor's own judgment — exactly the gap
-        D88 already closed once for the taper's steady-state case. This
-        requirement does not apply to the RoR-taper/never-add-heat law
-        (``enabled`` alone), which can only ever lower the ceiling relative
-        to entry and so never needs the guard to stay safe.
+        D88 already closed once for the taper's steady-state case.
+
+        **The master-flag requirement (round 4):** ``recovery_enabled`` is
+        meaningless with the RoR-taper loop itself (``enabled``) OFF —
+        :meth:`~roastpilot_agent.controller.RoastController.
+        _apply_deterministic_post_fc_levers` gates on ``config.enabled``
+        FIRST, before anything recovery-specific ever runs, so a
+        ``recovery_enabled=True`` / ``enabled=False`` combination is
+        completely inert. Without this half of the validator, the CLI's
+        launch-banner readout (:func:`~roastpilot_agent.cli.
+        _format_post_fc_loop_readout`) could print "BOUNDED-BIDIRECTIONAL
+        HEAT RECOVERY: ENABLED" for a config where the loop that would ever
+        actually raise heat never even runs — mislabeling a validation/
+        treatment arm to the operator. Requiring ``enabled=True`` makes the
+        banner never lie by construction: any config that survives this
+        validator and has ``recovery_enabled=True`` genuinely has the
+        recovery mechanism reachable.
+
+        This requirement (both halves) does not apply to the RoR-taper/
+        never-add-heat law alone (``enabled=True``, ``recovery_enabled``
+        left at its default ``False``), which can only ever lower the
+        ceiling relative to entry and so never needs the guard, and is
+        obviously unaffected by its OWN flag being on.
 
         Returns:
             The validated control-parameters instance.
 
         Raises:
-            ValueError: If ``recovery_enabled`` is ``True`` while
-                ``ceiling_guard_drop_enabled`` is ``False``.
+            ValueError: If ``recovery_enabled`` is ``True`` while either
+                ``enabled`` or ``ceiling_guard_drop_enabled`` is ``False``.
         """
         if self.recovery_enabled and not self.ceiling_guard_drop_enabled:
             raise ValueError(
@@ -741,6 +763,13 @@ class PostFirstCrackControl(BaseModel):
                 "can raise heat above entry with no deterministic 196 °C ceiling-guard "
                 "anchor would leave the bitter line owned solely by the advisor's own "
                 "judgment"
+            )
+        if self.recovery_enabled and not self.enabled:
+            raise ValueError(
+                "recovery_enabled requires enabled=True (the RoR-taper master flag) — "
+                "recovery is a relaxation of the taper's own never-add-heat-beyond-entry "
+                "ceiling, and is completely inert (and would mislabel the launch banner) "
+                "when the taper loop itself never runs"
             )
         return self
 

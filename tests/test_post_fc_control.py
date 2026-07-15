@@ -1148,6 +1148,20 @@ def test_recovery_enabled_requires_ceiling_guard_drop_enabled() -> None:
     PostFirstCrackControl(recovery_enabled=True, ceiling_guard_drop_enabled=True)
 
 
+def test_recovery_enabled_requires_the_ror_taper_master_flag() -> None:
+    """PR #560 round 4 Codex finding (P2): ``recovery_enabled=True`` with
+    the RoR-taper master flag (``enabled``) OFF is a mislabeling hazard --
+    ``_apply_deterministic_post_fc_levers`` gates on ``config.enabled``
+    FIRST, so recovery is completely inert in that combination, yet the CLI
+    launch banner would print "ENABLED" for a mechanism that never runs.
+    The validator's error message names the master flag explicitly (not
+    just "enabled", to disambiguate from ``ceiling_guard_drop_enabled``)."""
+    with pytest.raises(ValueError, match="enabled=True \\(the RoR-taper master flag\\)"):
+        PostFirstCrackControl(recovery_enabled=True, ceiling_guard_drop_enabled=True, enabled=False)
+    # The legal combo (all three prerequisites satisfied) still constructs.
+    PostFirstCrackControl(recovery_enabled=True, ceiling_guard_drop_enabled=True, enabled=True)
+
+
 # ---------------------------------------------------------------------------
 # D96 (#559): bounded-bidirectional heat recovery — the algorithm
 # ---------------------------------------------------------------------------

@@ -1769,30 +1769,53 @@ class RoastController:
             measured_ror_c_per_min=telemetry.bean_ror_c_per_min, dt_seconds=dt_seconds
         )
         # D96 (#559), PR #560 Codex findings (guard-eligible AND
-        # deterministic-drop-eligible same-tick raises — round 1's P1 and
+        # deterministic-drop-eligible same-tick RAISES — round 1's P1 and
         # round 2's P2, the same class of bug for the two different drop
         # paths): this method runs BEFORE BOTH `_maybe_ceiling_guard_drop`
         # AND `_maybe_deterministic_drop` in `tick()`'s order (see that
-        # ordering comment below), so — without these checks — a tick where
+        # ordering comment below), so — without this check — a tick where
         # EITHER drop path is already eligible while the recovery ceiling is
-        # elevated would still WRITE the raised/gliding heat command to the
-        # roaster before that drop fires a few lines later: the drop stops
-        # the roast, but the raise still reached hardware on its way there
+        # elevated would still WRITE a RAISED heat command to the roaster
+        # before that drop fires a few lines later: the drop stops the
+        # roast, but the raise still reached hardware on its way there
         # (worse, if `drop_beans()` itself then fails transiently, the roast
         # is left sitting in DEVELOPMENT with recovery-raised heat past the
         # drop's own target point — round 2's Codex finding). Skip THIS
-        # tick's write entirely — restoring the tentative `compute` step
-        # exactly like a rejected write, so the loop's internal state is
-        # untouched — whenever BOTH: (1) this step's ceiling is elevated
-        # above the plain D88 base (`heat_authority_state is not HOLDING` —
-        # deliberately the three-way enum, not the derived `recovery_active`
-        # boolean alone, since either RECOVERING or GLIDING must be caught),
-        # and (2) the SAME tick is independently eligible for EITHER drop
-        # path. Scoped to this exact condition so the skip cannot fire when
-        # recovery is inactive (`HOLDING`) or the RoR-taper flag is off —
-        # D88's byte-for-byte flag-off/recovery-inactive behaviour (the
-        # plain hold-at-entry write still landing before any later drop
-        # check) is completely unchanged.
+        # tick's write — restoring the tentative `compute` step exactly like
+        # a rejected write, so the loop's internal state is untouched —
+        # whenever BOTH: (1) this step's tentative output would RAISE heat
+        # ABOVE what is currently ACTUATED (`output.heat_percent >
+        # self._current_heat` — the SAME `self._current_heat` source the
+        # idempotence check below already trusts as "what the roaster
+        # really holds"), and (2) the SAME tick is independently eligible
+        # for EITHER drop path.
+        #
+        # **Round 4 fix (Codex P1): ADDS an actuated-level comparison
+        # alongside `heat_authority_state`, rather than replacing it.** The
+        # round-3 form skipped on `heat_authority_state is not HOLDING`
+        # alone — but during the exit/glide tail `output.heat_percent` can be
+        # BELOW the currently-actuated (still-raised) heat, i.e. the
+        # tentative write is a *lowering* move. Skipping THAT write inverted
+        # the mechanism's own intent: on a drop-eligible tick where
+        # `drop_beans()` then fails (transiently), the round-3 form would
+        # repeat the skip on every subsequent tick too, permanently freezing
+        # the roaster at its raised heat in DEVELOPMENT past the drop's own
+        # target — the exact "stuck at raised heat" failure this fix exists
+        # to prevent. A hold-or-lower write on a drop-due tick is always SAFE
+        # (it can only ever bring heat closer to, or hold below, the current
+        # level) and is precisely what a stuck-at-raised roaster needs to
+        # recover on its own even while the drop keeps failing — so only a
+        # genuine RAISE (strictly greater than actuated) is suppressed.
+        #
+        # `heat_authority_state is not HOLDING` MUST stay as the first
+        # condition (not dropped in favor of the actuated-level check alone):
+        # D88's own never-add-heat-beyond-entry law can ALSO legitimately
+        # raise heat above `self._current_heat` outside D96 entirely (e.g.
+        # the anti-stall floor recovering FROM a 0% bumpless handoff up
+        # toward `effective_ceiling` — a plain D88 write, recovery-inactive,
+        # that must NEVER be suppressed by a D96-specific guard). Requiring
+        # BOTH conditions scopes the skip to exactly "a D96 recovery/glide
+        # raise, on a drop-eligible tick" — never an ordinary D88 climb.
         #
         # BOTH mirrors below must track their sources exactly — a future
         # change to either `_maybe_ceiling_guard_drop`'s or
@@ -1828,8 +1851,11 @@ class RoastController:
         recovery_ceiling_elevated = (
             output.heat_authority_state is not PostFcHeatAuthorityState.HOLDING
         )
-        if recovery_ceiling_elevated and (
-            guard_eligible_this_tick or deterministic_drop_eligible_this_tick
+        tentative_write_would_raise_heat = output.heat_percent > self._current_heat
+        if (
+            recovery_ceiling_elevated
+            and tentative_write_would_raise_heat
+            and (guard_eligible_this_tick or deterministic_drop_eligible_this_tick)
         ):
             self._post_fc_controller.restore_state(pre_compute_state)
             return
