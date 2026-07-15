@@ -22,6 +22,7 @@ import pytest
 from roastpilot_agent.config import PostFirstCrackControl
 from roastpilot_agent.post_fc_control import (
     PostFcControlOutput,
+    PostFcHeatAuthorityState,
     PostFcRorController,
 )
 
@@ -1474,6 +1475,7 @@ def test_recovery_exit_glides_down_not_snaps() -> None:
         controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0) for _ in range(3)
     ]
     entry_output = entry_outputs[-1]
+    assert entry_output.heat_authority_state is PostFcHeatAuthorityState.RECOVERING
     assert entry_output.recovery_active is True
     assert entry_output.effective_ceiling_percent == 75  # jumps immediately, no glide on entry
 
@@ -1482,7 +1484,14 @@ def test_recovery_exit_glides_down_not_snaps() -> None:
         controller.compute(measured_ror_c_per_min=5.6, dt_seconds=5.0) for _ in range(3)
     ]
     ceilings_during_exit = [o.effective_ceiling_percent for o in exit_outputs]
-    assert exit_outputs[-1].recovery_active is False
+    # PR #560 Codex finding (diagnostics gap): the ceiling is STILL well
+    # above the D88 base right after exit confirms -- heat_authority_state
+    # correctly reads GLIDING (not HOLDING), and the derived recovery_active
+    # boolean (True for BOTH RECOVERING and GLIDING) reflects that too. The
+    # raw internal _recovery_active flag flips False here, but neither
+    # public field does.
+    assert exit_outputs[-1].heat_authority_state is PostFcHeatAuthorityState.GLIDING
+    assert exit_outputs[-1].recovery_active is True
 
     # The tick exit is CONFIRMED on already reflects one glide step down
     # from 75 (per the docstring: ticks_since_exit starts at 1 on the
@@ -1491,11 +1500,21 @@ def test_recovery_exit_glides_down_not_snaps() -> None:
 
     # Subsequent ticks continue gliding down by at most 5pp/tick until the
     # D88 base (60) is reached and held there.
-    post_exit_ceilings = [
-        controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0).effective_ceiling_percent
-        for _ in range(5)
+    post_exit_outputs = [
+        controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0) for _ in range(5)
     ]
+    post_exit_ceilings = [o.effective_ceiling_percent for o in post_exit_outputs]
     assert post_exit_ceilings == [65, 60, 60, 60, 60]
+    # heat_authority_state tracks the glide precisely: GLIDING while above
+    # the base, HOLDING once it locks there -- never HOLDING while elevated.
+    assert [o.heat_authority_state for o in post_exit_outputs] == [
+        PostFcHeatAuthorityState.GLIDING,
+        PostFcHeatAuthorityState.HOLDING,
+        PostFcHeatAuthorityState.HOLDING,
+        PostFcHeatAuthorityState.HOLDING,
+        PostFcHeatAuthorityState.HOLDING,
+    ]
+    assert [o.recovery_active for o in post_exit_outputs] == [True, False, False, False, False]
     # No step in the entire glide ever exceeds the configured per-tick rate.
     full_sequence = [75, *ceilings_during_exit, *post_exit_ceilings]
     steps = [a - b for a, b in zip(full_sequence, full_sequence[1:], strict=False)]
@@ -1506,33 +1525,54 @@ def test_recovery_re_entry_during_glide_cancels_the_glide_immediately() -> None:
     """If RoR crashes again WHILE the ceiling is still gliding down from a
     prior exit, re-entry must engage from the CURRENT (partially-glided)
     ceiling state and jump straight back to the full recovery cap -- the
-    glide-state must not persist or interfere with a fresh entry."""
+    glide-state must not persist or interfere with a fresh entry.
+
+    Uses a wider headroom (20, vs the 15 default) and a shorter confirm bar
+    (2 ticks) so the re-crash's SECOND confirm-tick lands WHILE the glide
+    counter is still active (not yet settled to HOLDING) -- exercising the
+    re-entry branch that fires from mid-glide specifically (as opposed to a
+    re-entry that happens to land after the glide has already settled back
+    to the D88 base, a structurally different code path this test does NOT
+    cover on its own)."""
     config = _recovery_config(
         taper_start_max_ror_c_per_min=6.0,
         taper_end_ror_c_per_min=6.0,
         taper_duration_seconds=1.0,
         ki_percent_per_ror_second=0.0,
         ror_smoothing_alpha=1.0,
+        recovery_headroom_percentage_points=20,
+        recovery_confirm_ticks=2,
     )
     controller = PostFcRorController(config)
     controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
 
-    for _ in range(3):
-        controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)  # confirm entry
-    for _ in range(2):
-        controller.compute(measured_ror_c_per_min=5.6, dt_seconds=5.0)  # confirm exit
-    exit_confirm = controller.compute(measured_ror_c_per_min=5.6, dt_seconds=5.0)
-    assert exit_confirm.recovery_active is False
-    mid_glide = controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0)
-    assert 60 < mid_glide.effective_ceiling_percent < 75  # genuinely mid-glide
+    entry_check = controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)
+    assert entry_check.heat_authority_state is PostFcHeatAuthorityState.HOLDING  # tick 1 of 2
+    entry_confirm = controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)  # tick 2 of 2
+    assert entry_confirm.effective_ceiling_percent == 80  # 60 + 20
 
-    # RoR crashes again before the glide reaches the base.
-    re_entry_outputs = [
-        controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0) for _ in range(3)
-    ]
-    re_entry = re_entry_outputs[-1]
+    exit_check = controller.compute(measured_ror_c_per_min=5.6, dt_seconds=5.0)
+    assert exit_check.heat_authority_state is PostFcHeatAuthorityState.RECOVERING  # tick 1 of 2
+    exit_confirm = controller.compute(measured_ror_c_per_min=5.6, dt_seconds=5.0)  # tick 2 of 2
+    # PR #560 Codex finding: right at exit confirmation the ceiling is still
+    # gliding down from the recovery cap -- GLIDING, not HOLDING, and
+    # recovery_active (True for both non-holding states) stays True too.
+    assert exit_confirm.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+    assert exit_confirm.recovery_active is True
+    mid_glide = controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0)
+    assert 60 < mid_glide.effective_ceiling_percent < 80  # genuinely mid-glide
+    assert mid_glide.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+
+    # RoR crashes again before the glide reaches the base. The SECOND tick
+    # of this pair is the one that confirms re-entry (recovery_confirm_ticks
+    # =2) while `_recovery_ticks_since_exit` is still non-None -- the
+    # mid-glide re-entry branch, not the settled-to-HOLDING one.
+    re_entry_first = controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)
+    assert re_entry_first.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+    re_entry = controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)
+    assert re_entry.heat_authority_state is PostFcHeatAuthorityState.RECOVERING
     assert re_entry.recovery_active is True
-    assert re_entry.effective_ceiling_percent == 75  # full cap, not a partial value
+    assert re_entry.effective_ceiling_percent == 80  # full cap, not a partial value
 
 
 def test_drop_and_estop_precedence_over_recovery_raise() -> None:

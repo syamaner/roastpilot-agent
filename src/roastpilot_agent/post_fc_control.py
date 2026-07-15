@@ -130,13 +130,78 @@ without touching it:
   of how the fan is used or how many entry/exit cycles occur — the c8
   advisor teaching (a separate slice) is a judgment/efficiency layer on top
   of this structural bound, not a substitute for it.
+* **Diagnostics (PR #560 Codex finding):** :attr:`PostFcControlOutput.
+  recovery_active` alone cannot distinguish the ``GLIDING`` tail from
+  ``HOLDING`` — it flips ``False`` the instant exit is confirmed even
+  though the ceiling can still sit well above the D88 base for several more
+  ticks. :class:`PostFcHeatAuthorityState` (``HOLDING``/``RECOVERING``/
+  ``GLIDING``) is the authoritative three-way state; any caller reasoning
+  about "is the ceiling still elevated above the D88 base right now" (e.g.
+  the controller's guard-eligibility check, immediately below) reads
+  :attr:`PostFcControlOutput.heat_authority_state` directly, never the
+  derived boolean.
+* **Guard-eligibility coupling (PR #560 Codex finding):** the CALLER
+  (:meth:`~roastpilot_agent.controller.RoastController.
+  _apply_deterministic_post_fc_levers`) skips this tick's heat/fan WRITE
+  entirely — restoring the tentative :meth:`compute` step exactly like a
+  rejected write — whenever this step's ``heat_authority_state`` is not
+  ``HOLDING`` AND the SAME tick is eligible for the 196 °C ceiling-guard
+  drop (``ceiling_guard_drop_enabled`` AND ``bean_temp_c >=
+  ceiling_guard_temp_c``): without this, the raised/gliding heat command
+  would still reach the roaster on the exact tick the guard also fires,
+  because the lever write (this method) runs BEFORE the guard check in
+  ``tick()``'s order. This module itself has no drop/guard concept
+  (unchanged — see the module docstring above); the skip is entirely the
+  caller's responsibility, scoped to RECOVERING/GLIDING ticks only so
+  flag-off and recovery-inactive (``HOLDING``) behaviour stays byte-for-byte
+  identical to before this fix.
 """
 
 from dataclasses import dataclass
+from enum import Enum
 
 from pydantic import BaseModel
 
 from roastpilot_agent.config import PostFirstCrackControl
+
+
+class PostFcHeatAuthorityState(Enum):
+    """The post-FC loop's current heat-ceiling regime this step (D96, #559,
+    PR #560 Codex finding — the diagnostics gap).
+
+    A plain ``Enum`` (D15: never string-compared in core logic; a
+    ``StrEnum`` here would let ``controller.py``'s guard-eligibility check
+    against it silently compile as a string comparison instead of a pyright
+    strict error). Three values, covering every state
+    :meth:`PostFcRorController.compute` can be in:
+
+    * ``HOLDING`` — the plain D88 never-add-heat-beyond-entry ceiling; no
+      recovery has ever engaged this engagement, or it fully settled back to
+      the D88 base after a prior exit.
+    * ``RECOVERING`` — the D96 recovery ceiling is FULLY ACTIVE (raised to
+      ``heat_engage_percent + recovery_headroom_percentage_points``,
+      clamped to ``heat_ceiling_percent``).
+    * ``GLIDING`` — recovery has EXITED but the effective ceiling has not
+      yet fully descended back to the D88 base (the exit-glide tail, D96's
+      addendum) — the state a bare ``recovery_active`` boolean could not
+      distinguish from ``HOLDING`` (a Codex finding on PR #560: the boolean
+      flips ``False`` the instant exit is confirmed even though the
+      ceiling can still sit well above the D88 base for several more ticks,
+      hiding the elevated-authority tail from any diagnostic or
+      guard-eligibility check that reads only the boolean).
+
+    ``PostFcControlOutput.recovery_active`` is kept as a derived
+    ``bool`` (``state is not HOLDING``) for the callers this slice already
+    shipped, but any NEW code reasoning about "is the ceiling still elevated
+    above the D88 base" (e.g. a guard-eligibility check) must read
+    :attr:`PostFcControlOutput.heat_authority_state` directly, never the
+    derived boolean alone — ``RECOVERING`` and ``GLIDING`` both need to be
+    caught, and only this enum distinguishes them.
+    """
+
+    HOLDING = "holding"
+    RECOVERING = "recovering"
+    GLIDING = "gliding"
 
 
 @dataclass(frozen=True)
@@ -253,15 +318,30 @@ class PostFcControlOutput(BaseModel, frozen=True):
     #: box (the anti-windup rollback engaged when combined with continued
     #: integration in the saturating direction).
     saturated: bool
-    #: D96 (#559): whether the recovery ceiling was active THIS step (either
-    #: at its full raised value or still gliding back down from it) — always
-    #: ``False`` when ``PostFirstCrackControl.recovery_enabled`` is ``False``
-    #: (the default), so a flag-off engagement's diagnostics are unaffected.
-    #: This is the SAME boolean :meth:`compute` used internally to pick
-    #: ``effective_ceiling_percent`` this step — a future caller (slice 2's
-    #: advisor-visibility wiring) reads this field directly rather than
-    #: re-deriving the state, the told==enforced discipline applied to this
-    #: field's own consumer.
+    #: D96 (#559): this step's heat-authority regime — ``HOLDING`` (the
+    #: plain D88 ceiling), ``RECOVERING`` (the D96 ceiling fully raised), or
+    #: ``GLIDING`` (recovery has exited but the ceiling has not yet fully
+    #: descended back to the D88 base). Always ``HOLDING`` when
+    #: ``PostFirstCrackControl.recovery_enabled`` is ``False`` (the default),
+    #: so a flag-off engagement's diagnostics are unaffected. This is the
+    #: SAME state :meth:`compute` used internally to pick
+    #: ``effective_ceiling_percent`` this step — any caller reasoning about
+    #: "is the ceiling still elevated above the D88 base" (e.g.
+    #: ``controller.py``'s guard-eligibility check, PR #560) MUST read this
+    #: field, never :attr:`recovery_active` alone — that boolean cannot
+    #: distinguish ``GLIDING`` from ``HOLDING`` (a Codex finding: it flips
+    #: ``False`` the instant exit is confirmed even though the ceiling can
+    #: still sit well above the D88 base for several more ticks).
+    heat_authority_state: PostFcHeatAuthorityState
+    #: **Derived, kept for the callers this slice already shipped.**
+    #: ``heat_authority_state is not PostFcHeatAuthorityState.HOLDING`` —
+    #: ``True`` for BOTH ``RECOVERING`` and ``GLIDING``. This is NOT the raw
+    #: internal ``recovery_active`` flag :meth:`compute` tracks (which is
+    #: ``False`` during ``GLIDING``) — it is the OR of the two non-holding
+    #: states, so existing "is anything elevated right now" callers stay
+    #: correct through the fix for the diagnostics gap above. New code should
+    #: prefer :attr:`heat_authority_state` directly when the HOLDING/
+    #: RECOVERING/GLIDING distinction matters.
     recovery_active: bool
 
 
@@ -770,6 +850,7 @@ class PostFcRorController:
         self._integrator = pre_step_integrator if pushing_further else tentative_integrator
 
         clamped = max(float(floor), min(float(ceiling), unclamped))
+        heat_authority_state = self._heat_authority_state()
         return PostFcControlOutput(
             heat_percent=round(clamped),
             setpoint_c_per_min=setpoint,
@@ -779,8 +860,30 @@ class PostFcRorController:
             effective_ceiling_percent=ceiling,
             effective_floor_percent=floor,
             saturated=saturated,
-            recovery_active=self._recovery_active,
+            heat_authority_state=heat_authority_state,
+            recovery_active=heat_authority_state is not PostFcHeatAuthorityState.HOLDING,
         )
+
+    def _heat_authority_state(self) -> PostFcHeatAuthorityState:
+        """This step's D96 heat-authority regime (PR #560 Codex finding).
+
+        ``RECOVERING`` while ``self._recovery_active`` is ``True``;
+        ``GLIDING`` while recovery has exited but
+        ``self._recovery_ticks_since_exit`` is still counting (the ceiling
+        has not yet fully descended to the D88 base); ``HOLDING`` otherwise
+        (never engaged, or fully settled). Mirrors exactly the three-way
+        branch :meth:`_effective_ceiling_percent` already uses to pick this
+        step's ceiling — reading the SAME two fields, never a second
+        independent derivation that could disagree with it.
+
+        Returns:
+            The current heat-authority state.
+        """
+        if self._recovery_active:
+            return PostFcHeatAuthorityState.RECOVERING
+        if self._recovery_ticks_since_exit is not None:
+            return PostFcHeatAuthorityState.GLIDING
+        return PostFcHeatAuthorityState.HOLDING
 
     def _advance_recovery_state(self, error_c_per_min: float) -> None:
         """Advance the D96 (#559) recovery entry/exit counters for one tick.
@@ -856,6 +959,26 @@ class PostFcRorController:
                 self._recovery_ticks_since_exit = None
             else:
                 self._recovery_ticks_since_exit += 1
+                # Settle back to HOLDING the instant the glide arithmetic
+                # itself reaches the D88 base (PR #560 Codex finding's
+                # corollary): without this, `_recovery_ticks_since_exit`
+                # would keep counting forever after the ceiling has already
+                # numerically bottomed out, permanently reporting GLIDING
+                # even once nothing is actually elevated any more. This
+                # mirrors `_effective_ceiling_percent`'s own
+                # `max(base, glided_down)` floor — once the glide's raw
+                # arithmetic value would fall AT or below that floor, there
+                # is nothing left to glide down from.
+                config_headroom = config.recovery_headroom_percentage_points
+                recovery_ceiling = min(
+                    config.heat_ceiling_percent,
+                    self._heat_engage_percent + config_headroom,
+                )
+                glided_down = recovery_ceiling - (
+                    config.recovery_exit_glide_pp_per_tick * self._recovery_ticks_since_exit
+                )
+                if glided_down <= self._never_add_heat_ceiling_percent():
+                    self._recovery_ticks_since_exit = None
         else:
             # Never engaged (or fully settled back to the D88 base ceiling)
             # this engagement: only the ENTRY counter advances.

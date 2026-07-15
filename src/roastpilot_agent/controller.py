@@ -48,7 +48,7 @@ from roastpilot_agent.models import (
     RoastTelemetry,
     recording_origin_slug,
 )
-from roastpilot_agent.post_fc_control import PostFcRorController
+from roastpilot_agent.post_fc_control import PostFcHeatAuthorityState, PostFcRorController
 from roastpilot_agent.roast_history import (
     DecisionTraceEntry,
     RoastCurveSample,
@@ -1768,6 +1768,39 @@ class RoastController:
         output = self._post_fc_controller.compute(
             measured_ror_c_per_min=telemetry.bean_ror_c_per_min, dt_seconds=dt_seconds
         )
+        # D96 (#559), PR #560 Codex finding (guard-eligible same-tick raise):
+        # this method runs BEFORE `_maybe_ceiling_guard_drop` in `tick()`'s
+        # order (see that ordering comment below), so — without this check —
+        # a tick where bean temperature has ALREADY reached
+        # `ceiling_guard_temp_c` while the recovery ceiling is elevated would
+        # still WRITE the raised/gliding heat command to the roaster before
+        # the guard's own drop fires a few lines later: the drop stops the
+        # roast, but the raise still reached hardware on its way there. Skip
+        # THIS tick's write entirely — restoring the tentative `compute` step
+        # exactly like a rejected write, so the loop's internal state is
+        # untouched — whenever BOTH: (1) this step's ceiling is elevated
+        # above the plain D88 base (`heat_authority_state is not HOLDING` —
+        # deliberately the three-way enum, not the derived `recovery_active`
+        # boolean alone, since either RECOVERING or GLIDING must be caught),
+        # and (2) the SAME tick is independently eligible for the guard drop
+        # (mirroring `_maybe_ceiling_guard_drop`'s own eligibility check
+        # exactly: the guard flag on, bean temperature already at or past
+        # the guard line). Scoped to this exact condition so the skip cannot
+        # fire when recovery is inactive (`HOLDING`) or the RoR-taper flag is
+        # off — D88's byte-for-byte flag-off/recovery-inactive behaviour
+        # (the plain hold-at-entry write still landing before any later
+        # guard check) is completely unchanged.
+        guard_config = self._config.post_first_crack_control
+        guard_eligible_this_tick = (
+            guard_config.ceiling_guard_drop_enabled
+            and telemetry.bean_temp_c >= guard_config.ceiling_guard_temp_c
+        )
+        recovery_ceiling_elevated = (
+            output.heat_authority_state is not PostFcHeatAuthorityState.HOLDING
+        )
+        if recovery_ceiling_elevated and guard_eligible_this_tick:
+            self._post_fc_controller.restore_state(pre_compute_state)
+            return
         # Build the DEVELOPMENT box from the ACTUATED PI output (#412
         # told==enforced): start from the full DEVELOPMENT box (heat/fan
         # 0-100, the profile-aware temperature ceilings), then narrow heat's

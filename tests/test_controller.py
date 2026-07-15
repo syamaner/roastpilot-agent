@@ -7839,11 +7839,19 @@ async def test_estop_precedence_over_recovery_raise_same_tick() -> None:
 
 @pytest.mark.asyncio
 async def test_ceiling_guard_drop_takes_precedence_over_recovery_raise_same_tick() -> None:
-    """A tick whose telemetry qualifies for BOTH a recovery raise AND the
-    196 °C ceiling-guard drop must drop, not raise heat further — the guard
-    runs (``_maybe_ceiling_guard_drop``) immediately after this module's
-    heat write in the SAME tick's ``tick()`` order, reading the freshest
-    bean temperature independent of what the recovery law just computed."""
+    """PR #560 Codex finding (P1, the guard-eligible same-tick raise): a tick
+    whose telemetry qualifies for BOTH a recovery raise AND the 196 °C
+    ceiling-guard drop must NOT let the raise reach hardware at all —
+    ``_apply_deterministic_post_fc_levers`` (this method) runs BEFORE
+    ``_maybe_ceiling_guard_drop`` in ``tick()``'s order, so without an
+    explicit skip the raised/gliding heat command would still be WRITTEN via
+    ``set_targets`` a few lines before the guard's drop fires. The fix skips
+    this tick's write entirely (restoring the tentative ``compute`` step)
+    whenever the ceiling is elevated (RECOVERING or GLIDING) AND the same
+    tick is independently guard-eligible — asserted here by inspecting the
+    FAKE MCP CALL LOG (``harness.executor.targets``) directly, not just the
+    phase outcome (which the drop alone would already satisfy even if a
+    raise write had snuck out moments earlier)."""
     config = _recovery_config(
         pre_fc_heat_target_percent=60,
         control_interval_seconds=5.0,
@@ -7854,6 +7862,7 @@ async def test_ceiling_guard_drop_takes_precedence_over_recovery_raise_same_tick
     await _charge_through_fc_at_heat(
         harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
     )
+    targets_before_the_tick = list(harness.executor.targets)
 
     # One tick with a shortfall large enough to confirm entry immediately
     # (recovery_confirm_ticks=1) AND a bean temperature already at the
@@ -7863,6 +7872,10 @@ async def test_ceiling_guard_drop_takes_precedence_over_recovery_raise_same_tick
     await harness.controller.tick()
 
     assert harness.controller.phase is RoastPhase.COOLING
+    # No heat/fan write reached the roaster this tick at all — the recovery
+    # law's tentative raise was fully suppressed, not merely superseded by a
+    # later drop.
+    assert harness.executor.targets == targets_before_the_tick
     executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
     assert {
         "command": "drop_beans",
