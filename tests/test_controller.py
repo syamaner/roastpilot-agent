@@ -3354,6 +3354,54 @@ async def test_fc_backdate_moves_drop_coherence_guard_release() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fc_backdate_keeps_advisor_context_window_overshoot_onset_referenced() -> None:
+    """#499 part 2 clock-semantics insurance: the D95 falsification was an
+    arithmetic bug (a NEW remaining-dwell-budget computation forgot to
+    subtract the ~22 s FC-confirmation gap between crack onset and the
+    receive-tick decision). c7's teaching adds no new arithmetic — it
+    reasons entirely on the EXISTING ``development_time_ratio`` /
+    ``target_development_percent_min``/``_max`` fields, which are already
+    onset-referenced via the real #337 backdate path
+    (``_first_crack_monotonic`` stamped through ``_backdated_now``). This
+    pins that a roast-13-shaped scenario (DTR pushed past the #499 window's
+    top edge while the bean is still materially below the drop target) keeps
+    reading a LARGER, onset-correct DTR under a genuine backdate — never a
+    receive-tick-inflated or silently-unadjusted one — so the context c7
+    reasons over cannot itself hide a D95-class clock error."""
+    plain = await _development_harness_via_fc_backdate(
+        charge_offset=0.0, fc_offset=300.0, dev_seconds=90.0, fc_backdate=0.0
+    )
+    backdated = await _development_harness_via_fc_backdate(
+        charge_offset=0.0, fc_offset=300.0, dev_seconds=90.0, fc_backdate=22.0
+    )
+    limits = plain.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    plain_ctx = plain.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
+        reading(bean=190.0, first_crack_detected=True), limits
+    )
+    backdated_ctx = backdated.controller._build_advisor_context(  # pyright: ignore[reportPrivateUsage]
+        reading(bean=190.0, first_crack_detected=True), limits
+    )
+    assert plain_ctx.development_time_ratio is not None
+    assert backdated_ctx.development_time_ratio is not None
+    # Both scenarios put the bean materially below the profile's 205 C target
+    # while DTR is already past the #499 window top — the roast-13 shape c7
+    # reasons about.
+    assert plain_ctx.target_development_percent_max is not None
+    assert plain_ctx.development_time_ratio * 100.0 > plain_ctx.target_development_percent_max
+    assert plain_ctx.current_bean_temp_c < plain_ctx.target_drop_temp_c - 5.0
+    # The backdated onset is 22 s EARLIER, so development (and DTR) reads
+    # LARGER by exactly that much more elapsed time — never smaller, never
+    # unadjusted (which would silently reproduce the D95 omission in this
+    # context, even though c7 adds no arithmetic of its own).
+    assert backdated_ctx.development_time_ratio > plain_ctx.development_time_ratio
+    # The DTR window itself (target ± drop_dev_margin_percent) is a profile/
+    # config-derived constant, NOT clock-dependent — it must be identical
+    # across both scenarios; only the ratio being compared against it moves.
+    assert backdated_ctx.target_development_percent_min == plain_ctx.target_development_percent_min
+    assert backdated_ctx.target_development_percent_max == plain_ctx.target_development_percent_max
+
+
+@pytest.mark.asyncio
 async def test_t0_debounce_resets_when_t0_absent() -> None:
     t0 = reading(bean=160.0, t0_detected=True)
     plain = reading(bean=160.0)

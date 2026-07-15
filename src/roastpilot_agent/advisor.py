@@ -1348,6 +1348,81 @@ _CONTROL_TEACHING_PROMPTS["c6"] = _CONTROL_TEACHING_PROMPTS["c5"].replace(
     "THE OBJECTIVE\n", _C6_HEAT_RECOVERY_SECTION + "THE OBJECTIVE\n", 1
 )
 
+# --- c7 (#499 part 2; roast-13 DTR-ahead-of-temperature pace mismatch) -------
+#
+# c7 is c6 PLUS one section, spliced just before THE OBJECTIVE so all of
+# c1+c2+c3+c4+c5+c6 is preserved byte-for-byte. It answers roast 13 (13 Jul,
+# El Durazno white honey): the joint-objective section (#499 part 1, shipped
+# in c1 and inherited by every later version) gave the model a DTR window
+# (target_development_percent_min/_max in context) and taught "a modest
+# overshoot of one target while closing the other is preferred to an early,
+# one-sided drop" — but named no notion of PACE. Roast 13's DTR crossed the
+# window's top edge at 87 s post-FC while the bean was only 46.7 % of the way
+# from first-crack temperature to target_drop_temp_c (DTR outran temperature
+# roughly 2:1). The advisor read the window's top edge as a soft finish line
+# and recommended should_drop=true at 190 C, 5 C short of target - the joint-
+# objective teaching never told it that a LARGE DTR overshoot, next to a
+# temperature target still materially unmet, is a sign the DTR clock is no
+# longer trustworthy evidence for the drop (post-FC RoR is not perfectly
+# linear; a DTR that races ahead means the clock, not the bean, has finished).
+#
+# This section does not touch the deterministic drop-coherence guard
+# (controller._drop_development_is_coherent, floor-only, unchanged) or the
+# deterministic drop anchor / ceiling guard (controller._maybe_deterministic_
+# drop / _maybe_ceiling_guard_drop, both requiring/enforcing real temperature,
+# unchanged) - roast 13's drop was the advisor's OWN should_drop=true on
+# ambiguous teaching, so the fix is teaching, not a new arithmetic law (the
+# 15 Jul D95 lesson: a control law re-derived from scratch nearly always
+# gets a clock wrong; a targeted refinement of an already-validated judgment
+# space does not carry that risk). It names NO new numbers (the DTR window,
+# the drop target, and the ceiling all come from context, the #218
+# two-copies rule) and does not widen the joint-objective teaching's general
+# "modest overshoot is preferred" framing into unconditional patience - it
+# narrows to the SPECIFIC pace-mismatch failure (DTR far ahead, temperature
+# far behind), leaving the opposite pace direction (temperature/heat ahead,
+# development behind, #405/roast-14-shaped) entirely to the existing c2/c5
+# stretch-development and heat-floor sections.
+_C7_DTR_PACE_SECTION = (
+    "POST-FIRST-CRACK: A LARGE DTR OVERSHOOT NEXT TO AN UNMET TEMPERATURE "
+    "TARGET IS A PACE MISMATCH, NOT A FINISH LINE\n"
+    "- The joint-objective section above says a MODEST overshoot of one target "
+    "while the other closes the gap is the correct, patient call. This section "
+    "sharpens what happens when the overshoot on the development side stops "
+    "being modest: if the development ratio / DTR is running WELL PAST the top "
+    "of the acceptable development window from the context while the bean "
+    "temperature is still MATERIALLY below target_drop_temp_c (not a couple of "
+    "degrees - a real gap), do not read the DTR number as 'development is done, "
+    "so drop'. A DTR racing far ahead of temperature progress means the "
+    "development-ratio clock is running faster than the bean is actually "
+    "developing, not that the bean has finished - the clock is no longer "
+    "trustworthy evidence for the drop on its own.\n"
+    "- In that SPECIFIC state (DTR well past the window top, temperature well "
+    "short of target), weight bean TEMPERATURE progress toward "
+    "target_drop_temp_c as the dominant signal and let the DTR overshoot "
+    "continue growing while you hold or gently steer toward the temperature "
+    "target - do not recommend should_drop=true on the DTR reading alone. "
+    "Keep watching the indicated bitter/emergency ceiling exactly as the "
+    "joint-objective section already teaches: it is still LAW, and it still "
+    "forces the drop the instant it is approached or reached regardless of "
+    "where DTR or temperature stand.\n"
+    "- This refines the joint-objective teaching; it does not reverse it. A "
+    "DTR modestly past its window while temperature is close behind is still "
+    "the ordinary, expected case the joint-objective section already handles "
+    "well - keep treating that as normal patience. This section is for the "
+    "LARGER gap: when DTR is running far ahead and temperature still has "
+    "real ground to cover, treat that combination as a signal to keep "
+    "developing toward temperature, not as permission to drop early on "
+    "development alone.\n"
+    "- This teaching is about DTR racing ahead of TEMPERATURE only. It says "
+    "nothing about the opposite case (temperature/heat already ahead while "
+    "development is behind) - that case is covered by the heat-floor and "
+    "development-stretch teaching above, unchanged by this section.\n"
+    "\n"
+)
+_CONTROL_TEACHING_PROMPTS["c7"] = _CONTROL_TEACHING_PROMPTS["c6"].replace(
+    "THE OBJECTIVE\n", _C7_DTR_PACE_SECTION + "THE OBJECTIVE\n", 1
+)
+
 
 def control_teaching_prompt(version: str = CONTROL_TEACHING_PROMPT_VERSION) -> str:
     """Return the versioned control teaching system prompt (#274 / D39.1).
