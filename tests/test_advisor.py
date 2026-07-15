@@ -1008,6 +1008,10 @@ def test_c3_is_the_default_prompt_version() -> None:
     # c6 is added selectable (the #396 over-braked recovery A/B arm); c3 stays default.
     assert instructions_for("c6") == control_teaching_prompt("c6")
     assert instructions_for("c5") != instructions_for("c6")
+    # c7 is added selectable (the #499 part-2 DTR-pace-mismatch A/B arm); c3 stays
+    # default.
+    assert instructions_for("c7") == control_teaching_prompt("c7")
+    assert instructions_for("c6") != instructions_for("c7")
     assert instructions_for("c3") != instructions_for("v4")
     assert instructions_for("v4") != instructions_for("v2")
     assert instructions_for("v3") != instructions_for("v2")
@@ -1216,6 +1220,49 @@ def test_c6_extends_c5_with_recovery() -> None:
         assert literal not in new_section, f"c6 recovery section must not bake in {literal!r}"
 
 
+def test_c7_extends_c6_with_dtr_pace_mismatch() -> None:
+    """c7 is c6 PLUS the #499 part-2 DTR-ahead-of-temperature pace-mismatch
+    section, with all of c1+c2+c3+c4+c5+c6 grounding kept.
+
+    Roast 13 (13 Jul, El Durazno white honey): the #499-part-1 joint-objective
+    window teaching (already present in c1, inherited by c6) told the model to
+    prefer a MODEST overshoot of one target while the other closes the gap,
+    but had no notion of a LARGE overshoot signalling the DTR clock itself is
+    unreliable evidence. The advisor read DTR past the window's top edge as a
+    finish line and dropped at 190 C, 5 C short of the 195 C target (DTR had
+    outrun temperature progress roughly 2:1). c7 adds the missing distinction:
+    a DTR well past the window top NEXT TO a temperature still materially
+    short is a pace mismatch, not a signal to drop — weight temperature
+    progress as dominant and keep watching the ceiling, which stays law.
+    """
+    c6 = control_teaching_prompt("c6")
+    c7 = control_teaching_prompt("c7")
+    # c7 is a strict superset of c6's grounding: every c6 line survives.
+    assert c6 in c7 or all(block in c7 for block in c6.split("\n\n")), (
+        "c7 must preserve c6's grounding verbatim"
+    )
+    lowered = c7.lower()
+    # The new DTR-pace-mismatch teaching.
+    assert "pace mismatch" in lowered
+    assert "not a finish line" in lowered or "not permission to drop early" in lowered
+    assert "well past the top" in lowered or "well past the window top" in lowered
+    # Explicitly scoped to DTR-ahead-of-temperature only — never broadens into
+    # the opposite pace direction (temperature/heat ahead, development behind,
+    # #405/roast-14-shaped), which stays the c2/c5 sections' territory.
+    assert "opposite case" in lowered
+    # Keeps the #499 joint-objective framing it refines (strict superset via c6/c1).
+    assert "joint objective" in lowered
+    assert "modest overshoot" in lowered
+    # Ceiling stays LAW, unconditionally, in the new section too.
+    assert "still law" in lowered or "ceiling" in lowered
+    # The new section names NO fixed roast-13 fixture numbers of its own
+    # (told==enforced; the live context carries every threshold/target).
+    start = c7.index("POST-FIRST-CRACK: A LARGE DTR OVERSHOOT")
+    new_section = c7[start : c7.index("THE OBJECTIVE\n", start)]
+    for literal in ("190", "195", "205", "5 C", "87 s", "46.7"):
+        assert literal not in new_section, f"c7 DTR-pace section must not bake in {literal!r}"
+
+
 # --- Codex P2 follow-up (#499): assert on the FINAL ASSEMBLED prompt, not
 # just the c1 fragment. The splice chain (c1 -> c2 -> c3 -> c4 -> c5 -> c6)
 # means a section added to c1 can be directly contradicted by a LATER-spliced
@@ -1227,9 +1274,13 @@ def test_c6_extends_c5_with_recovery() -> None:
 # section addition that reintroduces a first-past-the-post phrase downstream
 # of #499's joint-objective section is caught where it actually matters —
 # see docs/recent-fixes.md for the general anti-pattern this class guards.
+# c7 (#499 part 2) is included in both parametrizations below: it is spliced
+# AFTER the joint-objective section (the newest/most-spliced version, mirroring
+# how c6 was added to this same list), and it must not reintroduce the
+# first-past-the-post phrasing Codex originally found either.
 
 
-@pytest.mark.parametrize("version", ["c3", "c6"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7"])
 def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     version: str,
 ) -> None:
@@ -1250,7 +1301,7 @@ def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     assert "latest acceptable drop" not in lowered
 
 
-@pytest.mark.parametrize("version", ["c3", "c6"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7"])
 def test_assembled_prompt_joint_objective_precedes_every_later_section(
     version: str,
 ) -> None:
@@ -1265,6 +1316,7 @@ def test_assembled_prompt_joint_objective_precedes_every_later_section(
     for marker in (
         "POST-FIRST-CRACK: STRETCH DEVELOPMENT",  # c2
         "POST-FIRST-CRACK: FAN IS AN ACTIVE BRAKE",  # c3
+        "POST-FIRST-CRACK: A LARGE DTR OVERSHOOT",  # c7
     ):
         if marker in prompt:
             assert prompt.index(marker) > joint_index, (
@@ -1303,6 +1355,25 @@ def test_default_prompt_version_matches_control_teaching_version() -> None:
     (c2, ...) cannot silently leave the live default behind.
     """
     assert AdvisorConfig().prompt_version == CONTROL_TEACHING_PROMPT_VERSION
+
+
+def test_advisor_config_selects_c7_and_sends_its_system_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The D69 prompt-version discipline, applied to c7: selecting
+    ``prompt_version="c7"`` on :class:`AdvisorConfig` (the same config field the
+    Config UI's advisor.prompt_version selector writes, #499 part 2) actually
+    wires c7's instructions into the constructed ``PydanticAIAdvisor`` — not
+    just that ``control_teaching_prompt("c7")`` is byte-assembled correctly,
+    but that the CONFIG-SELECTABLE path reaches it. c3 stays the untouched
+    default (asserted separately above); this is additive, opt-in only.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
+    advisor = PydanticAIAdvisor(AdvisorConfig(prompt_version="c7"))
+    instructions = advisor._instructions  # type: ignore[reportPrivateUsage]
+    assert instructions == control_teaching_prompt("c7")
+    assert instructions != control_teaching_prompt("c3")
+    assert advisor.descriptor.prompt_version == "c7"
 
 
 def test_live_post_fc_advisor_uses_the_c3_system_prompt(
