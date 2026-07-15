@@ -7885,6 +7885,66 @@ async def test_ceiling_guard_drop_takes_precedence_over_recovery_raise_same_tick
 
 
 @pytest.mark.asyncio
+async def test_zero_elevation_recovery_does_not_suppress_a_drop_tick_write() -> None:
+    """PR #560 round 3 Codex finding: entry heat ALREADY AT
+    ``heat_ceiling_percent`` (the default 100, via ``_charge_through_fc``'s
+    pre-FC lever) means the recovery ceiling can never actually rise above
+    the D88 base — the entry/exit COUNTERS can still confirm (a genuine
+    sustained RoR shortfall), but ``heat_authority_state`` correctly reports
+    ``HOLDING`` throughout (the round-3 fix), so the guard/drop-eligibility
+    skip in ``_apply_deterministic_post_fc_levers`` (rounds 1/2) must NOT
+    fire on a tick that is ALSO guard-eligible — there is no real elevation
+    to protect the drop from suppressing hardware access for.
+
+    Both heat AND the drop firing look IDENTICAL whether the skip
+    incorrectly fires or not here (heat is pinned at 100 either way by the
+    static ceiling, and the guard's drop is unconditional on bean
+    temperature regardless of the post-FC lever's own skip) — so this test
+    reads ``_post_fc_last_actuation_monotonic`` directly, the one INTERNAL
+    signal that actually distinguishes the two code paths: the skip's
+    ``restore_state`` branch returns WITHOUT ever touching this cadence
+    timer, while the (correct) idempotent-write branch always advances it.
+    Verified this test genuinely catches the round-3 mutant (re-deleting the
+    fix locally reproduces this assertion failing, matching the algorithm-
+    level tests' own fail-then-pass verification)."""
+    config = _recovery_config(
+        ceiling_guard_temp_c=196.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=0,
+    )
+    harness = make_harness(config=config)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=100, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    cadence_before = harness.controller._post_fc_last_actuation_monotonic  # pyright: ignore[reportPrivateUsage]
+
+    # A sustained RoR shortfall confirms entry (recovery_confirm_ticks=1),
+    # AND the same tick's bean temperature is at the ceiling-guard line —
+    # both conditions the round-1/2 skip watches for. With ZERO headroom,
+    # heat_authority_state must stay HOLDING (round-3 fix), so the skip must
+    # not suppress this tick's write.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.COOLING
+    # The guard's drop still fires (unaffected by any of this).
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in executed
+    # THE assertion that actually distinguishes correct behaviour from the
+    # round-3 bug: the cadence timer ADVANCED past its pre-tick value (the
+    # idempotent-write branch ran, meaning the skip did NOT fire) — a
+    # phantom RECOVERING state would have hit the restore-and-return branch
+    # instead, leaving the cadence timer exactly where it was before.
+    cadence_after = harness.controller._post_fc_last_actuation_monotonic  # pyright: ignore[reportPrivateUsage]
+    assert cadence_after != cadence_before
+
+
+@pytest.mark.asyncio
 async def test_deterministic_drop_takes_precedence_over_recovery_raise_same_tick() -> None:
     """PR #560 round 2 Codex finding (P2, the same class as round 1's P1 but
     for the DETERMINISTIC drop anchor): with the guard set safely ABOVE the

@@ -746,18 +746,60 @@ def test_format_post_fc_loop_readout_ceiling_guard_enabled() -> None:
 
 
 def test_format_post_fc_loop_readout_both_enabled_two_loud_lines() -> None:
-    """The full D88 treatment arm (taper + guard) prints TWO ⚠️ lines — one per
-    flag — so the operator confirms each independently before charging beans."""
+    """The full D88 treatment arm (taper + guard, recovery still at its
+    default OFF) prints TWO ⚠️ lines — one per D88 flag — so the operator
+    confirms each independently before charging beans. The THIRD (D96
+    recovery) line is always present (#559/PR #560 round 3) but stays quiet
+    here since ``recovery_enabled`` was not passed (defaults ``False``)."""
     lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
         enabled=True, ceiling_guard_enabled=True, ceiling_guard_temp_c=195.5
     )
-    assert len(lines) == 2
+    assert len(lines) == 3
     text = "\n".join(lines)
     assert text.count("⚠️") == 2
     assert "POST-FC RoR LOOP: ENABLED" in text
     assert "CEILING-GUARD DROP: ENABLED" in text
     # The temperature shown is the resolved value, not a hardcoded default.
     assert "195.5 °C" in text
+    assert "bidirectional heat recovery: disabled" in text
+
+
+def test_format_post_fc_loop_readout_recovery_enabled_shows_cap() -> None:
+    """D96 (#559/PR #560 round 3): recovery ENABLED prints its own loud ⚠️
+    line naming D96 and the RESOLVED headroom cap (not a hardcoded default)
+    — the operator must be able to confirm the recovery state (both a
+    typo'd-OFF and an accidental-ON) and the actual raise ceiling from the
+    can't-miss startup readout, independent of the two D88 flags."""
+    lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
+        enabled=True,
+        ceiling_guard_enabled=True,
+        ceiling_guard_temp_c=196.0,
+        recovery_enabled=True,
+        recovery_headroom_percentage_points=15,
+    )
+    assert len(lines) == 3
+    text = "\n".join(lines)
+    assert text.count("⚠️") == 3
+    assert "BOUNDED-BIDIRECTIONAL HEAT RECOVERY: ENABLED" in text
+    assert "D96" in text
+    # The headroom cap shown is the resolved value, not a hardcoded default.
+    assert "15" in text
+    assert "bidirectional heat recovery: disabled" not in text
+
+
+def test_format_post_fc_loop_readout_recovery_disabled_by_default() -> None:
+    """The default (no ``recovery_enabled`` kwarg passed) reads as disabled,
+    quiet, and names D88's never-add-heat-beyond-entry law as still standing
+    — the pre-D96 readout shape stays reachable for any caller that predates
+    the recovery kwargs."""
+    lines = cli._format_post_fc_loop_readout(  # pyright: ignore[reportPrivateUsage]
+        enabled=False, ceiling_guard_enabled=False, ceiling_guard_temp_c=196.0
+    )
+    assert len(lines) == 3
+    text = "\n".join(lines)
+    assert "bidirectional heat recovery: disabled" in text
+    assert "D88 never-add-heat-beyond-entry stands" in text
+    assert "BOUNDED-BIDIRECTIONAL" not in text
 
 
 @pytest.mark.usefixtures("no_serve")
@@ -836,6 +878,81 @@ def test_serve_live_banner_reflects_resolved_d88_flags(
     # Loop OFF: its line stays quiet. Swapped caller wiring fails both checks.
     assert "post-FC RoR loop: disabled" in out
     assert "POST-FC RoR LOOP: ENABLED" not in out
+    # D96 (#559/PR #560 round 3): recovery was never set via env here, so it
+    # stays at its default OFF — the third line prints quiet, not silently
+    # omitted (an operator must see the line exists to know the flag was
+    # actually read, not just absent from an older binary).
+    assert "bidirectional heat recovery: disabled" in out
+    assert "BOUNDED-BIDIRECTIONAL" not in out
+
+
+@pytest.mark.usefixtures("no_serve")
+def test_serve_live_banner_reflects_resolved_recovery_flag_and_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D96 (#559/PR #560 round 3): the recovery banner line comes from the
+    RESOLVED config the serving agent loaded — end-to-end through the real
+    ``serve`` path, not the pure readout function, mirroring
+    ``test_serve_live_banner_reflects_resolved_d88_flags`` exactly for the
+    THIRD flag. Sets recovery ON with a non-default headroom cap (the
+    ceiling-guard flag must ALSO be on — the D96 cross-field validator
+    requires it) through the real nested env vars: the recovery line must be
+    loud with the resolved cap."""
+    from roastpilot_agent import live
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.config import AppConfig
+    from roastpilot_agent.store import RoastStore
+
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__CEILING_GUARD_DROP_ENABLED",
+        "true",
+    )
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__RECOVERY_ENABLED",
+        "true",
+    )
+    monkeypatch.setenv(
+        "ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__RECOVERY_HEADROOM_PERCENTAGE_POINTS",
+        "22",
+    )
+
+    spa = tmp_path / "dist"
+    spa.mkdir()
+    (spa / "index.html").write_text("<title>RoastPilot</title>", encoding="utf-8")
+
+    class _FakeMCP:
+        running = True
+        call_tool = staticmethod(_make_call_tool(_runtime_config_payload(roaster_driver="mock")))
+
+        async def stop(self) -> None:
+            return None
+
+    async def _fake_build(
+        config: AppConfig, *, store_path: Path
+    ) -> tuple[RoastService, _FakeMCP, RoastStore]:
+        store = RoastStore(store_path)
+        return RoastService(store), _FakeMCP(), store
+
+    monkeypatch.setattr(live, "build_live_service", _fake_build)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "roastpilot-agent",
+            "serve",
+            "--port",
+            "0",
+            "--spa-dir",
+            str(spa),
+            "--db",
+            str(tmp_path / "trace" / "live.sqlite3"),
+        ],
+    )
+
+    assert cli.main() == 0
+    out = capsys.readouterr().out
+    assert "BOUNDED-BIDIRECTIONAL HEAT RECOVERY: ENABLED" in out
+    assert "22" in out
+    assert "bidirectional heat recovery: disabled" not in out
 
 
 @pytest.mark.asyncio

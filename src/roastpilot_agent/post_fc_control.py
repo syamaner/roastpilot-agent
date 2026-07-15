@@ -865,24 +865,52 @@ class PostFcRorController:
         )
 
     def _heat_authority_state(self) -> PostFcHeatAuthorityState:
-        """This step's D96 heat-authority regime (PR #560 Codex finding).
+        """This step's D96 heat-authority regime (PR #560 Codex findings,
+        rounds 1 and 3).
 
-        ``RECOVERING`` while ``self._recovery_active`` is ``True``;
-        ``GLIDING`` while recovery has exited but
-        ``self._recovery_ticks_since_exit`` is still counting (the ceiling
-        has not yet fully descended to the D88 base); ``HOLDING`` otherwise
-        (never engaged, or fully settled). Mirrors exactly the three-way
-        branch :meth:`_effective_ceiling_percent` already uses to pick this
-        step's ceiling — reading the SAME two fields, never a second
-        independent derivation that could disagree with it.
+        ``RECOVERING`` while ``self._recovery_active`` is ``True`` AND the
+        ceiling this instant is ACTUALLY above the D88 base; ``GLIDING``
+        while recovery has exited but ``self._recovery_ticks_since_exit`` is
+        still counting AND the ceiling is still actually above the base;
+        ``HOLDING`` in every other case (never engaged, fully settled, OR —
+        round 3's finding — the internal counters say "active"/"gliding" but
+        the ceiling never actually moved above the base to begin with).
+
+        **Round 3 fix: reports ACTUAL elevation, not just internal
+        entry/exit-counter state.** With zero headroom
+        (``recovery_headroom_percentage_points=0``) or an engagement heat
+        already AT ``heat_ceiling_percent``,
+        :meth:`_recovery_ceiling_percent` equals
+        :meth:`_never_add_heat_ceiling_percent` exactly — the entry/exit
+        counters can still confirm (``self._recovery_active`` flips
+        ``True``), but the ceiling itself never actually rises. Without this
+        check, that no-op "recovery" would still report ``RECOVERING``,
+        which the controller's guard/drop-eligibility skip
+        (``_apply_deterministic_post_fc_levers``, PR #560 rounds 1/2) reads
+        as "elevated" and would suppress a drop-tick write for NOTHING — no
+        actual raise ever happened to justify the suppression. Basing the
+        reported STATE on real elevation (rather than adding a second check
+        at the controller call site) keeps told==enforced simplest: the
+        controller already trusts this one field completely; teaching it a
+        second "but only if ALSO really elevated" clause there would
+        duplicate arithmetic this method already owns.
 
         Returns:
             The current heat-authority state.
         """
+        base = self._never_add_heat_ceiling_percent()
         if self._recovery_active:
-            return PostFcHeatAuthorityState.RECOVERING
+            return (
+                PostFcHeatAuthorityState.RECOVERING
+                if self._recovery_ceiling_percent() > base
+                else PostFcHeatAuthorityState.HOLDING
+            )
         if self._recovery_ticks_since_exit is not None:
-            return PostFcHeatAuthorityState.GLIDING
+            return (
+                PostFcHeatAuthorityState.GLIDING
+                if self._effective_ceiling_percent() > base
+                else PostFcHeatAuthorityState.HOLDING
+            )
         return PostFcHeatAuthorityState.HOLDING
 
     def _advance_recovery_state(self, error_c_per_min: float) -> None:

@@ -1376,6 +1376,76 @@ def test_reset_clears_recovery_state_from_active_and_mid_glide() -> None:
     assert second_tick.recovery_active is False
 
 
+def test_zero_headroom_recovering_reports_holding_not_a_phantom_elevation() -> None:
+    """PR #560 round 3 Codex finding: with zero headroom
+    (``recovery_headroom_percentage_points=0``), the entry condition can
+    still CONFIRM (measured RoR persistently below setpoint, the trigger
+    margin exceeded for ``recovery_confirm_ticks`` consecutive ticks) — but
+    ``_recovery_ceiling_percent()`` equals the D88 base exactly
+    (``min(heat_ceiling_percent, heat_engage_percent + 0) ==
+    heat_engage_percent`` whenever ``heat_engage_percent <=
+    heat_ceiling_percent``, always true), so NOTHING actually elevates. The
+    reported state must stay ``HOLDING`` (not the internal counters'
+    ``RECOVERING``) throughout, the ceiling must stay pinned at the D88 base
+    the entire time, and ``recovery_active`` must stay ``False`` — a
+    controller reading this state to decide whether to suppress a drop-tick
+    write must never suppress one for a "recovery" that never actually
+    raised anything."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=6.0,
+        taper_end_ror_c_per_min=6.0,
+        taper_duration_seconds=1.0,
+        ki_percent_per_ror_second=0.0,
+        ror_smoothing_alpha=1.0,
+        recovery_headroom_percentage_points=0,
+        recovery_confirm_ticks=1,
+    )
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+
+    # A sustained shortfall well past the trigger margin -- the entry
+    # condition genuinely confirms every tick.
+    outputs = [controller.compute(measured_ror_c_per_min=4.0, dt_seconds=5.0) for _ in range(10)]
+    assert all(o.heat_authority_state is PostFcHeatAuthorityState.HOLDING for o in outputs), [
+        o.heat_authority_state for o in outputs
+    ]
+    assert all(o.recovery_active is False for o in outputs)
+    assert all(o.effective_ceiling_percent == 60 for o in outputs), [
+        o.effective_ceiling_percent for o in outputs
+    ]
+
+
+def test_entry_at_heat_ceiling_with_headroom_reports_holding_not_recovering() -> None:
+    """PR #560 round 3 Codex finding, the second reachable path to the same
+    bug: entry heat ALREADY AT ``heat_ceiling_percent`` (100 here) means
+    ``_recovery_ceiling_percent()`` (``min(100, 100 + 15) == 100``) equals
+    the D88 base regardless of a NON-zero headroom config -- there is simply
+    no room ABOVE the static ceiling to raise into. Same assertions as the
+    zero-headroom case: the reported state must stay ``HOLDING`` throughout,
+    never a phantom ``RECOVERING``."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=6.0,
+        taper_end_ror_c_per_min=6.0,
+        taper_duration_seconds=1.0,
+        ki_percent_per_ror_second=0.0,
+        ror_smoothing_alpha=1.0,
+        recovery_headroom_percentage_points=15,
+        recovery_confirm_ticks=1,
+        heat_ceiling_percent=100,
+    )
+    controller = PostFcRorController(config)
+    controller.reset(initial_heat_percent=100, ror_at_engagement_c_per_min=6.0)
+
+    outputs = [controller.compute(measured_ror_c_per_min=4.0, dt_seconds=5.0) for _ in range(10)]
+    assert all(o.heat_authority_state is PostFcHeatAuthorityState.HOLDING for o in outputs), [
+        o.heat_authority_state for o in outputs
+    ]
+    assert all(o.recovery_active is False for o in outputs)
+    assert all(o.effective_ceiling_percent == 100 for o in outputs), [
+        o.effective_ceiling_percent for o in outputs
+    ]
+
+
 def test_recovery_fuzz_ror_pinned_at_zero_saturates_at_cap_500_ticks() -> None:
     """Fuzz variant 1 (mandatory): pin measured RoR at 0.0 -- an even more
     extreme, sustained-forever shortfall than any real roast trace -- for
