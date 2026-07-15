@@ -1281,13 +1281,98 @@ def test_recovery_rollback_discipline_ticks_do_not_fake_accumulate() -> None:
 
     # The counter must be EXACTLY what it was before the rejected tick (2),
     # not 3 -- the rejected tick's tentative increment must not survive.
+    # Robustness note (D96 diff safety review): round-trip ALL FOUR recovery
+    # fields, not just the entry counter -- the rejected tick's tentative
+    # step could in principle also have touched recovery_active or the
+    # exit-side state if a future change to the ordering inside
+    # _advance_recovery_state ever let entry and exit interact within one
+    # call; asserting all four here catches that class directly rather than
+    # only the one field this specific scenario happens to move.
     after_restore = controller.snapshot_state()
+    assert after_restore == pre_step
     assert after_restore.recovery_ticks_above_trigger == 2
+    assert after_restore.recovery_ticks_within_exit == pre_step.recovery_ticks_within_exit
+    assert after_restore.recovery_active == pre_step.recovery_active
+    assert after_restore.recovery_ticks_since_exit == pre_step.recovery_ticks_since_exit
 
     # The real next accepted tick (the third genuine one) still correctly
     # confirms entry on ITS OWN third consecutive tick, not a phantom fourth.
     third = controller.compute(measured_ror_c_per_min=3.0, dt_seconds=5.0)
     assert third.recovery_active is True
+
+
+def test_reset_clears_recovery_state_from_active_and_mid_glide() -> None:
+    """D96 diff safety review finding (the surviving mutant): ``reset``'s
+    four recovery-field zeroing assignments are otherwise exercised but never
+    directly ASSERTED -- every other recovery test calls ``reset`` exactly
+    once on a FRESH controller, where ``__init__`` already zeroed the fields,
+    so deleting the zeroing lines in ``reset`` itself passed every existing
+    test. This test drives recovery into two DIFFERENT non-fresh states on
+    the SAME controller instance, then calls ``reset`` again (a fresh
+    true-FC-edge engagement, mirroring
+    ``test_c2_fresh_engage_recaptures_and_does_not_inherit_prior_episode``'s
+    taper-state precedent) and asserts the recovery state is fully cleared
+    each time -- the documented invariant (no recovery-state leak from a
+    PRIOR engagement into a new one) is unreachable in today's per-run
+    controller construction (a fresh ``RoastController`` per run, api.py) but
+    is one refactor away, so it is pinned here regardless.
+
+    Fail-then-pass: re-deleting the four zeroing assignments in ``reset``
+    (``post_fc_control.py`` — the lines setting
+    ``recovery_ticks_above_trigger``, ``recovery_ticks_within_exit``,
+    ``recovery_active``, and ``recovery_ticks_since_exit`` to their cleared
+    values) must fail this test."""
+    config = _recovery_config(
+        taper_start_max_ror_c_per_min=6.0,
+        taper_end_ror_c_per_min=6.0,
+        taper_duration_seconds=1.0,  # static setpoint at 6.0
+        ki_percent_per_ror_second=0.0,
+        ror_smoothing_alpha=1.0,
+    )
+    controller = PostFcRorController(config)
+
+    # --- Case 1: reset from a FULLY ACTIVE recovery state. ---
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    for _ in range(3):
+        controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)  # confirm entry
+    active_snapshot = controller.snapshot_state()
+    assert active_snapshot.recovery_active is True  # precondition: genuinely active
+
+    controller.reset(initial_heat_percent=55, ror_at_engagement_c_per_min=6.0)
+    cleared_from_active = controller.snapshot_state()
+    assert cleared_from_active.recovery_ticks_above_trigger == 0
+    assert cleared_from_active.recovery_ticks_within_exit == 0
+    assert cleared_from_active.recovery_active is False
+    assert cleared_from_active.recovery_ticks_since_exit is None
+    # The first post-reset tick computes the D88 BASE ceiling for the NEW
+    # engagement heat (55), never a leaked recovery cap from the old one.
+    first_tick = controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0)
+    assert first_tick.effective_ceiling_percent == 55
+    assert first_tick.recovery_active is False
+
+    # --- Case 2: reset from MID-GLIDE (recovery inactive but not yet fully
+    # settled back to the base -- a DIFFERENT non-fresh state than Case 1,
+    # since ``recovery_ticks_since_exit`` is the field Case 1 never
+    # exercises a non-None value for). ---
+    controller.reset(initial_heat_percent=60, ror_at_engagement_c_per_min=6.0)
+    for _ in range(3):
+        controller.compute(measured_ror_c_per_min=4.9, dt_seconds=5.0)  # confirm entry
+    for _ in range(3):
+        controller.compute(measured_ror_c_per_min=5.6, dt_seconds=5.0)  # confirm exit
+    mid_glide = controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0)
+    assert 60 < mid_glide.effective_ceiling_percent < 75  # genuinely mid-glide
+    mid_glide_snapshot = controller.snapshot_state()
+    assert mid_glide_snapshot.recovery_ticks_since_exit is not None  # precondition
+
+    controller.reset(initial_heat_percent=45, ror_at_engagement_c_per_min=6.0)
+    cleared_from_glide = controller.snapshot_state()
+    assert cleared_from_glide.recovery_ticks_above_trigger == 0
+    assert cleared_from_glide.recovery_ticks_within_exit == 0
+    assert cleared_from_glide.recovery_active is False
+    assert cleared_from_glide.recovery_ticks_since_exit is None
+    second_tick = controller.compute(measured_ror_c_per_min=6.0, dt_seconds=5.0)
+    assert second_tick.effective_ceiling_percent == 45  # the NEW engagement's D88 base
+    assert second_tick.recovery_active is False
 
 
 def test_recovery_fuzz_ror_pinned_at_zero_saturates_at_cap_500_ticks() -> None:
