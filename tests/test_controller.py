@@ -7882,3 +7882,84 @@ async def test_ceiling_guard_drop_takes_precedence_over_recovery_raise_same_tick
         "source": "policy",
         "reason": DropReason.CEILING_GUARD.value,
     } in executed
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_takes_precedence_over_recovery_raise_same_tick() -> None:
+    """PR #560 round 2 Codex finding (P2, the same class as round 1's P1 but
+    for the DETERMINISTIC drop anchor): with the guard set safely ABOVE the
+    profile's target_drop_temp_c (so `_maybe_ceiling_guard_drop` never fires
+    here — this test isolates the `_maybe_deterministic_drop` mirror), a tick
+    whose telemetry qualifies for BOTH a recovery raise AND the dev%/temp
+    anchor (bean >= target_drop_temp_c AND system dev% >= target_development_
+    percent) must NOT let the raise reach hardware — the same restore-and-
+    skip this method already applies for the ceiling guard now ALSO covers
+    the deterministic-drop anchor's own eligibility condition."""
+    config = _recovery_config(
+        ceiling_guard_temp_c=220.0,  # safely above PROFILE.target_drop_temp_c (205)
+        recovery_confirm_ticks=1,
+    )
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent, config=config
+    )
+    targets_before_the_tick = list(harness.executor.targets)
+
+    # One tick with a shortfall large enough to confirm entry immediately
+    # (recovery_confirm_ticks=1) AND bean/dev% both at the deterministic
+    # anchor's target — eligible for the anchor, NOT for the (much higher)
+    # guard.
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.COOLING
+    # No heat/fan write reached the roaster this tick at all.
+    assert harness.executor.targets == targets_before_the_tick
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.DEVELOPMENT_TARGET.value,
+    } in executed
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_precedence_holds_even_when_drop_beans_fails() -> None:
+    """The specific failure case PR #560's round-2 finding names: if
+    `drop_beans()` itself then FAILS (a transient actuator failure) on a tick
+    that was ALSO recovery-raise-eligible, the raise must STILL not have been
+    written — otherwise the roast would be left sitting in DEVELOPMENT with
+    recovery-raised heat past the drop's own target point, a strictly WORSE
+    outcome than a raise-then-successful-drop. The skip in
+    `_apply_deterministic_post_fc_levers` fires on ELIGIBILITY alone, before
+    `_maybe_deterministic_drop` ever attempts (and here fails) the actual
+    ``drop_beans()`` call, so this failure mode cannot compound the earlier
+    one."""
+
+    class RaisingDropExecutor(RecordingExecutor):
+        async def drop_beans(self) -> AppliedRoasterState:
+            raise RuntimeError("serial write dropped")
+
+    config = _recovery_config(
+        ceiling_guard_temp_c=220.0,
+        recovery_confirm_ticks=1,
+    )
+    harness = _development_harness_with_dev_percent(
+        system_dev_percent=PROFILE.target_development_percent,
+        config=config,
+        executor=RaisingDropExecutor(),
+    )
+    targets_before_the_tick = list(harness.executor.targets)
+
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    # The drop attempt failed (still DEVELOPMENT, a COMMAND_FAILED event) —
+    # but critically, no raise write reached the roaster either.
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.executor.targets == targets_before_the_tick
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.DEVELOPMENT_TARGET.value,
+    } in failed

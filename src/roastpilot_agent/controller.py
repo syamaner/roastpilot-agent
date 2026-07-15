@@ -1768,37 +1768,69 @@ class RoastController:
         output = self._post_fc_controller.compute(
             measured_ror_c_per_min=telemetry.bean_ror_c_per_min, dt_seconds=dt_seconds
         )
-        # D96 (#559), PR #560 Codex finding (guard-eligible same-tick raise):
-        # this method runs BEFORE `_maybe_ceiling_guard_drop` in `tick()`'s
-        # order (see that ordering comment below), so — without this check —
-        # a tick where bean temperature has ALREADY reached
-        # `ceiling_guard_temp_c` while the recovery ceiling is elevated would
-        # still WRITE the raised/gliding heat command to the roaster before
-        # the guard's own drop fires a few lines later: the drop stops the
-        # roast, but the raise still reached hardware on its way there. Skip
-        # THIS tick's write entirely — restoring the tentative `compute` step
+        # D96 (#559), PR #560 Codex findings (guard-eligible AND
+        # deterministic-drop-eligible same-tick raises — round 1's P1 and
+        # round 2's P2, the same class of bug for the two different drop
+        # paths): this method runs BEFORE BOTH `_maybe_ceiling_guard_drop`
+        # AND `_maybe_deterministic_drop` in `tick()`'s order (see that
+        # ordering comment below), so — without these checks — a tick where
+        # EITHER drop path is already eligible while the recovery ceiling is
+        # elevated would still WRITE the raised/gliding heat command to the
+        # roaster before that drop fires a few lines later: the drop stops
+        # the roast, but the raise still reached hardware on its way there
+        # (worse, if `drop_beans()` itself then fails transiently, the roast
+        # is left sitting in DEVELOPMENT with recovery-raised heat past the
+        # drop's own target point — round 2's Codex finding). Skip THIS
+        # tick's write entirely — restoring the tentative `compute` step
         # exactly like a rejected write, so the loop's internal state is
         # untouched — whenever BOTH: (1) this step's ceiling is elevated
         # above the plain D88 base (`heat_authority_state is not HOLDING` —
         # deliberately the three-way enum, not the derived `recovery_active`
         # boolean alone, since either RECOVERING or GLIDING must be caught),
-        # and (2) the SAME tick is independently eligible for the guard drop
-        # (mirroring `_maybe_ceiling_guard_drop`'s own eligibility check
-        # exactly: the guard flag on, bean temperature already at or past
-        # the guard line). Scoped to this exact condition so the skip cannot
-        # fire when recovery is inactive (`HOLDING`) or the RoR-taper flag is
-        # off — D88's byte-for-byte flag-off/recovery-inactive behaviour
-        # (the plain hold-at-entry write still landing before any later
-        # guard check) is completely unchanged.
+        # and (2) the SAME tick is independently eligible for EITHER drop
+        # path. Scoped to this exact condition so the skip cannot fire when
+        # recovery is inactive (`HOLDING`) or the RoR-taper flag is off —
+        # D88's byte-for-byte flag-off/recovery-inactive behaviour (the
+        # plain hold-at-entry write still landing before any later drop
+        # check) is completely unchanged.
+        #
+        # BOTH mirrors below must track their sources exactly — a future
+        # change to either `_maybe_ceiling_guard_drop`'s or
+        # `_maybe_deterministic_drop`'s own eligibility condition (e.g. a new
+        # gating clause) needs the SAME change made here, or this skip can
+        # silently drift out of sync with what actually makes a drop fire.
         guard_config = self._config.post_first_crack_control
+        # Mirrors `_maybe_ceiling_guard_drop`'s own eligibility exactly (the
+        # guard flag on, bean temperature already at or past the guard
+        # line) — that method's own phase/telemetry-None guards are already
+        # satisfied by this point (this method's own top-of-function gate
+        # already required `self._phase is RoastPhase.DEVELOPMENT` and
+        # `telemetry is not None`).
         guard_eligible_this_tick = (
             guard_config.ceiling_guard_drop_enabled
             and telemetry.bean_temp_c >= guard_config.ceiling_guard_temp_c
         )
+        # Mirrors `_maybe_deterministic_drop`'s own eligibility exactly (bean
+        # at/past `target_drop_temp_c` AND system dev% at/past
+        # `target_development_percent`) — that method's own
+        # ``enabled``/``_post_fc_engaged``/phase/``self._profile`` guards are
+        # already satisfied here too (this method's own top-of-function gate
+        # requires the identical `config.enabled`/`self._post_fc_engaged`/
+        # phase/`self._profile is not None` bundle). ``system_dev_percent``
+        # is ``None`` (development not yet computable) fails closed to
+        # NOT-eligible here, mirroring that method's own fail-closed branch.
+        system_dev_percent = self._development_percent()
+        deterministic_drop_eligible_this_tick = (
+            system_dev_percent is not None
+            and telemetry.bean_temp_c >= self._profile.target_drop_temp_c
+            and system_dev_percent >= self._profile.target_development_percent
+        )
         recovery_ceiling_elevated = (
             output.heat_authority_state is not PostFcHeatAuthorityState.HOLDING
         )
-        if recovery_ceiling_elevated and guard_eligible_this_tick:
+        if recovery_ceiling_elevated and (
+            guard_eligible_this_tick or deterministic_drop_eligible_this_tick
+        ):
             self._post_fc_controller.restore_state(pre_compute_state)
             return
         # Build the DEVELOPMENT box from the ACTUATED PI output (#412
