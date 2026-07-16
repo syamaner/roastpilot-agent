@@ -1235,6 +1235,10 @@ def test_c7_extends_c6_with_dtr_pace_mismatch() -> None:
     short is a pace mismatch, not a signal to drop — weight temperature
     progress as dominant and keep watching the ceiling, which stays law.
     """
+    from roastpilot_agent.advisor import (
+        _C7_DTR_PACE_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
     c6 = control_teaching_prompt("c6")
     c7 = control_teaching_prompt("c7")
     # c7 is a strict superset of c6's grounding: every c6 line survives.
@@ -1253,8 +1257,47 @@ def test_c7_extends_c6_with_dtr_pace_mismatch() -> None:
     # Keeps the #499 joint-objective framing it refines (strict superset via c6/c1).
     assert "joint objective" in lowered
     assert "modest overshoot" in lowered
-    # Ceiling stays LAW, unconditionally, in the new section too.
-    assert "still law" in lowered or "ceiling" in lowered
+    # Ceiling still forces the drop unconditionally in the new section too —
+    # via an explicit NUMERIC COMPARISON, not a restated "it is LAW" emphasis
+    # (the #499/#559 combined bake-off falsified the emphasis-repetition
+    # phrasing: both c7 and c8 hallucinated "at the ceiling" on the roast-15
+    # bottom-edge case at bean 187 / ceiling 195, a real 8 °C gap, while c3 —
+    # which never repeats the ceiling emphasis — read the numbers correctly
+    # 6/6). The revised teaching must make the model STATE the two numbers
+    # and COMPUTE the gap, never reason from a felt sense of proximity.
+    #
+    # PR #564 round 1 (Codex P2, test scoping): asserted against the SECTION
+    # CONSTANT directly (not the full assembled `lowered`), matching the
+    # discipline c8's own test now uses — c7's new section does not itself
+    # inherit this wording from an earlier version, so this specific test
+    # was not reachable by the inheritance bug the reviewer found in c8, but
+    # scoping it the same way is the more robust pattern regardless (a
+    # future c9 splicing after c7 would otherwise create the identical risk
+    # here).
+    new_section_lowered = _C7_DTR_PACE_SECTION.lower()
+    assert "compute the gap" in new_section_lowered
+    assert "never on a felt sense" in new_section_lowered
+    assert "ceiling" in new_section_lowered
+    # PR #564 round 2 (Codex P2 x3, all one root cause -- the anticipatory
+    # clause referenced quantities the model cannot evaluate from context):
+    # the reframe drops the lag reference ENTIRELY (round-1's "the time a
+    # drop takes to act" invited an invented constant), teaches the gap in
+    # the SAME per-minute units as bean_ror_c_per_min (no seconds, no unit
+    # conversion to botch), and names bitter_ceiling_temp_c EXPLICITLY --
+    # never emergency_drop_temp_c, the separate e-stop bound, not the
+    # planning ceiling. "Never waiting for the gap to literally hit zero"
+    # stays: the round-1 anticipatory lesson (gap==0 is too late) is
+    # preserved, just re-expressed without an unevaluable lag term.
+    assert "bean_ror_c_per_min" in _C7_DTR_PACE_SECTION
+    assert "bitter_ceiling_temp_c" in _C7_DTR_PACE_SECTION
+    assert "emergency_drop_temp_c" in _C7_DTR_PACE_SECTION
+    assert "small fraction" in new_section_lowered
+    assert "per minute" in new_section_lowered or "per-minute" in new_section_lowered
+    assert "never waiting for the gap to literally hit zero" in new_section_lowered
+    # Finding 5 (round 2): no seconds/lag reference anywhere in the new
+    # section -- the exact defect the reframe removes. A cheap, direct lock
+    # against a future edit reintroducing an invented time constant.
+    assert "second" not in new_section_lowered
     # The new section names NO fixed roast-13 fixture numbers of its own
     # (told==enforced; the live context carries every threshold/target).
     start = c7.index("POST-FIRST-CRACK: A LARGE DTR OVERSHOOT")
@@ -1278,7 +1321,15 @@ def test_c8_extends_c7_with_pace_bottom_edge_and_fan_coupling() -> None:
     crossing, (2) the explicit bottom-edge-is-not-a-finish-line teaching, and
     (3) fan->RoR coupling teaching that stays CONSISTENT with D96 slice 1's
     actual shipped mechanism (the heat loop's compensation is bounded and
-    suppressed near a drop, never an unconditional rescue)."""
+    suppressed near a drop, never an unconditional rescue).
+
+    #499/#559 combined bake-off amendment (issue #562): the ceiling sentence
+    in (2) originally restated "ceiling stays LAW" — the SAME emphasis
+    phrasing that (independently) falsified in c7 (below). Both c7 and c8
+    hallucinated "at the ceiling" on the roast-15 bottom-edge case (bean 187,
+    ceiling 195, an 8 C gap) while c3 read the numbers correctly 6/6. Revised
+    to an explicit numeric-comparison instruction (state the two numbers,
+    compute the gap) here too."""
     from roastpilot_agent.advisor import (
         _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
     )
@@ -1303,6 +1354,43 @@ def test_c8_extends_c7_with_pace_bottom_edge_and_fan_coupling() -> None:
     assert "not a finish line either" in lowered or "not a finish line" in lowered
     assert "no longer disqualif" in lowered  # "disqualifying"/"disqualified"
     assert "has not arrived" in lowered or "does not mean the roast has arrived" in lowered
+    # Ceiling still forces the drop unconditionally — via an explicit NUMERIC
+    # COMPARISON, not a restated "stays LAW" emphasis (the #562 bake-off
+    # falsification: that phrasing pattern-matched into a hallucinated
+    # "at the ceiling" on the roast-15 case, an 8 C real gap).
+    #
+    # PR #564 round 1 (Codex P2): asserting against `lowered` (the FULL
+    # assembled c8 text) here is a test-scoping bug -- c8 INHERITS c7's
+    # revised ceiling wording via the splice, so this exact phrase could
+    # survive in the assembled text even if c8's OWN new section lost it
+    # entirely (e.g. a future edit reverting c8's sentence back to a bare
+    # "stays LAW" while c7's stayed fixed would still pass here, silently,
+    # via c7's inherited copy). Assert against the SECTION CONSTANT directly
+    # instead -- the same discipline the exact-splice equality test above
+    # already uses.
+    new_section_lowered = _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION.lower()
+    assert "compute the gap" in new_section_lowered
+    assert "never on a felt sense" in new_section_lowered
+    # PR #564 round 2 (Codex P2 x3, all one root cause -- the anticipatory
+    # clause referenced quantities the model cannot evaluate from context):
+    # the reframe drops the lag reference ENTIRELY (round-1's "the time a
+    # drop takes to act" invited an invented constant), teaches the gap in
+    # the SAME per-minute units as bean_ror_c_per_min (no seconds, no unit
+    # conversion to botch), and names bitter_ceiling_temp_c EXPLICITLY --
+    # never emergency_drop_temp_c, the separate e-stop bound, not the
+    # planning ceiling. "Never waiting for the gap to literally hit zero"
+    # stays: the round-1 anticipatory lesson (gap==0 is too late) is
+    # preserved, just re-expressed without an unevaluable lag term.
+    assert "bean_ror_c_per_min" in _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION
+    assert "bitter_ceiling_temp_c" in _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION
+    assert "emergency_drop_temp_c" in _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION
+    assert "small fraction" in new_section_lowered
+    assert "per minute" in new_section_lowered or "per-minute" in new_section_lowered
+    assert "never waiting for the gap to literally hit zero" in new_section_lowered
+    # Finding 5 (round 2): no seconds/lag reference anywhere in the new
+    # section -- the exact defect the reframe removes. A cheap, direct lock
+    # against a future edit reintroducing an invented time constant.
+    assert "second" not in new_section_lowered
     # (3) Fan->RoR coupling, consistent with D96 slice 1's shipped mechanism —
     # the compensation is bounded/conditional, NOT an assumed rescue, and is
     # explicitly suppressed near a drop (never promises a raise will land).
@@ -1405,6 +1493,18 @@ def test_c1_grounds_development_numbers_to_context_no_invention() -> None:
     # The irreversible-drop framing is present so a fabricated number cannot drive
     # the drop.
     assert "irreversible" in lowered
+
+
+def test_c1_pins_the_confidence_scale() -> None:
+    """Issue #562 (the #499/#559 combined bake-off): both malformed decisions
+    the bake-off surfaced were confidence-scale confusion (7.0, 85.0 returned
+    on a 0-1 field). c1's own confidence mention (the only place in the
+    control-teaching frame that names it) named no scale — pin it "between 0
+    and 1" so the model is told the scale explicitly, inherited unchanged by
+    every later c-version (c2 through c8)."""
+    prompt = control_teaching_prompt("c1")
+    lowered = prompt.lower()
+    assert "confidence between 0 and 1" in lowered
 
 
 def test_default_prompt_version_matches_control_teaching_version() -> None:
