@@ -1279,12 +1279,21 @@ def test_c8_extends_c7_with_pace_bottom_edge_and_fan_coupling() -> None:
     (3) fan->RoR coupling teaching that stays CONSISTENT with D96 slice 1's
     actual shipped mechanism (the heat loop's compensation is bounded and
     suppressed near a drop, never an unconditional rescue)."""
+    from roastpilot_agent.advisor import (
+        _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
     c7 = control_teaching_prompt("c7")
     c8 = control_teaching_prompt("c8")
-    # c8 is a strict superset of c7's grounding: every c7 line survives.
-    assert c7 in c8 or all(block in c8 for block in c7.split("\n\n")), (
-        "c8 must preserve c7's grounding verbatim"
-    )
+    # c8 is c7 with the new section spliced in exactly before "THE OBJECTIVE"
+    # (the SAME splice advisor.py itself performs) -- an EXACT-SPLICE equality,
+    # not `c7 in c8` (which is always False: the splice makes c7 non-
+    # contiguous in c8) and not the weaker block-wise fallback this test
+    # originally used, which could silently pass even if the splice landed in
+    # the wrong place or mangled surrounding text.
+    assert c8 == c7.replace(
+        "THE OBJECTIVE\n", _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION + "THE OBJECTIVE\n", 1
+    ), "c8 must be EXACTLY c7 with the new section spliced before THE OBJECTIVE"
     lowered = c8.lower()
     # (1) Pace-comparison teaching, acting earlier than an edge crossing.
     assert "progress rates" in lowered
