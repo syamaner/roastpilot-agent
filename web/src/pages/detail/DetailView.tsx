@@ -154,7 +154,20 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
         <div className="flex flex-col gap-6">
           {isCompletedRun && (
             <>
-              <RoastRating runId={detail.id} rating={detail.rating} notes={detail.notes} />
+              {/* key: same class as ChargeWeight/RoastTastings below (#568
+                  round 7) — RoastRating keeps its own `editing` mode and
+                  draft state, so without a remount a pending mutate
+                  callback captured on run A could fire after navigating to
+                  run B (React reuses the instance across a runId prop
+                  change) and close/touch B's editor as if it were A's own
+                  save resolving. Prefixed for the same sibling-key-
+                  uniqueness reason as ChargeWeight's/RoastTastings' keys. */}
+              <RoastRating
+                key={`roast-rating-${detail.id}`}
+                runId={detail.id}
+                rating={detail.rating}
+                notes={detail.notes}
+              />
               {/* #520 round-2 P2: chargeWeightGrams is the EFFECTIVE charge
                   (corrected when present) — the server's own bound moved to match
                   (set_roasted_weight now rejects against the correction, not the

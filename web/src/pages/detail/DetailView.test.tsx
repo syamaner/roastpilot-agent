@@ -324,6 +324,52 @@ describe("DetailView composition", () => {
     expect(screen.getByTestId("tasting-notes")).toHaveValue("");
   });
 
+  it("#568 round 7 (PRRT_kwDOSzMG_c6RhcxP): opening run A's editor never leaks into run B's render after navigating away — the key={detail.id} remount (mirroring ChargeWeight/RoastTastings) mounts a FRESH RoastRating instance per run, never reusing A's `editing` state on B", async () => {
+    // Run B shares the IDENTICAL rating/notes as run A — isolates the
+    // cross-instance-reuse hazard from RoastRating's OWN (unrelated)
+    // props-sync effect (which resets `editing` on a genuine rating/notes
+    // CHANGE regardless of the key fix, and would mask this test either way
+    // if B's values differed from A's).
+    const detailB = { ...FIXTURE_DETAIL_LONG, rating: FIXTURE_DETAIL.rating, notes: FIXTURE_DETAIL.notes };
+
+    // Run A's rating save stalls — kept pending for the duration of this
+    // test; its own resolution isn't what this test is probing (round 4/5/6
+    // cover the in-flight/partial-failure lock windows already).
+    vi.spyOn(api, "rate").mockImplementation(() => new Promise(() => undefined));
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    const { rerender } = render(
+      <DetailView detail={FIXTURE_DETAIL} telemetry={FIXTURE_TELEMETRY} timeline={FIXTURE_TIMELINE} />,
+      { wrapper: wrapper() },
+    );
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    // Open run A's editor and pick a star (an in-progress DRAFT, not yet
+    // saved) — the state a stale reused instance would otherwise carry over.
+    fireEvent.click(screen.getByTestId("rating-edit"));
+    fireEvent.click(screen.getByTestId("star-3"));
+    expect(screen.getByTestId("star-3")).toHaveAttribute("data-filled", "true");
+
+    // Navigate to run B (the same re-render DetailPage performs on a route
+    // param change) WITHOUT ever closing A's editor first — the exact
+    // interleaving the round-lead described: "navigate to run B → open B's
+    // editor before A resolves." WITHOUT the key fix, React reuses the same
+    // RoastRating instance (detailB's rating/notes are unchanged from A's,
+    // so nothing else forces a reset), landing on run B's render STILL
+    // showing A's in-progress editing session — an operator would see A's
+    // own draft (star-3 selected) presented as if it were B's rating.
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: detailB.id, tastings: [] });
+    rerender(
+      <DetailView detail={detailB} telemetry={FIXTURE_TELEMETRY_LONG} timeline={FIXTURE_TIMELINE_LONG} />,
+    );
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    // Run B's OWN (fresh) instance must start read-only, exactly like every
+    // other newly-viewed completed run — never inheriting run A's
+    // still-open, still-mid-draft editing session.
+    expect(screen.getByTestId("rating-headline")).toBeInTheDocument();
+    expect(screen.queryByTestId("star-3")).not.toBeInTheDocument();
+  });
+
   it("resets the ChargeWeight correction draft when navigating between two different runs (#520 round-2 P4): run A's unsaved draft must never leak into a POST against run B", () => {
     const { rerender } = render(
       <DetailView detail={FIXTURE_DETAIL} telemetry={FIXTURE_TELEMETRY} timeline={FIXTURE_TIMELINE} />,
