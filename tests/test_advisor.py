@@ -1253,8 +1253,17 @@ def test_c7_extends_c6_with_dtr_pace_mismatch() -> None:
     # Keeps the #499 joint-objective framing it refines (strict superset via c6/c1).
     assert "joint objective" in lowered
     assert "modest overshoot" in lowered
-    # Ceiling stays LAW, unconditionally, in the new section too.
-    assert "still law" in lowered or "ceiling" in lowered
+    # Ceiling still forces the drop unconditionally in the new section too —
+    # via an explicit NUMERIC COMPARISON, not a restated "it is LAW" emphasis
+    # (the #499/#559 combined bake-off falsified the emphasis-repetition
+    # phrasing: both c7 and c8 hallucinated "at the ceiling" on the roast-15
+    # bottom-edge case at bean 187 / ceiling 195, a real 8 °C gap, while c3 —
+    # which never repeats the ceiling emphasis — read the numbers correctly
+    # 6/6). The revised teaching must make the model STATE the two numbers
+    # and COMPUTE the gap, never reason from a felt sense of proximity.
+    assert "compute the gap" in lowered
+    assert "never on a felt sense" in lowered
+    assert "ceiling" in lowered
     # The new section names NO fixed roast-13 fixture numbers of its own
     # (told==enforced; the live context carries every threshold/target).
     start = c7.index("POST-FIRST-CRACK: A LARGE DTR OVERSHOOT")
@@ -1278,7 +1287,15 @@ def test_c8_extends_c7_with_pace_bottom_edge_and_fan_coupling() -> None:
     crossing, (2) the explicit bottom-edge-is-not-a-finish-line teaching, and
     (3) fan->RoR coupling teaching that stays CONSISTENT with D96 slice 1's
     actual shipped mechanism (the heat loop's compensation is bounded and
-    suppressed near a drop, never an unconditional rescue)."""
+    suppressed near a drop, never an unconditional rescue).
+
+    #499/#559 combined bake-off amendment (issue #562): the ceiling sentence
+    in (2) originally restated "ceiling stays LAW" — the SAME emphasis
+    phrasing that (independently) falsified in c7 (below). Both c7 and c8
+    hallucinated "at the ceiling" on the roast-15 bottom-edge case (bean 187,
+    ceiling 195, an 8 C gap) while c3 read the numbers correctly 6/6. Revised
+    to an explicit numeric-comparison instruction (state the two numbers,
+    compute the gap) here too."""
     from roastpilot_agent.advisor import (
         _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
     )
@@ -1303,6 +1320,12 @@ def test_c8_extends_c7_with_pace_bottom_edge_and_fan_coupling() -> None:
     assert "not a finish line either" in lowered or "not a finish line" in lowered
     assert "no longer disqualif" in lowered  # "disqualifying"/"disqualified"
     assert "has not arrived" in lowered or "does not mean the roast has arrived" in lowered
+    # Ceiling still forces the drop unconditionally — via an explicit NUMERIC
+    # COMPARISON, not a restated "stays LAW" emphasis (the #562 bake-off
+    # falsification: that phrasing pattern-matched into a hallucinated
+    # "at the ceiling" on the roast-15 case, an 8 C real gap).
+    assert "compute the gap" in lowered
+    assert "never on a felt sense" in lowered
     # (3) Fan->RoR coupling, consistent with D96 slice 1's shipped mechanism —
     # the compensation is bounded/conditional, NOT an assumed rescue, and is
     # explicitly suppressed near a drop (never promises a raise will land).
@@ -1405,6 +1428,18 @@ def test_c1_grounds_development_numbers_to_context_no_invention() -> None:
     # The irreversible-drop framing is present so a fabricated number cannot drive
     # the drop.
     assert "irreversible" in lowered
+
+
+def test_c1_pins_the_confidence_scale() -> None:
+    """Issue #562 (the #499/#559 combined bake-off): both malformed decisions
+    the bake-off surfaced were confidence-scale confusion (7.0, 85.0 returned
+    on a 0-1 field). c1's own confidence mention (the only place in the
+    control-teaching frame that names it) named no scale — pin it "between 0
+    and 1" so the model is told the scale explicitly, inherited unchanged by
+    every later c-version (c2 through c8)."""
+    prompt = control_teaching_prompt("c1")
+    lowered = prompt.lower()
+    assert "confidence between 0 and 1" in lowered
 
 
 def test_default_prompt_version_matches_control_teaching_version() -> None:
