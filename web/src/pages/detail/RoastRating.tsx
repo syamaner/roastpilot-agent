@@ -28,6 +28,8 @@
  * this edit ever happened). `usePartialFailureLock` reads the shared signal
  * `RoastTastings` publishes for exactly that window, so Edit stays blocked
  * for its full duration too — not just the narrower in-flight moments.
+ * (Round 5: this signal is a plain module-scoped store, not a query-cache
+ * entry — see `useSaveRating.ts`'s own doc for why.)
  */
 
 import { useEffect, useState } from "react";

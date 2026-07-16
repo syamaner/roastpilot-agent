@@ -77,8 +77,8 @@
  * history list.
  */
 
-import { useCallback } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useSyncExternalStore } from "react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { api } from "@/lib/api";
 import { roastKeys } from "@/hooks/queries";
@@ -113,39 +113,74 @@ export function useSaveRating(runId: string) {
  * edit landing in that gap goes unobserved by `RoastTastings`, and its next
  * retry silently re-posts (and overwrites) the now-stale captured rating.
  *
- * Modeled as a tiny cache-resident boolean flag rather than reaching into
- * TanStack's own mutation-state history (`useMutationState`) — the latter's
- * behavior across `.reset()` calls and retries is exactly the kind of
- * implicit bookkeeping this whole Codex arc has been finding edges in;
- * an explicit flag this module owns end-to-end is easier to reason about
- * and test. `RoastTastings` is the only writer (`setPartialFailureLock`);
- * `RoastRating` (and `RoastTastings` itself, for its own Edit-adjacent
- * affordances) are readers via `usePartialFailureLock`.
+ * Round 5 (PRRT_kwDOSzMG_c6RgNHJ): the FIRST implementation stored this flag
+ * as a TanStack query under the `["roasts", runId, ...]` prefix with
+ * `queryFn: () => false` — which put it inside the blast radius of every
+ * OTHER widget's broad (non-`exact`) invalidation of `roastKeys.detail` /
+ * `roastKeys.history` (`RoastedWeight.tsx`, `ChargeWeight.tsx` both do this
+ * routinely). A refetch of this query resolves to `false` regardless of the
+ * REAL lock state, silently CLEARING an active lock the instant a sibling
+ * widget saves anything — reopening the exact stale-overwrite race round 4
+ * exists to close, via a completely unrelated co-action. This is UI
+ * coordination state, not server cache, and belongs in neither the query
+ * cache NOR TanStack's own mutation-state bookkeeping (the same lesson round
+ * 4's doc already drew against `useMutationState` — implicit lifecycle
+ * bookkeeping this whole arc keeps finding edges in). A plain module-scoped
+ * store, subscribed to via `useSyncExternalStore` (React's own primitive for
+ * exactly this — external mutable state with a snapshot + subscribe pair),
+ * has NO query key at all, so no invalidation from anywhere in the app can
+ * ever touch it. Its lifetime is controlled ONLY by `RoastTastings`' own
+ * state transitions and the explicit "Start over" discard — never by a
+ * cache event.
  */
-export function partialFailureLockKey(runId: string) {
-  return ["roasts", runId, "rating-partial-failure-lock"] as const;
+type PartialFailureListener = () => void;
+const partialFailureLocks = new Map<string, boolean>();
+const partialFailureListeners = new Map<string, Set<PartialFailureListener>>();
+
+function getPartialFailureLock(runId: string): boolean {
+  return partialFailureLocks.get(runId) ?? false;
+}
+
+function setPartialFailureLockValue(runId: string, locked: boolean): void {
+  if (partialFailureLocks.get(runId) === locked) return;
+  partialFailureLocks.set(runId, locked);
+  for (const listener of partialFailureListeners.get(runId) ?? []) listener();
+}
+
+function subscribePartialFailureLock(runId: string, listener: PartialFailureListener): () => void {
+  let listeners = partialFailureListeners.get(runId);
+  if (listeners === undefined) {
+    listeners = new Set();
+    partialFailureListeners.set(runId, listeners);
+  }
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0) partialFailureListeners.delete(runId);
+  };
 }
 
 export function usePartialFailureLock(runId: string): boolean {
-  const query = useQuery({
-    queryKey: partialFailureLockKey(runId),
-    queryFn: () => false,
-    initialData: false,
-    staleTime: Infinity,
-    gcTime: Infinity,
-  });
-  return query.data;
+  return useSyncExternalStore(
+    (listener) => subscribePartialFailureLock(runId, listener),
+    () => getPartialFailureLock(runId),
+  );
 }
 
 export function useSetPartialFailureLock(runId: string) {
-  const queryClient = useQueryClient();
   // Stable identity across renders (a `useEffect` in RoastTastings depends on
   // this) — otherwise a plain inline arrow would re-run that effect on every
   // render regardless of whether the lock value actually changed.
-  return useCallback(
-    (locked: boolean) => {
-      queryClient.setQueryData(partialFailureLockKey(runId), locked);
-    },
-    [queryClient, runId],
-  );
+  return useCallback((locked: boolean) => setPartialFailureLockValue(runId, locked), [runId]);
+}
+
+/** Test-only: this module-scoped store persists across tests within the
+ *  same file (unlike a per-test `QueryClient`, there is no fresh instance
+ *  per `render()`) — call in `afterEach` in any spec that can leave a lock
+ *  set (i.e. any test reaching a partial-failure state without an explicit
+ *  "Start over" or a full-success resolution), so a leaked `true` for one
+ *  run id can't silently gate an unrelated later test reusing that id. */
+export function __resetPartialFailureLocksForTests(): void {
+  partialFailureLocks.clear();
+  partialFailureListeners.clear();
 }

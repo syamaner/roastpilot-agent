@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/lib/api";
 import { RoastRating } from "./RoastRating";
+import { __resetPartialFailureLocksForTests } from "./useSaveRating";
 
 function wrapper() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -13,7 +14,13 @@ function wrapper() {
   );
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  // Defensive: this file only READS the module-scoped partial-failure lock
+  // (#568 round 5), never sets it, but resetting keeps every spec in this
+  // suite starting from a clean, known state regardless.
+  __resetPartialFailureLocksForTests();
+});
 
 describe("RoastRating (#566: read-only headline + edit affordance)", () => {
   it("renders a read-only headline from the persisted rating and notes, with no edit form visible", () => {

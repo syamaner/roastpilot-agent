@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { api } from "@/lib/api";
 import type { RoastDetail, TastingList } from "@/lib/types";
 import { RoastTastings } from "./RoastTastings";
+import { __resetPartialFailureLocksForTests } from "./useSaveRating";
 
 function wrapper() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -23,7 +24,14 @@ function fakeRatedDetail(runId = "r1"): RoastDetail {
   return { id: runId } as RoastDetail;
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  // The partial-failure lock (#568 round 5) is a module-scoped store, not a
+  // per-test QueryClient — several tests here intentionally end mid partial-
+  // failure (no "Start over", no full success), which would otherwise leave
+  // a `true` lock for "r1" bleeding into whichever test runs next.
+  __resetPartialFailureLocksForTests();
+});
 
 describe("RoastTastings", () => {
   it("renders no entries and a blank form when the run has no tastings yet", async () => {

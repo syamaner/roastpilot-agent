@@ -8,6 +8,7 @@ import { api } from "@/lib/api";
 import type { RoastDetail } from "@/lib/types";
 import { FIXTURE_DETAIL, FIXTURE_TELEMETRY, FIXTURE_TIMELINE } from "./fixture";
 import { DetailPage } from "./DetailPage";
+import { __resetPartialFailureLocksForTests } from "./useSaveRating";
 
 function renderAt(path: string) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -24,7 +25,12 @@ function renderAt(path: string) {
   return render(<DetailPage />, { wrapper: Wrapper });
 }
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  // See RoastTastings.test.tsx's afterEach for why this module-scoped store
+  // (#568 round 5) needs an explicit reset between tests.
+  __resetPartialFailureLocksForTests();
+});
 
 describe("DetailPage shell", () => {
   it("fetches by the route run id and renders the detail view", async () => {

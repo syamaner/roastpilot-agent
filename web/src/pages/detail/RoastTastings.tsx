@@ -77,17 +77,30 @@
  * which is false for the whole gap between the failure and its retry; that
  * gap is exactly the window this closes). `RoastRating`'s Edit reads the
  * SAME "a partial-failure window is open" signal via the shared
- * `usePartialFailureLock` (`useSaveRating.ts`) — an explicit cache flag this
- * module owns end-to-end, set the moment a partial failure is detected and
- * cleared on full success or an explicit discard — so no external direct
- * edit can land unobserved during that window either. A "Start over"
- * affordance (round 4's explicit escape) discards the frozen attempt and
- * both mutations' state, so the operator is never trapped — with a real, if
- * rare, tradeoff owned deliberately: starting over on a `tastingOnlyFailed`
- * state does NOT retract the tasting entry that already saved (it is
- * append-only by design), it only abandons the STUCK rating retry, leaving
- * that one tasting entry's stars as the last word until a fresh save or a
- * direct `RoastRating` edit corrects it.
+ * `usePartialFailureLock` (`useSaveRating.ts`) — set the moment a partial
+ * failure is detected and cleared on full success or an explicit discard —
+ * so no external direct edit can land unobserved during that window either.
+ * A "Start over" affordance (round 4's explicit escape) discards the frozen
+ * attempt and both mutations' state, so the operator is never trapped —
+ * with a real, if rare, tradeoff owned deliberately: starting over on a
+ * `tastingOnlyFailed` state does NOT retract the tasting entry that already
+ * saved (it is append-only by design), it only abandons the STUCK rating
+ * retry, leaving that one tasting entry's stars as the last word until a
+ * fresh save or a direct `RoastRating` edit corrects it.
+ *
+ * Round 5 (PRRT_kwDOSzMG_c6RgNHJ): the shared lock's FIRST implementation
+ * stored it as a query-cache entry under the `["roasts", runId, ...]`
+ * prefix — which put it inside the blast radius of `RoastedWeight.tsx` /
+ * `ChargeWeight.tsx`'s own routine, broad (non-`exact`) invalidation of
+ * `roastKeys.detail` / `roastKeys.history` on this same detail page. Saving
+ * a weight while a tasting/rating partial failure sat unresolved silently
+ * refetched (and cleared) the lock, re-enabling `RoastRating`'s Edit and
+ * reopening the exact stale-overwrite race round 4 exists to close — via a
+ * completely unrelated co-action. `usePartialFailureLock` now lives in a
+ * plain module-scoped store with no query key at all (see its own doc in
+ * `useSaveRating.ts`), so no invalidation from ANYWHERE in the app can ever
+ * touch it — its lifetime is controlled ONLY by this component's own state
+ * transitions and the explicit "Start over" discard.
  */
 
 import { useEffect, useRef, useState } from "react";

@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/lib/api";
+import { roastKeys } from "@/hooks/queries";
 import { DetailView } from "./DetailView";
 import {
   FIXTURE_DETAIL,
@@ -16,6 +17,7 @@ import {
   FIXTURE_TIMELINE_FAILED,
   FIXTURE_TIMELINE_LONG,
 } from "./fixture";
+import { __resetPartialFailureLocksForTests } from "./useSaveRating";
 
 function wrapper() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -73,7 +75,13 @@ describe("DetailView trace-row → curve highlight", () => {
   });
 });
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  // See RoastTastings.test.tsx's afterEach — this suite also drives a
+  // partial-failure state (module-scoped, not per-test QueryClient) on the
+  // shared FIXTURE_DETAIL.id, which could otherwise bleed into a later spec.
+  __resetPartialFailureLocksForTests();
+});
 
 describe("DetailView composition", () => {
   it("mounts ChargeWeight wired to the detail's frozen charge weight (#520) — the data-flows-to-the-render-tree check", () => {
@@ -203,6 +211,40 @@ describe("DetailView composition", () => {
     fireEvent.click(screen.getByTestId("tasting-save"));
     await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
     expect(screen.getByTestId("rating-edit")).not.toBeDisabled();
+  });
+
+  it("#568 round 5 (PRRT_kwDOSzMG_c6RgNHJ): a concurrent widget's BROAD (non-exact) invalidation of roastKeys.detail/history — exactly what RoastedWeight.tsx and ChargeWeight.tsx do routinely — does NOT clear an active partial-failure lock; RoastRating's Edit stays disabled across it", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    vi.spyOn(api, "rate").mockRejectedValue(new Error("rating endpoint down"));
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <DetailView detail={FIXTURE_DETAIL} telemetry={FIXTURE_TELEMETRY} timeline={FIXTURE_TIMELINE} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("tasting-star-2"));
+    fireEvent.click(screen.getByTestId("tasting-save"));
+    await waitFor(() => expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument());
+    expect(screen.getByTestId("rating-edit")).toBeDisabled();
+
+    // Simulate a concurrent RoastedWeight/ChargeWeight save landing on the
+    // SAME detail page — both invalidate these two keys WITHOUT `exact`,
+    // which is precisely the co-action that clobbered the round-5-broken
+    // lock implementation (it lived under the same roasts/{runId} prefix, so
+    // the invalidation's own refetch resolved to `false` and cleared it —
+    // asynchronously, hence `waitFor` below rather than an immediate assert).
+    await client.invalidateQueries({ queryKey: roastKeys.detail(FIXTURE_DETAIL.id) });
+    await client.invalidateQueries({ queryKey: roastKeys.history });
+
+    // The lock must survive — it has no query key at all now, so neither
+    // invalidation (nor the refetch either triggers) can touch it.
+    await waitFor(() => expect(screen.getByTestId("rating-edit")).toBeDisabled());
+    expect(screen.getByTestId("rating-edit-blocked")).toBeInTheDocument();
+    expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument();
   });
 
   it("resets the RoastTastings draft when navigating between two different runs (#522 Codex P2): run A's unsaved draft must never leak into a POST against run B", async () => {
