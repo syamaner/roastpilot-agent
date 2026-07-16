@@ -74,14 +74,16 @@ def test_roster_is_well_formed() -> None:
 
 
 def test_roster_is_the_277_screen_with_baseline_and_prior_winner() -> None:
-    """The as-run #277 roster has 10 unique models incl. baseline + prior winner.
+    """The as-run #277 roster has 11 unique models incl. baseline + prior winner.
 
     The 10th slug is ``x-ai/grok-4.3``, the recovery candidate added when the
     original ``x-ai/grok-4-fast`` slug 404'd as deprecated (see the
-    21 Jun results doc disposition).
+    21 Jun results doc disposition). The 11th is ``openai/gpt-5.6-luna``,
+    added 16 Jul after passing the ~5s latency screen (median 1.89s,
+    faster than the gpt-4o pin) for the #396 heat-fidelity A/B.
     """
     slugs = [c.slug for c in bakeoff.ROSTER]
-    assert len(slugs) == 10
+    assert len(slugs) == 11
     assert len(slugs) == len(set(slugs)), "roster slugs must be unique"
     # The gpt-4o n8n baseline (D40.4) and the prior winner are both present.
     baselines = [c.slug for c in bakeoff.ROSTER if c.tier is bakeoff.Tier.BASELINE]
@@ -104,6 +106,7 @@ def test_finalists_are_the_ones_carried_to_the_full_set() -> None:
     """
     expected = {
         "openai/gpt-4o",
+        "openai/gpt-5.6-luna",
         "google/gemini-3.1-flash-lite",
         "google/gemini-3-flash-preview",
         "openai/gpt-5-nano",
@@ -387,6 +390,43 @@ def mock_healthcheck(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
     monkeypatch.setattr(PydanticAIAdvisor, "healthcheck", fake_healthcheck)
+
+
+@pytest.mark.asyncio
+async def test_availability_sweep_applies_each_candidates_reasoning_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#572 Codex catch: the sweep must probe each candidate under its OWN
+    resolved reasoning cap (:func:`bakeoff.resolve_reasoning`), not the raw
+    run-wide ``reasoning`` — otherwise a reasoning-on candidate is
+    healthchecked UNCAPPED (provider default), and its bounded probe could
+    time out and drop a slug the (correctly-capped) scoring pass would have
+    handled fine.
+
+    Captures the ``reasoning`` argument each ``probe_slug`` call actually
+    receives, rather than asserting on sweep behaviour indirectly.
+    """
+    captured: dict[str, object] = {}
+
+    async def fake_probe_slug(
+        slug: str, prompt_version: str, reasoning: object, **_: object
+    ) -> bakeoff.AvailabilityResult:
+        captured[slug] = reasoning
+        return bakeoff.AvailabilityResult(slug=slug, available=True, attempts=1)
+
+    monkeypatch.setattr(bakeoff, "probe_slug", fake_probe_slug)
+
+    capped = bakeoff.Candidate(
+        "capped/slug", bakeoff.Tier.CONTROL_CANDIDATE, (RoastPhase.DEVELOPMENT,), reasoning="low"
+    )
+    uncapped = bakeoff.Candidate("uncapped/slug", bakeoff.Tier.BASELINE, (RoastPhase.DEVELOPMENT,))
+    await bakeoff.availability_sweep((capped, uncapped), "c3", "high")
+
+    # The capped candidate's OWN cap wins over the run-wide "high" (mirrors
+    # resolve_reasoning's precedence, used identically in scoring).
+    assert captured["capped/slug"] == "low"
+    # The uncapped candidate falls back to the run-wide reasoning, unchanged.
+    assert captured["uncapped/slug"] == "high"
 
 
 @pytest.mark.asyncio
