@@ -110,6 +110,35 @@ describe("DetailView composition", () => {
     await waitFor(() => expect(spy).toHaveBeenCalledWith(FIXTURE_DETAIL.id));
   });
 
+  it("#568 Codex (PRRT_kwDOSzMG_c6RdllD): RoastRating's own Edit is blocked while RoastTastings' one-gesture rating save is in flight — the two entry points never race a rating write", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    let resolveRate: (() => void) | undefined;
+    vi.spyOn(api, "rate").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRate = () => resolve({ id: FIXTURE_DETAIL.id } as Awaited<ReturnType<typeof api.rate>>);
+        }),
+    );
+    renderView();
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    // Fire a tasting save — its rating POST stalls, mid-flight.
+    fireEvent.click(screen.getByTestId("tasting-star-4"));
+    fireEvent.click(screen.getByTestId("tasting-save"));
+    await waitFor(() => expect(resolveRate).toBeDefined());
+
+    // RoastRating's own "Edit" must be disabled for the duration — an
+    // operator opening it here could otherwise clobber the in-flight
+    // tasting-triggered save with a stale direct edit (last-write-wins).
+    expect(screen.getByTestId("rating-edit")).toBeDisabled();
+    expect(screen.getByTestId("rating-edit-blocked")).toBeInTheDocument();
+
+    resolveRate?.();
+    await waitFor(() => expect(screen.getByTestId("rating-edit")).not.toBeDisabled());
+    expect(screen.queryByTestId("rating-edit-blocked")).not.toBeInTheDocument();
+  });
+
   it("resets the RoastTastings draft when navigating between two different runs (#522 Codex P2): run A's unsaved draft must never leak into a POST against run B", async () => {
     vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
     const { rerender } = render(

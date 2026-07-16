@@ -33,11 +33,19 @@
  * (the headline rating, `RoastRating`) from one gesture, seeded with the
  * tasting's own stars. Both mutations run concurrently; a partial failure
  * (one succeeds, one doesn't) is surfaced honestly rather than reported as a
- * blanket "Saved." — the form only resets and shows "Saved." once BOTH
- * succeed, and each failure names which record didn't save.
+ * blanket "Saved." — a `useEffect` keyed on both mutations SETTLING resets
+ * the form and shows "Saved." only once BOTH succeed (#568 Codex: resetting
+ * from the tasting mutation's own `onSuccess` alone would clear the star
+ * rating + notes draft even when the rating write went on to fail, and the
+ * partial-failure message's only recovery path — RoastRating's "Edit" —
+ * pre-fills from the OLD persisted rating, so the attempted values would be
+ * unrecoverable). Each failure names which record didn't save. A retry after
+ * a rating-only partial failure resubmits ONLY the rating — the tasting
+ * already succeeded and is append-only, so replaying it on retry would create
+ * a duplicate entry (a hazard this same preserved-draft fix newly exposed).
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { cn } from "@/lib/cn";
 import { useAddTasting, useTastings } from "@/hooks/queries";
@@ -90,11 +98,18 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
   // click — see the reset below) before the form reports "Saved." and resets.
   const isSaved =
     tastingMutation.isSuccess && ratingMutation.isSuccess && !isPending;
-  // Which record(s) failed on the LAST attempt — surfaced honestly rather
-  // than a blanket "Saved."; a partial failure never gets reported as full
-  // success.
+  // A "this record saved" claim requires the OTHER mutation to have SETTLED
+  // (succeeded, not just "hasn't failed yet") — #568 Codex: gating on
+  // `!otherFailed` alone is also true while the other mutation is still
+  // PENDING, so the UI could claim a record landed before it actually
+  // settled. `tasting-only saved` / `rating-only saved` are true only once
+  // the failing side has genuinely finished failing and the succeeding side
+  // has genuinely finished succeeding — never mid-flight.
   const tastingFailed = tastingMutation.isError;
   const ratingFailed = ratingMutation.isError;
+  const tastingOnlyFailed = tastingFailed && ratingMutation.isSuccess;
+  const ratingOnlyFailed = ratingFailed && tastingMutation.isSuccess;
+  const bothFailed = tastingFailed && ratingFailed;
 
   const toggle = <T,>(list: T[], value: T, setList: (next: T[]) => void) => {
     setList(list.includes(value) ? list.filter((v) => v !== value) : [...list, value]);
@@ -110,18 +125,34 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
     setDefects([]);
   };
 
+  // #568 Codex: the form previously reset (clearing the star rating + notes
+  // draft) the instant the TASTING mutation alone succeeded — even when the
+  // rating mutation went on to fail. The partial-failure message tells the
+  // operator to retry via RoastRating's "Edit", but that form pre-fills from
+  // the OLD persisted rating, not the just-attempted values — so the draft
+  // was silently lost with no way to recover it. Defer the reset until BOTH
+  // mutations have succeeded for this same attempt (the tasting record is
+  // append-only and already safely saved either way, so nothing is lost by
+  // waiting — only the draft-clearing is deferred, not the tasting write).
+  useEffect(() => {
+    if (isSaved) resetForm();
+  }, [isSaved]);
+
   const onSave = () => {
     if (stars === null) return;
     const trimmedNotes = notes.trim() === "" ? null : notes.trim();
 
-    // Reset any previous attempt's error/success state before firing this
-    // one, so a retry after a partial failure doesn't read as stale success
-    // on the side that already landed.
-    tastingMutation.reset();
-    ratingMutation.reset();
-
-    tastingMutation.mutate(
-      {
+    // A retry after a rating-only partial failure (#568: the draft is
+    // preserved for exactly this retry) must NOT resubmit the tasting — it
+    // already succeeded and is append-only, so clicking "Add tasting" again
+    // would create a SECOND, duplicate tasting entry for the one gesture.
+    // Only the rating write is retried in that case.
+    if (!ratingOnlyFailed) {
+      // Reset any previous attempt's error/success state before firing this
+      // one, so a retry after a partial failure doesn't read as stale
+      // success on the side that already landed.
+      tastingMutation.reset();
+      tastingMutation.mutate({
         stars,
         notes: trimmedNotes,
         tasted_at_utc: tastedAt === "" ? null : new Date(tastedAt).toISOString(),
@@ -129,13 +160,13 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
         grind_note: grindNote.trim() === "" ? null : grindNote.trim(),
         attributes,
         defects,
-      },
-      { onSuccess: resetForm },
-    );
+      });
+    }
     // The headline rating rides the tasting's own stars/notes — one gesture,
     // both records (#566). Fired independently of the tasting mutation
     // above: either can succeed or fail on its own, and a fetch failure on
     // one must never block or silently swallow the other.
+    ratingMutation.reset();
     ratingMutation.mutate({ stars, notes: trimmedNotes });
   };
 
@@ -260,18 +291,21 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
         </button>
         {/* #566: a partial failure (one of the two records didn't save) is
             surfaced honestly, never folded into a blanket "Saved." — each
-            span names which record failed. */}
-        {tastingFailed && ratingFailed && (
+            span names which record failed. #568 Codex: each "X saved"
+            claim requires the surviving mutation to have genuinely
+            SETTLED into success, not merely "hasn't failed yet" (which is
+            also true mid-flight). */}
+        {bothFailed && (
           <span data-testid="tasting-error" className="text-xs text-roast-fault">
             Save failed — try again.
           </span>
         )}
-        {tastingFailed && !ratingFailed && (
+        {tastingOnlyFailed && (
           <span data-testid="tasting-error" className="text-xs text-roast-fault">
             Tasting save failed — try again. (Rating saved.)
           </span>
         )}
-        {!tastingFailed && ratingFailed && (
+        {ratingOnlyFailed && (
           <span data-testid="rating-partial-error" className="text-xs text-roast-fault">
             Tasting saved, but the rating didn't update — use "Edit" on Your
             rating above to retry.

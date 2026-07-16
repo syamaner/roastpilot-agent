@@ -95,6 +95,43 @@ describe("RoastRating (#566: read-only headline + edit affordance)", () => {
     expect(screen.getByTestId("rating-save")).toBeInTheDocument();
   });
 
+  it("#568 Codex (P3, PRRT_kwDOSzMG_c6RdxDY): reopening the editor after a failed save does not flash the PRIOR attempt's status", async () => {
+    vi.spyOn(api, "rate").mockRejectedValue(new Error("nope"));
+    render(<RoastRating runId="r1" rating={4} notes="bright" />, { wrapper: wrapper() });
+
+    fireEvent.click(screen.getByTestId("rating-edit"));
+    fireEvent.click(screen.getByTestId("rating-save"));
+    await waitFor(() => expect(screen.getByTestId("rating-error")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("rating-cancel"));
+    fireEvent.click(screen.getByTestId("rating-edit"));
+
+    // The reopened editor must not carry over the PREVIOUS attempt's error —
+    // this is a fresh session, no save has been attempted yet.
+    expect(screen.queryByTestId("rating-error")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("rating-saved")).not.toBeInTheDocument();
+  });
+
+  it("#568 Codex (P3, PRRT_kwDOSzMG_c6RdxDY): reopening the editor after a SUCCESSFUL save does not flash a stale 'Saved.'", async () => {
+    vi.spyOn(api, "rate").mockResolvedValue({ id: "r1" } as Awaited<ReturnType<typeof api.rate>>);
+    const { rerender } = render(<RoastRating runId="r1" rating={4} notes="bright" />, {
+      wrapper: wrapper(),
+    });
+
+    fireEvent.click(screen.getByTestId("rating-edit"));
+    fireEvent.click(screen.getByTestId("rating-save"));
+    // The editor auto-closes to the read-only headline on success; simulate
+    // the parent NOT yet re-rendering with fresh props (the exact stale
+    // window #568's other fix closes at the cache layer — here we're
+    // specifically probing the mutation object's own carried-over status).
+    await waitFor(() => expect(screen.queryByTestId("rating-headline")).toBeInTheDocument());
+    rerender(<RoastRating runId="r1" rating={4} notes="bright" />);
+
+    fireEvent.click(screen.getByTestId("rating-edit"));
+    expect(screen.queryByTestId("rating-saved")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("rating-error")).not.toBeInTheDocument();
+  });
+
   it("re-syncs from a later prop change (e.g. a tasting save updating the headline) and drops out of edit mode", () => {
     const { rerender } = render(<RoastRating runId="r1" rating={null} notes={null} />, {
       wrapper: wrapper(),

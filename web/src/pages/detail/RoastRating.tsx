@@ -6,16 +6,26 @@
  * tasting also updates this headline from its stars, see `useSaveRating`).
  * This widget slims to a READ-ONLY headline (stars + the saved note, if any)
  * with an explicit "Edit" affordance for a direct tweak without a tasting
- * event. Posts via the same `api.rate` (`POST /api/roasts/{id}/rating`) and
- * invalidates the same run-detail query as `RoastTastings` — the SPA renders
- * the server's truth, not local optimistic state, either way.
+ * event. Posts via the same `api.rate` (`POST /api/roasts/{id}/rating`),
+ * which seeds the run-detail cache directly with its response — the SPA
+ * renders the server's truth, not local optimistic state, either way.
+ *
+ * Codex round on #568 (PRRT_kwDOSzMG_c6RdllD): `RoastTastings`' one-gesture
+ * save fires a rating POST from an entirely separate `useMutation` instance
+ * to this widget's own — nothing serialized the two, so an operator editing
+ * "Your rating" directly while a tasting-triggered rating save was in flight
+ * elsewhere on the page could last-write-wins clobber one gesture with the
+ * other. `useIsMutating` reads the SHARED `ratingMutationKey` across every
+ * call site on the page, so this widget can see (and block on) a save
+ * in-flight from `RoastTastings` even though it never rendered here.
  */
 
 import { useEffect, useState } from "react";
+import { useIsMutating } from "@tanstack/react-query";
 
 import { cn } from "@/lib/cn";
 import type { OperatorRatingRequest } from "@/lib/types";
-import { useSaveRating } from "./useSaveRating";
+import { ratingMutationKey, useSaveRating } from "./useSaveRating";
 
 type Stars = OperatorRatingRequest["stars"];
 const STAR_VALUES: Stars[] = [1, 2, 3, 4, 5];
@@ -30,6 +40,10 @@ export interface RoastRatingProps {
 
 export function RoastRating({ runId, rating, notes, className }: RoastRatingProps): React.JSX.Element {
   const mutation = useSaveRating(runId);
+  // Any in-flight rating write ANYWHERE on the page (this widget's own edit
+  // form, or RoastTastings' one-gesture save) — never just this instance's
+  // own `mutation.isPending`, or the two entry points could race (#568).
+  const ratingWriteInFlight = useIsMutating({ mutationKey: ratingMutationKey(runId) }) > 0;
   const [editing, setEditing] = useState(false);
   const [stars, setStars] = useState<Stars | null>(clampStars(rating));
   const [notesDraft, setNotesDraft] = useState(notes ?? "");
@@ -43,6 +57,14 @@ export function RoastRating({ runId, rating, notes, className }: RoastRatingProp
     setEditing(false);
   }, [rating, notes]);
 
+  const openEdit = () => {
+    // #568 (P3): the mutation object is reused across edit sessions, so a
+    // prior attempt's isError/isSuccess would otherwise flash a stale
+    // "Save failed"/"Saved." for an attempt that hasn't happened yet.
+    mutation.reset();
+    setEditing(true);
+  };
+
   const onSave = () => {
     if (stars === null) return;
     mutation.mutate(
@@ -52,6 +74,7 @@ export function RoastRating({ runId, rating, notes, className }: RoastRatingProp
   };
 
   const onCancel = () => {
+    mutation.reset();
     setStars(clampStars(rating));
     setNotesDraft(notes ?? "");
     setEditing(false);
@@ -68,13 +91,19 @@ export function RoastRating({ runId, rating, notes, className }: RoastRatingProp
           <button
             type="button"
             data-testid="rating-edit"
-            onClick={() => setEditing(true)}
-            className="text-xs font-medium text-primary hover:underline"
+            onClick={openEdit}
+            disabled={ratingWriteInFlight}
+            className="text-xs font-medium text-primary hover:underline disabled:cursor-not-allowed disabled:opacity-50 disabled:no-underline"
           >
             Edit
           </button>
         )}
       </div>
+      {!editing && ratingWriteInFlight && (
+        <p data-testid="rating-edit-blocked" className="text-xs text-muted-foreground">
+          A tasting save is updating this rating — try Edit again shortly.
+        </p>
+      )}
 
       {editing ? (
         <>
@@ -116,7 +145,7 @@ export function RoastRating({ runId, rating, notes, className }: RoastRatingProp
               type="button"
               data-testid="rating-save"
               onClick={onSave}
-              disabled={stars === null || mutation.isPending}
+              disabled={stars === null || ratingWriteInFlight}
               className="inline-flex items-center rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
               {mutation.isPending ? "Saving…" : "Save rating"}

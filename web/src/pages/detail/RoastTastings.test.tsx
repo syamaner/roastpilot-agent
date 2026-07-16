@@ -315,5 +315,82 @@ describe("RoastTastings", () => {
       resolveRate?.();
       await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
     });
+
+    it("#568 Codex (PRRT_kwDOSzMG_c6RdllH): never claims a record 'saved' while the OTHER mutation is still pending — settled success is required, not merely 'hasn't failed yet'", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+      // The tasting write resolves immediately; the rating write stalls —
+      // `!ratingFailed` is true THIS WHOLE TIME the rating is pending, so a
+      // naive "not failed" gate would wrongly show "Rating saved" before the
+      // rating mutation has actually settled.
+      vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: "r1", tastings: [] });
+      let resolveRate: (() => void) | undefined;
+      vi.spyOn(api, "rate").mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveRate = () => resolve(fakeRatedDetail());
+          }),
+      );
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+      await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+      fireEvent.click(screen.getByTestId("tasting-star-3"));
+      fireEvent.click(screen.getByTestId("tasting-save"));
+
+      // The tasting mutation has settled (success); the rating mutation is
+      // still in flight. No "X saved" claim of ANY kind may render yet.
+      await waitFor(() => expect(screen.getByTestId("tasting-save")).toHaveTextContent(/saving/i));
+      expect(screen.queryByTestId("tasting-saved")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("tasting-error")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("rating-partial-error")).not.toBeInTheDocument();
+
+      resolveRate?.();
+      await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
+    });
+
+    it("#568 Codex (PRRT_kwDOSzMG_c6RdxDJ): preserves the star rating + notes draft when the tasting succeeds but the rating write fails, so the operator's attempted values aren't lost", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+      vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: "r1", tastings: [] });
+      vi.spyOn(api, "rate").mockRejectedValue(new Error("rating endpoint down"));
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+      await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+      fireEvent.click(screen.getByTestId("tasting-star-5"));
+      fireEvent.change(screen.getByTestId("tasting-notes"), { target: { value: "sweet, floral" } });
+      fireEvent.click(screen.getByTestId("tasting-save"));
+
+      await waitFor(() => expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument());
+      // The draft must survive this partial failure — the tasting record
+      // itself is append-only and already safely saved, so nothing is lost
+      // by NOT clearing the form; clearing it here would strand the
+      // attempted stars/notes with no way to recover them (RoastRating's
+      // "Edit" pre-fills from the OLD persisted rating, not these values).
+      expect(screen.getByTestId("tasting-star-5")).toHaveAttribute("data-filled", "true");
+      expect(screen.getByTestId("tasting-notes")).toHaveValue("sweet, floral");
+    });
+
+    it("a retry after a rating-only partial failure resubmits ONLY the rating, never a duplicate tasting entry", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+      const addSpy = vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: "r1", tastings: [] });
+      const rateSpy = vi
+        .spyOn(api, "rate")
+        .mockRejectedValueOnce(new Error("rating endpoint down"))
+        .mockResolvedValueOnce(fakeRatedDetail());
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+      await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+      fireEvent.click(screen.getByTestId("tasting-star-4"));
+      fireEvent.click(screen.getByTestId("tasting-save"));
+      await waitFor(() => expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument());
+      expect(addSpy).toHaveBeenCalledTimes(1);
+
+      // Retry from the SAME (preserved) draft.
+      fireEvent.click(screen.getByTestId("tasting-save"));
+      await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
+
+      // The tasting was NOT resubmitted — still exactly one call — while the
+      // rating retried and succeeded.
+      expect(addSpy).toHaveBeenCalledTimes(1);
+      expect(rateSpy).toHaveBeenCalledTimes(2);
+    });
   });
 });
