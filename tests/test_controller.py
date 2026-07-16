@@ -29,7 +29,7 @@ from roastpilot_agent.config import (
     PreFirstCrackLevers,
     SafetyLimits,
 )
-from roastpilot_agent.control_policy import PhaseControlLimits
+from roastpilot_agent.control_policy import PhaseControlLimits, TrimSignal
 from roastpilot_agent.controller import (
     TERMINAL_LATCH_PHASES,
     TRANSITION_TABLE,
@@ -50,6 +50,7 @@ from roastpilot_agent.models import (
     AppliedRoasterState,
     DropReason,
     OperatorAction,
+    PostFcHeatAuthorityState,
     RoastCommand,
     RoastEventKind,
     RoastProfile,
@@ -8313,3 +8314,1138 @@ async def test_genuine_raise_on_drop_due_tick_still_suppressed_round4() -> None:
         "source": "policy",
         "reason": DropReason.DEVELOPMENT_TARGET.value,
     } in executed
+
+
+# --- #561 (D96 slice 1.5): post-failure heat-to-base clamp -----------------
+#
+# PR #560's own raise-suppression (rounds 1/2/4, tested above) covers the
+# DETERMINISTIC drop paths' eligibility window — a genuine raise on a tick
+# that is ALSO ceiling-guard- or dev%/temp-anchor-eligible is fully
+# suppressed before it ever reaches `set_targets`, so `_last_post_fc_output`
+# is never even updated on that tick (see `_apply_deterministic_post_fc_
+# levers`'s own "do NOT stash it" comment) and there is nothing for the
+# clamp below to undo. The residual PR #560 round 3 named, and #561 exists to
+# close, is the ADVISOR drop path: `_run_advisory`'s own should_drop branch
+# has NO analogous pre-write suppression, so a genuine recovery raise CAN
+# land (updating `_current_heat` and `_last_post_fc_output` to a
+# RECOVERING/GLIDING state) on an earlier tick, and a LATER tick's advisor
+# `should_drop=True` can then fail its `drop_beans()` call while heat is
+# still sitting at that raised value — exactly the "one-tick raise lands
+# before an advisor drop attempt" gap. These tests drive that scenario (and
+# the deterministic paths' own idempotent/inert edges) directly against the
+# clamp.
+
+
+class _AlwaysFailingDropExecutor(RecordingExecutor):
+    """Every ``drop_beans()`` call raises (a transient actuator failure)."""
+
+    async def drop_beans(self) -> AppliedRoasterState:
+        raise RuntimeError("serial write dropped")
+
+
+# #563/#570 sibling-PR interaction (pr-preflight, the #453 class): _bitter_
+# ceiling_temp_c() now feeds ceiling_guard_temp_c straight into
+# PhaseControlLimits (see _ISOLATED_CEILING_GUARD_LIMITS's own comment above,
+# ~:7850) rather than capping it first — a guard raised well above the drop
+# target to "stay clear of the guard and isolate a different anchor" (the
+# pattern every test below uses) now also needs emergency_drop_temp_c raised
+# above IT, or the resolved box fails its own emergency_drop_temp_c >
+# bitter_ceiling_temp_c validator. Reusing _ISOLATED_CEILING_GUARD_LIMITS
+# (emergency_drop_temp_c=225.0) covers every 220.0 guard temp below; one test
+# uses 230.0 (to stay clear of the guard while STILL driving the run into
+# FAULTED via a bean reading past max_bean_temp_c), which needs its own wider
+# fixture — reused here rather than duplicated per call site.
+_ISOLATED_CEILING_GUARD_LIMITS_230 = SafetyLimits(
+    emergency_drop_temp_c=231.0, max_bean_temp_c=234.0
+)
+
+
+async def _confirm_recovery_raise(harness: Harness, *, entry_heat: int) -> int:
+    """Drive one DEVELOPMENT tick with a sustained RoR shortfall large enough
+    to confirm D96 recovery entry immediately (``recovery_confirm_ticks=1``
+    on every caller below) — NOT drop-eligible (bean held well below
+    ``PROFILE.target_drop_temp_c``), so the raise writes normally (no round-4
+    suppression applies). Returns the resulting actuated heat, asserting it
+    genuinely rose above ``entry_heat``."""
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+    raised_heat = harness.controller.snapshot().current_heat
+    assert raised_heat > entry_heat
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    return raised_heat
+
+
+@pytest.mark.asyncio
+async def test_advisor_drop_failure_clamps_heat_to_base_when_recovery_elevated() -> None:
+    """The #561 residual itself: a recovery raise lands (via the loop, on a
+    tick that is NOT drop-eligible), then a LATER tick's advisor
+    ``should_drop=True`` fails its ``drop_beans()`` call while heat is still
+    at the raised value — the clamp must land a heat-only write back to the
+    D88 base (``heat_engage_percent``, 60 here) THROUGH THE SAFETY PATH
+    (asserted via the fake MCP call log), phase stays DEVELOPMENT, and
+    ``COMMAND_FAILED`` is emitted for the failed drop."""
+    # The FIRST TWO consults — the FC-transition tick inside
+    # `_charge_through_fc_at_heat` itself, then the raise-confirming tick
+    # driven by `_confirm_recovery_raise` below — must NOT recommend a drop,
+    # otherwise the raise and the drop-failure/clamp would collide on the
+    # SAME tick, which this test deliberately drives as two SEPARATE ticks
+    # (a dedicated same-tick-collision test follows this one). Every consult
+    # AFTER that (the default) recommends the drop that then fails.
+    advisor = FakeAdvisor(
+        [decision(heat=50, fan=40, drop=False), decision(heat=50, fan=40, drop=False)],
+        default_decision=decision(heat=50, fan=40, drop=True),
+    )
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=220.0,  # stay clear of the guard entirely
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    harness = make_harness(
+        config=config,
+        advisor=advisor,
+        executor=_AlwaysFailingDropExecutor(),
+        limits=_ISOLATED_CEILING_GUARD_LIMITS,
+    )
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    raised_heat = await _confirm_recovery_raise(harness, entry_heat=60)
+    assert raised_heat <= 75  # within the 60+15 recovery cap
+
+    # A later tick: the loop itself now holds/lowers (not a NEW raise, so it
+    # is unaffected by anything drop-eligibility related — the advisor's own
+    # should_drop path is the one under test), and the advisor is consulted
+    # and recommends a drop that then FAILS.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=6.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {"command": "drop_beans", "source": "advisor"} in failed
+    # The clamp's own write landed: the LAST set_targets call on the fake MCP
+    # log commanded heat back down to the D88 base (60), fan held at whatever
+    # was last actuated (unaffected by the heat-only clamp).
+    last_heat, _last_fan = harness.executor.targets[-1]
+    assert last_heat == 60
+    assert harness.controller.snapshot().current_heat == 60
+
+
+@pytest.mark.asyncio
+async def test_advisor_drop_failure_clamp_is_inert_when_recovery_never_elevated() -> None:
+    """Flag-off/HOLDING byte-for-byte inertness: with recovery never
+    triggered this engagement (``_last_post_fc_output`` is either ``None`` or
+    reports ``HOLDING``), a failed advisor drop issues NO extra clamp write —
+    the existing (pre-#561) failure behaviour is completely unchanged."""
+    advisor = FakeAdvisor(
+        [decision(heat=50, fan=40, drop=True)],
+        default_decision=decision(heat=50, fan=40, drop=True),
+    )
+    config = _post_fc_config()
+    assert config.post_first_crack_control.recovery_enabled is False
+    harness = make_harness(config=config, advisor=advisor, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc(harness, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0)
+    targets_before_the_tick = list(harness.executor.targets)
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=6.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {"command": "drop_beans", "source": "advisor"} in failed
+    # No clamp write: the only writes this tick (if any) are the ordinary
+    # post-FC loop's own actuation, never a SECOND heat-only write chasing it.
+    new_targets = harness.executor.targets[len(targets_before_the_tick) :]
+    assert len(new_targets) <= 1
+
+
+@pytest.mark.asyncio
+async def test_deterministic_drop_failure_clamps_heat_when_a_prior_raise_already_landed() -> None:
+    """The deterministic-drop-path analogue: recovery raises on an earlier,
+    NOT-yet-drop-eligible tick (so the round-4 suppression never applied and
+    the raise genuinely reached the roaster), and only on a LATER tick does
+    the bean cross into ceiling-guard-drop eligibility while ``drop_beans()``
+    keeps failing — this tick's own tentative write is a HOLD/LOWER (not a
+    fresh raise), so the round-4 skip does not suppress it either, and the
+    loop's own write already lands the actuated heat at (or below) the raise.
+    The clamp must independently drive heat to the D88 base and stay there,
+    exactly like the advisor path."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    harness = make_harness(config=config, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+
+    # A later tick crosses the ceiling-guard line while RoR has recovered
+    # (so this tick's own tentative output no longer exceeds actuated heat —
+    # a hold/lower, not a fresh raise) — `drop_beans()` fails.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=8.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in failed
+    assert harness.controller.snapshot().current_heat == 60
+
+
+@pytest.mark.asyncio
+async def test_clamp_already_at_base_issues_no_redundant_write() -> None:
+    """Idempotence: once heat has already settled at the D88 base (a prior
+    clamp, or the glide, already brought it there), a further failed drop
+    must not issue a redundant ``set_targets`` write — heat is already at the
+    floor there is nothing to clamp down to."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_exit_margin_c_per_min=0.5,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+        recovery_exit_glide_pp_per_tick=50,  # the max: steep glide for a short test
+    )
+    harness = make_harness(config=config, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+
+    # Exit confirms (RoR back within the exit margin) on a drop-eligible
+    # tick; the glide is steep enough (50 pp/tick, the config max) that the
+    # effective ceiling — and the clamp's base target — are both 60 already
+    # this tick.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=8.0)]
+    await harness.controller.tick()
+    assert harness.controller.snapshot().current_heat == 60
+    targets_after_first_clamp = list(harness.executor.targets)
+
+    # A further drop-eligible tick, still failing, with heat already AT base:
+    # no redundant clamp write.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=6.5)]
+    await harness.controller.tick()
+    assert harness.controller.snapshot().current_heat == 60
+    # Any new entries must be the loop's OWN idempotent path (no write at
+    # current_heat==target) — never a second write commanding 60 again.
+    new_targets = harness.executor.targets[len(targets_after_first_clamp) :]
+    assert (60, harness.controller.snapshot().current_fan) not in new_targets or not new_targets
+
+
+@pytest.mark.asyncio
+async def test_clamp_idempotent_while_still_gliding_below_base() -> None:
+    """The idempotence branch's OTHER reachable shape: ``self._current_heat``
+    can already sit AT OR BELOW the D88 base while ``heat_authority_state``
+    is STILL ``GLIDING`` (not yet settled to ``HOLDING``) — the PI's own
+    computed output can undercut the base well before the tick-counter-driven
+    glide state itself reaches ``HOLDING`` (a high measured RoR relative to
+    the taper's declining setpoint drives heat down hard on its own, entirely
+    independent of the ceiling's own descent). A ceiling-guard-eligible tick
+    landing in that window, with ``drop_beans()`` failing, must take the
+    IDEMPOTENT path (no redundant write) while still forcing the recovery
+    counters to a full exit — covering the shape the flag-off/HOLDING test
+    above does not reach."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=190.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_exit_margin_c_per_min=0.5,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+        recovery_exit_glide_pp_per_tick=1,  # slow: GLIDING persists across ticks
+    )
+    harness = make_harness(config=config, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+
+    # Probe (snapshot/restore, no side effect) that THIS tick's RoR would
+    # genuinely compute a GLIDING, already-at/below-base output — confirming
+    # the scenario is real before driving it through the actual tick below.
+    pfc = harness.controller._post_fc_controller  # pyright: ignore[reportPrivateUsage]
+    probe_state = pfc.snapshot_state()
+    probe_output = pfc.compute(measured_ror_c_per_min=12.0, dt_seconds=5.0)
+    pfc.restore_state(probe_state)
+    assert probe_output.heat_authority_state is PostFcHeatAuthorityState.GLIDING
+    assert probe_output.heat_percent <= 60
+
+    # A single tick: bean is already at the (deliberately low) guard line, and
+    # a high measured RoR relative to the taper's declining setpoint drives
+    # the PI's own output well below the base in one step — the SAME tick
+    # the ceiling-guard drop fires and then fails.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=12.0)]
+    await harness.controller.tick()
+
+    # Codex round-1 finding #1: the clamp clears the stashed output on this
+    # (idempotent, forced-exit) path too — the advisor must never see a
+    # stale GLIDING/RECOVERING authority state the controller just reset.
+    assert harness.controller._last_post_fc_output is None  # pyright: ignore[reportPrivateUsage]
+    heat_after = harness.controller.snapshot().current_heat
+    assert heat_after <= 60  # already at/below the base
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in failed
+    # No SECOND write landed for the clamp's own idempotence branch: the
+    # only heat write this tick was the loop's own (already at/below base).
+    heat_writes_this_tick = [h for h, _ in harness.executor.targets]
+    assert heat_writes_this_tick[-1] == heat_after
+    assert heat_writes_this_tick.count(heat_after) == 1
+    # The recovery counters were still forced to a full exit (not left
+    # "still gliding" for the next tick to reason from a stale ceiling).
+    state = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+    assert state.recovery_active is False
+    assert state.recovery_ticks_since_exit is None
+    assert state.recovery_ticks_above_trigger == 0
+    assert state.recovery_ticks_within_exit == 0
+
+
+@pytest.mark.asyncio
+async def test_repeated_clamp_failures_bound_heat_at_base_no_thrash() -> None:
+    """Repeated-failure sequence (the team-lead brief's bounded-behaviour
+    requirement): recovery raises, then EVERY subsequent tick is
+    drop-eligible and ``drop_beans()`` keeps failing across many ticks.
+    Heat must descend to (or, once the ordinary D88 taper itself takes over
+    with ``heat_authority_state`` back to ``HOLDING``, legitimately below)
+    the base and NEVER climb back up again — no raise/clamp thrash cycle,
+    which is what a broken re-arm (re-triggering recovery as an artifact of
+    the failed drop rather than a fresh RoR-shortfall confirmation) would
+    produce."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_exit_margin_c_per_min=0.5,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+        recovery_exit_glide_pp_per_tick=5,
+    )
+    harness = make_harness(config=config, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+
+    heats: list[int] = []
+    for _ in range(10):
+        harness.clock.advance(5.0)
+        # Held near the taper's own end-value RoR (not a fresh sustained
+        # shortfall) — a broken re-arm would re-confirm recovery and thrash
+        # heat back up; the correct behaviour is a monotonic descent (via
+        # the clamp, then the ordinary D88 taper once HOLDING) that never
+        # re-ascends.
+        harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=6.9)]
+        await harness.controller.tick()
+        assert harness.controller.phase is RoastPhase.DEVELOPMENT
+        heats.append(harness.controller.snapshot().current_heat)
+
+    # Heat is NON-INCREASING across the whole repeated-failure sequence —
+    # the clamp brings it down to the base and the ordinary (HOLDING) taper
+    # may continue lowering it further, but it never climbs back up (the
+    # no-thrash bound).
+    assert all(a >= b for a, b in zip(heats, heats[1:], strict=False)), heats
+    assert heats[-1] < 60  # strictly below entry by the end of the sequence
+    # It DID pass through (or land exactly on) the D88 base at some point on
+    # its way down — the clamp's own contribution, not just the taper's.
+    assert 60 in heats, heats
+
+
+@pytest.mark.asyncio
+async def test_clamp_forces_recovery_state_machine_to_exit() -> None:
+    """The re-arm design decision, pinned directly: after a successful clamp
+    write, the D96 recovery state machine's internal counters must be fully
+    reset to HOLDING (``recovery_active=False``,
+    ``recovery_ticks_since_exit=None``, both confirm counters at 0) — NOT
+    left as "confirmed active/gliding" — so a subsequent RoR sample sitting
+    exactly at the OLD trigger margin does not instantly re-confirm recovery
+    (it must run a full FRESH ``recovery_confirm_ticks`` window from
+    scratch)."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=2,  # >1 so re-arm-from-scratch is observable
+        recovery_headroom_percentage_points=15,
+    )
+    harness = make_harness(config=config, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    # Confirm entry across 2 ticks (recovery_confirm_ticks=2), neither
+    # drop-eligible.
+    for _ in range(2):
+        harness.clock.advance(5.0)
+        harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=2.0)]
+        await harness.controller.tick()
+    raised_heat = harness.controller.snapshot().current_heat
+    assert raised_heat > 60
+
+    # A drop-eligible tick with the SAME sustained shortfall (still above the
+    # trigger margin) — if the recovery counters were left "confirmed" rather
+    # than reset, this single tick would be enough to look like ongoing
+    # active recovery; the clamp must have reset them so this tick's own
+    # entry counter starts back at zero.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.controller.snapshot().current_heat == 60
+
+    post_fc_controller = harness.controller._post_fc_controller  # pyright: ignore[reportPrivateUsage]
+    state = post_fc_controller.snapshot_state()
+    assert state.recovery_active is False
+    assert state.recovery_ticks_since_exit is None
+    assert state.recovery_ticks_above_trigger == 0
+    assert state.recovery_ticks_within_exit == 0
+
+    # A SECOND consecutive drop-eligible/failing tick with the identical
+    # shortfall is only tick 1 of a FRESH confirm window (confirm_ticks=2) —
+    # heat must still be pinned at the base, not already re-raised.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+    assert harness.controller.snapshot().current_heat == 60
+
+
+class _AlwaysFailingDropAndArmableSetTargetsExecutor(RecordingExecutor):
+    """``drop_beans()`` always raises; ``set_targets()`` raises exactly once
+    per :meth:`arm_next_set_targets_failure` call, then delegates normally
+    (mirrors the established ``_ArmableFlakySetTargetsExecutor`` pattern) —
+    lets a test drive the CLAMP's own corrective write into a transient
+    actuator failure, independent of the drop failure that triggered it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._armed = False
+
+    def arm_next_set_targets_failure(self) -> None:
+        """The NEXT ``set_targets`` call raises; every other call succeeds."""
+        self._armed = True
+
+    async def drop_beans(self) -> AppliedRoasterState:
+        raise RuntimeError("serial write dropped")
+
+    async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+        if self._armed:
+            self._armed = False
+            raise RuntimeError("serial write dropped")
+        await super().set_targets(heat_percent=heat_percent, fan_percent=fan_percent)
+
+
+class _PersistentlyFailingDropAndSetTargetsExecutor(RecordingExecutor):
+    """``drop_beans()`` always raises; ``set_targets()`` raises on EVERY call
+    once :meth:`start_failing_set_targets` is called (never before — the
+    pre-FC lever's own writes, and the recovery-raise write, must land
+    normally during setup) — a PERSISTENT (not transient) MCP failure, for
+    Codex round-2 finding #1's reproduction: the clamp's own corrective write
+    never lands, no matter how many times it is attempted."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._fail_set_targets = False
+
+    def start_failing_set_targets(self) -> None:
+        """Every subsequent ``set_targets`` call raises, permanently."""
+        self._fail_set_targets = True
+
+    async def drop_beans(self) -> AppliedRoasterState:
+        raise RuntimeError("serial write dropped")
+
+    async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+        if self._fail_set_targets:
+            raise RuntimeError("serial write dropped")
+        await super().set_targets(heat_percent=heat_percent, fan_percent=fan_percent)
+
+
+@pytest.mark.asyncio
+async def test_clamp_write_itself_failing_leaves_recovery_state_untouched() -> None:
+    """#412 told==enforced extended to the clamp's own write: when the
+    CLAMP's corrective ``set_targets`` call is itself a transient actuator
+    failure (on top of the ``drop_beans()`` failure that triggered it), the
+    recovery state machine must be left EXACTLY as it was — no forced exit —
+    mirroring every other actuator-failure path in this module (the roaster's
+    real heat is unchanged, so there is no state/reality gap yet to close).
+    The NEXT tick gets another chance to clamp (and re-arm) once a write
+    actually lands."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    executor = _AlwaysFailingDropAndArmableSetTargetsExecutor()
+    harness = make_harness(config=config, executor=executor)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+
+    # Settle (bean below the guard line, so no drop attempt yet) until the
+    # loop's own write becomes IDEMPOTENT (current_heat == this tick's
+    # output) while the ceiling is still elevated (GLIDING, not yet
+    # HOLDING) -- otherwise the loop's OWN write would consume the armed
+    # set_targets failure before the clamp ever gets a turn.
+    for _ in range(2):
+        harness.clock.advance(5.0)
+        harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=6.0)]
+        await harness.controller.tick()
+    raised_heat = harness.controller.snapshot().current_heat
+    assert raised_heat > 60
+    out = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+    assert out is not None
+    assert out.heat_authority_state is not PostFcHeatAuthorityState.HOLDING
+    assert out.heat_percent == raised_heat  # this tick's own write was idempotent
+    pre_tick_state = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+    targets_before = list(harness.executor.targets)
+
+    # Arm the clamp's OWN corrective set_targets call to fail — the SAME RoR
+    # (so the loop's own tentative write this tick is idempotent and issues
+    # no set_targets call of its own), now with the bean at the guard line.
+    executor.arm_next_set_targets_failure()
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=6.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in failed
+    assert {"command": "set_targets"} in failed
+    # The clamp's own write failed: heat is UNCHANGED from before this tick
+    # (the actuator never actually moved), and no NEW write reached the fake
+    # MCP call log.
+    assert harness.controller.snapshot().current_heat == raised_heat
+    assert harness.executor.targets == targets_before
+    # The clamp's OWN forced-exit did NOT run on a write that never landed
+    # (mirrors every other actuator-failure path in this module) -- the
+    # loop's own ordinary `_advance_recovery_state` book-keeping (EMA, exit
+    # counters) still advances every tick regardless (that machinery is
+    # untouched by this fix), so what distinguishes "the clamp forced an
+    # exit" from "the ordinary loop's own bookkeeping advanced" is
+    # `heat_engage_percent` (the clamp's re-arm never changes it, since
+    # `_force_recovery_exit` only overwrites the four recovery-specific
+    # fields) staying put AND the counters NOT being the clamp's exact
+    # forced-exit shape (all zeroed / None simultaneously) -- here
+    # `recovery_ticks_since_exit` is 1 (the loop's own exit-confirmation
+    # this tick), never reset to `None` by a clamp that never wrote.
+    post_tick_state = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+    assert post_tick_state.heat_engage_percent == pre_tick_state.heat_engage_percent
+    forced_exit_shape = (
+        post_tick_state.recovery_active is False
+        and post_tick_state.recovery_ticks_since_exit is None
+        and post_tick_state.recovery_ticks_above_trigger == 0
+        and post_tick_state.recovery_ticks_within_exit == 0
+    )
+    assert not forced_exit_shape
+
+    # The NEXT tick: set_targets now succeeds normally (no longer armed), so
+    # the clamp's write lands and the recovery state machine is forced to
+    # exit as usual.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=6.0)]
+    await harness.controller.tick()
+    assert harness.controller.snapshot().current_heat < raised_heat
+    settled_state = harness.controller._post_fc_controller.snapshot_state()  # pyright: ignore[reportPrivateUsage]
+    if harness.controller.snapshot().current_heat <= 60:
+        assert settled_state.recovery_active is False
+        assert settled_state.recovery_ticks_since_exit is None
+
+
+@pytest.mark.asyncio
+async def test_clamp_box_stays_valid_under_a_hypothetically_narrowed_development_ceiling() -> None:
+    """safety-561 (Opus) Low-1 hardening: the clamp box's own
+    ``heat_ceiling_percent`` is not independently pinned — DEVELOPMENT
+    resolves it to 100 TODAY, so ``base <= ceiling`` always holds in
+    practice, but nothing in ``_clamp_heat_after_failed_drop`` PROVES that
+    for any future config that might narrow DEVELOPMENT's own heat ceiling.
+    This test forces exactly that hypothetical (patching
+    ``_control_limits`` to return a box whose ``heat_ceiling_percent`` sits
+    BELOW the D88 base the clamp needs to write) and asserts the clamp
+    still constructs a VALID box (no ``PhaseControlLimits`` validator
+    ``ValueError`` escaping ``tick()``) and still lands the corrective
+    write — proving the ``max(base, resolved_ceiling)`` widening genuinely
+    holds regardless of what DEVELOPMENT's own box resolves to, not just
+    for today's fixed 100."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    harness = make_harness(config=config, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+    raised_heat = harness.controller.snapshot().current_heat
+    assert raised_heat > 60  # the base
+
+    # Patch _control_limits (bound method, this instance only) so DEVELOPMENT
+    # resolves a heat ceiling of 50 -- BELOW the base (60) the clamp needs to
+    # write. A real (unwidened) `model_copy(update={"heat_floor_percent":
+    # 60, ...})` against this box would leave heat_ceiling_percent=50,
+    # constructing an invalid (floor > ceiling) PhaseControlLimits and
+    # raising uncaught inside tick().
+    real_control_limits = harness.controller._control_limits  # pyright: ignore[reportPrivateUsage]
+    narrowed_box = real_control_limits().model_copy(update={"heat_ceiling_percent": 50})
+
+    def _narrowed_control_limits(*, trim_signal: TrimSignal | None = None) -> PhaseControlLimits:
+        return narrowed_box
+
+    harness.controller._control_limits = _narrowed_control_limits  # pyright: ignore[reportAttributeAccessIssue, reportPrivateUsage]
+    try:
+        harness.clock.advance(5.0)
+        harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=8.0)]
+        await harness.controller.tick()  # must not raise
+    finally:
+        harness.controller._control_limits = real_control_limits  # pyright: ignore[reportPrivateUsage]
+
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in failed
+    # No PhaseControlLimits ValueError escaped tick() (the assertions above
+    # already prove this implicitly -- an uncaught raise would have failed
+    # the whole test before reaching here), and heat landed at or below the
+    # base despite the artificially narrowed ceiling -- never above it, and
+    # never left at the raised value. The narrowed box's own ceiling (50)
+    # legitimately pulls the LOOP's own write below the base first (heat
+    # <= 50 here); the safety property under test is that this constructs a
+    # VALID box and never re-raises heat, not the exact settled value.
+    assert harness.controller.snapshot().current_heat <= 60
+    assert harness.controller.snapshot().current_heat < raised_heat
+
+
+# --- Codex round 1 on PR #569: 3 real findings ------------------------------
+
+
+@pytest.mark.asyncio
+async def test_operator_drop_beans_failure_clamps_heat_when_recovery_elevated() -> None:
+    """Codex round-1 finding #2: the FOURTH drop path. A transient
+    ``drop_beans()`` failure on the OPERATOR's own drop (an early abort, or
+    an operator retry attempt) is the identical fail-safe-down condition the
+    other three drop paths clamp for — DEVELOPMENT can be left holding D96
+    recovery-raised heat with no further deterministic drop guaranteed to
+    retry promptly. The clamp must fire here too."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=220.0,  # stay clear -- isolate the operator path
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    executor = _AlwaysFailingDropAndArmableSetTargetsExecutor()
+    harness = make_harness(config=config, executor=executor, limits=_ISOLATED_CEILING_GUARD_LIMITS)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    raised_heat = await _confirm_recovery_raise(harness, entry_heat=60)
+    assert raised_heat <= 75
+
+    await harness.controller.operator_drop_beans()
+
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {"command": "drop_beans"} in failed
+    # The clamp's own write landed: heat is back at the D88 base, not left
+    # sitting at the raised value.
+    assert harness.controller.snapshot().current_heat == 60
+    last_heat, _last_fan = harness.executor.targets[-1]
+    assert last_heat == 60
+
+
+@pytest.mark.asyncio
+async def test_operator_drop_beans_failure_in_faulted_never_clamps() -> None:
+    """The operator-drop clamp is scoped to the non-``FAULTED`` case
+    (``will_transition``) only: from ``FAULTED`` heat is already off
+    (``_apply_fail_safe``) and ``SET_HEAT`` is not even in that phase's
+    command-phase-matrix row, so clamping there would be meaningless (and
+    the call site deliberately does not attempt it) — this pins that scope
+    directly, asserting no SET_HEAT write of any kind reaches the fake MCP
+    call log on a failed FAULTED-phase drop."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=230.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    executor = _AlwaysFailingDropAndArmableSetTargetsExecutor()
+    harness = make_harness(
+        config=config, executor=executor, limits=_ISOLATED_CEILING_GUARD_LIMITS_230
+    )
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+
+    # Drive the run into FAULTED via the hard e-stop ceiling (never through
+    # the clamp under test) — a bean reading past `max_bean_temp_c` (234.0
+    # here, the isolated fixture's own wider ceiling — still well below this
+    # reading, so the e-stop still fires exactly as before).
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=235.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.FAULTED
+    targets_before = list(harness.executor.targets)
+
+    await harness.controller.operator_drop_beans()
+
+    assert harness.controller.phase is RoastPhase.FAULTED  # no transition, per #210
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {"command": "drop_beans"} in failed
+    # No SET_HEAT write of any kind was attempted for this failed drop.
+    assert harness.executor.targets == targets_before
+
+
+@pytest.mark.asyncio
+async def test_clamp_clears_stale_advisor_context_on_forced_exit() -> None:
+    """Codex round-1 finding #1: after ``_force_recovery_exit`` resets
+    authority to HOLDING, the advisor context (and decision trace) built
+    LATER the same tick must never see a stale RECOVERING/GLIDING
+    ``post_fc_heat_authority_state`` — ``_last_post_fc_output`` must be
+    cleared, not left holding the pre-reset output."""
+    advisor = FakeAdvisor(
+        [decision(heat=50, fan=40, drop=False), decision(heat=50, fan=40, drop=False)],
+        default_decision=decision(heat=50, fan=40, drop=False),
+    )
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    harness = make_harness(config=config, advisor=advisor, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+
+    # A drop-eligible tick: the ceiling-guard drop fires and fails, forcing
+    # the clamp + recovery exit — the SAME tick's advisory consult (later in
+    # tick()'s order) must read HOLDING, never a stale RECOVERING/GLIDING
+    # value from before the clamp ran.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=8.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in failed
+    assert len(advisor.contexts) >= 1
+    last_context = advisor.contexts[-1]
+    assert last_context.post_fc_heat_authority_state is None
+    assert last_context.post_fc_setpoint_c_per_min is None
+    # The decision trace records the same tick — its own authority reasoning
+    # (if any) must not disagree with the context the advisor was actually
+    # shown; this is the told==enforced proof for this field.
+    assert harness.controller._last_post_fc_output is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_repeated_failed_drops_starting_below_base_never_reascend() -> None:
+    """Codex round-1 finding #3 (the subtle one): a repeated-failed-drop
+    sequence that starts with heat ALREADY below the D88 base (reached via
+    the loop's own PI action, independent of the ceiling) must never let a
+    later low-RoR sample raise heat back toward the base while the SAME drop
+    keeps failing every tick. Without the persistent
+    ``_post_fc_raise_suppressed_after_clamp`` latch, forcing the recovery
+    state machine fully to HOLDING on the first clamp would clear
+    ``heat_authority_state``'s own "elevated" signal, and a sustained RoR
+    shortfall could re-confirm entry the very next tick and re-raise heat —
+    reproducing exactly the failure this test pins against."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=190.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+        recovery_exit_glide_pp_per_tick=1,
+    )
+    harness = make_harness(config=config, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+
+    # Drive heat below the base via the loop's own PI action (a high RoR vs.
+    # the declining setpoint) on a guard-eligible, failing-drop tick — the
+    # clamp's idempotence branch fires and forces a full recovery exit.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=12.0)]
+    await harness.controller.tick()
+    heat_below_base = harness.controller.snapshot().current_heat
+    assert heat_below_base < 60
+    assert harness.controller._post_fc_raise_suppressed_after_clamp is True  # pyright: ignore[reportPrivateUsage]
+
+    # Now feed a SUSTAINED low-RoR shortfall (the exact condition that would
+    # re-confirm recovery entry within a single `recovery_confirm_ticks`
+    # window) across many subsequent ticks, still guard-eligible, still
+    # failing the drop every tick. Heat must NEVER re-ascend above where it
+    # settled -- the latch must keep suppressing the raise regardless of
+    # `heat_authority_state` re-confirming RECOVERING internally.
+    heats = [heat_below_base]
+    for _ in range(8):
+        harness.clock.advance(5.0)
+        harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=1.0)]
+        await harness.controller.tick()
+        assert harness.controller.phase is RoastPhase.DEVELOPMENT
+        heats.append(harness.controller.snapshot().current_heat)
+
+    assert all(a >= b for a, b in zip(heats, heats[1:], strict=False)), heats
+    assert max(heats) == heat_below_base  # never climbed back up at all
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert (
+        failed.count(
+            {
+                "command": "drop_beans",
+                "source": "policy",
+                "reason": DropReason.CEILING_GUARD.value,
+            }
+        )
+        >= 8
+    )
+
+
+@pytest.mark.asyncio
+async def test_raise_suppression_latch_clears_on_successful_drop() -> None:
+    """The latch is per-DEVELOPMENT-dwell state (mirrors ``_post_fc_engaged``
+    / ``_last_post_fc_output``'s own discipline): once a drop actually
+    SUCCEEDS, ``transition_to`` clears it unconditionally, and a later fresh
+    DEVELOPMENT dwell (a new FC edge) starts with it unset."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=190.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    harness = make_harness(config=config, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=12.0)]
+    await harness.controller.tick()
+    assert harness.controller._post_fc_raise_suppressed_after_clamp is True  # pyright: ignore[reportPrivateUsage]
+
+    # A SUCCESSFUL manual drop clears it via transition_to(COOLING) -- swap
+    # in a plain (succeeding) executor for this one call, since the
+    # harness's own executor class always fails drop_beans.
+    original_executor = harness.controller._executor  # pyright: ignore[reportPrivateUsage]
+    harness.controller._executor = RecordingExecutor()  # pyright: ignore[reportPrivateUsage]
+    try:
+        await harness.controller.operator_drop_beans()
+    finally:
+        harness.controller._executor = original_executor  # pyright: ignore[reportPrivateUsage]
+
+    assert harness.controller.phase is RoastPhase.COOLING
+    assert harness.controller._post_fc_raise_suppressed_after_clamp is False  # pyright: ignore[reportPrivateUsage]
+
+
+# --- Codex round 2 on PR #569: 2 coherent findings --------------------------
+
+
+@pytest.mark.asyncio
+async def test_advisor_path_arms_latch_even_when_corrective_write_also_fails() -> None:
+    """Codex round-2 finding #1 (the failed-corrective-write asymmetry):
+    reproduced first (see the reproduction notes in the commit message),
+    then fixed. The advisor's drop path is cadence-gated
+    (``AdvisoryCallPolicy``) — unlike the two deterministic drop paths,
+    which fire on EVERY DEVELOPMENT tick with no cadence gate and so retry
+    (and re-attempt the clamp) automatically next tick — so a failed
+    corrective write here has no guaranteed retry coming. The latch
+    (``_post_fc_raise_suppressed_after_clamp``) must arm regardless of
+    whether the write lands, or a persisting shortfall could re-raise heat
+    on a later, non-consulted tick with nothing left to catch it."""
+    advisor = FakeAdvisor(
+        [decision(heat=50, fan=40, drop=False), decision(heat=50, fan=40, drop=False)],
+        default_decision=decision(heat=50, fan=40, drop=True),
+    )
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=220.0,  # stay clear -- isolate the advisor path
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    executor = _PersistentlyFailingDropAndSetTargetsExecutor()
+    harness = make_harness(
+        config=config,
+        advisor=advisor,
+        executor=executor,
+        limits=_ISOLATED_CEILING_GUARD_LIMITS,
+    )
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    raised_heat = await _confirm_recovery_raise(harness, entry_heat=60)
+    assert raised_heat > 60
+
+    # NOW the persistent MCP failure starts: the advisor's should_drop=True
+    # fails its drop_beans() call, and the clamp's OWN corrective set_targets
+    # call ALSO fails.
+    executor.start_failing_set_targets()
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=6.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.controller.snapshot().current_heat == raised_heat  # write failed, unchanged
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {"command": "drop_beans", "source": "advisor"} in failed
+    assert {"command": "set_targets"} in failed
+    # The fix: the latch arms even though the corrective write itself
+    # failed (the pre-fix behaviour left this False).
+    assert harness.controller._post_fc_raise_suppressed_after_clamp is True  # pyright: ignore[reportPrivateUsage]
+
+    # Prove the latch actually PROTECTS: several further sub-cadence ticks
+    # (the advisor is NOT re-consulted — no phase/temp/RoR-delta trigger
+    # fires) with a persisting RoR shortfall must never re-raise heat, even
+    # though nothing ever retries the drop or the clamp again.
+    heats = [harness.controller.snapshot().current_heat]
+    for _ in range(5):
+        harness.clock.advance(0.5)  # well under the advisory min-interval
+        harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=1.0)]
+        await harness.controller.tick()
+        heats.append(harness.controller.snapshot().current_heat)
+    assert max(heats) == raised_heat  # never climbed any higher
+
+
+@pytest.mark.asyncio
+async def test_operator_path_arms_latch_even_when_corrective_write_also_fails() -> None:
+    """Codex round-2 finding #1, the operator-drop mirror: the operator's
+    drop is ONE-SHOT — never automatically retried by the controller at
+    all — so the latch must arm here too, even when the clamp's own
+    corrective write also fails."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=220.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    executor = _PersistentlyFailingDropAndSetTargetsExecutor()
+    harness = make_harness(config=config, executor=executor, limits=_ISOLATED_CEILING_GUARD_LIMITS)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    raised_heat = await _confirm_recovery_raise(harness, entry_heat=60)
+    assert raised_heat > 60
+
+    executor.start_failing_set_targets()
+    await harness.controller.operator_drop_beans()
+
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.controller.snapshot().current_heat == raised_heat
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {"command": "drop_beans"} in failed
+    assert {"command": "set_targets"} in failed
+    assert harness.controller._post_fc_raise_suppressed_after_clamp is True  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_deterministic_path_does_not_arm_latch_on_failed_corrective_write() -> None:
+    """The `self_healing=True` half of the same fix, pinned directly: the
+    deterministic ceiling-guard/dev%-anchor paths do NOT arm the latch on a
+    failed corrective write — they retry the drop (and the clamp) every
+    tick with no cadence gate, so the pre-existing "arm only on a landed
+    write" behaviour is deliberately UNCHANGED for them (this is what
+    safety-561's earlier `test_clamp_write_itself_failing_leaves_recovery_
+    state_untouched` already pinned; restated here explicitly against the
+    latch field itself, alongside the two non-self-healing tests above, so
+    the asymmetry is visible in one place)."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    executor = _AlwaysFailingDropAndArmableSetTargetsExecutor()
+    harness = make_harness(config=config, executor=executor)
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+
+    # Settle into an idempotent hold with the ceiling still elevated (the
+    # same construction the earlier test uses), then arm the clamp's OWN
+    # corrective write to fail on the guard-eligible tick.
+    for _ in range(2):
+        harness.clock.advance(5.0)
+        harness.reader.readings = [reading(bean=190.0, bean_ror_c_per_min=6.0)]
+        await harness.controller.tick()
+
+    executor.arm_next_set_targets_failure()
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=6.0)]
+    await harness.controller.tick()
+
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in failed
+    assert {"command": "set_targets"} in failed
+    # Deliberately UNCHANGED: the latch does not arm on this path's failed
+    # corrective write (the next tick's own retry is the mechanism instead).
+    assert harness.controller._post_fc_raise_suppressed_after_clamp is False  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_suppressed_tick_still_applies_a_fan_only_move() -> None:
+    """Codex round-2 finding #2 (the suppression must be HEAT-ONLY):
+    reproduced first, then fixed. On a tick where the raise-suppression
+    fires (elevated authority, drop-eligible, a genuine heat raise wanted),
+    a fan move the advisor's SAME-dwell consult already holds as the
+    desired target must still reach the roaster — in loop mode this method
+    is the sole writer (#498), so blocking the WHOLE write here would
+    strand a safe fan move alongside the unsafe heat raise, colliding with
+    the D96 doctrine ("fan is valuable and should be used to control")."""
+    # tick0 (FC transition): fan holds at 30. tick1 (raise-confirm, NOT
+    # drop-eligible): fan holds at 30 -- heat raises alone. tick2
+    # (drop-eligible, suppressed): the advisor's SAME-dwell consult (from
+    # tick1) already requested fan=90 -- STILL stranded at the START of
+    # tick2 (advisory runs AFTER the loop in tick()'s order), so tick2
+    # proves the strand; tick3 (also suppressed) proves it PERSISTS without
+    # the fix and is FIXED by it.
+    advisor = FakeAdvisor(
+        [decision(heat=50, fan=30, drop=False), decision(heat=50, fan=30, drop=False)],
+        default_decision=decision(heat=50, fan=90, drop=False),
+    )
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    harness = make_harness(config=config, advisor=advisor, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+    assert harness.controller.snapshot().current_fan == 30
+
+    # tick2: drop-eligible, the raise-suppression fires (heat held), the
+    # SAME tick's advisor consult requests fan=90 for the FIRST time -- that
+    # request lands in `_post_fc_desired_fan_percent` too late to be applied
+    # THIS tick (advisory runs after the loop), so fan is still 30 leaving
+    # this tick — expected, not the bug under test.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+    heat_after_tick2 = harness.controller.snapshot().current_heat
+    assert harness.controller._post_fc_desired_fan_percent == 90  # pyright: ignore[reportPrivateUsage]
+
+    # tick3: STILL drop-eligible/suppressed (heat still wants to raise), and
+    # NOW desired_fan (90) differs from current_fan (30) at the START of
+    # the tick -- this is the exact stranding window. The fix must let the
+    # fan-only move through while heat stays held.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    assert harness.controller.snapshot().current_fan == 90  # the fan move landed
+    assert harness.controller.snapshot().current_heat == heat_after_tick2  # heat held, not raised
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in failed
+    last_heat, last_fan = harness.executor.targets[-1]
+    assert last_heat == heat_after_tick2
+    assert last_fan == 90
+
+
+@pytest.mark.asyncio
+async def test_suppressed_tick_with_fan_already_correct_issues_no_write() -> None:
+    """The suppression's idempotence counterpart to the fan-permeable fix:
+    when fan is ALREADY at its desired value on a suppressed tick, no write
+    at all is issued (there is genuinely nothing to do — heat is correctly
+    held and fan needs no correction) — proves the fix did not turn every
+    suppressed tick into an unconditional write."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    harness = make_harness(config=config, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+    targets_before = list(harness.executor.targets)
+
+    # Fan is already at its (never-changed, default-held) desired value —
+    # a further suppressed tick must issue NO write at all.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=2.0)]
+    await harness.controller.tick()
+
+    assert harness.executor.targets == targets_before
