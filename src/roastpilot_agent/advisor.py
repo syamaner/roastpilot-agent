@@ -35,7 +35,13 @@ from pydantic_ai import (
 from pydantic_ai.models import Model
 
 from roastpilot_agent.config import AdvisorConfig
-from roastpilot_agent.models import AdvisorHealth, AdvisorHealthStatus, RoastPhase, RoastStyle
+from roastpilot_agent.models import (
+    AdvisorHealth,
+    AdvisorHealthStatus,
+    PostFcHeatAuthorityState,
+    RoastPhase,
+    RoastStyle,
+)
 from roastpilot_agent.roast_history import (
     DecisionTraceEntry,
     RoastCurveSample,
@@ -260,6 +266,38 @@ class AdvisorContext(BaseModel):
     # carries no style (pre-#405 profiles) or the context is built without a
     # profile.
     roast_style: RoastStyle | None = None
+    # D96 slice 2 (#559): the post-FC RoR-taper loop's CURRENT setpoint and
+    # heat-authority regime — the deferred advisor-visibility item the D89
+    # direction twice held back (see the ``post_fc_loop_active`` note above)
+    # and D96 explicitly returns to scope, so the two levers stop fighting
+    # blind: the advisor already sees ``current_heat_percent`` (what IS
+    # actuated) but had no way to see what the loop is currently TRYING to
+    # hold RoR to, or whether it has any raise authority left this tick.
+    #
+    # Both fields are copied VERBATIM from the SAME
+    # ``post_fc_control.PostFcControlOutput`` the controller's own tick
+    # already computed and used to build the safety box that tick (told ==
+    # enforced, the #497 precedent applied to these two new fields) — never
+    # re-derived here or anywhere else. ``post_fc_setpoint_c_per_min`` is the
+    # taper's live target RoR (``PostFcControlOutput.setpoint_c_per_min``);
+    # ``post_fc_heat_authority_state`` is the three-way regime
+    # (``PostFcControlOutput.heat_authority_state`` — HOLDING/RECOVERING/
+    # GLIDING, never the derived ``recovery_active`` boolean, which cannot
+    # distinguish RECOVERING from GLIDING). Both default ``None`` so a
+    # context built without the post-FC loop engaged this tick (pre-FC
+    # phases, the loop's own flag off, an operator-resume dwell where the
+    # loop is inert, or an older caller) stays valid — mirroring
+    # ``current_heat_percent``'s own ``None`` default exactly.
+    #
+    # Deliberately NO numeric raise-headroom field (e.g. "you have N more
+    # percentage points available") — that would duplicate arithmetic the
+    # loop's own ``_recovery_ceiling_percent()`` already owns and is exactly
+    # the kind of derived-field-that-can-disagree the told==enforced
+    # discipline exists to prevent; the qualitative state is enough context
+    # for judgment, the same scope ``post_fc_loop_active`` (a bool, #497) was
+    # given rather than a numeric budget.
+    post_fc_setpoint_c_per_min: float | None = None
+    post_fc_heat_authority_state: PostFcHeatAuthorityState | None = None
 
 
 class RoastDecision(BaseModel):
@@ -922,9 +960,17 @@ gpt-4o brake instead of dropping) on top of ``c3``; ``c5`` adds the roast-7
 heat-floor / keep-climbing teaching (the c3 brake crashed the RoR to an under-temp
 drop) on top of ``c4``; ``c6`` adds an explicit recovery action for the over-braked
 state (heat already 0, bean below drop temp — c5 bake-off showed gpt-4o reading
-heat=0 as a reason to HOLD rather than restoring heat) on top of ``c5``.
-``c1`` / ``c2`` / ``c4`` / ``c5`` / ``c6`` stay selectable for the #396 A/B;
-``c3`` remains the live default until the A/B validates a successor (operator-gated).
+heat=0 as a reason to HOLD rather than restoring heat) on top of ``c5``; ``c7``
+(#499 part 2) adds the DTR-racing-ahead-of-temperature pace-mismatch teaching
+(roast 13 — the advisor read the window's TOP edge as a soft finish line) on top
+of ``c6``; ``c8`` (D96 slice 2, #559) adds pace-not-edges progress-rate
+comparison, the bottom-edge mirror of c7's fix (roast 15 — the window's BOTTOM
+edge is not a finish line either), and fan->RoR-coupling teaching (use fan
+deliberately; the post-FC heat loop's compensation is bounded and suppressed
+near a drop, never an assumed rescue) on top of ``c7``.
+``c1`` / ``c2`` / ``c4`` / ``c5`` / ``c6`` / ``c7`` / ``c8`` stay selectable for
+the #396 A/B; ``c3`` remains the live default until the A/B validates a
+successor (operator-gated).
 """
 
 _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
@@ -1421,6 +1467,98 @@ _C7_DTR_PACE_SECTION = (
 )
 _CONTROL_TEACHING_PROMPTS["c7"] = _CONTROL_TEACHING_PROMPTS["c6"].replace(
     "THE OBJECTIVE\n", _C7_DTR_PACE_SECTION + "THE OBJECTIVE\n", 1
+)
+
+# --- c8 (D96 slice 2, #559; roast 15, run 8ac8a5e4 — the bottom-edge mirror
+# of c7's top-edge fix, plus fan->RoR coupling + pace-not-edges teaching) ----
+#
+# c8 is c7 PLUS one section, spliced just before THE OBJECTIVE so all of
+# c1+c2+c3+c4+c5+c6+c7 is preserved byte-for-byte. It answers roast 15 (15
+# Jul, Sumatra, trim-60/dev-19 recipe): the advisor pushed fan 30->90 in the
+# first minute of development (its one actuated lever, used for temperature
+# control) — a legitimate use of the lever, but it convectively crashed RoR
+# 7->3 C/min, and the post-FC loop (D88, pre-D96) had ZERO authority to
+# compensate (heat sat ceiling-locked at the trim-60 entry value). The bean
+# crawled 183->188 C over 115 s. At DTR 16.3 (window bottom 16 with the
+# dev-19 target) the advisor dropped citing "in range, approaching bitter
+# ceiling" at 188 C - 7 C SHORT of target_drop_temp_c. This is the SAME
+# structural failure c7 fixed at the opposite edge (roast 13: DTR racing past
+# the window TOP while temperature lagged) - here the DTR merely touches the
+# window BOTTOM (no longer disqualified) and the advisor read that as
+# "arrived", not "no longer too early".
+#
+# Three sections, addressing three distinct parts of the ratified D96 scope
+# (issue #559): (1) PACE, the sharper and EARLIER-acting form of c7's
+# edge-crossing teaching (the live evidence: by the tick DTR breaches an
+# edge, the pace mismatch has usually been accruing for a while - comparing
+# PROGRESS RATES catches it sooner); (2) the bottom-edge mirror of c7's
+# top-edge fix; (3) the fan->RoR coupling, taught CONSISTENTLY with D96's
+# actual shipped mechanism (slice 1, PR #560, five review rounds): the loop
+# MAY now raise heat to compensate for a fan-driven RoR crash, within a
+# hard bounded cap, but that raise is SUPPRESSED on any tick that is ALSO
+# guard- or drop-eligible (the "never let a raise land moments before a
+# drop" invariant, unaffected by D96) - so this teaching does NOT promise
+# the loop will rescue an aggressive fan move if the bean is already near
+# the drop target; it teaches the advisor to use fan deliberately BECAUSE
+# the backstop is bounded and conditional, not because it is unconditional.
+# Names NO new numbers not already in c7 (the DTR window, drop target,
+# ceiling all come from context; RoR values come from context; the #218
+# two-copies rule).
+_C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION = (
+    "POST-FIRST-CRACK: COMPARE PROGRESS RATES THROUGHOUT DEVELOPMENT, NOT "
+    "JUST AT THE WINDOW EDGES\n"
+    "- The pace-mismatch teaching above (DTR racing past the window TOP while "
+    "temperature lags) is easier to catch EARLY if you compare the two "
+    "progress rates continuously rather than waiting for DTR to cross an "
+    "edge: watch how fast the development ratio is closing on its target "
+    "window versus how fast bean temperature is closing on target_drop_temp_c. "
+    "If the development-ratio progress is clearly outpacing the temperature "
+    "progress well before DTR reaches the window, that is the SAME pace "
+    "mismatch already forming - do not wait for the window edge to confirm "
+    "it before weighting temperature more heavily and holding the climb.\n"
+    "\n"
+    "POST-FIRST-CRACK: THE WINDOW BOTTOM IS NOT A FINISH LINE EITHER\n"
+    "- The mirror image of the pace-mismatch failure above: reaching the "
+    "BOTTOM of the acceptable development-ratio window (target_development_"
+    "percent_min in context) means development is no longer DISQUALIFYING a "
+    "drop - it does not mean the roast has ARRIVED. Aim for "
+    "target_development_percent itself, the profile's real target, not the "
+    "window's lower edge. If bean temperature is still MATERIALLY below "
+    "target_drop_temp_c when DTR merely touches the window bottom (not a "
+    "couple of degrees - a real gap), that is still an under-temperature "
+    "roast even though the DTR number has stopped disqualifying the drop. Do "
+    "not recommend should_drop=true on 'DTR is in range' alone when "
+    "temperature has real ground left to cover - keep developing toward "
+    "target_drop_temp_c, same as the joint-objective section already "
+    "teaches for a temperature-ahead / development-behind mismatch. The "
+    "indicated bitter/emergency ceiling stays LAW throughout and still "
+    "forces the drop the instant it is approached, regardless of where DTR "
+    "or temperature stand.\n"
+    "\n"
+    "POST-FIRST-CRACK: FAN AGGRESSION CAN CRASH THE RATE OF RISE - USE IT "
+    "DELIBERATELY\n"
+    "- Fan is a real, coarse lever (THE MACHINE section above), but pushing "
+    "it up aggressively and quickly shifts heat transfer toward convective "
+    "cooling hard enough to crash the bean's rate of rise even while heat "
+    "stays unchanged - the bean can stop climbing meaningfully even though "
+    "nothing else moved. Watch the RATE OF RISE after a fan move, not just "
+    "bean temperature, to see whether the move is doing what you intended.\n"
+    "- A deterministic heat loop MAY compensate for a rate-of-rise shortfall "
+    "within a bounded ceiling above where heat entered development, but "
+    "that compensation is NOT guaranteed on every tick - in particular, it "
+    "is deliberately suppressed on any tick that is also close enough to "
+    "drop to be guard- or drop-eligible, so a raise can never land moments "
+    "before the roast is meant to stop. Do not rely on an assumed heat "
+    "rescue when choosing how hard to push fan, especially as bean "
+    "temperature nears target_drop_temp_c or the indicated ceiling - by "
+    "then any compensation may be structurally unavailable. Use fan "
+    "changes deliberately, sized to the effect you want, and confirm the "
+    "rate of rise is actually responding the way you expected rather than "
+    "assuming a backstop will absorb an aggressive move.\n"
+    "\n"
+)
+_CONTROL_TEACHING_PROMPTS["c8"] = _CONTROL_TEACHING_PROMPTS["c7"].replace(
+    "THE OBJECTIVE\n", _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION + "THE OBJECTIVE\n", 1
 )
 
 

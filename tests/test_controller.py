@@ -4471,6 +4471,127 @@ def test_post_fc_loop_active_helper_matches_run_advisory_gate() -> None:
     assert harness.controller._post_fc_loop_active() is True  # pyright: ignore[reportPrivateUsage]
 
 
+# --- D96 slice 2 (#559): AdvisorContext gains post_fc_setpoint_c_per_min /
+# post_fc_heat_authority_state, copied VERBATIM from the SAME
+# PostFcControlOutput the controller's own tick already computed (told ==
+# enforced, the #497 precedent extended to these two fields). -----------------
+
+
+@pytest.mark.asyncio
+async def test_advisor_context_post_fc_fields_none_before_loop_ever_computes() -> None:
+    """Baseline (post-FC loop flag off / not yet engaged): both new fields
+    default ``None`` — mirroring ``current_heat_percent``'s own ``None``
+    default exactly (the pre-D96 regime, byte-for-byte unaffected)."""
+    advisor = FakeAdvisor([decision()])
+    harness = harness_in_development(readings=[reading()], advisor=advisor)
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    ctx = advisor.contexts[-1]
+    assert ctx.post_fc_setpoint_c_per_min is None
+    assert ctx.post_fc_heat_authority_state is None
+
+
+@pytest.mark.asyncio
+async def test_advisor_context_post_fc_fields_populated_told_equals_enforced() -> None:
+    """Flag ON + true FC edge: both new fields are populated from the SAME
+    ``PostFcControlOutput`` the loop's write this tick actually used to build
+    the safety box — verified by comparing the context's fields against the
+    controller's OWN stashed ``_last_post_fc_output`` directly (told ==
+    enforced: not just "some plausible value", the EXACT same object's
+    fields), rather than independently re-deriving what they "should" be."""
+    config = _post_fc_config(control_interval_seconds=5.0)
+    advisor = FakeAdvisor([decision(heat=50, fan=60)], default_decision=decision(heat=99, fan=85))
+    harness = make_harness(config=config, advisor=advisor)
+    await _charge_through_fc(harness)
+    harness.clock.advance(5.0)  # past the command rate-limit + post-FC control cadence
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=4.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    ctx = advisor.contexts[-1]
+    stashed = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+    assert stashed is not None
+    assert ctx.post_fc_setpoint_c_per_min == stashed.setpoint_c_per_min
+    assert ctx.post_fc_heat_authority_state == stashed.heat_authority_state
+    # Not a vacuous comparison against itself: pin real, non-default values.
+    assert ctx.post_fc_setpoint_c_per_min is not None
+    assert ctx.post_fc_heat_authority_state is not None
+
+
+@pytest.mark.asyncio
+async def test_advisor_context_post_fc_fields_none_on_operator_resume() -> None:
+    """Flag ON but reached DEVELOPMENT via an operator resume (no true FC
+    edge, mirroring ``test_advisor_context_post_fc_loop_active_false_on_
+    operator_resume`` exactly): the loop never computed anything this
+    engagement (``_post_fc_engaged`` False, ``transition_to`` clears
+    ``_last_post_fc_output`` unconditionally on every transition), so both
+    new fields must read ``None`` — the advisor is driving post-FC heat/fan
+    directly in this regime and has no post-FC-loop state to be told about."""
+    config = _post_fc_config()
+    advisor = FakeAdvisor([decision(heat=61, fan=52)], default_decision=decision(heat=61, fan=52))
+    harness = make_harness(config=config, advisor=advisor)
+    harness.controller.load_profile(PROFILE)
+    await harness.controller.recover_from_restart(RoastPhase.DEVELOPMENT)
+    harness.controller.operator_resume(RoastPhase.DEVELOPMENT)
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    harness.reader.readings = [reading(bean=185.0, bean_ror_c_per_min=5.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+    ctx = advisor.contexts[-1]
+    assert ctx.post_fc_setpoint_c_per_min is None
+    assert ctx.post_fc_heat_authority_state is None
+
+
+@pytest.mark.asyncio
+async def test_advisor_context_post_fc_fields_not_stashed_on_recovery_suppressed_tick() -> None:
+    """D96 (#559): on a tick where the recovery-raise skip fires (PR #560
+    rounds 1/2/4 — the SAME-tick guard/drop-eligible raise suppression), the
+    tentative ``PostFcControlOutput`` is fully discarded (mirrors the PI
+    state restore) — it must NOT be stashed as ``_last_post_fc_output``.
+    ``AdvisorContext`` must never see a setpoint/heat-authority-state this
+    tick's write never actually used.
+
+    Uses the DETERMINISTIC-DROP path with a FAILING ``drop_beans()`` (rather
+    than the ceiling guard) so the phase stays DEVELOPMENT — a ceiling-guard
+    scenario transitions to COOLING on the same tick, which clears the stash
+    via ``transition_to``'s own unconditional reset regardless of whether the
+    suppression logic itself worked, confounding this specific assertion."""
+
+    class AlwaysFailingDropExecutor(RecordingExecutor):
+        async def drop_beans(self) -> AppliedRoasterState:
+            raise RuntimeError("serial write dropped")
+
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=220.0,  # stay clear of the guard; isolate the anchor
+        recovery_confirm_ticks=1,
+    )
+    advisor = FakeAdvisor([decision()], default_decision=decision())
+    harness = make_harness(config=config, advisor=advisor, executor=AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    harness.controller._charge_monotonic = harness.clock.now  # pyright: ignore[reportPrivateUsage]
+    fc_monotonic = harness.controller._first_crack_monotonic  # pyright: ignore[reportPrivateUsage]
+    assert fc_monotonic is not None
+    harness.controller._first_crack_monotonic = fc_monotonic - 10_000.0  # pyright: ignore[reportPrivateUsage]
+    stash_before = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+
+    # A tick with a shortfall large enough to confirm entry immediately
+    # (recovery_confirm_ticks=1) AND bean/dev% both at the deterministic
+    # anchor's target -- the exact same-tick suppression scenario, with the
+    # drop then failing so the phase stays DEVELOPMENT.
+    harness.clock.advance(5.0)
+    harness.reader.readings = [reading(bean=PROFILE.target_drop_temp_c, bean_ror_c_per_min=2.0)]
+    harness.controller.request_advisory()
+    await harness.controller.tick()
+
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT  # the drop failed, stayed here
+    stash_after = harness.controller._last_post_fc_output  # pyright: ignore[reportPrivateUsage]
+    assert stash_after == stash_before  # the suppressed tick's output never landed
+
+
 # --- #220: the snapshot surfaces development time + DTR for the live readouts.
 # Read-only projections of the already-computed advisor clocks; charge-referenced
 # DTR, NOT a chart re-origin (the snapshot roast clock above stays run-referenced).

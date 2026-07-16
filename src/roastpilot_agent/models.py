@@ -196,6 +196,50 @@ class DropReason(Enum):
     CEILING_GUARD = "ceiling_guard"
 
 
+class PostFcHeatAuthorityState(Enum):
+    """The post-FC RoR-taper loop's current heat-ceiling regime (D96, #559;
+    PR #560 Codex finding — the diagnostics gap; moved here from
+    ``post_fc_control.py`` in D96 slice 2, #559, so ``advisor.py``'s
+    ``AdvisorContext`` can carry it without ``models.py`` importing
+    ``post_fc_control.py`` — the SAME reasoning :class:`RoastPhase` and
+    :class:`DropReason` above already document: the vocabulary lives where
+    every consumer can reach it without a cycle, not where it is
+    semantically "owned").
+
+    A plain ``Enum`` (D15: never string-compared in core logic). Three
+    values, covering every state
+    ``post_fc_control.PostFcRorController.compute`` can be in:
+
+    * ``HOLDING`` — the plain D88 never-add-heat-beyond-entry ceiling; no
+      recovery has ever engaged this engagement, or it fully settled back to
+      the D88 base after a prior exit.
+    * ``RECOVERING`` — the D96 recovery ceiling is FULLY ACTIVE (raised to
+      ``heat_engage_percent + recovery_headroom_percentage_points``,
+      clamped to ``heat_ceiling_percent``).
+    * ``GLIDING`` — recovery has EXITED but the effective ceiling has not
+      yet fully descended back to the D88 base (the exit-glide tail, D96's
+      addendum) — the state a bare ``recovery_active`` boolean could not
+      distinguish from ``HOLDING`` (a Codex finding on PR #560: the boolean
+      flips ``False`` the instant exit is confirmed even though the
+      ceiling can still sit well above the D88 base for several more ticks,
+      hiding the elevated-authority tail from any diagnostic or
+      guard-eligibility check that reads only the boolean).
+
+    ``post_fc_control.PostFcControlOutput.recovery_active`` is kept as a
+    derived ``bool`` (``state is not HOLDING``) for the callers slice 1
+    already shipped, but any NEW code reasoning about "is the ceiling still
+    elevated above the D88 base" (e.g. a guard-eligibility check, or
+    ``AdvisorContext.post_fc_heat_authority_state``, #559 slice 2) must read
+    this field directly, never the derived boolean alone — ``RECOVERING``
+    and ``GLIDING`` both need to be caught, and only this enum distinguishes
+    them.
+    """
+
+    HOLDING = "holding"
+    RECOVERING = "recovering"
+    GLIDING = "gliding"
+
+
 # --- #197: microphone / first-crack capture-alive health (observability) ---
 #
 # The MCP audio first-crack pipeline reports a rich liveness status

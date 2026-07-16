@@ -158,50 +158,24 @@ without touching it:
 """
 
 from dataclasses import dataclass
-from enum import Enum
 
 from pydantic import BaseModel
 
 from roastpilot_agent.config import PostFirstCrackControl
+from roastpilot_agent.models import PostFcHeatAuthorityState
 
-
-class PostFcHeatAuthorityState(Enum):
-    """The post-FC loop's current heat-ceiling regime this step (D96, #559,
-    PR #560 Codex finding — the diagnostics gap).
-
-    A plain ``Enum`` (D15: never string-compared in core logic; a
-    ``StrEnum`` here would let ``controller.py``'s guard-eligibility check
-    against it silently compile as a string comparison instead of a pyright
-    strict error). Three values, covering every state
-    :meth:`PostFcRorController.compute` can be in:
-
-    * ``HOLDING`` — the plain D88 never-add-heat-beyond-entry ceiling; no
-      recovery has ever engaged this engagement, or it fully settled back to
-      the D88 base after a prior exit.
-    * ``RECOVERING`` — the D96 recovery ceiling is FULLY ACTIVE (raised to
-      ``heat_engage_percent + recovery_headroom_percentage_points``,
-      clamped to ``heat_ceiling_percent``).
-    * ``GLIDING`` — recovery has EXITED but the effective ceiling has not
-      yet fully descended back to the D88 base (the exit-glide tail, D96's
-      addendum) — the state a bare ``recovery_active`` boolean could not
-      distinguish from ``HOLDING`` (a Codex finding on PR #560: the boolean
-      flips ``False`` the instant exit is confirmed even though the
-      ceiling can still sit well above the D88 base for several more ticks,
-      hiding the elevated-authority tail from any diagnostic or
-      guard-eligibility check that reads only the boolean).
-
-    ``PostFcControlOutput.recovery_active`` is kept as a derived
-    ``bool`` (``state is not HOLDING``) for the callers this slice already
-    shipped, but any NEW code reasoning about "is the ceiling still elevated
-    above the D88 base" (e.g. a guard-eligibility check) must read
-    :attr:`PostFcControlOutput.heat_authority_state` directly, never the
-    derived boolean alone — ``RECOVERING`` and ``GLIDING`` both need to be
-    caught, and only this enum distinguishes them.
-    """
-
-    HOLDING = "holding"
-    RECOVERING = "recovering"
-    GLIDING = "gliding"
+# Re-exported for existing callers/tests that import PostFcHeatAuthorityState
+# from this module (D96 slice 2, #559): the enum's HOME moved to models.py
+# (so AdvisorContext, in advisor.py, can carry it without models.py — a leaf
+# module with no roastpilot_agent imports of its own — importing back into
+# post_fc_control.py, which would cycle). Same reasoning models.py already
+# documents for RoastPhase and DropReason.
+__all__ = [
+    "PostFcControlOutput",
+    "PostFcControllerState",
+    "PostFcHeatAuthorityState",
+    "PostFcRorController",
+]
 
 
 @dataclass(frozen=True)

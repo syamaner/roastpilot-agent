@@ -1263,6 +1263,64 @@ def test_c7_extends_c6_with_dtr_pace_mismatch() -> None:
         assert literal not in new_section, f"c7 DTR-pace section must not bake in {literal!r}"
 
 
+def test_c8_extends_c7_with_pace_bottom_edge_and_fan_coupling() -> None:
+    """c8 is c7 PLUS the D96 slice 2 (#559) teaching, with all of
+    c1+c2+c3+c4+c5+c6+c7 grounding kept.
+
+    Roast 15 (15 Jul, Sumatra, run 8ac8a5e4): the advisor pushed fan 30->90
+    in the first minute of development, crashing RoR 7->3 C/min; the D88
+    (pre-D96) post-FC loop had zero authority to compensate (heat sat
+    ceiling-locked at the trim-60 entry value), so the bean crawled 183->188 C
+    over 115 s. At DTR 16.3 (window bottom 16 with the dev-19 target) the
+    advisor dropped citing "in range" at 188 C, 7 C short of target — the
+    bottom-edge mirror of c7's top-edge fix (roast 13). c8 adds: (1) a
+    PACE-comparison framing that acts earlier than waiting for an edge
+    crossing, (2) the explicit bottom-edge-is-not-a-finish-line teaching, and
+    (3) fan->RoR coupling teaching that stays CONSISTENT with D96 slice 1's
+    actual shipped mechanism (the heat loop's compensation is bounded and
+    suppressed near a drop, never an unconditional rescue)."""
+    from roastpilot_agent.advisor import (
+        _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    c7 = control_teaching_prompt("c7")
+    c8 = control_teaching_prompt("c8")
+    # c8 is c7 with the new section spliced in exactly before "THE OBJECTIVE"
+    # (the SAME splice advisor.py itself performs) -- an EXACT-SPLICE equality,
+    # not `c7 in c8` (which is always False: the splice makes c7 non-
+    # contiguous in c8) and not the weaker block-wise fallback this test
+    # originally used, which could silently pass even if the splice landed in
+    # the wrong place or mangled surrounding text.
+    assert c8 == c7.replace(
+        "THE OBJECTIVE\n", _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION + "THE OBJECTIVE\n", 1
+    ), "c8 must be EXACTLY c7 with the new section spliced before THE OBJECTIVE"
+    lowered = c8.lower()
+    # (1) Pace-comparison teaching, acting earlier than an edge crossing.
+    assert "progress rates" in lowered
+    assert "well before" in lowered
+    # (2) Bottom-edge-is-not-a-finish-line teaching, the mirror of c7's fix.
+    assert "window bottom" in lowered or "bottom of the acceptable" in lowered
+    assert "not a finish line either" in lowered or "not a finish line" in lowered
+    assert "no longer disqualif" in lowered  # "disqualifying"/"disqualified"
+    assert "has not arrived" in lowered or "does not mean the roast has arrived" in lowered
+    # (3) Fan->RoR coupling, consistent with D96 slice 1's shipped mechanism —
+    # the compensation is bounded/conditional, NOT an assumed rescue, and is
+    # explicitly suppressed near a drop (never promises a raise will land).
+    assert "crash" in lowered and "rate of rise" in lowered
+    assert "may compensate" in lowered
+    assert "not guaranteed" in lowered
+    assert "suppressed" in lowered
+    assert "do not rely on an assumed heat rescue" in lowered
+    # The indicated ceiling stays LAW throughout the new teaching too.
+    assert "ceiling" in lowered
+    # The new section names NO fixed roast-15 fixture numbers of its own
+    # (told==enforced; the live context carries every threshold/target).
+    start = c8.index("POST-FIRST-CRACK: COMPARE PROGRESS RATES")
+    new_section = c8[start : c8.index("THE OBJECTIVE\n", start)]
+    for literal in ("183", "188", "16.3", "115 s", "7 C", "30", "90", "8ac8a5e4"):
+        assert literal not in new_section, f"c8's new section must not bake in {literal!r}"
+
+
 # --- Codex P2 follow-up (#499): assert on the FINAL ASSEMBLED prompt, not
 # just the c1 fragment. The splice chain (c1 -> c2 -> c3 -> c4 -> c5 -> c6)
 # means a section added to c1 can be directly contradicted by a LATER-spliced
@@ -1277,10 +1335,11 @@ def test_c7_extends_c6_with_dtr_pace_mismatch() -> None:
 # c7 (#499 part 2) is included in both parametrizations below: it is spliced
 # AFTER the joint-objective section (the newest/most-spliced version, mirroring
 # how c6 was added to this same list), and it must not reintroduce the
-# first-past-the-post phrasing Codex originally found either.
+# first-past-the-post phrasing Codex originally found either. c8 (D96 slice 2,
+# #559) is now the newest/most-spliced version and is added the same way.
 
 
-@pytest.mark.parametrize("version", ["c3", "c6", "c7"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8"])
 def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     version: str,
 ) -> None:
@@ -1301,7 +1360,7 @@ def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     assert "latest acceptable drop" not in lowered
 
 
-@pytest.mark.parametrize("version", ["c3", "c6", "c7"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8"])
 def test_assembled_prompt_joint_objective_precedes_every_later_section(
     version: str,
 ) -> None:
@@ -1317,6 +1376,7 @@ def test_assembled_prompt_joint_objective_precedes_every_later_section(
         "POST-FIRST-CRACK: STRETCH DEVELOPMENT",  # c2
         "POST-FIRST-CRACK: FAN IS AN ACTIVE BRAKE",  # c3
         "POST-FIRST-CRACK: A LARGE DTR OVERSHOOT",  # c7
+        "POST-FIRST-CRACK: COMPARE PROGRESS RATES",  # c8
     ):
         if marker in prompt:
             assert prompt.index(marker) > joint_index, (
@@ -1374,6 +1434,24 @@ def test_advisor_config_selects_c7_and_sends_its_system_prompt(
     assert instructions == control_teaching_prompt("c7")
     assert instructions != control_teaching_prompt("c3")
     assert advisor.descriptor.prompt_version == "c7"
+
+
+def test_advisor_config_selects_c8_and_sends_its_system_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The D69 prompt-version discipline, applied to c8 (D96 slice 2, #559):
+    selecting ``prompt_version="c8"`` on :class:`AdvisorConfig` (the same
+    config field the Config UI's advisor.prompt_version selector writes)
+    actually wires c8's instructions into the constructed
+    ``PydanticAIAdvisor`` — the CONFIG-SELECTABLE path reaches it, not just
+    that ``control_teaching_prompt("c8")`` is byte-assembled correctly. c3
+    stays the untouched default; this is additive, opt-in only."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "dummy-key")
+    advisor = PydanticAIAdvisor(AdvisorConfig(prompt_version="c8"))
+    instructions = advisor._instructions  # type: ignore[reportPrivateUsage]
+    assert instructions == control_teaching_prompt("c8")
+    assert instructions != control_teaching_prompt("c3")
+    assert advisor.descriptor.prompt_version == "c8"
 
 
 def test_live_post_fc_advisor_uses_the_c3_system_prompt(
