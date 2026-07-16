@@ -680,6 +680,17 @@ ROSTER: tuple[Candidate, ...] = (
         (RoastPhase.DEVELOPMENT,),
         finalist=True,
     ),
+    # gpt-5.6-luna — OpenAI GPT-5.6 speed/budget tier ($1/$6). Vetted 16 Jul: passed the
+    # ~5s latency screen (median 1.89s, fastest of the 5.6 family, faster than the gpt-4o
+    # pin) despite reasoning-on-by-default. Reasoning pinned low to hold the latency band.
+    Candidate(
+        "openai/gpt-5.6-luna",
+        Tier.CONTROL_CANDIDATE,
+        (RoastPhase.DEVELOPMENT,),
+        finalist=True,
+        latency_risk=True,
+        reasoning="low",
+    ),
     # gemini-3.1-flash-lite — the prior bake-off winner (fast + cheap). Reasoning
     # pinned minimal to hold the live-latency band.
     Candidate(

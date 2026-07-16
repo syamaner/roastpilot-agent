@@ -74,14 +74,16 @@ def test_roster_is_well_formed() -> None:
 
 
 def test_roster_is_the_277_screen_with_baseline_and_prior_winner() -> None:
-    """The as-run #277 roster has 10 unique models incl. baseline + prior winner.
+    """The as-run #277 roster has 11 unique models incl. baseline + prior winner.
 
     The 10th slug is ``x-ai/grok-4.3``, the recovery candidate added when the
     original ``x-ai/grok-4-fast`` slug 404'd as deprecated (see the
-    21 Jun results doc disposition).
+    21 Jun results doc disposition). The 11th is ``openai/gpt-5.6-luna``,
+    added 16 Jul after passing the ~5s latency screen (median 1.89s,
+    faster than the gpt-4o pin) for the #396 heat-fidelity A/B.
     """
     slugs = [c.slug for c in bakeoff.ROSTER]
-    assert len(slugs) == 10
+    assert len(slugs) == 11
     assert len(slugs) == len(set(slugs)), "roster slugs must be unique"
     # The gpt-4o n8n baseline (D40.4) and the prior winner are both present.
     baselines = [c.slug for c in bakeoff.ROSTER if c.tier is bakeoff.Tier.BASELINE]
@@ -104,6 +106,7 @@ def test_finalists_are_the_ones_carried_to_the_full_set() -> None:
     """
     expected = {
         "openai/gpt-4o",
+        "openai/gpt-5.6-luna",
         "google/gemini-3.1-flash-lite",
         "google/gemini-3-flash-preview",
         "openai/gpt-5-nano",
