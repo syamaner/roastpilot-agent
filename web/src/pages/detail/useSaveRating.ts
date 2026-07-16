@@ -57,9 +57,28 @@
  *    `rating`/`notes` — the two fields this mutation actually owns — fixes
  *    the original round-1 stale-headline flash exactly as before while
  *    never touching a sibling field's fresher value.
+ *
+ * Round 4 (PRRT_kwDOSzMG_c6RflFx): the seed above only ever touched
+ * `roastKeys.detail` — `roastKeys.history` (the `/roasts` list, its own
+ * `staleTime: 30_000`) never learns a rating changed, so navigating back to
+ * the history page right after a save can show the OLD star value (and any
+ * rating-based filter reading it) for up to 30s. History is read-heavy and
+ * not gated the way the two detail-page rating widgets are, so an
+ * invalidate-and-let-it-refetch is the right weight here (unlike the
+ * detail seed, there's no single in-flight mutation response to seed FROM —
+ * the list's own shape isn't `RoastDetail`).
+ *
+ * `roastKeys.history` is `["roasts"]` — the very PREFIX `roastKeys.detail`
+ * is built from, so this repeats the round-3 lesson in the other direction:
+ * a bare (non-`exact`) `invalidateQueries` here would ALSO mark the just-
+ * seeded detail query (and every OTHER run's detail/timeline/telemetry/
+ * tastings query) stale, inviting an unnecessary refetch that could race the
+ * careful merge-only seed above. `exact: true` scopes this to ONLY the
+ * history list.
  */
 
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useCallback } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { api } from "@/lib/api";
 import { roastKeys } from "@/hooks/queries";
@@ -79,6 +98,54 @@ export function useSaveRating(runId: string) {
       queryClient.setQueryData(roastKeys.detail(runId), (old: RoastDetail | undefined) =>
         old === undefined ? old : { ...old, rating: detail.rating, notes: detail.notes },
       );
+      void queryClient.invalidateQueries({ queryKey: roastKeys.history, exact: true });
     },
   });
+}
+
+/**
+ * Round 4 (PRRT_kwDOSzMG_c6RflFr / PRRT_kwDOSzMG_c6RflF1): a shared
+ * "partial-failure window is open" signal, so `RoastRating` can freeze its
+ * own Edit for the ENTIRE window between `RoastTastings`' partial failure
+ * and its retry (or an explicit discard) — not just while a rating WRITE is
+ * literally in flight (`ratingWriteInFlight`/`useIsMutating`), which is
+ * `false` for the whole gap in between. Without this, an external direct
+ * edit landing in that gap goes unobserved by `RoastTastings`, and its next
+ * retry silently re-posts (and overwrites) the now-stale captured rating.
+ *
+ * Modeled as a tiny cache-resident boolean flag rather than reaching into
+ * TanStack's own mutation-state history (`useMutationState`) — the latter's
+ * behavior across `.reset()` calls and retries is exactly the kind of
+ * implicit bookkeeping this whole Codex arc has been finding edges in;
+ * an explicit flag this module owns end-to-end is easier to reason about
+ * and test. `RoastTastings` is the only writer (`setPartialFailureLock`);
+ * `RoastRating` (and `RoastTastings` itself, for its own Edit-adjacent
+ * affordances) are readers via `usePartialFailureLock`.
+ */
+export function partialFailureLockKey(runId: string) {
+  return ["roasts", runId, "rating-partial-failure-lock"] as const;
+}
+
+export function usePartialFailureLock(runId: string): boolean {
+  const query = useQuery({
+    queryKey: partialFailureLockKey(runId),
+    queryFn: () => false,
+    initialData: false,
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  return query.data;
+}
+
+export function useSetPartialFailureLock(runId: string) {
+  const queryClient = useQueryClient();
+  // Stable identity across renders (a `useEffect` in RoastTastings depends on
+  // this) — otherwise a plain inline arrow would re-run that effect on every
+  // render regardless of whether the lock value actually changed.
+  return useCallback(
+    (locked: boolean) => {
+      queryClient.setQueryData(partialFailureLockKey(runId), locked);
+    },
+    [queryClient, runId],
+  );
 }

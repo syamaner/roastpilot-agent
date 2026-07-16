@@ -418,7 +418,7 @@ describe("RoastTastings", () => {
       expect(addSpy).toHaveBeenCalledTimes(2);
     });
 
-    it("#568 round 3 (PRRT_kwDOSzMG_c6RfBAE): editing the draft between a partial failure and its retry does NOT create a divergence — the retry resubmits the value ACTUALLY SUBMITTED on attempt one, not the since-edited draft", async () => {
+    it("#568 round 3 (PRRT_kwDOSzMG_c6RfBAE): a partial-failure retry resubmits the value ACTUALLY SUBMITTED on attempt one, not a since-edited draft (round 4 makes editing the frozen field impossible — see the freeze test below — but this asserts the retry payload pinning itself, belt and braces)", async () => {
       vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
       const addSpy = vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: "r1", tastings: [] });
       const rateSpy = vi
@@ -434,22 +434,101 @@ describe("RoastTastings", () => {
       await waitFor(() => expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument());
       expect(addSpy).toHaveBeenCalledWith("r1", expect.objectContaining({ stars: 2 }));
 
-      // The operator edits the PRESERVED draft before retrying — the
-      // tasting entry already saved reads 2 stars; if the retry used this
-      // LIVE value, the headline rating would read 4 while the tasting
-      // entry it's supposed to correspond to reads 2 — a real divergence
-      // from one nominal save.
+      // Round 4 freezes the star picker during this window (its own
+      // dedicated test asserts the `disabled` attribute directly) — this
+      // click is a no-op either way, which is itself part of the point:
+      // there is no longer any live draft to diverge from.
       fireEvent.click(screen.getByTestId("tasting-star-4"));
       fireEvent.click(screen.getByTestId("tasting-save"));
       await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
 
       // The retried rating call carries the ORIGINALLY SUBMITTED value (2),
-      // matching the tasting entry that's already saved — never the
-      // since-edited live draft (4).
+      // matching the tasting entry that's already saved.
       expect(rateSpy).toHaveBeenLastCalledWith("r1", expect.objectContaining({ stars: 2 }));
       // The tasting was never resubmitted at all (still exactly the one
-      // call from attempt one) — a second call with stars: 4 would itself
-      // be the #568 round-2 duplicate-tasting hazard reintroduced.
+      // call from attempt one) — a second call would itself be the #568
+      // round-2 duplicate-tasting hazard reintroduced.
+      expect(addSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("#568 round 4 (PRRT_kwDOSzMG_c6RflFr): FREEZES every tasting field (metadata included, not just stars) for the whole partial-failure window — nothing editable to drift between the failure and its retry", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+      vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: "r1", tastings: [] });
+      vi.spyOn(api, "rate").mockRejectedValue(new Error("rating endpoint down"));
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+      await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+      fireEvent.change(screen.getByTestId("tasting-grind-note"), { target: { value: "medium" } });
+      fireEvent.click(screen.getByTestId("tasting-star-2"));
+      fireEvent.click(screen.getByTestId("tasting-save"));
+      await waitFor(() => expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument());
+
+      // The whole form is frozen — not just while `isPending` (which is
+      // false here; the mutations have already SETTLED into this partial
+      // state) — metadata fields included, closing round 3's gap where only
+      // stars/notes were pinned on retry but grind-note/brew/tags/tasted-at
+      // still read live off the (still-editable) draft.
+      expect(screen.getByTestId("tasting-star-4")).toBeDisabled();
+      expect(screen.getByTestId("tasting-notes")).toBeDisabled();
+      expect(screen.getByTestId("tasting-tasted-at")).toBeDisabled();
+      expect(screen.getByTestId("tasting-brew-method")).toBeDisabled();
+      expect(screen.getByTestId("tasting-grind-note")).toBeDisabled();
+      expect(screen.getByTestId("tasting-attribute-sweetness")).toBeDisabled();
+      expect(screen.getByTestId("tasting-defect-bitter")).toBeDisabled();
+    });
+
+    it("#568 round 4 (PRRT_kwDOSzMG_c6RflFr): a retry resubmits the ENTIRE captured attempt — metadata included — never a hybrid record", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+      const addSpy = vi
+        .spyOn(api, "addTasting")
+        .mockRejectedValueOnce(new Error("tastings endpoint down"))
+        .mockResolvedValueOnce({ run_id: "r1", tastings: [] });
+      vi.spyOn(api, "rate").mockResolvedValue(fakeRatedDetail());
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+      await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+      fireEvent.click(screen.getByTestId("tasting-star-3"));
+      fireEvent.change(screen.getByTestId("tasting-grind-note"), { target: { value: "coarse" } });
+      fireEvent.click(screen.getByTestId("tasting-attribute-acidity"));
+      fireEvent.click(screen.getByTestId("tasting-save"));
+      await waitFor(() => expect(screen.getByTestId("tasting-error")).toBeInTheDocument());
+
+      // Retry (the fields are frozen — this is the ONLY way to change
+      // anything: click save again from the identical, frozen draft).
+      fireEvent.click(screen.getByTestId("tasting-save"));
+      await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
+
+      // Both calls carry the IDENTICAL metadata — the retry never rebuilt
+      // grind_note/attributes from a since-changed live draft, because
+      // there was never a since-changed draft to rebuild from.
+      expect(addSpy).toHaveBeenNthCalledWith(
+        2,
+        "r1",
+        expect.objectContaining({ stars: 3, grind_note: "coarse", attributes: ["acidity"] }),
+      );
+    });
+
+    it("#568 round 4 (PRRT_kwDOSzMG_c6RflFr): 'Start over' discards the frozen attempt and unfreezes the form, without resubmitting anything", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+      const addSpy = vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: "r1", tastings: [] });
+      vi.spyOn(api, "rate").mockRejectedValue(new Error("rating endpoint down"));
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+      await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+      fireEvent.click(screen.getByTestId("tasting-star-2"));
+      fireEvent.click(screen.getByTestId("tasting-save"));
+      await waitFor(() => expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument());
+      expect(addSpy).toHaveBeenCalledTimes(1);
+
+      fireEvent.click(screen.getByTestId("tasting-start-over"));
+
+      // The escape unfreezes the form (a fresh entry, not a stuck retry) and
+      // clears every partial-failure indicator — but never retracts the
+      // tasting entry that already saved (append-only by design).
+      expect(screen.queryByTestId("rating-partial-error")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("tasting-start-over")).not.toBeInTheDocument();
+      expect(screen.getByTestId("tasting-star-4")).not.toBeDisabled();
+      expect(screen.getByTestId("tasting-star-2")).toHaveAttribute("data-filled", "false");
       expect(addSpy).toHaveBeenCalledTimes(1);
     });
   });

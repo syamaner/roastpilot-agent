@@ -40,8 +40,13 @@ describe("useSaveRating", () => {
     // The cache reflects the MUTATION'S OWN response synchronously — no
     // dependency on invalidateQueries' refetch round-trip settling.
     expect(client.getQueryData(roastKeys.detail("r1"))).toEqual(returned);
-    // Never invalidates (that was the pre-fix, round-trip-dependent path).
-    expect(invalidateSpy).not.toHaveBeenCalled();
+    // The DETAIL query specifically is never invalidated (that was the
+    // pre-fix, round-trip-dependent path) — round 4 legitimately added a
+    // separate, scoped `roastKeys.history` invalidation (its own test
+    // below), so this asserts on the exact key rather than "never called".
+    expect(invalidateSpy).not.toHaveBeenCalledWith(
+      expect.objectContaining({ queryKey: roastKeys.detail("r1") }),
+    );
   });
 
   it("uses a mutationKey scoped by run id, shared across every call site (the #568 cross-widget serialization contract)", () => {
@@ -154,5 +159,25 @@ describe("useSaveRating", () => {
     // whatever (irrelevant, possibly stale) value the rating response
     // happened to carry for a field this mutation doesn't own.
     expect(cached?.roasted_weight_grams).toBe(42);
+  });
+
+  it("#568 round 4 (PRRT_kwDOSzMG_c6RflFx): invalidates the history list (EXACT, never the detail/sibling prefix it shares) so navigating back to /roasts doesn't show the stale star value", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(roastKeys.detail("r1"), fakeDetail({ rating: 2 }));
+    client.setQueryData(roastKeys.history, [{ id: "r1", rating: 2 }]);
+
+    vi.spyOn(api, "rate").mockResolvedValue(fakeDetail({ rating: 5, notes: "fresh" }));
+    const { result } = renderHook(() => useSaveRating("r1"), { wrapper: wrapper(client) });
+    result.current.mutate({ stars: 5, notes: "fresh" });
+    await waitFor(() => expect(result.current.isSuccess).toBe(true));
+
+    // The history list is marked stale — the next mount/focus/manual refetch
+    // will bring the fresh rating in, instead of sitting on the cached value
+    // for the remainder of its own 30s staleTime.
+    expect(client.getQueryState(roastKeys.history)?.isInvalidated).toBe(true);
+    // The DETAIL query itself is untouched by this invalidation (`exact`
+    // scopes it away from `roastKeys.history`, which is a PREFIX of
+    // `roastKeys.detail` — the round-3 lesson, mirrored).
+    expect(client.getQueryState(roastKeys.detail("r1"))?.isInvalidated).toBe(false);
   });
 });

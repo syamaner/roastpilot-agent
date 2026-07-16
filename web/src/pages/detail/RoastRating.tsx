@@ -18,6 +18,16 @@
  * other. `useIsMutating` reads the SHARED `ratingMutationKey` across every
  * call site on the page, so this widget can see (and block on) a save
  * in-flight from `RoastTastings` even though it never rendered here.
+ *
+ * Round 4 (PRRT_kwDOSzMG_c6RflF1): `ratingWriteInFlight` alone only covers
+ * the moments a rating mutation is literally PENDING — it is `false` for the
+ * whole gap between `RoastTastings`' partial failure and its retry, exactly
+ * the window an operator could open THIS widget's Edit, save a direct
+ * correction, and have it silently overwritten by `RoastTastings`' next
+ * retry (which re-posts whatever it captured on ITS attempt one, unaware
+ * this edit ever happened). `usePartialFailureLock` reads the shared signal
+ * `RoastTastings` publishes for exactly that window, so Edit stays blocked
+ * for its full duration too — not just the narrower in-flight moments.
  */
 
 import { useEffect, useState } from "react";
@@ -25,7 +35,7 @@ import { useIsMutating } from "@tanstack/react-query";
 
 import { cn } from "@/lib/cn";
 import type { OperatorRatingRequest } from "@/lib/types";
-import { ratingMutationKey, useSaveRating } from "./useSaveRating";
+import { ratingMutationKey, useSaveRating, usePartialFailureLock } from "./useSaveRating";
 
 type Stars = OperatorRatingRequest["stars"];
 const STAR_VALUES: Stars[] = [1, 2, 3, 4, 5];
@@ -44,6 +54,10 @@ export function RoastRating({ runId, rating, notes, className }: RoastRatingProp
   // form, or RoastTastings' one-gesture save) — never just this instance's
   // own `mutation.isPending`, or the two entry points could race (#568).
   const ratingWriteInFlight = useIsMutating({ mutationKey: ratingMutationKey(runId) }) > 0;
+  // Round 4: also blocked for the whole span of a RoastTastings partial
+  // failure awaiting retry/discard — see the module doc above.
+  const tastingPartialFailureOpen = usePartialFailureLock(runId);
+  const editBlocked = ratingWriteInFlight || tastingPartialFailureOpen;
   const [editing, setEditing] = useState(false);
   const [stars, setStars] = useState<Stars | null>(clampStars(rating));
   const [notesDraft, setNotesDraft] = useState(notes ?? "");
@@ -92,16 +106,18 @@ export function RoastRating({ runId, rating, notes, className }: RoastRatingProp
             type="button"
             data-testid="rating-edit"
             onClick={openEdit}
-            disabled={ratingWriteInFlight}
+            disabled={editBlocked}
             className="text-xs font-medium text-primary hover:underline disabled:cursor-not-allowed disabled:opacity-50 disabled:no-underline"
           >
             Edit
           </button>
         )}
       </div>
-      {!editing && ratingWriteInFlight && (
+      {!editing && editBlocked && (
         <p data-testid="rating-edit-blocked" className="text-xs text-muted-foreground">
-          A tasting save is updating this rating — try Edit again shortly.
+          {tastingPartialFailureOpen
+            ? "A tasting save needs a retry before this rating can be edited — resolve it in Tasting notes below (or Start over there)."
+            : "A tasting save is updating this rating — try Edit again shortly."}
         </p>
       )}
 
@@ -145,7 +161,7 @@ export function RoastRating({ runId, rating, notes, className }: RoastRatingProp
               type="button"
               data-testid="rating-save"
               onClick={onSave}
-              disabled={stars === null || ratingWriteInFlight}
+              disabled={stars === null || editBlocked}
               className="inline-flex items-center rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
             >
               {mutation.isPending ? "Saving…" : "Save rating"}

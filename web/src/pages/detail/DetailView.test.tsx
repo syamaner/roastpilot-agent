@@ -178,6 +178,33 @@ describe("DetailView composition", () => {
     expect(addSpy).not.toHaveBeenCalled();
   });
 
+  it("#568 round 4 (PRRT_kwDOSzMG_c6RflF1): RoastRating's Edit stays blocked for the WHOLE partial-failure window, not just while a rating write is literally in flight — an external edit can no longer land unobserved and be silently overwritten by RoastTastings' next retry", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    vi.spyOn(api, "rate").mockRejectedValue(new Error("rating endpoint down"));
+    renderView();
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    // A tasting save's rating side fails and SETTLES (not pending — genuinely
+    // failed) — the partial-failure window is now open.
+    fireEvent.click(screen.getByTestId("tasting-star-2"));
+    fireEvent.click(screen.getByTestId("tasting-save"));
+    await waitFor(() => expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument());
+
+    // Nothing is PENDING right now (both mutations have settled), so the
+    // narrower round-1/round-2 in-flight guard alone would NOT block this —
+    // round 4's shared partial-failure lock must.
+    expect(screen.getByTestId("rating-edit")).toBeDisabled();
+    expect(screen.getByTestId("rating-edit-blocked")).toBeInTheDocument();
+
+    // Resolving via RoastTastings' own retry (not Start over) reopens Edit
+    // once the cycle fully succeeds.
+    vi.spyOn(api, "rate").mockResolvedValue({ id: FIXTURE_DETAIL.id } as Awaited<ReturnType<typeof api.rate>>);
+    fireEvent.click(screen.getByTestId("tasting-save"));
+    await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
+    expect(screen.getByTestId("rating-edit")).not.toBeDisabled();
+  });
+
   it("resets the RoastTastings draft when navigating between two different runs (#522 Codex P2): run A's unsaved draft must never leak into a POST against run B", async () => {
     vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
     const { rerender } = render(
