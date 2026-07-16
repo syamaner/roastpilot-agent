@@ -49,7 +49,11 @@ from roastpilot_agent.models import (
     RoastTelemetry,
     recording_origin_slug,
 )
-from roastpilot_agent.post_fc_control import PostFcControlOutput, PostFcRorController
+from roastpilot_agent.post_fc_control import (
+    PostFcControllerState,
+    PostFcControlOutput,
+    PostFcRorController,
+)
 from roastpilot_agent.roast_history import (
     DecisionTraceEntry,
     RoastCurveSample,
@@ -2066,6 +2070,10 @@ class RoastController:
                 RoastEventKind.COMMAND_FAILED,
                 {"command": "drop_beans", "source": "policy", "reason": reason.value},
             )
+            # D96 slice 1.5 (#561): a failed drop while recovery authority is
+            # elevated must not leave the roaster sitting at raised heat —
+            # force it back to the D96/D88 base through the safety path.
+            await self._clamp_heat_after_failed_drop()
             return False
         self._adopt_applied_state(applied)
         self._events.emit(
@@ -2074,6 +2082,197 @@ class RoastController:
         )
         self.transition_to(RoastPhase.COOLING)
         return True
+
+    async def _clamp_heat_after_failed_drop(self) -> None:
+        """D96 slice 1.5 (#561): fail-safe-DOWN heat clamp on a FAILED drop
+        while D96 recovery authority is elevated.
+
+        PR #560's own raise-suppression (the skip inside
+        :meth:`_apply_deterministic_post_fc_levers`) stops a NEW raise from
+        reaching the roaster on a drop-eligible tick, and round 4 additionally
+        let a hold-or-lower write pass through so a failed drop under GLIDING
+        still descends on its own. The residual #561 identified: the SINGLE
+        tick where recovery CONFIRMS entry and a drop is independently
+        eligible the same tick still lands a genuine raise (the entry write
+        happens before either drop path runs — see ``tick()``'s order) — if
+        the drop that same tick then FAILS, the roast is left in DEVELOPMENT
+        holding that raised value with no further loop tick guaranteed to pull
+        it back down promptly (the loop's own cadence and deadband could
+        leave it elevated for several more seconds while every subsequent
+        tick keeps trying, and failing, the same drop).
+
+        This method is the ACTIVE companion to that passive glide: called from
+        every drop-failure branch (:meth:`_execute_deterministic_drop`, shared
+        by the ceiling-guard and dev%/temp-anchor paths, and the advisor drop
+        path in :meth:`_run_advisory`), it forces heat back to the D96/D88
+        base — :attr:`~roastpilot_agent.post_fc_control.PostFcControllerState.
+        heat_engage_percent`, the never-add-heat-beyond-entry anchor D96's
+        recovery ceiling itself is built from — THROUGH THE SAME SAFETY PATH
+        as every other roaster write (``evaluate_command_phase`` then
+        ``evaluate_command`` with a single-source box, mirroring
+        :meth:`_apply_deterministic_post_fc_levers`'s own write exactly).
+        Never a raw/bypassing write. The ONE deliberate deviation:
+        ``evaluate_command`` is called with ``seconds_since_last_command=
+        None`` — exempting only the ordinary command RATE LIMIT (never the
+        bounds/CLAMP check or the phase-matrix gate) — because the scenario
+        this method exists for is EXACTLY a same-tick collision: the raise
+        needing undoing is very often the immediately-preceding accepted
+        command this same tick (the loop's own write, a moment before the
+        drop attempt that then failed), so honouring the ordinary rate limit
+        here would silently swallow the corrective write on precisely the
+        tick it matters most. Safe because this write can only ever move
+        heat DOWN to a value the roast already legitimately held (see the
+        idempotence check below) — see the inline comment at the
+        ``evaluate_command`` call for the full reasoning.
+
+        **Scope (elevated-authority ticks only):** a no-op unless
+        ``self._last_post_fc_output.heat_authority_state is not HOLDING`` —
+        flag-off engagements and HOLDING (plain-D88) engagements never even
+        reach this check with a non-``None``, non-``HOLDING`` output, so their
+        behaviour is byte-for-byte unchanged (the #560 discipline). This also
+        means the method is naturally inert when
+        ``post_first_crack_control.enabled`` is ``False`` or the loop never
+        engaged this DEVELOPMENT dwell: :attr:`_last_post_fc_output` stays
+        ``None`` on both paths (cleared at disengage, never set while the
+        loop's own top-of-function gate no-ops it).
+
+        **Fail-safe-DOWN, never up:** the write only ever LOWERS heat. When
+        ``self._current_heat`` is already at or below the base
+        (``self._current_heat <= base``), there is nothing to clamp down to —
+        skip entirely (idempotence: a repeated failed-drop tick with heat
+        already at base issues no redundant write).
+
+        **Fan is untouched:** this is a heat-only fail-safe (D96's own scope);
+        the write holds fan at ``self._current_fan`` exactly, never reasoning
+        about the advisor's fan lever at all.
+
+        **Recovery re-arm (design decision, tick-table-justified):** on a
+        successful clamp write this method ALSO forces the recovery state
+        machine to fully EXIT — ``recovery_active=False``,
+        ``recovery_ticks_since_exit=None``, both confirm-tick counters zeroed
+        — via :meth:`~roastpilot_agent.post_fc_control.PostFcRorController.
+        restore_state` with a synthesized state that carries the CURRENT
+        (post-clamp) integrator/EMA/taper fields forward unchanged and only
+        overwrites the four recovery-specific fields. Justification from the
+        tick tables: leaving the counters as "confirmed active/gliding" after
+        forcibly overriding the ceiling's own output would let the very next
+        tick's :meth:`~roastpilot_agent.post_fc_control.PostFcRorController.
+        compute` call reason from a ceiling that no longer matches what the
+        roaster actually holds (``effective_ceiling`` stays at the recovery
+        value while ``_current_heat`` was just forced to the D88 base beneath
+        it) — a one-tick state/reality gap the #412 told==enforced rule
+        exists to prevent everywhere else in this codebase. Resetting clears
+        that gap and requires a FRESH ``recovery_confirm_ticks`` run before
+        authority elevates again, which is also the correct bounded-re-arm
+        behaviour for repeated failures: if ``drop_beans()`` keeps failing
+        every tick, each clamp re-confirms heat at the base and re-arms
+        cleanly rather than compounding a raise/clamp thrash — the roast
+        continues (the drop keeps being retried by the caller's own no-cadence
+        eligibility check), heat descends and STAYS at base across repeated
+        failures, and recovery can only re-engage after a genuine fresh
+        RoR-shortfall confirmation, never as an artifact of the failed drop
+        itself.
+
+        **Invariants held (unchanged by this method):** every write passes
+        the identical safety path as every other roaster write; the 196 °C
+        bitter ceiling / emergency-drop bound / e-stop live in
+        ``SafetyPolicy``'s temperature rules and are untouched here; emergency
+        stop remains reachable from every phase; a restart never auto-resumes
+        into this path (this method only ever runs from an already-active
+        DEVELOPMENT dwell, immediately after a drop attempt — never reachable
+        from ``operator_recovery_required``).
+        """
+        output = self._last_post_fc_output
+        if output is None or output.heat_authority_state is PostFcHeatAuthorityState.HOLDING:
+            return
+        state = self._post_fc_controller.snapshot_state()
+        base = state.heat_engage_percent
+        if self._current_heat <= base:
+            # Fail-safe-DOWN idempotence: already at or below the base — no
+            # write, but the recovery state machine is still forced to exit
+            # below (a failed drop with heat already settled at base is still
+            # a "stop trying to elevate" signal for the next tick).
+            self._force_recovery_exit(state)
+            return
+        box = self._control_limits().model_copy(
+            update={"heat_floor_percent": base, "heat_target_percent": base}
+        )
+        phase_validity = self._safety.evaluate_command_phase(
+            command=RoastCommand.SET_HEAT, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(phase_validity)
+        if phase_validity.verdict is not SafetyVerdict.ALLOW:  # pragma: no cover — DEVELOPMENT
+            # is in the SET_HEAT matrix row; unreachable defensive guard (mirrors
+            # the identical pre-FC/post-FC-loop guards above).
+            return
+        evaluation = self._safety.evaluate_command(
+            requested_heat=base,
+            requested_fan=self._current_fan,
+            # `seconds_since_last_command=None` DELIBERATELY exempts only the
+            # RATE LIMIT (never the bounds/CLAMP check, never the phase-matrix
+            # gate above) — the exact scenario this clamp exists for is a
+            # SAME-TICK collision: the raise that needs undoing was itself
+            # the previous accepted command this tick (`_last_command_
+            # monotonic` was just set by the loop's own write, so `
+            # _seconds_since_last_command()` would read ~0 and the ordinary
+            # `command_rate_limited` REJECT would silently swallow this write
+            # every time it matters most). Safe to exempt because this write
+            # can ONLY ever move heat DOWN (the idempotence check above
+            # already ensures `base < self._current_heat`, and `base` is
+            # itself a value the roast already held at some prior instant,
+            # never a fabricated one) — the rate limit exists to protect the
+            # ~1 Hz Hottop serial loop from a THRASHING thrash of writes, not
+            # from a single corrective descent immediately following the
+            # write it corrects. This mirrors `_apply_fail_safe`'s own
+            # bypass of ordinary write gating for a fail-closed heat-down
+            # action, applied here to the ONE additional gate
+            # (`evaluate_command`) `_apply_fail_safe` does not use at all.
+            seconds_since_last_command=None,
+            bounds=box,
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        executed = await self._execute_targets(evaluation)
+        if executed:
+            self._force_recovery_exit(state)
+        # A failed clamp write leaves the recovery state machine exactly as it
+        # was (mirrors every other actuator-failure path in this module): the
+        # roaster's real heat is unchanged, so there is no state/reality gap
+        # to close yet — the next tick's own drop-eligibility retry, and this
+        # same clamp, will be attempted again.
+
+    def _force_recovery_exit(self, state: PostFcControllerState) -> None:
+        """Force the D96 recovery state machine to HOLDING (#561).
+
+        Carries every non-recovery field of ``state`` forward unchanged
+        (integrator, bias, EMA, taper clock/r0, ``heat_engage_percent``) and
+        overwrites only the four recovery-specific fields to their fully-
+        exited values, via
+        :meth:`~roastpilot_agent.post_fc_control.PostFcRorController.
+        restore_state`. Called only after a successful (or already-idempotent)
+        post-failure heat clamp — see :meth:`_clamp_heat_after_failed_drop`
+        for the tick-table justification of forcing a full re-arm rather than
+        leaving the confirmed active/gliding counters in place.
+
+        Args:
+            state: A snapshot taken in the same clamp call this re-arm
+                belongs to (``PostFcRorController.snapshot_state()``), so the
+                non-recovery fields it carries are this tick's own — never a
+                stale snapshot from an earlier tick.
+        """
+        self._post_fc_controller.restore_state(
+            state.__class__(
+                integrator=state.integrator,
+                bias_percent=state.bias_percent,
+                ema=state.ema,
+                taper_elapsed_seconds=state.taper_elapsed_seconds,
+                taper_r0_c_per_min=state.taper_r0_c_per_min,
+                heat_engage_percent=state.heat_engage_percent,
+                recovery_ticks_above_trigger=0,
+                recovery_ticks_within_exit=0,
+                recovery_active=False,
+                recovery_ticks_since_exit=None,
+            )
+        )
 
     async def _maybe_ceiling_guard_drop(self, telemetry: RoastTelemetry | None) -> None:
         """Decoupled ceiling-guard drop: a bitter-line safety anchor, not a
@@ -3010,6 +3209,11 @@ class RoastController:
                         RoastEventKind.COMMAND_FAILED,
                         {"command": "drop_beans", "source": "advisor"},
                     )
+                    # D96 slice 1.5 (#561): same fail-safe-DOWN clamp as the
+                    # two deterministic drop paths (_execute_deterministic_drop)
+                    # — a failed advisor drop is exactly the residual PR #560
+                    # round 3 identified.
+                    await self._clamp_heat_after_failed_drop()
                     return
                 self._adopt_applied_state(applied)
                 self._events.emit(
