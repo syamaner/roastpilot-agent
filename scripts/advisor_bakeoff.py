@@ -3724,8 +3724,8 @@ async def main() -> int:
         "--roster",
         choices=["screen", "finalists"],
         default="screen",
-        help="replay mode: which #277 roster to run — 'screen' (all 9, default) or "
-        "'finalists' (the 5 carried to the full set).",
+        help="replay mode: which #277 roster to run — 'screen' (all 11, default) or "
+        "'finalists' (the 6 carried to the full set).",
     )
     parser.add_argument(
         "--test-set",
@@ -3878,8 +3878,8 @@ async def main() -> int:
     # A real run always uses backoff; retry is a no-op when attempts == 1.
     retry_policy = RetryPolicy(attempts=retry_attempts)
 
-    # #277 roster + test-set selection. The roster is the full screen (9) or the
-    # finalists (5); the test set is the known-good-medium fixtures (screen ~6 /
+    # #277 roster + test-set selection. The roster is the full screen (11) or the
+    # finalists (6); the test set is the known-good-medium fixtures (screen ~6 /
     # full 17) when --test-set is given, else the legacy two 7-Jun roasts.
     roster = finalist_roster() if args.roster == "finalists" else screen_roster()
     test_set_name = cast("str | None", args.test_set)
