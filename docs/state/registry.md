@@ -102,7 +102,51 @@
 
 ## Active Context
 
-**16 Jul 2026 (latest) — #563 TOLD-CEILING SEPARATION SHIPPED (design → Opus safety review
+**16 Jul 2026 (latest) — BATCH 4 COMPLETE: four tracks, three PRs merged + one design note
+(PRs #568/#570/#569; note on #567). D96 recovery law now FULLY BUILT on main.** Operator: "file
+it and run with it. Any other autonomous tasks, update the boards and get teams on them." Four
+parallel tracks, lead-orchestrated (per-track engineer + Opus safety reviewers), all landed:
+- **#563 → #570 (told-ceiling separation) MERGED** — the highest-leverage advisor fix; full
+  detail in the entry directly below. C4 bake-off PASS (9/15 vs 14/15 rationale-conflation, 0
+  regression).
+- **#561 → #569 (post-failure heat-to-base clamp, D96 slice 1.5) MERGED — completes the D96
+  recovery law on main** (slice 1 #560 + slice 1.5 #561 + slice 2 c8 #562, all flag-gated OFF).
+  Most-scrutinised path of the batch: TWO Opus safety reviews (core PASS + a focused re-review
+  PASS) + TWO Codex rounds, every finding real — a fourth uncovered drop path (operator_drop), a
+  stale-advisor-output gap after the forced recovery exit, a fail-safe-down hole (forcing HOLDING
+  re-enabled a base-seeking raise) → the `_post_fc_raise_suppressed_after_clamp` latch; then a
+  failed-corrective-write asymmetry + the latch stranding fan → `self_healing` param + heat-only
+  suppression via a threaded `actuated_heat`. **CI caught a real sibling interaction:** the branch,
+  built pre-#570, used `ceiling_guard_temp_c=220/230` fixtures that #570's told-ceiling change now
+  feeds into `PhaseControlLimits` → tripped its `emergency>bitter` validator → test-only fix
+  mirroring #563's `_ISOLATED_CEILING_GUARD_LIMITS` (the #453 build-before-a-sibling-merges class).
+- **#566 → #568 (rating + tasting merged into one entry gesture) MERGED — 7 Codex rounds, every
+  finding real, three async-state-machine classes converged at the ROOT** (not point-patched):
+  (1) cache-seed races → surgical merge-only `setQueryData` + `exact` cancel; (2) partial-retry/
+  lock → frozen partial-failure mode + full-payload capture + a module-scoped `useSyncExternalStore`
+  lock on the full `isFrozen` lifecycle (throughline: UI-coordination state does NOT belong in the
+  server cache); (3) component keying (RoastRating keyed by runId like its sibling). A durable
+  codex-wait specimen: green CI passed at round 1; the diff-read caught real cross-widget data-loss
+  across 7 rounds. Stopping-line judgment applied (effort-vs-value, not a mechanical severity gate).
+- **#567 (reference curves) — design note FINALIZED + attached to the issue; build PARKED at the
+  operator gate** (new-feature scope). n=3 corpus, replay-pinned-off, 3-arm bake-off, ship-disabled
+  flag; store re-verification fixed two stale facts (n=1→n=3 beans; a cooling-tail DTR artifact →
+  authoritative 190°C/715s/15.1% + 191°C/687s/12.4% off `development_percent`). **Open follow-on
+  (operator-raised):** a deterministic bean-SIMILARITY retrieval (altitude/density/moisture/
+  processing/size) as #567 v2 fallback for beans with no exact-slug match — assessed as sound but
+  gated on a schema gap (density + moisture not captured; altitude is a weak density proxy) and the
+  n=3 validation limit; a scoped research pass offered.
+
+**Process ledger:** the two-lens review (Opus safety-reviewer + Codex diff-read) repeatedly
+surfaced real interaction bugs neither caught alone (sharpest on the #569 clamp); author-fixes /
+lead-triages held throughout (D23); auto-merge never armed on the safety PRs; #570/#569/#568 all
+merged on the Codex-silent fallback (well-vetted). New runtime bean added same session: **Brazil
+Santos (Natural)** — 250 g / drop 195 / dev 14 % (de-risked first roast; extend to 15-16 % for
+deeper chocolate). **Next:** the D96 validation roast (c3 + /config trim 60 + Sumatra dev 19 +
+`recovery_enabled` flip — operator-gated hardware); the #567 build decision + the similarity-v2
+research; #396 full-corpus advisor A/B (optional).
+
+**16 Jul 2026 — #563 TOLD-CEILING SEPARATION SHIPPED (design → Opus safety review
 PASS → C4 bake-off PASS → PR).** The highest-leverage advisor fix the D96 prompt-testing arc
 found: `RoastControlPolicy._bitter_ceiling_temp_c()` capped the told bitter ceiling at
 `min(196, target_drop_temp_c)`, making the told number IDENTICAL to the drop target on every
