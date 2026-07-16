@@ -59,6 +59,9 @@ test("roast-detail — full-page snapshot of the detail page (canvas un-masked)"
   await expect(page.getByTestId("roast-conditions-temp")).toHaveText("29.7 °C");
   await expect(page.getByTestId("roast-conditions-humidity")).toHaveText("41 %");
   await expect(page.getByTestId("roast-conditions-pressure")).toHaveText("1008 hPa");
+  // #566: baseline regenerated — "Your rating" now renders the read-only
+  // headline (stars + saved note, with an "Edit" affordance) instead of the
+  // old always-editable star-picker form.
   await expect(page).toHaveScreenshot("roast-detail.png", { fullPage: true });
 });
 
@@ -160,6 +163,8 @@ test.describe("capped detail lists (#271)", () => {
       ...EXPECTED_TRACE_COLUMNS,
     ]);
 
+    // #566: baseline regenerated for the same rating-headline redesign as
+    // roast-detail.png above.
     await expect(page).toHaveScreenshot("roast-detail-capped.png", { fullPage: true });
   });
 
@@ -196,6 +201,8 @@ test.describe("advisor-failure detail (#170)", () => {
     await expect(page.getByTestId("advisor-status").first()).toHaveText("PROVIDER ERROR");
     await expect(page.getByTestId("advisor-summary-failed")).toHaveText("3 failed");
     await expect(page.getByTestId("advisor-timeline-empty")).toHaveCount(0);
+    // #566: baseline regenerated for the same rating-headline redesign as
+    // roast-detail.png above.
     await expect(page).toHaveScreenshot("roast-detail-advisor-failed.png", { fullPage: true });
   });
 });
