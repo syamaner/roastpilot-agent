@@ -393,6 +393,43 @@ def mock_healthcheck(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_availability_sweep_applies_each_candidates_reasoning_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#572 Codex catch: the sweep must probe each candidate under its OWN
+    resolved reasoning cap (:func:`bakeoff.resolve_reasoning`), not the raw
+    run-wide ``reasoning`` — otherwise a reasoning-on candidate is
+    healthchecked UNCAPPED (provider default), and its bounded probe could
+    time out and drop a slug the (correctly-capped) scoring pass would have
+    handled fine.
+
+    Captures the ``reasoning`` argument each ``probe_slug`` call actually
+    receives, rather than asserting on sweep behaviour indirectly.
+    """
+    captured: dict[str, object] = {}
+
+    async def fake_probe_slug(
+        slug: str, prompt_version: str, reasoning: object, **_: object
+    ) -> bakeoff.AvailabilityResult:
+        captured[slug] = reasoning
+        return bakeoff.AvailabilityResult(slug=slug, available=True, attempts=1)
+
+    monkeypatch.setattr(bakeoff, "probe_slug", fake_probe_slug)
+
+    capped = bakeoff.Candidate(
+        "capped/slug", bakeoff.Tier.CONTROL_CANDIDATE, (RoastPhase.DEVELOPMENT,), reasoning="low"
+    )
+    uncapped = bakeoff.Candidate("uncapped/slug", bakeoff.Tier.BASELINE, (RoastPhase.DEVELOPMENT,))
+    await bakeoff.availability_sweep((capped, uncapped), "c3", "high")
+
+    # The capped candidate's OWN cap wins over the run-wide "high" (mirrors
+    # resolve_reasoning's precedence, used identically in scoring).
+    assert captured["capped/slug"] == "low"
+    # The uncapped candidate falls back to the run-wide reasoning, unchanged.
+    assert captured["uncapped/slug"] == "high"
+
+
+@pytest.mark.asyncio
 async def test_availability_sweep_drops_and_reports_unavailable(
     mock_healthcheck: None,
 ) -> None:

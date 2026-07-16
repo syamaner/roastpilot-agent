@@ -42,14 +42,14 @@ PR with its own D-number.
 
 Exact operator run commands (#277 post-FC control bake-off)::
 
-    # 1) SCREEN — all 9 models, single seed, ~6 representative known-good mediums,
+    # 1) SCREEN — all 11 models, single seed, ~6 representative known-good mediums,
     #    the AS-BUILT c1 control prompt (default):
     OPENROUTER_API_KEY=sk-or-... \\
     python scripts/advisor_bakeoff.py --roster screen --test-set screen --seeds 1 \\
         --trajectory --max-spend 25 \\
         --out /tmp/bakeoff-screen.json --report-md /tmp/bakeoff-screen.md
 
-    # 2) FINALISTS — the 5 carried models, 2 seeds, the FULL 17 known-good mediums:
+    # 2) FINALISTS — the 6 carried models, 2 seeds, the FULL 17 known-good mediums:
     OPENROUTER_API_KEY=sk-or-... \\
     python scripts/advisor_bakeoff.py --roster finalists --test-set full --seeds 2 \\
         --trajectory --max-spend 25 \\
@@ -645,9 +645,10 @@ class Candidate:
         latency_risk: ``True`` for a model that reasons / "thinks" before output
             — a brief trace adds latency, a poor fit for the FC-slot hard gate.
             The mitigation is the per-candidate ``reasoning`` cap below.
-        finalist: ``True`` for the 5 finalists carried to the FULL 17-medium
-            set with 2 seeds (#277). Screen-only candidates are ``False`` — they
-            run the single-seed SCREEN subset only.
+        finalist: ``True`` for the 6 finalists carried to the FULL 17-medium
+            set with 2 seeds (#277; 5 as of the original #277 brief, plus
+            ``gpt-5.6-luna`` added 16 Jul for #396). Screen-only candidates are
+            ``False`` — they run the single-seed SCREEN subset only.
         reasoning: A per-candidate reasoning/thinking-effort cap (overrides the
             run-wide ``--reasoning``). The #277 brief pins Gemini / GPT reasoning
             to minimal / low so the live-latency band stays ~<=4 s; a reasoning
@@ -664,12 +665,14 @@ class Candidate:
 
 
 # The #277 post-FC control-advisor roster (operator brief, 21 Jun), encoded as
-# data. The SCREEN is 9 models run once over the ~6-roast subset; the 5 FINALISTS
-# (``finalist=True``) carry to the FULL 17-medium set with 2 seeds. Gemini / GPT
-# reasoning is pinned minimal / low per the brief (live-latency band ~<=4 s) — no
-# reasoning model runs at ``high`` here. The control loop is post-FC, so the
-# primary phase is DEVELOPMENT throughout. The availability sweep drops any slug
-# that does not resolve on OpenRouter, so a phantom next-gen slug is caught.
+# data. The SCREEN is 11 models run once over the ~6-roast subset (9 as of the
+# original #277 brief, plus ``gpt-5.6-luna`` added 16 Jul for #396); the 6
+# FINALISTS (``finalist=True``) carry to the FULL 17-medium set with 2 seeds.
+# Gemini / GPT reasoning is pinned minimal / low per the brief (live-latency
+# band ~<=4 s) — no reasoning model runs at ``high`` here. The control loop is
+# post-FC, so the primary phase is DEVELOPMENT throughout. The availability
+# sweep drops any slug that does not resolve on OpenRouter, so a phantom
+# next-gen slug is caught.
 ROSTER: tuple[Candidate, ...] = (
     # --- FINALISTS (carry to the full 17-medium set, 2 seeds) ----------------
     # gpt-4o — the PROVEN n8n autonomous-roaster baseline (D40.4): the co-baseline
@@ -1168,8 +1171,21 @@ async def availability_sweep(
     # Probe concurrently — each healthcheck is an independent network round trip,
     # so a serial loop would make the operator block ~1-3 s per slug before any
     # sampling starts. ``gather`` preserves roster order in its return value.
+    #
+    # Each candidate's OWN reasoning cap (``resolve_reasoning``) is applied here,
+    # not the raw run-wide ``reasoning`` — mirroring :func:`run_replay_cell` /
+    # :func:`score_candidate`'s scoring path. Without this, a reasoning-on
+    # candidate is healthchecked UNCAPPED (provider default, potentially slower
+    # than its scored cells), so the sweep's bounded probe could time out and
+    # drop a slug the scoring pass would have handled fine (Codex catch on
+    # PR #572, id PRRT_kwDOSzMG_c6RkK9S).
     results = list(
-        await asyncio.gather(*(probe_slug(cand.slug, prompt_version, reasoning) for cand in roster))
+        await asyncio.gather(
+            *(
+                probe_slug(cand.slug, prompt_version, resolve_reasoning(cand, reasoning))
+                for cand in roster
+            )
+        )
     )
     by_slug = {r.slug: r for r in results}
     survivors = [c for c in roster if by_slug[c.slug].available]
@@ -2255,9 +2271,11 @@ async def run_replay_bakeoff(
 DEFAULT_COST_PER_CALL_USD = 0.02
 
 # The operator-suggested #277 budget cap (USD). Sized to cover the screen pass
-# (9 models x ~6 roasts) plus the finalist full-set passes (5 models x 17 roasts
-# x 2 seeds) with headroom at the rough per-call estimate; surfaced in the
-# --max-spend help and the report so a run is never silently uncapped by accident.
+# (11 models x ~6 roasts) plus the finalist full-set passes (6 models x 17
+# roasts x 2 seeds) with headroom at the rough per-call estimate (still well
+# under this cap after gpt-5.6-luna's 16 Jul addition — see the constant's own
+# arithmetic in the roster module comment); surfaced in the --max-spend help
+# and the report so a run is never silently uncapped by accident.
 SUGGESTED_MAX_SPEND_USD = 25.0
 
 # How often the heartbeat line is emitted, in wall-clock seconds.
