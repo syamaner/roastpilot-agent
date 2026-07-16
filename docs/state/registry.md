@@ -102,6 +102,34 @@
 
 ## Active Context
 
+**16 Jul 2026 (latest) — D96 BUILT END-TO-END OVERNIGHT (PRs #558/#560/#562/#564); THE
+PROMPT-TESTING ARC FOUND THE TOLD-CEILING ROOT CAUSE (#563).** Slice 1 (#560): the
+bounded-bidirectional recovery law, merged DORMANT (`recovery_enabled=False`; validators require
+the ceiling guard AND the master flag) after five review rounds — entry/exit hysteresis with a
+ceiling glide, the drop-tick raise suppression (actuated-level-compared after a P1 showed the
+skip could freeze LOWERING writes on failed drops), #561 filed as slice 1.5 (post-failure
+heat-to-base clamp, before promotion). Slice 2 (#562): c8 (pace-not-edges + bottom-edge
+target-seeking + fan→RoR coupling) + AdvisorContext gains the loop's setpoint and a
+PostFcHeatAuthorityState enum (told==enforced, mutation-tested). #564: the teaching revision —
+numeric-comparison ceiling framing, an anticipatory per-minute-arithmetic drop trigger
+(bean_ror_c_per_min as the unit, bitter_ceiling_temp_c explicitly named), confidence-scale pin.
+**Four live bake-off runs (192 calls, $1.56, operator's standing OpenRouter approval) drove the
+revisions and found the structural root cause:** c7/c8's original ceiling emphasis hallucinated
+"bean at ceiling" 8 °C early; post-fix the failure MOVED to inference ("ceiling==target ⇒ no
+overshoot room ⇒ drop early") — a CORRECT reading of a misleading input, because
+`_bitter_ceiling_temp_c()` caps the told ceiling at min(196, target_drop) → 195==195 on every
+profile, a told≠enforced violation vs the real 196 guard → **#563 (likely the highest-leverage
+advisor fix)**. Design fact recorded: joint-objective PATIENCE architecturally outweighs the
+anticipatory projection when DTR is short (models hold ~50% even at a sub-actuation gap, without
+miscomputing) — #563's true-ceiling separation may dissolve the contest. #396 provisional:
+prompt >> model; gpt-4.1-mini decision-competitive at 1/6 cost. c3 stays the default AND the
+live selection; c7/c8 selectable-only with the full record on #499. **Validation-roast recipe,
+all merged: c3 + /config trim 60 + Sumatra dev 19 + `recovery_enabled` flip; watch the first
+raise event, exit re-trigger, real plant gain.** Also merged: #558 (the roast-day UI P1 pair —
+mismatch-view reload brick, stale-card false positive). Proposed next tracks: #563 design pass;
+reference curves (the designed-but-empty `reference_roasts` — the D95 bean-aware input; the
+operator's own context question surfaced it).
+
 **15 Jul 2026 (latest) — D94 AFFORDABILITY LAW FALSIFIED PRE-MERGE (D95); PR #551 CLOSED
 UNMERGED; D88's VALIDATED STACK STANDS.** The operator's flat-cup verdict on roasts 13/14
 ratified the #521 affordability-anchored post-FC setpoint (D94 + same-day m=0.1 hysteresis
