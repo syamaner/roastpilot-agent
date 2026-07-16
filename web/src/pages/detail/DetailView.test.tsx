@@ -247,6 +247,51 @@ describe("DetailView composition", () => {
     expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument();
   });
 
+  it("#568 round 6 (PRRT_kwDOSzMG_c6Rg5YO): RoastRating's Edit stays blocked in the TRANSIENT window where the rating side has already rejected but the tasting side is still pending — not just after both have settled", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    // The tasting mutation stalls, mid-flight — never settles until we
+    // resolve it explicitly.
+    let resolveTasting: (() => void) | undefined;
+    vi.spyOn(api, "addTasting").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveTasting = () => resolve({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+        }),
+    );
+    // The rating mutation rejects FAST — settled well before the tasting
+    // mutation above even gets a chance to.
+    vi.spyOn(api, "rate").mockRejectedValue(new Error("rating endpoint down"));
+    renderView();
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("tasting-star-2"));
+    fireEvent.click(screen.getByTestId("tasting-save"));
+
+    // Wait specifically for the RATING side to have settled into an error —
+    // at this instant the tasting mutation is STILL pending (never resolved
+    // above), so `hasUnresolvedPartial` (tastingOnlyFailed/ratingOnlyFailed/
+    // bothFailed — all require BOTH sides to have settled) is false, and the
+    // narrower round-1/round-2 `ratingWriteInFlight` in-flight guard has
+    // ALSO already gone false (the rating write itself is no longer
+    // pending). Only `isFrozen` (which also considers the tasting mutation's
+    // own `isPending`) is true here — this is the exact gap round 6 closes.
+    await waitFor(() => expect(resolveTasting).toBeDefined());
+    // Give the rating mutation's rejection a chance to actually land (it's
+    // mocked to reject immediately, but still asynchronously).
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(screen.getByTestId("tasting-save")).toHaveTextContent(/saving/i);
+    expect(screen.getByTestId("rating-edit")).toBeDisabled();
+    expect(screen.getByTestId("rating-edit-blocked")).toBeInTheDocument();
+
+    // Let the tasting settle too — the cycle reaches its normal
+    // ratingOnlyFailed partial-failure state, still frozen (re-confirms the
+    // round-4 behavior is undisturbed by this round-6 change).
+    resolveTasting?.();
+    await waitFor(() => expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument());
+    expect(screen.getByTestId("rating-edit")).toBeDisabled();
+  });
+
   it("resets the RoastTastings draft when navigating between two different runs (#522 Codex P2): run A's unsaved draft must never leak into a POST against run B", async () => {
     vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
     const { rerender } = render(

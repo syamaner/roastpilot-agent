@@ -241,13 +241,27 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
     }
   }, [isSaved]);
 
-  // Round 4: publish the shared "a partial-failure window is open" signal
-  // the moment one is detected, and clear it the moment the cycle resolves
-  // (full success, handled by the effect above running in the same render
-  // pass hasUnresolvedPartial goes false, or an explicit discard below).
+  // Round 4/6 (PRRT_kwDOSzMG_c6Rg5YO): publish the shared "this combined save
+  // gesture is not yet fully resolved" signal for the SAME `isFrozen` window
+  // this form freezes its own fields for — not the narrower
+  // `hasUnresolvedPartial` alone. Round 4's original version armed the lock
+  // only once a partial failure had SETTLED, leaving a real timing gap: if
+  // the rating mutation rejects FAST while `api.addTasting` is still
+  // pending, `otherRatingWriteInFlight` (RoastRating's own in-flight guard)
+  // has already gone false and `hasUnresolvedPartial` hasn't been set yet
+  // (the tasting side hasn't settled either way) — RoastTastings is frozen
+  // (`isFrozen` is true, since `isPending` still is) but RoastRating's Edit
+  // was ENABLED for that window, and a direct edit landing there gets
+  // silently overwritten the instant the tasting settles and the stale
+  // captured rating retries. Driving the lock off `isFrozen` covers the
+  // WHOLE combined-save lifecycle with one shared condition — armed the
+  // moment the gesture starts, held through any in-flight-partial transient
+  // and the settled-partial window, cleared only on full success (the
+  // effect above, which fires in the same render pass `isFrozen` goes
+  // false) or the explicit "Start over" below.
   useEffect(() => {
-    setPartialFailureLock(hasUnresolvedPartial);
-  }, [hasUnresolvedPartial, setPartialFailureLock]);
+    setPartialFailureLock(isFrozen);
+  }, [isFrozen, setPartialFailureLock]);
 
   const isRetry = hasUnresolvedPartial;
 
