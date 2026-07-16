@@ -1,0 +1,276 @@
+{
+  "mode": "563-told-ceiling-merge-gate",
+  "model_slug": "openai/gpt-4o",
+  "prompt_version": "c3",
+  "repeats_per_context": 3,
+  "intended_target_drop_c": 193.0,
+  "arm_a_ceiling_c": 193.0,
+  "arm_b_ceiling_c": 196.0,
+  "contexts": [
+    {
+      "label": "real_715s",
+      "is_constructed": false,
+      "bean_temp_c": 190.0,
+      "dtr_percent": 15.1,
+      "bean_ror_c_per_min": 3.1,
+      "arm_a": [
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 0.95,
+          "rationale": "The roast has reached a development time ratio (DTR) of 15.1%, which is aligned with the target of 15.0%. The current bean temperature is 190.0\u00b0C, and we are approaching the target drop temperature of 193.0\u00b0C. We are also nearing the bitter ceiling temperature of 193.0\u00b0C, and should therefore drop to avoid surpassing this ceiling, which is not simply a target but a boundary that should not be crossed. Holding further risks overshooting both the bitter ceiling and the development target."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 0.9,
+          "rationale": "The current bean temperature is 190.0\u00b0C with a Rate of Rise of 3.1\u00b0C per minute, approaching the target drop temperature of 193.0\u00b0C. The development time has reached a Development Time Ratio (DTR) of 15.1% which is within the target range of 12.0% to 18.0%. The bitter ceiling is at 193.0\u00b0C, which is also the drop target temperature. Since we are approaching the ceiling and both development and temperature targets are nearly satisfied, it is prudent to recommend the drop now to prevent overshooting the bitter ceiling."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 0.95,
+          "rationale": "The bean temperature is currently at 190.0 \u00b0C, approaching the target drop temperature of 193.0 \u00b0C. The development time ratio is at 15.1 %, which is within the acceptable target development window of 12.0 % to 18.0 %. Given that the bean temperature is nearing the target and the development is already in the target window, the roast is ready to be dropped. Additionally, the bitter ceiling of 193.0 \u00b0C is the legal limit not to be crossed, so recommending the drop now is appropriate to avoid any risk of surpassing it."
+        }
+      ],
+      "arm_b": [
+        {
+          "target_heat": 0,
+          "target_fan": 95,
+          "should_drop": false,
+          "confidence": 0.95,
+          "rationale": "The development time ratio is at 15.1%, which is within the acceptable range (12.0% to 18.0%) around the target 15.0%. Bean temperature is currently 190.0\u00b0C, slightly below the target drop temperature of 193.0\u00b0C. With heat already at 0, increase the fan to 95% to ensure we approach the drop temperature smoothly without crossing the 196.0\u00b0C bitter ceiling. Hold off on dropping until both temperature and development targets are satisfied."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": false,
+          "confidence": 0.95,
+          "rationale": "The roast is in the development phase with a current bean temperature of 190.0\u00b0C, below the target drop temperature of 193.0\u00b0C. The development time ratio (DTR) is at 15.1%, which is within the target range of 12.0-18.0%. With the current rate of rise at 3.1\u00b0C per minute, we can allow a bit more development time to get closer to the target drop temperature. Since heat is already at the minimum and the fan is quite high at 90, this setting is already helping to control the rise towards the drop temperature without risking overshoot of the bitter ceiling of 196\u00b0C. No drop is recommended yet, allowing a little more time to reach the temperature target. Continue monitoring closely."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 0.95,
+          "rationale": "The current bean temperature is at 190.0\u00b0C, which is close to the target drop temperature of 193.0\u00b0C, and the development time ratio is at 15.1%, which is at the target.\n\nGiven that both the temperature and the DTR targets are nearly satisfied, with the bean temperature only 3 degrees shy of the target and the bitter ceiling at 196.0\u00b0C, it is sensible to drop now since a modest overshoot of the DTR target is within the acceptable range so long as we're closing the temperature gap. Continuing the roast at this stage could lead to an unwanted increase in the DTR and potentially risk hitting the bitter ceiling.\n\nGiven these conditions, a drop is advised to ensure we meet both the temperature and DTR targets without exceeding the ceiling."
+        }
+      ]
+    },
+    {
+      "label": "probe_191c",
+      "is_constructed": true,
+      "bean_temp_c": 191.0,
+      "dtr_percent": 16.0,
+      "bean_ror_c_per_min": 3.0,
+      "arm_a": [
+        {
+          "target_heat": 0,
+          "target_fan": 95,
+          "should_drop": false,
+          "confidence": 0.95,
+          "rationale": "The current bean temperature is 191\u00b0C, with a target drop temperature of 193\u00b0C. The development ratio is 16%, which already meets the profile's target development percentage of 15%. Since we are very close to both the target drop temperature and the bitter ceiling of 193\u00b0C, it's critical to manage the gradient carefully. The heat is already at 0, which is appropriate for slowing the roast. However, with the fan at 90%, there's still just enough headroom to utilize the fan as a final braking force to help slow any further rise in temperature towards the bitter ceiling, while we allow the final degree or so for the temperature to align with development progress. Once these are perfectly coordinated and we are right at or before the bitter ceiling, the drop should be initiated."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 1.0,
+          "rationale": "The current bean temperature is 191.0 \u00b0C, which is close to the target drop temperature of 193.0 \u00b0C. The development time measures 725 seconds, giving a DTR of 16 %, which lies within the acceptable development range of 12.0 % to 18.0 %. Given that both the temperature and DTR targets are satisfied and we are close to the bitter ceiling of 193.0 \u00b0C, it's time to drop the beans to avoid exceeding this ceiling. The heat is at its minimum (0 %), and the fan is already set high (90 %), aligning with post-first-crack management strategies. Therefore, I recommend dropping the beans now."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 1.0,
+          "rationale": "The current bean temperature is 191.0\u00b0C, which is near the target drop temperature of 193.0\u00b0C. Development is at 16% per the context, which is within the accepted range of 12-18% for development. We have reached the joint objective where both the temperature and development targets are satisfied. Since we are approaching the bitter ceiling of 193.0\u00b0C, it is optimal to drop now to avoid any risk of crossing the ceiling and potentially compromising the roast quality."
+        }
+      ],
+      "arm_b": [
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 1.0,
+          "rationale": "The current bean temperature is 191.0 \u00b0C, with a target drop temperature of 193.0 \u00b0C. We have reached a development time ratio of 16 %, which satisfies the target range of 12 % to 18 %, indicating that development is complete. We are near the bitter ceiling of 196.0 \u00b0C, so it's crucial to avoid overshooting. The roast should be dropped immediately to avoid any risk of crossing the ceiling."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 0.95,
+          "rationale": "The current bean temperature is 191.0 \u00b0C, just 2.0 \u00b0C below the target drop temperature of 193.0 \u00b0C, and development is at 16 %, which is within the acceptable window of 12-18 %. The bitter ceiling is at 196.0 \u00b0C, so there is room to hold slightly if needed, but both temperature and development satisfy the joint objective at 191.0 \u00b0C and 16 % DTR. Recommending the drop now to align with the roast profile."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 1.0,
+          "rationale": "Both the temperature and development targets have been met. The current bean temperature is 191.0\u00b0C, just below the target drop temperature of 193.0\u00b0C. The development ratio is at 16%, which is slightly above the target of 15%, but within the acceptable window of 12-18%. We are also safely below the bitter ceiling of 196.0\u00b0C. Given these observations, the roast is ready to be dropped to prevent crossing the bitter ceiling, and ensure the quality of the roast."
+        }
+      ]
+    },
+    {
+      "label": "probe_192c",
+      "is_constructed": true,
+      "bean_temp_c": 192.0,
+      "dtr_percent": 17.0,
+      "bean_ror_c_per_min": 2.5,
+      "arm_a": [
+        {
+          "target_heat": 0,
+          "target_fan": 100,
+          "should_drop": true,
+          "confidence": 0.95,
+          "rationale": "The bean temperature is at 192.0\u00b0C, which is just below the target drop temperature of 193.0\u00b0C. The Development Time Ratio is at 17%, which is within the acceptable range (12-18%) and above the target of 15%. The indicated bitter ceiling is also at 193.0\u00b0C, meaning we are very close to it. Given these factors, it is prudent to recommend the drop now to avoid crossing the bitter ceiling while having achieved the development target."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 100,
+          "should_drop": true,
+          "confidence": 1.0,
+          "rationale": "The roast is currently at a bean temperature of 192.0\u00b0C with a Rate of Rise of 2.5\u00b0C/min and it has already reached a DTR of 17%, which is within the acceptable range of 12-18%. The target drop temperature is 193.0\u00b0C, and the bean is very close to this target. With the current fan at 90% and heat at 0%, there is limited room to further control the roast without risking overshooting the bitter ceiling, which is also 193.0\u00b0C. Therefore, it is advisable to drop now to maintain quality. The confidence in this decision is high due to the close proximity to both the target and bitter ceiling, ensuring we do not overshoot."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 95,
+          "should_drop": true,
+          "confidence": 0.9,
+          "rationale": "The development time ratio (DTR) is already at 17 %, which is slightly above the target of 15 % but within the acceptable range of 12-18 %. The current bean temperature is at 192.0 \u00b0C, just reaching the target drop temperature of 193.0 \u00b0C, and is at the bitter ceiling of 193.0 \u00b0C meaning there is no room to exceed this. Maintaining the bean temperature at this limit while exceeding the development target slightly ensures a well-developed roast. Recommend increasing the fan to 95 % to aid in quickly reaching the drop temperature if needed. Advise dropping immediately as the development time is satisfactory and exceeding the target drop temperature is not permissible."
+        }
+      ],
+      "arm_b": [
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 0.9,
+          "rationale": "The roast is in the development phase, and the bean temperature has reached 192.0\u00b0C, very close to the target drop temperature of 193.0\u00b0C. The Development Time Ratio (DTR) is at 17%, which is within the target range of 12-18%. Both the bean temperature and DTR targets are satisfied together, making it an appropriate time to recommend the drop, especially with the bitter ceiling at 196.0\u00b0C. The current settings are heat at 0% and fan at 90%, providing a stable environment, so no further adjustments are necessary except to proceed with the drop."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 0.95,
+          "rationale": "The roast is nearing completion with a current bean temperature of 192.0 \u00b0C, which is close to the target drop temperature of 193.0 \u00b0C. The Development Time Ratio (DTR) is at 17 %, within the target development window of 12-18 %. Given that the current heat is already at the minimum and the fan is at 90 %, the roast has a controlled environment. Since we're near the drop temperature and the development ratio is within the target range, it's appropriate to recommend the drop to prevent overshooting the bitter ceiling at 196.0 \u00b0C."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 100,
+          "should_drop": true,
+          "confidence": 0.9,
+          "rationale": "The development time ratio is at 17 %, which is well within the target range of 12-18 %, and the current bean temperature is 192.0 \u00b0C, which is just 1 degree below the target drop temperature of 193.0 \u00b0C. As we continue to close the temperature gap, the bitter ceiling of 196.0 \u00b0C approaches, providing only a small buffer. Current heat is already at 0, therefore, further cooling with maximum allowed fan power (100 %) is advised to avoid overshooting the bitter ceiling. Since both development target and bean temperature are nearly met with minimal risk of exceeding limits, the drop is recommended to ensure quality without crossing the ceiling limits."
+        }
+      ]
+    },
+    {
+      "label": "probe_193c",
+      "is_constructed": true,
+      "bean_temp_c": 193.0,
+      "dtr_percent": 18.0,
+      "bean_ror_c_per_min": 2.0,
+      "arm_a": [
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 1.0,
+          "rationale": "The bean temperature has reached the target drop temperature of 193.0\u00b0C, and the development time ratio is now at 18%, which is within the acceptable development window (12% - 18%). Additionally, the bean temperature is at the bitter ceiling of 193.0\u00b0C. It is essential to proceed with the drop to avoid exceeding the bitter ceiling. Current heat is already at the minimum level, and fan is at 90%, ensuring adequate cooling post-drop."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 100,
+          "should_drop": false,
+          "confidence": 0.9,
+          "rationale": "The current bean temperature is 193.0\u00b0C, which is at the target drop temperature. The development time ratio is at 18%, which exceeds the target of 15% but is within the acceptable range of 12-18%. However, since the bean temperature is only at the bitter ceiling of 193.0\u00b0C and not above, we should not drop yet. The current heat is already at 0, so the fan should be increased to 100% to cool the beans more rapidly and prevent crossing the bitter ceiling. The confidence is high because the current plan will prevent overshooting the ceiling while balancing on development percentage."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 1.0,
+          "rationale": "The current bean temperature is at the target drop temperature of 193 \u00b0C, while the development time ratio (DTR) is at 18 %, which is above the 15 % target but within the acceptable window (12%-18%). Both the temperature and development objectives are satisfied. Additionally, the current bean temperature is at the bitter ceiling of 193 \u00b0C, making an immediate drop necessary to avoid crossing the bitter ceiling."
+        }
+      ],
+      "arm_b": [
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 0.9,
+          "rationale": "The current bean temperature is at 193.0\u00b0C, which matches the target drop temperature. The development ratio (DTR) is at 18 %, which is within the target range (12-18 %). Since both targets (temperature and DTR) are met together, it is appropriate to drop the roast. Current heat is at 0 %, and the fan is at 90 %, maximizing cooling efficiency. There is no need for further adjustments since dropping the beans now would achieve the desired roast profile."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 0.95,
+          "rationale": "The current bean temperature is 193.0\u00b0C, which matches the target drop temperature. Development is at 18%, slightly above the target range of 15%, but within the acceptable range of 12-18%. Thus, it is appropriate to drop the beans now as both temperature and development criteria are satisfied, while remaining safely below the bitter ceiling of 196.0\u00b0C."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 0.95,
+          "rationale": "The roaster has reached the target drop temperature of 193\u00b0C, and the Development Time Ratio (DTR) is 18%, which is within the acceptable target window of 12% to 18%. Both the temperature and development targets are satisfied, so it is appropriate to drop the beans now. Current fan and heat settings are adequate, and the roast should be completed before approaching the bitter ceiling of 196\u00b0C."
+        }
+      ]
+    },
+    {
+      "label": "probe_194c",
+      "is_constructed": true,
+      "bean_temp_c": 194.0,
+      "dtr_percent": 18.5,
+      "bean_ror_c_per_min": 2.0,
+      "arm_a": [
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 1.0,
+          "rationale": "Development is at 18.5 % per the context, which is above the target range of 12-18 %, and bean temperature is at 194.0 C, slightly above the target drop temp of 193.0 C, yet within the emergency drop bound of 198.0 C. Both key objectives (beam temperature and development) exceed their targets and the bean is still within safe temperature bounds, so recommending dropping the beans immediately. Both targets satisfied and need to stop further development to avoid bitterness or other off-flavors due to exceeding the bitter ceiling."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 100,
+          "should_drop": true,
+          "confidence": 0.95,
+          "rationale": "Current bean temperature is 194.0 \u00b0C, slightly above the target drop temperature of 193.0 \u00b0C, and at the bitter ceiling. Development Time Ratio (DTR) is at 18.5 %, within the target development window of 12.0 % - 18.0 %. As both the temperature has reached the bitter ceiling and development is satisfactory, it's crucial to drop now to avoid overdevelopment or bitterness."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 100,
+          "should_drop": true,
+          "confidence": 1.0,
+          "rationale": "The current bean temperature of 194 \u00b0C exceeds the target drop temperature of 193 \u00b0C, and the DTR is at 18.5 %, which is well above the target.\n\nAdditionally, the current bean temperature is equal to the bitter ceiling, therefore, calling for a DROP to avoid any risk of bitterness.\n\nFan increased to maximum (from 90 % to 100 %) for maximum convective cooling."
+        }
+      ],
+      "arm_b": [
+        {
+          "target_heat": 0,
+          "target_fan": 100,
+          "should_drop": false,
+          "confidence": 0.9,
+          "rationale": "The roast is close to the bitter ceiling temperature of 196\u00b0C with a bean temperature of 194\u00b0C. Development percent (DTR) is at 18.5%, which is above the target range of 12-18%. However, since the bean temperature has not yet hit the bitter ceiling, and we are still under the drop temperature of 196\u00b0C, we should continue and monitor until both temperature targets are met or we approach the ceiling for a decisive drop. Holding off the drop allows for more development time consistency. Increasing the fan to 100% is intended to slow the rate of heat absorption and prevent overshooting the bitter ceiling."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 90,
+          "should_drop": true,
+          "confidence": 0.95,
+          "rationale": "The beans are at 194.0\u00b0C, exceeding the target drop temperature of 193.0\u00b0C. Although the development time ratio is 18.5%, slightly above the target range of 12-18%, it indicates a well-developed roast. To avoid crossing the bitter ceiling temperature of 196.0\u00b0C, a drop is recommended immediately to preserve the desired roast profile."
+        },
+        {
+          "target_heat": 0,
+          "target_fan": 95,
+          "should_drop": true,
+          "confidence": 1.0,
+          "rationale": "The current bean temperature is 194.0 \u00b0C which is slightly above the target drop temperature of 193.0 \u00b0C, but still below the bitter ceiling of 196.0 \u00b0C. The Development Time Ratio (DTR) is 18.5 %, which is within the acceptable range of 12.0 % to 18.0 %. This indicates that both the temperature and development targets have been effectively met together, justifying the decision to drop. The fan is raised slightly to arrest the rate of rise and prepare for cooling. Heat remains at 0 as the bean temperature is sufficiently high, indicating the roast is complete."
+        }
+      ]
+    }
+  ]
+}

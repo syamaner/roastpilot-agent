@@ -209,24 +209,84 @@ def test_bitter_and_emergency_ceilings_come_from_config() -> None:
     assert box.emergency_drop_temp_c == limits.emergency_drop_temp_c == 198.0
 
 
-def test_bitter_ceiling_capped_at_lower_profile_drop_target() -> None:
-    """A lighter roast is never told it may push to the 196 °C hard ceiling.
+def test_bitter_ceiling_is_never_capped_to_the_profile_drop_target() -> None:
+    """#563: the told bitter ceiling is profile-INDEPENDENT — never capped to
+    (or otherwise derived from) ``target_drop_temp_c``.
 
-    The bitter ceiling is the hard ``SafetyLimits`` value, lowered to the
-    profile's ``target_drop_temp_c`` when that target is lower.
+    Superseded test intent: the #273-era design capped the told ceiling at
+    ``min(hard_ceiling, target_drop_temp_c)``, which made the told number
+    IDENTICAL to the drop target on every seeded profile (195.0 capped
+    against the 196.0 hard ceiling) — the false "no overshoot room" premise
+    behind the #563 bake-off finding. A profile with a LOWER target must
+    still be told the true 196 °C planning line, not its own target.
     """
     light = _PROFILE.model_copy(update={"target_drop_temp_c": 190.0})
     box = RoastControlPolicy(SafetyLimits(), light).limits_for(RoastPhase.DEVELOPMENT)
-    assert box.bitter_ceiling_temp_c == 190.0
+    assert box.bitter_ceiling_temp_c == 196.0  # NOT 190.0 — the target never caps it
     # The emergency-drop bound is profile-independent (the last-resort bound).
     assert box.emergency_drop_temp_c == 198.0
 
 
-def test_bitter_ceiling_not_raised_by_higher_profile_target() -> None:
-    """A high profile drop target never *loosens* the hard bitter ceiling."""
+def test_bitter_ceiling_unaffected_by_a_higher_profile_target_too() -> None:
+    """A high profile drop target has no effect on the told ceiling either way
+    (#563: the two are fully independent numbers, not just one-directionally
+    capped)."""
     high = _PROFILE.model_copy(update={"target_drop_temp_c": 210.0})
     box = RoastControlPolicy(SafetyLimits(), high).limits_for(RoastPhase.DEVELOPMENT)
-    assert box.bitter_ceiling_temp_c == 196.0  # capped at the hard ceiling, not 210
+    assert box.bitter_ceiling_temp_c == 196.0
+
+
+def test_bitter_ceiling_is_the_ceiling_guard_temp_when_guard_enabled() -> None:
+    """#563: with the post-FC ceiling guard ON, the told ceiling is
+    ``ceiling_guard_temp_c`` — the number that actually fires the
+    deterministic drop — not the raw ``SafetyLimits.bitter_ceiling_temp_c``.
+
+    Uses a guard temperature (190.0) DISTINCT from both the hard 196.0 safety
+    line and the profile's own target, so this test cannot pass by numeric
+    coincidence (C2: the target-205 tests stay green whether or not the guard
+    wiring works, since the default guard temp equals the default hard
+    ceiling — this test pins the wiring itself).
+    """
+    from roastpilot_agent.config import PostFirstCrackControl
+
+    post_fc = PostFirstCrackControl(ceiling_guard_drop_enabled=True, ceiling_guard_temp_c=190.0)
+    box = RoastControlPolicy(SafetyLimits(), _PROFILE, post_fc_control=post_fc).limits_for(
+        RoastPhase.DEVELOPMENT
+    )
+    assert box.bitter_ceiling_temp_c == 190.0
+    assert box.bitter_ceiling_temp_c != SafetyLimits().bitter_ceiling_temp_c
+
+
+def test_bitter_ceiling_is_the_hard_safety_line_when_guard_disabled() -> None:
+    """#563: with the guard OFF, nothing deterministic enforces 196 °C (only
+    the 230 °C e-stop is truly enforced) — the told ceiling falls back to the
+    hard ``SafetyLimits.bitter_ceiling_temp_c`` line, a known told != enforced
+    gap accepted because 196 °C is still better operator guidance than no
+    ceiling at all (memory `told-vs-enforced-bitter-ceiling`). The
+    ``ceiling_guard_temp_c`` value must be IGNORED in this configuration.
+    """
+    from roastpilot_agent.config import PostFirstCrackControl
+
+    post_fc = PostFirstCrackControl(ceiling_guard_drop_enabled=False, ceiling_guard_temp_c=190.0)
+    box = RoastControlPolicy(SafetyLimits(), _PROFILE, post_fc_control=post_fc).limits_for(
+        RoastPhase.DEVELOPMENT
+    )
+    assert box.bitter_ceiling_temp_c == 196.0
+    assert box.bitter_ceiling_temp_c != 190.0  # the disabled guard's own temp is not read
+
+
+def test_bitter_ceiling_defaults_match_a_default_constructed_policy() -> None:
+    """A ``RoastControlPolicy`` built with no ``post_fc_control`` argument (the
+    keyword-only-with-a-default shape, C1) resolves the same told ceiling as
+    one built with an explicit default :class:`PostFirstCrackControl` — the
+    ~25 existing call sites that do not pass this argument are unaffected."""
+    from roastpilot_agent.config import PostFirstCrackControl
+
+    implicit = RoastControlPolicy(SafetyLimits(), _PROFILE)
+    explicit = RoastControlPolicy(SafetyLimits(), _PROFILE, post_fc_control=PostFirstCrackControl())
+    assert implicit.limits_for(RoastPhase.DEVELOPMENT).bitter_ceiling_temp_c == (
+        explicit.limits_for(RoastPhase.DEVELOPMENT).bitter_ceiling_temp_c
+    )
 
 
 def test_phase_control_limits_rejects_inverted_heat_box() -> None:
