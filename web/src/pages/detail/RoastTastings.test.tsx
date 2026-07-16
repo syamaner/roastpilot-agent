@@ -266,11 +266,11 @@ describe("RoastTastings", () => {
       await waitFor(() =>
         expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument(),
       );
-      // Points the operator at the real recovery path: RoastRating's own
-      // "Edit" affordance (the tasting form's own draft is gone — the
-      // tasting itself is append-only and already saved, so it must not be
-      // resubmitted; a direct rating retry belongs on RoastRating).
-      expect(screen.getByTestId("rating-partial-error")).toHaveTextContent("Edit");
+      // #568 round 2 (PRRT_kwDOSzMG_c6Reeti): the recovery path is THIS
+      // form's own preserved draft, not RoastRating's "Edit" — that form
+      // pre-fills from the OLD persisted rating and would lose the
+      // just-attempted values.
+      expect(screen.getByTestId("rating-partial-error")).toHaveTextContent("try again here");
       expect(screen.queryByTestId("tasting-saved")).not.toBeInTheDocument();
       expect(screen.queryByTestId("tasting-error")).not.toBeInTheDocument();
     });
@@ -368,7 +368,7 @@ describe("RoastTastings", () => {
       expect(screen.getByTestId("tasting-notes")).toHaveValue("sweet, floral");
     });
 
-    it("a retry after a rating-only partial failure resubmits ONLY the rating, never a duplicate tasting entry", async () => {
+    it("direction A: a retry after a rating-only partial failure resubmits ONLY the rating, never a duplicate tasting entry", async () => {
       vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
       const addSpy = vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: "r1", tastings: [] });
       const rateSpy = vi
@@ -391,6 +391,31 @@ describe("RoastTastings", () => {
       // rating retried and succeeded.
       expect(addSpy).toHaveBeenCalledTimes(1);
       expect(rateSpy).toHaveBeenCalledTimes(2);
+    });
+
+    it("direction B (#568 round 2, PRRT_kwDOSzMG_c6Reetd — the mirror of direction A): a retry after a tasting-only partial failure resubmits ONLY the tasting, never re-posting the already-succeeded rating", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+      const addSpy = vi
+        .spyOn(api, "addTasting")
+        .mockRejectedValueOnce(new Error("tastings endpoint down"))
+        .mockResolvedValueOnce({ run_id: "r1", tastings: [] });
+      const rateSpy = vi.spyOn(api, "rate").mockResolvedValue(fakeRatedDetail());
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+      await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+      fireEvent.click(screen.getByTestId("tasting-star-2"));
+      fireEvent.click(screen.getByTestId("tasting-save"));
+      await waitFor(() => expect(screen.getByTestId("tasting-error")).toBeInTheDocument());
+      expect(rateSpy).toHaveBeenCalledTimes(1);
+
+      // Retry from the SAME (preserved) draft.
+      fireEvent.click(screen.getByTestId("tasting-save"));
+      await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
+
+      // The rating was NOT resubmitted — still exactly one call — while the
+      // tasting retried and succeeded.
+      expect(rateSpy).toHaveBeenCalledTimes(1);
+      expect(addSpy).toHaveBeenCalledTimes(2);
     });
   });
 });

@@ -34,18 +34,27 @@
  * tasting's own stars. Both mutations run concurrently; a partial failure
  * (one succeeds, one doesn't) is surfaced honestly rather than reported as a
  * blanket "Saved." — a `useEffect` keyed on both mutations SETTLING resets
- * the form and shows "Saved." only once BOTH succeed (#568 Codex: resetting
- * from the tasting mutation's own `onSuccess` alone would clear the star
- * rating + notes draft even when the rating write went on to fail, and the
- * partial-failure message's only recovery path — RoastRating's "Edit" —
- * pre-fills from the OLD persisted rating, so the attempted values would be
- * unrecoverable). Each failure names which record didn't save. A retry after
- * a rating-only partial failure resubmits ONLY the rating — the tasting
- * already succeeded and is append-only, so replaying it on retry would create
- * a duplicate entry (a hazard this same preserved-draft fix newly exposed).
+ * the form and shows "Saved." only once BOTH succeed (#568 Codex round 1:
+ * resetting from the tasting mutation's own `onSuccess` alone would clear
+ * the star rating + notes draft even when the rating write went on to fail).
+ * Each failure names which record didn't save, and a retry resubmits ONLY
+ * the record that actually failed — never the one that already succeeded
+ * (round 2, PRRT_kwDOSzMG_c6Reetd: this must be symmetric in BOTH
+ * directions, or a retry from either partial-failure state can duplicate an
+ * append-only tasting or spuriously re-post an already-good rating).
+ *
+ * The rating-only-failed recovery path retries from THIS form's own
+ * preserved draft (round 2, PRRT_kwDOSzMG_c6Reeti) — NOT via `RoastRating`'s
+ * "Edit", which pre-fills from the OLD persisted rating and would lose the
+ * just-attempted values entirely. `RoastRating`'s own Edit stays blocked for
+ * the duration of any rating write from here too (round 2,
+ * PRRT_kwDOSzMG_c6ReetO: the last-write-wins guard is symmetric — a save
+ * here blocks Edit there, and a save there blocks "Add tasting" here, both
+ * via the shared `ratingMutationKey`).
  */
 
 import { useEffect, useState } from "react";
+import { useIsMutating } from "@tanstack/react-query";
 
 import { cn } from "@/lib/cn";
 import { useAddTasting, useTastings } from "@/hooks/queries";
@@ -56,7 +65,7 @@ import type {
   TastingDefect,
   TastingEntryRequest,
 } from "@/lib/types";
-import { useSaveRating } from "./useSaveRating";
+import { ratingMutationKey, useSaveRating } from "./useSaveRating";
 
 type Stars = TastingEntryRequest["stars"];
 const STAR_VALUES: Stars[] = [1, 2, 3, 4, 5];
@@ -84,6 +93,15 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
   const tastings = useTastings(runId);
   const tastingMutation = useAddTasting(runId);
   const ratingMutation = useSaveRating(runId);
+  // Round 2 (PRRT_kwDOSzMG_c6ReetO): the last-write-wins guard round 1 built
+  // was one-directional — RoastRating's own Edit was blocked while a
+  // tasting-triggered rating save was in flight, but nothing stopped a DIRECT
+  // RoastRating save that was already in flight from racing a SUBSEQUENT
+  // "Add tasting" click here, which fires a SECOND `api.rate` for the same
+  // run concurrently with the first. The shared `ratingMutationKey` makes
+  // "is a rating write in flight ANYWHERE on the page" visible from both
+  // widgets equally.
+  const otherRatingWriteInFlight = useIsMutating({ mutationKey: ratingMutationKey(runId) }) > 0;
 
   const [stars, setStars] = useState<Stars | null>(null);
   const [notes, setNotes] = useState("");
@@ -93,7 +111,8 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
   const [attributes, setAttributes] = useState<TastingAttribute[]>([]);
   const [defects, setDefects] = useState<TastingDefect[]>([]);
 
-  const isPending = tastingMutation.isPending || ratingMutation.isPending;
+  const isPending =
+    tastingMutation.isPending || ratingMutation.isPending || otherRatingWriteInFlight;
   // Both mutations must succeed (this save cycle, i.e. after the most recent
   // click — see the reset below) before the form reports "Saved." and resets.
   const isSaved =
@@ -142,11 +161,15 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
     if (stars === null) return;
     const trimmedNotes = notes.trim() === "" ? null : notes.trim();
 
-    // A retry after a rating-only partial failure (#568: the draft is
-    // preserved for exactly this retry) must NOT resubmit the tasting — it
-    // already succeeded and is append-only, so clicking "Add tasting" again
-    // would create a SECOND, duplicate tasting entry for the one gesture.
-    // Only the rating write is retried in that case.
+    // Round 2 (PRRT_kwDOSzMG_c6Reetd): the retry-dedup round 1 added was also
+    // one-directional — it skipped resubmitting the tasting on a
+    // ratingOnlyFailed retry, but a tastingOnlyFailed retry (tasting failed,
+    // rating already succeeded) still re-posted the ALREADY-SUCCEEDED rating.
+    // That re-post can itself fail (reporting a spurious rating failure on a
+    // retry that was really only about the tasting) or, if it succeeds,
+    // silently overwrite a rating value that may have moved since (e.g. a
+    // concurrent direct edit). A retry resubmits ONLY the record that
+    // actually failed last time — never the one that already landed.
     if (!ratingOnlyFailed) {
       // Reset any previous attempt's error/success state before firing this
       // one, so a retry after a partial failure doesn't read as stale
@@ -165,9 +188,13 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
     // The headline rating rides the tasting's own stars/notes — one gesture,
     // both records (#566). Fired independently of the tasting mutation
     // above: either can succeed or fail on its own, and a fetch failure on
-    // one must never block or silently swallow the other.
-    ratingMutation.reset();
-    ratingMutation.mutate({ stars, notes: trimmedNotes });
+    // one must never block or silently swallow the other. Skipped on a
+    // tastingOnlyFailed retry (this rating already succeeded) — same
+    // no-double-write rule as the tasting side, mirrored.
+    if (!tastingOnlyFailed) {
+      ratingMutation.reset();
+      ratingMutation.mutate({ stars, notes: trimmedNotes });
+    }
   };
 
   return (
@@ -307,8 +334,8 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
         )}
         {ratingOnlyFailed && (
           <span data-testid="rating-partial-error" className="text-xs text-roast-fault">
-            Tasting saved, but the rating didn't update — use "Edit" on Your
-            rating above to retry.
+            Tasting saved, but the rating didn't update — try again here to
+            retry just the rating.
           </span>
         )}
         {isSaved && (

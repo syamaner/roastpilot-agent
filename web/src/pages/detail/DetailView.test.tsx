@@ -110,7 +110,7 @@ describe("DetailView composition", () => {
     await waitFor(() => expect(spy).toHaveBeenCalledWith(FIXTURE_DETAIL.id));
   });
 
-  it("#568 Codex (PRRT_kwDOSzMG_c6RdllD): RoastRating's own Edit is blocked while RoastTastings' one-gesture rating save is in flight — the two entry points never race a rating write", async () => {
+  it("#568 Codex round 1 (PRRT_kwDOSzMG_c6RdllD), direction A: RoastRating's own Edit is blocked while RoastTastings' one-gesture rating save is in flight — the two entry points never race a rating write", async () => {
     vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
     vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
     let resolveRate: (() => void) | undefined;
@@ -137,6 +137,45 @@ describe("DetailView composition", () => {
     resolveRate?.();
     await waitFor(() => expect(screen.getByTestId("rating-edit")).not.toBeDisabled());
     expect(screen.queryByTestId("rating-edit-blocked")).not.toBeInTheDocument();
+  });
+
+  it("#568 round 2 (PRRT_kwDOSzMG_c6ReetO), direction B: RoastTastings' own 'Add tasting' is blocked while a DIRECT RoastRating save is in flight — the reverse of direction A, which round 1 left unguarded", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    const addSpy = vi
+      .spyOn(api, "addTasting")
+      .mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    let resolveRate: (() => void) | undefined;
+    vi.spyOn(api, "rate").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRate = () => resolve({ id: FIXTURE_DETAIL.id } as Awaited<ReturnType<typeof api.rate>>);
+        }),
+    );
+    renderView();
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    // Choose a tasting star BEFORE the direct edit fires — the tasting
+    // star buttons themselves are also disabled while a rating write is in
+    // flight, so this must happen first for `stars` to be non-null once
+    // unblocked (this test is probing the SAVE button's guard specifically,
+    // not the inputs' own disabled state — that's covered elsewhere).
+    fireEvent.click(screen.getByTestId("tasting-star-4"));
+
+    // Fire a DIRECT edit on RoastRating — its rating POST stalls, mid-flight.
+    fireEvent.click(screen.getByTestId("rating-edit"));
+    fireEvent.click(screen.getByTestId("star-3"));
+    fireEvent.click(screen.getByTestId("rating-save"));
+    await waitFor(() => expect(resolveRate).toBeDefined());
+
+    // RoastTastings' own save must be disabled for the duration — clicking
+    // "Add tasting" here would otherwise fire a SECOND, concurrent api.rate
+    // call for the same run while the direct edit is still in flight.
+    expect(screen.getByTestId("tasting-save")).toBeDisabled();
+
+    resolveRate?.();
+    await waitFor(() => expect(screen.getByTestId("tasting-save")).not.toBeDisabled());
+    // Never fired while blocked.
+    expect(addSpy).not.toHaveBeenCalled();
   });
 
   it("resets the RoastTastings draft when navigating between two different runs (#522 Codex P2): run A's unsaved draft must never leak into a POST against run B", async () => {

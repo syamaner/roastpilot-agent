@@ -23,6 +23,16 @@
  * (this widget's own edit form, and `RoastTastings`' one-gesture save) must never
  * race a rating write, since `useMutation` gives each call site its own local
  * pending flag otherwise.
+ *
+ * Round 2 (PRRT_kwDOSzMG_c6ReetW): the direct `setQueryData` seed itself opened
+ * a SEPARATE race — `useRoast`'s own background `refetchInterval` (queries.ts,
+ * polls every 5s while a run is still live) can have a GET for this same
+ * `roastKeys.detail` key already in flight when the mutation resolves. If that
+ * GET settles AFTER the seed, its resolver overwrites the just-seeded fresh
+ * rating with the pre-save snapshot it fetched before the mutation even ran —
+ * silently reverting the headline. `cancelQueries` BEFORE the seed aborts any
+ * in-flight GET for the key (TanStack's documented mutation/query race
+ * mitigation), so no stale resolver can land after and clobber it.
  */
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -40,7 +50,8 @@ export function useSaveRating(runId: string) {
   return useMutation({
     mutationKey: ratingMutationKey(runId),
     mutationFn: (body: OperatorRatingRequest) => api.rate(runId, body),
-    onSuccess: (detail) => {
+    onSuccess: async (detail) => {
+      await queryClient.cancelQueries({ queryKey: roastKeys.detail(runId) });
       queryClient.setQueryData(roastKeys.detail(runId), detail);
     },
   });
