@@ -1278,15 +1278,26 @@ def test_c7_extends_c6_with_dtr_pace_mismatch() -> None:
     assert "compute the gap" in new_section_lowered
     assert "never on a felt sense" in new_section_lowered
     assert "ceiling" in new_section_lowered
-    # PR #564 round 1 (Codex P2, physically-too-late trigger): the roast-3
-    # anticipatory lesson -- "forces the drop the instant the gap reaches
-    # zero" is too late given real thermal lag/drop-action time, so c7's OWN
-    # section must teach comparing the gap against the projected climb
-    # (RoR x lag), never a bare gap==0 trigger.
-    assert "too late" in new_section_lowered
+    # PR #564 round 2 (Codex P2 x3, all one root cause -- the anticipatory
+    # clause referenced quantities the model cannot evaluate from context):
+    # the reframe drops the lag reference ENTIRELY (round-1's "the time a
+    # drop takes to act" invited an invented constant), teaches the gap in
+    # the SAME per-minute units as bean_ror_c_per_min (no seconds, no unit
+    # conversion to botch), and names bitter_ceiling_temp_c EXPLICITLY --
+    # never emergency_drop_temp_c, the separate e-stop bound, not the
+    # planning ceiling. "Never waiting for the gap to literally hit zero"
+    # stays: the round-1 anticipatory lesson (gap==0 is too late) is
+    # preserved, just re-expressed without an unevaluable lag term.
     assert "bean_ror_c_per_min" in _C7_DTR_PACE_SECTION
-    assert "projected climb" in new_section_lowered
+    assert "bitter_ceiling_temp_c" in _C7_DTR_PACE_SECTION
+    assert "emergency_drop_temp_c" in _C7_DTR_PACE_SECTION
+    assert "small fraction" in new_section_lowered
+    assert "per minute" in new_section_lowered or "per-minute" in new_section_lowered
     assert "never waiting for the gap to literally hit zero" in new_section_lowered
+    # Finding 5 (round 2): no seconds/lag reference anywhere in the new
+    # section -- the exact defect the reframe removes. A cheap, direct lock
+    # against a future edit reintroducing an invented time constant.
+    assert "second" not in new_section_lowered
     # The new section names NO fixed roast-13 fixture numbers of its own
     # (told==enforced; the live context carries every threshold/target).
     start = c7.index("POST-FIRST-CRACK: A LARGE DTR OVERSHOOT")
@@ -1360,15 +1371,26 @@ def test_c8_extends_c7_with_pace_bottom_edge_and_fan_coupling() -> None:
     new_section_lowered = _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION.lower()
     assert "compute the gap" in new_section_lowered
     assert "never on a felt sense" in new_section_lowered
-    # PR #564 round 1 (Codex P2, physically-too-late trigger): the roast-3
-    # anticipatory lesson -- "forces the drop the instant the gap reaches
-    # zero" is too late given real thermal lag/drop-action time, so c8's OWN
-    # section must teach comparing the gap against the projected climb
-    # (RoR x lag), never a bare gap==0 trigger.
-    assert "too late" in new_section_lowered
+    # PR #564 round 2 (Codex P2 x3, all one root cause -- the anticipatory
+    # clause referenced quantities the model cannot evaluate from context):
+    # the reframe drops the lag reference ENTIRELY (round-1's "the time a
+    # drop takes to act" invited an invented constant), teaches the gap in
+    # the SAME per-minute units as bean_ror_c_per_min (no seconds, no unit
+    # conversion to botch), and names bitter_ceiling_temp_c EXPLICITLY --
+    # never emergency_drop_temp_c, the separate e-stop bound, not the
+    # planning ceiling. "Never waiting for the gap to literally hit zero"
+    # stays: the round-1 anticipatory lesson (gap==0 is too late) is
+    # preserved, just re-expressed without an unevaluable lag term.
     assert "bean_ror_c_per_min" in _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION
-    assert "projected climb" in new_section_lowered
+    assert "bitter_ceiling_temp_c" in _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION
+    assert "emergency_drop_temp_c" in _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION
+    assert "small fraction" in new_section_lowered
+    assert "per minute" in new_section_lowered or "per-minute" in new_section_lowered
     assert "never waiting for the gap to literally hit zero" in new_section_lowered
+    # Finding 5 (round 2): no seconds/lag reference anywhere in the new
+    # section -- the exact defect the reframe removes. A cheap, direct lock
+    # against a future edit reintroducing an invented time constant.
+    assert "second" not in new_section_lowered
     # (3) Fan->RoR coupling, consistent with D96 slice 1's shipped mechanism —
     # the compensation is bounded/conditional, NOT an assumed rescue, and is
     # explicitly suppressed near a drop (never promises a raise will land).
