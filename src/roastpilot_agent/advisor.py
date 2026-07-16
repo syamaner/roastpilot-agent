@@ -1090,26 +1090,39 @@ _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
         "for the JOINT objective below (bean temperature AND development "
         "ratio together), not the moment either arrives alone.\n"
         "\n"
-        # Safety-reviewer LOW (#499 Codex follow-up): an earlier draft claimed
-        # the bitter ceiling is "never below the target" — false whenever
-        # target_drop_temp_c is ABOVE the hard bitter ceiling (an unbounded
-        # profile field; RoastControlPolicy._bitter_ceiling_temp_c() only
-        # caps DOWNWARD, `min(hard_ceiling, target)`, so a high-target profile
-        # gets bitter_ceiling_temp_c BELOW its own target — see
+        # Safety-reviewer LOW (#499 Codex follow-up), REVISED for #563: an
+        # earlier draft claimed the bitter ceiling is "never below the
+        # target" — false whenever target_drop_temp_c is ABOVE the ceiling
+        # (an unbounded profile field; see
         # test_c1_joint_drop_section_makes_no_false_ceiling_ordering_for_a_
-        # high_target_profile, which renders the real box for a 205 °C-target
-        # profile against the 196 °C default hard ceiling). The text below
-        # makes NO relational (never-below / never-above) claim between the
-        # target and the ceiling for exactly this reason — only that they can
-        # coincide, and that the ceiling is always the law regardless.
+        # high_target_profile, a 205 °C-target profile against the 196 °C
+        # ceiling). #563 removed RoastControlPolicy._bitter_ceiling_temp_c()'s
+        # OTHER direction too: the told ceiling is no longer capped at
+        # min(hard_ceiling, target) — every seeded profile's target
+        # (195.0) used to make the told ceiling and the target IDENTICAL,
+        # which the #563 bake-off traced to a false "no overshoot room, drop
+        # now" inference in the c7/c8 gap arithmetic (ceiling minus bean
+        # temperature collapsing to zero at the target). Post-#563 the two
+        # are independent numbers that USUALLY differ (target 195, ceiling
+        # 196 on every seeded profile) and coincide only by config
+        # coincidence, never by construction — the opposite emphasis from
+        # the pre-#563 text this replaces ("on some profiles it EQUALS the
+        # target exactly"), which was accurate for the regime it was written
+        # in but would now read as the common case rather than the
+        # exception. The text below makes NO relational (never-below /
+        # never-above / usually-equal) claim between the target and the
+        # ceiling for exactly this reason — only that they are separate
+        # numbers, that they CAN coincide, and that the ceiling is always the
+        # law regardless of where the target sits.
         "THE DROP - A JOINT OBJECTIVE, NOT FIRST-PAST-THE-POST\n"
         "- The context gives you drop-relevant numbers with DIFFERENT "
         "MEANINGS - do not conflate them or substitute one for the other in "
-        "your rationale, even when two of them happen to share the same "
-        "value: target_drop_temp_c is the bean-temperature TARGET this roast "
-        "is aiming for; the indicated bitter ceiling is the roast's upper "
-        "drop bound - on some profiles it EQUALS the target exactly, and it "
-        "is still the LAW there, never a separate looser number; the "
+        "your rationale, even if they happen to be close or equal in value: "
+        "target_drop_temp_c is the bean-temperature TARGET this roast is "
+        "aiming for; the indicated bitter ceiling is a SEPARATE upper drop "
+        "bound - it is not derived from the target and does not move with "
+        "it, may sit above or below it depending on configuration, and is "
+        "always the LAW regardless of that relationship; the "
         "emergency-drop bound is a further, always-HIGHER hard stop past "
         "which the roast must be dropped regardless of development. Name "
         "each correctly when you refer to it - never assume the target and "

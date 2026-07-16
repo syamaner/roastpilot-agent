@@ -458,6 +458,7 @@ def _development_harness_with_dev_percent(
     advisor: RoastAdvisor | None = None,
     config: ControllerConfig | None = None,
     executor: RecordingExecutor | None = None,
+    limits: SafetyLimits | None = None,
 ) -> Harness:
     """A DEVELOPMENT harness whose SYSTEM development percent is a known value.
 
@@ -470,8 +471,20 @@ def _development_harness_with_dev_percent(
     ``executor`` is an optional command-executor override (e.g. a subclass that
     raises on ``drop_beans``) — defaults to the standard recording fake so
     existing callers are unaffected (#405 Slice C).
+
+    ``limits`` is an optional :class:`SafetyLimits` override (#563) — defaults
+    to :func:`make_harness`'s own default (``SafetyLimits()``) so existing
+    callers are unaffected. A caller that raises ``ceiling_guard_temp_c`` well
+    above ``PROFILE.target_drop_temp_c`` to isolate a different anchor (the
+    D96/#560 recovery tests) must raise ``emergency_drop_temp_c`` (and thus the
+    box's ``bitter_ceiling_temp_c``, since the told ceiling now reads
+    ``ceiling_guard_temp_c`` directly, #563) to match, or the resolved
+    ``PhaseControlLimits`` box fails its own ``emergency_drop_temp_c >
+    bitter_ceiling_temp_c`` validator.
     """
-    harness = make_harness(readings=[reading()], advisor=advisor, config=config, executor=executor)
+    harness = make_harness(
+        readings=[reading()], advisor=advisor, config=config, executor=executor, limits=limits
+    )
     controller = harness.controller
     controller.load_profile(PROFILE)
     controller.transition_to(RoastPhase.STARTING)
@@ -4568,7 +4581,12 @@ async def test_advisor_context_post_fc_fields_not_stashed_on_recovery_suppressed
         recovery_confirm_ticks=1,
     )
     advisor = FakeAdvisor([decision()], default_decision=decision())
-    harness = make_harness(config=config, advisor=advisor, executor=AlwaysFailingDropExecutor())
+    harness = make_harness(
+        config=config,
+        advisor=advisor,
+        executor=AlwaysFailingDropExecutor(),
+        limits=_ISOLATED_CEILING_GUARD_LIMITS,
+    )
     await _charge_through_fc_at_heat(
         harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
     )
@@ -7828,6 +7846,20 @@ def _recovery_config(
     )
 
 
+#: A :class:`SafetyLimits` companion for ``_recovery_config(ceiling_guard_temp_c=220.0, ...)``
+#: (#563). The told bitter ceiling now reads ``ceiling_guard_temp_c`` directly
+#: (:meth:`~roastpilot_agent.control_policy.RoastControlPolicy._bitter_ceiling_temp_c`),
+#: so a guard raised to 220.0 to "stay clear of the guard" and isolate a
+#: DIFFERENT anchor (the deterministic-drop / recovery-raise tests below, all of
+#: which top out at ``PROFILE.target_drop_temp_c`` == 205.0) must also raise
+#: ``emergency_drop_temp_c`` above it, or the resolved ``PhaseControlLimits`` box
+#: fails its own ``emergency_drop_temp_c > bitter_ceiling_temp_c`` validator (the
+#: guard temp was never plumbed into that box before #563, so this collision did
+#: not exist previously). ``max_bean_temp_c`` is raised alongside it to keep the
+#: existing ``emergency_drop_temp_c < max_bean_temp_c`` ordering satisfied.
+_ISOLATED_CEILING_GUARD_LIMITS = SafetyLimits(emergency_drop_temp_c=225.0, max_bean_temp_c=230.0)
+
+
 async def _charge_through_fc_at_heat(
     harness: Harness,
     *,
@@ -8081,7 +8113,9 @@ async def test_deterministic_drop_takes_precedence_over_recovery_raise_same_tick
         recovery_confirm_ticks=1,
     )
     harness = _development_harness_with_dev_percent(
-        system_dev_percent=PROFILE.target_development_percent, config=config
+        system_dev_percent=PROFILE.target_development_percent,
+        config=config,
+        limits=_ISOLATED_CEILING_GUARD_LIMITS,
     )
     targets_before_the_tick = list(harness.executor.targets)
 
@@ -8128,6 +8162,7 @@ async def test_deterministic_drop_precedence_holds_even_when_drop_beans_fails() 
         system_dev_percent=PROFILE.target_development_percent,
         config=config,
         executor=RaisingDropExecutor(),
+        limits=_ISOLATED_CEILING_GUARD_LIMITS,
     )
     targets_before_the_tick = list(harness.executor.targets)
 
@@ -8175,7 +8210,9 @@ async def test_gliding_heat_descends_through_repeated_failed_drops_same_tick() -
         recovery_headroom_percentage_points=15,
         recovery_exit_glide_pp_per_tick=5,
     )
-    harness = make_harness(config=config, executor=AlwaysFailingDropExecutor())
+    harness = make_harness(
+        config=config, executor=AlwaysFailingDropExecutor(), limits=_ISOLATED_CEILING_GUARD_LIMITS
+    )
     await _charge_through_fc_at_heat(
         harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
     )
@@ -8257,7 +8294,9 @@ async def test_genuine_raise_on_drop_due_tick_still_suppressed_round4() -> None:
         recovery_confirm_ticks=1,
     )
     harness = _development_harness_with_dev_percent(
-        system_dev_percent=PROFILE.target_development_percent, config=config
+        system_dev_percent=PROFILE.target_development_percent,
+        config=config,
+        limits=_ISOLATED_CEILING_GUARD_LIMITS,
     )
     targets_before_the_tick = list(harness.executor.targets)
 

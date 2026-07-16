@@ -30,7 +30,7 @@ from dataclasses import dataclass
 
 from pydantic import BaseModel, Field, model_validator
 
-from roastpilot_agent.config import PreFirstCrackLevers, SafetyLimits
+from roastpilot_agent.config import PostFirstCrackControl, PreFirstCrackLevers, SafetyLimits
 from roastpilot_agent.models import RoastPhase, RoastProfile
 
 # The full lever range. Phases the deterministic pre-FC policy does not own
@@ -217,11 +217,32 @@ class RoastControlPolicy:
     is told) **and** the safety gate (what the harness enforces) — there is no
     second copy of the numbers anywhere (told == enforced).
 
-    The temperature ceilings are profile-aware: ``bitter_ceiling_temp_c`` is the
-    hard software ceiling (``SafetyLimits``) but is *capped at the profile's drop
-    target* when that target is lower, so the model is never told it may push
-    above the roast it was configured for. The emergency-drop bound stays the
-    hard ``SafetyLimits`` value (the last-resort bound is profile-independent).
+    The told bitter ceiling is the TRUE enforced planning line, never capped to
+    the profile's drop target (#563; superseding the #273-era design, which
+    capped ``bitter_ceiling_temp_c`` at ``min(hard_ceiling, target_drop_temp_c)``
+    — every seeded profile's ``target_drop_temp_c`` was 195.0, one degree below
+    the real 196 °C guard, so the told number and the drop target were
+    IDENTICAL on every real roast; the c7/c8 prompt teaching's ceiling-minus-
+    bean-temperature gap arithmetic then collapsed to zero the instant bean
+    temperature neared 195, producing a false "no overshoot room, drop now"
+    inference — see the case-2 bake-off re-verification, issue #563). Told ==
+    enforced now means: when the post-FC ceiling guard
+    (``PostFirstCrackControl.ceiling_guard_drop_enabled``) is engaged, the told
+    ceiling is ``ceiling_guard_temp_c`` (the number that actually fires the
+    deterministic drop, :meth:`~roastpilot_agent.controller.RoastController.
+    _maybe_ceiling_guard_drop`); when the guard is disabled, the told ceiling is
+    the hard ``SafetyLimits.bitter_ceiling_temp_c`` line — a KNOWN told!=enforced
+    gap in that configuration (nothing deterministic enforces 196 °C there; only
+    ``SafetyLimits.max_bean_temp_c``'s 230 °C e-stop is truly enforced), accepted
+    because teaching 230 °C as "the line" would license far more overshoot than
+    the operator's own empirical bitter ceiling (memory
+    `told-vs-enforced-bitter-ceiling`; do not "fix" this branch by wiring
+    ``max_bean_temp_c`` in — that is a worse regression, not a fix). Neither
+    branch reads the profile's ``target_drop_temp_c`` — the target field already
+    carries "aim here"; the ceiling carries "never cross this", and the two are
+    independent numbers that may coincide by config coincidence but never by
+    construction. The emergency-drop bound stays the hard ``SafetyLimits`` value
+    unconditionally (the last-resort bound is profile- and guard-independent).
 
     The pre-FC deterministic *lever targets* are profile-aware too (D59 / #318,
     option C): the heat/fan the controller holds to first crack is sourced from
@@ -252,24 +273,37 @@ class RoastControlPolicy:
         profile: RoastProfile | None = None,
         *,
         pre_fc_levers: PreFirstCrackLevers | None = None,
+        post_fc_control: PostFirstCrackControl | None = None,
     ) -> None:
-        """Construct the policy from the safety limits, profile, and pre-FC levers.
+        """Construct the policy from the safety limits, profile, and pre/post-FC config.
 
         Args:
             limits: The hard safety limits (the single config source for the
                 heat/fan range and the bitter / emergency-drop ceilings).
             profile: The frozen active roast profile, or ``None`` when no run is
                 in progress (the limits then resolve from ``limits`` alone). The
-                profile only ever *tightens* a told ceiling, never loosens it.
+                profile's ``target_drop_temp_c`` never affects the told bitter
+                ceiling (#563) — it is a separate, independent number.
             pre_fc_levers: The deterministic pre-FC heat/fan lever parameters
                 (#222) — the operator's proven n8n defaults (heat 100 / fan low)
                 unless overridden. ``None`` uses :class:`PreFirstCrackLevers`
                 defaults; the parameters are profile/config-driven so a learned
                 plan (D42 §7.1) can later supply them without a code change.
+            post_fc_control: The post-FC control config (#563) — read only for
+                ``ceiling_guard_drop_enabled`` / ``ceiling_guard_temp_c``, which
+                decide the told bitter ceiling (see :meth:`_bitter_ceiling_temp_c`).
+                ``None`` uses :class:`~roastpilot_agent.config.PostFirstCrackControl`
+                defaults (the guard ON at 196 °C), matching the shipped default
+                config; keyword-only with a default so existing callers that do
+                not yet have this config in scope are unaffected (mirrors
+                ``pre_fc_levers``'s own optional-with-default shape).
         """
         self._limits = limits
         self._profile = profile
         self._pre_fc_levers = pre_fc_levers if pre_fc_levers is not None else PreFirstCrackLevers()
+        self._post_fc_control = (
+            post_fc_control if post_fc_control is not None else PostFirstCrackControl()
+        )
 
     def limits_for(
         self, phase: RoastPhase, *, trim_signal: TrimSignal | None = None
@@ -498,14 +532,49 @@ class RoastControlPolicy:
         return levers.fan_target_percent
 
     def _bitter_ceiling_temp_c(self) -> float:
-        """The told ≤196 °C bitter / drop ceiling, capped at the profile target.
+        """The told bitter / drop ceiling — the TRUE enforced planning line (#563).
 
-        The hard software ceiling from :class:`SafetyLimits`, lowered to the
-        active profile's ``target_drop_temp_c`` when that target is lower (a
-        lighter roast must never be told it may push to 196 °C). Returns the hard
-        ceiling unchanged when there is no profile or its target is higher.
+        Never capped to the profile's ``target_drop_temp_c`` (the #273-era
+        design did this, which made the told ceiling numerically IDENTICAL to
+        the drop target on every seeded profile — 195.0 capped against the
+        196.0 hard ceiling — collapsing the c7/c8 prompt teaching's ceiling-
+        minus-bean-temperature gap arithmetic to zero the instant bean
+        temperature neared the target, producing a false "no overshoot room"
+        inference; see issue #563 and the case-2 bake-off re-verification). The
+        target and the ceiling are independent numbers: the target carries "aim
+        here", the ceiling carries "never cross this", and they may coincide by
+        config coincidence but never by construction.
+
+        Two branches, both profile-independent, chosen by what is ACTUALLY
+        enforced in the current configuration (told == enforced applied
+        honestly to each):
+
+        * ``post_first_crack_control.ceiling_guard_drop_enabled`` is ``True``:
+          returns ``ceiling_guard_temp_c`` — the number
+          :meth:`~roastpilot_agent.controller.RoastController.
+          _maybe_ceiling_guard_drop` actually reads to fire the deterministic
+          drop. This is the number that is genuinely enforced, so it is the
+          number the model is told.
+        * The guard is disabled: returns the hard
+          ``SafetyLimits.bitter_ceiling_temp_c`` line unchanged. **This is a
+          KNOWN told != enforced gap** — with the guard off, nothing
+          deterministic stops a bean-temperature excursion at 196 °C; only
+          ``SafetyLimits.max_bean_temp_c``'s 230 °C e-stop is truly enforced
+          (``safety.SafetyPolicy.evaluate_command`` is temperature-blind; see
+          the module docstring and ``config.PostFirstCrackControl``'s D96
+          correction). Telling the model 230 °C instead would be a WORSE
+          regression — it would license the model to plan for a much hotter
+          roast than the operator's empirical bitter line — so this branch
+          deliberately keeps teaching the 196 °C line as aspirational guidance
+          even though it is advisor-judgment-enforced only in this
+          configuration, exactly as it always has been (memory
+          `told-vs-enforced-bitter-ceiling`). Do NOT "fix" this branch by
+          reading ``max_bean_temp_c`` here.
+
+        Returns:
+            The told bitter ceiling in Celsius, profile-independent.
         """
-        ceiling = self._limits.bitter_ceiling_temp_c
-        if self._profile is not None:
-            ceiling = min(ceiling, self._profile.target_drop_temp_c)
-        return ceiling
+        control = self._post_fc_control
+        if control.ceiling_guard_drop_enabled:
+            return control.ceiling_guard_temp_c
+        return self._limits.bitter_ceiling_temp_c
