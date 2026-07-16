@@ -1235,6 +1235,10 @@ def test_c7_extends_c6_with_dtr_pace_mismatch() -> None:
     short is a pace mismatch, not a signal to drop — weight temperature
     progress as dominant and keep watching the ceiling, which stays law.
     """
+    from roastpilot_agent.advisor import (
+        _C7_DTR_PACE_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
     c6 = control_teaching_prompt("c6")
     c7 = control_teaching_prompt("c7")
     # c7 is a strict superset of c6's grounding: every c6 line survives.
@@ -1261,9 +1265,28 @@ def test_c7_extends_c6_with_dtr_pace_mismatch() -> None:
     # which never repeats the ceiling emphasis — read the numbers correctly
     # 6/6). The revised teaching must make the model STATE the two numbers
     # and COMPUTE the gap, never reason from a felt sense of proximity.
-    assert "compute the gap" in lowered
-    assert "never on a felt sense" in lowered
-    assert "ceiling" in lowered
+    #
+    # PR #564 round 1 (Codex P2, test scoping): asserted against the SECTION
+    # CONSTANT directly (not the full assembled `lowered`), matching the
+    # discipline c8's own test now uses — c7's new section does not itself
+    # inherit this wording from an earlier version, so this specific test
+    # was not reachable by the inheritance bug the reviewer found in c8, but
+    # scoping it the same way is the more robust pattern regardless (a
+    # future c9 splicing after c7 would otherwise create the identical risk
+    # here).
+    new_section_lowered = _C7_DTR_PACE_SECTION.lower()
+    assert "compute the gap" in new_section_lowered
+    assert "never on a felt sense" in new_section_lowered
+    assert "ceiling" in new_section_lowered
+    # PR #564 round 1 (Codex P2, physically-too-late trigger): the roast-3
+    # anticipatory lesson -- "forces the drop the instant the gap reaches
+    # zero" is too late given real thermal lag/drop-action time, so c7's OWN
+    # section must teach comparing the gap against the projected climb
+    # (RoR x lag), never a bare gap==0 trigger.
+    assert "too late" in new_section_lowered
+    assert "bean_ror_c_per_min" in _C7_DTR_PACE_SECTION
+    assert "projected climb" in new_section_lowered
+    assert "never waiting for the gap to literally hit zero" in new_section_lowered
     # The new section names NO fixed roast-13 fixture numbers of its own
     # (told==enforced; the live context carries every threshold/target).
     start = c7.index("POST-FIRST-CRACK: A LARGE DTR OVERSHOOT")
@@ -1324,8 +1347,28 @@ def test_c8_extends_c7_with_pace_bottom_edge_and_fan_coupling() -> None:
     # COMPARISON, not a restated "stays LAW" emphasis (the #562 bake-off
     # falsification: that phrasing pattern-matched into a hallucinated
     # "at the ceiling" on the roast-15 case, an 8 C real gap).
-    assert "compute the gap" in lowered
-    assert "never on a felt sense" in lowered
+    #
+    # PR #564 round 1 (Codex P2): asserting against `lowered` (the FULL
+    # assembled c8 text) here is a test-scoping bug -- c8 INHERITS c7's
+    # revised ceiling wording via the splice, so this exact phrase could
+    # survive in the assembled text even if c8's OWN new section lost it
+    # entirely (e.g. a future edit reverting c8's sentence back to a bare
+    # "stays LAW" while c7's stayed fixed would still pass here, silently,
+    # via c7's inherited copy). Assert against the SECTION CONSTANT directly
+    # instead -- the same discipline the exact-splice equality test above
+    # already uses.
+    new_section_lowered = _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION.lower()
+    assert "compute the gap" in new_section_lowered
+    assert "never on a felt sense" in new_section_lowered
+    # PR #564 round 1 (Codex P2, physically-too-late trigger): the roast-3
+    # anticipatory lesson -- "forces the drop the instant the gap reaches
+    # zero" is too late given real thermal lag/drop-action time, so c8's OWN
+    # section must teach comparing the gap against the projected climb
+    # (RoR x lag), never a bare gap==0 trigger.
+    assert "too late" in new_section_lowered
+    assert "bean_ror_c_per_min" in _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION
+    assert "projected climb" in new_section_lowered
+    assert "never waiting for the gap to literally hit zero" in new_section_lowered
     # (3) Fan->RoR coupling, consistent with D96 slice 1's shipped mechanism —
     # the compensation is bounded/conditional, NOT an assumed rescue, and is
     # explicitly suppressed near a drop (never promises a raise will land).
