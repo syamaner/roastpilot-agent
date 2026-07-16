@@ -1931,25 +1931,40 @@ class RoastController:
         # (no eligibility check needed — the advisor can attempt, and fail, a
         # drop on literally any tick) until the drop finally succeeds or the
         # dwell ends (both clear the latch via `transition_to`).
-        if tentative_write_would_raise_heat and (
+        # Codex round-2 finding #2 (PR #569): the suppression must be
+        # HEAT-ONLY. It used to `restore_state` + `return` unconditionally —
+        # discarding the tentative PI step (correct: the raise itself must
+        # never land) but ALSO skipping the ENTIRE write, fan included. In
+        # loop mode this method is the SOLE writer (#498) — the advisor's own
+        # consult never actuates fan directly, it only stashes a target in
+        # `self._post_fc_desired_fan_percent` — so blocking the whole write
+        # here strands a legitimate, SAFE fan move alongside the unsafe heat
+        # raise. That collides with the D96 doctrine the operator ratified
+        # ("fan is valuable and should be used to control", #559): a fan
+        # move is never the hazard here, only a heat raise is. The fix:
+        # discard the tentative PI step exactly as before (the raise must
+        # never be actuated, and the PI's internal state must not race ahead
+        # of a heat command that will never land — the same #412 reasoning
+        # the executed/not-executed branch below applies), but substitute a
+        # HELD heat value (`self._current_heat` — never the raise) for the
+        # rest of this method's box/write/idempotence logic, so a fan-only
+        # move still reaches the roaster on a suppressed tick.
+        heat_suppressed_this_tick = tentative_write_would_raise_heat and (
             self._post_fc_raise_suppressed_after_clamp
             or (
                 recovery_ceiling_elevated
                 and (guard_eligible_this_tick or deterministic_drop_eligible_this_tick)
             )
-        ):
+        )
+        if heat_suppressed_this_tick:
             self._post_fc_controller.restore_state(pre_compute_state)
-            # D96 slice 2 (#559): the tentative `output` is fully discarded on
-            # this path (mirrors the PI state restore) — do NOT stash it as
-            # `_last_post_fc_output`. `_build_advisor_context` must never see
-            # a setpoint/heat-authority-state this tick's write never
-            # actually used.
-            return
+        actuated_heat = self._current_heat if heat_suppressed_this_tick else output.heat_percent
         # Build the DEVELOPMENT box from the ACTUATED PI output (#412
         # told==enforced): start from the full DEVELOPMENT box (heat/fan
         # 0-100, the profile-aware temperature ceilings), then narrow heat's
         # floor AND target to the loop's output — never an undamped/pre-clamp
-        # value.
+        # value — OR, on a suppressed tick, to the HELD current heat (never
+        # the discarded raise).
         #
         # #498 (D89 Tier 1, revises D88(5); coalesced to ONE writer per
         # BLOCKER-1, safety-reviewer): fan is NO LONGER pinned to a single
@@ -1958,7 +1973,8 @@ class RoastController:
         # branch) never writes; it only safety-evaluates its fan request and
         # holds the CLAMPED result in ``self._post_fc_desired_fan_percent``
         # (a target, no actuation). This write applies
-        # ``(taper_heat, desired_fan)`` together: the desired fan defaults to
+        # ``(taper_heat, desired_fan)`` together — or, on a suppressed tick,
+        # ``(held_heat, desired_fan)`` — the desired fan defaults to
         # ``self._current_fan`` (a genuine hold) until the advisor's first
         # loop-mode consult sets it, mirroring pre-#498 startup behaviour
         # exactly. The fan box stays the FULL DEVELOPMENT range (0-100, not
@@ -1972,44 +1988,66 @@ class RoastController:
         )
         box = self._control_limits().model_copy(
             update={
-                "heat_floor_percent": output.heat_percent,
-                "heat_target_percent": output.heat_percent,
+                "heat_floor_percent": actuated_heat,
+                "heat_target_percent": actuated_heat,
             }
         )
-        if self._current_heat == output.heat_percent and self._current_fan == desired_fan:
-            # Already at the loop's computed heat target AND the desired fan:
-            # no MCP write is issued (mirrors the pre-FC idempotence guard:
-            # avoids rate-limit churn and redundant serial writes). Checking
-            # BOTH fields (not heat alone) is the #498 coalesced-writer fix:
-            # a fan-only move (heat idempotent, desired fan changed) must
-            # still fire — a fan move is a real command, and this is the
-            # ONLY write path fan has in loop mode.
+        if self._current_heat == actuated_heat and self._current_fan == desired_fan:
+            # Already at the actuated heat target (the loop's own computed
+            # value, OR — Codex round-2 finding #2 — the HELD current heat on
+            # a suppressed tick) AND the desired fan: no MCP write is issued
+            # (mirrors the pre-FC idempotence guard: avoids rate-limit churn
+            # and redundant serial writes). Checking BOTH fields (not heat
+            # alone) is the #498 coalesced-writer fix: a fan-only move (heat
+            # idempotent, desired fan changed) must still fire — a fan move
+            # is a real command, and this is the ONLY write path fan has in
+            # loop mode. On a SUPPRESSED tick this branch is reached whenever
+            # fan is ALSO already at its desired value — genuinely nothing
+            # to do this tick (heat is correctly held, and fan needs no
+            # correction either).
             #
             # DELIBERATE DECISION on the #412 "state advances only on accepted
-            # write" rule for THIS idempotent case: the PI state (integrator +
-            # EMA, already advanced by the `compute()` call above) is KEPT, and
-            # the cadence timer DOES advance — this counts as accepted, not
-            # rejected. Reasoning: `self._current_heat`/`self._current_fan`
-            # ARE the last values the roaster actually holds, and they already
-            # equal `output.heat_percent`/`desired_fan` by this branch's own
-            # condition — so there is no gap between "what was computed/held"
-            # and "what the roaster is actually doing" for the state to race
-            # ahead of. This is UNLIKE a REJECT (rate limit) or a
-            # phase-matrix REJECT, where the roaster's real state is UNCHANGED
-            # from before this tick while the integrator/EMA would have
-            # advanced as if the new command had taken effect — THAT mismatch
-            # is what the restore-on-reject rule exists to prevent (a "phantom
-            # advance"). Restoring state here instead would freeze the
-            # integrator and the RoR EMA every steady-state (deadband-holding)
-            # tick — precisely the loop's expected common case — breaking both
-            # the EMA's cross-tick smoothing (#386/#412 lesson: it must keep
-            # tracking the live RoR every cadence tick) and the integrator's
-            # ability to keep accumulating a small deadband-adjacent error
-            # toward the next real move.
-            self._post_fc_last_actuation_monotonic = now
-            # D96 slice 2 (#559): this `output` stands (kept, not restored) —
-            # stash it for `_build_advisor_context` (told == enforced).
-            self._last_post_fc_output = output
+            # write" rule for THIS idempotent case: on a NON-suppressed tick,
+            # the PI state (integrator + EMA, already advanced by the
+            # `compute()` call above) is KEPT, and the cadence timer DOES
+            # advance — this counts as accepted, not rejected. Reasoning:
+            # `self._current_heat`/`self._current_fan` ARE the last values
+            # the roaster actually holds, and they already equal
+            # `output.heat_percent`/`desired_fan` by this branch's own
+            # condition — so there is no gap between "what was
+            # computed/held" and "what the roaster is actually doing" for
+            # the state to race ahead of. This is UNLIKE a REJECT (rate
+            # limit) or a phase-matrix REJECT, where the roaster's real
+            # state is UNCHANGED from before this tick while the
+            # integrator/EMA would have advanced as if the new command had
+            # taken effect — THAT mismatch is what the restore-on-reject
+            # rule exists to prevent (a "phantom advance"). Restoring state
+            # here instead would freeze the integrator and the RoR EMA every
+            # steady-state (deadband-holding) tick — precisely the loop's
+            # expected common case — breaking both the EMA's cross-tick
+            # smoothing (#386/#412 lesson: it must keep tracking the live
+            # RoR every cadence tick) and the integrator's ability to keep
+            # accumulating a small deadband-adjacent error toward the next
+            # real move. On a SUPPRESSED tick, by contrast, the PI state was
+            # ALREADY restored above (`heat_suppressed_this_tick`'s own
+            # branch) — this idempotent-heat/idempotent-fan path does
+            # nothing further to it, and the cadence timer is deliberately
+            # NOT advanced here either (mirrors the pre-existing suppression
+            # behaviour exactly: a suppressed tick never counts as a control
+            # actuation, so the next tick retries at the same elapsed-time
+            # budget).
+            if not heat_suppressed_this_tick:
+                self._post_fc_last_actuation_monotonic = now
+                # D96 slice 2 (#559): this `output` stands (kept, not
+                # restored) — stash it for `_build_advisor_context` (told ==
+                # enforced).
+                self._last_post_fc_output = output
+            # D96 slice 2 (#559), Codex round-1 finding #1 precedent applied
+            # here too: on a suppressed tick `_last_post_fc_output` is left
+            # exactly as `_force_recovery_exit`/the top-of-tick machinery
+            # already set it — never stashed here, since the ACTUATED heat
+            # (held) never matches what `output` (the discarded tentative
+            # raise) claims.
             return
         # Matrix gate first (SET_HEAT is valid in DEVELOPMENT — no change to
         # COMMAND_PHASE_MATRIX was needed for this slice; see the safety.py
@@ -2022,10 +2060,11 @@ class RoastController:
         if phase_validity.verdict is not SafetyVerdict.ALLOW:  # pragma: no cover — DEVELOPMENT
             # is in the SET_HEAT matrix row; unreachable defensive guard (mirrors
             # the identical pre-FC guard above).
-            self._post_fc_controller.restore_state(pre_compute_state)
+            if not heat_suppressed_this_tick:
+                self._post_fc_controller.restore_state(pre_compute_state)
             return
         evaluation = self._safety.evaluate_command(
-            requested_heat=output.heat_percent,
+            requested_heat=actuated_heat,
             # #498: the desired fan the advisor's consult already
             # safety-evaluated — re-clamped here into the SAME box this
             # write is evaluated against (told == enforced, #273/#412),
@@ -2048,16 +2087,18 @@ class RoastController:
         # AND advanced the cadence timer on an actuator failure, a phantom
         # advance (the roaster's real heat is unchanged, but the loop's
         # internal state raced ahead as if the command had applied).
-        if executed:
-            # Accepted AND actually executed: the loop's PI state (already
-            # advanced by the `compute` call above) stands, and the cadence
-            # timer advances so the NEXT actuation is paced from THIS
-            # confirmed instant.
+        if executed and not heat_suppressed_this_tick:
+            # Accepted AND actually executed (and NOT a suppressed-heat/
+            # fan-only tick, whose PI state was already restored above and
+            # must stay that way — Codex round-2 finding #2): the loop's PI
+            # state (already advanced by the `compute` call above) stands,
+            # and the cadence timer advances so the NEXT actuation is paced
+            # from THIS confirmed instant.
             self._post_fc_last_actuation_monotonic = now
             # D96 slice 2 (#559): this `output` stands (kept, not restored) —
             # stash it for `_build_advisor_context` (told == enforced).
             self._last_post_fc_output = output
-        else:
+        elif not executed and not heat_suppressed_this_tick:
             # NOT executed — REJECTed (e.g. rate-limited) OR an actuator
             # failure: undo the tentative `compute` step entirely so the
             # integrator/EMA/bias are exactly as they were before this tick
@@ -2127,7 +2168,11 @@ class RoastController:
             # D96 slice 1.5 (#561): a failed drop while recovery authority is
             # elevated must not leave the roaster sitting at raised heat —
             # force it back to the D96/D88 base through the safety path.
-            await self._clamp_heat_after_failed_drop()
+            # `self_healing=True`: this path (shared by the ceiling-guard and
+            # dev%/temp-anchor callers) fires on EVERY DEVELOPMENT tick with
+            # no cadence gate, so a failed corrective write is retried again
+            # next tick regardless (Codex round-2 finding #1's distinction).
+            await self._clamp_heat_after_failed_drop(self_healing=True)
             return False
         self._adopt_applied_state(applied)
         self._events.emit(
@@ -2137,7 +2182,7 @@ class RoastController:
         self.transition_to(RoastPhase.COOLING)
         return True
 
-    async def _clamp_heat_after_failed_drop(self) -> None:
+    async def _clamp_heat_after_failed_drop(self, *, self_healing: bool) -> None:
         """D96 slice 1.5 (#561): fail-safe-DOWN heat clamp on a FAILED drop
         while D96 recovery authority is elevated.
 
@@ -2181,6 +2226,34 @@ class RoastController:
         heat DOWN to a value the roast already legitimately held (see the
         idempotence check below) — see the inline comment at the
         ``evaluate_command`` call for the full reasoning.
+
+        **``self_healing`` (Codex round-2 finding #1 — the failed-corrective-
+        write asymmetry):** the two DETERMINISTIC drop paths
+        (:meth:`_execute_deterministic_drop`) fire on EVERY DEVELOPMENT tick
+        with no cadence gate as long as their eligibility condition holds —
+        if this clamp's own corrective write ALSO fails, the very next tick
+        re-attempts both the drop AND the clamp, so an unrecovered elevated
+        state is bounded to (at most) one tick before another attempt. The
+        advisor path is cadence-gated (:class:`AdvisoryCallPolicy` — could be
+        many seconds before the next consult) and the operator path is
+        one-shot (never automatically retried at all): on THOSE two paths, a
+        failed corrective write can leave the roast holding recovery-raised
+        heat with no further correction attempt coming for an unbounded
+        stretch, and the latch that is supposed to prevent a re-raise
+        (:attr:`_post_fc_raise_suppressed_after_clamp`) never arms either,
+        since arming happens only inside :meth:`_force_recovery_exit`, which
+        (correctly, per the #412 discipline) only runs on a write that
+        actually landed. ``self_healing=False`` (the advisor and operator
+        callers) arms the latch regardless of whether the write below
+        succeeds — reproduced directly before this fix: a hand-driven
+        failed-corrective-write tick on the advisor path left heat at its
+        raised value with the latch unarmed, and a run of sub-cadence ticks
+        (no re-consult) never corrected it. ``self_healing=True`` (the
+        deterministic callers) is UNCHANGED — they keep the pre-existing
+        behaviour (arm only on a landed write) because they do not need the
+        independent latch: the next tick's own retry already re-attempts
+        the clamp, and arming early there would gain nothing while adding a
+        second code path to reason about for no benefit.
 
         **Scope (elevated-authority ticks only):** a no-op unless
         ``self._last_post_fc_output.heat_authority_state is not HOLDING`` —
@@ -2313,11 +2386,27 @@ class RoastController:
         executed = await self._execute_targets(evaluation)
         if executed:
             self._force_recovery_exit(state)
-        # A failed clamp write leaves the recovery state machine exactly as it
-        # was (mirrors every other actuator-failure path in this module): the
-        # roaster's real heat is unchanged, so there is no state/reality gap
-        # to close yet — the next tick's own drop-eligibility retry, and this
-        # same clamp, will be attempted again.
+        elif not self_healing:
+            # Codex round-2 finding #1: the write FAILED (the roaster's real
+            # heat is unchanged — mirrors every other actuator-failure path
+            # in this module, and the recovery COUNTERS/PI state are left
+            # untouched here exactly as they would be on the self-healing
+            # paths, per the #412 discipline: state changes only on a write
+            # that actually landed) — but on a non-self-healing caller
+            # (advisor/operator) there is no guaranteed next-tick retry to
+            # eventually re-arm the suppression, so arm it HERE,
+            # independently of whether the counters themselves got reset.
+            # This is the ONE deliberate asymmetry `self_healing` encodes:
+            # the deterministic callers skip this branch entirely (they
+            # retry every tick regardless, and arming early there would
+            # gain nothing).
+            self._post_fc_raise_suppressed_after_clamp = True
+        # A failed clamp write on a SELF-HEALING path leaves the recovery
+        # state machine exactly as it was (mirrors every other actuator-
+        # failure path in this module): the roaster's real heat is
+        # unchanged, so there is no state/reality gap to close yet — the
+        # next tick's own drop-eligibility retry, and this same clamp, will
+        # be attempted again.
 
     def _force_recovery_exit(self, state: PostFcControllerState) -> None:
         """Force the D96 recovery state machine to HOLDING (#561).
@@ -3321,8 +3410,12 @@ class RoastController:
                     # D96 slice 1.5 (#561): same fail-safe-DOWN clamp as the
                     # two deterministic drop paths (_execute_deterministic_drop)
                     # — a failed advisor drop is exactly the residual PR #560
-                    # round 3 identified.
-                    await self._clamp_heat_after_failed_drop()
+                    # round 3 identified. `self_healing=False` (Codex round-2
+                    # finding #1): the advisor is cadence-gated
+                    # (AdvisoryCallPolicy) — there is no guaranteed retry next
+                    # tick, so the raise-suppression latch must arm here even
+                    # if the clamp's own corrective write also fails.
+                    await self._clamp_heat_after_failed_drop(self_healing=False)
                     return
                 self._adopt_applied_state(applied)
                 self._events.emit(
@@ -3913,7 +4006,11 @@ class RoastController:
             # the ORIGINAL three (policy/advisor) callers, which never fire
             # outside DEVELOPMENT in the first place.
             if will_transition:
-                await self._clamp_heat_after_failed_drop()
+                # `self_healing=False` (Codex round-2 finding #1): the
+                # operator's drop is one-shot — never automatically retried
+                # — so the raise-suppression latch must arm here even if
+                # the clamp's own corrective write also fails.
+                await self._clamp_heat_after_failed_drop(self_healing=False)
             return
         self._adopt_applied_state(applied)
         self._events.emit(
