@@ -40,6 +40,7 @@ from roastpilot_agent.models import (
     AdvisorTraceStatus,
     AppliedRoasterState,
     DropReason,
+    PostFcHeatAuthorityState,
     RoastCommand,
     RoastEventKind,
     RoastEventSource,
@@ -48,7 +49,7 @@ from roastpilot_agent.models import (
     RoastTelemetry,
     recording_origin_slug,
 )
-from roastpilot_agent.post_fc_control import PostFcHeatAuthorityState, PostFcRorController
+from roastpilot_agent.post_fc_control import PostFcControlOutput, PostFcRorController
 from roastpilot_agent.roast_history import (
     DecisionTraceEntry,
     RoastCurveSample,
@@ -720,6 +721,21 @@ class RoastController:
         # rule extended to a stateful loop) — a REJECTed tick must not consume
         # cadence budget.
         self._post_fc_last_actuation_monotonic: float | None = None
+        # D96 slice 2 (#559): the MOST RECENT PostFcControlOutput the loop
+        # computed this tick (or ``None`` before the loop has ever computed
+        # one this engagement/process) — stashed here, in
+        # ``_apply_deterministic_post_fc_levers``, so ``_build_advisor_context``
+        # (which runs LATER in the same ``tick()``, see that method's call
+        # order) can copy the setpoint/heat-authority-state fields VERBATIM
+        # into ``AdvisorContext`` (told == enforced, the #497 precedent
+        # applied to these two new fields) rather than recomputing an
+        # equivalent value that could drift out of sync with what the loop
+        # itself actually used to build the safety box THIS tick. Cleared
+        # (set back to ``None``) whenever the loop disengages (mirrors
+        # ``_post_fc_engaged``'s own reset), so a context built in a
+        # different DEVELOPMENT dwell or an operator-resume (loop inert)
+        # never reads a stale prior engagement's output.
+        self._last_post_fc_output: PostFcControlOutput | None = None
         # Safety-review fix (post-B2, Opus finding, MEDIUM): whether the post-FC
         # PI loop is ENGAGED for the current DEVELOPMENT dwell. ``DEVELOPMENT``
         # is reachable by two distinct edges — the true first-crack transition
@@ -1124,6 +1140,13 @@ class RoastController:
         # both levers directly) never inherits a stale desired fan from an
         # earlier engagement.
         self._post_fc_desired_fan_percent = None
+        # D96 slice 2 (#559): the stashed last-computed post-FC output is
+        # likewise per-engagement state — clear it unconditionally on every
+        # transition (same discipline as the two fields immediately above)
+        # so ``_build_advisor_context`` never reads a prior engagement's
+        # setpoint/heat-authority-state into a context built for a different
+        # DEVELOPMENT dwell or an operator-resume where the loop stays inert.
+        self._last_post_fc_output = None
         if previous in TERMINAL_LATCH_PHASES and target not in TERMINAL_LATCH_PHASES:
             # Leaving a terminal HOLD phase is an EXPLICIT operator action
             # (acknowledge → idle, resume, start cooling): the operator now owns
@@ -1858,6 +1881,11 @@ class RoastController:
             and (guard_eligible_this_tick or deterministic_drop_eligible_this_tick)
         ):
             self._post_fc_controller.restore_state(pre_compute_state)
+            # D96 slice 2 (#559): the tentative `output` is fully discarded on
+            # this path (mirrors the PI state restore) — do NOT stash it as
+            # `_last_post_fc_output`. `_build_advisor_context` must never see
+            # a setpoint/heat-authority-state this tick's write never
+            # actually used.
             return
         # Build the DEVELOPMENT box from the ACTUATED PI output (#412
         # told==enforced): start from the full DEVELOPMENT box (heat/fan
@@ -1921,6 +1949,9 @@ class RoastController:
             # ability to keep accumulating a small deadband-adjacent error
             # toward the next real move.
             self._post_fc_last_actuation_monotonic = now
+            # D96 slice 2 (#559): this `output` stands (kept, not restored) —
+            # stash it for `_build_advisor_context` (told == enforced).
+            self._last_post_fc_output = output
             return
         # Matrix gate first (SET_HEAT is valid in DEVELOPMENT — no change to
         # COMMAND_PHASE_MATRIX was needed for this slice; see the safety.py
@@ -1965,6 +1996,9 @@ class RoastController:
             # timer advances so the NEXT actuation is paced from THIS
             # confirmed instant.
             self._post_fc_last_actuation_monotonic = now
+            # D96 slice 2 (#559): this `output` stands (kept, not restored) —
+            # stash it for `_build_advisor_context` (told == enforced).
+            self._last_post_fc_output = output
         else:
             # NOT executed — REJECTed (e.g. rate-limited) OR an actuator
             # failure: undo the tentative `compute` step entirely so the
@@ -1975,6 +2009,8 @@ class RoastController:
             # than losing a full cadence interval to a write that never
             # reached the roaster.
             self._post_fc_controller.restore_state(pre_compute_state)
+            # D96 slice 2 (#559): `output` was NOT kept — do NOT stash it,
+            # mirroring the PI state restore immediately above.
 
     async def _execute_deterministic_drop(self, reason: DropReason) -> bool:
         """Shared drop-execution sequence for every deterministic (non-advisor,
@@ -4139,6 +4175,24 @@ class RoastController:
                 self._profile.target_development_percent + self._config.drop_dev_margin_percent
             ),
             roast_style=self._profile.roast_style,
+            # D96 slice 2 (#559): copied VERBATIM from
+            # ``self._last_post_fc_output`` — the SAME ``PostFcControlOutput``
+            # ``_apply_deterministic_post_fc_levers`` stashed earlier THIS
+            # tick (told == enforced, the #497 precedent) — never re-derived.
+            # ``None`` when the loop has not computed anything this
+            # engagement yet (pre-FC phases, the loop's flag off, an
+            # operator-resume dwell where the loop stays inert, or before its
+            # first control tick after the FC edge).
+            post_fc_setpoint_c_per_min=(
+                None
+                if self._last_post_fc_output is None
+                else self._last_post_fc_output.setpoint_c_per_min
+            ),
+            post_fc_heat_authority_state=(
+                None
+                if self._last_post_fc_output is None
+                else self._last_post_fc_output.heat_authority_state
+            ),
         )
 
     def _seconds_since_last_command(self) -> float | None:

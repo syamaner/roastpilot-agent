@@ -171,10 +171,11 @@ const PROVIDER_OPTIONS: FieldOption[] = [
   { value: "ollama",            label: "Ollama (local)" },
 ];
 
-// All seven c-series control-teaching prompts are real and selectable (c1–c7
+// All eight c-series control-teaching prompts are real and selectable (c1–c8
 // confirmed in advisor.py _CONTROL_TEACHING_PROMPTS). c3 is the live default.
 // c1/c2 are the original cuts (retained for A/B); c4/c5/c6 are experiment
-// selectors (#396); c7 is the #499 part-2 DTR-pace-mismatch experiment.
+// selectors (#396); c7 is the #499 part-2 DTR-pace-mismatch experiment; c8 is
+// the D96 slice 2 (#559) pace/bottom-edge/fan-coupling experiment.
 // Legacy v0/v1 prompts are internal only — not exposed here.
 const PROMPT_VERSION_OPTIONS: FieldOption[] = [
   { value: "c1", label: "c1 — original (v1 baseline)" },
@@ -184,6 +185,7 @@ const PROMPT_VERSION_OPTIONS: FieldOption[] = [
   { value: "c5", label: "c5 — experiment" },
   { value: "c6", label: "c6 — experiment (#396 A/B)" },
   { value: "c7", label: "c7 — experiment (#499 pt.2 DTR-pace A/B)" },
+  { value: "c8", label: "c8 — experiment (#559 D96 pace/bottom-edge/fan A/B)" },
 ];
 
 // ---------------------------------------------------------------------------
