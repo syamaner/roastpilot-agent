@@ -33,13 +33,37 @@
  * silently reverting the headline. `cancelQueries` BEFORE the seed aborts any
  * in-flight GET for the key (TanStack's documented mutation/query race
  * mitigation), so no stale resolver can land after and clobber it.
+ *
+ * Round 3 (PRRT_kwDOSzMG_c6RfBAA / PRRT_kwDOSzMG_c6RfBAJ): the seed above was
+ * itself two edges too wide, both closed here in one surgical pass so the
+ * cache write only ever touches what THIS mutation actually owns:
+ *
+ * 1. `roastKeys.detail(runId)` is `["roasts", runId]` — a PREFIX of the
+ *    sibling keys (`roastKeys.timeline`/`telemetry`/`tastings`, each
+ *    `["roasts", runId, "..."]`). TanStack's query-key matching is INCLUSIVE
+ *    by default, so the bare `cancelQueries({ queryKey })` above cancelled
+ *    any in-flight timeline/telemetry/tastings read too — the chart/trace/
+ *    tasting list could be left permanently empty (nothing re-triggers those
+ *    reads on a completed, non-polling detail view). `exact: true` scopes
+ *    the cancel to ONLY the detail query.
+ * 2. The whole-object `setQueryData(key, detail)` replaced the ENTIRE cached
+ *    `RoastDetail` with the rating endpoint's own response — which reflects
+ *    the state the SERVER saw when it handled the rating POST, not
+ *    necessarily the latest state of every OTHER field. A concurrent
+ *    roasted-weight/charge-weight save (their own mutations write straight
+ *    into this same cache entry) could have its fresh value silently rolled
+ *    back to whatever `api.rate`'s response happened to carry, reverted
+ *    until an unrelated remount. A FUNCTIONAL update that merges only
+ *    `rating`/`notes` — the two fields this mutation actually owns — fixes
+ *    the original round-1 stale-headline flash exactly as before while
+ *    never touching a sibling field's fresher value.
  */
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { api } from "@/lib/api";
 import { roastKeys } from "@/hooks/queries";
-import type { OperatorRatingRequest } from "@/lib/types";
+import type { OperatorRatingRequest, RoastDetail } from "@/lib/types";
 
 export function ratingMutationKey(runId: string) {
   return ["roasts", runId, "rating"] as const;
@@ -51,8 +75,10 @@ export function useSaveRating(runId: string) {
     mutationKey: ratingMutationKey(runId),
     mutationFn: (body: OperatorRatingRequest) => api.rate(runId, body),
     onSuccess: async (detail) => {
-      await queryClient.cancelQueries({ queryKey: roastKeys.detail(runId) });
-      queryClient.setQueryData(roastKeys.detail(runId), detail);
+      await queryClient.cancelQueries({ queryKey: roastKeys.detail(runId), exact: true });
+      queryClient.setQueryData(roastKeys.detail(runId), (old: RoastDetail | undefined) =>
+        old === undefined ? old : { ...old, rating: detail.rating, notes: detail.notes },
+      );
     },
   });
 }

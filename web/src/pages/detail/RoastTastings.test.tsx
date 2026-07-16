@@ -417,5 +417,40 @@ describe("RoastTastings", () => {
       expect(rateSpy).toHaveBeenCalledTimes(1);
       expect(addSpy).toHaveBeenCalledTimes(2);
     });
+
+    it("#568 round 3 (PRRT_kwDOSzMG_c6RfBAE): editing the draft between a partial failure and its retry does NOT create a divergence — the retry resubmits the value ACTUALLY SUBMITTED on attempt one, not the since-edited draft", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+      const addSpy = vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: "r1", tastings: [] });
+      const rateSpy = vi
+        .spyOn(api, "rate")
+        .mockRejectedValueOnce(new Error("rating endpoint down"))
+        .mockResolvedValueOnce(fakeRatedDetail());
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+      await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+      // Attempt one: 2 stars. Tasting succeeds; rating fails.
+      fireEvent.click(screen.getByTestId("tasting-star-2"));
+      fireEvent.click(screen.getByTestId("tasting-save"));
+      await waitFor(() => expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument());
+      expect(addSpy).toHaveBeenCalledWith("r1", expect.objectContaining({ stars: 2 }));
+
+      // The operator edits the PRESERVED draft before retrying — the
+      // tasting entry already saved reads 2 stars; if the retry used this
+      // LIVE value, the headline rating would read 4 while the tasting
+      // entry it's supposed to correspond to reads 2 — a real divergence
+      // from one nominal save.
+      fireEvent.click(screen.getByTestId("tasting-star-4"));
+      fireEvent.click(screen.getByTestId("tasting-save"));
+      await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
+
+      // The retried rating call carries the ORIGINALLY SUBMITTED value (2),
+      // matching the tasting entry that's already saved — never the
+      // since-edited live draft (4).
+      expect(rateSpy).toHaveBeenLastCalledWith("r1", expect.objectContaining({ stars: 2 }));
+      // The tasting was never resubmitted at all (still exactly the one
+      // call from attempt one) — a second call with stars: 4 would itself
+      // be the #568 round-2 duplicate-tasting hazard reintroduced.
+      expect(addSpy).toHaveBeenCalledTimes(1);
+    });
   });
 });

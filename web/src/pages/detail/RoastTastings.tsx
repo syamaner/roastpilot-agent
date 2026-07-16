@@ -53,7 +53,7 @@
  * via the shared `ratingMutationKey`).
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useIsMutating } from "@tanstack/react-query";
 
 import { cn } from "@/lib/cn";
@@ -111,6 +111,21 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
   const [attributes, setAttributes] = useState<TastingAttribute[]>([]);
   const [defects, setDefects] = useState<TastingDefect[]>([]);
 
+  // Round 3 (PRRT_kwDOSzMG_c6RfBAE): captured on the FIRST attempt of a save
+  // cycle, read back on any retry of that SAME cycle — never the live draft.
+  // Round 2's retry-dedup skips resubmitting whichever record already
+  // succeeded, but the mutation for the record that's STILL retrying reads
+  // `stars`/`notes` fresh off state; if the operator edits the draft between
+  // the partial failure and the retry (e.g. tasting succeeded @2 stars,
+  // rating failed, operator changes the star picker to 4 before retrying),
+  // the retry would post a rating of 4 while the already-saved tasting entry
+  // still reads 2 — a real divergence between the two records from ONE
+  // nominal save, with the UI reporting a blanket "Saved." that papers over
+  // it. Pinning both mutations of a retry to the values ACTUALLY SUBMITTED
+  // on attempt one closes this: the surviving retry writes the same value
+  // its sibling record already has, so the two can never disagree.
+  const attemptRef = useRef<{ stars: Stars; notes: string | null } | null>(null);
+
   const isPending =
     tastingMutation.isPending || ratingMutation.isPending || otherRatingWriteInFlight;
   // Both mutations must succeed (this save cycle, i.e. after the most recent
@@ -154,12 +169,24 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
   // append-only and already safely saved either way, so nothing is lost by
   // waiting — only the draft-clearing is deferred, not the tasting write).
   useEffect(() => {
-    if (isSaved) resetForm();
+    if (isSaved) {
+      resetForm();
+      attemptRef.current = null;
+    }
   }, [isSaved]);
+
+  const isRetry = tastingOnlyFailed || ratingOnlyFailed;
 
   const onSave = () => {
     if (stars === null) return;
     const trimmedNotes = notes.trim() === "" ? null : notes.trim();
+
+    // Round 3 (PRRT_kwDOSzMG_c6RfBAE): a retry of a partial-failure cycle
+    // reuses the EXACT payload captured on attempt one, never the live
+    // (possibly since-edited) draft — see `attemptRef`'s doc above. A fresh
+    // (non-retry) save captures its own payload as the new attempt-one.
+    const payload = isRetry && attemptRef.current !== null ? attemptRef.current : { stars, notes: trimmedNotes };
+    if (!isRetry) attemptRef.current = payload;
 
     // Round 2 (PRRT_kwDOSzMG_c6Reetd): the retry-dedup round 1 added was also
     // one-directional — it skipped resubmitting the tasting on a
@@ -176,8 +203,8 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
       // success on the side that already landed.
       tastingMutation.reset();
       tastingMutation.mutate({
-        stars,
-        notes: trimmedNotes,
+        stars: payload.stars,
+        notes: payload.notes,
         tasted_at_utc: tastedAt === "" ? null : new Date(tastedAt).toISOString(),
         brew_method: brewMethod === "" ? null : brewMethod,
         grind_note: grindNote.trim() === "" ? null : grindNote.trim(),
@@ -193,7 +220,7 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
     // no-double-write rule as the tasting side, mirrored.
     if (!tastingOnlyFailed) {
       ratingMutation.reset();
-      ratingMutation.mutate({ stars, notes: trimmedNotes });
+      ratingMutation.mutate({ stars: payload.stars, notes: payload.notes });
     }
   };
 
