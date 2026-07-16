@@ -840,13 +840,17 @@ def test_c1_joint_drop_section_distinguishes_drop_target_from_bitter_ceiling() -
     and the bitter ceiling was 196) — the prompt must explicitly teach the
     model these are DIFFERENT MEANINGS, never interchangeable.
 
-    Codex P2 follow-up: ``RoastControlPolicy._bitter_ceiling_temp_c`` CAPS the
-    told ceiling at the profile's ``target_drop_temp_c`` when that target is
-    lower than the hard bitter ceiling — so the two numbers can legitimately
-    be numerically EQUAL. The teaching must not claim they always differ (a
-    false claim that would recreate the confusion); it must teach that the
-    MEANING differs regardless of whether the values happen to coincide, and
-    anchor the always-distinct claim to the emergency-drop bound instead."""
+    #563 REVISION: ``RoastControlPolicy._bitter_ceiling_temp_c`` no longer caps
+    the told ceiling at the profile's ``target_drop_temp_c`` at all (the #499-era
+    cap made the two numbers IDENTICAL on every seeded profile — 195 capped
+    against 196 — which the #563 bake-off traced to a false "no overshoot room"
+    inference in the c7/c8 gap arithmetic). The teaching must still not claim
+    they always differ in VALUE (a config coincidence can still make them equal);
+    it must teach that the MEANING differs regardless, and that the ceiling is a
+    SEPARATE number that does not move with the target — the opposite emphasis
+    from the pre-#563 text, which read as "they usually coincide" rather than
+    "they usually differ". Anchor the always-distinct claim to the
+    emergency-drop bound, unaffected by this change."""
     prompt = control_teaching_prompt("c1")
     section_start = prompt.index("THE DROP - A JOINT OBJECTIVE")
     section_end = prompt.index("LEVER STABILITY")
@@ -854,21 +858,26 @@ def test_c1_joint_drop_section_distinguishes_drop_target_from_bitter_ceiling() -
     assert "target_drop_temp_c" in section
     assert "bitter" in section and "ceiling" in section
     assert "different meanings" in section
-    # Must NOT claim the target and ceiling always differ in VALUE — only in
-    # meaning. The always-numerically-distinct claim belongs to the
-    # emergency-drop bound (never capped by the profile), not the ceiling.
-    assert "equals the target" in section or "equal the target" in section
+    # #563: the ceiling is taught as a SEPARATE number, not derived from /
+    # moving with the target — the replacement for the pre-#563 "equals the
+    # target exactly" framing that no longer matches the common case.
+    assert "separate" in section
+    assert "does not move with it" in section or "not derived from the target" in section
     assert "emergency" in section and "higher" in section
     # Must NOT claim any fixed ORDERING between the ceiling and the target —
     # safety-reviewer LOW fold: an earlier draft said the ceiling is "never
     # below the target", which is false whenever target_drop_temp_c is ABOVE
-    # the hard bitter ceiling (an unbounded profile field — this module's own
-    # PROFILE fixture is target_drop_temp_c=205.0, above the 196 default hard
-    # ceiling, so RoastControlPolicy resolves bitter_ceiling_temp_c=196.0,
-    # BELOW the target). No relational claim survives that a real profile can
-    # falsify either way.
+    # the ceiling (an unbounded profile field — this module's own PROFILE
+    # fixture is target_drop_temp_c=205.0, above the 196 default ceiling, so
+    # RoastControlPolicy resolves bitter_ceiling_temp_c=196.0, BELOW the
+    # target). No relational claim survives that a real profile can falsify
+    # either way.
     assert "never below the target" not in section
     assert "never above the target" not in section
+    # Must NOT claim the two USUALLY coincide either — the #563-superseded
+    # framing this test used to pin (they now usually differ: target 195 vs
+    # ceiling 196 on every seeded profile).
+    assert "equals the target exactly" not in section
 
 
 def test_c1_joint_drop_section_makes_no_false_ceiling_ordering_for_a_high_target_profile() -> None:
