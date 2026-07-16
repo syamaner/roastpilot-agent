@@ -8343,6 +8343,23 @@ class _AlwaysFailingDropExecutor(RecordingExecutor):
         raise RuntimeError("serial write dropped")
 
 
+# #563/#570 sibling-PR interaction (pr-preflight, the #453 class): _bitter_
+# ceiling_temp_c() now feeds ceiling_guard_temp_c straight into
+# PhaseControlLimits (see _ISOLATED_CEILING_GUARD_LIMITS's own comment above,
+# ~:7850) rather than capping it first — a guard raised well above the drop
+# target to "stay clear of the guard and isolate a different anchor" (the
+# pattern every test below uses) now also needs emergency_drop_temp_c raised
+# above IT, or the resolved box fails its own emergency_drop_temp_c >
+# bitter_ceiling_temp_c validator. Reusing _ISOLATED_CEILING_GUARD_LIMITS
+# (emergency_drop_temp_c=225.0) covers every 220.0 guard temp below; one test
+# uses 230.0 (to stay clear of the guard while STILL driving the run into
+# FAULTED via a bean reading past max_bean_temp_c), which needs its own wider
+# fixture — reused here rather than duplicated per call site.
+_ISOLATED_CEILING_GUARD_LIMITS_230 = SafetyLimits(
+    emergency_drop_temp_c=231.0, max_bean_temp_c=234.0
+)
+
+
 async def _confirm_recovery_raise(harness: Harness, *, entry_heat: int) -> int:
     """Drive one DEVELOPMENT tick with a sustained RoR shortfall large enough
     to confirm D96 recovery entry immediately (``recovery_confirm_ticks=1``
@@ -8387,7 +8404,12 @@ async def test_advisor_drop_failure_clamps_heat_to_base_when_recovery_elevated()
         recovery_confirm_ticks=1,
         recovery_headroom_percentage_points=15,
     )
-    harness = make_harness(config=config, advisor=advisor, executor=_AlwaysFailingDropExecutor())
+    harness = make_harness(
+        config=config,
+        advisor=advisor,
+        executor=_AlwaysFailingDropExecutor(),
+        limits=_ISOLATED_CEILING_GUARD_LIMITS,
+    )
     await _charge_through_fc_at_heat(
         harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
     )
@@ -8924,7 +8946,7 @@ async def test_operator_drop_beans_failure_clamps_heat_when_recovery_elevated() 
         recovery_headroom_percentage_points=15,
     )
     executor = _AlwaysFailingDropAndArmableSetTargetsExecutor()
-    harness = make_harness(config=config, executor=executor)
+    harness = make_harness(config=config, executor=executor, limits=_ISOLATED_CEILING_GUARD_LIMITS)
     await _charge_through_fc_at_heat(
         harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
     )
@@ -8961,14 +8983,18 @@ async def test_operator_drop_beans_failure_in_faulted_never_clamps() -> None:
         recovery_headroom_percentage_points=15,
     )
     executor = _AlwaysFailingDropAndArmableSetTargetsExecutor()
-    harness = make_harness(config=config, executor=executor)
+    harness = make_harness(
+        config=config, executor=executor, limits=_ISOLATED_CEILING_GUARD_LIMITS_230
+    )
     await _charge_through_fc_at_heat(
         harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
     )
     await _confirm_recovery_raise(harness, entry_heat=60)
 
     # Drive the run into FAULTED via the hard e-stop ceiling (never through
-    # the clamp under test) — a bean reading past `max_bean_temp_c`.
+    # the clamp under test) — a bean reading past `max_bean_temp_c` (234.0
+    # here, the isolated fixture's own wider ceiling — still well below this
+    # reading, so the e-stop still fires exactly as before).
     harness.clock.advance(5.0)
     harness.reader.readings = [reading(bean=235.0, bean_ror_c_per_min=2.0)]
     await harness.controller.tick()
