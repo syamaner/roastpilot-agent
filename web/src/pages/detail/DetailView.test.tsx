@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/lib/api";
+import { roastKeys } from "@/hooks/queries";
 import { DetailView } from "./DetailView";
 import {
   FIXTURE_DETAIL,
@@ -16,6 +17,7 @@ import {
   FIXTURE_TIMELINE_FAILED,
   FIXTURE_TIMELINE_LONG,
 } from "./fixture";
+import { __resetPartialFailureLocksForTests } from "./useSaveRating";
 
 function wrapper() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -73,7 +75,13 @@ describe("DetailView trace-row → curve highlight", () => {
   });
 });
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  vi.restoreAllMocks();
+  // See RoastTastings.test.tsx's afterEach — this suite also drives a
+  // partial-failure state (module-scoped, not per-test QueryClient) on the
+  // shared FIXTURE_DETAIL.id, which could otherwise bleed into a later spec.
+  __resetPartialFailureLocksForTests();
+});
 
 describe("DetailView composition", () => {
   it("mounts ChargeWeight wired to the detail's frozen charge weight (#520) — the data-flows-to-the-render-tree check", () => {
@@ -110,6 +118,180 @@ describe("DetailView composition", () => {
     await waitFor(() => expect(spy).toHaveBeenCalledWith(FIXTURE_DETAIL.id));
   });
 
+  it("#568 Codex round 1 (PRRT_kwDOSzMG_c6RdllD), direction A: RoastRating's own Edit is blocked while RoastTastings' one-gesture rating save is in flight — the two entry points never race a rating write", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    let resolveRate: (() => void) | undefined;
+    vi.spyOn(api, "rate").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRate = () => resolve({ id: FIXTURE_DETAIL.id } as Awaited<ReturnType<typeof api.rate>>);
+        }),
+    );
+    renderView();
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    // Fire a tasting save — its rating POST stalls, mid-flight.
+    fireEvent.click(screen.getByTestId("tasting-star-4"));
+    fireEvent.click(screen.getByTestId("tasting-save"));
+    await waitFor(() => expect(resolveRate).toBeDefined());
+
+    // RoastRating's own "Edit" must be disabled for the duration — an
+    // operator opening it here could otherwise clobber the in-flight
+    // tasting-triggered save with a stale direct edit (last-write-wins).
+    expect(screen.getByTestId("rating-edit")).toBeDisabled();
+    expect(screen.getByTestId("rating-edit-blocked")).toBeInTheDocument();
+
+    resolveRate?.();
+    await waitFor(() => expect(screen.getByTestId("rating-edit")).not.toBeDisabled());
+    expect(screen.queryByTestId("rating-edit-blocked")).not.toBeInTheDocument();
+  });
+
+  it("#568 round 2 (PRRT_kwDOSzMG_c6ReetO), direction B: RoastTastings' own 'Add tasting' is blocked while a DIRECT RoastRating save is in flight — the reverse of direction A, which round 1 left unguarded", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    const addSpy = vi
+      .spyOn(api, "addTasting")
+      .mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    let resolveRate: (() => void) | undefined;
+    vi.spyOn(api, "rate").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveRate = () => resolve({ id: FIXTURE_DETAIL.id } as Awaited<ReturnType<typeof api.rate>>);
+        }),
+    );
+    renderView();
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    // Choose a tasting star BEFORE the direct edit fires — the tasting
+    // star buttons themselves are also disabled while a rating write is in
+    // flight, so this must happen first for `stars` to be non-null once
+    // unblocked (this test is probing the SAVE button's guard specifically,
+    // not the inputs' own disabled state — that's covered elsewhere).
+    fireEvent.click(screen.getByTestId("tasting-star-4"));
+
+    // Fire a DIRECT edit on RoastRating — its rating POST stalls, mid-flight.
+    fireEvent.click(screen.getByTestId("rating-edit"));
+    fireEvent.click(screen.getByTestId("star-3"));
+    fireEvent.click(screen.getByTestId("rating-save"));
+    await waitFor(() => expect(resolveRate).toBeDefined());
+
+    // RoastTastings' own save must be disabled for the duration — clicking
+    // "Add tasting" here would otherwise fire a SECOND, concurrent api.rate
+    // call for the same run while the direct edit is still in flight.
+    expect(screen.getByTestId("tasting-save")).toBeDisabled();
+
+    resolveRate?.();
+    await waitFor(() => expect(screen.getByTestId("tasting-save")).not.toBeDisabled());
+    // Never fired while blocked.
+    expect(addSpy).not.toHaveBeenCalled();
+  });
+
+  it("#568 round 4 (PRRT_kwDOSzMG_c6RflF1): RoastRating's Edit stays blocked for the WHOLE partial-failure window, not just while a rating write is literally in flight — an external edit can no longer land unobserved and be silently overwritten by RoastTastings' next retry", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    vi.spyOn(api, "rate").mockRejectedValue(new Error("rating endpoint down"));
+    renderView();
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    // A tasting save's rating side fails and SETTLES (not pending — genuinely
+    // failed) — the partial-failure window is now open.
+    fireEvent.click(screen.getByTestId("tasting-star-2"));
+    fireEvent.click(screen.getByTestId("tasting-save"));
+    await waitFor(() => expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument());
+
+    // Nothing is PENDING right now (both mutations have settled), so the
+    // narrower round-1/round-2 in-flight guard alone would NOT block this —
+    // round 4's shared partial-failure lock must.
+    expect(screen.getByTestId("rating-edit")).toBeDisabled();
+    expect(screen.getByTestId("rating-edit-blocked")).toBeInTheDocument();
+
+    // Resolving via RoastTastings' own retry (not Start over) reopens Edit
+    // once the cycle fully succeeds.
+    vi.spyOn(api, "rate").mockResolvedValue({ id: FIXTURE_DETAIL.id } as Awaited<ReturnType<typeof api.rate>>);
+    fireEvent.click(screen.getByTestId("tasting-save"));
+    await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
+    expect(screen.getByTestId("rating-edit")).not.toBeDisabled();
+  });
+
+  it("#568 round 5 (PRRT_kwDOSzMG_c6RgNHJ): a concurrent widget's BROAD (non-exact) invalidation of roastKeys.detail/history — exactly what RoastedWeight.tsx and ChargeWeight.tsx do routinely — does NOT clear an active partial-failure lock; RoastRating's Edit stays disabled across it", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    vi.spyOn(api, "rate").mockRejectedValue(new Error("rating endpoint down"));
+
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={client}>
+        <DetailView detail={FIXTURE_DETAIL} telemetry={FIXTURE_TELEMETRY} timeline={FIXTURE_TIMELINE} />
+      </QueryClientProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("tasting-star-2"));
+    fireEvent.click(screen.getByTestId("tasting-save"));
+    await waitFor(() => expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument());
+    expect(screen.getByTestId("rating-edit")).toBeDisabled();
+
+    // Simulate a concurrent RoastedWeight/ChargeWeight save landing on the
+    // SAME detail page — both invalidate these two keys WITHOUT `exact`,
+    // which is precisely the co-action that clobbered the round-5-broken
+    // lock implementation (it lived under the same roasts/{runId} prefix, so
+    // the invalidation's own refetch resolved to `false` and cleared it —
+    // asynchronously, hence `waitFor` below rather than an immediate assert).
+    await client.invalidateQueries({ queryKey: roastKeys.detail(FIXTURE_DETAIL.id) });
+    await client.invalidateQueries({ queryKey: roastKeys.history });
+
+    // The lock must survive — it has no query key at all now, so neither
+    // invalidation (nor the refetch either triggers) can touch it.
+    await waitFor(() => expect(screen.getByTestId("rating-edit")).toBeDisabled());
+    expect(screen.getByTestId("rating-edit-blocked")).toBeInTheDocument();
+    expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument();
+  });
+
+  it("#568 round 6 (PRRT_kwDOSzMG_c6Rg5YO): RoastRating's Edit stays blocked in the TRANSIENT window where the rating side has already rejected but the tasting side is still pending — not just after both have settled", async () => {
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    // The tasting mutation stalls, mid-flight — never settles until we
+    // resolve it explicitly.
+    let resolveTasting: (() => void) | undefined;
+    vi.spyOn(api, "addTasting").mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveTasting = () => resolve({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+        }),
+    );
+    // The rating mutation rejects FAST — settled well before the tasting
+    // mutation above even gets a chance to.
+    vi.spyOn(api, "rate").mockRejectedValue(new Error("rating endpoint down"));
+    renderView();
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    fireEvent.click(screen.getByTestId("tasting-star-2"));
+    fireEvent.click(screen.getByTestId("tasting-save"));
+
+    // Wait specifically for the RATING side to have settled into an error —
+    // at this instant the tasting mutation is STILL pending (never resolved
+    // above), so `hasUnresolvedPartial` (tastingOnlyFailed/ratingOnlyFailed/
+    // bothFailed — all require BOTH sides to have settled) is false, and the
+    // narrower round-1/round-2 `ratingWriteInFlight` in-flight guard has
+    // ALSO already gone false (the rating write itself is no longer
+    // pending). Only `isFrozen` (which also considers the tasting mutation's
+    // own `isPending`) is true here — this is the exact gap round 6 closes.
+    await waitFor(() => expect(resolveTasting).toBeDefined());
+    // Give the rating mutation's rejection a chance to actually land (it's
+    // mocked to reject immediately, but still asynchronously).
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(screen.getByTestId("tasting-save")).toHaveTextContent(/saving/i);
+    expect(screen.getByTestId("rating-edit")).toBeDisabled();
+    expect(screen.getByTestId("rating-edit-blocked")).toBeInTheDocument();
+
+    // Let the tasting settle too — the cycle reaches its normal
+    // ratingOnlyFailed partial-failure state, still frozen (re-confirms the
+    // round-4 behavior is undisturbed by this round-6 change).
+    resolveTasting?.();
+    await waitFor(() => expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument());
+    expect(screen.getByTestId("rating-edit")).toBeDisabled();
+  });
+
   it("resets the RoastTastings draft when navigating between two different runs (#522 Codex P2): run A's unsaved draft must never leak into a POST against run B", async () => {
     vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
     const { rerender } = render(
@@ -140,6 +322,52 @@ describe("DetailView composition", () => {
     // The draft must be gone — run A's stars/notes must not survive onto run B.
     expect(screen.getByTestId("tasting-star-4")).toHaveAttribute("data-filled", "false");
     expect(screen.getByTestId("tasting-notes")).toHaveValue("");
+  });
+
+  it("#568 round 7 (PRRT_kwDOSzMG_c6RhcxP): opening run A's editor never leaks into run B's render after navigating away — the key={detail.id} remount (mirroring ChargeWeight/RoastTastings) mounts a FRESH RoastRating instance per run, never reusing A's `editing` state on B", async () => {
+    // Run B shares the IDENTICAL rating/notes as run A — isolates the
+    // cross-instance-reuse hazard from RoastRating's OWN (unrelated)
+    // props-sync effect (which resets `editing` on a genuine rating/notes
+    // CHANGE regardless of the key fix, and would mask this test either way
+    // if B's values differed from A's).
+    const detailB = { ...FIXTURE_DETAIL_LONG, rating: FIXTURE_DETAIL.rating, notes: FIXTURE_DETAIL.notes };
+
+    // Run A's rating save stalls — kept pending for the duration of this
+    // test; its own resolution isn't what this test is probing (round 4/5/6
+    // cover the in-flight/partial-failure lock windows already).
+    vi.spyOn(api, "rate").mockImplementation(() => new Promise(() => undefined));
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: FIXTURE_DETAIL.id, tastings: [] });
+    const { rerender } = render(
+      <DetailView detail={FIXTURE_DETAIL} telemetry={FIXTURE_TELEMETRY} timeline={FIXTURE_TIMELINE} />,
+      { wrapper: wrapper() },
+    );
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    // Open run A's editor and pick a star (an in-progress DRAFT, not yet
+    // saved) — the state a stale reused instance would otherwise carry over.
+    fireEvent.click(screen.getByTestId("rating-edit"));
+    fireEvent.click(screen.getByTestId("star-3"));
+    expect(screen.getByTestId("star-3")).toHaveAttribute("data-filled", "true");
+
+    // Navigate to run B (the same re-render DetailPage performs on a route
+    // param change) WITHOUT ever closing A's editor first — the exact
+    // interleaving the round-lead described: "navigate to run B → open B's
+    // editor before A resolves." WITHOUT the key fix, React reuses the same
+    // RoastRating instance (detailB's rating/notes are unchanged from A's,
+    // so nothing else forces a reset), landing on run B's render STILL
+    // showing A's in-progress editing session — an operator would see A's
+    // own draft (star-3 selected) presented as if it were B's rating.
+    vi.spyOn(api, "tastings").mockResolvedValue({ run_id: detailB.id, tastings: [] });
+    rerender(
+      <DetailView detail={detailB} telemetry={FIXTURE_TELEMETRY_LONG} timeline={FIXTURE_TIMELINE_LONG} />,
+    );
+    await waitFor(() => expect(screen.getByTestId("roast-tastings")).toBeInTheDocument());
+
+    // Run B's OWN (fresh) instance must start read-only, exactly like every
+    // other newly-viewed completed run — never inheriting run A's
+    // still-open, still-mid-draft editing session.
+    expect(screen.getByTestId("rating-headline")).toBeInTheDocument();
+    expect(screen.queryByTestId("star-3")).not.toBeInTheDocument();
   });
 
   it("resets the ChargeWeight correction draft when navigating between two different runs (#520 round-2 P4): run A's unsaved draft must never leak into a POST against run B", () => {
