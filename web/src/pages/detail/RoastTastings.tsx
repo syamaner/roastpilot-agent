@@ -16,7 +16,7 @@
  * invite an accidental overwrite-looking edit of history).
  *
  * #533 (Codex P3 from #527 round 4): every input is disabled while a save is
- * in flight (`mutation.isPending`) — not just the save button. Previously
+ * in flight (either mutation pending) — not just the save button. Previously
  * only the button was disabled, so an operator who kept typing during a slow
  * save had that draft silently wiped when `onSuccess` unconditionally called
  * `resetForm()`. This form has no persisted value to re-sync a draft FROM
@@ -27,6 +27,14 @@
  * is therefore the simplest honest fix available here: the operator sees
  * the "Saving…" state and cannot lose a draft to a race they have no way
  * to observe.
+ *
+ * #566: this is now the PRIMARY entry point for a rating too — saving a
+ * tasting fires both `useAddTasting` (the tasting corpus) and `useSaveRating`
+ * (the headline rating, `RoastRating`) from one gesture, seeded with the
+ * tasting's own stars. Both mutations run concurrently; a partial failure
+ * (one succeeds, one doesn't) is surfaced honestly rather than reported as a
+ * blanket "Saved." — the form only resets and shows "Saved." once BOTH
+ * succeed, and each failure names which record didn't save.
  */
 
 import { useState } from "react";
@@ -40,6 +48,7 @@ import type {
   TastingDefect,
   TastingEntryRequest,
 } from "@/lib/types";
+import { useSaveRating } from "./useSaveRating";
 
 type Stars = TastingEntryRequest["stars"];
 const STAR_VALUES: Stars[] = [1, 2, 3, 4, 5];
@@ -65,7 +74,8 @@ export interface RoastTastingsProps {
 
 export function RoastTastings({ runId, className }: RoastTastingsProps): React.JSX.Element {
   const tastings = useTastings(runId);
-  const mutation = useAddTasting(runId);
+  const tastingMutation = useAddTasting(runId);
+  const ratingMutation = useSaveRating(runId);
 
   const [stars, setStars] = useState<Stars | null>(null);
   const [notes, setNotes] = useState("");
@@ -74,6 +84,17 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
   const [grindNote, setGrindNote] = useState("");
   const [attributes, setAttributes] = useState<TastingAttribute[]>([]);
   const [defects, setDefects] = useState<TastingDefect[]>([]);
+
+  const isPending = tastingMutation.isPending || ratingMutation.isPending;
+  // Both mutations must succeed (this save cycle, i.e. after the most recent
+  // click — see the reset below) before the form reports "Saved." and resets.
+  const isSaved =
+    tastingMutation.isSuccess && ratingMutation.isSuccess && !isPending;
+  // Which record(s) failed on the LAST attempt — surfaced honestly rather
+  // than a blanket "Saved."; a partial failure never gets reported as full
+  // success.
+  const tastingFailed = tastingMutation.isError;
+  const ratingFailed = ratingMutation.isError;
 
   const toggle = <T,>(list: T[], value: T, setList: (next: T[]) => void) => {
     setList(list.includes(value) ? list.filter((v) => v !== value) : [...list, value]);
@@ -91,10 +112,18 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
 
   const onSave = () => {
     if (stars === null) return;
-    mutation.mutate(
+    const trimmedNotes = notes.trim() === "" ? null : notes.trim();
+
+    // Reset any previous attempt's error/success state before firing this
+    // one, so a retry after a partial failure doesn't read as stale success
+    // on the side that already landed.
+    tastingMutation.reset();
+    ratingMutation.reset();
+
+    tastingMutation.mutate(
       {
         stars,
-        notes: notes.trim() === "" ? null : notes.trim(),
+        notes: trimmedNotes,
         tasted_at_utc: tastedAt === "" ? null : new Date(tastedAt).toISOString(),
         brew_method: brewMethod === "" ? null : brewMethod,
         grind_note: grindNote.trim() === "" ? null : grindNote.trim(),
@@ -103,6 +132,11 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
       },
       { onSuccess: resetForm },
     );
+    // The headline rating rides the tasting's own stars/notes — one gesture,
+    // both records (#566). Fired independently of the tasting mutation
+    // above: either can succeed or fail on its own, and a fetch failure on
+    // one must never block or silently swallow the other.
+    ratingMutation.mutate({ stars, notes: trimmedNotes });
   };
 
   return (
@@ -135,7 +169,7 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
               data-testid={`tasting-star-${value}`}
               data-filled={filled ? "true" : "false"}
               onClick={() => setStars(value)}
-              disabled={mutation.isPending}
+              disabled={isPending}
               className={cn(
                 "text-2xl leading-none transition-colors disabled:cursor-not-allowed disabled:opacity-50",
                 filled ? "text-roast-caution" : "text-muted-foreground/40 hover:text-muted-foreground",
@@ -153,7 +187,7 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
         onChange={(e) => setNotes(e.target.value)}
         placeholder="Tasting notes"
         rows={2}
-        disabled={mutation.isPending}
+        disabled={isPending}
         className="w-full resize-y rounded-md border border-border bg-input px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
       />
 
@@ -165,7 +199,7 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
             data-testid="tasting-tasted-at"
             value={tastedAt}
             onChange={(e) => setTastedAt(e.target.value)}
-            disabled={mutation.isPending}
+            disabled={isPending}
             className="rounded-md border border-border bg-input px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
           />
         </label>
@@ -175,7 +209,7 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
             data-testid="tasting-brew-method"
             value={brewMethod}
             onChange={(e) => setBrewMethod(e.target.value as BrewMethod | "")}
-            disabled={mutation.isPending}
+            disabled={isPending}
             className="rounded-md border border-border bg-input px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
           >
             <option value="">—</option>
@@ -192,7 +226,7 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
           value={grindNote}
           onChange={(e) => setGrindNote(e.target.value)}
           placeholder="Grind note"
-          disabled={mutation.isPending}
+          disabled={isPending}
           className="min-w-0 flex-1 rounded-md border border-border bg-input px-2 py-1 text-sm text-foreground placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
         />
       </div>
@@ -203,7 +237,7 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
         values={ATTRIBUTES}
         selected={attributes}
         onToggle={(value) => toggle(attributes, value, setAttributes)}
-        disabled={mutation.isPending}
+        disabled={isPending}
       />
       <TagRow
         label="Defects"
@@ -211,7 +245,7 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
         values={DEFECTS}
         selected={defects}
         onToggle={(value) => toggle(defects, value, setDefects)}
-        disabled={mutation.isPending}
+        disabled={isPending}
       />
 
       <div className="flex items-center gap-3">
@@ -219,17 +253,31 @@ export function RoastTastings({ runId, className }: RoastTastingsProps): React.J
           type="button"
           data-testid="tasting-save"
           onClick={onSave}
-          disabled={stars === null || mutation.isPending}
+          disabled={stars === null || isPending}
           className="inline-flex items-center rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {mutation.isPending ? "Saving…" : "Add tasting"}
+          {isPending ? "Saving…" : "Add tasting"}
         </button>
-        {mutation.isError && (
+        {/* #566: a partial failure (one of the two records didn't save) is
+            surfaced honestly, never folded into a blanket "Saved." — each
+            span names which record failed. */}
+        {tastingFailed && ratingFailed && (
           <span data-testid="tasting-error" className="text-xs text-roast-fault">
             Save failed — try again.
           </span>
         )}
-        {mutation.isSuccess && !mutation.isPending && (
+        {tastingFailed && !ratingFailed && (
+          <span data-testid="tasting-error" className="text-xs text-roast-fault">
+            Tasting save failed — try again. (Rating saved.)
+          </span>
+        )}
+        {!tastingFailed && ratingFailed && (
+          <span data-testid="rating-partial-error" className="text-xs text-roast-fault">
+            Tasting saved, but the rating didn't update — use "Edit" on Your
+            rating above to retry.
+          </span>
+        )}
+        {isSaved && (
           <span data-testid="tasting-saved" className="text-xs text-roast-nominal">
             Saved.
           </span>

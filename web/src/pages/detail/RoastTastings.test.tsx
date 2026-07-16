@@ -4,7 +4,7 @@ import type { ReactNode } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "@/lib/api";
-import type { TastingList } from "@/lib/types";
+import type { RoastDetail, TastingList } from "@/lib/types";
 import { RoastTastings } from "./RoastTastings";
 
 function wrapper() {
@@ -16,6 +16,11 @@ function wrapper() {
 
 function emptyList(runId = "r1"): TastingList {
   return { run_id: runId, tastings: [] };
+}
+
+/** api.rate resolves to the full RoastDetail; only `id` matters to callers here. */
+function fakeRatedDetail(runId = "r1"): RoastDetail {
+  return { id: runId } as RoastDetail;
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -94,6 +99,7 @@ describe("RoastTastings", () => {
         },
       ],
     });
+    vi.spyOn(api, "rate").mockResolvedValue(fakeRatedDetail());
     render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
     await waitFor(() => expect(api.tastings).toHaveBeenCalled());
 
@@ -119,6 +125,7 @@ describe("RoastTastings", () => {
     const addSpy = vi
       .spyOn(api, "addTasting")
       .mockResolvedValue({ run_id: "r1", tastings: [] });
+    vi.spyOn(api, "rate").mockResolvedValue(fakeRatedDetail());
     render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
     await waitFor(() => expect(api.tastings).toHaveBeenCalled());
 
@@ -152,6 +159,7 @@ describe("RoastTastings", () => {
   it("resets the form after a successful save", async () => {
     vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
     vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: "r1", tastings: [] });
+    vi.spyOn(api, "rate").mockResolvedValue(fakeRatedDetail());
     render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
     await waitFor(() => expect(api.tastings).toHaveBeenCalled());
 
@@ -174,6 +182,7 @@ describe("RoastTastings", () => {
           resolveSave = () => resolve({ run_id: "r1", tastings: [] });
         }),
     );
+    vi.spyOn(api, "rate").mockResolvedValue(fakeRatedDetail());
     render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
     await waitFor(() => expect(api.tastings).toHaveBeenCalled());
 
@@ -205,14 +214,106 @@ describe("RoastTastings", () => {
     expect(screen.getByTestId("tasting-save")).toBeDisabled();
   });
 
-  it("surfaces a save error", async () => {
+  it("surfaces a save error when BOTH records fail to save", async () => {
     vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
     vi.spyOn(api, "addTasting").mockRejectedValue(new Error("nope"));
+    vi.spyOn(api, "rate").mockRejectedValue(new Error("nope"));
     render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
     await waitFor(() => expect(api.tastings).toHaveBeenCalled());
 
     fireEvent.click(screen.getByTestId("tasting-star-1"));
     fireEvent.click(screen.getByTestId("tasting-save"));
     await waitFor(() => expect(screen.getByTestId("tasting-error")).toBeInTheDocument());
+    expect(screen.getByTestId("tasting-error")).toHaveTextContent("Save failed");
+  });
+
+  describe("#566: one gesture updates both the tasting corpus and the headline rating", () => {
+    it("fires both api.addTasting and api.rate from a single save, seeded with the tasting's own stars/notes", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+      const addSpy = vi
+        .spyOn(api, "addTasting")
+        .mockResolvedValue({ run_id: "r1", tastings: [] });
+      const rateSpy = vi.spyOn(api, "rate").mockResolvedValue(fakeRatedDetail());
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+      await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+      fireEvent.click(screen.getByTestId("tasting-star-4"));
+      fireEvent.change(screen.getByTestId("tasting-notes"), { target: { value: "great cup" } });
+      fireEvent.click(screen.getByTestId("tasting-save"));
+
+      await waitFor(() =>
+        expect(addSpy).toHaveBeenCalledWith(
+          "r1",
+          expect.objectContaining({ stars: 4, notes: "great cup" }),
+        ),
+      );
+      await waitFor(() =>
+        expect(rateSpy).toHaveBeenCalledWith("r1", { stars: 4, notes: "great cup" }),
+      );
+      await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
+    });
+
+    it("surfaces a partial failure honestly when the tasting saves but the rating update fails — never a false 'Saved.'", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+      vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: "r1", tastings: [] });
+      vi.spyOn(api, "rate").mockRejectedValue(new Error("rating endpoint down"));
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+      await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+      fireEvent.click(screen.getByTestId("tasting-star-5"));
+      fireEvent.click(screen.getByTestId("tasting-save"));
+
+      await waitFor(() =>
+        expect(screen.getByTestId("rating-partial-error")).toBeInTheDocument(),
+      );
+      // Points the operator at the real recovery path: RoastRating's own
+      // "Edit" affordance (the tasting form's own draft is gone — the
+      // tasting itself is append-only and already saved, so it must not be
+      // resubmitted; a direct rating retry belongs on RoastRating).
+      expect(screen.getByTestId("rating-partial-error")).toHaveTextContent("Edit");
+      expect(screen.queryByTestId("tasting-saved")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("tasting-error")).not.toBeInTheDocument();
+    });
+
+    it("surfaces a partial failure honestly when the rating saves but the tasting fails — never a false 'Saved.'", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+      vi.spyOn(api, "addTasting").mockRejectedValue(new Error("tastings endpoint down"));
+      vi.spyOn(api, "rate").mockResolvedValue(fakeRatedDetail());
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+      await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+      fireEvent.click(screen.getByTestId("tasting-star-2"));
+      fireEvent.click(screen.getByTestId("tasting-save"));
+
+      await waitFor(() => expect(screen.getByTestId("tasting-error")).toBeInTheDocument());
+      expect(screen.getByTestId("tasting-error")).toHaveTextContent("Rating saved");
+      expect(screen.queryByTestId("tasting-saved")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("rating-partial-error")).not.toBeInTheDocument();
+    });
+
+    it("is disabled while EITHER mutation is pending, not just the tasting save", async () => {
+      vi.spyOn(api, "tastings").mockResolvedValue(emptyList());
+      vi.spyOn(api, "addTasting").mockResolvedValue({ run_id: "r1", tastings: [] });
+      let resolveRate: (() => void) | undefined;
+      vi.spyOn(api, "rate").mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolveRate = () => resolve(fakeRatedDetail());
+          }),
+      );
+      render(<RoastTastings runId="r1" />, { wrapper: wrapper() });
+      await waitFor(() => expect(api.tastings).toHaveBeenCalled());
+
+      fireEvent.click(screen.getByTestId("tasting-star-3"));
+      fireEvent.click(screen.getByTestId("tasting-save"));
+
+      // The tasting write resolves quickly; the rating write is still in
+      // flight — the form must stay locked (and unsaved) until BOTH settle.
+      await waitFor(() => expect(screen.getByTestId("tasting-save")).toHaveTextContent(/saving/i));
+      expect(screen.queryByTestId("tasting-saved")).not.toBeInTheDocument();
+
+      resolveRate?.();
+      await waitFor(() => expect(screen.getByTestId("tasting-saved")).toBeInTheDocument());
+    });
   });
 });
