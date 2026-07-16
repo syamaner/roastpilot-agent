@@ -29,7 +29,7 @@ from roastpilot_agent.config import (
     PreFirstCrackLevers,
     SafetyLimits,
 )
-from roastpilot_agent.control_policy import PhaseControlLimits
+from roastpilot_agent.control_policy import PhaseControlLimits, TrimSignal
 from roastpilot_agent.controller import (
     TERMINAL_LATCH_PHASES,
     TRANSITION_TABLE,
@@ -8782,3 +8782,73 @@ async def test_clamp_write_itself_failing_leaves_recovery_state_untouched() -> N
     if harness.controller.snapshot().current_heat <= 60:
         assert settled_state.recovery_active is False
         assert settled_state.recovery_ticks_since_exit is None
+
+
+@pytest.mark.asyncio
+async def test_clamp_box_stays_valid_under_a_hypothetically_narrowed_development_ceiling() -> None:
+    """safety-561 (Opus) Low-1 hardening: the clamp box's own
+    ``heat_ceiling_percent`` is not independently pinned — DEVELOPMENT
+    resolves it to 100 TODAY, so ``base <= ceiling`` always holds in
+    practice, but nothing in ``_clamp_heat_after_failed_drop`` PROVES that
+    for any future config that might narrow DEVELOPMENT's own heat ceiling.
+    This test forces exactly that hypothetical (patching
+    ``_control_limits`` to return a box whose ``heat_ceiling_percent`` sits
+    BELOW the D88 base the clamp needs to write) and asserts the clamp
+    still constructs a VALID box (no ``PhaseControlLimits`` validator
+    ``ValueError`` escaping ``tick()``) and still lands the corrective
+    write — proving the ``max(base, resolved_ceiling)`` widening genuinely
+    holds regardless of what DEVELOPMENT's own box resolves to, not just
+    for today's fixed 100."""
+    config = _recovery_config(
+        pre_fc_heat_target_percent=60,
+        control_interval_seconds=5.0,
+        ceiling_guard_temp_c=196.0,
+        recovery_trigger_margin_c_per_min=1.0,
+        recovery_confirm_ticks=1,
+        recovery_headroom_percentage_points=15,
+    )
+    harness = make_harness(config=config, executor=_AlwaysFailingDropExecutor())
+    await _charge_through_fc_at_heat(
+        harness, expected_pre_fc_heat=60, fc_bean_temp_c=183.0, fc_ror_c_per_min=7.0
+    )
+    await _confirm_recovery_raise(harness, entry_heat=60)
+    raised_heat = harness.controller.snapshot().current_heat
+    assert raised_heat > 60  # the base
+
+    # Patch _control_limits (bound method, this instance only) so DEVELOPMENT
+    # resolves a heat ceiling of 50 -- BELOW the base (60) the clamp needs to
+    # write. A real (unwidened) `model_copy(update={"heat_floor_percent":
+    # 60, ...})` against this box would leave heat_ceiling_percent=50,
+    # constructing an invalid (floor > ceiling) PhaseControlLimits and
+    # raising uncaught inside tick().
+    real_control_limits = harness.controller._control_limits  # pyright: ignore[reportPrivateUsage]
+    narrowed_box = real_control_limits().model_copy(update={"heat_ceiling_percent": 50})
+
+    def _narrowed_control_limits(*, trim_signal: TrimSignal | None = None) -> PhaseControlLimits:
+        return narrowed_box
+
+    harness.controller._control_limits = _narrowed_control_limits  # pyright: ignore[reportAttributeAccessIssue, reportPrivateUsage]
+    try:
+        harness.clock.advance(5.0)
+        harness.reader.readings = [reading(bean=196.0, bean_ror_c_per_min=8.0)]
+        await harness.controller.tick()  # must not raise
+    finally:
+        harness.controller._control_limits = real_control_limits  # pyright: ignore[reportPrivateUsage]
+
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in failed
+    # No PhaseControlLimits ValueError escaped tick() (the assertions above
+    # already prove this implicitly -- an uncaught raise would have failed
+    # the whole test before reaching here), and heat landed at or below the
+    # base despite the artificially narrowed ceiling -- never above it, and
+    # never left at the raised value. The narrowed box's own ceiling (50)
+    # legitimately pulls the LOOP's own write below the base first (heat
+    # <= 50 here); the safety property under test is that this constructs a
+    # VALID box and never re-raises heat, not the exact settled value.
+    assert harness.controller.snapshot().current_heat <= 60
+    assert harness.controller.snapshot().current_heat < raised_heat

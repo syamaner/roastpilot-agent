@@ -2194,8 +2194,25 @@ class RoastController:
             # a "stop trying to elevate" signal for the next tick).
             self._force_recovery_exit(state)
             return
-        box = self._control_limits().model_copy(
-            update={"heat_floor_percent": base, "heat_target_percent": base}
+        # safety-561 (Opus, Low-1): the base box's `heat_ceiling_percent` is
+        # NOT independently pinned here — DEVELOPMENT resolves it to 100
+        # today, so `base <= ceiling` always holds, but a future config that
+        # narrowed DEVELOPMENT's heat_ceiling below `base` would raise
+        # `PhaseControlLimits`'s floor > ceiling validator UNCAUGHT inside
+        # `tick()`. This clamp only ever LOWERS heat to `base` (never raises
+        # it — the idempotence check above already ensures `base <
+        # self._current_heat`), so the box's ceiling must never be allowed to
+        # constrain that target: widen it defensively to
+        # `max(base, resolved_ceiling)` so the floor/ceiling relationship the
+        # write depends on can never invert, regardless of any future
+        # DEVELOPMENT config.
+        resolved_box = self._control_limits()
+        box = resolved_box.model_copy(
+            update={
+                "heat_floor_percent": base,
+                "heat_ceiling_percent": max(base, resolved_box.heat_ceiling_percent),
+                "heat_target_percent": base,
+            }
         )
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.SET_HEAT, phase=self._phase
