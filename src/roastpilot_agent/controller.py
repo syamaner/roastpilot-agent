@@ -763,6 +763,28 @@ class RoastController:
         # the pre-B2 fallback behaviour (see ``_run_advisory``'s
         # ``post_fc_loop_active`` gate).
         self._post_fc_engaged: bool = False
+        # D96 slice 1.5 (#561), Codex round-1 finding #3: latched TRUE the
+        # moment ANY drop-failure clamp fires (see
+        # ``_clamp_heat_after_failed_drop``), cleared unconditionally on
+        # every ``transition_to`` (the identical per-DEVELOPMENT-dwell
+        # discipline ``_post_fc_engaged``/``_last_post_fc_output`` already
+        # follow) — never carried into a later dwell. While set, the post-FC
+        # loop's own raise-suppression (``_apply_deterministic_post_fc_
+        # levers``) treats EVERY tick as if it were drop-eligible for the
+        # purpose of suppressing a raise, regardless of this tick's OWN
+        # eligibility and regardless of ``heat_authority_state`` (see that
+        # method's own comment for why: forcing the recovery state machine
+        # fully back to ``HOLDING`` on a successful clamp — the #412
+        # told==enforced fix for the ceiling/reality gap — also clears the
+        # `heat_authority_state is not HOLDING` signal the pre-existing
+        # same-tick suppression depends on, and a persistent RoR shortfall
+        # can re-confirm entry the very next tick; without this latch that
+        # re-confirmation would re-raise heat while the SAME drop keeps
+        # failing, on ticks the pre-existing mirrors do not even cover — the
+        # advisor's own ``should_drop`` path has no drop-eligibility mirror
+        # here at all, by design, since pre-suppressing on advisor-drop
+        # legality would neuter recovery through most of development).
+        self._post_fc_raise_suppressed_after_clamp: bool = False
         # #498 (D89 Tier 1, safety-reviewer BLOCKER-1 fix): the advisor's
         # safety-evaluated fan TARGET in loop mode — a held desire, never an
         # actuated value. The advisor consult and the taper's own write both
@@ -1151,6 +1173,16 @@ class RoastController:
         # setpoint/heat-authority-state into a context built for a different
         # DEVELOPMENT dwell or an operator-resume where the loop stays inert.
         self._last_post_fc_output = None
+        # D96 slice 1.5 (#561), Codex round-1 finding #3: the post-clamp
+        # raise-suppression latch is likewise per-DEVELOPMENT-dwell state —
+        # clear it unconditionally on every transition (identical discipline)
+        # so a fresh dwell (a new FC edge, or an operator resume) never
+        # inherits a stale "keep suppressing" latch from an earlier one. A
+        # SUCCESSFUL drop naturally clears it this same way (transition_to
+        # COOLING), which is exactly the intended "latch persists until the
+        # drop that keeps failing finally succeeds, or the dwell ends"
+        # behaviour.
+        self._post_fc_raise_suppressed_after_clamp = False
         if previous in TERMINAL_LATCH_PHASES and target not in TERMINAL_LATCH_PHASES:
             # Leaving a terminal HOLD phase is an EXPLICIT operator action
             # (acknowledge → idle, resume, start cooling): the operator now owns
@@ -1879,10 +1911,32 @@ class RoastController:
             output.heat_authority_state is not PostFcHeatAuthorityState.HOLDING
         )
         tentative_write_would_raise_heat = output.heat_percent > self._current_heat
-        if (
-            recovery_ceiling_elevated
-            and tentative_write_would_raise_heat
-            and (guard_eligible_this_tick or deterministic_drop_eligible_this_tick)
+        # D96 slice 1.5 (#561), Codex round-1 finding #3: the pre-existing
+        # same-tick suppression above (elevated authority AND drop-eligible
+        # THIS tick) is necessary but not sufficient once a clamp has fired
+        # this dwell. `_clamp_heat_after_failed_drop`'s own `_force_recovery_
+        # exit` resets the recovery state machine fully to HOLDING to close
+        # the ceiling/reality gap (#412) — but that SAME reset clears
+        # `recovery_ceiling_elevated`'s own signal, and a persisting RoR
+        # shortfall can re-confirm entry the very next tick (a fresh
+        # `recovery_confirm_ticks` run, which can be as short as 1 tick).
+        # Without an independent latch, that re-confirmed entry would raise
+        # heat again while the SAME drop keeps failing every tick — on ticks
+        # the two eligibility mirrors above do not even cover, since the
+        # ADVISOR's own `should_drop` path (the residual #561 exists for) has
+        # no such mirror here at all (by design: pre-suppressing on advisor-
+        # drop legality would neuter recovery through most of development).
+        # `_post_fc_raise_suppressed_after_clamp` closes this gap: once ANY
+        # clamp has fired this dwell, suppress every raise unconditionally
+        # (no eligibility check needed — the advisor can attempt, and fail, a
+        # drop on literally any tick) until the drop finally succeeds or the
+        # dwell ends (both clear the latch via `transition_to`).
+        if tentative_write_would_raise_heat and (
+            self._post_fc_raise_suppressed_after_clamp
+            or (
+                recovery_ceiling_elevated
+                and (guard_eligible_this_tick or deterministic_drop_eligible_this_tick)
+            )
         ):
             self._post_fc_controller.restore_state(pre_compute_state)
             # D96 slice 2 (#559): the tentative `output` is fully discarded on
@@ -2102,9 +2156,12 @@ class RoastController:
         tick keeps trying, and failing, the same drop).
 
         This method is the ACTIVE companion to that passive glide: called from
-        every drop-failure branch (:meth:`_execute_deterministic_drop`, shared
-        by the ceiling-guard and dev%/temp-anchor paths, and the advisor drop
-        path in :meth:`_run_advisory`), it forces heat back to the D96/D88
+        every drop-failure branch — :meth:`_execute_deterministic_drop`
+        (shared by the ceiling-guard and dev%/temp-anchor paths), the
+        advisor drop path in :meth:`_run_advisory`, and (Codex round-1
+        finding #2) the OPERATOR's own drop in :meth:`operator_drop_beans`,
+        scoped there to the non-``FAULTED`` (``will_transition``) case only
+        — it forces heat back to the D96/D88
         base — :attr:`~roastpilot_agent.post_fc_control.PostFcControllerState.
         heat_engage_percent`, the never-add-heat-beyond-entry anchor D96's
         recovery ceiling itself is built from — THROUGH THE SAME SAFETY PATH
@@ -2178,9 +2235,14 @@ class RoastController:
         bitter ceiling / emergency-drop bound / e-stop live in
         ``SafetyPolicy``'s temperature rules and are untouched here; emergency
         stop remains reachable from every phase; a restart never auto-resumes
-        into this path (this method only ever runs from an already-active
-        DEVELOPMENT dwell, immediately after a drop attempt — never reachable
-        from ``operator_recovery_required``).
+        into this path (never reachable from ``operator_recovery_required``).
+        Reachable from ``ROASTING_PRE_FIRST_CRACK`` too, via the operator's
+        own drop (Codex round-1 finding #2, the pre-FC early-abort case) —
+        harmlessly inert there: ``_last_post_fc_output`` is ``None`` in every
+        pre-FC phase (the loop only ever engages via the true FC edge, and
+        ``transition_to`` clears it on every other transition), so the
+        top-of-function ``output is None`` guard makes this a genuine no-op
+        outside DEVELOPMENT.
         """
         output = self._last_post_fc_output
         if output is None or output.heat_authority_state is PostFcHeatAuthorityState.HOLDING:
@@ -2270,6 +2332,34 @@ class RoastController:
         for the tick-table justification of forcing a full re-arm rather than
         leaving the confirmed active/gliding counters in place.
 
+        **Also arms the persistent raise-suppression latch** (Codex round-1
+        finding #3): resetting the recovery counters here closes the
+        ceiling/reality gap (#412) but ALSO clears
+        ``heat_authority_state``'s own "elevated" signal — which a
+        persisting RoR shortfall can re-confirm as soon as the very next
+        tick. Setting ``self._post_fc_raise_suppressed_after_clamp`` here
+        means :meth:`_apply_deterministic_post_fc_levers` keeps suppressing
+        every raise regardless of that re-confirmation (and regardless of
+        this tick's own drop-eligibility, unlike the pre-existing same-tick
+        mirrors) until a drop finally succeeds or the dwell ends — every
+        call site of this method represents a drop that just failed while
+        heat needed to be at or below the base, which is exactly the
+        condition the latch exists to remember.
+
+        **Also clears the stashed ``_last_post_fc_output``** (Codex round-1
+        finding #1): that field is copied VERBATIM into
+        :meth:`_build_advisor_context` (told == enforced, D96 slice 2) —
+        without this, a tick where a drop fails AFTER the loop already
+        stashed a RECOVERING/GLIDING output earlier the SAME tick would let
+        the advisor (and the decision trace) see stale elevated-authority
+        diagnostics for a state this method just reset to HOLDING beneath
+        it. ``None`` is exactly the correct value here: this method runs
+        AFTER the loop's own step for the tick, so there is no fresh,
+        still-valid ``PostFcControlOutput`` to stash instead — every reader
+        of this field (``_build_advisor_context``'s two ``None``-mapped
+        fields) already treats ``None`` as "the loop's state this tick is
+        not meaningfully known", the correct posture for a forced reset.
+
         Args:
             state: A snapshot taken in the same clamp call this re-arm
                 belongs to (``PostFcRorController.snapshot_state()``), so the
@@ -2290,6 +2380,8 @@ class RoastController:
                 recovery_ticks_since_exit=None,
             )
         )
+        self._post_fc_raise_suppressed_after_clamp = True
+        self._last_post_fc_output = None
 
     async def _maybe_ceiling_guard_drop(self, telemetry: RoastTelemetry | None) -> None:
         """Decoupled ceiling-guard drop: a bitter-line safety anchor, not a
@@ -3804,6 +3896,24 @@ class RoastController:
             applied = await self._executor.drop_beans()
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "drop_beans"})
+            # D96 slice 1.5 (#561), Codex round-1 finding #2: the operator's
+            # own drop is the FOURTH drop path, and a transient MCP failure
+            # here is the identical fail-safe-down condition the other three
+            # exist for — DEVELOPMENT can be left holding D96 recovery-raised
+            # heat with no further deterministic drop guaranteed to retry
+            # promptly (the operator may not immediately retry either).
+            # Scoped to `will_transition` (true only outside FAULTED): from
+            # FAULTED heat is ALREADY off (`_apply_fail_safe`) and SET_HEAT
+            # is not even in that phase's command-phase-matrix row, so the
+            # clamp would be a guaranteed-REJECT no-op there anyway — gating
+            # here keeps that intent explicit at the call site rather than
+            # relying on the clamp's own internal phase gate, and keeps
+            # `_clamp_heat_after_failed_drop`'s existing "DEVELOPMENT is the
+            # only phase either caller invokes this from" pragma honest for
+            # the ORIGINAL three (policy/advisor) callers, which never fire
+            # outside DEVELOPMENT in the first place.
+            if will_transition:
+                await self._clamp_heat_after_failed_drop()
             return
         self._adopt_applied_state(applied)
         self._events.emit(
