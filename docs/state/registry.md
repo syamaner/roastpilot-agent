@@ -102,7 +102,42 @@
 
 ## Active Context
 
-**16 Jul 2026 (latest) — D96 BUILT END-TO-END OVERNIGHT (PRs #558/#560/#562/#564); THE
+**16 Jul 2026 (latest) — #563 TOLD-CEILING SEPARATION SHIPPED (design → Opus safety review
+PASS → C4 bake-off PASS → PR).** The highest-leverage advisor fix the D96 prompt-testing arc
+found: `RoastControlPolicy._bitter_ceiling_temp_c()` capped the told bitter ceiling at
+`min(196, target_drop_temp_c)`, making the told number IDENTICAL to the drop target on every
+seeded profile (195 == 195) — a told≠enforced violation the c7/c8 prompt teaching's
+ceiling-minus-bean-temperature gap arithmetic then read as "no overshoot flexibility, drop
+early" (a correct inference from a false premise). Fix: the told ceiling now reflects what is
+ACTUALLY enforced — `ceiling_guard_temp_c` when the post-FC ceiling guard is enabled (the
+number that fires the real deterministic drop), or the hard `SafetyLimits.bitter_ceiling_temp_c`
+when the guard is disabled (an accepted, documented told≠enforced gap in that configuration —
+only the 230 °C e-stop is truly enforced there, but teaching 230 °C would license far more
+overshoot than the operator's empirical bitter line). Neither branch reads `target_drop_temp_c`
+any more — the target and ceiling are independent numbers. **Process, in full:** design note
+(consumer trace: `safety.py` never reads either temp field, so the only consumer is the advisor
+context; replay is definitionally immune, `advisor=None`/`run_loop=False`) → Opus safety review
+(`safety-563`) PASS with 5 conditions (keyword-only `post_fc_control` param mirroring
+`pre_fc_levers`; a semantically-flipping test rewritten + a guard-value-mismatch test added so
+the wiring is proven, not a numeric coincidence; the told≠enforced gap commented at the code
+site; C4 merge-gate bake-off; no target>ceiling validator — that configuration is pre-existing/
+tested, unaffected by this change) → implementation (found + fixed 5 `test_controller.py`
+D96/#560 recovery-law tests whose `ceiling_guard_temp_c=220.0` isolation fixture became
+inconsistent with the box's own validator once the guard temp started feeding the told ceiling
+directly — a `SafetyLimits` override restored their original intent; also surfaced a fail-closed
+hardening: an inconsistent guard config now raises `ValidationError` at construction instead of
+silently misinforming the model) → the Opus reviewer's own masked-regression check (nearly
+false-alarmed on a pytest worktree-resolution artifact, re-ran with isolation, confirmed the 5
+edited tests still go RED without the real fix) → C4 mini bake-off (~30 calls gpt-4o+c3, ~$0.60,
+roast-12's real trajectory + 4 constructed probe ticks 191-194 °C): **the mechanism-level read
+was the real evidence** — 9/15 (60%) of old-scheme rationales explicitly stated the conflated
+"ceiling equals target" premise (one reasoning off a ceiling the bean had already EXCEEDED) vs
+14/15 (93%) of new-scheme rationales correctly citing the real 196 °C line with genuine
+headroom; raw drop-rate table noisier (the conflation mostly changes the STATED REASON, not
+always the decision, once DTR is in-window near either number); zero regression. Cross-refs:
+issue #563, D96 (the arc that found the root cause), memory `told-vs-enforced-bitter-ceiling`.
+
+**16 Jul 2026 — D96 BUILT END-TO-END OVERNIGHT (PRs #558/#560/#562/#564); THE
 PROMPT-TESTING ARC FOUND THE TOLD-CEILING ROOT CAUSE (#563).** Slice 1 (#560): the
 bounded-bidirectional recovery law, merged DORMANT (`recovery_enabled=False`; validators require
 the ceiling guard AND the master flag) after five review rounds — entry/exit hysteresis with a

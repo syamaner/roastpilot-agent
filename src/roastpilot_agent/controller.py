@@ -4090,19 +4090,23 @@ class RoastController:
         """Build the single-source :class:`RoastControlPolicy` for this tick (#273).
 
         From the safety policy's *own* limits (``self._safety.limits`` — the same
-        config the gate enforces), the frozen active profile, and the configured
-        deterministic pre-FC levers (#222). Constructed fresh and side-effect free
-        each call; shared by :meth:`_policy_limits_for` (box resolution) and
-        :meth:`_trim_signal` (the #327 trim-window latch arming) so neither keeps a
-        second copy of the limit source.
+        config the gate enforces), the frozen active profile, the configured
+        deterministic pre-FC levers (#222), and the configured post-FC control
+        (#563 — decides the told bitter ceiling; see
+        :meth:`RoastControlPolicy._bitter_ceiling_temp_c`). Constructed fresh and
+        side-effect free each call; shared by :meth:`_policy_limits_for` (box
+        resolution) and :meth:`_trim_signal` (the #327 trim-window latch arming)
+        so neither keeps a second copy of the limit source.
 
         Returns:
-            A :class:`RoastControlPolicy` over the current safety limits + profile.
+            A :class:`RoastControlPolicy` over the current safety limits, profile,
+            and post-FC control config.
         """
         return RoastControlPolicy(
             self._safety.limits,
             self._profile,
             pre_fc_levers=self._config.pre_first_crack_levers,
+            post_fc_control=self._config.post_first_crack_control,
         )
 
     def _trim_signal(self, telemetry: RoastTelemetry | None) -> TrimSignal | None:
