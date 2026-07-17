@@ -2585,3 +2585,1027 @@ async def test_count_completed_runs_for_origin_counts_finalised_faulted(
         assert await tmp_store.count_completed_runs_for_origin(slug) == 1
     finally:
         await tmp_store.close()
+
+
+# --- #567 Slice A: reference-curve retrieval + representation ---
+
+
+def _reference_profile(origin: str = "Guatemala", *, weight: float = 250.0) -> RoastProfile:
+    return RoastProfile(
+        name=f"{origin} reference test",
+        bean_origin=origin,
+        bean_weight_grams=weight,
+        initial_heat_percent=70,
+        initial_fan_percent=40,
+        target_drop_temp_c=205.0,
+        target_development_percent=20.0,
+    )
+
+
+async def _seed_completed_run(
+    store: RoastStore,
+    run_id: str,
+    *,
+    profile: RoastProfile,
+    rating: Literal[1, 2, 3, 4, 5] | None,
+    corrected_charge_grams: float | None = None,
+) -> None:
+    """Create + complete a run, optionally rating it and correcting its charge."""
+    await store.create_run(
+        run_id=run_id, profile=profile, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    await store.complete_run(run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    if rating is not None:
+        await store.set_operator_rating(run_id, rating=rating)
+    if corrected_charge_grams is not None:
+        await store.set_corrected_charge(run_id, corrected_charge_grams=corrected_charge_grams)
+
+
+async def _record_row(
+    store: RoastStore,
+    run_id: str,
+    tick: int,
+    *,
+    phase: RoastPhase,
+    charge_elapsed: float | None,
+    bean_temp: float | None,
+    dev_pct: float | None = None,
+) -> None:
+    """Insert one telemetry row via the real write path (interval_seconds=0.0
+    so every call writes, regardless of the increasing ``elapsed_seconds``)."""
+    await store.record_telemetry(
+        run_id=run_id,
+        tick=tick,
+        agent_phase=phase,
+        elapsed_seconds=float(tick),
+        interval_seconds=0.0,
+        telemetry=None
+        if bean_temp is None
+        else RoastTelemetry(
+            bean_temp_c=bean_temp, env_temp_c=bean_temp + 15.0, bean_ror_c_per_min=6.0
+        ),
+        development_percent=dev_pct,
+        charge_elapsed_seconds=charge_elapsed,
+    )
+
+
+async def _seed_unbuildable_run(
+    store: RoastStore, run_id: str, *, profile: RoastProfile, rating: Literal[1, 2, 3, 4, 5]
+) -> None:
+    """Create + complete + rate a run with telemetry but NO ``development``-
+    phase rows — passes retrieval's rating/slug/weight filters (it is a
+    legitimate ranked candidate) but fails :meth:`RoastStore._build_reference_roast`
+    (no usable landmarks), pinning the Fix B (PR #574 review) fallthrough."""
+    await store.create_run(
+        run_id=run_id, profile=profile, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    await _record_row(
+        store,
+        run_id,
+        1,
+        phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        charge_elapsed=100.0,
+        bean_temp=150.0,
+    )
+    await store.complete_run(run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    await store.set_operator_rating(run_id, rating=rating)
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_picks_the_highest_rating(tmp_store: RoastStore) -> None:
+    """#567 §1.2: best-rated wins among qualifying candidates."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await _seed_completed_run(tmp_store, "low", profile=profile, rating=3)
+        await _seed_completed_run(tmp_store, "high", profile=profile, rating=5)
+        assert await tmp_store.find_reference_run(slug, 250.0) == "high"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_ties_break_on_recency(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#567 §1.2: equal ratings tie-break on the most recent ``completed_at_utc``.
+
+    ``completed_at_utc`` is immutable once a run is finalized (the store's own
+    completion trigger), so the two runs are given distinct completion instants
+    by controlling ``_utc_now()`` at seed time rather than backdating after the
+    fact."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+
+        monkeypatch.setattr(store_module, "_utc_now", lambda: "2026-01-01T00:00:00+00:00")
+        await _seed_completed_run(tmp_store, "older", profile=profile, rating=4)
+
+        monkeypatch.setattr(store_module, "_utc_now", lambda: "2026-06-01T00:00:00+00:00")
+        await _seed_completed_run(tmp_store, "newer", profile=profile, rating=4)
+
+        assert await tmp_store.find_reference_run(slug, 250.0) == "newer"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_excludes_below_min_rating(tmp_store: RoastStore) -> None:
+    """#567 §1.2: a 2-star reference is worse than none — excluded by the
+    default ``min_rating=3`` floor."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await _seed_completed_run(tmp_store, "two-star", profile=profile, rating=2)
+        assert await tmp_store.find_reference_run(slug, 250.0) is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_excludes_unrated_runs(tmp_store: RoastStore) -> None:
+    """A completed but never-rated run is today's empty-behavior baseline —
+    it must stay excluded, not silently qualify."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await _seed_completed_run(tmp_store, "unrated", profile=profile, rating=None)
+        assert await tmp_store.find_reference_run(slug, 250.0) is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_excludes_a_different_origin_slug(tmp_store: RoastStore) -> None:
+    """#567 §1.1: retrieval is keyed on the recording-origin slug — a
+    highly-rated run of a DIFFERENT bean never qualifies."""
+    await tmp_store.initialize()
+    try:
+        this_profile = _reference_profile("Guatemala")
+        other_profile = _reference_profile("Ethiopia")
+        this_slug = recording_origin_slug(this_profile)
+        assert this_slug is not None
+        await _seed_completed_run(tmp_store, "other-bean", profile=other_profile, rating=5)
+        assert await tmp_store.find_reference_run(this_slug, 250.0) is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_excludes_outside_weight_tolerance(tmp_store: RoastStore) -> None:
+    """#567 §1.4: ±10% of a 250 g charge is 225-275 g; a 200 g candidate falls
+    outside the band and is excluded."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile(weight=200.0)
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await _seed_completed_run(tmp_store, "light", profile=profile, rating=5)
+        assert await tmp_store.find_reference_run(slug, 250.0) is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_includes_inside_weight_tolerance(tmp_store: RoastStore) -> None:
+    """#567 §1.4: ±10% of a 250 g charge is 225-275 g; a 240 g candidate falls
+    inside the band and is included."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile(weight=240.0)
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await _seed_completed_run(tmp_store, "close", profile=profile, rating=5)
+        assert await tmp_store.find_reference_run(slug, 250.0) == "close"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_uses_corrected_charge_over_the_frozen_weight(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 §1.4: the frozen profile weight (200 g) is outside ±10% of 250 g,
+    but the operator-corrected charge (245 g) is inside it — the correction
+    is what the tolerance check compares against."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile(weight=200.0)
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await _seed_completed_run(
+            tmp_store, "corrected", profile=profile, rating=5, corrected_charge_grams=245.0
+        )
+        assert await tmp_store.find_reference_run(slug, 250.0) == "corrected"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_corrected_charge_can_push_a_candidate_out_of_tolerance(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 §1.4: the correction overrides the frozen weight in BOTH
+    directions — a frozen weight that would qualify (240 g, inside ±10% of
+    250 g) is excluded once corrected to 100 g, well outside tolerance."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile(weight=240.0)
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await _seed_completed_run(
+            tmp_store, "corrected-out", profile=profile, rating=5, corrected_charge_grams=100.0
+        )
+        assert await tmp_store.find_reference_run(slug, 250.0) is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_includes_the_low_weight_tolerance_boundary(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 §1.4: the tolerance check (store.py's ``<= tolerance``) is
+    inclusive — a candidate at EXACTLY ``250 * 0.90 = 225.0`` g must be
+    included, not excluded by an off-by-one ``<`` regression."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile(weight=225.0)
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await _seed_completed_run(tmp_store, "low-boundary", profile=profile, rating=5)
+        assert await tmp_store.find_reference_run(slug, 250.0) == "low-boundary"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_includes_the_high_weight_tolerance_boundary(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 §1.4: the tolerance check (store.py's ``<= tolerance``) is
+    inclusive — a candidate at EXACTLY ``250 * 1.10 = 275.0`` g must be
+    included, not excluded by an off-by-one ``<`` regression."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile(weight=275.0)
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await _seed_completed_run(tmp_store, "high-boundary", profile=profile, rating=5)
+        assert await tmp_store.find_reference_run(slug, 250.0) == "high-boundary"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_falls_through_a_higher_rated_wrong_slug_candidate(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 §1.2: the SQL ordering is best-rated-first, but a top-ranked
+    candidate that fails the Python-level slug check must fall through to
+    the next-best candidate rather than short-circuiting to ``None`` (a
+    ``continue`` regressing to ``break``/``return None`` would pass every
+    single-candidate test but fail here)."""
+    await tmp_store.initialize()
+    try:
+        this_profile = _reference_profile("Guatemala")
+        other_profile = _reference_profile("Ethiopia")
+        this_slug = recording_origin_slug(this_profile)
+        assert this_slug is not None
+        assert recording_origin_slug(other_profile) != this_slug
+
+        await _seed_completed_run(
+            tmp_store, "wrong-bean-five-star", profile=other_profile, rating=5
+        )
+        await _seed_completed_run(tmp_store, "right-bean-four-star", profile=this_profile, rating=4)
+
+        assert await tmp_store.find_reference_run(this_slug, 250.0) == "right-bean-four-star"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_falls_through_a_higher_rated_out_of_tolerance_candidate(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 §1.2/§1.4: the SQL-ranked top candidate is the SAME bean but
+    OUTSIDE the ±10% weight tolerance — retrieval must fall through to a
+    lower-rated, in-tolerance candidate rather than stopping at the first
+    same-slug row it sees."""
+    await tmp_store.initialize()
+    try:
+        out_of_tolerance = _reference_profile(weight=100.0)  # far outside ±10% of 250 g
+        in_tolerance = _reference_profile(weight=240.0)  # inside ±10% of 250 g
+        slug = recording_origin_slug(out_of_tolerance)
+        assert slug is not None
+        assert recording_origin_slug(in_tolerance) == slug
+
+        await _seed_completed_run(
+            tmp_store, "top-rated-wrong-weight", profile=out_of_tolerance, rating=5
+        )
+        await _seed_completed_run(
+            tmp_store, "lower-rated-right-weight", profile=in_tolerance, rating=3
+        )
+
+        assert await tmp_store.find_reference_run(slug, 250.0) == "lower-rated-right-weight"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_excludes_faulted_runs(tmp_store: RoastStore) -> None:
+    """#567 Fix C (PR #574 review): a faulted-but-FINALIZED run passes
+    ``completed_at_utc IS NOT NULL`` (it still consumed a recording slot, per
+    :meth:`RoastStore.count_completed_runs_for_origin`), but a faulted
+    trajectory is a bad reference — excluded via the retrieval SQL's
+    ``outcome = 'completed'`` clause."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await tmp_store.create_run(
+            run_id="faulted",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await tmp_store.complete_run(
+            run_id="faulted",
+            outcome="faulted",
+            agent_phase=RoastPhase.FAULTED,
+            fault_reason="test",
+        )
+        await tmp_store.set_operator_rating("faulted", rating=5)
+        assert await tmp_store.find_reference_run(slug, 250.0) is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_falls_through_a_higher_rated_faulted_candidate(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 Fix C (PR #574 review): a higher-rated FAULTED run of the same
+    bean+weight must not win over a lower-rated but genuinely completed one —
+    the ``outcome = 'completed'`` filter, not a Python-level short-circuit."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await tmp_store.create_run(
+            run_id="faulted-five-star",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await tmp_store.complete_run(
+            run_id="faulted-five-star",
+            outcome="faulted",
+            agent_phase=RoastPhase.FAULTED,
+            fault_reason="test",
+        )
+        await tmp_store.set_operator_rating("faulted-five-star", rating=5)
+        await _seed_completed_run(tmp_store, "completed-three-star", profile=profile, rating=3)
+
+        assert await tmp_store.find_reference_run(slug, 250.0) == "completed-three-star"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_landmarks_use_development_phase_not_cooling_tail(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 design note §6.4a: first-crack/drop landmarks are the FIRST/LAST
+    ``development``-phase telemetry rows, never the run's final row — which
+    here is a post-drop cooling tail with a FALLING bean temperature."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        await tmp_store.create_run(
+            run_id="landmarks",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _record_row(
+            tmp_store,
+            "landmarks",
+            1,
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            charge_elapsed=600.0,
+            bean_temp=185.0,
+        )
+        await _record_row(
+            tmp_store,
+            "landmarks",
+            2,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=612.0,
+            bean_temp=188.0,
+            dev_pct=1.0,
+        )
+        await _record_row(
+            tmp_store,
+            "landmarks",
+            3,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=650.0,
+            bean_temp=192.0,
+            dev_pct=6.0,
+        )
+        await _record_row(
+            tmp_store,
+            "landmarks",
+            4,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=715.0,
+            bean_temp=190.0,
+            dev_pct=15.1,
+        )
+        # Post-drop cooling tail: bean temp keeps being recorded and FALLS.
+        await _record_row(
+            tmp_store,
+            "landmarks",
+            5,
+            phase=RoastPhase.COOLING,
+            charge_elapsed=730.0,
+            bean_temp=174.0,
+        )
+        await _record_row(
+            tmp_store,
+            "landmarks",
+            6,
+            phase=RoastPhase.COMPLETE,
+            charge_elapsed=760.0,
+            bean_temp=100.0,
+        )
+        await tmp_store.complete_run(
+            run_id="landmarks", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("landmarks", rating=4)
+
+        reference = await tmp_store._build_reference_roast("landmarks", "test-slug")  # pyright: ignore[reportPrivateUsage]
+        assert reference is not None
+        assert reference.source_run_id == "landmarks"
+        assert reference.origin_slug == "test-slug"
+        assert reference.landmarks.first_crack_temp_c == 188.0
+        assert reference.landmarks.first_crack_elapsed_s == 612.0
+        assert reference.landmarks.drop_temp_c == 190.0
+        assert reference.landmarks.drop_development_percent == 15.1
+        assert reference.landmarks.operator_rating == 4
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_curve_trims_at_drop_not_cooling_tail(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 design note §3.1 + §6.4a (Fix D, PR #574 review): the curve is
+    trimmed to rows AT OR BEFORE the drop landmark — a post-drop cooling tail
+    with a FALLING bean temperature must never pollute "what a good roast's
+    shape looked like". The last-development index is shared with the drop
+    landmark (Fix A/D), so the two can never disagree."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        await tmp_store.create_run(
+            run_id="trim",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _record_row(
+            tmp_store,
+            "trim",
+            1,
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            charge_elapsed=600.0,
+            bean_temp=185.0,
+        )
+        await _record_row(
+            tmp_store,
+            "trim",
+            2,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=612.0,
+            bean_temp=188.0,
+            dev_pct=1.0,
+        )
+        await _record_row(
+            tmp_store,
+            "trim",
+            3,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=715.0,
+            bean_temp=190.0,
+            dev_pct=15.1,
+        )
+        # Post-drop cooling tail: charge_elapsed keeps advancing, bean temp FALLS.
+        await _record_row(
+            tmp_store,
+            "trim",
+            4,
+            phase=RoastPhase.COOLING,
+            charge_elapsed=730.0,
+            bean_temp=174.0,
+        )
+        await _record_row(
+            tmp_store,
+            "trim",
+            5,
+            phase=RoastPhase.COMPLETE,
+            charge_elapsed=760.0,
+            bean_temp=100.0,
+        )
+        await tmp_store.complete_run(
+            run_id="trim", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("trim", rating=5)
+
+        reference = await tmp_store._build_reference_roast("trim", "test-slug")  # pyright: ignore[reportPrivateUsage]
+        assert reference is not None
+        assert reference.landmarks.drop_temp_c == 190.0
+        # The curve's LAST sample is the drop (development) row, not the
+        # falling cooling tail — and no sample lies past the drop time.
+        assert reference.curve[-1].t_s == 715.0
+        assert reference.curve[-1].bean_c == 190.0
+        assert all(sample.t_s <= 715.0 for sample in reference.curve)
+        assert all(sample.bean_c not in (174.0, 100.0) for sample in reference.curve)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_curve_sample_field_mapping(tmp_store: RoastStore) -> None:
+    """Each curve sample maps ``charge_elapsed_seconds``/``bean_temp_c``/
+    ``env_temp_c``/``bean_ror_c_per_min`` onto ``t_s``/``bean_c``/``env_c``/
+    ``ror_c_min`` exactly."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        await tmp_store.create_run(
+            run_id="mapping",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await tmp_store.record_telemetry(
+            run_id="mapping",
+            tick=1,
+            agent_phase=RoastPhase.DEVELOPMENT,
+            elapsed_seconds=1.0,
+            interval_seconds=0.0,
+            telemetry=RoastTelemetry(bean_temp_c=188.0, env_temp_c=210.0, bean_ror_c_per_min=4.5),
+            development_percent=1.0,
+            charge_elapsed_seconds=612.0,
+        )
+        await tmp_store.complete_run(
+            run_id="mapping", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("mapping", rating=5)
+
+        reference = await tmp_store._build_reference_roast("mapping", "test-slug")  # pyright: ignore[reportPrivateUsage]
+        assert reference is not None
+        assert len(reference.curve) == 1
+        sample = reference.curve[0]
+        assert sample.t_s == 612.0
+        assert sample.bean_c == 188.0
+        assert sample.env_c == 210.0
+        assert sample.ror_c_min == 4.5
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_curve_skips_null_charge_elapsed_rows(
+    tmp_store: RoastStore,
+) -> None:
+    """The pre-charge lead-in (``charge_elapsed_seconds IS NULL``) never
+    becomes a curve point — ``t_s`` is a required field on
+    ``ReferenceCurveSample``."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        await tmp_store.create_run(
+            run_id="skip-null",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _record_row(
+            tmp_store,
+            "skip-null",
+            1,
+            phase=RoastPhase.PREHEATING,
+            charge_elapsed=None,
+            bean_temp=25.0,
+        )
+        await _record_row(
+            tmp_store,
+            "skip-null",
+            2,
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            charge_elapsed=None,
+            bean_temp=90.0,
+        )
+        await _record_row(
+            tmp_store,
+            "skip-null",
+            3,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=612.0,
+            bean_temp=188.0,
+            dev_pct=1.0,
+        )
+        await _record_row(
+            tmp_store,
+            "skip-null",
+            4,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=715.0,
+            bean_temp=190.0,
+            dev_pct=15.1,
+        )
+        await tmp_store.complete_run(
+            run_id="skip-null", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("skip-null", rating=5)
+
+        reference = await tmp_store._build_reference_roast("skip-null", "test-slug")  # pyright: ignore[reportPrivateUsage]
+        assert reference is not None
+        assert [sample.t_s for sample in reference.curve] == [612.0, 715.0]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_downsamples_curve_to_at_most_30_keeping_first_and_last(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 design note §3.1: 100 usable rows downsample to <= 30 curve
+    points, the first and last of which must survive the downsample."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        await tmp_store.create_run(
+            run_id="curve",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        for i in range(100):
+            tick = 1 + i
+            phase = RoastPhase.DEVELOPMENT if i >= 90 else RoastPhase.ROASTING_PRE_FIRST_CRACK
+            await _record_row(
+                tmp_store,
+                "curve",
+                tick,
+                phase=phase,
+                charge_elapsed=float(i),
+                bean_temp=100.0 + i,
+                dev_pct=float(i) if i >= 90 else None,
+            )
+        await tmp_store.complete_run(
+            run_id="curve", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("curve", rating=5)
+
+        reference = await tmp_store._build_reference_roast("curve", "test-slug")  # pyright: ignore[reportPrivateUsage]
+        assert reference is not None
+        assert len(reference.curve) <= 30
+        assert reference.curve[0].t_s == 0.0
+        assert reference.curve[-1].t_s == 99.0
+        # Strictly increasing: no duplicate/out-of-order index made it through.
+        t_values = [sample.t_s for sample in reference.curve]
+        assert t_values == sorted(set(t_values))
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_keeps_every_row_at_exactly_30_usable_rows(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 design note §3.1: exactly 30 usable rows is the
+    ``count <= max_samples`` no-op boundary of ``_evenly_spaced_indices`` —
+    every row survives unchanged, none dropped by an off-by-one."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        await tmp_store.create_run(
+            run_id="exactly-30",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        for i in range(30):
+            await _record_row(
+                tmp_store,
+                "exactly-30",
+                1 + i,
+                phase=RoastPhase.DEVELOPMENT,
+                charge_elapsed=float(i),
+                bean_temp=180.0 + i,
+                dev_pct=float(i),
+            )
+        await tmp_store.complete_run(
+            run_id="exactly-30", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("exactly-30", rating=5)
+
+        reference = await tmp_store._build_reference_roast("exactly-30", "test-slug")  # pyright: ignore[reportPrivateUsage]
+        assert reference is not None
+        assert len(reference.curve) == 30
+        assert [sample.t_s for sample in reference.curve] == [float(i) for i in range(30)]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_downsamples_31_rows_to_exactly_30(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 design note §3.1: 31 usable rows is one past the no-op boundary —
+    the downsample must return EXACTLY 30 points (not 29, not 31), with the
+    first and last usable rows preserved."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        await tmp_store.create_run(
+            run_id="exactly-31",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        for i in range(31):
+            await _record_row(
+                tmp_store,
+                "exactly-31",
+                1 + i,
+                phase=RoastPhase.DEVELOPMENT,
+                charge_elapsed=float(i),
+                bean_temp=180.0 + i,
+                dev_pct=float(i),
+            )
+        await tmp_store.complete_run(
+            run_id="exactly-31", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("exactly-31", rating=5)
+
+        reference = await tmp_store._build_reference_roast("exactly-31", "test-slug")  # pyright: ignore[reportPrivateUsage]
+        assert reference is not None
+        assert len(reference.curve) == 30
+        assert reference.curve[0].t_s == 0.0
+        assert reference.curve[-1].t_s == 30.0
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_returns_none_without_development_telemetry(
+    tmp_store: RoastStore,
+) -> None:
+    """A run that never reached first crack (no ``development`` rows) has no
+    usable landmarks — the whole reference is unusable, not partially built."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        await tmp_store.create_run(
+            run_id="no-dev",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _record_row(
+            tmp_store,
+            "no-dev",
+            1,
+            phase=RoastPhase.PREHEATING,
+            charge_elapsed=None,
+            bean_temp=25.0,
+        )
+        await _record_row(
+            tmp_store,
+            "no-dev",
+            2,
+            phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            charge_elapsed=100.0,
+            bean_temp=150.0,
+        )
+        await tmp_store.complete_run(
+            run_id="no-dev", outcome="aborted", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("no-dev", rating=5)
+        assert await tmp_store._build_reference_roast("no-dev", "test-slug") is None  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_returns_none_when_every_charge_elapsed_is_null(
+    tmp_store: RoastStore,
+) -> None:
+    """Development rows exist, but none carry a charge-elapsed clock — there
+    is no usable curve point, so the reference stays unusable rather than a
+    landmarks-only partial result."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        await tmp_store.create_run(
+            run_id="null-clock",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _record_row(
+            tmp_store,
+            "null-clock",
+            1,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=None,
+            bean_temp=188.0,
+            dev_pct=1.0,
+        )
+        await _record_row(
+            tmp_store,
+            "null-clock",
+            2,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=None,
+            bean_temp=190.0,
+            dev_pct=15.0,
+        )
+        await tmp_store.complete_run(
+            run_id="null-clock", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("null-clock", rating=5)
+        assert await tmp_store._build_reference_roast("null-clock", "test-slug") is None  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_returns_none_for_unknown_run(tmp_store: RoastStore) -> None:
+    await tmp_store.initialize()
+    try:
+        assert await tmp_store._build_reference_roast("ghost", "test-slug") is None  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_reference_roast_returns_none_when_never_rated(tmp_store: RoastStore) -> None:
+    """A completed run with real development telemetry but no operator
+    rating yet cannot populate the non-optional ``operator_rating`` field —
+    stays unusable, matching :meth:`find_reference_run`'s own floor."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        await tmp_store.create_run(
+            run_id="unrated-dev",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _record_row(
+            tmp_store,
+            "unrated-dev",
+            1,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=612.0,
+            bean_temp=188.0,
+            dev_pct=1.0,
+        )
+        await tmp_store.complete_run(
+            run_id="unrated-dev", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        assert await tmp_store._build_reference_roast("unrated-dev", "test-slug") is None  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_load_reference_roast_composes_find_and_build(tmp_store: RoastStore) -> None:
+    """The thin convenience wrapper chains :meth:`find_reference_run` into
+    :meth:`_build_reference_roast`, and stays ``None`` when nothing qualifies."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await tmp_store.create_run(
+            run_id="composed",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _record_row(
+            tmp_store,
+            "composed",
+            1,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=612.0,
+            bean_temp=188.0,
+            dev_pct=1.0,
+        )
+        await _record_row(
+            tmp_store,
+            "composed",
+            2,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=715.0,
+            bean_temp=190.0,
+            dev_pct=15.1,
+        )
+        await tmp_store.complete_run(
+            run_id="composed", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("composed", rating=5)
+
+        reference = await tmp_store.load_reference_roast(slug, 250.0)
+        assert reference is not None
+        assert reference.source_run_id == "composed"
+        assert reference.origin_slug == slug
+
+        # No qualifying reference for a bean nobody has roasted.
+        assert await tmp_store.load_reference_roast("ethiopia-nope-yet", 250.0) is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_load_reference_roast_falls_through_an_unbuildable_top_candidate(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 Fix B (PR #574 review): the top-RATED candidate has no
+    ``development``-phase telemetry (unbuildable) — ``load_reference_roast``
+    must fall through to the next-best, buildable candidate rather than
+    stopping at :meth:`find_reference_run`'s own top pick."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+
+        await _seed_unbuildable_run(tmp_store, "top-unbuildable", profile=profile, rating=5)
+        # find_reference_run itself still (correctly) reports the top-RATED id.
+        assert await tmp_store.find_reference_run(slug, 250.0) == "top-unbuildable"
+
+        await tmp_store.create_run(
+            run_id="lower-buildable",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await _record_row(
+            tmp_store,
+            "lower-buildable",
+            1,
+            phase=RoastPhase.DEVELOPMENT,
+            charge_elapsed=612.0,
+            bean_temp=188.0,
+            dev_pct=1.0,
+        )
+        await tmp_store.complete_run(
+            run_id="lower-buildable", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_operator_rating("lower-buildable", rating=3)
+
+        reference = await tmp_store.load_reference_roast(slug, 250.0)
+        assert reference is not None
+        assert reference.source_run_id == "lower-buildable"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_load_reference_roast_returns_none_when_every_candidate_is_unbuildable(
+    tmp_store: RoastStore,
+) -> None:
+    """#567 Fix B (PR #574 review): every ranked candidate fails to build —
+    ``load_reference_roast`` returns ``None`` rather than raising or
+    returning a partially-built reference."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+
+        await _seed_unbuildable_run(tmp_store, "unbuildable-a", profile=profile, rating=5)
+        await _seed_unbuildable_run(tmp_store, "unbuildable-b", profile=profile, rating=4)
+
+        assert await tmp_store.load_reference_roast(slug, 250.0) is None
+    finally:
+        await tmp_store.close()

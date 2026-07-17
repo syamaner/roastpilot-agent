@@ -803,6 +803,94 @@ class BeanProfileList(BaseModel):
     profiles: list[BeanProfile]
 
 
+# --- #567 Slice A: reference-curve retrieval + representation models ---
+#
+# A completed, well-rated past roast of THIS SAME bean, retrieved by
+# `store.RoastStore.find_reference_run` / `build_reference_roast` for future
+# advisor context. This slice is deliberately INERT: these models are read-only
+# retrieval output, not wired into `AdvisorContext`, `start_roast`, the
+# controller, replay, or config — that plumbing (and the AdvisorContext-facing
+# `ReferenceCurveSample`/`ReferenceRoastLandmarks` shape sketched in the design
+# note's §3.2, which carries actuated heat/fan levers these do not) is Slice B.
+# These three models are the simpler store-level representation the retrieval
+# logic itself produces; Slice B may adapt/project them onto the richer
+# AdvisorContext shape rather than reusing them verbatim. All temperatures are
+# Celsius.
+
+
+class ReferenceCurveSample(BaseModel):
+    """One downsampled point on a completed reference roast's telemetry curve.
+
+    Aligned on charge-elapsed seconds (``t_s``) — the same clock origin the
+    live curve window and the advisor's DTR clock already use (design note
+    §3.1), so a live trajectory can overlay a reference one with no
+    re-origining.
+    """
+
+    t_s: float
+    """Seconds since charge (T0) at this sample."""
+    bean_c: float
+    """Bean temperature at this sample."""
+    env_c: float | None = None
+    """Environment (drum) temperature at this sample, when recorded."""
+    ror_c_min: float | None = None
+    """Bean rate-of-rise in °C/min at this sample, when recorded."""
+
+
+class ReferenceLandmarks(BaseModel):
+    """First-crack and drop landmarks for a completed reference roast.
+
+    Extracted with the clock-safe, telemetry-phase-only rule pinned by the
+    #567 design note §6.4a: first crack is the FIRST ``telemetry_snapshots``
+    row tagged ``agent_phase == 'development'`` (development begins at FC),
+    and drop is the LAST such row — never the run's final row, which can fall
+    in the post-drop cooling tail (bean temperature keeps being recorded
+    while it falls after drop). This rule stays entirely within the
+    run-relative telemetry clock and never rebases against
+    ``roast_events.monotonic_seconds``, a different clock origin (see the
+    ``store-telemetry-event-clock-mismatch`` precedent).
+    """
+
+    first_crack_temp_c: float | None
+    """Bean temperature at the first ``development``-phase telemetry row, or
+    ``None`` if that row's temperature was never recorded."""
+    first_crack_elapsed_s: float | None
+    """Charge-elapsed seconds at the first ``development``-phase telemetry
+    row, or ``None`` if that row's charge-elapsed clock was never recorded."""
+    drop_temp_c: float | None
+    """Bean temperature at the last ``development``-phase telemetry row, or
+    ``None`` if that row's temperature was never recorded."""
+    drop_development_percent: float | None
+    """Development-time-ratio percent at the last ``development``-phase
+    telemetry row — the controller's own real-time DTR reading, read directly
+    off the stored column rather than reconstructed from an event timestamp
+    (design note §4's DTR-provenance note) — or ``None`` if that row never
+    recorded one."""
+    operator_rating: int
+    """The reference run's 1-5 star operator rating."""
+
+
+class ReferenceRoast(BaseModel):
+    """A completed, well-rated past roast of the same bean (#567 Slice A).
+
+    Pure retrieval + representation data returned by
+    :meth:`~roastpilot_agent.store.RoastStore.find_reference_run` /
+    :meth:`~roastpilot_agent.store.RoastStore.build_reference_roast`. Carries
+    no control authority and is not (yet) read by the controller, safety, the
+    advisor, or the API — Slice B wires it into ``AdvisorContext``.
+    """
+
+    source_run_id: str
+    """The retrieved run's ``roast_runs.id``."""
+    origin_slug: str
+    """The :func:`recording_origin_slug` both this roast and the reference
+    roast share."""
+    landmarks: ReferenceLandmarks
+    curve: list[ReferenceCurveSample]
+    """At most 30 downsampled telemetry points, always including the first
+    and last usable row (design note §3.1)."""
+
+
 # --- E7-S1: REST API response models (component plan §6) ---
 #
 # Typed response models for the REST surface live here, the shared-models
