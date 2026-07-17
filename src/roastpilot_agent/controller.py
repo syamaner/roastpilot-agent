@@ -41,6 +41,7 @@ from roastpilot_agent.models import (
     AppliedRoasterState,
     DropReason,
     PostFcHeatAuthorityState,
+    ReferenceRoast,
     RoastCommand,
     RoastEventKind,
     RoastEventSource,
@@ -606,6 +607,7 @@ class RoastController:
         event_emitter: EventEmitter,
         advisor: RoastAdvisor | None = None,
         clock: Clock = time.monotonic,
+        reference_roast: ReferenceRoast | None = None,
     ) -> None:
         self._config = config
         self._safety = safety
@@ -615,6 +617,15 @@ class RoastController:
         self._events = event_emitter
         self._advisor = advisor
         self._clock = clock
+        # #567 Slice B: a DIFFERENT completed, well-rated roast of THIS SAME
+        # bean, retrieved ONCE by the caller (RoastService, fail-soft, flag-
+        # gated) before construction and cached here for the run's entire
+        # lifetime — never re-retrieved per tick, and never mutated after
+        # __init__. ``None`` (the default) reproduces today's behaviour
+        # byte-for-byte: every existing caller/test that does not pass this
+        # argument stays valid. See :meth:`_build_advisor_context`, the only
+        # place this is read.
+        self._reference_roast = reference_roast
         self._phase: RoastPhase = RoastPhase.IDLE
         self._profile: RoastProfile | None = None
         self._run_started_monotonic: float | None = None
@@ -4624,6 +4635,16 @@ class RoastController:
                 None
                 if self._last_post_fc_output is None
                 else self._last_post_fc_output.heat_authority_state
+            ),
+            # #567 Slice B: the SAME ReferenceRoast the caller retrieved once
+            # (fail-soft, flag-gated) before construction and cached on
+            # ``self._reference_roast`` — never re-retrieved here or anywhere
+            # else in the tick loop. ``None`` (flag off, no qualifying past
+            # roast, or a replay session, which pins retrieval off) yields
+            # today's exact empty/None fields.
+            reference_curve=([] if self._reference_roast is None else self._reference_roast.curve),
+            reference_landmarks=(
+                None if self._reference_roast is None else self._reference_roast.landmarks
             ),
         )
 

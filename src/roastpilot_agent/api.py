@@ -81,6 +81,7 @@ from roastpilot_agent.models import (
     OperatorActionRequest,
     OperatorActionResult,
     OperatorRatingRequest,
+    ReferenceRoast,
     RoastCommand,
     RoastDetail,
     RoastedWeightRequest,
@@ -1645,7 +1646,7 @@ class RoastService:
         controller's idle→preheating start runs before returning; the per-tick
         loop runs as a background task when ``run_loop`` is set (tests drive
         ``service.runner.tick_once()`` directly with ``run_loop=False``)."""
-        runner = self._build_runner(run_id)
+        runner = await self._build_runner(run_id, profile)
         if runner is None:  # pragma: no cover — guarded by the caller
             return
         recording_roast_num = await self._recording_roast_num(profile)
@@ -1687,12 +1688,77 @@ class RoastService:
             return None
         return prior + 1
 
-    def _build_runner(self, run_id: str) -> "RoastRunner | None":
+    async def _retrieve_reference_for(self, profile: RoastProfile) -> ReferenceRoast | None:
+        """Fail-soft, flag-gated same-bean reference retrieval (#567 Slice B).
+
+        Returns ``None`` immediately when ``reference_curve.enabled`` is
+        ``False`` (the default) — no store read happens at all, matching
+        today's exact behaviour. When enabled, looks up a completed,
+        well-rated past roast of THIS SAME bean (by
+        :func:`~roastpilot_agent.models.recording_origin_slug`) via
+        :meth:`~roastpilot_agent.store.RoastStore.load_reference_roast`.
+
+        Mirrors :meth:`RoastRunner._persist_t0_if_charged`'s established
+        fail-soft shape exactly (design note §6.2, a must-fix, not an
+        optional nicety): any store error degrades to ``None`` — the
+        pre-#567 behaviour — rather than turning a working ``start_roast``
+        (or restart recovery) into a 500. A profile with no derivable
+        origin slug (:func:`recording_origin_slug` returns ``None`` — an
+        ad-hoc, unsaved profile) is treated the same way, with no store
+        call attempted.
+
+        Args:
+            profile: The roast profile being started (fresh) or restored
+                (recovery) — its identity fields drive the same-bean match
+                and its charge weight drives the weight-tolerance filter.
+
+        Returns:
+            The best usable :class:`~roastpilot_agent.models.ReferenceRoast`,
+            or ``None`` when the flag is off, no qualifying reference
+            exists, or the lookup failed.
+        """
+        if not self._config.controller.reference_curve.enabled:
+            return None
+        origin_slug = recording_origin_slug(profile)
+        if origin_slug is None:
+            return None
+        try:
+            return await self._store.load_reference_roast(origin_slug, profile.bean_weight_grams)
+        except Exception:
+            # Fail-safe: a store error on this advisory-only context lookup
+            # must never block a roast start or recovery; the only cost is
+            # degrading to no-reference (today's behaviour). Exercised
+            # directly by
+            # ``test_reference_curve_retrieval_fail_soft_never_blocks_start``
+            # (a real, non-defensive path — this is the design note §6.2
+            # must-fix, not unreachable defensive code).
+            _log.warning(
+                "load_reference_roast failed (origin=%r); starting/recovering with no reference",
+                origin_slug,
+                exc_info=True,
+            )
+            return None
+
+    async def _build_runner(self, run_id: str, profile: RoastProfile) -> "RoastRunner | None":
         """Construct a controller + runner bound to ``run_id`` (shared by the
-        fresh-start and restart-recovery paths). ``None`` in API-only mode."""
+        fresh-start and restart-recovery paths). ``None`` in API-only mode.
+
+        **#567 Slice B:** this is the SINGLE common construction point for
+        both a fresh start (``_begin_live_run``) and an agent-restart
+        recovery (``recover_on_start``), so it is also the single place the
+        same-bean reference is retrieved — once, fresh, fail-soft, flag-
+        gated (:meth:`_retrieve_reference_for`) — and cached on the new
+        controller instance for the run's lifetime. This satisfies the
+        design note's resume rule (§6.5): a resumed run re-retrieves fresh
+        rather than trying to persist/restore an in-memory cache across the
+        restart boundary, because a fresh controller (and so a fresh
+        ``self._reference_roast``) is unconditionally built here on every
+        restart-recovery path, exactly as it is on every fresh start.
+        """
         roaster = self._roaster
         if roaster is None:  # pragma: no cover — guarded by the caller
             return None
+        reference_roast = await self._retrieve_reference_for(profile)
         counter = _TickCounter()
         sink = StoreSnapshotSink(self._store, run_id, lambda: counter.value)
         emitter = BufferingEventEmitter(self.events, clock=self._clock)
@@ -1705,6 +1771,7 @@ class RoastService:
             event_emitter=emitter,
             advisor=self._advisor,
             clock=self._clock,
+            reference_roast=reference_roast,
         )
         runner = RoastRunner(
             controller=controller,
@@ -1774,7 +1841,7 @@ class RoastService:
             # cross-restart STALE fault.
             await self._store.finalize_stale_faulted_run(persisted.run_id)
             return
-        runner = self._build_runner(persisted.run_id)
+        runner = await self._build_runner(persisted.run_id, persisted.profile)
         if runner is None:  # pragma: no cover — guarded above
             return
         self.active_run_id = persisted.run_id

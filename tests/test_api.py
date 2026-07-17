@@ -16,7 +16,7 @@ import json
 from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 from unittest import mock
 
 import pytest
@@ -39,7 +39,7 @@ from roastpilot_agent.api import (
     create_app,
     stream_events,
 )
-from roastpilot_agent.config import AppConfig, ControllerConfig
+from roastpilot_agent.config import AppConfig, ControllerConfig, ReferenceCurve
 from roastpilot_agent.mcp_client import (
     AmbientStatus,
     FirstCrackStatus,
@@ -52,6 +52,7 @@ from roastpilot_agent.models import (
     MicHealth,
     OperatorAction,
     OperatorActionRequest,
+    ReferenceRoast,
     RoastCommand,
     RoastDetail,
     RoastedWeightRequest,
@@ -2555,20 +2556,25 @@ async def _live_service(
     mcp: FakeMCPClient,
     clock: FakeClock,
     raw_state: "_FakeRawState | None" = None,
+    profile: RoastProfile | None = None,
+    config: AppConfig | None = None,
+    advisor: "FakeAdvisor | None" = None,
 ) -> tuple[RoastService, str]:
     """Start a live (run_loop=False) service into preheating; return it + run id."""
-    config = AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0))
+    resolved_config = config or AppConfig(
+        controller=ControllerConfig(telemetry_log_interval_seconds=1.0)
+    )
     service = RoastService(
         store,
-        config=config,
+        config=resolved_config,
         roaster=mcp,
-        advisor=FakeAdvisor([], default_decision=_live_decision()),
+        advisor=advisor or FakeAdvisor([], default_decision=_live_decision()),
         exporter=mcp,
         run_loop=False,
         clock=clock,
         raw_state=raw_state,
     )
-    detail = await service.start_roast(_profile())
+    detail = await service.start_roast(profile or _profile())
     return service, detail.id
 
 
@@ -3297,7 +3303,9 @@ async def test_recover_faulted_then_acknowledge_preserves_fault_reason(
         clock=clock,
     )
     # Build the runner + re-enter operable-faulted directly (the in-session path).
-    runner = service._build_runner("run-fault-reason")  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+    runner = await service._build_runner(  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+        "run-fault-reason", _profile()
+    )
     assert runner is not None
     service.active_run_id = "run-fault-reason"
     await runner.recover_faulted(_profile())
@@ -4910,3 +4918,393 @@ def test_enumerate_audio_inputs_implementation(
     assert devices2 == []
     assert error2 is not None
     assert "PortAudio" in error2
+
+
+# --- #567 Slice B: reference-curve retrieval plumbing ---
+
+
+async def _seed_reference_run(
+    store: RoastStore,
+    run_id: str,
+    *,
+    profile: RoastProfile,
+    rating: Literal[1, 2, 3, 4, 5] = 5,
+) -> None:
+    """Seed a completed, rated, same-bean reference run with development-phase
+    telemetry so #567 retrieval can find + build it — mirrors
+    ``tests/test_store.py``'s own Slice A seeding helpers
+    (``_seed_completed_run`` / ``_record_row``), duplicated locally rather
+    than imported since those are private to that test module."""
+    await store.create_run(
+        run_id=run_id, profile=profile, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    await store.record_telemetry(
+        run_id=run_id,
+        tick=1,
+        agent_phase=RoastPhase.DEVELOPMENT,
+        elapsed_seconds=600.0,
+        interval_seconds=0.0,
+        telemetry=RoastTelemetry(bean_temp_c=182.0, env_temp_c=195.0, bean_ror_c_per_min=7.0),
+        development_percent=1.0,
+        charge_elapsed_seconds=600.0,
+    )
+    await store.record_telemetry(
+        run_id=run_id,
+        tick=2,
+        agent_phase=RoastPhase.DEVELOPMENT,
+        elapsed_seconds=715.0,
+        interval_seconds=0.0,
+        telemetry=RoastTelemetry(bean_temp_c=190.0, env_temp_c=200.0, bean_ror_c_per_min=4.0),
+        development_percent=15.1,
+        charge_elapsed_seconds=715.0,
+    )
+    await store.complete_run(run_id=run_id, outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    await store.set_operator_rating(run_id, rating=rating)
+
+
+async def _drive_to_development_consult(
+    service: RoastService, mcp: FakeMCPClient, clock: FakeClock
+) -> None:
+    """Drive a fresh (``_live_service``-started) run from preheating through
+    charge → first crack → one development tick, so the advisor is
+    consulted post-FC — the #567 reference fields only ever populate on a
+    DEVELOPMENT-phase consult. Mirrors the tick sequence
+    ``test_telemetry_frame_surfaces_development_time_and_dtr`` already
+    exercises for the same charge → FC → development path."""
+    await _tick(service, clock)  # preheat
+    mcp.frames = [_reading(95.0, 150.0, t0_detected=True)]
+    for _ in range(3):  # debounce (t0_debounce_ticks default 3)
+        await _tick(service, clock)
+    mcp.frames = [_reading(180.0, 205.0, t0_detected=True, first_crack_detected=True)]
+    await _tick(service, clock)  # → development (FC instant)
+    mcp.frames = [_reading(185.0, 208.0, t0_detected=True, first_crack_detected=True)]
+    await _tick(service, clock)  # a real development consult
+
+
+@pytest.mark.asyncio
+async def test_reference_curve_flag_off_zero_retrieval_and_empty_context(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE invariant this slice must prove (default OFF is byte-for-byte
+    today's behaviour): with ``reference_curve.enabled`` at its default
+    ``False``, NO store reference read happens at all — a spy on
+    ``RoastStore.load_reference_roast`` records zero calls — and the built
+    ``AdvisorContext``'s reference fields stay empty/``None``. A qualifying
+    same-bean reference is seeded FIRST, so a false pass ("nothing to find
+    anyway") is impossible: if retrieval ran at all, it would find this run."""
+    profile = _profile()
+    await _seed_reference_run(store, "ref-flag-off", profile=profile)
+
+    calls = 0
+    original = RoastStore.load_reference_roast
+
+    async def spy(self: RoastStore, *args: object, **kwargs: object) -> ReferenceRoast | None:
+        nonlocal calls
+        calls += 1
+        return await original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(RoastStore, "load_reference_roast", spy)
+
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    advisor = FakeAdvisor([], default_decision=_live_decision())
+    service, _run_id = await _live_service(
+        store, mcp=mcp, clock=clock, profile=profile, advisor=advisor
+    )
+    assert service._config.controller.reference_curve.enabled is False  # pyright: ignore[reportPrivateUsage]
+
+    await _drive_to_development_consult(service, mcp, clock)
+
+    assert calls == 0, "flag off must perform zero store reference reads"
+    assert advisor.contexts, "advisor should be consulted post-FC"
+    ctx = advisor.contexts[-1]
+    assert ctx.reference_curve == []
+    assert ctx.reference_landmarks is None
+
+
+@pytest.mark.asyncio
+async def test_reference_curve_flag_on_populates_advisor_context(store: RoastStore) -> None:
+    """Flag ON + a qualifying same-bean rated completed run: a fresh start
+    retrieves it, and the built ``AdvisorContext`` carries the curve +
+    landmarks."""
+    profile = _profile()
+    await _seed_reference_run(store, "ref-flag-on", profile=profile, rating=4)
+
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    advisor = FakeAdvisor([], default_decision=_live_decision())
+    config = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=1.0,
+            reference_curve=ReferenceCurve(enabled=True),
+        )
+    )
+    service, _run_id = await _live_service(
+        store, mcp=mcp, clock=clock, profile=profile, config=config, advisor=advisor
+    )
+    await _drive_to_development_consult(service, mcp, clock)
+
+    assert advisor.contexts, "advisor should be consulted post-FC"
+    ctx = advisor.contexts[-1]
+    assert ctx.reference_curve != []
+    assert ctx.reference_landmarks is not None
+    assert ctx.reference_landmarks.operator_rating == 4
+    assert ctx.reference_landmarks.drop_temp_c == pytest.approx(190.0)
+
+
+@pytest.mark.asyncio
+async def test_reference_curve_flag_on_retrieves_exactly_once_never_per_tick(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flag-ON analogue of the flag-off invariant
+    (``test_reference_curve_flag_off_zero_retrieval_and_empty_context``):
+    retrieval happens ONCE, at fresh-start construction (``_build_runner``),
+    never per tick and never per advisor consult. The prior
+    controller-level test (``test_advisor_context_reference_fields_populated_
+    from_cached_reference_roast``) only proves the controller reads back
+    whatever it was constructed with — it can't catch a regression that
+    moves retrieval INTO the tick path. This is the exact regression class
+    the slice exists to prevent: a future refactor that re-derives the
+    reference on every tick/consult would still pass every other test here
+    but fail this one."""
+    profile = _profile()
+    await _seed_reference_run(store, "ref-flag-on-once", profile=profile, rating=4)
+
+    calls = 0
+    original = RoastStore.load_reference_roast
+
+    async def spy(self: RoastStore, *args: object, **kwargs: object) -> ReferenceRoast | None:
+        nonlocal calls
+        calls += 1
+        return await original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(RoastStore, "load_reference_roast", spy)
+
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    advisor = FakeAdvisor([], default_decision=_live_decision())
+    config = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=1.0,
+            reference_curve=ReferenceCurve(enabled=True),
+        )
+    )
+    service, _run_id = await _live_service(
+        store, mcp=mcp, clock=clock, profile=profile, config=config, advisor=advisor
+    )
+    assert calls == 1, "retrieval must happen exactly once, at fresh-start construction"
+
+    await _drive_to_development_consult(service, mcp, clock)
+    assert calls == 1, "must not re-retrieve on the FC edge / first development consult"
+
+    # Two more post-FC ticks — more consults (DEVELOPMENT's advisory heartbeat
+    # is unthrottled by default) — must still leave the retrieval count at 1.
+    mcp.frames = [_reading(186.0, 209.0, t0_detected=True, first_crack_detected=True)]
+    await _tick(service, clock)
+    mcp.frames = [_reading(187.0, 210.0, t0_detected=True, first_crack_detected=True)]
+    await _tick(service, clock)
+
+    assert len(advisor.contexts) >= 2, "at least two post-FC consults must have run"
+    assert calls == 1, "retrieval must stay ONCE across multiple post-FC consults, never per tick"
+    ctx = advisor.contexts[-1]
+    assert ctx.reference_curve != []
+    assert ctx.reference_landmarks is not None
+
+
+@pytest.mark.asyncio
+async def test_reference_curve_retrieval_fail_soft_never_blocks_start(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``load_reference_roast`` that raises must degrade to no reference —
+    never block ``start_roast``, and never fault the run (design note §6.2:
+    a must-fix, not an optional nicety, mirroring
+    ``RoastRunner._persist_t0_if_charged``'s established fail-soft shape)."""
+    profile = _profile()
+    await _seed_reference_run(store, "ref-fail-soft", profile=profile)
+
+    async def boom(self: RoastStore, *args: object, **kwargs: object) -> ReferenceRoast | None:
+        raise RuntimeError("store hiccup")
+
+    monkeypatch.setattr(RoastStore, "load_reference_roast", boom)
+
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    advisor = FakeAdvisor([], default_decision=_live_decision())
+    config = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=1.0,
+            reference_curve=ReferenceCurve(enabled=True),
+        )
+    )
+    # start_roast (which retrieves the reference internally) must not raise.
+    service, run_id = await _live_service(
+        store, mcp=mcp, clock=clock, profile=profile, config=config, advisor=advisor
+    )
+    await _drive_to_development_consult(service, mcp, clock)
+
+    detail = await store.read_run(run_id)
+    assert detail is not None
+    assert detail.agent_phase is not RoastPhase.FAULTED
+    assert advisor.contexts
+    ctx = advisor.contexts[-1]
+    assert ctx.reference_curve == []
+    assert ctx.reference_landmarks is None
+
+
+@pytest.mark.asyncio
+async def test_resume_reretrieves_reference_when_flag_on(store: RoastStore) -> None:
+    """#567 design note §6.5: a resumed run rebuilds its context with a
+    FRESHLY retrieved reference (flag on) at the point ``recover_on_start``
+    builds a new controller — never persisted/restored across the restart
+    boundary. Mirrors
+    ``test_restart_restores_charge_clock_so_resumed_dtr_survives``'s own
+    restart → operator-resume → post-FC-consult sequence."""
+    profile = _profile()
+    await _seed_reference_run(store, "ref-resume-on", profile=profile, rating=4)
+    await store.create_run(
+        run_id="run-resume-ref-on",
+        profile=profile,
+        config=AppConfig(),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+
+    clock = FakeClock()
+    mcp = FakeMCPClient()
+    advisor = FakeAdvisor([], default_decision=_live_decision())
+    config = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=1.0,
+            reference_curve=ReferenceCurve(enabled=True),
+        )
+    )
+    service = RoastService(
+        store, config=config, roaster=mcp, advisor=advisor, run_loop=False, clock=clock
+    )
+    await service.recover_on_start()
+    assert mcp.commands() == []  # restart never auto-resumes heat/fan
+    recovered = await store.read_run("run-resume-ref-on")
+    assert recovered is not None
+    assert recovered.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+
+    await service.submit_operator_action(
+        "run-resume-ref-on",
+        OperatorActionRequest(
+            action=OperatorAction.ACKNOWLEDGE_RECOVERY,
+            payload={"resume_to": "roasting_pre_first_crack"},
+        ),
+    )
+    assert service.runner is not None
+    mcp.frames = [_reading(bean=150.0, env=185.0, bean_ror_c_per_min=4.0)]
+    await _tick(service, clock)  # drains the resume action
+    mcp.frames = [
+        _reading(bean=185.0, env=200.0, bean_ror_c_per_min=4.0, first_crack_detected=True)
+    ]
+    await _tick(service, clock)  # first crack → DEVELOPMENT
+    mcp.frames = [_reading(bean=186.0, env=201.0, bean_ror_c_per_min=4.0)]
+    await _tick(service, clock)  # development consult
+
+    assert advisor.contexts, "advisor should be consulted after resume + FC"
+    ctx = advisor.contexts[-1]
+    assert ctx.reference_curve != []
+    assert ctx.reference_landmarks is not None
+    assert ctx.reference_landmarks.operator_rating == 4
+
+
+@pytest.mark.asyncio
+async def test_resume_does_not_retrieve_reference_when_flag_off(store: RoastStore) -> None:
+    """The flag-off mirror of ``test_resume_reretrieves_reference_when_flag_on``:
+    the SAME restart → operator-resume → post-FC-consult sequence, with a
+    qualifying same-bean reference seeded, but the default (flag off)
+    config — the resumed run's context must stay empty/``None`` exactly
+    like a fresh start's."""
+    profile = _profile()
+    await _seed_reference_run(store, "ref-resume-off", profile=profile, rating=4)
+    await store.create_run(
+        run_id="run-resume-ref-off",
+        profile=profile,
+        config=AppConfig(),
+        agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+    )
+
+    clock = FakeClock()
+    mcp = FakeMCPClient()
+    advisor = FakeAdvisor([], default_decision=_live_decision())
+    config = AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0))
+    service = RoastService(
+        store, config=config, roaster=mcp, advisor=advisor, run_loop=False, clock=clock
+    )
+    await service.recover_on_start()
+    assert mcp.commands() == []  # restart never auto-resumes heat/fan
+    recovered = await store.read_run("run-resume-ref-off")
+    assert recovered is not None
+    assert recovered.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+
+    await service.submit_operator_action(
+        "run-resume-ref-off",
+        OperatorActionRequest(
+            action=OperatorAction.ACKNOWLEDGE_RECOVERY,
+            payload={"resume_to": "roasting_pre_first_crack"},
+        ),
+    )
+    assert service.runner is not None
+    mcp.frames = [_reading(bean=150.0, env=185.0, bean_ror_c_per_min=4.0)]
+    await _tick(service, clock)  # drains the resume action
+    mcp.frames = [
+        _reading(bean=185.0, env=200.0, bean_ror_c_per_min=4.0, first_crack_detected=True)
+    ]
+    await _tick(service, clock)  # first crack → DEVELOPMENT
+    mcp.frames = [_reading(bean=186.0, env=201.0, bean_ror_c_per_min=4.0)]
+    await _tick(service, clock)  # development consult
+
+    assert advisor.contexts, "advisor should be consulted after resume + FC"
+    ctx = advisor.contexts[-1]
+    assert ctx.reference_curve == []
+    assert ctx.reference_landmarks is None
+
+
+@pytest.mark.asyncio
+async def test_retrieve_reference_for_excludes_the_run_being_started(store: RoastStore) -> None:
+    """#567 design note §2: retrieval runs AFTER ``create_run``, so it only
+    ever sees COMPLETED prior runs — never the run currently being started,
+    even though that run's own frozen profile trivially matches its own
+    origin_slug + charge weight."""
+    profile = _profile()
+    await store.create_run(
+        run_id="the-run-being-started",
+        profile=profile,
+        config=AppConfig(),
+        agent_phase=RoastPhase.STARTING,
+    )
+    service = RoastService(
+        store,
+        config=AppConfig(controller=ControllerConfig(reference_curve=ReferenceCurve(enabled=True))),
+    )
+    reference = await service._retrieve_reference_for(profile)  # pyright: ignore[reportPrivateUsage]
+    assert reference is None
+
+
+@pytest.mark.asyncio
+async def test_retrieve_reference_for_skips_the_store_when_no_origin_slug(
+    store: RoastStore,
+) -> None:
+    """A profile whose identity fields yield no usable slug
+    (:func:`~roastpilot_agent.models.recording_origin_slug` returns
+    ``None`` — punctuation-only ``name``/``bean_origin``, no ``country``)
+    is treated the same as flag-off: no store call is attempted at all."""
+    punctuation_only_profile = RoastProfile(
+        name="---",
+        bean_origin="...",
+        bean_weight_grams=250.0,
+        initial_heat_percent=70,
+        initial_fan_percent=40,
+        target_drop_temp_c=205.0,
+        target_development_percent=20.0,
+    )
+    service = RoastService(
+        store,
+        config=AppConfig(controller=ControllerConfig(reference_curve=ReferenceCurve(enabled=True))),
+    )
+    reference = await service._retrieve_reference_for(  # pyright: ignore[reportPrivateUsage]
+        punctuation_only_profile
+    )
+    assert reference is None

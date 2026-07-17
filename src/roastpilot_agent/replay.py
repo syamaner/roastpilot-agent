@@ -67,7 +67,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from roastpilot_agent.api import QueuedOperatorAction, RoastService, create_app
-from roastpilot_agent.config import AppConfig, PostFirstCrackControl
+from roastpilot_agent.config import AppConfig, PostFirstCrackControl, ReferenceCurve
 from roastpilot_agent.live import mount_spa
 from roastpilot_agent.mcp_client import (
     EventSnapshot,
@@ -1003,6 +1003,7 @@ def build_replay_service(
     *,
     config: AppConfig | None = None,
     use_live_post_fc_control: bool = False,
+    use_live_reference_retrieval: bool = False,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> tuple[RoastService, ReplaySource, RoastStore]:
     """Wire a real :class:`RoastService` + :class:`ReplaySource` for an export.
@@ -1036,15 +1037,34 @@ def build_replay_service(
     live-defaults replay (e.g. to preview how a NEW recording would behave
     under the current production defaults, not to reproduce history).
 
+    **The identical invariant applies to same-bean reference retrieval
+    (#567 Slice B design note §6.5): replay must never perform a LIVE
+    reference lookup against the replaying machine's current store.** A
+    replay of an old export could otherwise pick up a reference roast that
+    did not exist yet (or was not yet rated) at the time the export was
+    originally recorded — replaying history under data that didn't exist
+    when it happened. So this factory ALSO overrides
+    ``reference_curve.enabled`` to ``False`` on whatever ``config``
+    resolves to, in the SAME ``model_copy`` this docstring describes above,
+    regardless of what ``config`` supplied — unless
+    ``use_live_reference_retrieval`` is set, mirroring
+    ``use_live_post_fc_control``'s own escape hatch exactly.
+
     Args:
         export_dir: The recorded ``roast.jsonl`` export directory to replay.
         store_path: Where to create the replay's own SQLite store.
         config: The base config to replay under; defaults to ``AppConfig()``.
-            Its ``post_first_crack_control`` section is overridden per the
-            invariant above unless ``use_live_post_fc_control`` is set.
+            Its ``post_first_crack_control`` and ``reference_curve`` sections
+            are overridden per the invariants above unless the matching
+            ``use_live_*`` flag is set.
         use_live_post_fc_control: Opt OUT of the pinned-baseline invariant —
             replay under ``config``'s own (possibly live-default) post-FC
             control settings instead. Default ``False``.
+        use_live_reference_retrieval: Opt OUT of the pinned-off reference
+            invariant — replay with same-bean reference retrieval running
+            LIVE against the replaying machine's current store instead of
+            forced off. Default ``False``. Mirrors
+            ``use_live_post_fc_control``.
         sleep: The inter-tick delay coroutine the free-running
             :meth:`ReplaySource.run` awaits; defaults to :func:`asyncio.sleep`.
             Tests pass a no-op so the free-running path drives the whole
@@ -1056,17 +1076,16 @@ def build_replay_service(
         ``(service, source, store)``.
     """
     app_config = config or AppConfig()
+    controller_pins: dict[str, object] = {}
     if not use_live_post_fc_control:
+        controller_pins["post_first_crack_control"] = PostFirstCrackControl(
+            enabled=False, ceiling_guard_drop_enabled=False
+        )
+    if not use_live_reference_retrieval:
+        controller_pins["reference_curve"] = ReferenceCurve(enabled=False)
+    if controller_pins:
         app_config = app_config.model_copy(
-            update={
-                "controller": app_config.controller.model_copy(
-                    update={
-                        "post_first_crack_control": PostFirstCrackControl(
-                            enabled=False, ceiling_guard_drop_enabled=False
-                        )
-                    }
-                )
-            }
+            update={"controller": app_config.controller.model_copy(update=controller_pins)}
         )
     control = ReplayRoasterControl()
     safety = SafetyPolicy(app_config.safety)

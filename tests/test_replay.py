@@ -17,12 +17,19 @@ import pytest
 import pytest_asyncio
 
 from roastpilot_agent.api import RoastService
-from roastpilot_agent.models import RoastEventKind, RoastPhase, SseEvent, SseEventType
+from roastpilot_agent.models import (
+    RoastEventKind,
+    RoastPhase,
+    RoastTelemetry,
+    SseEvent,
+    SseEventType,
+)
 from roastpilot_agent.replay import (
     MAX_SPEED,
     MIN_SPEED,
     ReplayMarker,
     ReplaySource,
+    build_replay_service,
     clamp_speed,
     create_replay_app,
     load_export,
@@ -875,6 +882,196 @@ async def test_replay_pins_the_baseline_post_fc_control_by_default(tmp_path: Pat
     # proves the ceiling guard did NOT fire mid-recording.
     assert "development" in no_config_timeline
     assert no_config_timeline[-2:] == ["cooling", "complete"]
+
+
+@pytest.mark.asyncio
+async def test_build_replay_service_pins_reference_curve_retrieval_off_by_default(
+    tmp_path: Path,
+) -> None:
+    """#567 Slice B (design note §6.5): replay must never perform a LIVE
+    same-bean reference lookup against the replaying machine's current
+    store — a replay of an old export could otherwise pick up a reference
+    that did not exist (or was not yet rated) at the time the export was
+    originally recorded. Mirrors
+    ``test_replay_pins_the_baseline_post_fc_control_by_default`` exactly:
+    the pin applies REGARDLESS of whether a config was supplied, and
+    regardless of what that config's own ``reference_curve.enabled`` was."""
+    from roastpilot_agent.config import AppConfig, ReferenceCurve
+
+    service_no_config, _source, store_no_config = build_replay_service(
+        _COOLING_COMPLETE, tmp_path / "cc_ref_no_config.sqlite3"
+    )
+    try:
+        assert (
+            service_no_config._config.controller.reference_curve.enabled is False  # pyright: ignore[reportPrivateUsage]
+        )
+    finally:
+        await store_no_config.close()
+
+    live_default_config = AppConfig(
+        controller=AppConfig().controller.model_copy(
+            update={"reference_curve": ReferenceCurve(enabled=True)}
+        )
+    )
+    service_explicit, _source2, store_explicit = build_replay_service(
+        _COOLING_COMPLETE,
+        tmp_path / "cc_ref_explicit_config.sqlite3",
+        config=live_default_config,
+    )
+    try:
+        assert (
+            service_explicit._config.controller.reference_curve.enabled is False  # pyright: ignore[reportPrivateUsage]
+        )
+    finally:
+        await store_explicit.close()
+
+
+@pytest.mark.asyncio
+async def test_build_replay_service_use_live_reference_retrieval_opt_out(
+    tmp_path: Path,
+) -> None:
+    """``use_live_reference_retrieval=True`` leaves the config's own
+    ``reference_curve.enabled`` exactly as supplied — the escape hatch,
+    mirroring ``use_live_post_fc_control``'s own opt-out."""
+    from roastpilot_agent.config import AppConfig, ReferenceCurve
+
+    live_config = AppConfig(
+        controller=AppConfig().controller.model_copy(
+            update={"reference_curve": ReferenceCurve(enabled=True)}
+        )
+    )
+    service, _source, store = build_replay_service(
+        _COOLING_COMPLETE,
+        tmp_path / "cc_ref_live_opt_out.sqlite3",
+        config=live_config,
+        use_live_reference_retrieval=True,
+    )
+    try:
+        assert (
+            service._config.controller.reference_curve.enabled is True  # pyright: ignore[reportPrivateUsage]
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_replay_service_both_live_opt_outs_leaves_controller_config_untouched(
+    tmp_path: Path,
+) -> None:
+    """With BOTH ``use_live_post_fc_control`` and
+    ``use_live_reference_retrieval`` set, no pin applies at all — the
+    supplied ``controller`` section passes through completely unmodified
+    (the ``model_copy`` pin block never runs when neither invariant needs
+    enforcing)."""
+    from roastpilot_agent.config import AppConfig, PostFirstCrackControl, ReferenceCurve
+
+    live_config = AppConfig(
+        controller=AppConfig().controller.model_copy(
+            update={
+                "post_first_crack_control": PostFirstCrackControl(
+                    enabled=True, ceiling_guard_drop_enabled=True
+                ),
+                "reference_curve": ReferenceCurve(enabled=True),
+            }
+        )
+    )
+    service, _source, store = build_replay_service(
+        _COOLING_COMPLETE,
+        tmp_path / "cc_both_live_opt_out.sqlite3",
+        config=live_config,
+        use_live_post_fc_control=True,
+        use_live_reference_retrieval=True,
+    )
+    try:
+        assert service._config.controller == live_config.controller  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_replay_session_never_retrieves_a_live_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end no-leak proof for the #567 replay pin (mirrors how
+    ``test_replay_pins_the_baseline_post_fc_control_by_default`` proves its
+    own pin through real behaviour, not just a resolved-config check).
+
+    A qualifying same-bean rated completed run is seeded directly into the
+    REPLAY's own store FIRST — so, if live retrieval ran at all, it would
+    find and return this run (a false pass is impossible). A full replay
+    session is then driven end-to-end to completion under a config with
+    ``reference_curve.enabled=True`` explicitly set (proving the FACTORY
+    pin overrides the caller's own config, not merely that the caller
+    forgot to opt in) — a spy on ``RoastStore.load_reference_roast`` must
+    record ZERO calls: no lookahead data leak from the replaying machine's
+    current corpus into a replayed old export."""
+    from roastpilot_agent.config import AppConfig, ReferenceCurve
+    from roastpilot_agent.replay import (
+        _profile_for,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
+    )
+    from roastpilot_agent.store import RoastStore
+
+    calls = 0
+    original = RoastStore.load_reference_roast
+
+    async def spy(self: RoastStore, *args: object, **kwargs: object) -> object | None:
+        nonlocal calls
+        calls += 1
+        return await original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(RoastStore, "load_reference_roast", spy)
+
+    store_path = tmp_path / "cc_ref_no_leak.sqlite3"
+    seed_store = RoastStore(store_path)
+    await seed_store.initialize()
+    try:
+        # The SAME identity fields build_replay_service's own _profile_for
+        # synthesizes for this export — so this seeded run trivially
+        # qualifies as a same-bean reference IF retrieval ran.
+        profile = _profile_for(_COOLING_COMPLETE.name)
+        await seed_store.create_run(
+            run_id="pre-existing-good-roast",
+            profile=profile,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await seed_store.record_telemetry(
+            run_id="pre-existing-good-roast",
+            tick=1,
+            agent_phase=RoastPhase.DEVELOPMENT,
+            elapsed_seconds=600.0,
+            interval_seconds=0.0,
+            telemetry=RoastTelemetry(bean_temp_c=182.0, env_temp_c=195.0, bean_ror_c_per_min=7.0),
+            development_percent=15.1,
+            charge_elapsed_seconds=600.0,
+        )
+        await seed_store.complete_run(
+            run_id="pre-existing-good-roast", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await seed_store.set_operator_rating("pre-existing-good-roast", rating=5)
+    finally:
+        await seed_store.close()
+
+    # A live-defaults config with the flag explicitly True — proves the
+    # FACTORY pin (not just that this caller happened not to opt in).
+    live_default_config = AppConfig(
+        controller=AppConfig().controller.model_copy(
+            update={"reference_curve": ReferenceCurve(enabled=True)}
+        )
+    )
+    _app, _service, source = await create_replay_app(
+        _COOLING_COMPLETE,
+        store_path,
+        step_mode=True,
+        speed=60,
+        config=live_default_config,
+    )
+    try:
+        await source.advance_to(ReplayMarker.END)
+    finally:
+        await source.aclose()
+
+    assert calls == 0, "a replay session must never perform a live reference read"
 
 
 async def _drop_commands(service: RoastService, source: ReplaySource) -> list[dict[str, object]]:
