@@ -23,6 +23,7 @@ from roastpilot_agent.replay import (
     MIN_SPEED,
     ReplayMarker,
     ReplaySource,
+    build_replay_service,
     clamp_speed,
     create_replay_app,
     load_export,
@@ -875,6 +876,110 @@ async def test_replay_pins_the_baseline_post_fc_control_by_default(tmp_path: Pat
     # proves the ceiling guard did NOT fire mid-recording.
     assert "development" in no_config_timeline
     assert no_config_timeline[-2:] == ["cooling", "complete"]
+
+
+@pytest.mark.asyncio
+async def test_build_replay_service_pins_reference_curve_retrieval_off_by_default(
+    tmp_path: Path,
+) -> None:
+    """#567 Slice B (design note §6.5): replay must never perform a LIVE
+    same-bean reference lookup against the replaying machine's current
+    store — a replay of an old export could otherwise pick up a reference
+    that did not exist (or was not yet rated) at the time the export was
+    originally recorded. Mirrors
+    ``test_replay_pins_the_baseline_post_fc_control_by_default`` exactly:
+    the pin applies REGARDLESS of whether a config was supplied, and
+    regardless of what that config's own ``reference_curve.enabled`` was."""
+    from roastpilot_agent.config import AppConfig, ReferenceCurve
+
+    service_no_config, _source, store_no_config = build_replay_service(
+        _COOLING_COMPLETE, tmp_path / "cc_ref_no_config.sqlite3"
+    )
+    try:
+        assert (
+            service_no_config._config.controller.reference_curve.enabled is False  # pyright: ignore[reportPrivateUsage]
+        )
+    finally:
+        await store_no_config.close()
+
+    live_default_config = AppConfig(
+        controller=AppConfig().controller.model_copy(
+            update={"reference_curve": ReferenceCurve(enabled=True)}
+        )
+    )
+    service_explicit, _source2, store_explicit = build_replay_service(
+        _COOLING_COMPLETE,
+        tmp_path / "cc_ref_explicit_config.sqlite3",
+        config=live_default_config,
+    )
+    try:
+        assert (
+            service_explicit._config.controller.reference_curve.enabled is False  # pyright: ignore[reportPrivateUsage]
+        )
+    finally:
+        await store_explicit.close()
+
+
+@pytest.mark.asyncio
+async def test_build_replay_service_use_live_reference_retrieval_opt_out(
+    tmp_path: Path,
+) -> None:
+    """``use_live_reference_retrieval=True`` leaves the config's own
+    ``reference_curve.enabled`` exactly as supplied — the escape hatch,
+    mirroring ``use_live_post_fc_control``'s own opt-out."""
+    from roastpilot_agent.config import AppConfig, ReferenceCurve
+
+    live_config = AppConfig(
+        controller=AppConfig().controller.model_copy(
+            update={"reference_curve": ReferenceCurve(enabled=True)}
+        )
+    )
+    service, _source, store = build_replay_service(
+        _COOLING_COMPLETE,
+        tmp_path / "cc_ref_live_opt_out.sqlite3",
+        config=live_config,
+        use_live_reference_retrieval=True,
+    )
+    try:
+        assert (
+            service._config.controller.reference_curve.enabled is True  # pyright: ignore[reportPrivateUsage]
+        )
+    finally:
+        await store.close()
+
+
+@pytest.mark.asyncio
+async def test_build_replay_service_both_live_opt_outs_leaves_controller_config_untouched(
+    tmp_path: Path,
+) -> None:
+    """With BOTH ``use_live_post_fc_control`` and
+    ``use_live_reference_retrieval`` set, no pin applies at all — the
+    supplied ``controller`` section passes through completely unmodified
+    (the ``model_copy`` pin block never runs when neither invariant needs
+    enforcing)."""
+    from roastpilot_agent.config import AppConfig, PostFirstCrackControl, ReferenceCurve
+
+    live_config = AppConfig(
+        controller=AppConfig().controller.model_copy(
+            update={
+                "post_first_crack_control": PostFirstCrackControl(
+                    enabled=True, ceiling_guard_drop_enabled=True
+                ),
+                "reference_curve": ReferenceCurve(enabled=True),
+            }
+        )
+    )
+    service, _source, store = build_replay_service(
+        _COOLING_COMPLETE,
+        tmp_path / "cc_both_live_opt_out.sqlite3",
+        config=live_config,
+        use_live_post_fc_control=True,
+        use_live_reference_retrieval=True,
+    )
+    try:
+        assert service._config.controller == live_config.controller  # pyright: ignore[reportPrivateUsage]
+    finally:
+        await store.close()
 
 
 async def _drop_commands(service: RoastService, source: ReplaySource) -> list[dict[str, object]]:

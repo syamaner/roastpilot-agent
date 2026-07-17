@@ -774,6 +774,42 @@ class PostFirstCrackControl(BaseModel):
         return self
 
 
+class ReferenceCurve(BaseModel):
+    """Same-bean reference-curve retrieval master flag (#567 Slice B).
+
+    Gates whether ``RoastService`` retrieves a completed, well-rated past
+    roast of THIS SAME bean (by :func:`~roastpilot_agent.models.
+    recording_origin_slug`) once at roast start and hands it to the
+    controller as read-only :class:`~roastpilot_agent.advisor.AdvisorContext`
+    (``reference_curve`` / ``reference_landmarks``) — a different completed
+    roast's own trajectory and landmarks, for the advisor to compare
+    against, never a target or a control input. No control path, safety
+    rule, or controller transition reads these fields back; retrieval is a
+    single store read at roast start (and again at post-restart recovery),
+    never per tick.
+
+    **This config model is inert on its own, mirroring
+    :class:`PostFirstCrackControl`'s own inert-until-wired posture**: with
+    ``enabled=False`` (the default), no store reference read ever happens
+    and ``AdvisorContext.reference_curve`` / ``reference_landmarks`` stay
+    empty / ``None`` — byte-for-byte identical to the pre-#567 behaviour.
+
+    ``enabled`` **defaults ``False`` and is hardware-gated for promotion**
+    (design note §6.6, mirroring D88's own ship-disabled-then-promote
+    posture): the design note's own replay bake-off is a gate to BUILD the
+    retrieval/representation machinery, not evidence sufficient to flip the
+    default — that requires at least one hardware roast with a live
+    reference present, ratified by the operator, same as D88/D90's own
+    validation-before-promotion precedent. Do not flip this default without
+    that hardware validation.
+    """
+
+    #: The master flag. ``False`` by default — no retrieval happens, and the
+    #: advisor context's reference fields stay empty/None, exactly today's
+    #: behaviour. Flip only after the hardware-validation gate above clears.
+    enabled: bool = Field(default=False)
+
+
 class PreFirstCrackLevers(BaseModel):
     """Deterministic pre-first-crack heat/fan lever parameters (D35 §3/§4-A, #222).
 
@@ -945,6 +981,15 @@ class ControllerConfig(BaseModel):
     # factory, not a bare model default, per the repo's pyright-strict
     # typed-default idiom (mirrors ``pre_first_crack_levers`` above).
     post_first_crack_control: PostFirstCrackControl = Field(default_factory=PostFirstCrackControl)
+    # #567 Slice B: same-bean reference-curve retrieval master flag. INERT with
+    # the default False (mirrors post_first_crack_control's own inert-until-
+    # wired posture): no store reference read happens and the advisor
+    # context's reference fields stay empty/None — byte-for-byte today's
+    # behaviour. Hardware-gated for promotion (see ReferenceCurve's
+    # docstring); parameterised factory per the repo's pyright-strict
+    # typed-default idiom (mirrors pre_first_crack_levers/
+    # post_first_crack_control above).
+    reference_curve: ReferenceCurve = Field(default_factory=ReferenceCurve)
     # D40.3 / D40.5 (#275): per-tick control-loop CONTEXT payload bounds. The
     # context builder (roast_history.RoastHistory) keeps the roast-so-far curve
     # as a bounded recent FULL-RESOLUTION window plus a milestone summary, and the

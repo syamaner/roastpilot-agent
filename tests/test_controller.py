@@ -51,6 +51,9 @@ from roastpilot_agent.models import (
     DropReason,
     OperatorAction,
     PostFcHeatAuthorityState,
+    ReferenceCurveSample,
+    ReferenceLandmarks,
+    ReferenceRoast,
     RoastCommand,
     RoastEventKind,
     RoastProfile,
@@ -128,6 +131,7 @@ def make_harness(
     config: ControllerConfig | None = None,
     limits: SafetyLimits | None = None,
     executor: RecordingExecutor | None = None,
+    reference_roast: ReferenceRoast | None = None,
 ) -> Harness:
     log: list[str] = []
     clock = FakeClock()
@@ -144,6 +148,7 @@ def make_harness(
         event_emitter=events,
         advisor=advisor,
         clock=clock,
+        reference_roast=reference_roast,
     )
     return Harness(controller, reader, executor, sink, events, clock, log)
 
@@ -4349,6 +4354,63 @@ def test_advisor_context_roast_style_is_intent_only_no_style_set() -> None:
     limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
     ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
     assert ctx.roast_style is None
+
+
+def _sample_reference_roast() -> ReferenceRoast:
+    """A minimal but non-trivial #567 reference for controller-level tests."""
+    return ReferenceRoast(
+        source_run_id="ref-run-1",
+        origin_slug="ethiopia-harness",
+        landmarks=ReferenceLandmarks(
+            first_crack_temp_c=182.0,
+            first_crack_elapsed_s=600.0,
+            drop_temp_c=190.0,
+            drop_development_percent=15.1,
+            operator_rating=4,
+        ),
+        curve=[
+            ReferenceCurveSample(t_s=600.0, bean_c=182.0, env_c=195.0, ror_c_min=7.0),
+            ReferenceCurveSample(t_s=715.0, bean_c=190.0, env_c=200.0, ror_c_min=4.0),
+        ],
+    )
+
+
+def test_advisor_context_reference_fields_default_empty_with_no_reference_roast() -> None:
+    """#567 Slice B invariant: a controller constructed with no
+    ``reference_roast`` (the default, ``None``) — every existing caller/test
+    that predates this story — builds an ``AdvisorContext`` with the exact
+    pre-#567 empty/``None`` reference fields."""
+    harness = make_harness()  # no reference_roast kwarg — the default path
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+    assert ctx.reference_curve == []
+    assert ctx.reference_landmarks is None
+
+
+def test_advisor_context_reference_fields_populated_from_cached_reference_roast() -> None:
+    """A controller constructed with a ``reference_roast`` (the caller's own
+    once-per-run, fail-soft retrieval) copies its ``curve``/``landmarks``
+    VERBATIM into every ``AdvisorContext`` built for the run's lifetime —
+    never re-derived, never re-retrieved per tick."""
+    reference = _sample_reference_roast()
+    harness = make_harness(reference_roast=reference)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    first_ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+    assert first_ctx.reference_curve == reference.curve
+    assert first_ctx.reference_landmarks == reference.landmarks
+
+    # A second tick's context build reads the SAME cached instance — no
+    # per-tick re-retrieval, no drift between calls.
+    harness.clock.advance(5.0)
+    second_ctx = harness.controller._build_advisor_context(reading(), limits)  # pyright: ignore[reportPrivateUsage]
+    assert second_ctx.reference_curve == reference.curve
+    assert second_ctx.reference_landmarks == reference.landmarks
 
 
 def test_advisor_context_roast_style_forwards_the_profiles_style_name() -> None:

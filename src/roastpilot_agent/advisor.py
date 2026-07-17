@@ -39,6 +39,8 @@ from roastpilot_agent.models import (
     AdvisorHealth,
     AdvisorHealthStatus,
     PostFcHeatAuthorityState,
+    ReferenceCurveSample,
+    ReferenceLandmarks,
     RoastPhase,
     RoastStyle,
 )
@@ -146,6 +148,25 @@ class AdvisorContext(BaseModel):
     authority; the deterministic drop anchor and the 196 °C ceiling guard are
     unchanged by this story. Default ``None`` for callers that build no
     profile (older callers, the drop-only bake-off).
+
+    ``reference_curve`` / ``reference_landmarks`` (#567 Slice B) carry a
+    DIFFERENT completed roast's own trajectory — a past, well-rated roast of
+    THIS SAME bean, retrieved by
+    :func:`~roastpilot_agent.models.recording_origin_slug` identity, never
+    the live curve window above (``roast_curve_window`` is always THIS
+    roast's own telemetry; see the #567 design note §0's terminology guard).
+    Both are read-only context with no control authority — the controller
+    and safety policy never read them back, and neither field carries an
+    actuated lever the way ``roast_curve_window``'s levers do. Shape-only:
+    the reference is something to compare a trajectory against, never a
+    target the controller or the advisor is required to hit. Populated by
+    the controller from a :class:`~roastpilot_agent.models.ReferenceRoast`
+    retrieved once at roast start (or fresh at post-restart recovery) and
+    cached for the run's lifetime — never re-retrieved per tick. Default
+    empty list / ``None`` for callers that build no reference (the
+    ``reference_curve.enabled`` config flag off, a bean with no qualifying
+    past roast, older callers, and every replay session, which pins live
+    reference retrieval off).
     """
 
     phase: RoastPhase
@@ -298,6 +319,18 @@ class AdvisorContext(BaseModel):
     # given rather than a numeric budget.
     post_fc_setpoint_c_per_min: float | None = None
     post_fc_heat_authority_state: PostFcHeatAuthorityState | None = None
+    # #567 Slice B: a DIFFERENT completed, well-rated roast of THIS SAME bean
+    # (retrieved by recording_origin_slug identity), for the advisor to
+    # compare its own trajectory against — read-only context, no control
+    # authority, shape-only (never a target). Retrieved once at roast start
+    # (or fresh at post-restart recovery) and cached for the run's lifetime;
+    # never re-retrieved per tick, and never populated during replay (the
+    # replay pin, mirroring post_first_crack_control's own pin). Default
+    # empty/None for callers that build no reference — the flag-off path
+    # (reference_curve.enabled=False, the default), a bean with no
+    # qualifying past roast, older callers, and the drop-only bake-off.
+    reference_curve: list[ReferenceCurveSample] = Field(default_factory=list[ReferenceCurveSample])
+    reference_landmarks: ReferenceLandmarks | None = None
 
 
 class RoastDecision(BaseModel):
