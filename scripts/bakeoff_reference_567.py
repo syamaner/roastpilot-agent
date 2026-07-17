@@ -50,10 +50,15 @@ self-exclusion, fixture reconstruction, reference injection, replay, resume,
 the cost guard, and the report — is provable at zero spend.
 
 Reads the real operator SQLite store (default ``~/roasts/roastpilot.sqlite3``,
-``--store``) via the normal :class:`~roastpilot_agent.store.RoastStore` —
-exactly how the live agent itself opens it (WAL + the same migration path);
-this script only ever calls read methods (``list_runs`` / ``read_run`` / the
-private reference-retrieval methods), so it can never write a roast record.
+``--store``), but NEVER opens that file itself: :func:`snapshot_store_to_temp`
+backs it up (via SQLite's own online backup API, against a strictly
+``mode=ro`` source connection) to a private temp copy first, and every
+:class:`~roastpilot_agent.store.RoastStore` call in this script — ``list_runs``
+/ ``read_run`` / the private reference-retrieval methods — operates on THAT
+copy. ``RoastStore.initialize()`` opens read-write and applies WAL/migrations
+(the normal, safe thing for the live agent to do to its own store), so this
+isolation is what keeps the operator's live database untouched even though
+this script only ever calls read methods on the (temp-copy) store.
 
 Exact operator run command (paid, real model calls)::
 
@@ -85,10 +90,12 @@ import argparse
 import asyncio
 import dataclasses
 import json
+import sqlite3
 import sys
 import tempfile
 import time
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -153,6 +160,52 @@ DEFAULT_MIN_GROUP_SIZE = 2
 ReasoningEffort = Literal["off", "minimal", "low", "medium", "high"]
 
 
+# --- Read-only store isolation (Codex PR #578 finding: never open the operator's
+# --- live DB read-write) -------------------------------------------------------
+
+
+def snapshot_store_to_temp(store_path: Path, tmp_dir: Path) -> Path:
+    """Copy the operator store to a private temp file; this script opens ONLY the copy.
+
+    ``RoastStore.initialize()`` opens its database read-write and applies the
+    WAL pragma + any pending migration (the normal, safe thing for the live
+    agent to do to ITS OWN store) — but this script is documented read-only
+    against the OPERATOR's real ``~/roasts/roastpilot.sqlite3``, and must never
+    open that file read-write, even transiently, even under ``--dry-run``.
+
+    Uses SQLite's own online backup API (:meth:`sqlite3.Connection.backup`)
+    against a strictly read-only (``mode=ro``) source connection, so the
+    snapshot is a fully consistent point-in-time copy (including anything
+    still only in the source's WAL) without ever acquiring a write lock on the
+    operator's file. The returned path lives under ``tmp_dir`` (the caller's
+    temp directory, cleaned up on exit) and is the ONLY path this script ever
+    opens read-write.
+
+    Args:
+        store_path: The real operator store to copy.
+        tmp_dir: A scratch directory the caller owns and will clean up.
+
+    Returns:
+        The path to the private snapshot copy.
+
+    Raises:
+        FileNotFoundError: If ``store_path`` does not exist.
+    """
+    if not store_path.exists():
+        raise FileNotFoundError(f"no store at {store_path}")
+    snapshot_path = tmp_dir / "store-snapshot.sqlite3"
+    source = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
+    try:
+        target = sqlite3.connect(str(snapshot_path))
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+    finally:
+        source.close()
+    return snapshot_path
+
+
 # --- Arm definitions (design note §6.4) --------------------------------------
 
 
@@ -213,6 +266,9 @@ class HeldOutMeta:
         charge_grams: The effective charge weight (corrected when present,
             else the frozen default) — the reference retrieval's tolerance
             anchor.
+        started_at_utc: The held-out roast's ``roast_runs.started_at_utc`` —
+            the look-ahead guard's anchor (Codex PR #578 finding): a reference
+            candidate must have COMPLETED strictly before this instant.
     """
 
     run_id: str
@@ -220,12 +276,17 @@ class HeldOutMeta:
     bean_label: str
     operator_rating: int
     charge_grams: float
+    started_at_utc: str
 
 
 async def _meta_for_run(store: RoastStore, run_id: str) -> HeldOutMeta | None:
     """Resolve one run's held-out metadata, or ``None`` if it cannot qualify.
 
-    A run cannot qualify when it does not exist, was never rated, or its
+    A run cannot qualify when it does not exist, was never rated, was not
+    completed (``outcome != "completed"`` — the same gate
+    :func:`discover_held_out_runs` applies via its own SQL/list filter, now
+    also enforced here so an explicit ``--run-ids`` cannot smuggle in an
+    aborted/faulted run the auto-discovery path would have rejected), or its
     frozen profile yields no :func:`recording_origin_slug` (no usable bean
     identity text at all — the same guard the store's own reference-retrieval
     query applies).
@@ -238,7 +299,7 @@ async def _meta_for_run(store: RoastStore, run_id: str) -> HeldOutMeta | None:
         The resolved :class:`HeldOutMeta`, or ``None``.
     """
     detail = await store.read_run(run_id)
-    if detail is None or detail.rating is None:
+    if detail is None or detail.rating is None or detail.outcome != "completed":
         return None
     origin_slug = recording_origin_slug(detail.profile)
     if origin_slug is None:
@@ -254,6 +315,7 @@ async def _meta_for_run(store: RoastStore, run_id: str) -> HeldOutMeta | None:
         bean_label=detail.profile.name,
         operator_rating=detail.rating,
         charge_grams=charge_grams,
+        started_at_utc=detail.started_at_utc,
     )
 
 
@@ -324,7 +386,7 @@ async def find_self_excluded_reference(
     min_rating: int,
     weight_tolerance_frac: float,
 ) -> ReferenceRoast | None:
-    """The best USABLE reference for ``meta``, with ``meta`` excluded from its own pool.
+    """The best USABLE, TEMPORALLY-PRIOR reference for ``meta``, self-excluded.
 
     Calls :meth:`~roastpilot_agent.store.RoastStore._ranked_reference_run_ids`
     directly (best-first) and filters ``meta.run_id`` out of the ranked list
@@ -337,17 +399,27 @@ async def find_self_excluded_reference(
     telemetry would otherwise legitimately outrank every other same-bean run,
     defeating the whole comparison).
 
+    A candidate must also have COMPLETED strictly before ``meta`` STARTED
+    (Codex PR #578 finding): excluding only ``meta.run_id`` still lets a
+    temporally LATER same-bean roast stand in as "the reference", which the
+    live agent could never have retrieved for that earlier roast — a
+    look-ahead leak. The candidate's own ``completed_at_utc`` is the anchor
+    (falling back to ``started_at_utc`` on the rare pre-completion-timestamp
+    row); a candidate whose timestamp cannot be read at all is skipped rather
+    than assumed prior.
+
     Args:
         store: The open store.
         meta: The held-out run to find a reference FOR (excluded from the
-            candidate pool).
+            candidate pool, and the temporal cutoff every candidate must
+            precede).
         min_rating: The reference candidate quality floor.
         weight_tolerance_frac: The charge-weight tolerance band.
 
     Returns:
-        The best usable :class:`~roastpilot_agent.models.ReferenceRoast` other
-        than ``meta`` itself, or ``None`` when no other qualifying, buildable
-        run exists.
+        The best usable, temporally-prior
+        :class:`~roastpilot_agent.models.ReferenceRoast`, or ``None`` when no
+        other qualifying, buildable, prior run exists.
     """
     ranked = await store._ranked_reference_run_ids(  # pyright: ignore[reportPrivateUsage]
         meta.origin_slug,
@@ -355,8 +427,17 @@ async def find_self_excluded_reference(
         min_rating=min_rating,
         weight_tolerance_frac=weight_tolerance_frac,
     )
+    held_out_started = datetime.fromisoformat(meta.started_at_utc)
     for run_id in ranked:
         if run_id == meta.run_id:
+            continue
+        candidate_detail = await store.read_run(run_id)
+        if candidate_detail is None:
+            continue
+        # completed_at_utc is optional (falls back to the always-present
+        # started_at_utc); RoastDetail guarantees the fallback is never None.
+        candidate_timestamp = candidate_detail.completed_at_utc or candidate_detail.started_at_utc
+        if datetime.fromisoformat(candidate_timestamp) >= held_out_started:
             continue
         reference = await store._build_reference_roast(  # pyright: ignore[reportPrivateUsage]
             run_id, meta.origin_slug
@@ -659,13 +740,30 @@ class ArmRecord:
         return sum(1 for t in self.ticks if t.error is not None)
 
 
-def arm_record_from_outcomes(arm: ArmSpec, outcomes: list[TickOutcome]) -> ArmRecord:
-    """Build an :class:`ArmRecord` from a completed replay's outcomes."""
+def arm_record_from_outcomes(
+    arm: ArmSpec, outcomes: list[TickOutcome], *, reference_injected: bool
+) -> ArmRecord:
+    """Build an :class:`ArmRecord` from a completed replay's outcomes.
+
+    Args:
+        arm: The arm spec (identity/label/prompt only — NOT the injection
+            source of truth; see ``reference_injected``).
+        outcomes: The per-tick replay outcomes.
+        reference_injected: Whether a reference was ACTUALLY spliced into this
+            arm's ticks (Codex PR #578 finding: ``arm.inject_reference`` is
+            only the REQUEST — a run whose bean has no other buildable
+            same-bean reference falls back to empty context even for arm 2/3,
+            per :func:`ticks_for_arm`, and the record must say so rather than
+            echo the request).
+
+    Returns:
+        The :class:`ArmRecord`.
+    """
     return ArmRecord(
         arm_key=arm.key,
         arm_label=arm.label,
         prompt_version=arm.prompt_version,
-        reference_injected=arm.inject_reference,
+        reference_injected=reference_injected,
         ticks=[tick_record_from_outcome(i, o) for i, o in enumerate(outcomes)],
     )
 
@@ -764,17 +862,43 @@ def sidecar_path(out: Path) -> Path:
     return out.with_name(out.name + ".cells.jsonl")
 
 
-CellKey = tuple[str, str]
+CellKey = tuple[str, str, str]
+
+
+def settings_key(model: str, cadence_seconds: float, *, dry_run: bool) -> str:
+    """The run-settings fingerprint folded into every checkpoint cell key.
+
+    Codex PR #578 finding: a bare ``(run_id, arm_key)`` key means a
+    ``--dry-run`` smoke or a different ``--model``/``--cadence-seconds`` run
+    against the SAME ``--out`` silently reuses another settings combination's
+    stale cells (a dry-run's fake decisions could even be replayed back as if
+    they were a real model's). Folding the settings that change what a cell
+    actually MEANS into the key means an incompatible re-run simply produces
+    a cache MISS (and appends a fresh, distinctly-keyed record) rather than a
+    silent collision — never a mixed sidecar file requiring manual cleanup.
+
+    Args:
+        model: The candidate model slug.
+        cadence_seconds: Roast-time spacing between scored ticks.
+        dry_run: Whether this run used the network-free fake advisor.
+
+    Returns:
+        A stable string fingerprint for the ``(model, cadence_seconds,
+        dry_run)`` triple.
+    """
+    return f"{model}|{cadence_seconds:.3f}|{dry_run}"
 
 
 class Checkpoint:
-    """Append-only sidecar of completed ``(run_id, arm_key)`` cells.
+    """Append-only sidecar of completed ``(run_id, arm_key, settings_key)`` cells.
 
     Mirrors ``advisor_bakeoff.Checkpoint``'s incremental-flush + resume
-    discipline at the ``(run_id, arm)`` grain this script uses: each completed
-    arm-cell is appended to the JSONL sidecar immediately, so a kill / budget
-    stop / crash leaves every finished cell recoverable, and a re-run with the
-    same ``--out`` skips cells already on disk.
+    discipline at the ``(run_id, arm, settings)`` grain this script uses: each
+    completed arm-cell is appended to the JSONL sidecar immediately, so a kill
+    / budget stop / crash leaves every finished cell recoverable, and a re-run
+    with the same ``--out`` AND settings skips cells already on disk. A record
+    from an incompatible settings combination (or a legacy record predating
+    the settings key) never resolves as a hit — see :func:`settings_key`.
     """
 
     def __init__(self, path: Path, *, resume: bool = True) -> None:
@@ -793,29 +917,43 @@ class Checkpoint:
             path.unlink()
 
     def _load(self) -> None:
-        """Load existing sidecar records, keyed by ``(run_id, arm_key)``."""
+        """Load existing sidecar records, keyed by ``(run_id, arm_key, settings_key)``.
+
+        A record written before this fix carries no ``settings_key`` field;
+        it is loaded under the empty-string fingerprint, which no live run
+        can ever request (:func:`settings_key` never returns ``""``), so a
+        legacy record is preserved on disk but never resolves as a resume hit.
+        """
         for line in self.path.read_text().splitlines():
             if not line.strip():
                 continue
             record = cast("dict[str, Any]", json.loads(line))
-            key = (str(record["run_id"]), str(record["arm_key"]))
+            key = (
+                str(record["run_id"]),
+                str(record["arm_key"]),
+                str(record.get("settings_key", "")),
+            )
             self._records[key] = record
 
-    def has(self, run_id: str, arm_key: str) -> bool:
-        """Return whether ``(run_id, arm_key)`` is already complete on disk."""
-        return (run_id, arm_key) in self._records
+    def has(self, run_id: str, arm_key: str, key_settings: str) -> bool:
+        """Return whether ``(run_id, arm_key, key_settings)`` is already complete on disk."""
+        return (run_id, arm_key, key_settings) in self._records
 
-    def get(self, run_id: str, arm_key: str) -> dict[str, Any]:
+    def get(self, run_id: str, arm_key: str, key_settings: str) -> dict[str, Any]:
         """Return the stored record for an already-complete cell."""
-        return self._records[(run_id, arm_key)]
+        return self._records[(run_id, arm_key, key_settings)]
 
     def append(self, record: dict[str, Any]) -> None:
-        """Persist one completed cell to disk immediately and remember it."""
+        """Persist one completed cell to disk immediately and remember it.
+
+        ``record`` must carry a ``"settings_key"`` field (see
+        :func:`settings_key`) — every call site in this script sets it.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record) + "\n")
             handle.flush()
-        key = (str(record["run_id"]), str(record["arm_key"]))
+        key = (str(record["run_id"]), str(record["arm_key"]), str(record["settings_key"]))
         self._records[key] = record
 
     def completed_count(self) -> int:
@@ -904,7 +1042,9 @@ async def run_bakeoff(
     """Run the full three-arm bake-off over every (auto-discovered or explicit) held-out run.
 
     Args:
-        store_path: The real operator SQLite store.
+        store_path: The real operator SQLite store — read via a private
+            snapshot copy (:func:`snapshot_store_to_temp`); never opened
+            read-write directly.
         model: The candidate model slug (all three arms use the same model).
         run_ids: Explicit held-out run ids, or ``None`` to auto-discover every
             completed+rated run in a same-bean group of >= ``min_group_size``.
@@ -923,71 +1063,88 @@ async def run_bakeoff(
     Returns:
         The :class:`BakeoffResult`.
     """
-    store = RoastStore(store_path)
-    await store.initialize()
-    try:
-        metas = (
-            await resolve_explicit_runs(store, run_ids)
-            if run_ids
-            else await discover_held_out_runs(store, min_group_size=min_group_size)
-        )
-        if not metas:
+    with tempfile.TemporaryDirectory(prefix="bakeoff-reference-567-") as tmp:
+        tmp_dir = Path(tmp)
+        # Codex PR #578 finding: never open the operator's live store
+        # read-write. RoastStore.initialize() opens read-write and applies
+        # WAL/migrations, so this script only ever opens a private snapshot
+        # COPY, never store_path itself — regardless of --dry-run.
+        snapshot_path = snapshot_store_to_temp(store_path, tmp_dir)
+        store = RoastStore(snapshot_path)
+        await store.initialize()
+        try:
+            metas = (
+                await resolve_explicit_runs(store, run_ids)
+                if run_ids
+                else await discover_held_out_runs(store, min_group_size=min_group_size)
+            )
+            if not metas:
+                print(
+                    "no held-out runs found (no completed+rated run in a same-bean "
+                    f"group of >= {min_group_size}, and --run-ids was not given)",
+                    flush=True,
+                )
+                return BakeoffResult(
+                    runs=[],
+                    skipped_runs=[],
+                    stopped_for_budget=False,
+                    resumed_cells=0,
+                    fresh_cells=0,
+                    total_cells=0,
+                )
+
+            checkpoint = Checkpoint(sidecar_path(out), resume=resume)
+            guard = CostGuard(cost_per_call, None if dry_run else max_spend)
+            key_settings = settings_key(model, cadence_seconds, dry_run=dry_run)
+            total_cells = len(metas) * len(ARMS)
+            run_labels = ", ".join(f"{m.bean_label} [{m.run_id[:8]}]" for m in metas)
             print(
-                "no held-out runs found (no completed+rated run in a same-bean "
-                f"group of >= {min_group_size}, and --run-ids was not given)",
+                f"held-out runs: {len(metas)} ({run_labels}) -> {total_cells} cells "
+                f"(runs x {len(ARMS)} arms)",
                 flush=True,
             )
-            return BakeoffResult(
-                runs=[],
-                skipped_runs=[],
-                stopped_for_budget=False,
-                resumed_cells=0,
-                fresh_cells=0,
-                total_cells=0,
-            )
 
-        checkpoint = Checkpoint(sidecar_path(out), resume=resume)
-        guard = CostGuard(cost_per_call, None if dry_run else max_spend)
-        total_cells = len(metas) * len(ARMS)
-        run_labels = ", ".join(f"{m.bean_label} [{m.run_id[:8]}]" for m in metas)
-        print(
-            f"held-out runs: {len(metas)} ({run_labels}) -> {total_cells} cells "
-            f"(runs x {len(ARMS)} arms)",
-            flush=True,
-        )
+            runs: list[RunRecord] = []
+            skipped_runs: list[str] = []
+            resumed_cells = 0
+            fresh_cells = 0
+            stopped = False
 
-        runs: list[RunRecord] = []
-        skipped_runs: list[str] = []
-        resumed_cells = 0
-        fresh_cells = 0
-        stopped = False
+            def _arm_record_from_checkpoint(record: dict[str, Any]) -> ArmRecord:
+                """Rebuild an :class:`ArmRecord` from a loaded checkpoint record."""
+                return ArmRecord(
+                    arm_key=str(record["arm_key"]),
+                    arm_label=str(record["arm_label"]),
+                    prompt_version=str(record["prompt_version"]),
+                    reference_injected=bool(record["reference_injected"]),
+                    ticks=[
+                        tick_record_from_json(cast("dict[str, Any]", t))
+                        for t in cast("list[Any]", record["ticks"])
+                    ],
+                )
 
-        with tempfile.TemporaryDirectory(prefix="bakeoff-reference-567-") as tmp:
-            tmp_dir = Path(tmp)
             for meta in metas:
                 if stopped:
                     break
-                all_cached = all(checkpoint.has(meta.run_id, arm.key) for arm in ARMS)
+                all_cached = all(checkpoint.has(meta.run_id, arm.key, key_settings) for arm in ARMS)
                 arm_records: dict[str, ArmRecord] = {}
                 reference_info: ReferenceInfo | None = None
                 tick_count = 0
 
                 if all_cached:
                     for arm in ARMS:
-                        record = checkpoint.get(meta.run_id, arm.key)
-                        arm_records[arm.key] = ArmRecord(
-                            arm_key=str(record["arm_key"]),
-                            arm_label=str(record["arm_label"]),
-                            prompt_version=str(record["prompt_version"]),
-                            reference_injected=bool(record["reference_injected"]),
-                            ticks=[
-                                tick_record_from_json(cast("dict[str, Any]", t))
-                                for t in cast("list[Any]", record["ticks"])
-                            ],
-                        )
+                        record = checkpoint.get(meta.run_id, arm.key, key_settings)
+                        arm_record = _arm_record_from_checkpoint(record)
+                        arm_records[arm.key] = arm_record
                         resumed_cells += 1
+                        # #578 finding 3: seed the guard with resumed calls too, so a
+                        # re-run's spend accounting (and --max-spend enforcement)
+                        # reflects EVERY call this --out has ever paid for, not just
+                        # the calls made in this process.
+                        if not dry_run:
+                            guard.add_calls(len(arm_record.ticks))
                     reference_info = _reference_from_json_or_meta(
-                        checkpoint.get(meta.run_id, ARMS[0].key)
+                        checkpoint.get(meta.run_id, ARMS[0].key, key_settings)
                     )
                     tick_count = len(arm_records[ARMS[0].key].ticks)
                     print(
@@ -996,7 +1153,7 @@ async def run_bakeoff(
                     )
                 else:
                     try:
-                        fixture = build_fixture_for_run(store_path, meta.run_id, tmp_dir)
+                        fixture = build_fixture_for_run(snapshot_path, meta.run_id, tmp_dir)
                         dev_ticks = build_development_ticks(
                             fixture, cadence_seconds=cadence_seconds
                         )
@@ -1030,19 +1187,13 @@ async def run_bakeoff(
                     )
 
                     for arm in ARMS:
-                        if checkpoint.has(meta.run_id, arm.key):
-                            record = checkpoint.get(meta.run_id, arm.key)
-                            arm_records[arm.key] = ArmRecord(
-                                arm_key=str(record["arm_key"]),
-                                arm_label=str(record["arm_label"]),
-                                prompt_version=str(record["prompt_version"]),
-                                reference_injected=bool(record["reference_injected"]),
-                                ticks=[
-                                    tick_record_from_json(cast("dict[str, Any]", t))
-                                    for t in cast("list[Any]", record["ticks"])
-                                ],
-                            )
+                        if checkpoint.has(meta.run_id, arm.key, key_settings):
+                            record = checkpoint.get(meta.run_id, arm.key, key_settings)
+                            arm_record = _arm_record_from_checkpoint(record)
+                            arm_records[arm.key] = arm_record
                             resumed_cells += 1
+                            if not dry_run:
+                                guard.add_calls(len(arm_record.ticks))
                             continue
                         if not dry_run and guard.would_exceed(tick_count):
                             stopped = True
@@ -1054,6 +1205,10 @@ async def run_bakeoff(
                                 flush=True,
                             )
                             break
+                        # #578 finding 1: reference may be None (no PRIOR same-bean run
+                        # qualified), in which case arm 2/3 silently degrade to arm 1's
+                        # empty context — reference_injected below records that REALITY.
+                        actually_injected = arm.inject_reference and reference is not None
                         arm_ticks = ticks_for_arm(dev_ticks, reference, inject=arm.inject_reference)
                         recommender = build_recommender(
                             model, arm.prompt_version, reasoning, dry_run=dry_run
@@ -1063,7 +1218,9 @@ async def run_bakeoff(
                         )
                         if not dry_run:
                             guard.add_calls(len(outcomes))
-                        arm_record = arm_record_from_outcomes(arm, outcomes)
+                        arm_record = arm_record_from_outcomes(
+                            arm, outcomes, reference_injected=actually_injected
+                        )
                         arm_records[arm.key] = arm_record
                         fresh_cells += 1
                         first_drop = arm_record.first_drop()
@@ -1080,9 +1237,13 @@ async def run_bakeoff(
                                 "arm_key": arm.key,
                                 "arm_label": arm.label,
                                 "prompt_version": arm.prompt_version,
-                                "reference_injected": arm.inject_reference,
+                                "reference_injected": actually_injected,
                                 "reference": reference_info_to_json(reference_info),
                                 "ticks": [tick_record_to_json(t) for t in arm_record.ticks],
+                                "settings_key": key_settings,
+                                "model": model,
+                                "cadence_seconds": cadence_seconds,
+                                "dry_run": dry_run,
                             }
                         )
 
@@ -1100,16 +1261,16 @@ async def run_bakeoff(
                         )
                     )
 
-        return BakeoffResult(
-            runs=runs,
-            skipped_runs=skipped_runs,
-            stopped_for_budget=stopped,
-            resumed_cells=resumed_cells,
-            fresh_cells=fresh_cells,
-            total_cells=total_cells,
-        )
-    finally:
-        await store.close()
+            return BakeoffResult(
+                runs=runs,
+                skipped_runs=skipped_runs,
+                stopped_for_budget=stopped,
+                resumed_cells=resumed_cells,
+                fresh_cells=fresh_cells,
+                total_cells=total_cells,
+            )
+        finally:
+            await store.close()
 
 
 # --- Report rendering ----------------------------------------------------------
@@ -1237,12 +1398,19 @@ def render_report(result: BakeoffResult, *, model: str, dry_run: bool) -> str:
         drop_dtrs: list[float] = []
         drop_temps: list[float] = []
         runs_with_drop = 0
+        # #578 finding 6: the denominator must be runs that actually HAVE a cell
+        # for this arm, not len(result.runs) — a --max-spend stop mid-run can
+        # leave a RunRecord with only arm 1 present, and dividing by every run
+        # (including ones this arm never ran on) makes a not-yet-run cell read
+        # as a false "no drop" instead of "not run".
+        runs_with_cell = 0
         reference_mentions = 0
         total_ticks = 0
         for run in result.runs:
             record = run.arms.get(arm.key)
             if record is None:
                 continue
+            runs_with_cell += 1
             first_drop = record.first_drop()
             if first_drop is not None:
                 runs_with_drop += 1
@@ -1256,7 +1424,7 @@ def render_report(result: BakeoffResult, *, model: str, dry_run: bool) -> str:
         mean_dtr = sum(drop_dtrs) / len(drop_dtrs) if drop_dtrs else None
         mean_temp = sum(drop_temps) / len(drop_temps) if drop_temps else None
         lines.append(
-            f"| {arm.label} | {runs_with_drop}/{len(result.runs)} | {_fmt(mean_dtr)} | "
+            f"| {arm.label} | {runs_with_drop}/{runs_with_cell} | {_fmt(mean_dtr)} | "
             f"{_fmt(mean_temp)} | {reference_mentions}/{total_ticks} ticks |"
         )
     lines.append("")
@@ -1321,8 +1489,9 @@ async def main() -> int:
         "--store",
         type=Path,
         default=Path.home() / "roasts" / "roastpilot.sqlite3",
-        help="path to the real operator SQLite store (read via RoastStore; only "
-        "read methods are called — never mutated)",
+        help="path to the real operator SQLite store; NEVER opened directly — a "
+        "private temp snapshot copy is opened instead, so this file is never "
+        "opened read-write",
     )
     parser.add_argument(
         "--model", default=DEFAULT_MODEL, help=f"candidate model slug (default: {DEFAULT_MODEL})"
