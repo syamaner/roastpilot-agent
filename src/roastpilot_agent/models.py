@@ -806,7 +806,7 @@ class BeanProfileList(BaseModel):
 # --- #567 Slice A: reference-curve retrieval + representation models ---
 #
 # A completed, well-rated past roast of THIS SAME bean, retrieved by
-# `store.RoastStore.find_reference_run` / `build_reference_roast` for future
+# `store.RoastStore.find_reference_run` / `load_reference_roast` for future
 # advisor context. This slice is deliberately INERT: these models are read-only
 # retrieval output, not wired into `AdvisorContext`, `start_roast`, the
 # controller, replay, or config — that plumbing (and the AdvisorContext-facing
@@ -875,7 +875,7 @@ class ReferenceRoast(BaseModel):
 
     Pure retrieval + representation data returned by
     :meth:`~roastpilot_agent.store.RoastStore.find_reference_run` /
-    :meth:`~roastpilot_agent.store.RoastStore.build_reference_roast`. Carries
+    :meth:`~roastpilot_agent.store.RoastStore.load_reference_roast`. Carries
     no control authority and is not (yet) read by the controller, safety, the
     advisor, or the API — Slice B wires it into ``AdvisorContext``.
     """
