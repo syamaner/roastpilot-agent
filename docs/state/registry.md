@@ -102,7 +102,45 @@
 
 ## Active Context
 
-**16 Jul 2026 (latest) — BATCH 4 COMPLETE: four tracks, three PRs merged + one design note
+**17 Jul 2026 (latest) — #567 REFERENCE CURVES: full code build SHIPPED across three slices
+(PRs #574/#575/#576), feature ships DISABLED. Operator picked #567 to build (said they'll do the
+D96 validation roast after it lands).** The designed-but-empty `reference_roasts` is now a working
+advisor-context input — the operator's own best-rated past roast of the SAME bean, retrieved at
+roast start and shown to the advisor as read-only context — gated OFF by default. Serial stack off
+`main`, lead-orchestrated (one `engineer-be` per slice + `safety-reviewer`/`qa` pre-open reviews +
+Codex post-open); ~13 reviewer findings folded across the stack, zero un-triaged threads:
+- **Slice A (#574, `46c5922`) — retrieval + representation, INERT (no wiring).**
+  `ReferenceCurveSample`/`ReferenceLandmarks`/`ReferenceRoast` models + `RoastStore.find_reference_run`
+  / `load_reference_roast` (private `_build_reference_roast`): best-rated (≥3) completed prior run of
+  the same `recording_origin_slug` within ±10 % charge weight, tie-break recency, best-USABLE
+  fall-through, `outcome='completed'` filter, clock-safe drop/FC landmarks off the development-phase
+  telemetry rows (no cooling-tail bug, §6.4a), ≤30-pt curve trimmed at drop. qa (3 test gaps) + Codex
+  (5: raw-string `RoastPhase`→typed `is`, faulted-run exclusion, unbuildable fall-through, curve trim,
+  private builder) all folded.
+- **Slice B (#575, `02b6626`) — plumbing, flag-gated default OFF.**
+  `controller.reference_curve.enabled` (default `False` = zero store reads, empty context, identical
+  CONTROL behaviour); `AdvisorContext.reference_curve`/`reference_landmarks` (read-only, shape-only, no
+  levers); fail-soft flag-gated retrieval retrieved ONCE in the common `_build_runner` (covers fresh
+  start + operator-resume; the just-created run excluded by hard SQL); replay pins retrieval OFF
+  (`use_live_reference_retrieval` hatch, mirrors the post-FC pin — no lookahead leak). **safety-reviewer
+  PASS** (six invariants traced: read-only, no control authority, restart-no-auto-resume, fail-soft);
+  qa folded (retrieve-once `calls==1` proof, end-to-end replay no-leak, doc precision).
+- **Slice C (#576, `c544667`) — c9 teaching + Config selector.** c9 = c8 + one minimal, non-imperative
+  reference section ("deviations are information, not commands"; names NO numbers; subordinate to the
+  profile's own targets and the joint-objective teaching); selectable-only, **c3 stays the live
+  default**; c9 added to the SPA prompt-version selector. qa PASS; Codex folded (expose c9 in the UI
+  selector) + one reasoned dismissal (`reference_curve.enabled` is env/launch-toggled like every
+  post-FC sibling flag — `post_first_crack_control.enabled`/`ceiling_guard`/`recovery_enabled` are all
+  absent from `/config` too — not a piecemeal UI decision for a prompt PR).
+**#567 stays OPEN** — feature ships DISABLED; promotion is gated on (1) the 3-arm offline bake-off
+(design §6.4: c8-no-ref / c8-ref-untaught / c9-ref-taught) as the FIRST gate, THEN (2) a hardware roast
+with a live reference (El Durazno / Colombia / Sumatra all qualify in the corpus). **The 3-arm bake-off
+is the next validation step — paid OpenRouter, produces DATA; offered, operator-gated.** Process notes:
+LSP diagnostics were STALE all session (phantom `build_reference_roast`/`tz` flags — real `pyright`
+always authoritative); the auto-mode classifier blocked `git commit --amend`/force-push in the main
+loop → used normal commits (squash-merge collapses them).
+
+**16 Jul 2026 — BATCH 4 COMPLETE: four tracks, three PRs merged + one design note
 (PRs #568/#570/#569; note on #567). D96 recovery law now FULLY BUILT on main.** Operator: "file
 it and run with it. Any other autonomous tasks, update the boards and get teams on them." Four
 parallel tracks, lead-orchestrated (per-track engineer + Opus safety reviewers), all landed:
