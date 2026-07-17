@@ -792,7 +792,12 @@ class ReferenceCurve(BaseModel):
     :class:`PostFirstCrackControl`'s own inert-until-wired posture**: with
     ``enabled=False`` (the default), no store reference read ever happens
     and ``AdvisorContext.reference_curve`` / ``reference_landmarks`` stay
-    empty / ``None`` — byte-for-byte identical to the pre-#567 behaviour.
+    empty / ``None`` — no store reads and empty context values, identical
+    CONTROL behaviour to the pre-#567 code. (Precisely: the advisor's
+    prompt JSON does gain two always-empty keys, ``reference_curve: []`` /
+    ``reference_landmarks: null`` — inherent to any new ``AdvisorContext``
+    field, the same as ``roast_style`` / ``post_fc_setpoint_c_per_min``
+    before it; this is a context-shape addition, not a behavioural one.)
 
     ``enabled`` **defaults ``False`` and is hardware-gated for promotion**
     (design note §6.6, mirroring D88's own ship-disabled-then-promote
@@ -984,9 +989,11 @@ class ControllerConfig(BaseModel):
     # #567 Slice B: same-bean reference-curve retrieval master flag. INERT with
     # the default False (mirrors post_first_crack_control's own inert-until-
     # wired posture): no store reference read happens and the advisor
-    # context's reference fields stay empty/None — byte-for-byte today's
-    # behaviour. Hardware-gated for promotion (see ReferenceCurve's
-    # docstring); parameterised factory per the repo's pyright-strict
+    # context's reference fields stay empty/None — no store reads, identical
+    # control behaviour to today's (see ReferenceCurve's docstring for the
+    # precise claim: the advisor prompt JSON does gain two always-empty
+    # keys, inherent to any new AdvisorContext field). Hardware-gated for
+    # promotion; parameterised factory per the repo's pyright-strict
     # typed-default idiom (mirrors pre_first_crack_levers/
     # post_first_crack_control above).
     reference_curve: ReferenceCurve = Field(default_factory=ReferenceCurve)

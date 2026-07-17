@@ -5053,6 +5053,65 @@ async def test_reference_curve_flag_on_populates_advisor_context(store: RoastSto
 
 
 @pytest.mark.asyncio
+async def test_reference_curve_flag_on_retrieves_exactly_once_never_per_tick(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flag-ON analogue of the flag-off invariant
+    (``test_reference_curve_flag_off_zero_retrieval_and_empty_context``):
+    retrieval happens ONCE, at fresh-start construction (``_build_runner``),
+    never per tick and never per advisor consult. The prior
+    controller-level test (``test_advisor_context_reference_fields_populated_
+    from_cached_reference_roast``) only proves the controller reads back
+    whatever it was constructed with — it can't catch a regression that
+    moves retrieval INTO the tick path. This is the exact regression class
+    the slice exists to prevent: a future refactor that re-derives the
+    reference on every tick/consult would still pass every other test here
+    but fail this one."""
+    profile = _profile()
+    await _seed_reference_run(store, "ref-flag-on-once", profile=profile, rating=4)
+
+    calls = 0
+    original = RoastStore.load_reference_roast
+
+    async def spy(self: RoastStore, *args: object, **kwargs: object) -> ReferenceRoast | None:
+        nonlocal calls
+        calls += 1
+        return await original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(RoastStore, "load_reference_roast", spy)
+
+    clock = FakeClock()
+    mcp = FakeMCPClient([_reading(178.0, 185.0)])
+    advisor = FakeAdvisor([], default_decision=_live_decision())
+    config = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=1.0,
+            reference_curve=ReferenceCurve(enabled=True),
+        )
+    )
+    service, _run_id = await _live_service(
+        store, mcp=mcp, clock=clock, profile=profile, config=config, advisor=advisor
+    )
+    assert calls == 1, "retrieval must happen exactly once, at fresh-start construction"
+
+    await _drive_to_development_consult(service, mcp, clock)
+    assert calls == 1, "must not re-retrieve on the FC edge / first development consult"
+
+    # Two more post-FC ticks — more consults (DEVELOPMENT's advisory heartbeat
+    # is unthrottled by default) — must still leave the retrieval count at 1.
+    mcp.frames = [_reading(186.0, 209.0, t0_detected=True, first_crack_detected=True)]
+    await _tick(service, clock)
+    mcp.frames = [_reading(187.0, 210.0, t0_detected=True, first_crack_detected=True)]
+    await _tick(service, clock)
+
+    assert len(advisor.contexts) >= 2, "at least two post-FC consults must have run"
+    assert calls == 1, "retrieval must stay ONCE across multiple post-FC consults, never per tick"
+    ctx = advisor.contexts[-1]
+    assert ctx.reference_curve != []
+    assert ctx.reference_landmarks is not None
+
+
+@pytest.mark.asyncio
 async def test_reference_curve_retrieval_fail_soft_never_blocks_start(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
