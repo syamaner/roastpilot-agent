@@ -27,6 +27,9 @@ from roastpilot_agent.models import (
     CommandTraceSource,
     CommandTraceStatus,
     LogManifest,
+    ReferenceCurveSample,
+    ReferenceLandmarks,
+    ReferenceRoast,
     RoastCommand,
     RoastDetail,
     RoastEventKind,
@@ -1872,6 +1875,312 @@ class RoastStore:
             advisor_decisions=advisor_decisions,
             commands=commands,
         )
+
+    # --- #567 Slice A: reference-curve retrieval + representation ---
+    #
+    # Pure retrieval + representation logic for a completed, well-rated past
+    # roast of the same bean (design note, issue #567, §1/§3/§6.4a). Read-only;
+    # nothing here is wired into ``start_roast``, ``AdvisorContext``, the
+    # controller, replay, or config — that plumbing is Slice B. Deliberately
+    # bypasses the schema-v1 ``reference_roasts`` table: that table is a
+    # dormant M2 cloud-sync cache shaped for a different (future) producer
+    # (design note §2) — these methods query ``roast_runs`` /
+    # ``telemetry_snapshots`` directly instead.
+
+    async def _ranked_reference_run_ids(
+        self,
+        origin_slug: str,
+        charge_grams: float,
+        *,
+        min_rating: int,
+        weight_tolerance_frac: float,
+    ) -> list[str]:
+        """Every qualifying reference run id, best-first (shared by :meth:`find_reference_run`
+        and :meth:`load_reference_roast`, Fix B — PR #574 review).
+
+        Retrieval rule (design note §1.2/§1.4): among COMPLETED runs
+        (``completed_at_utc IS NOT NULL AND outcome = 'completed'`` — a
+        faulted-but-finalized run consumed a recording slot per
+        :meth:`count_completed_runs_for_origin`, but its trajectory is never a
+        *good* reference, so it is excluded here even though it would still
+        count toward that unrelated metric) rated ``>= min_rating`` whose
+        frozen ``profile_json`` slugs
+        (:func:`~roastpilot_agent.models.recording_origin_slug`) to
+        ``origin_slug`` and whose actual charge weight is within
+        ``weight_tolerance_frac`` of ``charge_grams``. "Actual charge" is
+        ``corrected_charge_grams`` when the operator corrected it, else the
+        frozen ``profile_json.bean_weight_grams`` — the same fallback
+        :meth:`list_runs` / :meth:`read_run` already use for weight-loss %.
+
+        The completion/outcome/rating filter runs in SQL (``ORDER BY
+        operator_rating DESC, completed_at_utc DESC`` does the
+        best-rated/tie-break-recency ordering); the slug and charge-weight
+        checks run in Python row-by-row against that ordering, so the
+        returned list is ALREADY correctly ranked — no re-sort needed.
+        Collecting every passing candidate (not just the first) lets
+        :meth:`load_reference_roast` fall through to the next-best candidate
+        when the top-ranked one turns out to have no usable telemetry.
+
+        Args:
+            origin_slug: The recording-origin slug to match.
+            charge_grams: This roast's charge weight in grams — the tolerance
+                band (``weight_tolerance_frac`` of THIS value, design note
+                §1.4) a candidate's actual charge weight must fall within.
+            min_rating: The minimum ``operator_rating`` (1-5) a candidate must
+                have.
+            weight_tolerance_frac: The fractional charge-weight tolerance
+                (e.g. ``0.10`` = ±10 %) applied to ``charge_grams``.
+
+        Returns:
+            Every qualifying run id, best-rated first (ties broken by most
+            recent completion) — empty when none qualify.
+        """
+        async with self.connection.execute(
+            "SELECT id, profile_json, corrected_charge_grams FROM roast_runs"
+            " WHERE completed_at_utc IS NOT NULL AND outcome = 'completed'"
+            " AND operator_rating >= ?"
+            " ORDER BY operator_rating DESC, completed_at_utc DESC",
+            (min_rating,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        tolerance = weight_tolerance_frac * charge_grams
+        ranked: list[str] = []
+        for row in rows:
+            try:
+                profile = RoastProfile.model_validate_json(str(row["profile_json"]))
+            except ValueError:  # pragma: no cover - a frozen profile is always valid
+                continue
+            if recording_origin_slug(profile) != origin_slug:
+                continue
+            actual_charge = self._optional_float(row["corrected_charge_grams"])
+            if actual_charge is None:
+                actual_charge = profile.bean_weight_grams
+            if abs(actual_charge - charge_grams) <= tolerance:
+                ranked.append(str(row["id"]))
+        return ranked
+
+    async def find_reference_run(
+        self,
+        origin_slug: str,
+        charge_grams: float,
+        *,
+        min_rating: int = 3,
+        weight_tolerance_frac: float = 0.10,
+    ) -> str | None:
+        """Find the best completed reference run for a bean + charge weight.
+
+        A thin projection of :meth:`_ranked_reference_run_ids` onto its
+        top-ranked id — see that method's docstring for the full retrieval
+        rule. Note this is the best-RATED match, not necessarily the best
+        *usable* one (an older run might have no development telemetry);
+        :meth:`load_reference_roast` is the one that falls through to the
+        next-best candidate when the top one can't be built (Fix B, PR #574
+        review) — this method's ``str | None`` contract (and its existing
+        callers/tests) is unchanged.
+
+        Args:
+            origin_slug: The recording-origin slug to match (from
+                :func:`~roastpilot_agent.models.recording_origin_slug` on the
+                roast being started).
+            charge_grams: This roast's charge weight in grams.
+            min_rating: The minimum ``operator_rating`` (1-5) a candidate must
+                have. Defaults to ``3`` (the design note's quality floor).
+            weight_tolerance_frac: The fractional charge-weight tolerance
+                (default ``0.10`` = ±10 %) applied to ``charge_grams``.
+
+        Returns:
+            The best-qualifying run's ``id``, or ``None`` when no completed,
+            rated, same-origin, comparable-weight run exists.
+        """
+        ranked = await self._ranked_reference_run_ids(
+            origin_slug,
+            charge_grams,
+            min_rating=min_rating,
+            weight_tolerance_frac=weight_tolerance_frac,
+        )
+        return ranked[0] if ranked else None
+
+    async def _build_reference_roast(self, run_id: str, origin_slug: str) -> ReferenceRoast | None:
+        """Build a :class:`~roastpilot_agent.models.ReferenceRoast` from a run's telemetry.
+
+        PRIVATE (Codex PR #574 finding): this method only checks that
+        ``run_id`` was ever rated — it does NOT re-check ``outcome ==
+        'completed'`` or the ``>= min_rating`` quality floor that
+        :meth:`_ranked_reference_run_ids` enforces at retrieval time. It
+        assumes ``run_id`` is already a pre-filtered, retrieval-selected id
+        (the outcome/quality predicate is kept solely in
+        :meth:`_ranked_reference_run_ids`, not duplicated here). Calling it
+        directly with an arbitrary run id bypasses that filtering — the only
+        supported entry point for "a completed, well-rated reference" is
+        :meth:`load_reference_roast`; :meth:`find_reference_run` is the
+        best-match id query, and this builder is its internal, unfiltered
+        materialization step.
+
+        Reads ``telemetry_snapshots`` for ``run_id`` in tick order and derives:
+
+        - **Landmarks**: the clock-safe, telemetry-phase-only rule pinned by
+          the design note §6.4a — drop is the LAST row tagged
+          ``agent_phase == 'development'`` and first crack is the FIRST such
+          row (development begins at FC); never the run's last row, which can
+          land in the post-drop cooling tail. ``operator_rating`` is read from
+          ``roast_runs``.
+        - **Curve**: downsampled to at most 30 points, evenly spaced by index,
+          always including the first and last usable row (design note §3.1).
+          A row is "usable" when both ``charge_elapsed_seconds`` and
+          ``bean_temp_c`` are recorded (``t_s``/``bean_c`` are non-optional on
+          :class:`~roastpilot_agent.models.ReferenceCurveSample``). The curve
+          is also TRIMMED to rows at or before the drop landmark (Fix D, PR
+          #574 review) — the last-development row's position is computed
+          ONCE and shared with the drop landmark above, so the two can never
+          disagree about where the roast's "good shape" ends and the
+          post-drop cooling tail (falling temperatures) begins.
+
+        Args:
+            run_id: The reference run's ``roast_runs.id`` (typically one of
+                the ids ranked by :meth:`_ranked_reference_run_ids`).
+            origin_slug: The recording-origin slug to stamp onto the returned
+                :class:`~roastpilot_agent.models.ReferenceRoast` (this method
+                does not re-derive it from the run's own frozen profile —
+                the caller already has it from the retrieval side).
+
+        Returns:
+            The built :class:`~roastpilot_agent.models.ReferenceRoast`, or
+            ``None`` when the run doesn't exist, was never rated, has no
+            ``development``-phase telemetry, or every pre-drop telemetry row
+            is missing its charge-elapsed clock (no usable curve point).
+        """
+        async with self.connection.execute(
+            "SELECT operator_rating FROM roast_runs WHERE id = ?", (run_id,)
+        ) as cursor:
+            run_row = await cursor.fetchone()
+        if run_row is None or run_row["operator_rating"] is None:
+            return None
+        operator_rating = int(run_row["operator_rating"])
+
+        async with self.connection.execute(
+            "SELECT charge_elapsed_seconds, bean_temp_c, env_temp_c,"
+            " bean_ror_c_per_min, agent_phase, development_percent"
+            " FROM telemetry_snapshots WHERE run_id = ? ORDER BY tick ASC, id ASC",
+            (run_id,),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+
+        # Typed RoastPhase comparison (D15: never string-compare a phase in
+        # core logic) — indexed so the last-development position can be
+        # shared between the drop landmark and the curve trim below (Fix A +
+        # Fix D, PR #574 review).
+        development_indices = [
+            index
+            for index, row in enumerate(rows)
+            if RoastPhase(str(row["agent_phase"])) is RoastPhase.DEVELOPMENT
+        ]
+        if not development_indices:
+            return None
+        first_dev = rows[development_indices[0]]
+        last_dev_index = development_indices[-1]
+        last_dev = rows[last_dev_index]
+
+        # Trim the curve to rows AT OR BEFORE the drop (Fix D): the post-drop
+        # cooling tail keeps recording a FALLING bean temperature, which must
+        # never appear in "what a good roast's shape looked like".
+        pre_drop_rows = rows[: last_dev_index + 1]
+        usable = [
+            row
+            for row in pre_drop_rows
+            if row["charge_elapsed_seconds"] is not None and row["bean_temp_c"] is not None
+        ]
+        if not usable:
+            return None
+        sample_rows = [usable[i] for i in self._evenly_spaced_indices(len(usable), 30)]
+        curve = [
+            ReferenceCurveSample(
+                t_s=float(cast("float", row["charge_elapsed_seconds"])),
+                bean_c=float(cast("float", row["bean_temp_c"])),
+                env_c=self._optional_float(row["env_temp_c"]),
+                ror_c_min=self._optional_float(row["bean_ror_c_per_min"]),
+            )
+            for row in sample_rows
+        ]
+
+        landmarks = ReferenceLandmarks(
+            first_crack_temp_c=self._optional_float(first_dev["bean_temp_c"]),
+            first_crack_elapsed_s=self._optional_float(first_dev["charge_elapsed_seconds"]),
+            drop_temp_c=self._optional_float(last_dev["bean_temp_c"]),
+            drop_development_percent=self._optional_float(last_dev["development_percent"]),
+            operator_rating=operator_rating,
+        )
+        return ReferenceRoast(
+            source_run_id=run_id,
+            origin_slug=origin_slug,
+            landmarks=landmarks,
+            curve=curve,
+        )
+
+    async def load_reference_roast(
+        self,
+        origin_slug: str,
+        charge_grams: float,
+        *,
+        min_rating: int = 3,
+        weight_tolerance_frac: float = 0.10,
+    ) -> ReferenceRoast | None:
+        """The best USABLE reference: ranks candidates, builds the first that succeeds.
+
+        Unlike :meth:`find_reference_run` (which only ever returns the
+        top-RATED id), this iterates every ranked candidate from
+        :meth:`_ranked_reference_run_ids` and returns the first one
+        :meth:`_build_reference_roast` can actually build — falling through
+        past a top-ranked candidate with no usable telemetry (e.g. an older
+        run with no ``development``-phase rows) to the next-best one (Fix B,
+        PR #574 review).
+
+        Args:
+            origin_slug: The recording-origin slug to match.
+            charge_grams: This roast's charge weight in grams.
+            min_rating: The minimum ``operator_rating`` a candidate must have
+                (see :meth:`_ranked_reference_run_ids`).
+            weight_tolerance_frac: The fractional charge-weight tolerance
+                (see :meth:`_ranked_reference_run_ids`).
+
+        Returns:
+            The best USABLE :class:`~roastpilot_agent.models.ReferenceRoast`,
+            or ``None`` when no candidate qualifies, or every qualifying
+            candidate fails to build (see :meth:`_build_reference_roast`).
+        """
+        ranked = await self._ranked_reference_run_ids(
+            origin_slug,
+            charge_grams,
+            min_rating=min_rating,
+            weight_tolerance_frac=weight_tolerance_frac,
+        )
+        for run_id in ranked:
+            reference = await self._build_reference_roast(run_id, origin_slug)
+            if reference is not None:
+                return reference
+        return None
+
+    @staticmethod
+    def _evenly_spaced_indices(count: int, max_samples: int) -> list[int]:
+        """Evenly-spaced sample indices over ``count`` items, capped at ``max_samples``.
+
+        Always includes index ``0`` and ``count - 1`` (design note §3.1: a
+        plain index-stride selection could otherwise miss a boundary row by
+        construction). Returns every index unchanged when ``count <=
+        max_samples``.
+
+        Args:
+            count: The number of items to sample from.
+            max_samples: The maximum number of indices to return.
+
+        Returns:
+            A sorted, deduplicated list of indices into a ``count``-length
+            sequence, at most ``max_samples`` long.
+        """
+        if count <= max_samples:
+            return list(range(count))
+        step = (count - 1) / (max_samples - 1)
+        indices = {round(i * step) for i in range(max_samples)}
+        return sorted(indices)
 
     # --- #303: bean-profile library CRUD (D45) ---
     #
