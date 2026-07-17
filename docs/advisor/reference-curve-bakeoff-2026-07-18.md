@@ -4,11 +4,12 @@
 PARKED.** The offline gate did its job: `c9` + the same-bean reference, as built,
 is a mild regression, not an improvement. No hardware roast is warranted on it.
 
-Harness: `scripts/bakeoff_reference_567.py`. Raw results:
-`reference-curve-bakeoff-2026-07-18.json`. Model `openai/gpt-4o`; 10 held-out
+Harness: `scripts/bakeoff_reference_567.py`. Model `openai/gpt-4o`; 10 held-out
 runs across the three qualifying beans (Colombia Excelso Huila ×4, Guatemala El
 Durazno ×4, Sumatra Mandheling G1 ×2); 38 post-FC decision ticks per arm; 0
-errors; ~$2. Reproduce (needs a valid `OPENROUTER_API_KEY` — note the loading
+errors; ~$2. (The raw per-tick JSON is intentionally NOT committed — AGENTS.md
+forbids checked-in roast logs outside `tests/fixtures/`; this summary + traces
+are the record.) Reproduce (needs a valid `OPENROUTER_API_KEY` — note the loading
 gotcha below):
 
 ```
@@ -53,6 +54,13 @@ OPENROUTER_API_KEY="$(grep -E '^OPENROUTER_API_KEY=' .env | cut -d= -f2-)" \
   hinges on genuinely good references (4–5★); this corpus mostly cannot supply them.
 - **n=3 beans / 10 runs / replay-only** — directional, not conclusive (a perfect
   or damning small-set score is a warning, not a verdict).
+- **These committed numbers were produced by the pre-review harness.** Post-run
+  code review (PR #578) hardened the harness (a prior-roast-only reference filter
+  to remove a look-ahead leak, settings-aware checkpoint keying, read-only store
+  access, etc.). The result was NOT regenerated (feature parked, no re-spend); the
+  negative conclusion is robust to those fixes — same-bean roasts are near-identical
+  in quality, so the look-ahead neither systematically favoured nor disfavoured any
+  arm, and c9 regressed regardless.
 - The deeper signal matches the arc's lesson: the model reasons on **evaluable
   numbers, not a 30-point curve it doesn't parse**. If #567 is ever revisited, the
   promising direction is the *representation* (surface the reference as a labelled
