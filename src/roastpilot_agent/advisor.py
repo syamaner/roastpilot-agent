@@ -1000,10 +1000,15 @@ of ``c6``; ``c8`` (D96 slice 2, #559) adds pace-not-edges progress-rate
 comparison, the bottom-edge mirror of c7's fix (roast 15 — the window's BOTTOM
 edge is not a finish line either), and fan->RoR-coupling teaching (use fan
 deliberately; the post-FC heat loop's compensation is bounded and suppressed
-near a drop, never an assumed rescue) on top of ``c7``.
-``c1`` / ``c2`` / ``c4`` / ``c5`` / ``c6`` / ``c7`` / ``c8`` stay selectable for
-the #396 A/B; ``c3`` remains the live default until the A/B validates a
-successor (operator-gated).
+near a drop, never an assumed rescue) on top of ``c7``; ``c9`` (#567) adds the
+same-bean reference-roast teaching (compare this roast's shape to the operator's
+own best-rated past roast of the bean, carried in
+``reference_curve``/``reference_landmarks``; deviations are information, not
+commands, and the reference never overrides the profile's targets) on top of
+``c8`` — the "reference present AND taught" arm of the #567 three-arm bake-off.
+``c1`` / ``c2`` / ``c4`` / ``c5`` / ``c6`` / ``c7`` / ``c8`` / ``c9`` stay
+selectable for the #396 A/B; ``c3`` remains the live default until the A/B
+validates a successor (operator-gated).
 """
 
 _CONTROL_TEACHING_PROMPTS: dict[str, str] = {
@@ -1630,6 +1635,54 @@ _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION = (
 )
 _CONTROL_TEACHING_PROMPTS["c8"] = _CONTROL_TEACHING_PROMPTS["c7"].replace(
     "THE OBJECTIVE\n", _C8_PACE_BOTTOM_EDGE_AND_FAN_SECTION + "THE OBJECTIVE\n", 1
+)
+
+# --- c9 (#567: reference curves) — the same-bean reference-roast teaching ----
+#
+# c9 is c8 PLUS one section, spliced just before THE OBJECTIVE so all of
+# c1+c2+c3+c4+c5+c6+c7+c8 is preserved byte-for-byte. It is the "reference
+# present AND taught" arm of the #567 three-arm bake-off (design note §6.4):
+# arm 1 = c8, no reference; arm 2 = c8 with reference_curve/reference_landmarks
+# populated but UNTAUGHT (c8's own text, which never mentions the fields); arm 3
+# = c9, reference populated AND described here — comparing arm 3 vs arm 2
+# isolates the teaching's marginal effect, arm 2 vs arm 1 the raw data's.
+# The section is deliberately MINIMAL and NON-IMPERATIVE (design §3.3, and the
+# whole prompt-testing arc's lesson that prose teaching is fragile and imperative
+# rules mislead): it names NO new numbers (only the existing reference_curve /
+# reference_landmarks context fields), adds NO "match the reference" rule, and
+# explicitly subordinates the reference to the profile's own explicit targets and
+# the joint-objective / pace teaching above — "deviations are information, not
+# commands". Selectable-only; c3 stays the live default (the reference-taught arm
+# is promoted only if the bake-off + a hardware roast validate it, the design's
+# ship-disabled posture; #567).
+_C9_REFERENCE_CURVE_SECTION = (
+    "POST-FIRST-CRACK: A REFERENCE ROAST, WHEN PRESENT, IS INFORMATION - "
+    "NOT A COMMAND\n"
+    "- When reference_curve and reference_landmarks are present in context, "
+    "they are the operator's OWN best-rated past roast of THIS SAME bean: "
+    "reference_curve is that roast's realized shape (bean temperature and "
+    "rate of rise over the time since charge) and reference_landmarks is "
+    "where its first crack, drop, and development ratio landed, with the "
+    "rating the operator gave the cup. They are read-only context - a picture "
+    "of one roast that turned out well, not a target and not levers to copy.\n"
+    "- Read them the way you would glance at a good previous batch: compare "
+    "the SHAPE of this roast's trajectory to the reference's, and treat any "
+    "DEVIATION as information about where this roast is running hotter, "
+    "cooler, faster, or slower than one that cupped well - never as a command "
+    "to steer back onto it. The profile's own explicit targets "
+    "(target_drop_temp_c, target_development_percent and its window) and the "
+    "joint-objective and pace teaching above stay authoritative: the "
+    "reference never overrides them, and a difference from the reference is "
+    "not on its own a reason to move a lever or to drop.\n"
+    "- The reference may have been roasted under a different control law or "
+    "config, so its lever history is deliberately not shown and is not "
+    "something to imitate - it is the OUTCOME shape that informs, not the "
+    "path taken to it. When no reference is present (the fields are empty), "
+    "this section does not apply.\n"
+    "\n"
+)
+_CONTROL_TEACHING_PROMPTS["c9"] = _CONTROL_TEACHING_PROMPTS["c8"].replace(
+    "THE OBJECTIVE\n", _C9_REFERENCE_CURVE_SECTION + "THE OBJECTIVE\n", 1
 )
 
 
