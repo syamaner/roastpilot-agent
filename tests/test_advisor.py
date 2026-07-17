@@ -1418,6 +1418,69 @@ def test_c8_extends_c7_with_pace_bottom_edge_and_fan_coupling() -> None:
         assert literal not in new_section, f"c8's new section must not bake in {literal!r}"
 
 
+def test_c9_is_exactly_c8_plus_the_reference_section() -> None:
+    """c9 (#567) is c8 with the reference-roast section spliced in exactly
+    before "THE OBJECTIVE" (the SAME splice advisor.py performs) — an
+    EXACT-SPLICE equality, so all of c1..c8 is preserved byte-for-byte and the
+    ONLY delta is the reference section. The reference teaching must not have
+    leaked into c8 or the live default c3."""
+    from roastpilot_agent.advisor import (
+        _C9_REFERENCE_CURVE_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    c8 = control_teaching_prompt("c8")
+    c9 = control_teaching_prompt("c9")
+    assert c9 == c8.replace(
+        "THE OBJECTIVE\n", _C9_REFERENCE_CURVE_SECTION + "THE OBJECTIVE\n", 1
+    ), "c9 must be EXACTLY c8 with the reference section spliced before THE OBJECTIVE"
+    assert "A REFERENCE ROAST" not in c8
+    assert "A REFERENCE ROAST" not in control_teaching_prompt("c3")
+
+
+def test_c9_reference_section_is_information_not_command_and_names_no_numbers() -> None:
+    """#567 / design §3.3: the reference-roast section is DELIBERATELY minimal
+    and non-imperative. It must (1) name the real reference_curve /
+    reference_landmarks context fields as the operator's own best-rated past
+    roast of the same bean; (2) teach that deviations are INFORMATION, not a
+    command to steer back onto the reference; (3) subordinate the reference to
+    the profile's own explicit targets (never overrides, stays authoritative);
+    and (4) name NO new numbers — the #218 two-copies discipline, since the
+    prompt-testing arc showed a baked constant in a prose rule misleads the
+    model."""
+    from roastpilot_agent.advisor import (
+        _C9_REFERENCE_CURVE_SECTION,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    section = _C9_REFERENCE_CURVE_SECTION
+    lowered = section.lower()
+    # (1) the real context fields, framed as the same-bean best-rated roast.
+    assert "reference_curve" in section
+    assert "reference_landmarks" in section
+    assert "best-rated" in lowered and "same" in lowered
+    # (2) information, not a command.
+    assert "information" in lowered
+    assert "not a command" in lowered
+    assert "never as a command to steer back" in lowered
+    # (3) subordinate to the profile targets + joint objective (never overrides).
+    assert "target_drop_temp_c" in section
+    assert "never overrides" in lowered
+    assert "authoritative" in lowered
+    # (4) no baked numbers — every threshold/target comes from context.
+    assert not re.search(r"\d", section), "the reference section must name no hardcoded numbers"
+
+
+def test_c9_registered_selectable_and_not_the_live_default() -> None:
+    """c9 is a registered, selectable version wired the same as its siblings
+    (``instructions_for`` resolves it to the same text), and adding it does not
+    make it live — c3 stays the default (c9 is promoted only if the #567
+    bake-off + a hardware roast validate it, the design's ship-disabled
+    posture)."""
+    assert instructions_for("c9") == control_teaching_prompt("c9")
+    assert control_teaching_prompt("c9")  # non-empty
+    assert CONTROL_TEACHING_PROMPT_VERSION == "c3"
+    assert control_teaching_prompt("c9") != control_teaching_prompt(CONTROL_TEACHING_PROMPT_VERSION)
+
+
 # --- Codex P2 follow-up (#499): assert on the FINAL ASSEMBLED prompt, not
 # just the c1 fragment. The splice chain (c1 -> c2 -> c3 -> c4 -> c5 -> c6)
 # means a section added to c1 can be directly contradicted by a LATER-spliced
@@ -1436,7 +1499,7 @@ def test_c8_extends_c7_with_pace_bottom_edge_and_fan_coupling() -> None:
 # #559) is now the newest/most-spliced version and is added the same way.
 
 
-@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9"])
 def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     version: str,
 ) -> None:
@@ -1457,7 +1520,7 @@ def test_assembled_prompt_carries_the_joint_objective_and_no_contradiction(
     assert "latest acceptable drop" not in lowered
 
 
-@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8"])
+@pytest.mark.parametrize("version", ["c3", "c6", "c7", "c8", "c9"])
 def test_assembled_prompt_joint_objective_precedes_every_later_section(
     version: str,
 ) -> None:
@@ -1474,6 +1537,7 @@ def test_assembled_prompt_joint_objective_precedes_every_later_section(
         "POST-FIRST-CRACK: FAN IS AN ACTIVE BRAKE",  # c3
         "POST-FIRST-CRACK: A LARGE DTR OVERSHOOT",  # c7
         "POST-FIRST-CRACK: COMPARE PROGRESS RATES",  # c8
+        "POST-FIRST-CRACK: A REFERENCE ROAST",  # c9
     ):
         if marker in prompt:
             assert prompt.index(marker) > joint_index, (
