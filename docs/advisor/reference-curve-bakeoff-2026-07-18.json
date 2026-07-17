@@ -1,0 +1,1946 @@
+{
+  "model": "openai/gpt-4o",
+  "dry_run": false,
+  "max_spend": 5.0,
+  "cost_per_call": 0.02,
+  "stopped_for_budget": false,
+  "resumed_cells": 0,
+  "fresh_cells": 30,
+  "total_cells": 30,
+  "held_out_run_count": 10,
+  "skipped_runs": [],
+  "arms": [
+    {
+      "key": "arm1_no_reference",
+      "label": "Arm 1 \u2014 c8, no reference",
+      "prompt_version": "c8",
+      "inject_reference": false
+    },
+    {
+      "key": "arm2_reference_untaught",
+      "label": "Arm 2 \u2014 c8, reference present (untaught)",
+      "prompt_version": "c8",
+      "inject_reference": true
+    },
+    {
+      "key": "arm3_reference_taught",
+      "label": "Arm 3 \u2014 c9, reference present + taught",
+      "prompt_version": "c9",
+      "inject_reference": true
+    }
+  ],
+  "runs": [
+    {
+      "run_id": "5a32334c8da643eab8638032756a7cf7",
+      "bean_label": "Colombia Excelso Huila (Washed)",
+      "origin_slug": "colombia-excelso-huila-washed",
+      "operator_rating": 3,
+      "charge_grams": 250.0,
+      "tick_count": 4,
+      "reference": {
+        "source_run_id": "f3fc65fa6e72422597f1acb5e62fe135",
+        "operator_rating": 3,
+        "first_crack_temp_c": 185.0,
+        "first_crack_elapsed_s": 642.9975458749977,
+        "drop_temp_c": 193.0,
+        "drop_development_percent": 20.28688952398136,
+        "curve_points": 30
+      },
+      "arms": {
+        "arm1_no_reference": {
+          "arm_key": "arm1_no_reference",
+          "arm_label": "Arm 1 \u2014 c8, no reference",
+          "prompt_version": "c8",
+          "reference_injected": false,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 629.601,
+              "bean_temp_c": 187.0,
+              "development_time_ratio": 0.0326,
+              "target_heat": 0,
+              "target_fan": 90,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "Current bean temperature is at 187.0 C and the target drop temperature is 191.0 C. The development time ratio (DTR) is at 3.26 %, well below the target of 12.7 %. With heat already at 0 %, fan is our primary lever to control the rate of rise. Dropping the beans at this point would be premature, as both bean temperature and DTR are far from their respective targets. We'll maintain fan at 90 % to manage heat evacuation and smoke, while monitoring bean temperature to ensure it approaches the drop temperature as the DTR climbs.",
+              "latency_seconds": 2.862,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 660.282,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.0775,
+              "target_heat": 30,
+              "target_fan": 90,
+              "should_drop": false,
+              "confidence": 0.85,
+              "rationale": "The current bean temperature is 189.0\u00b0C, which is close but still below the target drop temperature of 191.0\u00b0C. The development time ratio is 7.75%, which is significantly below the target of 12.7%. We need to ensure that both targets are met before recommending the drop. Given that current_heat_percent is 0 and bean_ror_c_per_min is declining at 3.863\u00b0C/min, I recommend restoring some heat to ensure a controlled climb towards the target drop temperature while continuing development. Reducing the fan to 90% will slow the cooling effect slightly to allow more gradual development progress without crashing the rate of rise.",
+              "latency_seconds": 2.286,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 692.036,
+              "bean_temp_c": 191.0,
+              "development_time_ratio": 0.1199,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is precisely at the target_drop_temp_c of 191.0 \u00b0C, and the development ratio at 0.1199 is effectively at the target of 12.7 %. We are well within the development percent window, fully meeting both targets together. The bitter ceiling of 196.0 \u00b0C is not threatened, so the roast may drop gracefully without urgency. The ideal culmination of temperature and development conditions has arrived, recommending the drop decision now.",
+              "latency_seconds": 1.928,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 699.023,
+              "bean_temp_c": 191.0,
+              "development_time_ratio": 0.1287,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 1.0,
+              "rationale": "The development ratio (DTR) is at 12.87 %, which meets the target development percentage of 12.7 % (context number used). The current bean temperature is at the target drop temperature of 191.0 \u00b0C (context number used). Both temperature and development targets have converged as desired. Should drop is set to true.",
+              "latency_seconds": 1.765,
+              "error": null
+            }
+          ]
+        },
+        "arm2_reference_untaught": {
+          "arm_key": "arm2_reference_untaught",
+          "arm_label": "Arm 2 \u2014 c8, reference present (untaught)",
+          "prompt_version": "c8",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 629.601,
+              "bean_temp_c": 187.0,
+              "development_time_ratio": 0.0326,
+              "target_heat": 10,
+              "target_fan": 90,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "Development is at 3.26 %, well below the 12.7 % target. The bean temperature is 187.0 \u00b0C, below the 191.0 \u00b0C target. Heat is already at 0 %, which risks stalling the bean below the drop temperature. To maintain a low positive rate of rise and close the temperature gap, recommend restoring heat to 10 % and holding fan at 90 % to control RoR without crashing it. Watch both targets together, but do not drop yet as neither is satisfied.",
+              "latency_seconds": 2.233,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 660.282,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.0775,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is at 189.0\u00b0C, approaching the target drop temperature of 191.0\u00b0C. Development is at 7.75%, below the target 12.7%. The rate of rise is declining, though still positive, so heat is correctly set at 0 to slow the climb. The fan is at 100%, providing maximum cooling to control the environment temperature. We are not at the bitter ceiling of 196.0\u00b0C or the emergency drop limit of 198.0\u00b0C, allowing more development time without risk. Holding current settings should balance out the remaining climb to the drop temperature with the needed development time.",
+              "latency_seconds": 2.346,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 692.036,
+              "bean_temp_c": 191.0,
+              "development_time_ratio": 0.1199,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The bean temperature is at the target_drop_temp_c of 191.0\u00b0C and development is at 11.99 %, almost at the target of 12.7 %. This falls within the acceptable window (9.7 % - 15.7 %). Continuing the roast risks exceeding the bitter_ceiling_temp_c of 196.0\u00b0C, while the bean is still climbing with a rate of rise of 3.844\u00b0C/min. Dropping now prevents crossing that ceiling, while satisfying both temperature and development objectives, ensuring the roast is completed without becoming overly bitter.",
+              "latency_seconds": 1.951,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 699.023,
+              "bean_temp_c": 191.0,
+              "development_time_ratio": 0.1287,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The bean temperature is at 191\u00b0C, which matches the target drop temperature of 191\u00b0C. The development ratio is at 12.87% which also is in line with the target development percentage of 12.7%. Since both temperature and development ratio targets are met, it's appropriate to recommend dropping the roast to avoid overdevelopment and prevent crossing the bitter ceiling at 196\u00b0C. Fan should remain at 100% to aid in the cooling process post-drop.",
+              "latency_seconds": 1.948,
+              "error": null
+            }
+          ]
+        },
+        "arm3_reference_taught": {
+          "arm_key": "arm3_reference_taught",
+          "arm_label": "Arm 3 \u2014 c9, reference present + taught",
+          "prompt_version": "c9",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 629.601,
+              "bean_temp_c": 187.0,
+              "development_time_ratio": 0.0326,
+              "target_heat": 0,
+              "target_fan": 90,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The bean temperature is currently at 187.0\u00b0C, which is below the target_drop_temp_c of 191.0\u00b0C. The development ratio is 3.26%, far below the target of 12.7%. There is still a substantial gap to close on both temperature and development, and the bean is climbing steadily at the rate of 4.882\u00b0C per minute. Current fan and heat settings are aimed to control the climb, and holding the present settings at a high fan rate ensures enough convective cooling to avoid racing to the bitter ceiling of 196.0\u00b0C. Hold the current heat at 0 and fan at 90% until closer to both targets to achieve the joint drop objective.",
+              "latency_seconds": 2.595,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 660.282,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.0775,
+              "target_heat": 10,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.9,
+              "rationale": "Current bean temperature is 189.0\u00b0C and bean RoR is 3.863\u00b0C/min, aiming for a target drop temperature of 191.0\u00b0C. Development time is 51.191 seconds with a DTR of 7.75%, well below the target of 12.7%. The bean is climbing slowly with heat at 0, so a modest heat restoration to 10% will help close the temperature gap while letting development accrue. Recommend dropping the beans once both targets are satisfied or if nearing the bitter ceiling of 196\u00b0C with targets still short. Current fan at 100% maximizes convective cooling without crashing RoR.",
+              "latency_seconds": 2.213,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 692.036,
+              "bean_temp_c": 191.0,
+              "development_time_ratio": 0.1199,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The bean temperature has reached the target_drop_temp_c of 191\u00b0C while the development ratio is at 11.99 %, very close to the target of 12.7 % (inside the window of 9.7-15.7%). Given that the bean temperature is in the drop window and development is near the target, both conditions for dropping are met. The bitter ceiling of 196\u00b0C is well above the current bean temperature, which confirms safety for the drop. Recommend dropping now to satisfy the joint objective at desired development and temperature.",
+              "latency_seconds": 2.285,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 699.023,
+              "bean_temp_c": 191.0,
+              "development_time_ratio": 0.1287,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The bean temperature is at 191.0 \u00b0C, matching the target_drop_temp_c. The development ratio is 12.87 %, within the acceptable development range (target_development_percent_min 9.7 % to target_development_percent_max 15.7 %) and slightly above the target of 12.7 %. Both temperature and development targets are satisfied, making it appropriate to drop the beans now. Remaining in the roast would risk approaching the bitter_ceiling_temp_c of 196.0 \u00b0C, so the drop should be initiated immediately.",
+              "latency_seconds": 1.912,
+              "error": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "run_id": "b74153ed91bf4e5d81715ca7a0c7ffec",
+      "bean_label": "Colombia Excelso Huila (Washed)",
+      "origin_slug": "colombia-excelso-huila-washed",
+      "operator_rating": 3,
+      "charge_grams": 250.0,
+      "tick_count": 4,
+      "reference": {
+        "source_run_id": "f3fc65fa6e72422597f1acb5e62fe135",
+        "operator_rating": 3,
+        "first_crack_temp_c": 185.0,
+        "first_crack_elapsed_s": 642.9975458749977,
+        "drop_temp_c": 193.0,
+        "drop_development_percent": 20.28688952398136,
+        "curve_points": 30
+      },
+      "arms": {
+        "arm1_no_reference": {
+          "arm_key": "arm1_no_reference",
+          "arm_label": "Arm 1 \u2014 c8, no reference",
+          "prompt_version": "c8",
+          "reference_injected": false,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 624.157,
+              "bean_temp_c": 182.0,
+              "development_time_ratio": 0.0054,
+              "target_heat": 50,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Development is at 0.54 % per the context, significantly below the ~13.3 % target. Current heat is at 0 % and the bean temperature is rising at a rate of 5.794 C/min, but the temperature still has not reached the 188 C drop target; restoring heat is essential to maintain a positive rate of rise and ensure the bean reaches the drop temperature as development progresses. The fan should be held at 50 % to balance convective heat transfer without crashing the rate of rise.",
+              "latency_seconds": 2.069,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 659.281,
+              "bean_temp_c": 185.0,
+              "development_time_ratio": 0.0584,
+              "target_heat": 0,
+              "target_fan": 90,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The bean temperature is 185.0\u00b0C and the target drop temperature is 188.0\u00b0C; development is at 5.84% with a target of 13.3%. The bean is climbing steadily at a Rate of Rise of 4.898\u00b0C per minute. Current settings are heat at 0% and fan at 90%. Maintain this to allow more development time to accrue without crossing the bitter ceiling (196.0\u00b0C). Monitor closely as the temperature approaches the target.",
+              "latency_seconds": 2.071,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 695.756,
+              "bean_temp_c": 186.0,
+              "development_time_ratio": 0.1078,
+              "target_heat": 20,
+              "target_fan": 100,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The development is at 10.78%, while the target is 13.3%, indicating that development is still short of the target. Bean temperature is at 186.0\u00b0C, which is below the target drop temperature of 188.0\u00b0C. Current heat is at 0 and fan is at 100, causing the rate of rise to slow down to 2.81\u00b0C/min, which is too gentle given the 10% gap to the DTR target. To ensure the roast doesn't stall before reaching the desired temperature and development target, restore heat to 20% to encourage a low but positive rate of rise, while holding the fan at 100 to ensure continued smoke evacuation and prevent scorching. Monitoring should continue to ensure both temperature and development targets are approached smoothly.",
+              "latency_seconds": 2.352,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 717.161,
+              "bean_temp_c": 188.0,
+              "development_time_ratio": 0.1344,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 1.0,
+              "rationale": "Both the temperature (188.0 \u00b0C) and the development ratio (13.44 %, which is slightly above the target of 13.3 %) are within the drop window and below the bitter ceiling of 196.0 \u00b0C. Therefore, the roast can be dropped now, ensuring it does not exceed the bitter ceiling. The development time ratio meets the requirements for the roast profile, and the temperature is at the target_drop_temp_c.",
+              "latency_seconds": 1.87,
+              "error": null
+            }
+          ]
+        },
+        "arm2_reference_untaught": {
+          "arm_key": "arm2_reference_untaught",
+          "arm_label": "Arm 2 \u2014 c8, reference present (untaught)",
+          "prompt_version": "c8",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 624.157,
+              "bean_temp_c": 182.0,
+              "development_time_ratio": 0.0054,
+              "target_heat": 20,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Currently, the bean temperature is at 182.0\u00b0C, while the target drop temperature is 188.0\u00b0C. The development ratio is very low at 0.54%, far below the target of 13.3%. Heat is already at 0, but the fan has been increased to 50, which is helping to control the rate of rise at about 5.794\u00b0C per minute. Given the situation, it's essential to ensure the beans continue developing, so I'm restoring some heat to prevent a flat stall below the drop temperature. I am increasing the heat to 20% to maintain a positive rate of rise while also increasing the fan to 60 to manage temperature stability.",
+              "latency_seconds": 5.213,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 659.281,
+              "bean_temp_c": 185.0,
+              "development_time_ratio": 0.0584,
+              "target_heat": 10,
+              "target_fan": 90,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Development time is at 5.84 % per context, below the target of 13.3 %. Although bean temperature is climbing steadily at a rate of 4.898 C/min, it is still 3 degrees below the target drop temperature of 188 C. Current fan is at 90 %, a high value already helping manage the RoR. Given these details, and the current heat level being 0 (risking a stall), it's prudent to restore some heat (target_heat = 10 %) to maintain a controlled climb toward the target drop temperature, allowing for development to correctly align with its target before recommending the drop. This should help avoid dropping the beans prematurely. The current fan levels are appropriate for this stage, acting as a brake while still allowing the necessary heat retention for development.",
+              "latency_seconds": 5.002,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 695.756,
+              "bean_temp_c": 186.0,
+              "development_time_ratio": 0.1078,
+              "target_heat": 25,
+              "target_fan": 100,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The bean temperature is at 186.0\u00b0C and approaching the target drop temperature of 188.0\u00b0C, while the development ratio is at 10.78% per the context, short of the 13.3% target. The current rate of rise is positive at 2.81\u00b0C per minute, indicating a slow climb. Heat is at the floor (0%), but the target temperature is close and the RoR is stable, so a modest heat increase to 25% should aid the beans in climbing steadily to 188.0\u00b0C without overshooting. Fan is already at the ceiling (100%), maintaining it there will prevent the environment temperature from rising further and help keep smoked flavors in check. Continue development until both the bean temperature and development ratio converge near their targets. Do not drop at this moment as the development target is yet unmet.",
+              "latency_seconds": 2.767,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 717.161,
+              "bean_temp_c": 188.0,
+              "development_time_ratio": 0.1344,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 188.0\u00b0C, matching the target drop temperature. The development time ratio (DTR) is at 13.44%, slightly above the target of 13.3%. Given these conditions, the roast satisfies both temperature and development goals concurrently. With the DTR slightly over the target (but within the acceptable range of 10.3% to 16.3%) and the bean temperature precisely at the drop target, it's appropriate to drop the beans now. This will avoid unnecessary further development which could risk overshooting into the bitter ceiling of 196.0\u00b0C.",
+              "latency_seconds": 2.267,
+              "error": null
+            }
+          ]
+        },
+        "arm3_reference_taught": {
+          "arm_key": "arm3_reference_taught",
+          "arm_label": "Arm 3 \u2014 c9, reference present + taught",
+          "prompt_version": "c9",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 624.157,
+              "bean_temp_c": 182.0,
+              "development_time_ratio": 0.0054,
+              "target_heat": 30,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Currently, the development ratio is at 0.54 %, which is well below the target of 13.3 %. However, the bean temperature is following a stable rate of rise at 5.794 \u00b0C per minute and is at 182 \u00b0C, approaching the target drop temperature of 188 \u00b0C. Given the stability in rate of rise and the low development ratio, a modest increase in heat to 30 % will help maintain temperature advancement without overshooting the development time target. Further, the fan at 50 % is doing well in maintaining airflow, so it should stay as is. This approach aims to stretch development to reach its target alongside bean temperature without pushing too fast toward the bitter ceiling at 196 \u00b0C.",
+              "latency_seconds": 2.695,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 659.281,
+              "bean_temp_c": 185.0,
+              "development_time_ratio": 0.0584,
+              "target_heat": 0,
+              "target_fan": 90,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 185.0 \u00b0C, below the target drop temperature of 188.0 \u00b0C. The development ratio is at 5.84 %, below the target development ratio of 13.3 %. Heat is already at its floor of 0 %, and current fan setting is 90 % to control the rate of rise. The current rate of rise is 4.898 \u00b0C per minute, which should allow further development. Maintain current settings, as bean temperature and development ratio have not reached targets.",
+              "latency_seconds": 2.127,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 695.756,
+              "bean_temp_c": 186.0,
+              "development_time_ratio": 0.1078,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is at 186.0 \u00b0C and the target drop temperature is 188.0 \u00b0C, with the bean showing a gentle rise in temperature (RoR at 2.81 \u00b0C/min). The development ratio is currently 10.78 %, and the acceptable range is between 10.3 % and 16.3 %. However, the rate of rise suggests that if we continue at this pace, we might overshoot temperature quickly. Given that the development ratio is within the acceptable range and nearing upper target limits, while the bean temperature is close to the drop target, it is prudent to recommend the drop now to prevent running into the bitter ceiling without meaningful progress. The bitter ceiling temp is 196.0 \u00b0C and the environment is stable at 213.0 \u00b0C, showing no further significant climb risk. This decision weighs both conditions meeting their objectives together, which aligns with the joint objective strategy.",
+              "latency_seconds": 2.466,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 717.161,
+              "bean_temp_c": 188.0,
+              "development_time_ratio": 0.1344,
+              "target_heat": 10,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The bean temperature is 188.0\u00b0C, which matches the target drop temperature of 188.0\u00b0C. The development time ratio (DTR) is 13.44% according to context, slightly above the profile target of 13.3%. The rate of rise is positive at 2.789\u00b0C per minute. Given these conditions, the roast has achieved both its bean temperature and development ratio targets, and should be dropped to avoid overshooting. The current bitter ceiling is 196.0\u00b0C, so we are well below that limit. Target heat is set to 10% to maintain a gentle approach if needed.",
+              "latency_seconds": 2.408,
+              "error": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "run_id": "d251013e220c4364bb0a122de6a93244",
+      "bean_label": "Colombia Excelso Huila (Washed)",
+      "origin_slug": "colombia-excelso-huila-washed",
+      "operator_rating": 3,
+      "charge_grams": 250.0,
+      "tick_count": 4,
+      "reference": {
+        "source_run_id": "f3fc65fa6e72422597f1acb5e62fe135",
+        "operator_rating": 3,
+        "first_crack_temp_c": 185.0,
+        "first_crack_elapsed_s": 642.9975458749977,
+        "drop_temp_c": 193.0,
+        "drop_development_percent": 20.28688952398136,
+        "curve_points": 30
+      },
+      "arms": {
+        "arm1_no_reference": {
+          "arm_key": "arm1_no_reference",
+          "arm_label": "Arm 1 \u2014 c8, no reference",
+          "prompt_version": "c8",
+          "reference_injected": false,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 620.555,
+              "bean_temp_c": 185.0,
+              "development_time_ratio": 0.0051,
+              "target_heat": 40,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "The development time ratio (DTR) is currently at 0.5%, which is very low compared to the target of 11.1%. This indicates that we need to continue developing the roast to reach that target. The bean temperature is at 185.0\u00b0C, approaching the target drop temperature of 190.0\u00b0C. To ensure the bean continues to develop without stalling, I recommend increasing heat slightly to 40% while holding the fan steady at 50%. This will allow the bean to rise more gradually, ensuring it reaches the target temperature while accumulating adequate development time. Should_drop is false since we are not yet at any target thresholds or ceilings that would necessitate an immediate drop.",
+              "latency_seconds": 2.162,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 657.788,
+              "bean_temp_c": 188.0,
+              "development_time_ratio": 0.0614,
+              "target_heat": 10,
+              "target_fan": 85,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The development percent is at 6.14 %, which is below the target of 11.1 %. The bean temperature of 188.0 \u00b0C is approaching the target drop temperature of 190.0 \u00b0C. Heat is currently at 0 % and the bean rate of rise is 5.825 \u00b0C per minute, indicating a potential stall risk. Restoring some heat (to 10 %) could help continue the climb smoothly to ensure the bean reaches the drop temperature while allowing development to progress toward the target. Maintaining fan at 85 % keeps smoke clear without crashing the rate further.",
+              "latency_seconds": 2.155,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 688.297,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.103,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 190.0\u00b0C, which matches the target_drop_temp_c. The development time ratio (DTR) is 10.3%, very close to the target of 11.1% and within the acceptable window of 8.1% to 14.1%. With the bean temperature at the target and DTR at the window, both joint objectives are satisfied, suggesting the roast can be dropped now to prevent overdevelopment or exceeding the bitter ceiling, which is 196.0\u00b0C. Fan is at maximum, providing ample convective cooling, and heat is already at zero, indicating readiness for the drop.",
+              "latency_seconds": 2.034,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 695.479,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.1122,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "Both the bean temperature (190.0\u00b0C) and the development ratio (11.22%) match their respective targets simultaneously: the target bean temperature is exactly 190.0\u00b0C and the target DTR is approximately 11.1%. The bean is precisely at the target drop temperature, and the development percent is well within the target development window (8.1 - 14.1%) and matches the exact profile target. The declared bitter ceiling (196.0\u00b0C) provides ample safety margin for the drop to occur without any risk of overshooting. Therefore, it is optimal to drop the beans now to achieve the desired roast profile. As a precaution, the current setup with heat at 0% and fan at 100% facilitates immediate cooling after the drop.",
+              "latency_seconds": 2.061,
+              "error": null
+            }
+          ]
+        },
+        "arm2_reference_untaught": {
+          "arm_key": "arm2_reference_untaught",
+          "arm_label": "Arm 2 \u2014 c8, reference present (untaught)",
+          "prompt_version": "c8",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 620.555,
+              "bean_temp_c": 185.0,
+              "development_time_ratio": 0.0051,
+              "target_heat": 0,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 0.93,
+              "rationale": "Development is currently at 0.51% per the context, which is well below the 11.1% target. The bean temperature is at 185\u00b0C, with a target drop temperature of 190\u00b0C. Therefore, both targets - temperature and development - are far from being met.\n\nTo control the RoR better, the heat level should be further reduced to 0% to avoid racing to the temperature target while the development target is far behind. Increasing the fan to 60% will help stabilize the environment and control the RoR while also clearing smoke.\n\nAt this juncture, the decisive move is to align more closely with the target parameters using these changes, ensuring a smooth progression toward both the temperature and development targets before considering the drop.",
+              "latency_seconds": 2.988,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 657.788,
+              "bean_temp_c": 188.0,
+              "development_time_ratio": 0.0614,
+              "target_heat": 0,
+              "target_fan": 85,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "Current bean temperature is 188.0 C with a rate of rise (RoR) of 5.825 C per minute. The target drop temperature is 190.0 C, and the development time ratio (DTR) is currently 6.14 %, below the target of 11.1 %. The fan is already at 85 % and heat at 0 %, and no immediate action is needed to adjust these since they are appropriate for slowing the roast as development continues. Both bean temperature and development must be considered; the temperature needs to rise further to reach at least the drop target while development progresses.",
+              "latency_seconds": 1.609,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 688.297,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.103,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is exactly at the target drop temperature of 190.0\u00b0C, and the development ratio is at 10.3%, close enough to the 11.1% target. The bean's rate of rise is 3.938\u00b0C/min, indicating a strong upward momentum. With the bitter ceiling at 196.0\u00b0C, this rise could quickly put us at risk of a too-dark roast if not dropped promptly. The balance of bean temperature reaching its target and development ratio being in its window is sufficient to justify ending the roast now.",
+              "latency_seconds": 1.838,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 695.479,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.1122,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 190.0\u00b0C, which matches the target drop temperature of 190.0\u00b0C from the context. The development time ratio (DTR) is at 11.22%, slightly above the target of 11.1%, indicating that the development phase has met its objective. Consequently, both temperature and development ratio have reached their respective targets simultaneously, which is a condition for recommending the drop. Additionally, both these targets are achieved well below the bitter ceiling temperature of 196.0\u00b0C. Therefore, the roast should be dropped now to ensure optimal development.",
+              "latency_seconds": 1.581,
+              "error": null
+            }
+          ]
+        },
+        "arm3_reference_taught": {
+          "arm_key": "arm3_reference_taught",
+          "arm_label": "Arm 3 \u2014 c9, reference present + taught",
+          "prompt_version": "c9",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 620.555,
+              "bean_temp_c": 185.0,
+              "development_time_ratio": 0.0051,
+              "target_heat": 20,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "Development is currently at 0.51% per the context, well below the 11.1% target and even the minimum acceptable window of 8.1%. The bean temperature is at 185.0 \u00176C, still short of the 190.0 \u00176C drop target. Current heat is at 20% and fan at 50%, which is already a moderate level post-first-crack. Given the rate of rise is at 7.5 \u00176C/min, I recommend holding current settings to allow for both temperature and development time to progress. Dropping now would result in a severely underdeveloped roast.",
+              "latency_seconds": 1.939,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 657.788,
+              "bean_temp_c": 188.0,
+              "development_time_ratio": 0.0614,
+              "target_heat": 10,
+              "target_fan": 85,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The bean temperature is at 188.0\u00b0C, approaching the target of 190.0\u00b0C with an RoR of 5.825\u00b0C/min. Development time is at 40.372 seconds, corresponding to a DTR of 6.14%, while the target is 11.1%. To avoid stalling the bean below the drop temperature, I recommend restoring some heat to maintain a controlled climb toward the target drop temperature. Fan is already sufficiently high to aid in maintaining a consistent RoR without overshooting the bitter ceiling of 196.0\u00b0C. Thus, should_drop is held false to allow development to progress further.",
+              "latency_seconds": 2.206,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 688.297,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.103,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 190.0 \u00b0C, which matches the target drop temperature of 190.0 \u00b0C. Development time ratio (DTR) is at 10.3%, slightly below the target of 11.1% but within the acceptable development window (8.1% - 14.1%). The bean temperature is below the bitter ceiling of 196.0 \u00b0C, ensuring we are not risking bitterness. The current RoR is declining at 3.938 \u00b0C/min, which means we have already reached the temperature target and are at an acceptable development stage. Given these parameters, it is appropriate to drop the beans to prevent overshooting either development or the bitter ceiling.",
+              "latency_seconds": 1.75,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 695.479,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.1122,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 1.0,
+              "rationale": "The current bean temperature is 190.0\u00b0C, which is at the target_drop_temp_c of 190.0\u00b0C. The development time ratio (DTR) is 11.22%, slightly above the target of 11.1%, indicating we have met our development goal. Both target metrics (temperature and development) are satisfied, and the roast should be stopped now to prevent overdevelopment, especially considering the bitter ceiling is 196.0\u00b0C, well above the current bean temperature. With the fan at 100% and heat at 0%, the environmental conditions support a drop. Therefore, I recommend dropping the beans immediately.",
+              "latency_seconds": 2.036,
+              "error": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "run_id": "f3fc65fa6e72422597f1acb5e62fe135",
+      "bean_label": "Colombia Excelso Huila (Washed)",
+      "origin_slug": "colombia-excelso-huila-washed",
+      "operator_rating": 3,
+      "charge_grams": 250.0,
+      "tick_count": 6,
+      "reference": {
+        "source_run_id": "b74153ed91bf4e5d81715ca7a0c7ffec",
+        "operator_rating": 3,
+        "first_crack_temp_c": 182.0,
+        "first_crack_elapsed_s": 634.3442467089917,
+        "drop_temp_c": 187.0,
+        "drop_development_percent": 15.243722126242275,
+        "curve_points": 30
+      },
+      "arms": {
+        "arm1_no_reference": {
+          "arm_key": "arm1_no_reference",
+          "arm_label": "Arm 1 \u2014 c8, no reference",
+          "prompt_version": "c8",
+          "reference_injected": false,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 634.049,
+              "bean_temp_c": 185.0,
+              "development_time_ratio": 0.0092,
+              "target_heat": 40,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Development is at 0.92 %, very low compared to the target of 18.6 %. The bean temperature is at 185.0 \u00b0C, well below the target drop temperature of 193.0 \u00b0C. Both development and bean temperature need more time to meet their respective targets. Current heat is at 40 % and fan at 50 %, which are reasonable settings to continue developing without a crash or overshoot. Recommend holding these settings to allow for a smooth development without stalling.",
+              "latency_seconds": 2.14,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 671.822,
+              "bean_temp_c": 187.0,
+              "development_time_ratio": 0.0649,
+              "target_heat": 30,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "With the current bean temperature at 187.0\u00b0C and a target drop temperature set at 193.0\u00b0C, the roast is still below its intended drop point. The development time ratio is currently at 6.49%, which is well below the target development percentage of 18.6%. Thus, there is significant room for further development. The current heat and fan settings are already positioned to encourage a controlled, yet gradual rise in temperature. As such, adjustments are not necessary. It is crucial to balance development and temperature progression toward the target jointly, without prematurely aborting the roast process.",
+              "latency_seconds": 2.381,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 702.411,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.1056,
+              "target_heat": 40,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 189.0 \u00b0C, and the target drop temperature is 193.0 \u00b0C. Development is at 10.56% according to the provided context, which is below the target development percent of 18.6%. The bean's rate of rise is steady at 3.8 \u00b0C per minute, which is a healthy decline post-first-crack. Given that both the temperature target and development target are yet to be achieved, recommending to hold the current settings of heat at 40% and fan at 80% to continue a steady development until the targets are reached.",
+              "latency_seconds": 2.322,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 733.324,
+              "bean_temp_c": 191.0,
+              "development_time_ratio": 0.1433,
+              "target_heat": 20,
+              "target_fan": 85,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "At the current bean temperature of 191.0\u00b0C, we are nearing the target drop temperature of 193.0\u00b0C, and the rate of rise (RoR) is healthy at 3.902\u00b0C per minute. The development time ratio (DTR) is at 14.33%, slightly below the target of 18.6%, indicating we need more development time. The heat should be reduced to slow down the temperature increase, allowing more time for development. We can increase the fan to 85% to further control the RoR and help evacuate smoke. Both actions align to stretch the development time without letting the bean temperature race towards the bitter ceiling of 196\u00b0C. The drop should not be executed yet, as the development needs to continue to reach closer to the target DTR and temperature pair.",
+              "latency_seconds": 2.479,
+              "error": null
+            },
+            {
+              "tick_index": 4,
+              "roast_elapsed_seconds": 764.093,
+              "bean_temp_c": 193.0,
+              "development_time_ratio": 0.1778,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 1.0,
+              "rationale": "The bean temperature has reached the target drop temperature of 193.0\u00b0C and is closing in on the bitter ceiling of 196.0\u00b0C. The development time ratio (DTR) is at 17.78%, which aligns well within the target development window of 15.6% to 21.6%, and is close to the target of 18.6%. Since both the temperature and development targets are effectively met and the bean temperature is approaching the bitter ceiling, it is optimal to drop now to avoid overshooting the ceiling. Keeping heat at 0 and fan at 100 ensures the roast is ready for a smooth cooldown upon dropping.",
+              "latency_seconds": 2.036,
+              "error": null
+            },
+            {
+              "tick_index": 5,
+              "roast_elapsed_seconds": 772.426,
+              "bean_temp_c": 193.0,
+              "development_time_ratio": 0.1867,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The bean temperature is at 193.0\u00b0C, exactly matching the target_drop_temp_c of 193.0\u00b0C; development time ratio (DTR) is at 18.67%, slightly above the target_development_percent of 18.6%. Both targets are satisfied together. The roast is within both the temperature and development targets, and the bean temperature is below the bitter_ceiling_temp_c of 196.0\u00b0C, ensuring a safe drop now without approaching the ceiling. Therefore, recommend to drop now at a confidence level of 0.95.",
+              "latency_seconds": 1.829,
+              "error": null
+            }
+          ]
+        },
+        "arm2_reference_untaught": {
+          "arm_key": "arm2_reference_untaught",
+          "arm_label": "Arm 2 \u2014 c8, reference present (untaught)",
+          "prompt_version": "c8",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 634.049,
+              "bean_temp_c": 185.0,
+              "development_time_ratio": 0.0092,
+              "target_heat": 0,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.85,
+              "rationale": "Development is at 0.92% according to the context, far below the target of 18.6%. The bean temperature is 185.0\u00b0C, with a target drop temperature of 193.0\u00b0C. Since post-first-crack development has just started, the goal is to extend the development while steering toward the drop temperature. With current heat at 40%, cutting heat to 0% now will control the rate of rise and allow development to approach the target smoothly. Raising the fan to 70% will assist in cooling, preventing scorch, and evacuating smoke. The move should shape the decline effectively without crashing the rate of rise. Both changes align to prevent overshooting the bitter ceiling of 196.0\u00b0C while aligning development and temperature targets.",
+              "latency_seconds": 2.451,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 671.822,
+              "bean_temp_c": 187.0,
+              "development_time_ratio": 0.0649,
+              "target_heat": 0,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The roast is in the development phase, with bean temperature currently at 187.0\u00b0C. The RoR is 3.963\u00b0C/min and heat is set at 30%. Development is at 6.49%, below the target of 18.6%, suggesting there's still room for development. The current setup (heat 30%, fan 80%) is adequate for continuing the development phase without overshooting. Holding steady will help continue progress toward the temperature target of 193\u00b0C while allowing more development time, avoiding an imbalance where temperature hits the target while development lags behind. Maintain fan at 80% to stabilize the environment temperature. No immediate need to drop as we're not at bitter ceiling (196\u00b0C) or emergency drop (198\u00b0C).",
+              "latency_seconds": 2.257,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 702.411,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.1056,
+              "target_heat": 0,
+              "target_fan": 85,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "The roast is in the post-first-crack development phase, targeting a drop temperature of 193.0\u00b0C and a development ratio of 18.6%. Current bean temperature is 189.0\u00b0C, and DTR is 10.56%, which is below the target. Bean RoR is at 3.8\u00b0C/min, indicating steady progression toward the drop temperature, but development needs to continue. The bean temperature must rise to reach the target while stretching development time. Recommended to reduce heat to 0% to slow the climb and stretch development further, while increasing fan to 85% to manage RoR closely and pull environment temperature down without crashing the progression.",
+              "latency_seconds": 1.97,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 733.324,
+              "bean_temp_c": 191.0,
+              "development_time_ratio": 0.1433,
+              "target_heat": 20,
+              "target_fan": 85,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "Current bean temperature is 191.0\u00b0C, approaching the target drop temperature of 193.0\u00b0C. Development ratio is at 14.33%, below the target of 18.6%. Target a continued gentle climb to avoid a cool drop. Decrease heat further to 20% from 30% to slow the rate of rise and steer towards the ideal drop window, preventing overshoot while extending development time. Maintain a slight fan increase to 85% to further control the environment temperature, evacuate smoke, and stabilize the profile. Continue to hold; not ready to drop until both targets align more closely.",
+              "latency_seconds": 2.181,
+              "error": null
+            },
+            {
+              "tick_index": 4,
+              "roast_elapsed_seconds": 764.093,
+              "bean_temp_c": 193.0,
+              "development_time_ratio": 0.1778,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 193.0\u00b0C, matching the target drop temperature of 193.0\u00b0C. Furthermore, the development time ratio (DTR) is 17.78%, which is near the target development percent of 18.6%. The roast is in the acceptable development window (15.6% to 21.6%). As both criteria are fulfilled, the roast is ready for the drop. Holding further risks overshooting the bitter ceiling of 196.0\u00b0C as the bean continues to climb, even with heat at zero.",
+              "latency_seconds": 1.789,
+              "error": null
+            },
+            {
+              "tick_index": 5,
+              "roast_elapsed_seconds": 772.426,
+              "bean_temp_c": 193.0,
+              "development_time_ratio": 0.1867,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 193.0\u00b0C, which is at the target drop temperature of 193.0\u00b0C. However, the development ratio is slightly over the target at 18.67% (context value), just barely within the acceptable range of 18.6%. This means both conditions for the drop have been met. The rate of rise is quite low at 2.883\u00b0C/min, indicating a controlled decline. However, both temperature and development ratio are close to the targets, so it is appropriate to recommend should_drop=false and ensure the machine drops as soon as possible within the acceptable window, avoiding unnecessary delay to prevent exceeding the bitter ceiling of 196.0\u00b0C. No changes to heat or fan levels are needed as they are already at optimal settings for the drop.",
+              "latency_seconds": 2.033,
+              "error": null
+            }
+          ]
+        },
+        "arm3_reference_taught": {
+          "arm_key": "arm3_reference_taught",
+          "arm_label": "Arm 3 \u2014 c9, reference present + taught",
+          "prompt_version": "c9",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 634.049,
+              "bean_temp_c": 185.0,
+              "development_time_ratio": 0.0092,
+              "target_heat": 30,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 0.8,
+              "rationale": "The roast is in the development phase with the bean temperature at 185.0\u00b0C and a Rate of Rise (RoR) of 7.742\u00b0C/min. Development time is just beginning at 5.83 seconds, giving a DTR of only 0.92%, which is far from the 18.6% target (the window is 15.6% to 21.6%). The current bean temperature (185.0\u00b0C) is below the target drop temperature (193.0\u00b0C), and well below the bitter ceiling (196.0\u00b0C). With the development significantly short of target and a moderate RoR, we need to extend development. Lower heat further to 30% to gently slow the rise, and increase the fan to 60% to enhance cooling and convective heat transfer, guiding the bean temperature to rise steadily towards the target without overshooting. Dropping now would be premature given the low development ratio and the current temperature shortfall.",
+              "latency_seconds": 2.66,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 671.822,
+              "bean_temp_c": 187.0,
+              "development_time_ratio": 0.0649,
+              "target_heat": 30,
+              "target_fan": 80,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "Current bean temperature is 187.0\u00b0C and development percent/DTR is at 6.49%. The target drop temperature is 193.0\u00b0C, and the development percent target is 18.6%, neither of which are met. However, given the current Rate of Rise (3.963\u00b0C per minute) and proximity to both temperature and development targets, the safest decision at this point, while still below the bitter ceiling of 196.0\u00b0C, is to continue developing but plan to drop soon. Since we don't want to be caught short of both targets and risk going past the ceiling, an aggressive action isn't justified, so holding heat steady and fan steady is recommended. But due to the proximity to the previous reference drop at this bean temperature, recommending a cautious early drop while below the ceiling, though not yet perfectly aligned, ensures control over the roast outcome. A minor early drop strategy stabilizes the risk of surpassing bitter ceilings instead of a stall approach.",
+              "latency_seconds": 2.154,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 702.411,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.1056,
+              "target_heat": 50,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is 189.0\u00b0C, which is below the target drop temperature of 193.0\u00b0C. The development time ratio is at 10.6%, which is below the target 18.6%. The rate of rise is 3.8\u00b0C per minute, indicating that the beans are still developing, but slowly. To help the beans reach the target drop temperature more effectively while controlling the development rate, I recommend increasing the heat to 50% while holding the fan at 80%. This increase in heat should aid in driving the bean temperature closer to the target without overheating, given the bitter ceiling of 196.0\u00b0C is well above the current temperature.",
+              "latency_seconds": 1.872,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 733.324,
+              "bean_temp_c": 191.0,
+              "development_time_ratio": 0.1433,
+              "target_heat": 30,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Bean temperature is 191.0\u00b0C, approaching the target drop temperature of 193.0\u00b0C. However, the development time ratio is 14.33%, below the target of 18.6%. We're climbing steadily, avoiding the bitter ceiling temperature of 196.0\u00b0C. Current conditions are stable, but we need more time to develop. Hold the current settings and allow more development to accrue while the temperature continues to approach the target.",
+              "latency_seconds": 1.879,
+              "error": null
+            },
+            {
+              "tick_index": 4,
+              "roast_elapsed_seconds": 764.093,
+              "bean_temp_c": 193.0,
+              "development_time_ratio": 0.1778,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is 193.0 \u00b0C, which matches the target drop temperature of 193.0 \u00b0C exactly. The development ratio is 17.78%, which is within the target development window range and close to the target of 18.6%. Given that we are at the target temperature, further waiting only risks climbing toward the bitter ceiling of 196.0 \u00b0C without meaningful development gains. Hence, I recommend dropping the roast now to satisfy both temperature and development objectives concurrently.",
+              "latency_seconds": 1.597,
+              "error": null
+            },
+            {
+              "tick_index": 5,
+              "roast_elapsed_seconds": 772.426,
+              "bean_temp_c": 193.0,
+              "development_time_ratio": 0.1867,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 193.0\u00b0C, which matches the target_drop_temp_c. The development time ratio is 18.67 %, which is just slightly above the target of 18.6 %. Both these points indicate that the roast is meeting the joint objective for dropping. The bitter_ceiling_temp_c is at 196.0\u00b0C, meaning there's room to continue if we need, but the current parameters suggest an optimal drop now. Consequently, I recommend should_drop = true.",
+              "latency_seconds": 1.409,
+              "error": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "run_id": "a4299aea124b43d289bd425d4dc850c4",
+      "bean_label": "Guatemala El Durazno (White Honey)",
+      "origin_slug": "guatemala-el-durazno-white-honey",
+      "operator_rating": 4,
+      "charge_grams": 250.0,
+      "tick_count": 3,
+      "reference": {
+        "source_run_id": "edbe9a76364342ed9b1338affd77c758",
+        "operator_rating": 4,
+        "first_crack_temp_c": 186.0,
+        "first_crack_elapsed_s": 626.5669326661155,
+        "drop_temp_c": 191.0,
+        "drop_development_percent": 12.378020082467026,
+        "curve_points": 30
+      },
+      "arms": {
+        "arm1_no_reference": {
+          "arm_key": "arm1_no_reference",
+          "arm_label": "Arm 1 \u2014 c8, no reference",
+          "prompt_version": "c8",
+          "reference_injected": false,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 595.219,
+              "bean_temp_c": 188.0,
+              "development_time_ratio": 0.0319,
+              "target_heat": 60,
+              "target_fan": 45,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is 188.0\u00b0C, below the target of 194.0\u00b0C, with a bean Rate of Rise (RoR) of 6.669\u00b0C per minute. Development time ratio (DTR) is 3.19%, far below the target of ~13.0%. With ample room below the bitter ceiling of 196.0\u00b0C, we should lower heat to 60% to control the RoR and raise fan to 45% to manage convective cooling and evacuate smoke. We are focusing on extending development time and climbing steadily toward the temperature target.",
+              "latency_seconds": 1.988,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 629.701,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.0849,
+              "target_heat": 50,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 190.0\u00b0C, below the target drop temperature of 194.0\u00b0C, suggesting that we need to continue the roast to hit the temperature target while closing the development gap. The development percent is 8.49%, below the target of 13.0%, indicating that both temperature and development are short of target. The heat is set high at 83, risking a rapid approach to the bitter ceiling at 196.0\u00b0C if left unchanged, so I reduce heat to 50 to ease the rate of rise; at the same time, I increase fan to 60 to shift more heat transfer towards convection, helping control the environment temperature and evacuate smoke and chaff. This coordinated action aims to approach both targets together smoothly without overshooting the ceiling; should_drop is false since neither target is yet satisfied, and we are within safe bounds.",
+              "latency_seconds": 2.528,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 663.199,
+              "bean_temp_c": 194.0,
+              "development_time_ratio": 0.1312,
+              "target_heat": 91,
+              "target_fan": 40,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The bean temperature has reached the target drop temperature of 194.0\u00b0C per context, and development is at 13.12%, closely matching the target development percent of 13%. Both targets are satisfied without exceeding the bitter ceiling of 196.0\u00b0C. Based on these conditions, a drop is recommended with high confidence, while maintaining current heat and fan settings.",
+              "latency_seconds": 1.861,
+              "error": null
+            }
+          ]
+        },
+        "arm2_reference_untaught": {
+          "arm_key": "arm2_reference_untaught",
+          "arm_label": "Arm 2 \u2014 c8, reference present (untaught)",
+          "prompt_version": "c8",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 595.219,
+              "bean_temp_c": 188.0,
+              "development_time_ratio": 0.0319,
+              "target_heat": 60,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The roast is in the development phase just after first crack, with a current bean temperature of 188 C and a target drop temperature of 194 C. The current development time ratio (DTR) is 0.0319, which is below the target 13%. The rate of rise is 6.669 C/min, suitable for gradual development. To extend development time without stalling the roast, reduce heat to 60% while increasing fan to 50% to manage the rate of rise and facilitate more even heat transfer. This adjustment aims to achieve a controlled decline in RoR, gradually closing the gap to both temperature and development targets without risking a too early drop or overshoot of the bitter ceiling. Aggressively cutting heat or raising the fan beyond this could crash the rate of rise.",
+              "latency_seconds": 2.798,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 629.701,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.0849,
+              "target_heat": 75,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Currently, the bean temperature is 190.0 C with a target of 194.0 C, and development percent is at 8.49%, needing to reach 13.0%. Both temperature and development are short of their targets. The bean rate of rise is 4.881 C/min, indicating a reasonable momentum. I recommend reducing heat to 75%, and increasing the fan to 50% to shape the rate of rise gently downwards towards the target drop temperature while extending development time. The adjustments are within limits (heat: 0-100%, fan: 0-100%), keeping the roast balanced without stalling, and giving time for development to catch up.",
+              "latency_seconds": 2.292,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 663.199,
+              "bean_temp_c": 194.0,
+              "development_time_ratio": 0.1312,
+              "target_heat": 0,
+              "target_fan": 60,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The bean temperature has reached the target drop temperature of 194.0\u00b0C, and the development ratio (DTR) is 13.12%, slightly above the target of 13.0%. Both targets for a successful drop have been met. The fan should be increased to 60% to aid in cooling the beans promptly upon drop. Given these conditions, it is appropriate to recommend the drop now.",
+              "latency_seconds": 2.2,
+              "error": null
+            }
+          ]
+        },
+        "arm3_reference_taught": {
+          "arm_key": "arm3_reference_taught",
+          "arm_label": "Arm 3 \u2014 c9, reference present + taught",
+          "prompt_version": "c9",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 595.219,
+              "bean_temp_c": 188.0,
+              "development_time_ratio": 0.0319,
+              "target_heat": 68,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Development is at 3.19% per the context, which is well below the target of 13%. The bean temperature is climbing steadily at 188\u00b0C, with a target drop temperature of 194\u00b0C. To ensure a controlled development and avoid racing to the ceiling, I recommend reducing heat slightly to 68% from the current 73% and increasing the fan to 50% to enhance convective cooling and smooth the rate of rise. This adjustment aims to stretch development time while gently guiding the beans toward the target temperature, allowing both temperature and development targets to converge without overshooting the bitter ceiling at 196\u00b0C.",
+              "latency_seconds": 2.864,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 629.701,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.0849,
+              "target_heat": 76,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "Development is currently at 8.49%, which is below the target of 13%. The bean temperature of 190\u00b0C is approaching the target drop temperature of 194\u00b0C but has not reached it yet. To control the current high RoR (4.881\u00b0C/min) and ensure smooth development, I recommend reducing the heat to 76% and increasing the fan to 50% to decelerate the climb gently, allowing the development time to meet the target alongside the temperature. We are comfortably below the bitter ceiling of 196\u00b0C, so dropping now would lead to underdevelopment. Hold until both targets are satisfied.",
+              "latency_seconds": 2.074,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 663.199,
+              "bean_temp_c": 194.0,
+              "development_time_ratio": 0.1312,
+              "target_heat": 0,
+              "target_fan": 60,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is at 194.0\u00b0C, which matches the target drop temperature of 194.0\u00b0C. The development ratio is at 13.12%, slightly above the target of 13.0%, but within range and well below the bitter ceiling temperature of 196.0\u00b0C. Since both bean temperature and development are at their respective targets, I am recommending an immediate drop to prevent crossing the bitter ceiling and ensure the roast finishes within the desired profile parameters. The fan is increased to ensure a timely cooldown post-drop and evacuate smoke effectively.",
+              "latency_seconds": 1.853,
+              "error": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "run_id": "d55b0fce6c184e878042a6210d5c28f7",
+      "bean_label": "Guatemala El Durazno (White Honey)",
+      "origin_slug": "guatemala-el-durazno-white-honey",
+      "operator_rating": 4,
+      "charge_grams": 250.0,
+      "tick_count": 4,
+      "reference": {
+        "source_run_id": "edbe9a76364342ed9b1338affd77c758",
+        "operator_rating": 4,
+        "first_crack_temp_c": 186.0,
+        "first_crack_elapsed_s": 626.5669326661155,
+        "drop_temp_c": 191.0,
+        "drop_development_percent": 12.378020082467026,
+        "curve_points": 30
+      },
+      "arms": {
+        "arm1_no_reference": {
+          "arm_key": "arm1_no_reference",
+          "arm_label": "Arm 1 \u2014 c8, no reference",
+          "prompt_version": "c8",
+          "reference_injected": false,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 621.445,
+              "bean_temp_c": 184.0,
+              "development_time_ratio": 0.0052,
+              "target_heat": 20,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The current bead temperature is 184.0\u00b0C, and the target drop temperature is 190.0\u00b0C. The rate of rise is 5.791\u00b0C/min. Development time is very low at 0.5% (3.231 seconds into development), significantly below the target of 13.3%. Current heat is at 0, which might cause the roast to stall and under-develop if kept. Therefore, I recommend restoring some heat to 20% to maintain a positive rate of rise, fostering further development toward both temperature and development ratio targets. The fan is at 50%, which is adequate to manage heat without causing instability. Drop is not advised yet as neither the temperature nor the development objectives are met.",
+              "latency_seconds": 2.381,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 655.403,
+              "bean_temp_c": 187.0,
+              "development_time_ratio": 0.0567,
+              "target_heat": 0,
+              "target_fan": 75,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is at 187.0 \u00b0C, approaching the target drop temperature of 190.0 \u00b0C. Development is at 5.67 % (context number), well below the 13.3 % target, indicating we should allow more time for development. Current heat is already at 0 %, and fan is at 75 %. The rate of rise is 5.702 \u00b0C/min, suggesting that the beans are still developing without further heat input. The roast needs more time in the development phase, so hold the current fan setting to maintain stability and facilitate further development without risking a crash in the rate of rise.",
+              "latency_seconds": 1.813,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 689.132,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.1029,
+              "target_heat": 10,
+              "target_fan": 90,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "Current bean temperature is 189.0\u00b0C, close to the target drop temperature of 190.0\u00b0C, but with a DTR at 10.29% according to the context, which is lower than the target of 13.3%. The bean's temperature rise rate (4.996\u00b0C/min) is steady but almost reaching the drop temperature. Recommending a slight restoration in heat to 10% to maintain a gentle climb, ensuring the development continues toward its target DTR without stalling. Holding the fan at 90% to maintain current airflow and convection balance. Not recommending drop yet as the DTR is still short of its target.",
+              "latency_seconds": 1.906,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 713.867,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.134,
+              "target_heat": 0,
+              "target_fan": 90,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is exactly at the target_drop_temp_c of 190.0\u00b0C and the development time ratio (DTR) has reached 13.4%, which is slightly above the target of 13.3%. This places both the bean temperature and DTR within the desired drop window, enabling an optimal balance of temperature and development. Both targets have been satisfied simultaneously, and the current temperature is safely below the bitter ceiling of 196.0\u00b0C, ensuring no risk of bitterness in the roast. Consequently, it is appropriate to recommend the drop now, with a high confidence of 95%.",
+              "latency_seconds": 1.969,
+              "error": null
+            }
+          ]
+        },
+        "arm2_reference_untaught": {
+          "arm_key": "arm2_reference_untaught",
+          "arm_label": "Arm 2 \u2014 c8, reference present (untaught)",
+          "prompt_version": "c8",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 621.445,
+              "bean_temp_c": 184.0,
+              "development_time_ratio": 0.0052,
+              "target_heat": 0,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The roast is in the early phase of development with bean temperature at 184.0\u00b0C, which is below the target drop temperature of 190.0\u00b0C, and the development time ratio (DTR) is at 0.52%, far short of the 13.3% target. The rate of rise is moderate at 5.791\u00b0C/min, and the bean temperature is substantially below the bitter ceiling of 196.0\u00b0C. Current heat is at 0%, reflecting a prior cut to manage the roast pace. To avoid stalling, some heat should be restored to ensure the bean continues to approach the target temperature smoothly. Fan is steady at 50%, balancing convective heat without an increased brake effect needed now. Continuing to monitor the progression of bean temperature and development time as they approach their targets is essential, keeping current settings stable for another assessment tick.",
+              "latency_seconds": 2.281,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 655.403,
+              "bean_temp_c": 187.0,
+              "development_time_ratio": 0.0567,
+              "target_heat": 10,
+              "target_fan": 75,
+              "should_drop": false,
+              "confidence": 0.85,
+              "rationale": "Development is at 5.67% (per the context), below the 13.3% target. The bean temperature is 187.0\u00b0C, below the target drop temperature of 190.0\u00b0C. With the current rate of rise at 5.702\u00b0C/min, the roast is progressing toward the targets but not yet there. Current heat is 0%, which may cause the bean to stall before reaching the target temperature. I recommend increasing the heat slightly to 10% to ensure the beans continue to climb steadily toward the target drop temperature, while keeping the fan at 75% to manage the rate of rise and maintain airflow stability. No drop should be initiated at this point as neither the drop temperature nor the development target is complete.",
+              "latency_seconds": 1.935,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 689.132,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.1029,
+              "target_heat": 0,
+              "target_fan": 90,
+              "should_drop": true,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is 189.0 \u00b0C, very close to the target drop temperature of 190.0 \u00b0C. Development ratio (DTR) is at 10.29%, below the target 13.3% but within the acceptable range of 10.3% to 16.3%. Given the bean temperature is near the target and the DTR is within range, a drop is advisable to avoid crossing the bitter ceiling of 196.0 \u00b0C while ensuring adequate development. Current RoR is 4.996 \u00b0C/min, indicating a continued rise. Hence, call for the drop to fulfill both temperature and development objectives simultaneously.",
+              "latency_seconds": 1.667,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 713.867,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.134,
+              "target_heat": 0,
+              "target_fan": 90,
+              "should_drop": true,
+              "confidence": 1.0,
+              "rationale": "The roast has reached both targets: bean temperature is at 190.0 C, which matches the target_drop_temp_c of 190.0 C, and the Development Time Ratio (DTR) is 13.4 % (from context), which exceeds the target development percent of 13.3 %. Both temperature and development are in the desired range, and the bitter ceiling of 196.0 C provides ample safety, so it is appropriate to drop now.",
+              "latency_seconds": 1.34,
+              "error": null
+            }
+          ]
+        },
+        "arm3_reference_taught": {
+          "arm_key": "arm3_reference_taught",
+          "arm_label": "Arm 3 \u2014 c9, reference present + taught",
+          "prompt_version": "c9",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 621.445,
+              "bean_temp_c": 184.0,
+              "development_time_ratio": 0.0052,
+              "target_heat": 30,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "The roast is in the early development phase, shortly after first crack, with the current bean temperature at 184.0\u00b0C and a bean RoR of 5.791\u00b0C/min. Development time ratio (DTR) is at 0.52%, far below the target of 13.3%. The current heat is at 0%, which is too low to maintain a controlled rate of rise toward the target drop temperature of 190\u00b0C. Therefore, I recommend increasing heat to 30% to ensure the bean continues to climb toward the target drop temperature while keeping current fan at 50% to maintain a balance of convective cooling. The reference roast completed at a bean temperature of 191\u00b0C with a 12.38% development ratio, slightly under the current target, suggesting we need a bit more time in development. Both temperature and development ratio need further progression before considering a drop. Bitter ceiling is at 196\u00b0C, providing a buffer for continued development.",
+              "latency_seconds": 2.336,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 655.403,
+              "bean_temp_c": 187.0,
+              "development_time_ratio": 0.0567,
+              "target_heat": 10,
+              "target_fan": 75,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Current bean temperature is 187.0\u00027C with a target drop temperature of 190.0\u00027C. Development ratio is 5.67%, below the target of 13.3%. Bean RoR is 5.702 \u0002B\u0002B having heat at 0 for a bit has been necessary, but now could use a gentle lift ot keep the bean from stalling before full development. Dropping at this moment would be premature, as development is well below the target. Restoring a small amount of heat (10%) will ensure a continued climb towards the target drop temperature while simultaneously allowing development to progress without stalling. The fan remains at 75% to maintain cooling and control environment temperature. Adjusting the approach while still being mindful of the ceiling constraint.",
+              "latency_seconds": 2.765,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 689.132,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.1029,
+              "target_heat": 0,
+              "target_fan": 95,
+              "should_drop": false,
+              "confidence": 0.85,
+              "rationale": "The roast has been progressing with bean temperature at 189.0\u00b0C and development at 10.29%, which is below the target of 13.3%. The bean temperature target is 190.0\u00b0C, and we are close to it. Heat is already at 0%, indicating a focus on slowing the climb to allow for more development time. The fan is currently at 90%, and given we are nearing the drop temperature, a small increase to 95% in fan speed can help gently slow the bean temperature rise, buying time for the development ratio to increase. This will allow us to reach both temperature and development targets synchronously without crossing the bitter ceiling of 196.0\u00b0C. Should_drop is set to false as we haven't met both targets yet.",
+              "latency_seconds": 2.038,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 713.867,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.134,
+              "target_heat": 0,
+              "target_fan": 90,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The bean temperature (190.0\u00b0C) is at the target drop temperature (190.0\u00b0C), and the development time ratio (DTR) is 13.4%, which is slightly above the target development percentage (13.3%). Both targets are satisfied together, which suggests that it is the right moment to drop. Furthermore, the current bean temperature is well below the bitter ceiling (196.0\u00b0C), affirming that it is safe to proceed with the drop now without crossing any critical thresholds.",
+              "latency_seconds": 1.974,
+              "error": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "run_id": "edbe9a76364342ed9b1338affd77c758",
+      "bean_label": "Guatemala El Durazno (White Honey)",
+      "origin_slug": "guatemala-el-durazno-white-honey",
+      "operator_rating": 4,
+      "charge_grams": 250.0,
+      "tick_count": 3,
+      "reference": {
+        "source_run_id": "d55b0fce6c184e878042a6210d5c28f7",
+        "operator_rating": 4,
+        "first_crack_temp_c": 184.0,
+        "first_crack_elapsed_s": 631.3238057091366,
+        "drop_temp_c": 190.0,
+        "drop_development_percent": 15.101221963911529,
+        "curve_points": 30
+      },
+      "arms": {
+        "arm1_no_reference": {
+          "arm_key": "arm1_no_reference",
+          "arm_label": "Arm 1 \u2014 c8, no reference",
+          "prompt_version": "c8",
+          "reference_injected": false,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 623.808,
+              "bean_temp_c": 186.0,
+              "development_time_ratio": 0.017,
+              "target_heat": 45,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Post-first-crack, our objective is to ensure development meets the target while maintaining a controlled climb to the drop temperature. The bean temperature is currently 186.0\u00b0C with a target of 192.0\u00b0C. The development ratio (DTR) is at 1.7%, which is below the target of 10.4%, indicating development is still far from done. Therefore, we need to ensure a gentle climb without overshooting bean temperature. Reducing heat from 65% to 45% will help guide the roast into a smoother decline. Raising the fan to 50% increases airflow, aiding in heat evacuation and preventing overshooting the bitter ceiling of 196.0\u00b0C. Maintaining the current course will help meet the development and temperature objectives without risking an early drop.",
+              "latency_seconds": 2.495,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 654.595,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.0632,
+              "target_heat": 0,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 1.0,
+              "rationale": "Heat should be cut decisively now to control the development as the bean approaches the target drop temperature, currently at 189\u00b0C and aiming for 192\u00b0C. Development time ratio is at 6.32 %, well below the target of 10.4 %, allowing room to accrue more development before reaching the bitter ceiling of 196\u00b0C. Raising the fan to 60 % improves convective cooling and smoke evacuation. The bean's current rate of rise is 4.87\u00b0C per minute, with adequate room to adjust the curve without immediate need to drop.",
+              "latency_seconds": 2.061,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 685.129,
+              "bean_temp_c": 192.0,
+              "development_time_ratio": 0.105,
+              "target_heat": 65,
+              "target_fan": 40,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 192.0\u00b0C, which matches the target drop temperature of 192.0\u00b0C from the context, while the development ratio is 10.5%, slightly above the target development percent of 10.4%. This satisfies both the bean temperature and development targets concurrently, so we should drop the roast now. The bitter ceiling is at 196.0\u00b0C, offering safety for this drop decision.",
+              "latency_seconds": 2.287,
+              "error": null
+            }
+          ]
+        },
+        "arm2_reference_untaught": {
+          "arm_key": "arm2_reference_untaught",
+          "arm_label": "Arm 2 \u2014 c8, reference present (untaught)",
+          "prompt_version": "c8",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 623.808,
+              "bean_temp_c": 186.0,
+              "development_time_ratio": 0.017,
+              "target_heat": 40,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is 186.0\u00b0C, which is below the target drop temperature of 192.0\u00b0C. The development time ratio (DTR) is 0.017, far below the target of 10.4%. The rate of rise for the bean is 5.918\u00b0C per minute, indicating continued development. To extend development time while continuing to approach the target drop temperature smoothly, I recommend reducing heat to 40% to slow the rate of rise and increasing the fan to 50% to stabilize the environment temperature and improve convective cooling. This should help align temperature and development targets. The bean temperature is also well below the bitter ceiling of 196.0\u00b0C, giving us room to continue development without risk of overly high temperatures.",
+              "latency_seconds": 2.448,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 654.595,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.0632,
+              "target_heat": 50,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is 189.0\u00b0C, which is approaching the target drop temperature of 192.0\u00b0C. However, the development ratio is at 6.32%, which is below the minimum target of 7.4% and well below the target development percent of 10.4%. There needs to be a more extended development to reach the desired target. The rate of rise is currently 4.869\u00b0C per minute, which is healthy but needs moderation to achieve the development without overshooting the bitter ceiling. I am recommending a reduction in heat to 50% to slow the rate of rise, and an increase in fan to 60% for better convective cooling, ensuring a more controlled approach to the drop temperature while allowing development ratio to increase towards the target without a risk of crossing the bitter ceiling at 196.0\u00b0C. Dropping now would be premature as the development target has not yet been met.",
+              "latency_seconds": 2.783,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 685.129,
+              "bean_temp_c": 192.0,
+              "development_time_ratio": 0.105,
+              "target_heat": 40,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "Development is at 10.5 % per the context, slightly above the target of 10.4 %. Bean temperature has reached the target drop temperature of 192.0\u00b0C. The current rate of rise is modest at 5.871\u00b0C/min. Since the bean temperature target is achieved, we should drop soon but not before development slightly exceeds the target to ensure full completion. Current heat is at 65 %, no longer needed at this level, so cutting to 40 % is reasonable to gently slow it and pace remaining development. Fan raised to 50 % from 40 % aids airflow and cooling while preventing any smoke buildup. Bitter ceiling of 196\u00b0C leaves room to handle the remaining development deliberately without a premature drop. Hold for a moment to confirm balance between the targets, and prepare to drop soon once both metrics satisfy together.",
+              "latency_seconds": 2.53,
+              "error": null
+            }
+          ]
+        },
+        "arm3_reference_taught": {
+          "arm_key": "arm3_reference_taught",
+          "arm_label": "Arm 3 \u2014 c9, reference present + taught",
+          "prompt_version": "c9",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 623.808,
+              "bean_temp_c": 186.0,
+              "development_time_ratio": 0.017,
+              "target_heat": 50,
+              "target_fan": 40,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Development is currently at 1.7%, well below the 10.4% target. Bean temperature is 186.0\u00b0C, short of the target drop temperature of 192.0\u00b0C. The roast needs further development time and heat should be reduced to manage the bean's rate of rise. Lowering heat to 50% while holding the fan at 40% should maintain progress without overshooting the temperature or development targets. Reference roast cupped well with a drop temperature of 190\u00b0C, suggesting patience while developing this roast toward its current target. Drop only when the development percent and bean temperature are in the target range.",
+              "latency_seconds": 2.617,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 654.595,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.0632,
+              "target_heat": 65,
+              "target_fan": 40,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 189.0\u00176C, with a target drop temperature of 192.0\u00176C. The development ratio is currently 6.32%, below the target of 10.4%. The bean is steadily climbing at a rate of 4.869\u00176C/min. While we are approaching the desired conditions, neither temperature nor development targets have been satisfied yet. Thus, we should hold current levels to continue progress towards these targets. The bitter ceiling is at 196\u00176C, and we are safe regarding temperature.",
+              "latency_seconds": 2.136,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 685.129,
+              "bean_temp_c": 192.0,
+              "development_time_ratio": 0.105,
+              "target_heat": 65,
+              "target_fan": 40,
+              "should_drop": true,
+              "confidence": 0.9,
+              "rationale": "The bean temperature has reached the target drop temperature of 192.0\u00b0C, and the development time ratio (DTR) is 10.5%, which is within the profile's target of 10.4%. The target drop temperature and development target have both been satisfied. Moreover, the bean is well below the bitter ceiling temperature of 196.0\u00b0C, offering a safe margin to recommend the drop at this point.",
+              "latency_seconds": 1.486,
+              "error": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "run_id": "bf85c77a5436406285571a75df017512",
+      "bean_label": "Guatemala El Durazno (White Honey)",
+      "origin_slug": "guatemala-el-durazno-white-honey",
+      "operator_rating": 3,
+      "charge_grams": 250.0,
+      "tick_count": 3,
+      "reference": {
+        "source_run_id": "edbe9a76364342ed9b1338affd77c758",
+        "operator_rating": 4,
+        "first_crack_temp_c": 186.0,
+        "first_crack_elapsed_s": 626.5669326661155,
+        "drop_temp_c": 191.0,
+        "drop_development_percent": 12.378020082467026,
+        "curve_points": 30
+      },
+      "arms": {
+        "arm1_no_reference": {
+          "arm_key": "arm1_no_reference",
+          "arm_label": "Arm 1 \u2014 c8, no reference",
+          "prompt_version": "c8",
+          "reference_injected": false,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 609.455,
+              "bean_temp_c": 185.0,
+              "development_time_ratio": 0.0283,
+              "target_heat": 30,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Currently, the development time ratio is at 2.83%, which is significantly below the target of 9.5%. The bean temperature is 185.0\u00b0C, which is 4\u00b0C below the target drop temperature of 189.0\u00b0C. Given this, we are far from where we need to be. There's a considerable gap to cover both in terms of bean temperature and development time. Heat is currently at its minimum (0%), so it should be increased to promote more development. Fan speed is currently at 60%, which is quite high and should be held to prevent a crash in RoR. By increasing the heat to 30%, we can ensure the bean continues to climb towards the target drop temperature while development progresses.",
+              "latency_seconds": 2.229,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 645.805,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.083,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is 189.0\u00b0C, matching the target_drop_temp_c of 189.0\u00b0C. Development time is now at 53.584 seconds, translating to a development ratio of 8.3% which sits within the acceptable range (6.5% to 12.5%) but below the more precise target of 9.5%. However, given that we have reached the temperature target and the development ratio is close and within bounds, it is appropriate to recommend the drop, especially as heat is at 0% and fan is at 100%, indicating maximum current cooling effort. The gap to the bitter ceiling of 196.0\u00b0C supports a timely drop now to prevent overshooting.",
+              "latency_seconds": 1.772,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 654.538,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.0952,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is 189.0\u00b0C, which matches the target drop temperature of 189.0\u00b0C. The development time ratio is 9.5%, which is within the target range (6.5% - 12.5%). Both drop criteria are satisfied: temperature and development ratio have both reached their targets together. As the roast has arrived at the desired metrics, I recommend executing the drop.",
+              "latency_seconds": 1.315,
+              "error": null
+            }
+          ]
+        },
+        "arm2_reference_untaught": {
+          "arm_key": "arm2_reference_untaught",
+          "arm_label": "Arm 2 \u2014 c8, reference present (untaught)",
+          "prompt_version": "c8",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 609.455,
+              "bean_temp_c": 185.0,
+              "development_time_ratio": 0.0283,
+              "target_heat": 0,
+              "target_fan": 65,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is 185.0 \u00176C, which is 4.0 \u00176C below the target drop temperature of 189.0 \u00176C. The Development Time Ratio (DTR) is currently at 2.83 %, well below the target of 9.5 %. The rate of rise is positive at 4.593 \u00176C/min, allowing for additional development before drop. With heat already at 0 to prevent rapid temperature rise, a slight increase in fan speed to 65 % can help moderate the RoR without crashing it, ensuring a smoother approach to the target temperature without exceeding the bitter ceiling of 196.0 \u00176C. Therefore, do not drop yet.",
+              "latency_seconds": 2.276,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 645.805,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.083,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.9,
+              "rationale": "The bean temperature is at 189.0\u00b0C, which matches the target_drop_temp_c of 189.0\u00b0C. The development time ratio is at 8.3%, slightly short of the target 9.5%, but it is still within the acceptable development window (6.5% - 12.5%). Given that the bean temperature has already reached the planned drop point and we are within the development percent window, we should drop now to prevent overshooting the bitter ceiling of 196.0\u00b0C. Holding longer risks unnecessary development time, particularly with heat already at 0% and fan at 100% offering no further rate reduction.",
+              "latency_seconds": 1.676,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 654.538,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.0952,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is 189.0\u00b0C, matching the target drop temperature of 189.0\u00b0C, and the development time ratio (DTR) is 9.52% as per the context, slightly above the target development percent of 9.5%. Both the temperature target and the development target are satisfied simultaneously, and we are well within the bitter ceiling of 196.0\u00b0C. Given these conditions, it is appropriate to recommend the drop now.",
+              "latency_seconds": 1.384,
+              "error": null
+            }
+          ]
+        },
+        "arm3_reference_taught": {
+          "arm_key": "arm3_reference_taught",
+          "arm_label": "Arm 3 \u2014 c9, reference present + taught",
+          "prompt_version": "c9",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 609.455,
+              "bean_temp_c": 185.0,
+              "development_time_ratio": 0.0283,
+              "target_heat": 20,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.85,
+              "rationale": "The current development ratio is 2.83 %, which is below the target of 9.5 %. The bean temperature is at 185.0 \u00b0C, while the target drop temperature is 189.0 \u00b0C. The rate of rise (RoR) is 4.593 \u00b0C/min, indicating a steady climb. With the current heat at 0 %, the bean is unlikely to reach the temperature target if the development continues without intervention. To avoid a stall and ensure the bean hits the drop window correctly, I recommend restoring heat to 20 % to maintain a positive RoR. Increase the fan to 70 % to control smoke and help stabilize the environment temperature. We are below the bitter ceiling of 196.0 \u00b0C, so it's safe to make these adjustments without risking bitterness. The drop should not be executed until both development and temperature targets are met together.",
+              "latency_seconds": 1.946,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 645.805,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.083,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "Bean temperature is at the target drop temperature of 189.0\u00b0C, and development is at 8.3%, which is within the acceptable range (6.5%-12.5%). The bean is in the drop window, and the current RoR of 4.945\u00b0C per minute provides enough momentum to justify the decision. There's no benefit in extending development further with the current bean temperature near the drop target.",
+              "latency_seconds": 1.375,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 654.538,
+              "bean_temp_c": 189.0,
+              "development_time_ratio": 0.0952,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is 189.0\u00b0C, which matches the target_drop_temp_c of 189.0\u00b0C. The development time ratio (DTR) is 9.52%, which is within the target range. Both the temperature target and the development ratio target are satisfied together. As the bitter ceiling is 196.0\u00b0C, there is ample headroom to safely drop now without risk of overshooting the bitter ceiling. The combined targets have been met, allowing for a timely drop.",
+              "latency_seconds": 1.525,
+              "error": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "run_id": "43c84c98f052485ab35a98264d7ff8b5",
+      "bean_label": "Sumatra Mandheling G1 (Wet-Hulled)",
+      "origin_slug": "indonesia-sumatra-mandheling-g1-wet-hulled",
+      "operator_rating": 4,
+      "charge_grams": 255.0,
+      "tick_count": 3,
+      "reference": {
+        "source_run_id": "8ac8a5e4122941ca8109700fce92bc68",
+        "operator_rating": 4,
+        "first_crack_temp_c": 183.0,
+        "first_crack_elapsed_s": 612.0289644158911,
+        "drop_temp_c": 187.0,
+        "drop_development_percent": 15.60654333948595,
+        "curve_points": 30
+      },
+      "arms": {
+        "arm1_no_reference": {
+          "arm_key": "arm1_no_reference",
+          "arm_label": "Arm 1 \u2014 c8, no reference",
+          "prompt_version": "c8",
+          "reference_injected": false,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 643.431,
+              "bean_temp_c": 187.0,
+              "development_time_ratio": 0.033,
+              "target_heat": 50,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.85,
+              "rationale": "The development time ratio (DTR) is at 3.3% per the context, well below the target of 12.2%. Bean temperature is 187\u00b0C, which is short of the target drop temperature of 194\u00b0C. With both development and temperature targets running behind, we need to steer toward both simultaneously without rejecting either signal. Current heat is at 65%, and fan at 40%. I recommend lowering heat to 50% to manage the rate of rise while increasing fan to 50% to shift cooling more toward convective and clear heat from the drum. This should gently slow the temperature climb, allowing development to accrue without abruptly stalling or racing to the ceiling. Do not drop now; keep developing toward both targets together.",
+              "latency_seconds": 3.039,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 677.759,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.082,
+              "target_heat": 55,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The current bean temperature is 190.0\u00b0C, which is still below the target drop temp of 194.0\u00b0C. Development is at 8.2% per the context, below the target of 12.2%. With a RoR of 4.72\u00b0C/min, we should maintain a controlled climb toward the target temp and development ratio. Lowering heat slightly to 55% will help in controlling the RoR decline without a crash while keeping the fan at 80% to continue evacuating smoke and chaff. No action to drop until both targets are satisfied.",
+              "latency_seconds": 2.085,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 709.795,
+              "bean_temp_c": 194.0,
+              "development_time_ratio": 0.1234,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "Both the bean temperature (194.0 \u00b0C) and the development ratio (12.34 %) have reached their targets simultaneously. The target drop temperature is 194.0 \u00b0C, and the target development ratio is 12.2 % according to the profile, aligning well within the acceptable window. Considering both parameters are met and the proposed drop temperature aligns with a non-crossing of the bitter ceiling temperature (196.0 \u00b0C), dropping now will prevent any risk of bitterness while achieving the ideal roast development. Therefore, this is the optimal moment to drop.",
+              "latency_seconds": 1.858,
+              "error": null
+            }
+          ]
+        },
+        "arm2_reference_untaught": {
+          "arm_key": "arm2_reference_untaught",
+          "arm_label": "Arm 2 \u2014 c8, reference present (untaught)",
+          "prompt_version": "c8",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 643.431,
+              "bean_temp_c": 187.0,
+              "development_time_ratio": 0.033,
+              "target_heat": 50,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Post first crack, development is at 3.3%, which is well below the target of 12.2%. The current bean temperature is 187\u00b0C, below the target drop temperature of 194\u00b0C. Therefore, we should continue developing the roast. To pace the development without rushing toward the temperature ceiling, gently reduce the heat to 50% to slow the climb, while increasing the fan to 50% to help manage the environment temperature and evacuate smoke. This combination should provide a smooth rate of rise allowing development to catch up to the temperature target. We are not yet at the bitter ceiling of 196\u00b0C or the emergency drop of 198\u00b0C, so should not drop yet.",
+              "latency_seconds": 2.304,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 677.759,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.082,
+              "target_heat": 50,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.85,
+              "rationale": "The roast is in the development phase with a development ratio at 8.2%, which is below the target of 12.2%. The current bean temperature is 190.0\u00b0C, approaching the target drop temperature of 194.0\u00b0C. To avoid sprinting to the bitter ceiling of 196.0\u00b0C, a heat reduction to 50% is recommended to slow the rate of rise and extend development time toward the target. The fan is already at 80%, providing sufficient airflow for cooling and removing smoke. The current rate of rise is 4.72\u00b0C/min, indicating a strong climb, which supports the need to lower heat to control the approach to the drop temperature. No drop should be initiated until development approaches the target and bean temperature is close enough to the drop temperature.",
+              "latency_seconds": 2.549,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 709.795,
+              "bean_temp_c": 194.0,
+              "development_time_ratio": 0.1234,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.97,
+              "rationale": "The roast has reached the target drop temperature of 194.0\u00b0C, and the development time ratio (DTR) is at 12.34%, exceeding the target of 12.2%. Both quantitative targets are satisfied. The bean temperature is within the indicated bitter ceiling of 196.0\u00b0C, providing a safe margin for dropping now. As the bean temperature is at the target and development is slightly overshooting the target, recommending the drop is optimal to prevent any further overshoot or potential bitterness.",
+              "latency_seconds": 2.081,
+              "error": null
+            }
+          ]
+        },
+        "arm3_reference_taught": {
+          "arm_key": "arm3_reference_taught",
+          "arm_label": "Arm 3 \u2014 c9, reference present + taught",
+          "prompt_version": "c9",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 643.431,
+              "bean_temp_c": 187.0,
+              "development_time_ratio": 0.033,
+              "target_heat": 0,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The bean temperature is at 187.0 \u00b0C, which is 7 \u00b0C below the target drop temperature of 194.0 \u00b0C. The rate of rise is 5.519 \u00b0C/min, so there is a sufficient rate to approach the target drop temperature while still allowing for development. The current development ratio is 3.3 %, well below the target of 12.2 %. Heat should be cut to 0 to slow the rise and extend development time, while fan should be increased to 50 % to assist in controlling the rate of rise and evacuate smoke. The bitter ceiling is at 196.0 \u00b0C, providing some space to stretch the development further before approaching the ceiling limit. Hold on dropping until both bean temperature and development ratio targets converge.",
+              "latency_seconds": 2.555,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 677.759,
+              "bean_temp_c": 190.0,
+              "development_time_ratio": 0.082,
+              "target_heat": 50,
+              "target_fan": 80,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The roast is currently at 190.0\u00b0C with a target drop temperature of 194.0\u00b0C, and development is at 8.2%, below the target of 12.2%. The RoR of 4.72\u00b0C per minute is reasonable for further development, but requires modulation to avoid overshooting the bitter ceiling of 196.0\u00b0C.  Thus, a heat reduction to 50% is recommended to slow the ascent and avoid overshooting. The fan is already at 80% and providing adequate cooling, maintaining it while monitoring the climb closely for further adjustments if needed.",
+              "latency_seconds": 2.164,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 709.795,
+              "bean_temp_c": 194.0,
+              "development_time_ratio": 0.1234,
+              "target_heat": 25,
+              "target_fan": 85,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The current bean temperature is at 194.0\u00b0C, matching the target drop temperature of 194.0\u00b0C, and the development ratio is at 12.34 %, slightly above the target of 12.2 %. Both the temperature and the development ratio targets are met given this profile, and we are within the bitter ceiling of 196.0\u00b0C. However, the rate of rise is relatively high at 6.329 \u00b0C per minute, indicating that the bean temperature will soon exceed the bitter ceiling if we hold too long. Thus, I recommend dropping to prevent overshoot, acting now ensures we fulfill the targets without exceeding the bitter ceilings. Restoring a low heat can stabilize any potential rapid drop temperature fluctuation.",
+              "latency_seconds": 2.313,
+              "error": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "run_id": "8ac8a5e4122941ca8109700fce92bc68",
+      "bean_label": "Sumatra Mandheling G1 (Wet-Hulled)",
+      "origin_slug": "indonesia-sumatra-mandheling-g1-wet-hulled",
+      "operator_rating": 4,
+      "charge_grams": 255.0,
+      "tick_count": 4,
+      "reference": {
+        "source_run_id": "43c84c98f052485ab35a98264d7ff8b5",
+        "operator_rating": 4,
+        "first_crack_temp_c": 186.0,
+        "first_crack_elapsed_s": 635.8974676670041,
+        "drop_temp_c": 193.0,
+        "drop_development_percent": 14.11508077807838,
+        "curve_points": 30
+      },
+      "arms": {
+        "arm1_no_reference": {
+          "arm_key": "arm1_no_reference",
+          "arm_label": "Arm 1 \u2014 c8, no reference",
+          "prompt_version": "c8",
+          "reference_injected": false,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 603.05,
+              "bean_temp_c": 183.0,
+              "development_time_ratio": 0.0063,
+              "target_heat": 45,
+              "target_fan": 45,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "We are in the development phase, aiming to extend development time while controlling the rate of rise. The current bean temperature is at 183.0\u00b0C with a target drop temperature of 188.0\u00b0C, and the development ratio is at 0.63%, significantly below the target of 13.1%. To shape the roast effectively and prevent an early ceiling approach, I recommend reducing the heat to 45% to slow down the rate of rise, while increasing the fan to 45% to enhance convective cooling and evacuate smoke. This adjustment isn't aggressive and respects our target boundaries, as the bitter ceiling is 196\u00b0C and we have room to develop within this limit. No drop is recommended yet since both temperature and DTR are significantly below their targets.",
+              "latency_seconds": 2.44,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 635.552,
+              "bean_temp_c": 184.0,
+              "development_time_ratio": 0.0571,
+              "target_heat": 40,
+              "target_fan": 70,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Development is at 5.71 % per the context, well below the ~13 % target. Bean temperature is 184.0 C, approaching the 188.0 C target but not there yet. We should continue to steer towards both targets together. Lower heat to begin pacing the rate of rise, coordinating with an increase in fan to manage airflow and avoid scorching while stretching the DTR.",
+              "latency_seconds": 1.682,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 667.444,
+              "bean_temp_c": 186.0,
+              "development_time_ratio": 0.1022,
+              "target_heat": 60,
+              "target_fan": 90,
+              "should_drop": false,
+              "confidence": 1.0,
+              "rationale": "The roast is currently at a bean temperature of 186\u00b0C with a development ratio of 10.22%, per the context. The target drop temperature is 188\u00b0C and the target development percent is 13.1%. The rate of rise is 2.795\u00b0C per minute, which suggests a moderate climb towards both targets. Heat is currently set at 60%, and fan is at 90%, providing a good balance for continued development.\n\nBoth temperature and development targets have not yet been met concurrently; bean temperature is 2\u00b0C short of the target drop temperature, and development is still below the targeted DTR of 13.1%. The current RoR shows it's moving in the right direction, so hold the existing settings steady instead of making additional adjustments.\n\nMaintain current settings and let the roast continue developing until at least one of the targets is achieved first. Then, focus on achieving the second target without exceeding the bitter ceiling of 196\u00b0C. Both targets should ideally be hit together to recommend dropping. This hold strategy ensures the roast progresses smoothly without unnecessary fluctuations.",
+              "latency_seconds": 2.744,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 690.914,
+              "bean_temp_c": 188.0,
+              "development_time_ratio": 0.1327,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "Current bean temperature is at the target drop temperature of 188.0 C. The development ratio is at 13.27 %, close to the target of 13.1 %, and well within the acceptable range of 10.1 to 16.1 %. With the temperature being met and the development target essentially achieved, both criteria for dropping are satisfied. Further development risks nearing the bitter ceiling of 196 C. Therefore, the roast should be dropped now to ensure optimal flavor profile.",
+              "latency_seconds": 1.919,
+              "error": null
+            }
+          ]
+        },
+        "arm2_reference_untaught": {
+          "arm_key": "arm2_reference_untaught",
+          "arm_label": "Arm 2 \u2014 c8, reference present (untaught)",
+          "prompt_version": "c8",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 603.05,
+              "bean_temp_c": 183.0,
+              "development_time_ratio": 0.0063,
+              "target_heat": 30,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "First crack has just been detected, and development is only 0.63 % (well below the 13.1 % target). Therefore, dropping is premature. The bean temperature is at 183.0 C, with a target drop temperature of 188.0 C. The current rate of rise is 6.685 C/min, indicating a need to start slowing the ascent but still allowing development time to accrue. Reducing heat to 30 % and increasing fan to 50 % will help gradually lower the rate of rise for a controlled approach towards the target drop temperature while stretching development time.",
+              "latency_seconds": 2.09,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 635.552,
+              "bean_temp_c": 184.0,
+              "development_time_ratio": 0.0571,
+              "target_heat": 40,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Current bean temperature is 184.0\u00b0C, below the target drop temperature of 188.0\u00b0C. Development ratio is at 5.71%, which is below the target of 13.1%. Both temperature and development targets are unsatisfied, so dropping now would lead to under-development. Bean RoR is healthy at 4.6\u00b0C/min but can be steered downward. Recommend reducing heat to manage RoR decline slowly, while maintaining fan at 60% to sustain the bean's slow climb and ensure smoke evacuation. These adjustments aim to reach the drop temperature and development target together.",
+              "latency_seconds": 2.096,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 667.444,
+              "bean_temp_c": 186.0,
+              "development_time_ratio": 0.1022,
+              "target_heat": 40,
+              "target_fan": 90,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "With the current bean temperature at 186.0\u00b0C, close to the target drop temperature of 188.0\u00b0C, and development ratio at 10.22%, slightly below the target of 13.1%, we need to continue development while ensuring the bean temperature stabilizes. Reduce heat to 40% to slow the approach to target temperature while maintaining steady development, and maintain fan at 90% for adequate cooling and smoke evacuation. The bean should continue a slow climb towards the drop temperature without stalling development.",
+              "latency_seconds": 2.103,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 690.914,
+              "bean_temp_c": 188.0,
+              "development_time_ratio": 0.1327,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The bean temperature is at the target drop temperature (188.0\u00b0C), matching the profile's target_drop_temp_c. The development is at 13.27 %, which is slightly above the target development percent of 13.1 %. Given both targets are satisfied together, the roast is ready to drop. Moreover, the bean temperature is well below the bitter ceiling of 196\u00b0C, providing a safe margin.",
+              "latency_seconds": 1.964,
+              "error": null
+            }
+          ]
+        },
+        "arm3_reference_taught": {
+          "arm_key": "arm3_reference_taught",
+          "arm_label": "Arm 3 \u2014 c9, reference present + taught",
+          "prompt_version": "c9",
+          "reference_injected": true,
+          "ticks": [
+            {
+              "tick_index": 0,
+              "roast_elapsed_seconds": 603.05,
+              "bean_temp_c": 183.0,
+              "development_time_ratio": 0.0063,
+              "target_heat": 30,
+              "target_fan": 50,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "Development is only at 0.63 %, well below the target 13.1 %, and the bean temperature is 183.0 \u00b0C, short of the target drop temperature of 188.0 \u00b0C. The rate of rise is moderately high at 6.685 \u00b0C/min. Reduce heat significantly to slow the rate of rise and stretch development, but ensure the beans continue climbing. Increase the fan to 50 % to enhance convective heat transfer and evacuate smoke. This strategy aims to pace the development with the temperature reaching its drop target as development closes the gap.",
+              "latency_seconds": 2.22,
+              "error": null
+            },
+            {
+              "tick_index": 1,
+              "roast_elapsed_seconds": 635.552,
+              "bean_temp_c": 184.0,
+              "development_time_ratio": 0.0571,
+              "target_heat": 50,
+              "target_fan": 60,
+              "should_drop": false,
+              "confidence": 0.9,
+              "rationale": "The development time ratio (DTR) is at 5.71 % per the context, well below the target of 13.1 %. Bean temperature is 184.0\u00b0C, approaching the target drop temperature of 188.0\u00b0C. Current heat is at 60 % and fan at 60 %, with bean RoR at 4.593\u00b0C/min. Given the current RoR and the targets, a modest heat reduction to 50 % can help to pace the climb toward the drop temperature. Holding fan steady at 60 % ensures sufficient convective cooling and reduces the risk of overshooting. There is no immediate need to drop, as none of the drop conditions (temperature and development) are met together yet, and the roast is well below the bitter ceiling of 196.0\u00b0C.",
+              "latency_seconds": 2.475,
+              "error": null
+            },
+            {
+              "tick_index": 2,
+              "roast_elapsed_seconds": 667.444,
+              "bean_temp_c": 186.0,
+              "development_time_ratio": 0.1022,
+              "target_heat": 0,
+              "target_fan": 90,
+              "should_drop": false,
+              "confidence": 0.95,
+              "rationale": "Development is at 10.22 % per the context, which is below the 13.1 % target but within the acceptable window of 10.1 % minimum. Bean temperature is at 186.0\u00b0C, approaching the target of 188.0\u00b0C. The RoR is declining gently, but with heat still at 60 %, and to ensure the bean doesn't race to the bitter ceiling before reaching sufficient development, it's timely to cut heat aggressively. The fan is already at 90 % and should be maintained to control the environment temperature, maximizing convective cooling without crashing the RoR. A focus on extending development time further without crossing 188\u00b0C prematurely is crucial.",
+              "latency_seconds": 2.726,
+              "error": null
+            },
+            {
+              "tick_index": 3,
+              "roast_elapsed_seconds": 690.914,
+              "bean_temp_c": 188.0,
+              "development_time_ratio": 0.1327,
+              "target_heat": 0,
+              "target_fan": 100,
+              "should_drop": true,
+              "confidence": 0.95,
+              "rationale": "The bean temperature is at the target_drop_temp_c of 188.0\u00b0C, and the development percent is 13.27%, which is above the target of 13.1%. Both the bean temperature and development ratio targets have been met. Considering the bitter ceiling is 196\u00b0C, dropping now is advisable to avoid any risk of crossing it later. The combined criteria for the drop have been satisfied, making this the correct opportunity to initiate it.",
+              "latency_seconds": 2.044,
+              "error": null
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
