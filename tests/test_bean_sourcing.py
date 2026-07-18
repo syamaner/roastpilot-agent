@@ -23,6 +23,7 @@ import ipaddress
 import logging
 import subprocess
 import sys
+import time
 import zlib
 from collections.abc import AsyncGenerator
 
@@ -197,6 +198,72 @@ def test_extract_page_text_truncates_long_pages() -> None:
     huge = "<p>" + ("a" * 50_000) + "</p>"
     text = bean_sourcing._extract_page_text(huge)  # pyright: ignore[reportPrivateUsage]
     assert len(text) == bean_sourcing._MAX_EXTRACTED_CHARS  # pyright: ignore[reportPrivateUsage]
+
+
+# --- #587 P1 round 7: linear-time script/style strip (ReDoS fix) ---
+
+
+def test_strip_script_and_style_blocks_removes_well_formed_elements() -> None:
+    strip = bean_sourcing._strip_script_and_style_blocks  # pyright: ignore[reportPrivateUsage]
+    html = "<p>Before</p><script>var x = 1 < 2;</script><p>After</p>"
+    result = strip(html)
+    assert "var x" not in result
+    assert "Before" in result
+    assert "After" in result
+
+
+def test_strip_script_and_style_blocks_handles_element_ending_at_string_end() -> None:
+    """Covers the "no more open tags AND nothing left after the last
+    closed element" branch — the html ends immediately after </script>,
+    with no trailing text at all."""
+    strip = bean_sourcing._strip_script_and_style_blocks  # pyright: ignore[reportPrivateUsage]
+    html = "<script>var x = 1;</script>"
+    result = strip(html)
+    assert "var x" not in result
+
+
+def test_strip_script_and_style_blocks_handles_unterminated_script_tag() -> None:
+    """#587 P1: an unterminated ``<script>`` (no matching ``</script>``
+    anywhere) must not raise or hang — the rest of the document, having no
+    matching close, is treated as part of the (unterminated) element and
+    dropped; content BEFORE the open tag is preserved."""
+    strip = bean_sourcing._strip_script_and_style_blocks  # pyright: ignore[reportPrivateUsage]
+    html = "<p>Before</p><script>var x = 1; // never closed"
+    result = strip(html)
+    assert "Before" in result
+    assert "var x" not in result
+
+
+def test_extract_page_text_handles_unterminated_script_tag() -> None:
+    text = bean_sourcing._extract_page_text(  # pyright: ignore[reportPrivateUsage]
+        "<p>Kenya Kiambu AA</p><script>var x = 1;"
+    )
+    assert "Kenya Kiambu AA" in text
+    assert "var x" not in text
+
+
+def test_extract_page_text_pathological_unterminated_tags_completes_quickly() -> None:
+    """#587 P1, the actual ReDoS: the PRIOR backtracking regex
+    (``<(script|style)\\b[^>]*>.*?</\\1>``, ``DOTALL``) re-scanned the
+    ENTIRE remainder of the document from EVERY failed/unterminated open
+    tag — O(n) per tag, O(n^2) total for n such tags. A ~90 KB payload
+    with ~10k unterminated ``<script>`` opens (this test's exact shape)
+    would take unacceptably long (multi-second-to-minutes, scaling with
+    the payload) under that implementation. The linear-time replacement
+    must process this in a small fraction of a second — asserted with a
+    generous-for-CI-noise but still discriminating bound; the quadratic
+    version would blow past it by orders of magnitude, not narrowly."""
+    payload = "<script>" * 10_000 + "a" * 10_000
+    assert len(payload) > 80_000
+
+    started = time.monotonic()
+    result = bean_sourcing._extract_page_text(payload)  # pyright: ignore[reportPrivateUsage]
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0, f"script/style strip took {elapsed:.3f}s — looks quadratic again"
+    # The (single, unterminated) element swallows everything from the
+    # first <script> onward — nothing survives into the extracted text.
+    assert result == ""
 
 
 # --- _fetch_page_text ---
@@ -2029,6 +2096,19 @@ def test_normalize_optional_text_strips_and_blanks_to_none() -> None:
     assert normalize("  Kenya  ") == "Kenya"
 
 
+def test_extraction_instructions_require_explicit_blend_evidence() -> None:
+    """#587 P2 round 7: the prompt used to say a named single farm/region/
+    country IS itself a single-origin statement — meaning a page that just
+    named ONE origin (never actually addressing blend-vs-single-origin)
+    got an INVENTED explicit ``false`` instead of the honest ``null``. The
+    model must now be told to leave it null unless the page EXPLICITLY
+    addresses blending either way."""
+    instructions = bean_sourcing._EXTRACTION_INSTRUCTIONS  # pyright: ignore[reportPrivateUsage]
+    lowered = instructions.lower()
+    assert "explicitly" in lowered
+    assert "not itself" in lowered or "not an explicit" in lowered or "is not itself" in lowered
+
+
 def test_draft_from_identity_is_blend_silent_page_leaves_unset() -> None:
     """#587 P2: the page saying NOTHING about blend-vs-single-origin must
     leave ``is_blend`` unset (``None``) with no ``field_sources`` entry —
@@ -2326,9 +2406,9 @@ async def test_draft_bean_profile_from_url_rejects_url_with_fragment(
 
 def test_redact_url_credentials_strips_userinfo() -> None:
     redacted = bean_sourcing._redact_url_credentials(  # pyright: ignore[reportPrivateUsage]
-        "https://scraper:s3cr3t-token@vendor.example:8443/products/kenya?x=1"
+        "https://scraper:s3cr3t-token@vendor.example:8443/products/kenya"
     )
-    assert redacted == "https://vendor.example:8443/products/kenya?x=1"
+    assert redacted == "https://vendor.example:8443/products/kenya"
     assert "s3cr3t-token" not in redacted
     assert "scraper" not in redacted
 
@@ -2346,6 +2426,64 @@ def test_redact_url_credentials_strips_fragment() -> None:
     )
     assert redacted == "https://vendor.example/products/kenya"
     assert "s3cr3t" not in redacted
+
+
+def test_redact_url_credentials_strips_query_param_values() -> None:
+    """#587 P2 round 7: a credential-bearing query parameter
+    (``?access_token=...``) must be redacted too — keys are kept so the
+    redacted URL stays recognizable."""
+    redacted = bean_sourcing._redact_url_credentials(  # pyright: ignore[reportPrivateUsage]
+        "https://vendor.example/products/kenya?access_token=s3cr3t-token&ref=email"
+    )
+    assert redacted == "https://vendor.example/products/kenya?access_token=REDACTED&ref=REDACTED"
+    assert "s3cr3t-token" not in redacted
+
+
+def test_redact_url_credentials_leaves_a_query_free_url_unchanged() -> None:
+    url = "https://vendor.example/products/kenya"
+    assert bean_sourcing._redact_url_credentials(url) == url  # pyright: ignore[reportPrivateUsage]
+
+
+def test_redact_query_redacts_bare_token_with_no_equals_wholesale() -> None:
+    """A bare token with no ``=`` (e.g. a secret short-link id smuggled as
+    a "key" with no value) is indistinguishable from a blank-value ``key=``
+    pair via ``parse_qsl`` — redacted wholesale here instead, so the secret
+    itself is never left sitting unredacted in the "key" position."""
+    redact = bean_sourcing._redact_query  # pyright: ignore[reportPrivateUsage]
+    assert redact("SECRET_SHORT_LINK_ID") == "REDACTED"
+
+
+def test_redact_query_handles_multiple_params_and_empty_query() -> None:
+    redact = bean_sourcing._redact_query  # pyright: ignore[reportPrivateUsage]
+    assert redact("") == ""
+    assert redact("a=1&b=2") == "a=REDACTED&b=REDACTED"
+    assert redact("a=1;b=2") == "a=REDACTED&b=REDACTED"
+
+
+def test_redact_query_skips_empty_segments_from_doubled_separators() -> None:
+    redact = bean_sourcing._redact_query  # pyright: ignore[reportPrivateUsage]
+    assert redact("a=1&&b=2") == "a=REDACTED&b=REDACTED"
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_never_logs_a_query_param_secret(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Full-pipeline proof: a URL with a sensitive query parameter must
+    never appear un-redacted in ANY log line, including the normal
+    (non-rejected) happy-path logging."""
+    caplog.set_level(logging.INFO, logger="roastpilot_agent.bean_sourcing")
+    async with _mock_client(_html_response(200, _SAMPLE_HTML)) as http_client:
+        draft = await draft_bean_profile_from_url(
+            "https://vendor.example/products/kenya?access_token=s3cr3t-query-token",
+            advisor_config=_ADVISOR_CONFIG,
+            http_client=http_client,
+            model=_function_model_returning(_identity_args()),
+        )
+    assert draft.name
+    assert caplog.records, "expected at least the fetching/drafted info logs"
+    for record in caplog.records:
+        assert "s3cr3t-query-token" not in record.getMessage()
 
 
 def test_redact_url_credentials_returns_url_unchanged_on_malformed_url() -> None:

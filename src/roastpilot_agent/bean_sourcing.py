@@ -146,48 +146,109 @@ class BeanExtractionError(BeanSourcingError):
     neither a usable name nor a usable origin to draft from."""
 
 
-def _redact_url_credentials(url: str) -> str:
-    """Return ``url`` with any embedded userinfo (``user:pass@``) AND any
-    fragment stripped, for safe logging (#587 P1/P2: neither credentials
-    nor a fragment — which can carry a sensitive token, e.g. an OAuth
-    redirect's ``#access_token=...`` — may ever reach a log line, even
-    though :func:`draft_bean_profile_from_url` also rejects a credentialed
-    or fragment-bearing URL outright before any logging happens; this is
-    the defense-in-depth backstop for every OTHER place the source URL is
-    logged, now or in the future).
+def _redact_query(query: str) -> str:
+    """Redact every query-parameter VALUE in ``query`` (#587 P2, round 7).
 
-    Deliberately netloc-string-based rather than going through
-    ``SplitResult.username``/``.password``/``.port`` (which can themselves
-    raise on a malformed port, #587 P2): this helper is purely for a log
-    line and must NEVER itself raise, even on a malformed URL — the
-    ``urlsplit()`` call itself is guarded too (a malformed URL, e.g. an
-    unclosed IPv6 bracket, makes it raise ``ValueError`` eagerly), falling
-    back to returning ``url`` unchanged rather than raising out of a
-    logging helper. When it does parse, everything up to and including the
-    last ``@`` in the netloc is stripped (always the userinfo delimiter
-    when one is present — the host/port portion of a netloc cannot itself
-    contain an unescaped ``@``), and the fragment is dropped entirely.
+    A credential-bearing query parameter (``?access_token=...``,
+    ``?sig=...``, a pre-signed URL's ``?X-Amz-Signature=...``, and so on)
+    is exactly as sensitive as embedded userinfo or a fragment — it must
+    never reach a log line or the returned/stored ``source_url`` verbatim.
+    Every value is redacted, not an enumerated "sensitive-looking" subset:
+    this module cannot reliably know which vendor-specific query param
+    names carry secrets, so it treats the whole query as untrusted. Keys
+    are KEPT (so the redacted form stays recognizable — "there was an
+    access_token param" is useful context, "SECRET123" is not).
+
+    Split on the raw string (``&``/``;``, the two historically valid
+    separators) rather than via ``urllib.parse.parse_qsl`` +
+    ``urlencode``: a BARE token with no ``=`` (``?SECRET_SHORT_LINK_ID``)
+    and an explicit-but-empty value (``?key=``) both parse identically via
+    ``parse_qsl`` (as a "key" with a blank value) — redacting only the
+    ("blank") value in that case would leave the actual secret sitting
+    unredacted in the "key" position. Working on the raw segment instead
+    lets a bare token (no ``=`` present at all) be redacted WHOLESALE.
+
+    Args:
+        query: The raw query string (``SplitResult.query`` — no leading
+            ``?``).
+
+    Returns:
+        The query string with every value replaced by ``"REDACTED"``
+        (keys kept) and every bare/no-``=`` segment replaced by
+        ``"REDACTED"`` wholesale; the empty string unchanged.
+    """
+    if not query:
+        return query
+    redacted_segments: list[str] = []
+    for segment in re.split(r"[&;]", query):
+        if not segment:
+            continue
+        if "=" in segment:
+            key, _, _value = segment.partition("=")
+            redacted_segments.append(f"{key}=REDACTED")
+        else:
+            redacted_segments.append("REDACTED")
+    return "&".join(redacted_segments)
+
+
+def _redact_url_credentials(url: str) -> str:
+    """Return ``url`` with any embedded userinfo (``user:pass@``), query
+    parameter VALUES, and fragment stripped, for safe logging (#587 P1/P2:
+    none of these may ever reach a log line, even though
+    :func:`draft_bean_profile_from_url` also rejects a credentialed or
+    fragment-bearing URL outright before any logging happens; this is the
+    defense-in-depth backstop for every OTHER place the source URL is
+    logged, now or in the future — including a query-string secret, which
+    neither the userinfo nor the fragment check catches, #587 P2 round 7).
+
+    Deliberately netloc-string-based (not ``SplitResult.username``/
+    ``.password``/``.port``, which can themselves raise on a malformed
+    port, #587 P2) and raw-query-string-based (see :func:`_redact_query`)
+    rather than going through a full URL-rebuilding library path: this
+    helper is purely for a log line and must NEVER itself raise, even on a
+    malformed URL — the ``urlsplit()`` call itself is guarded too (a
+    malformed URL, e.g. an unclosed IPv6 bracket, makes it raise
+    ``ValueError`` eagerly), falling back to returning ``url`` unchanged
+    rather than raising out of a logging helper. When it does parse,
+    everything up to and including the last ``@`` in the netloc is
+    stripped (always the userinfo delimiter when one is present — the
+    host/port portion of a netloc cannot itself contain an unescaped
+    ``@``), every query-parameter value is redacted, and the fragment is
+    dropped entirely.
 
     Args:
         url: The URL to redact.
 
     Returns:
-        ``url`` with any userinfo and fragment removed; the original
-        ``url`` unchanged if it carries neither, or if it fails to parse at
-        all (this helper fails open to "log the original" rather than
-        raising, since bailing out of a logging call would be worse).
+        ``url`` with any userinfo, query values, and fragment removed; the
+        original ``url`` unchanged if it carries none of those, or if it
+        fails to parse at all (this helper fails open to "log the
+        original" rather than raising, since bailing out of a logging call
+        would be worse).
     """
     try:
         parsed = urlsplit(url)
     except ValueError:
         return url
     redacted_netloc = parsed.netloc.rsplit("@", 1)[-1] if "@" in parsed.netloc else parsed.netloc
-    if redacted_netloc == parsed.netloc and not parsed.fragment:
+    redacted_query = _redact_query(parsed.query)
+    if redacted_netloc == parsed.netloc and redacted_query == parsed.query and not parsed.fragment:
         return url
-    return urlunsplit(parsed._replace(netloc=redacted_netloc, fragment=""))
+    return urlunsplit(parsed._replace(netloc=redacted_netloc, query=redacted_query, fragment=""))
 
 
-_STRIP_TAG_BLOCK_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
+#: The OPENING ``<script ...>``/``<style ...>`` tag only — deliberately
+#: does NOT try to also match through to the closing tag in one pattern
+#: (see :func:`_strip_script_and_style_blocks`, #587 P1: that combined form
+#: is exactly the ReDoS this module used to have). ``[^>]*`` is bounded to
+#: the gap up to the tag's own closing ``>``, so this alone is linear.
+_SCRIPT_STYLE_OPEN_RE = re.compile(r"<(script|style)\b[^>]*>", re.IGNORECASE)
+#: The two possible closing tags, precompiled once (never per-element) —
+#: matched independently of the open tag via a forward, non-backtracking
+#: (bounded ``\s*``) search, never by re-scanning from the open tag with an
+#: unbounded ``.*?``.
+_SCRIPT_CLOSE_RE = re.compile(r"</script\s*>", re.IGNORECASE)
+_STYLE_CLOSE_RE = re.compile(r"</style\s*>", re.IGNORECASE)
 _ANY_TAG_RE = re.compile(r"<[^>]+>")
 _INLINE_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
 _BLANK_LINES_RE = re.compile(r"\n{3,}")
@@ -199,14 +260,76 @@ _BLANK_LINES_RE = re.compile(r"\n{3,}")
 _MAX_EXTRACTED_CHARS = 20_000
 
 
+def _strip_script_and_style_blocks(html: str) -> str:
+    """Remove every ``<script>...</script>``/``<style>...</style>`` ELEMENT
+    (open tag, content, close tag) from ``html``, replacing each with a
+    single space — in LINEAR time (#587 P1, ReDoS fix).
+
+    The prior implementation used one backtracking regex
+    (``<(script|style)\\b[^>]*>.*?</\\1>``, ``re.DOTALL``) whose ``.*?`` has
+    no bound on how far it scans looking for a closing tag. For a page with
+    many UNTERMINATED ``<script>``/``<style>`` opens (no matching close
+    anywhere in the document), the engine re-scans the ENTIRE REMAINDER of
+    the document from EVERY failed open tag before giving up and trying the
+    next one — O(n) work per open tag, O(n²) total for n such tags. This
+    is a measured (not assumed) CPU-exhaustion vector: a ~90 KB payload
+    with ~10k unterminated opens can exhaust CPU on this quadratic
+    behavior alone.
+
+    This instead walks ``html`` ONCE with a monotonically advancing cursor:
+    find the next open tag (:data:`_SCRIPT_STYLE_OPEN_RE`, itself bounded —
+    its ``[^>]*`` cannot span past the tag's own ``>``), then find ONLY
+    that element's closing tag via a forward search
+    (:data:`_SCRIPT_CLOSE_RE`/:data:`_STYLE_CLOSE_RE`, both simple
+    non-backtracking-body patterns) starting right after the open tag. On
+    success the cursor jumps past the close tag — it never re-scans
+    anything already passed. On failure (unterminated element) the search
+    necessarily reached end-of-string once, and the scan STOPS there
+    (mirroring how a browser's own tokenizer treats an unterminated
+    ``<script>``/``<style>`` as running to end-of-document) — so at most
+    ONE such full-remainder scan can ever happen across the whole call,
+    not one per open tag. Every character of ``html`` is examined by at
+    most a small constant number of these bounded operations, giving
+    overall O(n).
+
+    Args:
+        html: The raw HTML.
+
+    Returns:
+        ``html`` with every script/style element removed and replaced by a
+        single space each (matching the prior regex's
+        ``pattern.sub(" ", html)`` behavior).
+    """
+    pieces: list[str] = []
+    pos = 0
+    length = len(html)
+    while pos < length:
+        open_match = _SCRIPT_STYLE_OPEN_RE.search(html, pos)
+        if open_match is None:
+            pieces.append(html[pos:])
+            break
+        pieces.append(html[pos : open_match.start()])
+        pieces.append(" ")
+        close_re = _SCRIPT_CLOSE_RE if open_match.group(1).lower() == "script" else _STYLE_CLOSE_RE
+        close_match = close_re.search(html, open_match.end())
+        if close_match is None:
+            # Unterminated: the rest of the document is this element's
+            # content — nothing usable remains to scan.
+            break
+        pos = close_match.end()
+    return "".join(pieces)
+
+
 def _extract_page_text(html: str) -> str:
     """Strip a vendor page down to plain, LLM-readable text.
 
     A dependency-free HTML-to-text pass: ``<script>``/``<style>`` blocks are
     dropped whole (their content is never useful bean-identity text and
-    could be large), remaining tags are stripped, entities are unescaped, and
-    whitespace is collapsed. Good enough for a structured extraction prompt
-    without adding an HTML-parsing dependency to the lean runtime install.
+    could be large — see :func:`_strip_script_and_style_blocks`, which does
+    this in linear time), remaining tags are stripped, entities are
+    unescaped, and whitespace is collapsed. Good enough for a structured
+    extraction prompt without adding an HTML-parsing dependency to the lean
+    runtime install.
 
     Args:
         html: The raw response body, already decoded to text.
@@ -214,7 +337,7 @@ def _extract_page_text(html: str) -> str:
     Returns:
         Collapsed plain text, truncated to :data:`_MAX_EXTRACTED_CHARS`.
     """
-    without_blocks = _STRIP_TAG_BLOCK_RE.sub(" ", html)
+    without_blocks = _strip_script_and_style_blocks(html)
     without_tags = _ANY_TAG_RE.sub(" ", without_blocks)
     text = unescape(without_tags)
     text = _INLINE_WHITESPACE_RE.sub(" ", text)
@@ -1021,11 +1144,14 @@ Fields:
   actually stated as one, not one this extraction invented by averaging.
 - description: a short (1-3 sentence) summary of the tasting notes, process,
   or lot detail actually written on the page, in your own words.
-- is_blend: true if the page explicitly says this is a blend of multiple
-  origins; false if the page explicitly states or clearly identifies a
-  SINGLE origin (even one with a mixed varietal) — a named single farm,
-  region, or country IS a single-origin statement; leave null ONLY if the
-  page does not address single-origin-vs-blend at all.
+- is_blend: true ONLY if the page EXPLICITLY says this is a blend/mix of
+  multiple origins; false ONLY if the page EXPLICITLY says "single origin",
+  "single estate", or clearly equivalent wording. Leave null if the page
+  does not explicitly address blend-vs-single-origin status EITHER way —
+  merely naming one farm, region, or country is NOT itself an explicit
+  single-origin statement; the page may simply never have brought up
+  blending at all, and that silence must stay null, not become an
+  invented "false".
 """.strip()
 
 
@@ -1208,11 +1334,19 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
     The optional free-text fields (``country``, ``farm``, ``bean_varietal``,
     ``description``) are normalized via :func:`_normalize_optional_text`
     BEFORE both the provenance loop and the draft construction (#587 P2) —
-    see that function's docstring for why the ordering matters.
+    see that function's docstring for why the ordering matters. ``url`` is
+    carried onto ``source_url`` in its :func:`_redact_url_credentials`
+    form (#587 P2, round 7) — not the raw ``url``: a credential-bearing
+    query parameter (``?access_token=...``) must never persist into a
+    SAVED bean profile any more than it may reach a log line, even though
+    a fetch-blocking value (userinfo, a fragment) never reaches this far
+    at all (:func:`draft_bean_profile_from_url` rejects those outright,
+    before any fetch). The vendor page itself is still fetched with the
+    REAL, un-redacted URL — only what is returned/persisted is redacted.
 
     Args:
         identity: The provider's page-only extraction.
-        url: The source URL (carried onto ``source_url``).
+        url: The source URL (carried onto ``source_url`` in redacted form).
 
     Returns:
         The drafted profile, ready for the operator to review, edit, and
@@ -1320,7 +1454,7 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
             is_blend=identity.is_blend,
             processing=identity.processing,
             altitude_m=identity.altitude_m,
-            source_url=url,
+            source_url=_redact_url_credentials(url),
             charge_guidance_min_c=_DEFAULT_CHARGE_GUIDANCE_MIN_C,
             charge_guidance_max_c=_DEFAULT_CHARGE_GUIDANCE_MAX_C,
             initial_heat_percent=_DEFAULT_INITIAL_HEAT_PERCENT,
