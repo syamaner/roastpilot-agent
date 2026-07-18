@@ -102,7 +102,27 @@
 
 ## Active Context
 
-**17 Jul 2026 (latest) — #567 REFERENCE CURVES: full code build SHIPPED across three slices
+**18 Jul 2026 (latest) — #567 REFERENCE CURVES: offline bake-off ran NEGATIVE → feature PARKED
+(PR #578, data). The build stays DISABLED; no hardware roast warranted.** Operator picked the
+3-arm bake-off (design §6.4) as the validation gate, then chose **park** on the result. New harness
+`scripts/bakeoff_reference_567.py` (store-roast replay + self-excluding reference retrieval + 3 arms
++ spend cap/resume/dry-run); 10 held-out runs / gpt-4o / 0 errors / ~$2; result
+`docs/advisor/reference-curve-bakeoff-2026-07-18.md` (raw per-tick JSON deliberately
+NOT committed — AGENTS.md forbids checked-in roast logs). **Two clean findings:** (1) the
+reference DATA untaught is INERT — arm2==arm1 on 8/10, aggregate unchanged (12.4→12.3 % DTR), model
+never cites it (the 30-pt curve is ignored without teaching, cutting against the design's "data beats
+prose" hope); (2) the c9 TEACHING moves the drop EARLIER/shorter (12.4→10.6 % DTR, toward
+under-development, worst case DTR 6.5 %) and cites the reference only 3/38 — the fragile-prose
+perturbation the whole arc warned of, not reasoning from the reference. Caveats: n=3 beans /
+replay-only; corpus references are mostly 3★ (weak teachers). **Revisit direction (if ever): the DATA
+REPRESENTATION (surface the reference as labelled comparison numbers — the arithmetic form the model
+reasons on), NOT more c9 prose — a redesign, hence parked not iterated.** Gate did its job (caught a
+regression pre-hardware). Ops gotcha recorded: the advisor reads `OPENROUTER_API_KEY` from
+`os.environ`, so a stale shell-profile export SHADOWS a valid `.env` value → `401 User not found`;
+pass the `.env` value explicitly to bake-off scripts. **The [[567-reference-curves-v1-shipped]] code
+(3 slices) stays on `main`, disabled — do not re-build; #567 remains OPEN, now parked.**
+
+**17 Jul 2026 — #567 REFERENCE CURVES: full code build SHIPPED across three slices
 (PRs #574/#575/#576), feature ships DISABLED. Operator picked #567 to build (said they'll do the
 D96 validation roast after it lands).** The designed-but-empty `reference_roasts` is now a working
 advisor-context input — the operator's own best-rated past roast of the SAME bean, retrieved at
