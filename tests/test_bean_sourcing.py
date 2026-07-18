@@ -18,6 +18,7 @@ transitive import graph checked in a fresh subprocess).
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import subprocess
 import sys
 from collections.abc import AsyncGenerator
@@ -53,10 +54,24 @@ def _html_response(status_code: int, html: str) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
-async def _noop_assert_public_destination(url: str) -> None:
-    """Test double: skips the real DNS/IP validation (#587's SSRF guard) so
-    client-lifecycle/redirect-following tests can run without depending on a
-    real resolver — destination validation itself is covered separately."""
+#: A fixed TEST-NET-3 (RFC 5737) address the no-op destination stub below
+#: "resolves" every host to — not a real address, just a syntactically valid
+#: public IP literal so the pinning code path (which now needs a real
+#: ``ipaddress`` object to pin to) has something to pin to.
+_STUB_PUBLIC_IP = ipaddress.ip_address("203.0.113.10")
+
+
+async def _noop_assert_public_destination(
+    url: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """Test double: skips the real DNS/IP validation (#587's SSRF guard),
+    "resolving" every host to :data:`_STUB_PUBLIC_IP` so client-lifecycle/
+    redirect-following tests can drive the (now pinning) fetch path without
+    depending on a real resolver. Tests that need to assert the ORIGINAL
+    hostname is preserved (Host header, SNI) still can — this only stubs the
+    validated CONNECTION target; destination validation itself, and the
+    real pinning mechanism, are covered separately."""
+    return _STUB_PUBLIC_IP
 
 
 _SAMPLE_HTML = """
@@ -267,9 +282,14 @@ async def test_fetch_page_text_follows_redirects_on_internally_constructed_clien
     redirected_url = "https://www.vendor.example/products/kenya"
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url) == original_url:
+        # The connection is now PINNED to the (stubbed) validated IP, so the
+        # request's URL host is no longer the original hostname — route by
+        # the preserved ``Host`` header instead (#587 fix 1b).
+        host_header = request.headers.get("host")
+        assert request.url.host == str(_STUB_PUBLIC_IP)
+        if host_header == "vendor.example":
             return httpx.Response(302, headers={"Location": redirected_url})
-        assert str(request.url) == redirected_url
+        assert host_header == "www.vendor.example"
         return httpx.Response(200, content=_SAMPLE_HTML.encode())
 
     transport = httpx.MockTransport(handler)
@@ -357,13 +377,11 @@ async def test_fetch_page_text_rejects_redirect_into_private_address(
     it needs no resolver stub — it is rejected directly."""
     public_url = "https://vendor.example/products/kenya"
     private_target = "http://127.0.0.1/"
-    connected_urls: list[str] = []
+    request_hosts: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        connected_urls.append(str(request.url))
-        if str(request.url) == public_url:
-            return httpx.Response(302, headers={"Location": private_target})
-        pytest.fail(f"must never connect to a rejected redirect target: {request.url}")
+        request_hosts.append(request.headers.get("host"))
+        return httpx.Response(302, headers={"Location": private_target})
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -384,8 +402,9 @@ async def test_fetch_page_text_rejects_redirect_into_private_address(
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
             public_url, config=BeanSourcingConfig()
         )
-    # Only the (public, safe) origin hop was ever connected to.
-    assert connected_urls == [public_url]
+    # Only the (public, safe) origin hop was ever connected to — the
+    # rejected private redirect target was never fetched at all.
+    assert request_hosts == ["vendor.example"]
 
 
 @pytest.mark.asyncio
@@ -394,14 +413,75 @@ async def test_fetch_page_text_redirect_public_to_public_succeeds(
 ) -> None:
     """A public->public redirect keeps working end-to-end (not just the
     ``follow_redirects=False`` kwarg check above) — the SSRF guard runs on
-    both hops via a stubbed resolver that always reports a public address."""
-    original_url = "https://vendor.example/products/kenya"
-    redirected_url = "https://www.vendor.example/products/kenya"
+    AND pins EACH hop independently, via a stubbed resolver that reports a
+    (different) public address per host."""
+    original_host = "vendor.example"
+    redirected_host = "www.vendor.example"
+    original_url = f"https://{original_host}/products/kenya"
+    redirected_url = f"https://{redirected_host}/products/kenya"
+    host_ips = {original_host: "93.184.216.34", redirected_host: "93.184.216.35"}
+    resolver_calls: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if str(request.url) == original_url:
+        host_header = request.headers.get("host")
+        if host_header == original_host:
+            assert request.url.host == host_ips[original_host]
             return httpx.Response(302, headers={"Location": redirected_url})
-        assert str(request.url) == redirected_url
+        assert host_header == redirected_host
+        assert request.url.host == host_ips[redirected_host]
+        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        resolver_calls.append(host)
+        return [(None, None, None, "", (host_ips[host], port))]
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+        original_url, config=BeanSourcingConfig()
+    )
+    assert "Kenya Kiambu AA" in text
+    # Each hop was independently resolved (and thus independently validated
+    # + pinned) — exactly once per hop, no re-resolution.
+    assert resolver_calls == [original_host, redirected_host]
+
+
+# --- #587 fix 1b: DNS-rebinding TOCTOU close (connect-time IP pinning) ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_ssrf_guard_pins_connection_to_validated_ip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The actual HTTP request must target the VALIDATED IP literal — not
+    the hostname — with the original hostname preserved via the ``Host``
+    header and the ``sni_hostname`` extension (TLS SNI / certificate
+    hostname identity). This is what closes the DNS-rebinding TOCTOU gap: a
+    rebinding domain gets exactly one resolution (the validation one), and
+    the connection never gives it a second chance to answer differently."""
+    origin_url = "https://example.test/products/kenya"
+    public_ip = "93.184.216.34"
+    resolver_calls: list[str] = []
+    captured_requests: list[httpx.Request] = []
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        resolver_calls.append(host)
+        assert host == "example.test"
+        return [(None, None, None, "", (public_ip, port))]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
         return httpx.Response(200, content=_SAMPLE_HTML.encode())
 
     transport = httpx.MockTransport(handler)
@@ -411,13 +491,70 @@ async def test_fetch_page_text_redirect_public_to_public_succeeds(
         return real_async_client(transport=transport)
 
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
-    monkeypatch.setattr(
-        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
-    )
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+
     text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        original_url, config=BeanSourcingConfig()
+        origin_url, config=BeanSourcingConfig()
     )
     assert "Kenya Kiambu AA" in text
+
+    # Resolved exactly once — no second resolution left for a rebinding
+    # domain to poison (the #587 rebind-defeated proof).
+    assert resolver_calls == ["example.test"]
+    assert len(captured_requests) == 1
+    sent = captured_requests[0]
+    # The actual connection target is the validated IP literal...
+    assert sent.url.host == public_ip
+    # ...while routing/TLS identity stay pinned to the ORIGINAL hostname.
+    assert sent.headers.get("host") == "example.test"
+    assert sent.extensions.get("sni_hostname") == "example.test"
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_ssrf_guard_pins_ipv6_address_with_brackets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """IPv6 pinning smoke test: ``httpx.URL.copy_with(host=...)`` must
+    bracket a raw (unbracketed) ``ipaddress.IPv6Address`` string
+    automatically for the pinned request URL. A real IPv6 socket connect
+    isn't exercised — ``MockTransport`` substitutes the whole transport, so
+    there is no real network stack anywhere in this test suite — this
+    validates the pinned URL/host reaching the mock handler is well-formed
+    and correctly bracketed, which is the httpx-integration risk unique to
+    IPv6 pinning."""
+    origin_url = "https://example.test/products/kenya"
+    public_ipv6 = "2606:2800:220:1:248:1893:25c8:1946"
+    captured_requests: list[httpx.Request] = []
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int, int, int]]]:
+        return [(None, None, None, "", (public_ipv6, port, 0, 0))]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+
+    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+        origin_url, config=BeanSourcingConfig()
+    )
+    assert "Kenya Kiambu AA" in text
+    assert len(captured_requests) == 1
+    sent = captured_requests[0]
+    assert sent.url.host == public_ipv6
+    assert str(sent.url).startswith(f"https://[{public_ipv6}]")
+    assert sent.headers.get("host") == "example.test"
 
 
 @pytest.mark.asyncio

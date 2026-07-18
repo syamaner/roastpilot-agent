@@ -42,12 +42,22 @@ a loopback / private / link-local (including the ``169.254.169.254`` cloud
 metadata address) / multicast / unspecified / reserved address — checked on
 the origin URL *and* on every redirect hop the internally-constructed client
 follows, since a public URL can 302 into a private address just as easily as
-an operator can paste one directly. That destination check has a known,
-accepted residual gap: it resolves-then-connects, so a DNS record that
-changes between the check and the actual TCP connect (a "rebinding" race)
-is not caught — proportionate for a single-operator LAN tool fetching a
-green-coffee vendor page, not something worth a custom IP-pinning transport
-for. The whole fetch (all hops + body streaming) is additionally bounded by
+an operator can paste one directly. The naive "validate the hostname, then
+let ``httpx`` connect to the hostname" version of that check has a
+DNS-rebinding TOCTOU gap: a short-TTL domain can answer a public address on
+the validation lookup and a private/metadata address on ``httpx``'s own
+connect-time re-resolution (the exact shape behind CVE-2026-27826 /
+GHSA-489g-7rxv-6c8q in other fetch-URL-for-LLM tools). This module closes
+that gap by connect-time IP pinning: :func:`_assert_public_destination`
+returns the validated address, and :func:`_fetch_with_ssrf_guard` issues
+the request against that literal IP (``httpx.URL.copy_with(host=...)``) so
+there is no second resolution left to poison, while an explicit ``Host``
+header and the ``sni_hostname`` request extension keep routing/TLS identity
+(virtual host, SNI, certificate hostname check) pinned to the ORIGINAL
+hostname. The only remaining residual is parser-differential risk — a
+hostname the resolver and this module's own URL parsing could disagree on —
+mitigated by validating and pinning from the exact same parsed host on every
+hop. The whole fetch (all hops + body streaming) is additionally bounded by
 an end-to-end deadline independent of ``httpx``'s own per-request timeout,
 and the LLM extraction call is bounded by its own deadline — both mapped to
 this module's typed errors, never left to hang indefinitely.
@@ -138,9 +148,12 @@ def _extract_page_text(html: str) -> str:
 _MAX_REDIRECTS = 5
 
 
-async def _assert_public_destination(url: str) -> None:
-    """Reject a fetch destination that is not publicly routable (#587 fix 1,
-    SSRF guard).
+async def _assert_public_destination(
+    url: str,
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+    """Reject a fetch destination that is not publicly routable, and return
+    the validated address to CONNECT TO (#587 fix 1, SSRF guard + DNS-
+    rebinding fix).
 
     Parses ``url``'s host. If it is an IP literal, validates that address
     directly; otherwise resolves it via the non-blocking asyncio resolver
@@ -156,17 +169,23 @@ async def _assert_public_destination(url: str) -> None:
     302 into a private address just as easily as an operator can paste one
     in directly (#587).
 
-    This check resolves the host and then, separately, connects to it; a
-    DNS record that changes between those two steps (a "rebinding" race) is
-    not caught by this check, and the resolved address is deliberately not
-    pinned into the socket for the follow-up connect. Accepted as a
-    proportionate residual gap for a single-operator LAN tool — closing it
-    fully needs a custom connection-pinning transport, which is not
-    justified here.
+    The caller MUST connect to the returned address rather than letting
+    ``httpx`` re-resolve the hostname itself (see :func:`_fetch_with_ssrf_guard`)
+    — a hostname resolved and validated here, then handed to the HTTP client
+    as a hostname, gives a short-TTL DNS record a second chance to answer
+    differently at connect time (a "rebinding" race: public on this check,
+    private/metadata on the real connect). Returning the validated address
+    and pinning the actual connection to it closes that gap: there is no
+    second resolution left to poison.
 
     Args:
         url: The absolute URL about to be connected to (the origin URL, or a
             redirect hop's resolved ``Location``).
+
+    Returns:
+        The validated address (the first address checked — the literal IP
+        itself, or the first ``getaddrinfo`` result for a hostname; every
+        resolved address was checked, not just this one).
 
     Raises:
         BeanFetchError: The scheme is not ``http``/``https``, the URL has no
@@ -210,6 +229,8 @@ async def _assert_public_destination(url: str) -> None:
                 f"({address}) — blocked by the SSRF guard (#587)"
             )
 
+    return addresses[0]
+
 
 async def _fetch_with_ssrf_guard(
     client: httpx.AsyncClient,
@@ -220,13 +241,29 @@ async def _fetch_with_ssrf_guard(
     config: BeanSourcingConfig,
 ) -> str:
     """Fetch ``url`` on the internally-constructed client, following
-    redirects MANUALLY (#587 fix 1) so every hop passes
-    :func:`_assert_public_destination` before it is connected to.
+    redirects MANUALLY (#587 fix 1) with every hop's connection PINNED to
+    its validated address (#587 fix 1b, closes the DNS-rebinding TOCTOU
+    gap).
+
+    Per hop: :func:`_assert_public_destination` validates the CURRENT
+    (hostname-based) URL and returns the address to connect to; the actual
+    request is then issued against that address literally
+    (``httpx.URL.copy_with(host=...)``) so ``httpx``/``httpcore`` never
+    re-resolves the hostname themselves — there is no second DNS lookup a
+    rebinding attack could win. Routing and TLS identity stay pinned to the
+    ORIGINAL hostname: an explicit ``Host`` header (mirroring what ``httpx``
+    would have sent had it connected to the hostname directly) preserves
+    virtual-host routing, and the ``sni_hostname`` request extension keeps
+    the TLS ClientHello's SNI — and therefore certificate hostname
+    verification — targeting the real host, not the IP. The next hop's
+    ``Location`` is resolved against the ORIGINAL (hostname) URL, never the
+    IP-pinned one, so a relative redirect stays correct.
 
     Only used for the client this module constructs itself (never an
     injected ``http_client`` — see :func:`_fetch_page_text`); that client is
     built with ``follow_redirects=False`` so ``httpx`` never follows a
-    redirect for us before we get a chance to validate its destination.
+    redirect for us before we get a chance to validate (and pin) its
+    destination.
 
     Args:
         client: The internally-constructed ``httpx.AsyncClient``.
@@ -246,8 +283,17 @@ async def _fetch_with_ssrf_guard(
     """
     current_url = url
     for _ in range(_MAX_REDIRECTS + 1):
-        await _assert_public_destination(current_url)
-        async with client.stream("GET", current_url, headers=headers, timeout=timeout) as response:
+        validated_address = await _assert_public_destination(current_url)
+        original_url = httpx.URL(current_url)
+        pinned_url = original_url.copy_with(host=str(validated_address))
+        pinned_headers = {**headers, "Host": original_url.netloc.decode("ascii")}
+        async with client.stream(
+            "GET",
+            pinned_url,
+            headers=pinned_headers,
+            timeout=timeout,
+            extensions={"sni_hostname": original_url.host},
+        ) as response:
             if 300 <= response.status_code < 400:
                 location = response.headers.get("location")
                 if not location:
