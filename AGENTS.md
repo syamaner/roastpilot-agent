@@ -340,6 +340,18 @@ resolved (branch protection). So calibrate where findings go:
 **Escalate:** any diff touching `safety.py`, `controller.py`, or `models.py` enums —
 call it out in the summary so it is routed to `safety-reviewer`.
 
+**Escalate (capability-based, not file-based):** any diff that **fetches or parses
+untrusted external input, adds an external-input endpoint, or adds a new LLM-provider
+call path** → route to `security-reviewer` with `docs/review/untrusted-input-checklist.md`,
+**pre-open**. This fires even when the diff touches none of the safety files — a new
+fetch/parse surface is the highest-risk case and the easiest to miss. (The #587 lesson:
+the bean-sourcing fetch endpoint took **five** post-open Codex rounds — SSRF, fail-soft,
+resource-exhaustion, secret-hygiene, cross-feature-contention — because no pre-open lens
+covered web/application security; the file-based routing above never fired since it
+touched no safety file. `security-reviewer` + the checklist close that gap.) If the change
+adds a provider-calling path that could contend with the roast advisor (checklist class 6),
+ALSO run `safety-reviewer`.
+
 **Also verify:** tests assert real behavior (not smoke); new code is covered or
 carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`,
 `mcp_client.py`); public functions/methods have type hints + Google docstrings.
@@ -352,7 +364,10 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
 ## Claude Code
 
 - Sub-agents live under `.claude/agents/`. **Domain reviewers:**
-  `safety-reviewer` (PRs touching safety/controller/enums), `mcp-contract-checker`
+  `safety-reviewer` (PRs touching safety/controller/enums), `security-reviewer`
+  (web/application security — server-side fetch, untrusted-input parsing, new
+  external-input endpoints or provider-call paths; works
+  `docs/review/untrusted-input-checklist.md`), `mcp-contract-checker`
   (dependency bumps), `sim-roast-runner` (mock vertical slice + decision-trace
   summaries), `ui-reviewer` (Playwright against the replay harness). **Team
   roles** (define each once; reuse as an agent-team teammate, standalone, or a
@@ -365,8 +380,9 @@ carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`
   primitive (sub-agent / agent team / workflow), pick the model in the same breath.
   **Default to Sonnet** for the bulk of the work: scoped implementation (`engineer-be`,
   `engineer-fe`), mechanical checks (`mcp-contract-checker`, `sim-roast-runner`), and
-  routine review/audit (`pr-triage`, `qa`, `ui-reviewer`, `product-pm`) — all pinned
-  `model: sonnet`. **Reserve Opus** for genuinely hard reasoning: `safety-reviewer` is
+  routine review/audit (`pr-triage`, `qa`, `ui-reviewer`, `product-pm`,
+  `security-reviewer`) — all pinned `model: sonnet`. **Reserve Opus** for genuinely
+  hard reasoning: `safety-reviewer` is
   pinned `model: opus` (the one always-Opus role — a missed safety bug is the costly
   failure), and you may bump a specific spawn to Opus for gnarly architecture/design
   judgment or subtle correctness triage. Why the pins matter: an agent with no `model:`
