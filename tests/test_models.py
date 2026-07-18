@@ -15,6 +15,7 @@ from roastpilot_agent.models import (
     DEFAULT_ROAST_STYLE,
     ROAST_STYLE_TARGETS,
     BeanProfile,
+    BeanProfileDraft,
     BeanProfileInput,
     MicHealth,
     MicStatus,
@@ -857,6 +858,95 @@ def test_bean_profile_json_round_trip() -> None:
     )
     restored = BeanProfile.model_validate_json(bean.model_dump_json())
     assert restored == bean
+
+
+# --- #573 phase 1: BeanProfileDraft (add-bean-from-URL) ---
+
+
+def _bean_draft(**overrides: object) -> dict[str, object]:
+    base = _bean_profile(
+        source_url="https://example.com/products/kenya-aa",
+        field_sources={"name": "on_page", "target_development_percent": "origin_estimated"},
+        scouting_note="Scouting run — de-risked first-roast targets.",
+    )
+    base.update(overrides)
+    return base
+
+
+def test_bean_profile_draft_has_no_server_owned_fields() -> None:
+    """#573: like BeanProfileInput, a draft carries no id/timestamps — it is
+    never persisted directly."""
+    draft_fields = set(BeanProfileDraft.model_fields)
+    assert "id" not in draft_fields
+    assert "created_at" not in draft_fields
+    assert "updated_at" not in draft_fields
+    assert "bean_weight_grams" not in draft_fields
+    assert "default_bean_weight_grams" in draft_fields
+    assert "field_sources" in draft_fields
+    assert "scouting_note" in draft_fields
+
+
+def test_bean_profile_draft_shares_bean_profile_input_fields() -> None:
+    """#573: a draft is BeanProfileInput's shape PLUS the two draft-only
+    fields — so the operator can submit a (possibly edited) draft straight
+    to POST /api/bean-profiles by dropping field_sources/scouting_note."""
+    input_fields = set(BeanProfileInput.model_fields)
+    draft_fields = set(BeanProfileDraft.model_fields)
+    assert input_fields <= draft_fields
+    assert draft_fields - input_fields == {"field_sources", "scouting_note"}
+
+
+def test_bean_profile_draft_validates_and_strips_like_bean_profile() -> None:
+    """#573: the shared base validators apply — whitespace-only name
+    rejected, optional identity blanks normalize to None."""
+    with pytest.raises(pydantic.ValidationError):
+        BeanProfileDraft.model_validate(_bean_draft(name="   "))
+    draft = BeanProfileDraft.model_validate(_bean_draft(farm="  ", description="  "))
+    assert draft.farm is None
+    assert draft.description is None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"default_bean_weight_grams": 0},
+        {"default_bean_weight_grams": -10.0},
+        {"scouting_note": ""},
+        {"charge_guidance_min_c": 210.0},  # min > max
+        {"source_url": "not-a-url"},
+    ],
+)
+def test_bean_profile_draft_rejects_nonsense(overrides: dict[str, object]) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        BeanProfileDraft.model_validate(_bean_draft(**overrides))
+
+
+def test_bean_profile_draft_field_sources_round_trip() -> None:
+    """#573: the per-field provenance map (on_page vs origin_estimated)
+    survives a JSON round trip untouched."""
+    draft = BeanProfileDraft.model_validate(
+        _bean_draft(
+            field_sources={
+                "name": "on_page",
+                "bean_origin": "on_page",
+                "altitude_m": "origin_estimated",
+                "target_drop_temp_c": "origin_estimated",
+            }
+        )
+    )
+    restored = BeanProfileDraft.model_validate_json(draft.model_dump_json())
+    assert restored == draft
+    assert restored.field_sources["name"] == "on_page"
+    assert restored.field_sources["target_drop_temp_c"] == "origin_estimated"
+
+
+def test_bean_profile_draft_field_sources_rejects_unknown_source() -> None:
+    """#573: field_sources is a closed two-value vocabulary — an unknown
+    provenance string is rejected, not silently accepted."""
+    with pytest.raises(pydantic.ValidationError):
+        BeanProfileDraft.model_validate(
+            _bean_draft(field_sources={"name": "guessed_by_the_operator"})
+        )
 
 
 @pytest.mark.parametrize(

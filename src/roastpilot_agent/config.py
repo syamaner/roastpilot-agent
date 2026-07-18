@@ -1227,6 +1227,40 @@ class AdvisorConfig(BaseModel):
         return self.model_slug_by_phase.get(phase, self.model_slug)
 
 
+class BeanSourcingConfig(BaseModel):
+    """Add-bean-from-URL fetch limits (#573 phase 1).
+
+    Governs the respectful, fail-soft vendor-page fetch in
+    ``roastpilot_agent.bean_sourcing.draft_bean_profile_from_url``: a bounded
+    timeout, a hard cap on the response body (enforced while streaming, so an
+    oversized or slow-drip response is never read fully into memory), and an
+    identifying ``User-Agent`` (a vendor's own logs should be able to tell
+    this traffic apart from a browser). The structured LLM extraction step
+    reuses the operator's already-configured :class:`AdvisorConfig` (BYOK)
+    rather than a duplicate provider config here — see
+    ``bean_sourcing.draft_bean_profile_from_url``'s ``advisor_config``
+    parameter.
+    """
+
+    fetch_timeout_seconds: float = Field(default=10.0, gt=0)
+    """Bound on the vendor-page GET (connect + read). A product page is a
+    normal web response; 10 s comfortably covers a slow vendor host without
+    leaving a drafting request hanging indefinitely."""
+
+    max_response_bytes: int = Field(default=2_000_000, gt=0)
+    """Hard cap on the fetched response body. A green-coffee product page is a
+    few hundred KB at most (mostly markup/CSS); 2 MB leaves generous headroom
+    while still bounding memory use if a URL redirects into an unexpectedly
+    large asset."""
+
+    user_agent: str = Field(
+        default="RoastPilotAgent-BeanSourcing/1.0 (+https://github.com/syamaner/roastpilot-agent)",
+        min_length=1,
+    )
+    """Identifying ``User-Agent`` sent with the fetch — a courteous default a
+    vendor can distinguish from a browser or an unlabelled scraper."""
+
+
 class SafetyLimits(BaseModel):
     """Hard safety limits enforced by deterministic code (rule set: E3).
 
@@ -1554,6 +1588,7 @@ class AppConfig(BaseSettings):
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     mcp_device: MCPDeviceConfig = Field(default_factory=MCPDeviceConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    bean_sourcing: BeanSourcingConfig = Field(default_factory=BeanSourcingConfig)
 
     @model_validator(mode="after")
     def _check_ceiling_guard_within_safety_bounds(self) -> "AppConfig":

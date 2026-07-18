@@ -39,6 +39,7 @@ from roastpilot_agent.api import (
     create_app,
     stream_events,
 )
+from roastpilot_agent.bean_sourcing import BeanExtractionError, BeanFetchError
 from roastpilot_agent.config import AppConfig, ControllerConfig, ReferenceCurve
 from roastpilot_agent.mcp_client import (
     AmbientStatus,
@@ -47,6 +48,7 @@ from roastpilot_agent.mcp_client import (
     RoastSessionState,
 )
 from roastpilot_agent.models import (
+    BeanProfileDraft,
     ChargeWeightRequest,
     ClearStaleSessionRequest,
     MicHealth,
@@ -4320,6 +4322,140 @@ async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) ->
     assert colombia["altitude_m"] == 1600
     assert colombia["target_drop_temp_c"] == 195.0
     assert colombia["target_development_percent"] == 16.0
+
+
+# ---------------------------------------------------------------------------
+# POST /api/beans/draft-from-url (#573 phase 1 — add-bean-from-URL)
+# ---------------------------------------------------------------------------
+#
+# The service delegates to ``bean_sourcing.draft_bean_profile_from_url`` (its
+# own module-level function, tested exhaustively in test_bean_sourcing.py);
+# these tests monkeypatch that reference on ``roastpilot_agent.api`` to a
+# deterministic double, so no real fetch/LLM call happens here either — this
+# level is only about the route's request/response/error-code wiring, and
+# that this DRAFT endpoint never persists anything.
+
+
+def _draft_from(url: str) -> BeanProfileDraft:
+    return BeanProfileDraft(
+        name="Kenya Kiambu AA (Washed)",
+        bean_origin="Kenya",
+        processing="washed",
+        source_url=url,
+        initial_heat_percent=100,
+        initial_fan_percent=30,
+        target_drop_temp_c=195.0,
+        target_development_percent=15.0,
+        default_bean_weight_grams=250.0,
+        field_sources={"name": "on_page", "target_development_percent": "origin_estimated"},
+        scouting_note="Scouting run — de-risked first-roast targets.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_happy_path(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, object, object]] = []
+
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        calls.append((url, advisor_config, sourcing_config))
+        return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    response = await client.post(
+        "/api/beans/draft-from-url",
+        json={"url": "https://vendor.example/products/kenya-kiambu"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "Kenya Kiambu AA (Washed)"
+    assert body["source_url"] == "https://vendor.example/products/kenya-kiambu"
+    assert body["field_sources"]["target_development_percent"] == "origin_estimated"
+    assert "id" not in body  # never persisted / never mints a library id
+    # It reused the service's configured advisor + bean_sourcing config (BYOK).
+    assert len(calls) == 1
+    assert calls[0][0] == "https://vendor.example/products/kenya-kiambu"
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_never_creates_a_saved_profile(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#573 human-in-the-loop safeguard: drafting must not touch the saved
+    bean-profile library — it stays empty until the operator explicitly
+    POSTs to /api/bean-profiles."""
+
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    await client.post(
+        "/api/beans/draft-from-url", json={"url": "https://vendor.example/products/kenya"}
+    )
+    listed = await client.get("/api/bean-profiles")
+    assert listed.json() == {"profiles": []}
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_fetch_error_is_422(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        raise BeanFetchError(f"vendor page fetch failed for {url!r}")
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    response = await client.post(
+        "/api/beans/draft-from-url", json={"url": "https://vendor.example/products/down"}
+    )
+    assert response.status_code == 422
+    assert "fetch failed" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_extraction_error_is_422(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        raise BeanExtractionError("could not determine a bean name and origin from the page")
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    response = await client.post(
+        "/api/beans/draft-from-url", json={"url": "https://vendor.example/products/thin"}
+    )
+    assert response.status_code == 422
+    assert "could not determine" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_rejects_empty_url_body(client: AsyncClient) -> None:
+    response = await client.post("/api/beans/draft-from-url", json={"url": ""})
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_roast_service_draft_bean_from_url_reuses_configured_advisor_and_sourcing_config(
+    service: RoastService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#573: confirms the BYOK wiring — the service passes ITS configured
+    ``AdvisorConfig``/``BeanSourcingConfig`` straight through, so drafting
+    reuses the same provider/key the operator already set for the roast
+    advisor, via a SEPARATE call (not the roast advisor object itself)."""
+    captured: dict[str, object] = {}
+
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        captured["url"] = url
+        captured["advisor_config"] = advisor_config
+        captured["sourcing_config"] = sourcing_config
+        return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    draft = await service.draft_bean_from_url("https://vendor.example/products/kenya")
+    assert isinstance(draft, BeanProfileDraft)
+    assert captured["advisor_config"] is service._config.advisor  # pyright: ignore[reportPrivateUsage]
+    assert (
+        captured["sourcing_config"] is service._config.bean_sourcing  # pyright: ignore[reportPrivateUsage]
+    )
 
 
 # ---------------------------------------------------------------------------

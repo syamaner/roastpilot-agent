@@ -29,7 +29,7 @@ from typing import Annotated, Any, Literal, Protocol, cast
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import (
@@ -37,6 +37,11 @@ from roastpilot_agent.advisor import (
     AdvisorDescriptor,
     RoastAdvisor,
     RoastDecision,
+)
+from roastpilot_agent.bean_sourcing import (
+    BeanExtractionError,
+    BeanFetchError,
+    draft_bean_profile_from_url,
 )
 from roastpilot_agent.config import AppConfig, MCPDeviceConfig
 from roastpilot_agent.config_store import (
@@ -68,6 +73,7 @@ from roastpilot_agent.models import (
     AdvisorHealth,
     AdvisorTraceStatus,
     BeanProfile,
+    BeanProfileDraft,
     BeanProfileInput,
     BeanProfileList,
     ChargeWeightRequest,
@@ -2620,6 +2626,27 @@ class RoastService:
         except BeanProfileNotFoundError as exc:
             raise RoastRunNotFoundError(str(exc)) from exc
 
+    # --- #573 phase 1: add-bean-from-URL (bean-sourcing assistant) ---
+    #
+    # Fetch a vendor product URL + LLM-extract a draft profile. Deliberately
+    # NOT store-backed: this returns a draft only, never persists it. Saving
+    # remains the unchanged create_bean_profile action above, driven by the
+    # operator explicitly submitting the (possibly edited) draft.
+
+    async def draft_bean_from_url(self, url: str) -> BeanProfileDraft:
+        """Draft (never persist) a bean profile from a vendor URL (#573 phase 1).
+
+        Delegates to :func:`roastpilot_agent.bean_sourcing.draft_bean_profile_from_url`
+        with this service's configured advisor provider/key (BYOK, a SEPARATE
+        LLM call from the roast advisor) and fetch limits. No roaster/MCP
+        involvement — this path never touches the roast-control loop.
+        """
+        return await draft_bean_profile_from_url(
+            url,
+            advisor_config=self._config.advisor,
+            sourcing_config=self._config.bean_sourcing,
+        )
+
 
 def _get_service(request: Request) -> RoastService:
     """Dependency: the app's :class:`RoastService`, or 503 if unconfigured.
@@ -2880,6 +2907,34 @@ async def delete_bean_profile(profile_id: str, service: ServiceDep) -> dict[str,
     except RoastRunNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"id": profile_id, "result": "archived"}
+
+
+class DraftBeanFromUrlRequest(BaseModel):
+    """``POST /api/beans/draft-from-url`` request body (#573 phase 1)."""
+
+    url: str = Field(min_length=1)
+    """The vendor's green-coffee product page URL."""
+
+
+async def draft_bean_from_url(
+    body: DraftBeanFromUrlRequest, service: ServiceDep
+) -> BeanProfileDraft:
+    """``POST /api/beans/draft-from-url`` — draft a bean profile from a vendor
+    URL (#573 phase 1).
+
+    Fetches the page, extracts a bean identity via a SEPARATE LLM call from
+    the roast advisor, and returns a conservative-target draft — it never
+    persists anything (saving is the existing ``POST /api/bean-profiles``
+    action, driven by the operator explicitly submitting the reviewed draft).
+    A 422 on a bad/unreachable URL or a failed extraction; the detail message
+    names which.
+    """
+    try:
+        return await service.draft_bean_from_url(body.url)
+    except BeanFetchError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except BeanExtractionError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 CONFIG_PATH = "/api/config"
@@ -3295,6 +3350,7 @@ def create_app(
     app.post("/api/bean-profiles", status_code=201)(create_bean_profile)
     app.put("/api/bean-profiles/{profile_id}")(update_bean_profile)
     app.delete("/api/bean-profiles/{profile_id}")(delete_bean_profile)
+    app.post("/api/beans/draft-from-url")(draft_bean_from_url)
     app.get(EVENTS_PATH)(stream_events)
     if spa_dir is not None and (spa_dir / "index.html").is_file():
         # Imported lazily so the API-only/scaffold path carries no static-mount
