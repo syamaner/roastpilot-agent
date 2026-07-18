@@ -23,10 +23,15 @@ Each item: the check, the failure it prevents, and the fix pattern. Cite `file:l
 
 - [ ] **Scheme allow-list** — only `http`/`https`; reject everything else.
 - [ ] **Resolve + reject non-public IPs** — resolve the host (non-blocking) and reject
-      if **any** resolved address is non-global. Use `not ipaddress.ip_address(x).is_global`
-      (covers loopback / RFC1918 / link-local `169.254` incl. cloud-metadata / CGNAT
-      `100.64/10` / reserved / unspecified) **plus an explicit `is_multicast`** (which
-      `is_global` does *not* exclude). Validate **every** A/AAAA record, not just the first.
+      if **any** resolved address is non-global. `not ipaddress.ip_address(x).is_global`
+      is the base check (covers loopback / RFC1918 / link-local `169.254` incl.
+      cloud-metadata / CGNAT `100.64/10` / unspecified), but it is **not sufficient alone**:
+      also reject **`is_multicast`** and **`is_reserved`** explicitly — `is_global` can be
+      *true* for special-purpose IPv6 whose `is_reserved` is true. And for **IPv6 that
+      embeds an IPv4** — IPv4-mapped `::ffff:a.b.c.d`, IPv4-compatible `::a.b.c.d`, NAT64
+      `64:ff9b::/96` — extract the embedded IPv4 (`.ipv4_mapped`, prefix-detect the others)
+      and re-run the full public-check on it, or an attacker reaches internal IPv4 through a
+      "global" IPv6 literal. Validate **every** A/AAAA record, not just the first.
 - [ ] **Revalidate every redirect hop** — keep `follow_redirects=False`, follow manually,
       re-run the full destination check on each `Location`, bound the hop count.
 - [ ] **Pin the validated IP into the connection** (DNS-rebinding / TOCTOU) — connect to
@@ -56,6 +61,10 @@ Each item: the check, the failure it prevents, and the fix pattern. Cite `file:l
       Stream **raw** bytes with a raw cap, decompress with a bounded decoder
       (`zlib.decompressobj(...).decompress(data, max_length)`), fail closed past the cap.
       Constrain `Accept-Encoding` to codecs you can bound.
+- [ ] **Reject an incomplete/truncated compressed stream** — a truncated gzip/deflate body
+      can `decompress()`+`flush()` to *partial* output without raising, leaving
+      `decompressor.eof` False. Check `eof` (and `unconsumed_tail`) after flushing and fail
+      closed, or you feed a silently-truncated page to the extractor.
 - [ ] **Bound the work count** — redirect chains, retries, per-item loops all have limits.
 - [ ] **Concurrency bound** on any billable/expensive endpoint (semaphore → 429), so a
       caller can't fan out unbounded paid calls.
