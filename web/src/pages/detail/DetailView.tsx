@@ -155,7 +155,20 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
         <div className="flex flex-col gap-6">
           {isCompletedRun && (
             <>
-              <RoastDiscard runId={detail.id} excluded={detail.excluded ?? false} />
+              {/* key: same class as RoastRating/ChargeWeight/RoastTastings
+                  below — RoastDiscard keeps its own `confirming` step state,
+                  so without a remount a confirm opened on run A survives a
+                  navigation to run B (React reuses the instance across a
+                  runId prop change): clicking "Yes, discard" would then call
+                  discardRoast(B) while the operator thinks they are still
+                  confirming A's discard — the wrong roast gets hidden.
+                  Prefixed for the same sibling-key-uniqueness reason as the
+                  other keyed widgets here. */}
+              <RoastDiscard
+                key={`roast-discard-${detail.id}`}
+                runId={detail.id}
+                excluded={detail.excluded ?? false}
+              />
               {/* key: same class as ChargeWeight/RoastTastings below (#568
                   round 7) — RoastRating keeps its own `editing` mode and
                   draft state, so without a remount a pending mutate

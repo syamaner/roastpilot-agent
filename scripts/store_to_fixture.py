@@ -194,6 +194,22 @@ def _resolve_run_id(connection: sqlite3.Connection, run_id: str | None) -> str:
     filter applies only to the **no-arg auto-pick**, where "latest completed" is
     the sensible default and an in-progress run must not be grabbed mid-roast.
 
+    #582 corpus hygiene: a soft-DISCARDED run (``roast_runs.excluded = 1``) must
+    never re-enter the learning corpus through this exporter — that would
+    silently defeat the whole point of discarding it. The no-arg auto-pick
+    filters ``excluded = 0`` (an excluded run is simply never a candidate,
+    mirroring the store's own ``list_runs``/reference-retrieval filter); an
+    **explicit** ``--run-id`` that names a discarded run is refused outright
+    with a clear error rather than silently exported — there is no override
+    flag (the operator can ``POST .../restore`` first if they genuinely want
+    it back in the corpus, which is the same reversible action #582 already
+    exposes).
+
+    Guarded with the same ``PRAGMA table_info`` back-compat check the
+    ``roasted_weight_grams``/``corrected_charge_grams`` reads use just below
+    (a real pre-#582 store predates the ``excluded`` column entirely and has
+    no discarded runs to worry about).
+
     Args:
         connection: An open store connection.
         run_id: An explicit ``roast_runs.id``, or ``None`` to pick the latest
@@ -203,20 +219,33 @@ def _resolve_run_id(connection: sqlite3.Connection, run_id: str | None) -> str:
         The resolved run id.
 
     Raises:
-        FixtureConversionError: If the explicit id is unknown, or (auto-pick) the
-            store has no completed run.
+        FixtureConversionError: If the explicit id is unknown, the explicit id
+            names a discarded run, or (auto-pick) the store has no
+            non-discarded completed run.
     """
+    has_excluded_column = any(
+        row[1] == "excluded"
+        for row in connection.execute("PRAGMA table_info(roast_runs)").fetchall()
+    )
     if run_id is not None:
         row = connection.execute(
-            "SELECT id FROM roast_runs WHERE id = ?",
+            "SELECT id, excluded FROM roast_runs WHERE id = ?"
+            if has_excluded_column
+            else "SELECT id, 0 AS excluded FROM roast_runs WHERE id = ?",
             (run_id,),
         ).fetchone()
         if row is None:
             raise FixtureConversionError(f"no roast_run with id {run_id!r}")
+        if row["excluded"]:
+            raise FixtureConversionError(
+                f"roast_run {run_id!r} is discarded (#582) — restore it "
+                f"(POST /api/roasts/{run_id}/restore) before exporting it into the corpus"
+            )
         return str(row["id"])
     row = connection.execute(
         "SELECT id FROM roast_runs WHERE completed_at_utc IS NOT NULL"
-        " ORDER BY completed_at_utc DESC, rowid DESC LIMIT 1"
+        + (" AND excluded = 0" if has_excluded_column else "")
+        + " ORDER BY completed_at_utc DESC, rowid DESC LIMIT 1"
     ).fetchone()
     if row is None:
         raise FixtureConversionError("the store has no completed roast_runs")
