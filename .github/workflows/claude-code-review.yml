@@ -10,6 +10,16 @@ on:
     #   - "src/**/*.js"
     #   - "src/**/*.jsx"
 
+# #579: without this, a rapid sequence of pushes to the same PR can leave an
+# OLDER review run still posting inline threads after a newer push has
+# already changed the diff those threads referenced — stale findings against
+# code that no longer exists. Scoped per-PR (not per-ref/per-SHA) so a new
+# push cancels the prior push's still-running review, not just a literal
+# re-run of the identical commit.
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   claude-review:
     # Skip Dependabot PRs: GitHub withholds repository secrets from Dependabot
@@ -37,6 +47,48 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # #579: without this, claude-code-action's prepareAgentMode() calls
+          # configureGitAuth(), which embeds this job's OAuth-derived
+          # credential directly into .git/config's remote URL — readable on
+          # disk by anything this job's tool policy allows to read files,
+          # i.e. a real exfiltration path for a token this job should never
+          # need to write with at all (it only reviews and posts inline
+          # comments, never pushes). Setting `use_commit_signing: true` makes
+          # claude-code-action skip configureGitAuth() entirely. Posting
+          # inline findings is unaffected: that goes through the separate
+          # `mcp__github_inline_comment` server, authenticated from the
+          # job's own token via the environment, not through git or
+          # .git/config at all.
+          use_commit_signing: true
+          # #579: `--comment` runs the review under the plugin's own
+          # tag-mode permission profile, which defaults to `acceptEdits` —
+          # auto-confirming any edit/write/commit tool call rather than
+          # requiring interactive approval. This job only ever needs to READ
+          # the diff and POST inline review comments; it has no legitimate
+          # reason to touch the working tree, the git history, or delete
+          # anything, so deny every edit/write/commit-adjacent tool
+          # explicitly rather than relying on the plugin's default profile
+          # to stay conservative forever. Deny rules win over acceptEdits
+          # and the tag mode's own allow list.
+          #
+          # CRITICAL (#579 root cause): claude-code-action's own
+          # `install-mcp-server.ts::prepareMcpConfig` only installs the
+          # `github_inline_comment` MCP server when `claude_args` contains
+          # an `--allowedTools` entry starting with
+          # `mcp__github_inline_comment__` (matches the action's own
+          # canonical `examples/pr-review-comprehensive.yml`) — without that
+          # allowlist entry, findings silently degrade to a `gh pr comment`
+          # summary instead of the resolvable inline threads
+          # `required_conversation_resolution` actually gates merge on, and
+          # Codex was left as the sole inline gate (see #579). `--allowedTools`
+          # and `--disallowedTools` coexist safely here: deny still wins over
+          # allow (and over acceptEdits) for every write/commit-adjacent
+          # tool, so granting the inline-comment server and a few read-only
+          # `gh pr` Bash forms doesn't reopen the write blast radius the deny
+          # list closes.
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"
+            --disallowedTools "Edit,MultiEdit,Write,NotebookEdit,mcp__github_file_ops__commit_files,mcp__github_file_ops__delete_files,Bash(git add:*),Bash(git commit:*),Bash(git rm:*),Bash(git push:*)"
           # Agent-authored PRs advance via the `claude` GitHub App, so the
           # synchronize event's actor is `claude[bot]`; the action rejects
           # non-human actors unless allowlisted, leaving a permanent red X (and
