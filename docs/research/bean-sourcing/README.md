@@ -25,7 +25,7 @@ RoastPilot now has two LLM surfaces with different risk classes:
 
 | | **Advisor** | **Bean-sourcing** |
 |---|---|---|
-| Role | drives a roast through safety policy | extracts typed data for a human to review |
+| Role | advisory-only: returns typed decisions to the controller, which owns the loop; controller-originated writes pass safety policy (the LLM never controls hardware) | extracts typed data for a human to review |
 | Eval axis | **control safety** (bake-off + hardware gate) | **faithfulness** (does it read the page honestly / abstain) |
 | Failure mode | a bad roast | a bad *draft the human catches* |
 | Monitor | live roast traces | the operator's **draft→saved edits** (free ground truth) |
@@ -46,9 +46,13 @@ The single biggest improvement is to **not send raw HTML to the LLM** and to
    product pages (Shopify especially) very commonly embed a `schema.org/Product`
    block (`<script type="application/ld+json">`) plus Open Graph / microdata. The
    `extruct` library lifts all of these in one call. Whatever it yields
-   (name, brand, description, offers, `additionalProperty`) is **exact, free, and
-   confabulation-proof** — take it directly and feed it to the LLM as trusted
-   context to fill only the prose-only gaps (variety, process, altitude, notes).
+   (name, brand, description, offers, `additionalProperty`) is **exact and free**
+   — but *not* automatically about the requested bean: a page can carry stale,
+   variant, or related-product `Product` blocks, so JSON-LD is trusted only after
+   you **select the block matching the requested product** (by URL/title/offer) and
+   run it through the **same locality + provenance gates** as LLM output (§3).
+   Verified JSON-LD then feeds the LLM as trusted context to fill only the prose-only
+   gaps (variety, process, altitude, notes); unmatched blocks are ignored, not merged.
 2. **Boilerplate-strip to markdown with `trafilatura`** (`output_format='markdown'`)
    and feed *that* to the LLM, never raw HTML — ~65% fewer tokens and cleaner
    extraction (nav/footer/related-products stripped so the model isn't distracted
@@ -162,6 +166,16 @@ auditable in-repo synonym table (`fully washed → washed`) → names/free-text 
 normalized Levenshtein (≥0.9 COR, 0.6–0.9 PAR) with an LLM-judge only on the residual
 → blends by order-independent set alignment.
 
+**Ranges (altitude especially).** Suppliers often state a range ("1,200–2,000 m"),
+which the scalar `altitude_m` schema field cannot represent faithfully — a real repo
+case (several seeds collapse a supplier range into one scalar). Fix the policy
+explicitly, both in the schema and the scorer: label the gold value as the **range**;
+the extractor's contract is to return the range's midpoint (or low bound) **marked
+`origin_estimated`**, and the scorer credits COR when the model returns a scalar
+inside the gold range *and* flags it estimated, MIS if it abstains, SPU if it emits
+an out-of-range or unflagged scalar. (Preferably widen the schema to an optional
+`altitude_min_m`/`altitude_max_m` pair so a range can be stored faithfully.)
+
 Report three axes plus a combined rank that **makes an honest abstainer beat a
 confabulator**:
 
@@ -178,10 +192,18 @@ counts equally). Rank by `CombinedScore`; break ties on cost + latency.
 
 ### 5.2 Small-N rigor (N≈8–10 pages is *screening*, not certification)
 
-- **Wilson** 95% CIs on P/R/A at the field-decision level (never Wald).
+- **Page-level paired bootstrap for P/R/A** (10k resamples, resample *pages*),
+  **not** raw Wilson. Wilson assumes independent binary Bernoulli trials, but our
+  P/R/A numerators include fractional `PAR` outcomes *and* the field decisions are
+  clustered within pages — so a field-decision-level Wilson interval would understate
+  uncertainty and could drive the model gate wrongly. Reserve Wilson only for a
+  strictly-binary decomposition (e.g. COR-vs-not, PAR excluded), and even then report
+  it as indicative given the clustering.
 - **Paired McNemar — exact binomial** between the top models (<25 discordant pairs
-  → exact, not χ²), since every model sees the same fixtures.
-- **Paired bootstrap** (10k resamples, resample pages) CI on the CombinedScore gap.
+  → exact, not χ²), on a **binary** per-field correct/incorrect view, since every
+  model sees the same fixtures.
+- **Paired bootstrap** (10k resamples, resample pages) CI on the CombinedScore gap
+  (and on P/R/A, per the first bullet).
 - Committed caveat text: a perfect small-set score is a **warning** (over-easy
   fixture or mislabel), not a verdict; prefer model A over B only where CIs don't
   overlap *and* the paired test is significant; else choose on cost/latency. Field
@@ -194,16 +216,23 @@ The human-gate gives free ground truth (the Langfuse "Corrections" pattern):
 
 - `source_url`, resolved IP, fetch status/latency/bytes;
 - `model` slug + prompt-version hash;
-- `draft_output` (LLM proposal) **and** `saved_output` (operator accepted);
+- `draft_output` (LLM proposal) **and** `saved_output` (operator accepted, if any);
+- an explicit **outcome: `accepted` / `rejected` / `abandoned`** — a badly-extracted
+  draft the operator throws away has *no* `saved_output`, so without this the worst
+  extractions vanish from the metric (survivorship bias) and a field can look
+  ~0%-edited precisely because its drafts are routinely rejected;
 - `parsed_output` + which fields failed validation / reasked;
 - tokens in/out + cost, total latency, any exception, on_page/estimated ratio.
 
-Then, **per field, `edited = draft[field] != saved[field]`**, aggregated over a
-trailing window:
+Then, **per field, `edited = draft[field] != saved[field]`** for accepted drafts,
+aggregated over a trailing window — **and count `rejected`/`abandoned` outcomes as
+maximal edits** for the drift signal so rejections aren't silently dropped:
 
-- Rising edit rate on a field = extractor/prompt regression or a vendor page-layout
-  change → the practical **drift alarm**.
-- A field at ~0% edits over N drafts is a candidate to **auto-accept**.
+- Rising edit rate (or rising reject/abandon rate) on a field = extractor/prompt
+  regression or a vendor page-layout change → the practical **drift alarm**.
+- A field is an **auto-accept** candidate only if it is ~0%-edited across a window
+  with a **low reject/abandon rate** — never on edit-rate alone (that's the
+  survivorship trap above).
 - Keep `(page, saved_output)` pairs as a **growing eval fixture set** — replay
   offline whenever the prompt or model changes (the online→dataset→offline loop).
 
