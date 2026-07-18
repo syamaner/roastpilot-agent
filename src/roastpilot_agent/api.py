@@ -2954,17 +2954,27 @@ class DraftBeanFromUrlRequest(BaseModel):
     """The vendor's green-coffee product page URL."""
 
 
-#: #587 fix 5 (P1 #3353): bounds how many draft-from-url requests run
-#: concurrently. Each request is a billable BYOK LLM call (plus a
-#: server-side fetch of an operator-supplied URL) with no other rate limit
-#: on this route, so an unbounded burst of concurrent requests could both
-#: run up the operator's provider bill and tie up the process. Deliberately
-#: NOT an authentication control: this app has no authentication anywhere
-#: (a single-operator LAN tool, binds ``0.0.0.0`` via
-#: ``scripts/roast-live.sh``) — per-endpoint auth would be an app-wide
-#: architectural decision, not something to bolt onto one route, and is out
-#: of scope here by design.
-_DRAFT_BEAN_FROM_URL_CONCURRENCY = 2
+#: #587 fix 5 (P1 #3353): bounds how many draft-from-url requests can be
+#: ADMITTED at once (holding, or queued behind, the semaphore below). Each
+#: request is a billable BYOK LLM call (plus a server-side fetch of an
+#: operator-supplied URL) with no other rate limit on this route, so an
+#: unbounded burst of concurrent requests could both run up the operator's
+#: provider bill and tie up the process. Deliberately NOT an authentication
+#: control: this app has no authentication anywhere (a single-operator LAN
+#: tool, binds ``0.0.0.0`` via ``scripts/roast-live.sh``) — per-endpoint
+#: auth would be an app-wide architectural decision, not something to bolt
+#: onto one route, and is out of scope here by design.
+#:
+#: Fixed at 1, not 2 (#587 P2, round 6): ``RoastService.draft_bean_from_url``
+#: shares ``start_roast``'s ``_start_lock`` (holding it across the WHOLE
+#: fetch+extraction, #587 P1 round 5), so admitted requests already execute
+#: SERIALLY, not concurrently — a ``_start_lock`` acquired FAIRLY (FIFO)
+#: means a roast-start issued while ``N`` drafts are admitted waits behind
+#: ALL ``N`` of them. Capping admission at 1 caps that wait at a single
+#: fetch+extraction, which is the whole point of round 5's mutual-exclusion
+#: fix — allowing 2 admitted (but serialized) drafts would let a
+#: roast-start wait behind TWO of them instead of one.
+_DRAFT_BEAN_FROM_URL_CONCURRENCY = 1
 
 #: How long a request waits for a free concurrency slot before it fails
 #: closed with 429 rather than queuing indefinitely behind other in-flight
@@ -2988,15 +2998,20 @@ async def draft_bean_from_url(
     names which. A 409 while a roast is active (#587 P1) — see
     :meth:`RoastService.draft_bean_from_url`.
 
-    Concurrency-bounded (#587 fix 5): at most
-    :data:`_DRAFT_BEAN_FROM_URL_CONCURRENCY` calls run at once — each is a
-    billable BYOK LLM request, so this is a cost/resource-exhaustion
-    mitigation, not an access-control one. A request that cannot acquire a
-    slot within :data:`_DRAFT_BEAN_FROM_URL_ACQUIRE_TIMEOUT_SECONDS` gets a
-    429 rather than queuing indefinitely. This endpoint has NO
-    authentication, matching every other route in this single-operator LAN
-    app — that is a deliberate, existing, app-wide decision, not something
-    this fix changes or is meant to compensate for.
+    Concurrency-bounded (#587 fix 5; fixed at 1, #587 P2 round 6): at most
+    :data:`_DRAFT_BEAN_FROM_URL_CONCURRENCY` (one) request is ADMITTED at a
+    time — each is a billable BYOK LLM request, so this is a cost/resource-
+    exhaustion mitigation, not an access-control one. Because
+    ``RoastService.draft_bean_from_url`` also shares ``start_roast``'s
+    ``_start_lock`` (#587 P1 round 5), an admitted request actually runs
+    SERIALLY with any other in-flight draft or roast-start anyway — the
+    semaphore here is what turns a SECOND concurrent request into a fast
+    429 instead of it silently queuing behind an unbounded chain of others.
+    A request that cannot acquire the single slot within
+    :data:`_DRAFT_BEAN_FROM_URL_ACQUIRE_TIMEOUT_SECONDS` gets 429. This
+    endpoint has NO authentication, matching every other route in this
+    single-operator LAN app — that is a deliberate, existing, app-wide
+    decision, not something this fix changes or is meant to compensate for.
     """
     try:
         async with asyncio.timeout(_DRAFT_BEAN_FROM_URL_ACQUIRE_TIMEOUT_SECONDS):

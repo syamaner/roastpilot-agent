@@ -433,6 +433,120 @@ async def test_fetch_page_text_rejects_multicast_literal() -> None:
         )
 
 
+# --- #587 P2 round 6: reserved / embedded-IPv4 IPv6 forms ---
+
+
+def test_extract_embedded_ipv4_ipv4_mapped() -> None:
+    extract = bean_sourcing._extract_embedded_ipv4  # pyright: ignore[reportPrivateUsage]
+    assert extract(ipaddress.ip_address("::ffff:10.0.0.1")) == ipaddress.ip_address("10.0.0.1")
+    assert extract(ipaddress.ip_address("::ffff:8.8.8.8")) == ipaddress.ip_address("8.8.8.8")
+
+
+def test_extract_embedded_ipv4_nat64() -> None:
+    extract = bean_sourcing._extract_embedded_ipv4  # pyright: ignore[reportPrivateUsage]
+    # 64:ff9b::a00:1 embeds 10.0.0.1 (0a00:0001 as the low 32 bits).
+    assert extract(ipaddress.ip_address("64:ff9b::a00:1")) == ipaddress.ip_address("10.0.0.1")
+
+
+def test_extract_embedded_ipv4_ipv4_compatible() -> None:
+    extract = bean_sourcing._extract_embedded_ipv4  # pyright: ignore[reportPrivateUsage]
+    # ::a00:1 (deprecated IPv4-compatible form) embeds 10.0.0.1 too.
+    assert extract(ipaddress.ip_address("::a00:1")) == ipaddress.ip_address("10.0.0.1")
+
+
+def test_extract_embedded_ipv4_returns_none_for_plain_addresses() -> None:
+    extract = bean_sourcing._extract_embedded_ipv4  # pyright: ignore[reportPrivateUsage]
+    assert extract(ipaddress.ip_address("10.0.0.1")) is None
+    assert extract(ipaddress.ip_address("2606:2800:220:1:248:1893:25c8:1946")) is None
+
+
+def test_is_non_public_address_rejects_reserved_even_when_global() -> None:
+    """NAT64 (``64:ff9b::/96``) and IPv4-compatible (``::/96``) addresses
+    are ``is_global`` ``True`` in the stdlib despite ALSO being
+    ``is_reserved`` — verified directly, not assumed. An ``is_global``-only
+    check would let them through."""
+    is_non_public = bean_sourcing._is_non_public_address  # pyright: ignore[reportPrivateUsage]
+    nat64 = ipaddress.ip_address("64:ff9b::a00:1")
+    compatible = ipaddress.ip_address("::a00:1")
+    assert nat64.is_global is True  # the actual gap this fix closes
+    assert compatible.is_global is True
+    assert is_non_public(nat64) is True
+    assert is_non_public(compatible) is True
+
+
+def test_is_non_public_address_allows_genuine_global_addresses() -> None:
+    is_non_public = bean_sourcing._is_non_public_address  # pyright: ignore[reportPrivateUsage]
+    assert is_non_public(ipaddress.ip_address("93.184.216.34")) is False
+    assert is_non_public(ipaddress.ip_address("2606:2800:220:1:248:1893:25c8:1946")) is False
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_rejects_ipv4_mapped_loopback() -> None:
+    with pytest.raises(BeanFetchError, match="non-public address"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "http://[::ffff:127.0.0.1]/x", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_rejects_ipv4_mapped_private() -> None:
+    with pytest.raises(BeanFetchError, match="non-public address"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "http://[::ffff:10.0.0.1]/x", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_rejects_nat64_embedding_private_ipv4() -> None:
+    """``64:ff9b::a00:1`` embeds ``10.0.0.1`` — rejected here via the
+    ``is_reserved`` check on the OUTER address (the whole NAT64 prefix is
+    unconditionally reserved in the stdlib), which is the same outcome the
+    embedded-address re-check would independently reach too."""
+    with pytest.raises(BeanFetchError, match="non-public address"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "http://[64:ff9b::a00:1]/x", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_allows_a_genuine_global_ipv6_literal() -> None:
+    """Confirms the reserved/embedded-IPv4 hardening does not false-positive
+    on an ordinary global IPv6 literal."""
+    async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
+        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "http://[2606:2800:220:1:248:1893:25c8:1946]/x",
+            config=BeanSourcingConfig(),
+            http_client=client,
+        )
+    assert "Kenya Kiambu AA" in text
+
+
+@pytest.mark.asyncio
+async def test_assert_public_destination_rejects_embedded_ipv4_when_outer_address_passes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defense-in-depth wiring proof: even if a form embedding an IPv4
+    address were ever to pass the OUTER ``is_global``/``is_reserved``/
+    ``is_multicast`` checks (not reachable via any real address in the
+    currently-installed stdlib for the three forms this module handles —
+    see the ``_extract_embedded_ipv4``/``_is_non_public_address`` unit
+    tests above, which is why this test patches
+    ``_extract_embedded_ipv4`` directly rather than hunting for a real
+    address), the embedded address is independently re-validated and
+    rejected."""
+
+    def fake_extract_embedded_ipv4(
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    ) -> ipaddress.IPv4Address | None:
+        return ipaddress.IPv4Address("10.0.0.1")
+
+    monkeypatch.setattr(bean_sourcing, "_extract_embedded_ipv4", fake_extract_embedded_ipv4)
+    with pytest.raises(BeanFetchError, match="embeds a non-public IPv4"):
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            "http://[2606:2800:220:1:248:1893:25c8:1946]/x"
+        )
+
+
 @pytest.mark.asyncio
 async def test_assert_public_destination_rejects_hostname_resolving_to_private_ip(
     monkeypatch: pytest.MonkeyPatch,
@@ -1121,6 +1235,46 @@ async def test_assert_public_destination_maps_resolver_oserror(
 
 
 @pytest.mark.asyncio
+async def test_assert_public_destination_maps_resolver_unicode_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#587 P2 round 6: ``loop.getaddrinfo()`` raises ``UnicodeError``/
+    ``UnicodeEncodeError`` (NOT ``OSError``) for a hostname it cannot even
+    IDNA-encode — e.g. a lone UTF-16 surrogate reaching the resolver. Left
+    unguarded this escapes as an unhandled 500 instead of the typed
+    fail-soft error every other malformed-host case here gets. Simulated
+    via a patched resolver here (a lone-surrogate hostname is actually
+    rejected even earlier, by ``urlsplit()`` itself, in the real flow —
+    see the genuinely-reachable over-long-label test below)."""
+
+    async def failing_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        raise UnicodeError("encoding with 'idna' codec failed")
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", failing_getaddrinfo)
+    with pytest.raises(BeanFetchError, match="could not resolve host"):
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            "https://unresolvable.example/x"
+        )
+
+
+@pytest.mark.asyncio
+async def test_assert_public_destination_rejects_real_over_long_dns_label() -> None:
+    """A genuinely-reachable trigger, no resolver mocking: a DNS label over
+    63 characters cannot be IDNA-encoded, and the REAL
+    ``loop.getaddrinfo()`` raises ``UnicodeError`` for it — this passes
+    ``urlsplit()`` fine (it does not validate label lengths), so it is what
+    actually reaches the resolver's own ``UnicodeError`` path."""
+    long_label = "x" * 64
+    with pytest.raises(BeanFetchError, match="could not resolve host"):
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            f"https://{long_label}.example.test/x"
+        )
+
+
+@pytest.mark.asyncio
 async def test_assert_public_destination_rejects_host_resolving_to_no_addresses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1380,6 +1534,43 @@ def test_decompress_within_cap_rejects_corrupt_gzip_data() -> None:
     decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
     with pytest.raises(BeanFetchError, match="failed to decompress"):
         decode(b"not actually gzip data", "gzip", max_bytes=1000, url="https://x/y")
+
+
+def test_decompress_within_cap_rejects_truncated_gzip_body() -> None:
+    """#587 P2 round 6: a truncated gzip stream (a connection cut mid-body,
+    or a misbehaving server) can decompress+flush to PARTIAL output with NO
+    exception raised and ``decompressor.eof`` staying ``False`` — verified
+    directly against zlib's actual behavior before writing this test, not
+    assumed. Left unguarded this would silently hand the LLM extraction
+    step a truncated page instead of failing the fetch."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    payload = b"Kenya Kiambu AA washed process altitude 1850m tasting notes" * 3
+    compressed = gzip.compress(payload)
+    truncated = compressed[: len(compressed) - 15]
+    with pytest.raises(BeanFetchError, match="truncated/incomplete"):
+        decode(truncated, "gzip", max_bytes=len(payload) + 1, url="https://x/y")
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_rejects_a_truncated_gzip_response() -> None:
+    """Full-pipeline proof: a truncated gzip response body must fail soft
+    as ``BeanFetchError``, not silently draft from partial page text."""
+    payload = _SAMPLE_HTML.encode()
+    compressed = gzip.compress(payload)
+    truncated = compressed[: len(compressed) - 15]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=_bytes_stream(truncated), headers={"Content-Encoding": "gzip"}
+        )
+
+    async with _mock_client(httpx.MockTransport(handler)) as client:
+        with pytest.raises(BeanFetchError, match="truncated/incomplete"):
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/kenya",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
 
 
 @pytest.mark.asyncio
@@ -1695,6 +1886,48 @@ def test_draft_from_identity_marks_page_fields_on_page() -> None:
     # is_blend tri-state tests below for the explicit True/False cases).
     assert draft.is_blend is None
     assert "is_blend" not in draft.field_sources
+
+
+# --- #587 P2 round 6: altitude range must not be tagged on_page ---
+
+
+def test_extraction_instructions_tell_the_model_not_to_compute_a_midpoint() -> None:
+    """#587 P2 round 6: the prompt used to instruct the model to compute a
+    RANGE's midpoint for ``altitude_m``, which then got tagged
+    ``"on_page"`` for a value the page never actually stated as a single
+    number. The model must now be told to leave it null for a range."""
+    instructions = bean_sourcing._EXTRACTION_INSTRUCTIONS  # pyright: ignore[reportPrivateUsage]
+    assert "midpoint" in instructions.lower()
+    assert "do not compute" in instructions.lower() or "not compute" in instructions.lower()
+
+
+def test_draft_from_identity_altitude_range_page_leaves_altitude_null_and_unset() -> None:
+    """#587 P2 round 6: given the corrected prompt, a page that stated an
+    altitude RANGE extracts as ``altitude_m=None`` (the model's job, not
+    exercised here — this test proves the DOWNSTREAM provenance handling is
+    honest given that null) — no ``on_page`` tag for a value that was never
+    actually a stated scalar."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=None)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya"
+    )
+    assert draft.altitude_m is None
+    assert "altitude_m" not in draft.field_sources
+
+
+def test_draft_from_identity_altitude_single_value_still_tagged_on_page() -> None:
+    """A genuinely single-stated altitude is still honestly on_page —
+    the round-6 fix only closes the RANGE-midpoint case."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1850)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya"
+    )
+    assert draft.altitude_m == 1850
+    assert draft.field_sources["altitude_m"] == "on_page"
 
 
 # --- #587 P2: normalize optional identity values before tagging provenance ---

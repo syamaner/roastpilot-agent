@@ -229,6 +229,67 @@ def _extract_page_text(html: str) -> str:
 #: ``max_redirects=5`` policy this replaces.
 _MAX_REDIRECTS = 5
 
+#: NAT64 well-known prefix (RFC 6052) — an IPv6 address in this range embeds
+#: an IPv4 address in its low 32 bits (#587 P2, round 6).
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+
+#: The (deprecated) IPv4-compatible IPv6 prefix (RFC 4291 §2.5.5.1) — an
+#: IPv6 address in this range ALSO embeds an IPv4 address in its low 32
+#: bits. Distinct from the IPv4-MAPPED form (``::ffff:a.b.c.d``), which
+#: ``ipaddress.IPv6Address.ipv4_mapped`` already extracts directly.
+_IPV4_COMPATIBLE_PREFIX = ipaddress.ip_network("::/96")
+
+
+def _is_non_public_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """``True`` if ``address`` must be rejected by the SSRF guard (#587 P2,
+    round 6).
+
+    Rejected unless ``address.is_global`` — see :func:`_assert_public_destination`'s
+    docstring for what this single primitive covers (loopback, private,
+    link-local, unspecified, IANA-reserved, CGNAT). ``is_reserved`` is
+    checked EXPLICITLY too, alongside ``is_global``: some special-purpose
+    IPv6 forms — IPv4-compatible (``::a.b.c.d``) and NAT64
+    (``64:ff9b::/96``) — have ``is_global`` REPORTED AS ``True`` by the
+    stdlib despite ALSO being ``is_reserved`` (verified directly, not
+    assumed); ``is_global`` alone would let them through. Multicast is
+    rejected explicitly too, for the same reason (``is_global`` does not by
+    itself exclude it).
+    """
+    return not address.is_global or address.is_reserved or address.is_multicast
+
+
+def _extract_embedded_ipv4(
+    address: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> ipaddress.IPv4Address | None:
+    """Return the IPv4 address embedded in ``address``, or ``None`` if it
+    does not embed one (#587 P2, round 6).
+
+    Three IPv6 forms embed an IPv4 address in their low 32 bits, all of
+    which can be used to reach an internal IPv4 destination even when the
+    OUTER IPv6 address's own SSRF checks pass: IPv4-MAPPED
+    (``::ffff:a.b.c.d`` — extracted via the stdlib's own
+    ``ipv4_mapped`` property), IPv4-COMPATIBLE (``::a.b.c.d``, deprecated,
+    RFC 4291 §2.5.5.1), and NAT64 (``64:ff9b::/96``, RFC 6052). The
+    embedded address must be independently validated
+    (:func:`_assert_public_destination` does this) — a mapped/compatible/
+    NAT64 wrapper around a private IPv4 address is exactly as dangerous as
+    the private address itself.
+
+    Args:
+        address: The address to inspect.
+
+    Returns:
+        The embedded ``IPv4Address``, or ``None`` for a plain
+        ``IPv4Address`` input or an IPv6 address that embeds nothing.
+    """
+    if isinstance(address, ipaddress.IPv4Address):
+        return None
+    if address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    if address in _NAT64_PREFIX or address in _IPV4_COMPATIBLE_PREFIX:
+        return ipaddress.IPv4Address(int(address) & 0xFFFFFFFF)
+    return None
+
 
 async def _assert_public_destination(
     url: str,
@@ -243,19 +304,29 @@ async def _assert_public_destination(
     EVERY address the host resolves to, since a hostname can round-robin or
     dual-stack across a mix of public and non-public addresses.
 
-    An address is rejected unless ``address.is_global`` — the single
-    ``ipaddress`` primitive that correctly covers loopback, private
-    (RFC1918 and friends), link-local (this is what blocks the
-    ``169.254.169.254`` cloud metadata endpoint), unspecified, and
-    IANA-reserved, AND the Carrier-Grade NAT range ``100.64.0.0/10``
-    (Tailscale and similar overlay networks) — a naive
+    An address is rejected per :func:`_is_non_public_address`: unless
+    ``address.is_global`` — the single ``ipaddress`` primitive that
+    correctly covers loopback, private (RFC1918 and friends), link-local
+    (this is what blocks the ``169.254.169.254`` cloud metadata endpoint),
+    unspecified, and IANA-reserved, AND the Carrier-Grade NAT range
+    ``100.64.0.0/10`` (Tailscale and similar overlay networks) — a naive
     loopback/private/link-local/reserved-only predicate misses CGNAT
     entirely, since Python classifies it as neither private nor reserved.
     Multicast is rejected alongside it EXPLICITLY: ``is_global`` is defined
     as (approximately) "not private, with a CGNAT carve-out" and does NOT by
     itself exclude multicast (a multicast address is not in any "private"
     range, so ``is_global`` is ``True`` for one) — verified against the
-    stdlib implementation, not assumed.
+    stdlib implementation, not assumed. ``is_reserved`` is ALSO checked
+    explicitly (#587 P2, round 6): certain special-purpose IPv6 forms —
+    IPv4-compatible (``::a.b.c.d``) and NAT64 (``64:ff9b::/96``) — are
+    ``is_global`` ``True`` despite ALSO being ``is_reserved`` in the
+    stdlib, letting an ``is_global``-only check through. Finally, for any
+    IPv6 address that EMBEDS an IPv4 address (IPv4-mapped, IPv4-compatible,
+    or NAT64 — see :func:`_extract_embedded_ipv4`), the embedded IPv4 is
+    independently validated too — a mapped/compatible/NAT64 wrapper around
+    an internal IPv4 address is exactly as dangerous as that address
+    itself, and must not be let through just because the OUTER IPv6 form
+    happens to read as globally routable.
 
     Called on the origin URL and on every redirect ``Location`` the
     internally-constructed client is about to follow — a *public* URL can
@@ -321,7 +392,15 @@ async def _assert_public_destination(
         loop = asyncio.get_running_loop()
         try:
             resolved = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
+            # getaddrinfo() raises OSError for a genuine resolution
+            # failure, but UnicodeError (UnicodeDecodeError /
+            # UnicodeEncodeError — both ValueError subclasses, but NEITHER
+            # is an OSError) for a hostname it cannot even IDNA-encode in
+            # the first place — a label over 63 characters, or a lone
+            # UTF-16 surrogate, for instance. Left uncaught this escapes as
+            # an unhandled 500 instead of the typed fail-soft error every
+            # other malformed-host case here gets (#587 P2, round 6).
             raise BeanFetchError(f"could not resolve host {host!r} for {url!r}: {exc}") from exc
         addresses = [ipaddress.ip_address(info[4][0]) for info in resolved]
         if not addresses:
@@ -330,10 +409,17 @@ async def _assert_public_destination(
             ) from None
 
     for address in addresses:
-        if not address.is_global or address.is_multicast:
+        if _is_non_public_address(address):
             raise BeanFetchError(
                 f"fetch destination {url!r} resolves to a non-public address "
                 f"({address}) — blocked by the SSRF guard (#587)"
+            )
+        embedded_v4 = _extract_embedded_ipv4(address)
+        if embedded_v4 is not None and _is_non_public_address(embedded_v4):
+            raise BeanFetchError(
+                f"fetch destination {url!r} resolves to {address}, which embeds "
+                f"a non-public IPv4 address ({embedded_v4}) — blocked by the "
+                "SSRF guard (#587)"
             )
 
     return addresses
@@ -424,8 +510,13 @@ def _decompress_within_cap(
     Raises:
         BeanFetchError: ``content_encoding`` is not one of the encodings
             this module requests and knows how to decode safely, the
-            decoded output would exceed ``max_bytes``, or the body does not
-            decompress cleanly under its declared encoding.
+            decoded output would exceed ``max_bytes``, the body does not
+            decompress cleanly under its declared encoding, or the body is
+            TRUNCATED (#587 P2, round 6 — a cut-off gzip/deflate stream can
+            decompress+flush to partial output with no exception raised at
+            all and ``decompressor.eof`` staying ``False``; unguarded, that
+            silently hands the LLM extraction step a truncated page instead
+            of failing the fetch).
     """
     normalized = content_encoding.strip().lower()
     if normalized in ("", "identity"):
@@ -462,6 +553,16 @@ def _decompress_within_cap(
         raise BeanFetchError(
             f"vendor page failed to decompress ({content_encoding!r}) for {url!r}: {exc}"
         ) from exc
+    if not decompressor.eof:
+        # A truncated stream (connection cut mid-body, or a misbehaving
+        # server) can decompress+flush to PARTIAL output with no exception
+        # at all — verified directly against zlib's actual behavior, not
+        # assumed. Sending that partial text to the LLM extraction step
+        # would silently draft from an incomplete page instead of failing
+        # the fetch outright.
+        raise BeanFetchError(
+            f"vendor page sent a truncated/incomplete {content_encoding!r} body for {url!r}"
+        )
     if len(decoded) > max_bytes:
         raise BeanFetchError(
             f"vendor page exceeded the {max_bytes}-byte fetch cap (after decompression) for {url!r}"
@@ -869,6 +970,15 @@ class _ExtractedBeanIdentity(BaseModel):
     processing: ProcessingMethod | None = None
     bean_species: BeanSpecies | None = None
     altitude_m: int | None = Field(default=None, ge=0, le=4000)
+    """A single STATED altitude — never a computed midpoint of a page-given
+    RANGE (#587 P2, round 6: the extraction used to average a range down to
+    one number, which then got tagged ``"on_page"`` provenance for a value
+    the page never actually stated as a scalar; see
+    :data:`_EXTRACTION_INSTRUCTIONS`). A page that gives a range leaves this
+    ``None`` under the current (honest, minimal) fix. Capturing the range
+    itself (``altitude_min_m``/``altitude_max_m``) and estimating a midpoint
+    with its own ``"origin_estimated"`` provenance is a richer follow-up,
+    deferred to #590 — no new schema fields here."""
     description: str | None = None
     is_blend: bool | None = None
     """Tri-state, not a plain ``bool`` with a False default (#587 P2): the
@@ -904,9 +1014,11 @@ Fields:
   process") the method; otherwise null.
 - bean_species: arabica / robusta / liberica / excelsa — only if stated;
   arabica is the common case but do not assume it when the page is silent.
-- altitude_m: a single representative whole-metre value if the page gives an
-  altitude or an altitude range (use the midpoint of a stated range); null if
-  the page gives no altitude at all.
+- altitude_m: a whole-metre value ONLY if the page states a SINGLE altitude
+  (e.g. "1,850m"); leave null if the page gives no altitude at all, OR if it
+  gives a RANGE (e.g. "1,700-1,850m") — do NOT compute or return a midpoint
+  for a range; a single-value field must only ever hold a value the page
+  actually stated as one, not one this extraction invented by averaging.
 - description: a short (1-3 sentence) summary of the tasting notes, process,
   or lot detail actually written on the page, in your own words.
 - is_blend: true if the page explicitly says this is a blend of multiple
