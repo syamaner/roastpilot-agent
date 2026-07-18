@@ -65,6 +65,12 @@ Each item: the check, the failure it prevents, and the fix pattern. Cite `file:l
       can `decompress()`+`flush()` to *partial* output without raising, leaving
       `decompressor.eof` False. Check `eof` (and `unconsumed_tail`) after flushing and fail
       closed, or you feed a silently-truncated page to the extractor.
+- [ ] **No catastrophic-backtracking regex on untrusted input (ReDoS)** — a pattern with
+      `.*`/`[^x]*` scanning HTML/text can go **quadratic** on a pathological payload (e.g.
+      `"<script " * n` with no `>`), exhausting the CPU of the process (which here also runs
+      the roast controller). Use linear `str.find`/single-pass scanners for tag/markup
+      stripping, not backtracking regex; if a regex stays, prove it can't rescan a
+      no-terminator suffix.
 - [ ] **Bound the work count** — redirect chains, retries, per-item loops all have limits.
 - [ ] **Concurrency bound** on any billable/expensive endpoint (semaphore → 429), so a
       caller can't fan out unbounded paid calls.
@@ -74,8 +80,13 @@ Each item: the check, the failure it prevents, and the fix pattern. Cite `file:l
 - [ ] **Every parse/convert/decode on untrusted input maps to a typed error** the route
       handler translates (e.g. → `BeanFetchError`/`BeanExtractionError` → 422), never an
       unhandled 500. Audit **every** `urlsplit`/`urljoin`/`httpx.URL`/`.port`/`int()`/
-      `ipaddress.ip_address`/`.decode()`/provider-SDK call in the path. Two parsers rarely
-      agree — `urlsplit` accepts inputs `httpx.URL` rejects (NUL in path → `httpx.InvalidURL`).
+      `ipaddress.ip_address`/`getaddrinfo`/`.decode(charset)`/provider-SDK call in the path.
+      Two parsers rarely agree — `urlsplit` accepts inputs `httpx.URL` rejects (NUL in path →
+      `httpx.InvalidURL`); `getaddrinfo` raises `UnicodeError` (not `OSError`) on un-IDNA-able
+      hosts; `bytes.decode(response_charset)` raises `LookupError` on an unknown charset name
+      (`errors="replace"` does NOT cover an unknown *codec*). **Don't assume a library
+      pre-validates** — verify it, or guard the call; a class-sweep that *asserted*
+      `response.encoding` couldn't raise was wrong, and shipped a 500.
 - [ ] The module's fail-soft **docstring promise matches reality** — if it says "never
       raises an unhandled exception", prove it with a test per escape path.
 
