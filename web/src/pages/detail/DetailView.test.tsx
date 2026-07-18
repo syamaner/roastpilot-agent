@@ -466,9 +466,10 @@ describe("DetailView completed-run widget visibility (#533)", () => {
   // RoastedWeight / ChargeWeight / RoastTastings each POST a completed-run-
   // only endpoint. On an in-progress run's detail view (reachable via a
   // direct /roasts/:id visit while the roast is still live), rendering
-  // these forms offers 409-doomed saves. ONE gate at DetailView, not four
-  // per-widget checks.
-  it("hides all four completed-run-only widgets on an in-progress run (completed_at_utc: null)", () => {
+  // these forms offers 409-doomed saves. ONE gate at DetailView, not five
+  // per-widget checks. RoastDiscard (#582) joins the same gate — a discard
+  // is likewise a completed-run immutability exception.
+  it("hides all five completed-run-only widgets on an in-progress run (completed_at_utc: null)", () => {
     render(
       <DetailView
         detail={{ ...FIXTURE_DETAIL, completed_at_utc: null }}
@@ -481,14 +482,16 @@ describe("DetailView completed-run widget visibility (#533)", () => {
     expect(screen.queryByTestId("roasted-weight")).toBeNull();
     expect(screen.queryByTestId("charge-weight")).toBeNull();
     expect(screen.queryByTestId("roast-tastings")).toBeNull();
+    expect(screen.queryByTestId("roast-discard")).toBeNull();
   });
 
-  it("shows all four completed-run-only widgets on a completed run (completed_at_utc set)", () => {
+  it("shows all five completed-run-only widgets on a completed run (completed_at_utc set)", () => {
     renderView();
     expect(screen.getByTestId("roast-rating")).toBeInTheDocument();
     expect(screen.getByTestId("roasted-weight")).toBeInTheDocument();
     expect(screen.getByTestId("charge-weight")).toBeInTheDocument();
     expect(screen.getByTestId("roast-tastings")).toBeInTheDocument();
+    expect(screen.getByTestId("roast-discard")).toBeInTheDocument();
   });
 
   it("still renders RoastConditions and ExportOptions on an in-progress run — they are read-outs, not forms", () => {

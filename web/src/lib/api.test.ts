@@ -88,6 +88,32 @@ describe("api client", () => {
     });
   });
 
+  it("POST /discard returns the flagged detail (#582)", async () => {
+    mockFetch(200, { id: "r1", excluded: true });
+    const detail = await api.discardRoast("r1");
+    expect(detail.excluded).toBe(true);
+    expect(fetch).toHaveBeenCalledWith("/api/roasts/r1/discard", expect.any(Object));
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init).toMatchObject({ method: "POST" });
+  });
+
+  it("POST /restore returns the un-flagged detail (#582)", async () => {
+    mockFetch(200, { id: "r1", excluded: false });
+    const detail = await api.restoreRoast("r1");
+    expect(detail.excluded).toBe(false);
+    expect(fetch).toHaveBeenCalledWith("/api/roasts/r1/restore", expect.any(Object));
+    const [, init] = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(init).toMatchObject({ method: "POST" });
+  });
+
+  it("POST /discard surfaces the server's 409 detail on an in-progress run (#582)", async () => {
+    mockFetch(409, { detail: "run r1 is still in progress; discard it after completion" });
+    await expect(api.discardRoast("r1")).rejects.toMatchObject({
+      name: "ApiError",
+      status: 409,
+    });
+  });
+
   it("POST /clear-stale-session sends the reason body and returns the typed result (#525)", async () => {
     mockFetch(200, { run_id: "r1", outcome: "aborted", completed_at_utc: "2026-07-14T00:00:00Z" });
     const result = await api.clearStaleSession("r1", { reason: "orphaned after a crash" });

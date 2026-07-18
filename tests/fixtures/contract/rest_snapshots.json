@@ -11,6 +11,7 @@
       "resume_advisory",
       "emergency_stop"
     ],
+    "excluded": false,
     "export_manifest": null,
     "fault_reason": null,
     "id": "00000000000000000000000000000000",
@@ -75,6 +76,7 @@
     "corrected_charge_grams": null,
     "country": null,
     "development_percent": 37.5,
+    "excluded": false,
     "first_crack_at_utc": "2026-01-01T00:00:00+00:00",
     "id": "00000000000000000000000000000000",
     "is_blend": false,

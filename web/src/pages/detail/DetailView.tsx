@@ -31,6 +31,7 @@ import { DecisionTraceTable } from "./DecisionTraceTable";
 import { EventTimeline } from "./EventTimeline";
 import { ExportOptions } from "./ExportOptions";
 import { RoastConditions } from "./RoastConditions";
+import { RoastDiscard } from "./RoastDiscard";
 import { RoastRating } from "./RoastRating";
 import { RoastedWeight } from "./RoastedWeight";
 import { RoastTastings } from "./RoastTastings";
@@ -154,6 +155,7 @@ export function DetailView({ detail, telemetry, timeline }: DetailViewProps): Re
         <div className="flex flex-col gap-6">
           {isCompletedRun && (
             <>
+              <RoastDiscard runId={detail.id} excluded={detail.excluded ?? false} />
               {/* key: same class as ChargeWeight/RoastTastings below (#568
                   round 7) — RoastRating keeps its own `editing` mode and
                   draft state, so without a remount a pending mutate

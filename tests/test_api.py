@@ -1254,6 +1254,90 @@ async def test_set_charge_weight_twice_audits_the_prior_correction(
     assert second_payload["corrected_charge_grams"] == 252.0
 
 
+# --- discard / restore a roast (#582) ---
+
+
+@pytest.mark.asyncio
+async def test_discard_completed_run(client: AsyncClient, store: RoastStore) -> None:
+    await store.create_run(
+        run_id="run-d",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(run_id="run-d", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+
+    response = await client.post("/api/roasts/run-d/discard")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["excluded"] is True
+
+    # A discarded run drops out of the history list...
+    history = await client.get("/api/roasts")
+    assert "run-d" not in {run["id"] for run in history.json()["runs"]}
+    # ...but a direct link to its detail still works, flagged.
+    detail = await client.get("/api/roasts/run-d")
+    assert detail.status_code == 200
+    assert detail.json()["excluded"] is True
+
+
+@pytest.mark.asyncio
+async def test_restore_reverses_a_discard(client: AsyncClient, store: RoastStore) -> None:
+    await store.create_run(
+        run_id="run-r",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.COMPLETE,
+    )
+    await store.complete_run(run_id="run-r", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    discard = await client.post("/api/roasts/run-r/discard")
+    assert discard.json()["excluded"] is True
+
+    response = await client.post("/api/roasts/run-r/restore")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["excluded"] is False
+
+    history = await client.get("/api/roasts")
+    assert "run-r" in {run["id"] for run in history.json()["runs"]}
+
+
+@pytest.mark.asyncio
+async def test_discard_in_progress_run_conflicts(client: AsyncClient, store: RoastStore) -> None:
+    await store.create_run(
+        run_id="run-dip",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.DEVELOPMENT,
+    )
+    response = await client.post("/api/roasts/run-dip/discard")
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_restore_in_progress_run_conflicts(client: AsyncClient, store: RoastStore) -> None:
+    await store.create_run(
+        run_id="run-rip",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.DEVELOPMENT,
+    )
+    response = await client.post("/api/roasts/run-rip/restore")
+    assert response.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_discard_unknown_run_404(client: AsyncClient) -> None:
+    response = await client.post("/api/roasts/nope/discard")
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_restore_unknown_run_404(client: AsyncClient) -> None:
+    response = await client.post("/api/roasts/nope/restore")
+    assert response.status_code == 404
+
+
 # --- clear stale session (#525) ---
 
 

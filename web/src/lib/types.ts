@@ -362,6 +362,12 @@ export interface RoastSummary {
   ambient_temp_c?: number | null;
   ambient_humidity_pct?: number | null;
   ambient_pressure_hpa?: number | null;
+  // Reversible soft-exclude flag (#582). Always `false` here: the history list
+  // filters excluded=1 runs out entirely, so a discarded run never appears in
+  // this array. See `RoastDetail.excluded`, which DOES surface `true` (a
+  // direct link to a discarded run still works). Optional for back-compat
+  // with a pre-#582 fixture.
+  excluded?: boolean;
 }
 
 export interface RoastHistory {
@@ -403,6 +409,12 @@ export interface RoastDetail {
   // was served. Only ever non-null on the start-roast 201 response — the
   // confirm loop's capture point (see HealthResponse's field doc).
   instance_id?: string | null;
+  // Reversible soft-exclude flag (#582) — `true` when the operator has
+  // discarded this roast as bad-data (beans fine, but e.g. a detector-missed
+  // first crack polluted the derived DTR). The run's telemetry, events,
+  // decision trace, and any exported audio are all untouched — a soft flag,
+  // never a delete. Optional for back-compat with a pre-#582 fixture.
+  excluded?: boolean;
 }
 
 export interface TelemetryPoint {

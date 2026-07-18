@@ -116,6 +116,15 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  /** `POST /api/roasts/{id}/discard` — soft-exclude a bad-data roast (#582).
+   *  Reversible (see `restoreRoast`); 404 unknown run, 409 in-progress. */
+  discardRoast: (runId: string) =>
+    request<RoastDetail>(`/api/roasts/${runId}/discard`, { method: "POST" }),
+
+  /** `POST /api/roasts/{id}/restore` — reverse a discard (#582). */
+  restoreRoast: (runId: string) =>
+    request<RoastDetail>(`/api/roasts/${runId}/restore`, { method: "POST" }),
+
   /** `POST /api/roasts/{id}/clear-stale-session` — finalise a stranded STALE
    *  run (#525). A pure store write: issues no MCP command, never touches
    *  heat/fan/cooling. 404 unknown run; 409 if it's the process's own
