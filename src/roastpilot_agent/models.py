@@ -1067,6 +1067,13 @@ class RoastSummary(BaseModel):
     ambient_pressure_hpa: float | None = None
     """Ambient barometric pressure in hectopascals at charge (#342, D85), or
     ``None``."""
+    excluded: bool = False
+    """Reversible soft-exclude flag (#582), for filtering a bad-DATA roast out
+    of history/stats/the learning corpus without deleting it. Always ``False``
+    here: :meth:`~roastpilot_agent.store.RoastStore.list_runs` filters
+    ``excluded=1`` rows out of this list entirely — a discarded run never
+    appears in history. See :attr:`RoastDetail.excluded`, which a direct link
+    to a discarded run still surfaces as ``True``."""
 
 
 class RoastHistory(BaseModel):
@@ -1182,6 +1189,17 @@ class RoastDetail(BaseModel):
     one that accepted the start, the #513 port-impostor signature. ``None``
     is a legitimate value (e.g. a pre-#516 fixture) and must never itself be
     treated as a mismatch."""
+    excluded: bool = False
+    """Reversible soft-exclude flag (#582) — ``True`` when the operator has
+    discarded this roast as bad-data (beans fine, but e.g. a detector-missed
+    first crack polluted the derived DTR). Unlike :attr:`RoastSummary.excluded`
+    (always ``False`` — a discarded run never appears in the history list at
+    all), this DOES surface ``True``:
+    :meth:`~roastpilot_agent.store.RoastStore.read_run` still returns a
+    discarded run so a direct link works, carrying the flag so the detail page
+    can render a "Discarded" indicator + a restore action. The run's
+    telemetry, events, safety/advisor/command trail, and any exported audio
+    are all untouched — this is a soft flag, never a delete."""
 
 
 class TelemetryPoint(BaseModel):

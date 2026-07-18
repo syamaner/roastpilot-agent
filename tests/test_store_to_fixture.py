@@ -696,6 +696,67 @@ async def test_roast2_shaped_run_cooled_but_never_finalised(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_default_run_skips_a_discarded_run(tmp_path: Path) -> None:
+    """#582 corpus hygiene: a soft-discarded run must never re-enter the corpus
+    through the no-arg auto-pick, even when it is the MOST RECENT completed
+    run — a broken "most-recent" query with no ``excluded`` filter would
+    otherwise silently pick it right back up, defeating the discard."""
+    db_path = tmp_path / "discarded-most-recent.sqlite3"
+    store = await _synthetic_store(db_path, run_id="older-included", rating=3)
+    # A second, LATER-completed run — discarded, so it must be skipped even
+    # though a plain "most recent completed" query would otherwise pick it.
+    await store.create_run(
+        run_id="newer-discarded",
+        profile=_PROFILE,
+        config=AppConfig(),
+        agent_phase=RoastPhase.STARTING,
+    )
+    await store.record_telemetry(
+        run_id="newer-discarded",
+        tick=0,
+        agent_phase=RoastPhase.DEVELOPMENT,
+        elapsed_seconds=0.0,
+        interval_seconds=0.0,
+        telemetry=RoastTelemetry(bean_temp_c=60.0, env_temp_c=80.0),
+        heat_level_percent=100,
+        fan_level_percent=30,
+    )
+    await store.record_telemetry(
+        run_id="newer-discarded",
+        tick=1,
+        agent_phase=RoastPhase.DEVELOPMENT,
+        elapsed_seconds=120.0,
+        interval_seconds=0.0,
+        telemetry=RoastTelemetry(bean_temp_c=190.0, env_temp_c=210.0),
+        heat_level_percent=40,
+        fan_level_percent=30,
+    )
+    await _record_marks(store, "newer-discarded", charge_s=0.0, first_crack_s=90.0, drop_s=120.0)
+    await store.complete_run(
+        run_id="newer-discarded", outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    await store.set_run_excluded("newer-discarded", excluded=True)
+    await store.close()
+
+    entry = s2f.convert(db_path, tmp_path / "fixture")
+    assert entry["run_id"] == "older-included"
+
+
+@pytest.mark.asyncio
+async def test_explicit_discarded_run_id_raises(tmp_path: Path) -> None:
+    """#582: an explicit ``--run-id`` naming a discarded run is refused — it must
+    not silently re-export a run the operator explicitly excluded right back
+    into the learning corpus."""
+    db_path = tmp_path / "explicit-discarded.sqlite3"
+    store = await _synthetic_store(db_path, run_id="bad-data")
+    await store.set_run_excluded("bad-data", excluded=True)
+    await store.close()
+
+    with pytest.raises(s2f.FixtureConversionError, match="discarded"):
+        s2f.convert(db_path, tmp_path / "fixture", run_id="bad-data")
+
+
+@pytest.mark.asyncio
 async def test_default_run_is_most_recent_completed(tmp_path: Path) -> None:
     """With no --run-id, the converter picks the most-recent completed run."""
     db_path = tmp_path / "two-runs.sqlite3"

@@ -439,6 +439,32 @@ ALTER TABLE roast_runs ADD COLUMN corrected_charge_grams REAL
   CHECK (corrected_charge_grams IS NULL OR corrected_charge_grams > 0);
 """
 
+SCHEMA_V13_EXCLUDED = """
+-- #582: a reversible soft-exclude flag for a completed roast that produced BAD
+-- DATA while the beans themselves were fine (e.g. a detector-missed first
+-- crack the operator marked ~66 s / 7 degC late, so the derived DTR reads a
+-- bogus value) -- the store is deliberately immutable (no delete-run feature;
+-- a BEFORE DELETE trigger aborts; 10 child tables + FK enforcement), so this
+-- is the clean way to get a bad-data roast out of history/stats/the learning
+-- corpus WITHOUT deleting it -- the raw record, audio, FC-miss label, and BT
+-- curve are all retained (a detector-miss is prime FC fine-tuning data).
+--
+-- Same lifecycle as roasted_weight_grams (V7) / corrected_charge_grams (V12):
+-- the v2 completed-run immutability trigger guards a fixed column allow-list
+-- (it ABORTs only on the enumerated frozen columns), so this NEW column is
+-- permitted to change after completion -- including being TOGGLED BACK
+-- (reversible by design) -- without editing the shipped trigger. Verified
+-- empirically in test_store.py (test_excluded_flag_is_an_immutability_exception)
+-- alongside a same-session proof that the trigger still ABORTS a real-field
+-- update on a completed run (test_completed_runs_are_immutable) -- the new
+-- column does not weaken immutability for any existing field.
+--
+-- Default 0 = every existing/new roast stays visible until explicitly
+-- discarded (zero behavior change for the whole existing corpus on upgrade).
+ALTER TABLE roast_runs ADD COLUMN excluded INTEGER NOT NULL DEFAULT 0
+  CHECK (excluded IN (0, 1));
+"""
+
 #: Ordered migration scripts; index+1 is the resulting PRAGMA user_version.
 #: Append-only — never edit a shipped migration (plan §8: schema migration
 #: is test-covered).
@@ -455,6 +481,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V10_AMBIENT_CAPTURED_LATCH,
     SCHEMA_V11_TASTINGS,
     SCHEMA_V12_CORRECTED_CHARGE,
+    SCHEMA_V13_EXCLUDED,
 )
 
 
@@ -680,6 +707,14 @@ class RoastStore:
         is not yet completed). The origin is derived from each completed run's
         frozen ``profile_json`` via the shared :func:`recording_origin_slug`, the
         same slug the controller hands the MCP, so the count and the filename agree.
+
+        Deliberately does NOT filter on ``roast_runs.excluded`` (#582): this
+        count feeds a recording FILENAME slot number, not history/stats/corpus
+        presentation. A soft-discarded run's audio file still physically
+        exists on disk under the slot number it was recorded with (the whole
+        point of #582 is that nothing is deleted) — excluding it here would
+        double-assign that slot to the next real roast of the same bean and
+        collide with the discarded run's still-present recording.
 
         Args:
             origin_slug: The recording-origin slug to match (from
@@ -1419,6 +1454,37 @@ class RoastStore:
             f"the run's current roasted/charge weights"
         )
 
+    async def set_run_excluded(self, run_id: str, *, excluded: bool) -> None:
+        """Soft-exclude (or restore) a completed run from history/corpus (#582).
+
+        The same completed-only immutability-exception lifecycle as
+        :meth:`set_operator_rating` / :meth:`set_roasted_weight` /
+        :meth:`set_corrected_charge`: a discard/restore is entered after the
+        roast has finished (``completed_at_utc IS NOT NULL``), so an
+        in-progress run can never be silently hidden mid-roast. Reversible by
+        design — calling this again with the opposite value un-discards a
+        run. Nothing else is touched: the run row, its telemetry, events,
+        safety/advisor/command rows, and any exported audio stay exactly as
+        they were (soft flag, never a delete — the store has no delete-run
+        path at all, see the v2 ``BEFORE DELETE`` trigger).
+
+        Args:
+            run_id: The completed run to discard or restore.
+            excluded: ``True`` to discard (hide from history + corpus
+                retrieval), ``False`` to restore.
+
+        Raises:
+            RuntimeError: No completed run matches ``run_id``.
+        """
+        cursor = await self.connection.execute(
+            "UPDATE roast_runs SET excluded = ?, updated_at_utc = ?"
+            " WHERE id = ? AND completed_at_utc IS NOT NULL",
+            (1 if excluded else 0, _utc_now(), run_id),
+        )
+        await self.connection.commit()
+        if cursor.rowcount == 0:
+            raise RuntimeError(f"no completed roast_run with id {run_id!r}")
+
     async def add_tasting(
         self,
         run_id: str,
@@ -1607,7 +1673,14 @@ class RoastStore:
         (``SafetyVerdict.CLAMP.value`` / ``SafetyVerdict.REJECT.value``) and
         **bound as query parameters**, never raw SQL string literals (D15: a
         verdict rename must surface as a type error, not silently dodge the
-        compare)."""
+        compare).
+
+        A discarded run (``excluded = 1``, #582) is filtered out of this list
+        entirely — the whole point of the soft-exclude flag is to keep a
+        bad-data roast out of the operator-facing history surface without
+        deleting it. Its row, telemetry, events, and every child table stay
+        untouched; :meth:`read_run` still returns it (carrying
+        ``excluded=True``) for a direct link."""
         async with self.connection.execute(
             "SELECT r.id, r.started_at_utc, r.completed_at_utc, r.agent_phase,"
             " r.outcome, r.profile_json, r.operator_rating, r.roasted_weight_grams,"
@@ -1631,7 +1704,8 @@ class RoastStore:
             "  (SELECT s.verdict FROM safety_evaluations s"
             "   WHERE s.run_id = r.id AND s.tick = a.tick"
             "   ORDER BY s.id DESC LIMIT 1) = ?) AS advisor_rejected"
-            " FROM roast_runs r ORDER BY r.started_at_utc DESC, r.rowid DESC",
+            " FROM roast_runs r WHERE r.excluded = 0"
+            " ORDER BY r.started_at_utc DESC, r.rowid DESC",
             # D15: the verdict values bound as query parameters come from the typed
             # SafetyVerdict enum, never raw SQL string literals — a rename of an
             # enum member is a pyright error here, not a silently-passing string.
@@ -1675,18 +1749,26 @@ class RoastStore:
                     ambient_temp_c=self._optional_float(row["ambient_temp_c"]),
                     ambient_humidity_pct=self._optional_float(row["ambient_humidity_pct"]),
                     ambient_pressure_hpa=self._optional_float(row["ambient_pressure_hpa"]),
+                    # Always False here: the WHERE clause above already filters
+                    # excluded=1 rows out of this list entirely (#582).
+                    excluded=False,
                 )
             )
         return summaries
 
     async def read_run(self, run_id: str) -> RoastDetail | None:
         """Run detail (plan §6): profile, phase, outcome, export manifest.
-        ``None`` when no run has that id."""
+        ``None`` when no run has that id.
+
+        Unlike :meth:`list_runs`, this returns a discarded run (``excluded =
+        1``, #582) too — carrying ``excluded=True`` — so a direct link to a
+        discarded roast still works; only the history list hides it."""
         async with self.connection.execute(
             "SELECT id, agent_phase, profile_json, outcome, started_at_utc,"
             " completed_at_utc, fault_reason, operator_rating, operator_notes,"
             " roasted_weight_grams, corrected_charge_grams, ambient_temp_c,"
-            " ambient_humidity_pct, ambient_pressure_hpa, export_manifest_json"
+            " ambient_humidity_pct, ambient_pressure_hpa, export_manifest_json,"
+            " excluded"
             " FROM roast_runs WHERE id = ?",
             (run_id,),
         ) as cursor:
@@ -1727,6 +1809,7 @@ class RoastStore:
             ambient_temp_c=self._optional_float(row["ambient_temp_c"]),
             ambient_humidity_pct=self._optional_float(row["ambient_humidity_pct"]),
             ambient_pressure_hpa=self._optional_float(row["ambient_pressure_hpa"]),
+            excluded=bool(row["excluded"]),
         )
 
     async def read_telemetry_points(
@@ -1903,8 +1986,11 @@ class RoastStore:
         faulted-but-finalized run consumed a recording slot per
         :meth:`count_completed_runs_for_origin`, but its trajectory is never a
         *good* reference, so it is excluded here even though it would still
-        count toward that unrelated metric) rated ``>= min_rating`` whose
-        frozen ``profile_json`` slugs
+        count toward that unrelated metric), never DISCARDED
+        (``excluded = 0`` — #582: a soft-excluded run is bad-data by the
+        operator's own explicit call, so it must never surface as a
+        reference candidate — the corpus-hygiene point of the flag), rated
+        ``>= min_rating`` whose frozen ``profile_json`` slugs
         (:func:`~roastpilot_agent.models.recording_origin_slug`) to
         ``origin_slug`` and whose actual charge weight is within
         ``weight_tolerance_frac`` of ``charge_grams``. "Actual charge" is
@@ -1938,6 +2024,7 @@ class RoastStore:
         async with self.connection.execute(
             "SELECT id, profile_json, corrected_charge_grams FROM roast_runs"
             " WHERE completed_at_utc IS NOT NULL AND outcome = 'completed'"
+            " AND excluded = 0"
             " AND operator_rating >= ?"
             " ORDER BY operator_rating DESC, completed_at_utc DESC",
             (min_rating,),

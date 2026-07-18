@@ -2229,6 +2229,43 @@ class RoastService:
             raise RuntimeError(f"read_run returned None for corrected run {run_id}")
         return corrected
 
+    async def discard_roast(self, run_id: str) -> RoastDetail:
+        """Soft-exclude a completed roast as bad-data (#582), or 404/409.
+
+        Mirrors :meth:`rate`: 404 when the run is unknown; 409 when it is
+        still in progress — the exclude flag is a completed-run immutability
+        exception (a discard-worthy data problem is only knowable once the
+        roast has run its course), so the in-progress case surfaces as a
+        conflict rather than letting the store's ``RuntimeError`` escape as a
+        500. Idempotent: discarding an already-discarded run is a no-op 200,
+        not an error (the SPA can call it without first checking state).
+        Nothing is deleted — the run row, telemetry, events, and any exported
+        audio are untouched; the run simply drops out of
+        :meth:`history` / corpus retrieval until :meth:`restore_roast`.
+        """
+        return await self._set_excluded(run_id, excluded=True)
+
+    async def restore_roast(self, run_id: str) -> RoastDetail:
+        """Reverse a discard (#582), or 404/409. See :meth:`discard_roast`."""
+        return await self._set_excluded(run_id, excluded=False)
+
+    async def _set_excluded(self, run_id: str, *, excluded: bool) -> RoastDetail:
+        """Shared discard/restore body (#582) — the store write + 404/409 mapping
+        both :meth:`discard_roast` and :meth:`restore_roast` share."""
+        detail = await self._store.read_run(run_id)
+        if detail is None:
+            raise RoastRunNotFoundError(run_id)
+        if detail.completed_at_utc is None:
+            verb = "discard" if excluded else "restore"
+            raise RoastRunConflictError(
+                f"run {run_id} is still in progress; {verb} it after completion"
+            )
+        await self._store.set_run_excluded(run_id, excluded=excluded)
+        updated = await self._store.read_run(run_id)
+        if updated is None:  # pragma: no cover — immutable once completed
+            raise RuntimeError(f"read_run returned None for updated run {run_id}")
+        return updated
+
     #: Floor on the guard (c) telemetry-recency window (#525), regardless of
     #: the configured ``telemetry_log_interval_seconds``. Scaled UP by
     #: ``_stale_session_recency_window_seconds`` for a longer interval, never
@@ -2724,6 +2761,26 @@ async def set_charge_weight(
     """``POST /api/roasts/{run_id}/charge-weight`` — operator charge-weight correction (#520)."""
     try:
         return await service.set_charge_weight(run_id, request)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+async def discard_roast(run_id: str, service: ServiceDep) -> RoastDetail:
+    """``POST /api/roasts/{run_id}/discard`` — soft-exclude a bad-data roast (#582)."""
+    try:
+        return await service.discard_roast(run_id)
+    except RoastRunNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+async def restore_roast(run_id: str, service: ServiceDep) -> RoastDetail:
+    """``POST /api/roasts/{run_id}/restore`` — reverse a discard (#582)."""
+    try:
+        return await service.restore_roast(run_id)
     except RoastRunNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except RoastRunConflictError as exc:
@@ -3228,6 +3285,8 @@ def create_app(
     app.post("/api/roasts/{run_id}/rating")(rate_roast)
     app.post("/api/roasts/{run_id}/roasted-weight")(set_roasted_weight)
     app.post("/api/roasts/{run_id}/charge-weight")(set_charge_weight)
+    app.post("/api/roasts/{run_id}/discard")(discard_roast)
+    app.post("/api/roasts/{run_id}/restore")(restore_roast)
     app.post("/api/roasts/{run_id}/clear-stale-session")(clear_stale_session)
     app.post("/api/roasts/{run_id}/tastings", status_code=201)(add_tasting)
     app.get("/api/roasts/{run_id}/tastings")(list_tastings)

@@ -370,6 +370,39 @@ describe("DetailView composition", () => {
     expect(screen.queryByTestId("star-3")).not.toBeInTheDocument();
   });
 
+  it("resets the RoastDiscard confirm step when navigating between two different runs (#582 Codex): run A's open confirm must never leak into run B's render", () => {
+    const { rerender } = render(
+      <DetailView detail={FIXTURE_DETAIL} telemetry={FIXTURE_TELEMETRY} timeline={FIXTURE_TIMELINE} />,
+      { wrapper: wrapper() },
+    );
+
+    // Open run A's discard confirm — never clicked through. Both fixtures
+    // are un-excluded, so RoastDiscard's OWN props (excluded=false on both)
+    // would not force a different render on navigation — only the
+    // key={detail.id} remount (mirroring RoastRating/ChargeWeight/
+    // RoastTastings) closes this leak. Without it, React would reuse the
+    // same instance across the runId change, landing on run B's render
+    // still showing A's "Yes, discard" confirm — clicking it would call
+    // discardRoast(B) while the operator believes they are confirming A.
+    fireEvent.click(screen.getByTestId("roast-discard-button"));
+    expect(screen.getByTestId("roast-discard-confirm")).toBeInTheDocument();
+
+    // Simulate a client-side route change to a different run (DetailPage
+    // re-renders DetailView with a new `detail` prop, not a fresh mount).
+    rerender(
+      <DetailView
+        detail={FIXTURE_DETAIL_LONG}
+        telemetry={FIXTURE_TELEMETRY_LONG}
+        timeline={FIXTURE_TIMELINE_LONG}
+      />,
+    );
+
+    // Run B's OWN (fresh) instance must start un-confirmed — never inheriting
+    // run A's still-open confirm step.
+    expect(screen.getByTestId("roast-discard-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("roast-discard-confirm")).not.toBeInTheDocument();
+  });
+
   it("resets the ChargeWeight correction draft when navigating between two different runs (#520 round-2 P4): run A's unsaved draft must never leak into a POST against run B", () => {
     const { rerender } = render(
       <DetailView detail={FIXTURE_DETAIL} telemetry={FIXTURE_TELEMETRY} timeline={FIXTURE_TIMELINE} />,
@@ -466,9 +499,10 @@ describe("DetailView completed-run widget visibility (#533)", () => {
   // RoastedWeight / ChargeWeight / RoastTastings each POST a completed-run-
   // only endpoint. On an in-progress run's detail view (reachable via a
   // direct /roasts/:id visit while the roast is still live), rendering
-  // these forms offers 409-doomed saves. ONE gate at DetailView, not four
-  // per-widget checks.
-  it("hides all four completed-run-only widgets on an in-progress run (completed_at_utc: null)", () => {
+  // these forms offers 409-doomed saves. ONE gate at DetailView, not five
+  // per-widget checks. RoastDiscard (#582) joins the same gate — a discard
+  // is likewise a completed-run immutability exception.
+  it("hides all five completed-run-only widgets on an in-progress run (completed_at_utc: null)", () => {
     render(
       <DetailView
         detail={{ ...FIXTURE_DETAIL, completed_at_utc: null }}
@@ -481,14 +515,16 @@ describe("DetailView completed-run widget visibility (#533)", () => {
     expect(screen.queryByTestId("roasted-weight")).toBeNull();
     expect(screen.queryByTestId("charge-weight")).toBeNull();
     expect(screen.queryByTestId("roast-tastings")).toBeNull();
+    expect(screen.queryByTestId("roast-discard")).toBeNull();
   });
 
-  it("shows all four completed-run-only widgets on a completed run (completed_at_utc set)", () => {
+  it("shows all five completed-run-only widgets on a completed run (completed_at_utc set)", () => {
     renderView();
     expect(screen.getByTestId("roast-rating")).toBeInTheDocument();
     expect(screen.getByTestId("roasted-weight")).toBeInTheDocument();
     expect(screen.getByTestId("charge-weight")).toBeInTheDocument();
     expect(screen.getByTestId("roast-tastings")).toBeInTheDocument();
+    expect(screen.getByTestId("roast-discard")).toBeInTheDocument();
   });
 
   it("still renders RoastConditions and ExportOptions on an in-progress run — they are read-outs, not forms", () => {

@@ -336,11 +336,57 @@ async def test_v10_migration_adds_explicit_ambient_captured_latch_back_compat(
 
 
 @pytest.mark.asyncio
-async def test_fresh_store_is_v12(tmp_store: RoastStore) -> None:
-    """A brand-new store lands on the current (v12) schema version."""
+async def test_v13_migration_adds_excluded_flag_back_compat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#582: a REAL pre-v13 completed run (written on the pre-v13 schema, no
+    ``excluded`` column yet) upgrades cleanly through a genuine migration
+    round-trip, and its ``excluded`` flag reads back ``False`` (default 0)
+    post-migration — every pre-existing roast stays visible until explicitly
+    discarded (zero behavior change for the whole existing corpus on
+    upgrade), and it is NOT accidentally hidden by the new
+    ``list_runs``/reference-retrieval ``excluded = 0`` filters."""
+    pre_v13 = MIGRATIONS[:12]  # V1..V12 (before the soft-exclude flag)
+    assert len(pre_v13) == 12
+    db_path = tmp_path / "v13upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", pre_v13)
+    old = RoastStore(db_path=db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 12
+        await seeded_store(old)
+        # Complete the run against the pre-v13 schema — no ``excluded``
+        # column exists yet, so this is a genuine pre-existing completed
+        # roast (``complete_run`` only touches columns present since v1/v2).
+        await old.complete_run(run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path=db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 13 == len(MIGRATIONS)
+        row = await fetch_one(upgraded, "SELECT excluded FROM roast_runs WHERE id = 'run-1'")
+        assert row == (0,)
+        detail = await upgraded.read_run("run-1")
+        assert detail is not None
+        assert detail.excluded is False
+        # Still visible in history — not accidentally hidden by the new
+        # list_runs() excluded=0 filter.
+        summaries = await upgraded.list_runs()
+        assert [s.id for s in summaries] == ["run-1"]
+        assert summaries[0].excluded is False
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_store_is_v13(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v13) schema version."""
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 12 == len(MIGRATIONS)
+        assert await tmp_store.schema_version() == 13 == len(MIGRATIONS)
     finally:
         await tmp_store.close()
 
@@ -1821,6 +1867,193 @@ async def test_set_corrected_charge_on_active_run_raises(tmp_store: RoastStore) 
         await tmp_store.close()
 
 
+# --- soft-exclude / discard a roast (#582) ---
+
+
+@pytest.mark.asyncio
+async def test_excluded_flag_is_an_immutability_exception(tmp_store: RoastStore) -> None:
+    """#582 load-bearing empirical proof: the v2 immutability trigger's ``WHEN``
+    clause is an EXPLICIT column list (agent_phase, profile_json, config_json,
+    …) that does NOT enumerate ``excluded`` — so, exactly like
+    ``operator_rating`` / ``roasted_weight_grams`` / ``corrected_charge_grams``,
+    the new column is mutable on a completed run without editing the shipped
+    trigger. Verified directly against a real completed run: set, then
+    toggled back (reversible by design) — both UPDATEs must succeed."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_run_excluded("run-1", excluded=True)
+        row = await fetch_one(tmp_store, "SELECT excluded FROM roast_runs WHERE id = 'run-1'")
+        assert row == (1,)
+
+        # Reversible: toggling back to False on the SAME completed run also succeeds.
+        await tmp_store.set_run_excluded("run-1", excluded=False)
+        row = await fetch_one(tmp_store, "SELECT excluded FROM roast_runs WHERE id = 'run-1'")
+        assert row == (0,)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_immutability_trigger_still_aborts_real_fields_after_excluded_ships(
+    tmp_store: RoastStore,
+) -> None:
+    """#582 safety crux, other half of the empirical proof: adding the
+    ``excluded`` column must NOT weaken immutability for any REAL field —
+    the v2 trigger's ``WHEN`` clause is unedited, so a real-field UPDATE on a
+    completed run still ABORTs, exactly as :func:`test_completed_runs_are_immutable`
+    already proves pre-#582. Re-asserted here, in the SAME session as the
+    ``excluded`` mutability proof above, so the two facts are verified
+    together rather than relying on a historical test staying green."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        # The exception column mutates fine...
+        await tmp_store.set_run_excluded("run-1", excluded=True)
+        # ...but a real frozen field still aborts, trigger unweakened.
+        with pytest.raises(aiosqlite_module.IntegrityError, match="immutable"):
+            await tmp_store.update_run_phase("run-1", RoastPhase.IDLE)
+        with pytest.raises(aiosqlite_module.IntegrityError, match="immutable"):
+            await tmp_store.connection.execute(
+                "UPDATE roast_runs SET outcome = 'aborted' WHERE id = 'run-1'"
+            )
+        with pytest.raises(aiosqlite_module.IntegrityError, match="immutable"):
+            await tmp_store.connection.execute("DELETE FROM roast_runs WHERE id = 'run-1'")
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_run_excluded_on_unknown_run_raises(tmp_store: RoastStore) -> None:
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no completed roast_run"):
+            await tmp_store.set_run_excluded("ghost-run", excluded=True)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_set_run_excluded_on_active_run_raises(tmp_store: RoastStore) -> None:
+    """#582: completed-only, like the rating/roasted-weight/charge-correction —
+    an in-progress run cannot be silently hidden mid-roast."""
+    await seeded_store(tmp_store)
+    try:
+        with pytest.raises(RuntimeError, match="no completed roast_run"):
+            await tmp_store.set_run_excluded("run-1", excluded=True)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_excluded_run_is_filtered_from_list_runs(tmp_store: RoastStore) -> None:
+    """#582: a discarded run vanishes from the history list."""
+    await seeded_store(tmp_store, run_id="run-keep")
+    try:
+        await tmp_store.create_run(
+            run_id="run-discard",
+            profile=PROFILE,
+            config=AppConfig(),
+            agent_phase=RoastPhase.STARTING,
+        )
+        await tmp_store.complete_run(
+            run_id="run-keep", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.complete_run(
+            run_id="run-discard", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_run_excluded("run-discard", excluded=True)
+
+        summaries = await tmp_store.list_runs()
+        ids = {s.id for s in summaries}
+        assert ids == {"run-keep"}
+        assert all(not s.excluded for s in summaries)
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_excluded_run_restored_reappears_in_list_runs(tmp_store: RoastStore) -> None:
+    """#582: reversible — restoring a discarded run brings it back into history."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_run_excluded("run-1", excluded=True)
+        assert await tmp_store.list_runs() == []
+
+        await tmp_store.set_run_excluded("run-1", excluded=False)
+        summaries = await tmp_store.list_runs()
+        assert [s.id for s in summaries] == ["run-1"]
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_read_run_still_returns_a_discarded_run_flagged(tmp_store: RoastStore) -> None:
+    """#582: unlike list_runs, read_run keeps returning a discarded run — a
+    direct link still works — carrying excluded=True so the detail page can
+    render the discarded indicator + restore action."""
+    await seeded_store(tmp_store)
+    try:
+        detail = await tmp_store.read_run("run-1")
+        assert detail is not None
+        assert detail.excluded is False
+
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        await tmp_store.set_run_excluded("run-1", excluded=True)
+
+        discarded = await tmp_store.read_run("run-1")
+        assert discarded is not None
+        assert discarded.excluded is True
+        assert discarded.id == "run-1"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_discarding_a_run_leaves_its_child_rows_untouched(tmp_store: RoastStore) -> None:
+    """#582: a soft-exclude, never a delete — telemetry, events, and the export
+    manifest for a discarded run must survive byte-for-byte (the whole point:
+    the audio + FC-miss label are prime fine-tuning data, kept regardless)."""
+    await seeded_store(tmp_store)
+    try:
+        await tmp_store.record_telemetry(
+            run_id="run-1",
+            tick=1,
+            agent_phase=RoastPhase.ROASTING_PRE_FIRST_CRACK,
+            elapsed_seconds=10.0,
+            interval_seconds=0.0,
+            telemetry=RoastTelemetry(bean_temp_c=150.0, env_temp_c=165.0, bean_ror_c_per_min=6.0),
+        )
+        await tmp_store.record_event(
+            run_id="run-1",
+            kind=RoastEventKind.RUN_STARTED,
+            source=RoastEventSource.CONTROLLER,
+        )
+        await tmp_store.complete_run(
+            run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE
+        )
+        telemetry_before = await tmp_store.read_telemetry_points("run-1")
+        timeline_before = await tmp_store.read_timeline("run-1")
+
+        await tmp_store.set_run_excluded("run-1", excluded=True)
+
+        telemetry_after = await tmp_store.read_telemetry_points("run-1")
+        timeline_after = await tmp_store.read_timeline("run-1")
+        assert telemetry_after == telemetry_before
+        assert timeline_after == timeline_before
+    finally:
+        await tmp_store.close()
+
+
 # --- atomic cross-value bound (#520 round-2 P3) ---
 #
 # The API layer's own pre-checks (read `detail`, write moments later) leave a
@@ -2978,6 +3211,46 @@ async def test_find_reference_run_falls_through_a_higher_rated_faulted_candidate
         await _seed_completed_run(tmp_store, "completed-three-star", profile=profile, rating=3)
 
         assert await tmp_store.find_reference_run(slug, 250.0) == "completed-three-star"
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_excludes_a_discarded_run(tmp_store: RoastStore) -> None:
+    """#582: a soft-excluded (discarded) run must never surface as a reference
+    candidate — the corpus-hygiene point of the flag. Mirrors
+    :func:`test_find_reference_run_excludes_faulted_runs`, but for a run that
+    is otherwise a perfectly legitimate completed+rated+same-bean candidate."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await _seed_completed_run(tmp_store, "discarded", profile=profile, rating=5)
+        await tmp_store.set_run_excluded("discarded", excluded=True)
+        assert await tmp_store.find_reference_run(slug, 250.0) is None
+        assert await tmp_store.load_reference_roast(slug, 250.0) is None
+    finally:
+        await tmp_store.close()
+
+
+@pytest.mark.asyncio
+async def test_find_reference_run_falls_through_a_higher_rated_discarded_candidate(
+    tmp_store: RoastStore,
+) -> None:
+    """#582: a higher-rated but DISCARDED run of the same bean+weight must not
+    win over a lower-rated genuinely-included one — mirrors the faulted-run
+    fallthrough test for the excluded flag."""
+    await tmp_store.initialize()
+    try:
+        profile = _reference_profile()
+        slug = recording_origin_slug(profile)
+        assert slug is not None
+        await _seed_completed_run(tmp_store, "discarded-five-star", profile=profile, rating=5)
+        await tmp_store.set_run_excluded("discarded-five-star", excluded=True)
+        await _seed_completed_run(tmp_store, "included-three-star", profile=profile, rating=3)
+
+        assert await tmp_store.find_reference_run(slug, 250.0) == "included-three-star"
     finally:
         await tmp_store.close()
 
