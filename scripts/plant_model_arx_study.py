@@ -32,7 +32,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import shutil
 import sqlite3
 import sys
 import tempfile
@@ -86,12 +85,18 @@ FEATURE_NAMES: list[str] = (
     + [f"fan_lag{lag}" for lag in FAN_LAGS]
     + ["t_since_heat_chg", "fc_ind", "fc_x_heat"]
 )
-#: Columns kept for the "no heat/fan" ablation model.
-_NOHEAT_COLS: list[int] = [
-    i
-    for i, name in enumerate(FEATURE_NAMES)
-    if not (name.startswith(("heat_lag", "fan_lag")) or name == "fc_x_heat")
-]
+#: Feature names derived from the heat/fan inputs. The no-heat ablation must drop
+#: ALL of these -- including ``t_since_heat_chg`` (heat-change timing) and the
+#: ``fc_x_heat`` interaction -- or it secretly retains heat information and stops
+#: being a true heat-removed comparison.
+_HEAT_DERIVED: frozenset[str] = frozenset(
+    [f"heat_lag{lag}" for lag in HEAT_LAGS]
+    + [f"fan_lag{lag}" for lag in FAN_LAGS]
+    + ["t_since_heat_chg", "fc_x_heat"]
+)
+#: Columns kept for the "no heat/fan" ablation model (every heat-derived feature
+#: removed).
+_NOHEAT_COLS: list[int] = [i for i, name in enumerate(FEATURE_NAMES) if name not in _HEAT_DERIVED]
 
 
 def _empty_landmarks() -> dict[str, float]:
@@ -104,7 +109,9 @@ class Roast:
     """One roast unified to the common per-tick schema (charge-referenced, 1 Hz).
 
     Attributes:
-        rid: Roast identifier.
+        rid: Short display identifier (e.g. ``store:d3886fe0``).
+        source_id: Full provenance id -- the ``.alog`` filename (Artisan) or the
+            full store ``run_id``. Pins the exact input in the data manifest.
         corpus: ``"artisan"`` or ``"store"``.
         t: Integer seconds from charge (0..drop).
         bt: Bean temperature, deg C, per tick.
@@ -118,6 +125,7 @@ class Roast:
     """
 
     rid: str
+    source_id: str
     corpus: str
     t: NDArray[np.float64]
     bt: NDArray[np.float64]
@@ -237,6 +245,7 @@ def load_artisan(alog_dir: Path) -> list[Roast]:
 
         r = Roast(
             rid=f"artisan:{path.stem}",
+            source_id=path.name,
             corpus="artisan",
             t=t_grid,
             bt=bt,
@@ -322,13 +331,16 @@ def load_store(store_copy: Path) -> list[Roast]:
             )
             heat = _carry_forward(grid, secs, [by_sec[int(s)][2] for s in secs])
             fan = _carry_forward(grid, secs, [by_sec[int(s)][3] for s in secs])
-            base = float(grid.min())
-            t_grid = grid - base
+            # ``charge_elapsed_seconds`` is ALREADY on the charge/T0 clock (t=0 at
+            # charge), matching Artisan's charge-referenced grid. Use it as-is --
+            # do NOT re-reference to the first selected row, which would shift the
+            # clock whenever pre-T0 rows are dropped and misalign the t+h targets.
+            t_grid = grid
 
             fc_t = float("nan")
             for s in secs:
                 if by_sec[int(s)][4] == "development":
-                    fc_t = float(s) - base
+                    fc_t = float(s)
                     break
             fc_ev = con.execute(
                 "select payload_json from roast_events where run_id=? and kind='first_crack' "
@@ -351,6 +363,7 @@ def load_store(store_copy: Path) -> list[Roast]:
 
             r = Roast(
                 rid=f"store:{rid[:8]}",
+                source_id=rid,
                 corpus="store",
                 t=t_grid,
                 bt=bt,
@@ -664,16 +677,38 @@ def _sha256(path: Path) -> str:
 
 
 def _copy_store_readonly(store: Path, tmp: Path) -> Path:
-    """Copy the store DB into ``tmp`` and verify the copy matches the source.
+    """WAL-safely snapshot the store DB into ``tmp`` for read-only analysis.
 
-    The harness only ever reads the copy; the operator's live DB is never opened
-    read-write. Raises if the copy's sha256 diverges from the source.
+    The app runs SQLite in WAL mode and does not checkpoint, so committed rows
+    can live in the ``-wal`` sidecar. A plain file copy of the ``.sqlite3`` alone
+    would miss them. This uses the SQLite backup API from a **read-only**
+    connection, which consolidates the main DB + WAL into a single self-contained
+    snapshot. The operator's live DB is never opened read-write; the source
+    file's sha256 is verified unchanged across the backup.
+
+    Args:
+        store: The live store DB path.
+        tmp: A temp directory to hold the snapshot.
+
+    Returns:
+        The snapshot path.
+
+    Raises:
+        RuntimeError: If the source file's sha256 changed across the backup.
     """
     src_sha = _sha256(store)
     dst = tmp / "store_copy.sqlite3"
-    shutil.copyfile(store, dst)
-    if _sha256(dst) != src_sha:
-        raise RuntimeError("store copy sha256 mismatch -- read-only copy is corrupt")
+    src = sqlite3.connect(f"file:{store}?mode=ro", uri=True)
+    try:
+        snap = sqlite3.connect(dst)
+        try:
+            src.backup(snap)
+        finally:
+            snap.close()
+    finally:
+        src.close()
+    if _sha256(store) != src_sha:
+        raise RuntimeError("store source sha256 changed during backup -- not read-only")
     return dst
 
 
@@ -704,7 +739,7 @@ def _write_rmse_csv(rmse: dict[str, Any], rmse_mid: dict[str, Any], out_dir: Pat
     (out_dir / "loro_rmse.csv").write_text("\n".join(lines) + "\n")
 
 
-def _write_step_traces_csv(roasts: list[Roast], preds: dict[str, Any], out_dir: Path) -> None:
+def _write_step_traces_csv(roasts: list[Roast], preds: dict[str, Any], dest: Path) -> None:
     lines = ["rid,corpus,tick,base_ror,arx_20,act_20,arx_30,act_30,arx_40,act_40"]
     rmap = {r.rid: r for r in roasts}
     records: list[dict[str, Any]] = preds["records"]
@@ -726,7 +761,8 @@ def _write_step_traces_csv(roasts: list[Roast], preds: dict[str, Any], out_dir: 
             f"{float(rec['arx_30']):.2f},{float(rec['act_30']):.2f},"
             f"{float(rec['arx_40']):.2f},{float(rec['act_40']):.2f}"
         )
-    (out_dir / "step_response_traces.csv").write_text("\n".join(lines) + "\n")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text("\n".join(lines) + "\n")
 
 
 def _write_report(summary: dict[str, Any], out_dir: Path) -> None:
@@ -797,13 +833,16 @@ def _write_report(summary: dict[str, Any], out_dir: Path) -> None:
     (out_dir / "phase1-arx-report.md").write_text(report)
 
 
-def run_study(alog_dir: Path, store: Path, out_dir: Path) -> dict[str, Any]:
+def run_study(alog_dir: Path, store: Path, out_dir: Path, raw_traces: Path) -> dict[str, Any]:
     """Run the full study, write artifacts to ``out_dir``, and return the summary.
 
     Args:
         alog_dir: Directory of Artisan ``.alog`` files.
-        store: Path to the store SQLite DB (opened read-only via a temp copy).
-        out_dir: Directory to write the report and CSV/JSON artifacts.
+        store: Path to the store SQLite DB (opened read-only via a temp snapshot).
+        out_dir: Directory for the committable artifacts (report + aggregate
+            CSV/JSON). Never receives raw per-tick telemetry.
+        raw_traces: File path for the raw per-tick step-response traces (roast-log
+            data). Kept out of ``out_dir`` so it never lands in a tracked dir.
 
     Returns:
         The summary dict (also written as ``model_summary.json``).
@@ -835,7 +874,7 @@ def run_study(alog_dir: Path, store: Path, out_dir: Path) -> dict[str, Any]:
 
     _write_landmarks_csv(pooled, out_dir)
     _write_rmse_csv(cv["rmse"], cv["rmse_mid"], out_dir)
-    _write_step_traces_csv(pooled, cv["preds"], out_dir)
+    _write_step_traces_csv(pooled, cv["preds"], raw_traces)
 
     summary: dict[str, Any] = {
         "corpora": {
@@ -868,22 +907,23 @@ def emit_manifest(alog_dir: Path, store: Path, dest: Path) -> None:
         store: Path to the store SQLite DB (read-only).
         dest: Path to write the manifest markdown.
     """
+    # Drive the manifest off the SAME selection the study uses, so its set is
+    # exactly what was modelled -- not merely "marks parse" (load_artisan also
+    # drops roasts with a < 120 s charge->drop span).
+    modelled_artisan = load_artisan(alog_dir)
     alog_rows: list[tuple[str, str, int]] = []
-    for path in sorted(alog_dir.glob("*.alog")):
-        try:
-            profile = load_alog(path)
-            extract_marks(profile)
-        except (ValueError, SyntaxError):
-            continue
+    for r in modelled_artisan:
+        path = alog_dir / r.source_id
+        profile = load_alog(path)
         samples = len(list(profile.get("timex", [])))
-        alog_rows.append((path.name, _sha256(path), samples))
+        alog_rows.append((r.source_id, _sha256(path), samples))
 
     with tempfile.TemporaryDirectory() as td:
         store_copy = _copy_store_readonly(store, Path(td))
         store_sha = _sha256(store)
         run_ids = completed_store_run_ids(store_copy)
         used = load_store(store_copy)
-    used_ids = {r.rid.split(":", 1)[1] for r in used}
+    used_ids = {r.source_id for r in used}  # full run_ids
 
     lines: list[str] = []
     lines.append("# Phase-1 plant-model study -- data manifest (fingerprint, not data)")
@@ -899,8 +939,11 @@ def emit_manifest(alog_dir: Path, store: Path, dest: Path) -> None:
     lines.append("")
     lines.append("## Artisan `.alog` corpus")
     lines.append("")
-    lines.append(f"- Source dir (local, not committed): `{DEFAULT_ALOG_DIR}`")
-    lines.append(f"- Usable roasts (marked FC + drop, >= 120 s): **{len(alog_rows)}**")
+    lines.append(f"- Source dir used (local, not committed): `{alog_dir}`")
+    lines.append(
+        f"- Roasts modelled (marked FC + drop, >= 120 s span -- the exact set the "
+        f"study used): **{len(alog_rows)}**"
+    )
     lines.append("")
     lines.append("| # | filename | sha256 | samples |")
     lines.append("|---|---|---|---|")
@@ -909,7 +952,7 @@ def emit_manifest(alog_dir: Path, store: Path, dest: Path) -> None:
     lines.append("")
     lines.append("## Store roasts (`roastpilot.sqlite3`)")
     lines.append("")
-    lines.append(f"- Source DB (local, not committed): `{DEFAULT_STORE}`")
+    lines.append(f"- Source DB used (local, not committed): `{store}`")
     lines.append(f"- DB file sha256 at study time: `{store_sha}`")
     lines.append(
         "  (advisory only -- the DB grows as new roasts are recorded; the run ids "
@@ -965,7 +1008,17 @@ def main(argv: list[str] | None = None) -> int:
         "--out-dir",
         type=Path,
         default=Path("plant-model-out"),
-        help="directory to write the report and CSV/JSON artifacts",
+        help="directory for the COMMITTABLE artifacts (report + aggregate CSV/JSON)",
+    )
+    parser.add_argument(
+        "--raw-traces",
+        type=Path,
+        default=None,
+        help=(
+            "file path for the RAW per-tick step-response traces (roast-log data). "
+            "Defaults to a temp file so raw telemetry never lands in a tracked dir; "
+            "pass an explicit path to keep it."
+        ),
     )
     parser.add_argument(
         "--emit-manifest",
@@ -980,9 +1033,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"wrote manifest -> {args.emit_manifest}")
         return 0
 
-    summary = run_study(args.alog_dir, args.store, args.out_dir)
+    raw_traces: Path | None = args.raw_traces
+    if raw_traces is None:
+        raw_traces = Path(tempfile.gettempdir()) / "plant_model_step_response_traces.csv"
+    summary = run_study(args.alog_dir, args.store, args.out_dir, raw_traces)
     print(json.dumps(summary["corpora"], indent=2))
-    print(f"\nartifacts -> {args.out_dir}")
+    print(f"\ncommittable artifacts -> {args.out_dir}")
+    print(f"raw step-response traces (not committable) -> {raw_traces}")
     return 0
 
 
@@ -1019,7 +1076,7 @@ detection-method / policy differences, not a probe-scale shift:
 - **Drop BT ~-5.5 C (store lower).** The agent drops beans ~5 C cooler by policy
   (a deliberately conservative bitter-ceiling drop), not because the probe reads
   low.
-- **Turnaround ~+21.6 C.** Confounded by charge conditions (batch mass / charge
+- **Turnaround ~+21.9 C.** Confounded by charge conditions (batch mass / charge
   temp differ across the multi-year Artisan set) **and** the store sampling
   caveat below -- store telemetry is sparse (~5-6 s) and phase-gated, so the
   interpolated turnaround minimum is shallow. Not a reliable comparator.

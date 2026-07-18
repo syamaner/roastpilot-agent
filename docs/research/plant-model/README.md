@@ -46,9 +46,15 @@ From the repo root, with the project venv (`.venv`) set up per `AGENTS.md`:
 ```
 
 Both `--alog-dir` and `--store` default to the paths above, so on the operator's
-machine the flags are optional. The run also writes `step_response_traces.csv`
-(raw per-tick predicted-vs-actual on the heat-step segments) into `--out-dir`;
-that file is **regenerable and intentionally not committed** (see below).
+machine the flags are optional, and `--out-dir` only ever receives the
+committable artifacts.
+
+The raw per-tick step-response traces (`step_response_traces.csv`, raw roast-log
+data) are written **separately** and, by default, to a temp file **outside the
+repo** so a reproduce never drops raw telemetry into a tracked directory. Pass
+`--raw-traces <path>` to keep them somewhere explicit. The file is regenerable
+and intentionally not committed (see below); `.gitignore` also blocks it as a
+belt-and-suspenders guard.
 
 ## Guarantees
 

@@ -18,10 +18,10 @@ distributions between corpora:
 
 | Landmark | Artisan mean ± sd | Store mean ± sd | Offset (store − artisan) |
 |---|---|---|---|
-| turnaround_bt | 69.4 ± 9.8 (n=47) | 91.0 ± 3.8 (n=13) | +21.6 |
-| dry_end_bt | 150.5 ± 5.0 (n=47) | 150.1 ± 0.3 (n=12) | -0.4 |
+| turnaround_bt | 69.4 ± 9.8 (n=47) | 91.3 ± 3.8 (n=14) | +21.9 |
+| dry_end_bt | 150.5 ± 5.0 (n=47) | 150.1 ± 0.3 (n=13) | -0.4 |
 | fc_bt | 177.6 ± 3.9 (n=47) | 184.2 ± 2.3 (n=12) | +6.6 |
-| drop_bt | 196.4 ± 3.3 (n=47) | 190.8 ± 3.8 (n=13) | -5.5 |
+| drop_bt | 196.4 ± 3.3 (n=47) | 190.9 ± 3.6 (n=14) | -5.5 |
 
 **Finding: no clean evidence of a probe-calibration offset that would block
 pooling.** The apparent landmark offsets are all explained by
@@ -34,7 +34,7 @@ detection-method / policy differences, not a probe-scale shift:
 - **Drop BT ~-5.5 C (store lower).** The agent drops beans ~5 C cooler by policy
   (a deliberately conservative bitter-ceiling drop), not because the probe reads
   low.
-- **Turnaround ~+21.6 C.** Confounded by charge conditions (batch mass / charge
+- **Turnaround ~+21.9 C.** Confounded by charge conditions (batch mass / charge
   temp differ across the multi-year Artisan set) **and** the store sampling
   caveat below -- store telemetry is sparse (~5-6 s) and phase-gated, so the
   interpolated turnaround minimum is shallow. Not a reliable comparator.
@@ -51,10 +51,10 @@ harmless. Data volume is not the blocker (see the verdict).
 ## 2. Corpus statistics
 
 - Artisan roasts used: **47**
-- Store roasts used (completed, usable telemetry): **13**
-- Pooled roasts: **60**
-- Modelled ticks (all features + all-horizon targets present): **35814**
-- Pre-FC ticks: 34393 · Post-FC ticks: 6221
+- Store roasts used (completed, usable telemetry): **14**
+- Pooled roasts: **61**
+- Modelled ticks (all features + all-horizon targets present): **36429**
+- Pre-FC ticks: 35047 · Post-FC ticks: 6262
 
 RoR derived as a **trailing 30 s linear-fit slope** of BT (deg C/min), causal at
 every tick (uses only samples up to and including t). Applied identically to both
@@ -71,27 +71,27 @@ Never train and test on the same roast. RMSE in deg C/min. The **no-heat ARX**
 (all heat/fan columns dropped) is the honest control ablation: if the full model
 does not beat it, the ARX is only autoregressive trend-following.
 
-**All ticks (n=35814, charge->drop):**
+**All ticks (n=36429, charge->drop):**
 
 | Model | t+20 | t+30 | t+40 |
 |---|---|---|---|
-| **ARX (linear, full)** | 1.50 | 1.60 | 1.62 |
-| ARX, no heat/fan (ablation) | 1.55 | 1.69 | 1.74 |
-| persistence (RoR[t+h]=RoR[t]) | 8.13 | 10.05 | 11.31 |
-| linear RoR extrapolation | 8.58 | 14.33 | 20.82 |
-| **ARX gain vs best naive** | +6.63 (+82%) | +8.45 (+84%) | +9.69 (+86%) |
+| **ARX (linear, full)** | 1.51 | 1.61 | 1.63 |
+| ARX, no heat/fan (ablation) | 1.56 | 1.70 | 1.75 |
+| persistence (RoR[t+h]=RoR[t]) | 8.11 | 10.02 | 11.27 |
+| linear RoR extrapolation | 8.57 | 14.32 | 20.79 |
+| **ARX gain vs best naive** | +6.60 (+81%) | +8.40 (+84%) | +9.64 (+86%) |
 
 (Positive gain = ARX beats the best naive baseline by that many deg C/min.)
 
 **Mid/late roast only (BT >= 150 C -- where drop/RoR control actually happens,
-n=14280):**
+n=14542):**
 
 | Model | t+20 | t+30 | t+40 |
 |---|---|---|---|
-| **ARX (linear, full)** | 1.50 | 1.64 | 1.69 |
-| ARX, no heat/fan (ablation) | 1.63 | 1.85 | 1.97 |
-| persistence | 1.57 | 1.68 | 1.77 |
-| linear RoR extrapolation | 2.58 | 3.29 | 3.99 |
+| **ARX (linear, full)** | 1.51 | 1.65 | 1.69 |
+| ARX, no heat/fan (ablation) | 1.64 | 1.85 | 1.98 |
+| persistence | 1.58 | 1.69 | 1.78 |
+| linear RoR extrapolation | 2.60 | 3.32 | 4.03 |
 
 ## 4. Heat-step counterfactual (the control-relevant test)
 
@@ -101,14 +101,14 @@ within 5-40 s **after** a heat setpoint step of
 **full ARX vs no-heat ARX**: only the heat columns can explain the RoR bend a
 step induces.
 
-- Heat steps found -- Artisan: **374**, Store: **39**
-- Step-response ticks scored: **2839**
+- Heat steps found -- Artisan: **374**, Store: **40**
+- Step-response ticks scored: **2875**
 
 | Model | t+20 | t+30 | t+40 |
 |---|---|---|---|
-| **ARX full (on step-response)** | 1.78 | 1.90 | 1.92 |
-| ARX no-heat (on step-response) | 1.88 | 2.10 | 2.23 |
-| persistence (on step-response) | 15.26 | 18.65 | 21.03 |
+| **ARX full (on step-response)** | 1.80 | 1.91 | 1.93 |
+| ARX no-heat (on step-response) | 1.90 | 2.11 | 2.25 |
+| persistence (on step-response) | 15.18 | 18.54 | 20.90 |
 
 RMSE in deg C/min. If full ARX does not beat the no-heat ablation **here**, it
 has not learned the heat->RoR dynamics -- only smooth coasting, useless for

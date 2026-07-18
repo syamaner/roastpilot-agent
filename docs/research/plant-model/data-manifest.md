@@ -4,8 +4,8 @@ This manifest is how the study's raw inputs are "committed" under the `AGENTS.md
 
 ## Artisan `.alog` corpus
 
-- Source dir (local, not committed): `/Users/sertanyamaner/Library/Mobile Documents/com~apple~CloudDocs/roasting`
-- Usable roasts (marked FC + drop, >= 120 s): **47**
+- Source dir used (local, not committed): `/Users/sertanyamaner/Library/Mobile Documents/com~apple~CloudDocs/roasting`
+- Roasts modelled (marked FC + drop, >= 120 s span -- the exact set the study used): **47**
 
 | # | filename | sha256 | samples |
 |---|---|---|---|
@@ -59,29 +59,30 @@ This manifest is how the study's raw inputs are "committed" under the `AGENTS.md
 
 ## Store roasts (`roastpilot.sqlite3`)
 
-- Source DB (local, not committed): `/Users/sertanyamaner/roasts/roastpilot.sqlite3`
-- DB file sha256 at study time: `47b0e056a45ed2904aee731d3f276a14e61e222a7d2727a9afa7d7ba842530ba`
+- Source DB used (local, not committed): `/Users/sertanyamaner/roasts/roastpilot.sqlite3`
+- DB file sha256 at study time: `5bdbe9a5c3881cd5b19a88e0952d233e516292c284faa507a778bc5c62282b37`
   (advisory only -- the DB grows as new roasts are recorded; the run ids below pin the exact rows.)
-- Completed runs in DB: **13**
-- Completed runs actually modelled (>= 60 usable telemetry rows): **13**
+- Completed runs in DB: **14**
+- Completed runs actually modelled (>= 60 usable telemetry rows): **14**
 
 Completed-run telemetry is immutable once the run's completion trigger has fired, so the run id pins the data. Runs with fewer than 60 usable `roasting_pre_first_crack`/`development` telemetry rows are skipped by the harness.
 
 | # | run_id | modelled |
 |---|---|---|
-| 1 | `3fbfd8882d144965b1a2de4de8721d87` | no |
-| 2 | `5a32334c8da643eab8638032756a7cf7` | no |
-| 3 | `d251013e220c4364bb0a122de6a93244` | no |
-| 4 | `b74153ed91bf4e5d81715ca7a0c7ffec` | no |
-| 5 | `f3fc65fa6e72422597f1acb5e62fe135` | no |
-| 6 | `bf85c77a5436406285571a75df017512` | no |
-| 7 | `a4299aea124b43d289bd425d4dc850c4` | no |
-| 8 | `d55b0fce6c184e878042a6210d5c28f7` | no |
-| 9 | `edbe9a76364342ed9b1338affd77c758` | no |
-| 10 | `98fab734a83b4bab864c14f6a003040e` | no |
-| 11 | `43c84c98f052485ab35a98264d7ff8b5` | no |
-| 12 | `8ac8a5e4122941ca8109700fce92bc68` | no |
-| 13 | `f24fca980468443884227a9ed1e55486` | no |
+| 1 | `3fbfd8882d144965b1a2de4de8721d87` | yes |
+| 2 | `5a32334c8da643eab8638032756a7cf7` | yes |
+| 3 | `d251013e220c4364bb0a122de6a93244` | yes |
+| 4 | `b74153ed91bf4e5d81715ca7a0c7ffec` | yes |
+| 5 | `f3fc65fa6e72422597f1acb5e62fe135` | yes |
+| 6 | `bf85c77a5436406285571a75df017512` | yes |
+| 7 | `a4299aea124b43d289bd425d4dc850c4` | yes |
+| 8 | `d55b0fce6c184e878042a6210d5c28f7` | yes |
+| 9 | `edbe9a76364342ed9b1338affd77c758` | yes |
+| 10 | `98fab734a83b4bab864c14f6a003040e` | yes |
+| 11 | `43c84c98f052485ab35a98264d7ff8b5` | yes |
+| 12 | `8ac8a5e4122941ca8109700fce92bc68` | yes |
+| 13 | `f24fca980468443884227a9ed1e55486` | yes |
+| 14 | `98df5723345e4ff1b75170a9c3d32c6f` | yes |
 
 ## Exclusion note
 
