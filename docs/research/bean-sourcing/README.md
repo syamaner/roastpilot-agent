@@ -10,12 +10,16 @@ outside the roaster safety envelope (`bean_sourcing.py` never imports
 controller/safety/mcp_client).
 
 This note is the product of five parallel web-research passes (18 Jul 2026);
-every non-obvious claim below is cited in the source reports. Section 6 lists the
-key sources. **Bottom line: this is a simpler problem than the general "LLM
-extraction" literature implies** — a single product page is short, often already
-carries machine-readable structured data, and the human review step is the safety
-net. The high-value work is in *preprocessing* and *making provenance verified
-rather than claimed*, not in exotic decoding machinery.
+the source URLs are collected in **§7**. A caveat on the numbers: specific quantitative
+figures cited here (e.g. the ~65% token reduction, the ρ=0.31 confidence-signal
+correlation, the "35→3 schema violations") are each **single-source and indicative,
+not settled** — several rest on 2026 preprints or vendor blogs, and the raw research
+transcripts are not committed to the repo. Treat them as directional priors to falsify
+against our own bake-off, never as established constants. **Bottom line: this is a
+simpler problem than the general "LLM extraction" literature implies** — a single
+product page is short, often already carries machine-readable structured data, and the
+human review step is the safety net. The high-value work is in *preprocessing* and
+*making provenance verified rather than claimed*, not in exotic decoding machinery.
 
 ---
 
@@ -48,11 +52,14 @@ The single biggest improvement is to **not send raw HTML to the LLM** and to
    `extruct` library lifts all of these in one call. Whatever it yields
    (name, brand, description, offers, `additionalProperty`) is **exact and free**
    — but *not* automatically about the requested bean: a page can carry stale,
-   variant, or related-product `Product` blocks, so JSON-LD is trusted only after
-   you **select the block matching the requested product** (by URL/title/offer) and
-   run it through the **same locality + provenance gates** as LLM output (§3).
-   Verified JSON-LD then feeds the LLM as trusted context to fill only the prose-only
-   gaps (variety, process, altitude, notes); unmatched blocks are ignored, not merged.
+   variant, or related-product `Product` blocks, so JSON-LD is trusted only after an
+   **identity match** — select the block whose `@id`/`url`/`sku`/`name`/`offers` matches
+   the requested product URL, and ignore the rest. Note this is a *different* gate from
+   the LLM's DOM-**locality** check (§3): JSON-LD lives in a `<script>` block, not the
+   visual product region, so the locality gate would wrongly reject exactly the data
+   this stage exists to recover. Use **identity-match for structured data, DOM-locality
+   for LLM spans.** Verified JSON-LD then feeds the LLM as trusted context to fill only
+   the prose-only gaps (variety, process, altitude, notes); unmatched blocks are dropped.
 2. **Boilerplate-strip to markdown with `trafilatura`** (`output_format='markdown'`)
    and feed *that* to the LLM, never raw HTML — ~65% fewer tokens and cleaner
    extraction (nav/footer/related-products stripped so the model isn't distracted
@@ -80,8 +87,12 @@ make it **verified by code**. Four **free** levers (no extra LLM call), ship fir
    field returns `{value, evidence_quote}`. After the call, confirm in code that
    `evidence_quote` is a substring of the fetched page text (normalised) *and* the
    value is derivable from it. If the quote isn't on the page → the model fabricated
-   it → force `origin_estimated`/null. This converts "the model claims on_page" into
-   "the code confirmed on_page" — the highest-leverage single change.
+   it → **discard the value (set the field to null/unset)**. Do *not* relabel it
+   `origin_estimated`: a failed-gate value is a fabrication, not an estimate, and
+   `origin_estimated` is reserved for the deterministic `_draft_from_identity` fallback
+   (a value the code *derived*, e.g. an origin-typical default) — keeping the two
+   distinct is what makes the provenance tag honest. This converts "the model claims
+   on_page" into "the code confirmed on_page" — the highest-leverage single change.
 2. **Locality check.** Verify the evidence span sits in the main product region, not
    a "related products / you may also like" block — pure containment passes on the
    *wrong bean*; locality closes that hole.
@@ -163,8 +174,13 @@ output:
 Match functions per field type: canonicalise (trim/lower/whitespace) → units/numbers
 to canonical unit with tolerance (`1800masl == 1800 m`, ±5 m) → enums via an
 auditable in-repo synonym table (`fully washed → washed`) → names/free-text via
-normalized Levenshtein (≥0.9 COR, 0.6–0.9 PAR) with an LLM-judge only on the residual
-→ blends by order-independent set alignment.
+normalized Levenshtein (≥0.9 COR, 0.6–0.9 PAR) → blends by order-independent set
+alignment. **Levenshtein alone is not sufficient for free-text/names** — a short edit
+distance can hide a *contradiction* (`washed` vs `unwashed`, `natural` vs `not
+natural`), so a high string-similarity match must still pass a **semantic/contradiction
+check** (a synonym+antonym table for the closed-ish fields, an LLM-judge equivalence
+call for genuinely free text) before it scores COR; a detected contradiction is INC,
+not COR. Log every LLM-judge call so the score stays reproducible.
 
 **Ranges (altitude especially).** Suppliers often state a range ("1,200–2,000 m"),
 which the scalar `altitude_m` schema field cannot represent faithfully — a real repo
@@ -172,9 +188,13 @@ case (several seeds collapse a supplier range into one scalar). Fix the policy
 explicitly, both in the schema and the scorer: label the gold value as the **range**;
 the extractor's contract is to return the range's midpoint (or low bound) **marked
 `origin_estimated`**, and the scorer credits COR when the model returns a scalar
-inside the gold range *and* flags it estimated, MIS if it abstains, SPU if it emits
-an out-of-range or unflagged scalar. (Preferably widen the schema to an optional
-`altitude_min_m`/`altitude_max_m` pair so a range can be stored faithfully.)
+inside the gold range *and* flags it estimated, MIS if it abstains, and **INC** if it
+emits an out-of-range or unflagged scalar. Note the outcome is **INC, not SPU** —
+the gold value is *present* (a range), so a wrong scalar is a present-value error;
+**`SPU` stays reserved strictly for gold-*absent* fields** (a value invented where the
+page states nothing). Overloading `SPU` onto present-but-wrong values would double-count
+it in both the recall and the abstention axes. (Preferably widen the schema to an
+optional `altitude_min_m`/`altitude_max_m` pair so a range can be stored faithfully.)
 
 Report three axes plus a combined rank that **makes an honest abstainer beat a
 confabulator**:
@@ -199,11 +219,14 @@ counts equally). Rank by `CombinedScore`; break ties on cost + latency.
   uncertainty and could drive the model gate wrongly. Reserve Wilson only for a
   strictly-binary decomposition (e.g. COR-vs-not, PAR excluded), and even then report
   it as indicative given the clustering.
-- **Paired McNemar — exact binomial** between the top models (<25 discordant pairs
-  → exact, not χ²), on a **binary** per-field correct/incorrect view, since every
-  model sees the same fixtures.
-- **Paired bootstrap** (10k resamples, resample pages) CI on the CombinedScore gap
-  (and on P/R/A, per the first bullet).
+- **The page-clustered paired bootstrap is the PRIMARY significance test** (resample
+  *pages*, not field-decisions, so within-page correlation is respected) — on the
+  CombinedScore gap *and* on P/R/A.
+- **Paired McNemar — exact binomial** is a *secondary, indicative* check only: it
+  treats each field-pair as independent, which our own clustering caveat says is false,
+  so it **overstates** significance. Use it as a coarse tie-breaker on a binary
+  per-field correct/incorrect view (<25 discordant pairs → exact, not χ²), never as the
+  deciding test where it disagrees with the page-clustered bootstrap.
 - Committed caveat text: a perfect small-set score is a **warning** (over-easy
   fixture or mislabel), not a verdict; prefer model A over B only where CIs don't
   overlap *and* the paired test is significant; else choose on cost/latency. Field
@@ -212,29 +235,43 @@ counts equally). Rank by `CombinedScore`; break ties on cost + latency.
 ### 5.3 Runtime monitoring — the draft→saved signal (highest value, near-zero cost)
 
 The human-gate gives free ground truth (the Langfuse "Corrections" pattern):
-**log one row per draft** in the existing SQLite store —
+**log one row per extraction ATTEMPT** (not just per successful draft) in the existing
+SQLite store —
 
-- `source_url`, resolved IP, fetch status/latency/bytes;
+- `source_url` (**redacted of any credentials**), resolved IP, fetch status/latency/bytes;
 - `model` slug + prompt-version hash;
-- `draft_output` (LLM proposal) **and** `saved_output` (operator accepted, if any);
-- an explicit **outcome: `accepted` / `rejected` / `abandoned`** — a badly-extracted
-  draft the operator throws away has *no* `saved_output`, so without this the worst
-  extractions vanish from the metric (survivorship bias) and a field can look
-  ~0%-edited precisely because its drafts are routinely rejected;
+- **terminal state**: `drafted` / `fetch_failed` / `extraction_failed` — a key point:
+  **attempts that never produce a draft** (DNS/SSRF rejection, fetch timeout, size-cap
+  rejection, model exception, exhausted schema-validation retries) must be logged too,
+  or the failure modes are invisible and the success metrics are inflated by
+  survivorship;
+- for a drafted attempt: `draft_output` (LLM proposal) **and** `saved_output` (operator
+  accepted, if any), plus an explicit **operator outcome: `accepted` / `rejected` /
+  `abandoned`** (a badly-extracted draft the operator throws away has no `saved_output`);
 - `parsed_output` + which fields failed validation / reasked;
 - tokens in/out + cost, total latency, any exception, on_page/estimated ratio.
 
-Then, **per field, `edited = draft[field] != saved[field]`** for accepted drafts,
-aggregated over a trailing window — **and count `rejected`/`abandoned` outcomes as
-maximal edits** for the drift signal so rejections aren't silently dropped:
+Two signals, kept **separate** so a draft-level event doesn't contaminate per-field data:
 
-- Rising edit rate (or rising reject/abandon rate) on a field = extractor/prompt
-  regression or a vendor page-layout change → the practical **drift alarm**.
-- A field is an **auto-accept** candidate only if it is ~0%-edited across a window
-  with a **low reject/abandon rate** — never on edit-rate alone (that's the
-  survivorship trap above).
-- Keep `(page, saved_output)` pairs as a **growing eval fixture set** — replay
-  offline whenever the prompt or model changes (the online→dataset→offline loop).
+- **Per-field edit rate** — `edited = draft[field] != saved[field]`, computed **only over
+  `accepted` drafts**, aggregated over a trailing window. Do **not** fold `rejected`/
+  `abandoned` drafts into per-field counts: a rejected draft is not evidence that *every*
+  field was wrong, and an abandon may be an interruption, not a quality signal — attributing
+  a draft-level outcome to each field would poison the per-field rate.
+- **Draft-level outcome rate** — the `accepted`/`rejected`/`abandoned` and
+  `fetch_failed`/`extraction_failed` mix over the window, tracked as its own series.
+- **Drift alarm** = a rise in *either* series (a field's edit rate, or the draft-level
+  reject/abandon/failure rate). **Auto-accept** a field only when it is ~0%-edited across
+  a window **and** the draft-level reject/abandon rate is low — never on per-field edit
+  rate alone (the survivorship trap).
+- **Fixture promotion, carefully.** A saved profile is ground truth for the *desired bean
+  record*, **not** for *what the page stated* — the operator may correct or add off-page
+  knowledge. So a `saved_output` cannot be promoted wholesale to an eval fixture (whose
+  gold is "what the page supports"). Promote only after a labelling step that re-derives
+  each field's `{value, absent}` gold **from the page**, flagging fields the operator
+  added that the page didn't state as gold-`absent`. Also **persist the exact fetched page
+  snapshot** (locally, not committed — supplier pages mutate/disappear) so offline replay
+  runs against the real input, not a re-fetch.
 
 ### 5.4 Pre-operator guardrails
 
