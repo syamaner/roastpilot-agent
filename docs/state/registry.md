@@ -102,7 +102,30 @@
 
 ## Active Context
 
-**18 Jul 2026 (latest) — #567 REFERENCE CURVES: offline bake-off ran NEGATIVE → feature PARKED
+**18 Jul 2026 (later — D102 plant-model experiment + the discard-roast feature).** After #567
+parked, the operator's diagnosis that the system lacks RoR PROJECTION (only the pre-FC FC-ETA
+projects; post-FC is reactive) opened a new control-theoretic track: **D102 — a learned plant
+model (heat/fan → RoR) → predictive (MPC) post-FC control**, the process-model half of the D42
+learning loop, captured in `roastpilot-plan/roastpilot-agent/plant-model-mpc-plan.md` + issue #580.
+**Phase-1 ARX feasibility MERGED (PR #581): verdict NEEDS-MORE-DATA — the blocker is EXCITATION,
+not sample count** (heat is pinned ~65 %, the advisor moves fan not heat, so the heat→RoR channel is
+barely stimulated; ARX barely beats persistence in the BT≥150 control regime). Corpus = 47 Artisan
+`.alog` + 14 store runs (the WAL-safe copy fix caught a completed run hiding in the WAL, 13→14),
+same Hottop + room; reproducible via committed harness + a data-manifest fingerprint (no raw roast
+data in the repo). Path to GO: designed excitation (safe heat staircase/PRBS) + a grey-box FOPDT +
+a control-regime acceptance gate. **Discard-roast feature (#582, PR #583):** a reversible `excluded`
+flag that filters a bad-data roast out of history + the learning corpus WITHOUT deleting — motivated
+by the 18 Jul Brazil second batch (FC detector didn't fire, operator marked ~7 °C late → bogus DTR
+6.7 %). Schema V13, NO immutability-trigger change (safety-reviewer PASS: `excluded` mutable while
+real-field UPDATE + DELETE still abort); `list_runs` + reference retrieval + the fixture exporter all
+filter `excluded=0`; `count_completed_runs_for_origin` deliberately NOT filtered (recording-slot
+counter — excluding would collide the discarded run's preserved audio). The FC-miss audio + a
+labelled `fc-miss-label.json` are preserved under `~/roasts/captures/` for FC-detector fine-tuning.
+Roasts this day: Brazil Santos baseline (dev 14, dropped ~188/15.3 %) + a second batch (discarded).
+Follow-up tracked: the plant-model harness (`scripts/plant_model_arx_study.py`) also reads the store
+unfiltered and should skip discarded runs once #582 lands.
+
+**18 Jul 2026 — #567 REFERENCE CURVES: offline bake-off ran NEGATIVE → feature PARKED
 (PR #578, data). The build stays DISABLED; no hardware roast warranted.** Operator picked the
 3-arm bake-off (design §6.4) as the validation gate, then chose **park** on the result. New harness
 `scripts/bakeoff_reference_567.py` (store-roast replay + self-excluding reference retrieval + 3 arms
