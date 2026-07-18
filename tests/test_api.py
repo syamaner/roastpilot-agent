@@ -28,6 +28,7 @@ from httpx import ASGITransport, AsyncClient
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastDecision
 from roastpilot_agent.api import (
+    _DRAFT_BEAN_FROM_URL_CONCURRENCY,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     EventBroadcaster,
     QueuedOperatorAction,
     RoastRunConflictError,
@@ -4456,6 +4457,54 @@ async def test_roast_service_draft_bean_from_url_reuses_configured_advisor_and_s
     assert (
         captured["sourcing_config"] is service._config.bean_sourcing  # pyright: ignore[reportPrivateUsage]
     )
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_returns_429_when_concurrency_exhausted(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#587 fix 5: each draft-from-url call is a billable BYOK LLM request,
+    so a small module-level semaphore bounds how many run at once. Once
+    ``_DRAFT_BEAN_FROM_URL_CONCURRENCY`` requests are in flight (blocked
+    inside the drafting call), one more must fail fast with 429 rather than
+    queue behind them; releasing the blocked calls then lets them all
+    complete normally."""
+    entered = 0
+    all_slots_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        nonlocal entered
+        entered += 1
+        if entered == _DRAFT_BEAN_FROM_URL_CONCURRENCY:
+            all_slots_entered.set()
+        await release.wait()
+        return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+
+    blocking_tasks = [
+        asyncio.create_task(
+            client.post(
+                "/api/beans/draft-from-url",
+                json={"url": f"https://vendor.example/products/{i}"},
+            )
+        )
+        for i in range(_DRAFT_BEAN_FROM_URL_CONCURRENCY)
+    ]
+    try:
+        await asyncio.wait_for(all_slots_entered.wait(), timeout=2.0)
+
+        overflow_response = await client.post(
+            "/api/beans/draft-from-url",
+            json={"url": "https://vendor.example/products/overflow"},
+        )
+        assert overflow_response.status_code == 429
+    finally:
+        release.set()
+        results = await asyncio.gather(*blocking_tasks)
+    for result in results:
+        assert result.status_code == 200
 
 
 # ---------------------------------------------------------------------------

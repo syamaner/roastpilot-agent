@@ -34,14 +34,34 @@ while streaming. Every failure mode — a malformed URL, a transport error, a
 non-2xx response, an oversized body, or an LLM/provider failure — is raised
 as one of this module's typed errors; the pipeline never raises an unhandled
 exception or crashes the caller.
+
+**SSRF + resource-exhaustion hardening (#587):** the fetch is a server-side
+GET of an operator-supplied URL on a LAN tool with no authentication, so
+:func:`_assert_public_destination` rejects any destination that resolves to
+a loopback / private / link-local (including the ``169.254.169.254`` cloud
+metadata address) / multicast / unspecified / reserved address — checked on
+the origin URL *and* on every redirect hop the internally-constructed client
+follows, since a public URL can 302 into a private address just as easily as
+an operator can paste one directly. That destination check has a known,
+accepted residual gap: it resolves-then-connects, so a DNS record that
+changes between the check and the actual TCP connect (a "rebinding" race)
+is not caught — proportionate for a single-operator LAN tool fetching a
+green-coffee vendor page, not something worth a custom IP-pinning transport
+for. The whole fetch (all hops + body streaming) is additionally bounded by
+an end-to-end deadline independent of ``httpx``'s own per-request timeout,
+and the LLM extraction call is bounded by its own deadline — both mapped to
+this module's typed errors, never left to hang indefinitely.
 """
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 import logging
 import re
+import socket
 from html import unescape
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
@@ -112,6 +132,147 @@ def _extract_page_text(html: str) -> str:
     return text[:_MAX_EXTRACTED_CHARS]
 
 
+#: Redirect hops the internally-constructed client will follow manually
+#: (#587 fix 1) before giving up — matches the prior ``httpx``
+#: ``max_redirects=5`` policy this replaces.
+_MAX_REDIRECTS = 5
+
+
+async def _assert_public_destination(url: str) -> None:
+    """Reject a fetch destination that is not publicly routable (#587 fix 1,
+    SSRF guard).
+
+    Parses ``url``'s host. If it is an IP literal, validates that address
+    directly; otherwise resolves it via the non-blocking asyncio resolver
+    (``loop.getaddrinfo`` — never the blocking stdlib resolver) and validates
+    EVERY address the host resolves to, since a hostname can round-robin or
+    dual-stack across a mix of public and non-public addresses. An address is
+    rejected when it is loopback, private (RFC1918 and friends), link-local
+    (this is what blocks the ``169.254.169.254`` cloud metadata endpoint),
+    multicast, unspecified, or otherwise IANA-reserved.
+
+    Called on the origin URL and on every redirect ``Location`` the
+    internally-constructed client is about to follow — a *public* URL can
+    302 into a private address just as easily as an operator can paste one
+    in directly (#587).
+
+    This check resolves the host and then, separately, connects to it; a
+    DNS record that changes between those two steps (a "rebinding" race) is
+    not caught by this check, and the resolved address is deliberately not
+    pinned into the socket for the follow-up connect. Accepted as a
+    proportionate residual gap for a single-operator LAN tool — closing it
+    fully needs a custom connection-pinning transport, which is not
+    justified here.
+
+    Args:
+        url: The absolute URL about to be connected to (the origin URL, or a
+            redirect hop's resolved ``Location``).
+
+    Raises:
+        BeanFetchError: The scheme is not ``http``/``https``, the URL has no
+            host, the host could not be resolved, or any address it
+            resolves to (or the literal IP itself) is non-public.
+    """
+    parsed = urlsplit(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r}")
+
+    host = parsed.hostname
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+    try:
+        addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [
+            ipaddress.ip_address(host)
+        ]
+    except ValueError:
+        loop = asyncio.get_running_loop()
+        try:
+            resolved = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise BeanFetchError(f"could not resolve host {host!r} for {url!r}: {exc}") from exc
+        addresses = [ipaddress.ip_address(info[4][0]) for info in resolved]
+        if not addresses:
+            raise BeanFetchError(
+                f"host {host!r} resolved to no usable address for {url!r}"
+            ) from None
+
+    for address in addresses:
+        if (
+            address.is_loopback
+            or address.is_private
+            or address.is_link_local
+            or address.is_multicast
+            or address.is_unspecified
+            or address.is_reserved
+        ):
+            raise BeanFetchError(
+                f"fetch destination {url!r} resolves to a non-public address "
+                f"({address}) — blocked by the SSRF guard (#587)"
+            )
+
+
+async def _fetch_with_ssrf_guard(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str],
+    timeout: httpx.Timeout,
+    config: BeanSourcingConfig,
+) -> str:
+    """Fetch ``url`` on the internally-constructed client, following
+    redirects MANUALLY (#587 fix 1) so every hop passes
+    :func:`_assert_public_destination` before it is connected to.
+
+    Only used for the client this module constructs itself (never an
+    injected ``http_client`` — see :func:`_fetch_page_text`); that client is
+    built with ``follow_redirects=False`` so ``httpx`` never follows a
+    redirect for us before we get a chance to validate its destination.
+
+    Args:
+        client: The internally-constructed ``httpx.AsyncClient``.
+        url: The origin URL.
+        headers: Request headers (the identifying User-Agent).
+        timeout: The per-request ``httpx.Timeout``.
+        config: Response-size-cap settings.
+
+    Returns:
+        The decoded body of the final, non-redirect response.
+
+    Raises:
+        BeanFetchError: A destination rejected by the SSRF guard at any hop,
+            a non-2xx/non-3xx-with-``Location`` response, a body over the
+            size cap, a bare 3xx with no ``Location`` header, or more than
+            :data:`_MAX_REDIRECTS` redirects.
+    """
+    current_url = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        await _assert_public_destination(current_url)
+        async with client.stream("GET", current_url, headers=headers, timeout=timeout) as response:
+            if 300 <= response.status_code < 400:
+                location = response.headers.get("location")
+                if not location:
+                    raise BeanFetchError(
+                        f"vendor page redirected (HTTP {response.status_code}) with no "
+                        f"Location header for {current_url!r}"
+                    )
+                current_url = urljoin(current_url, location)
+                continue
+            if response.status_code >= 400:
+                raise BeanFetchError(
+                    f"vendor page fetch failed: HTTP {response.status_code} for {current_url!r}"
+                )
+            body = bytearray()
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > config.max_response_bytes:
+                    raise BeanFetchError(
+                        f"vendor page exceeded the {config.max_response_bytes}-byte "
+                        f"fetch cap: {current_url!r}"
+                    )
+            return bytes(body).decode("utf-8", errors="replace")
+    raise BeanFetchError(f"too many redirects (> {_MAX_REDIRECTS}) fetching {url!r}")
+
+
 async def _fetch_page_text(
     url: str,
     *,
@@ -120,13 +281,24 @@ async def _fetch_page_text(
 ) -> str:
     """Respectfully fetch ``url`` and return its extracted plain text.
 
-    An ``httpx`` GET, bounded by ``config.fetch_timeout_seconds``, sent with
-    an identifying ``User-Agent``, with a hard cap on the response body
+    An ``httpx`` GET, bounded by ``config.fetch_timeout_seconds`` per
+    request AND by an end-to-end ``config.fetch_timeout_seconds`` deadline
+    across the whole fetch — every redirect hop and the full body stream
+    (#587 fix 2, a slow-drip server can otherwise keep the request alive
+    indefinitely past any single-request timeout) — sent with an identifying
+    ``User-Agent``, with a hard cap on the response body
     (``config.max_response_bytes``) enforced by streaming the body and
-    aborting the moment the cap is crossed — an oversized or slow-drip
-    response is never read fully into memory. Fails soft: every failure mode
+    aborting the moment the cap is crossed. Fails soft: every failure mode
     is raised as a typed :class:`BeanFetchError`, never an unhandled
     exception.
+
+    The internally-constructed client never auto-follows a redirect —
+    :func:`_fetch_with_ssrf_guard` follows redirects manually so every hop's
+    destination clears :func:`_assert_public_destination` first (#587 fix
+    1). An injected ``http_client`` (the test seam, or a future
+    caller-supplied client) is exempt from that machinery: its redirect
+    policy and destination are the caller's to set, matching this module's
+    prior behavior.
 
     Args:
         url: The vendor product page URL.
@@ -139,8 +311,10 @@ async def _fetch_page_text(
         The extracted plain text of the page.
 
     Raises:
-        BeanFetchError: On a malformed URL, any transport/timeout failure, a
-            non-2xx response, or a body over the configured size cap.
+        BeanFetchError: On a malformed URL, a destination rejected by the
+            SSRF guard, any transport/timeout failure, a non-2xx response, a
+            body over the configured size cap, or exceeding the end-to-end
+            fetch deadline.
     """
     parsed = urlsplit(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -149,35 +323,37 @@ async def _fetch_page_text(
     headers = {"User-Agent": config.user_agent}
     timeout = httpx.Timeout(config.fetch_timeout_seconds)
     owns_client = http_client is None
-    # ``httpx.AsyncClient`` defaults to ``follow_redirects=False``: a 3xx
-    # response (status_code < 400, so it slips past the >=400 check below)
-    # would otherwise be returned with its near-empty redirect body, which
-    # the LLM then fails on with a misleading generic extraction error
-    # instead of seeing the real page. Vendor pages commonly 301/302
-    # (bare -> www, http -> https, trailing-slash). Only the client WE
-    # construct here can have its redirect policy set; an injected
-    # ``http_client`` (the test seam, or a future caller-supplied client) is
-    # used as-is — its policy is the caller's to set (#587).
-    client = (
-        http_client
-        if http_client is not None
-        else httpx.AsyncClient(follow_redirects=True, max_redirects=5)
-    )
+    client = http_client if http_client is not None else httpx.AsyncClient(follow_redirects=False)
     try:
-        async with client.stream("GET", url, headers=headers, timeout=timeout) as response:
-            if response.status_code >= 400:
-                raise BeanFetchError(
-                    f"vendor page fetch failed: HTTP {response.status_code} for {url!r}"
+        async with asyncio.timeout(config.fetch_timeout_seconds):
+            if owns_client:
+                html = await _fetch_with_ssrf_guard(
+                    client, url, headers=headers, timeout=timeout, config=config
                 )
-            body = bytearray()
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > config.max_response_bytes:
-                    raise BeanFetchError(
-                        f"vendor page exceeded the {config.max_response_bytes}-byte "
-                        f"fetch cap: {url!r}"
-                    )
-            html = bytes(body).decode("utf-8", errors="replace")
+            else:
+                # Injected client (the fetch test seam): its redirect policy
+                # and destination are the caller's to set — no SSRF guard,
+                # no manual redirect loop, matching this module's behavior
+                # before #587.
+                async with client.stream("GET", url, headers=headers, timeout=timeout) as response:
+                    if response.status_code >= 400:
+                        raise BeanFetchError(
+                            f"vendor page fetch failed: HTTP {response.status_code} for {url!r}"
+                        )
+                    body = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        body.extend(chunk)
+                        if len(body) > config.max_response_bytes:
+                            raise BeanFetchError(
+                                f"vendor page exceeded the {config.max_response_bytes}-byte "
+                                f"fetch cap: {url!r}"
+                            )
+                    html = bytes(body).decode("utf-8", errors="replace")
+    except TimeoutError as exc:
+        raise BeanFetchError(
+            f"vendor page fetch exceeded the {config.fetch_timeout_seconds:g}s end-to-end "
+            f"deadline for {url!r}"
+        ) from exc
     except BeanFetchError:
         raise
     except httpx.HTTPError as exc:
@@ -297,9 +473,11 @@ async def _extract_bean_identity(
 
     Raises:
         BeanExtractionError: On any provider/transport failure, a malformed
-            structured-output shape, or a failure to construct the
-            extraction agent itself (a missing optional provider dependency,
-            or an unsupported provider — see :func:`build_model`).
+            structured-output shape, a failure to construct the extraction
+            agent itself (a missing optional provider dependency, or an
+            unsupported provider — see :func:`build_model`), or exceeding
+            ``advisor_config.timeout_seconds`` (#587 fix 3 — an unbounded
+            LLM call must not be able to hang the drafting request forever).
     """
     try:
         # Agent construction (which calls ``build_model`` when ``model`` is
@@ -308,7 +486,12 @@ async def _extract_bean_identity(
         # and that must fail soft as ``BeanExtractionError`` too, not escape
         # as an unhandled exception (#587).
         agent = _bean_sourcing_agent(advisor_config, model=model)
-        result = await agent.run(page_text)
+        async with asyncio.timeout(advisor_config.timeout_seconds):
+            result = await agent.run(page_text)
+    except TimeoutError as exc:
+        raise BeanExtractionError(
+            f"bean identity extraction exceeded the {advisor_config.timeout_seconds:g}s deadline"
+        ) from exc
     except UnexpectedModelBehavior as exc:
         raise BeanExtractionError(
             f"bean identity extraction returned a malformed shape: {exc}"
@@ -428,6 +611,15 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
         # bean_origin fell back to country — still page-sourced, just via the
         # country field rather than an explicit bean_origin statement.
         field_sources["bean_origin"] = "on_page"
+    if identity.is_blend:
+        # is_blend is excluded from _IDENTITY_FIELDS because it defaults to
+        # False (never None/""), so the generic "not in (None, '')" test
+        # above would mark it "on_page" even when the page never mentioned
+        # blending. Record it explicitly, and only when the page actually
+        # said True — the default False stays provenance-less, which is what
+        # keeps "absent from field_sources" meaningful as "unset" (#587
+        # fix 4).
+        field_sources["is_blend"] = "on_page"
     for field_name in _TARGET_FIELDS:
         field_sources[field_name] = "origin_estimated"
 

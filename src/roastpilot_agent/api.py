@@ -2916,6 +2916,26 @@ class DraftBeanFromUrlRequest(BaseModel):
     """The vendor's green-coffee product page URL."""
 
 
+#: #587 fix 5 (P1 #3353): bounds how many draft-from-url requests run
+#: concurrently. Each request is a billable BYOK LLM call (plus a
+#: server-side fetch of an operator-supplied URL) with no other rate limit
+#: on this route, so an unbounded burst of concurrent requests could both
+#: run up the operator's provider bill and tie up the process. Deliberately
+#: NOT an authentication control: this app has no authentication anywhere
+#: (a single-operator LAN tool, binds ``0.0.0.0`` via
+#: ``scripts/roast-live.sh``) — per-endpoint auth would be an app-wide
+#: architectural decision, not something to bolt onto one route, and is out
+#: of scope here by design.
+_DRAFT_BEAN_FROM_URL_CONCURRENCY = 2
+
+#: How long a request waits for a free concurrency slot before it fails
+#: closed with 429 rather than queuing indefinitely behind other in-flight
+#: LLM calls.
+_DRAFT_BEAN_FROM_URL_ACQUIRE_TIMEOUT_SECONDS = 0.1
+
+_draft_bean_from_url_semaphore = asyncio.Semaphore(_DRAFT_BEAN_FROM_URL_CONCURRENCY)
+
+
 async def draft_bean_from_url(
     body: DraftBeanFromUrlRequest, service: ServiceDep
 ) -> BeanProfileDraft:
@@ -2928,13 +2948,33 @@ async def draft_bean_from_url(
     action, driven by the operator explicitly submitting the reviewed draft).
     A 422 on a bad/unreachable URL or a failed extraction; the detail message
     names which.
+
+    Concurrency-bounded (#587 fix 5): at most
+    :data:`_DRAFT_BEAN_FROM_URL_CONCURRENCY` calls run at once — each is a
+    billable BYOK LLM request, so this is a cost/resource-exhaustion
+    mitigation, not an access-control one. A request that cannot acquire a
+    slot within :data:`_DRAFT_BEAN_FROM_URL_ACQUIRE_TIMEOUT_SECONDS` gets a
+    429 rather than queuing indefinitely. This endpoint has NO
+    authentication, matching every other route in this single-operator LAN
+    app — that is a deliberate, existing, app-wide decision, not something
+    this fix changes or is meant to compensate for.
     """
+    try:
+        async with asyncio.timeout(_DRAFT_BEAN_FROM_URL_ACQUIRE_TIMEOUT_SECONDS):
+            await _draft_bean_from_url_semaphore.acquire()
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail="too many concurrent bean-draft requests in flight; try again shortly",
+        ) from exc
     try:
         return await service.draft_bean_from_url(body.url)
     except BeanFetchError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except BeanExtractionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    finally:
+        _draft_bean_from_url_semaphore.release()
 
 
 CONFIG_PATH = "/api/config"

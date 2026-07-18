@@ -17,8 +17,10 @@ transitive import graph checked in a fresh subprocess).
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
+from collections.abc import AsyncGenerator
 
 import httpx
 import pytest
@@ -49,6 +51,12 @@ def _html_response(status_code: int, html: str) -> httpx.MockTransport:
         return httpx.Response(status_code, content=html.encode())
 
     return httpx.MockTransport(handler)
+
+
+async def _noop_assert_public_destination(url: str) -> None:
+    """Test double: skips the real DNS/IP validation (#587's SSRF guard) so
+    client-lifecycle/redirect-following tests can run without depending on a
+    real resolver — destination validation itself is covered separately."""
 
 
 _SAMPLE_HTML = """
@@ -109,6 +117,17 @@ def _function_model_text(text: str) -> FunctionModel:
 def _function_model_raising(exc: BaseException) -> FunctionModel:
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         raise exc
+
+    return FunctionModel(respond)
+
+
+def _function_model_hanging() -> FunctionModel:
+    """A double that never returns — used to exercise the extraction
+    end-to-end timeout (#587 fix 3) without a real slow provider."""
+
+    async def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        await asyncio.sleep(10)
+        return ModelResponse(parts=[TextPart("too late")])  # pragma: no cover
 
     return FunctionModel(respond)
 
@@ -215,7 +234,9 @@ async def test_fetch_page_text_constructs_and_closes_its_own_client_when_none_in
 ) -> None:
     """Covers the owns_client=True branch: no client is injected, so the
     function must build (and close) a real ``httpx.AsyncClient`` — patched
-    here onto a mock transport so no real network is touched."""
+    here onto a mock transport so no real network is touched. The SSRF
+    destination check is stubbed out too (#587): this test is about client
+    lifecycle, not resolution — resolution itself is covered separately."""
     transport = _html_response(200, _SAMPLE_HTML)
     real_async_client = httpx.AsyncClient
 
@@ -223,6 +244,9 @@ async def test_fetch_page_text_constructs_and_closes_its_own_client_when_none_in
         return real_async_client(transport=transport)
 
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
     text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
         "https://vendor.example/products/kenya", config=BeanSourcingConfig()
     )
@@ -233,12 +257,12 @@ async def test_fetch_page_text_constructs_and_closes_its_own_client_when_none_in
 async def test_fetch_page_text_follows_redirects_on_internally_constructed_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#587 fix 1: ``httpx.AsyncClient`` defaults to ``follow_redirects=False``,
-    so a bare 301/302 (common for bare->www, http->https, trailing-slash)
-    would slip past the ``>=400`` check with a near-empty redirect body,
-    later failing the LLM call with a misleading generic error. Only the
-    internally-constructed client's policy can be forced — mirrors the
-    "constructs and closes its own client" seam above."""
+    """#587 fix 1: the internally-constructed client is built with
+    ``follow_redirects=False`` — ``_fetch_with_ssrf_guard`` follows redirects
+    MANUALLY instead, so every hop's destination clears
+    ``_assert_public_destination`` first. A public->public 302 (common for
+    bare->www, http->https, trailing-slash) must still resolve to the final
+    page's text (preserves the pre-#587 redirect-follow behavior)."""
     original_url = "https://vendor.example/products/kenya"
     redirected_url = "https://www.vendor.example/products/kenya"
 
@@ -257,12 +281,357 @@ async def test_fetch_page_text_follows_redirects_on_internally_constructed_clien
         return real_async_client(transport=transport, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing,
+        "_assert_public_destination",
+        _noop_assert_public_destination,
+    )
     text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
         original_url, config=BeanSourcingConfig()
     )
     assert "Kenya Kiambu AA" in text
-    assert captured_kwargs.get("follow_redirects") is True
-    assert captured_kwargs.get("max_redirects") == 5
+    assert captured_kwargs.get("follow_redirects") is False
+
+
+# --- #587 fix 1: SSRF destination guard ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_rejects_loopback_literal() -> None:
+    """The SSRF guard runs BEFORE any request is sent — an IP-literal
+    destination never touches the resolver or the network at all, so no
+    transport mocking is needed here (unlike the hostname-resolution case
+    below)."""
+    with pytest.raises(BeanFetchError, match="non-public address"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "http://127.0.0.1/x", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_rejects_private_rfc1918_literal() -> None:
+    with pytest.raises(BeanFetchError, match="non-public address"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "http://10.0.0.5/x", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_rejects_link_local_metadata_literal() -> None:
+    """Blocks the cloud-metadata address (``169.254.169.254``) directly."""
+    with pytest.raises(BeanFetchError, match="non-public address"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "http://169.254.169.254/latest/meta-data/", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_assert_public_destination_rejects_hostname_resolving_to_private_ip(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hostname (not a literal IP) that resolves to a private address must
+    be rejected too — the guard resolves via the real (patched) resolver."""
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        assert host == "internal.vendor.example"
+        return [(None, None, None, "", ("10.1.2.3", port))]
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(BeanFetchError, match="non-public address"):
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            "http://internal.vendor.example/x"
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_rejects_redirect_into_private_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PUBLIC origin URL that 302s to a private/loopback address must be
+    rejected — the private hop is never fetched (#587 fix 1). The origin
+    hostname's resolution is stubbed to a real public address (no DNS in
+    this sandbox); the redirect target is an IP literal (``127.0.0.1``), so
+    it needs no resolver stub — it is rejected directly."""
+    public_url = "https://vendor.example/products/kenya"
+    private_target = "http://127.0.0.1/"
+    connected_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        connected_urls.append(str(request.url))
+        if str(request.url) == public_url:
+            return httpx.Response(302, headers={"Location": private_target})
+        pytest.fail(f"must never connect to a rejected redirect target: {request.url}")
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        assert host == "vendor.example"
+        return [(None, None, None, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(BeanFetchError, match="non-public address"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            public_url, config=BeanSourcingConfig()
+        )
+    # Only the (public, safe) origin hop was ever connected to.
+    assert connected_urls == [public_url]
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_redirect_public_to_public_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A public->public redirect keeps working end-to-end (not just the
+    ``follow_redirects=False`` kwarg check above) — the SSRF guard runs on
+    both hops via a stubbed resolver that always reports a public address."""
+    original_url = "https://vendor.example/products/kenya"
+    redirected_url = "https://www.vendor.example/products/kenya"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == original_url:
+            return httpx.Response(302, headers={"Location": redirected_url})
+        assert str(request.url) == redirected_url
+        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+        original_url, config=BeanSourcingConfig()
+    )
+    assert "Kenya Kiambu AA" in text
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_exhausting_max_redirects_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        # Always redirects to a new URL — never terminates.
+        next_url = str(request.url) + "x"
+        return httpx.Response(302, headers={"Location": next_url})
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    with pytest.raises(BeanFetchError, match="too many redirects"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/x", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_bare_redirect_with_no_location_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302)  # no Location header
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    with pytest.raises(BeanFetchError, match="no Location header"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/x", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_rejects_redirect_to_non_http_scheme(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A redirect ``Location`` that switches to a non-http(s) scheme (e.g.
+    ``ftp://``) must be rejected by ``_assert_public_destination``'s own
+    scheme/host check, reached this time via the redirect hop rather than
+    the origin URL."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"Location": "ftp://internal.example/x"})
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        return [(None, None, None, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(BeanFetchError, match="well-formed"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/x", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_assert_public_destination_maps_resolver_oserror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolver failure (e.g. ``socket.gaierror``, a subclass of
+    ``OSError``) must be mapped to ``BeanFetchError``, not left to escape as
+    the raw ``OSError``."""
+
+    async def failing_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        raise OSError("name resolution failed")
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", failing_getaddrinfo)
+    with pytest.raises(BeanFetchError, match="could not resolve host"):
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            "https://unresolvable.example/x"
+        )
+
+
+@pytest.mark.asyncio
+async def test_assert_public_destination_rejects_host_resolving_to_no_addresses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A resolver that returns no addresses at all (an edge case some
+    resolvers can hit for a name with only unsupported record types) must
+    fail closed, not silently proceed with an empty address list."""
+
+    async def empty_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        return []
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", empty_getaddrinfo)
+    with pytest.raises(BeanFetchError, match="resolved to no usable address"):
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            "https://no-addresses.example/x"
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_owns_client_raises_on_non_2xx(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The non-2xx status check inside ``_fetch_with_ssrf_guard`` (the
+    owns-client path) — the equivalent injected-client check is covered by
+    ``test_fetch_page_text_raises_on_non_2xx`` above."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, content=b"not found")
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    with pytest.raises(BeanFetchError, match="404"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/gone", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_owns_client_raises_on_oversized_body(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The size-cap check inside ``_fetch_with_ssrf_guard`` (the owns-client
+    path) — the equivalent injected-client check is covered by
+    ``test_fetch_page_text_raises_on_oversized_body`` above."""
+    huge_html = "<p>" + ("x" * 5000) + "</p>"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=huge_html.encode())
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    with pytest.raises(BeanFetchError, match="fetch cap"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/huge",
+            config=BeanSourcingConfig(max_response_bytes=100),
+        )
+
+
+# --- #587 fix 2: end-to-end fetch deadline ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_end_to_end_timeout_raises_bean_fetch_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A slow-drip body (one that keeps yielding chunks forever, each within
+    a per-chunk delay under the per-request timeout) must still be bounded
+    by the END-TO-END deadline — never hang the request indefinitely."""
+
+    async def slow_handler(request: httpx.Request) -> httpx.Response:
+        async def slow_body() -> AsyncGenerator[bytes, None]:
+            while True:
+                await asyncio.sleep(0.05)
+                yield b"x"
+
+        return httpx.Response(200, content=slow_body())
+
+    transport = httpx.MockTransport(slow_handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    with pytest.raises(BeanFetchError, match="deadline"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/x",
+            config=BeanSourcingConfig(fetch_timeout_seconds=0.15),
+        )
 
 
 # --- _bean_sourcing_agent / _extract_bean_identity ---
@@ -305,6 +674,19 @@ async def test_extract_bean_identity_maps_provider_error() -> None:
     with pytest.raises(BeanExtractionError, match="provider error"):
         await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
             "page text", advisor_config=_ADVISOR_CONFIG, model=model
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_timeout_raises_bean_extraction_error() -> None:
+    """#587 fix 3: ``agent.run`` is bounded by ``advisor_config.timeout_seconds``
+    — a hung provider must fail soft as ``BeanExtractionError``, not hang the
+    drafting request forever."""
+    model = _function_model_hanging()
+    config = AdvisorConfig(timeout_seconds=0.05)
+    with pytest.raises(BeanExtractionError, match="deadline"):
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "page text", advisor_config=config, model=model
         )
 
 
@@ -356,6 +738,26 @@ def test_draft_from_identity_marks_page_fields_on_page() -> None:
     # fabricated value, and no field_sources entry claiming it is on_page.
     assert draft.bean_species is None
     assert "bean_species" not in draft.field_sources
+    # is_blend defaults to False in the fixture — the page never SAID
+    # anything about blending, so no provenance should be recorded for it
+    # either (#587 fix 4: absent-from-field_sources must mean "unset").
+    assert draft.is_blend is False
+    assert "is_blend" not in draft.field_sources
+
+
+def test_draft_from_identity_marks_explicit_is_blend_true_as_on_page() -> None:
+    """#587 fix 4: when the page explicitly states this IS a blend,
+    ``is_blend`` must be recorded as ``"on_page"`` provenance — the prior
+    ``_IDENTITY_FIELDS`` loop always skipped it (it defaults to False, never
+    None/""), so an explicit True never got provenance recorded at all."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=True)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/blend"
+    )
+    assert draft.is_blend is True
+    assert draft.field_sources["is_blend"] == "on_page"
 
 
 def test_draft_from_identity_marks_every_roast_target_origin_estimated() -> None:
