@@ -266,13 +266,50 @@ def load_artisan(alog_dir: Path) -> list[Roast]:
     return roasts
 
 
+def _has_excluded_column(con: sqlite3.Connection) -> bool:
+    """Whether ``roast_runs`` has the #582 ``excluded`` (soft-discard) column.
+
+    Mirrors the same ``PRAGMA table_info`` back-compat check
+    ``store_to_fixture.py::_resolve_run_id`` uses: a real pre-#582 store
+    predates the column entirely and has no discarded runs to worry about.
+
+    Args:
+        con: An open store connection.
+
+    Returns:
+        ``True`` if ``roast_runs.excluded`` exists.
+    """
+    return any(
+        row[1] == "excluded" for row in con.execute("PRAGMA table_info(roast_runs)").fetchall()
+    )
+
+
+def _completed_run_ids_query(con: sqlite3.Connection) -> str:
+    """The ``roast_runs`` SELECT for completed, non-discarded run ids.
+
+    #582 corpus hygiene: a soft-DISCARDED run (``roast_runs.excluded = 1``)
+    must never re-enter the plant-model corpus on a re-run, mirroring the
+    store's own ``list_runs``/reference-retrieval filter and
+    ``store_to_fixture.py``'s exporter. Guarded so a pre-#582 store (no
+    ``excluded`` column) still works.
+
+    Args:
+        con: An open store connection.
+
+    Returns:
+        A SQL ``SELECT`` string selecting ``id`` from ``roast_runs``.
+    """
+    base = "select id from roast_runs where outcome='completed'"
+    if _has_excluded_column(con):
+        base += " and excluded = 0"
+    return base + " order by started_at_utc"
+
+
 def completed_store_run_ids(store_copy: Path) -> list[str]:
-    """Return the completed store run ids, ordered, from a read-only copy."""
+    """Return the completed, non-discarded store run ids, ordered, from a read-only copy."""
     con = sqlite3.connect(f"file:{store_copy}?mode=ro", uri=True)
     try:
-        rows = con.execute(
-            "select id from roast_runs where outcome='completed' order by started_at_utc"
-        ).fetchall()
+        rows = con.execute(_completed_run_ids_query(con)).fetchall()
     finally:
         con.close()
     return [str(r[0]) for r in rows]
@@ -281,21 +318,20 @@ def completed_store_run_ids(store_copy: Path) -> list[str]:
 def load_store(store_copy: Path) -> list[Roast]:
     """Load and unify the completed store roasts from a read-only DB copy.
 
+    #582 soft-discarded runs (``roast_runs.excluded = 1``) are excluded from
+    the corpus (see ``_completed_run_ids_query``).
+
     Args:
         store_copy: Path to a read-only copy of the store SQLite DB.
 
     Returns:
-        The parsed completed roasts with usable telemetry (>= 60 raw rows).
+        The parsed completed, non-discarded roasts with usable telemetry
+        (>= 60 raw rows).
     """
     con = sqlite3.connect(f"file:{store_copy}?mode=ro", uri=True)
     roasts: list[Roast] = []
     try:
-        run_ids = [
-            str(r[0])
-            for r in con.execute(
-                "select id from roast_runs where outcome='completed' order by started_at_utc"
-            )
-        ]
+        run_ids = [str(r[0]) for r in con.execute(_completed_run_ids_query(con))]
         for rid in run_ids:
             rows = con.execute(
                 "select charge_elapsed_seconds, bean_temp_c, env_temp_c, "

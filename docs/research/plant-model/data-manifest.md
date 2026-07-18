@@ -62,8 +62,8 @@ This manifest is how the study's raw inputs are "committed" under the `AGENTS.md
 - Source DB used (local, not committed): `/Users/sertanyamaner/roasts/roastpilot.sqlite3`
 - DB file sha256 at study time: `5bdbe9a5c3881cd5b19a88e0952d233e516292c284faa507a778bc5c62282b37`
   (advisory only -- the DB grows as new roasts are recorded; the run ids below pin the exact rows.)
-- Completed runs in DB: **14**
-- Completed runs actually modelled (>= 60 usable telemetry rows): **14**
+- Completed runs in DB: **13**
+- Completed runs actually modelled (>= 60 usable telemetry rows): **13**
 
 Completed-run telemetry is immutable once the run's completion trigger has fired, so the run id pins the data. Runs with fewer than 60 usable `roasting_pre_first_crack`/`development` telemetry rows are skipped by the harness.
 
@@ -82,7 +82,6 @@ Completed-run telemetry is immutable once the run's completion trigger has fired
 | 11 | `43c84c98f052485ab35a98264d7ff8b5` | yes |
 | 12 | `8ac8a5e4122941ca8109700fce92bc68` | yes |
 | 13 | `f24fca980468443884227a9ed1e55486` | yes |
-| 14 | `98df5723345e4ff1b75170a9c3d32c6f` | yes |
 
 ## Exclusion note
 
