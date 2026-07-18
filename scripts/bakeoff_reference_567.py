@@ -142,6 +142,15 @@ DEFAULT_CADENCE_SECONDS = 30.0
 #: usage, not a billed dollar amount, so this is an estimate).
 DEFAULT_COST_PER_CALL_USD = 0.02
 
+#: Bound on one real provider call (Codex PR #578 round 3 finding: the live
+#: controller and ``advisor_bakeoff.py`` both wrap ``get_recommendation`` in
+#: an explicit timeout; this script's real path did not, so a hung
+#: OpenRouter/model call could hang the whole paid run indefinitely). Mirrors
+#: ``advisor_bakeoff.MEASURE_TIMEOUT`` exactly — a generous bound (not the
+#: live 10 s tick gate) so slow-but-alive advice is still captured as a
+#: recorded tick error rather than genuinely wedging the process.
+MEASURE_TIMEOUT_SECONDS = 90.0
+
 #: The design's quality floor for a CANDIDATE reference roast (design note
 #: §1.2; matches ``RoastStore.find_reference_run``'s / ``load_reference_roast``'s
 #: own default).
@@ -652,6 +661,16 @@ def build_recommender(
 ) -> Recommender:
     """Build the per-arm recommender: the real advisor, or :class:`DryRunAdvisor`.
 
+    The real path bounds every call with :data:`MEASURE_TIMEOUT_SECONDS`
+    (Codex PR #578 round 3 finding — mirrors ``advisor_bakeoff.py``'s own
+    ``asyncio.wait_for(advisor.get_recommendation(context), timeout=
+    MEASURE_TIMEOUT)`` pattern, and the live controller's own timeout
+    discipline): an unbounded await could hang a paid run indefinitely on a
+    stuck provider. ``replay_roast`` already catches any exception the
+    recommender raises (including the ``TimeoutError`` ``asyncio.wait_for``
+    raises on expiry) and records it as that tick's error, so a timeout reads
+    exactly like any other provider failure — no special-casing needed here.
+
     Args:
         model: The candidate model slug.
         prompt_version: ``c8`` or ``c9``.
@@ -663,9 +682,14 @@ def build_recommender(
     """
     if dry_run:
         return DryRunAdvisor(model, prompt_version).get_recommendation
-    return PydanticAIAdvisor(
-        make_advisor_config(model, prompt_version, reasoning)
-    ).get_recommendation
+    advisor = PydanticAIAdvisor(make_advisor_config(model, prompt_version, reasoning))
+
+    async def recommend(context: AdvisorContext) -> RoastDecision:
+        return await asyncio.wait_for(
+            advisor.get_recommendation(context), timeout=MEASURE_TIMEOUT_SECONDS
+        )
+
+    return recommend
 
 
 # --- Per-tick / per-arm / per-run records -------------------------------------
@@ -1277,21 +1301,40 @@ async def run_bakeoff(
                             f"first_drop={first_drop_label} ~${guard.spend:.2f} total",
                             flush=True,
                         )
-                        checkpoint.append(
-                            {
-                                "run_id": meta.run_id,
-                                "arm_key": arm.key,
-                                "arm_label": arm.label,
-                                "prompt_version": arm.prompt_version,
-                                "reference_injected": actually_injected,
-                                "reference": reference_info_to_json(reference_info),
-                                "ticks": [tick_record_to_json(t) for t in arm_record.ticks],
-                                "settings_key": key_settings,
-                                "model": model,
-                                "cadence_seconds": cadence_seconds,
-                                "dry_run": dry_run,
-                            }
+                        # #578 round 3 finding 1: a cell where EVERY tick errored (the
+                        # exact case that hit this PR's first paid run — a stale/401
+                        # OpenRouter key) must NOT be checkpointed as complete. A
+                        # completed-looking checkpoint record for an all-error cell
+                        # would make a later resume SKIP it — silently treating the
+                        # auth/provider failure as "done" and producing an empty
+                        # report instead of retrying once the real problem is fixed.
+                        # A PARTIALLY-errored cell (some ticks got a real decision)
+                        # still checkpoints — only a wholly-failed cell is withheld.
+                        all_ticks_errored = bool(outcomes) and arm_record.error_count() == len(
+                            arm_record.ticks
                         )
+                        if all_ticks_errored:
+                            print(
+                                f"  [cell] {arm.key} | ALL {len(outcomes)} ticks errored — "
+                                f"NOT checkpointed, a resume will retry this cell",
+                                flush=True,
+                            )
+                        else:
+                            checkpoint.append(
+                                {
+                                    "run_id": meta.run_id,
+                                    "arm_key": arm.key,
+                                    "arm_label": arm.label,
+                                    "prompt_version": arm.prompt_version,
+                                    "reference_injected": actually_injected,
+                                    "reference": reference_info_to_json(reference_info),
+                                    "ticks": [tick_record_to_json(t) for t in arm_record.ticks],
+                                    "settings_key": key_settings,
+                                    "model": model,
+                                    "cadence_seconds": cadence_seconds,
+                                    "dry_run": dry_run,
+                                }
+                            )
 
                 if arm_records:
                     runs.append(
