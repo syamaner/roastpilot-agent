@@ -72,3 +72,7 @@ ds-bundle/
 
 # Playwright MCP interactive-session artifacts (ui-reviewer captures — never committed)
 .playwright-mcp/
+
+# Phase-1 plant-model study: raw per-tick roast traces are never committed (AGENTS.md).
+step_response_traces.csv
+docs/research/plant-model/step_response_traces.csv
