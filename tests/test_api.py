@@ -28,7 +28,6 @@ from httpx import ASGITransport, AsyncClient
 from roastpilot_agent import __version__
 from roastpilot_agent.advisor import AdvisorContext, FakeAdvisor, RoastDecision
 from roastpilot_agent.api import (
-    _DRAFT_BEAN_FROM_URL_CONCURRENCY,  # pyright: ignore[reportPrivateUsage, reportPrivateImportUsage]
     EventBroadcaster,
     QueuedOperatorAction,
     RoastRunConflictError,
@@ -4484,51 +4483,116 @@ async def test_roast_service_draft_bean_from_url_raises_when_a_roast_is_active(
 
 
 @pytest.mark.asyncio
+async def test_draft_bean_from_url_and_start_roast_are_mutually_exclusive(
+    service: RoastService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#587 P1 (round 5): ``draft_bean_from_url`` shares ``start_roast``'s
+    ``_start_lock``, held across the WHOLE fetch+extraction — not just the
+    active-run check — so a roast-start issued while a draft is in flight
+    cannot interleave and start underneath it. Without this, an
+    unsynchronized ``active_run()`` snapshot could pass, yield during the
+    (multi-second) fetch/LLM call, and let a concurrent roast start in that
+    window — reopening the exact advisor-starvation race the #587 P1 guard
+    exists to close."""
+    draft_entered = asyncio.Event()
+    release_draft = asyncio.Event()
+    events: list[str] = []
+
+    async def slow_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        events.append("draft_entered")
+        draft_entered.set()
+        await release_draft.wait()
+        events.append("draft_exited")
+        return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", slow_draft)
+
+    draft_task = asyncio.create_task(
+        service.draft_bean_from_url("https://vendor.example/products/kenya")
+    )
+    await asyncio.wait_for(draft_entered.wait(), timeout=2.0)
+
+    start_task = asyncio.create_task(service.start_roast(_profile()))
+    # Give the event loop a beat: start_roast must be BLOCKED on the shared
+    # _start_lock, not proceeding concurrently with the in-flight draft.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not start_task.done(), "start_roast must wait for the shared lock"
+    events.append("start_still_blocked_while_draft_in_flight")
+
+    release_draft.set()
+    draft = await draft_task
+    detail = await start_task
+
+    assert events == [
+        "draft_entered",
+        "start_still_blocked_while_draft_in_flight",
+        "draft_exited",
+    ]
+    assert isinstance(draft, BeanProfileDraft)
+    assert isinstance(detail, RoastDetail)
+    assert detail.id
+
+
+@pytest.mark.asyncio
 async def test_draft_bean_from_url_returns_429_when_concurrency_exhausted(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """#587 fix 5: each draft-from-url call is a billable BYOK LLM request,
-    so a small module-level semaphore bounds how many run at once. Once
-    ``_DRAFT_BEAN_FROM_URL_CONCURRENCY`` requests are in flight (blocked
-    inside the drafting call), one more must fail fast with 429 rather than
-    queue behind them; releasing the blocked calls then lets them all
-    complete normally."""
+    so a small module-level semaphore bounds how many requests can be
+    ADMITTED at once. #587 P1 round 5 note: admitted requests now execute
+    SERIALLY — ``draft_bean_from_url`` shares ``start_roast``'s
+    ``_start_lock`` (see
+    ``test_draft_bean_from_url_and_start_roast_are_mutually_exclusive``),
+    so a SECOND admitted request queues behind the first rather than
+    running concurrently with it; the semaphore's job now is bounding how
+    many requests can be admitted (in flight OR queued behind the lock) —
+    a THIRD concurrent request still fails fast with 429 rather than
+    queuing indefinitely, and every admitted request still eventually
+    completes once the first releases."""
     entered = 0
-    all_slots_entered = asyncio.Event()
+    first_entered = asyncio.Event()
     release = asyncio.Event()
 
     async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
         nonlocal entered
         entered += 1
-        if entered == _DRAFT_BEAN_FROM_URL_CONCURRENCY:
-            all_slots_entered.set()
+        first_entered.set()
         await release.wait()
         return _draft_from(url)
 
     monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
 
-    blocking_tasks = [
-        asyncio.create_task(
-            client.post(
-                "/api/beans/draft-from-url",
-                json={"url": f"https://vendor.example/products/{i}"},
-            )
-        )
-        for i in range(_DRAFT_BEAN_FROM_URL_CONCURRENCY)
-    ]
-    try:
-        await asyncio.wait_for(all_slots_entered.wait(), timeout=2.0)
+    # Slot 1: admitted by the semaphore AND actually executing (blocked
+    # inside fake_draft, holding the shared _start_lock).
+    task1 = asyncio.create_task(
+        client.post("/api/beans/draft-from-url", json={"url": "https://vendor.example/products/1"})
+    )
+    await asyncio.wait_for(first_entered.wait(), timeout=2.0)
 
-        overflow_response = await client.post(
-            "/api/beans/draft-from-url",
-            json={"url": "https://vendor.example/products/overflow"},
-        )
-        assert overflow_response.status_code == 429
-    finally:
-        release.set()
-        results = await asyncio.gather(*blocking_tasks)
-    for result in results:
-        assert result.status_code == 200
+    # Slot 2: admitted by the semaphore (a slot is free) but QUEUED behind
+    # the shared lock task1 holds — it must NOT complete, or even reach
+    # fake_draft, until task1 releases.
+    task2 = asyncio.create_task(
+        client.post("/api/beans/draft-from-url", json={"url": "https://vendor.example/products/2"})
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not task2.done(), "the second admitted request must queue behind the shared lock"
+    assert entered == 1, "the second request must not reach fake_draft while queued"
+
+    # A THIRD concurrent request exhausts the semaphore itself -> 429.
+    overflow_response = await client.post(
+        "/api/beans/draft-from-url", json={"url": "https://vendor.example/products/overflow"}
+    )
+    assert overflow_response.status_code == 429
+
+    release.set()
+    result1 = await task1
+    result2 = await task2
+    assert result1.status_code == 200
+    assert result2.status_code == 200
+    assert entered == 2
 
 
 @pytest.mark.asyncio

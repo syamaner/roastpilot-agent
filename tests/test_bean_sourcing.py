@@ -18,10 +18,12 @@ transitive import graph checked in a fresh subprocess).
 from __future__ import annotations
 
 import asyncio
+import gzip
 import ipaddress
 import logging
 import subprocess
 import sys
+import zlib
 from collections.abc import AsyncGenerator
 
 import httpx
@@ -48,9 +50,26 @@ def _mock_client(handler: httpx.MockTransport) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=handler)
 
 
+async def _bytes_stream(data: bytes) -> AsyncGenerator[bytes, None]:
+    """A single-chunk async byte stream (#587 P1 round 2/5): plain
+    ``httpx.Response(status, content=<bytes>)`` PRE-BUFFERS the body and
+    marks the response's stream as ALREADY CONSUMED — harmless for
+    ``aiter_bytes()`` (which special-cases pre-buffered content and just
+    chunks it) but fatal for ``aiter_raw()`` (which this module's fetch
+    path now uses instead — no such special case, so it raises
+    ``httpx.StreamConsumed``). Every test double that constructs a response
+    BODY must go through this helper (or its own async generator, like the
+    slow-body timeout test does) instead of a bare ``content=bytes``, to
+    behave like an actual streamed-over-the-wire HTTP response rather than
+    a fully-buffered-upfront one — no production response is ever
+    pre-buffered like that, so this is a MORE realistic fixture too, not
+    just a workaround."""
+    yield data
+
+
 def _html_response(status_code: int, html: str) -> httpx.MockTransport:
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(status_code, content=html.encode())
+        return httpx.Response(status_code, content=_bytes_stream(html.encode()))
 
     return httpx.MockTransport(handler)
 
@@ -332,7 +351,7 @@ async def test_fetch_page_text_follows_redirects_on_internally_constructed_clien
         if host_header == "vendor.example":
             return httpx.Response(302, headers={"Location": redirected_url})
         assert host_header == "www.vendor.example"
-        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -498,7 +517,7 @@ async def test_fetch_page_text_redirect_public_to_public_succeeds(
             return httpx.Response(302, headers={"Location": redirected_url})
         assert host_header == redirected_host
         assert request.url.host == host_ips[redirected_host]
-        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -551,7 +570,7 @@ async def test_fetch_with_ssrf_guard_pins_connection_to_validated_ip(
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured_requests.append(request)
-        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -603,7 +622,7 @@ async def test_fetch_with_ssrf_guard_pins_ipv6_address_with_brackets(
 
     def handler(request: httpx.Request) -> httpx.Response:
         captured_requests.append(request)
-        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -686,7 +705,7 @@ async def test_fetch_page_text_redirect_public_to_public_tracks_sni_per_hop(
         if host_header == original_host:
             return httpx.Response(302, headers={"Location": redirected_url})
         assert host_header == redirected_host
-        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -727,7 +746,7 @@ async def test_fetch_with_ssrf_guard_tries_next_address_after_connect_error(
         attempted_hosts.append(request.url.host)
         if request.url.host == bad_ip:
             raise httpx.ConnectError("connection refused", request=request)
-        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -801,7 +820,7 @@ async def test_fetch_with_ssrf_guard_tries_next_address_after_connect_timeout(
         attempted_hosts.append(request.url.host)
         if request.url.host == bad_ip:
             raise httpx.ConnectTimeout("connect timed out", request=request)
-        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -849,7 +868,7 @@ async def test_fetch_one_hop_divides_connect_timeout_across_candidates(
     monkeypatch.setattr(httpx.AsyncClient, "stream", recording_stream)
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
 
     candidate_addresses = [
         ipaddress.ip_address("93.184.216.34"),
@@ -884,7 +903,7 @@ async def test_fetch_page_text_decodes_declared_non_utf8_charset_injected_client
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            content=html_latin1,
+            content=_bytes_stream(html_latin1),
             headers={"Content-Type": "text/html; charset=iso-8859-1"},
         )
 
@@ -908,7 +927,7 @@ async def test_fetch_with_ssrf_guard_decodes_declared_non_utf8_charset(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
-            content=html_latin1,
+            content=_bytes_stream(html_latin1),
             headers={"Content-Type": "text/html; charset=iso-8859-1"},
         )
 
@@ -1163,7 +1182,7 @@ async def test_fetch_page_text_owns_client_raises_on_non_2xx(
     ``test_fetch_page_text_raises_on_non_2xx`` above."""
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(404, content=b"not found")
+        return httpx.Response(404, content=_bytes_stream(b"not found"))
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -1191,7 +1210,7 @@ async def test_fetch_page_text_owns_client_raises_on_oversized_body(
     huge_html = "<p>" + ("x" * 5000) + "</p>"
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=huge_html.encode())
+        return httpx.Response(200, content=_bytes_stream(huge_html.encode()))
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -1247,7 +1266,7 @@ async def test_fetch_page_text_injected_client_rejects_a_single_oversized_decomp
     huge_body = b"x" * 5000
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=huge_body)
+        return httpx.Response(200, content=_bytes_stream(huge_body))
 
     async with _mock_client(httpx.MockTransport(handler)) as client:
         with pytest.raises(BeanFetchError, match="fetch cap"):
@@ -1266,7 +1285,7 @@ async def test_fetch_with_ssrf_guard_rejects_a_single_oversized_decompressed_chu
     huge_body = b"x" * 5000
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, content=huge_body)
+        return httpx.Response(200, content=_bytes_stream(huge_body))
 
     transport = httpx.MockTransport(handler)
     real_async_client = httpx.AsyncClient
@@ -1283,6 +1302,250 @@ async def test_fetch_with_ssrf_guard_rejects_a_single_oversized_decompressed_chu
             "https://vendor.example/bomb",
             config=BeanSourcingConfig(max_response_bytes=100),
         )
+
+
+# --- #587 P1 round 2: streaming decompression, bounded raw AND decoded ---
+
+
+def test_decompress_within_cap_passes_through_identity() -> None:
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    assert decode(b"hello", "", max_bytes=100, url="https://x/y") == b"hello"
+    assert decode(b"hello", "identity", max_bytes=100, url="https://x/y") == b"hello"
+
+
+def test_decompress_within_cap_decodes_gzip() -> None:
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    payload = b"<html>Kenya Kiambu AA</html>"
+    compressed = gzip.compress(payload)
+    assert decode(compressed, "gzip", max_bytes=1000, url="https://x/y") == payload
+    # Case/whitespace-insensitive, and the "x-gzip" alias.
+    assert decode(compressed, " GZIP ", max_bytes=1000, url="https://x/y") == payload
+    assert decode(compressed, "x-gzip", max_bytes=1000, url="https://x/y") == payload
+
+
+def test_decompress_within_cap_decodes_deflate_with_zlib_header() -> None:
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    payload = b"<html>Kenya Kiambu AA</html>"
+    compressed = zlib.compress(payload)  # zlib-wrapped (has the 2-byte header)
+    assert decode(compressed, "deflate", max_bytes=1000, url="https://x/y") == payload
+
+
+def test_decompress_within_cap_decodes_raw_deflate_without_zlib_header() -> None:
+    """Some servers send raw DEFLATE (no zlib header) despite the
+    "deflate" Content-Encoding name — the first attempt must fail over to
+    a raw window, mirroring httpx's own DeflateDecoder compatibility."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    payload = b"<html>Kenya Kiambu AA</html>"
+    compressor = zlib.compressobj(wbits=-zlib.MAX_WBITS)
+    compressed = compressor.compress(payload) + compressor.flush()
+    assert decode(compressed, "deflate", max_bytes=1000, url="https://x/y") == payload
+
+
+def test_decompress_within_cap_rejects_unsupported_encoding() -> None:
+    """#587 P2: only gzip/deflate are requested/decoded — brotli, zstd, or
+    an unknown value fails closed rather than being silently mistreated as
+    identity (LLM-extraction garbage) or decompressed by an unimported lib."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(BeanFetchError, match="unsupported Content-Encoding"):
+        decode(b"whatever-bytes", "br", max_bytes=1000, url="https://x/y")
+
+
+def test_decompress_within_cap_rejects_decompression_bomb() -> None:
+    """A small compressed payload that decompresses beyond the cap must
+    raise — and must never actually allocate the full decompressed size."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    huge_payload = b"a" * 1_000_000  # highly compressible -> tiny gzip body
+    compressed = gzip.compress(huge_payload)
+    assert len(compressed) < 2000  # confirms this really is a "bomb" shape
+    with pytest.raises(BeanFetchError, match="fetch cap"):
+        decode(compressed, "gzip", max_bytes=1000, url="https://x/y")
+
+
+def test_decompress_within_cap_rejects_exact_one_byte_over_cap_with_no_unconsumed_tail() -> None:
+    """Boundary case: a payload whose TRUE decoded size is exactly
+    ``max_bytes + 1`` can fully consume the compressed input AND leave
+    ``unconsumed_tail`` EMPTY (the decompressor has genuinely nothing left
+    to give) — so the ``unconsumed_tail`` check alone does not catch it;
+    the trailing length check after ``flush()`` is what does. Verified
+    directly against zlib's actual behavior at this exact boundary before
+    writing this test, not assumed."""
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    payload = b"x" * 101
+    compressed = gzip.compress(payload)
+    with pytest.raises(BeanFetchError, match="fetch cap"):
+        decode(compressed, "gzip", max_bytes=100, url="https://x/y")
+
+
+def test_decompress_within_cap_rejects_corrupt_gzip_data() -> None:
+    decode = bean_sourcing._decompress_within_cap  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(BeanFetchError, match="failed to decompress"):
+        decode(b"not actually gzip data", "gzip", max_bytes=1000, url="https://x/y")
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_injected_client_rejects_a_gzip_decompression_bomb() -> None:
+    """#587 P1 round 2: a SMALL gzip body that decompresses beyond the cap
+    must raise BeanFetchError — proving the cap is enforced on the DECODED
+    size, not just the (small, wire-size) raw/compressed body. Injected-
+    client path."""
+    huge_payload = b"a" * 1_000_000
+    compressed = gzip.compress(huge_payload)
+    assert len(compressed) < 2000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=_bytes_stream(compressed), headers={"Content-Encoding": "gzip"}
+        )
+
+    async with _mock_client(httpx.MockTransport(handler)) as client:
+        with pytest.raises(BeanFetchError, match="fetch cap"):
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/bomb.gz",
+                config=BeanSourcingConfig(max_response_bytes=1000),
+                http_client=client,
+            )
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_ssrf_guard_rejects_a_gzip_decompression_bomb(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owns-client-path version of the gzip decompression-bomb test above."""
+    huge_payload = b"a" * 1_000_000
+    compressed = gzip.compress(huge_payload)
+    assert len(compressed) < 2000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=_bytes_stream(compressed), headers={"Content-Encoding": "gzip"}
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    with pytest.raises(BeanFetchError, match="fetch cap"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/bomb.gz",
+            config=BeanSourcingConfig(max_response_bytes=1000),
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_decodes_a_small_legitimate_gzip_body() -> None:
+    """A well-behaved small gzip response decodes correctly end-to-end
+    (not just the decompression-bomb rejection path)."""
+    compressed = gzip.compress(_SAMPLE_HTML.encode())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, content=_bytes_stream(compressed), headers={"Content-Encoding": "gzip"}
+        )
+
+    async with _mock_client(httpx.MockTransport(handler)) as client:
+        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/kenya",
+            config=BeanSourcingConfig(),
+            http_client=client,
+        )
+    assert "Kenya Kiambu AA" in text
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_sends_gzip_deflate_only_accept_encoding() -> None:
+    """#587 P1 round 2: this module requests ONLY gzip/deflate — never
+    br/zstd, which it has no safe (cap-bounded) way to decode."""
+    captured_headers: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_headers.update(request.headers)
+        return httpx.Response(200, content=_bytes_stream(_SAMPLE_HTML.encode()))
+
+    async with _mock_client(httpx.MockTransport(handler)) as client:
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/kenya",
+            config=BeanSourcingConfig(),
+            http_client=client,
+        )
+    assert captured_headers.get("accept-encoding") == "gzip, deflate"
+
+
+# --- #587 P2 round 5: httpx.InvalidURL (a NUL byte passes urlsplit but not httpx.URL) ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_ssrf_guard_rejects_nul_byte_in_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A NUL byte in the path passes ``urlsplit()`` (so
+    ``_assert_public_destination`` validates the host fine) but
+    ``httpx.URL()`` raises ``httpx.InvalidURL`` for it — not an
+    ``httpx.HTTPError`` subclass, so it must be mapped explicitly
+    (#587 P2) rather than escaping as an unhandled 500. Owns-client path:
+    caught inside ``_fetch_one_hop`` itself."""
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    with pytest.raises(BeanFetchError, match="well-formed"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/prod\x00uct", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_injected_client_rejects_nul_byte_in_path() -> None:
+    """Injected-client-path version: caught by ``_fetch_page_text``'s own
+    outer ``httpx.InvalidURL`` handler, since the injected client's
+    ``client.stream(url)`` call is what parses the NUL-bearing url this
+    time (no ``_fetch_one_hop`` in this path to catch it earlier)."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail("must never connect for an invalid URL")
+
+    async with _mock_client(httpx.MockTransport(handler)) as client:
+        with pytest.raises(BeanFetchError, match="well-formed"):
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/prod\x00uct",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+
+
+# --- #587 P2 round 5: no env proxies on the internally-constructed client ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_constructs_client_with_trust_env_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#587 P2: with an env HTTPS_PROXY set, httpx's default
+    ``trust_env=True`` would route the fetch through a CONNECT-tunnelling
+    proxy that TLS-verifies against the pinned IP LITERAL (the
+    ``sni_hostname`` extension is not honored by the tunnel) — silently
+    defeating connect-time pinning. The internally-constructed client must
+    disable this; an injected client is untouched (the caller's to set)."""
+    transport = _html_response(200, _SAMPLE_HTML)
+    real_async_client = httpx.AsyncClient
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        captured_kwargs.update(kwargs)
+        return real_async_client(transport=transport, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+        "https://vendor.example/products/kenya", config=BeanSourcingConfig()
+    )
+    assert captured_kwargs.get("trust_env") is False
 
 
 # --- #587 fix 2: end-to-end fetch deadline ---
@@ -1491,6 +1754,22 @@ def test_draft_from_identity_whitespace_only_bean_varietal_does_not_reject_draft
     )
     assert draft.bean_varietal is None
     assert "bean_varietal" not in draft.field_sources
+
+
+def test_draft_from_identity_whitespace_only_bean_origin_falls_back_to_country() -> None:
+    """#587 P2 round 5: a whitespace-only ``bean_origin`` is TRUTHY, so an
+    un-normalized ``identity.bean_origin or country`` fallback chain would
+    let it WIN over a perfectly good page-sourced ``country``, then strip
+    to empty and wrongly reject the whole draft as having no usable
+    origin. Normalizing ``bean_origin`` BEFORE the fallback fixes this."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(bean_origin="   ", country="Ethiopia")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/eth"
+    )
+    assert draft.bean_origin == "Ethiopia"
+    assert draft.field_sources["bean_origin"] == "on_page"
 
 
 def test_draft_from_identity_whitespace_padded_values_are_stripped_and_still_on_page() -> None:
@@ -1784,6 +2063,34 @@ async def test_draft_bean_profile_from_url_rejects_embedded_credentials(
     assert any("vendor.example" in record.getMessage() for record in caplog.records)
 
 
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_rejects_url_with_fragment(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#587 P2 round 5: a URL fragment can carry a sensitive token (e.g. an
+    OAuth redirect's ``#access_token=...``) — must be rejected BEFORE any
+    fetch/logging, and the token must never appear in any log line."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail("must not fetch a URL with a fragment")
+
+    caplog.set_level(logging.INFO, logger="roastpilot_agent.bean_sourcing")
+    async with _mock_client(httpx.MockTransport(handler)) as http_client:
+        with pytest.raises(BeanFetchError, match="fragment"):
+            await draft_bean_profile_from_url(
+                "https://vendor.example/products/kenya#access_token=s3cr3t-token",
+                advisor_config=_ADVISOR_CONFIG,
+                http_client=http_client,
+                model=_function_model_returning(_identity_args()),
+            )
+    assert caplog.records, "expected a redacted rejection log line"
+    for record in caplog.records:
+        message = record.getMessage()
+        assert "s3cr3t-token" not in message
+        assert "access_token" not in message
+    assert any("vendor.example" in record.getMessage() for record in caplog.records)
+
+
 def test_redact_url_credentials_strips_userinfo() -> None:
     redacted = bean_sourcing._redact_url_credentials(  # pyright: ignore[reportPrivateUsage]
         "https://scraper:s3cr3t-token@vendor.example:8443/products/kenya?x=1"
@@ -1795,6 +2102,25 @@ def test_redact_url_credentials_strips_userinfo() -> None:
 
 def test_redact_url_credentials_leaves_credential_free_url_unchanged() -> None:
     url = "https://vendor.example/products/kenya"
+    assert bean_sourcing._redact_url_credentials(url) == url  # pyright: ignore[reportPrivateUsage]
+
+
+def test_redact_url_credentials_strips_fragment() -> None:
+    """#587 P2 round 5: a fragment can carry a sensitive token — the
+    logging-safe redaction must strip it, same as userinfo."""
+    redacted = bean_sourcing._redact_url_credentials(  # pyright: ignore[reportPrivateUsage]
+        "https://vendor.example/products/kenya#access_token=s3cr3t"
+    )
+    assert redacted == "https://vendor.example/products/kenya"
+    assert "s3cr3t" not in redacted
+
+
+def test_redact_url_credentials_returns_url_unchanged_on_malformed_url() -> None:
+    """This helper must NEVER raise, even on a URL that fails to parse at
+    all (#587 P2 round 5) — bailing out of a logging call is worse than
+    logging the (still credential-bearing, in this specific edge case)
+    original."""
+    url = "http://[::1"
     assert bean_sourcing._redact_url_credentials(url) == url  # pyright: ignore[reportPrivateUsage]
 
 

@@ -71,13 +71,36 @@ identity. The only remaining residual is parser-differential risk — a
 hostname the resolver and this module's own URL parsing could disagree on —
 mitigated by validating and pinning from the exact same parsed host on every
 hop. An operator-supplied URL with embedded credentials (``user:pass@host``)
-is rejected up front, before any logging or outbound request — and even
-that rejection path aside, the source URL is only ever logged in a
-credential-redacted form (:func:`_redact_url_credentials`). The whole fetch
-(all hops + body streaming) is additionally bounded by an end-to-end
-deadline independent of ``httpx``'s own per-request timeout, and the LLM
-extraction call is bounded by its own deadline — both mapped to this
-module's typed errors, never left to hang indefinitely.
+or a fragment (``#...`` — can carry a sensitive token, e.g. an OAuth
+redirect's ``#access_token=...``) is rejected up front, before any logging
+or outbound request — and even that rejection path aside, the source URL
+is only ever logged in a credential-and-fragment-redacted form
+(:func:`_redact_url_credentials`). The internally-constructed client sets
+``trust_env=False``: an operator/system ``HTTPS_PROXY`` would otherwise
+route the fetch through a CONNECT-tunnelling proxy that TLS-verifies
+against the pinned IP literal (the ``sni_hostname`` extension is not
+honored by the tunnel), silently defeating connect-time pinning. Response
+bodies are decompressed by THIS module, not ``httpx``: the fetch is
+streamed via ``response.aiter_raw()`` (the still-compressed wire bytes,
+capped to ``max_response_bytes`` before any decompression happens at all —
+never ``aiter_bytes()``, whose *internal* per-chunk decompression has no
+output-size bound of its own and so is itself a decompression-bomb vector)
+and decoded via :func:`_decompress_within_cap`, which bounds the DECODED
+output too (``zlib.decompressobj.decompress(..., max_length=...)``, the
+stdlib-documented technique). Only ``gzip``/``deflate`` are requested
+(``Accept-Encoding``) and decoded; this module declares no
+``brotli``/``zstandard`` dependency, so it never asks a server to use them
+and fails closed if one sends them anyway. The whole fetch (all hops + body
+streaming) is additionally bounded by an end-to-end deadline independent of
+``httpx``'s own per-request timeout, and the LLM extraction call is bounded
+by its own deadline — both mapped to this module's typed errors, never left
+to hang indefinitely. Drafting is also mutually exclusive with starting a
+roast (:meth:`~roastpilot_agent.api.RoastService.draft_bean_from_url` holds
+the same lock :meth:`~roastpilot_agent.api.RoastService.start_roast` does,
+across its own active-run check AND the whole fetch+extraction) — a
+bean-extraction LLM call sharing a resource-constrained provider (e.g.
+local Ollama) with an active roast's advisor calls can starve them into the
+controller's sustained-outage safety fallback.
 """
 
 from __future__ import annotations
@@ -87,6 +110,7 @@ import ipaddress
 import logging
 import re
 import socket
+import zlib
 from html import unescape
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -123,33 +147,44 @@ class BeanExtractionError(BeanSourcingError):
 
 
 def _redact_url_credentials(url: str) -> str:
-    """Return ``url`` with any embedded userinfo (``user:pass@``) stripped,
-    for safe logging (#587 P1: a vendor URL's credentials must never reach a
-    log line — even though :func:`draft_bean_profile_from_url` also rejects
-    a credentialed URL outright before any logging happens, this is the
-    defense-in-depth backstop for every OTHER place the source URL is
+    """Return ``url`` with any embedded userinfo (``user:pass@``) AND any
+    fragment stripped, for safe logging (#587 P1/P2: neither credentials
+    nor a fragment — which can carry a sensitive token, e.g. an OAuth
+    redirect's ``#access_token=...`` — may ever reach a log line, even
+    though :func:`draft_bean_profile_from_url` also rejects a credentialed
+    or fragment-bearing URL outright before any logging happens; this is
+    the defense-in-depth backstop for every OTHER place the source URL is
     logged, now or in the future).
 
     Deliberately netloc-string-based rather than going through
     ``SplitResult.username``/``.password``/``.port`` (which can themselves
     raise on a malformed port, #587 P2): this helper is purely for a log
-    line and must never itself raise on a malformed URL — it just strips
-    everything up to and including the last ``@`` in the netloc, which is
-    always the userinfo delimiter when one is present (the host/port
-    portion of a netloc cannot itself contain an unescaped ``@``).
+    line and must NEVER itself raise, even on a malformed URL — the
+    ``urlsplit()`` call itself is guarded too (a malformed URL, e.g. an
+    unclosed IPv6 bracket, makes it raise ``ValueError`` eagerly), falling
+    back to returning ``url`` unchanged rather than raising out of a
+    logging helper. When it does parse, everything up to and including the
+    last ``@`` in the netloc is stripped (always the userinfo delimiter
+    when one is present — the host/port portion of a netloc cannot itself
+    contain an unescaped ``@``), and the fragment is dropped entirely.
 
     Args:
         url: The URL to redact.
 
     Returns:
-        ``url`` unchanged if it carries no userinfo; otherwise the same URL
-        with the ``user[:pass]@`` portion removed.
+        ``url`` with any userinfo and fragment removed; the original
+        ``url`` unchanged if it carries neither, or if it fails to parse at
+        all (this helper fails open to "log the original" rather than
+        raising, since bailing out of a logging call would be worse).
     """
-    parsed = urlsplit(url)
-    if "@" not in parsed.netloc:
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
         return url
-    redacted_netloc = parsed.netloc.rsplit("@", 1)[-1]
-    return urlunsplit(parsed._replace(netloc=redacted_netloc))
+    redacted_netloc = parsed.netloc.rsplit("@", 1)[-1] if "@" in parsed.netloc else parsed.netloc
+    if redacted_netloc == parsed.netloc and not parsed.fragment:
+        return url
+    return urlunsplit(parsed._replace(netloc=redacted_netloc, fragment=""))
 
 
 _STRIP_TAG_BLOCK_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
@@ -334,6 +369,106 @@ def _append_within_cap(body: bytearray, chunk: bytes, *, max_bytes: int, url: st
     body.extend(chunk)
 
 
+#: Sent as this module's OWN ``Accept-Encoding`` (overriding ``httpx``'s
+#: default, which also offers ``br``/``zstd`` whenever those optional
+#: decoder libraries happen to be installed) — deliberately gzip/deflate
+#: ONLY (#587 P1). Both are decoded here via stdlib ``zlib`` with a
+#: cap-bounded ``decompress(data, max_length=...)`` call (see
+#: :func:`_decompress_within_cap`); this module declares no
+#: ``brotli``/``brotlicffi``/``zstandard`` dependency in ``pyproject.toml``
+#: and imports none, so it has no safe way to bound a brotli/zstd
+#: decompression the same way — a compliant server simply never sends
+#: either, because we never asked for them.
+_ACCEPT_ENCODING = "gzip, deflate"
+
+
+def _decompress_within_cap(
+    raw_body: bytes, content_encoding: str, *, max_bytes: int, url: str
+) -> bytes:
+    """Decompress ``raw_body`` per ``content_encoding``, bounded to
+    ``max_bytes`` of DECODED output (#587 P1, compression-bomb guard —
+    round 2).
+
+    ``raw_body`` is the STILL-COMPRESSED response body, already capped to
+    ``max_bytes`` raw bytes by the caller (streamed via
+    ``response.aiter_raw()``, never ``aiter_bytes()`` — see the callers).
+    That raw cap alone is not enough: a highly-compressed body can still
+    decompress to something enormous. ``zlib.decompressobj.decompress``'s
+    ``max_length`` parameter bounds the OUTPUT of a single call — the
+    stdlib-documented technique for safely decompressing untrusted data —
+    so this never allocates more than ``max_bytes + 1`` decoded bytes
+    REGARDLESS of the compression ratio, in one bounded call (no
+    hand-rolled incremental multi-call draining loop needed, since the raw
+    input is already fully buffered and capped by the time this runs).
+
+    Only ``gzip``/``deflate``/absent/``identity`` are decoded — anything
+    else (``br``, ``zstd``, an unknown/typo'd value) is REJECTED rather
+    than silently treated as identity (which would hand the LLM extraction
+    step raw compressed garbage) or decompressed by a library this module
+    does not import (see :data:`_ACCEPT_ENCODING`): this module only ever
+    REQUESTS gzip/deflate, so a compliant server never sends anything else;
+    a non-compliant one that does anyway fails closed here rather than
+    silently corrupting the extracted text.
+
+    Args:
+        raw_body: The still-compressed (or identity) response body.
+        content_encoding: The response's ``Content-Encoding`` header value
+            (``""`` when absent).
+        max_bytes: The configured response-size cap
+            (``BeanSourcingConfig.max_response_bytes``).
+        url: The URL being fetched (for the error message).
+
+    Returns:
+        The decoded (decompressed) bytes.
+
+    Raises:
+        BeanFetchError: ``content_encoding`` is not one of the encodings
+            this module requests and knows how to decode safely, the
+            decoded output would exceed ``max_bytes``, or the body does not
+            decompress cleanly under its declared encoding.
+    """
+    normalized = content_encoding.strip().lower()
+    if normalized in ("", "identity"):
+        return raw_body
+    if normalized not in ("gzip", "x-gzip", "deflate"):
+        raise BeanFetchError(
+            f"vendor page used an unsupported Content-Encoding "
+            f"{content_encoding!r} for {url!r} (only gzip/deflate are "
+            "requested and decoded)"
+        )
+    try:
+        if normalized == "deflate":
+            try:
+                decompressor = zlib.decompressobj()
+                decoded = decompressor.decompress(raw_body, max_bytes + 1)
+            except zlib.error:
+                # Some servers send raw DEFLATE (no zlib header) despite
+                # the "deflate" name — retry with a raw window, mirroring
+                # httpx's own DeflateDecoder compatibility shim.
+                decompressor = zlib.decompressobj(-zlib.MAX_WBITS)
+                decoded = decompressor.decompress(raw_body, max_bytes + 1)
+        else:
+            decompressor = zlib.decompressobj(zlib.MAX_WBITS | 16)
+            decoded = decompressor.decompress(raw_body, max_bytes + 1)
+        if decompressor.unconsumed_tail:
+            # decompress() stopped at max_length with more input left to
+            # process — the decoded output would have exceeded the cap.
+            raise BeanFetchError(
+                f"vendor page exceeded the {max_bytes}-byte fetch cap "
+                f"(after decompression) for {url!r}"
+            )
+        decoded += decompressor.flush()
+    except zlib.error as exc:
+        raise BeanFetchError(
+            f"vendor page failed to decompress ({content_encoding!r}) for {url!r}: {exc}"
+        ) from exc
+    if len(decoded) > max_bytes:
+        raise BeanFetchError(
+            f"vendor page exceeded the {max_bytes}-byte fetch cap (after decompression) for {url!r}"
+        )
+    return decoded
+
+
 def _decode_response_body(body: bytes, response: httpx.Response) -> str:
     """Decode a raw fetched body using the response's declared charset
     (#587 P2) instead of assuming UTF-8.
@@ -419,7 +554,17 @@ async def _fetch_one_hop(
             response, a body over the size cap, a bare 3xx with no
             ``Location`` header, or a malformed redirect ``Location``.
     """
-    original_url = httpx.URL(current_url)
+    try:
+        # ``httpx.URL()`` uses a DIFFERENT (stricter, in some ways) parser
+        # than the stdlib ``urlsplit()`` this hop's url was already checked
+        # with — e.g. a NUL byte in the path passes ``urlsplit`` but
+        # ``httpx.URL()`` raises ``httpx.InvalidURL`` for it, which is NOT
+        # an ``httpx.HTTPError`` subclass and so bypasses the generic
+        # mapping in :func:`_fetch_page_text`, escaping as an unhandled 500
+        # (#587 P2).
+        original_url = httpx.URL(current_url)
+    except httpx.InvalidURL as exc:
+        raise BeanFetchError(f"not a well-formed http(s) URL: {current_url!r} ({exc})") from exc
     pinned_headers = {**headers, "Host": original_url.netloc.decode("ascii")}
     per_address_timeout = timeout
     if len(candidate_addresses) > 1 and timeout.connect is not None:
@@ -463,12 +608,27 @@ async def _fetch_one_hop(
                     raise BeanFetchError(
                         f"vendor page fetch failed: HTTP {response.status_code} for {current_url!r}"
                     )
-                body = bytearray()
-                async for chunk in response.aiter_bytes():
+                # aiter_raw(), never aiter_bytes() (#587 P1 round 2):
+                # aiter_bytes() runs httpx's OWN internal decompression per
+                # network chunk with no output-size bound at all, so a
+                # single (still small, still within our raw cap) chunk
+                # could already have been decompressed into something huge
+                # INSIDE httpx before _append_within_cap ever saw it.
+                # aiter_raw() yields the STILL-COMPRESSED bytes as received
+                # off the wire; we cap those, then decompress ourselves
+                # with an explicit output bound (_decompress_within_cap).
+                raw_body = bytearray()
+                async for chunk in response.aiter_raw():
                     _append_within_cap(
-                        body, chunk, max_bytes=config.max_response_bytes, url=current_url
+                        raw_body, chunk, max_bytes=config.max_response_bytes, url=current_url
                     )
-                return _decode_response_body(bytes(body), response), False
+                decoded = _decompress_within_cap(
+                    bytes(raw_body),
+                    response.headers.get("content-encoding", ""),
+                    max_bytes=config.max_response_bytes,
+                    url=current_url,
+                )
+                return _decode_response_body(decoded, response), False
         except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             last_connect_error = exc
             continue
@@ -605,7 +765,7 @@ async def _fetch_page_text(
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise BeanFetchError(f"not a well-formed http(s) URL: {url!r}")
 
-    headers = {"User-Agent": config.user_agent}
+    headers = {"User-Agent": config.user_agent, "Accept-Encoding": _ACCEPT_ENCODING}
     timeout = httpx.Timeout(config.fetch_timeout_seconds)
     owns_client = http_client is None
     client = (
@@ -621,6 +781,15 @@ async def _fetch_page_text(
             # redirect could silently skip re-validating the new host's TLS
             # identity. Forcing a fresh connection per request closes that.
             limits=httpx.Limits(max_keepalive_connections=0),
+            # No env proxies (#587 P2, round 5): httpx defaults to
+            # trust_env=True, so an operator/system HTTPS_PROXY would route
+            # this fetch through a CONNECT-tunnelling proxy that TLS-
+            # verifies against the PINNED IP LITERAL, not the original
+            # hostname the sni_hostname extension names — silently
+            # bypassing the whole connect-time-pinning defense above. The
+            # injected client (test seam / future caller) is untouched;
+            # its proxy behavior is the caller's to set.
+            trust_env=False,
         )
     )
     try:
@@ -639,12 +808,21 @@ async def _fetch_page_text(
                         raise BeanFetchError(
                             f"vendor page fetch failed: HTTP {response.status_code} for {url!r}"
                         )
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes():
+                    # aiter_raw() + our own bounded decompress — see the
+                    # owns-client path's identical comment in
+                    # _fetch_one_hop (#587 P1 round 2).
+                    raw_body = bytearray()
+                    async for chunk in response.aiter_raw():
                         _append_within_cap(
-                            body, chunk, max_bytes=config.max_response_bytes, url=url
+                            raw_body, chunk, max_bytes=config.max_response_bytes, url=url
                         )
-                    html = _decode_response_body(bytes(body), response)
+                    decoded = _decompress_within_cap(
+                        bytes(raw_body),
+                        response.headers.get("content-encoding", ""),
+                        max_bytes=config.max_response_bytes,
+                        url=url,
+                    )
+                    html = _decode_response_body(decoded, response)
     except TimeoutError as exc:
         raise BeanFetchError(
             f"vendor page fetch exceeded the {config.fetch_timeout_seconds:g}s end-to-end "
@@ -652,6 +830,16 @@ async def _fetch_page_text(
         ) from exc
     except BeanFetchError:
         raise
+    except httpx.InvalidURL as exc:
+        # httpx.URL()'s parser is stricter than urlsplit() in some ways
+        # (e.g. a NUL byte in the path passes urlsplit() but httpx.URL()
+        # rejects it) — httpx.InvalidURL is NOT an httpx.HTTPError
+        # subclass, so it would bypass the generic mapping below and
+        # escape as an unhandled 500 (#587 P2). Reachable here via the
+        # injected-client path's client.stream(url) internally parsing
+        # ``url``; the owns-client path's own httpx.URL() call (in
+        # _fetch_one_hop) is already guarded at the source.
+        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r} ({exc})") from exc
     except httpx.HTTPError as exc:
         raise BeanFetchError(f"vendor page fetch failed for {url!r}: {exc}") from exc
     finally:
@@ -929,7 +1117,13 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
     """
     name = (identity.name or "").strip()
     country = _normalize_optional_text(identity.country)
-    bean_origin = (identity.bean_origin or country or "").strip()
+    # Normalized BEFORE the fallback chain (#587 P2, round 5): a raw
+    # whitespace-only identity.bean_origin is truthy, so an un-normalized
+    # ``identity.bean_origin or country`` would let it WIN the fallback
+    # over a perfectly good page-sourced country, then strip to empty and
+    # wrongly reject the whole draft as having no usable origin.
+    raw_bean_origin = _normalize_optional_text(identity.bean_origin)
+    bean_origin = raw_bean_origin or country or ""
     farm = _normalize_optional_text(identity.farm)
     bean_varietal = _normalize_optional_text(identity.bean_varietal)
     description = _normalize_optional_text(identity.description)
@@ -943,22 +1137,23 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
         identity.processing, _SCOUTING_TARGETS_BY_PROCESSING[None]
     )
 
-    # The values used for provenance tagging — normalized where
-    # normalization matters (#587 P2: country/farm/bean_varietal/description).
-    # ``bean_origin`` is deliberately the RAW ``identity.bean_origin`` here,
-    # NOT the local ``bean_origin`` var (which already has the
-    # fallback-to-country applied): the generic loop below must tag
-    # "on_page" only when the page stated bean_origin DIRECTLY, so the
-    # separate fallback-to-country special case immediately below stays
-    # reachable and meaningful (and the two stay honestly distinguishable —
-    # not that it changes the resulting provenance value, both are
-    # "on_page", but it keeps the branch structure legible). ``name`` is
-    # similarly its own local stripped var — the page's usable-name check
-    # already guarantees it is non-blank by this point.
+    # The values used for provenance tagging — every one already
+    # normalized where normalization matters (#587 P2: country/farm/
+    # bean_varietal/description/bean_origin). ``bean_origin`` here is the
+    # NORMALIZED-BUT-PRE-FALLBACK ``raw_bean_origin``, NOT the local
+    # ``bean_origin`` var (which already has the fallback-to-country
+    # applied): the generic loop below must tag "on_page" only when the
+    # page stated bean_origin DIRECTLY, so the separate fallback-to-country
+    # special case immediately below stays reachable and meaningful (and
+    # the two stay honestly distinguishable — not that it changes the
+    # resulting provenance value, both are "on_page", but it keeps the
+    # branch structure legible). ``name`` is similarly its own local
+    # stripped var — the page's usable-name check already guarantees it is
+    # non-blank by this point.
     identity_values: dict[str, object] = {
         "name": name,
         "country": country,
-        "bean_origin": identity.bean_origin,
+        "bean_origin": raw_bean_origin,
         "farm": farm,
         "bean_varietal": bean_varietal,
         "processing": identity.processing,
@@ -1067,9 +1262,10 @@ async def draft_bean_profile_from_url(
         The drafted :class:`~roastpilot_agent.models.BeanProfileDraft`.
 
     Raises:
-        BeanFetchError: The URL embeds credentials (``user:pass@host``, #587
-            P1 — checked FIRST, before any logging or outbound request), or
-            the vendor page could not be fetched.
+        BeanFetchError: The URL embeds credentials (``user:pass@host``) or
+            a fragment (``#...``, #587 P1/P2 — both checked FIRST, before
+            any logging or outbound request), or the vendor page could not
+            be fetched.
         BeanExtractionError: The LLM call failed, or the page yielded too
             little identity to draft a profile from.
     """
@@ -1094,6 +1290,27 @@ async def draft_bean_profile_from_url(
             "vendor URLs with embedded credentials (user:pass@host) are not "
             "supported — remove the credentials from the URL and, if the "
             "page needs authentication, save the profile manually instead"
+        )
+    if parsed_url.fragment:
+        # A fragment (#587 P2, round 5) is never sent to the vendor over
+        # HTTP (fragments are client-side-only, per the URL spec) — the
+        # risk is entirely in what THIS module does with the raw ``url``
+        # value itself: it is logged (mirroring the credential leak above)
+        # and, worse, carried verbatim into the returned draft's
+        # ``source_url`` — so a URL an operator pasted straight out of an
+        # OAuth redirect (``#access_token=...``) or a hash-router page
+        # would leak that token into logs and into a saved bean profile.
+        # Mirrors the credential check exactly: rejected up front, logged
+        # only in fragment-and-credential-redacted form.
+        _log.warning(
+            "draft_bean_profile_from_url: rejected a URL with a fragment: %r",
+            _redact_url_credentials(url),
+        )
+        raise BeanFetchError(
+            "vendor URLs with a fragment (#...) are not supported — a "
+            "fragment can carry a sensitive token (e.g. an OAuth redirect's "
+            "#access_token=...) that must never be fetched, logged, or "
+            "stored; remove the fragment from the URL"
         )
 
     config = sourcing_config if sourcing_config is not None else BeanSourcingConfig()

@@ -2641,34 +2641,49 @@ class RoastService:
         LLM call from the roast advisor) and fetch limits. No roaster/MCP
         involvement — this path never touches the roast-control loop.
 
-        Guarded against an active roast (#587 P1): checked FIRST, before any
-        fetch or LLM work, using the SAME persisted active-run signal
-        :meth:`start_roast` and :meth:`health` already use
-        (``self._store.active_run()``) — not a new state source. On a
-        resource-constrained provider (especially the local Ollama path,
-        which serialises inference), a bean-extraction call can occupy the
-        same backend an active post-FC roast needs for control advice; those
-        advice calls then time out at
+        Guarded against an active roast (#587 P1): the active-run check uses
+        the SAME persisted signal :meth:`start_roast` and :meth:`health`
+        already use (``self._store.active_run()``) — not a new state
+        source. On a resource-constrained provider (especially the local
+        Ollama path, which serialises inference), a bean-extraction call can
+        occupy the same backend an active post-FC roast needs for control
+        advice; those advice calls then time out at
         ``ControllerConfig.advisory_timeout_seconds`` and 3 consecutive
         availability failures trip the sustained-outage safety fallback.
+
+        Mutually exclusive with :meth:`start_roast` (#587 P1 round 5): both
+        share ``self._start_lock``, and THIS method holds it across the
+        active-run check AND THE WHOLE fetch+extraction, not just the
+        check. An unsynchronized check-then-fetch would leave a race: the
+        check could pass, yield during the (multi-second) fetch/LLM call,
+        and let a concurrent ``POST /api/roasts`` start a roast underneath
+        it — reopening the exact advisor-starvation window this guard
+        exists to close. The trade-off is a roast-start issued while a
+        draft is in flight WAITS for the draft to finish (bounded by the
+        fetch + extraction timeouts, so at most
+        ``sourcing_config.fetch_timeout_seconds +
+        advisor_config.timeout_seconds``) rather than racing it — a rare,
+        bounded delay is the safe side of this trade; a single operator is
+        unlikely to issue both at once regardless.
 
         Raises:
             RoastRunConflictError: A roast is currently active (maps to
                 HTTP 409 at the route).
         """
-        active = await self._store.active_run()
-        if active is not None:
-            raise RoastRunConflictError(
-                "bean drafting is unavailable while a roast is active (run "
-                f"{active.run_id}, phase {active.agent_phase.value}) — it "
-                "would compete with the roast advisor for the same backend; "
-                "try again once the roast ends"
+        async with self._start_lock:
+            active = await self._store.active_run()
+            if active is not None:
+                raise RoastRunConflictError(
+                    "bean drafting is unavailable while a roast is active (run "
+                    f"{active.run_id}, phase {active.agent_phase.value}) — it "
+                    "would compete with the roast advisor for the same backend; "
+                    "try again once the roast ends"
+                )
+            return await draft_bean_profile_from_url(
+                url,
+                advisor_config=self._config.advisor,
+                sourcing_config=self._config.bean_sourcing,
             )
-        return await draft_bean_profile_from_url(
-            url,
-            advisor_config=self._config.advisor,
-            sourcing_config=self._config.bean_sourcing,
-        )
 
 
 def _get_service(request: Request) -> RoastService:
