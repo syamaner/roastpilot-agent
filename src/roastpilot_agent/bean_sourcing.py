@@ -44,11 +44,11 @@ from html import unescape
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai import Agent, ModelAPIError, ModelSettings, UnexpectedModelBehavior
 from pydantic_ai.models import Model
 
-from roastpilot_agent.advisor import build_model
+from roastpilot_agent.advisor import AdvisorDependencyError, AdvisorError, build_model
 from roastpilot_agent.config import AdvisorConfig, BeanSourcingConfig
 from roastpilot_agent.models import (
     BeanFieldSource,
@@ -149,7 +149,20 @@ async def _fetch_page_text(
     headers = {"User-Agent": config.user_agent}
     timeout = httpx.Timeout(config.fetch_timeout_seconds)
     owns_client = http_client is None
-    client = http_client if http_client is not None else httpx.AsyncClient()
+    # ``httpx.AsyncClient`` defaults to ``follow_redirects=False``: a 3xx
+    # response (status_code < 400, so it slips past the >=400 check below)
+    # would otherwise be returned with its near-empty redirect body, which
+    # the LLM then fails on with a misleading generic extraction error
+    # instead of seeing the real page. Vendor pages commonly 301/302
+    # (bare -> www, http -> https, trailing-slash). Only the client WE
+    # construct here can have its redirect policy set; an injected
+    # ``http_client`` (the test seam, or a future caller-supplied client) is
+    # used as-is — its policy is the caller's to set (#587).
+    client = (
+        http_client
+        if http_client is not None
+        else httpx.AsyncClient(follow_redirects=True, max_redirects=5)
+    )
     try:
         async with client.stream("GET", url, headers=headers, timeout=timeout) as response:
             if response.status_code >= 400:
@@ -283,11 +296,18 @@ async def _extract_bean_identity(
         The provider's honest, page-only bean identity.
 
     Raises:
-        BeanExtractionError: On any provider/transport failure, or a
-            malformed structured-output shape.
+        BeanExtractionError: On any provider/transport failure, a malformed
+            structured-output shape, or a failure to construct the
+            extraction agent itself (a missing optional provider dependency,
+            or an unsupported provider — see :func:`build_model`).
     """
-    agent = _bean_sourcing_agent(advisor_config, model=model)
     try:
+        # Agent construction (which calls ``build_model`` when ``model`` is
+        # omitted) lives INSIDE the try: it can raise ``AdvisorDependencyError``
+        # / ``AdvisorError`` on a misconfigured or under-installed provider,
+        # and that must fail soft as ``BeanExtractionError`` too, not escape
+        # as an unhandled exception (#587).
+        agent = _bean_sourcing_agent(advisor_config, model=model)
         result = await agent.run(page_text)
     except UnexpectedModelBehavior as exc:
         raise BeanExtractionError(
@@ -295,6 +315,10 @@ async def _extract_bean_identity(
         ) from exc
     except ModelAPIError as exc:
         raise BeanExtractionError(f"bean identity extraction provider error: {exc}") from exc
+    except (AdvisorDependencyError, AdvisorError) as exc:
+        raise BeanExtractionError(
+            f"bean identity extraction could not build its model: {exc}"
+        ) from exc
     return result.output
 
 
@@ -377,7 +401,11 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
     Raises:
         BeanExtractionError: When the page yielded neither a usable ``name``
             nor a usable ``bean_origin``/``country`` — too little identity to
-            draft a profile from.
+            draft a profile from — or when the assembled draft fails
+            :class:`BeanProfileDraft`'s own field validation (e.g. a
+            ``source_url`` embedding userinfo or a malformed port, which
+            :func:`_fetch_page_text`'s scheme/host check does not itself
+            reject, per #587).
     """
     name = (identity.name or "").strip()
     bean_origin = (identity.bean_origin or identity.country or "").strip()
@@ -414,28 +442,38 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
         "review it before roasting."
     )
 
-    return BeanProfileDraft(
-        name=name,
-        bean_origin=bean_origin,
-        bean_varietal=identity.bean_varietal,
-        country=identity.country,
-        farm=identity.farm,
-        description=identity.description,
-        bean_species=identity.bean_species,
-        is_blend=identity.is_blend,
-        processing=identity.processing,
-        altitude_m=identity.altitude_m,
-        source_url=url,
-        charge_guidance_min_c=_DEFAULT_CHARGE_GUIDANCE_MIN_C,
-        charge_guidance_max_c=_DEFAULT_CHARGE_GUIDANCE_MAX_C,
-        initial_heat_percent=_DEFAULT_INITIAL_HEAT_PERCENT,
-        initial_fan_percent=_DEFAULT_INITIAL_FAN_PERCENT,
-        target_drop_temp_c=drop_temp_c,
-        target_development_percent=dev_percent,
-        default_bean_weight_grams=_DEFAULT_BEAN_WEIGHT_GRAMS,
-        field_sources=field_sources,
-        scouting_note=scouting_note,
-    )
+    try:
+        return BeanProfileDraft(
+            name=name,
+            bean_origin=bean_origin,
+            bean_varietal=identity.bean_varietal,
+            country=identity.country,
+            farm=identity.farm,
+            description=identity.description,
+            bean_species=identity.bean_species,
+            is_blend=identity.is_blend,
+            processing=identity.processing,
+            altitude_m=identity.altitude_m,
+            source_url=url,
+            charge_guidance_min_c=_DEFAULT_CHARGE_GUIDANCE_MIN_C,
+            charge_guidance_max_c=_DEFAULT_CHARGE_GUIDANCE_MAX_C,
+            initial_heat_percent=_DEFAULT_INITIAL_HEAT_PERCENT,
+            initial_fan_percent=_DEFAULT_INITIAL_FAN_PERCENT,
+            target_drop_temp_c=drop_temp_c,
+            target_development_percent=dev_percent,
+            default_bean_weight_grams=_DEFAULT_BEAN_WEIGHT_GRAMS,
+            field_sources=field_sources,
+            scouting_note=scouting_note,
+        )
+    except ValidationError as exc:
+        # BeanProfileDraft.source_url runs a stricter validator (models.py —
+        # rejects embedded userinfo and a malformed port) than the
+        # scheme/host check _fetch_page_text already passed, so a fetched-ok
+        # URL can still fail here (#587) — fail soft, not an unhandled
+        # pydantic.ValidationError.
+        raise BeanExtractionError(
+            f"drafted bean profile failed validation for {url!r}: {exc}"
+        ) from exc
 
 
 async def draft_bean_profile_from_url(

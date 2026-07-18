@@ -24,9 +24,11 @@ import httpx
 import pytest
 from pydantic_ai import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
+from pydantic_ai.models import Model
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from roastpilot_agent import bean_sourcing
+from roastpilot_agent.advisor import AdvisorDependencyError
 from roastpilot_agent.bean_sourcing import (
     BeanExtractionError,
     BeanFetchError,
@@ -227,6 +229,42 @@ async def test_fetch_page_text_constructs_and_closes_its_own_client_when_none_in
     assert "Kenya Kiambu AA" in text
 
 
+@pytest.mark.asyncio
+async def test_fetch_page_text_follows_redirects_on_internally_constructed_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#587 fix 1: ``httpx.AsyncClient`` defaults to ``follow_redirects=False``,
+    so a bare 301/302 (common for bare->www, http->https, trailing-slash)
+    would slip past the ``>=400`` check with a near-empty redirect body,
+    later failing the LLM call with a misleading generic error. Only the
+    internally-constructed client's policy can be forced — mirrors the
+    "constructs and closes its own client" seam above."""
+    original_url = "https://vendor.example/products/kenya"
+    redirected_url = "https://www.vendor.example/products/kenya"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == original_url:
+            return httpx.Response(302, headers={"Location": redirected_url})
+        assert str(request.url) == redirected_url
+        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        captured_kwargs.update(kwargs)
+        return real_async_client(transport=transport, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+        original_url, config=BeanSourcingConfig()
+    )
+    assert "Kenya Kiambu AA" in text
+    assert captured_kwargs.get("follow_redirects") is True
+    assert captured_kwargs.get("max_redirects") == 5
+
+
 # --- _bean_sourcing_agent / _extract_bean_identity ---
 
 
@@ -267,6 +305,28 @@ async def test_extract_bean_identity_maps_provider_error() -> None:
     with pytest.raises(BeanExtractionError, match="provider error"):
         await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
             "page text", advisor_config=_ADVISOR_CONFIG, model=model
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_maps_build_model_dependency_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#587 fix 2: ``_bean_sourcing_agent`` (which calls ``build_model`` when
+    ``model`` is omitted) used to run BEFORE the try block, so an
+    ``AdvisorDependencyError`` from a missing optional provider dependency
+    escaped uncaught instead of failing soft as ``BeanExtractionError``."""
+
+    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+        raise AdvisorDependencyError(
+            "advisor provider 'anthropic' needs an optional dependency: "
+            "pip install 'roastpilot-agent[anthropic]'"
+        )
+
+    monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
+    with pytest.raises(BeanExtractionError, match="could not build its model"):
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "page text", advisor_config=_ADVISOR_CONFIG
         )
 
 
@@ -439,6 +499,48 @@ async def test_draft_bean_profile_from_url_propagates_thin_page_extraction_error
                 model=_function_model_returning(
                     _identity_args(name=None, bean_origin=None, country=None)
                 ),
+            )
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_maps_build_model_dependency_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#587 fix 2, full pipeline: a missing optional provider dependency
+    surfaced by ``build_model`` (via ``_bean_sourcing_agent``) must reach the
+    caller as ``BeanExtractionError``, not the raw ``AdvisorDependencyError``.
+    ``model`` is deliberately omitted so the ``build_model`` path is hit."""
+
+    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+        raise AdvisorDependencyError(
+            "advisor provider 'anthropic' needs an optional dependency: "
+            "pip install 'roastpilot-agent[anthropic]'"
+        )
+
+    monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
+    async with _mock_client(_html_response(200, _SAMPLE_HTML)) as http_client:
+        with pytest.raises(BeanExtractionError, match="could not build its model"):
+            await draft_bean_profile_from_url(
+                "https://vendor.example/products/kenya-kiambu",
+                advisor_config=_ADVISOR_CONFIG,
+                http_client=http_client,
+            )
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_maps_source_url_validation_error() -> None:
+    """#587 fix 3: ``BeanProfileDraft.source_url`` runs a stricter validator
+    (models.py — rejects embedded userinfo and a malformed port) than
+    ``_fetch_page_text``'s own scheme/host check, so a URL that fetches fine
+    can still fail ``BeanProfileDraft`` construction. That must fail soft as
+    ``BeanExtractionError``, not an unhandled ``pydantic.ValidationError``."""
+    async with _mock_client(_html_response(200, _SAMPLE_HTML)) as http_client:
+        with pytest.raises(BeanExtractionError, match="failed validation"):
+            await draft_bean_profile_from_url(
+                "https://user:pass@vendor.example/products/kenya-kiambu",
+                advisor_config=_ADVISOR_CONFIG,
+                http_client=http_client,
+                model=_function_model_returning(_identity_args()),
             )
 
 
