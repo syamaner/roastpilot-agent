@@ -27,21 +27,23 @@ distributions between corpora:
 pooling.** The apparent landmark offsets are all explained by
 detection-method / policy differences, not a probe-scale shift:
 
-- **FC BT ~+6.6 C (store higher).** Store FC is MCP audio detection, which lags
-  the true crack ~12-21 s; BT keeps climbing during that lag, so the flagged BT
-  reads higher. Artisan FC is operator-marked at the crack. This is detector lag,
-  not calibration.
-- **Drop BT ~-5.5 C (store lower).** The agent drops beans ~5 C cooler by policy
-  (a deliberately conservative bitter-ceiling drop), not because the probe reads
-  low.
-- **Turnaround ~+21.9 C.** Confounded by charge conditions (batch mass / charge
-  temp differ across the multi-year Artisan set) **and** the store sampling
-  caveat below -- store telemetry is sparse (~5-6 s) and phase-gated, so the
-  interpolated turnaround minimum is shallow. Not a reliable comparator.
-- **Dry-end ~150 C in BOTH (offset ~0 C).** This is the one directly comparable
-  region. Store fires `drying_end` at a 150 C threshold (pinned by construction),
-  but Artisan operators *independently marked* dry-end at ~150 C on average --
-  i.e. the two BT scales agree to within ~0.5 C where we can check them.
+- **FC BT +6.6 C (store higher).** Store FC is MCP audio detection, which
+  lags the true crack ~12-21 s; BT keeps climbing during that lag, so the
+  flagged BT reads higher. Artisan FC is operator-marked at the crack. This is
+  detector lag, not calibration.
+- **Drop BT -5.5 C (store lower).** The agent drops beans ~5 C cooler
+  by policy (a deliberately conservative bitter-ceiling drop), not because the
+  probe reads low.
+- **Turnaround +21.6 C.** Confounded by charge conditions (batch
+  mass / charge temp differ across the multi-year Artisan set) **and** the
+  store sampling caveat below -- store telemetry is sparse (~5-6 s) and
+  phase-gated, so the interpolated turnaround minimum is shallow. Not a
+  reliable comparator.
+- **Dry-end ~150 C in BOTH (offset -0.4 C).** This is the one
+  directly comparable region. Store fires `drying_end` at a 150 C threshold
+  (pinned by construction), but Artisan operators *independently marked*
+  dry-end at ~150 C on average -- i.e. the two BT scales agree to within
+  ~0.5 C where we can check them.
 
 **Decision: pooled the two corpora directly, with no offset subtraction.** The
 model target is RoR (dBT/dt), which is invariant to a constant BT offset anyway;

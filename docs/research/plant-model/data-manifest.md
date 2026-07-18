@@ -62,10 +62,10 @@ This manifest is how the study's raw inputs are "committed" under the `AGENTS.md
 - Source DB used (local, not committed): `/Users/sertanyamaner/roasts/roastpilot.sqlite3`
 - DB file sha256 at study time: `5bdbe9a5c3881cd5b19a88e0952d233e516292c284faa507a778bc5c62282b37`
   (advisory only -- the DB grows as new roasts are recorded; the run ids below pin the exact rows.)
-- Completed runs in DB: **13**
+- Completed store runs included (excluding #582 soft-discarded runs): **13**
 - Completed runs actually modelled (>= 60 usable telemetry rows): **13**
 
-Completed-run telemetry is immutable once the run's completion trigger has fired, so the run id pins the data. Runs with fewer than 60 usable `roasting_pre_first_crack`/`development` telemetry rows are skipped by the harness.
+Completed-run telemetry is immutable once the run's completion trigger has fired, so the run id pins the data. Runs with fewer than 60 usable `roasting_pre_first_crack`/`development` telemetry rows are skipped by the harness. A soft-discarded run (`roast_runs.excluded = 1`, #582) still exists with `outcome='completed'` in the DB but is never a candidate here -- it is not counted above and does not appear in the table below.
 
 | # | run_id | modelled |
 |---|---|---|

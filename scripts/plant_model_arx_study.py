@@ -822,6 +822,7 @@ def _write_report(summary: dict[str, Any], out_dir: Path) -> None:
         return " | ".join(f"{cf[model][f't+{h}']:.2f}" for h in HORIZONS)
 
     cal_lines: list[str] = []
+    cal_offsets: dict[str, str] = {}
     for k in ("turnaround_bt", "dry_end_bt", "fc_bt", "drop_bt"):
         v = cal[k]
         am = "-" if v["artisan_mean"] is None else f"{v['artisan_mean']:.1f}"
@@ -833,11 +834,21 @@ def _write_report(summary: dict[str, Any], out_dir: Path) -> None:
         acol = f"{am} ± {asd} (n={v['artisan_n']})"
         scol = f"{smn} ± {ssd} (n={v['store_n']})"
         cal_lines.append(f"| {k} | {acol} | {scol} | {off} |")
+        # Narrative-bullet offsets below the table are derived from the SAME
+        # calibration_report() offsets the table renders, so the prose can
+        # never drift from the table (a hard-coded literal did, #584 Codex
+        # finding 2 -- turnaround was +21.9 in prose after a data change made
+        # the table +21.6).
+        cal_offsets[k] = off
 
     steps_a = cf["step_counts"]["artisan"]
     steps_s = cf["step_counts"]["store"]
     report = _REPORT_TEMPLATE.format(
         cal_table="\n".join(cal_lines),
+        fc_offset=cal_offsets["fc_bt"],
+        drop_offset=cal_offsets["drop_bt"],
+        turnaround_offset=cal_offsets["turnaround_bt"],
+        dry_end_offset=cal_offsets["dry_end_bt"],
         artisan_roasts=c["artisan_roasts"],
         store_roasts=c["store_roasts"],
         pooled_roasts=c["pooled_roasts"],
@@ -994,7 +1005,9 @@ def emit_manifest(alog_dir: Path, store: Path, dest: Path) -> None:
         "  (advisory only -- the DB grows as new roasts are recorded; the run ids "
         "below pin the exact rows.)"
     )
-    lines.append(f"- Completed runs in DB: **{len(run_ids)}**")
+    lines.append(
+        f"- Completed store runs included (excluding #582 soft-discarded runs): **{len(run_ids)}**"
+    )
     lines.append(
         f"- Completed runs actually modelled (>= 60 usable telemetry rows): **{len(used_ids)}**"
     )
@@ -1003,7 +1016,9 @@ def emit_manifest(alog_dir: Path, store: Path, dest: Path) -> None:
         "Completed-run telemetry is immutable once the run's completion trigger has "
         "fired, so the run id pins the data. Runs with fewer than 60 usable "
         "`roasting_pre_first_crack`/`development` telemetry rows are skipped by the "
-        "harness."
+        "harness. A soft-discarded run (`roast_runs.excluded = 1`, #582) still exists "
+        "with `outcome='completed'` in the DB but is never a candidate here -- it is "
+        "not counted above and does not appear in the table below."
     )
     lines.append("")
     lines.append("| # | run_id | modelled |")
@@ -1105,21 +1120,23 @@ distributions between corpora:
 pooling.** The apparent landmark offsets are all explained by
 detection-method / policy differences, not a probe-scale shift:
 
-- **FC BT ~+6.6 C (store higher).** Store FC is MCP audio detection, which lags
-  the true crack ~12-21 s; BT keeps climbing during that lag, so the flagged BT
-  reads higher. Artisan FC is operator-marked at the crack. This is detector lag,
-  not calibration.
-- **Drop BT ~-5.5 C (store lower).** The agent drops beans ~5 C cooler by policy
-  (a deliberately conservative bitter-ceiling drop), not because the probe reads
-  low.
-- **Turnaround ~+21.9 C.** Confounded by charge conditions (batch mass / charge
-  temp differ across the multi-year Artisan set) **and** the store sampling
-  caveat below -- store telemetry is sparse (~5-6 s) and phase-gated, so the
-  interpolated turnaround minimum is shallow. Not a reliable comparator.
-- **Dry-end ~150 C in BOTH (offset ~0 C).** This is the one directly comparable
-  region. Store fires `drying_end` at a 150 C threshold (pinned by construction),
-  but Artisan operators *independently marked* dry-end at ~150 C on average --
-  i.e. the two BT scales agree to within ~0.5 C where we can check them.
+- **FC BT {fc_offset} C (store higher).** Store FC is MCP audio detection, which
+  lags the true crack ~12-21 s; BT keeps climbing during that lag, so the
+  flagged BT reads higher. Artisan FC is operator-marked at the crack. This is
+  detector lag, not calibration.
+- **Drop BT {drop_offset} C (store lower).** The agent drops beans ~5 C cooler
+  by policy (a deliberately conservative bitter-ceiling drop), not because the
+  probe reads low.
+- **Turnaround {turnaround_offset} C.** Confounded by charge conditions (batch
+  mass / charge temp differ across the multi-year Artisan set) **and** the
+  store sampling caveat below -- store telemetry is sparse (~5-6 s) and
+  phase-gated, so the interpolated turnaround minimum is shallow. Not a
+  reliable comparator.
+- **Dry-end ~150 C in BOTH (offset {dry_end_offset} C).** This is the one
+  directly comparable region. Store fires `drying_end` at a 150 C threshold
+  (pinned by construction), but Artisan operators *independently marked*
+  dry-end at ~150 C on average -- i.e. the two BT scales agree to within
+  ~0.5 C where we can check them.
 
 **Decision: pooled the two corpora directly, with no offset subtraction.** The
 model target is RoR (dBT/dt), which is invariant to a constant BT offset anyway;
