@@ -255,7 +255,15 @@ async def _assert_public_destination(
             address it resolves to (or the literal IP itself) is not
             globally routable.
     """
-    parsed = urlsplit(url)
+    try:
+        # A malformed URL (e.g. an unclosed IPv6 bracket, "http://[::1")
+        # makes urlsplit() raise ValueError EAGERLY — called on every hop
+        # (including redirect targets this module itself resolves), so this
+        # needs its own guard independent of _fetch_page_text's initial
+        # check (#587 P2).
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r} ({exc})") from exc
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise BeanFetchError(f"not a well-formed http(s) URL: {url!r}")
 
@@ -294,6 +302,36 @@ async def _assert_public_destination(
             )
 
     return addresses
+
+
+def _append_within_cap(body: bytearray, chunk: bytes, *, max_bytes: int, url: str) -> None:
+    """Append ``chunk`` to ``body`` IF doing so would stay within
+    ``max_bytes`` — otherwise raise WITHOUT appending (#587 P1,
+    compression-bomb guard).
+
+    ``response.aiter_bytes()`` yields DECOMPRESSED bytes, so a
+    highly-compressed gzip/brotli body can hand the caller a SINGLE chunk
+    that blows past the cap on its own. Checking the running total BEFORE
+    appending — rather than extending first and checking after — means
+    ``body`` never transiently holds more than ``max_bytes``; a
+    check-after-append implementation would also eventually raise here, but
+    only after ``body`` had already ballooned past the cap for at least
+    that one (potentially huge) chunk.
+
+    Args:
+        body: The buffer accumulated so far; mutated in place ONLY when the
+            appended total would stay within ``max_bytes``.
+        chunk: The next chunk read from the response stream.
+        max_bytes: The configured response-size cap
+            (``BeanSourcingConfig.max_response_bytes``).
+        url: The URL being fetched (for the error message).
+
+    Raises:
+        BeanFetchError: Appending ``chunk`` would exceed ``max_bytes``.
+    """
+    if len(body) + len(chunk) > max_bytes:
+        raise BeanFetchError(f"vendor page exceeded the {max_bytes}-byte fetch cap: {url!r}")
+    body.extend(chunk)
 
 
 def _decode_response_body(body: bytes, response: httpx.Response) -> str:
@@ -337,11 +375,26 @@ async def _fetch_one_hop(
     candidate addresses in turn until one connects (#587 P2: a dual-stack
     host with a dead route on one family, or a transient CDN node, must not
     fail the whole fetch when an alternate resolved address would work).
+    Catches both ``httpx.ConnectError`` (e.g. connection refused) AND
+    ``httpx.ConnectTimeout`` (a "black-holed" address — a route exists but
+    nothing ever answers) — the two are SIBLING exceptions under
+    ``httpx.TransportError``, not a subclass relationship, so a fallback
+    loop that only caught ``ConnectError`` would silently give up on a
+    timed-out address instead of trying the next one.
 
     Every attempt is pinned to its candidate IP literal
     (``httpx.URL.copy_with(host=...)``) with the original hostname preserved
     via an explicit ``Host`` header and the ``sni_hostname`` extension (SNI +
     certificate-hostname identity) — see :func:`_fetch_with_ssrf_guard`.
+
+    When there is more than one candidate, each attempt's CONNECT phase is
+    bounded to ``timeout.connect`` divided by the candidate count (#587 P2)
+    — read/write/pool stay at the full configured value. Without this, one
+    black-holed FIRST address could consume the entire per-request connect
+    budget, leaving no time for the fallback loop to even attempt a second
+    address before the caller's outer end-to-end deadline
+    (``asyncio.timeout`` in :func:`_fetch_page_text`) also expires — the
+    per-address bound is what actually gives the fallback a chance to run.
 
     Args:
         client: The internally-constructed ``httpx.AsyncClient``.
@@ -349,7 +402,9 @@ async def _fetch_one_hop(
         candidate_addresses: Every address :func:`_assert_public_destination`
             validated for ``current_url``'s host, tried in order.
         headers: Request headers (the identifying User-Agent).
-        timeout: The per-request ``httpx.Timeout``.
+        timeout: The per-request ``httpx.Timeout`` (its ``connect`` value is
+            subdivided across candidates; ``read``/``write``/``pool`` are
+            reused as-is).
         config: Response-size-cap settings.
 
     Returns:
@@ -359,13 +414,22 @@ async def _fetch_one_hop(
         is the final decoded page text.
 
     Raises:
-        BeanFetchError: Every candidate address failed to connect, a
-            non-2xx/non-3xx-with-``Location`` response, a body over the size
-            cap, or a bare 3xx with no ``Location`` header.
+        BeanFetchError: Every candidate address failed to connect (or
+            timed out connecting), a non-2xx/non-3xx-with-``Location``
+            response, a body over the size cap, a bare 3xx with no
+            ``Location`` header, or a malformed redirect ``Location``.
     """
     original_url = httpx.URL(current_url)
     pinned_headers = {**headers, "Host": original_url.netloc.decode("ascii")}
-    last_connect_error: httpx.ConnectError | None = None
+    per_address_timeout = timeout
+    if len(candidate_addresses) > 1 and timeout.connect is not None:
+        per_address_timeout = httpx.Timeout(
+            connect=timeout.connect / len(candidate_addresses),
+            read=timeout.read,
+            write=timeout.write,
+            pool=timeout.pool,
+        )
+    last_connect_error: httpx.ConnectError | httpx.ConnectTimeout | None = None
     for candidate_address in candidate_addresses:
         pinned_url = original_url.copy_with(host=str(candidate_address))
         try:
@@ -373,7 +437,7 @@ async def _fetch_one_hop(
                 "GET",
                 pinned_url,
                 headers=pinned_headers,
-                timeout=timeout,
+                timeout=per_address_timeout,
                 extensions={"sni_hostname": original_url.host},
             ) as response:
                 if 300 <= response.status_code < 400:
@@ -383,21 +447,29 @@ async def _fetch_one_hop(
                             f"vendor page redirected (HTTP {response.status_code}) with no "
                             f"Location header for {current_url!r}"
                         )
-                    return urljoin(current_url, location), True
+                    try:
+                        # A malformed Location (e.g. an unclosed IPv6
+                        # bracket, "http://[::1") makes urljoin() raise
+                        # ValueError, which would otherwise escape as an
+                        # unhandled 500 (#587 P2).
+                        next_url = urljoin(current_url, location)
+                    except ValueError as exc:
+                        raise BeanFetchError(
+                            f"vendor page redirected to a malformed Location "
+                            f"{location!r} for {current_url!r}: {exc}"
+                        ) from exc
+                    return next_url, True
                 if response.status_code >= 400:
                     raise BeanFetchError(
                         f"vendor page fetch failed: HTTP {response.status_code} for {current_url!r}"
                     )
                 body = bytearray()
                 async for chunk in response.aiter_bytes():
-                    body.extend(chunk)
-                    if len(body) > config.max_response_bytes:
-                        raise BeanFetchError(
-                            f"vendor page exceeded the {config.max_response_bytes}-byte "
-                            f"fetch cap: {current_url!r}"
-                        )
+                    _append_within_cap(
+                        body, chunk, max_bytes=config.max_response_bytes, url=current_url
+                    )
                 return _decode_response_body(bytes(body), response), False
-        except httpx.ConnectError as exc:
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
             last_connect_error = exc
             continue
     raise BeanFetchError(
@@ -521,7 +593,15 @@ async def _fetch_page_text(
             body over the configured size cap, or exceeding the end-to-end
             fetch deadline.
     """
-    parsed = urlsplit(url)
+    try:
+        # A malformed URL (e.g. an unclosed IPv6 bracket, "http://[::1")
+        # makes urlsplit() raise ValueError EAGERLY (unlike a bad port,
+        # which it only raises on lazily via .port) — left unguarded this
+        # escapes as an unhandled 500 instead of the typed fail-soft error
+        # every other malformed-URL case here gets (#587 P2).
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r} ({exc})") from exc
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise BeanFetchError(f"not a well-formed http(s) URL: {url!r}")
 
@@ -561,12 +641,9 @@ async def _fetch_page_text(
                         )
                     body = bytearray()
                     async for chunk in response.aiter_bytes():
-                        body.extend(chunk)
-                        if len(body) > config.max_response_bytes:
-                            raise BeanFetchError(
-                                f"vendor page exceeded the {config.max_response_bytes}-byte "
-                                f"fetch cap: {url!r}"
-                            )
+                        _append_within_cap(
+                            body, chunk, max_bytes=config.max_response_bytes, url=url
+                        )
                     html = _decode_response_body(bytes(body), response)
     except TimeoutError as exc:
         raise BeanFetchError(
@@ -793,6 +870,34 @@ _DEFAULT_INITIAL_FAN_PERCENT = 30
 _DEFAULT_BEAN_WEIGHT_GRAMS = 250.0
 
 
+def _normalize_optional_text(value: str | None) -> str | None:
+    """Strip an optional identity string; blank-after-strip normalizes to
+    ``None`` (#587 P2).
+
+    Matches :class:`~roastpilot_agent.models.BeanProfileDraft`'s OWN
+    optional-text validators (``_BeanProfileFieldsBase._strip_optional_identity``
+    for ``country``/``farm``/``description``), applied here FIRST so the
+    same normalization is visible to both the provenance-tagging loop and
+    the draft construction below — without this, a whitespace-only page
+    value would get tagged ``"on_page"`` for a field that then silently
+    becomes ``None`` on construction (a provenance lie), and for
+    ``bean_varietal`` specifically (whose OWN base-model validator,
+    ``_strip_and_require_content``, RAISES on a whitespace-only value rather
+    than normalizing it) an un-normalized whitespace-only extraction would
+    reject the WHOLE draft instead of just being treated as unstated.
+
+    Args:
+        value: The raw extracted value, or ``None``.
+
+    Returns:
+        The stripped value, or ``None`` if it was ``None`` or blank.
+    """
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
 def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanProfileDraft:
     """Assemble the :class:`BeanProfileDraft` from an extracted identity.
 
@@ -800,6 +905,10 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
     (:data:`_SCOUTING_TARGETS_BY_PROCESSING`) and builds the honest per-field
     ``field_sources`` map: every identity field the page stated is
     ``"on_page"``; every roast-target field is always ``"origin_estimated"``.
+    The optional free-text fields (``country``, ``farm``, ``bean_varietal``,
+    ``description``) are normalized via :func:`_normalize_optional_text`
+    BEFORE both the provenance loop and the draft construction (#587 P2) —
+    see that function's docstring for why the ordering matters.
 
     Args:
         identity: The provider's page-only extraction.
@@ -819,7 +928,11 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
             reject, per #587).
     """
     name = (identity.name or "").strip()
-    bean_origin = (identity.bean_origin or identity.country or "").strip()
+    country = _normalize_optional_text(identity.country)
+    bean_origin = (identity.bean_origin or country or "").strip()
+    farm = _normalize_optional_text(identity.farm)
+    bean_varietal = _normalize_optional_text(identity.bean_varietal)
+    description = _normalize_optional_text(identity.description)
     if not name or not bean_origin:
         raise BeanExtractionError(
             f"could not determine a bean name and origin from the page ({url!r}) "
@@ -830,12 +943,36 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
         identity.processing, _SCOUTING_TARGETS_BY_PROCESSING[None]
     )
 
+    # The values used for provenance tagging — normalized where
+    # normalization matters (#587 P2: country/farm/bean_varietal/description).
+    # ``bean_origin`` is deliberately the RAW ``identity.bean_origin`` here,
+    # NOT the local ``bean_origin`` var (which already has the
+    # fallback-to-country applied): the generic loop below must tag
+    # "on_page" only when the page stated bean_origin DIRECTLY, so the
+    # separate fallback-to-country special case immediately below stays
+    # reachable and meaningful (and the two stay honestly distinguishable —
+    # not that it changes the resulting provenance value, both are
+    # "on_page", but it keeps the branch structure legible). ``name`` is
+    # similarly its own local stripped var — the page's usable-name check
+    # already guarantees it is non-blank by this point.
+    identity_values: dict[str, object] = {
+        "name": name,
+        "country": country,
+        "bean_origin": identity.bean_origin,
+        "farm": farm,
+        "bean_varietal": bean_varietal,
+        "processing": identity.processing,
+        "bean_species": identity.bean_species,
+        "altitude_m": identity.altitude_m,
+        "description": description,
+    }
+
     field_sources: dict[str, BeanFieldSource] = {}
     for field_name in _IDENTITY_FIELDS:
-        raw_value = getattr(identity, field_name)
+        raw_value = identity_values[field_name]
         if raw_value not in (None, ""):
             field_sources[field_name] = "on_page"
-    if "bean_origin" not in field_sources and identity.country:
+    if "bean_origin" not in field_sources and country:
         # bean_origin fell back to country — still page-sourced, just via the
         # country field rather than an explicit bean_origin statement.
         field_sources["bean_origin"] = "on_page"
@@ -868,10 +1005,10 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
         return BeanProfileDraft(
             name=name,
             bean_origin=bean_origin,
-            bean_varietal=identity.bean_varietal,
-            country=identity.country,
-            farm=identity.farm,
-            description=identity.description,
+            bean_varietal=bean_varietal,
+            country=country,
+            farm=farm,
+            description=description,
             bean_species=identity.bean_species,
             is_blend=identity.is_blend,
             processing=identity.processing,
@@ -940,7 +1077,14 @@ async def draft_bean_profile_from_url(
     # logging, no fetch, no billable LLM call — so a URL with embedded
     # basic-auth credentials is never sent over the wire (to the vendor OR
     # to the LLM provider) and never appears in a log line even transiently.
-    parsed_url = urlsplit(url)
+    # A malformed URL (e.g. an unclosed IPv6 bracket) makes urlsplit() raise
+    # ValueError eagerly (#587 P2) — this is the very first thing ANY url
+    # goes through, so it needs its own guard rather than relying on a
+    # later call site to catch it.
+    try:
+        parsed_url = urlsplit(url)
+    except ValueError as exc:
+        raise BeanFetchError(f"not a well-formed http(s) URL: {url!r} ({exc})") from exc
     if parsed_url.username is not None or parsed_url.password is not None:
         _log.warning(
             "draft_bean_profile_from_url: rejected a URL with embedded credentials: %r",

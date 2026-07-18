@@ -2640,7 +2640,30 @@ class RoastService:
         with this service's configured advisor provider/key (BYOK, a SEPARATE
         LLM call from the roast advisor) and fetch limits. No roaster/MCP
         involvement — this path never touches the roast-control loop.
+
+        Guarded against an active roast (#587 P1): checked FIRST, before any
+        fetch or LLM work, using the SAME persisted active-run signal
+        :meth:`start_roast` and :meth:`health` already use
+        (``self._store.active_run()``) — not a new state source. On a
+        resource-constrained provider (especially the local Ollama path,
+        which serialises inference), a bean-extraction call can occupy the
+        same backend an active post-FC roast needs for control advice; those
+        advice calls then time out at
+        ``ControllerConfig.advisory_timeout_seconds`` and 3 consecutive
+        availability failures trip the sustained-outage safety fallback.
+
+        Raises:
+            RoastRunConflictError: A roast is currently active (maps to
+                HTTP 409 at the route).
         """
+        active = await self._store.active_run()
+        if active is not None:
+            raise RoastRunConflictError(
+                "bean drafting is unavailable while a roast is active (run "
+                f"{active.run_id}, phase {active.agent_phase.value}) — it "
+                "would compete with the roast advisor for the same backend; "
+                "try again once the roast ends"
+            )
         return await draft_bean_profile_from_url(
             url,
             advisor_config=self._config.advisor,
@@ -2947,7 +2970,8 @@ async def draft_bean_from_url(
     persists anything (saving is the existing ``POST /api/bean-profiles``
     action, driven by the operator explicitly submitting the reviewed draft).
     A 422 on a bad/unreachable URL or a failed extraction; the detail message
-    names which.
+    names which. A 409 while a roast is active (#587 P1) — see
+    :meth:`RoastService.draft_bean_from_url`.
 
     Concurrency-bounded (#587 fix 5): at most
     :data:`_DRAFT_BEAN_FROM_URL_CONCURRENCY` calls run at once — each is a
@@ -2969,6 +2993,8 @@ async def draft_bean_from_url(
         ) from exc
     try:
         return await service.draft_bean_from_url(body.url)
+    except RoastRunConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BeanFetchError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except BeanExtractionError as exc:

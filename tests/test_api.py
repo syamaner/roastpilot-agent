@@ -4460,6 +4460,30 @@ async def test_roast_service_draft_bean_from_url_reuses_configured_advisor_and_s
 
 
 @pytest.mark.asyncio
+async def test_roast_service_draft_bean_from_url_raises_when_a_roast_is_active(
+    service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#587 P1: uses the SAME persisted active-run signal ``start_roast``
+    and ``health`` already use (``store.active_run()``) — checked BEFORE
+    the fetch/LLM call, which must never be invoked."""
+
+    async def fail_if_called(
+        url: str, *, advisor_config: object, sourcing_config: object
+    ) -> object:
+        pytest.fail("must not fetch/extract while a roast is active")
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fail_if_called)
+    await store.create_run(
+        run_id="run-active",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    with pytest.raises(RoastRunConflictError, match="active"):
+        await service.draft_bean_from_url("https://vendor.example/products/kenya")
+
+
+@pytest.mark.asyncio
 async def test_draft_bean_from_url_returns_429_when_concurrency_exhausted(
     client: AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4505,6 +4529,55 @@ async def test_draft_bean_from_url_returns_429_when_concurrency_exhausted(
         results = await asyncio.gather(*blocking_tasks)
     for result in results:
         assert result.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_conflicts_when_a_roast_is_active(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#587 P1: bean extraction is a billable LLM call that can occupy the
+    SAME backend an active roast's post-FC advisor needs for control advice
+    — most acutely on a resource-constrained local provider (Ollama, which
+    serialises inference) — starving those calls into
+    ``ControllerConfig.advisory_timeout_seconds`` and the sustained-outage
+    safety fallback after 3 consecutive failures. Must 409 BEFORE any
+    fetch/LLM work: proven here by a ``draft_bean_profile_from_url`` double
+    that ``pytest.fail``s if ever invoked."""
+
+    async def fail_if_called(
+        url: str, *, advisor_config: object, sourcing_config: object
+    ) -> object:
+        pytest.fail("must not fetch/extract while a roast is active")
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fail_if_called)
+
+    started = await client.post("/api/roasts", json=_profile().model_dump())
+    assert started.status_code == 201
+
+    response = await client.post(
+        "/api/beans/draft-from-url",
+        json={"url": "https://vendor.example/products/kenya"},
+    )
+    assert response.status_code == 409
+    assert "active" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_works_when_idle(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The #587 P1 active-roast guard must not false-positive when idle —
+    the ordinary happy path keeps working once the guard is added."""
+
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    response = await client.post(
+        "/api/beans/draft-from-url",
+        json={"url": "https://vendor.example/products/kenya"},
+    )
+    assert response.status_code == 200
 
 
 # ---------------------------------------------------------------------------

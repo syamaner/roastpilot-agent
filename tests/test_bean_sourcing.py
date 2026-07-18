@@ -200,6 +200,44 @@ async def test_fetch_page_text_rejects_scheme_without_host() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_page_text_rejects_url_with_unclosed_ipv6_bracket() -> None:
+    """#587 P2: ``urlsplit()`` raises ``ValueError`` EAGERLY (unlike a bad
+    port, which it only raises lazily via ``.port``) for a malformed IPv6
+    bracket like ``http://[::1`` — left unguarded this escapes as an
+    unhandled 500 instead of the typed fail-soft error every other
+    malformed-URL case here gets."""
+    with pytest.raises(BeanFetchError, match="well-formed"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "http://[::1", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_assert_public_destination_rejects_url_with_unclosed_ipv6_bracket() -> None:
+    """Same malformed-bracket case, but reached via ``_assert_public_destination``
+    directly — this function is called per-hop (including redirect targets
+    ``_fetch_page_text``'s own initial check never sees), so it needs its
+    own guard independent of that one (#587 P2)."""
+    with pytest.raises(BeanFetchError, match="well-formed"):
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            "http://[::1"
+        )
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_rejects_url_with_unclosed_ipv6_bracket() -> None:
+    """Same malformed-bracket case, but reached via the PUBLIC entry point's
+    own credential-check ``urlsplit()`` call — the very first thing ANY url
+    goes through (#587 P2)."""
+    with pytest.raises(BeanFetchError, match="well-formed"):
+        await draft_bean_profile_from_url(
+            "http://[::1",
+            advisor_config=_ADVISOR_CONFIG,
+            model=_function_model_returning(_identity_args()),
+        )
+
+
+@pytest.mark.asyncio
 async def test_fetch_page_text_success_extracts_text() -> None:
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
         text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
@@ -746,6 +784,93 @@ async def test_fetch_with_ssrf_guard_raises_when_every_address_fails_to_connect(
         )
 
 
+@pytest.mark.asyncio
+async def test_fetch_with_ssrf_guard_tries_next_address_after_connect_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#587 P2: ``httpx.ConnectTimeout`` (a "black-holed" address — a route
+    exists but nothing ever answers) is a SIBLING of ``httpx.ConnectError``
+    under ``httpx.TransportError``, not a subclass — a fallback loop that
+    only caught ``ConnectError`` would silently give up on a timed-out
+    first address instead of trying the next one."""
+    bad_ip = "1.1.1.1"
+    good_ip = "93.184.216.34"
+    attempted_hosts: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempted_hosts.append(request.url.host)
+        if request.url.host == bad_ip:
+            raise httpx.ConnectTimeout("connect timed out", request=request)
+        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        return [
+            (None, None, None, "", (bad_ip, port)),
+            (None, None, None, "", (good_ip, port)),
+        ]
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+        "https://vendor.example/products/kenya", config=BeanSourcingConfig()
+    )
+    assert "Kenya Kiambu AA" in text
+    assert attempted_hosts == [bad_ip, good_ip]
+
+
+@pytest.mark.asyncio
+async def test_fetch_one_hop_divides_connect_timeout_across_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#587 P2: with more than one candidate address, each attempt's
+    CONNECT phase must be bounded to a FRACTION of the configured connect
+    timeout — otherwise one black-holed FIRST address could consume the
+    entire per-request connect budget, leaving the fallback loop no time to
+    even attempt a second address before the caller's outer end-to-end
+    deadline also expires."""
+    captured_timeouts: list[httpx.Timeout] = []
+    original_stream = httpx.AsyncClient.stream
+
+    def recording_stream(
+        self: httpx.AsyncClient, method: str, url: object, **kwargs: object
+    ) -> object:
+        captured_timeouts.append(kwargs.get("timeout"))  # type: ignore[arg-type]
+        return original_stream(self, method, url, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(httpx.AsyncClient, "stream", recording_stream)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+
+    candidate_addresses = [
+        ipaddress.ip_address("93.184.216.34"),
+        ipaddress.ip_address("1.1.1.1"),
+    ]
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result, is_redirect = await bean_sourcing._fetch_one_hop(  # pyright: ignore[reportPrivateUsage]
+            client,
+            "https://vendor.example/products/kenya",
+            candidate_addresses,
+            headers={"User-Agent": "x"},
+            timeout=httpx.Timeout(10.0),
+            config=BeanSourcingConfig(),
+        )
+    assert is_redirect is False
+    assert "Kenya Kiambu AA" in result
+    assert len(captured_timeouts) == 1
+    assert captured_timeouts[0].connect == 5.0
+    assert captured_timeouts[0].read == 10.0
+
+
 # --- #587 P2: decode using the response's declared charset ---
 
 
@@ -884,6 +1009,78 @@ async def test_fetch_page_text_rejects_redirect_to_non_http_scheme(
 
 
 @pytest.mark.asyncio
+async def test_fetch_page_text_rejects_redirect_to_malformed_location(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#587 P2: a malformed redirect ``Location`` (an unclosed IPv6 bracket,
+    ``http://[::1``) makes ``urljoin()`` raise ``ValueError`` — left
+    unguarded this escapes as an unhandled 500 instead of failing soft.
+
+    Uses HTTP 300 (Multiple Choices), not 302: ``httpx`` itself EAGERLY
+    parses the ``Location`` header for the standard redirect codes
+    (301/302/303/307/308) regardless of ``follow_redirects`` (confirmed by
+    reading ``httpx._client``'s ``_send_handling_redirects`` — it always
+    calls ``_build_redirect_request``/``_redirect_url``, just conditionally
+    on whether to actually FOLLOW it), so a malformed Location on one of
+    those codes is already caught by httpx's own ``RemoteProtocolError``
+    (mapped here via the pre-existing generic ``except httpx.HTTPError``
+    handler — also fail-soft, just a different message). ``300`` is
+    OUTSIDE that standard list (``Response.has_redirect_location`` is
+    ``False`` for it) but still inside this module's own broader
+    ``300 <= status_code < 400`` redirect-hop range, so httpx hands us the
+    raw header untouched and OUR OWN ``urljoin()`` call — the one this test
+    targets — is what has to catch the malformed value."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(300, headers={"Location": "http://[::1"})
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    with pytest.raises(BeanFetchError, match="malformed Location"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/x", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_rejects_standard_redirect_code_with_malformed_location(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to the test above: on a STANDARD redirect code (302),
+    ``httpx`` itself intercepts the malformed ``Location`` first
+    (``RemoteProtocolError``), which the pre-existing generic
+    ``except httpx.HTTPError`` handler already maps to ``BeanFetchError`` —
+    proving this path was ALREADY fail-soft even before this module's own
+    ``urljoin()`` guard, and stays fail-soft with it."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"Location": "http://[::1"})
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    with pytest.raises(BeanFetchError, match="fetch failed"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/x", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
 async def test_assert_public_destination_maps_resolver_oserror(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1009,6 +1206,81 @@ async def test_fetch_page_text_owns_client_raises_on_oversized_body(
     with pytest.raises(BeanFetchError, match="fetch cap"):
         await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
             "https://vendor.example/huge",
+            config=BeanSourcingConfig(max_response_bytes=100),
+        )
+
+
+# --- #587 P1: compression-bomb guard (check the cap BEFORE appending) ---
+
+
+def test_append_within_cap_raises_without_mutating_body_over_cap() -> None:
+    """#587 P1: proves the buffer NEVER exceeds the cap directly — a
+    check-AFTER-append implementation would also eventually raise here
+    (the coverage of "it raises" alone does not discriminate the two), but
+    would have mutated ``body`` to be over-cap first. This asserts ``body``
+    is untouched by the over-cap chunk."""
+    body = bytearray(b"short")
+    with pytest.raises(BeanFetchError, match="fetch cap"):
+        bean_sourcing._append_within_cap(  # pyright: ignore[reportPrivateUsage]
+            body, b"x" * 1000, max_bytes=10, url="https://vendor.example/x"
+        )
+    assert bytes(body) == b"short"
+    assert len(body) <= 10
+
+
+def test_append_within_cap_allows_a_chunk_that_stays_within_the_cap() -> None:
+    body = bytearray()
+    bean_sourcing._append_within_cap(  # pyright: ignore[reportPrivateUsage]
+        body, b"hello", max_bytes=10, url="https://vendor.example/x"
+    )
+    assert bytes(body) == b"hello"
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_injected_client_rejects_a_single_oversized_decompressed_chunk() -> (
+    None
+):
+    """#587 P1: simulates a compression bomb — ``aiter_bytes()`` handing the
+    caller a SINGLE (decompressed) chunk that alone blows past the cap,
+    rather than many small chunks accumulating past it. Injected-client
+    path."""
+    huge_body = b"x" * 5000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=huge_body)
+
+    async with _mock_client(httpx.MockTransport(handler)) as client:
+        with pytest.raises(BeanFetchError, match="fetch cap"):
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/bomb",
+                config=BeanSourcingConfig(max_response_bytes=100),
+                http_client=client,
+            )
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_ssrf_guard_rejects_a_single_oversized_decompressed_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Owns-client-path version of the compression-bomb test above."""
+    huge_body = b"x" * 5000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=huge_body)
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    with pytest.raises(BeanFetchError, match="fetch cap"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/bomb",
             config=BeanSourcingConfig(max_response_bytes=100),
         )
 
@@ -1160,6 +1432,89 @@ def test_draft_from_identity_marks_page_fields_on_page() -> None:
     # is_blend tri-state tests below for the explicit True/False cases).
     assert draft.is_blend is None
     assert "is_blend" not in draft.field_sources
+
+
+# --- #587 P2: normalize optional identity values before tagging provenance ---
+
+
+def test_draft_from_identity_whitespace_only_country_not_tagged_on_page() -> None:
+    """#587 P2: a whitespace-only ``country`` is accepted by
+    ``_ExtractedBeanIdentity`` but normalizes to ``None`` on
+    ``BeanProfileDraft`` (the base model's ``_strip_optional_identity``
+    validator) — the raw-value provenance check must not tag it
+    ``"on_page"`` for a value that becomes ``None`` (a provenance lie)."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(country="   ")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya"
+    )
+    assert draft.country is None
+    assert "country" not in draft.field_sources
+
+
+def test_draft_from_identity_whitespace_only_farm_not_tagged_on_page() -> None:
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(farm="   ")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya"
+    )
+    assert draft.farm is None
+    assert "farm" not in draft.field_sources
+
+
+def test_draft_from_identity_whitespace_only_description_not_tagged_on_page() -> None:
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(description="   ")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya"
+    )
+    assert draft.description is None
+    assert "description" not in draft.field_sources
+
+
+def test_draft_from_identity_whitespace_only_bean_varietal_does_not_reject_draft() -> None:
+    """#587 P2 (the acute case): ``BeanProfileDraft.bean_varietal`` runs the
+    STRICTER base-model validator (``_strip_and_require_content``), which
+    RAISES on a whitespace-only value rather than normalizing it — passed
+    through un-normalized, a whitespace-only page extraction would reject
+    the WHOLE draft (``BeanExtractionError``) instead of just being treated
+    as unstated. Pre-normalizing to ``None`` before construction avoids
+    that entirely."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(bean_varietal="   ")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya"
+    )
+    assert draft.bean_varietal is None
+    assert "bean_varietal" not in draft.field_sources
+
+
+def test_draft_from_identity_whitespace_padded_values_are_stripped_and_still_on_page() -> None:
+    """Whitespace-PADDED (not whitespace-ONLY) optional text must still be
+    stripped and tagged on_page — normalization must not turn a real value
+    into "unstated"."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(country="  Kenya  ", farm="  Gakuyuini Factory  ")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya"
+    )
+    assert draft.country == "Kenya"
+    assert draft.field_sources["country"] == "on_page"
+    assert draft.farm == "Gakuyuini Factory"
+    assert draft.field_sources["farm"] == "on_page"
+
+
+def test_normalize_optional_text_strips_and_blanks_to_none() -> None:
+    normalize = bean_sourcing._normalize_optional_text  # pyright: ignore[reportPrivateUsage]
+    assert normalize(None) is None
+    assert normalize("") is None
+    assert normalize("   ") is None
+    assert normalize("  Kenya  ") == "Kenya"
 
 
 def test_draft_from_identity_is_blend_silent_page_leaves_unset() -> None:
