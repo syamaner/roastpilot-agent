@@ -107,7 +107,8 @@
 3-arm bake-off (design §6.4) as the validation gate, then chose **park** on the result. New harness
 `scripts/bakeoff_reference_567.py` (store-roast replay + self-excluding reference retrieval + 3 arms
 + spend cap/resume/dry-run); 10 held-out runs / gpt-4o / 0 errors / ~$2; result
-`docs/advisor/reference-curve-bakeoff-2026-07-18.{md,json}`. **Two clean findings:** (1) the
+`docs/advisor/reference-curve-bakeoff-2026-07-18.md` (raw per-tick JSON deliberately
+NOT committed — AGENTS.md forbids checked-in roast logs). **Two clean findings:** (1) the
 reference DATA untaught is INERT — arm2==arm1 on 8/10, aggregate unchanged (12.4→12.3 % DTR), model
 never cites it (the 30-pt curve is ignored without teaching, cutting against the design's "data beats
 prose" hope); (2) the c9 TEACHING moves the drop EARLIER/shorter (12.4→10.6 % DTR, toward
