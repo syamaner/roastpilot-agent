@@ -336,6 +336,52 @@ async def test_v10_migration_adds_explicit_ambient_captured_latch_back_compat(
 
 
 @pytest.mark.asyncio
+async def test_v13_migration_adds_excluded_flag_back_compat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#582: a REAL pre-v13 completed run (written on the pre-v13 schema, no
+    ``excluded`` column yet) upgrades cleanly through a genuine migration
+    round-trip, and its ``excluded`` flag reads back ``False`` (default 0)
+    post-migration — every pre-existing roast stays visible until explicitly
+    discarded (zero behavior change for the whole existing corpus on
+    upgrade), and it is NOT accidentally hidden by the new
+    ``list_runs``/reference-retrieval ``excluded = 0`` filters."""
+    pre_v13 = MIGRATIONS[:12]  # V1..V12 (before the soft-exclude flag)
+    assert len(pre_v13) == 12
+    db_path = tmp_path / "v13upgrade.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", pre_v13)
+    old = RoastStore(db_path=db_path)
+    await old.initialize()
+    try:
+        assert await old.schema_version() == 12
+        await seeded_store(old)
+        # Complete the run against the pre-v13 schema — no ``excluded``
+        # column exists yet, so this is a genuine pre-existing completed
+        # roast (``complete_run`` only touches columns present since v1/v2).
+        await old.complete_run(run_id="run-1", outcome="completed", agent_phase=RoastPhase.COMPLETE)
+    finally:
+        await old.close()
+
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path=db_path)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 13 == len(MIGRATIONS)
+        row = await fetch_one(upgraded, "SELECT excluded FROM roast_runs WHERE id = 'run-1'")
+        assert row == (0,)
+        detail = await upgraded.read_run("run-1")
+        assert detail is not None
+        assert detail.excluded is False
+        # Still visible in history — not accidentally hidden by the new
+        # list_runs() excluded=0 filter.
+        summaries = await upgraded.list_runs()
+        assert [s.id for s in summaries] == ["run-1"]
+        assert summaries[0].excluded is False
+    finally:
+        await upgraded.close()
+
+
+@pytest.mark.asyncio
 async def test_fresh_store_is_v13(tmp_store: RoastStore) -> None:
     """A brand-new store lands on the current (v13) schema version."""
     await tmp_store.initialize()
