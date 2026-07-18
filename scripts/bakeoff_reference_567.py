@@ -470,7 +470,9 @@ def build_fixture_for_run(store_path: Path, run_id: str, tmp_dir: Path) -> Path:
     return Path(cast("str", entry["fixture"]))
 
 
-def build_development_ticks(fixture: Path, *, cadence_seconds: float) -> list[ReplayTick]:
+def build_development_ticks(
+    fixture: Path, *, cadence_seconds: float, profile_name: str
+) -> list[ReplayTick]:
     """Reconstruct + enrich a fixture's ticks, scoped to post-FC DEVELOPMENT.
 
     Reuses ``advisor_bakeoff``'s exact #277 machinery: :func:`build_ticks`
@@ -482,12 +484,22 @@ def build_development_ticks(fixture: Path, *, cadence_seconds: float) -> list[Re
     Args:
         fixture: The exported ``roast.jsonl``.
         cadence_seconds: Roast-time spacing between scored ticks.
+        profile_name: The held-out roast's REAL bean profile name (Codex PR
+            #578 round 2 finding: :func:`build_ticks` defaults
+            ``profile_name`` to the fixture's parent directory names —
+            ``build_fixture_for_run`` writes fixtures under
+            ``tmp_dir/<run_id>/``, so an unset ``profile_name`` stamps every
+            advisor context with a meaningless temp-dir label instead of the
+            bean's actual name). Pass the SAME identity
+            :func:`~roastpilot_agent.models.recording_origin_slug` and the
+            reference retrieval already use (``HeldOutMeta.bean_label`` — the
+            frozen ``RoastProfile.name``), never re-derived here.
 
     Returns:
         The post-FC development ticks, enriched, in roast order. May be empty
         for a degenerate fixture (guarded by the caller).
     """
-    ticks, ground = build_ticks(fixture, cadence_seconds=cadence_seconds)
+    ticks, ground = build_ticks(fixture, cadence_seconds=cadence_seconds, profile_name=profile_name)
     ticks = enrich_ticks_with_control_context(ticks, ground)
     return development_only(ticks)
 
@@ -865,10 +877,18 @@ def sidecar_path(out: Path) -> Path:
 CellKey = tuple[str, str, str]
 
 
-def settings_key(model: str, cadence_seconds: float, *, dry_run: bool) -> str:
+def settings_key(
+    model: str,
+    cadence_seconds: float,
+    *,
+    dry_run: bool,
+    reasoning: ReasoningEffort | None,
+    reference_min_rating: int,
+    weight_tolerance_frac: float,
+) -> str:
     """The run-settings fingerprint folded into every checkpoint cell key.
 
-    Codex PR #578 finding: a bare ``(run_id, arm_key)`` key means a
+    Codex PR #578 finding (round 1): a bare ``(run_id, arm_key)`` key means a
     ``--dry-run`` smoke or a different ``--model``/``--cadence-seconds`` run
     against the SAME ``--out`` silently reuses another settings combination's
     stale cells (a dry-run's fake decisions could even be replayed back as if
@@ -877,16 +897,33 @@ def settings_key(model: str, cadence_seconds: float, *, dry_run: bool) -> str:
     a cache MISS (and appends a fresh, distinctly-keyed record) rather than a
     silent collision — never a mixed sidecar file requiring manual cleanup.
 
+    Round 2 finding: ``--reasoning`` changes the real advisor's own behavior
+    (the OpenAI-compatible reasoning-effort request param), and
+    ``--reference-min-rating`` / ``--weight-tolerance-frac`` change WHICH
+    reference roast :func:`find_self_excluded_reference` retrieves for a run
+    (arm 2/3's injected content) — all three are decision-affecting exactly
+    like model/cadence/dry-run, so they belong in the same fingerprint.
+
     Args:
         model: The candidate model slug.
         cadence_seconds: Roast-time spacing between scored ticks.
         dry_run: Whether this run used the network-free fake advisor.
+        reasoning: Reasoning effort for the real OpenAI-compatible path
+            (``None`` = provider default; ignored but still fingerprinted
+            under ``--dry-run``, where it has no effect but costs nothing to
+            include).
+        reference_min_rating: The reference candidate quality floor.
+        weight_tolerance_frac: The reference candidate charge-weight
+            tolerance.
 
     Returns:
-        A stable string fingerprint for the ``(model, cadence_seconds,
-        dry_run)`` triple.
+        A stable string fingerprint for the full settings tuple.
     """
-    return f"{model}|{cadence_seconds:.3f}|{dry_run}"
+    reasoning_label = reasoning if reasoning is not None else "default"
+    return (
+        f"{model}|{cadence_seconds:.3f}|{dry_run}|{reasoning_label}|"
+        f"{reference_min_rating}|{weight_tolerance_frac:.4f}"
+    )
 
 
 class Checkpoint:
@@ -1095,7 +1132,14 @@ async def run_bakeoff(
 
             checkpoint = Checkpoint(sidecar_path(out), resume=resume)
             guard = CostGuard(cost_per_call, None if dry_run else max_spend)
-            key_settings = settings_key(model, cadence_seconds, dry_run=dry_run)
+            key_settings = settings_key(
+                model,
+                cadence_seconds,
+                dry_run=dry_run,
+                reasoning=reasoning,
+                reference_min_rating=reference_min_rating,
+                weight_tolerance_frac=weight_tolerance_frac,
+            )
             total_cells = len(metas) * len(ARMS)
             run_labels = ", ".join(f"{m.bean_label} [{m.run_id[:8]}]" for m in metas)
             print(
@@ -1155,7 +1199,9 @@ async def run_bakeoff(
                     try:
                         fixture = build_fixture_for_run(snapshot_path, meta.run_id, tmp_dir)
                         dev_ticks = build_development_ticks(
-                            fixture, cadence_seconds=cadence_seconds
+                            fixture,
+                            cadence_seconds=cadence_seconds,
+                            profile_name=meta.bean_label,
                         )
                     except (FixtureConversionError, ValueError) as exc:
                         print(f"[skip] {meta.run_id}: {exc}", flush=True)
@@ -1391,19 +1437,23 @@ def render_report(result: BakeoffResult, *, model: str, dry_run: bool) -> str:
     lines.append("")
     lines.append(
         "| Arm | runs with a drop call | mean drop DTR % | mean drop bean °C | "
-        'rationale mentions "reference" |'
+        'rationale mentions "reference" | ref actually injected |'
     )
-    lines.append("|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|")
     for arm in ARMS:
         drop_dtrs: list[float] = []
         drop_temps: list[float] = []
         runs_with_drop = 0
-        # #578 finding 6: the denominator must be runs that actually HAVE a cell
-        # for this arm, not len(result.runs) — a --max-spend stop mid-run can
-        # leave a RunRecord with only arm 1 present, and dividing by every run
-        # (including ones this arm never ran on) makes a not-yet-run cell read
-        # as a false "no drop" instead of "not run".
+        # #578 round 1 finding 6: the denominator must be runs that actually
+        # HAVE a cell for this arm, not len(result.runs) — a --max-spend stop
+        # mid-run can leave a RunRecord with only arm 1 present, and dividing
+        # by every run (including ones this arm never ran on) makes a
+        # not-yet-run cell read as a false "no drop" instead of "not run".
         runs_with_cell = 0
+        # #578 round 2 finding 5: how many of this arm's cells ACTUALLY had a
+        # reference spliced in (vs. requested — see ArmRecord.reference_injected,
+        # round 1 finding 7). Always 0 for arm 1 (never requests injection).
+        injected_cell_count = 0
         reference_mentions = 0
         total_ticks = 0
         for run in result.runs:
@@ -1411,6 +1461,19 @@ def render_report(result: BakeoffResult, *, model: str, dry_run: bool) -> str:
             if record is None:
                 continue
             runs_with_cell += 1
+            if record.reference_injected:
+                injected_cell_count += 1
+            # #578 round 2 finding 5: arm 2/3's drop-rate / DTR / temp / mention
+            # aggregate is scoped to cells where a reference was ACTUALLY
+            # injected. A bean with no usable PRIOR same-bean run (round 1
+            # finding 1's temporal filter) makes arm 2/3 silently degrade to
+            # arm 1's empty context — that run must not be counted as
+            # "reference present" evidence, or the two arms' numbers mix
+            # genuine reference-present behavior with plain no-reference
+            # behavior. Arm 1 never requests injection, so this never filters
+            # its own row — it stays the full, always-no-reference baseline.
+            if arm.inject_reference and not record.reference_injected:
+                continue
             first_drop = record.first_drop()
             if first_drop is not None:
                 runs_with_drop += 1
@@ -1423,9 +1486,15 @@ def render_report(result: BakeoffResult, *, model: str, dry_run: bool) -> str:
                     reference_mentions += 1
         mean_dtr = sum(drop_dtrs) / len(drop_dtrs) if drop_dtrs else None
         mean_temp = sum(drop_temps) / len(drop_temps) if drop_temps else None
+        # The drop-rate denominator mirrors the same injected-only scoping as
+        # the metrics above: arm 2/3 count against injected_cell_count (the
+        # REAL population their numbers are drawn from), arm 1 against every
+        # cell it ran on.
+        drop_rate_denominator = injected_cell_count if arm.inject_reference else runs_with_cell
         lines.append(
-            f"| {arm.label} | {runs_with_drop}/{runs_with_cell} | {_fmt(mean_dtr)} | "
-            f"{_fmt(mean_temp)} | {reference_mentions}/{total_ticks} ticks |"
+            f"| {arm.label} | {runs_with_drop}/{drop_rate_denominator} | {_fmt(mean_dtr)} | "
+            f"{_fmt(mean_temp)} | {reference_mentions}/{total_ticks} ticks | "
+            f"{injected_cell_count}/{runs_with_cell} |"
         )
     lines.append("")
     lines.append(
@@ -1433,6 +1502,14 @@ def render_report(result: BakeoffResult, *, model: str, dry_run: bool) -> str:
         "verbatim rationale text (never a scored metric) — a rough signal of whether "
         "the model's stated reasoning engages with the reference at all, useful for "
         "spot-checking arm 2 (untaught — expected near-zero) against arm 3 (taught)."
+    )
+    lines.append(
+        'The "ref actually injected" column is the REAL denominator behind arm 2/3\'s '
+        "other columns: cells where a usable PRIOR same-bean reference existed and was "
+        "spliced in, out of every cell that ran for that arm. A run whose bean has no "
+        "qualifying prior roast falls back to arm 1's empty context for arm 2/3 too — "
+        "excluded from their drop-rate/DTR/temp/mention numbers above, never silently "
+        "counted as reference-present evidence."
     )
     if result.skipped_runs:
         lines.append("")
@@ -1583,6 +1660,29 @@ async def main() -> int:
             "--max-spend is required for a real (non-dry-run) run — pass --dry-run instead "
             "for a zero-spend wiring check"
         )
+    # Codex PR #578 round 2: a zero or negative --cost-per-call makes
+    # would_exceed's "projected = calls * cost_per_call" arithmetic never
+    # exceed --max-spend, so the budget guard never trips — the same
+    # unbounded-spend hole the required --max-spend exists to close.
+    if cast("float", args.cost_per_call) <= 0:
+        parser.error("--cost-per-call must be > 0 (a zero/negative value defeats --max-spend)")
+    # Codex PR #578 round 2: a repeated --run-ids entry double-counts that
+    # held-out roast in `runs` and the aggregate (it is silently replayed
+    # twice under separate loop iterations). Reject rather than silently
+    # dedup, so a copy-paste mistake is visible immediately.
+    run_ids_arg = cast("list[str] | None", args.run_ids)
+    if run_ids_arg is not None:
+        seen_run_ids: set[str] = set()
+        duplicate_run_ids: set[str] = set()
+        for run_id in run_ids_arg:
+            if run_id in seen_run_ids:
+                duplicate_run_ids.add(run_id)
+            seen_run_ids.add(run_id)
+        if duplicate_run_ids:
+            parser.error(
+                f"--run-ids: duplicate id(s) {sorted(duplicate_run_ids)} — "
+                f"pass each run id only once"
+            )
 
     reasoning: ReasoningEffort | None = (
         None if args.reasoning == "default" else cast("ReasoningEffort", args.reasoning)
