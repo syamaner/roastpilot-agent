@@ -37,30 +37,47 @@ exception or crashes the caller.
 
 **SSRF + resource-exhaustion hardening (#587):** the fetch is a server-side
 GET of an operator-supplied URL on a LAN tool with no authentication, so
-:func:`_assert_public_destination` rejects any destination that resolves to
-a loopback / private / link-local (including the ``169.254.169.254`` cloud
-metadata address) / multicast / unspecified / reserved address — checked on
-the origin URL *and* on every redirect hop the internally-constructed client
-follows, since a public URL can 302 into a private address just as easily as
-an operator can paste one directly. The naive "validate the hostname, then
-let ``httpx`` connect to the hostname" version of that check has a
-DNS-rebinding TOCTOU gap: a short-TTL domain can answer a public address on
-the validation lookup and a private/metadata address on ``httpx``'s own
-connect-time re-resolution (the exact shape behind CVE-2026-27826 /
-GHSA-489g-7rxv-6c8q in other fetch-URL-for-LLM tools). This module closes
-that gap by connect-time IP pinning: :func:`_assert_public_destination`
-returns the validated address, and :func:`_fetch_with_ssrf_guard` issues
-the request against that literal IP (``httpx.URL.copy_with(host=...)``) so
-there is no second resolution left to poison, while an explicit ``Host``
-header and the ``sni_hostname`` request extension keep routing/TLS identity
-(virtual host, SNI, certificate hostname check) pinned to the ORIGINAL
-hostname. The only remaining residual is parser-differential risk — a
+:func:`_assert_public_destination` rejects any destination whose resolved
+address is not ``is_global`` (this is the single primitive that correctly
+covers loopback / private (RFC1918) / link-local (including the
+``169.254.169.254`` cloud metadata address) / unspecified / IANA-reserved
+*and* Carrier-Grade NAT (``100.64.0.0/10`` — Tailscale/CGNAT ranges a naive
+private-only predicate misses), with multicast rejected alongside it
+explicitly (``is_global`` alone does not exclude multicast — see the
+function's own docstring) — checked on the origin URL *and* on every
+redirect hop the internally-constructed client follows, since a public URL
+can 302 into a private address just as easily as an operator can paste one
+directly. The naive "validate the hostname, then let ``httpx`` connect to
+the hostname" version of that check has a DNS-rebinding TOCTOU gap: a
+short-TTL domain can answer a public address on the validation lookup and a
+private/metadata address on ``httpx``'s own connect-time re-resolution (the
+exact shape behind CVE-2026-27826 / GHSA-489g-7rxv-6c8q in other
+fetch-URL-for-LLM tools). This module closes that gap by connect-time IP
+pinning: :func:`_assert_public_destination` returns every validated address
+a hostname resolved to, and :func:`_fetch_with_ssrf_guard` issues the
+request against a literal IP from that list (``httpx.URL.copy_with(host=...)``,
+trying the next candidate address on a connect failure — a dual-stack host
+with a dead IPv6 route, or a transient CDN node, should not fail the whole
+fetch) so there is no second resolution left to poison, while an explicit
+``Host`` header and the ``sni_hostname`` request extension keep
+routing/TLS identity (virtual host, SNI, certificate hostname check) pinned
+to the ORIGINAL hostname. The internally-constructed client also disables
+keepalive pooling (``httpx.Limits(max_keepalive_connections=0)``): with IP
+pinning, two DIFFERENT hostnames that happen to resolve to the SAME address
+would otherwise share one pooled connection/origin, and ``sni_hostname``
+only applies when a connection is *opened* — a pooled reuse across a
+host-changing redirect would silently skip re-validating the new host's TLS
+identity. The only remaining residual is parser-differential risk — a
 hostname the resolver and this module's own URL parsing could disagree on —
 mitigated by validating and pinning from the exact same parsed host on every
-hop. The whole fetch (all hops + body streaming) is additionally bounded by
-an end-to-end deadline independent of ``httpx``'s own per-request timeout,
-and the LLM extraction call is bounded by its own deadline — both mapped to
-this module's typed errors, never left to hang indefinitely.
+hop. An operator-supplied URL with embedded credentials (``user:pass@host``)
+is rejected up front, before any logging or outbound request — and even
+that rejection path aside, the source URL is only ever logged in a
+credential-redacted form (:func:`_redact_url_credentials`). The whole fetch
+(all hops + body streaming) is additionally bounded by an end-to-end
+deadline independent of ``httpx``'s own per-request timeout, and the LLM
+extraction call is bounded by its own deadline — both mapped to this
+module's typed errors, never left to hang indefinitely.
 """
 
 from __future__ import annotations
@@ -71,7 +88,7 @@ import logging
 import re
 import socket
 from html import unescape
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 from pydantic import BaseModel, Field, ValidationError
@@ -103,6 +120,36 @@ class BeanExtractionError(BeanSourcingError):
     """The page could not be mapped to a usable bean identity: the LLM
     provider/transport failed, its output was malformed, or the page stated
     neither a usable name nor a usable origin to draft from."""
+
+
+def _redact_url_credentials(url: str) -> str:
+    """Return ``url`` with any embedded userinfo (``user:pass@``) stripped,
+    for safe logging (#587 P1: a vendor URL's credentials must never reach a
+    log line — even though :func:`draft_bean_profile_from_url` also rejects
+    a credentialed URL outright before any logging happens, this is the
+    defense-in-depth backstop for every OTHER place the source URL is
+    logged, now or in the future).
+
+    Deliberately netloc-string-based rather than going through
+    ``SplitResult.username``/``.password``/``.port`` (which can themselves
+    raise on a malformed port, #587 P2): this helper is purely for a log
+    line and must never itself raise on a malformed URL — it just strips
+    everything up to and including the last ``@`` in the netloc, which is
+    always the userinfo delimiter when one is present (the host/port
+    portion of a netloc cannot itself contain an unescaped ``@``).
+
+    Args:
+        url: The URL to redact.
+
+    Returns:
+        ``url`` unchanged if it carries no userinfo; otherwise the same URL
+        with the ``user[:pass]@`` portion removed.
+    """
+    parsed = urlsplit(url)
+    if "@" not in parsed.netloc:
+        return url
+    redacted_netloc = parsed.netloc.rsplit("@", 1)[-1]
+    return urlunsplit(parsed._replace(netloc=redacted_netloc))
 
 
 _STRIP_TAG_BLOCK_RE = re.compile(r"<(script|style)\b[^>]*>.*?</\1>", re.IGNORECASE | re.DOTALL)
@@ -150,54 +197,78 @@ _MAX_REDIRECTS = 5
 
 async def _assert_public_destination(
     url: str,
-) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
     """Reject a fetch destination that is not publicly routable, and return
-    the validated address to CONNECT TO (#587 fix 1, SSRF guard + DNS-
-    rebinding fix).
+    EVERY validated address to try CONNECTING TO (#587 fix 1, SSRF guard +
+    DNS-rebinding fix; #587 P2, multi-address resilience).
 
     Parses ``url``'s host. If it is an IP literal, validates that address
     directly; otherwise resolves it via the non-blocking asyncio resolver
     (``loop.getaddrinfo`` — never the blocking stdlib resolver) and validates
     EVERY address the host resolves to, since a hostname can round-robin or
-    dual-stack across a mix of public and non-public addresses. An address is
-    rejected when it is loopback, private (RFC1918 and friends), link-local
-    (this is what blocks the ``169.254.169.254`` cloud metadata endpoint),
-    multicast, unspecified, or otherwise IANA-reserved.
+    dual-stack across a mix of public and non-public addresses.
+
+    An address is rejected unless ``address.is_global`` — the single
+    ``ipaddress`` primitive that correctly covers loopback, private
+    (RFC1918 and friends), link-local (this is what blocks the
+    ``169.254.169.254`` cloud metadata endpoint), unspecified, and
+    IANA-reserved, AND the Carrier-Grade NAT range ``100.64.0.0/10``
+    (Tailscale and similar overlay networks) — a naive
+    loopback/private/link-local/reserved-only predicate misses CGNAT
+    entirely, since Python classifies it as neither private nor reserved.
+    Multicast is rejected alongside it EXPLICITLY: ``is_global`` is defined
+    as (approximately) "not private, with a CGNAT carve-out" and does NOT by
+    itself exclude multicast (a multicast address is not in any "private"
+    range, so ``is_global`` is ``True`` for one) — verified against the
+    stdlib implementation, not assumed.
 
     Called on the origin URL and on every redirect ``Location`` the
     internally-constructed client is about to follow — a *public* URL can
     302 into a private address just as easily as an operator can paste one
     in directly (#587).
 
-    The caller MUST connect to the returned address rather than letting
-    ``httpx`` re-resolve the hostname itself (see :func:`_fetch_with_ssrf_guard`)
-    — a hostname resolved and validated here, then handed to the HTTP client
-    as a hostname, gives a short-TTL DNS record a second chance to answer
-    differently at connect time (a "rebinding" race: public on this check,
-    private/metadata on the real connect). Returning the validated address
-    and pinning the actual connection to it closes that gap: there is no
-    second resolution left to poison.
+    The caller MUST connect to one of the returned addresses rather than
+    letting ``httpx`` re-resolve the hostname itself (see
+    :func:`_fetch_with_ssrf_guard`) — a hostname resolved and validated
+    here, then handed to the HTTP client as a hostname, gives a short-TTL
+    DNS record a second chance to answer differently at connect time (a
+    "rebinding" race: public on this check, private/metadata on the real
+    connect). Returning the validated addresses and pinning the actual
+    connection to one of them closes that gap: there is no second
+    resolution left to poison. Returning ALL of them (not just the first)
+    lets the caller fall back to another address if the first one it tries
+    is unreachable (a dual-stack host with a dead IPv6 route, or a
+    transient CDN node) — a resolution race must not fail the whole fetch
+    when a perfectly good alternate address was also returned.
 
     Args:
         url: The absolute URL about to be connected to (the origin URL, or a
             redirect hop's resolved ``Location``).
 
     Returns:
-        The validated address (the first address checked — the literal IP
-        itself, or the first ``getaddrinfo`` result for a hostname; every
-        resolved address was checked, not just this one).
+        Every validated address (the literal IP itself, in a single-element
+        list, or every ``getaddrinfo`` result for a hostname).
 
     Raises:
         BeanFetchError: The scheme is not ``http``/``https``, the URL has no
-            host, the host could not be resolved, or any address it
-            resolves to (or the literal IP itself) is non-public.
+            host or a malformed port, the host could not be resolved, or any
+            address it resolves to (or the literal IP itself) is not
+            globally routable.
     """
     parsed = urlsplit(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise BeanFetchError(f"not a well-formed http(s) URL: {url!r}")
 
     host = parsed.hostname
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        # ``urlsplit`` parses a bad port lazily: accessing ``.port`` raises
+        # ``ValueError`` on a non-numeric or out-of-range port (#587 P2) —
+        # left unguarded this becomes an unhandled 500 instead of the typed
+        # fail-soft error every other malformed-URL case gets here.
+        explicit_port = parsed.port
+    except ValueError as exc:
+        raise BeanFetchError(f"malformed port in {url!r}: {exc}") from exc
+    port = explicit_port or (443 if parsed.scheme == "https" else 80)
 
     try:
         addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [
@@ -216,20 +287,122 @@ async def _assert_public_destination(
             ) from None
 
     for address in addresses:
-        if (
-            address.is_loopback
-            or address.is_private
-            or address.is_link_local
-            or address.is_multicast
-            or address.is_unspecified
-            or address.is_reserved
-        ):
+        if not address.is_global or address.is_multicast:
             raise BeanFetchError(
                 f"fetch destination {url!r} resolves to a non-public address "
                 f"({address}) — blocked by the SSRF guard (#587)"
             )
 
-    return addresses[0]
+    return addresses
+
+
+def _decode_response_body(body: bytes, response: httpx.Response) -> str:
+    """Decode a raw fetched body using the response's declared charset
+    (#587 P2) instead of assuming UTF-8.
+
+    ``response.encoding`` reads the ``charset`` parameter off the
+    ``Content-Type`` header when present, falling back to UTF-8 otherwise —
+    it is safe to read here even though the body was collected manually via
+    ``aiter_bytes()`` (to enforce the streaming size cap) rather than
+    ``response.read()``/``response.text``, because the default
+    ``default_encoding="utf-8"`` never needs the body itself to resolve. A
+    vendor page served as e.g. ``text/html; charset=iso-8859-1`` must decode
+    under ITS declared charset, not get silently corrupted into replacement
+    characters by an unconditional UTF-8 decode. ``errors="replace"`` is
+    kept as the final fallback so a body that does not even decode cleanly
+    under its own declared charset still yields text rather than raising.
+
+    Args:
+        body: The raw fetched bytes (already capped to the configured size
+            limit).
+        response: The ``httpx.Response`` whose headers determine the
+            encoding.
+
+    Returns:
+        The decoded text.
+    """
+    return body.decode(response.encoding or "utf-8", errors="replace")
+
+
+async def _fetch_one_hop(
+    client: httpx.AsyncClient,
+    current_url: str,
+    candidate_addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address],
+    *,
+    headers: dict[str, str],
+    timeout: httpx.Timeout,
+    config: BeanSourcingConfig,
+) -> tuple[str, bool]:
+    """Fetch a single hop of ``current_url``, trying each of its validated
+    candidate addresses in turn until one connects (#587 P2: a dual-stack
+    host with a dead route on one family, or a transient CDN node, must not
+    fail the whole fetch when an alternate resolved address would work).
+
+    Every attempt is pinned to its candidate IP literal
+    (``httpx.URL.copy_with(host=...)``) with the original hostname preserved
+    via an explicit ``Host`` header and the ``sni_hostname`` extension (SNI +
+    certificate-hostname identity) — see :func:`_fetch_with_ssrf_guard`.
+
+    Args:
+        client: The internally-constructed ``httpx.AsyncClient``.
+        current_url: This hop's (hostname-based) URL.
+        candidate_addresses: Every address :func:`_assert_public_destination`
+            validated for ``current_url``'s host, tried in order.
+        headers: Request headers (the identifying User-Agent).
+        timeout: The per-request ``httpx.Timeout``.
+        config: Response-size-cap settings.
+
+    Returns:
+        ``(text_or_next_url, is_redirect)``: when ``is_redirect`` is
+        ``True``, the first element is the resolved absolute redirect
+        target URL for the caller to validate and fetch next; otherwise it
+        is the final decoded page text.
+
+    Raises:
+        BeanFetchError: Every candidate address failed to connect, a
+            non-2xx/non-3xx-with-``Location`` response, a body over the size
+            cap, or a bare 3xx with no ``Location`` header.
+    """
+    original_url = httpx.URL(current_url)
+    pinned_headers = {**headers, "Host": original_url.netloc.decode("ascii")}
+    last_connect_error: httpx.ConnectError | None = None
+    for candidate_address in candidate_addresses:
+        pinned_url = original_url.copy_with(host=str(candidate_address))
+        try:
+            async with client.stream(
+                "GET",
+                pinned_url,
+                headers=pinned_headers,
+                timeout=timeout,
+                extensions={"sni_hostname": original_url.host},
+            ) as response:
+                if 300 <= response.status_code < 400:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise BeanFetchError(
+                            f"vendor page redirected (HTTP {response.status_code}) with no "
+                            f"Location header for {current_url!r}"
+                        )
+                    return urljoin(current_url, location), True
+                if response.status_code >= 400:
+                    raise BeanFetchError(
+                        f"vendor page fetch failed: HTTP {response.status_code} for {current_url!r}"
+                    )
+                body = bytearray()
+                async for chunk in response.aiter_bytes():
+                    body.extend(chunk)
+                    if len(body) > config.max_response_bytes:
+                        raise BeanFetchError(
+                            f"vendor page exceeded the {config.max_response_bytes}-byte "
+                            f"fetch cap: {current_url!r}"
+                        )
+                return _decode_response_body(bytes(body), response), False
+        except httpx.ConnectError as exc:
+            last_connect_error = exc
+            continue
+    raise BeanFetchError(
+        f"could not connect to any resolved address for {current_url!r}: {last_connect_error}"
+    ) from last_connect_error
 
 
 async def _fetch_with_ssrf_guard(
@@ -242,28 +415,33 @@ async def _fetch_with_ssrf_guard(
 ) -> str:
     """Fetch ``url`` on the internally-constructed client, following
     redirects MANUALLY (#587 fix 1) with every hop's connection PINNED to
-    its validated address (#587 fix 1b, closes the DNS-rebinding TOCTOU
-    gap).
+    one of its validated addresses (#587 fix 1b, closes the DNS-rebinding
+    TOCTOU gap; #587 P2, tries every validated address before giving up).
 
     Per hop: :func:`_assert_public_destination` validates the CURRENT
-    (hostname-based) URL and returns the address to connect to; the actual
-    request is then issued against that address literally
-    (``httpx.URL.copy_with(host=...)``) so ``httpx``/``httpcore`` never
-    re-resolves the hostname themselves — there is no second DNS lookup a
-    rebinding attack could win. Routing and TLS identity stay pinned to the
-    ORIGINAL hostname: an explicit ``Host`` header (mirroring what ``httpx``
-    would have sent had it connected to the hostname directly) preserves
-    virtual-host routing, and the ``sni_hostname`` request extension keeps
-    the TLS ClientHello's SNI — and therefore certificate hostname
-    verification — targeting the real host, not the IP. The next hop's
-    ``Location`` is resolved against the ORIGINAL (hostname) URL, never the
-    IP-pinned one, so a relative redirect stays correct.
+    (hostname-based) URL and returns every address to try;
+    :func:`_fetch_one_hop` issues the request against those addresses in
+    turn, literally (``httpx.URL.copy_with(host=...)``), so
+    ``httpx``/``httpcore`` never re-resolves the hostname themselves —
+    there is no second DNS lookup a rebinding attack could win. Routing and
+    TLS identity stay pinned to the ORIGINAL hostname: an explicit ``Host``
+    header (mirroring what ``httpx`` would have sent had it connected to
+    the hostname directly) preserves virtual-host routing, and the
+    ``sni_hostname`` request extension keeps the TLS ClientHello's SNI —
+    and therefore certificate hostname verification — targeting the real
+    host, not the IP. The next hop's ``Location`` is resolved against the
+    ORIGINAL (hostname) URL, never the IP-pinned one, so a relative
+    redirect stays correct.
 
     Only used for the client this module constructs itself (never an
     injected ``http_client`` — see :func:`_fetch_page_text`); that client is
-    built with ``follow_redirects=False`` so ``httpx`` never follows a
-    redirect for us before we get a chance to validate (and pin) its
-    destination.
+    built with ``follow_redirects=False`` (so ``httpx`` never follows a
+    redirect for us before we get a chance to validate/pin its destination)
+    and ``limits=httpx.Limits(max_keepalive_connections=0)`` (so a
+    host-changing redirect that happens to pin to the SAME address as a
+    prior hop can never reuse that hop's pooled connection — and therefore
+    its already-negotiated TLS identity — for the NEW host; ``sni_hostname``
+    only takes effect when a connection is opened, not when one is reused).
 
     Args:
         client: The internally-constructed ``httpx.AsyncClient``.
@@ -277,45 +455,26 @@ async def _fetch_with_ssrf_guard(
 
     Raises:
         BeanFetchError: A destination rejected by the SSRF guard at any hop,
-            a non-2xx/non-3xx-with-``Location`` response, a body over the
+            every validated address failing to connect, a
+            non-2xx/non-3xx-with-``Location`` response, a body over the
             size cap, a bare 3xx with no ``Location`` header, or more than
             :data:`_MAX_REDIRECTS` redirects.
     """
     current_url = url
     for _ in range(_MAX_REDIRECTS + 1):
-        validated_address = await _assert_public_destination(current_url)
-        original_url = httpx.URL(current_url)
-        pinned_url = original_url.copy_with(host=str(validated_address))
-        pinned_headers = {**headers, "Host": original_url.netloc.decode("ascii")}
-        async with client.stream(
-            "GET",
-            pinned_url,
-            headers=pinned_headers,
+        candidate_addresses = await _assert_public_destination(current_url)
+        result, is_redirect = await _fetch_one_hop(
+            client,
+            current_url,
+            candidate_addresses,
+            headers=headers,
             timeout=timeout,
-            extensions={"sni_hostname": original_url.host},
-        ) as response:
-            if 300 <= response.status_code < 400:
-                location = response.headers.get("location")
-                if not location:
-                    raise BeanFetchError(
-                        f"vendor page redirected (HTTP {response.status_code}) with no "
-                        f"Location header for {current_url!r}"
-                    )
-                current_url = urljoin(current_url, location)
-                continue
-            if response.status_code >= 400:
-                raise BeanFetchError(
-                    f"vendor page fetch failed: HTTP {response.status_code} for {current_url!r}"
-                )
-            body = bytearray()
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > config.max_response_bytes:
-                    raise BeanFetchError(
-                        f"vendor page exceeded the {config.max_response_bytes}-byte "
-                        f"fetch cap: {current_url!r}"
-                    )
-            return bytes(body).decode("utf-8", errors="replace")
+            config=config,
+        )
+        if is_redirect:
+            current_url = result
+            continue
+        return result
     raise BeanFetchError(f"too many redirects (> {_MAX_REDIRECTS}) fetching {url!r}")
 
 
@@ -369,7 +528,21 @@ async def _fetch_page_text(
     headers = {"User-Agent": config.user_agent}
     timeout = httpx.Timeout(config.fetch_timeout_seconds)
     owns_client = http_client is None
-    client = http_client if http_client is not None else httpx.AsyncClient(follow_redirects=False)
+    client = (
+        http_client
+        if http_client is not None
+        else httpx.AsyncClient(
+            follow_redirects=False,
+            # No keepalive pooling (#587 P2): with connect-time IP pinning,
+            # two DIFFERENT hostnames that happen to resolve to the SAME
+            # address would otherwise share one pooled connection/origin —
+            # and ``sni_hostname`` only applies when a connection is
+            # OPENED, not when a pooled one is reused, so a host-changing
+            # redirect could silently skip re-validating the new host's TLS
+            # identity. Forcing a fresh connection per request closes that.
+            limits=httpx.Limits(max_keepalive_connections=0),
+        )
+    )
     try:
         async with asyncio.timeout(config.fetch_timeout_seconds):
             if owns_client:
@@ -394,7 +567,7 @@ async def _fetch_page_text(
                                 f"vendor page exceeded the {config.max_response_bytes}-byte "
                                 f"fetch cap: {url!r}"
                             )
-                    html = bytes(body).decode("utf-8", errors="replace")
+                    html = _decode_response_body(bytes(body), response)
     except TimeoutError as exc:
         raise BeanFetchError(
             f"vendor page fetch exceeded the {config.fetch_timeout_seconds:g}s end-to-end "
@@ -432,7 +605,14 @@ class _ExtractedBeanIdentity(BaseModel):
     bean_species: BeanSpecies | None = None
     altitude_m: int | None = Field(default=None, ge=0, le=4000)
     description: str | None = None
-    is_blend: bool = False
+    is_blend: bool | None = None
+    """Tri-state, not a plain ``bool`` with a False default (#587 P2): the
+    page can state EITHER "this is a blend" (``True``) OR "this is a single
+    origin" (``False``) OR say nothing about it at all (``None``) — a bare
+    ``bool`` cannot distinguish the second case from the third, which would
+    make an unstated page silently look like an on-page "not a blend"
+    claim. See :data:`_EXTRACTION_INSTRUCTIONS` and
+    :func:`_draft_from_identity`'s provenance handling."""
 
 
 _EXTRACTION_INSTRUCTIONS = """
@@ -464,9 +644,11 @@ Fields:
   the page gives no altitude at all.
 - description: a short (1-3 sentence) summary of the tasting notes, process,
   or lot detail actually written on the page, in your own words.
-- is_blend: true only if the page explicitly says this is a blend of
-  multiple origins; false for a single-origin bean, even one with a mixed
-  varietal.
+- is_blend: true if the page explicitly says this is a blend of multiple
+  origins; false if the page explicitly states or clearly identifies a
+  SINGLE origin (even one with a mixed varietal) — a named single farm,
+  region, or country IS a single-origin statement; leave null ONLY if the
+  page does not address single-origin-vs-blend at all.
 """.strip()
 
 
@@ -657,14 +839,16 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
         # bean_origin fell back to country — still page-sourced, just via the
         # country field rather than an explicit bean_origin statement.
         field_sources["bean_origin"] = "on_page"
-    if identity.is_blend:
-        # is_blend is excluded from _IDENTITY_FIELDS because it defaults to
-        # False (never None/""), so the generic "not in (None, '')" test
-        # above would mark it "on_page" even when the page never mentioned
-        # blending. Record it explicitly, and only when the page actually
-        # said True — the default False stays provenance-less, which is what
-        # keeps "absent from field_sources" meaningful as "unset" (#587
-        # fix 4).
+    if identity.is_blend is not None:
+        # is_blend is excluded from _IDENTITY_FIELDS because its "the page
+        # said nothing" value is None, not ""/False — the generic
+        # "not in (None, '')" test above would work for None but a bare
+        # ``False`` used to be indistinguishable from "unstated" before
+        # #587 P2 made this field tri-state. Now: on_page for an explicit
+        # True OR an explicit False (the page addressed single-origin vs
+        # blend either way), and no field_sources entry at all when the
+        # page said nothing (identity.is_blend is None) — "absent from
+        # field_sources" stays meaningful as "unset".
         field_sources["is_blend"] = "on_page"
     for field_name in _TARGET_FIELDS:
         field_sources[field_name] = "origin_estimated"
@@ -746,12 +930,30 @@ async def draft_bean_profile_from_url(
         The drafted :class:`~roastpilot_agent.models.BeanProfileDraft`.
 
     Raises:
-        BeanFetchError: The vendor page could not be fetched.
+        BeanFetchError: The URL embeds credentials (``user:pass@host``, #587
+            P1 — checked FIRST, before any logging or outbound request), or
+            the vendor page could not be fetched.
         BeanExtractionError: The LLM call failed, or the page yielded too
             little identity to draft a profile from.
     """
+    # Credential-leak guard (#587 P1): checked before ANYTHING else — no
+    # logging, no fetch, no billable LLM call — so a URL with embedded
+    # basic-auth credentials is never sent over the wire (to the vendor OR
+    # to the LLM provider) and never appears in a log line even transiently.
+    parsed_url = urlsplit(url)
+    if parsed_url.username is not None or parsed_url.password is not None:
+        _log.warning(
+            "draft_bean_profile_from_url: rejected a URL with embedded credentials: %r",
+            _redact_url_credentials(url),
+        )
+        raise BeanFetchError(
+            "vendor URLs with embedded credentials (user:pass@host) are not "
+            "supported — remove the credentials from the URL and, if the "
+            "page needs authentication, save the profile manually instead"
+        )
+
     config = sourcing_config if sourcing_config is not None else BeanSourcingConfig()
-    _log.info("draft_bean_profile_from_url: fetching %r", url)
+    _log.info("draft_bean_profile_from_url: fetching %r", _redact_url_credentials(url))
     page_text = await _fetch_page_text(url, config=config, http_client=http_client)
     identity = await _extract_bean_identity(page_text, advisor_config=advisor_config, model=model)
     draft = _draft_from_identity(identity, url=url)

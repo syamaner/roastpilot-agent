@@ -856,6 +856,19 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
     """The charge weight (grams) that would pre-fill a new roast's form if
     this draft is saved; adjustable per roast like every other profile."""
 
+    is_blend: bool | None = None  # pyright: ignore[reportIncompatibleVariableOverride]
+    """Overrides the shared base's plain ``bool`` (#587): a DRAFT's blend
+    flag is honestly tri-state, because "the page never mentioned blending"
+    and "the page said single-origin" are different facts. ``True``/``False``
+    when the vendor page explicitly addressed it (tracked as ``"on_page"`` in
+    :attr:`field_sources`); ``None`` when the page said nothing at all (no
+    ``field_sources`` entry — absent means unset, per the same convention
+    every other field_sources-tracked field follows). Every OTHER profile
+    type (:class:`BeanProfile`, :class:`RoastProfile`, ``BeanProfileInput``)
+    keeps the base's plain ``bool``: the operator always resolves it to a
+    concrete choice before saving/starting a roast, so tri-state has no
+    meaning there — this override is scoped to the draft only."""
+
     field_sources: dict[str, BeanFieldSource] = Field(default_factory=dict)
     """Per-field provenance keyed by field name (e.g. ``"bean_varietal"``,
     ``"target_development_percent"``) — see :data:`BeanFieldSource`. A field

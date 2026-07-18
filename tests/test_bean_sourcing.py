@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import logging
 import subprocess
 import sys
 from collections.abc import AsyncGenerator
@@ -54,16 +55,19 @@ def _html_response(status_code: int, html: str) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
-#: A fixed TEST-NET-3 (RFC 5737) address the no-op destination stub below
-#: "resolves" every host to — not a real address, just a syntactically valid
-#: public IP literal so the pinning code path (which now needs a real
+#: A GENUINELY global address (example.com's real A record) the no-op
+#: destination stub below "resolves" every host to — not TEST-NET
+#: (``203.0.113.0/24`` and friends), which the ``is_global`` SSRF predicate
+#: (#587 CGNAT fix) now correctly rejects as non-public, since TEST-NET is a
+#: documentation/reserved range. Needs to be a real, syntactically valid
+#: public IP literal so the pinning code path (which needs a real
 #: ``ipaddress`` object to pin to) has something to pin to.
-_STUB_PUBLIC_IP = ipaddress.ip_address("203.0.113.10")
+_STUB_PUBLIC_IP = ipaddress.ip_address("93.184.216.34")
 
 
 async def _noop_assert_public_destination(
     url: str,
-) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
     """Test double: skips the real DNS/IP validation (#587's SSRF guard),
     "resolving" every host to :data:`_STUB_PUBLIC_IP` so client-lifecycle/
     redirect-following tests can drive the (now pinning) fetch path without
@@ -71,7 +75,7 @@ async def _noop_assert_public_destination(
     hostname is preserved (Host header, SNI) still can — this only stubs the
     validated CONNECTION target; destination validation itself, and the
     real pinning mechanism, are covered separately."""
-    return _STUB_PUBLIC_IP
+    return [_STUB_PUBLIC_IP]
 
 
 _SAMPLE_HTML = """
@@ -102,7 +106,7 @@ def _identity_args(**overrides: object) -> dict[str, object]:
         "bean_species": None,
         "altitude_m": 1775,
         "description": "Blackcurrant, tomato, bright acidity.",
-        "is_blend": False,
+        "is_blend": None,
     }
     base.update(overrides)
     return base
@@ -346,6 +350,33 @@ async def test_fetch_page_text_rejects_link_local_metadata_literal() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fetch_page_text_rejects_cgnat_literal() -> None:
+    """#587 CGNAT fix: ``100.64.0.0/10`` (Carrier-Grade NAT — also the range
+    Tailscale and similar overlay networks use) is neither ``is_private``
+    nor ``is_reserved`` in Python's ``ipaddress`` — a naive
+    loopback/private/link-local/reserved-only predicate silently lets it
+    through. ``is_global`` has an explicit carve-out for this exact range
+    (verified against the stdlib docstring, not assumed) and correctly
+    rejects it."""
+    with pytest.raises(BeanFetchError, match="non-public address"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "http://100.64.0.1/x", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_rejects_multicast_literal() -> None:
+    """``is_global`` alone does NOT exclude multicast (a multicast address
+    is not in any ``is_private`` range, so ``is_global`` reports ``True``
+    for one — verified directly against the stdlib, not assumed) — the
+    guard rejects ``is_multicast`` explicitly, alongside ``is_global``."""
+    with pytest.raises(BeanFetchError, match="non-public address"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "http://224.0.0.1/x", config=BeanSourcingConfig()
+        )
+
+
+@pytest.mark.asyncio
 async def test_assert_public_destination_rejects_hostname_resolving_to_private_ip(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -557,6 +588,221 @@ async def test_fetch_with_ssrf_guard_pins_ipv6_address_with_brackets(
     assert sent.headers.get("host") == "example.test"
 
 
+# --- #587 P2: no keepalive pooling (TLS identity on a host-changing redirect) ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_constructs_client_with_no_keepalive_pooling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#587 P2: with connect-time IP pinning, two DIFFERENT hostnames that
+    happen to resolve to the SAME address would otherwise share one pooled
+    connection/origin — and ``sni_hostname`` only applies when a connection
+    is OPENED, not when a pooled one is reused, so a host-changing redirect
+    could silently skip re-validating the new host's TLS identity.
+    ``httpx.MockTransport`` never performs real connection pooling (it
+    substitutes the whole transport), so the strongest assertion available
+    at this layer is that the internally-constructed client is CONFIGURED
+    with no keepalive connections — mirrors the existing
+    ``follow_redirects`` kwarg-capture test above."""
+    transport = _html_response(200, _SAMPLE_HTML)
+    real_async_client = httpx.AsyncClient
+    captured_kwargs: dict[str, object] = {}
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        captured_kwargs.update(kwargs)
+        return real_async_client(transport=transport, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+        "https://vendor.example/products/kenya", config=BeanSourcingConfig()
+    )
+    limits = captured_kwargs.get("limits")
+    assert isinstance(limits, httpx.Limits)
+    assert limits.max_keepalive_connections == 0
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_redirect_public_to_public_tracks_sni_per_hop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Complements the no-keepalive-pooling config test above: even at the
+    ``MockTransport`` layer (no real connection reuse to observe), each
+    hop's request must carry the SNI (``sni_hostname`` extension) for THAT
+    hop's own host, never a stale one from a prior hop — the closest
+    behavioral proxy for "TLS identity tracks the new host each hop" this
+    test layer can assert."""
+    original_host = "vendor.example"
+    redirected_host = "www.vendor.example"
+    original_url = f"https://{original_host}/products/kenya"
+    redirected_url = f"https://{redirected_host}/products/kenya"
+    host_ips = {original_host: "93.184.216.34", redirected_host: "93.184.216.35"}
+    sni_per_request: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sni_per_request.append(request.extensions.get("sni_hostname"))
+        host_header = request.headers.get("host")
+        if host_header == original_host:
+            return httpx.Response(302, headers={"Location": redirected_url})
+        assert host_header == redirected_host
+        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        return [(None, None, None, "", (host_ips[host], port))]
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+        original_url, config=BeanSourcingConfig()
+    )
+    assert "Kenya Kiambu AA" in text
+    assert sni_per_request == [original_host, redirected_host]
+
+
+# --- #587 P2: try every validated address before giving up ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_ssrf_guard_tries_next_address_after_connect_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dual-stack host whose first resolved address is unreachable (a dead
+    route, or a transient CDN node) must still succeed via its SECOND
+    validated address, rather than failing the whole fetch."""
+    bad_ip = "1.1.1.1"
+    good_ip = "93.184.216.34"
+    attempted_hosts: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempted_hosts.append(request.url.host)
+        if request.url.host == bad_ip:
+            raise httpx.ConnectError("connection refused", request=request)
+        return httpx.Response(200, content=_SAMPLE_HTML.encode())
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        return [
+            (None, None, None, "", (bad_ip, port)),
+            (None, None, None, "", (good_ip, port)),
+        ]
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+        "https://vendor.example/products/kenya", config=BeanSourcingConfig()
+    )
+    assert "Kenya Kiambu AA" in text
+    assert attempted_hosts == [bad_ip, good_ip]
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_ssrf_guard_raises_when_every_address_fails_to_connect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When EVERY validated address fails to connect, the fetch must still
+    fail soft as a typed ``BeanFetchError``, not leak the raw
+    ``httpx.ConnectError``."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        return [(None, None, None, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    with pytest.raises(BeanFetchError, match="could not connect to any resolved address"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/kenya", config=BeanSourcingConfig()
+        )
+
+
+# --- #587 P2: decode using the response's declared charset ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_decodes_declared_non_utf8_charset_injected_client() -> None:
+    """#587 P2: a page served with a declared non-UTF-8 charset must decode
+    under THAT charset, not get corrupted by an unconditional UTF-8 decode.
+    Injected-client path (mirrors the owns-client version below)."""
+    html_latin1 = "<p>Café Kenya</p>".encode("iso-8859-1")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=html_latin1,
+            headers={"Content-Type": "text/html; charset=iso-8859-1"},
+        )
+
+    async with _mock_client(httpx.MockTransport(handler)) as client:
+        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/cafe",
+            config=BeanSourcingConfig(),
+            http_client=client,
+        )
+    assert "Café Kenya" in text
+
+
+@pytest.mark.asyncio
+async def test_fetch_with_ssrf_guard_decodes_declared_non_utf8_charset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#587 P2: owns-client path version of the charset-decode fix — must
+    behave identically to the injected-client path above."""
+    html_latin1 = "<p>Café Kenya</p>".encode("iso-8859-1")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content=html_latin1,
+            headers={"Content-Type": "text/html; charset=iso-8859-1"},
+        )
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    monkeypatch.setattr(
+        bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
+    )
+    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+        "https://vendor.example/products/cafe", config=BeanSourcingConfig()
+    )
+    assert "Café Kenya" in text
+
+
 @pytest.mark.asyncio
 async def test_fetch_page_text_exhausting_max_redirects_raises(
     monkeypatch: pytest.MonkeyPatch,
@@ -676,6 +922,38 @@ async def test_assert_public_destination_rejects_host_resolving_to_no_addresses(
     with pytest.raises(BeanFetchError, match="resolved to no usable address"):
         await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
             "https://no-addresses.example/x"
+        )
+
+
+@pytest.mark.asyncio
+async def test_assert_public_destination_rejects_non_numeric_port() -> None:
+    """#587 P2: ``urlsplit(...).port`` raises ``ValueError`` on a non-numeric
+    port — left unguarded this becomes an unhandled 500 instead of the typed
+    fail-soft error every other malformed-URL case here gets."""
+    with pytest.raises(BeanFetchError, match="malformed port"):
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example:bad/x"
+        )
+
+
+@pytest.mark.asyncio
+async def test_assert_public_destination_rejects_out_of_range_port() -> None:
+    """#587 P2: same failure mode as the non-numeric case, for a numeric but
+    out-of-TCP-range port (> 65535)."""
+    with pytest.raises(BeanFetchError, match="malformed port"):
+        await bean_sourcing._assert_public_destination(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example:99999/x"
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_owns_client_rejects_malformed_port() -> None:
+    """Full-pipeline proof: a malformed port reaches ``_fetch_page_text``
+    (via the owns-client path — no client injected) as ``BeanFetchError``,
+    never an unhandled exception."""
+    with pytest.raises(BeanFetchError, match="malformed port"):
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example:bad/x", config=BeanSourcingConfig()
         )
 
 
@@ -875,18 +1153,49 @@ def test_draft_from_identity_marks_page_fields_on_page() -> None:
     # fabricated value, and no field_sources entry claiming it is on_page.
     assert draft.bean_species is None
     assert "bean_species" not in draft.field_sources
-    # is_blend defaults to False in the fixture — the page never SAID
-    # anything about blending, so no provenance should be recorded for it
-    # either (#587 fix 4: absent-from-field_sources must mean "unset").
-    assert draft.is_blend is False
+    # is_blend defaults to None (unstated) in the fixture — the page never
+    # SAID anything about blending, so no provenance should be recorded for
+    # it either (#587 P2: absent-from-field_sources must mean "unset", and
+    # None is now the ONLY value that means that — see the dedicated
+    # is_blend tri-state tests below for the explicit True/False cases).
+    assert draft.is_blend is None
     assert "is_blend" not in draft.field_sources
 
 
-def test_draft_from_identity_marks_explicit_is_blend_true_as_on_page() -> None:
-    """#587 fix 4: when the page explicitly states this IS a blend,
-    ``is_blend`` must be recorded as ``"on_page"`` provenance — the prior
-    ``_IDENTITY_FIELDS`` loop always skipped it (it defaults to False, never
-    None/""), so an explicit True never got provenance recorded at all."""
+def test_draft_from_identity_is_blend_silent_page_leaves_unset() -> None:
+    """#587 P2: the page saying NOTHING about blend-vs-single-origin must
+    leave ``is_blend`` unset (``None``) with no ``field_sources`` entry —
+    distinct from an explicit ``False``."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=None)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/silent"
+    )
+    assert draft.is_blend is None
+    assert "is_blend" not in draft.field_sources
+
+
+def test_draft_from_identity_is_blend_explicit_single_origin_marks_on_page() -> None:
+    """#587 P2: an explicit ``False`` (the page states or clearly identifies
+    a SINGLE origin) is a page-sourced FACT, not silence — before this fix a
+    bare ``bool`` default made this indistinguishable from "the page said
+    nothing"; it must now be recorded ``on_page`` just like an explicit
+    ``True`` is."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=False)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/single-origin"
+    )
+    assert draft.is_blend is False
+    assert draft.field_sources["is_blend"] == "on_page"
+
+
+def test_draft_from_identity_is_blend_explicit_blend_marks_on_page() -> None:
+    """#587 P2 (supersedes the earlier True-only fix, #587 fix 4): when the
+    page explicitly states this IS a blend, ``is_blend`` must be recorded as
+    ``"on_page"`` provenance."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(is_blend=True)
     )
@@ -1069,18 +1378,69 @@ async def test_draft_bean_profile_from_url_maps_build_model_dependency_error(
 @pytest.mark.asyncio
 async def test_draft_bean_profile_from_url_maps_source_url_validation_error() -> None:
     """#587 fix 3: ``BeanProfileDraft.source_url`` runs a stricter validator
-    (models.py — rejects embedded userinfo and a malformed port) than
-    ``_fetch_page_text``'s own scheme/host check, so a URL that fetches fine
-    can still fail ``BeanProfileDraft`` construction. That must fail soft as
-    ``BeanExtractionError``, not an unhandled ``pydantic.ValidationError``."""
+    (models.py — rejects a malformed port) than the earlier fetch-path
+    checks for an INJECTED ``http_client`` (which skips the SSRF guard/port
+    check entirely — that machinery only runs for the internally-constructed
+    client, see :func:`_fetch_page_text`), so a URL that fetches fine can
+    still fail ``BeanProfileDraft`` construction. That must fail soft as
+    ``BeanExtractionError``, not an unhandled ``pydantic.ValidationError``.
+
+    (The embedded-userinfo variant of this gap is now closed EARLIER and
+    UNIVERSALLY — regardless of injected vs. owned client — by
+    ``draft_bean_profile_from_url``'s own upfront credential check, #587
+    P1; see ``test_draft_bean_profile_from_url_rejects_embedded_credentials``.)
+    """
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as http_client:
         with pytest.raises(BeanExtractionError, match="failed validation"):
             await draft_bean_profile_from_url(
-                "https://user:pass@vendor.example/products/kenya-kiambu",
+                "https://vendor.example:99999/products/kenya-kiambu",
                 advisor_config=_ADVISOR_CONFIG,
                 http_client=http_client,
                 model=_function_model_returning(_identity_args()),
             )
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_rejects_embedded_credentials(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#587 P1: a URL with embedded basic-auth credentials must be rejected
+    BEFORE any fetch or logging — proven here by an ``http_client`` that
+    would ``pytest.fail`` if ever invoked — and every captured log line must
+    carry only the REDACTED URL (no raw credentials), never the original."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail("must not fetch a URL with embedded credentials")
+
+    caplog.set_level(logging.INFO, logger="roastpilot_agent.bean_sourcing")
+    async with _mock_client(httpx.MockTransport(handler)) as http_client:
+        with pytest.raises(BeanFetchError, match="credentials"):
+            await draft_bean_profile_from_url(
+                "https://scraper:s3cr3t-token@vendor.example/products/kenya",
+                advisor_config=_ADVISOR_CONFIG,
+                http_client=http_client,
+                model=_function_model_returning(_identity_args()),
+            )
+    assert caplog.records, "expected a redacted rejection log line"
+    for record in caplog.records:
+        message = record.getMessage()
+        assert "s3cr3t-token" not in message
+        assert "scraper:" not in message
+    assert any("vendor.example" in record.getMessage() for record in caplog.records)
+
+
+def test_redact_url_credentials_strips_userinfo() -> None:
+    redacted = bean_sourcing._redact_url_credentials(  # pyright: ignore[reportPrivateUsage]
+        "https://scraper:s3cr3t-token@vendor.example:8443/products/kenya?x=1"
+    )
+    assert redacted == "https://vendor.example:8443/products/kenya?x=1"
+    assert "s3cr3t-token" not in redacted
+    assert "scraper" not in redacted
+
+
+def test_redact_url_credentials_leaves_credential_free_url_unchanged() -> None:
+    url = "https://vendor.example/products/kenya"
+    assert bean_sourcing._redact_url_credentials(url) == url  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
