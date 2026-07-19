@@ -2307,14 +2307,20 @@ _IDENTITY_FIELDS: tuple[str, ...] = (
     "description",
 )
 
-#: Closed-vocabulary enum fields DEMOTED UNCONDITIONALLY in D1 (#590 D1
-#: scoping fold, resolves claude-review SHLcA / Codex SHMGm), never run
-#: through :func:`_contains_whole_phrase` — their values are common
-#: English words that collide with unrelated page prose, and a display-
-#: spelling mismatch (e.g. ``wet_hulled`` vs. "wet hulled") would
-#: mislabel even a real match. Safe direction (never a false
-#: ``"on_page"``); proper enum verification is D2's job.
-_ENUM_FIELDS_DEFERRED_TO_D2: frozenset[str] = frozenset({"processing", "bean_species"})
+#: Fields DEMOTED UNCONDITIONALLY in D1 — never routed through
+#: :func:`_value_is_contained` (#590 D1 scoping, round-2 review: pure
+#: string containment can't safely verify a TYPED value against arbitrary
+#: page-numeral/vocabulary noise — e.g. a "honey" PROCESS collides with a
+#: "honey" tasting note, an altitude digit run collides with a price/SKU).
+#: ``altitude_m``/``processing``/``bean_species`` are verified in **D2**
+#: (an evidence-quote citation; F adds constrained enums). ``is_blend`` is
+#: handled separately in :func:`_draft_from_identity` (excluded from
+#: :data:`_IDENTITY_FIELDS` for its tri-state ``None``) and deferred to
+#: **D2/E** — polarity verification needs LOCALITY (a single-origin
+#: product page can still contain the word "blend" via an unrelated
+#: "shop our house blend" cross-sell link), which token presence alone
+#: cannot provide.
+_FIELDS_DEFERRED_TO_D2: frozenset[str] = frozenset({"altitude_m", "processing", "bean_species"})
 
 #: Roast-target fields a vendor page never states — always
 #: ``"origin_estimated"`` in the drafted :attr:`BeanProfileDraft.field_sources`.
@@ -2368,128 +2374,6 @@ def _normalize_for_containment(text: str) -> str:
     return " ".join(text.casefold().translate(_CONTAINMENT_PUNCTUATION_TRANSLATION).split())
 
 
-def _digits_only(text: str) -> str:
-    """Reduce ``text`` to its digit characters only, in order.
-
-    Used for a single numeric FIELD VALUE (e.g. ``altitude_m``) — never for
-    the corpus (see :func:`_digit_run_tokens` for that; concatenating every
-    digit across an entire page into one stream lets a digit sub-sequence
-    match across two UNRELATED numbers — #590 D1 bug 1, a real
-    containment-spoofing bug: ``2406`` would "match" a page reading
-    "SKU 24. Ships within 06 business days." even though no such number
-    appears anywhere).
-
-    Args:
-        text: The text to reduce (a single value's ``str()`` form).
-
-    Returns:
-        Only the digit characters of ``text``, concatenated in order.
-    """
-    return "".join(ch for ch in text if ch.isdigit())
-
-
-def _next_digit_run_length(text: str, start: int) -> int:
-    """Count the consecutive digit characters in ``text`` starting at ``start``.
-
-    Args:
-        text: The text to scan.
-        start: The index to start counting from.
-
-    Returns:
-        The number of consecutive digit characters at ``text[start:]``
-        (``0`` if ``start`` is out of range or not a digit).
-    """
-    length = 0
-    index = start
-    while index < len(text) and text[index].isdigit():
-        length += 1
-        index += 1
-    return length
-
-
-def _join_thousands_separated_digits(text: str) -> str:
-    """Join a digit run across a thousands separator — comma OR period,
-    LOCALE-INDEPENDENT (#590 D1 fold: the original comma-only version
-    reproduced the exact price-spoof it was meant to close, for a
-    decimal-comma locale like "€18,00").
-
-    A separator can't be identified as thousands-vs-decimal by which
-    CHARACTER it is (``,``/``.`` both serve either role by locale) — only
-    by SHAPE: a thousands group is always exactly 3 digits. So a
-    separator between two digits is joined (removed) ONLY when the digit
-    run immediately following it is exactly 3 digits long — e.g.
-    ``"1,800"`` (comma then "800") joins to ``"1800"``, while ``"€18,00"``
-    (comma then "00") does not, leaving separate runs
-    (:func:`_digit_run_tokens` splits there). See the tests for the
-    ``€18,00`` / ``1.800`` / ``1.234.567`` cases.
-
-    Pure ``str``/list scan (no regex), so this stays ReDoS-free.
-    Deliberately does NOT touch the general-purpose
-    :func:`_normalize_for_containment` output, which maps ALL punctuation
-    to a space and would otherwise split every thousands-separated number.
-
-    Args:
-        text: The raw corpus text (not the whitespace-collapsed
-            :func:`_normalize_for_containment` form).
-
-    Returns:
-        ``text`` with every qualifying thousands separator removed.
-    """
-    kept: list[str] = []
-    last_index = len(text) - 1
-    for index, ch in enumerate(text):
-        if (
-            ch in (",", ".")
-            and 0 < index < last_index
-            and text[index - 1].isdigit()
-            and _next_digit_run_length(text, index + 1) == 3
-        ):
-            continue
-        kept.append(ch)
-    return "".join(kept)
-
-
-def _digit_run_tokens(text: str) -> list[str]:
-    """Split ``text`` into its maximal digit runs (#590 D1).
-
-    Splits on every non-digit character — pure ``str`` scan, no regex.
-    Intended input is :func:`_join_thousands_separated_digits`'s output, so a
-    thousands-separated number survives as ONE run while every other
-    punctuation boundary (a price's decimal period, a SKU's trailing
-    period, whitespace) still splits distinct numbers apart:
-    ``"$18.00"`` -> ``["18", "00"]``; ``"1800 masl"`` -> ``["1800"]``;
-    ``"SKU 24. within 06"`` -> ``["24", "06"]``.
-
-    Args:
-        text: The text to split (typically already run through
-            :func:`_join_thousands_separated_digits`).
-
-    Returns:
-        Every maximal run of digit characters, in order.
-    """
-    runs: list[str] = []
-    current: list[str] = []
-    for ch in text:
-        if ch.isdigit():
-            current.append(ch)
-        elif current:
-            runs.append("".join(current))
-            current = []
-    if current:
-        runs.append("".join(current))
-    return runs
-
-
-#: A numeric field's digit run shorter than this is never trusted as
-#: "contained" (#590 D1) — an EXTRA guard on top of the exact digit-run
-#: match :func:`_value_is_contained` now performs (the exact match already
-#: closes the cross-number spoofing bug 1; this floor additionally keeps a
-#: bare 1-2 digit exact match — common noise elsewhere on a vendor page, a
-#: price/SKU/year — from counting). 3 covers every realistic coffee-growing
-#: altitude (typically 3-4 digits, e.g. "500"-"2500").
-_MIN_NUMERIC_CONTAINMENT_DIGITS = 3
-
-
 def _contains_whole_phrase(phrase: str, corpus_normalized: str) -> bool:
     """Whether ``phrase`` appears in ``corpus_normalized`` as a whole,
     contiguous word sequence — not merely a substring (#590 D1 bug 2).
@@ -2506,8 +2390,7 @@ def _contains_whole_phrase(phrase: str, corpus_normalized: str) -> bool:
     page chrome; word-boundary padding closes that.
 
     Args:
-        phrase: The already-normalized needle (a field value or a blend
-            intent token).
+        phrase: The already-normalized needle (a field value).
         corpus_normalized: The page corpus, already normalized via
             :func:`_normalize_for_containment`.
 
@@ -2520,48 +2403,32 @@ def _contains_whole_phrase(phrase: str, corpus_normalized: str) -> bool:
     return f" {phrase} " in f" {corpus_normalized} "
 
 
-def _value_is_contained(
-    value: object, corpus_normalized: str, corpus_digit_runs: list[str]
-) -> bool:
-    """Test whether ``value`` is verifiably present in the page corpus (#590 D1).
+def _value_is_contained(value: object, corpus_normalized: str) -> bool:
+    """Test whether ``value`` is verifiably present in the page corpus as a
+    whole word/phrase (#590 D1 — scoped to FREE-TEXT identity fields only,
+    round-2 review: typed fields are deferred to D2/E instead, see
+    :data:`_FIELDS_DEFERRED_TO_D2`).
 
     Gates the ``"on_page"`` provenance tag: a field earns ``"on_page"`` only
     when its extracted value is actually present in the SAME page text the
-    model was given (:func:`_draft_from_identity`'s ``corpus``) — trusting
-    the model's *claim* alone (the pre-D1 behavior) let a confabulated value
-    through with a false "verified" tag.
-
-    Numeric values (currently only ``altitude_m``) are compared by EXACT
-    equality against ``corpus_digit_runs`` — the corpus's maximal digit
-    runs, computed ONCE by the caller via :func:`_digit_run_tokens` over
-    :func:`_join_thousands_separated_digits`'s output (see that function's
-    docstring for the locale-independent thousands-separator rule) —
-    never substring-within-a-run and never across two runs. A digit run
-    SHORTER than :data:`_MIN_NUMERIC_CONTAINMENT_DIGITS` is never
-    considered contained even on an exact match — real coffee altitudes are
-    3+ digit values, so this extra floor costs nothing legitimate while
-    keeping a bare 1-2 digit coincidence (a price, a SKU, a year) from
-    counting. Every other value is compared as a whole WORD/PHRASE (via
-    :func:`_contains_whole_phrase`) of the normalized corpus — never a raw
-    substring, which would let e.g. "Java" match inside "JavaScript".
-
-    Both comparisons can under-verify a real value (words legitimately
-    scattered non-adjacently across the page) — the intentionally SAFE
-    direction for D1: over-demotion asks the operator to review a field
-    that was actually fine, it never fabricates trust in a confabulated
-    one. D2's evidence-quote gate is where this precision is refined.
+    model was given (:func:`_draft_from_identity`'s ``corpus``), via
+    :func:`_contains_whole_phrase` — never a raw substring, which would let
+    e.g. "Java" match inside "JavaScript" — trusting the model's *claim*
+    alone (the pre-D1 behavior) let a confabulated value through with a
+    false "verified" tag. This can under-verify a real value whose words
+    are legitimately scattered non-adjacently across the page — the
+    intentionally SAFE direction for D1: over-demotion asks the operator
+    to review a field that was actually fine, it never fabricates trust
+    in a confabulated one. D2's evidence-quote gate is where this
+    precision is refined.
 
     Args:
-        value: The raw extracted field value (``str``, ``int``, or any
-            other identity-field type). ``None``/empty values are never
-            contained. ``bool`` (``is_blend``) is never routed through this
-            function — see :func:`_is_blend_polarity_confirmed`.
+        value: The raw extracted field value (``str`` or any other
+            identity-field type; ``None``/empty values are never
+            contained).
         corpus_normalized: The page corpus, already passed through
             :func:`_normalize_for_containment` ONCE by the caller (never
             re-normalized per field).
-        corpus_digit_runs: The page corpus's maximal digit runs, already
-            computed ONCE by the caller via :func:`_digit_run_tokens`
-            (never recomputed per field).
 
     Returns:
         ``True`` if ``value`` is verifiably present in the corpus,
@@ -2571,14 +2438,7 @@ def _value_is_contained(
     """
     if value is None:
         return False
-    if isinstance(value, bool):
-        return False  # pragma: no cover - defensive: is_blend bypasses this function entirely
     try:
-        if isinstance(value, (int, float)):
-            value_digits = _digits_only(str(value))
-            if len(value_digits) < _MIN_NUMERIC_CONTAINMENT_DIGITS:
-                return False
-            return value_digits in corpus_digit_runs
         text = str(value).strip()
         if not text:
             return False
@@ -2586,35 +2446,6 @@ def _value_is_contained(
         return _contains_whole_phrase(normalized_value, corpus_normalized)
     except Exception:  # pragma: no cover - defensive: containment must fail soft, never raise
         return False
-
-
-#: Blend-intent evidence required for EACH polarity of ``is_blend`` (#590
-#: D1 fold, Codex P2). Evidence must match the SPECIFIC value the model
-#: returned — the pre-fold version accepted EITHER token for EITHER
-#: polarity, which could certify the OPPOSITE of the page's own claim.
-#: Deliberately small: D2's evidence-quote gate is where this refines.
-_BLEND_TRUE_TOKENS: tuple[str, ...] = ("blend",)
-_BLEND_FALSE_TOKENS: tuple[str, ...] = ("single origin",)
-
-
-def _is_blend_polarity_confirmed(is_blend: bool, corpus_normalized: str) -> bool:
-    """Whether the corpus supports the SPECIFIC ``is_blend`` polarity the
-    model returned (#590 D1 fold) — matched to polarity, never "either
-    token, either polarity" (see :data:`_BLEND_TRUE_TOKENS`'s docstring).
-
-    Args:
-        is_blend: The model-returned value to verify. ``None`` (the page
-            said nothing) is never routed here — see
-            :func:`_draft_from_identity`.
-        corpus_normalized: The page corpus, already normalized via
-            :func:`_normalize_for_containment`.
-
-    Returns:
-        ``True`` if the corpus contains whole-word/phrase evidence
-        matching ``is_blend``'s specific polarity.
-    """
-    tokens = _BLEND_TRUE_TOKENS if is_blend else _BLEND_FALSE_TOKENS
-    return any(_contains_whole_phrase(token, corpus_normalized) for token in tokens)
 
 
 def _normalize_optional_text(value: str | None) -> str | None:
@@ -2652,24 +2483,24 @@ def _draft_from_identity(
 
     Applies the conservative scouting targets
     (:data:`_SCOUTING_TARGETS_BY_PROCESSING`) and builds the honest per-field
-    ``field_sources`` map: an identity field is tagged ``"on_page"`` only
-    when its value is CODE-VERIFIED present in ``corpus`` — the exact page
-    text the model was given (:func:`_value_is_contained` /
-    :func:`_is_blend_polarity_confirmed`, #590 D1) — otherwise it is demoted to
-    ``"origin_estimated"`` even though the model returned a non-blank
-    value. This closes the pre-D1 gap where every non-blank model-returned
-    field was blanket-tagged ``"on_page"`` on the model's claim alone, with
-    no check that the value was actually on the page (a confabulated value
-    could pass through "verified"). ``description`` is EXEMPT from the
-    containment gate — it is long prose the model may legitimately
-    summarise/paraphrase rather than quote verbatim, it is lower-stakes
-    (the roast advisor never reads it), and D2's evidence-quote gate is
-    where prose precision, if it turns out to matter, will be handled;
-    it keeps the original presence-only tagging.
-    :data:`_ENUM_FIELDS_DEFERRED_TO_D2` (``processing``, ``bean_species``)
-    are likewise never run through the containment matcher — demoted
-    unconditionally in D1 (see that constant's docstring for why). Every
-    roast-target field is always ``"origin_estimated"`` (the page never
+    ``field_sources`` map: a FREE-TEXT identity field (``name``, ``country``,
+    ``bean_origin``, ``farm``, ``bean_varietal``) is tagged ``"on_page"``
+    only when its value is CODE-VERIFIED present in ``corpus`` — the exact
+    page text the model was given (:func:`_value_is_contained`, #590 D1) —
+    otherwise it is demoted to ``"origin_estimated"`` even though the model
+    returned a non-blank value. This closes the pre-D1 gap where every
+    non-blank model-returned field was blanket-tagged ``"on_page"`` on the
+    model's claim alone, with no check that the value was actually on the
+    page (a confabulated value could pass through "verified").
+    ``description`` is EXEMPT from the containment gate — it is long prose
+    the model may legitimately summarise/paraphrase rather than quote
+    verbatim, it is lower-stakes (the roast advisor never reads it), and
+    it keeps the original presence-only tagging. :data:`_FIELDS_DEFERRED_TO_D2`
+    (``altitude_m``, ``processing``, ``bean_species``) and ``is_blend`` are
+    TYPED fields, never run through the containment matcher at all — see
+    that constant's docstring for why pure string containment can't safely
+    verify them; both demote unconditionally in D1. Every roast-target
+    field is always ``"origin_estimated"`` (the page never
     states a roast target). The optional free-text fields (``country``, ``farm``,
     ``bean_varietal``, ``description``) are normalized via
     :func:`_normalize_optional_text` BEFORE both the provenance loop and
@@ -2753,14 +2584,9 @@ def _draft_from_identity(
         "description": description,
     }
 
-    # Both normalized ONCE, not per field (#590 D1) — every containment
-    # check below reuses these same corpus forms. corpus_digit_runs is
-    # deliberately derived from the RAW corpus, not corpus_normalized:
-    # _normalize_for_containment maps every comma to a space, which would
-    # split a genuine thousands-separated "1,800" into two digit runs
-    # (see _join_thousands_separated_digits's docstring).
+    # Normalized ONCE, not per field (#590 D1) — every containment check
+    # below reuses this same corpus form.
     corpus_normalized = _normalize_for_containment(corpus)
-    corpus_digit_runs = _digit_run_tokens(_join_thousands_separated_digits(corpus))
 
     field_sources: dict[str, BeanFieldSource] = {}
     for field_name in _IDENTITY_FIELDS:
@@ -2772,17 +2598,14 @@ def _draft_from_identity(
             # see the function docstring for why.
             field_sources[field_name] = "on_page"
             continue
-        if field_name in _ENUM_FIELDS_DEFERRED_TO_D2:
-            # processing/bean_species are demoted UNCONDITIONALLY in D1
-            # (#590 D1 scoping fold) — see _ENUM_FIELDS_DEFERRED_TO_D2's
-            # docstring for why crude whole-word containment cannot safely
-            # verify a closed-vocabulary enum.
+        if field_name in _FIELDS_DEFERRED_TO_D2:
+            # altitude_m/processing/bean_species are TYPED fields, demoted
+            # UNCONDITIONALLY in D1, never routed through the containment
+            # matcher — see _FIELDS_DEFERRED_TO_D2's docstring for why.
             field_sources[field_name] = "origin_estimated"
             continue
         field_sources[field_name] = (
-            "on_page"
-            if _value_is_contained(raw_value, corpus_normalized, corpus_digit_runs)
-            else "origin_estimated"
+            "on_page" if _value_is_contained(raw_value, corpus_normalized) else "origin_estimated"
         )
     if "bean_origin" not in field_sources and country:
         # bean_origin fell back to country — inherit COUNTRY's own verified
@@ -2797,20 +2620,13 @@ def _draft_from_identity(
         # said nothing" value is None, not ""/False — the generic
         # "not in (None, '')" test above would work for None but a bare
         # ``False`` used to be indistinguishable from "unstated" before
-        # #587 P2 made this field tri-state. Now: an explicit True or False
-        # earns "on_page" only when the corpus supports THAT SPECIFIC
-        # polarity (#590 D1 fold, _is_blend_polarity_confirmed) — a bare
-        # bool isn't a substring, so containment is checked at the concept
-        # level, not the value level, and matched to the returned value so
-        # a page that only supports the OPPOSITE polarity cannot certify
-        # it. No field_sources entry at all when the page said nothing
+        # #587 P2 made this field tri-state. An explicit True or False is
+        # DEFERRED to D2/E (#590 D1 scoping, see _FIELDS_DEFERRED_TO_D2's
+        # docstring) — always demoted, never routed through any matcher.
+        # No field_sources entry at all when the page said nothing
         # (identity.is_blend is None) — "absent from field_sources" stays
         # meaningful as "unset".
-        field_sources["is_blend"] = (
-            "on_page"
-            if _is_blend_polarity_confirmed(identity.is_blend, corpus_normalized)
-            else "origin_estimated"
-        )
+        field_sources["is_blend"] = "origin_estimated"
     for field_name in _TARGET_FIELDS:
         field_sources[field_name] = "origin_estimated"
 
