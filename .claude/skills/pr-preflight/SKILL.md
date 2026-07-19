@@ -12,7 +12,7 @@ each before moving on; **do not open the PR until all four pass.**
 ## 0. Orient
 
 !`git branch --show-current`
-!`git diff --stat origin/main`
+!`git diff --stat $(git merge-base origin/main HEAD)`
 
 ## 1. Gates — green before opening (not after)
 
@@ -69,6 +69,10 @@ If a gate fails, fix it and re-run before continuing.
   split it back to the planned boundary and open the current slice only. Reactively
   discovering the size here is the failure this catches; plan the slices up front, don't
   split a monolith at review time.
+- **Executable `.md` counts as logic, not exempt docs.** The doc exemption is for
+  prose (README, design notes, plan files). Agent/skill/workflow definitions under
+  `.claude/` (`agents/*.md`, `skills/**/*.md`, `workflows/*.mjs`) are executable behaviour
+  — they count toward the 400-line logic cap and get review like code.
 - **Separate data from logic.** Fixtures, snapshots, generated files, research
   output, bake-off results belong in their OWN PR or commit — never bundled with
   logic. They inflate size and don't need code review the way logic does. If the

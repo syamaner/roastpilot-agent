@@ -45,8 +45,10 @@ definition.
   (see PR-Hygiene) — an ordered set of thin PRs, each under the 400-line logic cap; each
   slice is one PR on its own branch `feature/{issue-number}-{slug}-{slice}` (or a plain
   `{slug}` when a story is genuinely a single slice), and every PR references the story
-  issue (`Refs #N`, or `Closes #N` only on the slice that finishes it). A story that is
-  one big PR is an unplanned monolith — split it to the plan.
+  issue (`Refs #N`, or `Closes #N` only on the slice that finishes it). A story whose
+  plan called for multiple slices but ships as one big PR is an unplanned monolith —
+  split it to the plan; a story whose kickoff plan is genuinely one slice under the cap
+  stays one PR (don't manufacture slices to hit a count).
 - The PR that completes a story updates the epic file's status table in the
   same PR — file state and GitHub state never drift.
 - Before starting a task: read `docs/state/registry.md`, open the active
@@ -160,7 +162,8 @@ Before starting a story:
 5. **Write the PR plan** (see PR-Hygiene: "PR-plan the story at KICKOFF") — the ordered
    list of thin PRs (scope / rough size / reviewers / deps), each under the 400-line logic
    cap, *before* writing code. Record it in the story brief / issue.
-6. Work on a branch named `feature/{issue-number}-{slug}` for the first planned PR.
+6. Work on a branch for the **first planned slice** — `feature/{issue-number}-{slug}-{slice}`
+   for a multi-slice plan, or plain `feature/{issue-number}-{slug}` when the plan is one slice.
 
 After completing a story:
 
