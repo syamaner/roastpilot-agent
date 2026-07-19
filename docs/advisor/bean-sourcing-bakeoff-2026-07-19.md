@@ -99,6 +99,12 @@ model-choice headline (every field counts equally).
 
 ## Honest caveats (screening, not certification)
 
+- **Latency was NOT captured for the committed result above.** The evaluation plan
+  tie-breaks a statistical dead heat (Findings #1 — most top-model pairs cross zero) on
+  cost PLUS latency, but this run predates per-call latency capture in the harness (added
+  #600 round-2). The pick above stands on macro-F1 + cost alone; a latency column lands
+  on the next re-run (the harness now records it), and the pick should be re-checked
+  against it then.
 - **N ≈ 9 pages.** Per the research §5.2, this reliably surfaces a model that hallucinates
   or mis-formats badly, but a 2–3 point CombinedScore gap between two good models sits
   inside overlapping CIs and should NOT decide the pick — fall back to cost + latency
@@ -106,15 +112,23 @@ model-choice headline (every field counts equally).
   primary test; McNemar/Wilson treat field decisions as independent and overstate
   certainty (indicative only).
 - **RANGE-altitude `COR` is currently unreachable against the real, unmodified
-  extractor.** The extraction prompt tells the model never to compute a midpoint for a
-  stated altitude range, and a scalar altitude is always tagged `"on_page"`, never
-  `"origin_estimated"` — so a page whose gold altitude is a RANGE can only ever score
-  `MIS` or `INC` on that cell, regardless of model quality. Two of the nine pages
-  (`cbc-costa-rica-laminita-tarrazu`, `counterculture-concepcion-huista`) hit this,
-  uniformly deflating every model's absolute recall/macro-F1 by the same amount — it does
-  not change the *relative* ranking. See the harness's module docstring for the full
-  mechanism; aligning the RANGE contract with a real midpoint/`origin_estimated`
-  extractor feature is deferred to #590.
+  extractor — and its effect on the RANKING is NOT guaranteed uniform.** The extraction
+  prompt tells the model never to compute a midpoint for a stated altitude range, and a
+  scalar altitude is always tagged `"on_page"`, never `"origin_estimated"` — so a page
+  whose gold altitude is a RANGE can only ever score `MIS` (weight 0, a compliant
+  abstention) or `INC` (weight −0.5, a leaked scalar) on that cell, never `COR`,
+  regardless of model quality. Two of the nine pages (`cbc-costa-rica-laminita-tarrazu`,
+  `counterculture-concepcion-huista`) hit this. **In the committed leaderboard above, all
+  eight models happened to abstain on both cells (`MIS`, weight 0)**, so this run's
+  deflation was uniform across the roster and did not by itself reorder anything — but
+  that uniformity is a property of THIS run, not a guarantee: a model that leaks an
+  in-range scalar instead of abstaining scores `INC` there, an asymmetric penalty a
+  compliant abstainer does not pay, which CAN shift both CombinedScore and macro-F1
+  ordering on a different pass. Given the top-five pairwise gaps are already inside
+  bootstrap noise (Findings #1), treat any close ranking as provisional until the RANGE
+  contract is resolved (or these two cells are excluded from scoring). See the harness's
+  module docstring for the full mechanism; aligning the RANGE contract with a real
+  midpoint/`origin_estimated` extractor feature is deferred to #590.
 - **Run-to-run sampling variance is real even though the extractor pins
   `temperature=0.0`** for literal, deterministic extraction — provider-side
   nondeterminism (routing, batching, sampler implementation details) is not fully
