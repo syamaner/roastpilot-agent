@@ -1258,25 +1258,42 @@ def _select_identity_matched_product(
 ) -> dict[str, object] | None:
     """Select the JSON-LD Product block that IDENTITY-matches ``url`` (#590
     slice B, README §2): trusted only when one of its OWN identity signals
-    (:func:`_product_identity_candidates`) locator-matches
-    (:func:`_locators_identity_match`) ``url`` — a stale/variant block or no
-    match falls through to the LLM-only path.
+    (:func:`_product_identity_candidates`) locator-matches ``url`` — a
+    stale/variant block or no match falls through to the LLM-only path.
+
+    TWO passes over every block (#590 P2 fix, round 2): an EXACT locator
+    match (host+path AND query equal) wins first, over ALL blocks, before
+    any query-less WILDCARD match (:func:`_locators_identity_match`) is
+    even considered — a page can carry both a generic (query-less) Product
+    block and a variant-specific one (``?variant=...``); without this a
+    single-pass, first-hit scan could let the generic block SHADOW the
+    exact one purely by document order. Each pass is itself
+    order-independent: it finds an exact/wildcard match anywhere in
+    ``raw_items``, not just the first one encountered.
 
     Args:
         raw_items: Every top-level JSON-LD item found on the page.
         url: The fetched page's own URL (the identity to match against).
 
     Returns:
-        The first matching Product block in document order, or ``None``.
+        The matching Product block (exact match preferred over a wildcard
+        one), or ``None``.
     """
     target = _canonical_product_locator(url, base_url=url)
     if target is None:
         return None
-    for block in _product_blocks_from_items(raw_items):
-        for candidate in _product_identity_candidates(block):
-            locator = _canonical_product_locator(candidate, base_url=url)
-            if locator is not None and _locators_identity_match(locator, target):
-                return block
+    blocks = _product_blocks_from_items(raw_items)
+    for exact_only in (True, False):
+        for block in blocks:
+            for candidate in _product_identity_candidates(block):
+                locator = _canonical_product_locator(candidate, base_url=url)
+                if locator is None:
+                    continue
+                is_match = (
+                    locator == target if exact_only else _locators_identity_match(locator, target)
+                )
+                if is_match:
+                    return block
     return None
 
 

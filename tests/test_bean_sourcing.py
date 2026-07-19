@@ -2878,6 +2878,20 @@ def test_select_identity_matched_product_returns_none_for_malformed_target_url()
     )
 
 
+def test_select_identity_matched_product_skips_a_malformed_candidate_url() -> None:
+    """A VALID target but a candidate whose own url is malformed (an
+    unclosed IPv6 bracket) must be skipped, not crash — in EACH pass."""
+    raw_items: list[dict[str, object]] = [
+        {"@type": "Product", "name": "Malformed", "url": "http://[::1"},
+        {"@type": "Product", "name": "Real", "url": _MATCHING_JSON_LD_URL},
+    ]
+    matched = bean_sourcing._select_identity_matched_product(  # pyright: ignore[reportPrivateUsage]
+        raw_items, url=_MATCHING_JSON_LD_URL
+    )
+    assert matched is not None
+    assert matched["name"] == "Real"
+
+
 def test_select_identity_matched_product_query_discriminates_between_variants() -> None:
     """#590 P2 fix: two blocks sharing a path but DIFFERENT identity-bearing
     queries (a query-param-selected origin, or a Shopify ``?variant=...``)
@@ -2919,6 +2933,47 @@ def test_select_identity_matched_product_matches_query_less_json_ld_against_quer
     )
     assert matched is not None
     assert matched["name"] == "Kenya"
+
+
+def test_select_identity_matched_product_prefers_exact_match_over_query_less_generic_block() -> (
+    None
+):
+    """#590 P2 fix, round 2 (Codex): a page can carry BOTH a generic
+    (query-less) Product block and a variant-specific one — the generic
+    block must NOT shadow the exact one just because it appears first in
+    document order; an exact locator match (host+path AND query) always
+    wins over the query-less wildcard fallback."""
+    raw_items: list[dict[str, object]] = [
+        {"@type": "Product", "name": "Generic", "url": "https://vendor.example/product"},
+        {
+            "@type": "Product",
+            "name": "Variant B",
+            "url": "https://vendor.example/product?variant=B",
+        },
+    ]
+    matched = bean_sourcing._select_identity_matched_product(  # pyright: ignore[reportPrivateUsage]
+        raw_items, url="https://vendor.example/product?variant=B"
+    )
+    assert matched is not None
+    assert matched["name"] == "Variant B"
+
+
+def test_select_identity_matched_product_prefers_exact_match_regardless_of_block_order() -> None:
+    """Same as above with the blocks in the OPPOSITE document order — the
+    two-pass selection must be order-independent within each pass."""
+    raw_items: list[dict[str, object]] = [
+        {
+            "@type": "Product",
+            "name": "Variant B",
+            "url": "https://vendor.example/product?variant=B",
+        },
+        {"@type": "Product", "name": "Generic", "url": "https://vendor.example/product"},
+    ]
+    matched = bean_sourcing._select_identity_matched_product(  # pyright: ignore[reportPrivateUsage]
+        raw_items, url="https://vendor.example/product?variant=B"
+    )
+    assert matched is not None
+    assert matched["name"] == "Variant B"
 
 
 def test_facts_from_product_block_unwraps_nested_brand_object() -> None:
