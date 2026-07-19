@@ -1856,16 +1856,20 @@ async def _fetch_page_text(
     # ``RoastService.draft_bean_from_url``'s ``_start_lock`` — the SAME
     # lock ``start_roast`` needs — so an unbounded call here would let a
     # pathological page hang ALL roast starts, defeating the very
-    # advisor-starvation guard that lock exists for, and falsifying this
-    # function's own documented "bounded by fetch_timeout +
-    # extraction_timeout" contract (api.py). Reusing
+    # advisor-starvation guard that lock exists for. Reusing
     # ``fetch_timeout_seconds`` (rather than adding a third timeout knob)
-    # keeps that contract intact. Note: ``asyncio.timeout`` cancels the
-    # *await*, not the underlying OS thread (no safe way to kill a running
-    # thread in Python) — the trade-off ``asyncio.to_thread`` always has;
-    # what matters for the ``_start_lock`` interaction is that THIS
-    # coroutine stops waiting and releases the lock promptly, which this
-    # achieves.
+    # avoids a new config field, but it does NOT keep the lock-hold bound
+    # unchanged: this is a SECOND, SEQUENTIAL ``asyncio.timeout`` block on
+    # the same ``fetch_timeout_seconds`` value, after the fetch's own
+    # already closed — so the fetch term counts TWICE in the worst case,
+    # not once. ``RoastService.draft_bean_from_url``'s docstring (api.py)
+    # states the corrected bound: at most
+    # ``2 * fetch_timeout_seconds + extraction_timeout_seconds``. Note also
+    # that ``asyncio.timeout`` cancels the *await*, not the underlying OS
+    # thread (no safe way to kill a running thread in Python) — the
+    # trade-off ``asyncio.to_thread`` always has; what matters for the
+    # ``_start_lock`` interaction is that THIS coroutine stops waiting and
+    # releases the lock promptly, which this achieves.
     try:
         async with asyncio.timeout(config.fetch_timeout_seconds):
             markdown = await asyncio.to_thread(_extract_page_markdown, html)
