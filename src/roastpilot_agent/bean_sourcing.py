@@ -2330,6 +2330,155 @@ _DEFAULT_INITIAL_FAN_PERCENT = 30
 _DEFAULT_BEAN_WEIGHT_GRAMS = 250.0
 
 
+#: Punctuation mapped to a SPACE (never deleted) before whitespace
+#: collapse, so a hyphenated phrase like "single-origin" normalizes to the
+#: same two-word form as "single origin" instead of gluing into
+#: "singleorigin" (#590 D1).
+_CONTAINMENT_PUNCTUATION_TRANSLATION = str.maketrans({ch: " " for ch in ",.'\"-()"})
+
+
+def _normalize_for_containment(text: str) -> str:
+    """Normalize text for value-containment comparison (#590 D1).
+
+    Case-folds, maps a small fixed set of punctuation to spaces
+    (:data:`_CONTAINMENT_PUNCTUATION_TRANSLATION`), then collapses every
+    whitespace run to one space. ``str``-only operations
+    (``casefold``/``translate``/``split``/``join``) — deliberately NO
+    regex, so this stays free of the catastrophic-backtracking (ReDoS)
+    surface a check running over attacker-controlled vendor-page text must
+    avoid (see ``docs/review/untrusted-input-checklist.md`` §3).
+
+    Args:
+        text: The raw text to normalize — either a field value or the page
+            corpus.
+
+    Returns:
+        The case-folded, punctuation-neutralized, whitespace-collapsed
+        form.
+    """
+    return " ".join(text.casefold().translate(_CONTAINMENT_PUNCTUATION_TRANSLATION).split())
+
+
+def _digits_only(text: str) -> str:
+    """Reduce ``text`` to its digit characters only, in order.
+
+    Used for numeric containment (``altitude_m``): a vendor page may render
+    "1,800 masl" for a value the model returns as the bare int ``1800`` —
+    comparing digit runs sidesteps unit/separator/comma noise without any
+    regex (#590 D1).
+
+    Args:
+        text: The text to reduce.
+
+    Returns:
+        Only the digit characters of ``text``, concatenated in order.
+    """
+    return "".join(ch for ch in text if ch.isdigit())
+
+
+#: A numeric field's digit run shorter than this is never trusted as
+#: "contained" (#590 D1) — see :func:`_value_is_contained`'s docstring for
+#: why. 3 covers every realistic coffee-growing altitude (typically
+#: 3-4 digits, e.g. "500"-"2500") while excluding a bare 1-2 digit run
+#: that is common noise elsewhere on a vendor page.
+_MIN_NUMERIC_CONTAINMENT_DIGITS = 3
+
+
+def _value_is_contained(value: object, corpus_normalized: str) -> bool:
+    """Test whether ``value`` is verifiably present in the page corpus (#590 D1).
+
+    Gates the ``"on_page"`` provenance tag: a field earns ``"on_page"`` only
+    when its extracted value is actually present in the SAME page text the
+    model was given (:func:`_draft_from_identity`'s ``corpus``) — trusting
+    the model's *claim* alone (the pre-D1 behavior) let a confabulated value
+    through with a false "verified" tag.
+
+    Numeric values (currently only ``altitude_m``) are compared on their
+    DIGIT RUNS only via :func:`_digits_only`, since a page may render
+    "1,800 masl" for a value the model returns as the bare int ``1800`` —
+    comparing the full normalized string would miss that. A digit run
+    SHORTER than :data:`_MIN_NUMERIC_CONTAINMENT_DIGITS` is never
+    considered contained, even if it happens to appear — a short run (e.g.
+    "1" or "42") is common noise in unrelated page numbers (a price, a
+    SKU, a year, "100% arabica"), so trusting it would OVER-verify a
+    confabulated value instead of erring toward the safe demote direction;
+    real coffee altitudes are 3+ digit values, so this costs nothing
+    legitimate. Every other value is compared as a whole-value SUBSTRING of
+    the normalized corpus (via :func:`_normalize_for_containment`).
+
+    Whole-value substring containment can under-verify a real value whose
+    tokens are legitimately scattered across the page (e.g. separated by
+    other text) — that is the intentionally SAFE direction for D1:
+    over-demotion just asks the operator to review a field that was
+    actually fine, it never fabricates trust in a confabulated one. D2's
+    evidence-quote gate is where this precision is refined.
+
+    Args:
+        value: The raw extracted field value (``str``, ``int``, or any
+            other identity-field type). ``None``/empty values are never
+            contained. ``bool`` (``is_blend``) is never routed through this
+            function — see :func:`_is_blend_addressed`.
+        corpus_normalized: The page corpus, already passed through
+            :func:`_normalize_for_containment` ONCE by the caller (never
+            re-normalized per field).
+
+    Returns:
+        ``True`` if ``value`` is verifiably present in the corpus,
+        ``False`` otherwise — including on any unexpected normalization
+        failure, since containment must fail SOFT (toward "not verified"),
+        never by raising out of a draft.
+    """
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return False  # pragma: no cover - defensive: is_blend bypasses this function entirely
+    try:
+        if isinstance(value, (int, float)):
+            value_digits = _digits_only(str(value))
+            if len(value_digits) < _MIN_NUMERIC_CONTAINMENT_DIGITS:
+                return False
+            return value_digits in _digits_only(corpus_normalized)
+        text = str(value).strip()
+        if not text:
+            return False
+        normalized_value = _normalize_for_containment(text)
+        return bool(normalized_value) and normalized_value in corpus_normalized
+    except Exception:  # pragma: no cover - defensive: containment must fail soft, never raise
+        return False
+
+
+#: Minimal token set for the ``is_blend`` containment check (#590 D1) — a
+#: bare ``True``/``False`` isn't itself a substring, so this asks instead
+#: "did the page address blend-vs-single-origin AT ALL", the same
+#: either-way provenance the pre-D1 code already granted for an explicit
+#: value on either side. Deliberately small: D2's evidence-quote gate is
+#: where this refines, not a growing keyword list here.
+_BLEND_INTENT_TOKENS: tuple[str, ...] = ("blend", "single origin")
+
+
+def _is_blend_addressed(corpus_normalized: str) -> bool:
+    """Whether the corpus mentions blend-vs-single-origin at all (#590 D1).
+
+    Matches each token as a WHOLE, space-delimited word (padding the
+    corpus with a leading/trailing space and searching for
+    ``f" {token} "``) rather than a raw substring — plain substring
+    containment would let "blend" match inside "blended"/"blender"/
+    "unblended", over-verifying a page that never actually addresses
+    blend-vs-single-origin. Still pure ``str`` operations (no regex), so
+    this stays ReDoS-free.
+
+    Args:
+        corpus_normalized: The page corpus, already normalized via
+            :func:`_normalize_for_containment`.
+
+    Returns:
+        ``True`` if any of :data:`_BLEND_INTENT_TOKENS` appears in the
+        corpus as a whole word (or word sequence).
+    """
+    padded_corpus = f" {corpus_normalized} "
+    return any(f" {token} " in padded_corpus for token in _BLEND_INTENT_TOKENS)
+
+
 def _normalize_optional_text(value: str | None) -> str | None:
     """Strip an optional identity string; blank-after-strip normalizes to
     ``None`` (#587 P2).
@@ -2358,17 +2507,33 @@ def _normalize_optional_text(value: str | None) -> str | None:
     return stripped or None
 
 
-def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanProfileDraft:
+def _draft_from_identity(
+    identity: _ExtractedBeanIdentity, *, url: str, corpus: str
+) -> BeanProfileDraft:
     """Assemble the :class:`BeanProfileDraft` from an extracted identity.
 
     Applies the conservative scouting targets
     (:data:`_SCOUTING_TARGETS_BY_PROCESSING`) and builds the honest per-field
-    ``field_sources`` map: every identity field the page stated is
-    ``"on_page"``; every roast-target field is always ``"origin_estimated"``.
-    The optional free-text fields (``country``, ``farm``, ``bean_varietal``,
-    ``description``) are normalized via :func:`_normalize_optional_text`
-    BEFORE both the provenance loop and the draft construction (#587 P2) —
-    see that function's docstring for why the ordering matters. ``url`` is
+    ``field_sources`` map: an identity field is tagged ``"on_page"`` only
+    when its value is CODE-VERIFIED present in ``corpus`` — the exact page
+    text the model was given (:func:`_value_is_contained` /
+    :func:`_is_blend_addressed`, #590 D1) — otherwise it is demoted to
+    ``"origin_estimated"`` even though the model returned a non-blank
+    value. This closes the pre-D1 gap where every non-blank model-returned
+    field was blanket-tagged ``"on_page"`` on the model's claim alone, with
+    no check that the value was actually on the page (a confabulated value
+    could pass through "verified"). ``description`` is EXEMPT from the
+    containment gate — it is long prose the model may legitimately
+    summarise/paraphrase rather than quote verbatim, it is lower-stakes
+    (the roast advisor never reads it), and D2's evidence-quote gate is
+    where prose precision, if it turns out to matter, will be handled;
+    it keeps the original presence-only tagging. Every roast-target field
+    is always ``"origin_estimated"`` (the page never states a roast
+    target). The optional free-text fields (``country``, ``farm``,
+    ``bean_varietal``, ``description``) are normalized via
+    :func:`_normalize_optional_text` BEFORE both the provenance loop and
+    the draft construction (#587 P2) — see that function's docstring for
+    why the ordering matters. ``url`` is
     carried onto ``source_url`` in its :func:`_redact_url_credentials`
     form (#587 P2, round 7) — not the raw ``url``: a credential-bearing
     query parameter (``?access_token=...``) must never persist into a
@@ -2381,6 +2546,11 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
     Args:
         identity: The provider's page-only extraction.
         url: The source URL (carried onto ``source_url`` in redacted form).
+        corpus: The SAME page text the model saw when producing ``identity``
+            (:func:`draft_bean_profile_from_url` threads its already-fetched
+            ``page_text`` straight through — never re-fetched or expanded
+            here) — the containment-verification corpus for ``"on_page"``
+            tagging.
 
     Returns:
         The drafted profile, ready for the operator to review, edit, and
@@ -2442,26 +2612,48 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
         "description": description,
     }
 
+    # Normalized ONCE, not per field (#590 D1) — every containment check
+    # below reuses this same corpus form.
+    corpus_normalized = _normalize_for_containment(corpus)
+
     field_sources: dict[str, BeanFieldSource] = {}
     for field_name in _IDENTITY_FIELDS:
         raw_value = identity_values[field_name]
-        if raw_value not in (None, ""):
+        if raw_value in (None, ""):
+            continue
+        if field_name == "description":
+            # description is EXEMPT from the containment gate (#590 D1) —
+            # see the function docstring for why.
             field_sources[field_name] = "on_page"
+            continue
+        field_sources[field_name] = (
+            "on_page" if _value_is_contained(raw_value, corpus_normalized) else "origin_estimated"
+        )
     if "bean_origin" not in field_sources and country:
-        # bean_origin fell back to country — still page-sourced, just via the
-        # country field rather than an explicit bean_origin statement.
-        field_sources["bean_origin"] = "on_page"
+        # bean_origin fell back to country — inherit COUNTRY's own verified
+        # provenance (#590 D1), not an automatic "on_page": country was
+        # already gated in the loop above (it is guaranteed an entry there
+        # since it is truthy here), so a confabulated country must not
+        # silently promote the bean_origin fallback to "on_page" just
+        # because the fallback ran.
+        field_sources["bean_origin"] = field_sources["country"]
     if identity.is_blend is not None:
         # is_blend is excluded from _IDENTITY_FIELDS because its "the page
         # said nothing" value is None, not ""/False — the generic
         # "not in (None, '')" test above would work for None but a bare
         # ``False`` used to be indistinguishable from "unstated" before
-        # #587 P2 made this field tri-state. Now: on_page for an explicit
-        # True OR an explicit False (the page addressed single-origin vs
-        # blend either way), and no field_sources entry at all when the
-        # page said nothing (identity.is_blend is None) — "absent from
+        # #587 P2 made this field tri-state. Now: an explicit True or False
+        # earns "on_page" only when the corpus actually addresses
+        # blend-vs-single-origin at all (#590 D1, _is_blend_addressed) — a
+        # bare bool isn't a substring, so containment is checked at the
+        # concept level, not the value level; a page that never mentions
+        # either demotes to origin_estimated instead of trusting the
+        # model's bare claim. No field_sources entry at all when the page
+        # said nothing (identity.is_blend is None) — "absent from
         # field_sources" stays meaningful as "unset".
-        field_sources["is_blend"] = "on_page"
+        field_sources["is_blend"] = (
+            "on_page" if _is_blend_addressed(corpus_normalized) else "origin_estimated"
+        )
     for field_name in _TARGET_FIELDS:
         field_sources[field_name] = "origin_estimated"
 
@@ -2612,7 +2804,7 @@ async def draft_bean_profile_from_url(
     identity = await _extract_bean_identity(
         page_text, advisor_config=advisor_config, sourcing_config=config, model=model
     )
-    draft = _draft_from_identity(identity, url=url)
+    draft = _draft_from_identity(identity, url=url, corpus=page_text)
     _log.info(
         "draft_bean_profile_from_url: drafted %r (%d fields sourced)",
         draft.name,

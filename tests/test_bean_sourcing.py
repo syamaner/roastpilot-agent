@@ -118,6 +118,17 @@ _SAMPLE_HTML = """
 """
 
 
+#: A page corpus containing every default ``_identity_args()`` value
+#: verbatim (or, for ``altitude_m``, its digit run) — the default ``corpus``
+#: for ``_draft_from_identity`` tests that expect the default identity's
+#: fields to verify as ``"on_page"`` (#590 D1).
+_IDENTITY_PAGE_TEXT = (
+    "Kenya Kiambu AA (Washed) is a washed coffee from Kenya, grown on the "
+    "Gakuyuini Factory farm. Variety: SL28, SL34. Altitude: 1775m. "
+    "Tasting notes: blackcurrant, tomato, bright acidity."
+)
+
+
 def _identity_args(**overrides: object) -> dict[str, object]:
     base: dict[str, object] = {
         "name": "Kenya Kiambu AA (Washed)",
@@ -2292,7 +2303,7 @@ def test_draft_from_identity_marks_page_fields_on_page() -> None:
         _identity_args()
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert isinstance(draft, BeanProfileDraft)
     for field in (
@@ -2319,6 +2330,86 @@ def test_draft_from_identity_marks_page_fields_on_page() -> None:
     assert "is_blend" not in draft.field_sources
 
 
+# --- #590 D1: code-verified on_page via value containment ---
+
+
+def test_draft_from_identity_confabulated_farm_is_demoted_to_origin_estimated() -> None:
+    """A field value the model returned but the corpus never actually
+    states (a confabulation) must be demoted to ``"origin_estimated"``,
+    not blanket-trusted just because the model claimed it (#590 D1 — the
+    core gap this slice closes)."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(farm="Finca El Injerto")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
+    )
+    assert draft.farm == "Finca El Injerto"
+    assert draft.field_sources["farm"] == "origin_estimated"
+
+
+def test_draft_from_identity_confabulated_bean_varietal_is_demoted() -> None:
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(bean_varietal="Geisha")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
+    )
+    assert draft.bean_varietal == "Geisha"
+    assert draft.field_sources["bean_varietal"] == "origin_estimated"
+
+
+def test_draft_from_identity_description_stays_exempt_even_when_paraphrased() -> None:
+    """``description`` is EXEMPT from the containment gate (#590 D1) — the
+    model may legitimately summarize/paraphrase the page's prose rather
+    than quote it verbatim, so it stays ``"on_page"`` on presence alone
+    even though this paraphrase is not a literal substring of the corpus."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(description="A fruity, bright Kenyan coffee with berry notes.")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
+    )
+    assert draft.description == "A fruity, bright Kenyan coffee with berry notes."
+    assert draft.field_sources["description"] == "on_page"
+
+
+def test_value_is_contained_none_and_empty_are_never_contained() -> None:
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    corpus = bean_sourcing._normalize_for_containment(_IDENTITY_PAGE_TEXT)  # pyright: ignore[reportPrivateUsage]
+    assert is_contained(None, corpus) is False
+    assert is_contained("", corpus) is False
+    assert is_contained("   ", corpus) is False
+
+
+def test_value_is_contained_matches_case_and_punctuation_insensitively() -> None:
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    corpus = bean_sourcing._normalize_for_containment("Farm: Gakuyuini Factory.")  # pyright: ignore[reportPrivateUsage]
+    assert is_contained("gakuyuini factory", corpus) is True
+    assert is_contained("GAKUYUINI FACTORY", corpus) is True
+    assert is_contained("Nairobi Estate", corpus) is False
+
+
+def test_value_is_contained_rejects_a_short_numeric_digit_run() -> None:
+    """A shield-review finding (#590 D1 shift-left pass): a bare 1-2 digit
+    run is common noise elsewhere on a vendor page (a price, a SKU, a
+    year, "100% arabica") — trusting it would OVER-verify a confabulated
+    altitude instead of erring toward the safe demote direction. Even a
+    LITERAL match under :data:`bean_sourcing._MIN_NUMERIC_CONTAINMENT_DIGITS`
+    must not count as contained."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    corpus = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
+        "This lot sells for $42 a bag."
+    )
+    assert is_contained(42, corpus) is False
+
+
+def test_value_is_contained_accepts_a_realistic_altitude_digit_run() -> None:
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    corpus = bean_sourcing._normalize_for_containment("Altitude: 1850m.")  # pyright: ignore[reportPrivateUsage]
+    assert is_contained(1850, corpus) is True
+
+
 # --- #587 P2 round 6: altitude range must not be tagged on_page ---
 
 
@@ -2342,7 +2433,7 @@ def test_draft_from_identity_altitude_range_page_leaves_altitude_null_and_unset(
         _identity_args(altitude_m=None)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.altitude_m is None
     assert "altitude_m" not in draft.field_sources
@@ -2355,10 +2446,43 @@ def test_draft_from_identity_altitude_single_value_still_tagged_on_page() -> Non
         _identity_args(altitude_m=1850)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=f"{_IDENTITY_PAGE_TEXT} Altitude: 1850m.",
     )
     assert draft.altitude_m == 1850
     assert draft.field_sources["altitude_m"] == "on_page"
+
+
+def test_draft_from_identity_altitude_numeric_containment_ignores_thousands_comma() -> None:
+    """#590 D1: the page may render "1,800 masl" for a value the model
+    returns as the bare int ``1800`` — numeric containment compares digit
+    runs (:func:`bean_sourcing._digits_only`), so the thousands separator
+    and unit noise must not defeat the match."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="Grown at 1,800 masl on volcanic soil.",
+    )
+    assert draft.altitude_m == 1800
+    assert draft.field_sources["altitude_m"] == "on_page"
+
+
+def test_draft_from_identity_altitude_not_on_page_is_demoted() -> None:
+    """A confabulated altitude (the model returned a number the page never
+    stated) must demote to ``origin_estimated``, not stay ``on_page`` on
+    the model's claim alone (#590 D1)."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=2200)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
+    )
+    assert draft.altitude_m == 2200
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
 # --- #587 P2: normalize optional identity values before tagging provenance ---
@@ -2374,7 +2498,7 @@ def test_draft_from_identity_whitespace_only_country_not_tagged_on_page() -> Non
         _identity_args(country="   ")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.country is None
     assert "country" not in draft.field_sources
@@ -2385,7 +2509,7 @@ def test_draft_from_identity_whitespace_only_farm_not_tagged_on_page() -> None:
         _identity_args(farm="   ")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.farm is None
     assert "farm" not in draft.field_sources
@@ -2396,7 +2520,7 @@ def test_draft_from_identity_whitespace_only_description_not_tagged_on_page() ->
         _identity_args(description="   ")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.description is None
     assert "description" not in draft.field_sources
@@ -2414,7 +2538,7 @@ def test_draft_from_identity_whitespace_only_bean_varietal_does_not_reject_draft
         _identity_args(bean_varietal="   ")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.bean_varietal is None
     assert "bean_varietal" not in draft.field_sources
@@ -2430,7 +2554,9 @@ def test_draft_from_identity_whitespace_only_bean_origin_falls_back_to_country()
         _identity_args(bean_origin="   ", country="Ethiopia")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/eth"
+        identity,
+        url="https://vendor.example/products/eth",
+        corpus="Ethiopia Yirgacheffe, a natural process lot.",
     )
     assert draft.bean_origin == "Ethiopia"
     assert draft.field_sources["bean_origin"] == "on_page"
@@ -2444,7 +2570,7 @@ def test_draft_from_identity_whitespace_padded_values_are_stripped_and_still_on_
         _identity_args(country="  Kenya  ", farm="  Gakuyuini Factory  ")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.country == "Kenya"
     assert draft.field_sources["country"] == "on_page"
@@ -2481,7 +2607,7 @@ def test_draft_from_identity_is_blend_silent_page_leaves_unset() -> None:
         _identity_args(is_blend=None)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/silent"
+        identity, url="https://vendor.example/products/silent", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.is_blend is None
     assert "is_blend" not in draft.field_sources
@@ -2492,12 +2618,15 @@ def test_draft_from_identity_is_blend_explicit_single_origin_marks_on_page() -> 
     a SINGLE origin) is a page-sourced FACT, not silence — before this fix a
     bare ``bool`` default made this indistinguishable from "the page said
     nothing"; it must now be recorded ``on_page`` just like an explicit
-    ``True`` is."""
+    ``True`` is. #590 D1: this now ALSO requires the corpus to actually
+    address blend-vs-single-origin (:func:`bean_sourcing._is_blend_addressed`)."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(is_blend=False)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/single-origin"
+        identity,
+        url="https://vendor.example/products/single-origin",
+        corpus="This is a single origin lot from one farm, not a blend.",
     )
     assert draft.is_blend is False
     assert draft.field_sources["is_blend"] == "on_page"
@@ -2506,15 +2635,46 @@ def test_draft_from_identity_is_blend_explicit_single_origin_marks_on_page() -> 
 def test_draft_from_identity_is_blend_explicit_blend_marks_on_page() -> None:
     """#587 P2 (supersedes the earlier True-only fix, #587 fix 4): when the
     page explicitly states this IS a blend, ``is_blend`` must be recorded as
-    ``"on_page"`` provenance."""
+    ``"on_page"`` provenance. #590 D1: gated on the corpus actually
+    containing a blend-intent token."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(is_blend=True)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/blend"
+        identity,
+        url="https://vendor.example/products/blend",
+        corpus="A house blend combining beans from three origins.",
     )
     assert draft.is_blend is True
     assert draft.field_sources["is_blend"] == "on_page"
+
+
+def test_draft_from_identity_is_blend_explicit_but_corpus_silent_is_demoted() -> None:
+    """#590 D1: an explicit ``True``/``False`` the model returned, but the
+    corpus never actually addresses blend-vs-single-origin at all, must
+    demote to ``origin_estimated`` — a bare model claim is not itself
+    evidence."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=True)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
+    )
+    assert draft.is_blend is True
+    assert draft.field_sources["is_blend"] == "origin_estimated"
+
+
+def test_is_blend_addressed_does_not_match_inside_an_unrelated_word() -> None:
+    """A shift-left finding (#590 D1): plain substring containment would
+    let "blend" match inside "blended"/"blender" — an unrelated mention
+    (e.g. a kitchen blender upsell) must not count as the page addressing
+    blend-vs-single-origin. :func:`bean_sourcing._is_blend_addressed`
+    matches whole words only."""
+    is_addressed = bean_sourcing._is_blend_addressed  # pyright: ignore[reportPrivateUsage]
+    corpus = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
+        "Pairs perfectly with our best-selling kitchen blender."
+    )
+    assert is_addressed(corpus) is False
 
 
 def test_draft_from_identity_marks_every_roast_target_origin_estimated() -> None:
@@ -2522,7 +2682,7 @@ def test_draft_from_identity_marks_every_roast_target_origin_estimated() -> None
         _identity_args()
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     for field in (
         "charge_guidance_min_c",
@@ -2542,10 +2702,27 @@ def test_draft_from_identity_bean_origin_falls_back_to_country_and_is_still_on_p
         _identity_args(bean_origin=None, country="Ethiopia")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/eth"
+        identity,
+        url="https://vendor.example/products/eth",
+        corpus="Ethiopia Yirgacheffe, a natural process lot.",
     )
     assert draft.bean_origin == "Ethiopia"
     assert draft.field_sources["bean_origin"] == "on_page"
+
+
+def test_draft_from_identity_bean_origin_fallback_inherits_a_demoted_country() -> None:
+    """#590 D1: when ``bean_origin`` falls back to ``country``, the
+    fallback must inherit COUNTRY's own verified provenance rather than an
+    automatic ``"on_page"`` — a confabulated country (absent from the
+    corpus) must leave the bean_origin fallback demoted too."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(bean_origin=None, country="Ethiopia")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/eth", corpus=_IDENTITY_PAGE_TEXT
+    )
+    assert draft.bean_origin == "Ethiopia"
+    assert draft.field_sources["bean_origin"] == "origin_estimated"
 
 
 @pytest.mark.parametrize(
@@ -2570,7 +2747,7 @@ def test_draft_from_identity_raises_when_name_or_origin_is_missing(
     )
     with pytest.raises(BeanExtractionError, match="could not determine"):
         bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-            identity, url="https://vendor.example/products/nope"
+            identity, url="https://vendor.example/products/nope", corpus=_IDENTITY_PAGE_TEXT
         )
 
 
@@ -2593,7 +2770,7 @@ def test_draft_from_identity_applies_conservative_scouting_targets_by_processing
         _identity_args(processing=processing)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/x"
+        identity, url="https://vendor.example/products/x", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.target_drop_temp_c == expected_drop
     assert draft.target_development_percent == expected_dev
@@ -3309,6 +3486,73 @@ async def test_draft_bean_profile_from_url_feeds_json_ld_context_to_extraction_p
     assert draft.name == "Kenya Kiambu AA (Washed)"
     assert any("Structured data found in this page" in prompt for prompt in seen_prompts)
     assert any("KE-KIAMBU-AA" in prompt for prompt in seen_prompts)
+
+
+#: A page whose VISIBLE body never states the product name/description —
+#: only the JSON-LD block does. Proves the #590 D1 containment corpus
+#: includes the prepended JSON-LD DATA section, not just the extracted
+#: body text.
+_JSON_LD_ONLY_URL = "https://vendor.example/products/colombia-huila"
+
+_JSON_LD_ONLY_HTML = """
+<html>
+<head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Product",
+  "name": "Colombia Huila Pink Bourbon",
+  "url": "https://vendor.example/products/colombia-huila",
+  "description": "A vibrant lot from Huila."
+}
+</script>
+</head>
+<body>
+<p>Great coffee. Free shipping on orders over $50. Subscribe and save.</p>
+</body>
+</html>
+"""
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_json_ld_only_value_verifies_on_page() -> None:
+    """#590 D1: the containment corpus is the SAME page text the model
+    saw, which includes the prepended JSON-LD DATA section — a field value
+    present ONLY via JSON-LD (never in the visible body text) must still
+    verify ``"on_page"``, not get wrongly demoted for being off the
+    rendered body."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        tool_name = info.output_tools[0].name
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name,
+                    _identity_args(
+                        name="Colombia Huila Pink Bourbon",
+                        country="Colombia",
+                        bean_origin="Colombia",
+                        farm=None,
+                        bean_varietal=None,
+                        processing=None,
+                        bean_species=None,
+                        altitude_m=None,
+                        description="A vibrant lot from Huila.",
+                        is_blend=None,
+                    ),
+                )
+            ]
+        )
+
+    async with _mock_client(_html_response(200, _JSON_LD_ONLY_HTML)) as http_client:
+        draft = await draft_bean_profile_from_url(
+            _JSON_LD_ONLY_URL,
+            advisor_config=_ADVISOR_CONFIG,
+            http_client=http_client,
+            model=FunctionModel(respond),
+        )
+    assert draft.name == "Colombia Huila Pink Bourbon"
+    assert draft.field_sources["name"] == "on_page"
 
 
 # --- #590 slice C: _extract_page_markdown (trafilatura) ---
