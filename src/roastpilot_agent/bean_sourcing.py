@@ -1100,19 +1100,16 @@ async def _fetch_with_ssrf_guard(
 # fails soft to ``None``/``[]``: a stale/absent block, or malformed
 # JSON-LD, falls through to the unchanged LLM-only path.
 
-#: Bounds how many top-level JSON-LD items (incl. one level of ``@graph``
-#: nesting) the identity-match scan inspects, independent of the existing
-#: ``max_response_bytes`` page-byte cap.
+#: Bounds how many top-level JSON-LD items (incl. one ``@graph`` level) the
+#: identity-match scan inspects, independent of the page-byte cap.
 _MAX_JSON_LD_ITEMS = 25
 
 
 @dataclass(frozen=True)
 class _JsonLdProductFacts:
     """Textual facts read off an identity-matched JSON-LD Product block
-    (#590 slice B) — every field ``None`` when absent. No bean-identity
-    field mapping (``processing``/``bean_species`` have no general
-    schema.org Product equivalent): just grounding text for
-    :func:`_format_json_ld_context`.
+    (#590 slice B) — every field ``None`` when absent; just grounding text
+    for :func:`_format_json_ld_context`, no bean-identity field mapping.
     """
 
     name: str | None = None
@@ -1198,10 +1195,9 @@ def _is_product_type(type_value: object) -> bool:
 
 def _product_blocks_from_items(raw_items: list[dict[str, object]]) -> list[dict[str, object]]:
     """Collect every schema.org Product block out of ``raw_items`` (#590
-    slice B), including one level of ``@graph`` nesting — the common
-    WooCommerce/Yoast pattern of wrapping several entities in one
-    ``{"@graph": [...]}`` block. Bounds recursion to one level; work is
-    additionally capped at :data:`_MAX_JSON_LD_ITEMS` blocks inspected.
+    slice B), including one level of ``@graph`` nesting (the common
+    WooCommerce/Yoast wrapper pattern). Bounds recursion to one level and
+    caps inspection at :data:`_MAX_JSON_LD_ITEMS` blocks.
 
     Args:
         raw_items: Every top-level JSON-LD item found on the page.
@@ -1353,28 +1349,26 @@ def _parse_html_for_json_ld(html: str) -> list[dict[str, object]]:
     **Parser/syntax choice.** Uses ``lxml.html.HTMLParser`` (HTML, not XML,
     parsing mode) with ``no_network=True``. Verified directly (not assumed):
     unlike ``lxml.etree.XMLParser``, HTML-mode parsing never processes a
-    ``<!DOCTYPE html [...]>`` block's internal ``<!ENTITY>`` declarations at
-    all — a ``<!ENTITY xxe SYSTEM "file:///...">`` payload comes through as
-    the literal, UNEXPANDED string ``"&xxe;"`` (HTML5 has no equivalent of
-    XML's general-entity mechanism). ``no_network=True`` is set regardless,
-    as an explicit, defence-in-depth second layer, stopping the parser
-    itself from ever dereferencing an external DTD/entity over the network.
+    ``<!DOCTYPE html [...]>`` block's internal ``<!ENTITY>`` declarations —
+    a ``<!ENTITY xxe SYSTEM "file:///...">`` payload comes through as the
+    literal, UNEXPANDED string ``"&xxe;"`` (HTML5 has no XML general-entity
+    mechanism). ``no_network=True`` stays set regardless, defence-in-depth
+    against the parser itself ever dereferencing an external DTD/entity.
     Restricted to ``syntaxes=["json-ld"]`` (plain JSON, no XML-entity
-    surface of its own); this module builds its OWN parser instance and
-    hands ``extruct.extract()`` the ALREADY-parsed tree (bypassing its
-    internal ``parse_html()``, which applies no safety kwargs) so the safe
-    configuration is explicit and owned here. ``extruct``'s microdata/RDFa
-    syntaxes route through ADDITIONAL XML-mode parsing this module has not
-    hardened and does not need — see
-    ``docs/review/untrusted-input-checklist.md`` class 4: only the syntax
-    verified safe here is used.
+    surface); this module builds its OWN parser instance and hands
+    ``extruct.extract()`` the ALREADY-parsed tree (bypassing its internal
+    ``parse_html()``, which applies no safety kwargs). ``extruct``'s
+    microdata/RDFa syntaxes route through ADDITIONAL XML-mode parsing this
+    module has not hardened — see
+    ``docs/review/untrusted-input-checklist.md`` class 4.
 
     Bounded and fail-soft: ``html`` is already capped upstream
-    (``BeanSourcingConfig.max_response_bytes``); the returned list is
-    additionally capped at :data:`_MAX_JSON_LD_ITEMS`. Any exception
-    parsing/extraction raises on malformed/adversarial JSON-LD (beyond what
-    ``errors="ignore"`` already swallows internally) yields ``[]`` rather
-    than propagating — this stage must NEVER interrupt drafting.
+    (``max_response_bytes``); :data:`_MAX_JSON_LD_ITEMS` bounds the
+    RETURNED list (sliced after ``extruct.extract()`` already ran), not the
+    extraction pass itself — implicitly bounded by the page-byte cap alone
+    (measured: ~27 ms typical, ~190 ms pathological). Any exception on
+    malformed/adversarial JSON-LD (beyond ``errors="ignore"``'s own
+    handling) yields ``[]`` rather than propagating.
 
     Args:
         html: The raw, already-decoded page HTML.
@@ -1429,6 +1423,9 @@ def _build_json_ld_context(html: str, url: str) -> str | None:
     own, and this wraps the whole chain in one more catch-all so a defect in
     any of them degrades to "no JSON-LD context" (the pipeline's existing
     LLM-only behaviour) rather than ever raising out of a page fetch.
+    NOTE: identity-match verifies the BLOCK, not each individual field
+    value — a per-field evidence-quote/containment check is deferred to
+    slice D (tracked, not yet closed).
 
     Args:
         html: The raw, already-decoded page HTML.
