@@ -2321,6 +2321,110 @@ async def test_extract_bean_identity_maps_build_model_dependency_error(
         )
 
 
+# --- #590 D2a: evidence-quote schema + prompt (capture only, no provenance change) ---
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_round_trips_evidence_quotes() -> None:
+    """The four ``*_evidence`` fields arrive on the extraction result
+    unchanged — the schema addition itself, exercised through a real
+    ``agent.run`` call (never hand-constructed via ``model_validate``)."""
+    args = _identity_args(
+        altitude_m_evidence="Altitude: 1,700-1,850m.",
+        processing_evidence="Process: washed.",
+        bean_species_evidence=None,
+        is_blend_evidence=None,
+    )
+    model = _function_model_returning(args)
+    identity = await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text", advisor_config=_ADVISOR_CONFIG, model=model
+    )
+    assert identity.altitude_m_evidence == "Altitude: 1,700-1,850m."
+    assert identity.processing_evidence == "Process: washed."
+    assert identity.bean_species_evidence is None
+    assert identity.is_blend_evidence is None
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_prompt_still_yields_valid_identity() -> None:
+    """The rewritten :data:`bean_sourcing._EXTRACTION_INSTRUCTIONS` (abstention
+    bias + CoT nudge + evidence-quote instructions, #590 D2a) does not break
+    the extraction agent's construction or its structured-output contract —
+    a plain identity round trip still succeeds end to end."""
+    model = _function_model_returning(_identity_args())
+    identity = await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text", advisor_config=_ADVISOR_CONFIG, model=model
+    )
+    assert identity.name == "Kenya Kiambu AA (Washed)"
+    assert identity.altitude_m == 1775
+
+
+def test_extraction_instructions_never_offer_a_placeholder_value() -> None:
+    """The abstention-bias prompt text (#590 D2a, folding in slice F) must
+    say null-on-absence, not offer the model a placeholder string to use
+    instead — a regression here would silently reintroduce a spurious
+    "unknown"/"none" value the D1 provenance loop cannot distinguish from a
+    real one."""
+    assert "null" in bean_sourcing._EXTRACTION_INSTRUCTIONS  # pyright: ignore[reportPrivateUsage]
+    assert '"none"' in bean_sourcing._EXTRACTION_INSTRUCTIONS  # pyright: ignore[reportPrivateUsage]
+    assert "verbatim" in bean_sourcing._EXTRACTION_INSTRUCTIONS  # pyright: ignore[reportPrivateUsage]
+
+
+def test_draft_from_identity_evidence_quotes_do_not_change_provenance() -> None:
+    """Regression proof (#590 D2a's core invariant): an identity carrying
+    the four ``*_evidence`` quotes for the SAME page the D1 test fixture
+    uses produces a BYTE-IDENTICAL ``field_sources`` map to D1's — capturing
+    the quotes changes nothing about what is verified, only what is
+    available for a later slice to verify."""
+    identity_with_evidence = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            altitude_m_evidence="Altitude: 1775m.",
+            processing_evidence="washed coffee",
+            bean_species_evidence=None,
+            is_blend_evidence=None,
+        )
+    )
+    identity_without_evidence = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args()
+    )
+    draft_with_evidence = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity_with_evidence,
+        url="https://vendor.example/products/kenya",
+        corpus=_IDENTITY_PAGE_TEXT,
+    )
+    draft_without_evidence = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity_without_evidence,
+        url="https://vendor.example/products/kenya",
+        corpus=_IDENTITY_PAGE_TEXT,
+    )
+    assert draft_with_evidence.field_sources == draft_without_evidence.field_sources
+    # The four typed fields still demote unconditionally (D1 law, untouched
+    # by D2a) even though a genuine supporting quote is now attached.
+    assert draft_with_evidence.field_sources["altitude_m"] == "origin_estimated"
+    assert draft_with_evidence.field_sources["processing"] == "origin_estimated"
+    assert "bean_species" not in draft_with_evidence.field_sources
+    assert "is_blend" not in draft_with_evidence.field_sources
+    # Free-text fields keep verifying exactly as D1 did.
+    for field in ("name", "country", "bean_origin", "farm", "bean_varietal", "description"):
+        assert draft_with_evidence.field_sources[field] == "on_page", field
+
+
+def test_draft_from_identity_abstained_processing_has_no_spurious_provenance() -> None:
+    """A model that abstains (``processing=None``, page silent) — per the
+    D2a prompt's null-on-absence rule — must yield no value and no
+    ``field_sources`` entry for it, evidence quote or not (#590 D2a: the
+    null-on-absence prompt behaviour holding at the schema/draft level,
+    independent of any live LLM call)."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(processing=None, processing_evidence=None)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
+    )
+    assert draft.processing is None
+    assert "processing" not in draft.field_sources
+
+
 # --- _draft_from_identity: honest imputation + conservative targets ---
 
 
