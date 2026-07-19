@@ -152,7 +152,10 @@ Before starting a story:
 2. Open the active epic file listed in the registry.
 3. Read the GitHub story issue and any comments.
 4. Confirm acceptance criteria and current risks.
-5. Work on a branch named `feature/{issue-number}-{slug}`.
+5. **Write the PR plan** (see PR-Hygiene: "PR-plan the story at KICKOFF") — the ordered
+   list of thin PRs (scope / rough size / reviewers / deps), each under the 400-line logic
+   cap, *before* writing code. Record it in the story brief / issue.
+6. Work on a branch named `feature/{issue-number}-{slug}` for the first planned PR.
 
 After completing a story:
 
@@ -225,12 +228,16 @@ checklist before you open.
   (safety / security / qa). You should know "this story is 8 PRs, and PR3 does exactly
   X" *before* PR1 opens. This lives in the story brief (a lead / `product-pm` activity).
   Reactively splitting a 900-line diff at review time is the failure mode this prevents
-  (#587's ~800-line module and #600's ~2,000-line harness were unplanned monoliths —
-  they should have been ~3 and ~4 planned slices; the shift-left folds then *masked* the
-  size problem instead of fixing it).
-- **Keep logic PRs small — the ≤ ~400-line cap is a HARD STOP, not a target.** If a
-  logic diff exceeds it, the PR plan was too coarse: split before opening, no exceptions.
-  (Data/fixtures/generated files are exempt — they go in their own PR per the rule above.)
+  (#587's ~800-line module and #600's ~2,000-line harness were unplanned monoliths — the
+  logic in each should have been ~3 and ~6 planned slices under the cap below; the
+  shift-left folds then *masked* the size problem instead of fixing it).
+- **Keep logic PRs small — the 400-line cap is a HARD STOP.** Measure **logic** lines
+  only: `git diff --stat origin/main` minus data/fixtures/generated/doc files (those are
+  exempt and go in their own PR per the rule above). If the logic diff exceeds **400**,
+  the PR plan was too coarse — split to the planned slice boundary before opening. Enough
+  slices that every one is under the cap: the ~2,000-line #600 harness was ~5–6 reviewable
+  logic slices (scoring / stats / runner / report), not 4. The number is exact (400), the
+  slicing is what flexes.
 - **Shift review LEFT — mandatory, not optional.** Before opening: run all gates +
   an adversarial self-critique, AND run the domain reviewer on the BRANCH
   (`safety-reviewer` for safety/controller/enum/recovery, `qa` for tests) and
