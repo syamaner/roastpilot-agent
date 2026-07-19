@@ -1,0 +1,27 @@
+{
+  "provenance": {
+    "vendor": "Onyx Coffee Lab",
+    "url": "https://onyxcoffeelab.com/products/monarch",
+    "captured": "2026-07-19",
+    "note": "A year-round BLEND that nonetheless carries a structured Coffee Summary spec block (Origin 'Colombia, Ethiopia', Variety 'Mixed', Process 'Washed', Avg Elevation 1800 MASL). Nav-heavy Shopify page (same truncation caveat as the other Onyx pages)."
+  },
+  "name": {"value": "Monarch"},
+  "fields": {
+    "origin": {"value": "Colombia, Ethiopia"},
+    "region": {"absent": true},
+    "farm": {"absent": true},
+    "variety": {"value": ["Mixed"]},
+    "process": {"value": "washed"},
+    "altitude": {"value": 1800},
+    "tasting_notes": {"value": ["dark chocolate", "winey berries", "caramelized"]},
+    "is_blend": {"value": true},
+    "species": {"absent": true},
+    "roast_guidance": {"value": "dark"}
+  },
+  "labeling_flags": [
+    "is_blend=true: an 'evergreen blend' / 'most developed roast'.",
+    "origin='Colombia, Ethiopia': the structured Origin spec lists both countries. A model returning just 'Colombia' should score PAR via normalized string similarity. SPOT-CHECK.",
+    "variety=[Mixed]: the spec Variety value is literally 'Mixed' (mixed varieties); recorded verbatim.",
+    "process=washed / altitude=1800: taken from the structured spec block."
+  ]
+}

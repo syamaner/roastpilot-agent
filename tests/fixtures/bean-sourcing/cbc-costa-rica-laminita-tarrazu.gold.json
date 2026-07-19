@@ -1,0 +1,25 @@
+{
+  "provenance": {
+    "vendor": "Coffee Bean Corral",
+    "url": "https://www.coffeebeancorral.com/products/costa-rica-laminita-tarrazu",
+    "captured": "2026-07-19",
+    "note": "Green-coffee product page with a structured Specifications block (country/local region/process/variety/altitude) plus a Cupping Notes paragraph."
+  },
+  "name": {"value": "Costa Rica: La Minita Estate, Tarrazu"},
+  "fields": {
+    "origin": {"value": "Costa Rica"},
+    "region": {"value": "Tarrazu"},
+    "farm": {"value": "La Minita Estate"},
+    "variety": {"value": ["Caturra"]},
+    "process": {"value": "washed"},
+    "altitude": {"value": {"min_m": 1143, "max_m": 1524}},
+    "tasting_notes": {"value": ["orange citrus", "caramelized sugar", "chocolate", "acidity", "medium body"]},
+    "is_blend": {"value": false},
+    "species": {"absent": true},
+    "roast_guidance": {"absent": true}
+  },
+  "labeling_flags": [
+    "is_blend=false: the page explicitly states the estate is 'not combined with any other farms in a cooperative scenario' and is 'milled by itself' (an explicit single-estate statement, so not merely an implied single origin).",
+    "altitude is a stated RANGE (1,143 - 1,524 masl); recorded as a range per README section 5.1."
+  ]
+}

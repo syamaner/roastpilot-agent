@@ -1,0 +1,26 @@
+{
+  "provenance": {
+    "vendor": "Coffee Bean Corral",
+    "url": "https://www.coffeebeancorral.com/products/dominican-republic-organic-ramirez-honey-process",
+    "captured": "2026-07-19",
+    "note": "Green-coffee product page with a structured Specifications block. Notably carries NO prose tasting/cupping notes (only numeric Flavor Profile bars) -> tasting_notes is gold-absent."
+  },
+  "name": {"value": "Dominican Republic: Organic Ramirez Red Honey, Jarabacoa"},
+  "fields": {
+    "origin": {"value": "Dominican Republic"},
+    "region": {"value": "Jarabacoa"},
+    "farm": {"value": "Ramirez"},
+    "variety": {"value": ["Red Caturra"]},
+    "process": {"value": "honey"},
+    "altitude": {"value": 1400},
+    "tasting_notes": {"absent": true},
+    "is_blend": {"absent": true},
+    "species": {"absent": true},
+    "roast_guidance": {"absent": true}
+  },
+  "labeling_flags": [
+    "farm=Ramirez: 'Ramirez' is a producer/family name that appears only in the product title ('Organic Ramirez Red Honey'); there is no dedicated farm/co-op spec field. Treated as the producer for the farm/producer field. SPOT-CHECK.",
+    "is_blend=absent: single farm/producer coffee but the page never explicitly states single-origin vs blend status.",
+    "altitude is a single stated value (1,400 masl)."
+  ]
+}

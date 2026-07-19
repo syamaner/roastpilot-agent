@@ -1,0 +1,27 @@
+{
+  "provenance": {
+    "vendor": "Klatch Coffee",
+    "url": "https://www.klatchcoffee.com/products/el-salvador-jasal-orange-geisha-anaerobic-natural",
+    "captured": "2026-07-19",
+    "note": "Single-farm micro-lot with a spec block (Varietal/Process/Farm/Farmer/Region) plus rich story prose. No altitude is stated anywhere on the page."
+  },
+  "name": {"value": "El Salvador Jasal Orange Geisha Anaerobic Natural"},
+  "fields": {
+    "origin": {"value": "El Salvador"},
+    "region": {"value": "Apaneca-Ilamatepec"},
+    "farm": {"value": "Finca San Francisco"},
+    "variety": {"value": ["Geisha"]},
+    "process": {"value": "anaerobic"},
+    "altitude": {"absent": true},
+    "tasting_notes": {"value": ["orange blossom", "apricot", "pink grapefruit", "cocoa", "pineapple", "cherry"]},
+    "is_blend": {"absent": true},
+    "species": {"absent": true},
+    "roast_guidance": {"value": "medium-light"}
+  },
+  "labeling_flags": [
+    "region=Apaneca-Ilamatepec: the prose states the farm is in the Apaneca-Ilamatepec growing region (town of Juayua), but the structured Region spec field literally says 'El Salvador'. Used the more-specific prose region. SPOT-CHECK.",
+    "variety=[Geisha]: spec says 'Geisha'; prose/name call it 'Orange Geisha' (a Geisha x orange bourbon cross). A model returning 'Orange Geisha' should score COR via set/substring alignment.",
+    "process=anaerobic: the page states 'Anaerobic Natural'; mapped to the 'anaerobic' enum (the novel step) rather than 'natural'. SPOT-CHECK.",
+    "altitude=absent: the page never states an elevation figure (only 'the highest part of the farm')."
+  ]
+}
