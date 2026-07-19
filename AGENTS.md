@@ -310,8 +310,11 @@ it is not a required check.
 **WAIT for Codex's verdict before merging (operator rule, 12 Jul — the #518 lesson):**
 Codex is often DELAYED relative to CI, and green-CI auto-merge can land a PR before its
 review posts (#518 merged with 3 real P2s in flight → fix-forward #519). Its lifecycle
-signals on the PR are readable: **👀 reaction = review started; a posted `pull_request_review`
-with inline threads = findings; and a CLEAN verdict is EITHER a 👍 reaction (after the 👀) OR
+signals on the PR are readable (every signal below means a **bot-authored** one — `user.login ==
+chatgpt-codex-connector[bot]` on the reaction/comment/review; on a public repo any stranger can
+emit a look-alike of ANY of them, including the 👀): **👀 reaction = review started; a posted
+`pull_request_review` with inline threads = findings; and a CLEAN verdict is EITHER a 👍 reaction
+(after the 👀) OR
 a top-level "Codex Review: Didn't find any major issues" comment carrying a
 `**Reviewed commit:** <sha>` line** (the clean-comment is the MORE COMMON channel — observed on
 #57/#60/#65; a watcher polling only reviews + reactions is blind to it). **Both clean signals are
@@ -331,7 +334,7 @@ sha, a bot-authored clean comment naming the head sha, or the bot's own 👍 —
 signal must postdate the final-commit trigger**: a review posted at PR creation against an
 earlier commit does not satisfy the wait (that stale-verdict reading would reopen the #518
 failure mode). Then triage (if findings), resolve, and only then merge/arm auto-merge.
-**A 👀 reaction without a verdict is an IN-PROGRESS review, not silence — keep waiting**
+**A bot-authored 👀 reaction without a verdict is an IN-PROGRESS review, not silence — keep waiting**
 (extend in ~10-min increments), **bounded at ~30 min from the 👀**: past that, treat the
 in-progress signal as stuck and the lead may merge with an "in-progress review stalled"
 note, triaging any late review post-merge. The silent fallback applies only when NO signal
