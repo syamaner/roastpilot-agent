@@ -115,7 +115,7 @@ local Ollama) with an active roast's advisor calls can starve them into the
 controller's sustained-outage safety fallback.
 
 **Deterministic JSON-LD extraction, ahead of the LLM (#590 slice B):**
-before the LLM sees the page, :func:`_build_json_ld_context` looks for a
+before the LLM sees the page, :func:`_match_json_ld_product_facts` looks for a
 ``schema.org/Product`` ``<script type="application/ld+json">`` block
 (``extruct``, JSON-LD syntax only — see :func:`_parse_html_for_json_ld` for
 the XXE-safe parser config and why microdata/RDFa are excluded), then
@@ -1656,15 +1656,17 @@ def _parse_html_for_json_ld(html: str) -> list[dict[str, object]]:
     ][:_MAX_JSON_LD_ITEMS]
 
 
-def _build_json_ld_context(html: str, url: str) -> str | None:
-    """Build the JSON-LD grounding context for the extraction prompt over
-    ``html``, identity-matched to ``url`` (#590 slice B), or ``None`` —
-    the top-level, fully fail-soft entry point :func:`_fetch_page_text`
-    calls. Chains parse → identity-match → format (each already fails
-    soft; this wraps the whole chain in one more catch-all so a defect
-    degrades to "no JSON-LD context" rather than raising out of a fetch).
-    NOTE: identity-match verifies the BLOCK, not each field value — a
-    per-field evidence-quote/containment check is deferred to slice D."""
+def _match_json_ld_product_facts(html: str, url: str) -> _JsonLdProductFacts | None:
+    """Parse ``html`` and return the RAW facts off the JSON-LD Product
+    block identity-matched to ``url`` (#590 slice B; split out of the
+    former ``_build_json_ld_context`` in #590 D1 fold 1 so the raw facts
+    are available for the vendor-data-only verification corpus too, not
+    just the LLM-prompt-formatted context). Fully fail-soft: chains parse
+    → identity-match (each already fails soft; this wraps the whole chain
+    in one more catch-all so a defect degrades to "no facts" rather than
+    raising out of a fetch). NOTE: identity-match verifies the BLOCK, not
+    each field value — a per-field evidence-quote check is deferred to
+    slice D2."""
     try:
         raw_items = _parse_html_for_json_ld(html)
         if not raw_items:
@@ -1672,7 +1674,7 @@ def _build_json_ld_context(html: str, url: str) -> str | None:
         matched = _select_identity_matched_product(raw_items, url=url)
         if matched is None:
             return None
-        return _format_json_ld_context(_facts_from_product_block(matched))
+        return _facts_from_product_block(matched)
     except Exception:
         _log.debug(
             "bean_sourcing: JSON-LD context build failed; falling back to LLM-only",
@@ -1681,13 +1683,40 @@ def _build_json_ld_context(html: str, url: str) -> str | None:
         return None
 
 
-async def _fetch_page_text(
+def _json_ld_fact_values(facts: _JsonLdProductFacts | None) -> str:
+    """Join the RAW JSON-LD fact values (name/brand/sku/description) with
+    NO header or labels — vendor data only (#590 D1 fold 1). Contrast
+    :func:`_format_json_ld_context`, which adds OUR OWN generated
+    provenance header/labels for the LLM prompt; that formatted text must
+    never enter the containment-verification corpus, or a model-returned
+    value could match OUR scaffolding ("Structured data found in this
+    page's JSON-LD...", "- name:", ...) instead of real vendor content.
+
+    Args:
+        facts: The matched block's raw facts, or ``None``.
+
+    Returns:
+        The non-blank fact values newline-joined, or ``""``.
+    """
+    if facts is None:
+        return ""
+    values = (facts.name, facts.brand, facts.sku, facts.description)
+    return "\n".join(value for value in values if value)
+
+
+async def _fetch_and_extract(
     url: str,
     *,
     config: BeanSourcingConfig,
     http_client: httpx.AsyncClient | None = None,
-) -> str:
-    """Respectfully fetch ``url`` and return its extracted plain text.
+) -> tuple[str, _JsonLdProductFacts | None]:
+    """Respectfully fetch ``url`` and return its extracted plain text plus
+    any identity-matched JSON-LD Product facts.
+
+    The shared fetch/extraction core :func:`_fetch_page_text` wraps (#590
+    D1 fold 1) to build both the LLM-prompt text and the vendor-data-only
+    verification corpus — this function does no prompt/corpus FORMATTING
+    itself, only fetch + extraction.
 
     An ``httpx`` GET, bounded by ``config.fetch_timeout_seconds`` per
     request AND by an end-to-end ``config.fetch_timeout_seconds`` deadline
@@ -1709,11 +1738,11 @@ async def _fetch_page_text(
     prior behavior.
 
     Also runs the deterministic JSON-LD product extraction (#590 slice B —
-    :func:`_build_json_ld_context`) over the fetched HTML before it is
-    reduced to page-body text: a JSON-LD Product block that identity-matches
-    the FINAL fetched URL (after any redirects, not necessarily ``url``
-    itself — #590 P1 fix) is prepended ahead of the extracted text;
-    omitted (unchanged) when none is found.
+    :func:`_match_json_ld_product_facts`) over the fetched HTML: a
+    JSON-LD Product block that identity-matches the FINAL fetched URL
+    (after any redirects, not necessarily ``url`` itself — #590 P1 fix)
+    is returned alongside the extracted text; ``None`` when none is
+    found.
 
     The page-BODY portion of that text is now trafilatura's
     boilerplate-stripped Markdown (#590 slice C —
@@ -1735,11 +1764,14 @@ async def _fetch_page_text(
             constructed, used, and closed when omitted.
 
     Returns:
-        The extracted page-body text (trafilatura Markdown, or the
-        linear-strip fallback — including when the markdown extraction
-        step itself times out, #590 slice C P2 fix: that falls back too,
-        it does not fail the draft), prefixed with a JSON-LD context
-        section (:func:`_build_json_ld_context`) when one was found.
+        A ``(extracted_text, facts)`` pair. ``extracted_text`` is the
+        page-body text (trafilatura Markdown, or the linear-strip
+        fallback — including when the markdown extraction step itself
+        times out, #590 slice C P2 fix: that falls back too, it does not
+        fail the draft). ``facts`` is the JSON-LD Product block's raw
+        fields (:func:`_match_json_ld_product_facts`), identity-matched
+        to the FINAL fetched URL (after any redirects — #590 P1 fix), or
+        ``None`` when no matching block was found.
 
     Raises:
         BeanFetchError: On a malformed URL, a destination rejected by the
@@ -1909,10 +1941,51 @@ async def _fetch_page_text(
     extracted_text = markdown or _extract_page_text(html)
     # final_url, not url (#590 P1 fix) — a redirect commonly canonicalises
     # the URL, and the fetched HTML's own JSON-LD reflects the FINAL one.
-    json_ld_context = _build_json_ld_context(html, final_url)
-    if json_ld_context is None:
-        return extracted_text
-    return f"{json_ld_context}\n\n{extracted_text}"
+    facts = _match_json_ld_product_facts(html, final_url)
+    return extracted_text, facts
+
+
+@dataclass(frozen=True)
+class _FetchedPage:
+    """A fetched vendor page's two text forms (#590 D1 fold 1).
+
+    ``prompt_text`` is what the LLM sees for extraction — the JSON-LD
+    context header/labels (:func:`_format_json_ld_context`) prepended
+    ahead of the extracted body when a block matched, the body alone
+    otherwise (this is :func:`_fetch_page_text`'s ORIGINAL, pre-fold
+    ``str`` contract, unchanged). ``verification_corpus`` is
+    VENDOR-DATA-ONLY (the extracted page body plus the raw JSON-LD fact
+    VALUES, :func:`_json_ld_fact_values` — never our own generated
+    header/labels) — the corpus :func:`_draft_from_identity` verifies
+    ``on_page`` claims against. Using ``prompt_text`` there would let a
+    model-returned value match OUR scaffolding text instead of real
+    vendor content, defeating the whole provenance guarantee.
+    """
+
+    prompt_text: str
+    verification_corpus: str
+
+
+async def _fetch_page_text(
+    url: str,
+    *,
+    config: BeanSourcingConfig,
+    http_client: httpx.AsyncClient | None = None,
+) -> _FetchedPage:
+    """Fetch ``url`` and return both of :class:`_FetchedPage`'s text
+    forms (#590 D1 fold 1 — this function's return type changed from a
+    bare ``str`` to :class:`_FetchedPage`, so ``.prompt_text`` is the
+    pre-fold return value; ``.verification_corpus`` is new). See
+    :func:`_fetch_and_extract` for the fetch/extraction behavior and
+    failure modes."""
+    extracted_text, facts = await _fetch_and_extract(url, config=config, http_client=http_client)
+    json_ld_context = _format_json_ld_context(facts) if facts is not None else None
+    prompt_text = (
+        extracted_text if json_ld_context is None else f"{json_ld_context}\n\n{extracted_text}"
+    )
+    fact_values = _json_ld_fact_values(facts)
+    verification_corpus = extracted_text if not fact_values else f"{extracted_text}\n{fact_values}"
+    return _FetchedPage(prompt_text=prompt_text, verification_corpus=verification_corpus)
 
 
 class _ExtractedBeanIdentity(BaseModel):
@@ -2307,6 +2380,21 @@ _IDENTITY_FIELDS: tuple[str, ...] = (
     "description",
 )
 
+#: Fields DEMOTED UNCONDITIONALLY in D1 — never routed through
+#: :func:`_value_is_contained` (#590 D1 scoping, round-2 review: pure
+#: string containment can't safely verify a TYPED value against arbitrary
+#: page-numeral/vocabulary noise — e.g. a "honey" PROCESS collides with a
+#: "honey" tasting note, an altitude digit run collides with a price/SKU).
+#: ``altitude_m``/``processing``/``bean_species`` are verified in **D2**
+#: (an evidence-quote citation; F adds constrained enums). ``is_blend`` is
+#: handled separately in :func:`_draft_from_identity` (excluded from
+#: :data:`_IDENTITY_FIELDS` for its tri-state ``None``) and deferred to
+#: **D2/E** — polarity verification needs LOCALITY (a single-origin
+#: product page can still contain the word "blend" via an unrelated
+#: "shop our house blend" cross-sell link), which token presence alone
+#: cannot provide.
+_FIELDS_DEFERRED_TO_D2: frozenset[str] = frozenset({"altitude_m", "processing", "bean_species"})
+
 #: Roast-target fields a vendor page never states — always
 #: ``"origin_estimated"`` in the drafted :attr:`BeanProfileDraft.field_sources`.
 _TARGET_FIELDS: tuple[str, ...] = (
@@ -2328,6 +2416,115 @@ _DEFAULT_CHARGE_GUIDANCE_MAX_C = 200.0
 _DEFAULT_INITIAL_HEAT_PERCENT = 100
 _DEFAULT_INITIAL_FAN_PERCENT = 30
 _DEFAULT_BEAN_WEIGHT_GRAMS = 250.0
+
+
+#: Punctuation mapped to a SPACE (never deleted) before whitespace
+#: collapse, so a hyphenated phrase like "single-origin" normalizes to the
+#: same two-word form as "single origin" instead of gluing into
+#: "singleorigin" (#590 D1). Broadened (round-3 review) beyond the
+#: original ``,.'"-()`` to also cover ``/\:;!?[]{}<>|`` and the en/em
+#: dash + curly-quote variants (``–—''""``) — without this,
+#: "SL28/SL34" on the page failed to match a "SL28, SL34" value and a
+#: real field over-demoted.
+_CONTAINMENT_PUNCTUATION_TRANSLATION = str.maketrans(
+    {ch: " " for ch in ",.'\"-()/\\:;!?[]{}<>|–—‘’“”"}
+)
+
+
+def _normalize_for_containment(text: str) -> str:
+    """Normalize text for value-containment comparison (#590 D1).
+
+    Case-folds, maps a small fixed set of punctuation to spaces
+    (:data:`_CONTAINMENT_PUNCTUATION_TRANSLATION`), then collapses every
+    whitespace run to one space. ``str``-only operations
+    (``casefold``/``translate``/``split``/``join``) — deliberately NO
+    regex, so this stays free of the catastrophic-backtracking (ReDoS)
+    surface a check running over attacker-controlled vendor-page text must
+    avoid (see ``docs/review/untrusted-input-checklist.md`` §3).
+
+    Args:
+        text: The raw text to normalize — either a field value or the page
+            corpus.
+
+    Returns:
+        The case-folded, punctuation-neutralized, whitespace-collapsed
+        form.
+    """
+    return " ".join(text.casefold().translate(_CONTAINMENT_PUNCTUATION_TRANSLATION).split())
+
+
+def _contains_whole_phrase(phrase: str, corpus_normalized: str) -> bool:
+    """Whether ``phrase`` appears in ``corpus_normalized`` as a whole,
+    contiguous word sequence — not merely a substring (#590 D1 bug 2).
+
+    Both ``phrase`` and ``corpus_normalized`` are assumed already run
+    through :func:`_normalize_for_containment` (case-folded,
+    whitespace-single-spaced), so padding both with a boundary space and
+    doing one plain ``in`` check is equivalent to verifying ``phrase``'s
+    words are a CONTIGUOUS SUBLIST of the corpus's words, while staying a
+    single guaranteed-linear ``str.__contains__`` call — no regex, no
+    nested loop. Plain substring containment (the pre-fix behavior) let
+    ``"java"`` match inside ``"javascript"`` and ``"india"`` match inside
+    ``"indianapolis"``, verifying a confabulated origin from unrelated
+    page chrome; word-boundary padding closes that.
+
+    Args:
+        phrase: The already-normalized needle (a field value).
+        corpus_normalized: The page corpus, already normalized via
+            :func:`_normalize_for_containment`.
+
+    Returns:
+        ``True`` if ``phrase`` appears as a whole word/phrase in the
+        corpus, ``False`` otherwise (including for an empty ``phrase``).
+    """
+    if not phrase:
+        return False
+    return f" {phrase} " in f" {corpus_normalized} "
+
+
+def _value_is_contained(value: object, corpus_normalized: str) -> bool:
+    """Test whether ``value`` is verifiably present in the page corpus as a
+    whole word/phrase (#590 D1 — scoped to FREE-TEXT identity fields only,
+    round-2 review: typed fields are deferred to D2/E instead, see
+    :data:`_FIELDS_DEFERRED_TO_D2`).
+
+    Gates the ``"on_page"`` provenance tag: a field earns ``"on_page"`` only
+    when its extracted value is actually present in the SAME page text the
+    model was given (:func:`_draft_from_identity`'s ``corpus``), via
+    :func:`_contains_whole_phrase` — never a raw substring, which would let
+    e.g. "Java" match inside "JavaScript" — trusting the model's *claim*
+    alone (the pre-D1 behavior) let a confabulated value through with a
+    false "verified" tag. This can under-verify a real value whose words
+    are legitimately scattered non-adjacently across the page — the
+    intentionally SAFE direction for D1: over-demotion asks the operator
+    to review a field that was actually fine, it never fabricates trust
+    in a confabulated one. D2's evidence-quote gate is where this
+    precision is refined.
+
+    Args:
+        value: The raw extracted field value (``str`` or any other
+            identity-field type; ``None``/empty values are never
+            contained).
+        corpus_normalized: The page corpus, already passed through
+            :func:`_normalize_for_containment` ONCE by the caller (never
+            re-normalized per field).
+
+    Returns:
+        ``True`` if ``value`` is verifiably present in the corpus,
+        ``False`` otherwise — including on any unexpected normalization
+        failure, since containment must fail SOFT (toward "not verified"),
+        never by raising out of a draft.
+    """
+    if value is None:
+        return False
+    try:
+        text = str(value).strip()
+        if not text:
+            return False
+        normalized_value = _normalize_for_containment(text)
+        return _contains_whole_phrase(normalized_value, corpus_normalized)
+    except Exception:  # pragma: no cover - defensive: containment must fail soft, never raise
+        return False
 
 
 def _normalize_optional_text(value: str | None) -> str | None:
@@ -2358,17 +2555,36 @@ def _normalize_optional_text(value: str | None) -> str | None:
     return stripped or None
 
 
-def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanProfileDraft:
+def _draft_from_identity(
+    identity: _ExtractedBeanIdentity, *, url: str, corpus: str
+) -> BeanProfileDraft:
     """Assemble the :class:`BeanProfileDraft` from an extracted identity.
 
     Applies the conservative scouting targets
     (:data:`_SCOUTING_TARGETS_BY_PROCESSING`) and builds the honest per-field
-    ``field_sources`` map: every identity field the page stated is
-    ``"on_page"``; every roast-target field is always ``"origin_estimated"``.
-    The optional free-text fields (``country``, ``farm``, ``bean_varietal``,
-    ``description``) are normalized via :func:`_normalize_optional_text`
-    BEFORE both the provenance loop and the draft construction (#587 P2) —
-    see that function's docstring for why the ordering matters. ``url`` is
+    ``field_sources`` map: a FREE-TEXT identity field (``name``, ``country``,
+    ``bean_origin``, ``farm``, ``bean_varietal``) is tagged ``"on_page"``
+    only when its value is CODE-VERIFIED present in ``corpus`` — the exact
+    page text the model was given (:func:`_value_is_contained`, #590 D1) —
+    otherwise it is demoted to ``"origin_estimated"`` even though the model
+    returned a non-blank value. This closes the pre-D1 gap where every
+    non-blank model-returned field was blanket-tagged ``"on_page"`` on the
+    model's claim alone, with no check that the value was actually on the
+    page (a confabulated value could pass through "verified").
+    ``description`` is EXEMPT from the containment gate — it is long prose
+    the model may legitimately summarise/paraphrase rather than quote
+    verbatim, it is lower-stakes (the roast advisor never reads it), and
+    it keeps the original presence-only tagging. :data:`_FIELDS_DEFERRED_TO_D2`
+    (``altitude_m``, ``processing``, ``bean_species``) and ``is_blend`` are
+    TYPED fields, never run through the containment matcher at all — see
+    that constant's docstring for why pure string containment can't safely
+    verify them; both demote unconditionally in D1. Every roast-target
+    field is always ``"origin_estimated"`` (the page never
+    states a roast target). The optional free-text fields (``country``, ``farm``,
+    ``bean_varietal``, ``description``) are normalized via
+    :func:`_normalize_optional_text` BEFORE both the provenance loop and
+    the draft construction (#587 P2) — see that function's docstring for
+    why the ordering matters. ``url`` is
     carried onto ``source_url`` in its :func:`_redact_url_credentials`
     form (#587 P2, round 7) — not the raw ``url``: a credential-bearing
     query parameter (``?access_token=...``) must never persist into a
@@ -2381,6 +2597,11 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
     Args:
         identity: The provider's page-only extraction.
         url: The source URL (carried onto ``source_url`` in redacted form).
+        corpus: The SAME page text the model saw when producing ``identity``
+            (:func:`draft_bean_profile_from_url` threads its already-fetched
+            ``page_text`` straight through — never re-fetched or expanded
+            here) — the containment-verification corpus for ``"on_page"``
+            tagging.
 
     Returns:
         The drafted profile, ready for the operator to review, edit, and
@@ -2442,26 +2663,49 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
         "description": description,
     }
 
+    # Normalized ONCE, not per field (#590 D1) — every containment check
+    # below reuses this same corpus form.
+    corpus_normalized = _normalize_for_containment(corpus)
+
     field_sources: dict[str, BeanFieldSource] = {}
     for field_name in _IDENTITY_FIELDS:
         raw_value = identity_values[field_name]
-        if raw_value not in (None, ""):
+        if raw_value in (None, ""):
+            continue
+        if field_name == "description":
+            # description is EXEMPT from the containment gate (#590 D1) —
+            # see the function docstring for why.
             field_sources[field_name] = "on_page"
+            continue
+        if field_name in _FIELDS_DEFERRED_TO_D2:
+            # altitude_m/processing/bean_species are TYPED fields, demoted
+            # UNCONDITIONALLY in D1, never routed through the containment
+            # matcher — see _FIELDS_DEFERRED_TO_D2's docstring for why.
+            field_sources[field_name] = "origin_estimated"
+            continue
+        field_sources[field_name] = (
+            "on_page" if _value_is_contained(raw_value, corpus_normalized) else "origin_estimated"
+        )
     if "bean_origin" not in field_sources and country:
-        # bean_origin fell back to country — still page-sourced, just via the
-        # country field rather than an explicit bean_origin statement.
-        field_sources["bean_origin"] = "on_page"
+        # bean_origin fell back to country — inherit COUNTRY's own verified
+        # provenance (#590 D1), not an automatic "on_page": country was
+        # already gated in the loop above (it is guaranteed an entry there
+        # since it is truthy here), so a confabulated country must not
+        # silently promote the bean_origin fallback to "on_page" just
+        # because the fallback ran.
+        field_sources["bean_origin"] = field_sources["country"]
     if identity.is_blend is not None:
         # is_blend is excluded from _IDENTITY_FIELDS because its "the page
         # said nothing" value is None, not ""/False — the generic
         # "not in (None, '')" test above would work for None but a bare
         # ``False`` used to be indistinguishable from "unstated" before
-        # #587 P2 made this field tri-state. Now: on_page for an explicit
-        # True OR an explicit False (the page addressed single-origin vs
-        # blend either way), and no field_sources entry at all when the
-        # page said nothing (identity.is_blend is None) — "absent from
-        # field_sources" stays meaningful as "unset".
-        field_sources["is_blend"] = "on_page"
+        # #587 P2 made this field tri-state. An explicit True or False is
+        # DEFERRED to D2/E (#590 D1 scoping, see _FIELDS_DEFERRED_TO_D2's
+        # docstring) — always demoted, never routed through any matcher.
+        # No field_sources entry at all when the page said nothing
+        # (identity.is_blend is None) — "absent from field_sources" stays
+        # meaningful as "unset".
+        field_sources["is_blend"] = "origin_estimated"
     for field_name in _TARGET_FIELDS:
         field_sources[field_name] = "origin_estimated"
 
@@ -2472,7 +2716,8 @@ def _draft_from_identity(identity: _ExtractedBeanIdentity, *, url: str) -> BeanP
         f"{identity.processing or 'unstated'} processing method, so a wrong guess "
         "cannot burn the batch. Taste and step the development target up on the "
         "next bag if it reads underdeveloped. Every field marked "
-        '"origin_estimated" in field_sources was NOT found on the vendor page — '
+        '"origin_estimated" in field_sources was NOT confirmed present on the '
+        "vendor page (either absent, or a typed field not yet verified) — "
         "review it before roasting."
     )
 
@@ -2604,15 +2849,18 @@ async def draft_bean_profile_from_url(
 
     config = sourcing_config if sourcing_config is not None else BeanSourcingConfig()
     _log.info("draft_bean_profile_from_url: fetching %r", _redact_url_credentials(url))
-    page_text = await _fetch_page_text(url, config=config, http_client=http_client)
+    page = await _fetch_page_text(url, config=config, http_client=http_client)
     # config (never sourcing_config directly) — the fetch's already-resolved
     # default, so the extraction step's model/timeout resolution stays
     # consistent with the fetch's, rather than re-deriving its own None
     # fallback here (#590 slice A).
     identity = await _extract_bean_identity(
-        page_text, advisor_config=advisor_config, sourcing_config=config, model=model
+        page.prompt_text, advisor_config=advisor_config, sourcing_config=config, model=model
     )
-    draft = _draft_from_identity(identity, url=url)
+    # page.verification_corpus, NOT page.prompt_text (#590 D1 fold 1) — the
+    # prompt text carries OUR OWN generated JSON-LD header/labels, which
+    # must never enter the containment gate (see _FetchedPage's docstring).
+    draft = _draft_from_identity(identity, url=url, corpus=page.verification_corpus)
     _log.info(
         "draft_bean_profile_from_url: drafted %r (%d fields sourced)",
         draft.name,

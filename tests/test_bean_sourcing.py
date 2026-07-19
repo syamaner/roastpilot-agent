@@ -118,6 +118,17 @@ _SAMPLE_HTML = """
 """
 
 
+#: A page corpus containing every default ``_identity_args()`` value
+#: verbatim (or, for ``altitude_m``, its digit run) — the default ``corpus``
+#: for ``_draft_from_identity`` tests that expect the default identity's
+#: fields to verify as ``"on_page"`` (#590 D1).
+_IDENTITY_PAGE_TEXT = (
+    "Kenya Kiambu AA (Washed) is a washed coffee from Kenya, grown on the "
+    "Gakuyuini Factory farm. Variety: SL28, SL34. Altitude: 1775m. "
+    "Tasting notes: blackcurrant, tomato, bright acidity."
+)
+
+
 def _identity_args(**overrides: object) -> dict[str, object]:
     base: dict[str, object] = {
         "name": "Kenya Kiambu AA (Washed)",
@@ -398,11 +409,13 @@ async def test_draft_bean_profile_from_url_rejects_url_with_unclosed_ipv6_bracke
 @pytest.mark.asyncio
 async def test_fetch_page_text_success_extracts_text() -> None:
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/kenya",
-            config=BeanSourcingConfig(),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/kenya",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
     assert "Kenya Kiambu AA" in text
 
 
@@ -462,9 +475,11 @@ async def test_fetch_page_text_constructs_and_closes_its_own_client_when_none_in
     monkeypatch.setattr(
         bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
     )
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        "https://vendor.example/products/kenya", config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/kenya", config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
 
 
@@ -506,9 +521,11 @@ async def test_fetch_page_text_follows_redirects_on_internally_constructed_clien
         "_assert_public_destination",
         _noop_assert_public_destination,
     )
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        original_url, config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            original_url, config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
     assert captured_kwargs.get("follow_redirects") is False
 
@@ -652,11 +669,13 @@ async def test_fetch_page_text_allows_a_genuine_global_ipv6_literal() -> None:
     """Confirms the reserved/embedded-IPv4 hardening does not false-positive
     on an ordinary global IPv6 literal."""
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "http://[2606:2800:220:1:248:1893:25c8:1946]/x",
-            config=BeanSourcingConfig(),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "http://[2606:2800:220:1:248:1893:25c8:1946]/x",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
     assert "Kenya Kiambu AA" in text
 
 
@@ -787,9 +806,11 @@ async def test_fetch_page_text_redirect_public_to_public_succeeds(
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        original_url, config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            original_url, config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
     # Each hop was independently resolved (and thus independently validated
     # + pinned) — exactly once per hop, no re-resolution.
@@ -835,9 +856,11 @@ async def test_fetch_with_ssrf_guard_pins_connection_to_validated_ip(
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
 
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        origin_url, config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            origin_url, config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
 
     # Resolved exactly once — no second resolution left for a rebinding
@@ -887,9 +910,11 @@ async def test_fetch_with_ssrf_guard_pins_ipv6_address_with_brackets(
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
 
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        origin_url, config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            origin_url, config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
     assert len(captured_requests) == 1
     sent = captured_requests[0]
@@ -974,9 +999,11 @@ async def test_fetch_page_text_redirect_public_to_public_tracks_sni_per_hop(
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        original_url, config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            original_url, config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
     assert sni_per_request == [original_host, redirected_host]
 
@@ -1018,9 +1045,11 @@ async def test_fetch_with_ssrf_guard_tries_next_address_after_connect_error(
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        "https://vendor.example/products/kenya", config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/kenya", config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
     assert attempted_hosts == [bad_ip, good_ip]
 
@@ -1092,9 +1121,11 @@ async def test_fetch_with_ssrf_guard_tries_next_address_after_connect_timeout(
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        "https://vendor.example/products/kenya", config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/kenya", config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
     assert attempted_hosts == [bad_ip, good_ip]
 
@@ -1161,11 +1192,13 @@ async def test_fetch_page_text_decodes_declared_non_utf8_charset_injected_client
         )
 
     async with _mock_client(httpx.MockTransport(handler)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/cafe",
-            config=BeanSourcingConfig(),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/cafe",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
     assert "Café Kenya" in text
 
 
@@ -1194,9 +1227,11 @@ async def test_fetch_with_ssrf_guard_decodes_declared_non_utf8_charset(
     monkeypatch.setattr(
         bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
     )
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        "https://vendor.example/products/cafe", config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/cafe", config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Café Kenya" in text
 
 
@@ -1798,11 +1833,13 @@ async def test_fetch_page_text_decodes_a_small_legitimate_gzip_body() -> None:
         )
 
     async with _mock_client(httpx.MockTransport(handler)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/kenya",
-            config=BeanSourcingConfig(),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/kenya",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
     assert "Kenya Kiambu AA" in text
 
 
@@ -2292,7 +2329,7 @@ def test_draft_from_identity_marks_page_fields_on_page() -> None:
         _identity_args()
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert isinstance(draft, BeanProfileDraft)
     for field in (
@@ -2301,11 +2338,15 @@ def test_draft_from_identity_marks_page_fields_on_page() -> None:
         "bean_origin",
         "farm",
         "bean_varietal",
-        "processing",
-        "altitude_m",
         "description",
     ):
         assert draft.field_sources[field] == "on_page", field
+    # processing/altitude_m are DEFERRED (typed) fields (#590 D1 scoping) —
+    # demoted unconditionally even though the page genuinely states
+    # "washed"/1775m and the model returned them correctly; see the
+    # dedicated _is_always_demoted_in_d1 tests for the individual coverage.
+    assert draft.field_sources["processing"] == "origin_estimated"
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
     # bean_species was NOT stated on the page (None in the fixture) — no
     # fabricated value, and no field_sources entry claiming it is on_page.
     assert draft.bean_species is None
@@ -2317,6 +2358,240 @@ def test_draft_from_identity_marks_page_fields_on_page() -> None:
     # is_blend tri-state tests below for the explicit True/False cases).
     assert draft.is_blend is None
     assert "is_blend" not in draft.field_sources
+
+
+# --- #590 D1: code-verified on_page via value containment ---
+
+
+def test_draft_from_identity_confabulated_farm_is_demoted_to_origin_estimated() -> None:
+    """A field value the model returned but the corpus never actually
+    states (a confabulation) must be demoted to ``"origin_estimated"``,
+    not blanket-trusted just because the model claimed it (#590 D1 — the
+    core gap this slice closes)."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(farm="Finca El Injerto")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
+    )
+    assert draft.farm == "Finca El Injerto"
+    assert draft.field_sources["farm"] == "origin_estimated"
+
+
+def test_draft_from_identity_confabulated_bean_varietal_is_demoted() -> None:
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(bean_varietal="Geisha")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
+    )
+    assert draft.bean_varietal == "Geisha"
+    assert draft.field_sources["bean_varietal"] == "origin_estimated"
+
+
+def test_draft_from_identity_bean_varietal_matches_slash_separated_page_form() -> None:
+    """#590 D1 fold 3 (round-3 Codex P2): the punctuation-normalisation
+    set only mapped ``,.'"-()`` to spaces, so a page rendering
+    "SL28/SL34" (slash, no comma) failed to match a genuine
+    ``bean_varietal="SL28, SL34"`` value and over-demoted it. The
+    broadened set (``/\\:;!?[]{}<>|`` + en/em dash + curly quotes) must
+    verify it."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(bean_varietal="SL28 SL34")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="Variety: SL28/SL34, grown at high altitude.",
+    )
+    assert draft.bean_varietal == "SL28 SL34"
+    assert draft.field_sources["bean_varietal"] == "on_page"
+
+
+def test_draft_from_identity_description_stays_exempt_even_when_paraphrased() -> None:
+    """``description`` is EXEMPT from the containment gate (#590 D1) — the
+    model may legitimately summarize/paraphrase the page's prose rather
+    than quote it verbatim, so it stays ``"on_page"`` on presence alone
+    even though this paraphrase is not a literal substring of the corpus."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(description="A fruity, bright Kenyan coffee with berry notes.")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
+    )
+    assert draft.description == "A fruity, bright Kenyan coffee with berry notes."
+    assert draft.field_sources["description"] == "on_page"
+
+
+def test_draft_from_identity_processing_is_always_demoted_in_d1() -> None:
+    """#590 D1 scoping fold (resolves claude-review SHLcA / Codex SHMGm):
+    ``processing`` is a closed-vocabulary enum whose values are common
+    English words that collide with unrelated page prose, so it is
+    demoted UNCONDITIONALLY in D1 — even when the page GENUINELY states
+    "washed" and the model correctly returned it. D2's evidence-quote
+    gate is where enum verification belongs (see
+    :data:`bean_sourcing._FIELDS_DEFERRED_TO_D2`)."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(processing="washed")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="This lot was fully washed and sun-dried on raised beds.",
+    )
+    assert draft.processing == "washed"
+    assert draft.field_sources["processing"] == "origin_estimated"
+
+
+def test_draft_from_identity_processing_honey_collision_is_demoted() -> None:
+    """The exact collision repro: ``processing="honey"`` (the process)
+    trivially word-matches an unrelated TASTING-NOTE mention of "honey"
+    (the flavor) — crude single-word containment can't tell those apart,
+    so D1 never even tries; it demotes unconditionally either way."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(processing="honey")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="Tasting notes: honey, stone fruit, and a clean, sweet finish.",
+    )
+    assert draft.processing == "honey"
+    assert draft.field_sources["processing"] == "origin_estimated"
+
+
+def test_draft_from_identity_bean_species_is_always_demoted_in_d1() -> None:
+    """Same D1 scoping fold as processing, for the other deferred enum
+    field: ``bean_species`` demotes unconditionally even when genuinely
+    stated on the page."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(bean_species="arabica")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="100% arabica beans, hand-picked at peak ripeness.",
+    )
+    assert draft.bean_species == "arabica"
+    assert draft.field_sources["bean_species"] == "origin_estimated"
+
+
+def _containment_corpus(raw: str) -> str:
+    """Build the normalized corpus form :func:`bean_sourcing._value_is_contained`
+    takes, exactly as :func:`bean_sourcing._draft_from_identity` computes it
+    once per draft (#590 D1) — a shared test helper."""
+    return bean_sourcing._normalize_for_containment(raw)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_value_is_contained_none_and_empty_are_never_contained() -> None:
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized = _containment_corpus(_IDENTITY_PAGE_TEXT)
+    assert is_contained(None, normalized) is False
+    assert is_contained("", normalized) is False
+    assert is_contained("   ", normalized) is False
+
+
+def test_value_is_contained_matches_case_and_punctuation_insensitively() -> None:
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized = _containment_corpus("Farm: Gakuyuini Factory.")
+    assert is_contained("gakuyuini factory", normalized) is True
+    assert is_contained("GAKUYUINI FACTORY", normalized) is True
+    assert is_contained("Nairobi Estate", normalized) is False
+
+
+def test_contains_whole_phrase_rejects_an_empty_phrase() -> None:
+    """A value that normalizes to an EMPTY phrase (e.g. a punctuation-only
+    string, since :func:`_normalize_for_containment` maps every
+    ``,.'"-()`` to a space) must never be treated as contained."""
+    contains_whole_phrase = bean_sourcing._contains_whole_phrase  # pyright: ignore[reportPrivateUsage]
+    corpus_normalized = _containment_corpus("A washed lot from Kenya.")
+    assert contains_whole_phrase("", corpus_normalized) is False
+
+
+def test_value_is_contained_rejects_a_punctuation_only_value() -> None:
+    """End-to-end: a confabulated field value that is punctuation-only
+    (normalizes to an empty phrase) must demote, not raise or false-match."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized = _containment_corpus("A washed lot from Kenya.")
+    assert is_contained("---", normalized) is False
+
+
+def test_value_is_contained_rejects_java_matching_inside_javascript() -> None:
+    """Plain substring containment let "Java" match inside "JavaScript"
+    boilerplate — a confabulated origin verified from unrelated site
+    chrome. Whole-word matching must reject it."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized = _containment_corpus("Please enable JavaScript in your browser to use this site.")
+    assert is_contained("Java", normalized) is False
+
+
+def test_value_is_contained_rejects_india_matching_inside_indianapolis() -> None:
+    """Plain substring containment let "India" match inside "Indianapolis"
+    — a confabulated origin verified from an unrelated shipping-address
+    mention. Whole-word matching must reject it."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized = _containment_corpus("Our roastery has a second location in Indianapolis, IN.")
+    assert is_contained("India", normalized) is False
+
+
+def test_value_is_contained_accepts_a_real_adjacent_multi_word_origin() -> None:
+    """A genuine two-word origin stated adjacently on the page verifies."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized = _containment_corpus("A washed lot from Yirgacheffe, Ethiopia.")
+    assert is_contained("Yirgacheffe Ethiopia", normalized) is True
+
+
+def test_value_is_contained_accepts_a_real_single_word_origin() -> None:
+    """A genuine whole-word origin verifies."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized = _containment_corpus("A bright, fruit-forward lot from Kenya.")
+    assert is_contained("Kenya", normalized) is True
+
+
+def test_draft_from_identity_bean_origin_yirgacheffe_whole_word_is_on_page() -> None:
+    """End-to-end free-text verification: a page stating "Yirgacheffe" as
+    a whole word with a matching ``bean_origin`` value earns ``on_page``."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(bean_origin="Yirgacheffe", country="Ethiopia")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/yirgacheffe",
+        corpus="A washed lot from Yirgacheffe, Ethiopia.",
+    )
+    assert draft.bean_origin == "Yirgacheffe"
+    assert draft.field_sources["bean_origin"] == "on_page"
+
+
+def test_draft_from_identity_country_java_from_javascript_boilerplate_is_demoted() -> None:
+    """Bug 2 repro, end-to-end: a confabulated ``country="Java"`` must
+    demote when the page only mentions "JavaScript" boilerplate, never
+    the country."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(country="Java", bean_origin="Java")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/java",
+        corpus="Please enable JavaScript in your browser to use this site.",
+    )
+    assert draft.country == "Java"
+    assert draft.field_sources["country"] == "origin_estimated"
+
+
+def test_draft_from_identity_country_india_from_indianapolis_is_demoted() -> None:
+    """Bug 2 repro, end-to-end: a confabulated ``country="India"`` must
+    demote when the page only mentions "Indianapolis"."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(country="India", bean_origin="India")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/india",
+        corpus="Our roastery has a second location in Indianapolis, IN.",
+    )
+    assert draft.country == "India"
+    assert draft.field_sources["country"] == "origin_estimated"
 
 
 # --- #587 P2 round 6: altitude range must not be tagged on_page ---
@@ -2342,23 +2617,30 @@ def test_draft_from_identity_altitude_range_page_leaves_altitude_null_and_unset(
         _identity_args(altitude_m=None)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.altitude_m is None
     assert "altitude_m" not in draft.field_sources
 
 
-def test_draft_from_identity_altitude_single_value_still_tagged_on_page() -> None:
-    """A genuinely single-stated altitude is still honestly on_page —
-    the round-6 fix only closes the RANGE-midpoint case."""
+def test_draft_from_identity_altitude_is_always_demoted_in_d1() -> None:
+    """#590 D1 scoping (round-2 review): ``altitude_m`` is a TYPED field,
+    demoted UNCONDITIONALLY in D1 — even when the page GENUINELY states
+    "Altitude: 1850 m" and the model correctly returned it. Pure string
+    containment can't safely verify a number against arbitrary page-
+    numeral noise (a price, a SKU, a year); D2's evidence-quote gate is
+    where numeric verification belongs (see
+    :data:`bean_sourcing._FIELDS_DEFERRED_TO_D2`)."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(altitude_m=1850)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=f"{_IDENTITY_PAGE_TEXT} Altitude: 1850 m.",
     )
     assert draft.altitude_m == 1850
-    assert draft.field_sources["altitude_m"] == "on_page"
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
 # --- #587 P2: normalize optional identity values before tagging provenance ---
@@ -2374,7 +2656,7 @@ def test_draft_from_identity_whitespace_only_country_not_tagged_on_page() -> Non
         _identity_args(country="   ")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.country is None
     assert "country" not in draft.field_sources
@@ -2385,7 +2667,7 @@ def test_draft_from_identity_whitespace_only_farm_not_tagged_on_page() -> None:
         _identity_args(farm="   ")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.farm is None
     assert "farm" not in draft.field_sources
@@ -2396,7 +2678,7 @@ def test_draft_from_identity_whitespace_only_description_not_tagged_on_page() ->
         _identity_args(description="   ")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.description is None
     assert "description" not in draft.field_sources
@@ -2414,7 +2696,7 @@ def test_draft_from_identity_whitespace_only_bean_varietal_does_not_reject_draft
         _identity_args(bean_varietal="   ")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.bean_varietal is None
     assert "bean_varietal" not in draft.field_sources
@@ -2430,7 +2712,9 @@ def test_draft_from_identity_whitespace_only_bean_origin_falls_back_to_country()
         _identity_args(bean_origin="   ", country="Ethiopia")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/eth"
+        identity,
+        url="https://vendor.example/products/eth",
+        corpus="Ethiopia Yirgacheffe, a natural process lot.",
     )
     assert draft.bean_origin == "Ethiopia"
     assert draft.field_sources["bean_origin"] == "on_page"
@@ -2444,7 +2728,7 @@ def test_draft_from_identity_whitespace_padded_values_are_stripped_and_still_on_
         _identity_args(country="  Kenya  ", farm="  Gakuyuini Factory  ")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.country == "Kenya"
     assert draft.field_sources["country"] == "on_page"
@@ -2481,40 +2765,45 @@ def test_draft_from_identity_is_blend_silent_page_leaves_unset() -> None:
         _identity_args(is_blend=None)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/silent"
+        identity, url="https://vendor.example/products/silent", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.is_blend is None
     assert "is_blend" not in draft.field_sources
 
 
-def test_draft_from_identity_is_blend_explicit_single_origin_marks_on_page() -> None:
-    """#587 P2: an explicit ``False`` (the page states or clearly identifies
-    a SINGLE origin) is a page-sourced FACT, not silence — before this fix a
-    bare ``bool`` default made this indistinguishable from "the page said
-    nothing"; it must now be recorded ``on_page`` just like an explicit
-    ``True`` is."""
-    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
-        _identity_args(is_blend=False)
-    )
-    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/single-origin"
-    )
-    assert draft.is_blend is False
-    assert draft.field_sources["is_blend"] == "on_page"
-
-
-def test_draft_from_identity_is_blend_explicit_blend_marks_on_page() -> None:
-    """#587 P2 (supersedes the earlier True-only fix, #587 fix 4): when the
-    page explicitly states this IS a blend, ``is_blend`` must be recorded as
-    ``"on_page"`` provenance."""
+def test_draft_from_identity_is_blend_true_is_always_demoted_in_d1() -> None:
+    """#590 D1 scoping (round-2 review): ``is_blend`` is DEFERRED to D2/E
+    (see :data:`bean_sourcing._FIELDS_DEFERRED_TO_D2`'s docstring) — token
+    presence alone is unsafe positional evidence (a single-origin product
+    page can still contain the word "blend" via an unrelated "shop our
+    house blend" cross-sell link; true verification needs LOCALITY). An
+    explicit ``True`` the model returned always demotes, even when the
+    page genuinely says "blend"."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(is_blend=True)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/blend"
+        identity,
+        url="https://vendor.example/products/blend",
+        corpus="Our house blend combines beans from three origins.",
     )
     assert draft.is_blend is True
-    assert draft.field_sources["is_blend"] == "on_page"
+    assert draft.field_sources["is_blend"] == "origin_estimated"
+
+
+def test_draft_from_identity_is_blend_false_is_always_demoted_in_d1() -> None:
+    """The mirror case: an explicit ``False`` always demotes too, even
+    when the page genuinely says "single origin"."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=False)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/single-origin",
+        corpus="This is a single origin lot from one estate.",
+    )
+    assert draft.is_blend is False
+    assert draft.field_sources["is_blend"] == "origin_estimated"
 
 
 def test_draft_from_identity_marks_every_roast_target_origin_estimated() -> None:
@@ -2522,7 +2811,7 @@ def test_draft_from_identity_marks_every_roast_target_origin_estimated() -> None
         _identity_args()
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/kenya"
+        identity, url="https://vendor.example/products/kenya", corpus=_IDENTITY_PAGE_TEXT
     )
     for field in (
         "charge_guidance_min_c",
@@ -2537,15 +2826,53 @@ def test_draft_from_identity_marks_every_roast_target_origin_estimated() -> None
     assert "scouting run" in draft.scouting_note.lower()
 
 
+def test_draft_from_identity_scouting_note_does_not_claim_deferred_fields_absent() -> None:
+    """#590 D1 fold 2 (round-3 Codex P2): the note used to say every
+    ``origin_estimated`` field "was NOT found on the vendor page" — false
+    for a deferred TYPED field (e.g. ``processing``) that genuinely IS on
+    the page but demotes pending D2/E verification. The wording must be
+    honest for both the genuinely-absent and the deferred cases, and must
+    NOT claim absence outright."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(processing="washed")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="This lot was fully washed and sun-dried on raised beds.",
+    )
+    assert draft.field_sources["processing"] == "origin_estimated"
+    note = draft.scouting_note.lower()
+    assert "not confirmed present" in note
+    assert "was not found on the vendor page" not in note
+
+
 def test_draft_from_identity_bean_origin_falls_back_to_country_and_is_still_on_page() -> None:
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(bean_origin=None, country="Ethiopia")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/eth"
+        identity,
+        url="https://vendor.example/products/eth",
+        corpus="Ethiopia Yirgacheffe, a natural process lot.",
     )
     assert draft.bean_origin == "Ethiopia"
     assert draft.field_sources["bean_origin"] == "on_page"
+
+
+def test_draft_from_identity_bean_origin_fallback_inherits_a_demoted_country() -> None:
+    """#590 D1: when ``bean_origin`` falls back to ``country``, the
+    fallback must inherit COUNTRY's own verified provenance rather than an
+    automatic ``"on_page"`` — a confabulated country (absent from the
+    corpus) must leave the bean_origin fallback demoted too."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(bean_origin=None, country="Ethiopia")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/eth", corpus=_IDENTITY_PAGE_TEXT
+    )
+    assert draft.bean_origin == "Ethiopia"
+    assert draft.field_sources["bean_origin"] == "origin_estimated"
 
 
 @pytest.mark.parametrize(
@@ -2570,7 +2897,7 @@ def test_draft_from_identity_raises_when_name_or_origin_is_missing(
     )
     with pytest.raises(BeanExtractionError, match="could not determine"):
         bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-            identity, url="https://vendor.example/products/nope"
+            identity, url="https://vendor.example/products/nope", corpus=_IDENTITY_PAGE_TEXT
         )
 
 
@@ -2593,7 +2920,7 @@ def test_draft_from_identity_applies_conservative_scouting_targets_by_processing
         _identity_args(processing=processing)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity, url="https://vendor.example/products/x"
+        identity, url="https://vendor.example/products/x", corpus=_IDENTITY_PAGE_TEXT
     )
     assert draft.target_drop_temp_c == expected_drop
     assert draft.target_development_percent == expected_dev
@@ -3133,35 +3460,39 @@ def test_parse_html_for_json_ld_fails_soft_on_deeply_nested_json_recursion_bomb(
     assert bean_sourcing._parse_html_for_json_ld(payload) == []  # pyright: ignore[reportPrivateUsage]
 
 
-# --- #590 slice B: _build_json_ld_context ---
+# --- #590 slice B: _match_json_ld_product_facts (#590 D1 fold 1: renamed
+# from _build_json_ld_context, which now composes this + _format_json_ld_
+# context — both independently tested) ---
 
 
-def test_build_json_ld_context_returns_formatted_block_for_a_matching_page() -> None:
-    context = bean_sourcing._build_json_ld_context(  # pyright: ignore[reportPrivateUsage]
+def test_match_json_ld_product_facts_returns_facts_for_a_matching_page() -> None:
+    facts = bean_sourcing._match_json_ld_product_facts(  # pyright: ignore[reportPrivateUsage]
         _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT), _MATCHING_JSON_LD_URL
     )
-    assert context is not None
-    assert "Kenya Kiambu AA (Washed)" in context
-    assert "KE-KIAMBU-AA" in context
+    assert facts is not None
+    assert facts.name == "Kenya Kiambu AA (Washed)"
+    assert facts.sku == "KE-KIAMBU-AA"
 
 
-def test_build_json_ld_context_returns_none_without_json_ld() -> None:
+def test_match_json_ld_product_facts_returns_none_without_json_ld() -> None:
     assert (
-        bean_sourcing._build_json_ld_context(_SAMPLE_HTML, _MATCHING_JSON_LD_URL)  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._match_json_ld_product_facts(  # pyright: ignore[reportPrivateUsage]
+            _SAMPLE_HTML, _MATCHING_JSON_LD_URL
+        )
         is None
     )
 
 
-def test_build_json_ld_context_returns_none_for_a_stale_unmatched_block() -> None:
+def test_match_json_ld_product_facts_returns_none_for_a_stale_unmatched_block() -> None:
     assert (
-        bean_sourcing._build_json_ld_context(  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._match_json_ld_product_facts(  # pyright: ignore[reportPrivateUsage]
             _html_with_json_ld(_STALE_JSON_LD_SCRIPT), _MATCHING_JSON_LD_URL
         )
         is None
     )
 
 
-def test_build_json_ld_context_fails_soft_on_internal_exception(
+def test_match_json_ld_product_facts_fails_soft_on_internal_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def _raise(html: str) -> list[dict[str, object]]:
@@ -3169,7 +3500,7 @@ def test_build_json_ld_context_fails_soft_on_internal_exception(
 
     monkeypatch.setattr(bean_sourcing, "_parse_html_for_json_ld", _raise)
     assert (
-        bean_sourcing._build_json_ld_context(  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._match_json_ld_product_facts(  # pyright: ignore[reportPrivateUsage]
             _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT), _MATCHING_JSON_LD_URL
         )
         is None
@@ -3184,9 +3515,11 @@ async def test_fetch_page_text_prepends_matching_json_ld_context() -> None:
     async with _mock_client(
         _html_response(200, _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT))
     ) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+            )
+        ).prompt_text
     assert text.startswith("Structured data found in this page's JSON-LD")
     assert "KE-KIAMBU-AA" in text
     assert "Kenya Kiambu AA" in text  # the plain-text extraction still follows
@@ -3197,9 +3530,11 @@ async def test_fetch_page_text_ignores_a_stale_unmatched_json_ld_block() -> None
     async with _mock_client(
         _html_response(200, _html_with_json_ld(_STALE_JSON_LD_SCRIPT))
     ) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+            )
+        ).prompt_text
     assert "Structured data found in this page" not in text
     assert "Yirgacheffe" not in text  # the stale block's own text never leaks in
 
@@ -3212,9 +3547,11 @@ async def test_fetch_page_text_without_json_ld_falls_through_byte_for_byte_uncha
     finds nothing usable; see the ``_returns_none`` variant below for that
     path)."""
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+            )
+        ).prompt_text
     assert text == bean_sourcing._extract_page_markdown(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
 
 
@@ -3224,9 +3561,11 @@ async def test_fetch_page_text_fails_soft_on_a_page_with_malformed_json_ld() -> 
         '<script type="application/ld+json">{not valid json at all!}</script>'
     )
     async with _mock_client(_html_response(200, malformed_page)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+            )
+        ).prompt_text
     assert "Structured data found in this page" not in text
     assert "Kenya Kiambu AA" in text
 
@@ -3274,9 +3613,11 @@ async def test_fetch_page_text_identity_matches_json_ld_against_final_redirected
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        original_url, config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            original_url, config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Structured data found in this page's JSON-LD" in text
     assert "KE-REDIRECTED" in text
 
@@ -3309,6 +3650,106 @@ async def test_draft_bean_profile_from_url_feeds_json_ld_context_to_extraction_p
     assert draft.name == "Kenya Kiambu AA (Washed)"
     assert any("Structured data found in this page" in prompt for prompt in seen_prompts)
     assert any("KE-KIAMBU-AA" in prompt for prompt in seen_prompts)
+
+
+#: A page whose VISIBLE body never states the product name/description —
+#: only the JSON-LD block does. Proves the #590 D1 containment corpus
+#: includes the prepended JSON-LD DATA section, not just the extracted
+#: body text.
+_JSON_LD_ONLY_URL = "https://vendor.example/products/colombia-huila"
+
+_JSON_LD_ONLY_HTML = """
+<html>
+<head>
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Product",
+  "name": "Colombia Huila Pink Bourbon",
+  "url": "https://vendor.example/products/colombia-huila",
+  "description": "A vibrant lot from Huila."
+}
+</script>
+</head>
+<body>
+<p>Great coffee. Free shipping on orders over $50. Subscribe and save.</p>
+</body>
+</html>
+"""
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_json_ld_only_value_verifies_on_page() -> None:
+    """#590 D1: the containment corpus is the SAME page text the model
+    saw, which includes the prepended JSON-LD DATA section — a field value
+    present ONLY via JSON-LD (never in the visible body text) must still
+    verify ``"on_page"``, not get wrongly demoted for being off the
+    rendered body."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        tool_name = info.output_tools[0].name
+        return ModelResponse(
+            parts=[
+                ToolCallPart(
+                    tool_name,
+                    _identity_args(
+                        name="Colombia Huila Pink Bourbon",
+                        country="Colombia",
+                        bean_origin="Colombia",
+                        farm=None,
+                        bean_varietal=None,
+                        processing=None,
+                        bean_species=None,
+                        altitude_m=None,
+                        description="A vibrant lot from Huila.",
+                        is_blend=None,
+                    ),
+                )
+            ]
+        )
+
+    async with _mock_client(_html_response(200, _JSON_LD_ONLY_HTML)) as http_client:
+        draft = await draft_bean_profile_from_url(
+            _JSON_LD_ONLY_URL,
+            advisor_config=_ADVISOR_CONFIG,
+            http_client=http_client,
+            model=FunctionModel(respond),
+        )
+    assert draft.name == "Colombia Huila Pink Bourbon"
+    assert draft.field_sources["name"] == "on_page"
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_confabulated_value_from_our_own_header_is_demoted() -> (
+    None
+):
+    """#590 D1 fold 1 (Codex P2): the LLM-prompt text (``page_text``) is
+    prefixed with OUR OWN generated JSON-LD context header/labels
+    ("Structured data found in this page's JSON-LD (schema.org Product
+    block, identity-matched to the fetched URL)."). Reusing that text as
+    the containment-verification corpus let a model-returned value match
+    OUR scaffolding instead of real vendor content — a prompt-injected
+    page could aim a confabulated value straight at it. The verification
+    corpus must be vendor-data-only, so a value drawn from the header
+    ("schema org Product block", present only in generated text — the
+    page's actual name is "Kenya Kiambu AA (Washed)") must demote."""
+    identity = _identity_args(name="schema org Product block")
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        tool_name = info.output_tools[0].name
+        return ModelResponse(parts=[ToolCallPart(tool_name, identity)])
+
+    async with _mock_client(
+        _html_response(200, _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT))
+    ) as http_client:
+        draft = await draft_bean_profile_from_url(
+            _MATCHING_JSON_LD_URL,
+            advisor_config=_ADVISOR_CONFIG,
+            http_client=http_client,
+            model=FunctionModel(respond),
+        )
+    assert draft.name == "schema org Product block"
+    assert draft.field_sources["name"] == "origin_estimated"
 
 
 # --- #590 slice C: _extract_page_markdown (trafilatura) ---
@@ -3505,11 +3946,13 @@ def test_sanitize_trafilatura_frontmatter_passes_through_unclosed_block_unchange
 @pytest.mark.asyncio
 async def test_fetch_page_text_uses_trafilatura_markdown_as_page_body() -> None:
     async with _mock_client(_html_response(200, _NAV_HEAVY_HTML)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/ethiopia-guji",
-            config=BeanSourcingConfig(),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/ethiopia-guji",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
     assert "Roast Recommendation" in text
     assert "Category 0" not in text  # nav boilerplate never reaches the LLM
 
@@ -3527,11 +3970,13 @@ async def test_fetch_page_text_falls_back_to_linear_strip_when_trafilatura_retur
 
     monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _no_markdown)
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/kenya-kiambu",
-            config=BeanSourcingConfig(),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/kenya-kiambu",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
     assert text == bean_sourcing._extract_page_text(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
     assert "Kenya Kiambu AA" in text
 
@@ -3569,11 +4014,13 @@ async def test_fetch_page_text_bounds_a_hanging_markdown_extraction_with_a_timeo
     monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _hangs)
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
         started = time.monotonic()
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/kenya-kiambu",
-            config=BeanSourcingConfig(fetch_timeout_seconds=0.1),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/kenya-kiambu",
+                config=BeanSourcingConfig(fetch_timeout_seconds=0.1),
+                http_client=client,
+            )
+        ).prompt_text
         elapsed = time.monotonic() - started
     assert elapsed < 1.0, f"markdown-extraction timeout did not bound the call: {elapsed:.2f}s"
     # Falls back to the SAME linear-strip text the None/exception paths
@@ -3592,9 +4039,11 @@ async def test_fetch_page_text_prepends_json_ld_ahead_of_trafilatura_markdown() 
         "<p>Roast Recommendation: filler prose so trafilatura keeps this paragraph too.</p>",
     )
     async with _mock_client(_html_response(200, page)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+            )
+        ).prompt_text
     expected_markdown = bean_sourcing._extract_page_markdown(page)  # pyright: ignore[reportPrivateUsage]
     assert expected_markdown is not None
     json_ld_index = text.find("Structured data found in this page's JSON-LD")
