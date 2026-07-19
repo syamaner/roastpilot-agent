@@ -59,9 +59,13 @@ If a gate fails, fix it and re-run before continuing.
 
 ## 2. Size + data/logic split
 
-- **Logic PRs target ≤ ~400 changed lines.** Over that, split the story into
-  thinner vertical slices (a story may be several stacked PRs) rather than ship
-  one large PR.
+- **The ≤ ~400-line logic cap is a HARD STOP, not a target.** If the logic diff
+  exceeds it, STOP — do not open. The story should already have a **PR plan from
+  kickoff** (AGENTS.md PR-Hygiene: the ordered list of thin PRs decided *before*
+  writing code); a diff over the cap means the plan was too coarse or you merged two
+  planned slices — split it back out to the planned boundary and open the current slice
+  only. Reactively discovering the size here is the failure this catches; the fix is to
+  plan the slices up front, not to split a monolith at review time.
 - **Separate data from logic.** Fixtures, snapshots, generated files, research
   output, bake-off results belong in their OWN PR or commit — never bundled with
   logic. They inflate size and don't need code review the way logic does. If the

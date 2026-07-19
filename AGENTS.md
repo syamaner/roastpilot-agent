@@ -219,8 +219,18 @@ checklist before you open.
   output, bake-off results go in their OWN PR (or at least their own commit),
   never bundled with logic — they were the size outliers and don't need code
   review the way logic does.
-- **Keep logic PRs small.** Target ≤ ~400 changed lines; split a story into thin
-  vertical slices at kickoff, not at review (a story may be several stacked PRs).
+- **PR-plan the story at KICKOFF — a planning step, not an execution-time reaction.**
+  Before writing code, decompose the story into an **ordered list of thin PRs**, each
+  with its scope, rough size, dependencies, and which reviewers it triggers
+  (safety / security / qa). You should know "this story is 8 PRs, and PR3 does exactly
+  X" *before* PR1 opens. This lives in the story brief (a lead / `product-pm` activity).
+  Reactively splitting a 900-line diff at review time is the failure mode this prevents
+  (#587's ~800-line module and #600's ~2,000-line harness were unplanned monoliths —
+  they should have been ~3 and ~4 planned slices; the shift-left folds then *masked* the
+  size problem instead of fixing it).
+- **Keep logic PRs small — the ≤ ~400-line cap is a HARD STOP, not a target.** If a
+  logic diff exceeds it, the PR plan was too coarse: split before opening, no exceptions.
+  (Data/fixtures/generated files are exempt — they go in their own PR per the rule above.)
 - **Shift review LEFT — mandatory, not optional.** Before opening: run all gates +
   an adversarial self-critique, AND run the domain reviewer on the BRANCH
   (`safety-reviewer` for safety/controller/enum/recovery, `qa` for tests) and
