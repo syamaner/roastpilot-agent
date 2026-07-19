@@ -27,7 +27,13 @@ jobs:
     # and the action fails. Dependency bumps don't need a Claude code review —
     # CI + codecov cover them. (claude-review is not a required check, so a
     # Dependabot PR is never blocked; this just removes the spurious red X.)
-    if: ${{ github.actor != 'dependabot[bot]' }}
+    #
+    # Skip DRAFT PRs (D103 draft-first loop): pr-preflight step 5 opens a PR as a
+    # draft to converge Codex (the diverse lens) BEFORE marking it ready. Running
+    # claude-review on the draft too would double its runs and land findings
+    # pre-ready; the `ready_for_review` trigger (already in `on:` above) fires it
+    # once the PR leaves draft, plus `synchronize` on later pushes.
+    if: ${{ github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false }}
 
     runs-on: ubuntu-latest
     permissions:
