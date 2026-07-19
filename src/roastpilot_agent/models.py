@@ -803,6 +803,84 @@ class BeanProfileList(BaseModel):
     profiles: list[BeanProfile]
 
 
+# --- #573 phase 1: add-bean-from-URL draft (add-bean-profile skill, productised) ---
+#
+# ``POST /api/beans/draft-from-url`` response contract. This is DELIBERATELY
+# not persisted anywhere: the endpoint (``roastpilot_agent.bean_sourcing`` +
+# the API route) fetches a vendor product page, extracts a bean identity, and
+# drafts conservative first-roast targets for the operator to review, edit,
+# and — only if they choose — save via the EXISTING, unchanged
+# ``POST /api/bean-profiles`` (``BeanProfileInput``) action. Human-in-the-loop
+# by construction: there is no code path from a fetched URL to a saved
+# profile that does not pass back through the operator.
+
+BeanFieldSource = Literal["on_page", "origin_estimated"]
+"""Per-field provenance for a :class:`BeanProfileDraft` (#573): ``"on_page"``
+when the value was read from the vendor page text, ``"origin_estimated"``
+when it was imputed — a conservative first-roast target, or a value the page
+did not state. A constrained ``Literal``, deliberately not a ``models.py``
+``Enum`` — matching the :data:`BeanSpecies` / :data:`ProcessingMethod`
+precedent: this is bean metadata, not a safety verdict, so it stays OUT of
+the enum surface the safety-reviewer escalation routes on."""
+
+
+class BeanProfileDraft(_BeanProfileFieldsBase):
+    """A drafted, NOT-YET-SAVED bean profile from add-bean-from-URL (#573 phase 1).
+
+    Returned by ``POST /api/beans/draft-from-url`` for the operator to
+    review, edit, and save — this type is read-only advisory output. Neither
+    this model nor anything in :mod:`roastpilot_agent.bean_sourcing` persists
+    it; saving remains the existing ``POST /api/bean-profiles``
+    (:class:`BeanProfileInput`) action, unchanged, so a saved profile is
+    always the result of an explicit operator action, never an automatic
+    side effect of drafting one.
+
+    Carries every :class:`BeanProfile` field except the server-owned
+    ``id``/timestamps (the same shape as :class:`BeanProfileInput`), plus:
+
+    - :attr:`field_sources` — honest per-field provenance (see
+      :data:`BeanFieldSource`): every bean-identity field the vendor page
+      actually stated is ``"on_page"``; every roast TARGET (charge guidance,
+      initial heat/fan, drop temperature, development percent, default
+      weight) is always ``"origin_estimated"`` — a vendor page never states a
+      development-percent target or a drop temperature, so these are never
+      presented as scraped fact.
+    - :attr:`scouting_note` — the conservative "scouting run" framing the
+      operator sees alongside the drafted targets: a wrong target on an
+      unfamiliar bean must not burn a batch.
+
+    All temperatures Celsius, per the shared base.
+    """
+
+    default_bean_weight_grams: float = Field(gt=0)
+    """The charge weight (grams) that would pre-fill a new roast's form if
+    this draft is saved; adjustable per roast like every other profile."""
+
+    is_blend: bool | None = None  # pyright: ignore[reportIncompatibleVariableOverride]
+    """Overrides the shared base's plain ``bool`` (#587): a DRAFT's blend
+    flag is honestly tri-state, because "the page never mentioned blending"
+    and "the page said single-origin" are different facts. ``True``/``False``
+    when the vendor page explicitly addressed it (tracked as ``"on_page"`` in
+    :attr:`field_sources`); ``None`` when the page said nothing at all (no
+    ``field_sources`` entry — absent means unset, per the same convention
+    every other field_sources-tracked field follows). Every OTHER profile
+    type (:class:`BeanProfile`, :class:`RoastProfile`, ``BeanProfileInput``)
+    keeps the base's plain ``bool``: the operator always resolves it to a
+    concrete choice before saving/starting a roast, so tri-state has no
+    meaning there — this override is scoped to the draft only."""
+
+    field_sources: dict[str, BeanFieldSource] = Field(default_factory=dict)
+    """Per-field provenance keyed by field name (e.g. ``"bean_varietal"``,
+    ``"target_development_percent"``) — see :data:`BeanFieldSource`. A field
+    absent from this map means it was left ``None``/unset (never found on the
+    page and not imputed), not "on the label"."""
+
+    scouting_note: str = Field(min_length=1)
+    """Operator-facing conservative-target framing text (#573): explains why
+    the drafted targets are a de-risked first-roast starting point, not a
+    fixed recipe."""
+
+
 # --- #567 Slice A: reference-curve retrieval + representation models ---
 #
 # A completed, well-rated past roast of THIS SAME bean, retrieved by

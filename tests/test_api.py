@@ -39,6 +39,7 @@ from roastpilot_agent.api import (
     create_app,
     stream_events,
 )
+from roastpilot_agent.bean_sourcing import BeanExtractionError, BeanFetchError
 from roastpilot_agent.config import AppConfig, ControllerConfig, ReferenceCurve
 from roastpilot_agent.mcp_client import (
     AmbientStatus,
@@ -47,6 +48,7 @@ from roastpilot_agent.mcp_client import (
     RoastSessionState,
 )
 from roastpilot_agent.models import (
+    BeanProfileDraft,
     ChargeWeightRequest,
     ClearStaleSessionRequest,
     MicHealth,
@@ -4320,6 +4322,313 @@ async def test_seeded_ethiopia_profile_is_served_over_http(store: RoastStore) ->
     assert colombia["altitude_m"] == 1600
     assert colombia["target_drop_temp_c"] == 195.0
     assert colombia["target_development_percent"] == 16.0
+
+
+# ---------------------------------------------------------------------------
+# POST /api/beans/draft-from-url (#573 phase 1 — add-bean-from-URL)
+# ---------------------------------------------------------------------------
+#
+# The service delegates to ``bean_sourcing.draft_bean_profile_from_url`` (its
+# own module-level function, tested exhaustively in test_bean_sourcing.py);
+# these tests monkeypatch that reference on ``roastpilot_agent.api`` to a
+# deterministic double, so no real fetch/LLM call happens here either — this
+# level is only about the route's request/response/error-code wiring, and
+# that this DRAFT endpoint never persists anything.
+
+
+def _draft_from(url: str) -> BeanProfileDraft:
+    return BeanProfileDraft(
+        name="Kenya Kiambu AA (Washed)",
+        bean_origin="Kenya",
+        processing="washed",
+        source_url=url,
+        initial_heat_percent=100,
+        initial_fan_percent=30,
+        target_drop_temp_c=195.0,
+        target_development_percent=15.0,
+        default_bean_weight_grams=250.0,
+        field_sources={"name": "on_page", "target_development_percent": "origin_estimated"},
+        scouting_note="Scouting run — de-risked first-roast targets.",
+    )
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_happy_path(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, object, object]] = []
+
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        calls.append((url, advisor_config, sourcing_config))
+        return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    response = await client.post(
+        "/api/beans/draft-from-url",
+        json={"url": "https://vendor.example/products/kenya-kiambu"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "Kenya Kiambu AA (Washed)"
+    assert body["source_url"] == "https://vendor.example/products/kenya-kiambu"
+    assert body["field_sources"]["target_development_percent"] == "origin_estimated"
+    assert "id" not in body  # never persisted / never mints a library id
+    # It reused the service's configured advisor + bean_sourcing config (BYOK).
+    assert len(calls) == 1
+    assert calls[0][0] == "https://vendor.example/products/kenya-kiambu"
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_never_creates_a_saved_profile(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#573 human-in-the-loop safeguard: drafting must not touch the saved
+    bean-profile library — it stays empty until the operator explicitly
+    POSTs to /api/bean-profiles."""
+
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    await client.post(
+        "/api/beans/draft-from-url", json={"url": "https://vendor.example/products/kenya"}
+    )
+    listed = await client.get("/api/bean-profiles")
+    assert listed.json() == {"profiles": []}
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_fetch_error_is_422(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        raise BeanFetchError(f"vendor page fetch failed for {url!r}")
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    response = await client.post(
+        "/api/beans/draft-from-url", json={"url": "https://vendor.example/products/down"}
+    )
+    assert response.status_code == 422
+    assert "fetch failed" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_extraction_error_is_422(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        raise BeanExtractionError("could not determine a bean name and origin from the page")
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    response = await client.post(
+        "/api/beans/draft-from-url", json={"url": "https://vendor.example/products/thin"}
+    )
+    assert response.status_code == 422
+    assert "could not determine" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_rejects_empty_url_body(client: AsyncClient) -> None:
+    response = await client.post("/api/beans/draft-from-url", json={"url": ""})
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_roast_service_draft_bean_from_url_reuses_configured_advisor_and_sourcing_config(
+    service: RoastService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#573: confirms the BYOK wiring — the service passes ITS configured
+    ``AdvisorConfig``/``BeanSourcingConfig`` straight through, so drafting
+    reuses the same provider/key the operator already set for the roast
+    advisor, via a SEPARATE call (not the roast advisor object itself)."""
+    captured: dict[str, object] = {}
+
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        captured["url"] = url
+        captured["advisor_config"] = advisor_config
+        captured["sourcing_config"] = sourcing_config
+        return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    draft = await service.draft_bean_from_url("https://vendor.example/products/kenya")
+    assert isinstance(draft, BeanProfileDraft)
+    assert captured["advisor_config"] is service._config.advisor  # pyright: ignore[reportPrivateUsage]
+    assert (
+        captured["sourcing_config"] is service._config.bean_sourcing  # pyright: ignore[reportPrivateUsage]
+    )
+
+
+@pytest.mark.asyncio
+async def test_roast_service_draft_bean_from_url_raises_when_a_roast_is_active(
+    service: RoastService, store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#587 P1: uses the SAME persisted active-run signal ``start_roast``
+    and ``health`` already use (``store.active_run()``) — checked BEFORE
+    the fetch/LLM call, which must never be invoked."""
+
+    async def fail_if_called(
+        url: str, *, advisor_config: object, sourcing_config: object
+    ) -> object:
+        pytest.fail("must not fetch/extract while a roast is active")
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fail_if_called)
+    await store.create_run(
+        run_id="run-active",
+        profile=_profile(),
+        config=AppConfig(),
+        agent_phase=RoastPhase.PREHEATING,
+    )
+    with pytest.raises(RoastRunConflictError, match="active"):
+        await service.draft_bean_from_url("https://vendor.example/products/kenya")
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_and_start_roast_are_mutually_exclusive(
+    service: RoastService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#587 P1 (round 5): ``draft_bean_from_url`` shares ``start_roast``'s
+    ``_start_lock``, held across the WHOLE fetch+extraction — not just the
+    active-run check — so a roast-start issued while a draft is in flight
+    cannot interleave and start underneath it. Without this, an
+    unsynchronized ``active_run()`` snapshot could pass, yield during the
+    (multi-second) fetch/LLM call, and let a concurrent roast start in that
+    window — reopening the exact advisor-starvation race the #587 P1 guard
+    exists to close."""
+    draft_entered = asyncio.Event()
+    release_draft = asyncio.Event()
+    events: list[str] = []
+
+    async def slow_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        events.append("draft_entered")
+        draft_entered.set()
+        await release_draft.wait()
+        events.append("draft_exited")
+        return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", slow_draft)
+
+    draft_task = asyncio.create_task(
+        service.draft_bean_from_url("https://vendor.example/products/kenya")
+    )
+    await asyncio.wait_for(draft_entered.wait(), timeout=2.0)
+
+    start_task = asyncio.create_task(service.start_roast(_profile()))
+    # Give the event loop a beat: start_roast must be BLOCKED on the shared
+    # _start_lock, not proceeding concurrently with the in-flight draft.
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert not start_task.done(), "start_roast must wait for the shared lock"
+    events.append("start_still_blocked_while_draft_in_flight")
+
+    release_draft.set()
+    draft = await draft_task
+    detail = await start_task
+
+    assert events == [
+        "draft_entered",
+        "start_still_blocked_while_draft_in_flight",
+        "draft_exited",
+    ]
+    assert isinstance(draft, BeanProfileDraft)
+    assert isinstance(detail, RoastDetail)
+    assert detail.id
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_returns_429_when_concurrency_exhausted(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#587 fix 5: each draft-from-url call is a billable BYOK LLM request,
+    so a module-level semaphore bounds how many requests can be ADMITTED at
+    once. Fixed at 1, not 2 (#587 P2, round 6): ``draft_bean_from_url``
+    also shares ``start_roast``'s ``_start_lock`` (#587 P1 round 5, held
+    across the WHOLE fetch+extraction — see
+    ``test_draft_bean_from_url_and_start_roast_are_mutually_exclusive``),
+    and that lock is acquired FAIRLY (FIFO), so admitting MORE than one
+    draft at a time would let a roast-start wait behind however many are
+    admitted, not just one. With the cap at 1, a SECOND concurrent request
+    must fail fast with 429 (no queuing at all — the single slot is
+    already taken); releasing the first then lets it complete normally."""
+    entered = 0
+    first_entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        nonlocal entered
+        entered += 1
+        first_entered.set()
+        await release.wait()
+        return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+
+    # The one admission slot: taken and executing (blocked inside
+    # fake_draft, holding the shared _start_lock too).
+    task1 = asyncio.create_task(
+        client.post("/api/beans/draft-from-url", json={"url": "https://vendor.example/products/1"})
+    )
+    await asyncio.wait_for(first_entered.wait(), timeout=2.0)
+
+    # A second concurrent request exhausts the (single) semaphore slot
+    # immediately -> 429, with no queuing.
+    overflow_response = await client.post(
+        "/api/beans/draft-from-url", json={"url": "https://vendor.example/products/overflow"}
+    )
+    assert overflow_response.status_code == 429
+
+    release.set()
+    result1 = await task1
+    assert result1.status_code == 200
+    assert entered == 1
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_conflicts_when_a_roast_is_active(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#587 P1: bean extraction is a billable LLM call that can occupy the
+    SAME backend an active roast's post-FC advisor needs for control advice
+    — most acutely on a resource-constrained local provider (Ollama, which
+    serialises inference) — starving those calls into
+    ``ControllerConfig.advisory_timeout_seconds`` and the sustained-outage
+    safety fallback after 3 consecutive failures. Must 409 BEFORE any
+    fetch/LLM work: proven here by a ``draft_bean_profile_from_url`` double
+    that ``pytest.fail``s if ever invoked."""
+
+    async def fail_if_called(
+        url: str, *, advisor_config: object, sourcing_config: object
+    ) -> object:
+        pytest.fail("must not fetch/extract while a roast is active")
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fail_if_called)
+
+    started = await client.post("/api/roasts", json=_profile().model_dump())
+    assert started.status_code == 201
+
+    response = await client.post(
+        "/api/beans/draft-from-url",
+        json={"url": "https://vendor.example/products/kenya"},
+    )
+    assert response.status_code == 409
+    assert "active" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_works_when_idle(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The #587 P1 active-roast guard must not false-positive when idle —
+    the ordinary happy path keeps working once the guard is added."""
+
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        return _draft_from(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    response = await client.post(
+        "/api/beans/draft-from-url",
+        json={"url": "https://vendor.example/products/kenya"},
+    )
+    assert response.status_code == 200
 
 
 # ---------------------------------------------------------------------------
