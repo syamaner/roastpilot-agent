@@ -310,9 +310,17 @@ it is not a required check.
 **WAIT for Codex's verdict before merging (operator rule, 12 Jul — the #518 lesson):**
 Codex is often DELAYED relative to CI, and green-CI auto-merge can land a PR before its
 review posts (#518 merged with 3 real P2s in flight → fix-forward #519). Its lifecycle
-signals on the PR are readable: **👀 reaction = review started; a posted review = findings;
-a 👍 reaction (after the 👀) = done, nothing found.** So: do NOT arm auto-merge at open.
-After the final commit + `@codex review`, wait for either the review or the 👍 — **and the
+signals on the PR are readable: **👀 reaction = review started; a posted `pull_request_review`
+with inline threads = findings; and a CLEAN verdict is EITHER a 👍 reaction (after the 👀) OR
+a top-level "Codex Review: Didn't find any major issues" comment carrying a
+`**Reviewed commit:** <sha>` line** (the clean-comment is the MORE COMMON channel — observed on
+#57/#60/#65; a watcher polling only reviews + reactions is blind to it). **Both clean signals are
+authoritative ONLY when authored by the Codex bot identity (`chatgpt-codex-connector[bot]`):** the
+repo is public, so anyone can add a 👍 OR post a look-alike comment copying the title + the visible
+head sha — verify the reaction's / comment's `user.login` is the bot (the reactions API exposes it),
+because content or a bare reaction alone is spoofable. So: do NOT arm auto-merge at open.
+After the final commit + `@codex review`, wait for a findings-review, a bot-authored clean comment,
+or the 👍 — **and the
 signal must postdate the final-commit trigger**: a review posted at PR creation against an
 earlier commit does not satisfy the wait (that stale-verdict reading would reopen the #518
 failure mode). Then triage (if findings), resolve, and only then merge/arm auto-merge.
@@ -320,7 +328,7 @@ failure mode). Then triage (if findings), resolve, and only then merge/arm auto-
 (extend in ~10-min increments), **bounded at ~30 min from the 👀**: past that, treat the
 in-progress signal as stuck and the lead may merge with an "in-progress review stalled"
 note, triaging any late review post-merge. The silent fallback applies only when NO signal
-at all (no post-trigger 👀, review, or 👍) has appeared ~15 min after green CI: re-trigger
+at all (no post-trigger 👀, review, clean comment, or 👍) has appeared ~15 min after green CI: re-trigger
 once more on the same commit and **wait a full second window (~10 min)**; only if still
 nothing is merging allowed — note "Codex silent" in the merge context so a late review is
 triaged as post-merge follow-up, not a surprise.
