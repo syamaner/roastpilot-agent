@@ -14,6 +14,7 @@ from roastpilot_agent.config import (
     DEFAULT_ADVISOR_MODEL,
     AdvisorConfig,
     AppConfig,
+    BeanSourcingConfig,
     ControllerConfig,
     PostFirstCrackControl,
     SafetyLimits,
@@ -260,6 +261,30 @@ def test_app_config_defaults_without_env(monkeypatch: pytest.MonkeyPatch) -> Non
     assert config.controller == ControllerConfig()
     assert config.advisor == AdvisorConfig()
     assert config.safety == SafetyLimits()
+    assert config.bean_sourcing == BeanSourcingConfig()
+
+
+def test_bean_sourcing_config_defaults() -> None:
+    """#573 phase 1: sane, conservative add-bean-from-URL fetch limits."""
+    config = BeanSourcingConfig()
+    assert config.fetch_timeout_seconds == 10.0
+    assert config.max_response_bytes == 2_000_000
+    assert config.user_agent
+    assert "RoastPilotAgent" in config.user_agent
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"fetch_timeout_seconds": 0},
+        {"fetch_timeout_seconds": -1},
+        {"max_response_bytes": 0},
+        {"user_agent": ""},
+    ],
+)
+def test_bean_sourcing_config_rejects_nonsense(overrides: dict[str, object]) -> None:
+    with pytest.raises(pydantic.ValidationError):
+        BeanSourcingConfig.model_validate(overrides)
 
 
 def test_app_config_loads_nested_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
