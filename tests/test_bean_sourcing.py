@@ -2312,11 +2312,15 @@ def test_draft_from_identity_marks_page_fields_on_page() -> None:
         "bean_origin",
         "farm",
         "bean_varietal",
-        "processing",
         "altitude_m",
         "description",
     ):
         assert draft.field_sources[field] == "on_page", field
+    # processing is a DEFERRED enum field (#590 D1 scoping fold) — demoted
+    # unconditionally even though the page genuinely states "washed" and
+    # the model returned it; see test_draft_from_identity_processing_is_
+    # always_demoted_in_d1 below for the dedicated coverage.
+    assert draft.field_sources["processing"] == "origin_estimated"
     # bean_species was NOT stated on the page (None in the fixture) — no
     # fabricated value, and no field_sources entry claiming it is on_page.
     assert draft.bean_species is None
@@ -2374,6 +2378,59 @@ def test_draft_from_identity_description_stays_exempt_even_when_paraphrased() ->
     assert draft.field_sources["description"] == "on_page"
 
 
+def test_draft_from_identity_processing_is_always_demoted_in_d1() -> None:
+    """#590 D1 scoping fold (resolves claude-review SHLcA / Codex SHMGm):
+    ``processing`` is a closed-vocabulary enum whose values are common
+    English words that collide with unrelated page prose, so it is
+    demoted UNCONDITIONALLY in D1 — even when the page GENUINELY states
+    "washed" and the model correctly returned it. D2's evidence-quote
+    gate is where enum verification belongs (see
+    :data:`bean_sourcing._ENUM_FIELDS_DEFERRED_TO_D2`)."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(processing="washed")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="This lot was fully washed and sun-dried on raised beds.",
+    )
+    assert draft.processing == "washed"
+    assert draft.field_sources["processing"] == "origin_estimated"
+
+
+def test_draft_from_identity_processing_honey_collision_is_demoted() -> None:
+    """The exact collision repro: ``processing="honey"`` (the process)
+    trivially word-matches an unrelated TASTING-NOTE mention of "honey"
+    (the flavor) — crude single-word containment can't tell those apart,
+    so D1 never even tries; it demotes unconditionally either way."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(processing="honey")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="Tasting notes: honey, stone fruit, and a clean, sweet finish.",
+    )
+    assert draft.processing == "honey"
+    assert draft.field_sources["processing"] == "origin_estimated"
+
+
+def test_draft_from_identity_bean_species_is_always_demoted_in_d1() -> None:
+    """Same D1 scoping fold as processing, for the other deferred enum
+    field: ``bean_species`` demotes unconditionally even when genuinely
+    stated on the page."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(bean_species="arabica")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="100% arabica beans, hand-picked at peak ripeness.",
+    )
+    assert draft.bean_species == "arabica"
+    assert draft.field_sources["bean_species"] == "origin_estimated"
+
+
 def _containment_corpus(raw: str) -> tuple[str, list[str]]:
     """Build the ``(corpus_normalized, corpus_digit_runs)`` pair
     :func:`bean_sourcing._value_is_contained` takes, exactly as
@@ -2382,7 +2439,7 @@ def _containment_corpus(raw: str) -> tuple[str, list[str]]:
     both corpus forms the same way the production code does."""
     normalized = bean_sourcing._normalize_for_containment(raw)  # pyright: ignore[reportPrivateUsage]
     digit_runs = bean_sourcing._digit_run_tokens(  # pyright: ignore[reportPrivateUsage]
-        bean_sourcing._strip_thousands_commas(raw)  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._join_thousands_separated_digits(raw)  # pyright: ignore[reportPrivateUsage]
     )
     return normalized, digit_runs
 
@@ -2479,6 +2536,39 @@ def test_value_is_contained_still_accepts_a_thousands_separated_altitude() -> No
     is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
     normalized, digit_runs = _containment_corpus("Grown at 1,800 masl on volcanic soil.")
     assert is_contained(1800, normalized, digit_runs) is True
+
+
+# --- #590 D1 fold 1 (Codex P2): decimal-comma locale numeric spoofing ---
+
+
+def test_value_is_contained_rejects_a_decimal_comma_price() -> None:
+    """The original comma-only thousands-strip reproduced the exact
+    price-spoof it was meant to close, for a decimal-COMMA locale:
+    "€18,00" would strip its comma to "1800", letting a confabulated
+    ``altitude_m=1800`` verify against a page stating only a price. The
+    locale-independent shape rule (join only when EXACTLY 3 digits follow
+    the separator) must reject this: "00" is 2 digits, not 3."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized, digit_runs = _containment_corpus("This exceptional lot costs €18,00 per bag.")
+    assert is_contained(1800, normalized, digit_runs) is False
+
+
+def test_value_is_contained_accepts_a_eu_thousands_period() -> None:
+    """The mirror positive case: a EUROPEAN thousands-separator PERIOD
+    (rather than a comma) must still verify — "1.800" -> period followed
+    by exactly 3 digits ("800") -> joined -> "1800"."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized, digit_runs = _containment_corpus("Grown at 1.800 meters above sea level.")
+    assert is_contained(1800, normalized, digit_runs) is True
+
+
+def test_join_thousands_separated_digits_joins_chained_separators() -> None:
+    """A chained thousands form ("1.234.567") joins at EVERY separator
+    that is followed by exactly 3 digits, not just the first."""
+    join = bean_sourcing._join_thousands_separated_digits  # pyright: ignore[reportPrivateUsage]
+    digit_run_tokens = bean_sourcing._digit_run_tokens  # pyright: ignore[reportPrivateUsage]
+    joined = join("1.234.567 bags produced.")
+    assert digit_run_tokens(joined) == ["1234567"]
 
 
 def test_value_is_contained_rejects_java_matching_inside_javascript() -> None:
@@ -2795,15 +2885,15 @@ def test_draft_from_identity_is_blend_explicit_single_origin_marks_on_page() -> 
     a SINGLE origin) is a page-sourced FACT, not silence — before this fix a
     bare ``bool`` default made this indistinguishable from "the page said
     nothing"; it must now be recorded ``on_page`` just like an explicit
-    ``True`` is. #590 D1: this now ALSO requires the corpus to actually
-    address blend-vs-single-origin (:func:`bean_sourcing._is_blend_addressed`)."""
+    ``True`` is. #590 D1: this now ALSO requires the corpus to support
+    THAT SPECIFIC polarity (:func:`bean_sourcing._is_blend_polarity_confirmed`)."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(is_blend=False)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
         identity,
         url="https://vendor.example/products/single-origin",
-        corpus="This is a single origin lot from one farm, not a blend.",
+        corpus="This is a single origin lot from one farm.",
     )
     assert draft.is_blend is False
     assert draft.field_sources["is_blend"] == "on_page"
@@ -2812,15 +2902,15 @@ def test_draft_from_identity_is_blend_explicit_single_origin_marks_on_page() -> 
 def test_draft_from_identity_is_blend_explicit_blend_marks_on_page() -> None:
     """#587 P2 (supersedes the earlier True-only fix, #587 fix 4): when the
     page explicitly states this IS a blend, ``is_blend`` must be recorded as
-    ``"on_page"`` provenance. #590 D1: gated on the corpus actually
-    containing a blend-intent token."""
+    ``"on_page"`` provenance. #590 D1: gated on the corpus containing a
+    "blend" token matching the ``True`` polarity."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(is_blend=True)
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
         identity,
         url="https://vendor.example/products/blend",
-        corpus="A house blend combining beans from three origins.",
+        corpus="Our house blend combines beans from three origins.",
     )
     assert draft.is_blend is True
     assert draft.field_sources["is_blend"] == "on_page"
@@ -2841,17 +2931,71 @@ def test_draft_from_identity_is_blend_explicit_but_corpus_silent_is_demoted() ->
     assert draft.field_sources["is_blend"] == "origin_estimated"
 
 
-def test_is_blend_addressed_does_not_match_inside_an_unrelated_word() -> None:
+def test_draft_from_identity_is_blend_true_with_only_single_origin_page_is_demoted() -> None:
+    """#590 D1 fold (Codex P2): the pre-fold ``_is_blend_addressed`` accepted
+    EITHER "blend" OR "single origin" for EITHER polarity, so
+    ``is_blend=True`` against a page that only says "single origin" used
+    to certify ``on_page`` — the exact OPPOSITE of the page's own claim.
+    Must demote instead."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=True)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/single-origin",
+        corpus="This is a single origin lot from one estate.",
+    )
+    assert draft.is_blend is True
+    assert draft.field_sources["is_blend"] == "origin_estimated"
+
+
+def test_draft_from_identity_is_blend_false_with_only_blend_page_is_demoted() -> None:
+    """The mirror repro: ``is_blend=False`` against a page that only says
+    "blend" (never "single origin") must demote, not certify the opposite
+    of the page's own claim."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=False)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/blend",
+        corpus="Our house blend combines beans from three origins.",
+    )
+    assert draft.is_blend is False
+    assert draft.field_sources["is_blend"] == "origin_estimated"
+
+
+def test_is_blend_polarity_confirmed_true_requires_a_blend_token() -> None:
     """A shift-left finding (#590 D1): plain substring containment would
-    let "blend" match inside "blended"/"blender" — an unrelated mention
-    (e.g. a kitchen blender upsell) must not count as the page addressing
-    blend-vs-single-origin. :func:`bean_sourcing._is_blend_addressed`
-    matches whole words only."""
-    is_addressed = bean_sourcing._is_blend_addressed  # pyright: ignore[reportPrivateUsage]
-    corpus = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
+    also let "blend" match inside "blended"/"blender" — an unrelated
+    mention (e.g. a kitchen blender upsell) must not count as evidence.
+    :func:`bean_sourcing._is_blend_polarity_confirmed` matches whole words
+    only, AND only the token matching the returned polarity."""
+    is_confirmed = bean_sourcing._is_blend_polarity_confirmed  # pyright: ignore[reportPrivateUsage]
+    blender_corpus = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
         "Pairs perfectly with our best-selling kitchen blender."
     )
-    assert is_addressed(corpus) is False
+    single_origin_corpus = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
+        "This is a single origin lot from one estate."
+    )
+    blend_corpus = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
+        "Our house blend combines beans from three origins."
+    )
+    assert is_confirmed(True, blender_corpus) is False
+    assert is_confirmed(True, single_origin_corpus) is False
+    assert is_confirmed(True, blend_corpus) is True
+
+
+def test_is_blend_polarity_confirmed_false_requires_a_single_origin_token() -> None:
+    is_confirmed = bean_sourcing._is_blend_polarity_confirmed  # pyright: ignore[reportPrivateUsage]
+    blend_corpus = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
+        "Our house blend combines beans from three origins."
+    )
+    single_origin_corpus = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
+        "This is a single origin lot from one estate."
+    )
+    assert is_confirmed(False, blend_corpus) is False
+    assert is_confirmed(False, single_origin_corpus) is True
 
 
 def test_draft_from_identity_marks_every_roast_target_origin_estimated() -> None:
