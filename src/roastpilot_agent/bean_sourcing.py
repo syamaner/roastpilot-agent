@@ -2362,13 +2362,16 @@ def _normalize_for_containment(text: str) -> str:
 def _digits_only(text: str) -> str:
     """Reduce ``text`` to its digit characters only, in order.
 
-    Used for numeric containment (``altitude_m``): a vendor page may render
-    "1,800 masl" for a value the model returns as the bare int ``1800`` —
-    comparing digit runs sidesteps unit/separator/comma noise without any
-    regex (#590 D1).
+    Used for a single numeric FIELD VALUE (e.g. ``altitude_m``) — never for
+    the corpus (see :func:`_digit_run_tokens` for that; concatenating every
+    digit across an entire page into one stream lets a digit sub-sequence
+    match across two UNRELATED numbers — #590 D1 bug 1, a real
+    containment-spoofing bug: ``2406`` would "match" a page reading
+    "SKU 24. Ships within 06 business days." even though no such number
+    appears anywhere).
 
     Args:
-        text: The text to reduce.
+        text: The text to reduce (a single value's ``str()`` form).
 
     Returns:
         Only the digit characters of ``text``, concatenated in order.
@@ -2376,15 +2379,115 @@ def _digits_only(text: str) -> str:
     return "".join(ch for ch in text if ch.isdigit())
 
 
+def _strip_thousands_commas(text: str) -> str:
+    """Remove a comma that sits BETWEEN two digits from ``text`` (#590 D1).
+
+    Only a THOUSANDS-SEPARATOR comma is removed (``"1,800"`` -> ``"1800"``)
+    — every other character, including a decimal/price period, is left
+    untouched (``"$18.00"`` stays ``"$18.00"``, so :func:`_digit_run_tokens`
+    still splits it into two SEPARATE runs ``["18", "00"]`` rather than one
+    number). Pure ``str``/list scan (no regex), so this stays ReDoS-free.
+    Deliberately does NOT touch the general-purpose
+    :func:`_normalize_for_containment` output, which maps ALL punctuation
+    (commas included) to a space and would otherwise split a genuine
+    ``"1,800"`` into two separate digit runs and lose the very case this
+    function exists to keep intact.
+
+    Args:
+        text: The raw corpus text (not the whitespace-collapsed
+            :func:`_normalize_for_containment` form).
+
+    Returns:
+        ``text`` with every inter-digit comma removed.
+    """
+    kept: list[str] = []
+    last_index = len(text) - 1
+    for index, ch in enumerate(text):
+        if (
+            ch == ","
+            and 0 < index < last_index
+            and text[index - 1].isdigit()
+            and text[index + 1].isdigit()
+        ):
+            continue
+        kept.append(ch)
+    return "".join(kept)
+
+
+def _digit_run_tokens(text: str) -> list[str]:
+    """Split ``text`` into its maximal digit runs (#590 D1).
+
+    Splits on every non-digit character — pure ``str`` scan, no regex.
+    Intended input is :func:`_strip_thousands_commas`'s output, so a
+    thousands-separated number survives as ONE run while every other
+    punctuation boundary (a price's decimal period, a SKU's trailing
+    period, whitespace) still splits distinct numbers apart:
+    ``"$18.00"`` -> ``["18", "00"]``; ``"1800 masl"`` -> ``["1800"]``;
+    ``"SKU 24. within 06"`` -> ``["24", "06"]``.
+
+    Args:
+        text: The text to split (typically already run through
+            :func:`_strip_thousands_commas`).
+
+    Returns:
+        Every maximal run of digit characters, in order.
+    """
+    runs: list[str] = []
+    current: list[str] = []
+    for ch in text:
+        if ch.isdigit():
+            current.append(ch)
+        elif current:
+            runs.append("".join(current))
+            current = []
+    if current:
+        runs.append("".join(current))
+    return runs
+
+
 #: A numeric field's digit run shorter than this is never trusted as
-#: "contained" (#590 D1) — see :func:`_value_is_contained`'s docstring for
-#: why. 3 covers every realistic coffee-growing altitude (typically
-#: 3-4 digits, e.g. "500"-"2500") while excluding a bare 1-2 digit run
-#: that is common noise elsewhere on a vendor page.
+#: "contained" (#590 D1) — an EXTRA guard on top of the exact digit-run
+#: match :func:`_value_is_contained` now performs (the exact match already
+#: closes the cross-number spoofing bug 1; this floor additionally keeps a
+#: bare 1-2 digit exact match — common noise elsewhere on a vendor page, a
+#: price/SKU/year — from counting). 3 covers every realistic coffee-growing
+#: altitude (typically 3-4 digits, e.g. "500"-"2500").
 _MIN_NUMERIC_CONTAINMENT_DIGITS = 3
 
 
-def _value_is_contained(value: object, corpus_normalized: str) -> bool:
+def _contains_whole_phrase(phrase: str, corpus_normalized: str) -> bool:
+    """Whether ``phrase`` appears in ``corpus_normalized`` as a whole,
+    contiguous word sequence — not merely a substring (#590 D1 bug 2).
+
+    Both ``phrase`` and ``corpus_normalized`` are assumed already run
+    through :func:`_normalize_for_containment` (case-folded,
+    whitespace-single-spaced), so padding both with a boundary space and
+    doing one plain ``in`` check is equivalent to verifying ``phrase``'s
+    words are a CONTIGUOUS SUBLIST of the corpus's words, while staying a
+    single guaranteed-linear ``str.__contains__`` call — no regex, no
+    nested loop. Plain substring containment (the pre-fix behavior) let
+    ``"java"`` match inside ``"javascript"`` and ``"india"`` match inside
+    ``"indianapolis"``, verifying a confabulated origin from unrelated
+    page chrome; word-boundary padding closes that.
+
+    Args:
+        phrase: The already-normalized needle (a field value or a blend
+            intent token).
+        corpus_normalized: The page corpus, already normalized via
+            :func:`_normalize_for_containment`.
+
+    Returns:
+        ``True`` if ``phrase`` appears as a whole word/phrase in the
+        corpus, ``False`` otherwise (including for an empty ``phrase``).
+    """
+    if not phrase:
+        return False
+    return f" {phrase} " in f" {corpus_normalized} "
+
+
+def _value_is_contained(
+    value: object, corpus_normalized: str, corpus_digit_runs: list[str]
+) -> bool:
     """Test whether ``value`` is verifiably present in the page corpus (#590 D1).
 
     Gates the ``"on_page"`` provenance tag: a field earns ``"on_page"`` only
@@ -2393,25 +2496,28 @@ def _value_is_contained(value: object, corpus_normalized: str) -> bool:
     the model's *claim* alone (the pre-D1 behavior) let a confabulated value
     through with a false "verified" tag.
 
-    Numeric values (currently only ``altitude_m``) are compared on their
-    DIGIT RUNS only via :func:`_digits_only`, since a page may render
-    "1,800 masl" for a value the model returns as the bare int ``1800`` —
-    comparing the full normalized string would miss that. A digit run
+    Numeric values (currently only ``altitude_m``) are compared by EXACT
+    equality against ``corpus_digit_runs`` — the corpus's maximal digit
+    runs, computed ONCE by the caller via :func:`_digit_run_tokens` over
+    :func:`_strip_thousands_commas`'s output — never substring-within-a-run
+    and never across two runs (the pre-fix bug: concatenating every corpus
+    digit into one stream let a value match a sub-sequence spanning two
+    unrelated numbers, e.g. a price and an unrelated SKU). A digit run
     SHORTER than :data:`_MIN_NUMERIC_CONTAINMENT_DIGITS` is never
-    considered contained, even if it happens to appear — a short run (e.g.
-    "1" or "42") is common noise in unrelated page numbers (a price, a
-    SKU, a year, "100% arabica"), so trusting it would OVER-verify a
-    confabulated value instead of erring toward the safe demote direction;
-    real coffee altitudes are 3+ digit values, so this costs nothing
-    legitimate. Every other value is compared as a whole-value SUBSTRING of
-    the normalized corpus (via :func:`_normalize_for_containment`).
+    considered contained even on an exact match — real coffee altitudes are
+    3+ digit values, so this extra floor costs nothing legitimate while
+    keeping a bare 1-2 digit coincidence (a price, a SKU, a year) from
+    counting. Every other value is compared as a whole WORD/PHRASE (via
+    :func:`_contains_whole_phrase`) of the normalized corpus — never a raw
+    substring, which would let e.g. "Java" match inside "JavaScript".
 
-    Whole-value substring containment can under-verify a real value whose
-    tokens are legitimately scattered across the page (e.g. separated by
-    other text) — that is the intentionally SAFE direction for D1:
-    over-demotion just asks the operator to review a field that was
-    actually fine, it never fabricates trust in a confabulated one. D2's
-    evidence-quote gate is where this precision is refined.
+    Both the numeric exact-match and the whole-phrase match can
+    under-verify a real value (a genuine European "1.800" thousands form,
+    or real words legitimately scattered non-adjacently across the page)
+    — that is the intentionally SAFE direction for D1: over-demotion just
+    asks the operator to review a field that was actually fine, it never
+    fabricates trust in a confabulated one. D2's evidence-quote gate is
+    where this precision is refined.
 
     Args:
         value: The raw extracted field value (``str``, ``int``, or any
@@ -2421,6 +2527,9 @@ def _value_is_contained(value: object, corpus_normalized: str) -> bool:
         corpus_normalized: The page corpus, already passed through
             :func:`_normalize_for_containment` ONCE by the caller (never
             re-normalized per field).
+        corpus_digit_runs: The page corpus's maximal digit runs, already
+            computed ONCE by the caller via :func:`_digit_run_tokens`
+            (never recomputed per field).
 
     Returns:
         ``True`` if ``value`` is verifiably present in the corpus,
@@ -2437,12 +2546,12 @@ def _value_is_contained(value: object, corpus_normalized: str) -> bool:
             value_digits = _digits_only(str(value))
             if len(value_digits) < _MIN_NUMERIC_CONTAINMENT_DIGITS:
                 return False
-            return value_digits in _digits_only(corpus_normalized)
+            return value_digits in corpus_digit_runs
         text = str(value).strip()
         if not text:
             return False
         normalized_value = _normalize_for_containment(text)
-        return bool(normalized_value) and normalized_value in corpus_normalized
+        return _contains_whole_phrase(normalized_value, corpus_normalized)
     except Exception:  # pragma: no cover - defensive: containment must fail soft, never raise
         return False
 
@@ -2459,13 +2568,11 @@ _BLEND_INTENT_TOKENS: tuple[str, ...] = ("blend", "single origin")
 def _is_blend_addressed(corpus_normalized: str) -> bool:
     """Whether the corpus mentions blend-vs-single-origin at all (#590 D1).
 
-    Matches each token as a WHOLE, space-delimited word (padding the
-    corpus with a leading/trailing space and searching for
-    ``f" {token} "``) rather than a raw substring — plain substring
-    containment would let "blend" match inside "blended"/"blender"/
-    "unblended", over-verifying a page that never actually addresses
-    blend-vs-single-origin. Still pure ``str`` operations (no regex), so
-    this stays ReDoS-free.
+    Matches each token as a WHOLE word/phrase via
+    :func:`_contains_whole_phrase` rather than a raw substring — plain
+    substring containment would let "blend" match inside
+    "blended"/"blender"/"unblended", over-verifying a page that never
+    actually addresses blend-vs-single-origin.
 
     Args:
         corpus_normalized: The page corpus, already normalized via
@@ -2475,8 +2582,7 @@ def _is_blend_addressed(corpus_normalized: str) -> bool:
         ``True`` if any of :data:`_BLEND_INTENT_TOKENS` appears in the
         corpus as a whole word (or word sequence).
     """
-    padded_corpus = f" {corpus_normalized} "
-    return any(f" {token} " in padded_corpus for token in _BLEND_INTENT_TOKENS)
+    return any(_contains_whole_phrase(token, corpus_normalized) for token in _BLEND_INTENT_TOKENS)
 
 
 def _normalize_optional_text(value: str | None) -> str | None:
@@ -2612,9 +2718,14 @@ def _draft_from_identity(
         "description": description,
     }
 
-    # Normalized ONCE, not per field (#590 D1) — every containment check
-    # below reuses this same corpus form.
+    # Both normalized ONCE, not per field (#590 D1) — every containment
+    # check below reuses these same corpus forms. corpus_digit_runs is
+    # deliberately derived from the RAW corpus, not corpus_normalized:
+    # _normalize_for_containment maps every comma to a space, which would
+    # split a genuine thousands-separated "1,800" into two digit runs
+    # (see _strip_thousands_commas's docstring).
     corpus_normalized = _normalize_for_containment(corpus)
+    corpus_digit_runs = _digit_run_tokens(_strip_thousands_commas(corpus))
 
     field_sources: dict[str, BeanFieldSource] = {}
     for field_name in _IDENTITY_FIELDS:
@@ -2627,7 +2738,9 @@ def _draft_from_identity(
             field_sources[field_name] = "on_page"
             continue
         field_sources[field_name] = (
-            "on_page" if _value_is_contained(raw_value, corpus_normalized) else "origin_estimated"
+            "on_page"
+            if _value_is_contained(raw_value, corpus_normalized, corpus_digit_runs)
+            else "origin_estimated"
         )
     if "bean_origin" not in field_sources and country:
         # bean_origin fell back to country — inherit COUNTRY's own verified

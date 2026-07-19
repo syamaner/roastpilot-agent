@@ -2374,40 +2374,217 @@ def test_draft_from_identity_description_stays_exempt_even_when_paraphrased() ->
     assert draft.field_sources["description"] == "on_page"
 
 
+def _containment_corpus(raw: str) -> tuple[str, list[str]]:
+    """Build the ``(corpus_normalized, corpus_digit_runs)`` pair
+    :func:`bean_sourcing._value_is_contained` takes, exactly as
+    :func:`bean_sourcing._draft_from_identity` computes it once per draft
+    (#590 D1) — a shared test helper so every direct unit test below builds
+    both corpus forms the same way the production code does."""
+    normalized = bean_sourcing._normalize_for_containment(raw)  # pyright: ignore[reportPrivateUsage]
+    digit_runs = bean_sourcing._digit_run_tokens(  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._strip_thousands_commas(raw)  # pyright: ignore[reportPrivateUsage]
+    )
+    return normalized, digit_runs
+
+
 def test_value_is_contained_none_and_empty_are_never_contained() -> None:
     is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
-    corpus = bean_sourcing._normalize_for_containment(_IDENTITY_PAGE_TEXT)  # pyright: ignore[reportPrivateUsage]
-    assert is_contained(None, corpus) is False
-    assert is_contained("", corpus) is False
-    assert is_contained("   ", corpus) is False
+    normalized, digit_runs = _containment_corpus(_IDENTITY_PAGE_TEXT)
+    assert is_contained(None, normalized, digit_runs) is False
+    assert is_contained("", normalized, digit_runs) is False
+    assert is_contained("   ", normalized, digit_runs) is False
 
 
 def test_value_is_contained_matches_case_and_punctuation_insensitively() -> None:
     is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
-    corpus = bean_sourcing._normalize_for_containment("Farm: Gakuyuini Factory.")  # pyright: ignore[reportPrivateUsage]
-    assert is_contained("gakuyuini factory", corpus) is True
-    assert is_contained("GAKUYUINI FACTORY", corpus) is True
-    assert is_contained("Nairobi Estate", corpus) is False
+    normalized, digit_runs = _containment_corpus("Farm: Gakuyuini Factory.")
+    assert is_contained("gakuyuini factory", normalized, digit_runs) is True
+    assert is_contained("GAKUYUINI FACTORY", normalized, digit_runs) is True
+    assert is_contained("Nairobi Estate", normalized, digit_runs) is False
 
 
 def test_value_is_contained_rejects_a_short_numeric_digit_run() -> None:
-    """A shield-review finding (#590 D1 shift-left pass): a bare 1-2 digit
+    """A shift-left finding (#590 D1 pre-open pass): a bare 1-2 digit
     run is common noise elsewhere on a vendor page (a price, a SKU, a
     year, "100% arabica") — trusting it would OVER-verify a confabulated
     altitude instead of erring toward the safe demote direction. Even a
-    LITERAL match under :data:`bean_sourcing._MIN_NUMERIC_CONTAINMENT_DIGITS`
-    must not count as contained."""
+    LITERAL exact-run match under
+    :data:`bean_sourcing._MIN_NUMERIC_CONTAINMENT_DIGITS` must not count
+    as contained."""
     is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
-    corpus = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
-        "This lot sells for $42 a bag."
-    )
-    assert is_contained(42, corpus) is False
+    normalized, digit_runs = _containment_corpus("This lot sells for $42 a bag.")
+    assert is_contained(42, normalized, digit_runs) is False
 
 
 def test_value_is_contained_accepts_a_realistic_altitude_digit_run() -> None:
     is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
-    corpus = bean_sourcing._normalize_for_containment("Altitude: 1850m.")  # pyright: ignore[reportPrivateUsage]
-    assert is_contained(1850, corpus) is True
+    normalized, digit_runs = _containment_corpus("Altitude: 1850m.")
+    assert is_contained(1850, normalized, digit_runs) is True
+
+
+def test_digit_run_tokens_flushes_a_trailing_run_with_no_terminating_punctuation() -> None:
+    """A digit run at the VERY END of the text (no trailing punctuation to
+    trigger the mid-scan flush) must still be captured."""
+    digit_run_tokens = bean_sourcing._digit_run_tokens  # pyright: ignore[reportPrivateUsage]
+    assert digit_run_tokens("Altitude 1850") == ["1850"]
+
+
+def test_contains_whole_phrase_rejects_an_empty_phrase() -> None:
+    """A value that normalizes to an EMPTY phrase (e.g. a punctuation-only
+    string, since :func:`_normalize_for_containment` maps every
+    ``,.'"-()`` to a space) must never be treated as contained."""
+    contains_whole_phrase = bean_sourcing._contains_whole_phrase  # pyright: ignore[reportPrivateUsage]
+    corpus_normalized = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
+        "A washed lot from Kenya."
+    )
+    assert contains_whole_phrase("", corpus_normalized) is False
+
+
+def test_value_is_contained_rejects_a_punctuation_only_value() -> None:
+    """End-to-end: a confabulated field value that is punctuation-only
+    (normalizes to an empty phrase) must demote, not raise or false-match."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized, digit_runs = _containment_corpus("A washed lot from Kenya.")
+    assert is_contained("---", normalized, digit_runs) is False
+
+
+# --- #590 D1 independent security-reviewer pass: two containment-spoofing bugs ---
+
+
+def test_value_is_contained_rejects_a_price_that_normalizes_to_the_same_digits() -> None:
+    """Bug 1 (BLOCKER) repro, exact: concatenating every digit across the
+    whole corpus let ``1800`` "match" a page reading only "$18.00" (a
+    price, ``["18", "00"]`` as digit RUNS — no altitude anywhere). Exact
+    digit-run equality must reject it."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized, digit_runs = _containment_corpus(
+        "This exceptional lot is priced at $18.00 per 12oz bag."
+    )
+    assert is_contained(1800, normalized, digit_runs) is False
+
+
+def test_value_is_contained_rejects_a_value_spanning_two_unrelated_numbers() -> None:
+    """Bug 1 (BLOCKER) repro, exact: ``2406`` must not "match" a page
+    whose only numbers are an unrelated SKU (``24``) and a shipping
+    window (``06``) — the old digit-concatenation bug matched across
+    number boundaries; exact digit-run equality must reject it."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized, digit_runs = _containment_corpus("SKU 24. Ships within 06 business days.")
+    assert is_contained(2406, normalized, digit_runs) is False
+
+
+def test_value_is_contained_still_accepts_a_thousands_separated_altitude() -> None:
+    """The positive case must stay green after the bug-1 fix: a genuine
+    ``"1,800 masl"`` thousands-separator form still verifies ``1800``."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized, digit_runs = _containment_corpus("Grown at 1,800 masl on volcanic soil.")
+    assert is_contained(1800, normalized, digit_runs) is True
+
+
+def test_value_is_contained_rejects_java_matching_inside_javascript() -> None:
+    """Bug 2 (MEDIUM) repro, exact: plain substring containment let
+    "Java" match inside "JavaScript" boilerplate — a confabulated origin
+    verified from unrelated site chrome. Whole-word matching must reject
+    it."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized, digit_runs = _containment_corpus(
+        "Please enable JavaScript in your browser to use this site."
+    )
+    assert is_contained("Java", normalized, digit_runs) is False
+
+
+def test_value_is_contained_rejects_india_matching_inside_indianapolis() -> None:
+    """Bug 2 (MEDIUM) repro, exact: plain substring containment let
+    "India" match inside "Indianapolis" — a confabulated origin verified
+    from an unrelated shipping-address mention. Whole-word matching must
+    reject it."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized, digit_runs = _containment_corpus(
+        "Our roastery has a second location in Indianapolis, IN."
+    )
+    assert is_contained("India", normalized, digit_runs) is False
+
+
+def test_value_is_contained_accepts_a_real_adjacent_multi_word_origin() -> None:
+    """The positive multi-word case must stay green after the bug-2 fix:
+    a genuine two-word origin stated adjacently on the page still
+    verifies."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized, digit_runs = _containment_corpus("A washed lot from Yirgacheffe, Ethiopia.")
+    assert is_contained("Yirgacheffe Ethiopia", normalized, digit_runs) is True
+
+
+def test_value_is_contained_accepts_a_real_single_word_origin() -> None:
+    """The positive single-word case must stay green after the bug-2 fix:
+    a genuine whole-word origin still verifies."""
+    is_contained = bean_sourcing._value_is_contained  # pyright: ignore[reportPrivateUsage]
+    normalized, digit_runs = _containment_corpus("A bright, fruit-forward lot from Kenya.")
+    assert is_contained("Kenya", normalized, digit_runs) is True
+
+
+def test_draft_from_identity_altitude_from_a_price_page_is_demoted() -> None:
+    """Bug 1 repro, end-to-end through :func:`_draft_from_identity`'s own
+    ``corpus_digit_runs`` wiring (not just the isolated
+    :func:`_value_is_contained` unit): a confabulated ``altitude_m=1800``
+    must demote when the page's only matching digits are a ``$18.00``
+    price."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="This exceptional lot is priced at $18.00 per 12oz bag.",
+    )
+    assert draft.altitude_m == 1800
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+def test_draft_from_identity_altitude_spanning_two_numbers_is_demoted() -> None:
+    """Bug 1 repro, end-to-end: a confabulated ``altitude_m=2406`` must
+    demote when the page's only digits are an unrelated SKU and shipping
+    window."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=2406)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="SKU 24. Ships within 06 business days.",
+    )
+    assert draft.altitude_m == 2406
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+def test_draft_from_identity_country_java_from_javascript_boilerplate_is_demoted() -> None:
+    """Bug 2 repro, end-to-end: a confabulated ``country="Java"`` must
+    demote when the page only mentions "JavaScript" boilerplate, never
+    the country."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(country="Java", bean_origin="Java")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/java",
+        corpus="Please enable JavaScript in your browser to use this site.",
+    )
+    assert draft.country == "Java"
+    assert draft.field_sources["country"] == "origin_estimated"
+
+
+def test_draft_from_identity_country_india_from_indianapolis_is_demoted() -> None:
+    """Bug 2 repro, end-to-end: a confabulated ``country="India"`` must
+    demote when the page only mentions "Indianapolis"."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(country="India", bean_origin="India")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/india",
+        corpus="Our roastery has a second location in Indianapolis, IN.",
+    )
+    assert draft.country == "India"
+    assert draft.field_sources["country"] == "origin_estimated"
 
 
 # --- #587 P2 round 6: altitude range must not be tagged on_page ---
