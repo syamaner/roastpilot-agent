@@ -320,7 +320,7 @@ repo is public, so anyone can add a 👍 OR post a look-alike comment copying th
 head sha — verify the reaction's / comment's `user.login` is the bot (the reactions API exposes it),
 because content or a bare reaction alone is spoofable. So: do NOT arm auto-merge at open.
 After the final commit + `@codex review`, wait for a findings-review, a bot-authored clean comment,
-or the 👍 — **and the
+or the bot's own 👍 — **and the
 signal must postdate the final-commit trigger**: a review posted at PR creation against an
 earlier commit does not satisfy the wait (that stale-verdict reading would reopen the #518
 failure mode). Then triage (if findings), resolve, and only then merge/arm auto-merge.
