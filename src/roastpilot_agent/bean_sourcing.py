@@ -2001,12 +2001,15 @@ class _ExtractedBeanIdentity(BaseModel):
     percent or a drop temperature.
 
     The four ``*_evidence`` fields (#590 slice D2a) are a PARALLEL, optional
-    verbatim quote alongside each TYPED field (:data:`_TYPED_CITATION_FIELDS`
-    plus ``is_blend``). As of slice D2b, :func:`_draft_from_identity` runs
-    the three :data:`_TYPED_CITATION_FIELDS` quotes through
-    :func:`_quote_supports_value`, flipping a field to ``"on_page"`` on a
-    genuine, value-supporting citation. ``is_blend_evidence`` stays
-    CAPTURED-BUT-UNCONSUMED — polarity verification needs locality (slice E).
+    verbatim quote alongside each TYPED field (``altitude_m``,
+    ``processing``, ``bean_species``, ``is_blend``). As of slice D2b, ONLY
+    ``altitude_m_evidence`` is consumed — :func:`_draft_from_identity` runs
+    it through :func:`_quote_supports_altitude`, flipping ``altitude_m`` to
+    ``"on_page"`` on a genuine, proximate, single-segment citation. The
+    other three stay CAPTURED-BUT-UNCONSUMED: sound enum verification needs
+    locality + conflicting-method handling (Codex round-1, SH8b4/SH8b7)
+    that D2b's flat cue-only approach can't provide safely — deferred to
+    slice E, same as ``is_blend``'s polarity.
     """
 
     name: str | None = None
@@ -2016,14 +2019,14 @@ class _ExtractedBeanIdentity(BaseModel):
     bean_varietal: str | None = None
     processing: ProcessingMethod | None = None
     processing_evidence: str | None = Field(default=None, max_length=500)
-    """A verbatim span supporting ``processing`` (#590 D2a), verified by
-    :func:`_quote_supports_value` (#590 D2b). Bounded to
+    """A verbatim span supporting ``processing`` (#590 D2a). Captured but
+    UNCONSUMED — enum verification is deferred to slice E (locality +
+    conflicting-method handling). Bounded to
     :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's LOW."""
     bean_species: BeanSpecies | None = None
     bean_species_evidence: str | None = Field(default=None, max_length=500)
-    """A verbatim span of page text supporting ``bean_species`` (#590 D2a).
-    Verified by :func:`_quote_supports_value` (#590 D2b) — see
-    ``processing_evidence`` for the bound rationale."""
+    """A verbatim span of page text supporting ``bean_species`` (#590
+    D2a). Captured but UNCONSUMED — see ``processing_evidence``."""
     altitude_m: int | None = Field(default=None, ge=0, le=4000)
     """A single STATED altitude — never a computed midpoint of a page-given
     RANGE (#587 P2, round 6: the extraction used to average a range down to
@@ -2036,8 +2039,8 @@ class _ExtractedBeanIdentity(BaseModel):
     deferred to #590 — no new schema fields here."""
     altitude_m_evidence: str | None = Field(default=None, max_length=500)
     """A verbatim span of page text supporting ``altitude_m`` (#590 D2a).
-    Verified by :func:`_quote_supports_value` (#590 D2b) — see
-    ``processing_evidence`` for the bound rationale."""
+    Verified by :func:`_quote_supports_altitude` (#590 D2b) — bounded to
+    :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's LOW."""
     description: str | None = None
     is_blend: bool | None = None
     """Tri-state, not a plain ``bool`` with a False default (#587 P2): the
@@ -2426,61 +2429,31 @@ _IDENTITY_FIELDS: tuple[str, ...] = (
     "description",
 )
 
-#: TYPED fields never routed through :func:`_value_is_contained` (#590 D1
-#: scoping: pure string containment can't safely verify a TYPED value).
-#: Verified instead via the citation gate, :func:`_quote_supports_value`
-#: (#590 D2b). ``is_blend`` (excluded from :data:`_IDENTITY_FIELDS` for its
-#: tri-state ``None``) stays deferred to **slice E** — locality.
-_TYPED_CITATION_FIELDS: frozenset[str] = frozenset({"altitude_m", "processing", "bean_species"})
+#: TYPED enum fields DEFERRED to slice E (#590 D2b Codex round-1: SH8b4/
+#: SH8b7). Sound enum verification needs LOCALITY + conflicting-method
+#: handling (a competing/negated process mention nearby can supply the
+#: "independent cue" for the WRONG value; a bare substring cue collides
+#: with unrelated prose) that flat, cue-only matching cannot provide
+#: safely — so D2b narrowed to ``altitude_m`` only (see
+#: :func:`_quote_supports_altitude`) and these two, like ``is_blend``,
+#: demote unconditionally until E lands.
+_ENUM_FIELDS_DEFERRED_TO_E: frozenset[str] = frozenset({"processing", "bean_species"})
 
 #: Elevation cues an ``altitude_m`` evidence quote must carry, PROXIMATE to
-#: the value's digit-run token (#590 D2b fold 1). Deliberately NOT bare
-#: ``"m"`` (too promiscuous). ``"above"``/``"sea"``/``"level"`` cover
-#: "above sea level" as 3 individually-checkable words. Per-TOKEN
-#: substring, so a GLUED token like ``"1800masl"`` counts (distance 0).
+#: the value's digit-run token (#590 D2b). Deliberately NOT bare ``"m"``
+#: (too promiscuous) and NOT standalone ``"above"``/``"sea"``/``"level"``
+#: (fix 1, SH8bw: "Stock level: 1,800 bags" used to verify a confabulated
+#: altitude off the bare word "level" alone) — "above sea level" is
+#: checked as a COMPLETE contiguous phrase instead, see
+#: :func:`_altitude_evidence_supports_value`. Per-TOKEN substring, so a
+#: GLUED token like ``"1800masl"`` counts (distance 0).
 _ALTITUDE_CUES: frozenset[str] = frozenset(
-    {
-        "masl",
-        "meters",
-        "metres",
-        "meter",
-        "metre",
-        "altitude",
-        "elevation",
-        "asl",
-        "msnm",
-        "above",
-        "sea",
-        "level",
-    }
+    {"masl", "meters", "metres", "meter", "metre", "altitude", "elevation", "asl", "msnm"}
 )
 
 #: How many word positions may separate a value-matching digit token from
-#: an elevation-cue token and still count as PROXIMATE (#590 D2b fold 1).
+#: an elevation-cue token and still count as PROXIMATE (#590 D2b).
 _ALTITUDE_CUE_PROXIMITY_WINDOW: int = 4
-
-#: Process cues a ``processing`` evidence quote must contain, INDEPENDENT
-#: of the enum's own display spelling (#590 D2b) — includes several
-#: processing values THEMSELVES, generically process-y words too.
-#: :func:`_process_cue_present` excludes every cue that is a SUBSTRING of
-#: ``value``'s display spelling (fold 2: excluding only the raw literal was
-#: vacuous for ``wet_hulled``, whose display embeds the cue "hulled").
-_PROCESS_CUES: frozenset[str] = frozenset(
-    {
-        "process",
-        "processed",
-        "processing",
-        "method",
-        "fermentation",
-        "fermented",
-        "washed",
-        "natural",
-        "honey",
-        "anaerobic",
-        "hulled",
-        "pulped",
-    }
-)
 
 #: Roast-target fields a vendor page never states — always
 #: ``"origin_estimated"`` in the drafted :attr:`BeanProfileDraft.field_sources`.
@@ -2571,9 +2544,10 @@ def _contains_whole_phrase(phrase: str, corpus_normalized: str) -> bool:
 
 def _value_is_contained(value: object, corpus_normalized: str) -> bool:
     """Test whether ``value`` is verifiably present in the page corpus as a
-    whole word/phrase (#590 D1 — scoped to FREE-TEXT identity fields only,
-    round-2 review: typed fields go through the citation gate instead, see
-    :data:`_TYPED_CITATION_FIELDS`).
+    whole word/phrase (#590 D1 — scoped to FREE-TEXT identity fields only;
+    ``altitude_m`` goes through the citation gate instead, see
+    :func:`_quote_supports_altitude`; ``processing``/``bean_species``/
+    ``is_blend`` demote unconditionally, deferred to slice E).
 
     Gates the ``"on_page"`` provenance tag: a field earns ``"on_page"`` only
     when its extracted value is actually present in the SAME page text the
@@ -2645,12 +2619,11 @@ def _numeric_tokens(text: str) -> frozenset[str]:
 
 
 def _token_carries_altitude_cue(token: str) -> bool:
-    """Whether whitespace-split ``token`` contains an elevation cue as a
-    substring (#590 D2b), casefolded — so a glued token like
-    ``"1800masl"`` counts.
+    """Whether ``token`` contains an elevation cue as a substring (#590
+    D2b), casefolded — so a glued token like ``"1800masl"`` counts.
 
     Args:
-        token: One whitespace-delimited token from the raw evidence quote.
+        token: One :func:`_proximity_tokens` token.
 
     Returns:
         ``True`` if any :data:`_ALTITUDE_CUES` member is a substring of
@@ -2659,16 +2632,80 @@ def _token_carries_altitude_cue(token: str) -> bool:
     return any(cue in token.casefold() for cue in _ALTITUDE_CUES)
 
 
+def _proximity_tokens(text: str) -> list[str]:
+    """Tokenize ``text`` on punctuation AND whitespace — split on
+    non-alphanumeric runs — for altitude cue-proximity measurement (#590
+    D2b fix 2, SH8b9). A whitespace-ONLY split let a colon/semicolon/
+    hyphen-joined chain (e.g. ``"shop-elevation-map"``) collapse into ONE
+    token, putting an unrelated digit run and cue at distance 0. A comma
+    or period directly BETWEEN two digits is preserved (not a boundary),
+    so a grouped number like ``"1,800"`` still tokenizes as one ``"1800"``
+    run — any OTHER non-alphanumeric character is a hard boundary. Pure
+    ``str`` iteration, no regex (ReDoS-free).
+
+    Args:
+        text: The raw (not pre-normalized) evidence-quote text.
+
+    Returns:
+        The alphanumeric-run tokens, in order, boundary characters dropped.
+    """
+    tokens: list[str] = []
+    current: list[str] = []
+    length = len(text)
+    for i, char in enumerate(text):
+        if char.isalnum():
+            current.append(char)
+        elif (
+            char in ",."
+            and current
+            and current[-1].isdigit()
+            and i + 1 < length
+            and text[i + 1].isdigit()
+        ):
+            continue  # elide a thousands-separator/decimal point between digits
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _above_sea_level_cue_indices(tokens: list[str]) -> list[int]:
+    """Index positions of the contiguous 3-token phrase "above sea level"
+    within ``tokens`` (#590 D2b fix 1, SH8bw) — checked as a COMPLETE
+    phrase, never as 3 independent single-word cues (standalone "level"
+    alone used to let a "Stock level: 1,800 bags" quote verify a
+    confabulated altitude).
+
+    Args:
+        tokens: The proximity token list (:func:`_proximity_tokens`).
+
+    Returns:
+        The middle ("sea") token index of every match, used as that
+        match's proximity anchor.
+    """
+    return [
+        i + 1
+        for i in range(len(tokens) - 2)
+        if tokens[i].casefold() == "above"
+        and tokens[i + 1].casefold() == "sea"
+        and tokens[i + 2].casefold() == "level"
+    ]
+
+
 def _altitude_evidence_supports_value(value: int, raw_quote: str) -> bool:
     """Whether ``raw_quote`` supports ``value`` for ``altitude_m`` via a
-    PROXIMATE digit-run + elevation cue (#590 D2b fold 1 — whole-quote
-    co-presence let a quote launder an unrelated number, e.g. a review
-    count, against a cue from a different sentence). Tokenizes the RAW
-    quote on whitespace (unlike :func:`_normalize_for_containment`, a
-    comma-grouped/decimal number stays ONE token) and requires a cue token
-    within :data:`_ALTITUDE_CUE_PROXIMITY_WINDOW` positions of a token
-    whose digit run (:func:`_numeric_tokens`) equals ``value``. Closes
-    whole-quote laundering, NOT wrong-entity attribution — E's gap.
+    PROXIMATE digit-run + elevation cue (#590 D2b) — whole-quote
+    co-presence alone let a quote launder an unrelated number, e.g. a
+    review count, against a cue from a different clause. Tokenizes on
+    punctuation AND whitespace (:func:`_proximity_tokens`) and requires an
+    elevation-cue token (:data:`_ALTITUDE_CUES` substring, or the
+    "above sea level" phrase, :func:`_above_sea_level_cue_indices`) within
+    :data:`_ALTITUDE_CUE_PROXIMITY_WINDOW` positions of a token whose
+    digit run (:func:`_numeric_tokens`) equals ``value``. Closes
+    whole-quote laundering, NOT wrong-entity attribution — that locality
+    gap is slice E's.
 
     Args:
         value: The claimed altitude in metres.
@@ -2679,11 +2716,12 @@ def _altitude_evidence_supports_value(value: int, raw_quote: str) -> bool:
         proximity window, ``False`` otherwise.
     """
     target = str(value)
-    tokens = raw_quote.split()
+    tokens = _proximity_tokens(raw_quote)
     digit_indices = [i for i, token in enumerate(tokens) if target in _numeric_tokens(token)]
     if not digit_indices:
         return False
     cue_indices = [i for i, token in enumerate(tokens) if _token_carries_altitude_cue(token)]
+    cue_indices += _above_sea_level_cue_indices(tokens)
     if not cue_indices:
         return False
     return any(
@@ -2691,107 +2729,88 @@ def _altitude_evidence_supports_value(value: int, raw_quote: str) -> bool:
     )
 
 
-def _enum_display_spellings(value: str) -> tuple[str, ...]:
-    """The display spelling(s) of an underscore-joined enum literal (#590
-    D2b), e.g. ``"wet_hulled"`` -> ``("wet hulled", "wet-hulled")``.
-
-    Vendor prose writes a compound method space- or hyphen-joined, never
-    with the schema's underscore — and ``"_"`` is deliberately NOT in
-    :data:`_CONTAINMENT_PUNCTUATION_TRANSLATION` (shared with D1's
-    free-text gate; widening it would perturb unrelated behavior). A value
-    with no underscore has exactly one spelling: itself.
-
-    Args:
-        value: The raw enum literal (``processing`` or ``bean_species``).
-
-    Returns:
-        A 1- or 2-tuple of display spellings to check for in a quote.
-    """
-    if "_" not in value:
-        return (value,)
-    return (value.replace("_", " "), value.replace("_", "-"))
+#: Hard sentence/line boundaries a corpus is segmented on for authenticity
+#: checking (#590 D2b fix 3, SH8b8) — deliberately does NOT touch D1's
+#: free-text :func:`_contains_whole_phrase`/:func:`_value_is_contained`;
+#: this is a NEW, stricter check used only for the D2b altitude quote.
+_CORPUS_SEGMENT_BOUNDARIES: frozenset[str] = frozenset({".", "\n", ";", "!", "?"})
 
 
-def _enum_display_present(value: str, normalized_quote: str) -> bool:
-    """Whether one of ``value``'s display spellings appears as a whole
-    phrase in ``normalized_quote`` (#590 D2b).
+def _split_corpus_segments(corpus: str) -> list[str]:
+    """Split ``corpus`` into single-sentence/line segments on
+    :data:`_CORPUS_SEGMENT_BOUNDARIES` (#590 D2b fix 3). Pure ``str``
+    iteration, no regex.
 
     Args:
-        value: The raw enum literal (``processing`` or ``bean_species``).
-        normalized_quote: The evidence quote, already passed through
-            :func:`_normalize_for_containment`.
+        corpus: The raw (not pre-normalized) page corpus.
 
     Returns:
-        ``True`` if any display spelling of ``value`` (see
-        :func:`_enum_display_spellings`) is present, ``False`` otherwise.
+        The non-empty segments, boundary characters dropped.
     """
+    segments: list[str] = []
+    current: list[str] = []
+    for char in corpus:
+        if char in _CORPUS_SEGMENT_BOUNDARIES:
+            if current:
+                segments.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    if current:
+        segments.append("".join(current))
+    return segments
+
+
+def _is_authentic_span(quote: str, corpus: str) -> bool:
+    """Whether ``quote`` is a whole-phrase match WITHIN A SINGLE
+    sentence/line segment of ``corpus`` (#590 D2b fix 3, SH8b8) — plain
+    whole-corpus containment lets a fabricated quote splice words from
+    DIFFERENT sentences (a sentence-final number + the next sentence's
+    opening word, joined once :func:`_normalize_for_containment` turns the
+    period into a space) into a span never actually written contiguously.
+    Splits ``corpus`` on hard boundaries
+    (:func:`_split_corpus_segments`), normalizes each segment
+    independently, and requires the normalized quote to be a whole-phrase
+    match within ONE such segment. Used only for the D2b altitude quote —
+    D1's free-text fields keep the plain whole-corpus check.
+
+    Args:
+        quote: The raw evidence quote (not pre-normalized).
+        corpus: The raw page corpus (not pre-normalized).
+
+    Returns:
+        ``True`` if the quote is a whole-phrase match within a single
+        corpus segment, ``False`` otherwise.
+    """
+    normalized_quote = _normalize_for_containment(quote)
+    if not normalized_quote:
+        return False
     return any(
-        _contains_whole_phrase(_normalize_for_containment(spelling), normalized_quote)
-        for spelling in _enum_display_spellings(value)
+        _contains_whole_phrase(normalized_quote, _normalize_for_containment(segment))
+        for segment in _split_corpus_segments(corpus)
     )
 
 
-def _process_cue_present(value: str, normalized_quote: str) -> bool:
-    """Whether ``normalized_quote`` carries a process cue INDEPENDENT of
-    ``value``'s own DISPLAY spelling (#590 D2b fold 2 — excluding only the
-    raw literal was vacuous for ``wet_hulled``, whose display embeds the
-    cue "hulled"). Excludes every :data:`_PROCESS_CUES` token that is a
-    substring of ANY of ``value``'s display spellings
-    (:func:`_enum_display_spellings`) before checking.
+def _quote_supports_altitude(value: int | None, quote: str | None, corpus: str) -> bool:
+    """Whether ``quote`` genuinely supports ``value`` for ``altitude_m``
+    (#590 D2b, narrowed to this one field — see
+    :data:`_ENUM_FIELDS_DEFERRED_TO_E`). Two conditions, both required:
+    (1) an AUTHENTIC single-segment page span (:func:`_is_authentic_span`,
+    fix 3), and (2) a PROXIMATE elevation cue
+    (:func:`_altitude_evidence_supports_value`, fixes 1 + 2). Fails SOFT
+    on any defect — never raises out of a draft.
 
     Args:
-        value: The raw ``processing`` enum literal.
-        normalized_quote: The evidence quote, already passed through
-            :func:`_normalize_for_containment`.
-
-    Returns:
-        ``True`` if an independent process cue is present, ``False``
-        otherwise.
-    """
-    display_spellings = _enum_display_spellings(value)
-    eligible_cues = {
-        cue for cue in _PROCESS_CUES if not any(cue in spelling for spelling in display_spellings)
-    }
-    return any(cue in normalized_quote for cue in eligible_cues)
-
-
-def _quote_supports_value(
-    value: object, quote: str | None, corpus_normalized: str, field: str
-) -> bool:
-    """Whether ``quote`` genuinely supports ``value`` for ``field`` (#590
-    D2b) — the citation gate a :data:`_TYPED_CITATION_FIELDS` member must
-    pass to flip from an unconditional demote to code-verified
-    ``"on_page"``. Two conditions, both required:
-
-    1. **Genuine page text** — a whole-phrase match against
-       ``corpus_normalized`` (:func:`_contains_whole_phrase`), the SAME
-       vendor-data-only corpus D1 checks free-text fields against, never
-       ``prompt_text``. A fabricated quote fails here.
-    2. **Derivable with a PROXIMATE field-type cue**: ``altitude_m`` needs
-       a value-matching digit-run token with an elevation cue within a
-       bounded word window (:func:`_altitude_evidence_supports_value`);
-       ``processing`` needs its display spelling
-       (:func:`_enum_display_present`) plus a cue INDEPENDENT of that
-       spelling (:func:`_process_cue_present`); ``bean_species`` needs only
-       its display spelling — the species token itself IS the cue.
-
-    Fails SOFT on any defect — never raises out of a draft.
-
-    Args:
-        value: The typed field's extracted value (``int`` for
-            ``altitude_m``; the enum literal ``str`` for ``processing``/
-            ``bean_species``). ``None`` never supports.
-        quote: The model's verbatim evidence span for this field, or
+        value: The extracted ``altitude_m`` value. ``None`` never supports.
+        quote: The model's verbatim ``altitude_m_evidence`` span, or
             ``None``.
-        corpus_normalized: The page's verification corpus, already passed
-            through :func:`_normalize_for_containment` ONCE by the caller.
-        field: One of :data:`_TYPED_CITATION_FIELDS`'s members; any other
-            value returns ``False``.
+        corpus: The page's RAW verification corpus (not pre-normalized —
+            :func:`_is_authentic_span` needs the original sentence
+            boundaries).
 
     Returns:
-        ``True`` only when the quote is genuine page text AND
-        independently supports ``value`` for ``field``; ``False``
-        otherwise.
+        ``True`` only when the quote is an authentic single-segment span
+        AND independently supports ``value``; ``False`` otherwise.
     """
     if value is None or not quote:
         return False
@@ -2799,27 +2818,9 @@ def _quote_supports_value(
         raw_quote = quote.strip()
         if not raw_quote:
             return False
-        normalized_quote = _normalize_for_containment(raw_quote)
-        if not _contains_whole_phrase(normalized_quote, corpus_normalized):
-            return False  # the cited span is not genuine page text
-        if field == "altitude_m":
-            if not isinstance(value, int):
-                # Defensive: the schema types this ``int``, but ``value``
-                # is typed ``object`` here (also called directly in tests).
-                return False
-            # Proximity-bound (#590 D2b fold 1); residual wrong-entity
-            # attribution is slice E's (locality), not this gate's.
-            return _altitude_evidence_supports_value(value, raw_quote)
-        if field == "processing":
-            value_str = str(value)
-            # Independent-of-display-spelling cue (#590 D2b fold 2); same
-            # residual wrong-entity gap as altitude_m above, left to E.
-            return _enum_display_present(value_str, normalized_quote) and _process_cue_present(
-                value_str, normalized_quote
-            )
-        if field == "bean_species":
-            return _enum_display_present(str(value), normalized_quote)
-        return False  # any field outside _TYPED_CITATION_FIELDS never verifies
+        if not _is_authentic_span(raw_quote, corpus):
+            return False  # not a genuine single-segment page quote
+        return _altitude_evidence_supports_value(value, raw_quote)
     except Exception:  # pragma: no cover - defensive: citation gate must fail soft, never raise
         return False
 
@@ -2871,15 +2872,15 @@ def _draft_from_identity(
     ``description`` is EXEMPT from the containment gate — it is long prose
     the model may legitimately summarise/paraphrase rather than quote
     verbatim, it is lower-stakes (the roast advisor never reads it), and
-    it keeps the original presence-only tagging. :data:`_TYPED_CITATION_FIELDS`
-    (``altitude_m``, ``processing``, ``bean_species``) never run through the
-    containment matcher — see that constant's docstring for why. They go
-    through the citation gate, :func:`_quote_supports_value` (#590 D2b),
-    instead: genuine value-supporting evidence flips a field to
-    ``"on_page"``, otherwise it demotes. ``is_blend`` stays demoted
-    unconditionally (deferred to slice E — locality). Every roast-target
-    field is always ``"origin_estimated"``. The optional free-text fields
-    (``country``, ``farm``,
+    it keeps the original presence-only tagging. ``altitude_m`` never runs
+    through the containment matcher — it goes through the citation gate,
+    :func:`_quote_supports_altitude` (#590 D2b, narrowed to this one field
+    — see :data:`_ENUM_FIELDS_DEFERRED_TO_E`), instead: genuine, proximate,
+    single-segment evidence flips it to ``"on_page"``, otherwise it
+    demotes. ``processing``/``bean_species``/``is_blend`` all stay demoted
+    unconditionally (locality + enum verification deferred to slice E).
+    Every roast-target field is always ``"origin_estimated"``. The
+    optional free-text fields (``country``, ``farm``,
     ``bean_varietal``, ``description``) are normalized via
     :func:`_normalize_optional_text` BEFORE both the provenance loop and
     the draft construction (#587 P2) — see that function's docstring for
@@ -2892,14 +2893,15 @@ def _draft_from_identity(
     at all (:func:`draft_bean_profile_from_url` rejects those outright,
     before any fetch). The vendor page itself is still fetched with the
     REAL, un-redacted URL — only what is returned/persisted is redacted.
-    ``identity``'s ``*_evidence`` quotes (#590 D2a) need no separate
-    parameter; three of the four are consumed here via
-    :func:`_quote_supports_value` (#590 D2b), ``is_blend_evidence`` stays
-    unconsumed pending slice E.
+    Of ``identity``'s four ``*_evidence`` quotes (#590 D2a), only
+    ``altitude_m_evidence`` is consumed here, via
+    :func:`_quote_supports_altitude`; the other three stay unconsumed
+    pending slice E.
 
     Args:
         identity: The provider's page-only extraction, including its four
-            ``*_evidence`` quote fields (three consumed here, see above).
+            ``*_evidence`` quote fields (only ``altitude_m_evidence``
+            consumed here, see above).
         url: The source URL (carried onto ``source_url`` in redacted form).
         corpus: The SAME page text the model saw when producing ``identity``
             (:func:`draft_bean_profile_from_url` threads its already-fetched
@@ -2971,15 +2973,6 @@ def _draft_from_identity(
     # below reuses this same corpus form.
     corpus_normalized = _normalize_for_containment(corpus)
 
-    # The three typed fields' evidence quotes, keyed the same as
-    # identity_values above (#590 D2b) — is_blend_evidence is intentionally
-    # absent, it stays unconsumed pending slice E.
-    evidence_quotes: dict[str, str | None] = {
-        "altitude_m": identity.altitude_m_evidence,
-        "processing": identity.processing_evidence,
-        "bean_species": identity.bean_species_evidence,
-    }
-
     field_sources: dict[str, BeanFieldSource] = {}
     for field_name in _IDENTITY_FIELDS:
         raw_value = identity_values[field_name]
@@ -2990,15 +2983,22 @@ def _draft_from_identity(
             # see the function docstring for why.
             field_sources[field_name] = "on_page"
             continue
-        if field_name in _TYPED_CITATION_FIELDS:
-            # altitude_m/processing/bean_species are TYPED fields, never
-            # routed through the containment matcher — gated by the
-            # citation check instead (#590 D2b), see
-            # _TYPED_CITATION_FIELDS's docstring for why.
+        if field_name in _ENUM_FIELDS_DEFERRED_TO_E:
+            # processing/bean_species demote unconditionally — enum
+            # verification is deferred to slice E, see that constant's
+            # docstring for why.
+            field_sources[field_name] = "origin_estimated"
+            continue
+        if field_name == "altitude_m":
+            # The only TYPED field gated by the citation check in D2b
+            # (#590 D2b, narrowed from D2b's original 3-field scope) —
+            # uses the RAW corpus, not corpus_normalized, since
+            # _quote_supports_altitude's authenticity check needs the
+            # original sentence boundaries.
             field_sources[field_name] = (
                 "on_page"
-                if _quote_supports_value(
-                    raw_value, evidence_quotes[field_name], corpus_normalized, field_name
+                if _quote_supports_altitude(
+                    identity.altitude_m, identity.altitude_m_evidence, corpus
                 )
                 else "origin_estimated"
             )

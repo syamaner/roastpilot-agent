@@ -2432,13 +2432,15 @@ def test_draft_from_identity_abstained_processing_has_no_spurious_provenance() -
     assert "processing" not in draft.field_sources
 
 
-# --- #590 D2b: the evidence-quote citation gate ---
+# --- #590 D2b: the altitude citation gate (narrowed to altitude_m only —
+# Codex round-1 triage: sound processing/bean_species verification needs
+# locality + conflicting-method logic deferred to slice E) ---
 
 
-def test_quote_supports_value_price_cited_as_altitude_evidence_is_rejected() -> None:
+def test_quote_supports_altitude_price_cited_as_evidence_is_rejected() -> None:
     """HEADLINE adversarial test: a model citing a PRICE span as altitude
     evidence must be rejected. The quote genuinely appears on the page
-    (whole-phrase containment passes) and even contains a digit run that
+    (authentic single-segment span) and even contains a digit run that
     numerically equals the claimed altitude (``$18.00`` -> ``"1800"`` once
     the thousands-separator-elision in :func:`_numeric_tokens` strips the
     decimal point) — so digit presence ALONE is not enough. What must
@@ -2464,19 +2466,18 @@ def test_quote_supports_value_price_cited_as_altitude_evidence_is_rejected() -> 
         "1800masl",
         "elevation of 1800 metres",
         "at 1800 above sea level",
+        "1800 above sea level",
         "altitude of 1800",
     ],
 )
-def test_quote_supports_value_altitude_genuinely_verified_flips_on_page(
-    evidence_quote: str,
-) -> None:
-    """A quote that both (a) actually appears on the page and (b) genuinely
-    supports the value — a matching digit run with an elevation cue
-    PROXIMATE to it (:data:`bean_sourcing._ALTITUDE_CUE_PROXIMITY_WINDOW`),
-    in any of the accepted forms (comma-grouped digits, a glued unit, a
-    different cue word, the multi-word "above sea level" phrase, or a cue
-    BEFORE the digits) — flips ``altitude_m`` to code-verified
-    ``"on_page"``."""
+def test_quote_supports_altitude_genuinely_verified_flips_on_page(evidence_quote: str) -> None:
+    """A quote that both (a) is an authentic single-segment page span and
+    (b) genuinely supports the value — a matching digit run with an
+    elevation cue PROXIMATE to it
+    (:data:`bean_sourcing._ALTITUDE_CUE_PROXIMITY_WINDOW`), in any of the
+    accepted forms (comma-grouped digits, a glued unit, a different cue
+    word, the complete "above sea level" phrase, or a cue BEFORE the
+    digits) — flips ``altitude_m`` to code-verified ``"on_page"``."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(altitude_m=1800, altitude_m_evidence=evidence_quote)
     )
@@ -2488,13 +2489,14 @@ def test_quote_supports_value_altitude_genuinely_verified_flips_on_page(
     assert draft.field_sources["altitude_m"] == "on_page"
 
 
-def test_quote_supports_value_altitude_review_count_laundering_demotes() -> None:
-    """#590 D2b fold 1 (security-reviewer): a quote can be genuine page
-    text and contain BOTH a number equal to the claimed altitude and an
-    elevation-cue word — while the number is actually a review count and
-    the cue belongs to an unrelated sentence about the shop's physical
-    elevation/directions. Whole-quote co-presence used to launder this;
-    the cue must now be PROXIMATE to the matching digit token."""
+def test_quote_supports_altitude_review_count_laundering_demotes() -> None:
+    """A quote can be genuine page text and contain BOTH a number equal to
+    the claimed altitude and an elevation-cue word — while the number is
+    actually a review count and the cue belongs to a different sentence
+    about the shop's physical elevation/directions. This quote also spans
+    a sentence boundary internally ("...this year. View..."), so it fails
+    the fix-3 authenticity check (:func:`bean_sourcing._is_authentic_span`)
+    outright — it was never a genuine single-segment span."""
     corpus = (
         "Free shipping on all orders. Customer reviews: 1,800 5-star ratings this year. "
         "View our shop's elevation and directions on the map page for visiting hours."
@@ -2509,10 +2511,10 @@ def test_quote_supports_value_altitude_review_count_laundering_demotes() -> None
     assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
-def test_quote_supports_value_altitude_phone_number_laundering_demotes() -> None:
-    """The phone-number variant of the same laundering class: the digits
-    are a toll-free number, not an altitude, and the nearest elevation cue
-    is far outside the proximity window."""
+def test_quote_supports_altitude_phone_number_laundering_demotes() -> None:
+    """The phone-number variant of the same laundering class also spans a
+    sentence boundary ("...order. Our elevation-view...") and fails
+    authenticity."""
     quote = "Call 1800 555 0100 to place an order. Our elevation-view tasting room is open daily."
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(altitude_m=1800, altitude_m_evidence=quote)
@@ -2525,10 +2527,49 @@ def test_quote_supports_value_altitude_phone_number_laundering_demotes() -> None
     assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
-def test_quote_supports_value_altitude_fabricated_quote_demotes() -> None:
+def test_quote_supports_altitude_punctuation_glued_launder_demotes() -> None:
+    """#590 D2b fix 2 (SH8b9) HEADLINE repro: a colon/semicolon/hyphen-glued
+    chain used to whitespace-tokenize into ONE token, putting the digits
+    and "elevation" at proximity distance 0 (always inside the window,
+    regardless of how far apart they really are). Retokenizing on
+    punctuation AND whitespace (:func:`bean_sourcing._proximity_tokens`)
+    fixes the distance computation; this exact quote also contains ';'
+    (a fix-3 sentence boundary), so it fails authenticity too — both
+    fixes converge on the same demote."""
+    quote = "Reviews:1,800;shipping;shop-elevation-map"
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800, altitude_m_evidence=quote)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=f"{_IDENTITY_PAGE_TEXT} {quote}",
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+def test_quote_supports_altitude_stock_level_launder_demotes() -> None:
+    """#590 D2b fix 1 (SH8bw) HEADLINE repro: standalone "level" used to be
+    an elevation cue, so "Stock level: 1,800 bags" (a genuine, single-
+    sentence, authentic page span) verified a confabulated altitude off
+    the bare word "level" alone. Dropping standalone above/sea/level (now
+    only the complete "above sea level" phrase counts) closes this."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800, altitude_m_evidence="Stock level: 1,800 bags")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="Stock level: 1,800 bags remain in inventory.",
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+def test_quote_supports_altitude_fabricated_quote_demotes() -> None:
     """A quote that genuinely WOULD support the value if it were real page
     text, but is never actually on the page (a fabricated citation), must
-    still demote — the whole-phrase-in-corpus check is the first gate."""
+    still demote — the authentic-single-segment-span check is the first
+    gate."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(altitude_m=1800, altitude_m_evidence="grown at 1,800 masl")
     )
@@ -2540,111 +2581,63 @@ def test_quote_supports_value_altitude_fabricated_quote_demotes() -> None:
     assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
-def test_quote_supports_value_processing_washed_with_process_cue_flips_on_page() -> None:
+def test_quote_supports_altitude_cross_sentence_splice_demotes() -> None:
+    """#590 D2b fix 3 (SH8b8) HEADLINE repro: whole-corpus normalized
+    containment turns a sentence-ending period into a space, so
+    "...at 1800." + "Masl is..." (two DIFFERENT sentences) reads as the
+    contiguous phrase "1800 masl" once normalized — a fabricated citation
+    that was never actually written together. The authentic-span check
+    (:func:`bean_sourcing._is_authentic_span`) requires the quote to be a
+    whole-phrase match WITHIN a single corpus segment, closing this."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
-        _identity_args(processing="washed", processing_evidence="fully washed process")
+        _identity_args(altitude_m=1800, altitude_m_evidence="1800 masl")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
         identity,
         url="https://vendor.example/products/kenya",
-        corpus="This lot went through a fully washed process before drying.",
+        corpus="This farm sits at 1800. Masl is the unit used here.",
     )
-    assert draft.field_sources["processing"] == "on_page"
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
-def test_quote_supports_value_processing_honey_tasting_note_collision_demotes() -> None:
-    """The homonym collision D2b must close: ``processing="honey"`` is BOTH
-    a processing method name AND a common tasting-note word. A quote that
-    is genuinely on the page and genuinely contains the word "honey" but
-    is actually a TASTING NOTE, not a process statement, must not verify —
-    there is no independent process cue (:data:`bean_sourcing._PROCESS_CUES`
-    minus the value's own word) anywhere in the quote."""
+def test_quote_supports_altitude_real_single_sentence_quote_verifies() -> None:
+    """The positive mirror of the cross-sentence-splice case: a quote that
+    genuinely sits within ONE sentence, surrounded by other sentences on
+    both sides, still verifies."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
-        _identity_args(processing="honey", processing_evidence="notes of honey and citrus")
+        _identity_args(altitude_m=1800, altitude_m_evidence="1800 masl elevation")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
         identity,
         url="https://vendor.example/products/kenya",
-        corpus="Tasting notes of honey and citrus with a syrupy body.",
+        corpus=(
+            "Random intro text. This farm sits at 1800 masl elevation. More text follows after."
+        ),
+    )
+    assert draft.field_sources["altitude_m"] == "on_page"
+
+
+def test_draft_from_identity_processing_and_species_always_demote_in_d2b() -> None:
+    """#590 D2b Codex round-1 (SH8b4/SH8b7): ``processing``/``bean_species``
+    demote unconditionally, even with a genuine, well-cued evidence quote —
+    sound enum verification is deferred to slice E."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            processing="washed",
+            processing_evidence="fully washed process",
+            bean_species="arabica",
+            bean_species_evidence="100% arabica",
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=(
+            f"{_IDENTITY_PAGE_TEXT} This lot went through a fully washed process before "
+            "drying. This is 100% arabica."
+        ),
     )
     assert draft.field_sources["processing"] == "origin_estimated"
-
-
-def test_quote_supports_value_processing_wet_hulled_bare_quote_demotes() -> None:
-    """#590 D2b fold 2 (security-reviewer): a compound enum value's DISPLAY
-    spelling can itself embed a :data:`bean_sourcing._PROCESS_CUES` token —
-    ``wet_hulled``'s display "wet hulled" contains "hulled", which is
-    itself a cue — so excluding only the raw literal ``"wet_hulled"`` left
-    the "independent cue" check vacuously satisfied by the SAME evidence
-    that satisfied display-presence. A bare "wet hulled" quote (no
-    separate "process"/"method" word) must now demote."""
-    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
-        _identity_args(processing="wet_hulled", processing_evidence="wet hulled")
-    )
-    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity,
-        url="https://vendor.example/products/indonesia",
-        corpus="This Sumatra lot is wet hulled, giving it a heavy body.",
-    )
-    assert draft.field_sources["processing"] == "origin_estimated"
-
-
-@pytest.mark.parametrize("evidence_quote", ["wet hulled process", "wet hulled method"])
-def test_quote_supports_value_processing_wet_hulled_with_independent_cue_flips_on_page(
-    evidence_quote: str,
-) -> None:
-    """The mirror positive case: a quote carrying a GENUINELY independent
-    process cue (beyond the display spelling's own "hulled") still
-    verifies."""
-    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
-        _identity_args(processing="wet_hulled", processing_evidence=evidence_quote)
-    )
-    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity,
-        url="https://vendor.example/products/indonesia",
-        corpus=f"This Sumatra lot uses the {evidence_quote}, giving it a heavy body.",
-    )
-    assert draft.field_sources["processing"] == "on_page"
-
-
-def test_quote_supports_value_processing_wet_hulled_absent_from_quote_demotes() -> None:
-    """The mirror negative case — a genuine, on-page quote that never
-    mentions the compound display spelling at all must still demote,
-    exercising the "neither display spelling matched" path."""
-    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
-        _identity_args(processing="wet_hulled", processing_evidence="fully washed process")
-    )
-    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity,
-        url="https://vendor.example/products/indonesia",
-        corpus="This lot went through a fully washed process before drying.",
-    )
-    assert draft.field_sources["processing"] == "origin_estimated"
-
-
-def test_quote_supports_value_bean_species_arabica_flips_on_page() -> None:
-    """``bean_species``'s display spelling alone is sufficient — the
-    species token itself IS the cue (#590 D2/E kickoff plan)."""
-    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
-        _identity_args(bean_species="arabica", bean_species_evidence="100% arabica")
-    )
-    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity,
-        url="https://vendor.example/products/kenya",
-        corpus=f"{_IDENTITY_PAGE_TEXT} This is 100% arabica.",
-    )
-    assert draft.field_sources["bean_species"] == "on_page"
-
-
-def test_quote_supports_value_bean_species_fabricated_quote_demotes() -> None:
-    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
-        _identity_args(bean_species="robusta", bean_species_evidence="100% robusta")
-    )
-    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity,
-        url="https://vendor.example/products/kenya",
-        corpus=_IDENTITY_PAGE_TEXT,  # never mentions robusta at all
-    )
     assert draft.field_sources["bean_species"] == "origin_estimated"
 
 
@@ -2680,62 +2673,24 @@ def test_draft_from_identity_absent_altitude_with_stray_evidence_quote_has_no_en
     assert "altitude_m" not in draft.field_sources
 
 
-@pytest.mark.parametrize(
-    "evidence_quote",
-    ["", "   ", None],
-)
-def test_quote_supports_value_fails_soft_on_malformed_quote(evidence_quote: str | None) -> None:
+@pytest.mark.parametrize("evidence_quote", ["", "   ", None])
+def test_quote_supports_altitude_fails_soft_on_malformed_quote(
+    evidence_quote: str | None,
+) -> None:
     """A blank/whitespace-only/``None`` evidence quote must demote, never
     raise (fail-soft is mandatory over untrusted model output)."""
-    corpus_normalized = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
-        "grown at 1800 masl"
-    )
     assert (
-        bean_sourcing._quote_supports_value(  # pyright: ignore[reportPrivateUsage]
-            1800, evidence_quote, corpus_normalized, "altitude_m"
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, evidence_quote, "grown at 1800 masl"
         )
         is False
     )
 
 
-def test_quote_supports_value_returns_false_for_none_value() -> None:
-    corpus_normalized = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
-        "grown at 1800 masl"
-    )
+def test_quote_supports_altitude_returns_false_for_none_value() -> None:
     assert (
-        bean_sourcing._quote_supports_value(  # pyright: ignore[reportPrivateUsage]
-            None, "grown at 1800 masl", corpus_normalized, "altitude_m"
-        )
-        is False
-    )
-
-
-def test_quote_supports_value_altitude_returns_false_for_a_non_int_value() -> None:
-    """Defensive: ``value`` is typed ``object`` on this function (it is
-    also called directly, e.g. by this test) — a mismatched type for the
-    ``"altitude_m"`` field fails soft rather than raising out of
-    ``str()``/:func:`bean_sourcing._numeric_tokens`."""
-    corpus_normalized = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
-        "grown at 1800 masl"
-    )
-    assert (
-        bean_sourcing._quote_supports_value(  # pyright: ignore[reportPrivateUsage]
-            "1800", "grown at 1800 masl", corpus_normalized, "altitude_m"
-        )
-        is False
-    )
-
-
-def test_quote_supports_value_returns_false_for_an_unrecognized_field() -> None:
-    """Defensive: any field name outside :data:`bean_sourcing._TYPED_CITATION_FIELDS`
-    (e.g. a free-text field routed here by mistake) fails soft to ``False``,
-    never raises or silently verifies."""
-    corpus_normalized = bean_sourcing._normalize_for_containment(  # pyright: ignore[reportPrivateUsage]
-        "Kenya Kiambu AA"
-    )
-    assert (
-        bean_sourcing._quote_supports_value(  # pyright: ignore[reportPrivateUsage]
-            "Kenya Kiambu AA", "Kenya Kiambu AA", corpus_normalized, "name"
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            None, "grown at 1800 masl", "grown at 1800 masl"
         )
         is False
     )
@@ -2760,25 +2715,51 @@ def test_numeric_tokens_flushes_a_trailing_digit_run_at_string_end() -> None:
     assert numeric_tokens("elevation 1850") == {"1850"}
 
 
-def test_enum_display_spellings_underscore_and_plain_forms() -> None:
-    display_spellings = bean_sourcing._enum_display_spellings  # pyright: ignore[reportPrivateUsage]
-    assert display_spellings("washed") == ("washed",)
-    assert display_spellings("wet_hulled") == ("wet hulled", "wet-hulled")
-
-
 def test_token_carries_altitude_cue_matches_a_substring_case_insensitively() -> None:
     token_carries_cue = bean_sourcing._token_carries_altitude_cue  # pyright: ignore[reportPrivateUsage]
     assert token_carries_cue("MASL") is True
     assert token_carries_cue("1800masl") is True
     assert token_carries_cue("shipping") is False
+    assert token_carries_cue("level") is False  # #590 D2b fix 1: no longer a cue
+
+
+def test_proximity_tokens_splits_on_punctuation_preserving_grouped_numbers() -> None:
+    """#590 D2b fix 2 (SH8b9): colon/semicolon/hyphen are hard boundaries,
+    but a comma/period directly between two digits is preserved."""
+    proximity_tokens = bean_sourcing._proximity_tokens  # pyright: ignore[reportPrivateUsage]
+    assert proximity_tokens("Reviews:1,800;shipping;shop-elevation-map") == [
+        "Reviews",
+        "1800",
+        "shipping",
+        "shop",
+        "elevation",
+        "map",
+    ]
+    assert proximity_tokens("1800masl") == ["1800masl"]
+
+
+def test_proximity_tokens_boundary_at_string_end_and_orphan_separators() -> None:
+    """A trailing comma right after a digit (nothing following it) is a
+    boundary, not an elision — covers the ``i + 1 < length`` guard — and a
+    leading/orphan punctuation mark with no accumulated token is dropped
+    without producing a spurious empty token."""
+    proximity_tokens = bean_sourcing._proximity_tokens  # pyright: ignore[reportPrivateUsage]
+    assert proximity_tokens("1800,") == ["1800"]
+    assert proximity_tokens(",,1800") == ["1800"]
+    assert proximity_tokens("abc,123") == ["abc", "123"]
+
+
+def test_above_sea_level_cue_indices_finds_the_contiguous_phrase() -> None:
+    indices = bean_sourcing._above_sea_level_cue_indices  # pyright: ignore[reportPrivateUsage]
+    assert indices(["1800", "above", "sea", "level"]) == [2]
+    assert indices(["1800", "above", "the", "level"]) == []
+    assert indices(["above", "sea"]) == []
 
 
 def test_altitude_evidence_supports_value_no_matching_digit_token_returns_false() -> None:
-    """#590 D2b fold 1: a quote that never mentions the value's digits at
-    all (even with cues present) must not verify — exercises the
-    ``digit_indices`` empty-list branch directly, since this quote never
-    reaches this function through ``_draft_from_identity`` if it also
-    fails the earlier whole-quote containment check."""
+    """A quote that never mentions the value's digits at all (even with
+    cues present) must not verify — exercises the ``digit_indices``
+    empty-list branch directly."""
     supports_value = bean_sourcing._altitude_evidence_supports_value  # pyright: ignore[reportPrivateUsage]
     assert supports_value(1800, "This is a wonderful high altitude lot") is False
 
@@ -2787,6 +2768,23 @@ def test_altitude_evidence_supports_value_no_cue_token_returns_false() -> None:
     """A matching digit token with NO cue token anywhere in the quote."""
     supports_value = bean_sourcing._altitude_evidence_supports_value  # pyright: ignore[reportPrivateUsage]
     assert supports_value(1800, "priced at 1800 dollars") is False
+
+
+def test_split_corpus_segments_drops_boundaries_and_skips_consecutive_ones() -> None:
+    """Consecutive boundary characters (e.g. ``". "`` then another
+    boundary) must not produce a spurious empty segment — exercises the
+    "boundary hit with an empty accumulator" no-op branch."""
+    split_segments = bean_sourcing._split_corpus_segments  # pyright: ignore[reportPrivateUsage]
+    assert split_segments("One. Two.. Three") == ["One", " Two", " Three"]
+    assert split_segments("No boundary at all") == ["No boundary at all"]
+    assert split_segments("Ends with a boundary.") == ["Ends with a boundary"]
+
+
+def test_is_authentic_span_blank_quote_returns_false() -> None:
+    """A quote that normalizes to blank (all punctuation, no words) must
+    fail soft to ``False`` rather than vacuously matching."""
+    is_authentic = bean_sourcing._is_authentic_span  # pyright: ignore[reportPrivateUsage]
+    assert is_authentic("...", "Some real page text.") is False
 
 
 # --- _draft_from_identity: honest imputation + conservative targets ---
