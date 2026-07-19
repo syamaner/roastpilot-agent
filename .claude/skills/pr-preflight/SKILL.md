@@ -1,6 +1,6 @@
 ---
 name: pr-preflight
-description: Run the full pre-open preflight on the current branch BEFORE opening a PR — gates, a size + data/logic split check, an adversarial self-critique, and the domain reviewer on the branch — so review findings and lint fold into the first push instead of becoming post-open rework. Use before opening any PR.
+description: Run the full pre-open preflight on the current branch BEFORE opening a PR — gates, a size + data/logic split check, an adversarial self-critique, the domain reviewer (incl. security-reviewer for external-input surfaces), and a draft-PR Codex diverse-lens loop before marking ready — so review findings and lint fold into the first push instead of becoming post-open rework. Use before opening any PR.
 ---
 
 Run this on the PR branch **before** `gh pr create`. The build's PR-flow metrics
@@ -80,6 +80,13 @@ Read your own diff as a hostile reviewer would. Check:
   recently-fixed anti-pattern + a grep signature); if your diff matches a signature, apply the
   same fix. **When you fix a CLASS of bug, ADD an entry** so the next sibling PR is warned — this
   is how the agent team externalises the shared memory it otherwise lacks;
+- **fix the CLASS, sweep the repo — never per-symptom (the round-2..N rework engine).** When a
+  finding (yours or a reviewer's) is one instance of a class — a sanitizer that misses one escape,
+  one un-normalized value, one un-mapped parse, one un-audited grant target — fix it in one place
+  (a shared helper) and `grep` the whole repo for siblings before pushing. A per-symptom patch just
+  moves the same finding to the next round on the next line; one categorical fix collapses the loop.
+  (This is what turned #587's whack-a-mole into a class-sweep, and what `security-reviewer` does by
+  design — sweep the category, not the instance.);
 - every **Architecture Invariant** the diff could touch (AGENTS.md): safety policy
   on every roaster write; controller owns the loop (advisor never gets MCP write
   tools); restart never auto-resumes heat/fan; Celsius only; plain `Enum` not
@@ -102,7 +109,7 @@ bots because this pass was skipped).
   `docs/review/untrusted-input-checklist.md`. This routing is **capability-based, not
   file-based**: it fires even when the diff touches none of the safety files — a brand-new
   fetch/parse surface is the highest-risk case *and* the easiest to miss (the #587 lesson:
-  a fetch endpoint took five post-open Codex rounds because no pre-open lens covered it).
+  a fetch endpoint took NINE post-open Codex rounds because no pre-open lens covered it).
   If class 6 (cross-feature contention with the roast loop) applies, ALSO run safety-reviewer;
 - test quality / coverage / acceptance-criteria coverage → **qa** (Agent);
 - otherwise, a general code-review pass over the diff.
@@ -121,8 +128,49 @@ prevented).
   defect is the system working. Remove the *catchable-pre-open* findings, not the
   review itself.
 
-## Only when 1–4 pass
+## 5. Fold the DIVERSE lens on a DRAFT before "ready" — draft → `@codex review` → fold
 
-Open the PR (`gh pr create`), then follow the **PR Merge Policy** in AGENTS.md
-(independent triage — the author never triages its own PR; every conversation
-resolved; `codecov/patch` green; squash-merge; delete the branch).
+Steps 1–4 are the Claude family (author + subagent reviewers); they share blind spots —
+a same-family lens co-accepts a bug the author already rationalised. **Codex is a
+different model family and catches exactly that class**, and the measured gap is large
+(#587: nine Codex rounds, all real; roastpilot-cloud F1-S8: 5 rounds, ~15 real P1s on a
+security keystone two Opus safety passes called clean — all post-open). Put Codex in the
+loop **while the PR is still a draft**, so its finds fold instead of becoming post-ready
+rework:
+
+1. Open the PR as a **draft** (`gh pr create --draft`).
+2. Trigger `@codex review` (one comment).
+3. **Wait for the verdict on the current head sha** — match Codex's `Reviewed commit:` to
+   the PR head sha; a **👀 reaction = still reviewing** (keep waiting), a **posted review =
+   findings**, a **👍 after 👀 = complete-clean** (the AGENTS.md Codex-wait signals — read
+   those, don't invent a timestamp threshold; the ~30-min-from-👀 stall + silent-fallback
+   windows there are the only sanctioned time-based exits).
+4. Fold every real finding **by CLASS** (step 3 — one categorical fix + repo-sweep, not
+   per-symptom), dismiss the rest in-thread with a reason.
+5. **Re-run the branch gates + domain review (steps 1–4) after any code change** — a Codex
+   fold can break a gate or reopen a review finding; the pre-ready results only count if
+   they reflect the final draft state.
+6. Re-trigger Codex only after a **settled** batch of folds (not on every intermediate
+   push — the draft phase is where iteration lives, but don't spam the trigger), and
+   re-match the new head sha.
+
+**Iterating with Codex here is expected and correct** — this is the pre-ready phase. The
+AGENTS.md **"once-on-final-commit, don't re-litigate"** rule governs the **post-ready**
+phase (a marked-ready PR heading to merge), where re-triggering across pushes is the churn
+we avoid. Draft = iterate to clean; ready = clean already.
+
+> Note on `claude-review`: opening a draft does run `.github/workflows/claude-code-review.yml`
+> (it listens to `opened`). That is fine — `claude-review` is **not** a required check and
+> passes-on-findings; its draft runs are cheap signal, not a gate. Don't churn on them.
+
+**KPI:** count **pre-ready Codex folds** as their own line in the PR body (alongside the
+step-4 pre-open review count). This does NOT redefine AGENTS.md's *pre-open* rework
+boundary (findings folded before the PR is *opened*) — a draft PR is open, so draft-phase
+folds are a distinct, additional shift-left category. Both counts trending up is the win.
+
+## Only when 1–5 pass
+
+Mark the PR **ready** (`gh pr ready`), then follow the **PR Merge Policy** in AGENTS.md
+(independent triage — the author never triages its own PR; every conversation resolved;
+`codecov/patch` green; the post-ready once-on-final-commit Codex discipline; squash-merge;
+delete the branch).

@@ -297,6 +297,16 @@ catches what a strong single lens misses; the constraint Codex must satisfy is *
 re-litigating resolved threads on every push*, which the once-on-final-commit discipline
 enforces. (Memory: `claude-review-not-a-required-check`.)
 
+**Draft phase vs ready phase (the shift-left reconciliation, D103-adjacent).** The
+once-on-final-commit rule above governs the **post-ready** phase — a marked-ready PR heading
+to merge, where re-triggering across pushes is re-litigation churn. It does **not** forbid
+iterating with Codex on a **draft** PR *before* it is marked ready: the `pr-preflight` skill's
+step 5 runs `@codex review` on the draft and folds by class until clean, which is exactly
+where the #587-style rounds belong (pre-ready folds, not post-open rework). Draft = iterate to
+clean (re-trigger on settled batches, not every push); ready = clean already, then
+once-on-final-commit applies. Opening a draft does run `claude-review` (`on: opened`) — fine,
+it is not a required check.
+
 **WAIT for Codex's verdict before merging (operator rule, 12 Jul — the #518 lesson):**
 Codex is often DELAYED relative to CI, and green-CI auto-merge can land a PR before its
 review posts (#518 merged with 3 real P2s in flight → fix-forward #519). Its lifecycle
