@@ -80,6 +80,16 @@ DEFAULT_ADVISOR_MODEL_BY_PHASE: dict[RoastPhase, str] = {
     RoastPhase.DEVELOPMENT: DEFAULT_ADVISOR_MODEL,
 }
 
+#: The canonical OpenRouter API base URL — :attr:`AdvisorConfig.provider_base_url`'s
+#: own default, and the single source of truth
+#: ``bean_sourcing._resolve_extraction_model_slug`` compares against to tell
+#: an actual OpenRouter endpoint apart from an arbitrary OTHER
+#: OpenAI-compatible endpoint (a local server, LiteLLM, etc. — ``provider ==
+#: "openai_compatible"`` covers ALL of those, not just OpenRouter, #590 P2
+#: fix). Kept here (not duplicated) so both call sites — and any future
+#: one — stay in lockstep with this one literal.
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
 
 class LateMaillardTrim(BaseModel):
     """Deterministic anticipatory heat-trim parameters, late Maillard → FC (D35 §3, #327).
@@ -1158,7 +1168,7 @@ class AdvisorConfig(BaseModel):
     provider: Literal["openai", "anthropic", "google", "ollama", "openai_compatible"] = (
         "openai_compatible"
     )
-    provider_base_url: str = "https://openrouter.ai/api/v1"
+    provider_base_url: str = OPENROUTER_BASE_URL
     api_key_env: str = Field(default="OPENROUTER_API_KEY", min_length=1)
     model_slug: str = Field(default=DEFAULT_ADVISOR_MODEL, min_length=1)
     # Phase-keyed model override map (#173). The MECHANISM for phase-dependent
@@ -1228,7 +1238,7 @@ class AdvisorConfig(BaseModel):
 
 
 class BeanSourcingConfig(BaseModel):
-    """Add-bean-from-URL fetch limits (#573 phase 1).
+    """Add-bean-from-URL fetch + extraction limits (#573 phase 1, #590 slice A).
 
     Governs the respectful, fail-soft vendor-page fetch in
     ``roastpilot_agent.bean_sourcing.draft_bean_profile_from_url``: a bounded
@@ -1236,10 +1246,17 @@ class BeanSourcingConfig(BaseModel):
     oversized or slow-drip response is never read fully into memory), and an
     identifying ``User-Agent`` (a vendor's own logs should be able to tell
     this traffic apart from a browser). The structured LLM extraction step
-    reuses the operator's already-configured :class:`AdvisorConfig` (BYOK)
-    rather than a duplicate provider config here — see
+    reuses the operator's already-configured :class:`AdvisorConfig` for
+    provider/key (BYOK) — see
     ``bean_sourcing.draft_bean_profile_from_url``'s ``advisor_config``
-    parameter.
+    parameter — but owns its OWN extraction timeout
+    (:attr:`extraction_timeout_seconds`), independent of the roast-advice
+    timeout :class:`AdvisorConfig` configures (#590 slice A: a one-shot
+    bean draft is not a per-tick advice call). The extraction MODEL
+    (:attr:`model_slug`) defaults to a PROVIDER-AWARE resolution rather
+    than a fixed slug — see :attr:`model_slug`'s own docstring — so a bean
+    draft neither rides whatever roast-advice model happens to be
+    configured nor sends an OpenRouter-prefixed slug to a native provider.
     """
 
     fetch_timeout_seconds: float = Field(default=10.0, gt=0)
@@ -1259,6 +1276,56 @@ class BeanSourcingConfig(BaseModel):
     )
     """Identifying ``User-Agent`` sent with the fetch — a courteous default a
     vendor can distinguish from a browser or an unlabelled scraper."""
+
+    extraction_timeout_seconds: float = Field(default=45.0, gt=0)
+    """Bound on the bean-identity extraction LLM call
+    (``bean_sourcing._extract_bean_identity``'s ``agent.run()``) —
+    deliberately a SEPARATE, LONGER budget than
+    :attr:`AdvisorConfig.timeout_seconds` (10 s), which bounds the
+    *per-tick roast-advice* call the live control loop makes once a second.
+    A bean draft is a one-shot request the operator explicitly triggers by
+    pasting a vendor URL and can wait ~30 s for; the 10 s advice budget
+    starved every call for the reasoning models tested in the bean-sourcing
+    bake-off (``gpt-5-nano``/``gpt-5-mini`` both scored 0/81 on the first
+    pass — see ``docs/advisor/bean-sourcing-bakeoff-2026-07-19.md``,
+    "Operational findings"). 45 s matches the budget the bake-off itself
+    used to get a fair read on those models."""
+
+    model_slug: str | None = Field(default=None, min_length=1)
+    """An explicit extraction model slug, independent of whatever model
+    :class:`AdvisorConfig` has configured for roast advice — bean drafting
+    must not silently ride a roast-advice model swap. ``None`` (the
+    default) means "resolve provider-aware" rather than "use a fixed slug"
+    — see ``bean_sourcing._resolve_extraction_model_slug``:
+
+    - When the advisor is actually pointed at **OpenRouter** — i.e.
+      :attr:`AdvisorConfig.provider` is ``"openai_compatible"`` AND
+      :attr:`AdvisorConfig.provider_base_url` matches :data:`OPENROUTER_BASE_URL`
+      (the BYOK-OpenRouter path the bake-off used) — it resolves to
+      ``"openai/gpt-5-mini"``, the bean-sourcing extraction bake-off's
+      screening pick (``docs/advisor/bean-sourcing-bakeoff-2026-07-19.md``:
+      best macro-F1/recall of any model with zero page errors, ~1/8 the
+      cost of the ``gpt-4o`` ceiling). That bake-off ran on the pre-#590
+      extraction pipeline and is explicitly flagged there as a SCREENING
+      pick to re-confirm once the #590 preprocessing (extruct/trafilatura)
+      lands, not a locked decision. ``provider == "openai_compatible"``
+      ALONE is not enough to key this on (a P2 caught in review, after the
+      P1 below): that provider setting also covers ANY OTHER
+      OpenAI-compatible endpoint (a local server, LiteLLM, etc. via a
+      custom ``provider_base_url``), which does not necessarily serve
+      ``"openai/gpt-5-mini"`` either.
+    - For anything else — a NATIVE provider (``openai``/``anthropic``/
+      ``google``/``ollama``), OR an ``openai_compatible`` provider pointed
+      at a non-OpenRouter endpoint — it resolves to
+      ``advisor_config.model_slug`` instead. The OpenRouter-prefixed
+      ``"openai/gpt-5-mini"`` slug is meaningless (or silently wrong-vendor)
+      against those, which made every extraction fail whenever the
+      operator's advisor was configured that way (a P1 caught in review on
+      the PR that introduced this field, before merge).
+
+    Set this explicitly to opt OUT of the provider-aware default and pin a
+    specific slug regardless of provider (e.g. the bake-off harness does
+    this per roster model under test)."""
 
 
 class SafetyLimits(BaseModel):

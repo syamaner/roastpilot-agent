@@ -12,6 +12,7 @@ import pytest
 
 from roastpilot_agent.config import (
     DEFAULT_ADVISOR_MODEL,
+    OPENROUTER_BASE_URL,
     AdvisorConfig,
     AppConfig,
     BeanSourcingConfig,
@@ -116,6 +117,10 @@ def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
     config = AdvisorConfig()
     assert config.provider == "openai_compatible"
     assert config.provider_base_url == "https://openrouter.ai/api/v1"
+    # Drift guard (#590 P2 fix): AdvisorConfig's own default must stay in
+    # lockstep with the shared OPENROUTER_BASE_URL constant
+    # bean_sourcing._resolve_extraction_model_slug compares against.
+    assert config.provider_base_url == OPENROUTER_BASE_URL
     assert config.api_key_env == "OPENROUTER_API_KEY"
     # #277 post-FC control bake-off PIN (21 Jun): gpt-4o via OpenRouter — closest
     # to the operator's real heat moves (heat MAE ~7.5 pp) and the proven n8n
@@ -265,12 +270,20 @@ def test_app_config_defaults_without_env(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_bean_sourcing_config_defaults() -> None:
-    """#573 phase 1: sane, conservative add-bean-from-URL fetch limits."""
+    """#573 phase 1 + #590 slice A: sane, conservative add-bean-from-URL
+    fetch limits, and a dedicated (longer) extraction timeout, decoupled
+    from the roast-advice config. ``model_slug`` defaults to ``None`` — a
+    sentinel meaning "resolve provider-aware"
+    (``bean_sourcing._resolve_extraction_model_slug``, #590 P1 fix), not a
+    fixed OpenRouter slug that would be invalid against a native advisor
+    provider."""
     config = BeanSourcingConfig()
     assert config.fetch_timeout_seconds == 10.0
     assert config.max_response_bytes == 2_000_000
     assert config.user_agent
     assert "RoastPilotAgent" in config.user_agent
+    assert config.extraction_timeout_seconds == 45.0
+    assert config.model_slug is None
 
 
 @pytest.mark.parametrize(
@@ -280,6 +293,9 @@ def test_bean_sourcing_config_defaults() -> None:
         {"fetch_timeout_seconds": -1},
         {"max_response_bytes": 0},
         {"user_agent": ""},
+        {"extraction_timeout_seconds": 0},
+        {"extraction_timeout_seconds": -1},
+        {"model_slug": ""},
     ],
 )
 def test_bean_sourcing_config_rejects_nonsense(overrides: dict[str, object]) -> None:
