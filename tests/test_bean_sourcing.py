@@ -2665,19 +2665,67 @@ def test_canonical_product_locator_resolves_relative_and_normalizes() -> None:
     locator = bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
         "/products/kenya-kiambu/", base_url="https://Vendor.example/other-page"
     )
-    assert locator == "vendor.example/products/kenya-kiambu"
+    assert locator == bean_sourcing._CanonicalLocator(  # pyright: ignore[reportPrivateUsage]
+        host_path="vendor.example/products/kenya-kiambu", query=""
+    )
 
 
-def test_canonical_product_locator_ignores_scheme_and_query() -> None:
-    a = bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
+def test_canonical_product_locator_ignores_scheme_but_preserves_query() -> None:
+    """Scheme is still ignored for identity (http/https don't discriminate),
+    but the query is now PRESERVED on the locator itself (#590 P2 fix) —
+    whether it discriminates a MATCH is `_locators_identity_match`'s job,
+    not this function's."""
+    with_query = bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
         "http://vendor.example/products/kenya-kiambu?ref=email",
         base_url="https://vendor.example/products/kenya-kiambu",
     )
-    b = bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
+    without_query = bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
         "https://vendor.example/products/kenya-kiambu",
         base_url="https://vendor.example/products/kenya-kiambu",
     )
-    assert a == b == "vendor.example/products/kenya-kiambu"
+    assert with_query is not None
+    assert without_query is not None
+    assert with_query.host_path == without_query.host_path == "vendor.example/products/kenya-kiambu"
+    assert with_query.query == "ref=email"
+    assert without_query.query == ""
+
+
+def test_canonical_product_locator_normalizes_query_param_order() -> None:
+    a = bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
+        "https://vendor.example/p?a=1&b=2", base_url="https://vendor.example/p"
+    )
+    b = bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
+        "https://vendor.example/p?b=2&a=1", base_url="https://vendor.example/p"
+    )
+    assert a == b
+
+
+def test_locators_identity_match_requires_same_host_path() -> None:
+    a = bean_sourcing._CanonicalLocator(host_path="vendor.example/p", query="")  # pyright: ignore[reportPrivateUsage]
+    b = bean_sourcing._CanonicalLocator(host_path="vendor.example/other", query="")  # pyright: ignore[reportPrivateUsage]
+    assert bean_sourcing._locators_identity_match(a, b) is False  # pyright: ignore[reportPrivateUsage]
+
+
+def test_locators_identity_match_rejects_a_discriminating_query_mismatch() -> None:
+    """`?id=kenya` vs `?id=ethiopia` on the SAME path must NOT cross-match
+    (#590 P2 fix) — the query is a real identity discriminator here (a
+    query-param-selected product, or a Shopify `?variant=...`)."""
+    kenya = bean_sourcing._CanonicalLocator(host_path="vendor.example/p", query="id=kenya")  # pyright: ignore[reportPrivateUsage]
+    ethiopia = bean_sourcing._CanonicalLocator(  # pyright: ignore[reportPrivateUsage]
+        host_path="vendor.example/p", query="id=ethiopia"
+    )
+    assert bean_sourcing._locators_identity_match(kenya, ethiopia) is False  # pyright: ignore[reportPrivateUsage]
+
+
+def test_locators_identity_match_allows_a_query_less_side_to_match_either_way() -> None:
+    """A JSON-LD block's own url commonly omits a page's variant/tracking
+    query entirely — a query-less side must still match a query-bearing
+    one on the SAME path (#590 P2 fix), or the block is lost even though it
+    IS the right product."""
+    with_query = bean_sourcing._CanonicalLocator(host_path="vendor.example/p", query="id=kenya")  # pyright: ignore[reportPrivateUsage]
+    without_query = bean_sourcing._CanonicalLocator(host_path="vendor.example/p", query="")  # pyright: ignore[reportPrivateUsage]
+    assert bean_sourcing._locators_identity_match(with_query, without_query) is True  # pyright: ignore[reportPrivateUsage]
+    assert bean_sourcing._locators_identity_match(without_query, with_query) is True  # pyright: ignore[reportPrivateUsage]
 
 
 def test_canonical_product_locator_rejects_malformed_value() -> None:
@@ -2828,6 +2876,49 @@ def test_select_identity_matched_product_returns_none_for_malformed_target_url()
         )
         is None
     )
+
+
+def test_select_identity_matched_product_query_discriminates_between_variants() -> None:
+    """#590 P2 fix: two blocks sharing a path but DIFFERENT identity-bearing
+    queries (a query-param-selected origin, or a Shopify ``?variant=...``)
+    must not cross-match — the requested URL's query picks the right one."""
+    raw_items: list[dict[str, object]] = [
+        {
+            "@type": "Product",
+            "name": "Kenya",
+            "url": "https://vendor.example/product?id=kenya",
+        },
+        {
+            "@type": "Product",
+            "name": "Ethiopia",
+            "url": "https://vendor.example/product?id=ethiopia",
+        },
+    ]
+    kenya_match = bean_sourcing._select_identity_matched_product(  # pyright: ignore[reportPrivateUsage]
+        raw_items, url="https://vendor.example/product?id=kenya"
+    )
+    ethiopia_match = bean_sourcing._select_identity_matched_product(  # pyright: ignore[reportPrivateUsage]
+        raw_items, url="https://vendor.example/product?id=ethiopia"
+    )
+    assert kenya_match is not None and kenya_match["name"] == "Kenya"
+    assert ethiopia_match is not None and ethiopia_match["name"] == "Ethiopia"
+
+
+def test_select_identity_matched_product_matches_query_less_json_ld_against_query_bearing_url() -> (
+    None
+):
+    """#590 P2 fix: a JSON-LD block whose OWN url omits the page's variant/
+    tracking query must still match a requested URL that carries one — a
+    query-less side is not itself discriminating, so the block that IS the
+    right product is not lost."""
+    raw_items: list[dict[str, object]] = [
+        {"@type": "Product", "name": "Kenya", "url": "https://vendor.example/product"}
+    ]
+    matched = bean_sourcing._select_identity_matched_product(  # pyright: ignore[reportPrivateUsage]
+        raw_items, url="https://vendor.example/product?variant=12345"
+    )
+    assert matched is not None
+    assert matched["name"] == "Kenya"
 
 
 def test_facts_from_product_block_unwraps_nested_brand_object() -> None:
@@ -3078,6 +3169,56 @@ async def test_fetch_page_text_fails_soft_on_a_page_with_malformed_json_ld() -> 
         )
     assert "Structured data found in this page" not in text
     assert "Kenya Kiambu AA" in text
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_identity_matches_json_ld_against_final_redirected_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#590 slice B P1 fix: a redirect (bare -> www here, but equally
+    http->https/trailing-slash/slug canonicalisation) means the fetched
+    HTML's own JSON-LD reflects the FINAL URL, not the operator-supplied
+    one — identity-match must run against the URL _fetch_with_ssrf_guard
+    actually landed on. Before the fix this JSON-LD (whose ``url`` is the
+    REDIRECTED, not the original, URL) would never match."""
+    original_host = "vendor.example"
+    redirected_host = "www.vendor.example"
+    original_url = f"https://{original_host}/products/kenya-kiambu"
+    redirected_url = f"https://{redirected_host}/products/kenya-kiambu"
+    host_ips = {original_host: "93.184.216.34", redirected_host: "93.184.216.35"}
+    page_with_json_ld = _html_with_json_ld(
+        '<script type="application/ld+json">'
+        f'{{"@type": "Product", "name": "Kenya Kiambu AA", "sku": "KE-REDIRECTED", '
+        f'"url": "{redirected_url}"}}'
+        "</script>"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        host_header = request.headers.get("host")
+        if host_header == original_host:
+            return httpx.Response(302, headers={"Location": redirected_url})
+        assert host_header == redirected_host
+        return httpx.Response(200, content=_bytes_stream(page_with_json_ld.encode()))
+
+    transport = httpx.MockTransport(handler)
+    real_async_client = httpx.AsyncClient
+
+    def fake_async_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        return real_async_client(transport=transport)
+
+    async def fake_getaddrinfo(
+        host: str, port: int, *, type: int
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        return [(None, None, None, "", (host_ips[host], port))]
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
+    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+        original_url, config=BeanSourcingConfig()
+    )
+    assert "Structured data found in this page's JSON-LD" in text
+    assert "KE-REDIRECTED" in text
 
 
 # --- #590 slice B: reaches the extraction prompt (draft_bean_profile_from_url) ---
@@ -3449,6 +3590,35 @@ async def test_draft_bean_profile_from_url_never_logs_a_query_param_secret(
             model=_function_model_returning(_identity_args()),
         )
     assert draft.name
+    assert caplog.records, "expected at least the fetching/drafted info logs"
+    for record in caplog.records:
+        assert "s3cr3t-query-token" not in record.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_json_ld_match_never_logs_a_query_param_secret(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """#590 P2 fix regression guard: the identity-match locator now carries
+    the query (previously dropped), so a page with a MATCHING JSON-LD block
+    exercises that new code path on a secret-bearing requested URL — the
+    locator is purely in-memory (never logged/stored); confirms
+    ``_redact_url_credentials``/``_redact_query`` (#587, unchanged by this
+    fix) still strip the token from every log line and the persisted
+    ``source_url``. The JSON-LD block's own (query-less, canonical) url
+    still matches per the query-less-side rule."""
+    caplog.set_level(logging.INFO, logger="roastpilot_agent.bean_sourcing")
+    page_with_json_ld = _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT)
+    async with _mock_client(_html_response(200, page_with_json_ld)) as http_client:
+        draft = await draft_bean_profile_from_url(
+            f"{_MATCHING_JSON_LD_URL}?access_token=s3cr3t-query-token",
+            advisor_config=_ADVISOR_CONFIG,
+            http_client=http_client,
+            model=_function_model_returning(_identity_args()),
+        )
+    assert draft.name
+    assert draft.source_url is not None
+    assert "s3cr3t-query-token" not in draft.source_url
     assert caplog.records, "expected at least the fetching/drafted info logs"
     for record in caplog.records:
         assert "s3cr3t-query-token" not in record.getMessage()

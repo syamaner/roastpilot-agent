@@ -143,7 +143,7 @@ import zlib
 from dataclasses import dataclass
 from html import unescape
 from typing import Any, cast
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import extruct  # type: ignore[import-untyped]
 import httpx
@@ -1025,7 +1025,7 @@ async def _fetch_with_ssrf_guard(
     headers: dict[str, str],
     timeout: httpx.Timeout,
     config: BeanSourcingConfig,
-) -> str:
+) -> tuple[str, str]:
     """Fetch ``url`` on the internally-constructed client, following
     redirects MANUALLY (#587 fix 1) with every hop's connection PINNED to
     one of its validated addresses (#587 fix 1b, closes the DNS-rebinding
@@ -1064,7 +1064,9 @@ async def _fetch_with_ssrf_guard(
         config: Response-size-cap settings.
 
     Returns:
-        The decoded body of the final, non-redirect response.
+        A ``(body, final_url)`` pair (#590 P1 fix — the fetched HTML's own
+        JSON-LD reflects the FINAL, possibly-redirected URL, not the
+        operator-supplied one).
 
     Raises:
         BeanFetchError: A destination rejected by the SSRF guard at any hop,
@@ -1087,7 +1089,7 @@ async def _fetch_with_ssrf_guard(
         if is_redirect:
             current_url = result
             continue
-        return result
+        return result, current_url
     raise BeanFetchError(f"too many redirects (> {_MAX_REDIRECTS}) fetching {url!r}")
 
 
@@ -1145,24 +1147,29 @@ def _clean_json_ld_text(value: object) -> str | None:
     return stripped[:_MAX_JSON_LD_FIELD_CHARS] or None
 
 
-def _canonical_product_locator(value: str, *, base_url: str) -> str | None:
-    """Normalise a JSON-LD identity candidate for an IDENTITY comparison
-    against the fetched page's URL (#590 slice B).
+@dataclass(frozen=True)
+class _CanonicalLocator:
+    """A normalised (host+path, query) IDENTITY locator (#590 P2 fix) —
+    kept in-memory only; ``_redact_url_credentials``/``_redact_query``
+    (#587) are unchanged and still gate everything logged/persisted."""
 
-    Resolves ``value`` against ``base_url`` (a JSON-LD ``url``/``@id`` is
-    commonly page-relative), then reduces it to lower-cased host + path
-    (trailing slash/query/fragment dropped) — scheme/query differences
-    commonly do not change product identity, so this avoids spurious
-    non-matches while still requiring the SAME product path.
+    host_path: str
+    query: str
+
+
+def _canonical_product_locator(value: str, *, base_url: str) -> _CanonicalLocator | None:
+    """Resolve ``value`` (untrusted) against ``base_url`` and reduce it to
+    lower-cased host+path (trailing slash/fragment dropped) plus a sorted,
+    order/encoding-normalised query (#590 slice B; query preserved, #590 P2
+    fix — ``?id=kenya`` must discriminate).
 
     Args:
-        value: The candidate URL/``@id`` string (untrusted).
+        value: The candidate URL/``@id`` string.
         base_url: The URL to resolve a relative ``value`` against.
 
     Returns:
-        The normalised ``"host/path"`` locator, or ``None`` if ``value``
-        does not resolve to a well-formed ``http``/``https`` URL with a
-        host — never raises.
+        The normalised locator, or ``None`` if not a well-formed
+        ``http``/``https`` URL with a host — never raises.
     """
     try:
         absolute = urljoin(base_url, value)
@@ -1172,20 +1179,22 @@ def _canonical_product_locator(value: str, *, base_url: str) -> str | None:
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         return None
     path = parsed.path.rstrip("/") or "/"
-    return f"{parsed.hostname.lower()}{path}"
+    query = urlencode(sorted(parse_qsl(parsed.query, keep_blank_values=True)))
+    return _CanonicalLocator(host_path=f"{parsed.hostname.lower()}{path}", query=query)
+
+
+def _locators_identity_match(a: _CanonicalLocator, b: _CanonicalLocator) -> bool:
+    """Same product? Host+path must match; query only discriminates when
+    BOTH sides carry one (#590 P2 fix — a query-less side, the common case
+    for a JSON-LD block's own url, matches any query on the other)."""
+    return a.host_path == b.host_path and (not a.query or not b.query or a.query == b.query)
 
 
 def _is_product_type(type_value: object) -> bool:
-    """Whether a JSON-LD ``@type`` value names schema.org ``Product`` (#590
-    slice B) — tolerant of a bare string, a list of types, or a full
-    schema.org URI (matched on the final segment). Case-sensitive.
-
-    Args:
-        type_value: The raw ``@type`` value (any JSON shape).
-
-    Returns:
-        Whether any element names ``Product``.
-    """
+    """Whether a JSON-LD ``@type`` value (any JSON shape) names schema.org
+    ``Product`` (#590 slice B) — tolerant of a bare string, a list of
+    types, or a full schema.org URI (matched on the final segment).
+    Case-sensitive."""
     values = cast("list[object]", type_value) if isinstance(type_value, list) else [type_value]
     for value in values:
         if isinstance(value, str) and value.rsplit("/", 1)[-1].rsplit("#", 1)[-1] == "Product":
@@ -1194,17 +1203,10 @@ def _is_product_type(type_value: object) -> bool:
 
 
 def _product_blocks_from_items(raw_items: list[dict[str, object]]) -> list[dict[str, object]]:
-    """Collect every schema.org Product block out of ``raw_items`` (#590
-    slice B), including one level of ``@graph`` nesting (the common
-    WooCommerce/Yoast wrapper pattern). Bounds recursion to one level and
-    caps inspection at :data:`_MAX_JSON_LD_ITEMS` blocks.
-
-    Args:
-        raw_items: Every top-level JSON-LD item found on the page.
-
-    Returns:
-        Every block whose ``@type`` names ``Product``, in document order.
-    """
+    """Collect every ``@type`` == ``Product`` block out of ``raw_items``
+    (#590 slice B), in document order, including one level of ``@graph``
+    nesting (the common WooCommerce/Yoast wrapper). Bounds recursion to one
+    level and caps inspection at :data:`_MAX_JSON_LD_ITEMS` blocks."""
     blocks: list[dict[str, object]] = []
     inspected = 0
     for item in raw_items:
@@ -1230,17 +1232,10 @@ def _product_blocks_from_items(raw_items: list[dict[str, object]]) -> list[dict[
 
 
 def _product_identity_candidates(block: dict[str, object]) -> list[str]:
-    """Every URL-shaped identity signal a Product block can carry (#590
-    slice B): ``@id``, ``url``, and any ``offers[].url`` (single object or
-    list, both valid schema.org shapes).
-
-    Args:
-        block: A parsed JSON-LD block whose ``@type`` names ``Product``.
-
-    Returns:
-        Every candidate found (non-string/missing skipped), ``@id``/``url``/
-        offers order.
-    """
+    """Every URL-shaped identity signal ``block`` (a JSON-LD ``Product``)
+    can carry (#590 slice B), ``@id``/``url``/offers order: ``@id``,
+    ``url``, and any ``offers[].url`` (single object or list, both valid
+    schema.org shapes); non-string/missing values skipped."""
     candidates: list[str] = []
     for key in ("@id", "url"):
         value = block.get(key)
@@ -1262,10 +1257,9 @@ def _select_identity_matched_product(
     raw_items: list[dict[str, object]], *, url: str
 ) -> dict[str, object] | None:
     """Select the JSON-LD Product block that IDENTITY-matches ``url`` (#590
-    slice B, the README §2 gate): a block is trusted only when one of its
-    OWN identity signals (:func:`_product_identity_candidates`) resolves to
-    the SAME normalised locator (:func:`_canonical_product_locator`) as
-    ``url`` — conservative by construction, a stale/variant block or no
+    slice B, README §2): trusted only when one of its OWN identity signals
+    (:func:`_product_identity_candidates`) locator-matches
+    (:func:`_locators_identity_match`) ``url`` — a stale/variant block or no
     match falls through to the LLM-only path.
 
     Args:
@@ -1280,23 +1274,16 @@ def _select_identity_matched_product(
         return None
     for block in _product_blocks_from_items(raw_items):
         for candidate in _product_identity_candidates(block):
-            if _canonical_product_locator(candidate, base_url=url) == target:
+            locator = _canonical_product_locator(candidate, base_url=url)
+            if locator is not None and _locators_identity_match(locator, target):
                 return block
     return None
 
 
 def _facts_from_product_block(block: dict[str, object]) -> _JsonLdProductFacts:
-    """Read the small set of trusted textual facts off an identity-matched
-    Product block (#590 slice B).
-
-    Args:
-        block: An identity-matched JSON-LD Product block.
-
-    Returns:
-        The extracted, cleaned facts (:func:`_clean_json_ld_text`) — a
-        ``brand`` given as a nested ``{"name": ...}`` object (the common
-        schema.org shape) is unwrapped to its name.
-    """
+    """Read the small set of trusted, cleaned (:func:`_clean_json_ld_text`)
+    textual facts off an identity-matched Product ``block`` (#590 slice B)
+    — a ``brand`` given as a nested ``{"name": ...}`` object is unwrapped."""
     brand = block.get("brand")
     brand_name: object = (
         cast("dict[str, object]", brand).get("name") if isinstance(brand, dict) else brand
@@ -1312,17 +1299,9 @@ def _facts_from_product_block(block: dict[str, object]) -> _JsonLdProductFacts:
 def _format_json_ld_context(facts: _JsonLdProductFacts) -> str | None:
     """Format ``facts`` as a short, clearly-labelled DATA section for the
     extraction prompt (#590 slice B) — never an instruction role (checklist
-    class 7): still attacker-influenceable content, so the header states
-    provenance only (deliberately not "verified"/"confirmed", which could
-    itself read as an elevated-trust directive) and says explicitly this
-    is data, not instructions.
-
-    Args:
-        facts: The identity-matched block's extracted textual facts.
-
-    Returns:
-        The formatted context block, or ``None`` when every field absent.
-    """
+    class 7): header states provenance only, not "verified"/"confirmed"
+    (could read as an elevated-trust directive), and says explicitly this
+    is data, not instructions. ``None`` when every field is absent."""
     lines = [
         f"- {label}: {value}"
         for label, value in (
@@ -1346,29 +1325,26 @@ def _parse_html_for_json_ld(html: str) -> list[dict[str, object]]:
     """Safely parse ``html`` and return every top-level JSON-LD item (#590
     slice B — the XXE-safety crux).
 
-    **Parser/syntax choice.** Uses ``lxml.html.HTMLParser`` (HTML, not XML,
-    parsing mode) with ``no_network=True``. Verified directly (not assumed):
-    unlike ``lxml.etree.XMLParser``, HTML-mode parsing never processes a
-    ``<!DOCTYPE html [...]>`` block's internal ``<!ENTITY>`` declarations —
-    a ``<!ENTITY xxe SYSTEM "file:///...">`` payload comes through as the
-    literal, UNEXPANDED string ``"&xxe;"`` (HTML5 has no XML general-entity
-    mechanism). ``no_network=True`` stays set regardless, defence-in-depth
-    against the parser itself ever dereferencing an external DTD/entity.
-    Restricted to ``syntaxes=["json-ld"]`` (plain JSON, no XML-entity
-    surface); this module builds its OWN parser instance and hands
+    **Parser/syntax choice.** ``lxml.html.HTMLParser`` (HTML, not XML, mode)
+    with ``no_network=True``. Verified directly: unlike
+    ``lxml.etree.XMLParser``, HTML-mode never processes a ``<!DOCTYPE html
+    [...]>`` block's ``<!ENTITY>`` declarations — an XXE payload comes
+    through as the literal, UNEXPANDED string (HTML5 has no XML
+    general-entity mechanism); ``no_network=True`` stays set regardless, as
+    defence-in-depth. Restricted to ``syntaxes=["json-ld"]`` (plain JSON, no
+    XML-entity surface); builds its OWN parser instance and hands
     ``extruct.extract()`` the ALREADY-parsed tree (bypassing its internal
-    ``parse_html()``, which applies no safety kwargs). ``extruct``'s
-    microdata/RDFa syntaxes route through ADDITIONAL XML-mode parsing this
-    module has not hardened — see
-    ``docs/review/untrusted-input-checklist.md`` class 4.
+    ``parse_html()``, no safety kwargs of its own) — ``extruct``'s
+    microdata/RDFa route through ADDITIONAL XML-mode parsing this module
+    has not hardened, see ``docs/review/untrusted-input-checklist.md``
+    class 4.
 
     Bounded and fail-soft: ``html`` is already capped upstream
     (``max_response_bytes``); :data:`_MAX_JSON_LD_ITEMS` bounds the
-    RETURNED list (sliced after ``extruct.extract()`` already ran), not the
-    extraction pass itself — implicitly bounded by the page-byte cap alone
-    (measured: ~27 ms typical, ~190 ms pathological). Any exception on
-    malformed/adversarial JSON-LD (beyond ``errors="ignore"``'s own
-    handling) yields ``[]`` rather than propagating.
+    RETURNED list (sliced after ``extruct.extract()`` already ran, not the
+    extraction pass itself — implicitly bounded by the page-byte cap alone,
+    measured ~27 ms typical / ~190 ms pathological). Any exception on
+    malformed/adversarial JSON-LD yields ``[]`` rather than propagating.
 
     Args:
         html: The raw, already-decoded page HTML.
@@ -1378,15 +1354,14 @@ def _parse_html_for_json_ld(html: str) -> list[dict[str, object]]:
         :data:`_MAX_JSON_LD_ITEMS`; ``[]`` on any failure or no JSON-LD.
     """
     try:
-        # lxml ships no type stubs (Unknown to pyright — mirrors the
-        # sounddevice precedent, api.py:_list_devices).
+        # lxml ships no type stubs (mirrors the sounddevice precedent,
+        # api.py:_list_devices).
         parser = lxml.html.HTMLParser(encoding="utf-8", no_network=True)
         tree = lxml.html.fromstring(html, parser=parser)  # type: ignore[reportUnknownVariableType]
     except (lxml.etree.LxmlError, ValueError):  # type: ignore[reportUnknownMemberType]
         return []
     try:
-        # extruct.extract's own source IS fully typed (pyright infers
-        # dict[str, list[dict[str, Any]]] directly); only `tree` (above)
+        # extruct.extract's own source IS fully typed; only `tree` (above)
         # is untyped.
         result: dict[str, list[dict[str, Any]]] = extruct.extract(
             tree,  # type: ignore[reportUnknownArgumentType]
@@ -1394,17 +1369,14 @@ def _parse_html_for_json_ld(html: str) -> list[dict[str, object]]:
             errors="ignore",
         )
     except Exception:
-        # This stage must NEVER interrupt drafting — any extraction-time
-        # exception on adversarial JSON-LD (beyond errors="ignore"'s own
-        # internal handling) falls back to "nothing found".
+        # Never interrupt drafting: any extraction-time exception on
+        # adversarial JSON-LD falls back to "nothing found".
         _log.debug("bean_sourcing: extruct JSON-LD extraction raised", exc_info=True)
         return []
     items = result.get("json-ld", [])
-    # extruct's declared return type is a static annotation on an unstubbed
-    # library, not a runtime guarantee — a top-level JSON-LD array of
-    # non-object values (e.g. "[1, 2, 3]") yields those raw values too, so
-    # this filter (pyright deems it redundant per the DECLARED type; kept
-    # for the runtime reality) is a real safety net, not decoration.
+    # extruct's declared return type is a static annotation, not a runtime
+    # guarantee — a top-level array of non-object values (e.g. "[1, 2]")
+    # yields those raw values too; this filter is a real safety net.
     return [
         item
         for item in items
@@ -1413,27 +1385,14 @@ def _parse_html_for_json_ld(html: str) -> list[dict[str, object]]:
 
 
 def _build_json_ld_context(html: str, url: str) -> str | None:
-    """Build the JSON-LD grounding context for the extraction prompt (#590
-    slice B), or ``None`` when nothing usable was found — the top-level,
-    fully fail-soft entry point :func:`_fetch_page_text` calls.
-
-    Chains parse (:func:`_parse_html_for_json_ld`) → identity-match
-    (:func:`_select_identity_matched_product`) → format
-    (:func:`_format_json_ld_context`); every step already fails soft on its
-    own, and this wraps the whole chain in one more catch-all so a defect in
-    any of them degrades to "no JSON-LD context" (the pipeline's existing
-    LLM-only behaviour) rather than ever raising out of a page fetch.
-    NOTE: identity-match verifies the BLOCK, not each individual field
-    value — a per-field evidence-quote/containment check is deferred to
-    slice D (tracked, not yet closed).
-
-    Args:
-        html: The raw, already-decoded page HTML.
-        url: The fetched page's own URL (the identity to match against).
-
-    Returns:
-        The formatted context block, or ``None``.
-    """
+    """Build the JSON-LD grounding context for the extraction prompt over
+    ``html``, identity-matched to ``url`` (#590 slice B), or ``None`` —
+    the top-level, fully fail-soft entry point :func:`_fetch_page_text`
+    calls. Chains parse → identity-match → format (each already fails
+    soft; this wraps the whole chain in one more catch-all so a defect
+    degrades to "no JSON-LD context" rather than raising out of a fetch).
+    NOTE: identity-match verifies the BLOCK, not each field value — a
+    per-field evidence-quote/containment check is deferred to slice D."""
     try:
         raw_items = _parse_html_for_json_ld(html)
         if not raw_items:
@@ -1480,9 +1439,9 @@ async def _fetch_page_text(
     Also runs the deterministic JSON-LD product extraction (#590 slice B —
     :func:`_build_json_ld_context`) over the fetched HTML before it is
     stripped to plain text: a JSON-LD Product block that identity-matches
-    ``url`` is prepended as a short context section ahead of the extracted
-    text; omitted (text unchanged) when none is found, so every pre-#590
-    caller/fixture is unaffected.
+    the FINAL fetched URL (after any redirects, not necessarily ``url``
+    itself — #590 P1 fix) is prepended ahead of the extracted text;
+    omitted (unchanged) when none is found.
 
     Args:
         url: The vendor product page URL.
@@ -1541,17 +1500,19 @@ async def _fetch_page_text(
             trust_env=False,
         )
     )
+    final_url = url
     try:
         async with asyncio.timeout(config.fetch_timeout_seconds):
             if owns_client:
-                html = await _fetch_with_ssrf_guard(
+                html, final_url = await _fetch_with_ssrf_guard(
                     client, url, headers=headers, timeout=timeout, config=config
                 )
             else:
                 # Injected client (the fetch test seam): its redirect policy
                 # and destination are the caller's to set — no SSRF guard,
                 # no manual redirect loop, matching this module's behavior
-                # before #587.
+                # before #587. ``response.url`` covers a caller-followed
+                # redirect too (stays ``url`` under the seam's own default).
                 async with client.stream("GET", url, headers=headers, timeout=timeout) as response:
                     if response.status_code >= 400:
                         raise BeanFetchError(
@@ -1572,6 +1533,7 @@ async def _fetch_page_text(
                         url=url,
                     )
                     html = _decode_response_body(decoded, response)
+                    final_url = str(response.url)
     except TimeoutError as exc:
         raise BeanFetchError(
             f"vendor page fetch exceeded the {config.fetch_timeout_seconds:g}s end-to-end "
@@ -1595,7 +1557,9 @@ async def _fetch_page_text(
         if owns_client:
             await client.aclose()
     extracted_text = _extract_page_text(html)
-    json_ld_context = _build_json_ld_context(html, url)
+    # final_url, not url (#590 P1 fix) — a redirect commonly canonicalises
+    # the URL, and the fetched HTML's own JSON-LD reflects the FINAL one.
+    json_ld_context = _build_json_ld_context(html, final_url)
     if json_ld_context is None:
         return extracted_text
     return f"{json_ld_context}\n\n{extracted_text}"
