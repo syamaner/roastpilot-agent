@@ -41,7 +41,14 @@ definition.
   small contract/validation fixtures under `tests/fixtures/` (plan §8) —
   e.g. the 7 Jun 2026 live-roast JSONL/summary excerpts the MCP mirrors
   validate against.
-- One PR per story, branch: `feature/{issue-number}-{slug}`.
+- **One PR per SLICE, not per story.** A story is decomposed at kickoff into its PR plan
+  (see PR-Hygiene) — an ordered set of thin PRs, each under the 400-line logic cap; each
+  slice is one PR on its own branch `feature/{issue-number}-{slug}-{slice}` (or plain
+  `feature/{issue-number}-{slug}` when a story is genuinely a single slice), and every PR references the story
+  issue (`Refs #N`, or `Closes #N` only on the slice that finishes it). A story whose
+  plan called for multiple slices but ships as one big PR is an unplanned monolith —
+  split it to the plan; a story whose kickoff plan is genuinely one slice under the cap
+  stays one PR (don't manufacture slices to hit a count).
 - The PR that completes a story updates the epic file's status table in the
   same PR — file state and GitHub state never drift.
 - Before starting a task: read `docs/state/registry.md`, open the active
@@ -152,7 +159,11 @@ Before starting a story:
 2. Open the active epic file listed in the registry.
 3. Read the GitHub story issue and any comments.
 4. Confirm acceptance criteria and current risks.
-5. Work on a branch named `feature/{issue-number}-{slug}`.
+5. **Write the PR plan** (see PR-Hygiene: "PR-plan the story at KICKOFF") — the ordered
+   list of thin PRs (scope / rough size / reviewers / deps), each under the 400-line logic
+   cap, *before* writing code. Record it in the story brief / issue.
+6. Work on a branch for the **first planned slice** — `feature/{issue-number}-{slug}-{slice}`
+   for a multi-slice plan, or plain `feature/{issue-number}-{slug}` when the plan is one slice.
 
 After completing a story:
 
@@ -219,8 +230,24 @@ checklist before you open.
   output, bake-off results go in their OWN PR (or at least their own commit),
   never bundled with logic — they were the size outliers and don't need code
   review the way logic does.
-- **Keep logic PRs small.** Target ≤ ~400 changed lines; split a story into thin
-  vertical slices at kickoff, not at review (a story may be several stacked PRs).
+- **PR-plan the story at KICKOFF — a planning step, not an execution-time reaction.**
+  Before writing code, decompose the story into an **ordered list of thin PRs**, each
+  with its scope, rough size, dependencies, and which reviewers it triggers
+  (safety / security / qa). You should know "this story is 8 PRs, and PR3 does exactly
+  X" *before* PR1 opens. This lives in the story brief (a lead / `product-pm` activity).
+  Reactively splitting a 900-line diff at review time is the failure mode this prevents
+  (#587's ~800-line module and #600's ~2,000-line harness were unplanned monoliths — the
+  logic in each should have been ~3 and ~6 planned slices under the cap below; the
+  shift-left folds then *masked* the size problem instead of fixing it).
+- **Keep logic PRs small — the 400-line cap is a HARD STOP.** Measure **logic** lines
+  from the branch's MERGE BASE (not the advancing `origin/main` tip):
+  `git diff --stat $(git merge-base origin/main HEAD)` (equivalently
+  `git diff --stat origin/main...HEAD`), minus data/fixtures/generated/doc files (those
+  are exempt and go in their own PR per the rule above). If the logic diff exceeds **400**,
+  the PR plan was too coarse — split to the planned slice boundary before opening. Enough
+  slices that every one is under the cap: the ~2,000-line #600 harness was ~5–6 reviewable
+  logic slices (scoring / stats / runner / report), not 4. The number is exact (400), the
+  slicing is what flexes.
 - **Shift review LEFT — mandatory, not optional.** Before opening: run all gates +
   an adversarial self-critique, AND run the domain reviewer on the BRANCH
   (`safety-reviewer` for safety/controller/enum/recovery, `qa` for tests) and

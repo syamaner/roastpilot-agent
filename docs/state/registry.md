@@ -90,8 +90,10 @@
 
 - Before starting implementation, read this registry, then the active epic
   file, then the GitHub issue for the story.
-- One PR per story; branch `feature/{issue-number}-{slug}`; the PR that
-  completes a story updates the epic file's status table in the same PR.
+- One PR per SLICE (a story is PR-planned at kickoff into thin slices, each ≤400
+  logic lines — see AGENTS.md PR-Hygiene); branch
+  `feature/{issue-number}-{slug}-{slice}`; the PR that completes a story updates
+  the epic file's status table in the same PR.
 - Plans live in `~/git/roastpilot-plan` and are the source of truth; record
   resolved open items in component plan §11.
 - Closing an epic = create the next epic's story issues from its spec

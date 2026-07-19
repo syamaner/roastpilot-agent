@@ -12,7 +12,7 @@ each before moving on; **do not open the PR until all four pass.**
 ## 0. Orient
 
 !`git branch --show-current`
-!`git diff --stat origin/main`
+!`git diff --stat $(git merge-base origin/main HEAD)`
 
 ## 1. Gates — green before opening (not after)
 
@@ -59,9 +59,20 @@ If a gate fails, fix it and re-run before continuing.
 
 ## 2. Size + data/logic split
 
-- **Logic PRs target ≤ ~400 changed lines.** Over that, split the story into
-  thinner vertical slices (a story may be several stacked PRs) rather than ship
-  one large PR.
+- **The 400-line logic cap is a HARD STOP — the number is exact, not "~400".** Measure
+  **logic** lines from the branch's MERGE BASE (so an advancing `origin/main` doesn't
+  inflate the count): `git diff --stat $(git merge-base origin/main HEAD)` (equivalently
+  `git diff --stat origin/main...HEAD`), minus data/fixtures/generated/doc files. If that
+  exceeds **400**, STOP — do not open. The story should already have a **PR plan from
+  kickoff** (AGENTS.md PR-Hygiene: the ordered list of thin PRs decided *before* writing
+  code); over the cap means the plan was too coarse or you merged two planned slices —
+  split it back to the planned boundary and open the current slice only. Reactively
+  discovering the size here is the failure this catches; plan the slices up front, don't
+  split a monolith at review time.
+- **Executable `.md` counts as logic, not exempt docs.** The doc exemption is for
+  prose (README, design notes, plan files). Agent/skill/workflow definitions under
+  `.claude/` (`agents/*.md`, `skills/**/*.md`, `workflows/*.mjs`) are executable behaviour
+  — they count toward the 400-line logic cap and get review like code.
 - **Separate data from logic.** Fixtures, snapshots, generated files, research
   output, bake-off results belong in their OWN PR or commit — never bundled with
   logic. They inflate size and don't need code review the way logic does. If the
