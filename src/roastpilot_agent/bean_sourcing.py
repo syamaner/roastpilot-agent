@@ -115,7 +115,7 @@ local Ollama) with an active roast's advisor calls can starve them into the
 controller's sustained-outage safety fallback.
 
 **Deterministic JSON-LD extraction, ahead of the LLM (#590 slice B):**
-before the LLM sees the page, :func:`_build_json_ld_context` looks for a
+before the LLM sees the page, :func:`_match_json_ld_product_facts` looks for a
 ``schema.org/Product`` ``<script type="application/ld+json">`` block
 (``extruct``, JSON-LD syntax only — see :func:`_parse_html_for_json_ld` for
 the XXE-safe parser config and why microdata/RDFa are excluded), then
@@ -1656,15 +1656,17 @@ def _parse_html_for_json_ld(html: str) -> list[dict[str, object]]:
     ][:_MAX_JSON_LD_ITEMS]
 
 
-def _build_json_ld_context(html: str, url: str) -> str | None:
-    """Build the JSON-LD grounding context for the extraction prompt over
-    ``html``, identity-matched to ``url`` (#590 slice B), or ``None`` —
-    the top-level, fully fail-soft entry point :func:`_fetch_page_text`
-    calls. Chains parse → identity-match → format (each already fails
-    soft; this wraps the whole chain in one more catch-all so a defect
-    degrades to "no JSON-LD context" rather than raising out of a fetch).
-    NOTE: identity-match verifies the BLOCK, not each field value — a
-    per-field evidence-quote/containment check is deferred to slice D."""
+def _match_json_ld_product_facts(html: str, url: str) -> _JsonLdProductFacts | None:
+    """Parse ``html`` and return the RAW facts off the JSON-LD Product
+    block identity-matched to ``url`` (#590 slice B; split out of the
+    former ``_build_json_ld_context`` in #590 D1 fold 1 so the raw facts
+    are available for the vendor-data-only verification corpus too, not
+    just the LLM-prompt-formatted context). Fully fail-soft: chains parse
+    → identity-match (each already fails soft; this wraps the whole chain
+    in one more catch-all so a defect degrades to "no facts" rather than
+    raising out of a fetch). NOTE: identity-match verifies the BLOCK, not
+    each field value — a per-field evidence-quote check is deferred to
+    slice D2."""
     try:
         raw_items = _parse_html_for_json_ld(html)
         if not raw_items:
@@ -1672,7 +1674,7 @@ def _build_json_ld_context(html: str, url: str) -> str | None:
         matched = _select_identity_matched_product(raw_items, url=url)
         if matched is None:
             return None
-        return _format_json_ld_context(_facts_from_product_block(matched))
+        return _facts_from_product_block(matched)
     except Exception:
         _log.debug(
             "bean_sourcing: JSON-LD context build failed; falling back to LLM-only",
@@ -1681,13 +1683,40 @@ def _build_json_ld_context(html: str, url: str) -> str | None:
         return None
 
 
-async def _fetch_page_text(
+def _json_ld_fact_values(facts: _JsonLdProductFacts | None) -> str:
+    """Join the RAW JSON-LD fact values (name/brand/sku/description) with
+    NO header or labels — vendor data only (#590 D1 fold 1). Contrast
+    :func:`_format_json_ld_context`, which adds OUR OWN generated
+    provenance header/labels for the LLM prompt; that formatted text must
+    never enter the containment-verification corpus, or a model-returned
+    value could match OUR scaffolding ("Structured data found in this
+    page's JSON-LD...", "- name:", ...) instead of real vendor content.
+
+    Args:
+        facts: The matched block's raw facts, or ``None``.
+
+    Returns:
+        The non-blank fact values newline-joined, or ``""``.
+    """
+    if facts is None:
+        return ""
+    values = (facts.name, facts.brand, facts.sku, facts.description)
+    return "\n".join(value for value in values if value)
+
+
+async def _fetch_and_extract(
     url: str,
     *,
     config: BeanSourcingConfig,
     http_client: httpx.AsyncClient | None = None,
-) -> str:
-    """Respectfully fetch ``url`` and return its extracted plain text.
+) -> tuple[str, _JsonLdProductFacts | None]:
+    """Respectfully fetch ``url`` and return its extracted plain text plus
+    any identity-matched JSON-LD Product facts.
+
+    The shared fetch/extraction core :func:`_fetch_page_text` wraps (#590
+    D1 fold 1) to build both the LLM-prompt text and the vendor-data-only
+    verification corpus — this function does no prompt/corpus FORMATTING
+    itself, only fetch + extraction.
 
     An ``httpx`` GET, bounded by ``config.fetch_timeout_seconds`` per
     request AND by an end-to-end ``config.fetch_timeout_seconds`` deadline
@@ -1709,11 +1738,11 @@ async def _fetch_page_text(
     prior behavior.
 
     Also runs the deterministic JSON-LD product extraction (#590 slice B —
-    :func:`_build_json_ld_context`) over the fetched HTML before it is
-    reduced to page-body text: a JSON-LD Product block that identity-matches
-    the FINAL fetched URL (after any redirects, not necessarily ``url``
-    itself — #590 P1 fix) is prepended ahead of the extracted text;
-    omitted (unchanged) when none is found.
+    :func:`_match_json_ld_product_facts`) over the fetched HTML: a
+    JSON-LD Product block that identity-matches the FINAL fetched URL
+    (after any redirects, not necessarily ``url`` itself — #590 P1 fix)
+    is returned alongside the extracted text; ``None`` when none is
+    found.
 
     The page-BODY portion of that text is now trafilatura's
     boilerplate-stripped Markdown (#590 slice C —
@@ -1735,11 +1764,14 @@ async def _fetch_page_text(
             constructed, used, and closed when omitted.
 
     Returns:
-        The extracted page-body text (trafilatura Markdown, or the
-        linear-strip fallback — including when the markdown extraction
-        step itself times out, #590 slice C P2 fix: that falls back too,
-        it does not fail the draft), prefixed with a JSON-LD context
-        section (:func:`_build_json_ld_context`) when one was found.
+        A ``(extracted_text, facts)`` pair. ``extracted_text`` is the
+        page-body text (trafilatura Markdown, or the linear-strip
+        fallback — including when the markdown extraction step itself
+        times out, #590 slice C P2 fix: that falls back too, it does not
+        fail the draft). ``facts`` is the JSON-LD Product block's raw
+        fields (:func:`_match_json_ld_product_facts`), identity-matched
+        to the FINAL fetched URL (after any redirects — #590 P1 fix), or
+        ``None`` when no matching block was found.
 
     Raises:
         BeanFetchError: On a malformed URL, a destination rejected by the
@@ -1909,10 +1941,51 @@ async def _fetch_page_text(
     extracted_text = markdown or _extract_page_text(html)
     # final_url, not url (#590 P1 fix) — a redirect commonly canonicalises
     # the URL, and the fetched HTML's own JSON-LD reflects the FINAL one.
-    json_ld_context = _build_json_ld_context(html, final_url)
-    if json_ld_context is None:
-        return extracted_text
-    return f"{json_ld_context}\n\n{extracted_text}"
+    facts = _match_json_ld_product_facts(html, final_url)
+    return extracted_text, facts
+
+
+@dataclass(frozen=True)
+class _FetchedPage:
+    """A fetched vendor page's two text forms (#590 D1 fold 1).
+
+    ``prompt_text`` is what the LLM sees for extraction — the JSON-LD
+    context header/labels (:func:`_format_json_ld_context`) prepended
+    ahead of the extracted body when a block matched, the body alone
+    otherwise (this is :func:`_fetch_page_text`'s ORIGINAL, pre-fold
+    ``str`` contract, unchanged). ``verification_corpus`` is
+    VENDOR-DATA-ONLY (the extracted page body plus the raw JSON-LD fact
+    VALUES, :func:`_json_ld_fact_values` — never our own generated
+    header/labels) — the corpus :func:`_draft_from_identity` verifies
+    ``on_page`` claims against. Using ``prompt_text`` there would let a
+    model-returned value match OUR scaffolding text instead of real
+    vendor content, defeating the whole provenance guarantee.
+    """
+
+    prompt_text: str
+    verification_corpus: str
+
+
+async def _fetch_page_text(
+    url: str,
+    *,
+    config: BeanSourcingConfig,
+    http_client: httpx.AsyncClient | None = None,
+) -> _FetchedPage:
+    """Fetch ``url`` and return both of :class:`_FetchedPage`'s text
+    forms (#590 D1 fold 1 — this function's return type changed from a
+    bare ``str`` to :class:`_FetchedPage`, so ``.prompt_text`` is the
+    pre-fold return value; ``.verification_corpus`` is new). See
+    :func:`_fetch_and_extract` for the fetch/extraction behavior and
+    failure modes."""
+    extracted_text, facts = await _fetch_and_extract(url, config=config, http_client=http_client)
+    json_ld_context = _format_json_ld_context(facts) if facts is not None else None
+    prompt_text = (
+        extracted_text if json_ld_context is None else f"{json_ld_context}\n\n{extracted_text}"
+    )
+    fact_values = _json_ld_fact_values(facts)
+    verification_corpus = extracted_text if not fact_values else f"{extracted_text}\n{fact_values}"
+    return _FetchedPage(prompt_text=prompt_text, verification_corpus=verification_corpus)
 
 
 class _ExtractedBeanIdentity(BaseModel):
@@ -2348,8 +2421,14 @@ _DEFAULT_BEAN_WEIGHT_GRAMS = 250.0
 #: Punctuation mapped to a SPACE (never deleted) before whitespace
 #: collapse, so a hyphenated phrase like "single-origin" normalizes to the
 #: same two-word form as "single origin" instead of gluing into
-#: "singleorigin" (#590 D1).
-_CONTAINMENT_PUNCTUATION_TRANSLATION = str.maketrans({ch: " " for ch in ",.'\"-()"})
+#: "singleorigin" (#590 D1). Broadened (round-3 review) beyond the
+#: original ``,.'"-()`` to also cover ``/\:;!?[]{}<>|`` and the en/em
+#: dash + curly-quote variants (``–—''""``) — without this,
+#: "SL28/SL34" on the page failed to match a "SL28, SL34" value and a
+#: real field over-demoted.
+_CONTAINMENT_PUNCTUATION_TRANSLATION = str.maketrans(
+    {ch: " " for ch in ",.'\"-()/\\:;!?[]{}<>|–—‘’“”"}
+)
 
 
 def _normalize_for_containment(text: str) -> str:
@@ -2637,7 +2716,8 @@ def _draft_from_identity(
         f"{identity.processing or 'unstated'} processing method, so a wrong guess "
         "cannot burn the batch. Taste and step the development target up on the "
         "next bag if it reads underdeveloped. Every field marked "
-        '"origin_estimated" in field_sources was NOT found on the vendor page — '
+        '"origin_estimated" in field_sources was NOT confirmed present on the '
+        "vendor page (either absent, or a typed field not yet verified) — "
         "review it before roasting."
     )
 
@@ -2769,15 +2849,18 @@ async def draft_bean_profile_from_url(
 
     config = sourcing_config if sourcing_config is not None else BeanSourcingConfig()
     _log.info("draft_bean_profile_from_url: fetching %r", _redact_url_credentials(url))
-    page_text = await _fetch_page_text(url, config=config, http_client=http_client)
+    page = await _fetch_page_text(url, config=config, http_client=http_client)
     # config (never sourcing_config directly) — the fetch's already-resolved
     # default, so the extraction step's model/timeout resolution stays
     # consistent with the fetch's, rather than re-deriving its own None
     # fallback here (#590 slice A).
     identity = await _extract_bean_identity(
-        page_text, advisor_config=advisor_config, sourcing_config=config, model=model
+        page.prompt_text, advisor_config=advisor_config, sourcing_config=config, model=model
     )
-    draft = _draft_from_identity(identity, url=url, corpus=page_text)
+    # page.verification_corpus, NOT page.prompt_text (#590 D1 fold 1) — the
+    # prompt text carries OUR OWN generated JSON-LD header/labels, which
+    # must never enter the containment gate (see _FetchedPage's docstring).
+    draft = _draft_from_identity(identity, url=url, corpus=page.verification_corpus)
     _log.info(
         "draft_bean_profile_from_url: drafted %r (%d fields sourced)",
         draft.name,

@@ -409,11 +409,13 @@ async def test_draft_bean_profile_from_url_rejects_url_with_unclosed_ipv6_bracke
 @pytest.mark.asyncio
 async def test_fetch_page_text_success_extracts_text() -> None:
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/kenya",
-            config=BeanSourcingConfig(),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/kenya",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
     assert "Kenya Kiambu AA" in text
 
 
@@ -473,9 +475,11 @@ async def test_fetch_page_text_constructs_and_closes_its_own_client_when_none_in
     monkeypatch.setattr(
         bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
     )
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        "https://vendor.example/products/kenya", config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/kenya", config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
 
 
@@ -517,9 +521,11 @@ async def test_fetch_page_text_follows_redirects_on_internally_constructed_clien
         "_assert_public_destination",
         _noop_assert_public_destination,
     )
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        original_url, config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            original_url, config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
     assert captured_kwargs.get("follow_redirects") is False
 
@@ -663,11 +669,13 @@ async def test_fetch_page_text_allows_a_genuine_global_ipv6_literal() -> None:
     """Confirms the reserved/embedded-IPv4 hardening does not false-positive
     on an ordinary global IPv6 literal."""
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "http://[2606:2800:220:1:248:1893:25c8:1946]/x",
-            config=BeanSourcingConfig(),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "http://[2606:2800:220:1:248:1893:25c8:1946]/x",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
     assert "Kenya Kiambu AA" in text
 
 
@@ -798,9 +806,11 @@ async def test_fetch_page_text_redirect_public_to_public_succeeds(
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        original_url, config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            original_url, config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
     # Each hop was independently resolved (and thus independently validated
     # + pinned) — exactly once per hop, no re-resolution.
@@ -846,9 +856,11 @@ async def test_fetch_with_ssrf_guard_pins_connection_to_validated_ip(
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
 
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        origin_url, config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            origin_url, config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
 
     # Resolved exactly once — no second resolution left for a rebinding
@@ -898,9 +910,11 @@ async def test_fetch_with_ssrf_guard_pins_ipv6_address_with_brackets(
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
 
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        origin_url, config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            origin_url, config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
     assert len(captured_requests) == 1
     sent = captured_requests[0]
@@ -985,9 +999,11 @@ async def test_fetch_page_text_redirect_public_to_public_tracks_sni_per_hop(
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        original_url, config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            original_url, config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
     assert sni_per_request == [original_host, redirected_host]
 
@@ -1029,9 +1045,11 @@ async def test_fetch_with_ssrf_guard_tries_next_address_after_connect_error(
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        "https://vendor.example/products/kenya", config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/kenya", config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
     assert attempted_hosts == [bad_ip, good_ip]
 
@@ -1103,9 +1121,11 @@ async def test_fetch_with_ssrf_guard_tries_next_address_after_connect_timeout(
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        "https://vendor.example/products/kenya", config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/kenya", config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Kenya Kiambu AA" in text
     assert attempted_hosts == [bad_ip, good_ip]
 
@@ -1172,11 +1192,13 @@ async def test_fetch_page_text_decodes_declared_non_utf8_charset_injected_client
         )
 
     async with _mock_client(httpx.MockTransport(handler)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/cafe",
-            config=BeanSourcingConfig(),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/cafe",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
     assert "Café Kenya" in text
 
 
@@ -1205,9 +1227,11 @@ async def test_fetch_with_ssrf_guard_decodes_declared_non_utf8_charset(
     monkeypatch.setattr(
         bean_sourcing, "_assert_public_destination", _noop_assert_public_destination
     )
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        "https://vendor.example/products/cafe", config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/cafe", config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Café Kenya" in text
 
 
@@ -1809,11 +1833,13 @@ async def test_fetch_page_text_decodes_a_small_legitimate_gzip_body() -> None:
         )
 
     async with _mock_client(httpx.MockTransport(handler)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/kenya",
-            config=BeanSourcingConfig(),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/kenya",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
     assert "Kenya Kiambu AA" in text
 
 
@@ -2363,6 +2389,25 @@ def test_draft_from_identity_confabulated_bean_varietal_is_demoted() -> None:
     assert draft.field_sources["bean_varietal"] == "origin_estimated"
 
 
+def test_draft_from_identity_bean_varietal_matches_slash_separated_page_form() -> None:
+    """#590 D1 fold 3 (round-3 Codex P2): the punctuation-normalisation
+    set only mapped ``,.'"-()`` to spaces, so a page rendering
+    "SL28/SL34" (slash, no comma) failed to match a genuine
+    ``bean_varietal="SL28, SL34"`` value and over-demoted it. The
+    broadened set (``/\\:;!?[]{}<>|`` + en/em dash + curly quotes) must
+    verify it."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(bean_varietal="SL28 SL34")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="Variety: SL28/SL34, grown at high altitude.",
+    )
+    assert draft.bean_varietal == "SL28 SL34"
+    assert draft.field_sources["bean_varietal"] == "on_page"
+
+
 def test_draft_from_identity_description_stays_exempt_even_when_paraphrased() -> None:
     """``description`` is EXEMPT from the containment gate (#590 D1) — the
     model may legitimately summarize/paraphrase the page's prose rather
@@ -2779,6 +2824,27 @@ def test_draft_from_identity_marks_every_roast_target_origin_estimated() -> None
     ):
         assert draft.field_sources[field] == "origin_estimated", field
     assert "scouting run" in draft.scouting_note.lower()
+
+
+def test_draft_from_identity_scouting_note_does_not_claim_deferred_fields_absent() -> None:
+    """#590 D1 fold 2 (round-3 Codex P2): the note used to say every
+    ``origin_estimated`` field "was NOT found on the vendor page" — false
+    for a deferred TYPED field (e.g. ``processing``) that genuinely IS on
+    the page but demotes pending D2/E verification. The wording must be
+    honest for both the genuinely-absent and the deferred cases, and must
+    NOT claim absence outright."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(processing="washed")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="This lot was fully washed and sun-dried on raised beds.",
+    )
+    assert draft.field_sources["processing"] == "origin_estimated"
+    note = draft.scouting_note.lower()
+    assert "not confirmed present" in note
+    assert "was not found on the vendor page" not in note
 
 
 def test_draft_from_identity_bean_origin_falls_back_to_country_and_is_still_on_page() -> None:
@@ -3394,35 +3460,39 @@ def test_parse_html_for_json_ld_fails_soft_on_deeply_nested_json_recursion_bomb(
     assert bean_sourcing._parse_html_for_json_ld(payload) == []  # pyright: ignore[reportPrivateUsage]
 
 
-# --- #590 slice B: _build_json_ld_context ---
+# --- #590 slice B: _match_json_ld_product_facts (#590 D1 fold 1: renamed
+# from _build_json_ld_context, which now composes this + _format_json_ld_
+# context — both independently tested) ---
 
 
-def test_build_json_ld_context_returns_formatted_block_for_a_matching_page() -> None:
-    context = bean_sourcing._build_json_ld_context(  # pyright: ignore[reportPrivateUsage]
+def test_match_json_ld_product_facts_returns_facts_for_a_matching_page() -> None:
+    facts = bean_sourcing._match_json_ld_product_facts(  # pyright: ignore[reportPrivateUsage]
         _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT), _MATCHING_JSON_LD_URL
     )
-    assert context is not None
-    assert "Kenya Kiambu AA (Washed)" in context
-    assert "KE-KIAMBU-AA" in context
+    assert facts is not None
+    assert facts.name == "Kenya Kiambu AA (Washed)"
+    assert facts.sku == "KE-KIAMBU-AA"
 
 
-def test_build_json_ld_context_returns_none_without_json_ld() -> None:
+def test_match_json_ld_product_facts_returns_none_without_json_ld() -> None:
     assert (
-        bean_sourcing._build_json_ld_context(_SAMPLE_HTML, _MATCHING_JSON_LD_URL)  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._match_json_ld_product_facts(  # pyright: ignore[reportPrivateUsage]
+            _SAMPLE_HTML, _MATCHING_JSON_LD_URL
+        )
         is None
     )
 
 
-def test_build_json_ld_context_returns_none_for_a_stale_unmatched_block() -> None:
+def test_match_json_ld_product_facts_returns_none_for_a_stale_unmatched_block() -> None:
     assert (
-        bean_sourcing._build_json_ld_context(  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._match_json_ld_product_facts(  # pyright: ignore[reportPrivateUsage]
             _html_with_json_ld(_STALE_JSON_LD_SCRIPT), _MATCHING_JSON_LD_URL
         )
         is None
     )
 
 
-def test_build_json_ld_context_fails_soft_on_internal_exception(
+def test_match_json_ld_product_facts_fails_soft_on_internal_exception(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def _raise(html: str) -> list[dict[str, object]]:
@@ -3430,7 +3500,7 @@ def test_build_json_ld_context_fails_soft_on_internal_exception(
 
     monkeypatch.setattr(bean_sourcing, "_parse_html_for_json_ld", _raise)
     assert (
-        bean_sourcing._build_json_ld_context(  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._match_json_ld_product_facts(  # pyright: ignore[reportPrivateUsage]
             _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT), _MATCHING_JSON_LD_URL
         )
         is None
@@ -3445,9 +3515,11 @@ async def test_fetch_page_text_prepends_matching_json_ld_context() -> None:
     async with _mock_client(
         _html_response(200, _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT))
     ) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+            )
+        ).prompt_text
     assert text.startswith("Structured data found in this page's JSON-LD")
     assert "KE-KIAMBU-AA" in text
     assert "Kenya Kiambu AA" in text  # the plain-text extraction still follows
@@ -3458,9 +3530,11 @@ async def test_fetch_page_text_ignores_a_stale_unmatched_json_ld_block() -> None
     async with _mock_client(
         _html_response(200, _html_with_json_ld(_STALE_JSON_LD_SCRIPT))
     ) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+            )
+        ).prompt_text
     assert "Structured data found in this page" not in text
     assert "Yirgacheffe" not in text  # the stale block's own text never leaks in
 
@@ -3473,9 +3547,11 @@ async def test_fetch_page_text_without_json_ld_falls_through_byte_for_byte_uncha
     finds nothing usable; see the ``_returns_none`` variant below for that
     path)."""
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+            )
+        ).prompt_text
     assert text == bean_sourcing._extract_page_markdown(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
 
 
@@ -3485,9 +3561,11 @@ async def test_fetch_page_text_fails_soft_on_a_page_with_malformed_json_ld() -> 
         '<script type="application/ld+json">{not valid json at all!}</script>'
     )
     async with _mock_client(_html_response(200, malformed_page)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+            )
+        ).prompt_text
     assert "Structured data found in this page" not in text
     assert "Kenya Kiambu AA" in text
 
@@ -3535,9 +3613,11 @@ async def test_fetch_page_text_identity_matches_json_ld_against_final_redirected
     monkeypatch.setattr("roastpilot_agent.bean_sourcing.httpx.AsyncClient", fake_async_client)
     loop = asyncio.get_running_loop()
     monkeypatch.setattr(loop, "getaddrinfo", fake_getaddrinfo)
-    text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-        original_url, config=BeanSourcingConfig()
-    )
+    text = (
+        await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            original_url, config=BeanSourcingConfig()
+        )
+    ).prompt_text
     assert "Structured data found in this page's JSON-LD" in text
     assert "KE-REDIRECTED" in text
 
@@ -3637,6 +3717,39 @@ async def test_draft_bean_profile_from_url_json_ld_only_value_verifies_on_page()
         )
     assert draft.name == "Colombia Huila Pink Bourbon"
     assert draft.field_sources["name"] == "on_page"
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_confabulated_value_from_our_own_header_is_demoted() -> (
+    None
+):
+    """#590 D1 fold 1 (Codex P2): the LLM-prompt text (``page_text``) is
+    prefixed with OUR OWN generated JSON-LD context header/labels
+    ("Structured data found in this page's JSON-LD (schema.org Product
+    block, identity-matched to the fetched URL)."). Reusing that text as
+    the containment-verification corpus let a model-returned value match
+    OUR scaffolding instead of real vendor content — a prompt-injected
+    page could aim a confabulated value straight at it. The verification
+    corpus must be vendor-data-only, so a value drawn from the header
+    ("schema org Product block", present only in generated text — the
+    page's actual name is "Kenya Kiambu AA (Washed)") must demote."""
+    identity = _identity_args(name="schema org Product block")
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        tool_name = info.output_tools[0].name
+        return ModelResponse(parts=[ToolCallPart(tool_name, identity)])
+
+    async with _mock_client(
+        _html_response(200, _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT))
+    ) as http_client:
+        draft = await draft_bean_profile_from_url(
+            _MATCHING_JSON_LD_URL,
+            advisor_config=_ADVISOR_CONFIG,
+            http_client=http_client,
+            model=FunctionModel(respond),
+        )
+    assert draft.name == "schema org Product block"
+    assert draft.field_sources["name"] == "origin_estimated"
 
 
 # --- #590 slice C: _extract_page_markdown (trafilatura) ---
@@ -3833,11 +3946,13 @@ def test_sanitize_trafilatura_frontmatter_passes_through_unclosed_block_unchange
 @pytest.mark.asyncio
 async def test_fetch_page_text_uses_trafilatura_markdown_as_page_body() -> None:
     async with _mock_client(_html_response(200, _NAV_HEAVY_HTML)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/ethiopia-guji",
-            config=BeanSourcingConfig(),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/ethiopia-guji",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
     assert "Roast Recommendation" in text
     assert "Category 0" not in text  # nav boilerplate never reaches the LLM
 
@@ -3855,11 +3970,13 @@ async def test_fetch_page_text_falls_back_to_linear_strip_when_trafilatura_retur
 
     monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _no_markdown)
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/kenya-kiambu",
-            config=BeanSourcingConfig(),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/kenya-kiambu",
+                config=BeanSourcingConfig(),
+                http_client=client,
+            )
+        ).prompt_text
     assert text == bean_sourcing._extract_page_text(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
     assert "Kenya Kiambu AA" in text
 
@@ -3897,11 +4014,13 @@ async def test_fetch_page_text_bounds_a_hanging_markdown_extraction_with_a_timeo
     monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _hangs)
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
         started = time.monotonic()
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            "https://vendor.example/products/kenya-kiambu",
-            config=BeanSourcingConfig(fetch_timeout_seconds=0.1),
-            http_client=client,
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/kenya-kiambu",
+                config=BeanSourcingConfig(fetch_timeout_seconds=0.1),
+                http_client=client,
+            )
+        ).prompt_text
         elapsed = time.monotonic() - started
     assert elapsed < 1.0, f"markdown-extraction timeout did not bound the call: {elapsed:.2f}s"
     # Falls back to the SAME linear-strip text the None/exception paths
@@ -3920,9 +4039,11 @@ async def test_fetch_page_text_prepends_json_ld_ahead_of_trafilatura_markdown() 
         "<p>Roast Recommendation: filler prose so trafilatura keeps this paragraph too.</p>",
     )
     async with _mock_client(_html_response(200, page)) as client:
-        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
-        )
+        text = (
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+            )
+        ).prompt_text
     expected_markdown = bean_sourcing._extract_page_markdown(page)  # pyright: ignore[reportPrivateUsage]
     assert expected_markdown is not None
     json_ld_index = text.find("Structured data found in this page's JSON-LD")
