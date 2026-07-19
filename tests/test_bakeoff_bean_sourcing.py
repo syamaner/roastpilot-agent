@@ -14,6 +14,7 @@ new scoring logic.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -76,6 +77,82 @@ def test_load_corpus_pairs_and_labels_every_field(corpus: list[bo.CorpusPage]) -
             assert ("value" in gold) ^ (gold.get("absent") is True), (page.slug, spec.name)
 
 
+def test_load_corpus_wires_the_gold_product_name(corpus: list[bo.CorpusPage]) -> None:
+    """The gold JSON's top-level ``name`` must be scored, not silently
+    dropped (#600 finding)."""
+    page = _page(corpus, "cbc-costa-rica")
+    assert page.gold_fields["name"]["value"] == "Costa Rica: La Minita Estate, Tarrazu"
+
+
+def test_load_corpus_preserves_crlf_fixture_bytes(corpus: list[bo.CorpusPage]) -> None:
+    """The committed fixtures are byte-exact (``.gitattributes -text``); a
+    universal-newline read would silently strip their CRLF line endings
+    before the mock transport ever serves them (#600 finding)."""
+    page = _page(corpus, "cbc-costa-rica")
+    assert "\r\n" in page.html
+
+
+def test_load_corpus_rejects_missing_scored_field(tmp_path: Path) -> None:
+    """A malformed/incomplete custom ``--fixtures-dir`` gold record must fail
+    at LOAD time (before any provider is built / paid call made), not after
+    every model has already been run (#600 finding)."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    # "origin" is entirely absent from "fields" -- not even {"absent": true}.
+    incomplete_fields = {
+        f.name: {"absent": True} for f in bo.FIELD_SPECS if f.name not in ("origin", "name")
+    }
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                "fields": incomplete_fields,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="origin"):
+        bo.load_corpus(tmp_path)
+
+
+def test_load_corpus_rejects_ambiguous_gold_shape(tmp_path: Path) -> None:
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_absent = {f.name: {"absent": True} for f in bo.FIELD_SPECS if f.name != "name"}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                # "origin" ambiguously has BOTH a value and absent=True.
+                "fields": {**all_absent, "origin": {"value": "Ecuador", "absent": True}},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="origin"):
+        bo.load_corpus(tmp_path)
+
+
+def test_load_corpus_rejects_a_gold_json_with_no_top_level_name(tmp_path: Path) -> None:
+    """A custom gold record missing the top-level ``name`` key entirely (the
+    ``if name_field is not None`` branch's False path) must fail the same
+    missing-field validation, not silently score an absent name."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_present: dict[str, dict[str, Any]] = {
+        f.name: {"value": "x"} for f in bo.FIELD_SPECS if f.name not in ("name", "is_blend")
+    }
+    all_present["is_blend"] = {"value": False}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                # no top-level "name" key at all.
+                "fields": all_present,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="name"):
+        bo.load_corpus(tmp_path)
+
+
 # --- The four headline scoring cases, through the REAL pipeline ---------------
 
 
@@ -102,7 +179,16 @@ async def test_gold_values_score_cor(corpus: list[bo.CorpusPage]) -> None:
         }
     )
     outcomes = await _score(page, model)
-    matched = ("origin", "region", "farm", "variety", "process", "tasting_notes", "is_blend")
+    matched = (
+        "name",
+        "origin",
+        "region",
+        "farm",
+        "variety",
+        "process",
+        "tasting_notes",
+        "is_blend",
+    )
     for field_name in matched:
         assert outcomes[field_name] is bo.Outcome.COR, field_name
 
@@ -238,6 +324,7 @@ def test_altitude_absent_value_is_spu() -> None:
 
 _compare_text = bo._compare_text  # pyright: ignore[reportPrivateUsage]
 _compare_enum = bo._compare_enum  # pyright: ignore[reportPrivateUsage]
+_compare_variety = bo._compare_variety  # pyright: ignore[reportPrivateUsage]
 
 
 def test_text_multi_origin_partial() -> None:
@@ -255,6 +342,86 @@ def test_enum_synonym_canonicalises() -> None:
 
 def test_contradiction_guard_demotes_to_inc() -> None:
     assert bo.has_contradiction("washed process", "unwashed process") is True
+
+
+# --- Hallucinated-addition penalty (#600 finding) -----------------------------
+
+
+def test_text_hallucinated_addition_is_not_cor() -> None:
+    """Gold tokens fully present PLUS an unsupported extra origin must not
+    score full credit -- recall alone (1.0 here) used to award COR."""
+    assert _compare_text("Costa Rica", "Costa Rica, Ethiopia") is bo.Outcome.PAR
+
+
+def test_text_exact_match_still_cor() -> None:
+    """The precision gate must not demote a genuinely exact answer."""
+    assert _compare_text("Costa Rica", "Costa Rica") is bo.Outcome.COR
+
+
+def test_variety_hallucinated_addition_is_not_cor() -> None:
+    assert _compare_variety(["Caturra"], "Caturra, Geisha") is bo.Outcome.PAR
+
+
+def test_variety_exact_match_still_cor() -> None:
+    assert _compare_variety(["Caturra", "Typica"], "Caturra and Typica") is bo.Outcome.COR
+
+
+def test_word_bag_precision_empty_model_text_is_full_credit() -> None:
+    """Nothing to penalise when the model returned no content words at all."""
+    assert bo.word_bag_precision(["Costa Rica"], "") == 1.0
+
+
+# --- Tasting-notes vs. process/lot prose (#600 finding) ------------------------
+
+
+def _draft_with_description(description: str | None) -> BeanProfileDraft:
+    return BeanProfileDraft(
+        name="X",
+        bean_origin="Y",
+        initial_heat_percent=100,
+        initial_fan_percent=30,
+        target_drop_temp_c=194.0,
+        target_development_percent=14.0,
+        default_bean_weight_grams=250.0,
+        scouting_note="scouting",
+        description=description,
+    )
+
+
+def _tasting_spec() -> bo.FieldSpec:
+    return next(s for s in bo.FIELD_SPECS if s.name == "tasting_notes")
+
+
+def test_process_only_description_on_absent_tasting_is_abs_cor() -> None:
+    """A faithful process/lot-only description on a page with NO cupping
+    prose must score as a correct abstention on TASTE, not a hallucinated
+    tasting-notes claim -- the production ``description`` field legitimately
+    covers process/lot detail as well as flavour (#600 finding)."""
+    gold: dict[str, Any] = {"absent": True}
+    draft = _draft_with_description("Honey-processed lot from Ramirez farm at 1400 masl.")
+    assert bo.classify_field(_tasting_spec(), gold, draft) is bo.Outcome.ABS_COR
+
+
+def test_flavour_description_on_absent_tasting_is_spu() -> None:
+    """A description that DOES assert flavour content on a gold-absent page
+    is still a genuine confabulation."""
+    gold: dict[str, Any] = {"absent": True}
+    draft = _draft_with_description("Notes of dark chocolate and bright citrus.")
+    assert bo.classify_field(_tasting_spec(), gold, draft) is bo.Outcome.SPU
+
+
+def test_process_only_description_on_present_tasting_is_mis() -> None:
+    """A process-only description does not attempt the tasting-notes field
+    at all when gold expects one -- a recall miss, not a wrong-value match."""
+    gold = {"value": ["orange citrus", "chocolate"]}
+    draft = _draft_with_description("Washed process, harvested at 1400 masl.")
+    assert bo.classify_field(_tasting_spec(), gold, draft) is bo.Outcome.MIS
+
+
+def test_matching_flavour_description_on_present_tasting_is_cor() -> None:
+    gold = {"value": ["orange citrus", "chocolate"]}
+    draft = _draft_with_description("orange citrus, chocolate, medium body")
+    assert bo.classify_field(_tasting_spec(), gold, draft) is bo.Outcome.COR
 
 
 # --- Metrics -----------------------------------------------------------------
@@ -293,6 +460,39 @@ def test_err_excluded_from_combined_and_counts() -> None:
     assert bo.combined_score([bo.Outcome.ERR]) is None
 
 
+def test_macro_f1_counts_never_attempted_field_as_zero() -> None:
+    """A field the model NEVER attempts (always abstains, even when gold is
+    present) must count as F1 0.0 in the macro average, not be excluded --
+    excluding it lets a model improve its headline by dodging hard fields
+    (#600 finding)."""
+    always_mis_field = "origin"
+    field_names = [s.name for s in bo.FIELD_SPECS]
+    outcomes = {name: bo.Outcome.COR for name in field_names}
+    outcomes[always_mis_field] = bo.Outcome.MIS
+    run = _run("m", {"p1": dict(outcomes), "p2": dict(outcomes)})
+    n = len(field_names)
+    # every field except "origin" is perfect COR (F1 1.0); "origin" is always
+    # MIS -- recall is defined (0.0) but precision is undefined (no COR/PAR/
+    # INC/SPU ever), so F1 is None and must count as 0.0, not be dropped.
+    expected = (n - 1) / n
+    assert bo.macro_f1(run) == pytest.approx(expected)
+
+
+def test_macro_f1_excludes_a_field_never_gold_present() -> None:
+    """A field the CORPUS never had gold-PRESENT for (always a correct
+    abstention, ABS-COR) is genuinely not applicable and stays EXCLUDED --
+    distinct from the always-MIS case above, which IS scored 0.0."""
+    always_abs_cor_field = "species"
+    field_names = [s.name for s in bo.FIELD_SPECS]
+    outcomes = {name: bo.Outcome.COR for name in field_names}
+    outcomes[always_abs_cor_field] = bo.Outcome.ABS_COR
+    run = _run("m", {"p1": dict(outcomes), "p2": dict(outcomes)})
+    # every OTHER field is perfect COR (F1 1.0); "species" has no gold-present
+    # cell anywhere (recall undefined) so it is excluded, not scored 0 -- the
+    # macro average over the remaining fields is still a perfect 1.0.
+    assert bo.macro_f1(run) == pytest.approx(1.0)
+
+
 # --- Statistics (section 5.2) ------------------------------------------------
 
 
@@ -328,6 +528,48 @@ def test_paired_bootstrap_combined_is_deterministic_and_centred() -> None:
     assert first.high == pytest.approx(1.5)
 
 
+def test_paired_bootstrap_combined_flattens_cell_weighted_not_page_averaged() -> None:
+    """The bootstrap gap must match the leaderboard's flattened, cell-
+    weighted CombinedScore -- NOT a mean of equal-weighted per-page averages,
+    which diverges when pages have different scorable-cell counts (#600
+    finding)."""
+    # page "p1" has 1 cell, page "p2" has 3 cells -- unequal counts.
+    run_a = _run(
+        "a",
+        {
+            "p1": {"x": bo.Outcome.COR},
+            "p2": {"x": bo.Outcome.COR, "y": bo.Outcome.COR, "z": bo.Outcome.COR},
+        },
+    )
+    run_b = _run(
+        "b",
+        {
+            "p1": {"x": bo.Outcome.INC},
+            "p2": {"x": bo.Outcome.INC, "y": bo.Outcome.INC, "z": bo.Outcome.INC},
+        },
+    )
+    ci = bo.paired_bootstrap_combined(run_a, run_b, resamples=10, seed=1)
+    # every cell is COR (+1.0) vs INC (-0.5) regardless of page, so the
+    # flattened gap is exactly +1.5 (same as the equal-weighted case here,
+    # since every cell shares the same outcome -- the key point is this must
+    # equal combined_score(all A cells) - combined_score(all B cells)).
+    all_a = [o for page in run_a.pages for o in page.outcomes.values()]
+    all_b = [o for page in run_b.pages for o in page.outcomes.values()]
+    expected = bo.combined_score(all_a) - bo.combined_score(all_b)  # type: ignore[operator]
+    assert ci.estimate == pytest.approx(expected)
+
+
+def test_paired_bootstrap_combined_handles_all_err_pages() -> None:
+    """When every shared page's cells are all ``ERR``, the flattened
+    CombinedScore is undefined for every resample -- must degrade gracefully
+    (a zero-width, zero-resample interval), not crash."""
+    run_a = _run("a", {"p": {"x": bo.Outcome.ERR}})
+    run_b = _run("b", {"p": {"x": bo.Outcome.ERR}})
+    ci = bo.paired_bootstrap_combined(run_a, run_b, resamples=50, seed=1)
+    assert ci.estimate == 0.0
+    assert ci.resamples == 0
+
+
 def test_paired_bootstrap_metric_recall_gap() -> None:
     run_a = _run("a", {f"p{i}": {"x": bo.Outcome.COR} for i in range(4)})
     run_b = _run("b", {f"p{i}": {"x": bo.Outcome.MIS} for i in range(4)})
@@ -353,9 +595,31 @@ def test_load_dotenv_key(tmp_path: Path) -> None:
     assert bo.load_dotenv_key(tmp_path / "nope") is None
 
 
+def test_resolve_roster_for_slugs_roster_members() -> None:
+    slugs = [bo.MODEL_ROSTER[0].slug, bo.MODEL_ROSTER[1].slug]
+    resolved = bo.resolve_roster_for_slugs(slugs)
+    assert [m.slug for m in resolved] == slugs
+
+
+def test_resolve_roster_for_slugs_rejects_unpriced_custom_slug() -> None:
+    """A custom ``--models`` slug with no roster price used to fall back to
+    an implicit $0 estimate, letting it bypass ``--max-spend`` entirely
+    (#600 finding); it must be refused instead."""
+    with pytest.raises(ValueError, match="some/unknown-slug"):
+        bo.resolve_roster_for_slugs(["some/unknown-slug"])
+
+
 @pytest.mark.asyncio
 async def test_main_refuses_without_max_spend() -> None:
     assert await bo.main(["--out", "/tmp/rp588-should-not-write.json"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_main_refuses_unpriced_custom_model(capsys: pytest.CaptureFixture[str]) -> None:
+    code = await bo.main(["--models", "some/unknown-slug", "--max-spend", "5"])
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "some/unknown-slug" in err
 
 
 @pytest.mark.asyncio
@@ -383,6 +647,35 @@ def test_render_report_has_headline_pairwise_cost_and_caveat(
     assert "Pairwise significance" in report
     assert "Estimated paid-run cost" in report
     assert "SCREENING harness, not certification" in report
+    assert "RANGE-altitude COR" in report  # the range-altitude caveat (#600)
+    assert "PARTIAL RUN" not in report
+
+
+def test_render_report_pairwise_reports_every_promised_axis(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """The report's own selection rule leans on P/R/A bootstrap CIs, not
+    recall alone -- precision and abstention-correctness gaps must be
+    reported too (#600 finding)."""
+    runs = [_full_run("model-a", bo.Outcome.COR), _full_run("model-b", bo.Outcome.INC)]
+    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:2]))
+    assert "faithfulness (precision) gap" in report
+    assert "abstention gap" in report
+
+
+def test_render_report_marks_budget_stopped_runs_partial(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    runs = [_full_run("model-a", bo.Outcome.COR)]
+    report = bo.render_report(
+        runs,
+        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        stopped_early=True,
+        unevaluated_slugs=["model-b", "model-c"],
+    )
+    assert "PARTIAL RUN" in report
+    assert "model-b" in report
+    assert "model-c" in report
 
 
 def test_run_json_roundtrips_outcomes() -> None:
@@ -395,6 +688,41 @@ def test_run_json_roundtrips_outcomes() -> None:
     }
 
 
+def test_run_json_roundtrips_extracted_values() -> None:
+    """The drafted values must survive the checkpoint/artifact round trip, so
+    a wrong label/match-function can be audited or rescored offline without
+    re-calling the (paid) model (#600 finding)."""
+    page = bo.PageResult(
+        slug="p",
+        outcomes={"origin": bo.Outcome.COR},
+        error=None,
+        on_page_fields=1,
+        extracted={"name": "X", "country": "Ecuador"},
+    )
+    run = bo.ModelRun(model_slug="m", pages=[page])
+    rebuilt = bo._run_from_checkpoint(bo.run_to_json(run))  # pyright: ignore[reportPrivateUsage]
+    assert rebuilt.pages[0].extracted == {"name": "X", "country": "Ecuador"}
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_persists_extracted_draft(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    page = _page(corpus, "cbc-costa-rica")
+    model = _model_returning({"name": "Costa Rica La Minita", "country": "Costa Rica"})
+    run = await bo.run_model_over_corpus(
+        [page], model_slug="m", advisor_config=_ADVISOR_CONFIG, model=model
+    )
+    extracted = run.pages[0].extracted
+    assert extracted is not None
+    assert extracted["name"] == "Costa Rica La Minita"
+    # a failed page persists no extracted draft.
+    failed = await bo.run_model_over_corpus(
+        [page], model_slug="m", advisor_config=_ADVISOR_CONFIG, model=_model_text_only()
+    )
+    assert failed.pages[0].extracted is None
+
+
 def test_checkpoint_appends_and_resumes(tmp_path: Path) -> None:
     path = tmp_path / "cells.jsonl"
     first = bo.Checkpoint(path, resume=False)
@@ -405,13 +733,59 @@ def test_checkpoint_appends_and_resumes(tmp_path: Path) -> None:
     assert not bo.Checkpoint(path, resume=False).has("m1")  # truncated
 
 
+def test_checkpoint_recovers_earlier_records_after_truncated_final_line(
+    tmp_path: Path,
+) -> None:
+    """A kill mid-``write`` can leave the LAST appended line incomplete; the
+    earlier, complete, already-paid-for records must still be recoverable
+    (#600 finding)."""
+    path = tmp_path / "cells.jsonl"
+    checkpoint = bo.Checkpoint(path, resume=False)
+    checkpoint.append(bo.run_to_json(_run("m1", {"p": {"origin": bo.Outcome.COR}})))
+    checkpoint.append(bo.run_to_json(_run("m2", {"p": {"origin": bo.Outcome.COR}})))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"model_slug": "m3", "pages": [truncated')  # no trailing newline
+    reopened = bo.Checkpoint(path, resume=True)
+    assert reopened.has("m1")
+    assert reopened.has("m2")
+    assert not reopened.has("m3")
+
+
+def test_checkpoint_raises_on_malformed_interior_line(tmp_path: Path) -> None:
+    """A malformed line that is NOT the final one is real corruption, not an
+    interrupted append, and must still raise."""
+    path = tmp_path / "cells.jsonl"
+    checkpoint = bo.Checkpoint(path, resume=False)
+    checkpoint.append(bo.run_to_json(_run("m1", {"p": {"origin": bo.Outcome.COR}})))
+    m2_record = json.dumps(bo.run_to_json(_run("m2", {"p": {"origin": bo.Outcome.COR}})))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write("not json at all\n")
+        handle.write(m2_record + "\n")
+    with pytest.raises(json.JSONDecodeError):
+        bo.Checkpoint(path, resume=True)
+
+
+def test_checkpoint_ignores_stale_fingerprinted_records(tmp_path: Path) -> None:
+    path = tmp_path / "cells.jsonl"
+    written = bo.Checkpoint(path, resume=False, fingerprint="fp-a")
+    written.append(bo.run_to_json(_run("m1", {"p": {"origin": bo.Outcome.COR}})))
+    same_fp = bo.Checkpoint(path, resume=True, fingerprint="fp-a")
+    assert same_fp.has("m1")
+    different_fp = bo.Checkpoint(path, resume=True, fingerprint="fp-b")
+    assert not different_fp.has("m1")
+    # an empty fingerprint disables the guard entirely (back-compat / tests
+    # that do not care about staleness).
+    no_guard = bo.Checkpoint(path, resume=True)
+    assert no_guard.has("m1")
+
+
 @pytest.mark.asyncio
 async def test_run_bakeoff_budget_stop_makes_no_calls(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
     roster = [bo.RosterModel("m1", 1.0, 1.0, "x")]
     estimates = bo.estimate_cost(corpus, roster)
-    runs = await bo.run_bakeoff(
+    result = await bo.run_bakeoff(
         corpus,
         ["m1"],
         out=tmp_path / "o.json",
@@ -419,7 +793,9 @@ async def test_run_bakeoff_budget_stop_makes_no_calls(
         max_spend=0.0,  # first model's estimate > 0 -> stop before any (paid) call
         cost_estimates=estimates,
     )
-    assert runs == []
+    assert result.runs == []
+    assert result.stopped_early is True
+    assert result.unevaluated_slugs == ["m1"]
 
 
 @pytest.mark.asyncio
@@ -427,9 +803,10 @@ async def test_run_bakeoff_resumes_without_calls(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
     out = tmp_path / "o.json"
-    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False)
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
     checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
-    runs = await bo.run_bakeoff(
+    result = await bo.run_bakeoff(
         corpus,
         ["m1"],
         out=out,
@@ -437,4 +814,138 @@ async def test_run_bakeoff_resumes_without_calls(
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
     )
-    assert [r.model_slug for r in runs] == ["m1"]
+    assert [r.model_slug for r in result.runs] == ["m1"]
+    assert result.stopped_early is False
+    assert result.unevaluated_slugs == []
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_stale_fingerprint_is_not_resumed(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """A checkpoint written against a DIFFERENT corpus/settings must not be
+    silently resumed and mixed into this run's leaderboard (#600 finding)."""
+    out = tmp_path / "o.json"
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint="stale-fingerprint")
+    checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
+    # max_spend=0.0 -> if the stale record were wrongly resumed the run would
+    # short-circuit with no budget check; instead it must be treated as NOT
+    # on disk and hit the (real) budget-stop path.
+    result = await bo.run_bakeoff(
+        corpus,
+        ["m1"],
+        out=out,
+        resume=True,
+        max_spend=0.0,
+        cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 1.0, 1.0, "x")]),
+    )
+    assert result.runs == []
+    assert result.stopped_early is True
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """Every page erroring (a transient outage) must not be cached as 'done'
+    -- a re-run should retry, not resume the outage forever (#600 finding)."""
+    out = tmp_path / "o.json"
+    result = await bo.run_bakeoff(
+        corpus,
+        ["m1"],
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
+        model=_model_text_only(),
+    )
+    assert result.runs[0].model_slug == "m1"
+    assert all(page.error is not None for page in result.runs[0].pages)
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert not checkpoint.has("m1")
+
+
+def test_run_wholly_failed_detects_all_errored_pages() -> None:
+    run = bo.ModelRun(
+        model_slug="m",
+        pages=[
+            bo.PageResult(slug="a", outcomes={}, error="boom", on_page_fields=0),
+            bo.PageResult(slug="b", outcomes={}, error="boom", on_page_fields=0),
+        ],
+    )
+    assert bo._run_wholly_failed(run) is True  # pyright: ignore[reportPrivateUsage]
+    mixed = bo.ModelRun(
+        model_slug="m",
+        pages=[
+            bo.PageResult(slug="a", outcomes={}, error="boom", on_page_fields=0),
+            bo.PageResult(slug="b", outcomes={}, error=None, on_page_fields=1),
+        ],
+    )
+    assert bo._run_wholly_failed(mixed) is False  # pyright: ignore[reportPrivateUsage]
+    empty = bo.ModelRun(model_slug="m", pages=[])
+    assert bo._run_wholly_failed(empty) is False  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_checkpoints_a_successful_run(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """The ordinary (non-wholly-failed) success path DOES checkpoint."""
+    model = _model_returning({"name": "X", "country": "Ecuador"})
+    out = tmp_path / "o.json"
+    result = await bo.run_bakeoff(
+        corpus,
+        ["m1"],
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
+        model=model,
+    )
+    assert result.stopped_early is False
+    assert result.runs[0].model_slug == "m1"
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert checkpoint.has("m1")
+
+
+@pytest.mark.asyncio
+async def test_main_full_run_writes_artifact_and_partial_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Drives ``main()``'s full (non-``--estimate-only``) success path against
+    a monkeypatched, network-free :func:`bo.run_bakeoff` -- covers the
+    artifact/report-writing + :class:`BakeoffResult` propagation glue,
+    including the PARTIAL-run labelling, without a real paid call."""
+    canned = bo.BakeoffResult(
+        runs=[_full_run(bo.MODEL_ROSTER[0].slug, bo.Outcome.COR)],
+        stopped_early=True,
+        unevaluated_slugs=[bo.MODEL_ROSTER[1].slug],
+    )
+
+    async def _fake_run_bakeoff(*args: object, **kwargs: object) -> bo.BakeoffResult:
+        return canned
+
+    monkeypatch.setattr(bo, "run_bakeoff", _fake_run_bakeoff)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-not-real")
+    out = tmp_path / "out.json"
+    report_md = tmp_path / "report.md"
+    code = await bo.main(
+        [
+            "--models",
+            bo.MODEL_ROSTER[0].slug,
+            bo.MODEL_ROSTER[1].slug,
+            "--max-spend",
+            "5",
+            "--out",
+            str(out),
+            "--report-md",
+            str(report_md),
+        ]
+    )
+    assert code == 0
+    artifact = json.loads(out.read_text())
+    assert artifact["stopped_early"] is True
+    assert artifact["unevaluated_slugs"] == [bo.MODEL_ROSTER[1].slug]
+    assert "PARTIAL RUN" in report_md.read_text()
