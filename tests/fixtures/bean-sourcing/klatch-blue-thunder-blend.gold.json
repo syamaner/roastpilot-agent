@@ -1,0 +1,26 @@
+{
+  "provenance": {
+    "vendor": "Klatch Coffee",
+    "url": "https://www.klatchcoffee.com/products/blue-thunder-blend",
+    "captured": "2026-07-19",
+    "note": "Dark-roast BLEND. Spec block gives Process/Region/Mouthfeel; Region is literally 'Global'."
+  },
+  "name": {"value": "Blue Thunder Blend"},
+  "fields": {
+    "origin": {"absent": true},
+    "region": {"absent": true},
+    "farm": {"absent": true},
+    "variety": {"absent": true},
+    "process": {"value": "washed"},
+    "altitude": {"absent": true},
+    "tasting_notes": {"value": ["smoky", "sweet", "bitter cocoa", "roasted chestnuts", "earthy"]},
+    "is_blend": {"value": true},
+    "species": {"absent": true},
+    "roast_guidance": {"value": "dark"}
+  },
+  "labeling_flags": [
+    "is_blend=true: explicitly a 'blend' combining a French Roast of Central/South American beans and a Sumatra wet-hulled coffee.",
+    "origin=absent and region=absent: the page's Region spec is 'Global' (a non-geographic placeholder for a multi-origin blend), so no single origin country/region is stated. SPOT-CHECK.",
+    "process=washed: the page's Process spec states 'Washed', though the prose says the blend includes a Sumatra WET-HULLED component (a contradiction handled by taking the structured spec value)."
+  ]
+}

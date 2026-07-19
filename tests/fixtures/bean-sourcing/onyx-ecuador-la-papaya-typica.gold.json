@@ -1,0 +1,26 @@
+{
+  "provenance": {
+    "vendor": "Onyx Coffee Lab",
+    "url": "https://onyxcoffeelab.com/products/ecuador-la-papaya-typica-26",
+    "captured": "2026-07-19",
+    "note": "Single-farm micro-lot (Hacienda La Papaya, Juan Pena). Nav-heavy Shopify page: the product spec block sits past the 20,000-char truncation cap (same caveat as the other Onyx pages)."
+  },
+  "name": {"value": "Ecuador La Papaya Typica"},
+  "fields": {
+    "origin": {"value": "Ecuador"},
+    "region": {"value": "Saraguro"},
+    "farm": {"value": "Hacienda La Papaya"},
+    "variety": {"value": ["Typica Mejorado"]},
+    "process": {"value": "washed"},
+    "altitude": {"value": 2000},
+    "tasting_notes": {"value": ["red fruit", "sweetness", "complexity", "tart acidity"]},
+    "is_blend": {"absent": true},
+    "species": {"absent": true},
+    "roast_guidance": {"absent": true}
+  },
+  "labeling_flags": [
+    "variety=[Typica Mejorado]: spec/prose say 'Typica Mejorado'; the product name says only 'Typica'. A model returning 'Typica' should score PAR (partial).",
+    "altitude=2000: the spec states 'Avg Elevation 2000 MASL' (a single value); the prose also gives a 1,800-2,200 m range. Labelled the single stated 2000 value (not the range).",
+    "region=Saraguro: the prose states the farm is in the Saraguro region of southern Ecuador."
+  ]
+}

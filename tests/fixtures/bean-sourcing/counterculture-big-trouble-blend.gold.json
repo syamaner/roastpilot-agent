@@ -1,0 +1,27 @@
+{
+  "provenance": {
+    "vendor": "Counter Culture Coffee",
+    "url": "https://counterculturecoffee.com/products/big-trouble",
+    "captured": "2026-07-19",
+    "note": "Year-round medium-dark BLEND. Blend components are behind a roast-date selector but appear in the page text (e.g. Cenfrocafe/Incahuasi Peru, Baroida Honey Papua New Guinea)."
+  },
+  "name": {"value": "Big Trouble"},
+  "fields": {
+    "origin": {"value": "Peru"},
+    "region": {"absent": true},
+    "farm": {"absent": true},
+    "variety": {"absent": true},
+    "process": {"value": "washed"},
+    "altitude": {"absent": true},
+    "tasting_notes": {"value": ["nutty", "caramel", "chocolate"]},
+    "is_blend": {"value": true},
+    "species": {"absent": true},
+    "roast_guidance": {"value": "medium-dark"}
+  },
+  "labeling_flags": [
+    "is_blend=true: explicitly 'our best-selling blend' / 'Year-Round Blend'.",
+    "origin=Peru: a multi-origin blend ('sourced from ... across the globe'); the dominant listed components are Peruvian (Cenfrocafe/Incahuasi Peru, 90-100%) with a 10% Papua New Guinea component. Recorded as the primary/dominant country per the extractor's 'primary bean' convention for blends. SPOT-CHECK (components rotate by roast date).",
+    "process=washed: the page's Process spec states 'Washed', though the blend also lists a honey-process PNG component (the structured spec value is used).",
+    "roast_guidance=medium-dark recorded for future scoring; not scored in phase 1 (the extractor has no page-sourced roast-guidance field)."
+  ]
+}

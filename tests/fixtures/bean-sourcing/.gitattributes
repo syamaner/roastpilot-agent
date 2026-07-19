@@ -1,0 +1,4 @@
+# Captured vendor HTML fixtures are byte-exact snapshots of the fetched pages
+# (the AGENTS.md tests/fixtures/ exception). Never apply EOL/text normalization
+# to them, so the committed bytes match exactly what was fetched from the vendor.
+*.html -text

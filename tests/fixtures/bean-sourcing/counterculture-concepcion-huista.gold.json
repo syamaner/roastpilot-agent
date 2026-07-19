@@ -1,0 +1,26 @@
+{
+  "provenance": {
+    "vendor": "Counter Culture Coffee",
+    "url": "https://counterculturecoffee.com/products/concepcion-huista",
+    "captured": "2026-07-19",
+    "note": "Roasted single-origin (cooperative lot) with a Harvest spec block (Process/Elevation/Variety) plus story prose."
+  },
+  "name": {"value": "Concepcion Huista"},
+  "fields": {
+    "origin": {"value": "Guatemala"},
+    "region": {"value": "Concepcion Huista"},
+    "farm": {"value": "CODECH"},
+    "variety": {"value": ["Caturra", "Bourbon", "Catuai", "Pache"]},
+    "process": {"value": "washed"},
+    "altitude": {"value": {"min_m": 1600, "max_m": 1900}},
+    "tasting_notes": {"value": ["cherry", "apple", "creamy body"]},
+    "is_blend": {"absent": true},
+    "species": {"absent": true},
+    "roast_guidance": {"absent": true}
+  },
+  "labeling_flags": [
+    "is_blend=absent: sold on Counter Culture's single-origin menu and sourced from the CODECH cooperative, but the page never plainly states THIS product's single-origin-vs-blend status (its prose discusses cooperative blends vs single-farm lots generically). Marked absent rather than false. SPOT-CHECK.",
+    "farm=CODECH: the coffee is attributed to the CODECH cooperative (Coordinadora de Organizaciones de Desarrollo de Concepcion Huista); recorded as the co-op for the farm/producer field.",
+    "region=Concepcion Huista (town). altitude is a stated RANGE (1,600-1,900 m)."
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "provenance": {
+    "vendor": "Onyx Coffee Lab",
+    "url": "https://onyxcoffeelab.com/products/colombia-jairo-arcila-rose-process",
+    "captured": "2026-07-19",
+    "note": "Single-producer micro-lot. Nav-heavy Shopify page: the product spec block (variety/process/elevation) sits well past the extractor's 20,000-char text-truncation cap, so a live run may see mostly navigation text -> expect low recall on this page (a real preprocessing finding, README section 2)."
+  },
+  "name": {"value": "Colombia Jairo Arcila Rose Process"},
+  "fields": {
+    "origin": {"value": "Colombia"},
+    "region": {"absent": true},
+    "farm": {"value": "Finca Santa Monica"},
+    "variety": {"value": ["Pink Bourbon"]},
+    "process": {"value": "honey"},
+    "altitude": {"value": 1500},
+    "tasting_notes": {"value": ["floral", "rose", "tea-like", "clarity", "brightness"]},
+    "is_blend": {"absent": true},
+    "species": {"absent": true},
+    "roast_guidance": {"value": "medium"}
+  },
+  "labeling_flags": [
+    "process=honey: the structured PROCESS METHOD spec says 'Innoculated, White Honey'; the prose also describes a 72-hour anaerobic fermentation before honey drying, so 'anaerobic' is also defensible. Used the structured spec (honey). SPOT-CHECK.",
+    "farm=Finca Santa Monica: producer Jairo Arcila at Finca Santa Monica; recorded the farm name.",
+    "region=absent: the page does not state this lot's region (Huila is mentioned only in generic Pink-Bourbon history).",
+    "altitude=1500 (Avg Elevation 1500 MASL, single stated value)."
+  ]
+}
