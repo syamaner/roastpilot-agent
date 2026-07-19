@@ -3429,6 +3429,76 @@ def test_extract_page_markdown_xxe_payload_does_not_expand_entity_or_touch_netwo
     assert "&xxe;" in markdown
 
 
+# --- #590 slice C P1 fix: metadata frontmatter leaks the page's own
+# og:url/canonical url/hostname/sitename regardless of whether a url=
+# argument is passed to trafilatura.extract; sanitised down to title only ---
+
+
+def test_extract_page_markdown_strips_url_hostname_sitename_leak_from_frontmatter() -> None:
+    """A page's OWN ``og:url``/``<link rel="canonical">`` tag — attacker-
+    influenceable content, not this module's own fetch destination — must
+    never reach the LLM prompt as a code-populated-looking ``url:``/
+    ``hostname:``/``sitename:`` frontmatter key, even though NO ``url=``
+    argument is ever passed to ``trafilatura.extract`` (#590 slice C P1
+    fix: the prior docstring's "no leak because no url= is passed" claim
+    was verified WRONG)."""
+    html = (
+        "<html><head>"
+        '<link rel="canonical" href="http://169.254.169.254/latest/meta-data/">'
+        '<meta property="og:url" content="http://internal-admin.example.local/secret-path">'
+        "</head><body><article>"
+        "<h1>Kenya Kiambu AA (Washed)</h1>"
+        "<p>Origin: Kenya. Region: Kiambu. Farm: Gakuyuini Factory.</p>"
+        "<p>Process: washed. Altitude: 1,700-1,850m.</p>"
+        "</article></body></html>"
+    )
+    markdown = bean_sourcing._extract_page_markdown(html)  # pyright: ignore[reportPrivateUsage]
+    assert markdown is not None
+    assert "169.254.169.254" not in markdown
+    assert "internal-admin.example.local" not in markdown
+    assert "url:" not in markdown
+    assert "hostname:" not in markdown
+    assert "sitename:" not in markdown
+    # The one field with_metadata=True was enabled to recover still survives.
+    assert "title: Kenya Kiambu AA (Washed)" in markdown
+
+
+def test_sanitize_trafilatura_frontmatter_keeps_only_title() -> None:
+    sanitize = bean_sourcing._sanitize_trafilatura_frontmatter  # pyright: ignore[reportPrivateUsage]
+    markdown = (
+        "---\n"
+        "title: Kenya Kiambu AA\n"
+        "author: Vendor Roastery\n"
+        "url: http://internal.example/leak\n"
+        "hostname: internal.example\n"
+        "sitename: internal.example\n"
+        "---\n"
+        "Body text here."
+    )
+    assert sanitize(markdown) == "---\ntitle: Kenya Kiambu AA\n---\nBody text here."
+
+
+def test_sanitize_trafilatura_frontmatter_drops_block_entirely_when_no_title() -> None:
+    sanitize = bean_sourcing._sanitize_trafilatura_frontmatter  # pyright: ignore[reportPrivateUsage]
+    markdown = "---\nurl: http://internal.example/leak\nhostname: internal.example\n---\nBody text."
+    assert sanitize(markdown) == "Body text."
+
+
+def test_sanitize_trafilatura_frontmatter_passes_through_text_without_frontmatter() -> None:
+    sanitize = bean_sourcing._sanitize_trafilatura_frontmatter  # pyright: ignore[reportPrivateUsage]
+    assert sanitize("Just plain body text, no frontmatter block at all.") == (
+        "Just plain body text, no frontmatter block at all."
+    )
+
+
+def test_sanitize_trafilatura_frontmatter_passes_through_unclosed_block_unchanged() -> None:
+    """Defensive branch: a string that starts like a frontmatter block but
+    never closes is left untouched rather than guessed at."""
+    sanitize = bean_sourcing._sanitize_trafilatura_frontmatter  # pyright: ignore[reportPrivateUsage]
+    malformed = "---\ntitle: Kenya Kiambu AA\nno closing delimiter here"
+    assert sanitize(malformed) == malformed
+
+
 # --- #590 slice C: wired into _fetch_page_text (primary, with linear-strip fallback) ---
 
 
@@ -3464,6 +3534,40 @@ async def test_fetch_page_text_falls_back_to_linear_strip_when_trafilatura_retur
         )
     assert text == bean_sourcing._extract_page_text(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
     assert "Kenya Kiambu AA" in text
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_bounds_a_hanging_markdown_extraction_with_a_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#590 slice C P1 fix: the trafilatura call runs AFTER the fetch's own
+    ``asyncio.timeout`` block already closed, and under
+    ``RoastService.draft_bean_from_url``'s ``_start_lock`` — SHARED with
+    ``start_roast`` — so an unbounded call here would hang every roast
+    start, not just this draft. A pathologically slow/hanging
+    ``_extract_page_markdown`` must fail closed with a typed
+    ``BeanFetchError`` within ``config.fetch_timeout_seconds``, not hang."""
+
+    def _hangs(html: str) -> str | None:
+        # A REAL (synchronous) sleep — this runs on the asyncio.to_thread
+        # worker thread, mirroring a genuinely pathological/slow parse;
+        # asyncio.timeout can only stop the AWAIT, not this thread, so it
+        # keeps running in the background after the test's own timeout
+        # fires — kept short so that residual cost stays negligible.
+        time.sleep(1.0)
+        return "should never be observed"  # pragma: no cover
+
+    monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _hangs)
+    async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
+        started = time.monotonic()
+        with pytest.raises(BeanFetchError, match="deadline"):
+            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+                "https://vendor.example/products/kenya-kiambu",
+                config=BeanSourcingConfig(fetch_timeout_seconds=0.1),
+                http_client=client,
+            )
+        elapsed = time.monotonic() - started
+    assert elapsed < 1.0, f"markdown-extraction timeout did not bound the call: {elapsed:.2f}s"
 
 
 @pytest.mark.asyncio
