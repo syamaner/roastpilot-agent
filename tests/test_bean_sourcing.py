@@ -26,6 +26,7 @@ import sys
 import time
 import zlib
 from collections.abc import AsyncGenerator, Callable
+from typing import Literal
 
 import httpx
 import pytest
@@ -1935,10 +1936,7 @@ async def test_fetch_page_text_end_to_end_timeout_raises_bean_fetch_error(
 
 def test_bean_sourcing_agent_builds_model_from_sourcing_config_default_when_none_injected() -> None:
     """Covers the model=None branch without any network call — build_model
-    only constructs the Model object. #590 slice A: the model comes from
-    ``BeanSourcingConfig.model_slug`` (default ``"openai/gpt-5-mini"``), NOT
-    ``advisor_config.model_slug`` — the advisor config here is deliberately
-    given a DIFFERENT model slug to prove it is not the one consulted."""
+    only constructs the Model object."""
     agent = bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
         AdvisorConfig(
             provider="openai_compatible",
@@ -1949,35 +1947,66 @@ def test_bean_sourcing_agent_builds_model_from_sourcing_config_default_when_none
     assert agent is not None
 
 
-def test_bean_sourcing_agent_uses_sourcing_config_model_slug(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """#590 slice A: an explicit ``sourcing_config.model_slug`` is passed to
-    ``build_model`` as its ``model_slug`` override — not
-    ``advisor_config.model_slug``."""
-    captured: dict[str, object] = {}
+# --- _resolve_extraction_model_slug (#590 P1 fix: provider-aware default) ---
+#
+# Codex caught a P1 on the PR that introduced BeanSourcingConfig.model_slug:
+# its OpenRouter-slug default ("openai/gpt-5-mini") was handed to
+# build_model() unconditionally, regardless of advisor_config.provider — so
+# an operator on a NATIVE provider (openai/anthropic/google/ollama) got an
+# invalid (or silently wrong-vendor) model slug and every extraction failed,
+# a regression from their currently-working, provider-compatible advisor
+# model. The three cases below pin the fix.
 
-    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
-        captured["config"] = config
-        captured["model_slug"] = model_slug
-        return _function_model_returning(_identity_args())
 
-    monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
-    bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
-        _ADVISOR_CONFIG,
-        sourcing_config=BeanSourcingConfig(model_slug="x-ai/grok-4.3"),
+def test_resolve_extraction_model_slug_openai_compatible_uses_bakeoff_default() -> None:
+    """(a) provider "openai_compatible" (BYOK-OpenRouter, the bake-off's own
+    setup) + no explicit override -> the bake-off's OpenRouter screening
+    pick, "openai/gpt-5-mini"."""
+    advisor_config = AdvisorConfig(provider="openai_compatible", model_slug="openai/gpt-4o")
+    resolved = bean_sourcing._resolve_extraction_model_slug(  # pyright: ignore[reportPrivateUsage]
+        advisor_config, None
     )
-    assert captured["model_slug"] == "x-ai/grok-4.3"
+    assert resolved == "openai/gpt-5-mini"
 
 
-def test_bean_sourcing_agent_defaults_model_slug_to_gpt5_mini_when_sourcing_config_omitted(
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "google", "ollama"])
+def test_resolve_extraction_model_slug_native_provider_uses_advisor_model_slug(
+    provider: Literal["openai", "anthropic", "google", "ollama"],
+) -> None:
+    """(b) a NATIVE provider + no explicit override -> the operator's own
+    advisor_config.model_slug, NEVER the OpenRouter-prefixed
+    "openai/gpt-5-mini" default (#590 P1: that slug is invalid/wrong-vendor
+    against a native provider's own API)."""
+    advisor_config = AdvisorConfig(provider=provider, model_slug="a-native-provider-model")
+    resolved = bean_sourcing._resolve_extraction_model_slug(  # pyright: ignore[reportPrivateUsage]
+        advisor_config, None
+    )
+    assert resolved == "a-native-provider-model"
+    assert resolved != "openai/gpt-5-mini"
+
+
+@pytest.mark.parametrize("provider", ["openai_compatible", "anthropic"])
+def test_resolve_extraction_model_slug_explicit_override_wins_regardless_of_provider(
+    provider: Literal["openai_compatible", "anthropic"],
+) -> None:
+    """An explicit ``sourcing_config.model_slug`` always wins, whatever the
+    provider — the operator (or the bake-off harness, pinning a slug per
+    roster model under test) is trusted to have named a compatible one."""
+    advisor_config = AdvisorConfig(provider=provider, model_slug="advisor-default")
+    sourcing_config = BeanSourcingConfig(model_slug="explicit-override")
+    resolved = bean_sourcing._resolve_extraction_model_slug(  # pyright: ignore[reportPrivateUsage]
+        advisor_config, sourcing_config
+    )
+    assert resolved == "explicit-override"
+
+
+def test_bean_sourcing_agent_uses_resolved_model_slug_openai_compatible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No ``sourcing_config`` at all (not even ``None`` explicitly) falls
-    back to :data:`bean_sourcing._DEFAULT_EXTRACTION_MODEL_SLUG`
-    (``"openai/gpt-5-mini"``), mirroring ``BeanSourcingConfig.model_slug``'s
-    own default — never silently building whatever
-    ``advisor_config.model_slug`` happens to be."""
+    """Integration: with provider "openai_compatible" and no explicit
+    override, ``_bean_sourcing_agent`` passes the bake-off default to
+    ``build_model`` — not ``advisor_config.model_slug``, which is
+    deliberately set to something else here to prove it is not consulted."""
     captured: dict[str, object] = {}
 
     def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
@@ -1986,16 +2015,49 @@ def test_bean_sourcing_agent_defaults_model_slug_to_gpt5_mini_when_sourcing_conf
 
     monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
     bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
-        AdvisorConfig(model_slug="anthropic/claude-opus-4.8")
+        AdvisorConfig(provider="openai_compatible", model_slug="anthropic/claude-opus-4.8")
     )
     assert captured["model_slug"] == "openai/gpt-5-mini"
 
 
-def test_default_extraction_model_slug_matches_config_default() -> None:
-    """Drift guard: the module-level fallback constant must always equal
-    ``BeanSourcingConfig.model_slug``'s own default."""
-    default_model_slug = bean_sourcing._DEFAULT_EXTRACTION_MODEL_SLUG  # pyright: ignore[reportPrivateUsage]
-    assert BeanSourcingConfig().model_slug == default_model_slug
+def test_bean_sourcing_agent_native_provider_uses_advisor_model_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(b) integration, the P1 regression test: with a NATIVE provider and
+    no explicit ``sourcing_config`` override, ``_bean_sourcing_agent`` must
+    pass ``advisor_config.model_slug`` to ``build_model`` — never the
+    OpenRouter-only default."""
+    captured: dict[str, object] = {}
+
+    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+        captured["model_slug"] = model_slug
+        return _function_model_returning(_identity_args())
+
+    monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
+    bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
+        AdvisorConfig(provider="openai", model_slug="gpt-5-mini")
+    )
+    assert captured["model_slug"] == "gpt-5-mini"
+
+
+def test_bean_sourcing_agent_injected_model_overrides_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(c) an injected ``model=`` wins over BOTH the provider-aware default
+    AND an explicit ``sourcing_config.model_slug`` — ``build_model`` must
+    not even be called."""
+
+    def fail_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+        raise AssertionError("build_model must not be called when model= is injected")
+
+    monkeypatch.setattr(bean_sourcing, "build_model", fail_build_model)
+    injected = _function_model_returning(_identity_args())
+    agent = bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
+        AdvisorConfig(provider="openai", model_slug="gpt-5-mini"),
+        sourcing_config=BeanSourcingConfig(model_slug="explicit-override"),
+        model=injected,
+    )
+    assert agent is not None
 
 
 def test_default_extraction_timeout_matches_config_default() -> None:
@@ -2473,9 +2535,9 @@ async def test_draft_bean_profile_from_url_threads_extraction_timeout_from_sourc
 async def test_draft_bean_profile_from_url_threads_model_slug_from_sourcing_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """#590 slice A, full pipeline: ``sourcing_config.model_slug`` (not
-    ``advisor_config.model_slug``) reaches ``build_model`` when no ``model``
-    is injected."""
+    """#590 slice A, full pipeline: an EXPLICIT ``sourcing_config.model_slug``
+    (not ``advisor_config.model_slug``, and overriding the provider-aware
+    default too) reaches ``build_model`` when no ``model`` is injected."""
     captured: dict[str, object] = {}
 
     def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
@@ -2491,6 +2553,31 @@ async def test_draft_bean_profile_from_url_threads_model_slug_from_sourcing_conf
             http_client=http_client,
         )
     assert captured["model_slug"] == "x-ai/grok-4.3"
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_native_provider_uses_advisor_model_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(b) full-pipeline P1 regression test: a NATIVE advisor provider with
+    no ``sourcing_config`` at all must extract with
+    ``advisor_config.model_slug`` — never the OpenRouter-only
+    "openai/gpt-5-mini" default, which is invalid/wrong-vendor against a
+    native provider's own API."""
+    captured: dict[str, object] = {}
+
+    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+        captured["model_slug"] = model_slug
+        return _function_model_returning(_identity_args())
+
+    monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
+    async with _mock_client(_html_response(200, _SAMPLE_HTML)) as http_client:
+        await draft_bean_profile_from_url(
+            "https://vendor.example/products/kenya-kiambu",
+            advisor_config=AdvisorConfig(provider="openai", model_slug="gpt-5-mini"),
+            http_client=http_client,
+        )
+    assert captured["model_slug"] == "gpt-5-mini"
 
 
 @pytest.mark.asyncio

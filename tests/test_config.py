@@ -266,15 +266,19 @@ def test_app_config_defaults_without_env(monkeypatch: pytest.MonkeyPatch) -> Non
 
 def test_bean_sourcing_config_defaults() -> None:
     """#573 phase 1 + #590 slice A: sane, conservative add-bean-from-URL
-    fetch limits, and a dedicated (longer) extraction timeout + default
-    extraction model, decoupled from the roast-advice config."""
+    fetch limits, and a dedicated (longer) extraction timeout, decoupled
+    from the roast-advice config. ``model_slug`` defaults to ``None`` — a
+    sentinel meaning "resolve provider-aware"
+    (``bean_sourcing._resolve_extraction_model_slug``, #590 P1 fix), not a
+    fixed OpenRouter slug that would be invalid against a native advisor
+    provider."""
     config = BeanSourcingConfig()
     assert config.fetch_timeout_seconds == 10.0
     assert config.max_response_bytes == 2_000_000
     assert config.user_agent
     assert "RoastPilotAgent" in config.user_agent
     assert config.extraction_timeout_seconds == 45.0
-    assert config.model_slug == "openai/gpt-5-mini"
+    assert config.model_slug is None
 
 
 @pytest.mark.parametrize(

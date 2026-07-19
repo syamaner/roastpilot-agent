@@ -1240,12 +1240,13 @@ class BeanSourcingConfig(BaseModel):
     provider/key (BYOK) — see
     ``bean_sourcing.draft_bean_profile_from_url``'s ``advisor_config``
     parameter — but owns its OWN extraction timeout
-    (:attr:`extraction_timeout_seconds`) and model
-    (:attr:`model_slug`), independent of the roast-advice
-    timeout/model :class:`AdvisorConfig` configures (#590 slice A: a
-    one-shot bean draft is not a per-tick advice call, and must not
-    silently ride whatever model the operator has configured for roast
-    advice).
+    (:attr:`extraction_timeout_seconds`), independent of the roast-advice
+    timeout :class:`AdvisorConfig` configures (#590 slice A: a one-shot
+    bean draft is not a per-tick advice call). The extraction MODEL
+    (:attr:`model_slug`) defaults to a PROVIDER-AWARE resolution rather
+    than a fixed slug — see :attr:`model_slug`'s own docstring — so a bean
+    draft neither rides whatever roast-advice model happens to be
+    configured nor sends an OpenRouter-prefixed slug to a native provider.
     """
 
     fetch_timeout_seconds: float = Field(default=10.0, gt=0)
@@ -1280,17 +1281,33 @@ class BeanSourcingConfig(BaseModel):
     "Operational findings"). 45 s matches the budget the bake-off itself
     used to get a fair read on those models."""
 
-    model_slug: str = Field(default="openai/gpt-5-mini", min_length=1)
-    """The model used for bean-identity extraction, independent of whatever
-    model :class:`AdvisorConfig` has configured for roast advice — bean
-    drafting must not silently ride a roast-advice model swap. Defaults to
-    the bean-sourcing extraction bake-off's screening pick
-    (``docs/advisor/bean-sourcing-bakeoff-2026-07-19.md``: best macro-F1/
-    recall of any model with zero page errors, ~1/8 the cost of the
-    ``gpt-4o`` ceiling). That bake-off ran on the pre-#590 extraction
-    pipeline and is explicitly flagged there as a SCREENING pick to
-    re-confirm once the #590 preprocessing (extruct/trafilatura) lands, not
-    a locked decision."""
+    model_slug: str | None = Field(default=None, min_length=1)
+    """An explicit extraction model slug, independent of whatever model
+    :class:`AdvisorConfig` has configured for roast advice — bean drafting
+    must not silently ride a roast-advice model swap. ``None`` (the
+    default) means "resolve provider-aware" rather than "use a fixed slug"
+    — see ``bean_sourcing._resolve_extraction_model_slug``:
+
+    - When :attr:`AdvisorConfig.provider` is ``"openai_compatible"`` (the
+      BYOK-OpenRouter path the bake-off used), it resolves to
+      ``"openai/gpt-5-mini"`` — the bean-sourcing extraction bake-off's
+      screening pick (``docs/advisor/bean-sourcing-bakeoff-2026-07-19.md``:
+      best macro-F1/recall of any model with zero page errors, ~1/8 the
+      cost of the ``gpt-4o`` ceiling). That bake-off ran on the pre-#590
+      extraction pipeline and is explicitly flagged there as a SCREENING
+      pick to re-confirm once the #590 preprocessing (extruct/trafilatura)
+      lands, not a locked decision.
+    - For a NATIVE provider (``openai``/``anthropic``/``google``/
+      ``ollama``), it resolves to ``advisor_config.model_slug`` instead —
+      the OpenRouter-prefixed ``"openai/gpt-5-mini"`` slug is meaningless
+      (or silently wrong-vendor) against a native provider's own API, which
+      made every extraction fail whenever the operator's advisor was
+      configured on a native provider (a P1 caught in review on the PR that
+      introduced this field, before merge).
+
+    Set this explicitly to opt OUT of the provider-aware default and pin a
+    specific slug regardless of provider (e.g. the bake-off harness does
+    this per roster model under test)."""
 
 
 class SafetyLimits(BaseModel):

@@ -2156,10 +2156,13 @@ def make_sourcing_config(model_slug: str) -> BeanSourcingConfig:
     roast advisor happens to be configured with). This harness compares
     MANY models in one run by varying the slug under test per roster entry
     (see :func:`run_bakeoff`'s real, non-injected-``model`` path) — it must
-    vary the SAME slug on ``BeanSourcingConfig`` now, or every real
-    (paid) run would silently extract with the config default
-    (``"openai/gpt-5-mini"``) regardless of which roster model it claims to
-    be scoring.
+    set the SAME slug explicitly on ``BeanSourcingConfig`` now, or every
+    real (paid) run would silently resolve the extraction model
+    provider-aware instead (``bean_sourcing._resolve_extraction_model_slug``,
+    #590 P1 fix) — here that would still land on the bake-off's OpenRouter
+    default (``"openai/gpt-5-mini"``, since :func:`make_advisor_config`
+    always sets ``provider="openai_compatible"``), regardless of which
+    roster model this run claims to be scoring.
 
     Args:
         model_slug: The roster model under test.
