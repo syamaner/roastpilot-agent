@@ -2662,9 +2662,11 @@ class RoastService:
         draft is in flight WAITS for the draft to finish (bounded by the
         fetch + extraction timeouts, so at most
         ``sourcing_config.fetch_timeout_seconds +
-        advisor_config.timeout_seconds``) rather than racing it — a rare,
-        bounded delay is the safe side of this trade; a single operator is
-        unlikely to issue both at once regardless.
+        sourcing_config.extraction_timeout_seconds`` — #590 slice A moved
+        the extraction bound off ``advisor_config.timeout_seconds`` onto
+        its own, longer, ``BeanSourcingConfig`` setting) rather than racing
+        it — a rare, bounded delay is the safe side of this trade; a single
+        operator is unlikely to issue both at once regardless.
 
         Raises:
             RoastRunConflictError: A roast is currently active (maps to

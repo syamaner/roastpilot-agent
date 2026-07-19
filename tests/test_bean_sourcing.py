@@ -1933,13 +1933,76 @@ async def test_fetch_page_text_end_to_end_timeout_raises_bean_fetch_error(
 # --- _bean_sourcing_agent / _extract_bean_identity ---
 
 
-def test_bean_sourcing_agent_builds_model_from_advisor_config_when_none_injected() -> None:
-    """Covers the model=None branch (build_model(advisor_config)) without any
-    network call — build_model only constructs the Model object."""
+def test_bean_sourcing_agent_builds_model_from_sourcing_config_default_when_none_injected() -> None:
+    """Covers the model=None branch without any network call — build_model
+    only constructs the Model object. #590 slice A: the model comes from
+    ``BeanSourcingConfig.model_slug`` (default ``"openai/gpt-5-mini"``), NOT
+    ``advisor_config.model_slug`` — the advisor config here is deliberately
+    given a DIFFERENT model slug to prove it is not the one consulted."""
     agent = bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
-        AdvisorConfig(provider="openai_compatible", api_key_env="ROASTPILOT_TEST_UNSET_KEY")
+        AdvisorConfig(
+            provider="openai_compatible",
+            api_key_env="ROASTPILOT_TEST_UNSET_KEY",
+            model_slug="openai/gpt-4o",
+        )
     )
     assert agent is not None
+
+
+def test_bean_sourcing_agent_uses_sourcing_config_model_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#590 slice A: an explicit ``sourcing_config.model_slug`` is passed to
+    ``build_model`` as its ``model_slug`` override — not
+    ``advisor_config.model_slug``."""
+    captured: dict[str, object] = {}
+
+    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+        captured["config"] = config
+        captured["model_slug"] = model_slug
+        return _function_model_returning(_identity_args())
+
+    monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
+    bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
+        _ADVISOR_CONFIG,
+        sourcing_config=BeanSourcingConfig(model_slug="x-ai/grok-4.3"),
+    )
+    assert captured["model_slug"] == "x-ai/grok-4.3"
+
+
+def test_bean_sourcing_agent_defaults_model_slug_to_gpt5_mini_when_sourcing_config_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No ``sourcing_config`` at all (not even ``None`` explicitly) falls
+    back to :data:`bean_sourcing._DEFAULT_EXTRACTION_MODEL_SLUG`
+    (``"openai/gpt-5-mini"``), mirroring ``BeanSourcingConfig.model_slug``'s
+    own default — never silently building whatever
+    ``advisor_config.model_slug`` happens to be."""
+    captured: dict[str, object] = {}
+
+    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+        captured["model_slug"] = model_slug
+        return _function_model_returning(_identity_args())
+
+    monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
+    bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
+        AdvisorConfig(model_slug="anthropic/claude-opus-4.8")
+    )
+    assert captured["model_slug"] == "openai/gpt-5-mini"
+
+
+def test_default_extraction_model_slug_matches_config_default() -> None:
+    """Drift guard: the module-level fallback constant must always equal
+    ``BeanSourcingConfig.model_slug``'s own default."""
+    default_model_slug = bean_sourcing._DEFAULT_EXTRACTION_MODEL_SLUG  # pyright: ignore[reportPrivateUsage]
+    assert BeanSourcingConfig().model_slug == default_model_slug
+
+
+def test_default_extraction_timeout_matches_config_default() -> None:
+    """Drift guard: the module-level fallback constant must always equal
+    ``BeanSourcingConfig.extraction_timeout_seconds``'s own default."""
+    default_timeout = bean_sourcing._DEFAULT_EXTRACTION_TIMEOUT_SECONDS  # pyright: ignore[reportPrivateUsage]
+    assert BeanSourcingConfig().extraction_timeout_seconds == default_timeout
 
 
 @pytest.mark.asyncio
@@ -1974,16 +2037,56 @@ async def test_extract_bean_identity_maps_provider_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_extract_bean_identity_timeout_raises_bean_extraction_error() -> None:
-    """#587 fix 3: ``agent.run`` is bounded by ``advisor_config.timeout_seconds``
-    — a hung provider must fail soft as ``BeanExtractionError``, not hang the
-    drafting request forever."""
+async def test_extract_bean_identity_timeout_uses_sourcing_config_not_advisor_config() -> None:
+    """#590 slice A: the extraction deadline is
+    ``sourcing_config.extraction_timeout_seconds`` — NOT
+    ``advisor_config.timeout_seconds``. ``advisor_config`` here is given a
+    LONG timeout that would never fire on its own, and ``sourcing_config`` a
+    short one, so this only passes if the short, sourcing-owned deadline is
+    the one actually enforced (the old coupling would let this hang for the
+    full 10s test-suite-unfriendly duration, or simply never time out at
+    all with a 100s advisor budget)."""
     model = _function_model_hanging()
-    config = AdvisorConfig(timeout_seconds=0.05)
+    advisor_config = AdvisorConfig(timeout_seconds=100.0)
+    sourcing_config = BeanSourcingConfig(extraction_timeout_seconds=0.05)
     with pytest.raises(BeanExtractionError, match="deadline"):
         await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
-            "page text", advisor_config=config, model=model
+            "page text",
+            advisor_config=advisor_config,
+            sourcing_config=sourcing_config,
+            model=model,
         )
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_default_timeout_ignores_short_advisor_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Omitting ``sourcing_config`` entirely falls back to
+    :data:`bean_sourcing._DEFAULT_EXTRACTION_TIMEOUT_SECONDS` (45s) — never
+    to ``advisor_config.timeout_seconds`` (the old, too-tight 10s advice
+    budget that timed out reasoning models in the bean-sourcing bake-off).
+    Spies on ``asyncio.timeout`` to assert the actual deadline passed to it,
+    with a deliberately tiny ``advisor_config.timeout_seconds`` that would
+    prove the (undesired) coupling if it were still in effect."""
+    recorded: list[float] = []
+    real_timeout = asyncio.timeout
+
+    def spy_timeout(delay: float) -> asyncio.Timeout:
+        recorded.append(delay)
+        return real_timeout(delay)
+
+    # Patches the shared ``asyncio`` module object (not ``bean_sourcing``'s
+    # own import binding) -- bean_sourcing.py's own ``import asyncio`` refers
+    # to this same module instance, so its ``asyncio.timeout(...)`` call
+    # picks up the spy too.
+    monkeypatch.setattr(asyncio, "timeout", spy_timeout)
+    model = _function_model_returning(_identity_args())
+    advisor_config = AdvisorConfig(timeout_seconds=0.001)
+    await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text", advisor_config=advisor_config, model=model
+    )
+    assert recorded == [bean_sourcing._DEFAULT_EXTRACTION_TIMEOUT_SECONDS]  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -2345,6 +2448,49 @@ async def test_draft_bean_profile_from_url_end_to_end() -> None:
     assert draft.field_sources["bean_varietal"] == "on_page"
     assert draft.field_sources["target_development_percent"] == "origin_estimated"
     assert draft.default_bean_weight_grams == 250.0
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_threads_extraction_timeout_from_sourcing_config() -> (
+    None
+):
+    """#590 slice A, full pipeline: a short
+    ``sourcing_config.extraction_timeout_seconds`` reaches the extraction
+    call even though ``advisor_config.timeout_seconds`` is long — proves
+    the decoupling holds end-to-end, not just at the unit level."""
+    async with _mock_client(_html_response(200, _SAMPLE_HTML)) as http_client:
+        with pytest.raises(BeanExtractionError, match="deadline"):
+            await draft_bean_profile_from_url(
+                "https://vendor.example/products/kenya-kiambu",
+                advisor_config=AdvisorConfig(timeout_seconds=100.0),
+                sourcing_config=BeanSourcingConfig(extraction_timeout_seconds=0.05),
+                http_client=http_client,
+                model=_function_model_hanging(),
+            )
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_threads_model_slug_from_sourcing_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#590 slice A, full pipeline: ``sourcing_config.model_slug`` (not
+    ``advisor_config.model_slug``) reaches ``build_model`` when no ``model``
+    is injected."""
+    captured: dict[str, object] = {}
+
+    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+        captured["model_slug"] = model_slug
+        return _function_model_returning(_identity_args())
+
+    monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
+    async with _mock_client(_html_response(200, _SAMPLE_HTML)) as http_client:
+        await draft_bean_profile_from_url(
+            "https://vendor.example/products/kenya-kiambu",
+            advisor_config=AdvisorConfig(model_slug="openai/gpt-4o"),
+            sourcing_config=BeanSourcingConfig(model_slug="x-ai/grok-4.3"),
+            http_client=http_client,
+        )
+    assert captured["model_slug"] == "x-ai/grok-4.3"
 
 
 @pytest.mark.asyncio

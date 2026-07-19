@@ -265,12 +265,16 @@ def test_app_config_defaults_without_env(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 def test_bean_sourcing_config_defaults() -> None:
-    """#573 phase 1: sane, conservative add-bean-from-URL fetch limits."""
+    """#573 phase 1 + #590 slice A: sane, conservative add-bean-from-URL
+    fetch limits, and a dedicated (longer) extraction timeout + default
+    extraction model, decoupled from the roast-advice config."""
     config = BeanSourcingConfig()
     assert config.fetch_timeout_seconds == 10.0
     assert config.max_response_bytes == 2_000_000
     assert config.user_agent
     assert "RoastPilotAgent" in config.user_agent
+    assert config.extraction_timeout_seconds == 45.0
+    assert config.model_slug == "openai/gpt-5-mini"
 
 
 @pytest.mark.parametrize(
@@ -280,6 +284,9 @@ def test_bean_sourcing_config_defaults() -> None:
         {"fetch_timeout_seconds": -1},
         {"max_response_bytes": 0},
         {"user_agent": ""},
+        {"extraction_timeout_seconds": 0},
+        {"extraction_timeout_seconds": -1},
+        {"model_slug": ""},
     ],
 )
 def test_bean_sourcing_config_rejects_nonsense(overrides: dict[str, object]) -> None:

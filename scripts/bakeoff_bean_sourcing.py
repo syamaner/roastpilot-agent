@@ -163,7 +163,8 @@ class RosterModel:
 #: at run time (they drift). NOT run on import or under the self-test.
 #: A one-shot bean-draft's extraction budget (seconds). Decoupled from the 10s
 #: per-tick roast-advice default so slow/reasoning models are measured on quality,
-#: not cut off; a user pasting a URL tolerates this. See make_advisor_config.
+#: not cut off; a user pasting a URL tolerates this. See make_sourcing_config
+#: (the extraction-owning config, #590 slice A) and make_advisor_config.
 BAKEOFF_EXTRACTION_TIMEOUT_S: float = 45.0
 
 MODEL_ROSTER: tuple[RosterModel, ...] = (
@@ -1013,7 +1014,9 @@ async def draft_for_page(
         model: An injected PydanticAI ``Model`` (the self-test seam); ``None``
             builds the real provider model from ``advisor_config`` (a paid
             call).
-        sourcing_config: Fetch-limit config; a default is built when omitted.
+        sourcing_config: Fetch/extraction-limit config (#590 slice A: also
+            selects the extraction model/timeout, not just the fetch); a
+            default is built when omitted.
 
     Returns:
         ``(draft, None)`` on success, or ``(None, error_str)`` on any typed
@@ -1096,7 +1099,7 @@ async def run_model_over_corpus(
         model_slug: The model's report label.
         advisor_config: The provider/key/model config.
         model: An injected ``Model`` (self-test); ``None`` = a real paid call.
-        sourcing_config: Fetch-limit config.
+        sourcing_config: Fetch/extraction-limit config (#590 slice A).
 
     Returns:
         The :class:`ModelRun`.
@@ -2122,7 +2125,15 @@ def load_dotenv_key(repo_root: Path, key: str = OPENROUTER_KEY_ENV) -> str | Non
 
 
 def make_advisor_config(model_slug: str) -> AdvisorConfig:
-    """An OpenRouter-backed config pinning every phase to ``model_slug``."""
+    """An OpenRouter-backed config pinning every phase to ``model_slug``.
+
+    ``model_slug``/``timeout_seconds`` here drive the (unused, in this
+    harness) roast-ADVICE path only — since #590 slice A,
+    ``draft_bean_profile_from_url`` builds the EXTRACTION model/timeout
+    from :func:`make_sourcing_config` instead (see its own docstring). Kept
+    set here too (harmlessly) so this config stays representative of a real
+    operator config pinning one model everywhere.
+    """
     from roastpilot_agent.models import RoastPhase  # noqa: PLC0415
 
     return AdvisorConfig(
@@ -2131,13 +2142,37 @@ def make_advisor_config(model_slug: str) -> AdvisorConfig:
         api_key_env=OPENROUTER_KEY_ENV,
         model_slug=model_slug,
         model_slug_by_phase={phase: model_slug for phase in RoastPhase},
-        # A one-shot bean-draft is NOT a per-tick roast-advice call: the operator
-        # pastes a URL and can wait ~30s, so the extraction gets a realistic
-        # budget rather than the 10s advice default (which timed out reasoning
-        # models like gpt-5-nano/gpt-5-mini on the first bake-off pass — a real
-        # finding: the extraction deadline should be decoupled from and longer
-        # than the advice deadline; tracked for the extractor config, #590).
         timeout_seconds=BAKEOFF_EXTRACTION_TIMEOUT_S,
+    )
+
+
+def make_sourcing_config(model_slug: str) -> BeanSourcingConfig:
+    """The extraction model/timeout config for one bake-off roster slug.
+
+    #590 slice A moved bean-identity EXTRACTION off
+    ``AdvisorConfig.model_slug``/``timeout_seconds`` onto
+    ``BeanSourcingConfig.model_slug``/``extraction_timeout_seconds`` (a
+    one-shot bean draft must not silently ride whatever model/timeout the
+    roast advisor happens to be configured with). This harness compares
+    MANY models in one run by varying the slug under test per roster entry
+    (see :func:`run_bakeoff`'s real, non-injected-``model`` path) — it must
+    vary the SAME slug on ``BeanSourcingConfig`` now, or every real
+    (paid) run would silently extract with the config default
+    (``"openai/gpt-5-mini"``) regardless of which roster model it claims to
+    be scoring.
+
+    Args:
+        model_slug: The roster model under test.
+
+    Returns:
+        A :class:`BeanSourcingConfig` pinning extraction to ``model_slug``,
+        with the bake-off's own 45s extraction budget (matches the config
+        default, kept explicit here for the same "representative operator
+        config" reason as :func:`make_advisor_config`).
+    """
+    return BeanSourcingConfig(
+        model_slug=model_slug,
+        extraction_timeout_seconds=BAKEOFF_EXTRACTION_TIMEOUT_S,
     )
 
 
@@ -2243,7 +2278,11 @@ async def run_bakeoff(
                 executed_slugs=executed_slugs,
             )
         run = await run_model_over_corpus(
-            pages, model_slug=slug, advisor_config=make_advisor_config(slug), model=model
+            pages,
+            model_slug=slug,
+            advisor_config=make_advisor_config(slug),
+            model=model,
+            sourcing_config=make_sourcing_config(slug),
         )
         spent += upcoming
         executed_slugs.append(slug)  # a real call was attempted, win or lose

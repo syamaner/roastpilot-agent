@@ -1228,7 +1228,7 @@ class AdvisorConfig(BaseModel):
 
 
 class BeanSourcingConfig(BaseModel):
-    """Add-bean-from-URL fetch limits (#573 phase 1).
+    """Add-bean-from-URL fetch + extraction limits (#573 phase 1, #590 slice A).
 
     Governs the respectful, fail-soft vendor-page fetch in
     ``roastpilot_agent.bean_sourcing.draft_bean_profile_from_url``: a bounded
@@ -1236,10 +1236,16 @@ class BeanSourcingConfig(BaseModel):
     oversized or slow-drip response is never read fully into memory), and an
     identifying ``User-Agent`` (a vendor's own logs should be able to tell
     this traffic apart from a browser). The structured LLM extraction step
-    reuses the operator's already-configured :class:`AdvisorConfig` (BYOK)
-    rather than a duplicate provider config here — see
+    reuses the operator's already-configured :class:`AdvisorConfig` for
+    provider/key (BYOK) — see
     ``bean_sourcing.draft_bean_profile_from_url``'s ``advisor_config``
-    parameter.
+    parameter — but owns its OWN extraction timeout
+    (:attr:`extraction_timeout_seconds`) and model
+    (:attr:`model_slug`), independent of the roast-advice
+    timeout/model :class:`AdvisorConfig` configures (#590 slice A: a
+    one-shot bean draft is not a per-tick advice call, and must not
+    silently ride whatever model the operator has configured for roast
+    advice).
     """
 
     fetch_timeout_seconds: float = Field(default=10.0, gt=0)
@@ -1259,6 +1265,32 @@ class BeanSourcingConfig(BaseModel):
     )
     """Identifying ``User-Agent`` sent with the fetch — a courteous default a
     vendor can distinguish from a browser or an unlabelled scraper."""
+
+    extraction_timeout_seconds: float = Field(default=45.0, gt=0)
+    """Bound on the bean-identity extraction LLM call
+    (``bean_sourcing._extract_bean_identity``'s ``agent.run()``) —
+    deliberately a SEPARATE, LONGER budget than
+    :attr:`AdvisorConfig.timeout_seconds` (10 s), which bounds the
+    *per-tick roast-advice* call the live control loop makes once a second.
+    A bean draft is a one-shot request the operator explicitly triggers by
+    pasting a vendor URL and can wait ~30 s for; the 10 s advice budget
+    starved every call for the reasoning models tested in the bean-sourcing
+    bake-off (``gpt-5-nano``/``gpt-5-mini`` both scored 0/81 on the first
+    pass — see ``docs/advisor/bean-sourcing-bakeoff-2026-07-19.md``,
+    "Operational findings"). 45 s matches the budget the bake-off itself
+    used to get a fair read on those models."""
+
+    model_slug: str = Field(default="openai/gpt-5-mini", min_length=1)
+    """The model used for bean-identity extraction, independent of whatever
+    model :class:`AdvisorConfig` has configured for roast advice — bean
+    drafting must not silently ride a roast-advice model swap. Defaults to
+    the bean-sourcing extraction bake-off's screening pick
+    (``docs/advisor/bean-sourcing-bakeoff-2026-07-19.md``: best macro-F1/
+    recall of any model with zero page errors, ~1/8 the cost of the
+    ``gpt-4o`` ceiling). That bake-off ran on the pre-#590 extraction
+    pipeline and is explicitly flagged there as a SCREENING pick to
+    re-confirm once the #590 preprocessing (extruct/trafilatura) lands, not
+    a locked decision."""
 
 
 class SafetyLimits(BaseModel):

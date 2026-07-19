@@ -23,10 +23,17 @@ tools and only returns typed ``RoastDecision``). This module:
   tools of any kind wired in, so there is no path from a fetched URL back
   into the roast-control loop;
 - reuses :func:`roastpilot_agent.advisor.build_model` only as the shared,
-  pure PydanticAI provider-construction factory (BYOK: the same
-  provider/key/model config the operator already set for the roast advisor
-  drives this SEPARATE call too) — that function builds a ``Model``, not an
-  advisor, and carries no roaster/controller/safety coupling itself.
+  pure PydanticAI provider-construction factory (BYOK: the operator's
+  already-configured provider/key drive this SEPARATE call too) — that
+  function builds a ``Model``, not an advisor, and carries no
+  roaster/controller/safety coupling itself. The MODEL SLUG and the
+  extraction call's timeout are its own,
+  :class:`~roastpilot_agent.config.BeanSourcingConfig`-owned settings
+  (:attr:`~roastpilot_agent.config.BeanSourcingConfig.model_slug`,
+  :attr:`~roastpilot_agent.config.BeanSourcingConfig.extraction_timeout_seconds`
+  — #590 slice A) — deliberately NOT ``AdvisorConfig.model_slug``/
+  ``timeout_seconds``, which are the roast advisor's per-tick control-loop
+  settings and must not silently drive a one-shot bean draft;
 
 Fetching is respectful and fail-soft (issue #573 safeguards): a bounded
 timeout, an identifying User-Agent, and a hard response-size cap enforced
@@ -1278,8 +1285,31 @@ Fields:
 """.strip()
 
 
+#: Fallback extraction timeout used only when :func:`_extract_bean_identity`
+#: is called with no :class:`~roastpilot_agent.config.BeanSourcingConfig` at
+#: all — mirrors :attr:`~roastpilot_agent.config.BeanSourcingConfig.extraction_timeout_seconds`'s
+#: own default (a dedicated ``tests/test_bean_sourcing.py`` case keeps the
+#: two from silently drifting apart). Deliberately never falls back to
+#: ``AdvisorConfig.timeout_seconds`` (the 10 s per-tick roast-advice budget)
+#: — that coupling is exactly what #590 slice A removes; reintroducing it
+#: here as an implicit fallback would undo the fix for every caller that
+#: happens to omit ``sourcing_config``.
+_DEFAULT_EXTRACTION_TIMEOUT_SECONDS: float = 45.0
+
+#: Fallback extraction model slug used only when :func:`_bean_sourcing_agent`
+#: is called with no :class:`~roastpilot_agent.config.BeanSourcingConfig` at
+#: all — mirrors :attr:`~roastpilot_agent.config.BeanSourcingConfig.model_slug`'s
+#: own default (bean-sourcing bake-off screening pick,
+#: ``docs/advisor/bean-sourcing-bakeoff-2026-07-19.md``); kept in sync by the
+#: same drift test as :data:`_DEFAULT_EXTRACTION_TIMEOUT_SECONDS`.
+_DEFAULT_EXTRACTION_MODEL_SLUG: str = "openai/gpt-5-mini"
+
+
 def _bean_sourcing_agent(
-    advisor_config: AdvisorConfig, *, model: Model | None = None
+    advisor_config: AdvisorConfig,
+    *,
+    sourcing_config: BeanSourcingConfig | None = None,
+    model: Model | None = None,
 ) -> Agent[None, _ExtractedBeanIdentity]:
     """Build the bean-identity extraction agent.
 
@@ -1288,19 +1318,35 @@ def _bean_sourcing_agent(
     :class:`roastpilot_agent.advisor.PydanticAIAdvisor` — with no MCP tools
     of any kind wired in. Reuses :func:`roastpilot_agent.advisor.build_model`
     (the shared, pure provider-construction factory, D18) so the operator's
-    already-configured provider/key/model (BYOK) drives this SEPARATE call
-    too, without duplicating provider-construction logic.
+    already-configured provider/key (BYOK) drives this SEPARATE call too,
+    without duplicating provider-construction logic — but the MODEL SLUG
+    comes from ``sourcing_config.model_slug``, not
+    ``advisor_config.model_slug`` (#590 slice A: bean drafting must not
+    silently ride whatever model is configured for roast advice).
 
     Args:
-        advisor_config: The operator's advisor provider/key/model config.
-        model: An injected ``Model`` (the extraction test seam); built via
-            :func:`build_model` when omitted.
+        advisor_config: The operator's advisor provider/key config.
+        sourcing_config: The extraction model config. Its ``model_slug``
+            (default ``"openai/gpt-5-mini"``,
+            :data:`_DEFAULT_EXTRACTION_MODEL_SLUG` when omitted entirely)
+            is passed to :func:`build_model` as its ``model_slug`` override.
+        model: An injected ``Model`` (the extraction test seam) — always
+            wins over ``sourcing_config.model_slug`` when given, matching
+            :func:`build_model`'s own injection-seam precedence.
 
     Returns:
         The extraction agent, temperature 0 for deterministic, literal
         (non-inventive) extraction.
     """
-    resolved_model = model if model is not None else build_model(advisor_config)
+    if model is not None:
+        resolved_model = model
+    else:
+        model_slug = (
+            sourcing_config.model_slug
+            if sourcing_config is not None
+            else _DEFAULT_EXTRACTION_MODEL_SLUG
+        )
+        resolved_model = build_model(advisor_config, model_slug=model_slug)
     return Agent(
         resolved_model,
         output_type=_ExtractedBeanIdentity,
@@ -1313,13 +1359,26 @@ async def _extract_bean_identity(
     page_text: str,
     *,
     advisor_config: AdvisorConfig,
+    sourcing_config: BeanSourcingConfig | None = None,
     model: Model | None = None,
 ) -> _ExtractedBeanIdentity:
     """Run the structured bean-identity extraction call over ``page_text``.
 
     Args:
         page_text: The vendor page's extracted plain text.
-        advisor_config: The operator's advisor provider/key/model config.
+        advisor_config: The operator's advisor provider/key config (BYOK) —
+            reused for the PROVIDER/key only; see :func:`_bean_sourcing_agent`
+            for why the MODEL comes from ``sourcing_config`` instead.
+        sourcing_config: The extraction model/timeout config
+            (:attr:`~roastpilot_agent.config.BeanSourcingConfig.model_slug`,
+            :attr:`~roastpilot_agent.config.BeanSourcingConfig.extraction_timeout_seconds`
+            — #590 slice A). :data:`_DEFAULT_EXTRACTION_TIMEOUT_SECONDS` /
+            :data:`_DEFAULT_EXTRACTION_MODEL_SLUG` are used when omitted
+            entirely; never ``advisor_config.timeout_seconds`` (the 10 s
+            per-tick roast-advice budget the extraction call used to
+            inherit, timing out reasoning models in the bean-sourcing
+            bake-off — see
+            ``docs/advisor/bean-sourcing-bakeoff-2026-07-19.md``).
         model: An injected PydanticAI ``Model`` (the extraction test seam).
 
     Returns:
@@ -1330,21 +1389,27 @@ async def _extract_bean_identity(
             structured-output shape, a failure to construct the extraction
             agent itself (a missing optional provider dependency, or an
             unsupported provider — see :func:`build_model`), or exceeding
-            ``advisor_config.timeout_seconds`` (#587 fix 3 — an unbounded
-            LLM call must not be able to hang the drafting request forever).
+            ``sourcing_config.extraction_timeout_seconds`` (#587 fix 3, #590
+            slice A — an unbounded LLM call must not be able to hang the
+            drafting request forever).
     """
+    extraction_timeout_seconds = (
+        sourcing_config.extraction_timeout_seconds
+        if sourcing_config is not None
+        else _DEFAULT_EXTRACTION_TIMEOUT_SECONDS
+    )
     try:
         # Agent construction (which calls ``build_model`` when ``model`` is
         # omitted) lives INSIDE the try: it can raise ``AdvisorDependencyError``
         # / ``AdvisorError`` on a misconfigured or under-installed provider,
         # and that must fail soft as ``BeanExtractionError`` too, not escape
         # as an unhandled exception (#587).
-        agent = _bean_sourcing_agent(advisor_config, model=model)
-        async with asyncio.timeout(advisor_config.timeout_seconds):
+        agent = _bean_sourcing_agent(advisor_config, sourcing_config=sourcing_config, model=model)
+        async with asyncio.timeout(extraction_timeout_seconds):
             result = await agent.run(page_text)
     except TimeoutError as exc:
         raise BeanExtractionError(
-            f"bean identity extraction exceeded the {advisor_config.timeout_seconds:g}s deadline"
+            f"bean identity extraction exceeded the {extraction_timeout_seconds:g}s deadline"
         ) from exc
     except UnexpectedModelBehavior as exc:
         raise BeanExtractionError(
@@ -1619,13 +1684,18 @@ async def draft_bean_profile_from_url(
 
     Args:
         url: The vendor product page URL.
-        advisor_config: The operator's advisor provider/key/model config
-            (BYOK) — reused for this separate extraction call.
-        sourcing_config: Fetch timeout/size-cap/User-Agent settings.
+        advisor_config: The operator's advisor provider/key config (BYOK) —
+            reused for the PROVIDER/key only; the extraction MODEL comes
+            from ``sourcing_config.model_slug`` (#590 slice A).
+        sourcing_config: Fetch timeout/size-cap/User-Agent settings, plus
+            the extraction model/timeout
+            (:attr:`~roastpilot_agent.config.BeanSourcingConfig.model_slug`,
+            :attr:`~roastpilot_agent.config.BeanSourcingConfig.extraction_timeout_seconds`).
             Defaults are constructed when omitted.
         http_client: An injectable ``httpx.AsyncClient`` (the fetch test
             seam).
-        model: An injectable PydanticAI ``Model`` (the extraction test seam).
+        model: An injectable PydanticAI ``Model`` (the extraction test seam)
+            — always wins over ``sourcing_config.model_slug`` when given.
 
     Returns:
         The drafted :class:`~roastpilot_agent.models.BeanProfileDraft`.
@@ -1685,7 +1755,13 @@ async def draft_bean_profile_from_url(
     config = sourcing_config if sourcing_config is not None else BeanSourcingConfig()
     _log.info("draft_bean_profile_from_url: fetching %r", _redact_url_credentials(url))
     page_text = await _fetch_page_text(url, config=config, http_client=http_client)
-    identity = await _extract_bean_identity(page_text, advisor_config=advisor_config, model=model)
+    # config (never sourcing_config directly) — the fetch's already-resolved
+    # default, so the extraction step's model/timeout resolution stays
+    # consistent with the fetch's, rather than re-deriving its own None
+    # fallback here (#590 slice A).
+    identity = await _extract_bean_identity(
+        page_text, advisor_config=advisor_config, sourcing_config=config, model=model
+    )
     draft = _draft_from_identity(identity, url=url)
     _log.info(
         "draft_bean_profile_from_url: drafted %r (%d fields sourced)",
