@@ -2034,15 +2034,17 @@ def test_resolve_extraction_model_slug_openai_compatible_non_openrouter() -> Non
         OPENROUTER_BASE_URL,
         OPENROUTER_BASE_URL + "/",
         "HTTPS://OpenRouter.AI/api/v1",
+        "https://openrouter.ai:443/api/v1",
     ],
-    ids=["exact", "trailing-slash", "case-variant"],
+    ids=["exact", "trailing-slash", "case-variant", "explicit-default-port"],
 )
 def test_resolve_extraction_model_slug_openai_compatible_openrouter_variants(
     provider_base_url: str,
 ) -> None:
     """(e) provider "openai_compatible" WITH the OpenRouter base URL —
-    including a trailing-slash and a host-case variant — resolves to the
-    bake-off default, tolerant per ``_normalize_base_url``."""
+    including a trailing-slash, a host-case, and an explicit-default-port
+    (``:443``) variant — resolves to the bake-off default, tolerant per
+    ``_normalize_base_url``."""
     advisor_config = AdvisorConfig(
         provider="openai_compatible",
         provider_base_url=provider_base_url,
@@ -2052,6 +2054,41 @@ def test_resolve_extraction_model_slug_openai_compatible_openrouter_variants(
         advisor_config, None
     )
     assert resolved == "openai/gpt-5-mini"
+
+
+def test_resolve_extraction_model_slug_openai_compatible_non_default_port_not_openrouter() -> None:
+    """A NON-default explicit port (e.g. a LAN reverse-proxy in front of an
+    OpenAI-compatible endpoint on ``:8443``) must NOT be treated as
+    OpenRouter — dropping it would be the exact false-positive
+    ``_normalize_base_url``'s default-port tolerance must not introduce."""
+    advisor_config = AdvisorConfig(
+        provider="openai_compatible",
+        provider_base_url="https://openrouter.ai:8443/api/v1",
+        model_slug="a-proxied-model",
+    )
+    resolved = bean_sourcing._resolve_extraction_model_slug(  # pyright: ignore[reportPrivateUsage]
+        advisor_config, None
+    )
+    assert resolved == "a-proxied-model"
+    assert resolved != "openai/gpt-5-mini"
+
+
+def test_resolve_extraction_model_slug_openai_compatible_malformed_port_not_openrouter() -> None:
+    """A malformed (non-numeric) port in ``provider_base_url`` must not
+    crash resolution — ``urlsplit(...).port`` raises ``ValueError``,
+    ``_normalize_base_url`` catches it, the comparison simply fails to
+    match, and resolution falls through to ``advisor_config.model_slug``
+    (this function must never raise)."""
+    advisor_config = AdvisorConfig(
+        provider="openai_compatible",
+        provider_base_url="https://openrouter.ai:notaport/api/v1",
+        model_slug="a-fallback-model",
+    )
+    resolved = bean_sourcing._resolve_extraction_model_slug(  # pyright: ignore[reportPrivateUsage]
+        advisor_config, None
+    )
+    assert resolved == "a-fallback-model"
+    assert resolved != "openai/gpt-5-mini"
 
 
 def test_resolve_extraction_model_slug_sourcing_config_present_but_model_slug_unset() -> None:
