@@ -80,6 +80,16 @@ DEFAULT_ADVISOR_MODEL_BY_PHASE: dict[RoastPhase, str] = {
     RoastPhase.DEVELOPMENT: DEFAULT_ADVISOR_MODEL,
 }
 
+#: The canonical OpenRouter API base URL — :attr:`AdvisorConfig.provider_base_url`'s
+#: own default, and the single source of truth
+#: ``bean_sourcing._resolve_extraction_model_slug`` compares against to tell
+#: an actual OpenRouter endpoint apart from an arbitrary OTHER
+#: OpenAI-compatible endpoint (a local server, LiteLLM, etc. — ``provider ==
+#: "openai_compatible"`` covers ALL of those, not just OpenRouter, #590 P2
+#: fix). Kept here (not duplicated) so both call sites — and any future
+#: one — stay in lockstep with this one literal.
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
 
 class LateMaillardTrim(BaseModel):
     """Deterministic anticipatory heat-trim parameters, late Maillard → FC (D35 §3, #327).
@@ -1158,7 +1168,7 @@ class AdvisorConfig(BaseModel):
     provider: Literal["openai", "anthropic", "google", "ollama", "openai_compatible"] = (
         "openai_compatible"
     )
-    provider_base_url: str = "https://openrouter.ai/api/v1"
+    provider_base_url: str = OPENROUTER_BASE_URL
     api_key_env: str = Field(default="OPENROUTER_API_KEY", min_length=1)
     model_slug: str = Field(default=DEFAULT_ADVISOR_MODEL, min_length=1)
     # Phase-keyed model override map (#173). The MECHANISM for phase-dependent
@@ -1288,22 +1298,30 @@ class BeanSourcingConfig(BaseModel):
     default) means "resolve provider-aware" rather than "use a fixed slug"
     — see ``bean_sourcing._resolve_extraction_model_slug``:
 
-    - When :attr:`AdvisorConfig.provider` is ``"openai_compatible"`` (the
-      BYOK-OpenRouter path the bake-off used), it resolves to
-      ``"openai/gpt-5-mini"`` — the bean-sourcing extraction bake-off's
+    - When the advisor is actually pointed at **OpenRouter** — i.e.
+      :attr:`AdvisorConfig.provider` is ``"openai_compatible"`` AND
+      :attr:`AdvisorConfig.provider_base_url` matches :data:`OPENROUTER_BASE_URL`
+      (the BYOK-OpenRouter path the bake-off used) — it resolves to
+      ``"openai/gpt-5-mini"``, the bean-sourcing extraction bake-off's
       screening pick (``docs/advisor/bean-sourcing-bakeoff-2026-07-19.md``:
       best macro-F1/recall of any model with zero page errors, ~1/8 the
       cost of the ``gpt-4o`` ceiling). That bake-off ran on the pre-#590
       extraction pipeline and is explicitly flagged there as a SCREENING
       pick to re-confirm once the #590 preprocessing (extruct/trafilatura)
-      lands, not a locked decision.
-    - For a NATIVE provider (``openai``/``anthropic``/``google``/
-      ``ollama``), it resolves to ``advisor_config.model_slug`` instead —
-      the OpenRouter-prefixed ``"openai/gpt-5-mini"`` slug is meaningless
-      (or silently wrong-vendor) against a native provider's own API, which
-      made every extraction fail whenever the operator's advisor was
-      configured on a native provider (a P1 caught in review on the PR that
-      introduced this field, before merge).
+      lands, not a locked decision. ``provider == "openai_compatible"``
+      ALONE is not enough to key this on (a P2 caught in review, after the
+      P1 below): that provider setting also covers ANY OTHER
+      OpenAI-compatible endpoint (a local server, LiteLLM, etc. via a
+      custom ``provider_base_url``), which does not necessarily serve
+      ``"openai/gpt-5-mini"`` either.
+    - For anything else — a NATIVE provider (``openai``/``anthropic``/
+      ``google``/``ollama``), OR an ``openai_compatible`` provider pointed
+      at a non-OpenRouter endpoint — it resolves to
+      ``advisor_config.model_slug`` instead. The OpenRouter-prefixed
+      ``"openai/gpt-5-mini"`` slug is meaningless (or silently wrong-vendor)
+      against those, which made every extraction fail whenever the
+      operator's advisor was configured that way (a P1 caught in review on
+      the PR that introduced this field, before merge).
 
     Set this explicitly to opt OUT of the provider-aware default and pin a
     specific slug regardless of provider (e.g. the bake-off harness does

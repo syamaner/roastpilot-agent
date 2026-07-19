@@ -12,6 +12,7 @@ import pytest
 
 from roastpilot_agent.config import (
     DEFAULT_ADVISOR_MODEL,
+    OPENROUTER_BASE_URL,
     AdvisorConfig,
     AppConfig,
     BeanSourcingConfig,
@@ -116,6 +117,10 @@ def test_advisor_defaults_match_d5_d18_and_bakeoff() -> None:
     config = AdvisorConfig()
     assert config.provider == "openai_compatible"
     assert config.provider_base_url == "https://openrouter.ai/api/v1"
+    # Drift guard (#590 P2 fix): AdvisorConfig's own default must stay in
+    # lockstep with the shared OPENROUTER_BASE_URL constant
+    # bean_sourcing._resolve_extraction_model_slug compares against.
+    assert config.provider_base_url == OPENROUTER_BASE_URL
     assert config.api_key_env == "OPENROUTER_API_KEY"
     # #277 post-FC control bake-off PIN (21 Jun): gpt-4o via OpenRouter — closest
     # to the operator's real heat moves (heat MAE ~7.5 pp) and the proven n8n

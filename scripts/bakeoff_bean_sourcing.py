@@ -126,7 +126,11 @@ from roastpilot_agent.bean_sourcing import (  # noqa: E402
     BeanSourcingError,
     draft_bean_profile_from_url,
 )
-from roastpilot_agent.config import AdvisorConfig, BeanSourcingConfig  # noqa: E402
+from roastpilot_agent.config import (  # noqa: E402
+    OPENROUTER_BASE_URL,
+    AdvisorConfig,
+    BeanSourcingConfig,
+)
 from roastpilot_agent.models import BeanProfileDraft  # noqa: E402
 
 # --- Constants ---------------------------------------------------------------
@@ -137,7 +141,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[1]
 #: fixture exception).
 DEFAULT_FIXTURES_DIR = _REPO_ROOT / "tests" / "fixtures" / "bean-sourcing"
 
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+# OPENROUTER_BASE_URL is imported from roastpilot_agent.config (the single
+# canonical constant, #590 P2 fix) rather than duplicated here — this
+# harness's own real (paid) run is deliberately, always OpenRouter, and
+# bean_sourcing._resolve_extraction_model_slug now compares
+# AdvisorConfig.provider_base_url against that SAME constant to decide
+# whether an advisor is actually on OpenRouter.
 OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
 
 

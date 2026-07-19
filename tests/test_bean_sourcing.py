@@ -42,7 +42,7 @@ from roastpilot_agent.bean_sourcing import (
     BeanFetchError,
     draft_bean_profile_from_url,
 )
-from roastpilot_agent.config import AdvisorConfig, BeanSourcingConfig
+from roastpilot_agent.config import OPENROUTER_BASE_URL, AdvisorConfig, BeanSourcingConfig
 from roastpilot_agent.models import BeanProfileDraft
 
 # --- test doubles ---
@@ -1947,7 +1947,7 @@ def test_bean_sourcing_agent_builds_model_from_sourcing_config_default_when_none
     assert agent is not None
 
 
-# --- _resolve_extraction_model_slug (#590 P1 fix: provider-aware default) ---
+# --- _resolve_extraction_model_slug (#590 P1 + P2 fix: provider-aware default) ---
 #
 # Codex caught a P1 on the PR that introduced BeanSourcingConfig.model_slug:
 # its OpenRouter-slug default ("openai/gpt-5-mini") was handed to
@@ -1955,14 +1955,23 @@ def test_bean_sourcing_agent_builds_model_from_sourcing_config_default_when_none
 # an operator on a NATIVE provider (openai/anthropic/google/ollama) got an
 # invalid (or silently wrong-vendor) model slug and every extraction failed,
 # a regression from their currently-working, provider-compatible advisor
-# model. The three cases below pin the fix.
+# model. A follow-up P2 caught that ``provider == "openai_compatible"``
+# alone is NOT synonymous with OpenRouter — that provider setting also
+# covers any OTHER OpenAI-compatible endpoint (a local server, LiteLLM,
+# etc. via a custom ``provider_base_url``) — so the gate additionally keys
+# on ``provider_base_url`` actually matching OpenRouter's. The cases below
+# pin both fixes.
 
 
 def test_resolve_extraction_model_slug_openai_compatible_uses_bakeoff_default() -> None:
-    """(a) provider "openai_compatible" (BYOK-OpenRouter, the bake-off's own
-    setup) + no explicit override -> the bake-off's OpenRouter screening
-    pick, "openai/gpt-5-mini"."""
-    advisor_config = AdvisorConfig(provider="openai_compatible", model_slug="openai/gpt-4o")
+    """(a) provider "openai_compatible" WITH the OpenRouter base URL
+    (BYOK-OpenRouter, the bake-off's own setup) + no explicit override ->
+    the bake-off's OpenRouter screening pick, "openai/gpt-5-mini"."""
+    advisor_config = AdvisorConfig(
+        provider="openai_compatible",
+        provider_base_url=OPENROUTER_BASE_URL,
+        model_slug="openai/gpt-4o",
+    )
     resolved = bean_sourcing._resolve_extraction_model_slug(  # pyright: ignore[reportPrivateUsage]
         advisor_config, None
     )
@@ -2000,13 +2009,72 @@ def test_resolve_extraction_model_slug_explicit_override_wins_regardless_of_prov
     assert resolved == "explicit-override"
 
 
+def test_resolve_extraction_model_slug_openai_compatible_non_openrouter() -> None:
+    """(d) #590 P2 fix: provider "openai_compatible" pointed at a
+    NON-OpenRouter endpoint (a local server / LiteLLM / etc. via a custom
+    ``provider_base_url``) + no explicit override -> the operator's own
+    ``advisor_config.model_slug``, NOT the OpenRouter-only default —
+    ``provider == "openai_compatible"`` alone is not synonymous with
+    OpenRouter."""
+    advisor_config = AdvisorConfig(
+        provider="openai_compatible",
+        provider_base_url="https://my-local-litellm.example/v1",
+        model_slug="locally-served-model",
+    )
+    resolved = bean_sourcing._resolve_extraction_model_slug(  # pyright: ignore[reportPrivateUsage]
+        advisor_config, None
+    )
+    assert resolved == "locally-served-model"
+    assert resolved != "openai/gpt-5-mini"
+
+
+@pytest.mark.parametrize(
+    "provider_base_url",
+    [
+        OPENROUTER_BASE_URL,
+        OPENROUTER_BASE_URL + "/",
+        "HTTPS://OpenRouter.AI/api/v1",
+    ],
+    ids=["exact", "trailing-slash", "case-variant"],
+)
+def test_resolve_extraction_model_slug_openai_compatible_openrouter_variants(
+    provider_base_url: str,
+) -> None:
+    """(e) provider "openai_compatible" WITH the OpenRouter base URL —
+    including a trailing-slash and a host-case variant — resolves to the
+    bake-off default, tolerant per ``_normalize_base_url``."""
+    advisor_config = AdvisorConfig(
+        provider="openai_compatible",
+        provider_base_url=provider_base_url,
+        model_slug="openai/gpt-4o",
+    )
+    resolved = bean_sourcing._resolve_extraction_model_slug(  # pyright: ignore[reportPrivateUsage]
+        advisor_config, None
+    )
+    assert resolved == "openai/gpt-5-mini"
+
+
+def test_resolve_extraction_model_slug_sourcing_config_present_but_model_slug_unset() -> None:
+    """A ``sourcing_config`` that customizes only ``extraction_timeout_seconds``
+    (leaving ``model_slug`` at its own ``None`` default) must still fall
+    through to the provider-aware resolution — not be mistaken for an
+    explicit override of ``None`` itself."""
+    advisor_config = AdvisorConfig(provider="openai", model_slug="the-advisor-model")
+    sourcing_config = BeanSourcingConfig(extraction_timeout_seconds=99.0)
+    resolved = bean_sourcing._resolve_extraction_model_slug(  # pyright: ignore[reportPrivateUsage]
+        advisor_config, sourcing_config
+    )
+    assert resolved == "the-advisor-model"
+
+
 def test_bean_sourcing_agent_uses_resolved_model_slug_openai_compatible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Integration: with provider "openai_compatible" and no explicit
-    override, ``_bean_sourcing_agent`` passes the bake-off default to
-    ``build_model`` — not ``advisor_config.model_slug``, which is
-    deliberately set to something else here to prove it is not consulted."""
+    """Integration: with provider "openai_compatible" pointed at OpenRouter
+    and no explicit override, ``_bean_sourcing_agent`` passes the bake-off
+    default to ``build_model`` — not ``advisor_config.model_slug``, which
+    is deliberately set to something else here to prove it is not
+    consulted."""
     captured: dict[str, object] = {}
 
     def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
@@ -2015,7 +2083,11 @@ def test_bean_sourcing_agent_uses_resolved_model_slug_openai_compatible(
 
     monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
     bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
-        AdvisorConfig(provider="openai_compatible", model_slug="anthropic/claude-opus-4.8")
+        AdvisorConfig(
+            provider="openai_compatible",
+            provider_base_url=OPENROUTER_BASE_URL,
+            model_slug="anthropic/claude-opus-4.8",
+        )
     )
     assert captured["model_slug"] == "openai/gpt-5-mini"
 
@@ -2578,6 +2650,35 @@ async def test_draft_bean_profile_from_url_native_provider_uses_advisor_model_sl
             http_client=http_client,
         )
     assert captured["model_slug"] == "gpt-5-mini"
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_openai_compatible_non_openrouter_uses_advisor_model_slug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(d) full-pipeline P2 regression test: an ``openai_compatible``
+    advisor pointed at a NON-OpenRouter endpoint, with no
+    ``sourcing_config`` at all, must extract with
+    ``advisor_config.model_slug`` — never the OpenRouter-only
+    "openai/gpt-5-mini" default."""
+    captured: dict[str, object] = {}
+
+    def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
+        captured["model_slug"] = model_slug
+        return _function_model_returning(_identity_args())
+
+    monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
+    async with _mock_client(_html_response(200, _SAMPLE_HTML)) as http_client:
+        await draft_bean_profile_from_url(
+            "https://vendor.example/products/kenya-kiambu",
+            advisor_config=AdvisorConfig(
+                provider="openai_compatible",
+                provider_base_url="https://my-local-litellm.example/v1",
+                model_slug="locally-served-model",
+            ),
+            http_client=http_client,
+        )
+    assert captured["model_slug"] == "locally-served-model"
 
 
 @pytest.mark.asyncio

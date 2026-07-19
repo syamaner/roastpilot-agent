@@ -32,9 +32,12 @@ tools and only returns typed ``RoastDecision``). This module:
   — #590 slice A) — deliberately NOT ``AdvisorConfig.timeout_seconds``, the
   roast advisor's per-tick control-loop budget. The extraction MODEL slug
   is resolved PROVIDER-AWARE (:func:`_resolve_extraction_model_slug`): an
-  OpenRouter-specific default when the advisor is on the OpenRouter path,
-  the operator's own ``AdvisorConfig.model_slug`` on a native provider
-  (never an OpenRouter-prefixed slug sent to a native provider's API);
+  OpenRouter-specific default only when the advisor is ACTUALLY pointed at
+  OpenRouter (:func:`_is_openrouter_endpoint` — an OpenAI-compatible
+  ``provider`` setting alone is not enough, since it also covers other
+  OpenAI-compatible endpoints), the operator's own
+  ``AdvisorConfig.model_slug`` otherwise (never an OpenRouter-prefixed slug
+  sent to a native provider, or a different OpenAI-compatible endpoint);
 
 
 Fetching is respectful and fail-soft (issue #573 safeguards): a bounded
@@ -129,7 +132,7 @@ from pydantic_ai import Agent, ModelAPIError, ModelSettings, UnexpectedModelBeha
 from pydantic_ai.models import Model
 
 from roastpilot_agent.advisor import AdvisorDependencyError, AdvisorError, build_model
-from roastpilot_agent.config import AdvisorConfig, BeanSourcingConfig
+from roastpilot_agent.config import OPENROUTER_BASE_URL, AdvisorConfig, BeanSourcingConfig
 from roastpilot_agent.models import (
     BeanFieldSource,
     BeanProfileDraft,
@@ -1300,22 +1303,78 @@ _DEFAULT_EXTRACTION_TIMEOUT_SECONDS: float = 45.0
 
 #: The bean-sourcing extraction bake-off's screening pick
 #: (``docs/advisor/bean-sourcing-bakeoff-2026-07-19.md``) — an OpenRouter
-#: slug. Only ever handed to :func:`build_model` when the advisor provider
-#: is ITSELF the OpenRouter-compatible path (``"openai_compatible"``) — see
-#: :func:`_resolve_extraction_model_slug`. Using it for a NATIVE provider
-#: (``openai``/``anthropic``/``google``/``ollama``) was a P1 caught in
-#: review on the PR that introduced this constant, before merge: an
+#: slug. Only ever handed to :func:`build_model` when the advisor is
+#: ACTUALLY pointed at OpenRouter (see :func:`_is_openrouter_endpoint` /
+#: :func:`_resolve_extraction_model_slug`) — NOT merely because
+#: ``advisor_config.provider == "openai_compatible"``: that provider
+#: setting also covers ANY OTHER OpenAI-compatible endpoint (a local
+#: server, LiteLLM, etc. via a custom ``provider_base_url``), which was a
+#: P2 caught in review on the PR that first added this default: an
+#: ``openai_compatible`` config pointed somewhere other than OpenRouter
+#: would still get handed this OpenRouter-only slug. Using it for a NATIVE
+#: provider (``openai``/``anthropic``/``google``/``ollama``) was the
+#: original P1 this constant's gating exists to prevent: an
 #: OpenRouter-prefixed slug like ``"openai/gpt-5-mini"`` is invalid (or
-#: silently wrong-vendor) against a native provider's own API, so every
-#: extraction failed whenever the operator's advisor happened to be
-#: configured on a native provider rather than OpenRouter.
+#: silently wrong-vendor) against those, so every extraction failed
+#: whenever the operator's advisor happened to be configured that way.
 _DEFAULT_EXTRACTION_MODEL_SLUG: str = "openai/gpt-5-mini"
+
+
+def _normalize_base_url(url: str) -> str:
+    """Normalise a provider base URL for tolerant comparison (#590 P2 fix).
+
+    Strips a trailing ``/`` and lower-cases the host (scheme/path stay
+    case-sensitive, matching URL semantics — only the host is defined to be
+    case-insensitive) so ``"https://openrouter.ai/api/v1"``,
+    ``"https://openrouter.ai/api/v1/"``, and
+    ``"https://OpenRouter.ai/api/v1"`` all normalise identically. Never
+    raises: :func:`urlsplit` on a non-URL string degrades to a mostly-empty
+    ``SplitResult`` rather than raising (unlike the eager-raising cases
+    this module guards elsewhere for the FETCH path), so a malformed
+    ``provider_base_url`` here just fails the equality check harmlessly
+    (falls through to the native-provider branch) rather than crashing
+    model resolution.
+
+    Args:
+        url: The base URL to normalise.
+
+    Returns:
+        The normalised URL for ``==`` comparison.
+    """
+    stripped = url.strip().rstrip("/")
+    parsed = urlsplit(stripped)
+    return urlunsplit(parsed._replace(netloc=parsed.netloc.lower()))
+
+
+def _is_openrouter_endpoint(advisor_config: AdvisorConfig) -> bool:
+    """Whether ``advisor_config`` is ACTUALLY pointed at OpenRouter (#590 P2 fix).
+
+    ``advisor_config.provider == "openai_compatible"`` alone is NOT
+    sufficient: that provider setting is the generic OpenAI-compatible-API
+    path, which also covers a local server, LiteLLM, or any other
+    OpenAI-compatible endpoint reachable via a custom ``provider_base_url``
+    — none of which necessarily serve the OpenRouter-specific
+    :data:`_DEFAULT_EXTRACTION_MODEL_SLUG`. This additionally requires
+    ``provider_base_url`` to match :data:`~roastpilot_agent.config.OPENROUTER_BASE_URL`
+    (tolerant of a trailing-slash / host-case variant — see
+    :func:`_normalize_base_url`).
+
+    Args:
+        advisor_config: The operator's advisor provider/key/model config.
+
+    Returns:
+        ``True`` only when the provider is ``"openai_compatible"`` AND its
+        base URL resolves to OpenRouter's.
+    """
+    return advisor_config.provider == "openai_compatible" and _normalize_base_url(
+        advisor_config.provider_base_url
+    ) == _normalize_base_url(OPENROUTER_BASE_URL)
 
 
 def _resolve_extraction_model_slug(
     advisor_config: AdvisorConfig, sourcing_config: BeanSourcingConfig | None
 ) -> str:
-    """Resolve the extraction model slug, PROVIDER-AWARE (#590, P1 fix).
+    """Resolve the extraction model slug, PROVIDER-AWARE (#590, P1 + P2 fix).
 
     An explicit ``sourcing_config.model_slug`` (when set) always wins,
     regardless of provider — an operator (or the bake-off harness, which
@@ -1324,18 +1383,20 @@ def _resolve_extraction_model_slug(
     ``advisor_config.provider``.
 
     Otherwise (``sourcing_config`` omitted, or its ``model_slug`` left
-    ``None`` — the common case): when the advisor provider is
-    ``"openai_compatible"`` (the BYOK-OpenRouter path the bean-sourcing
-    bake-off used), this resolves to
+    ``None`` — the common case): when the advisor is ACTUALLY pointed at
+    OpenRouter (:func:`_is_openrouter_endpoint` — the BYOK-OpenRouter path
+    the bean-sourcing bake-off used), this resolves to
     :data:`_DEFAULT_EXTRACTION_MODEL_SLUG` (``"openai/gpt-5-mini"``, an
-    OpenRouter slug). For any NATIVE provider (``openai``/``anthropic``/
-    ``google``/``ollama``), that OpenRouter-prefixed slug is invalid (or
-    silently wrong-vendor) against the provider's own API — so this falls
-    back to ``advisor_config.model_slug`` instead, the operator's own
-    already-working, provider-compatible roast-advice model. Bean drafting
+    OpenRouter slug). For anything else — a NATIVE provider
+    (``openai``/``anthropic``/``google``/``ollama``), OR an
+    ``openai_compatible`` provider pointed at a DIFFERENT (non-OpenRouter)
+    endpoint — that OpenRouter-prefixed slug is invalid (or silently
+    wrong-vendor) against the actual endpoint — so this falls back to
+    ``advisor_config.model_slug`` instead, the operator's own
+    already-working, endpoint-compatible roast-advice model. Bean drafting
     still doesn't ride a *roast-advice model swap* silently in the common
     (OpenRouter) case; it just can't default to an OpenRouter-only slug on
-    a provider OpenRouter slugs don't apply to.
+    an endpoint OpenRouter slugs don't apply to.
 
     Args:
         advisor_config: The operator's advisor provider/key/model config.
@@ -1347,7 +1408,7 @@ def _resolve_extraction_model_slug(
     """
     if sourcing_config is not None and sourcing_config.model_slug is not None:
         return sourcing_config.model_slug
-    if advisor_config.provider == "openai_compatible":
+    if _is_openrouter_endpoint(advisor_config):
         return _DEFAULT_EXTRACTION_MODEL_SLUG
     return advisor_config.model_slug
 
