@@ -3545,29 +3545,41 @@ async def test_fetch_page_text_bounds_a_hanging_markdown_extraction_with_a_timeo
     ``RoastService.draft_bean_from_url``'s ``_start_lock`` — SHARED with
     ``start_roast`` — so an unbounded call here would hang every roast
     start, not just this draft. A pathologically slow/hanging
-    ``_extract_page_markdown`` must fail closed with a typed
-    ``BeanFetchError`` within ``config.fetch_timeout_seconds``, not hang."""
+    ``_extract_page_markdown`` must not hang past ``config.fetch_timeout_seconds``.
+
+    #590 slice C P2 fix (Codex fold, #608): on that timeout the draft FALLS
+    BACK to the linear-strip pass, exactly like the ``None``/exception
+    cases — it must NOT raise ``BeanFetchError`` (a 422). Before this
+    slice every page used the fast, synchronous linear-strip path; a
+    slow-to-parse page timing out here must not regress that page from
+    "draft succeeds via linear-strip" to a 422 that didn't exist before
+    this slice. The lock-hold bound still holds (the wait is capped, only
+    the OUTCOME changed from fail to fall back)."""
 
     def _hangs(html: str) -> str | None:
         # A REAL (synchronous) sleep — this runs on the asyncio.to_thread
         # worker thread, mirroring a genuinely pathological/slow parse;
         # asyncio.timeout can only stop the AWAIT, not this thread, so it
         # keeps running in the background after the test's own timeout
-        # fires — kept short so that residual cost stays negligible.
+        # fires (tracked separately as #607) — kept short so that residual
+        # cost stays negligible.
         time.sleep(1.0)
         return "should never be observed"  # pragma: no cover
 
     monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _hangs)
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
         started = time.monotonic()
-        with pytest.raises(BeanFetchError, match="deadline"):
-            await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
-                "https://vendor.example/products/kenya-kiambu",
-                config=BeanSourcingConfig(fetch_timeout_seconds=0.1),
-                http_client=client,
-            )
+        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/kenya-kiambu",
+            config=BeanSourcingConfig(fetch_timeout_seconds=0.1),
+            http_client=client,
+        )
         elapsed = time.monotonic() - started
     assert elapsed < 1.0, f"markdown-extraction timeout did not bound the call: {elapsed:.2f}s"
+    # Falls back to the SAME linear-strip text the None/exception paths
+    # use — the draft proceeds, it does not fail.
+    assert text == bean_sourcing._extract_page_text(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
+    assert "Kenya Kiambu AA" in text
 
 
 @pytest.mark.asyncio

@@ -141,8 +141,9 @@ otherwise have to cut, behind nav/footer/related-products text) survive
 model never needed. The slice-B JSON-LD prepend is unchanged: it still runs
 over the raw fetched HTML and prepends ahead of whichever page-body text
 wins. :func:`_extract_page_text` becomes the fail-soft FALLBACK — used only
-when trafilatura returns nothing usable or raises (:func:`_fetch_page_text`)
-— so a page can only get better extraction from this slice, never worse.
+when trafilatura returns nothing usable, raises, or times out
+(:func:`_fetch_page_text`) — so a page can only get better extraction from
+this slice, never worse.
 Runs entirely on the already-fetched, already-capped, already-decoded page
 text (no new network access, no new byte budget); its own HTML parser is
 verified XXE-safe the same way slice B's ``extruct`` parser is (HTML mode
@@ -153,7 +154,12 @@ loop via ``asyncio.to_thread`` in :func:`_fetch_page_text` (checklist class
 (#590 slice C P1 fix — this call runs under
 :meth:`~roastpilot_agent.api.RoastService.draft_bean_from_url`'s
 ``_start_lock``, shared with ``start_roast``, so an unbounded call here
-would hang every roast start, not just this draft): measured up to ~2.5s of
+would hang every roast start, not just this draft). On that timeout the
+draft FALLS BACK to the linear-strip pass rather than failing (#590 slice C
+P2 fix — a slow-to-parse page must not regress from "draft succeeds via
+linear-strip", true before this slice, to a 422 that didn't exist before
+it); the timeout only bounds the WAIT, never the outcome. Measured up to
+~2.5s of
 CPU-bound tree-walking on a page at the ``max_response_bytes`` cap, which
 would otherwise block the whole process's event loop (health checks, SSE
 heartbeats to other connected clients — not just an active roast, which
@@ -1730,16 +1736,18 @@ async def _fetch_page_text(
 
     Returns:
         The extracted page-body text (trafilatura Markdown, or the
-        linear-strip fallback), prefixed with a JSON-LD context section
-        (:func:`_build_json_ld_context`) when one was found.
+        linear-strip fallback — including when the markdown extraction
+        step itself times out, #590 slice C P2 fix: that falls back too,
+        it does not fail the draft), prefixed with a JSON-LD context
+        section (:func:`_build_json_ld_context`) when one was found.
 
     Raises:
         BeanFetchError: On a malformed URL, a destination rejected by the
-            SSRF guard, any transport/timeout failure, a non-2xx response, a
-            body over the configured size cap, exceeding the end-to-end
-            fetch deadline, or exceeding that SAME deadline again for the
-            (separately bounded — #590 slice C) trafilatura markdown
-            extraction step.
+            SSRF guard, any transport/timeout failure, a non-2xx response,
+            or a body over the configured size cap. The (separately
+            bounded — #590 slice C) trafilatura markdown extraction step
+            does NOT raise on its own timeout — it falls back to the
+            linear-strip pass instead, same as a ``None``/exception result.
     """
     try:
         # A malformed URL (e.g. an unclosed IPv6 bracket, "http://[::1")
@@ -1869,15 +1877,35 @@ async def _fetch_page_text(
     # thread (no safe way to kill a running thread in Python) — the
     # trade-off ``asyncio.to_thread`` always has; what matters for the
     # ``_start_lock`` interaction is that THIS coroutine stops waiting and
-    # releases the lock promptly, which this achieves.
+    # releases the lock promptly, which this achieves. The hung worker
+    # thread itself keeps running in the background regardless (tracked as
+    # #607, orthogonal to this fix).
+    #
+    # ON TIMEOUT: FALL BACK to the linear-strip pass, same as the
+    # None/exception cases below — do NOT fail the draft (#590 slice C
+    # Codex fold, #608). Before this slice EVERY page used the fast,
+    # synchronous linear-strip path; a slow-to-parse page timing out here
+    # must not regress that page from "draft succeeds via linear-strip" to
+    # a 422 that didn't exist before this slice. The ``2 * fetch_timeout +
+    # extraction_timeout`` lock-hold bound above still holds: the
+    # markdown-extraction stage still counts once (it still ran for up to
+    # ``fetch_timeout_seconds`` before giving up), the linear-strip
+    # fallback that follows is fast/synchronous/bounded by the same
+    # byte cap the markdown path already respects (negligible next to
+    # either timeout), and the draft then proceeds into
+    # ``_extract_bean_identity``'s OWN, separate ``extraction_timeout`` —
+    # no new unbounded stage is introduced.
     try:
         async with asyncio.timeout(config.fetch_timeout_seconds):
             markdown = await asyncio.to_thread(_extract_page_markdown, html)
-    except TimeoutError as exc:
-        raise BeanFetchError(
-            f"vendor page markdown extraction exceeded the "
-            f"{config.fetch_timeout_seconds:g}s deadline for {url!r}"
-        ) from exc
+    except TimeoutError:
+        _log.debug(
+            "bean_sourcing: trafilatura markdown extraction exceeded the "
+            "%.3gs deadline for %r; falling back to linear-strip",
+            config.fetch_timeout_seconds,
+            url,
+        )
+        markdown = None
     extracted_text = markdown or _extract_page_text(html)
     # final_url, not url (#590 P1 fix) — a redirect commonly canonicalises
     # the URL, and the fetched HTML's own JSON-LD reflects the FINAL one.
