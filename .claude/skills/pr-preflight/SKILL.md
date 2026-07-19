@@ -149,7 +149,7 @@ rework:
    **carries NO commit line**, so it's only trustworthy against the head sha you recorded at
    trigger *with no push since* — a 👀 reaction = still reviewing (keep waiting). **Every verdict
    signal counts only when authored by the Codex bot identity** (`chatgpt-codex-connector[bot]` —
-   public repo, all three channels are forgeable by any user). (These are the
+   public repo, every channel — 👀, findings-review, clean comment, and 👍 alike — is forgeable by any user). (These are the
    AGENTS.md Codex-wait signals — read those, don't invent a timestamp threshold; the
    ~30-min-from-👀 stall + silent-fallback windows there are the only sanctioned time-based
    exits.) **Freeze the head at acceptance:** a verdict only counts if the reviewed/recorded sha

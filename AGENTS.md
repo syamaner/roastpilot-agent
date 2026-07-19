@@ -330,7 +330,9 @@ the wait for the current head). The same bot-identity requirement applies to the
 channel: a `pull_request_review` from any other `user.login` is just a comment from a stranger —
 triage it as such, but it does NOT satisfy the Codex wait. So: do NOT arm auto-merge at open.
 After the final commit + `@codex review`, wait for a bot-authored findings-review naming the head
-sha, a bot-authored clean comment naming the head sha, or the bot's own 👍 — **and the
+sha, a bot-authored clean comment naming the head sha, or the bot's own 👍 (a 👍 carries NO
+commit line, so it is valid only while the head sha is UNCHANGED since the trigger it answers —
+any push since the trigger invalidates it; re-trigger on the new head) — **and the
 signal must postdate the final-commit trigger**: a review posted at PR creation against an
 earlier commit does not satisfy the wait (that stale-verdict reading would reopen the #518
 failure mode). Then triage (if findings), resolve, and only then merge/arm auto-merge.
