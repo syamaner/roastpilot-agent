@@ -138,16 +138,18 @@ security keystone two Opus safety passes called clean — all post-open). Put Co
 loop **while the PR is still a draft**, so its finds fold instead of becoming post-ready
 rework:
 
-1. Open the PR as a **draft** (`gh pr create --draft`).
-2. Trigger `@codex review` (one comment).
-3. **Wait for the verdict on the current head sha** — match Codex's `Reviewed commit:` to
-   the PR head sha; a **👀 reaction = still reviewing** (keep waiting), a **posted review =
-   findings**, a **👍 after 👀 = complete-clean** (the AGENTS.md Codex-wait signals — read
-   those, don't invent a timestamp threshold; the ~30-min-from-👀 stall + silent-fallback
-   windows there are the only sanctioned time-based exits). **Freeze the head at acceptance:**
-   a verdict only counts if its reviewed-commit sha **still equals the current head** when you
-   accept it — a concurrent teammate push after the trigger makes a later 👍 describe the *old*
-   head; re-check the sha and re-trigger if it moved.
+1. Open the PR as a **draft** (`gh pr create --draft`), and **record the current head sha**.
+2. **Codex auto-reviews at PR creation** (AGENTS.md), so opening the draft usually fires it —
+   only post `@codex review` if it did *not* fire. Don't double-trigger.
+3. **Wait for the verdict on the recorded head sha** — a **posted review** carries a
+   `Reviewed commit:` line (match it to the head); a **👍 after 👀 = complete-clean** but
+   **carries NO commit line**, so it's only trustworthy against the head sha you recorded at
+   trigger *with no push since* — a 👀 reaction = still reviewing (keep waiting). (These are the
+   AGENTS.md Codex-wait signals — read those, don't invent a timestamp threshold; the
+   ~30-min-from-👀 stall + silent-fallback windows there are the only sanctioned time-based
+   exits.) **Freeze the head at acceptance:** a verdict only counts if the reviewed/recorded sha
+   **still equals the current head**; a concurrent teammate push after the trigger invalidates a
+   later 👍 (it describes the old head) — re-check the sha and re-trigger if it moved.
 4. Fold every real finding **by CLASS** (step 3 — one categorical fix + repo-sweep, not
    per-symptom). **Triage stays author-independent (D23):** when the work is delivered by an
    agent teammate, the author fixes but does **not** decide which findings are "real" or dismiss

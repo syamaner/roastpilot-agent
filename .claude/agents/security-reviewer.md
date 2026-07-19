@@ -29,15 +29,18 @@ If the diff matches none of these, say so and stop — don't invent scope.
 ## What to check (the classes — full detail in the checklist)
 
 1. **SSRF / destination control** — scheme allow-list; resolve + reject non-global IPs
-   (`not is_global` **plus** explicit `is_multicast`; all A/AAAA records); per-hop redirect
+   (`not is_global` **plus** explicit `is_multicast` AND `is_reserved`, and extract + re-check
+   the embedded IPv4 of mapped/compat/NAT64 IPv6; all A/AAAA records); per-hop redirect
    revalidation; DNS-rebind IP-pinning (validated IP into the connection, Host/SNI
    preserved); `trust_env=False` on the pinned client.
 2. **Secret / PII hygiene** — reject `userinfo@` and `#fragment` before any log/fetch/store;
    redact URLs in logs; no secret in a log, error, or response body.
 3. **Resource exhaustion** — one end-to-end `asyncio.timeout` + per-op timeouts; response
    byte cap enforced *before* buffer growth; **bounded decompression** (raw cap + bounded
-   decoder — a compression bomb is the classic miss); bounded redirect/retry/loop counts;
-   concurrency bound on billable endpoints.
+   decoder + reject an incomplete `eof` stream — a compression bomb is the classic miss);
+   **no ReDoS** (linear `str.find`, not backtracking regex on HTML); bounded redirect/retry/
+   loop counts; a concurrency bound that REJECTS (429) not queues, plus a rate/spend bound on
+   billable endpoints; cap the INBOUND request body before the framework parses it.
 4. **Fail-soft** — every `urlsplit`/`urljoin`/`httpx.URL`/`.port`/`int()`/`ipaddress`/
    `getaddrinfo`/`.decode(charset)` on untrusted input maps to a **typed** error, **never an
    unhandled 500** — and map by *origin*: a parse/decode failure on attacker-influenced input →

@@ -360,7 +360,10 @@ resource-exhaustion, secret-hygiene, cross-feature-contention — because no pre
 covered web/application security; the file-based routing above never fired since it
 touched no safety file. `security-reviewer` + the checklist close that gap.) If the change
 adds a provider-calling path that could contend with the roast advisor (checklist class 6),
-ALSO run `safety-reviewer`.
+ALSO run `safety-reviewer`. This capability routing is not limited to `pr-preflight`: the
+`review-branch` roster workflow (`.claude/workflows/review-branch.mjs`) should likewise include
+`security-reviewer` in its lens set when the branch diff matches the external-input test, so the
+roster pass and the pre-open pass agree.
 
 **Also verify:** tests assert real behavior (not smoke); new code is covered or
 carries `# pragma: no cover` *with a reason* (repo convention — see `store.py`,
