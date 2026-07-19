@@ -12,7 +12,7 @@
 
 If a diff matches, run this list pre-open and route it to **`security-reviewer`**.
 This checklist is the codified retro of PR #587 (the bean-sourcing fetch endpoint),
-where the same seven classes below surfaced across **five** Codex rounds because no
+where the same classes below surfaced across **nine** Codex rounds because no
 pre-open lens covered them. Fold them in the first push instead.
 
 Each item: the check, the failure it prevents, and the fix pattern. Cite `file:line`.
@@ -76,12 +76,22 @@ Each item: the check, the failure it prevents, and the fix pattern. Cite `file:l
       cap protects against a hostile *upstream*, but a new external-input endpoint also takes
       a client request; on a direct ASGI/Uvicorn deployment with no fronting proxy, an
       oversized/deeply-nested JSON or form body is buffered + parsed before your handler runs.
-      Enforce a max request-body size (and parse depth) at the route.
+      **Enforce it BEFORE the framework parses the body** — a check inside the route handler is
+      too late for a FastAPI endpoint with a Pydantic body param (the framework buffers +
+      deserializes first). Use ASGI middleware (inspect `Content-Length` / bound the receive
+      stream) or a server limit (`uvicorn --limit-max-request-size`-equivalent), plus a parse-
+      depth bound.
 - [ ] **Concurrency bound that REJECTS, not one that queues** — a plain `async with
       semaphore:` *waits* when exhausted, so callers pile up unbounded (memory/latency) and it
       never returns 429. Use a **non-blocking / bounded acquire** (`locked()` check, or acquire
       within a short `asyncio.timeout` → 429 on failure) on any billable/expensive endpoint, so
       excess load is rejected rather than accumulated.
+- [ ] **A rate/spend bound is NOT the same as a concurrency bound** — rejecting only *while
+      another call is in flight* still lets a client serially fire back-to-back requests (burning
+      provider spend) as fast as each finishes. A billable endpoint needs a rate/spend limit
+      (token bucket / N-per-window) in addition to the concurrency cap; if that's an app-wide
+      policy decision (e.g. an unauthenticated LAN tool), name it and track it, don't silently
+      leave it uncapped.
 
 ## 4. Fail-soft — no unhandled exception becomes a 500
 
@@ -132,7 +142,23 @@ Each item: the check, the failure it prevents, and the fix pattern. Cite `file:l
       and for anything genuinely heavy run it off the loop (thread/executor) — the §3 resource
       caps and this contention guard are the same concern viewed from the roast loop.
 
-## 7. Invariant separation
+## 7. LLM prompt-injection & tool boundary
+
+When fetched/decoded **attacker-controlled content** (a vendor page, a webhook payload)
+flows into an LLM prompt, the content is untrusted *instructions*, not just data:
+
+- [ ] **The LLM path has no write tools / no privileged actions.** A prompt-injected page
+      must not be able to make the model call a tool, mutate state, or reach the roaster —
+      the advisor invariant (advisor never gets MCP write tools) applies here too. The
+      extraction agent returns typed data only.
+- [ ] **Treat the model's output as untrusted** — it can be steered by injected page text, so
+      the same normalization + provenance-verification (class 5) + human review gate the value
+      before it is used. An injected "origin: Jamaica Blue Mountain" is caught by the
+      evidence/containment check, not trusted because the model said so.
+- [ ] **Don't concatenate page text into a system/instruction role** — keep fetched content in
+      a clearly-delimited data slot, never where it reads as operator instructions.
+
+## 8. Invariant separation
 
 - [ ] An external-input module stays **outside the safety envelope** — no
       `controller`/`safety`/`mcp_client` imports (assert with a direct + transitive

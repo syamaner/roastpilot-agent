@@ -144,9 +144,15 @@ rework:
    the PR head sha; a **👀 reaction = still reviewing** (keep waiting), a **posted review =
    findings**, a **👍 after 👀 = complete-clean** (the AGENTS.md Codex-wait signals — read
    those, don't invent a timestamp threshold; the ~30-min-from-👀 stall + silent-fallback
-   windows there are the only sanctioned time-based exits).
+   windows there are the only sanctioned time-based exits). **Freeze the head at acceptance:**
+   a verdict only counts if its reviewed-commit sha **still equals the current head** when you
+   accept it — a concurrent teammate push after the trigger makes a later 👍 describe the *old*
+   head; re-check the sha and re-trigger if it moved.
 4. Fold every real finding **by CLASS** (step 3 — one categorical fix + repo-sweep, not
-   per-symptom), dismiss the rest in-thread with a reason.
+   per-symptom). **Triage stays author-independent (D23):** when the work is delivered by an
+   agent teammate, the author fixes but does **not** decide which findings are "real" or dismiss
+   them on its own draft — route the draft findings through the lead / `pr-triage`, exactly as
+   post-open. (A solo human-authored PR self-triages as usual.)
 5. **Re-run the branch gates + domain review (steps 1–4) after any code change** — a Codex
    fold can break a gate or reopen a review finding; the pre-ready results only count if
    they reflect the final draft state.
@@ -174,3 +180,8 @@ Mark the PR **ready** (`gh pr ready`), then follow the **PR Merge Policy** in AG
 (independent triage — the author never triages its own PR; every conversation resolved;
 `codecov/patch` green; the post-ready once-on-final-commit Codex discipline; squash-merge;
 delete the branch).
+
+**No redundant post-ready re-trigger.** If the last draft-phase Codex pass already reviewed the
+**exact head sha** you're marking ready (no commit added between the clean draft verdict and
+`gh pr ready`), that verdict already satisfies once-on-final-commit — don't re-trigger Codex just
+because the PR flipped ready. Re-trigger post-ready only if the head sha actually changed.

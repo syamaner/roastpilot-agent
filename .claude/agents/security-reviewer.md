@@ -26,7 +26,7 @@ Any diff that, on the server:
 
 If the diff matches none of these, say so and stop — don't invent scope.
 
-## What to check (the seven classes — full detail in the checklist)
+## What to check (the classes — full detail in the checklist)
 
 1. **SSRF / destination control** — scheme allow-list; resolve + reject non-global IPs
    (`not is_global` **plus** explicit `is_multicast`; all A/AAAA records); per-hop redirect
@@ -53,7 +53,11 @@ If the diff matches none of these, say so and stop — don't invent scope.
    roast / starve the advisor; the guard must be **race-free** (check + work under the same
    lock the roast-start path uses). **This one is safety-adjacent — name it in your summary
    and escalate to `safety-reviewer`.**
-7. **Invariant separation** — the module imports no `controller`/`safety`/`mcp_client`
+7. **LLM prompt-injection & tool boundary** — when attacker-controlled fetched/decoded content
+   flows into an LLM prompt, it's untrusted *instructions*: the LLM path has no write tools /
+   privileged actions, its output is treated as untrusted (normalized + provenance-verified +
+   human-gated), and page content lives in a delimited data slot, never a system/instruction role.
+8. **Invariant separation** — the module imports no `controller`/`safety`/`mcp_client`
    (direct + transitive import test present and green).
 
 ## How to work
