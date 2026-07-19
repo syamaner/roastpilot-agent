@@ -135,9 +135,14 @@ class RosterModel:
 #: The section-4 cost/quality-frontier shortlist for the (later, gated) paid
 #: run. Prices are the note's list prices -- VERIFY in the OpenRouter dashboard
 #: at run time (they drift). NOT run on import or under the self-test.
+#: A one-shot bean-draft's extraction budget (seconds). Decoupled from the 10s
+#: per-tick roast-advice default so slow/reasoning models are measured on quality,
+#: not cut off; a user pasting a URL tolerates this. See make_advisor_config.
+BAKEOFF_EXTRACTION_TIMEOUT_S: float = 45.0
+
 MODEL_ROSTER: tuple[RosterModel, ...] = (
     RosterModel("openai/gpt-5-nano", 0.05, 0.40, "cheapest frontier; the one to beat on price"),
-    RosterModel("x-ai/grok-4-fast", 0.20, 0.50, "cheapest output, 2M ctx; verify strict-schema"),
+    RosterModel("x-ai/grok-4.3", 0.20, 0.50, "grok-4-fast deprecated (404); 4.3 is the live slug"),
     RosterModel("google/gemini-3.1-flash-lite", 0.25, 1.00, "beats gpt-5-mini on 6/8 benches"),
     RosterModel("openai/gpt-5-mini", 0.25, 2.00, "ParseBench small-model reference; safe default"),
     RosterModel("openai/gpt-4.1-mini", 0.40, 1.60, "battle-tested strict-SO workhorse"),
@@ -1466,6 +1471,13 @@ def make_advisor_config(model_slug: str) -> AdvisorConfig:
         api_key_env=OPENROUTER_KEY_ENV,
         model_slug=model_slug,
         model_slug_by_phase={phase: model_slug for phase in RoastPhase},
+        # A one-shot bean-draft is NOT a per-tick roast-advice call: the operator
+        # pastes a URL and can wait ~30s, so the extraction gets a realistic
+        # budget rather than the 10s advice default (which timed out reasoning
+        # models like gpt-5-nano/gpt-5-mini on the first bake-off pass — a real
+        # finding: the extraction deadline should be decoupled from and longer
+        # than the advice deadline; tracked for the extractor config, #590).
+        timeout_seconds=BAKEOFF_EXTRACTION_TIMEOUT_S,
     )
 
 
