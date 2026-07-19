@@ -41,7 +41,12 @@ definition.
   small contract/validation fixtures under `tests/fixtures/` (plan §8) —
   e.g. the 7 Jun 2026 live-roast JSONL/summary excerpts the MCP mirrors
   validate against.
-- One PR per story, branch: `feature/{issue-number}-{slug}`.
+- **One PR per SLICE, not per story.** A story is decomposed at kickoff into its PR plan
+  (see PR-Hygiene) — an ordered set of thin PRs, each under the 400-line logic cap; each
+  slice is one PR on its own branch `feature/{issue-number}-{slug}-{slice}` (or a plain
+  `{slug}` when a story is genuinely a single slice), and every PR references the story
+  issue (`Refs #N`, or `Closes #N` only on the slice that finishes it). A story that is
+  one big PR is an unplanned monolith — split it to the plan.
 - The PR that completes a story updates the epic file's status table in the
   same PR — file state and GitHub state never drift.
 - Before starting a task: read `docs/state/registry.md`, open the active
@@ -232,8 +237,10 @@ checklist before you open.
   logic in each should have been ~3 and ~6 planned slices under the cap below; the
   shift-left folds then *masked* the size problem instead of fixing it).
 - **Keep logic PRs small — the 400-line cap is a HARD STOP.** Measure **logic** lines
-  only: `git diff --stat origin/main` minus data/fixtures/generated/doc files (those are
-  exempt and go in their own PR per the rule above). If the logic diff exceeds **400**,
+  from the branch's MERGE BASE (not the advancing `origin/main` tip):
+  `git diff --stat $(git merge-base origin/main HEAD)` (equivalently
+  `git diff --stat origin/main...HEAD`), minus data/fixtures/generated/doc files (those
+  are exempt and go in their own PR per the rule above). If the logic diff exceeds **400**,
   the PR plan was too coarse — split to the planned slice boundary before opening. Enough
   slices that every one is under the cap: the ~2,000-line #600 harness was ~5–6 reviewable
   logic slices (scoring / stats / runner / report), not 4. The number is exact (400), the
