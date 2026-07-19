@@ -335,7 +335,9 @@ failure mode). Then triage (if findings), resolve, and only then merge/arm auto-
 (extend in ~10-min increments), **bounded at ~30 min from the 👀**: past that, treat the
 in-progress signal as stuck and the lead may merge with an "in-progress review stalled"
 note, triaging any late review post-merge. The silent fallback applies only when NO signal
-at all (no post-trigger 👀, review, clean comment, or 👍) has appeared ~15 min after green CI: re-trigger
+at all (no *valid bot-authored* post-trigger 👀, review, clean comment, or 👍 — an invalid signal
+per the rules above, e.g. a stranger's reaction or a stale-sha comment, does NOT count as
+Codex activity and must not suppress this fallback) has appeared ~15 min after green CI: re-trigger
 once more on the same commit and **wait a full second window (~10 min)**; only if still
 nothing is merging allowed — note "Codex silent" in the merge context so a late review is
 triaged as post-merge follow-up, not a surprise.
