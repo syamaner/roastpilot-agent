@@ -79,7 +79,21 @@ dependencies = [
   # imports every syntax module regardless of which ``syntaxes`` a caller
   # requests at runtime — accepted for the extraction quality this buys
   # (docs/research/bean-sourcing/README.md §2).
-  "extruct>=0.18,<0.19"
+  "extruct>=0.18,<0.19",
+  # #590 slice C: boilerplate-stripped markdown preprocessing ahead of the
+  # bean-sourcing LLM call (bean_sourcing._extract_page_markdown) — ~65%
+  # fewer tokens and nav/footer/related-products stripped so a page's
+  # product specs survive the character cap instead of being lost behind
+  # boilerplate (docs/research/bean-sourcing/README.md §2). Shares lxml
+  # with ``extruct`` above. Pinned to the 2.1 surface this module calls
+  # (``trafilatura.extract(..., output_format="markdown")``); its own HTML
+  # parser (``lxml.html.HTMLParser``, HTML mode) never expands DTD entities
+  # and defaults to ``no_network=True`` — verified empirically (an XXE/DTD
+  # payload comes through inert, no outbound connection attempted) — see
+  # bean_sourcing._extract_page_markdown's docstring. Pulls courlan,
+  # htmldate, justext, dateparser (+ babel/pytz/tzlocal/tld) — trafilatura's
+  # own dependency set, accepted for the extraction-quality win.
+  "trafilatura>=2.1,<3"
 ]
 
 # D18 native-provider extras: install only what your configured

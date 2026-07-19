@@ -3206,11 +3206,16 @@ async def test_fetch_page_text_ignores_a_stale_unmatched_json_ld_block() -> None
 
 @pytest.mark.asyncio
 async def test_fetch_page_text_without_json_ld_falls_through_byte_for_byte_unchanged() -> None:
+    """No JSON-LD on the page: the page-body text is exactly whatever
+    :func:`_extract_page_markdown` produces for it (#590 slice C — the
+    linear-strip :func:`_extract_page_text` is only reached when trafilatura
+    finds nothing usable; see the ``_returns_none`` variant below for that
+    path)."""
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
         text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
             _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
         )
-    assert text == bean_sourcing._extract_page_text(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
+    assert text == bean_sourcing._extract_page_markdown(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -3304,6 +3309,184 @@ async def test_draft_bean_profile_from_url_feeds_json_ld_context_to_extraction_p
     assert draft.name == "Kenya Kiambu AA (Washed)"
     assert any("Structured data found in this page" in prompt for prompt in seen_prompts)
     assert any("KE-KIAMBU-AA" in prompt for prompt in seen_prompts)
+
+
+# --- #590 slice C: _extract_page_markdown (trafilatura) ---
+
+#: A nav-heavy page whose real product specs sit well past where a naive
+#: byte-capped linear strip would have to cut (the Onyx-page failure #600's
+#: bake-off surfaced) — trafilatura's boilerplate stripping must keep the
+#: specs even under a cap the raw nav text alone blows past.
+_NAV_HEAVY_HTML = (
+    "<html><head><title>Vendor Shop</title></head><body>\n"
+    "<nav><ul>"
+    + "".join(
+        f'<li><a href="/collections/cat-{i}">Category {i} filler nav text</a></li>'
+        for i in range(20)
+    )
+    + "</ul></nav>\n"
+    "<main><article>\n"
+    "<h1>Ethiopia Guji Natural</h1>\n"
+    "<p>Origin: Ethiopia. Region: Guji.</p>\n"
+    "<p>Process: Natural.</p>\n"
+    "<p>Roast Recommendation: Light to Medium roast.</p>\n"
+    "</article></main>\n"
+    "</body></html>"
+)
+
+
+def test_extract_page_markdown_keeps_specs_a_naive_cap_would_cut(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Onyx-page case: nav boilerplate alone exceeds a small character
+    cap, so the linear-strip fallback never reaches the product specs — but
+    trafilatura strips the nav ENTIRELY, so the (much shorter) real content
+    fits the SAME cap untruncated (#590 slice C, README §2)."""
+    monkeypatch.setattr(bean_sourcing, "_MAX_EXTRACTED_CHARS", 300)
+
+    linear = bean_sourcing._extract_page_text(_NAV_HEAVY_HTML)  # pyright: ignore[reportPrivateUsage]
+    markdown = bean_sourcing._extract_page_markdown(_NAV_HEAVY_HTML)  # pyright: ignore[reportPrivateUsage]
+
+    assert len(linear) == 300
+    assert "Roast Recommendation" not in linear  # cut off by the naive cap
+
+    assert markdown is not None
+    assert "Ethiopia Guji Natural" in markdown  # the h1/title, via with_metadata
+    assert "Roast Recommendation" in markdown  # survives — nav never ate the budget
+    assert "Category 0" not in markdown  # nav boilerplate is gone, not just deferred
+
+
+def test_extract_page_markdown_truncates_to_the_same_cap_as_linear_strip() -> None:
+    huge_article = (
+        "<html><body><article><h1>Huge Bean</h1>"
+        + "".join(f"<p>Paragraph {i} of real tasting-note prose content.</p>" for i in range(2000))
+        + "</article></body></html>"
+    )
+    markdown = bean_sourcing._extract_page_markdown(huge_article)  # pyright: ignore[reportPrivateUsage]
+    assert markdown is not None
+    assert len(markdown) == bean_sourcing._MAX_EXTRACTED_CHARS  # pyright: ignore[reportPrivateUsage]
+
+
+def test_extract_page_markdown_returns_none_when_trafilatura_finds_nothing() -> None:
+    """A JS-only/too-sparse page trafilatura cannot make sense of — the
+    ``None`` branch :func:`_fetch_page_text` falls back on."""
+    assert bean_sourcing._extract_page_markdown("<html><body></body></html>") is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_extract_page_markdown_returns_none_when_trafilatura_returns_blank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _blank(*args: object, **kwargs: object) -> str:
+        return "   \n  "
+
+    # String-target setattr (matches the ``httpx.AsyncClient`` monkeypatch
+    # convention above): ``trafilatura`` is re-exported implicitly, so a
+    # direct ``bean_sourcing.trafilatura`` attribute reference trips
+    # pyright strict's ``reportPrivateImportUsage``.
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.trafilatura.extract", _blank)
+    assert bean_sourcing._extract_page_markdown(_SAMPLE_HTML) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_extract_page_markdown_fails_soft_on_internal_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("simulated trafilatura failure")
+
+    monkeypatch.setattr("roastpilot_agent.bean_sourcing.trafilatura.extract", _raise)
+    assert bean_sourcing._extract_page_markdown(_SAMPLE_HTML) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_extract_page_markdown_xxe_payload_does_not_expand_entity_or_touch_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirrors the ``_parse_html_for_json_ld`` XXE test (#590 slice B) for
+    trafilatura's OWN, separate parser instance (#590 slice C, checklist
+    class 4): an external-entity payload referencing a local/metadata
+    address must never be fetched or expanded."""
+    connect_attempts: list[object] = []
+
+    def _spy_connect(self: socket.socket, address: object) -> None:
+        connect_attempts.append(address)
+        raise OSError("network access blocked in test")
+
+    monkeypatch.setattr(socket.socket, "connect", _spy_connect)
+    xxe_payload = (
+        "<!DOCTYPE html [<!ENTITY xxe SYSTEM "
+        '"http://169.254.169.254/latest/meta-data/">]>\n'
+        "<html><body><article>"
+        "<h1>Ethiopia Guji Natural</h1>"
+        "<p>Origin: Ethiopia. Notes: &xxe; plus enough further prose padding "
+        "for trafilatura to treat this as real article content worth "
+        "keeping rather than discarding as too sparse.</p>"
+        "</article></body></html>"
+    )
+    markdown = bean_sourcing._extract_page_markdown(xxe_payload)  # pyright: ignore[reportPrivateUsage]
+    assert connect_attempts == []
+    assert markdown is not None
+    # The entity is NEVER expanded in HTML parsing mode — the literal,
+    # unexpanded marker string comes through unchanged, not fetched content.
+    assert "&xxe;" in markdown
+
+
+# --- #590 slice C: wired into _fetch_page_text (primary, with linear-strip fallback) ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_uses_trafilatura_markdown_as_page_body() -> None:
+    async with _mock_client(_html_response(200, _NAV_HEAVY_HTML)) as client:
+        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/ethiopia-guji",
+            config=BeanSourcingConfig(),
+            http_client=client,
+        )
+    assert "Roast Recommendation" in text
+    assert "Category 0" not in text  # nav boilerplate never reaches the LLM
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_falls_back_to_linear_strip_when_trafilatura_returns_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Trafilatura finding nothing usable must not regress the page below
+    the pre-slice-C linear-strip behavior (#590 slice C: fail-soft
+    fallback, never worse than before)."""
+
+    def _no_markdown(html: str) -> str | None:
+        return None
+
+    monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _no_markdown)
+    async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
+        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            "https://vendor.example/products/kenya-kiambu",
+            config=BeanSourcingConfig(),
+            http_client=client,
+        )
+    assert text == bean_sourcing._extract_page_text(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
+    assert "Kenya Kiambu AA" in text
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_prepends_json_ld_ahead_of_trafilatura_markdown() -> None:
+    """The slice-B JSON-LD prepend still lands ahead of the (now
+    trafilatura-produced) page-body text (#590 slice C)."""
+    page = _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT).replace(
+        "<p>Tasting notes: blackcurrant, tomato, bright acidity.</p>",
+        "<p>Tasting notes: blackcurrant, tomato, bright acidity.</p>"
+        "<p>Roast Recommendation: filler prose so trafilatura keeps this paragraph too.</p>",
+    )
+    async with _mock_client(_html_response(200, page)) as client:
+        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+        )
+    expected_markdown = bean_sourcing._extract_page_markdown(page)  # pyright: ignore[reportPrivateUsage]
+    assert expected_markdown is not None
+    json_ld_index = text.find("Structured data found in this page's JSON-LD")
+    markdown_index = text.find(expected_markdown)
+    assert json_ld_index == 0
+    assert markdown_index > json_ld_index
+    assert "KE-KIAMBU-AA" in text
+    assert "Roast Recommendation" in text
 
 
 # --- draft_bean_profile_from_url: full pipeline (fetch + extract + draft) ---
