@@ -2464,16 +2464,19 @@ def test_quote_supports_value_price_cited_as_altitude_evidence_is_rejected() -> 
         "1800masl",
         "elevation of 1800 metres",
         "at 1800 above sea level",
+        "altitude of 1800",
     ],
 )
 def test_quote_supports_value_altitude_genuinely_verified_flips_on_page(
     evidence_quote: str,
 ) -> None:
     """A quote that both (a) actually appears on the page and (b) genuinely
-    supports the value — a matching digit run plus an elevation cue, in
-    any of the accepted forms (comma-grouped digits, a glued unit, a
-    different cue word, or the multi-word "above sea level" phrase) —
-    flips ``altitude_m`` to code-verified ``"on_page"``."""
+    supports the value — a matching digit run with an elevation cue
+    PROXIMATE to it (:data:`bean_sourcing._ALTITUDE_CUE_PROXIMITY_WINDOW`),
+    in any of the accepted forms (comma-grouped digits, a glued unit, a
+    different cue word, the multi-word "above sea level" phrase, or a cue
+    BEFORE the digits) — flips ``altitude_m`` to code-verified
+    ``"on_page"``."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(altitude_m=1800, altitude_m_evidence=evidence_quote)
     )
@@ -2483,6 +2486,43 @@ def test_quote_supports_value_altitude_genuinely_verified_flips_on_page(
         corpus=f"{_IDENTITY_PAGE_TEXT} This lot is {evidence_quote}.",
     )
     assert draft.field_sources["altitude_m"] == "on_page"
+
+
+def test_quote_supports_value_altitude_review_count_laundering_demotes() -> None:
+    """#590 D2b fold 1 (security-reviewer): a quote can be genuine page
+    text and contain BOTH a number equal to the claimed altitude and an
+    elevation-cue word — while the number is actually a review count and
+    the cue belongs to an unrelated sentence about the shop's physical
+    elevation/directions. Whole-quote co-presence used to launder this;
+    the cue must now be PROXIMATE to the matching digit token."""
+    corpus = (
+        "Free shipping on all orders. Customer reviews: 1,800 5-star ratings this year. "
+        "View our shop's elevation and directions on the map page for visiting hours."
+    )
+    quote = "reviews: 1,800 5-star ratings this year. View our shop's elevation and directions"
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800, altitude_m_evidence=quote)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=corpus
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+def test_quote_supports_value_altitude_phone_number_laundering_demotes() -> None:
+    """The phone-number variant of the same laundering class: the digits
+    are a toll-free number, not an altitude, and the nearest elevation cue
+    is far outside the proximity window."""
+    quote = "Call 1800 555 0100 to place an order. Our elevation-view tasting room is open daily."
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800, altitude_m_evidence=quote)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=f"{_IDENTITY_PAGE_TEXT} {quote}",
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
 def test_quote_supports_value_altitude_fabricated_quote_demotes() -> None:
@@ -2530,12 +2570,14 @@ def test_quote_supports_value_processing_honey_tasting_note_collision_demotes() 
     assert draft.field_sources["processing"] == "origin_estimated"
 
 
-def test_quote_supports_value_processing_wet_hulled_display_spelling_flips_on_page() -> None:
-    """A compound enum value's own display spelling is sufficient evidence
-    — ``wet_hulled``'s "hulled" component is an independent
-    :data:`bean_sourcing._PROCESS_CUES` token distinct from the value's own
-    literal (``"wet_hulled"`` != ``"hulled"``), so a bare "wet hulled"
-    quote (no separate "process"/"method" word) still verifies."""
+def test_quote_supports_value_processing_wet_hulled_bare_quote_demotes() -> None:
+    """#590 D2b fold 2 (security-reviewer): a compound enum value's DISPLAY
+    spelling can itself embed a :data:`bean_sourcing._PROCESS_CUES` token —
+    ``wet_hulled``'s display "wet hulled" contains "hulled", which is
+    itself a cue — so excluding only the raw literal ``"wet_hulled"`` left
+    the "independent cue" check vacuously satisfied by the SAME evidence
+    that satisfied display-presence. A bare "wet hulled" quote (no
+    separate "process"/"method" word) must now demote."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(processing="wet_hulled", processing_evidence="wet hulled")
     )
@@ -2543,6 +2585,24 @@ def test_quote_supports_value_processing_wet_hulled_display_spelling_flips_on_pa
         identity,
         url="https://vendor.example/products/indonesia",
         corpus="This Sumatra lot is wet hulled, giving it a heavy body.",
+    )
+    assert draft.field_sources["processing"] == "origin_estimated"
+
+
+@pytest.mark.parametrize("evidence_quote", ["wet hulled process", "wet hulled method"])
+def test_quote_supports_value_processing_wet_hulled_with_independent_cue_flips_on_page(
+    evidence_quote: str,
+) -> None:
+    """The mirror positive case: a quote carrying a GENUINELY independent
+    process cue (beyond the display spelling's own "hulled") still
+    verifies."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(processing="wet_hulled", processing_evidence=evidence_quote)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/indonesia",
+        corpus=f"This Sumatra lot uses the {evidence_quote}, giving it a heavy body.",
     )
     assert draft.field_sources["processing"] == "on_page"
 
@@ -2704,6 +2764,29 @@ def test_enum_display_spellings_underscore_and_plain_forms() -> None:
     display_spellings = bean_sourcing._enum_display_spellings  # pyright: ignore[reportPrivateUsage]
     assert display_spellings("washed") == ("washed",)
     assert display_spellings("wet_hulled") == ("wet hulled", "wet-hulled")
+
+
+def test_token_carries_altitude_cue_matches_a_substring_case_insensitively() -> None:
+    token_carries_cue = bean_sourcing._token_carries_altitude_cue  # pyright: ignore[reportPrivateUsage]
+    assert token_carries_cue("MASL") is True
+    assert token_carries_cue("1800masl") is True
+    assert token_carries_cue("shipping") is False
+
+
+def test_altitude_evidence_supports_value_no_matching_digit_token_returns_false() -> None:
+    """#590 D2b fold 1: a quote that never mentions the value's digits at
+    all (even with cues present) must not verify — exercises the
+    ``digit_indices`` empty-list branch directly, since this quote never
+    reaches this function through ``_draft_from_identity`` if it also
+    fails the earlier whole-quote containment check."""
+    supports_value = bean_sourcing._altitude_evidence_supports_value  # pyright: ignore[reportPrivateUsage]
+    assert supports_value(1800, "This is a wonderful high altitude lot") is False
+
+
+def test_altitude_evidence_supports_value_no_cue_token_returns_false() -> None:
+    """A matching digit token with NO cue token anywhere in the quote."""
+    supports_value = bean_sourcing._altitude_evidence_supports_value  # pyright: ignore[reportPrivateUsage]
+    assert supports_value(1800, "priced at 1800 dollars") is False
 
 
 # --- _draft_from_identity: honest imputation + conservative targets ---
