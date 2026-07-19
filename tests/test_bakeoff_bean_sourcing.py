@@ -153,6 +153,122 @@ def test_load_corpus_rejects_a_gold_json_with_no_top_level_name(tmp_path: Path) 
         bo.load_corpus(tmp_path)
 
 
+# --- Gold value TYPE validation (#600 round-2 finding) -------------------------
+#
+# _validate_gold_shape only checked that a "value" KEY existed; a custom
+# fixtures-dir gold record like {"value": null} or an altitude range missing
+# "min_m" passed that check and then crashed mid-paid-run in canon/numeric
+# conversion/range indexing. _validate_gold_value_type extends the load-time
+# check to the value's actual TYPE, so this fails before any provider spend.
+
+_text_spec = next(s for s in bo.FIELD_SPECS if s.kind == "text")
+_variety_spec = next(s for s in bo.FIELD_SPECS if s.kind == "variety")
+_bool_spec = next(s for s in bo.FIELD_SPECS if s.kind == "bool")
+_altitude_spec = next(s for s in bo.FIELD_SPECS if s.kind == "altitude")
+
+
+def test_validate_gold_value_type_rejects_null_text() -> None:
+    with pytest.raises(ValueError, match="non-empty string"):
+        bo._validate_gold_value_type("slug", _text_spec, None)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validate_gold_value_type_accepts_valid_text() -> None:
+    bo._validate_gold_value_type("slug", _text_spec, "Ecuador")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validate_gold_value_type_variety_accepts_scalar_and_list() -> None:
+    bo._validate_gold_value_type("slug", _variety_spec, "Caturra")  # pyright: ignore[reportPrivateUsage]
+    bo._validate_gold_value_type(  # pyright: ignore[reportPrivateUsage]
+        "slug", _variety_spec, ["Caturra", "Typica"]
+    )
+
+
+def test_validate_gold_value_type_variety_rejects_empty_list() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        bo._validate_gold_value_type("slug", _variety_spec, [])  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validate_gold_value_type_variety_rejects_non_string_elements() -> None:
+    with pytest.raises(ValueError, match="non-empty"):
+        bo._validate_gold_value_type(  # pyright: ignore[reportPrivateUsage]
+            "slug", _variety_spec, ["Caturra", 3]
+        )
+
+
+def test_validate_gold_value_type_bool_rejects_non_bool() -> None:
+    with pytest.raises(ValueError, match="must be a bool"):
+        bo._validate_gold_value_type("slug", _bool_spec, "true")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validate_gold_value_type_altitude_range_missing_key() -> None:
+    with pytest.raises(ValueError, match="missing"):
+        bo._validate_gold_value_type(  # pyright: ignore[reportPrivateUsage]
+            "slug", _altitude_spec, {"min_m": 1000}
+        )
+
+
+def test_validate_gold_value_type_altitude_range_non_numeric_bound() -> None:
+    with pytest.raises(ValueError, match="numeric"):
+        bo._validate_gold_value_type(  # pyright: ignore[reportPrivateUsage]
+            "slug", _altitude_spec, {"min_m": "low", "max_m": 2000}
+        )
+
+
+def test_validate_gold_value_type_altitude_scalar_rejects_string() -> None:
+    with pytest.raises(ValueError, match="number"):
+        bo._validate_gold_value_type("slug", _altitude_spec, "1400")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validate_gold_value_type_altitude_accepts_scalar_and_range() -> None:
+    bo._validate_gold_value_type("slug", _altitude_spec, 1400)  # pyright: ignore[reportPrivateUsage]
+    bo._validate_gold_value_type(  # pyright: ignore[reportPrivateUsage]
+        "slug", _altitude_spec, {"min_m": 1000, "max_m": 2000}
+    )
+
+
+def test_load_corpus_rejects_null_value_before_paid_calls(tmp_path: Path) -> None:
+    """The exact ``name: {"value": null}`` example from the finding."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_present: dict[str, dict[str, Any]] = {
+        f.name: {"value": "x"} for f in bo.FIELD_SPECS if f.name not in ("name", "is_blend")
+    }
+    all_present["is_blend"] = {"value": False}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": None},
+                "fields": all_present,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="non-empty string"):
+        bo.load_corpus(tmp_path)
+
+
+def test_load_corpus_rejects_altitude_range_missing_min_m(tmp_path: Path) -> None:
+    """The exact 'altitude range missing min_m' example from the finding."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_present: dict[str, dict[str, Any]] = {
+        f.name: {"value": "x"}
+        for f in bo.FIELD_SPECS
+        if f.name not in ("altitude", "is_blend", "name")
+    }
+    all_present["is_blend"] = {"value": False}
+    all_present["altitude"] = {"value": {"max_m": 2000}}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                "fields": all_present,
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="min_m"):
+        bo.load_corpus(tmp_path)
+
+
 # --- The four headline scoring cases, through the REAL pipeline ---------------
 
 
@@ -493,6 +609,73 @@ def test_macro_f1_excludes_a_field_never_gold_present() -> None:
     assert bo.macro_f1(run) == pytest.approx(1.0)
 
 
+# --- Latency capture (#600 round-2 finding) -------------------------------
+#
+# The evaluation plan tie-breaks a statistical tie on cost PLUS latency, but
+# the harness didn't measure it: the 45s timeout can only identify a
+# censored failure, not distinguish a fast model from a slow one.
+
+
+def test_page_latencies_and_median_p95() -> None:
+    pages = [
+        bo.PageResult(slug="a", outcomes={}, error=None, on_page_fields=0, elapsed_s=1.0),
+        bo.PageResult(slug="b", outcomes={}, error=None, on_page_fields=0, elapsed_s=3.0),
+        bo.PageResult(slug="c", outcomes={}, error=None, on_page_fields=0, elapsed_s=None),
+    ]
+    run = bo.ModelRun(model_slug="m", pages=pages)
+    assert bo.page_latencies(run) == [1.0, 3.0]
+    latency = bo.latency_median_p95(run)
+    assert latency is not None
+    median, p95 = latency
+    assert median == pytest.approx(2.0)
+    assert p95 == pytest.approx(2.9)
+
+
+def test_latency_median_p95_none_when_unmeasured() -> None:
+    run = bo.ModelRun(
+        model_slug="m",
+        pages=[bo.PageResult(slug="a", outcomes={}, error=None, on_page_fields=0)],
+    )
+    assert bo.latency_median_p95(run) is None
+
+
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_captures_elapsed_time(corpus: list[bo.CorpusPage]) -> None:
+    model = _model_returning({"name": "X", "country": "Ecuador"})
+    run = await bo.run_model_over_corpus(
+        [corpus[0]], model_slug="m", advisor_config=_ADVISOR_CONFIG, model=model
+    )
+    assert run.pages[0].elapsed_s is not None
+    assert run.pages[0].elapsed_s >= 0.0
+
+
+def test_run_json_roundtrips_elapsed_s() -> None:
+    page = bo.PageResult(
+        slug="p", outcomes={"origin": bo.Outcome.COR}, error=None, on_page_fields=1, elapsed_s=4.2
+    )
+    run = bo.ModelRun(model_slug="m", pages=[page])
+    rebuilt = bo._run_from_checkpoint(bo.run_to_json(run))  # pyright: ignore[reportPrivateUsage]
+    assert rebuilt.pages[0].elapsed_s == pytest.approx(4.2)
+
+
+def test_run_json_roundtrips_missing_elapsed_s_as_none() -> None:
+    """A pre-round-2 checkpoint record with no ``elapsed_s`` key must still load."""
+    record = {
+        "model_slug": "m",
+        "pages": [
+            {
+                "slug": "p",
+                "error": None,
+                "on_page_fields": 0,
+                "outcomes": {"origin": "COR"},
+                # no "elapsed_s" key at all -- an old checkpoint record.
+            }
+        ],
+    }
+    rebuilt = bo._run_from_checkpoint(record)  # pyright: ignore[reportPrivateUsage]
+    assert rebuilt.pages[0].elapsed_s is None
+
+
 # --- Statistics (section 5.2) ------------------------------------------------
 
 
@@ -645,10 +828,11 @@ def test_render_report_has_headline_pairwise_cost_and_caveat(
     assert "bean-sourcing extraction bake-off" in report
     assert "macro F1" in report
     assert "Pairwise significance" in report
-    assert "Estimated paid-run cost" in report
+    assert "## Cost" in report
     assert "SCREENING harness, not certification" in report
     assert "RANGE-altitude COR" in report  # the range-altitude caveat (#600)
     assert "PARTIAL RUN" not in report
+    assert "EXCLUDED -- transient failure" not in report
 
 
 def test_render_report_pairwise_reports_every_promised_axis(
@@ -676,6 +860,60 @@ def test_render_report_marks_budget_stopped_runs_partial(
     assert "PARTIAL RUN" in report
     assert "model-b" in report
     assert "model-c" in report
+
+
+def test_render_report_marks_failed_models_excluded(corpus: list[bo.CorpusPage]) -> None:
+    """A wholly-failed model must appear ONLY in the exclusion banner, never
+    in the leaderboard/per-page/pairwise sections below it (#600 round-2
+    finding)."""
+    runs = [_full_run("model-a", bo.Outcome.COR)]
+    report = bo.render_report(
+        runs,
+        bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
+        failed_slugs=["model-failed"],
+    )
+    assert "EXCLUDED -- transient failure" in report
+    assert "model-failed" in report
+    assert "- models scored: 1" in report  # the failed model is NOT counted
+
+
+def test_render_report_pairwise_covers_all_pairs_not_just_first(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """The pairwise section must generate every comparison the selection
+    relies on, not just first-model-vs-rest (#600 round-2 finding)."""
+    runs = [
+        _full_run("model-a", bo.Outcome.COR),
+        _full_run("model-b", bo.Outcome.PAR),
+        _full_run("model-c", bo.Outcome.INC),
+    ]
+    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:3]))
+    # C(3,2) = 3 pairs, including model-b vs model-c (neither is "the first model").
+    assert "`model-a` vs `model-b`" in report
+    assert "`model-a` vs `model-c`" in report
+    assert "`model-b` vs `model-c`" in report
+
+
+def test_render_report_labels_actual_spend_vs_resumed(corpus: list[bo.CorpusPage]) -> None:
+    """A newly-called model's cost must be labelled ACTUAL spend, not the
+    generic pre-run 'NOT yet spent' estimate framing (#600 round-2 finding)."""
+    runs = [_full_run("model-a", bo.Outcome.COR), _full_run("model-b", bo.Outcome.COR)]
+    cost_estimates = [
+        bo.ModelCostEstimate(slug="model-a", input_tokens=100, output_tokens=50, usd=0.01),
+        bo.ModelCostEstimate(slug="model-b", input_tokens=100, output_tokens=50, usd=0.02),
+    ]
+    report = bo.render_report(runs, cost_estimates, executed_slugs=["model-a"])
+    assert "ACTUALLY SPENT" in report
+    assert "$0.0100" in report  # only model-a's cost counted as spent
+    assert "spent this run" in report
+    assert "resumed (no new spend)" in report
+
+
+def test_render_report_no_executed_slugs_is_pure_estimate(corpus: list[bo.CorpusPage]) -> None:
+    runs = [_full_run("model-a", bo.Outcome.COR)]
+    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    assert "NOT yet spent" in report
+    assert "ACTUALLY SPENT" not in report
 
 
 def test_run_json_roundtrips_outcomes() -> None:
@@ -796,6 +1034,8 @@ async def test_run_bakeoff_budget_stop_makes_no_calls(
     assert result.runs == []
     assert result.stopped_early is True
     assert result.unevaluated_slugs == ["m1"]
+    assert result.executed_slugs == []
+    assert result.failed_slugs == []
 
 
 @pytest.mark.asyncio
@@ -817,6 +1057,83 @@ async def test_run_bakeoff_resumes_without_calls(
     assert [r.model_slug for r in result.runs] == ["m1"]
     assert result.stopped_early is False
     assert result.unevaluated_slugs == []
+    assert result.executed_slugs == []  # resumed, not newly called
+    assert result.failed_slugs == []
+
+
+# --- Pipeline fingerprint (#600 round-2 finding) --------------------------
+#
+# compute_fingerprint used to key only on corpus content: changing the
+# extractor's preprocessing (e.g. #590) without touching the committed
+# HTML/gold fixtures would silently resume a pre-change checkpoint.
+
+
+def test_pipeline_fingerprint_is_deterministic_and_nonempty() -> None:
+    first = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    second = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    assert first == second
+    assert first  # this env can locate the extractor/harness source files
+
+
+def test_compute_fingerprint_changes_with_pipeline_fingerprint(
+    corpus: list[bo.CorpusPage], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(bo, "_pipeline_fingerprint", lambda: "pipeline-a")
+    fp_a = bo.compute_fingerprint(corpus)
+    monkeypatch.setattr(bo, "_pipeline_fingerprint", lambda: "pipeline-b")
+    fp_b = bo.compute_fingerprint(corpus)
+    assert fp_a != fp_b
+
+
+def test_pipeline_fingerprint_disabled_when_source_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Introspection failure degrades to the corpus-only guard rather than
+    crashing a real run."""
+
+    def _no_source(_module: object) -> str | None:
+        return None
+
+    monkeypatch.setattr(bo.inspect, "getsourcefile", _no_source)
+    assert bo._pipeline_fingerprint() == ""  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_pipeline_change_invalidates_resume(
+    corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Changing the evaluated pipeline (e.g. #590 preprocessing) without
+    touching the corpus must NOT silently resume the pre-change checkpoint
+    -- the exact #590 scenario the finding calls out."""
+    out = tmp_path / "o.json"
+    model = _model_returning({"name": "X", "country": "Ecuador"})
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+
+    monkeypatch.setattr(bo, "_pipeline_fingerprint", lambda: "pipeline-v1")
+    first = await bo.run_bakeoff(
+        corpus,
+        ["m1"],
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(corpus, roster),
+        model=model,
+    )
+    assert first.executed_slugs == ["m1"]
+
+    # same corpus, DIFFERENT pipeline fingerprint (simulating a #590-style
+    # preprocessing change) -- must re-execute, not resume the stale record.
+    monkeypatch.setattr(bo, "_pipeline_fingerprint", lambda: "pipeline-v2")
+    second = await bo.run_bakeoff(
+        corpus,
+        ["m1"],
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(corpus, roster),
+        model=model,
+    )
+    assert second.executed_slugs == ["m1"]
 
 
 @pytest.mark.asyncio
@@ -848,7 +1165,10 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
     """Every page erroring (a transient outage) must not be cached as 'done'
-    -- a re-run should retry, not resume the outage forever (#600 finding)."""
+    -- a re-run should retry, not resume the outage forever (#600 finding) --
+    AND must not appear in ``runs`` as a scored 0.000 row polluting the
+    leaderboard/statistics (#600 round-2 finding): it is reported separately
+    via ``failed_slugs`` instead."""
     out = tmp_path / "o.json"
     result = await bo.run_bakeoff(
         corpus,
@@ -859,8 +1179,9 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
         cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
         model=_model_text_only(),
     )
-    assert result.runs[0].model_slug == "m1"
-    assert all(page.error is not None for page in result.runs[0].pages)
+    assert result.runs == []
+    assert result.failed_slugs == ["m1"]
+    assert result.executed_slugs == ["m1"]  # a paid attempt WAS made
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
     assert not checkpoint.has("m1")
@@ -922,6 +1243,8 @@ async def test_main_full_run_writes_artifact_and_partial_report(
         runs=[_full_run(bo.MODEL_ROSTER[0].slug, bo.Outcome.COR)],
         stopped_early=True,
         unevaluated_slugs=[bo.MODEL_ROSTER[1].slug],
+        failed_slugs=["some/failed-slug"],
+        executed_slugs=[bo.MODEL_ROSTER[0].slug, "some/failed-slug"],
     )
 
     async def _fake_run_bakeoff(*args: object, **kwargs: object) -> bo.BakeoffResult:
@@ -930,7 +1253,9 @@ async def test_main_full_run_writes_artifact_and_partial_report(
     monkeypatch.setattr(bo, "run_bakeoff", _fake_run_bakeoff)
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test-not-real")
     out = tmp_path / "out.json"
-    report_md = tmp_path / "report.md"
+    # a report-md path into a NONEXISTENT nested dir -- must be created, not
+    # crash after the (simulated) paid run (#600 round-2 finding).
+    report_md = tmp_path / "nested" / "reports" / "report.md"
     code = await bo.main(
         [
             "--models",
@@ -948,4 +1273,10 @@ async def test_main_full_run_writes_artifact_and_partial_report(
     artifact = json.loads(out.read_text())
     assert artifact["stopped_early"] is True
     assert artifact["unevaluated_slugs"] == [bo.MODEL_ROSTER[1].slug]
-    assert "PARTIAL RUN" in report_md.read_text()
+    assert artifact["failed_slugs"] == ["some/failed-slug"]
+    assert artifact["executed_slugs"] == [bo.MODEL_ROSTER[0].slug, "some/failed-slug"]
+    report_text = report_md.read_text()
+    assert "PARTIAL RUN" in report_text
+    assert "EXCLUDED -- transient failure" in report_text
+    assert "some/failed-slug" in report_text
+    assert "ACTUALLY SPENT" in report_text

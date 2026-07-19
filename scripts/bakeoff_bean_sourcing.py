@@ -99,11 +99,14 @@ import argparse
 import asyncio
 import dataclasses
 import hashlib
+import inspect
+import itertools
 import json
 import os
 import random
 import re
 import sys
+import time
 import unicodedata
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from dataclasses import dataclass
@@ -118,6 +121,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))  # editable
 
 from pydantic_ai.models import Model  # noqa: E402
 
+import roastpilot_agent.bean_sourcing as _bean_sourcing_module  # noqa: E402
 from roastpilot_agent.bean_sourcing import (  # noqa: E402
     BeanSourcingError,
     draft_bean_profile_from_url,
@@ -409,6 +413,60 @@ class CorpusPage:
     vendor: str
 
 
+def _validate_gold_value_type(slug: str, spec: FieldSpec, value: Any) -> None:
+    """Validate one field's ``value`` payload matches the type the scorer needs.
+
+    Extends :func:`_validate_gold_shape` from mere KEY presence (``"value"``
+    exists) to actual TYPE checking: ``{"value": null}`` used to pass the
+    shape check and then crash in ``canon``/numeric conversion/range
+    indexing partway through a paid run (#600 round-2 finding) -- every
+    branch below rejects ``None`` (and every other wrong shape) the same
+    way, so a null value is caught here regardless of field kind.
+
+    Args:
+        slug: The fixture stem (for the error message).
+        spec: The field spec (its ``kind`` selects the expected shape).
+        value: The candidate ``value`` payload.
+
+    Raises:
+        ValueError: If ``value`` does not match the shape ``spec.kind`` needs.
+    """
+    label = f"{slug}.gold.json: field {spec.name!r} (kind={spec.kind!r}) 'value'"
+    if spec.kind in ("text", "enum"):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{label} must be a non-empty string, got {value!r}")
+    elif spec.kind in ("variety", "tasting"):
+        ok_scalar = isinstance(value, str) and bool(value.strip())
+        ok_list = False
+        if isinstance(value, list):
+            items = cast("list[Any]", value)
+            ok_list = bool(items) and all(isinstance(v, str) and v.strip() for v in items)
+        if not (ok_scalar or ok_list):
+            raise ValueError(
+                f"{label} must be a non-empty string or a non-empty list of non-empty "
+                f"strings, got {value!r}"
+            )
+    elif spec.kind == "bool":
+        if not isinstance(value, bool):
+            raise ValueError(f"{label} must be a bool, got {value!r}")
+    elif spec.kind == "altitude":
+        if isinstance(value, dict):
+            range_value = cast("dict[str, Any]", value)
+            missing = [k for k in ("min_m", "max_m") if k not in range_value]
+            if missing:
+                raise ValueError(f"{label} RANGE is missing {missing}: {value!r}")
+            for key in ("min_m", "max_m"):
+                bound = range_value[key]
+                if not isinstance(bound, (int, float)) or isinstance(bound, bool):
+                    raise ValueError(f"{label} RANGE {key!r} must be numeric, got {bound!r}")
+        elif not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(
+                f"{label} must be a number or a {{'min_m', 'max_m'}} range dict, got {value!r}"
+            )
+    else:  # pragma: no cover - every FIELD_SPECS kind is handled above
+        raise AssertionError(f"unhandled FieldSpec.kind {spec.kind!r} for {spec.name!r}")
+
+
 def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> None:
     """Validate every scored field has exactly one of ``{"value": ...}`` / ``{"absent": true}``.
 
@@ -416,15 +474,18 @@ def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> N
     made), so a malformed custom ``--fixtures-dir`` gold record fails fast
     with a clear message instead of the run completing every paid model call
     and only then crashing in :func:`render_report`'s unconditional per-field
-    indexing (#600 finding).
+    indexing (#600 finding) -- extended in round 2 to also validate the
+    ``value`` payload's TYPE (see :func:`_validate_gold_value_type`), not
+    just that the ``"value"`` key exists.
 
     Args:
         slug: The fixture stem (for the error message).
         gold_fields: The candidate ``field -> gold-state`` map.
 
     Raises:
-        ValueError: If a required field is missing, or has neither/both of
-            ``"value"``/``"absent": true``.
+        ValueError: If a required field is missing, has neither/both of
+            ``"value"``/``"absent": true``, or a present ``"value"`` has the
+            wrong type/shape for its field kind.
     """
     for spec in FIELD_SPECS:
         field = gold_fields.get(spec.name)
@@ -440,6 +501,8 @@ def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> N
                 f"{slug}.gold.json: field {spec.name!r} must have exactly one of "
                 "{'value': ...} or {'absent': true}, got " + repr(field)
             )
+        if has_value:
+            _validate_gold_value_type(slug, spec, field["value"])
 
 
 def load_corpus(fixtures_dir: Path) -> list[CorpusPage]:
@@ -988,6 +1051,13 @@ class PageResult:
             match-function fix re-run offline) without re-calling the model
             (#600 finding) -- contains only bean-identity/roast-guidance
             values, nothing secret.
+        elapsed_s: Wall-clock seconds for this page's draft attempt
+            (success OR failure -- a censored timeout is itself latency
+            signal). ``None`` only for a checkpoint record written before
+            this field existed. Feeds the cost+latency tie-break the
+            selection plan specifies for a statistical tie (#600 round-2
+            finding): the 45s timeout alone can only identify a censored
+            failure, not distinguish a 2s model from a 40s one.
     """
 
     slug: str
@@ -995,6 +1065,7 @@ class PageResult:
     error: str | None
     on_page_fields: int
     extracted: dict[str, Any] | None = None
+    elapsed_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1032,9 +1103,11 @@ async def run_model_over_corpus(
     """
     results: list[PageResult] = []
     for page in pages:
+        started = time.monotonic()
         draft, error = await draft_for_page(
             page, advisor_config=advisor_config, model=model, sourcing_config=sourcing_config
         )
+        elapsed_s = time.monotonic() - started
         on_page = (
             0 if draft is None else sum(1 for v in draft.field_sources.values() if v == "on_page")
         )
@@ -1045,6 +1118,7 @@ async def run_model_over_corpus(
                 error=error,
                 on_page_fields=on_page,
                 extracted=None if draft is None else draft.model_dump(mode="json"),
+                elapsed_s=elapsed_s,
             )
         )
     return ModelRun(model_slug=model_slug, pages=results)
@@ -1147,6 +1221,31 @@ def macro_f1(run: ModelRun) -> float | None:
     return sum(per_field) / len(per_field) if per_field else None
 
 
+def page_latencies(run: ModelRun) -> list[float]:
+    """Every page's captured wall-clock elapsed seconds.
+
+    Omits any page with no captured latency (``None`` -- only a checkpoint
+    record written before latency capture existed).
+    """
+    return [p.elapsed_s for p in run.pages if p.elapsed_s is not None]
+
+
+def latency_median_p95(run: ModelRun) -> tuple[float, float] | None:
+    """``(median, p95)`` per-page latency in seconds, or ``None`` if unmeasured.
+
+    The evaluation plan tie-breaks a statistical dead heat (see the
+    page-clustered bootstrap CIs -- most pairs among the top models cross
+    zero) on cost PLUS latency; the 45s extraction timeout alone can only
+    flag a censored failure, not distinguish a fast model from a slow one
+    (#600 round-2 finding). Reuses :func:`_percentile` (module-order-
+    independent: called only after the whole module has loaded).
+    """
+    values = sorted(page_latencies(run))
+    if not values:
+        return None
+    return _percentile(values, 0.5), _percentile(values, 0.95)
+
+
 @dataclass(frozen=True)
 class ModelMetrics:
     """A model's headline metrics over the corpus."""
@@ -1160,6 +1259,8 @@ class ModelMetrics:
     macro_f1: float | None
     combined_score: float | None
     page_errors: int
+    median_latency_s: float | None
+    p95_latency_s: float | None
 
 
 def model_metrics(run: ModelRun) -> ModelMetrics:
@@ -1167,6 +1268,7 @@ def model_metrics(run: ModelRun) -> ModelMetrics:
     counts = tally(all_outcomes(run))
     prec = precision(counts)
     rec = recall(counts)
+    latency = latency_median_p95(run)
     return ModelMetrics(
         model_slug=run.model_slug,
         counts=counts,
@@ -1177,6 +1279,8 @@ def model_metrics(run: ModelRun) -> ModelMetrics:
         macro_f1=macro_f1(run),
         combined_score=combined_score(all_outcomes(run)),
         page_errors=sum(1 for page in run.pages if page.error is not None),
+        median_latency_s=latency[0] if latency else None,
+        p95_latency_s=latency[1] if latency else None,
     )
 
 
@@ -1611,6 +1715,8 @@ def render_report(
     *,
     stopped_early: bool = False,
     unevaluated_slugs: Sequence[str] = (),
+    failed_slugs: Sequence[str] = (),
+    executed_slugs: Sequence[str] = (),
 ) -> str:
     """Render the markdown scorecard for one or more model runs.
 
@@ -1624,6 +1730,17 @@ def render_report(
             finding).
         unevaluated_slugs: The requested models never run, when
             ``stopped_early`` is ``True``.
+        failed_slugs: Models excluded because every page errored (a
+            transient outage, not a quality result) -- rendered as a
+            separate banner; never counted in the leaderboard/stats below
+            since they are already excluded from ``runs`` (#600 round-2
+            finding).
+        executed_slugs: Models a REAL call was made for THIS invocation (see
+            :attr:`BakeoffResult.executed_slugs`) -- distinguishes ACTUAL
+            spend from a pre-run planning estimate in the cost section
+            (#600 round-2 finding). Empty (the default) renders the cost
+            section as a pure pre-run estimate, matching a direct
+            :func:`render_report` call outside :func:`run_bakeoff`.
 
     Returns:
         The markdown report text.
@@ -1639,24 +1756,41 @@ def render_report(
             "resume) before treating any ranking here as final."
         )
         lines.append("")
+    if failed_slugs:
+        lines.append(
+            "> **EXCLUDED -- transient failure.** Every page errored (a bad key / provider "
+            f"outage, not a quality result) for {len(failed_slugs)} model(s): "
+            f"{', '.join(f'`{s}`' for s in failed_slugs)}. Excluded from the leaderboard "
+            "and every statistic below (never a scored 0.000 row) and NOT checkpointed --"
+            " re-run to retry them."
+        )
+        lines.append("")
     lines.append(f"- models scored: {len(runs)}")
     lines.append(f"- corpus pages: {len(runs[0].pages) if runs else 0}")
     lines.append("")
-    lines.append("## Per-model headline (macro F1 is the model-choice headline)")
+    lines.append(
+        "## Per-model headline (macro F1 is the model-choice headline; latency is the "
+        "cost/latency tie-break signal for a statistical tie)"
+    )
     lines.append("")
     lines.append(
         "| Model | COR | PAR | INC | MIS | ABS-COR | SPU | ERR | Recall | Faithful | Abstain | "
-        "micro F1 | macro F1 | Combined |"
+        "micro F1 | macro F1 | Combined | latency p50/p95 (s) |"
     )
-    lines.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
+    lines.append("|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|")
     for run in runs:
         m = model_metrics(run)
         c = m.counts
+        latency = (
+            f"{m.median_latency_s:.1f} / {m.p95_latency_s:.1f}"
+            if m.median_latency_s is not None and m.p95_latency_s is not None
+            else "n/a"
+        )
         lines.append(
             f"| `{m.model_slug}` | {c.cor} | {c.par} | {c.inc} | {c.mis} | {c.abs_cor} | "
             f"{c.spu} | {c.err} | {_fmt(m.recall)} | {_fmt(m.precision)} | "
             f"{_fmt(m.abstention)} | {_fmt(m.micro_f1)} | {_fmt(m.macro_f1)} | "
-            f"{_fmt(m.combined_score)} |"
+            f"{_fmt(m.combined_score)} | {latency} |"
         )
     lines.append("")
 
@@ -1672,10 +1806,12 @@ def render_report(
         lines.append("")
 
     if len(runs) >= 2:
-        lines.append("## Pairwise significance (first model vs each other, section 5.2)")
+        lines.append(
+            "## Pairwise significance (ALL pairs, section 5.2) -- every comparison the "
+            "selection relies on is generated here, not just one model versus the rest"
+        )
         lines.append("")
-        base = runs[0]
-        for other in runs[1:]:
+        for base, other in itertools.combinations(runs, 2):
             boot = paired_bootstrap_combined(base, other)
             rec = paired_bootstrap_metric(base, other, recall)
             prec = paired_bootstrap_metric(base, other, precision)
@@ -1692,23 +1828,53 @@ def render_report(
             )
         lines.append("")
 
-    lines.append("## Estimated paid-run cost (for approval -- NOT yet spent)")
+    cost_by_slug = {est.slug: est.usd for est in cost_estimates}
+    executed_set = set(executed_slugs)
+    scored_slugs = {r.model_slug for r in runs}
+    resumed_set = scored_slugs - executed_set
+    if executed_slugs:
+        actually_spent = sum(cost_by_slug.get(s, 0.0) for s in executed_slugs)
+        lines.append("## Cost")
+        lines.append("")
+        lines.append(
+            f"**${actually_spent:.4f} ACTUALLY SPENT** this invocation, on "
+            f"{len(executed_slugs)} newly-called model(s): "
+            f"{', '.join(f'`{s}`' for s in executed_slugs)}."
+        )
+    else:
+        lines.append("## Cost (pre-run estimate -- NOT yet spent)")
+        lines.append("")
+        lines.append(
+            "$0.0000 spent this invocation -- every scored model below was resumed from an "
+            "existing checkpoint (no new paid calls) or this is a pre-run estimate."
+        )
     lines.append("")
-    lines.append("| Model | in tok | out tok | est. USD (full corpus, 1 pass) |")
-    lines.append("|---|--:|--:|--:|")
+    lines.append("| Model | in tok | out tok | est. USD (full corpus, 1 pass) | status |")
+    lines.append("|---|--:|--:|--:|---|")
     total = 0.0
     for est in cost_estimates:
         total += est.usd
+        if est.slug in executed_set:
+            status = "spent this run"
+        elif est.slug in resumed_set:
+            status = "resumed (no new spend)"
+        else:
+            status = "not run"
         lines.append(
-            f"| `{est.slug}` | {est.input_tokens} | {est.output_tokens} | ${est.usd:.4f} |"
+            f"| `{est.slug}` | {est.input_tokens} | {est.output_tokens} | ${est.usd:.4f} | "
+            f"{status} |"
         )
-    lines.append(f"| **roster total (1 pass each)** | | | **${total:.4f}** |")
+    lines.append(
+        f"| **roster total (1 pass each, every requested model)** | | | **${total:.4f}** | |"
+    )
     lines.append("")
     lines.append(
         "Token counts use a chars/4 heuristic over the extractor's ACTUAL post-strip "
         "prompt text; prompt caching on the stable schema/instructions makes the real "
-        "cost lower. A self-consistency vote (sample 3-5x) or a two-pass entailment "
-        "judge would multiply these figures accordingly."
+        "cost lower. This harness has no live token-usage readback, so a model marked "
+        "'spent this run' used exactly this estimate as its actual charge. A "
+        "self-consistency vote (sample 3-5x) or a two-pass entailment judge would "
+        "multiply these figures accordingly."
     )
     lines.append("")
     lines.append("## Caveat")
@@ -1731,6 +1897,8 @@ def run_to_json(run: ModelRun) -> dict[str, Any]:
             "macro_f1": m.macro_f1,
             "combined_score": m.combined_score,
             "page_errors": m.page_errors,
+            "median_latency_s": m.median_latency_s,
+            "p95_latency_s": m.p95_latency_s,
         },
         "pages": [
             {
@@ -1741,6 +1909,7 @@ def run_to_json(run: ModelRun) -> dict[str, Any]:
                     field_name: outcome.value for field_name, outcome in page.outcomes.items()
                 },
                 "extracted": page.extracted,
+                "elapsed_s": page.elapsed_s,
             }
             for page in run.pages
         ],
@@ -1755,30 +1924,67 @@ def sidecar_path(out: Path) -> Path:
     return out.with_name(out.name + ".cells.jsonl")
 
 
+def _pipeline_fingerprint() -> str:
+    """A fingerprint of the EVALUATED PIPELINE (not the corpus).
+
+    Hashes ``roastpilot_agent/bean_sourcing.py`` (the extraction/preprocessing
+    pipeline this harness runs unchanged) together with this harness's OWN
+    source (its scoring logic -- ``FIELD_SPECS``, comparators, thresholds) and
+    the extraction timeout. Any code change to either invalidates a stale
+    checkpoint automatically, with nothing to remember to bump.
+
+    This closes the exact gap the fixture-only fingerprint left open (#600
+    round-2 finding): #590 (preprocessing) changes ``bean_sourcing.py``
+    WITHOUT touching any committed HTML/gold fixture, so a corpus-only
+    fingerprint would silently resume the pre-#590 checkpoint as if it were
+    the post-#590 result.
+
+    Returns:
+        A short, stable hex digest of the extractor + harness source bytes
+        plus the extraction timeout. ``""`` (fingerprinting disabled) if the
+        extractor's source file cannot be located (e.g. a frozen/zipped
+        install) -- degrading to the pre-existing corpus-only guard rather
+        than crashing a real run over an unreachable introspection failure.
+    """
+    try:
+        extractor_source = inspect.getsourcefile(_bean_sourcing_module)
+        harness_source = inspect.getsourcefile(sys.modules[__name__])
+        if extractor_source is None or harness_source is None:
+            return ""
+        digest = hashlib.sha256()
+        digest.update(Path(extractor_source).read_bytes())
+        digest.update(Path(harness_source).read_bytes())
+        digest.update(str(BAKEOFF_EXTRACTION_TIMEOUT_S).encode())
+        return digest.hexdigest()[:16]
+    except OSError:  # pragma: no cover - only when source is unavailable
+        return ""
+
+
 def compute_fingerprint(pages: Sequence[CorpusPage]) -> str:
-    """A stable fingerprint of the corpus content (a stale-resume guard).
+    """A stable fingerprint of the corpus content AND the evaluated pipeline.
 
     Stored in every checkpoint record and compared on load: reusing an
     ``--out`` path after changing ``--fixtures-dir``, editing a page's HTML,
-    or relabelling gold values would otherwise silently resume old records
-    and combine them with freshly-run models into one leaderboard whose
-    entries were evaluated against DIFFERENT experiments (#600 finding).
-    Deliberately keyed on corpus content only (not e.g. the extraction
-    timeout) -- a config change that does not alter the scored ground truth
-    should not force a full re-run; the corpus is what actually determines
-    whether two runs are comparable.
+    relabelling gold values, OR changing the extraction/scoring pipeline
+    itself (see :func:`_pipeline_fingerprint`) would otherwise silently
+    resume old records and combine them with freshly-run models into one
+    leaderboard whose entries were evaluated against DIFFERENT experiments
+    (#600 finding, hardened in round 2 to also cover pipeline drift).
 
     Args:
         pages: The corpus the run will be scored against.
 
     Returns:
-        A short, stable hex digest of every page's slug/url/html/gold_fields.
+        A short, stable hex digest of every page's slug/url/html/gold_fields
+        plus the current pipeline fingerprint.
     """
     payload = [
         {"slug": p.slug, "url": p.url, "html": p.html, "gold_fields": p.gold_fields} for p in pages
     ]
     encoded = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()[:16]
+    digest = hashlib.sha256(encoded)
+    digest.update(_pipeline_fingerprint().encode())
+    return digest.hexdigest()[:16]
 
 
 def _load_checkpoint_lines(path: Path) -> list[dict[str, Any]]:
@@ -1945,17 +2151,31 @@ class BakeoffResult:
     """The outcome of :func:`run_bakeoff`.
 
     Attributes:
-        runs: The completed :class:`ModelRun` list (resumed + freshly run).
+        runs: The SCORED :class:`ModelRun` list (resumed + freshly run,
+            EXCLUDING any wholly-failed run -- see :attr:`failed_slugs`).
         stopped_early: Whether the spend guard stopped BEFORE evaluating every
             requested model -- the result is PARTIAL, not a completed roster
             comparison (#600 finding).
-        unevaluated_slugs: The requested model slugs never run because of the
-            budget stop (empty when ``stopped_early`` is ``False``).
+        unevaluated_slugs: The requested model slugs never run at all because
+            of the budget stop (empty when ``stopped_early`` is ``False``).
+        failed_slugs: Model slugs whose run was a total outage (every page
+            errored -- a bad key / provider fault, not a quality result).
+            EXCLUDED from ``runs`` and therefore from every metric, the
+            leaderboard, and pairwise statistics -- a transient failure must
+            not masquerade as a scored 0.000 row (#600 round-2 finding). Not
+            checkpointed either, so a re-run retries these models.
+        executed_slugs: Model slugs a REAL (paid) call was made for THIS
+            invocation -- includes ``failed_slugs`` (a paid attempt was still
+            made) but excludes anything resumed from an existing checkpoint.
+            Distinguishes actual spend from a pre-run estimate in the report
+            (#600 round-2 finding): a resumed model made no new call.
     """
 
     runs: list[ModelRun]
     stopped_early: bool
     unevaluated_slugs: list[str]
+    failed_slugs: list[str]
+    executed_slugs: list[str]
 
 
 async def run_bakeoff(
@@ -1976,9 +2196,11 @@ async def run_bakeoff(
     (a transient provider outage / bad key / timeout, not a real quality
     result) is NOT checkpointed, so a plain retry actually retries it instead
     of resuming and permanently reporting the outage as the model's score
-    (#600 finding) -- it is still counted against the spend guard (a paid
-    attempt was made) and still returned in ``runs`` for this invocation's
-    report, just not persisted to the sidecar.
+    (#600 finding) -- AND is excluded from ``runs`` entirely (round-2
+    hardening), so it cannot appear as a scored 0.000 row polluting the
+    leaderboard or the pairwise/bootstrap statistics; it is reported
+    separately via :attr:`BakeoffResult.failed_slugs`. It IS still counted
+    against the spend guard (a paid attempt was made).
 
     Args:
         pages: The corpus.
@@ -1998,6 +2220,8 @@ async def run_bakeoff(
     fingerprint = compute_fingerprint(pages)
     checkpoint = Checkpoint(sidecar_path(out), resume=resume, fingerprint=fingerprint)
     runs: list[ModelRun] = []
+    failed_slugs: list[str] = []
+    executed_slugs: list[str] = []
     spent = 0.0
     for index, slug in enumerate(model_slugs):
         if checkpoint.has(slug):
@@ -2012,20 +2236,27 @@ async def run_bakeoff(
                 flush=True,
             )
             return BakeoffResult(
-                runs=runs, stopped_early=True, unevaluated_slugs=list(model_slugs[index:])
+                runs=runs,
+                stopped_early=True,
+                unevaluated_slugs=list(model_slugs[index:]),
+                failed_slugs=failed_slugs,
+                executed_slugs=executed_slugs,
             )
         run = await run_model_over_corpus(
             pages, model_slug=slug, advisor_config=make_advisor_config(slug), model=model
         )
         spent += upcoming
+        executed_slugs.append(slug)  # a real call was attempted, win or lose
         if _run_wholly_failed(run):
             print(
-                f"[run] {slug}: ALL {len(run.pages)} page(s) errored -- treating as a "
-                "transient failure, NOT checkpointing (a re-run will retry this model)",
+                f"[run] {slug}: ALL {len(run.pages)} page(s) errored -- transient failure, "
+                "EXCLUDED from the leaderboard/statistics, NOT checkpointed (a re-run will "
+                "retry this model)",
                 flush=True,
             )
-        else:
-            checkpoint.append(run_to_json(run))
+            failed_slugs.append(slug)
+            continue
+        checkpoint.append(run_to_json(run))
         m = model_metrics(run)
         print(
             f"[run] {slug}: combined={_fmt(m.combined_score)} macroF1={_fmt(m.macro_f1)} "
@@ -2033,7 +2264,13 @@ async def run_bakeoff(
             flush=True,
         )
         runs.append(run)
-    return BakeoffResult(runs=runs, stopped_early=False, unevaluated_slugs=[])
+    return BakeoffResult(
+        runs=runs,
+        stopped_early=False,
+        unevaluated_slugs=[],
+        failed_slugs=failed_slugs,
+        executed_slugs=executed_slugs,
+    )
 
 
 def _run_from_checkpoint(record: dict[str, Any]) -> ModelRun:
@@ -2044,6 +2281,7 @@ def _run_from_checkpoint(record: dict[str, Any]) -> ModelRun:
             field_name: Outcome(value)
             for field_name, value in cast("dict[str, str]", page["outcomes"]).items()
         }
+        elapsed_raw = page.get("elapsed_s")
         pages.append(
             PageResult(
                 slug=str(page["slug"]),
@@ -2051,6 +2289,7 @@ def _run_from_checkpoint(record: dict[str, Any]) -> ModelRun:
                 error=cast("str | None", page["error"]),
                 on_page_fields=int(page["on_page_fields"]),
                 extracted=cast("dict[str, Any] | None", page.get("extracted")),
+                elapsed_s=None if elapsed_raw is None else float(cast("float", elapsed_raw)),
             )
         )
     return ModelRun(model_slug=str(record["model_slug"]), pages=pages)
@@ -2143,6 +2382,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
         cost_estimates,
         stopped_early=result.stopped_early,
         unevaluated_slugs=result.unevaluated_slugs,
+        failed_slugs=result.failed_slugs,
+        executed_slugs=result.executed_slugs,
     )
     print("\n" + report, flush=True)
 
@@ -2154,6 +2395,8 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 "runs": [run_to_json(r) for r in result.runs],
                 "stopped_early": result.stopped_early,
                 "unevaluated_slugs": result.unevaluated_slugs,
+                "failed_slugs": result.failed_slugs,
+                "executed_slugs": result.executed_slugs,
             },
             indent=2,
         )
@@ -2161,6 +2404,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
     print(f"\nwrote artifact -> {out_path}", flush=True)
     if args.report_md is not None:
         report_path = cast("Path", args.report_md)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
         report_path.write_text(report)
         print(f"wrote markdown report -> {report_path}", flush=True)
     return 0
