@@ -39,9 +39,13 @@ If the diff matches none of these, say so and stop — don't invent scope.
    decoder — a compression bomb is the classic miss); bounded redirect/retry/loop counts;
    concurrency bound on billable endpoints.
 4. **Fail-soft** — every `urlsplit`/`urljoin`/`httpx.URL`/`.port`/`int()`/`ipaddress`/
-   `.decode()`/provider call on untrusted input maps to a **typed** error → 4xx, never an
-   unhandled 500. Grep the whole path; two parsers rarely agree (`urlsplit` vs `httpx.URL`).
-   Verify the module's fail-soft docstring is true, per escape path.
+   `getaddrinfo`/`.decode(charset)` on untrusted input maps to a **typed** error, **never an
+   unhandled 500** — and map by *origin*: a parse/decode failure on attacker-influenced input →
+   **4xx**, but a provider timeout/rate-limit/outage → **502/503** (don't misclassify a
+   dependency outage as bad input). Grep the whole path; two parsers rarely agree (`urlsplit`
+   vs `httpx.URL`; `getaddrinfo` `UnicodeError`; `decode` `LookupError`). Also require a **safe
+   deserializer** for any untrusted format (`yaml.safe_load`/`defusedxml`/no `pickle`). Verify
+   the module's fail-soft docstring is true, per escape path.
 5. **Normalization consistency** — every extracted value normalized *before* provenance
    tagging / required-field checks / model construction; tri-state (nullable) where "absent"
    must differ from "explicitly empty/false".
