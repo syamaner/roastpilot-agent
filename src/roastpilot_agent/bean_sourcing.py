@@ -237,19 +237,6 @@ def _redact_url_credentials(url: str) -> str:
     return urlunsplit(parsed._replace(netloc=redacted_netloc, query=redacted_query, fragment=""))
 
 
-#: The OPENING ``<script ...>``/``<style ...>`` tag only — deliberately
-#: does NOT try to also match through to the closing tag in one pattern
-#: (see :func:`_strip_script_and_style_blocks`, #587 P1: that combined form
-#: is exactly the ReDoS this module used to have). ``[^>]*`` is bounded to
-#: the gap up to the tag's own closing ``>``, so this alone is linear.
-_SCRIPT_STYLE_OPEN_RE = re.compile(r"<(script|style)\b[^>]*>", re.IGNORECASE)
-#: The two possible closing tags, precompiled once (never per-element) —
-#: matched independently of the open tag via a forward, non-backtracking
-#: (bounded ``\s*``) search, never by re-scanning from the open tag with an
-#: unbounded ``.*?``.
-_SCRIPT_CLOSE_RE = re.compile(r"</script\s*>", re.IGNORECASE)
-_STYLE_CLOSE_RE = re.compile(r"</style\s*>", re.IGNORECASE)
-_ANY_TAG_RE = re.compile(r"<[^>]+>")
 _INLINE_WHITESPACE_RE = re.compile(r"[ \t\f\v]+")
 _BLANK_LINES_RE = re.compile(r"\n{3,}")
 
@@ -260,37 +247,90 @@ _BLANK_LINES_RE = re.compile(r"\n{3,}")
 _MAX_EXTRACTED_CHARS = 20_000
 
 
+def _tag_name_starts_at(lower_html: str, pos: int, tag_name: str) -> bool:
+    """``True`` if ``lower_html[pos:]`` starts with ``"<" + tag_name`` at a
+    genuine TAG-NAME boundary — e.g. matches ``"<script>"``/``"<script "``/
+    ``"<script/>"`` but NOT ``"<scripty>"`` (mirrors a regex ``\\b`` after
+    the tag name, without using one).
+
+    Args:
+        lower_html: ``html.lower()`` (case-INsensitive tag-name matching,
+            like the regex this replaces used ``re.IGNORECASE`` for).
+        pos: The index of the ``"<"`` to check.
+        tag_name: The lowercase tag name to match (``"script"``/``"style"``).
+
+    Returns:
+        Whether a tag with exactly this name starts at ``pos``.
+    """
+    prefix = "<" + tag_name
+    end = pos + len(prefix)
+    if not lower_html.startswith(prefix, pos):
+        return False
+    if end >= len(lower_html):
+        return True
+    next_char = lower_html[end]
+    return not (next_char.isalnum() or next_char == "_")
+
+
 def _strip_script_and_style_blocks(html: str) -> str:
     """Remove every ``<script>...</script>``/``<style>...</style>`` ELEMENT
     (open tag, content, close tag) from ``html``, replacing each with a
-    single space — in LINEAR time (#587 P1, ReDoS fix).
+    single space — in LINEAR time, using ONLY ``str.find`` (never a regex
+    with an unbounded/character-class-star body) — #587 P1, ReDoS fix,
+    round 8 (round 7's version, which used ``[^>]*`` to find the OPEN
+    tag's own closing ``>``, was STILL quadratic — see below).
 
-    The prior implementation used one backtracking regex
-    (``<(script|style)\\b[^>]*>.*?</\\1>``, ``re.DOTALL``) whose ``.*?`` has
-    no bound on how far it scans looking for a closing tag. For a page with
-    many UNTERMINATED ``<script>``/``<style>`` opens (no matching close
-    anywhere in the document), the engine re-scans the ENTIRE REMAINDER of
-    the document from EVERY failed open tag before giving up and trying the
-    next one — O(n) work per open tag, O(n²) total for n such tags. This
-    is a measured (not assumed) CPU-exhaustion vector: a ~90 KB payload
-    with ~10k unterminated opens can exhaust CPU on this quadratic
-    behavior alone.
+    The original implementation used one backtracking regex
+    (``<(script|style)\\b[^>]*>.*?</\\1>``, ``re.DOTALL``): its ``.*?`` has
+    no bound on how far it scans looking for a closing tag, so many
+    UNTERMINATED opens made it re-scan the entire document remainder from
+    EVERY failed open — O(n) per tag, O(n²) total. Round 7 fixed THAT, but
+    kept ``[^>]*`` for the opening tag's OWN attribute section — a regex
+    character-class star is not backtracking-ambiguous on its own, but it
+    is still UNBOUNDED: for input like ``"<script " * n`` (a tag opener
+    with no ``>`` ANYWHERE in the document), ``[^>]*`` at every one of the
+    n occurrences scans all the way to end-of-string looking for a ``>``
+    that never comes — O(n) per occurrence, O(n²) total again, just moved
+    from the CONTENT search to the ATTRIBUTE search. This measured gap is
+    what round 8 closes: no regex with an unbounded body anywhere in this
+    function.
 
-    This instead walks ``html`` ONCE with a monotonically advancing cursor:
-    find the next open tag (:data:`_SCRIPT_STYLE_OPEN_RE`, itself bounded —
-    its ``[^>]*`` cannot span past the tag's own ``>``), then find ONLY
-    that element's closing tag via a forward search
-    (:data:`_SCRIPT_CLOSE_RE`/:data:`_STYLE_CLOSE_RE`, both simple
-    non-backtracking-body patterns) starting right after the open tag. On
-    success the cursor jumps past the close tag — it never re-scans
-    anything already passed. On failure (unterminated element) the search
-    necessarily reached end-of-string once, and the scan STOPS there
-    (mirroring how a browser's own tokenizer treats an unterminated
-    ``<script>``/``<style>`` as running to end-of-document) — so at most
-    ONE such full-remainder scan can ever happen across the whole call,
-    not one per open tag. Every character of ``html`` is examined by at
-    most a small constant number of these bounded operations, giving
-    overall O(n).
+    This walks ``html`` ONCE with a monotonically advancing cursor, using
+    only ``str.find`` (itself a single, efficient forward scan — never
+    backtracking, never re-trying from a shifted start on failure):
+
+    1. ``html.find("<", pos)`` — the next ``<`` at or after ``pos``.
+    2. Check (case-insensitively, via :func:`_tag_name_starts_at`) whether
+       it opens a ``script``/``style`` element; if not, keep the single
+       ``<`` character as-is and continue from just past it — the SAME
+       cursor-never-rewinds discipline as step 1, so this branch alone is
+       O(n) total across the whole call.
+    3. ``html.find(">", ...)`` to find where the OPENING tag itself ends.
+    4. ``html.lower().find("</script"/"</style", ...)`` to find the start
+       of the matching CLOSING tag, then another ``html.find(">", ...)``
+       for where THAT ends.
+
+    The critical safety property: EVERY ``str.find`` call in steps 3–4
+    either (a) succeeds within a BOUNDED distance that does not overlap
+    with any other call's scanned range (the cursor only moves forward,
+    so distances sum to at most ``len(html)``), or (b) fails — and a
+    failure at ANY of these steps means "there is nothing left in the
+    document this function can make sense of" (no ``>`` anywhere left, or
+    no closing tag anywhere left), so the function stops IMMEDIATELY and
+    permanently on the first such failure rather than retrying at the next
+    ``<`` — there can be AT MOST ONE such full-remainder scan in the
+    entire call, not one per occurrence. This is what makes it genuinely
+    O(n), not just "no longer backtracking."
+
+    A KNOWN, accepted trade-off from stopping-on-first-failure: a
+    genuinely self-closing ``<style/>`` with no LATER ``</style>`` tag
+    (invalid per the HTML5 spec — script/style are not void elements, so a
+    real browser also does not treat a stray ``/`` as self-closing them —
+    but conceivably present in a generated/malformed vendor page) is
+    treated as unterminated, swallowing the rest of the document, rather
+    than being left alone the way the prior regex-based versions would
+    have. Not exercised by any known real vendor page or this module's
+    test fixtures; documented here rather than silently accepted.
 
     Args:
         html: The raw HTML.
@@ -300,23 +340,90 @@ def _strip_script_and_style_blocks(html: str) -> str:
         single space each (matching the prior regex's
         ``pattern.sub(" ", html)`` behavior).
     """
+    lower_html = html.lower()
     pieces: list[str] = []
     pos = 0
     length = len(html)
     while pos < length:
-        open_match = _SCRIPT_STYLE_OPEN_RE.search(html, pos)
-        if open_match is None:
+        open_pos = html.find("<", pos)
+        if open_pos == -1:
             pieces.append(html[pos:])
             break
-        pieces.append(html[pos : open_match.start()])
-        pieces.append(" ")
-        close_re = _SCRIPT_CLOSE_RE if open_match.group(1).lower() == "script" else _STYLE_CLOSE_RE
-        close_match = close_re.search(html, open_match.end())
-        if close_match is None:
-            # Unterminated: the rest of the document is this element's
-            # content — nothing usable remains to scan.
+        if _tag_name_starts_at(lower_html, open_pos, "script"):
+            tag_name = "script"
+        elif _tag_name_starts_at(lower_html, open_pos, "style"):
+            tag_name = "style"
+        else:
+            # Not a script/style opener — keep this ONE "<" character
+            # as-is (the generic tag-stripping pass, _strip_remaining_tags,
+            # handles ordinary tags) and resume scanning from just past it.
+            pieces.append(html[pos : open_pos + 1])
+            pos = open_pos + 1
+            continue
+        open_tag_end = html.find(">", open_pos)
+        if open_tag_end == -1:
+            # No ">" anywhere in the rest of the document — the opening
+            # tag itself never closes, so nothing after it can either.
+            pieces.append(html[pos:open_pos])
             break
-        pos = close_match.end()
+        close_tag_start = lower_html.find(f"</{tag_name}", open_tag_end + 1)
+        if close_tag_start == -1:
+            pieces.append(html[pos:open_pos])
+            pieces.append(" ")
+            break
+        close_tag_end = html.find(">", close_tag_start)
+        if close_tag_end == -1:
+            pieces.append(html[pos:open_pos])
+            pieces.append(" ")
+            break
+        pieces.append(html[pos:open_pos])
+        pieces.append(" ")
+        pos = close_tag_end + 1
+    return "".join(pieces)
+
+
+def _strip_remaining_tags(html: str) -> str:
+    """Strip every remaining ``<...>`` tag from ``html`` (script/style
+    elements are already gone by this point — see
+    :func:`_strip_script_and_style_blocks`), in LINEAR time using ONLY
+    ``str.find`` (#587 P1, ReDoS fix, round 8).
+
+    Replaces the prior ``re.compile(r"<[^>]+>").sub(" ", html)``: that
+    character-class-star regex has the identical unbounded-scan flaw
+    :func:`_strip_script_and_style_blocks` used to have — for input like
+    ``"<div " * n`` (an opening ``<`` with no ``>`` anywhere in the
+    document), ``[^>]+`` at every one of the n occurrences scans to
+    end-of-string looking for a ``>`` that never comes — O(n) per
+    occurrence, O(n²) total.
+
+    Same discipline as the script/style stripper: ``html.find("<", pos)``
+    then ``html.find(">", ...)``, cursor only ever advances, and a FAILED
+    ``find(">", ...)`` (no closing bracket anywhere in the remainder)
+    stops the function immediately and permanently rather than retrying at
+    the next ``<`` — at most one full-remainder scan in the whole call.
+
+    Args:
+        html: HTML with script/style elements already removed.
+
+    Returns:
+        ``html`` with every ``<...>`` tag replaced by a single space.
+    """
+    pieces: list[str] = []
+    pos = 0
+    length = len(html)
+    while pos < length:
+        open_pos = html.find("<", pos)
+        if open_pos == -1:
+            pieces.append(html[pos:])
+            break
+        pieces.append(html[pos:open_pos])
+        close_pos = html.find(">", open_pos)
+        if close_pos == -1:
+            # No ">" anywhere left — nothing recognizable remains.
+            pieces.append(" ")
+            break
+        pieces.append(" ")
+        pos = close_pos + 1
     return "".join(pieces)
 
 
@@ -325,11 +432,11 @@ def _extract_page_text(html: str) -> str:
 
     A dependency-free HTML-to-text pass: ``<script>``/``<style>`` blocks are
     dropped whole (their content is never useful bean-identity text and
-    could be large — see :func:`_strip_script_and_style_blocks`, which does
-    this in linear time), remaining tags are stripped, entities are
-    unescaped, and whitespace is collapsed. Good enough for a structured
-    extraction prompt without adding an HTML-parsing dependency to the lean
-    runtime install.
+    could be large — see :func:`_strip_script_and_style_blocks`), remaining
+    tags are stripped (:func:`_strip_remaining_tags`) — both LINEAR-time,
+    ``str.find``-based passes, #587 P1 — entities are unescaped, and
+    whitespace is collapsed. Good enough for a structured extraction prompt
+    without adding an HTML-parsing dependency to the lean runtime install.
 
     Args:
         html: The raw response body, already decoded to text.
@@ -338,7 +445,7 @@ def _extract_page_text(html: str) -> str:
         Collapsed plain text, truncated to :data:`_MAX_EXTRACTED_CHARS`.
     """
     without_blocks = _strip_script_and_style_blocks(html)
-    without_tags = _ANY_TAG_RE.sub(" ", without_blocks)
+    without_tags = _strip_remaining_tags(without_blocks)
     text = unescape(without_tags)
     text = _INLINE_WHITESPACE_RE.sub(" ", text)
     text = "\n".join(line.strip() for line in text.splitlines())
@@ -709,6 +816,18 @@ def _decode_response_body(body: bytes, response: httpx.Response) -> str:
     kept as the final fallback so a body that does not even decode cleanly
     under its own declared charset still yields text rather than raising.
 
+    ``response.encoding`` is NOT a hard guarantee of a decodable codec name
+    (#587 P2, round 8): it is validated against the codec registry in the
+    common case, but that is an ``httpx``-internal implementation detail
+    this module does not control (and the ``encoding`` SETTER, used
+    elsewhere in ``httpx``'s own internals, does not re-validate at all) —
+    an unrecognized charset name raises ``LookupError`` from
+    ``bytes.decode()``, which ``errors="replace"`` does NOT protect against
+    (that parameter only governs DECODE errors within an already-resolved
+    codec, not an unknown codec NAME). Caught here and treated the same as
+    a garbled body under a recognized charset: fail soft to UTF-8, never a
+    500 over a vendor's bad ``Content-Type`` header.
+
     Args:
         body: The raw fetched bytes (already capped to the configured size
             limit).
@@ -718,7 +837,11 @@ def _decode_response_body(body: bytes, response: httpx.Response) -> str:
     Returns:
         The decoded text.
     """
-    return body.decode(response.encoding or "utf-8", errors="replace")
+    encoding = response.encoding or "utf-8"
+    try:
+        return body.decode(encoding, errors="replace")
+    except LookupError:
+        return body.decode("utf-8", errors="replace")
 
 
 async def _fetch_one_hop(

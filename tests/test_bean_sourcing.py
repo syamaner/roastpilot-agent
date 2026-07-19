@@ -25,7 +25,7 @@ import subprocess
 import sys
 import time
 import zlib
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 
 import httpx
 import pytest
@@ -200,7 +200,7 @@ def test_extract_page_text_truncates_long_pages() -> None:
     assert len(text) == bean_sourcing._MAX_EXTRACTED_CHARS  # pyright: ignore[reportPrivateUsage]
 
 
-# --- #587 P1 round 7: linear-time script/style strip (ReDoS fix) ---
+# --- #587 P1 rounds 7-8: linear-time script/style + tag strip (ReDoS fix) ---
 
 
 def test_strip_script_and_style_blocks_removes_well_formed_elements() -> None:
@@ -263,6 +263,75 @@ def test_extract_page_text_pathological_unterminated_tags_completes_quickly() ->
     assert elapsed < 2.0, f"script/style strip took {elapsed:.3f}s — looks quadratic again"
     # The (single, unterminated) element swallows everything from the
     # first <script> onward — nothing survives into the extracted text.
+    assert result == ""
+
+
+def test_tag_name_starts_at_handles_tag_name_at_string_end() -> None:
+    """Covers the "tag name reaches exactly end-of-string, no character
+    left to check for a word boundary" branch."""
+    starts_at = bean_sourcing._tag_name_starts_at  # pyright: ignore[reportPrivateUsage]
+    assert starts_at("<script", 0, "script") is True
+    assert starts_at("<style", 0, "style") is True
+    # "<scripty" is NOT a "script" tag — the char right after "script" is a
+    # word character, so this is a longer, different tag name.
+    assert starts_at("<scripty", 0, "script") is False
+
+
+def test_strip_script_and_style_blocks_handles_missing_open_tag_close_bracket() -> None:
+    """#587 P1, round 8 — THE bug round 7 missed: an opening tag with no
+    ">" anywhere in the rest of the document (round 7's ``[^>]*``-based
+    open-tag matcher was still quadratic on exactly this shape). Content
+    BEFORE the broken opener is preserved; nothing after it survives."""
+    strip = bean_sourcing._strip_script_and_style_blocks  # pyright: ignore[reportPrivateUsage]
+    result = strip("<p>Before</p><script never closed at all")
+    assert "Before" in result
+    assert "never closed" not in result
+
+
+def test_strip_script_and_style_blocks_handles_missing_close_tag_close_bracket() -> None:
+    """The CLOSING tag itself is found (``</script``) but has no ">" after
+    it anywhere in the remaining document."""
+    strip = bean_sourcing._strip_script_and_style_blocks  # pyright: ignore[reportPrivateUsage]
+    result = strip("<p>Before</p><script>var x = 1;</script no closing bracket")
+    assert "Before" in result
+    assert "var x" not in result
+
+
+def test_strip_remaining_tags_handles_missing_close_bracket() -> None:
+    strip = bean_sourcing._strip_remaining_tags  # pyright: ignore[reportPrivateUsage]
+    result = strip("Before<div never closed at all")
+    assert result == "Before "
+
+
+@pytest.mark.parametrize(
+    "payload_fn",
+    [
+        lambda: "<script " * 50_000,
+        lambda: "<div " * 50_000,
+    ],
+    ids=["script-opener-no-close-bracket", "div-opener-no-close-bracket"],
+)
+def test_extract_page_text_pathological_opener_with_no_close_bracket_completes_quickly(
+    payload_fn: Callable[[], str],
+) -> None:
+    """#587 P1, round 8 — the EXACT shape round 7 missed: an opener
+    (``<script ``/``<div ``) repeated many times with a trailing SPACE but
+    NO ">" anywhere. Round 7's ``[^>]*``/``[^>]+`` regexes each re-scanned
+    the entire remaining document from every occurrence looking for a ">"
+    that never comes — O(n) per occurrence, O(n^2) total (the SAME
+    quadratic shape as the original finding, just moved to the attribute
+    search). Genuinely linear now: must complete in a small fraction of a
+    second even at 50,000 repetitions (~350-400 KB)."""
+    payload = payload_fn()
+    assert len(payload) > 200_000
+
+    started = time.monotonic()
+    result = bean_sourcing._extract_page_text(payload)  # pyright: ignore[reportPrivateUsage]
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0, f"tag strip took {elapsed:.3f}s — still looks quadratic"
+    # No ">" anywhere in the whole payload -> nothing survives past the
+    # first opener; the result is empty either way.
     assert result == ""
 
 
@@ -1126,6 +1195,25 @@ async def test_fetch_with_ssrf_guard_decodes_declared_non_utf8_charset(
         "https://vendor.example/products/cafe", config=BeanSourcingConfig()
     )
     assert "Café Kenya" in text
+
+
+def test_decode_response_body_falls_back_to_utf8_on_unknown_charset() -> None:
+    """#587 P2, round 8: ``response.encoding`` is not a hard guarantee of a
+    decodable codec name — ``bytes.decode()`` raises ``LookupError`` for an
+    unrecognized one, which ``errors="replace"`` does NOT protect against
+    (that only governs decode errors WITHIN an already-resolved codec, not
+    an unknown codec NAME). ``httpx``'s own ``Response.encoding`` getter
+    validates the common case (a ``Content-Type: charset=...`` header) via
+    the codec registry, but the ``.encoding`` SETTER — used elsewhere in
+    ``httpx``'s own internals — does not re-validate at all; forced here
+    via that setter to exercise the fallback directly and deterministically
+    (independent of httpx-version-specific getter validation behavior)."""
+    response = httpx.Response(200, content=b"hello")
+    response.encoding = "not-a-real-codec"
+    result = bean_sourcing._decode_response_body(  # pyright: ignore[reportPrivateUsage]
+        b"hello", response
+    )
+    assert result == "hello"
 
 
 @pytest.mark.asyncio
