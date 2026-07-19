@@ -43,8 +43,8 @@ definition.
   validate against.
 - **One PR per SLICE, not per story.** A story is decomposed at kickoff into its PR plan
   (see PR-Hygiene) — an ordered set of thin PRs, each under the 400-line logic cap; each
-  slice is one PR on its own branch `feature/{issue-number}-{slug}-{slice}` (or a plain
-  `{slug}` when a story is genuinely a single slice), and every PR references the story
+  slice is one PR on its own branch `feature/{issue-number}-{slug}-{slice}` (or plain
+  `feature/{issue-number}-{slug}` when a story is genuinely a single slice), and every PR references the story
   issue (`Refs #N`, or `Closes #N` only on the slice that finishes it). A story whose
   plan called for multiple slices but ships as one big PR is an unplanned monolith —
   split it to the plan; a story whose kickoff plan is genuinely one slice under the cap
