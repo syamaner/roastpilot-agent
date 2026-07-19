@@ -72,8 +72,16 @@ Each item: the check, the failure it prevents, and the fix pattern. Cite `file:l
       stripping, not backtracking regex; if a regex stays, prove it can't rescan a
       no-terminator suffix.
 - [ ] **Bound the work count** — redirect chains, retries, per-item loops all have limits.
-- [ ] **Concurrency bound** on any billable/expensive endpoint (semaphore → 429), so a
-      caller can't fan out unbounded paid calls.
+- [ ] **Cap the INBOUND request body too, not just the fetched response** — the response
+      cap protects against a hostile *upstream*, but a new external-input endpoint also takes
+      a client request; on a direct ASGI/Uvicorn deployment with no fronting proxy, an
+      oversized/deeply-nested JSON or form body is buffered + parsed before your handler runs.
+      Enforce a max request-body size (and parse depth) at the route.
+- [ ] **Concurrency bound that REJECTS, not one that queues** — a plain `async with
+      semaphore:` *waits* when exhausted, so callers pile up unbounded (memory/latency) and it
+      never returns 429. Use a **non-blocking / bounded acquire** (`locked()` check, or acquire
+      within a short `asyncio.timeout` → 429 on failure) on any billable/expensive endpoint, so
+      excess load is rejected rather than accumulated.
 
 ## 4. Fail-soft — no unhandled exception becomes a 500
 
@@ -89,6 +97,15 @@ Each item: the check, the failure it prevents, and the fix pattern. Cite `file:l
       `response.encoding` couldn't raise was wrong, and shipped a 500.
 - [ ] The module's fail-soft **docstring promise matches reality** — if it says "never
       raises an unhandled exception", prove it with a test per escape path.
+- [ ] **Distinguish client-input errors (4xx) from dependency failures (5xx).** A parse/decode
+      failure on attacker-influenced input is a **4xx** (bad request). But a provider timeout,
+      rate-limit, credential rejection, or outage is an **operational** failure — return
+      **502/503**, not 4xx; misclassifying an outage as "bad input" hides real incidents and
+      lies to the caller. Map by *origin of the failure*, not by "any exception → 4xx".
+- [ ] **Use a SAFE deserializer for every untrusted format.** SSRF/fail-soft/resource checks
+      all pass while the parser itself executes code or fetches entities: `yaml.safe_load` (never
+      `yaml.load`), `defusedxml` / external-entities-disabled for XML (XXE), **never `pickle`/
+      `marshal`/`eval`** on untrusted bytes. Name the parser and confirm it's the safe variant.
 
 ## 5. Data-contract & normalization consistency
 
@@ -108,6 +125,12 @@ Each item: the check, the failure it prevents, and the fix pattern. Cite `file:l
       the same backend can starve it. Guard on the active-run signal (→ 409), and make the
       guard **race-free**: check + do the work under the same lock the roast-start path uses,
       or a concurrent start can interleave after the check.
+- [ ] **CPU-heavy synchronous parsing counts as contention too, not just provider calls.**
+      The same process runs the roast controller, so a synchronous HTML/markup/decompression
+      parse (see the ReDoS + compression-bomb items in §3) blocks the event loop and can stall
+      the advisor tick even with no provider call involved. Keep such parsing linear/bounded,
+      and for anything genuinely heavy run it off the loop (thread/executor) — the §3 resource
+      caps and this contention guard are the same concern viewed from the roast loop.
 
 ## 7. Invariant separation
 
