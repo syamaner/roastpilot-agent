@@ -21,6 +21,7 @@ import asyncio
 import gzip
 import ipaddress
 import logging
+import socket
 import subprocess
 import sys
 import time
@@ -28,6 +29,7 @@ import zlib
 from collections.abc import AsyncGenerator, Callable
 from typing import Literal
 
+import extruct  # type: ignore[import-untyped]
 import httpx
 import pytest
 from pydantic_ai import ModelHTTPError
@@ -2599,6 +2601,513 @@ def test_draft_from_identity_applies_conservative_scouting_targets_by_processing
     # band (issue #573): drop <=195, dev in [13, 15].
     assert draft.target_drop_temp_c <= 195.0
     assert 13.0 <= draft.target_development_percent <= 15.0
+
+
+# --- #590 slice B: deterministic JSON-LD product extraction (unit) ---
+
+_MATCHING_JSON_LD_URL = "https://vendor.example/products/kenya-kiambu"
+
+_MATCHING_JSON_LD_SCRIPT = """
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Product",
+  "name": "Kenya Kiambu AA (Washed)",
+  "url": "https://vendor.example/products/kenya-kiambu",
+  "sku": "KE-KIAMBU-AA",
+  "brand": {"@type": "Brand", "name": "Vendor Roastery"},
+  "description": "A washed Kenyan lot from Kiambu.",
+  "offers": {"@type": "Offer", "url": "https://vendor.example/products/kenya-kiambu"}
+}
+</script>
+"""
+
+#: A DIFFERENT product's block, embedded on the SAME page ("customers also
+#: bought" style) — the identity-match gate must reject it (#590 slice B).
+_STALE_JSON_LD_SCRIPT = """
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "Product",
+  "name": "Ethiopia Yirgacheffe (Natural)",
+  "url": "https://vendor.example/products/ethiopia-yirgacheffe",
+  "description": "A DIFFERENT, unrelated product on the same page."
+}
+</script>
+"""
+
+
+def _html_with_json_ld(*scripts: str) -> str:
+    """``_SAMPLE_HTML`` with one or more JSON-LD ``<script>`` blocks spliced
+    into ``<head>`` (#590 slice B test fixture)."""
+    return _SAMPLE_HTML.replace("<head>", "<head>" + "".join(scripts), 1)
+
+
+def test_clean_json_ld_text_rejects_non_string_and_blank() -> None:
+    assert bean_sourcing._clean_json_ld_text("  Kenya  ") == "Kenya"  # pyright: ignore[reportPrivateUsage]
+    assert bean_sourcing._clean_json_ld_text("   ") is None  # pyright: ignore[reportPrivateUsage]
+    assert bean_sourcing._clean_json_ld_text(42) is None  # pyright: ignore[reportPrivateUsage]
+    assert bean_sourcing._clean_json_ld_text(None) is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_clean_json_ld_text_truncates_an_oversized_field() -> None:
+    # A malicious page could put an enormous string in a single JSON-LD
+    # field (e.g. "description"); this must never reach the LLM prompt
+    # unbounded, independent of the separate page-text truncation (#590
+    # slice B resource-exhaustion guard).
+    huge_value = "x" * 10_000
+    cleaned = bean_sourcing._clean_json_ld_text(huge_value)  # pyright: ignore[reportPrivateUsage]
+    assert cleaned is not None
+    assert len(cleaned) == bean_sourcing._MAX_JSON_LD_FIELD_CHARS  # pyright: ignore[reportPrivateUsage]
+
+
+def test_canonical_product_locator_resolves_relative_and_normalizes() -> None:
+    locator = bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
+        "/products/kenya-kiambu/", base_url="https://Vendor.example/other-page"
+    )
+    assert locator == "vendor.example/products/kenya-kiambu"
+
+
+def test_canonical_product_locator_ignores_scheme_and_query() -> None:
+    a = bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
+        "http://vendor.example/products/kenya-kiambu?ref=email",
+        base_url="https://vendor.example/products/kenya-kiambu",
+    )
+    b = bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
+        "https://vendor.example/products/kenya-kiambu",
+        base_url="https://vendor.example/products/kenya-kiambu",
+    )
+    assert a == b == "vendor.example/products/kenya-kiambu"
+
+
+def test_canonical_product_locator_rejects_malformed_value() -> None:
+    assert (
+        bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
+            "http://[::1", base_url="https://vendor.example/products/kenya-kiambu"
+        )
+        is None
+    )
+
+
+def test_canonical_product_locator_rejects_non_http_scheme() -> None:
+    assert (
+        bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
+            "mailto:sales@vendor.example", base_url="https://vendor.example/x"
+        )
+        is None
+    )
+
+
+def test_canonical_product_locator_rejects_missing_host() -> None:
+    # A DIFFERENT-scheme base_url avoids urljoin's same-scheme netloc-
+    # inheriting compatibility quirk, so the empty-host "https:///..." form
+    # is resolved as-is rather than folded onto the base's own host.
+    assert (
+        bean_sourcing._canonical_product_locator(  # pyright: ignore[reportPrivateUsage]
+            "https:///no-host", base_url="ftp://vendor.example/x"
+        )
+        is None
+    )
+
+
+def test_is_product_type_matches_bare_string() -> None:
+    assert bean_sourcing._is_product_type("Product") is True  # pyright: ignore[reportPrivateUsage]
+
+
+def test_is_product_type_matches_within_a_list_and_skips_non_strings() -> None:
+    assert bean_sourcing._is_product_type(["Thing", 42, "Product"]) is True  # pyright: ignore[reportPrivateUsage]
+
+
+def test_is_product_type_matches_full_schema_org_uri() -> None:
+    assert bean_sourcing._is_product_type("https://schema.org/Product") is True  # pyright: ignore[reportPrivateUsage]
+
+
+def test_is_product_type_rejects_non_matching_and_wrong_case() -> None:
+    assert bean_sourcing._is_product_type("BreadcrumbList") is False  # pyright: ignore[reportPrivateUsage]
+    assert bean_sourcing._is_product_type("product") is False  # pyright: ignore[reportPrivateUsage]
+    assert bean_sourcing._is_product_type(None) is False  # pyright: ignore[reportPrivateUsage]
+
+
+def test_product_blocks_from_items_finds_top_level_and_graph_nested() -> None:
+    items: list[dict[str, object]] = [
+        {"@type": "Product", "name": "Top-level"},
+        {
+            "@type": "WebPage",
+            "@graph": [
+                {"@type": "BreadcrumbList"},
+                {"@type": "Product", "name": "Nested"},
+            ],
+        },
+    ]
+    blocks = bean_sourcing._product_blocks_from_items(items)  # pyright: ignore[reportPrivateUsage]
+    assert [b["name"] for b in blocks] == ["Top-level", "Nested"]
+
+
+def test_product_blocks_from_items_skips_non_list_graph_and_non_dict_nested() -> None:
+    items: list[dict[str, object]] = [
+        {"@type": "WebPage", "@graph": "not-a-list"},
+        {"@type": "WebPage", "@graph": [1, 2, {"@type": "Product", "name": "Nested"}]},
+    ]
+    blocks = bean_sourcing._product_blocks_from_items(items)  # pyright: ignore[reportPrivateUsage]
+    assert [b["name"] for b in blocks] == ["Nested"]
+
+
+def test_product_blocks_from_items_bounds_top_level_inspection() -> None:
+    items: list[dict[str, object]] = [{"@type": "Product", "name": f"item-{i}"} for i in range(30)]
+    blocks = bean_sourcing._product_blocks_from_items(items)  # pyright: ignore[reportPrivateUsage]
+    assert len(blocks) == bean_sourcing._MAX_JSON_LD_ITEMS  # pyright: ignore[reportPrivateUsage]
+
+
+def test_product_blocks_from_items_bounds_nested_graph_inspection() -> None:
+    items: list[dict[str, object]] = [
+        {
+            "@type": "WebPage",
+            "@graph": [{"@type": "Product", "name": f"nested-{i}"} for i in range(30)],
+        }
+    ]
+    blocks = bean_sourcing._product_blocks_from_items(items)  # pyright: ignore[reportPrivateUsage]
+    # The top-level WebPage item itself counts against the shared bound too.
+    assert len(blocks) == bean_sourcing._MAX_JSON_LD_ITEMS - 1  # pyright: ignore[reportPrivateUsage]
+
+
+def test_product_identity_candidates_collects_id_url_and_offers_list() -> None:
+    block: dict[str, object] = {
+        "@id": "https://vendor.example/products/a",
+        "url": "https://vendor.example/products/b",
+        "offers": [
+            {"url": "https://vendor.example/products/c"},
+            {"no_url": "ignored"},
+            "not-a-dict",
+        ],
+    }
+    candidates = bean_sourcing._product_identity_candidates(block)  # pyright: ignore[reportPrivateUsage]
+    assert candidates == [
+        "https://vendor.example/products/a",
+        "https://vendor.example/products/b",
+        "https://vendor.example/products/c",
+    ]
+
+
+def test_product_identity_candidates_handles_single_offer_object_and_missing_offers() -> None:
+    with_single_offer = bean_sourcing._product_identity_candidates(  # pyright: ignore[reportPrivateUsage]
+        {"offers": {"url": "https://vendor.example/products/d"}}
+    )
+    assert with_single_offer == ["https://vendor.example/products/d"]
+    assert bean_sourcing._product_identity_candidates({}) == []  # pyright: ignore[reportPrivateUsage]
+
+
+def test_select_identity_matched_product_finds_matching_block_among_others() -> None:
+    raw_items: list[dict[str, object]] = [
+        {"@type": "Product", "name": "Stale", "url": "https://vendor.example/products/other"},
+        {"@type": "Product", "name": "Real", "url": _MATCHING_JSON_LD_URL},
+    ]
+    matched = bean_sourcing._select_identity_matched_product(  # pyright: ignore[reportPrivateUsage]
+        raw_items, url=_MATCHING_JSON_LD_URL
+    )
+    assert matched is not None
+    assert matched["name"] == "Real"
+
+
+def test_select_identity_matched_product_returns_none_when_nothing_matches() -> None:
+    raw_items: list[dict[str, object]] = [
+        {"@type": "Product", "name": "Stale", "url": "https://vendor.example/products/other"}
+    ]
+    assert (
+        bean_sourcing._select_identity_matched_product(  # pyright: ignore[reportPrivateUsage]
+            raw_items, url=_MATCHING_JSON_LD_URL
+        )
+        is None
+    )
+
+
+def test_select_identity_matched_product_returns_none_for_malformed_target_url() -> None:
+    raw_items: list[dict[str, object]] = [{"@type": "Product", "url": "not-http"}]
+    assert (
+        bean_sourcing._select_identity_matched_product(  # pyright: ignore[reportPrivateUsage]
+            raw_items, url="mailto:x@vendor.example"
+        )
+        is None
+    )
+
+
+def test_facts_from_product_block_unwraps_nested_brand_object() -> None:
+    facts = bean_sourcing._facts_from_product_block(  # pyright: ignore[reportPrivateUsage]
+        {
+            "name": " Kenya Kiambu AA ",
+            "brand": {"name": "Vendor Roastery"},
+            "sku": "KE-1",
+            "description": "A lot.",
+        }
+    )
+    assert facts.name == "Kenya Kiambu AA"
+    assert facts.brand == "Vendor Roastery"
+    assert facts.sku == "KE-1"
+    assert facts.description == "A lot."
+
+
+def test_facts_from_product_block_accepts_plain_string_brand_and_missing_fields() -> None:
+    facts = bean_sourcing._facts_from_product_block({"brand": "Vendor Roastery"})  # pyright: ignore[reportPrivateUsage]
+    assert facts.brand == "Vendor Roastery"
+    assert facts.name is None
+    facts_no_brand = bean_sourcing._facts_from_product_block({})  # pyright: ignore[reportPrivateUsage]
+    assert facts_no_brand.brand is None
+
+
+def test_format_json_ld_context_renders_present_fields_only() -> None:
+    facts = bean_sourcing._JsonLdProductFacts(name="Kenya Kiambu AA", sku="KE-1")  # pyright: ignore[reportPrivateUsage]
+    context = bean_sourcing._format_json_ld_context(facts)  # pyright: ignore[reportPrivateUsage]
+    assert context is not None
+    assert "- name: Kenya Kiambu AA" in context
+    assert "- sku: KE-1" in context
+    assert "- brand:" not in context
+
+
+def test_format_json_ld_context_returns_none_when_every_field_absent() -> None:
+    assert (
+        bean_sourcing._format_json_ld_context(bean_sourcing._JsonLdProductFacts())  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+# --- #590 slice B: _parse_html_for_json_ld (the XXE-safety boundary) ---
+
+
+def test_parse_html_for_json_ld_extracts_matching_script() -> None:
+    items = bean_sourcing._parse_html_for_json_ld(  # pyright: ignore[reportPrivateUsage]
+        _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT)
+    )
+    assert len(items) == 1
+    assert items[0]["name"] == "Kenya Kiambu AA (Washed)"
+
+
+def test_parse_html_for_json_ld_returns_empty_list_when_no_json_ld_present() -> None:
+    assert bean_sourcing._parse_html_for_json_ld(_SAMPLE_HTML) == []  # pyright: ignore[reportPrivateUsage]
+
+
+def test_parse_html_for_json_ld_fails_soft_on_malformed_json() -> None:
+    malformed = _html_with_json_ld(
+        '<script type="application/ld+json">{not valid json at all!}</script>'
+    )
+    assert bean_sourcing._parse_html_for_json_ld(malformed) == []  # pyright: ignore[reportPrivateUsage]
+
+
+def test_parse_html_for_json_ld_fails_soft_on_unparseable_html() -> None:
+    # An empty document raises lxml.etree.ParserError ("Document is empty"),
+    # verified directly against lxml's real behavior — the LxmlError branch.
+    assert bean_sourcing._parse_html_for_json_ld("") == []  # pyright: ignore[reportPrivateUsage]
+
+
+def test_parse_html_for_json_ld_fails_soft_when_extruct_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("simulated extruct failure")
+
+    monkeypatch.setattr(extruct, "extract", _raise)
+    items = bean_sourcing._parse_html_for_json_ld(  # pyright: ignore[reportPrivateUsage]
+        _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT)
+    )
+    assert items == []
+
+
+def test_parse_html_for_json_ld_filters_non_dict_top_level_items() -> None:
+    array_of_scalars = _html_with_json_ld(
+        '<script type="application/ld+json">'
+        '[1, "two", {"@type": "Product", "name": "Three"}]'
+        "</script>"
+    )
+    items = bean_sourcing._parse_html_for_json_ld(array_of_scalars)  # pyright: ignore[reportPrivateUsage]
+    assert items == [{"@type": "Product", "name": "Three"}]
+
+
+def test_parse_html_for_json_ld_xxe_payload_does_not_expand_entity_or_touch_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An external-entity payload referencing a local/metadata address must
+    never be fetched or expanded (#590 slice B, checklist class 4)."""
+    connect_attempts: list[object] = []
+
+    def _spy_connect(self: socket.socket, address: object) -> None:
+        # Records the attempt and fails closed — the test's whole point is
+        # that this must NEVER be called at all, so it deliberately never
+        # forwards to a real connect (safe even if that assumption were
+        # ever wrong: no real network I/O happens from a test either way).
+        connect_attempts.append(address)
+        raise OSError("network access blocked in test")
+
+    monkeypatch.setattr(socket.socket, "connect", _spy_connect)
+    xxe_payload = (
+        "<!DOCTYPE html [<!ENTITY xxe SYSTEM "
+        '"http://169.254.169.254/latest/meta-data/">]>\n'
+        "<html><body>"
+        '<script type="application/ld+json">'
+        '{"@type": "Product", "name": "Bean", "url": "' + _MATCHING_JSON_LD_URL + '", '
+        '"description": "&xxe;"}'
+        "</script>"
+        "</body></html>"
+    )
+    items = bean_sourcing._parse_html_for_json_ld(xxe_payload)  # pyright: ignore[reportPrivateUsage]
+    assert connect_attempts == []
+    assert len(items) == 1
+    # The entity is NEVER expanded in HTML parsing mode — the literal,
+    # unexpanded marker string comes through unchanged, not fetched content.
+    assert items[0]["description"] == "&xxe;"
+
+
+def test_parse_html_for_json_ld_billion_laughs_style_payload_completes_quickly() -> None:
+    """A deeply-nested internal-entity declaration (the "billion laughs"
+    shape) must not hang or crash — HTML-mode parsing never expands it."""
+    payload = (
+        "<!DOCTYPE html [\n"
+        '<!ENTITY lol "lol">\n'
+        '<!ENTITY lol2 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">\n'
+        '<!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">\n'
+        "]>\n"
+        "<html><body>"
+        '<script type="application/ld+json">{"@type": "Product", "name": "&lol3;"}</script>'
+        "</body></html>"
+    )
+    start = time.monotonic()
+    items = bean_sourcing._parse_html_for_json_ld(payload)  # pyright: ignore[reportPrivateUsage]
+    elapsed = time.monotonic() - start
+    assert elapsed < 2.0
+    assert len(items) == 1
+    assert items[0]["name"] == "&lol3;"
+
+
+def test_parse_html_for_json_ld_fails_soft_on_deeply_nested_json_recursion_bomb() -> None:
+    """A JSON-native DoS shape (unlike the inert HTML-entity one above): a
+    deeply-nested JSON array exhausts Python's ``json.loads`` recursion
+    limit (verified directly: ``RecursionError``) rather than the XML-DTD
+    entity mechanism — must still fail soft, not crash the fetch."""
+    deeply_nested_array = "[" * 5000 + "]" * 5000
+    payload = _html_with_json_ld(
+        f'<script type="application/ld+json">{deeply_nested_array}</script>'
+    )
+    assert bean_sourcing._parse_html_for_json_ld(payload) == []  # pyright: ignore[reportPrivateUsage]
+
+
+# --- #590 slice B: _build_json_ld_context ---
+
+
+def test_build_json_ld_context_returns_formatted_block_for_a_matching_page() -> None:
+    context = bean_sourcing._build_json_ld_context(  # pyright: ignore[reportPrivateUsage]
+        _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT), _MATCHING_JSON_LD_URL
+    )
+    assert context is not None
+    assert "Kenya Kiambu AA (Washed)" in context
+    assert "KE-KIAMBU-AA" in context
+
+
+def test_build_json_ld_context_returns_none_without_json_ld() -> None:
+    assert (
+        bean_sourcing._build_json_ld_context(_SAMPLE_HTML, _MATCHING_JSON_LD_URL)  # pyright: ignore[reportPrivateUsage]
+        is None
+    )
+
+
+def test_build_json_ld_context_returns_none_for_a_stale_unmatched_block() -> None:
+    assert (
+        bean_sourcing._build_json_ld_context(  # pyright: ignore[reportPrivateUsage]
+            _html_with_json_ld(_STALE_JSON_LD_SCRIPT), _MATCHING_JSON_LD_URL
+        )
+        is None
+    )
+
+
+def test_build_json_ld_context_fails_soft_on_internal_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _raise(html: str) -> list[dict[str, object]]:
+        raise RuntimeError("simulated internal failure")
+
+    monkeypatch.setattr(bean_sourcing, "_parse_html_for_json_ld", _raise)
+    assert (
+        bean_sourcing._build_json_ld_context(  # pyright: ignore[reportPrivateUsage]
+            _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT), _MATCHING_JSON_LD_URL
+        )
+        is None
+    )
+
+
+# --- #590 slice B: wired into _fetch_page_text ---
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_prepends_matching_json_ld_context() -> None:
+    async with _mock_client(
+        _html_response(200, _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT))
+    ) as client:
+        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+        )
+    assert text.startswith("Structured data found in this page's JSON-LD")
+    assert "KE-KIAMBU-AA" in text
+    assert "Kenya Kiambu AA" in text  # the plain-text extraction still follows
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_ignores_a_stale_unmatched_json_ld_block() -> None:
+    async with _mock_client(
+        _html_response(200, _html_with_json_ld(_STALE_JSON_LD_SCRIPT))
+    ) as client:
+        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+        )
+    assert "Structured data found in this page" not in text
+    assert "Yirgacheffe" not in text  # the stale block's own text never leaks in
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_without_json_ld_falls_through_byte_for_byte_unchanged() -> None:
+    async with _mock_client(_html_response(200, _SAMPLE_HTML)) as client:
+        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+        )
+    assert text == bean_sourcing._extract_page_text(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_fetch_page_text_fails_soft_on_a_page_with_malformed_json_ld() -> None:
+    malformed_page = _html_with_json_ld(
+        '<script type="application/ld+json">{not valid json at all!}</script>'
+    )
+    async with _mock_client(_html_response(200, malformed_page)) as client:
+        text = await bean_sourcing._fetch_page_text(  # pyright: ignore[reportPrivateUsage]
+            _MATCHING_JSON_LD_URL, config=BeanSourcingConfig(), http_client=client
+        )
+    assert "Structured data found in this page" not in text
+    assert "Kenya Kiambu AA" in text
+
+
+# --- #590 slice B: reaches the extraction prompt (draft_bean_profile_from_url) ---
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_feeds_json_ld_context_to_extraction_prompt() -> None:
+    seen_prompts: list[str] = []
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        for message in messages:
+            for part in message.parts:
+                text = getattr(part, "content", None)
+                if isinstance(text, str):
+                    seen_prompts.append(text)
+        tool_name = info.output_tools[0].name
+        return ModelResponse(parts=[ToolCallPart(tool_name, _identity_args())])
+
+    async with _mock_client(
+        _html_response(200, _html_with_json_ld(_MATCHING_JSON_LD_SCRIPT))
+    ) as http_client:
+        draft = await draft_bean_profile_from_url(
+            _MATCHING_JSON_LD_URL,
+            advisor_config=_ADVISOR_CONFIG,
+            http_client=http_client,
+            model=FunctionModel(respond),
+        )
+    assert draft.name == "Kenya Kiambu AA (Washed)"
+    assert any("Structured data found in this page" in prompt for prompt in seen_prompts)
+    assert any("KE-KIAMBU-AA" in prompt for prompt in seen_prompts)
 
 
 # --- draft_bean_profile_from_url: full pipeline (fetch + extract + draft) ---
