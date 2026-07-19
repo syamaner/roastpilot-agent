@@ -2661,11 +2661,16 @@ class RoastService:
         exists to close. The trade-off is a roast-start issued while a
         draft is in flight WAITS for the draft to finish (bounded by the
         fetch + extraction timeouts, so at most
-        ``sourcing_config.fetch_timeout_seconds +
+        ``2 * sourcing_config.fetch_timeout_seconds +
         sourcing_config.extraction_timeout_seconds`` — #590 slice A moved
         the extraction bound off ``advisor_config.timeout_seconds`` onto
-        its own, longer, ``BeanSourcingConfig`` setting) rather than racing
-        it — a rare, bounded delay is the safe side of this trade; a single
+        its own, longer, ``BeanSourcingConfig`` setting; the fetch term
+        counts TWICE because #590 slice C's markdown-extraction step
+        reuses ``fetch_timeout_seconds`` for its OWN ``asyncio.timeout``
+        block, SEQUENTIALLY after the page-fetch's own,
+        identically-bounded block already closed — see
+        ``bean_sourcing._fetch_page_text``) rather than racing it — a
+        rare, bounded delay is the safe side of this trade; a single
         operator is unlikely to issue both at once regardless.
 
         Raises:

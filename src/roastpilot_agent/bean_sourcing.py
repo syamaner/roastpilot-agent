@@ -130,6 +130,51 @@ the page text — never an instruction role (checklist class 7). No new
 schema field or evidence gate here: a field the model returns is tagged
 ``"on_page"`` by the SAME existing :func:`_draft_from_identity` logic —
 the full evidence-quote/containment gate is a later slice (D).
+
+**Trafilatura markdown preprocessing (#590 slice C):** the page-BODY portion
+of the text handed to the LLM is now :func:`_extract_page_markdown`'s
+``trafilatura``-produced, boilerplate-stripped Markdown — replacing the
+raw linear-strip pass (:func:`_extract_page_text`) as the PRIMARY source,
+so a page's product specs (often placed well past where a byte cap would
+otherwise have to cut, behind nav/footer/related-products text) survive
+:data:`_MAX_EXTRACTED_CHARS` instead of being pushed out by boilerplate the
+model never needed. The slice-B JSON-LD prepend is unchanged: it still runs
+over the raw fetched HTML and prepends ahead of whichever page-body text
+wins. :func:`_extract_page_text` becomes the fail-soft FALLBACK — used only
+when trafilatura returns nothing usable, raises, or times out
+(:func:`_fetch_page_text`) — so a page can only get better extraction from
+this slice, never worse.
+Runs entirely on the already-fetched, already-capped, already-decoded page
+text (no new network access, no new byte budget); its own HTML parser is
+verified XXE-safe the same way slice B's ``extruct`` parser is (HTML mode
+never expands DTD entities; ``no_network`` defaults ``True`` and is never
+overridden) — see :func:`_extract_page_markdown`. Dispatched off the event
+loop via ``asyncio.to_thread`` in :func:`_fetch_page_text` (checklist class
+6), BOUNDED by that same call's ``config.fetch_timeout_seconds`` deadline
+(#590 slice C P1 fix — this call runs under
+:meth:`~roastpilot_agent.api.RoastService.draft_bean_from_url`'s
+``_start_lock``, shared with ``start_roast``, so an unbounded call here
+would hang every roast start, not just this draft). On that timeout the
+draft FALLS BACK to the linear-strip pass rather than failing (#590 slice C
+P2 fix — a slow-to-parse page must not regress from "draft succeeds via
+linear-strip", true before this slice, to a 422 that didn't exist before
+it); the timeout only bounds the WAIT, never the outcome. Measured up to
+~2.5s of
+CPU-bound tree-walking on a page at the ``max_response_bytes`` cap, which
+would otherwise block the whole process's event loop (health checks, SSE
+heartbeats to other connected clients — not just an active roast, which
+this feature already excludes by a separate mutex) for that entire window.
+The date-extraction pass — measured as the majority of that CPU cost, and
+never used by this feature — is disabled
+(``date_extraction_params={"extensive_search": False}``, #590 slice C P2
+fix) to shrink it further. The metadata frontmatter this enables is
+sanitised down to ``title`` only before use — see
+:func:`_sanitize_trafilatura_frontmatter` for why trafilatura's OTHER
+frontmatter keys (``url``/``hostname``/``sitename``, populated from the
+page's OWN, attacker-influenceable ``<link rel="canonical">``/``og:url``
+tags regardless of whether a ``url=`` argument is passed to
+``trafilatura.extract``) must never reach the LLM prompt looking like
+code-verified provenance.
 """
 
 from __future__ import annotations
@@ -149,6 +194,7 @@ import extruct  # type: ignore[import-untyped]
 import httpx
 import lxml.etree  # type: ignore[import-untyped]
 import lxml.html  # type: ignore[import-untyped]
+import trafilatura
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai import Agent, ModelAPIError, ModelSettings, UnexpectedModelBehavior
 from pydantic_ai.models import Model
@@ -462,15 +508,19 @@ def _strip_remaining_tags(html: str) -> str:
 
 
 def _extract_page_text(html: str) -> str:
-    """Strip a vendor page down to plain, LLM-readable text.
+    """Strip a vendor page down to plain, LLM-readable text — the FALLBACK
+    page-body extraction path (#590 slice C promoted :func:`_extract_page_markdown`
+    to primary; this function now only runs when trafilatura returns nothing
+    usable, or raises, for a given page — see :func:`_fetch_page_text`).
 
     A dependency-free HTML-to-text pass: ``<script>``/``<style>`` blocks are
     dropped whole (their content is never useful bean-identity text and
     could be large — see :func:`_strip_script_and_style_blocks`), remaining
     tags are stripped (:func:`_strip_remaining_tags`) — both LINEAR-time,
     ``str.find``-based passes, #587 P1 — entities are unescaped, and
-    whitespace is collapsed. Good enough for a structured extraction prompt
-    without adding an HTML-parsing dependency to the lean runtime install.
+    whitespace is collapsed. No boilerplate/nav stripping of its own (that
+    is what :func:`_extract_page_markdown` buys); good enough as a
+    never-worse-than-before safety net.
 
     Args:
         html: The raw response body, already decoded to text.
@@ -486,6 +536,211 @@ def _extract_page_text(html: str) -> str:
     text = _BLANK_LINES_RE.sub("\n\n", text)
     text = text.strip()
     return text[:_MAX_EXTRACTED_CHARS]
+
+
+# --- #590 slice C: trafilatura boilerplate-stripped markdown, ahead of the
+# linear-strip fallback ---
+#
+# Replaces _extract_page_text as the PRIMARY page-body text source: a
+# vendor page's nav/footer/related-products boilerplate is stripped by
+# trafilatura's own content-region heuristics (not a byte cap racing the
+# boilerplate for space), so a page's product specs survive the
+# _MAX_EXTRACTED_CHARS cap instead of being pushed out by nav text the
+# model never needed (docs/research/bean-sourcing/README.md §2, the
+# Onyx-page failure the #600 bake-off surfaced). Fails soft to
+# _extract_page_text — never a worse-than-before regression.
+
+
+def _extract_page_markdown(html: str) -> str | None:
+    """Boilerplate-stripped Markdown of ``html`` via ``trafilatura`` (#590
+    slice C) — the primary page-body text source :func:`_fetch_page_text`
+    feeds the LLM, ahead of the :func:`_extract_page_text` linear-strip
+    fallback.
+
+    **XXE-safety (checklist class 4 — the crux of this function).**
+    ``trafilatura`` parses ``html`` with its OWN ``lxml.html.HTMLParser``
+    instance (``trafilatura.utils.HTML_PARSER``, verified directly against
+    the installed 2.1 build) — HTML mode, not XML mode, exactly the same
+    parser class (though a separate instance, with different construction
+    kwargs) :func:`_parse_html_for_json_ld` already established the
+    XXE-safe posture for (#590 slice B): HTML mode never processes a
+    ``<!DOCTYPE html [...]>`` block's ``<!ENTITY>`` declarations at all, so
+    an XXE/billion-laughs payload comes through as the literal, UNEXPANDED
+    marker string, never fetched or expanded; lxml's ``no_network`` flag
+    (which additionally blocks any external-entity network access during
+    parsing, defense-in-depth on top of HTML mode already ignoring DTD
+    entities) defaults to ``True`` and is never overridden by trafilatura or
+    this call. Verified EMPIRICALLY, not just by reading the defaults: a
+    local HTTP server + a
+    ``<!ENTITY xxe SYSTEM "http://127.0.0.1:<port>/...">`` payload fed
+    through ``trafilatura.extract`` never makes the outbound connection and
+    the entity stays unexpanded in the returned text (see
+    ``tests/test_bean_sourcing.py``'s XXE test for this function, mirroring
+    the existing JSON-LD one). No ``url``/network-fetching parameter of
+    ``trafilatura.extract`` is ever passed here — this call is pure
+    in-memory string processing over ``html``, which is already the
+    fully-fetched, already-``max_response_bytes``-capped, already-decoded
+    page text (#587); it opens no connection and reads no new bytes of its
+    own, so the SSRF/resource-cap machinery above is unaffected.
+
+    **Fail-soft (checklist class 4).** ``trafilatura.extract`` returns
+    ``None`` on some pages (JS-rendered content, markup it cannot make
+    sense of) — treated as "nothing usable", not an error. Any exception it
+    raises on adversarial/malformed input is caught here too. Both cases
+    fall through to ``None``, telling :func:`_fetch_page_text` to use the
+    :func:`_extract_page_text` linear-strip fallback instead — a page can
+    only get BETTER extraction from this slice, never worse.
+
+    ``with_metadata=True``: verified empirically (not just read from docs)
+    that trafilatura's body-extraction pass commonly DROPS a page's own
+    ``<h1>`` product-name heading outright when it matches the page's
+    detected title (its own dedup heuristic against duplicate title text) —
+    on a realistic multi-paragraph product page the bean's own NAME can
+    disappear from the body text entirely, which would be a materially
+    worse regression than any nav/boilerplate this slice removes (the very
+    field bean-sourcing most needs). ``with_metadata=True`` recovers it as a
+    YAML frontmatter block prepended to the same returned string — still
+    page DATA, not an instruction role (checklist class 7).
+
+    **CORRECTION (#590 slice C P1 fix) — this metadata block is NOT
+    source-URL-safe by default.** An earlier version of this docstring
+    claimed no source-URL/host could leak here because no ``url=`` argument
+    is passed to ``trafilatura.extract``. That claim was WRONG, verified
+    empirically: ``with_metadata=True`` populates ``url``/``hostname``/
+    ``sitename`` frontmatter keys from the PAGE'S OWN
+    ``<link rel="canonical">``/``og:url`` meta tags —
+    attacker-influenceable page content — regardless of whether a ``url=``
+    argument was ever supplied to the call. Left as-is, that would print an
+    attacker-chosen address (up to and including an internal/metadata-
+    service address, since this module's own SSRF guard only validates the
+    FETCH destination, not values embedded in the fetched page's own meta
+    tags) into the LLM prompt looking like CODE-POPULATED, verified
+    provenance metadata rather than ordinary untrusted page text — a
+    spoofed-provenance vector the future slice-D evidence/containment gate
+    would need to treat with extra suspicion precisely because it doesn't
+    read as ordinary body prose. Closed by
+    :func:`_sanitize_trafilatura_frontmatter`, which strips every
+    frontmatter key except ``title`` (the only one this function was ever
+    enabled to recover) before the text is used.
+
+    ``date_extraction_params={"extensive_search": False}`` (#590 slice C P2
+    fix): the metadata pass's date search is measured to dominate this
+    call's CPU cost (the majority of it) and this feature has no use for a
+    publish date — narrowing it shrinks both the CPU cost (still dispatched
+    off the event loop and now also timeout-bounded, see
+    :func:`_fetch_page_text`) and the metadata-leak surface #2 above closes
+    anyway (one fewer field ever populated).
+
+    Args:
+        html: The raw, already-decoded page HTML — the SAME already-capped
+            input :func:`_extract_page_text` receives; no separate byte
+            budget.
+
+    Returns:
+        The extracted Markdown (with a leading, ``title``-only metadata
+        frontmatter block — see :func:`_sanitize_trafilatura_frontmatter`),
+        stripped and truncated to :data:`_MAX_EXTRACTED_CHARS` (the same cap
+        the linear-strip path enforces), or ``None`` when trafilatura found
+        nothing usable, the result was blank, or the call raised.
+    """
+    try:
+        markdown = trafilatura.extract(
+            html,
+            output_format="markdown",
+            include_comments=False,
+            include_tables=True,
+            with_metadata=True,
+            date_extraction_params={"extensive_search": False},
+        )
+    except Exception:
+        # Never interrupt drafting: any extraction-time exception on
+        # adversarial/malformed markup falls back to the linear-strip path.
+        _log.debug(
+            "bean_sourcing: trafilatura markdown extraction raised; falling back to linear-strip",
+            exc_info=True,
+        )
+        return None
+    if markdown is None:
+        return None
+    sanitized = _sanitize_trafilatura_frontmatter(markdown)
+    stripped = sanitized.strip()
+    if not stripped:
+        return None
+    return stripped[:_MAX_EXTRACTED_CHARS]
+
+
+#: Every trafilatura frontmatter key (``core.determine_returnstring``'s
+#: fixed field list, version 2.1) EXCEPT this one is stripped by
+#: :func:`_sanitize_trafilatura_frontmatter` — ``title`` is the only field
+#: :func:`_extract_page_markdown` was ever enabled ``with_metadata=True``
+#: to recover (a page's own product-name heading, otherwise dropped by
+#: trafilatura's title-dedup heuristic).
+_ALLOWED_FRONTMATTER_KEYS = ("title:",)
+
+
+def _sanitize_trafilatura_frontmatter(markdown: str) -> str:
+    """Strip every trafilatura metadata-frontmatter key except ``title``
+    from ``markdown`` (#590 slice C P1 fix — the metadata-leak blocker).
+
+    ``trafilatura``'s ``with_metadata=True`` (see :func:`_extract_page_markdown`)
+    populates its YAML-ish frontmatter's ``url``/``hostname``/``sitename``
+    keys from the PAGE'S OWN ``<link rel="canonical">``/``og:url`` meta
+    tags — attacker-influenceable page content — regardless of whether a
+    ``url=`` argument was passed to ``trafilatura.extract`` (verified
+    empirically: even with no ``url`` argument at all, a page carrying an
+    ``og:url``/canonical tag pointing at an arbitrary address, including an
+    internal/cloud-metadata one, has that address printed into the
+    returned text as a code-populated-looking ``url:``/``hostname:``/
+    ``sitename:`` frontmatter key). Left unfiltered, that reads as
+    trusted, verified provenance to the LLM (and, later, to the slice-D
+    evidence/containment gate) even though it is exactly as
+    attacker-influenced as the rest of the page body (checklist class 7) —
+    a spoofed-provenance vector. ``with_metadata=True`` was only ever
+    enabled to recover the page's own ``title`` (trafilatura's
+    body-extraction pass drops a duplicate ``<h1>`` — see
+    :func:`_extract_page_markdown`), so every OTHER metadata key
+    (``url``/``hostname``/``sitename``/``author``/``date``/``description``/
+    ``categories``/``tags``/``fingerprint``/``id``/``license``) is dropped
+    here.
+
+    **Why a plain per-line filter is safe here** (not a full YAML parser):
+    trafilatura's frontmatter shape is fixed by trafilatura's own rendering
+    code (a leading ``---`` line, one ``key: value`` line per POPULATED
+    field in a FIXED key order, a closing ``---`` line) — the keys and
+    delimiter structure are never attacker-influenced, only a value can be.
+    And every value is guaranteed newline-free before rendering:
+    trafilatura's own ``Document.clean_and_trim`` runs every metadata
+    attribute through ``line_processing``/``trim`` (collapses ALL
+    whitespace, including any embedded newline, to a single space) before
+    :func:`_extract_page_markdown` ever sees the result — verified
+    empirically (an embedded literal newline in a page's title does not
+    survive into the returned string) — so an attacker cannot smuggle a
+    fake extra ``key: value`` line into the frontmatter block via a
+    metadata value. A per-line ``str.startswith`` filter is therefore a
+    complete, not just a best-effort, defense.
+
+    Args:
+        markdown: The raw string ``trafilatura.extract`` returned (may or
+            may not start with a frontmatter block).
+
+    Returns:
+        ``markdown`` with every frontmatter key other than ``title``
+        removed (the frontmatter block dropped entirely when it carried no
+        ``title``); unchanged if it carries no frontmatter block at all.
+    """
+    if not markdown.startswith("---\n"):
+        return markdown
+    closing = markdown.find("\n---\n", 4)
+    if closing == -1:
+        # No closing delimiter within the string — not a well-formed
+        # frontmatter block after all; leave untouched rather than guess.
+        return markdown
+    frontmatter_lines = markdown[4:closing].splitlines()
+    body = markdown[closing + len("\n---\n") :]
+    kept = [line for line in frontmatter_lines if line.startswith(_ALLOWED_FRONTMATTER_KEYS)]
+    if not kept:
+        return body
+    return "---\n" + "\n".join(kept) + "\n---\n" + body
 
 
 #: Redirect hops the internally-constructed client will follow manually
@@ -1455,10 +1710,22 @@ async def _fetch_page_text(
 
     Also runs the deterministic JSON-LD product extraction (#590 slice B —
     :func:`_build_json_ld_context`) over the fetched HTML before it is
-    stripped to plain text: a JSON-LD Product block that identity-matches
+    reduced to page-body text: a JSON-LD Product block that identity-matches
     the FINAL fetched URL (after any redirects, not necessarily ``url``
     itself — #590 P1 fix) is prepended ahead of the extracted text;
     omitted (unchanged) when none is found.
+
+    The page-BODY portion of that text is now trafilatura's
+    boilerplate-stripped Markdown (#590 slice C —
+    :func:`_extract_page_markdown`), not the raw linear-strip pass: nav /
+    footer / related-products text is dropped by trafilatura's own
+    content-region heuristics rather than surviving into the
+    :data:`_MAX_EXTRACTED_CHARS` cap and pushing a page's actual product
+    specs out of it. :func:`_extract_page_text` (the ORIGINAL, unchanged
+    linear-strip pass) is kept as the fail-soft FALLBACK — used only when
+    trafilatura returns nothing usable (``None``, blank, or JS-only
+    content) or raises — so a page can only get better extraction from this
+    slice, never worse than before it.
 
     Args:
         url: The vendor product page URL.
@@ -1468,15 +1735,19 @@ async def _fetch_page_text(
             constructed, used, and closed when omitted.
 
     Returns:
-        The extracted plain text of the page, prefixed with a JSON-LD
-        context section (:func:`_build_json_ld_context`) when one was
-        found.
+        The extracted page-body text (trafilatura Markdown, or the
+        linear-strip fallback — including when the markdown extraction
+        step itself times out, #590 slice C P2 fix: that falls back too,
+        it does not fail the draft), prefixed with a JSON-LD context
+        section (:func:`_build_json_ld_context`) when one was found.
 
     Raises:
         BeanFetchError: On a malformed URL, a destination rejected by the
-            SSRF guard, any transport/timeout failure, a non-2xx response, a
-            body over the configured size cap, or exceeding the end-to-end
-            fetch deadline.
+            SSRF guard, any transport/timeout failure, a non-2xx response,
+            or a body over the configured size cap. The (separately
+            bounded — #590 slice C) trafilatura markdown extraction step
+            does NOT raise on its own timeout — it falls back to the
+            linear-strip pass instead, same as a ``None``/exception result.
     """
     try:
         # A malformed URL (e.g. an unclosed IPv6 bracket, "http://[::1")
@@ -1573,7 +1844,69 @@ async def _fetch_page_text(
     finally:
         if owns_client:
             await client.aclose()
-    extracted_text = _extract_page_text(html)
+    # #590 slice C: trafilatura's boilerplate-stripped markdown is the
+    # PRIMARY page-body text; the linear-strip pass is only the fail-soft
+    # fallback when trafilatura finds nothing usable or raises. Dispatched
+    # to a thread (checklist class 6 — CPU-heavy synchronous parsing is
+    # contention too, not just provider calls): measured up to ~2.5s of
+    # CPU-bound tree-walking on a page at the ``max_response_bytes`` cap,
+    # which would otherwise block the single event loop (other requests —
+    # SSE heartbeats, health checks — for that whole window) for a call
+    # this module's own concurrency-1 semaphore
+    # (``api._draft_bean_from_url_semaphore``) already keeps to at most one
+    # in flight. Matches the existing ``asyncio.to_thread`` convention for
+    # blocking work elsewhere in this codebase (e.g. ``api.py``'s config
+    # load/serial-enumeration calls).
+    #
+    # BOUNDED by its own ``config.fetch_timeout_seconds`` deadline (#590
+    # slice C P1 fix): this call sits AFTER the fetch's own
+    # ``asyncio.timeout`` block above already closed, and it runs under
+    # ``RoastService.draft_bean_from_url``'s ``_start_lock`` — the SAME
+    # lock ``start_roast`` needs — so an unbounded call here would let a
+    # pathological page hang ALL roast starts, defeating the very
+    # advisor-starvation guard that lock exists for. Reusing
+    # ``fetch_timeout_seconds`` (rather than adding a third timeout knob)
+    # avoids a new config field, but it does NOT keep the lock-hold bound
+    # unchanged: this is a SECOND, SEQUENTIAL ``asyncio.timeout`` block on
+    # the same ``fetch_timeout_seconds`` value, after the fetch's own
+    # already closed — so the fetch term counts TWICE in the worst case,
+    # not once. ``RoastService.draft_bean_from_url``'s docstring (api.py)
+    # states the corrected bound: at most
+    # ``2 * fetch_timeout_seconds + extraction_timeout_seconds``. Note also
+    # that ``asyncio.timeout`` cancels the *await*, not the underlying OS
+    # thread (no safe way to kill a running thread in Python) — the
+    # trade-off ``asyncio.to_thread`` always has; what matters for the
+    # ``_start_lock`` interaction is that THIS coroutine stops waiting and
+    # releases the lock promptly, which this achieves. The hung worker
+    # thread itself keeps running in the background regardless (tracked as
+    # #607, orthogonal to this fix).
+    #
+    # ON TIMEOUT: FALL BACK to the linear-strip pass, same as the
+    # None/exception cases below — do NOT fail the draft (#590 slice C
+    # Codex fold, #608). Before this slice EVERY page used the fast,
+    # synchronous linear-strip path; a slow-to-parse page timing out here
+    # must not regress that page from "draft succeeds via linear-strip" to
+    # a 422 that didn't exist before this slice. The ``2 * fetch_timeout +
+    # extraction_timeout`` lock-hold bound above still holds: the
+    # markdown-extraction stage still counts once (it still ran for up to
+    # ``fetch_timeout_seconds`` before giving up), the linear-strip
+    # fallback that follows is fast/synchronous/bounded by the same
+    # byte cap the markdown path already respects (negligible next to
+    # either timeout), and the draft then proceeds into
+    # ``_extract_bean_identity``'s OWN, separate ``extraction_timeout`` —
+    # no new unbounded stage is introduced.
+    try:
+        async with asyncio.timeout(config.fetch_timeout_seconds):
+            markdown = await asyncio.to_thread(_extract_page_markdown, html)
+    except TimeoutError:
+        _log.debug(
+            "bean_sourcing: trafilatura markdown extraction exceeded the "
+            "%.3gs deadline for %r; falling back to linear-strip",
+            config.fetch_timeout_seconds,
+            url,
+        )
+        markdown = None
+    extracted_text = markdown or _extract_page_text(html)
     # final_url, not url (#590 P1 fix) — a redirect commonly canonicalises
     # the URL, and the fetched HTML's own JSON-LD reflects the FINAL one.
     json_ld_context = _build_json_ld_context(html, final_url)
