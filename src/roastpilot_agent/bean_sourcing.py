@@ -2003,9 +2003,8 @@ class _ExtractedBeanIdentity(BaseModel):
     The four ``*_evidence`` fields (#590 slice D2a) are a PARALLEL, optional
     verbatim quote alongside each TYPED field (``altitude_m``,
     ``processing``, ``bean_species``, ``is_blend``). ``altitude_m_evidence``
-    feeds the ENABLED citation gate (:func:`_quote_supports_altitude`,
-    :data:`_ALTITUDE_CITATION_GATE_ENABLED`, #590 D2c) — the other three
-    stay CAPTURED-BUT-UNCONSUMED, deferred to slice E
+    feeds the ENABLED citation gate (:func:`_quote_supports_altitude`) —
+    the other three stay CAPTURED-BUT-UNCONSUMED, deferred to slice E
     (:data:`_ENUM_FIELDS_DEFERRED_TO_E`).
     """
 
@@ -2431,16 +2430,14 @@ _IDENTITY_FIELDS: tuple[str, ...] = (
 _ENUM_FIELDS_DEFERRED_TO_E: frozenset[str] = frozenset({"processing", "bean_species"})
 
 #: ENABLED (#590 D2c, #615) — :func:`_quote_supports_altitude` now
-#: certifies ``altitude_m`` at runtime. Ships after five hardening folds
-#: (cue-value binding, suffix-only glued-m, non-metre unit rejection, the
-#: segmenter's thousands-period exception, and range-endpoint rejection)
-#: closed the gaps round-3 review found in the #590 D2b machinery.
+#: certifies ``altitude_m`` at runtime, after five hardening folds (cue
+#: adjacency, suffix-only glued-m, non-metre unit rejection, the
+#: segmenter's thousands-period exception, range-endpoint rejection).
 _ALTITUDE_CITATION_GATE_ENABLED: Final = True
 
-#: Elevation cues an ``altitude_m`` evidence quote must carry, BOUND to
-#: the value's digit-run token (:func:`_cue_binds_to_value`, #590 D2c fold
-#: 1). NOT bare ``"m"``; NOT standalone ``"above"``/``"sea"``/``"level"``
-#: (a bare "level" used to verify a confabulated altitude) — "above sea
+#: Elevation cues an ``altitude_m`` evidence quote must carry, ADJACENT to
+#: the value's digit-run token (:func:`_cue_binds_to_value`). NOT bare
+#: ``"m"``; NOT standalone ``"above"``/``"sea"``/``"level"`` — "above sea
 #: level" is a COMPLETE phrase instead, see
 #: :func:`_altitude_evidence_supports_value`. Matched as a WHOLE alpha run
 #: (:func:`_token_carries_altitude_cue`) — a substring like ``"meter"``
@@ -2449,21 +2446,9 @@ _ALTITUDE_CUES: frozenset[str] = frozenset(
     {"masl", "meters", "metres", "meter", "metre", "altitude", "elevation", "asl", "msnm"}
 )
 
-#: Small connective words a cue may bridge over a value token through and
-#: still BIND to it (:func:`_cue_binds_to_value`, #590 D2c fold 1) — e.g.
-#: "altitude of 1800". A real intervening noun ("coffee", "with") is NOT
-#: in this set, so "High-altitude coffee with 1,800 reviews" does not bind.
-_ALTITUDE_CUE_STOPWORDS: frozenset[str] = frozenset(
-    {"of", "at", "is", "about", "approx", "approximately", "around"}
-)
-
-#: The outer bound (word positions) a stopword-bridged cue may still span
-#: to bind to a value token (:func:`_cue_binds_to_value`, #590 D2b/D2c).
-_ALTITUDE_CUE_PROXIMITY_WINDOW: int = 4
-
-#: Non-metre length units that must REJECT an altitude reading regardless
-#: of a nearby elevation cue (#590 D2c fold 3) — a page stating "Elevation:
-#: 1,800 ft" must never certify a metres claim of 1800.
+#: Non-metre length units that REJECT an altitude reading regardless of a
+#: nearby cue (fold 3) — "Elevation: 1,800 ft" must never certify 1800
+#: metres. Single-word only; "sq ft" is a forward-looking gap (LOW, #615).
 _NON_METRE_UNIT_TOKENS: frozenset[str] = frozenset(
     {
         "ft",
@@ -2473,6 +2458,7 @@ _NON_METRE_UNIT_TOKENS: frozenset[str] = frozenset(
         "yard",
         "yards",
         "km",
+        "kms",
         "kilometre",
         "kilometres",
         "kilometer",
@@ -2482,6 +2468,10 @@ _NON_METRE_UNIT_TOKENS: frozenset[str] = frozenset(
         "miles",
     }
 )
+
+#: Qualifiers that certify a stated BOUND, not a scalar reading (fold 5) —
+#: "up to 1,800 masl" / "1,800 masl max" state a ceiling, not exactly 1800m.
+_ALTITUDE_BOUND_QUALIFIERS: frozenset[str] = frozenset({"max", "maximum", "plus"})
 
 #: Roast-target fields a vendor page never states — always
 #: ``"origin_estimated"`` in the drafted :attr:`BeanProfileDraft.field_sources`.
@@ -2625,14 +2615,23 @@ def _elides_as_thousands_separator(text: str, i: int) -> bool:
         i: The candidate separator index.
 
     Returns:
-        ``True`` if exactly 3 digits immediately follow ``i``.
+        ``True`` if exactly 3 digits immediately follow ``i`` AND the
+        digit run before ``i`` starts at a clean word boundary.
     """
     length = len(text)
     if i + 3 >= length:
         return False
     if not (text[i + 1].isdigit() and text[i + 2].isdigit() and text[i + 3].isdigit()):
         return False
-    return not (i + 4 < length and text[i + 4].isdigit())
+    if i + 4 < length and text[i + 4].isdigit():
+        return False
+    # Fold 3: "v1.800" must NOT elide — the digit run before ``i`` has to
+    # start at a word boundary, or a glued letter prefix ("v") would let a
+    # version number masquerade as a thousands-grouped one.
+    run_start = i - 1
+    while run_start > 0 and text[run_start - 1].isdigit():
+        run_start -= 1
+    return run_start == 0 or not text[run_start - 1].isalnum()
 
 
 def _numeric_tokens(text: str) -> frozenset[str]:
@@ -2698,23 +2697,26 @@ def _token_carries_altitude_cue(token: str) -> bool:
     return any(run in _ALTITUDE_CUES for run in _alpha_runs(token))
 
 
-def _proximity_tokens(text: str) -> list[str]:
-    """Tokenize ``text`` on punctuation AND whitespace — split on
-    non-alphanumeric runs — for altitude cue-proximity measurement (#590
-    D2b fix 2: whitespace-only split let a punctuation-joined chain
-    collapse into ONE token). A VALID thousands separator
-    (:func:`_elides_as_thousands_separator`) is preserved. No regex.
+def _proximity_tokens_with_starts(text: str) -> list[tuple[str, int]]:
+    """Tokenize ``text`` on punctuation AND whitespace, preserving a VALID
+    thousands separator (:func:`_elides_as_thousands_separator`). No
+    regex. The core scanner behind :func:`_proximity_tokens`, ALSO
+    recording each token's start index so :func:`_is_isolated_value_token`
+    (fold 2) can inspect the raw character before it without re-scanning.
 
     Args:
         text: The raw (not pre-normalized) evidence-quote text.
 
     Returns:
-        The alphanumeric-run tokens, boundary characters dropped.
+        ``(token, start_index)`` pairs, boundary characters dropped.
     """
-    tokens: list[str] = []
+    tokens: list[tuple[str, int]] = []
     current: list[str] = []
+    start = 0
     for i, char in enumerate(text):
         if char.isalnum():
+            if not current:
+                start = i
             current.append(char)
         elif (
             char in ",."
@@ -2724,11 +2726,45 @@ def _proximity_tokens(text: str) -> list[str]:
         ):
             continue
         elif current:
-            tokens.append("".join(current))
+            tokens.append(("".join(current), start))
             current = []
     if current:
-        tokens.append("".join(current))
+        tokens.append(("".join(current), start))
     return tokens
+
+
+def _proximity_tokens(text: str) -> list[str]:
+    """Thin wrapper over :func:`_proximity_tokens_with_starts` dropping
+    the start-index half — the plain token list every other caller uses.
+
+    Args:
+        text: The raw (not pre-normalized) evidence-quote text.
+
+    Returns:
+        The alphanumeric-run tokens, boundary characters dropped.
+    """
+    return [token for token, _ in _proximity_tokens_with_starts(text)]
+
+
+def _is_isolated_value_token(raw_text: str, start: int) -> bool:
+    """Whether the character before ``raw_text[start]`` is a safe LEFT
+    boundary for a value token — start-of-text, whitespace, or opening
+    punctuation — NOT a hyphen/underscore/alphanumeric glued on (fold 2).
+    Catches "SKU-1800m": the hyphen is an ordinary :func:`_proximity_tokens`
+    boundary, indistinguishable from a space unless checked against the
+    raw text directly.
+
+    Args:
+        raw_text: The raw (not pre-normalized) text the token came from.
+        start: The token's start index in ``raw_text``.
+
+    Returns:
+        ``True`` if the value token is not glued to a preceding identifier.
+    """
+    if start == 0:
+        return True
+    before = raw_text[start - 1]
+    return before.isspace() or before in "([{\"':"
 
 
 def _above_sea_level_cue_indices(tokens: list[str]) -> list[int]:
@@ -2741,10 +2777,8 @@ def _above_sea_level_cue_indices(tokens: list[str]) -> list[int]:
 
     Returns:
         BOTH edge anchors — the "above" and "level" token indices — of
-        every match (#590 D2c fold 1), so :func:`_cue_binds_to_value` can
-        bind from whichever side of the phrase a value token sits on
-        (e.g. "1800 above sea level" binds off the near "above" edge, not
-        the phrase's middle).
+        every match, so :func:`_cue_binds_to_value` can bind from
+        whichever side of the phrase a value token sits on.
     """
     return [
         edge
@@ -2758,11 +2792,9 @@ def _above_sea_level_cue_indices(tokens: list[str]) -> list[int]:
 
 def _is_glued_metre_suffix(token: str, target: str) -> bool:
     """Whether ``token`` is EXACTLY the value's digit run with a bare "m"
-    unit glued directly on, SUFFIX-only (#590 D2c fold 2) — e.g.
-    ``"1850m"``. A PREFIX form like ``"M1800"`` (a model number, not a
-    glued unit) must not match: :func:`_alpha_runs` alone can't
-    distinguish the two since it discards character position, so this
-    checks the raw token directly instead.
+    glued on, SUFFIX-only (fold 2) — e.g. ``"1850m"``. A PREFIX form like
+    ``"M1800"`` must not match: :func:`_alpha_runs` discards position, so
+    this checks the raw token directly.
 
     Args:
         token: One :func:`_proximity_tokens` token whose digit run already
@@ -2778,11 +2810,10 @@ def _is_glued_metre_suffix(token: str, target: str) -> bool:
 def _digit_token_has_non_metre_unit(tokens: list[str], digit_index: int) -> bool:
     """Whether the value token at ``digit_index`` carries or is directly
     followed by a NON-METRE length unit (:data:`_NON_METRE_UNIT_TOKENS`,
-    #590 D2c fold 3) — a reading stated in feet/yards/kilometres/miles
-    must never certify a metres claim, regardless of a nearby elevation
-    cue. Checks both the digit token's own trailing alpha run (a glued
-    form, e.g. ``"1800ft"``) and the immediately following whole token (a
-    space-separated form, e.g. ``"1,800 ft"``).
+    fold 3) — a reading in feet/yards/kilometres/miles must never certify
+    a metres claim, regardless of a nearby cue. Checks the digit token's
+    trailing alpha run (glued, e.g. ``"1800ft"``) and the immediately
+    following token (space-separated, e.g. ``"1,800 ft"``).
 
     Args:
         tokens: The full :func:`_proximity_tokens` token list.
@@ -2799,45 +2830,34 @@ def _digit_token_has_non_metre_unit(tokens: list[str], digit_index: int) -> bool
     return next_index < len(tokens) and tokens[next_index].casefold() in _NON_METRE_UNIT_TOKENS
 
 
-def _cue_binds_to_value(tokens: list[str], digit_index: int, cue_index: int) -> bool:
-    """Whether the cue token at ``cue_index`` genuinely BINDS to the value
-    token at ``digit_index`` (#590 D2c fold 1) — replaces the old plain
-    ``abs(distance) <= window`` scan, which let an unrelated intervening
-    noun phrase count as proximate (``"High-altitude coffee with 1,800
-    reviews"`` used to bind on "altitude" alone). A cue binds only when it
-    is IMMEDIATELY adjacent to the value (distance <= 1), or within
-    :data:`_ALTITUDE_CUE_PROXIMITY_WINDOW` positions with ONLY small
-    connective words (:data:`_ALTITUDE_CUE_STOPWORDS`) between them —
-    "altitude of 1800" binds (only "of" intervenes), "High-altitude
-    coffee with 1,800 reviews" does not ("coffee"/"with" are real nouns).
+def _cue_binds_to_value(digit_index: int, cue_index: int) -> bool:
+    """Whether the cue at ``cue_index`` BINDS to the value at
+    ``digit_index`` — STRICT ADJACENCY only (distance <= 1; fold 1,
+    tightened post-security-review: the deleted ±4 stopword-bridge let a
+    cue bind an unrelated number sharing only a connective word,
+    e.g. "altitude of about 1,800 reviews"). This also demotes a
+    unit-less cue-first form like "altitude of 1800" — accepted, since
+    the compact form the prompt itself uses ("1,850m") still binds at
+    distance 0 via :func:`_is_glued_metre_suffix`.
 
     Args:
-        tokens: The full :func:`_proximity_tokens` token list.
         digit_index: The value-matching digit token's index.
         cue_index: The candidate cue token's index.
 
     Returns:
-        ``True`` if the cue binds to the value under the rule above.
+        ``True`` if the cue is immediately adjacent to the value.
     """
-    distance = abs(digit_index - cue_index)
-    if distance <= 1:
-        return True
-    if distance > _ALTITUDE_CUE_PROXIMITY_WINDOW:
-        return False
-    low, high = (digit_index, cue_index) if digit_index < cue_index else (cue_index, digit_index)
-    return all(tokens[i].casefold() in _ALTITUDE_CUE_STOPWORDS for i in range(low + 1, high))
+    return abs(digit_index - cue_index) <= 1
 
 
 def _altitude_evidence_supports_value(value: int, raw_quote: str) -> bool:
-    """Whether ``raw_quote`` supports ``value`` for ``altitude_m`` via a
-    BOUND digit-run + elevation cue (#590 D2b/D2c): a cue token
-    (:func:`_token_carries_altitude_cue`,
-    :func:`_above_sea_level_cue_indices`, or a suffix-glued "m",
-    :func:`_is_glued_metre_suffix`) that genuinely
-    :func:`_cue_binds_to_value` to a :func:`_proximity_tokens` token whose
-    digit run equals ``value`` — excluding any value token that carries a
-    NON-METRE unit (:func:`_digit_token_has_non_metre_unit`, fold 3)
-    regardless of how good a nearby cue looks.
+    """Whether ``raw_quote`` supports ``value`` for ``altitude_m`` via an
+    ADJACENT digit-run + elevation cue (:func:`_token_carries_altitude_cue`,
+    :func:`_above_sea_level_cue_indices`, or an ISOLATED suffix-glued "m",
+    fold 2) that :func:`_cue_binds_to_value` to a :func:`_proximity_tokens`
+    token whose digit run equals ``value`` — excluding any value token
+    carrying a NON-METRE unit (:func:`_digit_token_has_non_metre_unit`,
+    fold 3) regardless of how good a nearby cue looks.
 
     Args:
         value: The claimed altitude in metres.
@@ -2848,7 +2868,8 @@ def _altitude_evidence_supports_value(value: int, raw_quote: str) -> bool:
         ``False`` otherwise.
     """
     target = str(value)
-    tokens = _proximity_tokens(raw_quote)
+    tokens_with_starts = _proximity_tokens_with_starts(raw_quote)
+    tokens = [token for token, _ in tokens_with_starts]
     digit_indices = [
         i
         for i, token in enumerate(tokens)
@@ -2858,12 +2879,17 @@ def _altitude_evidence_supports_value(value: int, raw_quote: str) -> bool:
         return False
     cue_indices = [i for i, token in enumerate(tokens) if _token_carries_altitude_cue(token)]
     cue_indices += _above_sea_level_cue_indices(tokens)
-    # A bare "m" glued directly onto the value-matching digits (e.g.
-    # "1,850m") is unambiguous — standalone "m" elsewhere is not a cue.
-    cue_indices += [i for i in digit_indices if _is_glued_metre_suffix(tokens[i], target)]
+    # A glued "m" (e.g. "1,850m") is unambiguous ONLY when not itself
+    # glued onto a preceding identifier ("SKU-1800m", fold 2).
+    cue_indices += [
+        i
+        for i in digit_indices
+        if _is_glued_metre_suffix(tokens[i], target)
+        and _is_isolated_value_token(raw_quote, tokens_with_starts[i][1])
+    ]
     if not cue_indices:
         return False
-    return any(_cue_binds_to_value(tokens, d, c) for d in digit_indices for c in cue_indices)
+    return any(_cue_binds_to_value(d, c) for d in digit_indices for c in cue_indices)
 
 
 #: Hard sentence/line boundaries a corpus is segmented on for authenticity
@@ -2874,12 +2900,10 @@ _CORPUS_SEGMENT_BOUNDARIES: frozenset[str] = frozenset({".", "\n", ";", "!", "?"
 
 def _split_corpus_segments(corpus: str) -> list[str]:
     """Split ``corpus`` into single-sentence/line segments on
-    :data:`_CORPUS_SEGMENT_BOUNDARIES` (#590 D2b fix 3), except a period
-    that is a VALID thousands separator
-    (:func:`_elides_as_thousands_separator`, #590 D2c fold 4) — else a
-    European-style number like ``"grown at 1.850m"`` could never form an
-    authentic span, since :func:`_proximity_tokens` deliberately elides
-    that same period when tokenizing. No regex.
+    :data:`_CORPUS_SEGMENT_BOUNDARIES`, except a period that is a VALID
+    thousands separator (:func:`_elides_as_thousands_separator`, fold 4)
+    — else "grown at 1.850m" could never form an authentic span, since
+    :func:`_proximity_tokens` elides that same period. No regex.
 
     Args:
         corpus: The raw (not pre-normalized) page corpus.
@@ -2911,16 +2935,15 @@ def _split_corpus_segments(corpus: str) -> list[str]:
 
 def _find_authentic_segment(quote: str, corpus: str) -> str | None:
     """Return the single corpus segment containing ``quote`` as an
-    authentic whole-phrase span, or ``None`` (#590 D2b fix 3 / D2c fold 5)
-    — plain whole-corpus containment lets a fabricated quote splice words
-    from DIFFERENT sentences into a span never actually written
-    contiguously, so this requires a whole-phrase match WITHIN ONE
-    segment (:func:`_split_corpus_segments`). Returning the segment itself
-    (not just a bool) lets the range-endpoint check
-    (:func:`_value_is_range_endpoint`) run against the FULL segment, not
-    the model-cropped quote, which can hide a preceding range digit the
-    quote itself never included. Only for the D2b/D2c altitude quote —
-    D1's free-text fields keep the whole-corpus check.
+    authentic whole-phrase span, or ``None`` — plain whole-corpus
+    containment lets a fabricated quote splice words from DIFFERENT
+    sentences into a span never actually written contiguously, so this
+    requires a whole-phrase match WITHIN ONE segment
+    (:func:`_split_corpus_segments`). Returning the segment (not just a
+    bool) lets :func:`_value_is_range_endpoint` (fold 5) run against the
+    FULL segment, not the model-cropped quote, which can hide a preceding
+    range digit. Only for the altitude quote — D1's free-text fields keep
+    the whole-corpus check.
 
     Args:
         quote: The raw evidence quote (not pre-normalized).
@@ -2939,15 +2962,28 @@ def _find_authentic_segment(quote: str, corpus: str) -> str | None:
     return None
 
 
+def _looks_like_a_value_token(token: str) -> bool:
+    """Whether ``token`` STARTS with a digit — a plain number ("1600") and
+    a unit-glued one ("1800m") both count, so the range check (fold 4)
+    does not miss an endpoint that carries its own unit.
+
+    Args:
+        token: One :func:`_proximity_tokens` token.
+
+    Returns:
+        ``True`` if ``token`` is non-empty and starts with a digit.
+    """
+    return bool(token) and token[0].isdigit()
+
+
 def _value_is_range_endpoint(value: int, segment: str) -> bool:
-    """Whether ``value``'s digit token, located within ``segment`` (the
-    FULL authentic segment, not a model-cropped quote, #590 D2c fold 5),
-    is a RANGE endpoint — immediately preceded by another digit token, or
-    by "to"/"and" that is itself immediately preceded by a digit token.
-    Catches ``"1,600-1,800 masl"``, ``"1600 to 1800 masl"``, and
-    ``"between 1600 and 1800 masl"`` cropped down to a quote naming only
-    the upper bound, which would otherwise certify a scalar reading of a
-    stated range.
+    """Whether ``value``'s digit token, in ``segment`` (the FULL authentic
+    segment, not a model-cropped quote), is a RANGE endpoint or a stated
+    BOUND — checked in BOTH directions (fold 4: backward-only missed a
+    FORWARD range like "1,800m to 2,000m"): adjacent to another value
+    token; adjacent to "to"/"and" adjacent to a value token; "up to";
+    or a bound qualifier within 2 tokens forward ("1,800 masl max", fold
+    5). Catches a range/ceiling cropped to a quote naming only one bound.
 
     Args:
         value: The claimed altitude in metres.
@@ -2955,17 +2991,30 @@ def _value_is_range_endpoint(value: int, segment: str) -> bool:
 
     Returns:
         ``True`` if any occurrence of ``value``'s digit token in
-        ``segment`` is a range endpoint.
+        ``segment`` is a range endpoint or a stated bound.
     """
     target = str(value)
     tokens = _proximity_tokens(segment)
+    last_index = len(tokens) - 1
     for i, token in enumerate(tokens):
-        if i == 0 or target not in _numeric_tokens(token):
+        if target not in _numeric_tokens(token):
             continue
-        previous = tokens[i - 1]
-        if previous.isdigit():
-            return True
-        if previous.casefold() in ("to", "and") and i >= 2 and tokens[i - 2].isdigit():
+        # "" sentinels are safe: they match none of the checks below.
+        before = tokens[i - 2] if i >= 2 else ""
+        previous = tokens[i - 1].casefold() if i >= 1 else ""
+        up_to = previous == "to" and before.casefold() == "up"
+        precedes = _looks_like_a_value_token(tokens[i - 1] if i >= 1 else "") or (
+            previous in ("to", "and") and (_looks_like_a_value_token(before) or up_to)
+        )
+        after = tokens[i + 2] if i + 2 <= last_index else ""
+        following = tokens[i + 1].casefold() if i < last_index else ""
+        follows = (
+            _looks_like_a_value_token(tokens[i + 1] if i < last_index else "")
+            or following in _ALTITUDE_BOUND_QUALIFIERS
+            or (following in ("to", "and") and _looks_like_a_value_token(after))
+            or after.casefold() in _ALTITUDE_BOUND_QUALIFIERS
+        )
+        if precedes or follows:
             return True
     return False
 
@@ -3057,13 +3106,13 @@ def _draft_from_identity(
     verbatim, it is lower-stakes (the roast advisor never reads it), and
     it keeps the original presence-only tagging. ``altitude_m`` never runs
     through the containment matcher — it is CODE-VERIFIED instead via its
-    own citation gate (:func:`_quote_supports_altitude`,
-    :data:`_ALTITUDE_CITATION_GATE_ENABLED`, ENABLED #590 D2c): a genuine,
-    bound, non-range-endpoint ``altitude_m_evidence`` quote earns
-    ``"on_page"``; an absent, unbound, or otherwise unsupported one demotes
-    to ``"origin_estimated"`` like ``processing``/``bean_species``/
-    ``is_blend`` (:data:`_ENUM_FIELDS_DEFERRED_TO_E`, still deferred to
-    slice E). Every roast-target field is always ``"origin_estimated"``.
+    own ENABLED citation gate (:func:`_quote_supports_altitude`,
+    :data:`_ALTITUDE_CITATION_GATE_ENABLED`): a genuine, bound,
+    non-range-endpoint ``altitude_m_evidence`` quote earns ``"on_page"``;
+    anything else demotes to ``"origin_estimated"`` like
+    ``processing``/``bean_species``/``is_blend``
+    (:data:`_ENUM_FIELDS_DEFERRED_TO_E`, still deferred to slice E). Every
+    roast-target field is always ``"origin_estimated"``.
     The optional free-text fields (``country``, ``farm``,
     ``bean_varietal``, ``description``) are normalized via
     :func:`_normalize_optional_text` BEFORE both the provenance loop and
