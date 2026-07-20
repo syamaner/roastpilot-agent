@@ -1955,14 +1955,19 @@ class _FetchedPage:
     JSON-LD fact VALUES, :func:`_json_ld_fact_values` — never our own
     generated header/labels) are carried SEPARATELY so a future locality
     gate can compute over the body alone (a merged blob would misread the
-    JSON-LD tail as page prose). ``verification_corpus`` stays a DERIVED,
-    byte-identical property — the vendor-data-only containment corpus
-    :func:`_draft_from_identity` verifies ``on_page`` claims against.
+    JSON-LD tail as page prose). ``json_ld_name`` is the matched block's
+    own ``name`` fact ALONE (Codex round-1, SaV9L) — deliberately not
+    recovered from ``json_ld_values``, whose first line is a brand/SKU
+    whenever the block omits ``name``. ``verification_corpus`` stays a
+    DERIVED, byte-identical property — the vendor-data-only containment
+    corpus :func:`_draft_from_identity` verifies ``on_page`` claims
+    against.
     """
 
     prompt_text: str
     extracted_text: str
     json_ld_values: str
+    json_ld_name: str = ""
 
     @property
     def verification_corpus(self) -> str:
@@ -1996,7 +2001,10 @@ async def _fetch_page_text(
     )
     fact_values = _json_ld_fact_values(facts)
     return _FetchedPage(
-        prompt_text=prompt_text, extracted_text=extracted_text, json_ld_values=fact_values
+        prompt_text=prompt_text,
+        extracted_text=extracted_text,
+        json_ld_values=fact_values,
+        json_ld_name=(facts.name if facts is not None else None) or "",
     )
 
 
@@ -3169,22 +3177,6 @@ def _frontmatter_title_and_body(body_text: str) -> tuple[str | None, str]:
     return None, rest
 
 
-def _json_ld_anchor_name(json_ld_values: str) -> str:
-    """The JSON-LD identity anchor (A2, #590 slice E1) recoverable from
-    the flat ``json_ld_values`` string: its FIRST line, which
-    :func:`_json_ld_fact_values`'s fixed ``(name, brand, sku,
-    description)`` join order guarantees is the identity-matched
-    product's ``name`` whenever a name was present.
-
-    Args:
-        json_ld_values: :func:`_json_ld_fact_values`'s output.
-
-    Returns:
-        The first line, or ``""`` when ``json_ld_values`` is blank.
-    """
-    return json_ld_values.splitlines()[0] if json_ld_values else ""
-
-
 def _heading_text(line: str) -> str | None:
     """The heading text if ``line`` is a Markdown ATX heading — optional
     indent, 1-6 ``#`` characters, then a space (#590 slice E1) — else
@@ -3230,7 +3222,7 @@ def _heading_matches_anchor(heading_text: str, anchors_normalized: list[str]) ->
     )
 
 
-def _main_product_region(body_text: str, json_ld_values: str) -> str:
+def _main_product_region(body_text: str, json_ld_values: str, json_ld_name: str) -> str:
     """The fail-closed main-product-region text within ``body_text``
     (#590 slice E1) — the text a future citation gate (E1b's
     ``is_blend``; #617/D2d's altitude) authenticates evidence quotes
@@ -3239,17 +3231,34 @@ def _main_product_region(body_text: str, json_ld_values: str) -> str:
     Not yet consumed by any field's provenance (capture-only, like D2a).
 
     Positive anchors only, never a denylist: A1 is the frontmatter
-    ``title:`` value (:func:`_frontmatter_title_and_body`); A2 is the
-    JSON-LD identity-matched product name (:func:`_json_ld_anchor_name`).
+    ``title:`` value (:func:`_frontmatter_title_and_body`); A2 is
+    ``json_ld_name`` itself — the identity-matched JSON-LD Product
+    block's ACTUAL ``name`` fact, never recovered from the flattened
+    ``json_ld_values`` string (Codex round-1, SaV9L): when a matched
+    block omits ``name`` but states ``brand``/``sku``, that flattened
+    string's first line is a brand/SKU, not a product name — treating it
+    as an anchor would let a generic brand heading ("## Acme") open a
+    body region with no genuine anchor present, a fail-open crack in the
+    whitelist. A2 exists ONLY when ``json_ld_name`` is itself non-blank.
     The region is the UNION of:
 
+    - A1's title TEXT itself, prepended when present (Codex round-1,
+      SaV9T) — trusted by construction (it IS the anchor), so a page
+      whose only blend/polarity statement is the title line (e.g.
+      ``title: Morning House Blend``) still lets a quote of the title
+      authenticate;
     - the LEAD region (the post-frontmatter body up to the first heading
       or :func:`_line_is_sentinel` line) — included ONLY when A1 exists
       (a linear-strip page, with no frontmatter at all, never gets a
       lead region);
     - every ANCHORED-HEADING region — a heading whose text matches an
-      anchor (:func:`_heading_matches_anchor`), extended up to the next
-      heading of ANY level or a sentinel line; and
+      anchor (:func:`_heading_matches_anchor`) AND is NOT ITSELF a
+      sentinel line (Codex round-1, SaV9O: sentinel status is checked
+      BEFORE the anchor match, so a heading that is both — e.g. "## More
+      from Acme" when "Acme" is the anchor — never opens a region; a
+      sentinel heading only ever closes/truncates, like every other
+      sentinel line), extended up to the next heading of ANY level or a
+      sentinel line; and
     - ``json_ld_values`` itself, appended unconditionally when non-blank
       (already identity-matched to the URL upstream, so it is
       main-region by construction, never scanned for headings/sentinels).
@@ -3263,6 +3272,10 @@ def _main_product_region(body_text: str, json_ld_values: str) -> str:
         body_text: The page's extracted body text (:attr:`_FetchedPage.extracted_text`).
         json_ld_values: The identity-matched JSON-LD fact values
             (:func:`_json_ld_fact_values`'s output), or ``""``.
+        json_ld_name: The identity-matched JSON-LD Product block's own
+            ``name`` fact (cleaned, or ``""`` when absent) — see A2
+            above; deliberately a SEPARATE argument from
+            ``json_ld_values``, never derived from it.
 
     Returns:
         The main-region text, or ``""`` when no anchor is available and
@@ -3273,7 +3286,7 @@ def _main_product_region(body_text: str, json_ld_values: str) -> str:
         normalized
         for normalized in (
             _normalize_for_containment(title or ""),
-            _normalize_for_containment(_json_ld_anchor_name(json_ld_values)),
+            _normalize_for_containment(json_ld_name),
         )
         if normalized
     ]
@@ -3283,6 +3296,7 @@ def _main_product_region(body_text: str, json_ld_values: str) -> str:
     regions: list[str] = []
 
     if title:
+        regions.append(title)
         lead: list[str] = []
         for line in lines:
             if _heading_text(line) is not None or _line_is_sentinel(line):
@@ -3293,8 +3307,13 @@ def _main_product_region(body_text: str, json_ld_values: str) -> str:
 
     index = 0
     while index < total:
-        heading = _heading_text(lines[index])
-        if heading is not None and _heading_matches_anchor(heading, anchors_normalized):
+        line = lines[index]
+        heading = _heading_text(line)
+        if (
+            heading is not None
+            and not _line_is_sentinel(line)
+            and _heading_matches_anchor(heading, anchors_normalized)
+        ):
             index += 1
             region_lines: list[str] = []
             while (
@@ -3316,7 +3335,12 @@ def _main_product_region(body_text: str, json_ld_values: str) -> str:
 
 
 def _draft_from_identity(
-    identity: _ExtractedBeanIdentity, *, url: str, corpus: str, json_ld_values: str = ""
+    identity: _ExtractedBeanIdentity,
+    *,
+    url: str,
+    corpus: str,
+    json_ld_values: str = "",
+    json_ld_name: str = "",
 ) -> BeanProfileDraft:
     """Assemble the :class:`BeanProfileDraft` from an extracted identity.
 
@@ -3376,6 +3400,11 @@ def _draft_from_identity(
             (:func:`_json_ld_fact_values`'s output, or ``""``) — appended
             to ``corpus`` to form the merged containment corpus, and
             threaded separately into :func:`_main_product_region`.
+        json_ld_name: The identity-matched JSON-LD Product block's own
+            ``name`` fact (or ``""``) — :func:`_main_product_region`'s
+            A2 anchor, deliberately separate from ``json_ld_values``
+            (whose first line is a brand/SKU whenever the block omits
+            ``name``).
 
     Returns:
         The drafted profile, ready for the operator to review, edit, and
@@ -3449,7 +3478,7 @@ def _draft_from_identity(
     # logic with no new plumbing (#590 slice E1b consumes this against
     # identity.is_blend_evidence via _quote_supports_is_blend) — not yet
     # consumed by any field's provenance.
-    _main_product_region(corpus, json_ld_values)
+    _main_product_region(corpus, json_ld_values, json_ld_name)
 
     field_sources: dict[str, BeanFieldSource] = {}
     for field_name in _IDENTITY_FIELDS:
@@ -3657,7 +3686,11 @@ async def draft_bean_profile_from_url(
     # _draft_from_identity can compute _main_product_region over the body
     # alone.
     draft = _draft_from_identity(
-        identity, url=url, corpus=page.extracted_text, json_ld_values=page.json_ld_values
+        identity,
+        url=url,
+        corpus=page.extracted_text,
+        json_ld_values=page.json_ld_values,
+        json_ld_name=page.json_ld_name,
     )
     _log.info(
         "draft_bean_profile_from_url: drafted %r (%d fields sourced)",

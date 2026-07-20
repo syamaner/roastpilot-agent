@@ -4024,9 +4024,9 @@ def _framed(title: str, body: str) -> str:
 
 def test_main_product_region_a1_only_lead_region_no_json_ld() -> None:
     region = bean_sourcing._main_product_region(  # pyright: ignore[reportPrivateUsage]
-        _framed("Kenya Kiambu AA", "Great coffee here.\n"), ""
+        _framed("Kenya Kiambu AA", "Great coffee here.\n"), "", ""
     )
-    assert region == "Great coffee here."
+    assert region == "Kenya Kiambu AA\nGreat coffee here."
 
 
 def test_main_product_region_a2_only_no_title_no_heading() -> None:
@@ -4036,6 +4036,7 @@ def test_main_product_region_a2_only_no_title_no_heading() -> None:
     region = bean_sourcing._main_product_region(  # pyright: ignore[reportPrivateUsage]
         "Some plain linear-strip text with no frontmatter at all.",
         "Kenya Kiambu AA",
+        "Kenya Kiambu AA",
     )
     assert region == "Kenya Kiambu AA"
 
@@ -4044,7 +4045,7 @@ def test_main_product_region_neither_anchor_collapses_to_empty() -> None:
     """The fail-closed law, directly on the pure function: with NEITHER
     anchor, the region is "" — never the whole corpus."""
     region = bean_sourcing._main_product_region(  # pyright: ignore[reportPrivateUsage]
-        "Some plain linear-strip text with nothing else on the page.", ""
+        "Some plain linear-strip text with nothing else on the page.", "", ""
     )
     assert region == ""
 
@@ -4060,7 +4061,9 @@ def test_main_product_region_both_anchors_headings_multiple_levels() -> None:
         "### Unrelated Subsection\n"
         "Excluded content under an unmatched sub-heading.\n",
     )
-    region = bean_sourcing._main_product_region(body, "Kenya Kiambu AA")  # pyright: ignore[reportPrivateUsage]
+    region = bean_sourcing._main_product_region(  # pyright: ignore[reportPrivateUsage]
+        body, "Kenya Kiambu AA", "Kenya Kiambu AA"
+    )
     assert "Intro line before any heading." in region
     assert "Top-level anchored content." in region
     assert "Nested anchored content too." in region
@@ -4077,7 +4080,7 @@ def test_main_product_region_sentinel_paragraph_truncates_lead_region() -> None:
         "\n"
         "You may also like our house blend for an everyday cup.\n",
     )
-    region = bean_sourcing._main_product_region(body, "")  # pyright: ignore[reportPrivateUsage]
+    region = bean_sourcing._main_product_region(body, "", "")  # pyright: ignore[reportPrivateUsage]
     assert "single origin" in region
     assert "house blend" not in region.lower()
 
@@ -4090,7 +4093,7 @@ def test_main_product_region_anchored_heading_closes_at_next_heading() -> None:
         "## Shipping Information\n"
         "This shop also offers a house blend gift box.\n",
     )
-    region = bean_sourcing._main_product_region(body, "")  # pyright: ignore[reportPrivateUsage]
+    region = bean_sourcing._main_product_region(body, "", "")  # pyright: ignore[reportPrivateUsage]
     assert "house blend of three lots" in region
     assert "gift box" not in region
 
@@ -4103,8 +4106,64 @@ def test_main_product_region_two_consecutive_anchored_headings_yield_no_empty_re
         "Kenya Kiambu AA",
         "## Kenya Kiambu AA\n## Kenya Kiambu AA\nReal content under the second heading.\n",
     )
-    region = bean_sourcing._main_product_region(body, "")  # pyright: ignore[reportPrivateUsage]
-    assert region == "Real content under the second heading."
+    region = bean_sourcing._main_product_region(body, "", "")  # pyright: ignore[reportPrivateUsage]
+    assert region == "Kenya Kiambu AA\nReal content under the second heading."
+
+
+def test_main_product_region_json_ld_name_absent_brand_heading_opens_nothing() -> None:
+    """Codex round-1 fold (SaV9L): when the identity-matched JSON-LD
+    Product block omits ``name`` but states ``brand``/``sku``,
+    ``json_ld_values``'s first line is that brand/SKU, not a product
+    name. A2 must come from ``json_ld_name`` alone — with it blank, a
+    heading matching the brand text must NOT open a region."""
+    region = bean_sourcing._main_product_region(  # pyright: ignore[reportPrivateUsage]
+        "## Acme\nWelcome to our shop, browse our full range.\n",
+        "Acme Roasters",
+        "",
+    )
+    assert region == "Acme Roasters"
+    assert "Welcome to our shop" not in region
+
+
+def test_main_product_region_json_ld_name_present_heading_opens_as_before() -> None:
+    """The mirror case: with ``json_ld_name`` genuinely set to the
+    product's own name, a matching heading still opens its region exactly
+    as before this fold."""
+    region = bean_sourcing._main_product_region(  # pyright: ignore[reportPrivateUsage]
+        "## Kenya Kiambu AA\nReal product content here.\n",
+        "Kenya Kiambu AA",
+        "Kenya Kiambu AA",
+    )
+    assert "Real product content here." in region
+
+
+def test_main_product_region_sentinel_heading_never_opens_even_when_anchor_matches() -> None:
+    """Codex round-1 fold (SaV9O): a heading that is BOTH a sentinel and
+    an anchor match ("## More from <anchor>") never opens a region — the
+    sentinel check runs first, regardless of the anchor match."""
+    body = _framed(
+        "Kenya Kiambu AA",
+        "Great single origin coffee.\n"
+        "## More from Kenya Kiambu AA\n"
+        "Our house blend for everyday drinking.\n",
+    )
+    region = bean_sourcing._main_product_region(body, "", "")  # pyright: ignore[reportPrivateUsage]
+    assert "Our house blend for everyday drinking." not in region
+
+
+def test_main_product_region_includes_title_text_for_authentication() -> None:
+    """Codex round-1 fold (SaV9T): A1's title text is itself part of the
+    main region, so a quote of the title alone (the only blend/polarity
+    statement on a page whose body is just tasting notes) can still
+    authenticate."""
+    body = _framed("Morning House Blend", "Notes of cocoa and dried fruit linger sweetly.\n")
+    region = bean_sourcing._main_product_region(body, "", "")  # pyright: ignore[reportPrivateUsage]
+    assert (
+        bean_sourcing._find_authentic_segment(  # pyright: ignore[reportPrivateUsage]
+            "Morning House Blend", region
+        )
+        is not None
+    )
 
 
 def test_frontmatter_title_and_body_untitled_block_returns_none() -> None:
