@@ -187,7 +187,7 @@ import socket
 import zlib
 from dataclasses import dataclass
 from html import unescape
-from typing import Any, cast
+from typing import Any, Final, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import extruct  # type: ignore[import-untyped]
@@ -2002,9 +2002,9 @@ class _ExtractedBeanIdentity(BaseModel):
 
     The four ``*_evidence`` fields (#590 slice D2a) are a PARALLEL, optional
     verbatim quote alongside each TYPED field (``altitude_m``,
-    ``processing``, ``bean_species``, ``is_blend``). As of slice D2b, ONLY
-    ``altitude_m_evidence`` is consumed, via :func:`_quote_supports_altitude`.
-    The other three stay CAPTURED-BUT-UNCONSUMED, deferred to slice E.
+    ``processing``, ``bean_species``, ``is_blend``). All four stay
+    CAPTURED-BUT-UNCONSUMED at runtime — ``altitude_m_evidence`` feeds a
+    DORMANT gate, :data:`_ALTITUDE_CITATION_GATE_ENABLED`, pending D2c.
     """
 
     name: str | None = None
@@ -2032,8 +2032,8 @@ class _ExtractedBeanIdentity(BaseModel):
     with its own ``"origin_estimated"`` provenance is a richer follow-up,
     deferred to #590 — no new schema fields here."""
     altitude_m_evidence: str | None = Field(default=None, max_length=500)
-    """A verbatim span of page text supporting ``altitude_m`` (#590 D2a).
-    Verified by :func:`_quote_supports_altitude` (#590 D2b) — bounded to
+    """A verbatim span supporting ``altitude_m`` (#590 D2a). Checked by
+    :func:`_quote_supports_altitude`, DORMANT pending D2c. Bounded to
     :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's LOW."""
     description: str | None = None
     is_blend: bool | None = None
@@ -2423,12 +2423,15 @@ _IDENTITY_FIELDS: tuple[str, ...] = (
     "description",
 )
 
-#: TYPED enum fields DEFERRED to slice E (#590 D2b — sound enum
-#: verification needs LOCALITY + conflicting-method handling flat,
-#: cue-only matching can't provide safely). D2b narrowed to
-#: ``altitude_m`` only (:func:`_quote_supports_altitude`); these two, like
-#: ``is_blend``, demote unconditionally until E lands.
+#: TYPED enum fields DEFERRED to slice E (#590 D2b — sound verification
+#: needs LOCALITY + conflicting-method handling flat matching can't
+#: provide safely). These two, like ``is_blend``, demote until E lands.
 _ENUM_FIELDS_DEFERRED_TO_E: frozenset[str] = frozenset({"processing", "bean_species"})
+
+#: Ships DORMANT (#590 D2b) — :func:`_quote_supports_altitude` is
+#: complete and unit-tested, but round-3 review found more cue-value/unit
+#: hardening it needs first. Tracked as #615/D2c, which flips this.
+_ALTITUDE_CITATION_GATE_ENABLED: Final = False
 
 #: Elevation cues an ``altitude_m`` evidence quote must carry, PROXIMATE to
 #: the value's digit-run token (#590 D2b). NOT bare ``"m"``; NOT
@@ -2783,10 +2786,9 @@ def _is_authentic_span(quote: str, corpus: str) -> bool:
     sentence/line segment of ``corpus`` (#590 D2b fix 3) — plain
     whole-corpus containment lets a fabricated quote splice words from
     DIFFERENT sentences into a span never actually written contiguously.
-    Splits ``corpus`` on hard boundaries
-    (:func:`_split_corpus_segments`), and requires the normalized quote
-    to be a whole-phrase match within ONE segment. Only for the D2b
-    altitude quote — D1's free-text fields keep the whole-corpus check.
+    Splits ``corpus`` on hard boundaries (:func:`_split_corpus_segments`)
+    and requires a whole-phrase match within ONE segment. Only for the
+    D2b altitude quote — D1's free-text fields keep the whole-corpus check.
 
     Args:
         quote: The raw evidence quote (not pre-normalized).
@@ -2886,12 +2888,12 @@ def _draft_from_identity(
     the model may legitimately summarise/paraphrase rather than quote
     verbatim, it is lower-stakes (the roast advisor never reads it), and
     it keeps the original presence-only tagging. ``altitude_m`` never runs
-    through the containment matcher — it goes through the citation gate,
-    :func:`_quote_supports_altitude` (#590 D2b) instead.
-    ``processing``/``bean_species``/``is_blend`` all stay demoted
-    unconditionally, deferred to slice E (:data:`_ENUM_FIELDS_DEFERRED_TO_E`).
-    Every roast-target field is always ``"origin_estimated"``. The
-    optional free-text fields (``country``, ``farm``,
+    through the containment matcher — its citation gate ships DORMANT
+    (:data:`_ALTITUDE_CITATION_GATE_ENABLED`), so it demotes
+    unconditionally today like ``processing``/``bean_species``/
+    ``is_blend`` (:data:`_ENUM_FIELDS_DEFERRED_TO_E`). Every roast-target
+    field is always ``"origin_estimated"``. The optional free-text fields
+    (``country``, ``farm``,
     ``bean_varietal``, ``description``) are normalized via
     :func:`_normalize_optional_text` BEFORE both the provenance loop and
     the draft construction (#587 P2) — see that function's docstring for
@@ -2904,14 +2906,12 @@ def _draft_from_identity(
     at all (:func:`draft_bean_profile_from_url` rejects those outright,
     before any fetch). The vendor page itself is still fetched with the
     REAL, un-redacted URL — only what is returned/persisted is redacted.
-    Of ``identity``'s four ``*_evidence`` quotes (#590 D2a), only
-    ``altitude_m_evidence`` is consumed here; the other three stay
-    unconsumed pending slice E.
+    None of ``identity``'s four ``*_evidence`` quotes (#590 D2a) affect
+    provenance while the gate is dormant.
 
     Args:
         identity: The provider's page-only extraction, including its four
-            ``*_evidence`` quote fields (only ``altitude_m_evidence``
-            consumed, see above).
+            ``*_evidence`` quote fields (see above).
         url: The source URL (carried onto ``source_url`` in redacted form).
         corpus: The SAME page text the model saw when producing ``identity``
             (:func:`draft_bean_profile_from_url` threads its already-fetched
@@ -2998,15 +2998,12 @@ def _draft_from_identity(
             field_sources[field_name] = "origin_estimated"
             continue
         if field_name == "altitude_m":
-            # Gated by the citation check — uses RAW corpus, not
-            # corpus_normalized (authenticity needs sentence boundaries).
-            field_sources[field_name] = (
-                "on_page"
-                if _quote_supports_altitude(
-                    identity.altitude_m, identity.altitude_m_evidence, corpus
-                )
-                else "origin_estimated"
+            # DORMANT (_ALTITUDE_CITATION_GATE_ENABLED) — ``and`` short-
+            # circuits before the check ever runs, until D2c flips it.
+            gate_verdict = _ALTITUDE_CITATION_GATE_ENABLED and _quote_supports_altitude(
+                identity.altitude_m, identity.altitude_m_evidence, corpus
             )
+            field_sources[field_name] = "on_page" if gate_verdict else "origin_estimated"
             continue
         field_sources[field_name] = (
             "on_page" if _value_is_contained(raw_value, corpus_normalized) else "origin_estimated"

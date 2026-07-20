@@ -2373,11 +2373,13 @@ def test_extraction_instructions_never_offer_a_placeholder_value() -> None:
 def test_draft_from_identity_evidence_quotes_do_not_change_free_text_provenance() -> None:
     """Regression proof: attaching ``*_evidence`` quotes to an identity does
     not change how the FIVE FREE-TEXT fields verify — D1's containment gate
-    for them is untouched by #590 D2b. (Superseded #590 D2a claim: before
-    D2b existed, the four typed fields stayed byte-identical too; D2b's
-    whole purpose is to flip a typed field when its quote genuinely
-    supports the value, so that part of the old invariant no longer holds
-    — see the dedicated ``--- #590 D2b`` tests below for the flip cases.)"""
+    for them is untouched by #590 D2b. The TYPED fields (``altitude_m``,
+    ``processing``) stay byte-identical regardless of evidence quality too:
+    ``processing`` is deferred to slice E unconditionally, and
+    ``altitude_m``'s citation gate (:func:`bean_sourcing._quote_supports_altitude`)
+    ships DORMANT (:data:`bean_sourcing._ALTITUDE_CITATION_GATE_ENABLED`) — see
+    the dedicated ``--- #590 D2b`` tests below, which call the gate function
+    directly, for its (currently inert) verification logic."""
     identity_with_evidence = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(
             altitude_m_evidence="Altitude: 1775m.",
@@ -2402,13 +2404,10 @@ def test_draft_from_identity_evidence_quotes_do_not_change_free_text_provenance(
     for field in ("name", "country", "bean_origin", "farm", "bean_varietal", "description"):
         assert draft_with_evidence.field_sources[field] == "on_page", field
         assert draft_without_evidence.field_sources[field] == "on_page", field
-    # The typed fields DIVERGE from the no-evidence draft: altitude's quote
-    # ("Altitude: 1775m.") genuinely supports 1775 (digit run + "altitude"
-    # cue) and flips; processing's quote ("washed coffee") lacks an
-    # INDEPENDENT process cue beyond its own display word and still
-    # demotes — see the individual D2b tests for both mechanisms in
-    # isolation.
-    assert draft_with_evidence.field_sources["altitude_m"] == "on_page"
+    # Even a genuinely quote-supported altitude ("Altitude: 1775m." — digit
+    # run + "altitude" cue) stays origin_estimated while the gate is
+    # dormant — no divergence from the no-evidence draft.
+    assert draft_with_evidence.field_sources["altitude_m"] == "origin_estimated"
     assert draft_with_evidence.field_sources["processing"] == "origin_estimated"
     assert draft_without_evidence.field_sources["altitude_m"] == "origin_estimated"
     assert draft_without_evidence.field_sources["processing"] == "origin_estimated"
@@ -2435,6 +2434,13 @@ def test_draft_from_identity_abstained_processing_has_no_spurious_provenance() -
 # --- #590 D2b: the altitude citation gate (narrowed to altitude_m only —
 # Codex round-1 triage: sound processing/bean_species verification needs
 # locality + conflicting-method logic deferred to slice E) ---
+#
+# The gate ships DORMANT (_ALTITUDE_CITATION_GATE_ENABLED = False, #615/
+# D2c hardens + flips it). Tests below that assert a "_demotes" outcome
+# via _draft_from_identity are still valid proof of today's SAFE runtime
+# behaviour (altitude_m always demotes), but no longer exercise the
+# specific mechanism their docstring names — that mechanism is proven by
+# a sibling test calling the gate function(s) directly.
 
 
 def test_quote_supports_altitude_price_cited_as_evidence_is_rejected() -> None:
@@ -2481,16 +2487,16 @@ def test_quote_supports_altitude_glued_metre_unit_flips_on_page() -> None:
     ``_EXTRACTION_INSTRUCTIONS`` itself exemplifies ("1,850m") could never
     verify before this fix — bare "m" isn't a recognized elevation cue on
     its own, so a unit GLUED directly onto the value-matching digits is
-    now accepted as unambiguous (distance 0)."""
-    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
-        _identity_args(altitude_m=1850, altitude_m_evidence="grown at 1,850m")
+    now accepted as unambiguous (distance 0). Calls the gate function
+    directly (:data:`bean_sourcing._ALTITUDE_CITATION_GATE_ENABLED` ships
+    DORMANT, so :func:`_draft_from_identity` never surfaces this verdict
+    at runtime yet — see ``test_quote_supports_altitude_ships_dormant``)."""
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1850, "grown at 1,850m", "This lot is grown at 1,850m above the valley floor."
+        )
+        is True
     )
-    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity,
-        url="https://vendor.example/products/kenya",
-        corpus="This lot is grown at 1,850m above the valley floor.",
-    )
-    assert draft.field_sources["altitude_m"] == "on_page"
 
 
 def test_quote_supports_altitude_space_separated_bare_m_still_demotes() -> None:
@@ -2541,16 +2547,16 @@ def test_quote_supports_altitude_genuinely_verified_flips_on_page(evidence_quote
     (:data:`bean_sourcing._ALTITUDE_CUE_PROXIMITY_WINDOW`), in any of the
     accepted forms (comma-grouped digits, a glued unit, a different cue
     word, the complete "above sea level" phrase, or a cue BEFORE the
-    digits) — flips ``altitude_m`` to code-verified ``"on_page"``."""
-    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
-        _identity_args(altitude_m=1800, altitude_m_evidence=evidence_quote)
+    digits) — the gate itself returns ``True`` (calling it directly, since
+    :func:`_draft_from_identity` never surfaces this while the gate ships
+    DORMANT, :data:`bean_sourcing._ALTITUDE_CITATION_GATE_ENABLED`)."""
+    corpus = f"{_IDENTITY_PAGE_TEXT} This lot is {evidence_quote}."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, evidence_quote, corpus
+        )
+        is True
     )
-    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity,
-        url="https://vendor.example/products/kenya",
-        corpus=f"{_IDENTITY_PAGE_TEXT} This lot is {evidence_quote}.",
-    )
-    assert draft.field_sources["altitude_m"] == "on_page"
 
 
 def test_quote_supports_altitude_review_count_laundering_demotes() -> None:
@@ -2661,16 +2667,17 @@ def test_quote_supports_altitude_fabricated_quote_demotes() -> None:
     """A quote that genuinely WOULD support the value if it were real page
     text, but is never actually on the page (a fabricated citation), must
     still demote — the authentic-single-segment-span check is the first
-    gate."""
-    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
-        _identity_args(altitude_m=1800, altitude_m_evidence="grown at 1,800 masl")
+    gate. Calls the gate function directly (dormant at the
+    :func:`_draft_from_identity` level, see
+    ``test_quote_supports_altitude_ships_dormant``)."""
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800,
+            "grown at 1,800 masl",
+            _IDENTITY_PAGE_TEXT,  # never mentions 1800/masl at all
+        )
+        is False
     )
-    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity,
-        url="https://vendor.example/products/kenya",
-        corpus=_IDENTITY_PAGE_TEXT,  # never mentions 1800/masl at all
-    )
-    assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
 def test_quote_supports_altitude_cross_sentence_splice_demotes() -> None:
@@ -2695,18 +2702,15 @@ def test_quote_supports_altitude_cross_sentence_splice_demotes() -> None:
 def test_quote_supports_altitude_real_single_sentence_quote_verifies() -> None:
     """The positive mirror of the cross-sentence-splice case: a quote that
     genuinely sits within ONE sentence, surrounded by other sentences on
-    both sides, still verifies."""
-    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
-        _identity_args(altitude_m=1800, altitude_m_evidence="1800 masl elevation")
+    both sides, still verifies (gate function called directly — dormant
+    at the :func:`_draft_from_identity` level)."""
+    corpus = "Random intro text. This farm sits at 1800 masl elevation. More text follows after."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "1800 masl elevation", corpus
+        )
+        is True
     )
-    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
-        identity,
-        url="https://vendor.example/products/kenya",
-        corpus=(
-            "Random intro text. This farm sits at 1800 masl elevation. More text follows after."
-        ),
-    )
-    assert draft.field_sources["altitude_m"] == "on_page"
 
 
 def test_draft_from_identity_processing_and_species_always_demote_in_d2b() -> None:
@@ -2746,6 +2750,31 @@ def test_draft_from_identity_is_blend_still_demotes_with_a_genuine_evidence_quot
         corpus="This is a blend of three origins, roasted together.",
     )
     assert draft.field_sources["is_blend"] == "origin_estimated"
+
+
+def test_quote_supports_altitude_ships_dormant() -> None:
+    """#590 D2b: the citation gate ships DORMANT
+    (:data:`bean_sourcing._ALTITUDE_CITATION_GATE_ENABLED` is ``False``,
+    pending #615/D2c hardening) — even a PERFECT citation (genuine,
+    proximate, authentic) must still demote at runtime, because
+    :func:`_draft_from_identity` gates the flip on the flag. The
+    underlying gate function itself (tested directly elsewhere in this
+    file) would return ``True`` for this exact quote."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800, altitude_m_evidence="grown at 1,800 masl")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=f"{_IDENTITY_PAGE_TEXT} This lot is grown at 1,800 masl.",
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "grown at 1,800 masl", f"{_IDENTITY_PAGE_TEXT} This lot is grown at 1,800 masl."
+        )
+        is True
+    )
 
 
 def test_draft_from_identity_absent_altitude_with_stray_evidence_quote_has_no_entry() -> None:
