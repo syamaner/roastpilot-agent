@@ -2565,6 +2565,34 @@ def test_quote_supports_altitude_stock_level_launder_demotes() -> None:
     assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
+@pytest.mark.parametrize(
+    ("evidence_quote", "corpus_sentence"),
+    [
+        (
+            "1,800 parameter guide",
+            "Featured in our 1,800 parameter guide for enthusiasts.",
+        ),
+        ("1800 kilometer drive", "This is a 1800 kilometer drive from the coast."),
+        ("1800 diameter", "The pipe has a 1800 diameter design."),
+    ],
+)
+def test_quote_supports_altitude_whole_word_cue_closes_substring_launder(
+    evidence_quote: str, corpus_sentence: str
+) -> None:
+    """#590 D2b (claude-review): ``"meter"`` used to match as a SUBSTRING
+    inside ``"parameter"``/``"diameter"``/``"kilometer"`` — a false cue
+    sitting directly adjacent to an unrelated, genuinely on-page number
+    still passed the proximity window. Whole-word cue matching
+    (:func:`bean_sourcing._token_carries_altitude_cue`) closes this."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800, altitude_m_evidence=evidence_quote)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=corpus_sentence
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
 def test_quote_supports_altitude_fabricated_quote_demotes() -> None:
     """A quote that genuinely WOULD support the value if it were real page
     text, but is never actually on the page (a fabricated citation), must
@@ -2715,12 +2743,36 @@ def test_numeric_tokens_flushes_a_trailing_digit_run_at_string_end() -> None:
     assert numeric_tokens("elevation 1850") == {"1850"}
 
 
-def test_token_carries_altitude_cue_matches_a_substring_case_insensitively() -> None:
+def test_alpha_runs_splits_on_digits_and_casefolds() -> None:
+    alpha_runs = bean_sourcing._alpha_runs  # pyright: ignore[reportPrivateUsage]
+    assert alpha_runs("MASL") == ["masl"]
+    assert alpha_runs("1800masl") == ["masl"]
+    assert alpha_runs("800masl") == ["masl"]
+    assert alpha_runs("1800") == []
+    assert alpha_runs("parameter") == ["parameter"]
+    # letters followed by digits (mid-token flush, not just the post-loop one)
+    assert alpha_runs("masl1800") == ["masl"]
+    assert alpha_runs("masl1800m") == ["masl", "m"]
+
+
+def test_token_carries_altitude_cue_matches_a_whole_word_case_insensitively() -> None:
+    """#590 D2b (claude-review): a SUBSTRING check let ``"meter"`` match
+    inside ``"parameter"``/``"diameter"``/``"kilometer"`` — reopening the
+    laundering class even after fix 1 dropped standalone above/sea/level.
+    A token only carries a cue when one of its whole alphabetic runs
+    (:func:`_alpha_runs`) EQUALS an :data:`_ALTITUDE_CUES` member."""
     token_carries_cue = bean_sourcing._token_carries_altitude_cue  # pyright: ignore[reportPrivateUsage]
     assert token_carries_cue("MASL") is True
     assert token_carries_cue("1800masl") is True
+    assert token_carries_cue("800masl") is True
+    assert token_carries_cue("meters") is True
     assert token_carries_cue("shipping") is False
     assert token_carries_cue("level") is False  # #590 D2b fix 1: no longer a cue
+    assert token_carries_cue("parameter") is False  # the substring bug this fix closes
+    assert token_carries_cue("diameter") is False
+    assert token_carries_cue("kilometer") is False
+    assert token_carries_cue("kilometres") is False  # != "metres"
+    assert token_carries_cue("1800parameter") is False  # glued form of the same bug
 
 
 def test_proximity_tokens_splits_on_punctuation_preserving_grouped_numbers() -> None:
