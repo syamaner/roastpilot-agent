@@ -2440,13 +2440,11 @@ def test_draft_from_identity_abstained_processing_has_no_spurious_provenance() -
 def test_quote_supports_altitude_price_cited_as_evidence_is_rejected() -> None:
     """HEADLINE adversarial test: a model citing a PRICE span as altitude
     evidence must be rejected. The quote genuinely appears on the page
-    (authentic single-segment span) and even contains a digit run that
-    numerically equals the claimed altitude (``$18.00`` -> ``"1800"`` once
-    the thousands-separator-elision in :func:`_numeric_tokens` strips the
-    decimal point) — so digit presence ALONE is not enough. What must
-    close this spoof is the missing elevation cue: "priced at $18.00" has
-    no ``masl``/``meters``/``altitude``/etc. token anywhere, so the gate
-    must still demote."""
+    (authentic single-segment span); ``"$18.00"``'s cents are only 2
+    digits, so :func:`_elides_as_thousands_separator` (#590 D2b fix 1)
+    correctly refuses to collapse it into a hallucinated ``"1800"`` — no
+    digit match at all, and "priced at $18.00" also has no elevation cue
+    anywhere, so the gate must still demote either way."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(altitude_m=1800, altitude_m_evidence="priced at $18.00")
     )
@@ -2456,6 +2454,72 @@ def test_quote_supports_altitude_price_cited_as_evidence_is_rejected() -> None:
         corpus=f"{_IDENTITY_PAGE_TEXT} This lot is priced at $18.00 per pound.",
     )
     assert draft.altitude_m == 1800
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+def test_quote_supports_altitude_decimal_comma_price_demotes() -> None:
+    """#590 D2b fix 1 (Codex round, SXVDN): the old unconditional
+    inter-digit elision let a decimal-comma price like "€18,00" collapse
+    to a hallucinated "1800" digit token, which then paired with an
+    UNRELATED "High-altitude" cue within the proximity window. Only a
+    VALID 3-digit thousands grouping elides now
+    (:func:`bean_sourcing._elides_as_thousands_separator`), so "18,00"
+    (2 digits after the comma) never produces "1800" at all."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800, altitude_m_evidence="High-altitude coffee costs €18,00")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="High-altitude coffee costs €18,00 per bag.",
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+def test_quote_supports_altitude_glued_metre_unit_flips_on_page() -> None:
+    """#590 D2b fix 2 (Codex round, SXVDR): the exact compact form
+    ``_EXTRACTION_INSTRUCTIONS`` itself exemplifies ("1,850m") could never
+    verify before this fix — bare "m" isn't a recognized elevation cue on
+    its own, so a unit GLUED directly onto the value-matching digits is
+    now accepted as unambiguous (distance 0)."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1850, altitude_m_evidence="grown at 1,850m")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="This lot is grown at 1,850m above the valley floor.",
+    )
+    assert draft.field_sources["altitude_m"] == "on_page"
+
+
+def test_quote_supports_altitude_space_separated_bare_m_still_demotes() -> None:
+    """The safe-direction mirror of fix 2: "1850 m" (space-separated, not
+    glued) must NOT verify off the bare "m" alone — only a unit glued
+    directly onto the matching digits is unambiguous enough to count."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1850, altitude_m_evidence="1850 m")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="This lot sits at 1850 m according to the survey.",
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+def test_quote_supports_altitude_glued_m_on_different_number_has_no_effect() -> None:
+    """A bare "m" glued to a DIFFERENT (non-matching) number must not
+    leak into verifying an unrelated claimed altitude — the digit run
+    never matches the claimed value at all."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800, altitude_m_evidence="priced at 18m tall shelving")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="This shop uses priced at 18m tall shelving for storage.",
+    )
     assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
@@ -2741,6 +2805,23 @@ def test_numeric_tokens_flushes_a_trailing_digit_run_at_string_end() -> None:
     ends) must still be captured via the post-loop flush."""
     numeric_tokens = bean_sourcing._numeric_tokens  # pyright: ignore[reportPrivateUsage]
     assert numeric_tokens("elevation 1850") == {"1850"}
+
+
+def test_numeric_tokens_does_not_elide_a_decimal_comma_with_two_digits() -> None:
+    """#590 D2b fix 1: a genuine 2-digit decimal (cents) must NOT collapse
+    into a hallucinated thousands-grouped number."""
+    numeric_tokens = bean_sourcing._numeric_tokens  # pyright: ignore[reportPrivateUsage]
+    assert numeric_tokens("18,00") == {"18", "00"}
+    assert numeric_tokens("1,234,567 units") == {"1234567"}
+
+
+def test_elides_as_thousands_separator_requires_exactly_three_digits() -> None:
+    elides = bean_sourcing._elides_as_thousands_separator  # pyright: ignore[reportPrivateUsage]
+    assert elides("1,800", 1) is True
+    assert elides("18,00", 2) is False  # only 2 digits follow
+    assert elides("1,8a0", 1) is False  # non-digit within the next 3
+    assert elides("1,8000", 1) is False  # 4 digits follow, not exactly 3
+    assert elides("1,80", 1) is False  # fewer than 3 chars remain
 
 
 def test_alpha_runs_splits_on_digits_and_casefolds() -> None:
