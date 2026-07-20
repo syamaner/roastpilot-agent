@@ -2002,10 +2002,9 @@ class _ExtractedBeanIdentity(BaseModel):
 
     The four ``*_evidence`` fields (#590 slice D2a) are a PARALLEL, optional
     verbatim quote alongside each TYPED field (``altitude_m``,
-    ``processing``, ``bean_species``, ``is_blend``). ``altitude_m_evidence``
-    feeds the ENABLED citation gate (:func:`_quote_supports_altitude`) —
-    the other three stay CAPTURED-BUT-UNCONSUMED, deferred to slice E
-    (:data:`_ENUM_FIELDS_DEFERRED_TO_E`).
+    ``processing``, ``bean_species``, ``is_blend``). All four stay
+    CAPTURED-BUT-UNCONSUMED at runtime — ``altitude_m_evidence`` feeds a
+    DORMANT gate, :data:`_ALTITUDE_CITATION_GATE_ENABLED`, pending D2d.
     """
 
     name: str | None = None
@@ -2034,7 +2033,7 @@ class _ExtractedBeanIdentity(BaseModel):
     deferred to #590 — no new schema fields here."""
     altitude_m_evidence: str | None = Field(default=None, max_length=500)
     """A verbatim span supporting ``altitude_m`` (#590 D2a). Checked by
-    :func:`_quote_supports_altitude` (ENABLED, #590 D2c). Bounded to
+    :func:`_quote_supports_altitude`, DORMANT pending D2d. Bounded to
     :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's LOW."""
     description: str | None = None
     is_blend: bool | None = None
@@ -2429,11 +2428,16 @@ _IDENTITY_FIELDS: tuple[str, ...] = (
 #: provide safely). These two, like ``is_blend``, demote until E lands.
 _ENUM_FIELDS_DEFERRED_TO_E: frozenset[str] = frozenset({"processing", "bean_species"})
 
-#: ENABLED (#590 D2c, #615) — :func:`_quote_supports_altitude` now
-#: certifies ``altitude_m`` at runtime, after five hardening folds (cue
+#: Ships DORMANT (#590 D2c, #615) — the five hardening folds (cue
 #: adjacency, suffix-only glued-m, non-metre unit rejection, the
-#: segmenter's thousands-period exception, range-endpoint rejection).
-_ALTITUDE_CITATION_GATE_ENABLED: Final = True
+#: segmenter's thousands-period exception, range-endpoint rejection)
+#: stand, but round-6 (Codex) review found 6 MORE shape bypasses (a
+#: field-delimiter-blind adjacency, above/below/at-least bounds, an
+#: un-isolated plain-digit identifier, a quote-scoped unit check a
+#: cropped quote defeats, a unit-mediated range, a decimal-split
+#: segment) — the guard-stack design FAILS OPEN on novel text shapes.
+#: Enablement moves to a fail-CLOSED whitelist redesign (D2d, #615).
+_ALTITUDE_CITATION_GATE_ENABLED: Final = False
 
 #: Elevation cues an ``altitude_m`` evidence quote must carry, ADJACENT to
 #: the value's digit-run token (:func:`_cue_binds_to_value`). NOT bare
@@ -3105,15 +3109,12 @@ def _draft_from_identity(
     the model may legitimately summarise/paraphrase rather than quote
     verbatim, it is lower-stakes (the roast advisor never reads it), and
     it keeps the original presence-only tagging. ``altitude_m`` never runs
-    through the containment matcher — it is CODE-VERIFIED instead via its
-    own ENABLED citation gate (:func:`_quote_supports_altitude`,
-    :data:`_ALTITUDE_CITATION_GATE_ENABLED`): a genuine, bound,
-    non-range-endpoint ``altitude_m_evidence`` quote earns ``"on_page"``;
-    anything else demotes to ``"origin_estimated"`` like
-    ``processing``/``bean_species``/``is_blend``
-    (:data:`_ENUM_FIELDS_DEFERRED_TO_E`, still deferred to slice E). Every
-    roast-target field is always ``"origin_estimated"``.
-    The optional free-text fields (``country``, ``farm``,
+    through the containment matcher — its citation gate ships DORMANT
+    (:data:`_ALTITUDE_CITATION_GATE_ENABLED`), so it demotes
+    unconditionally today like ``processing``/``bean_species``/
+    ``is_blend`` (:data:`_ENUM_FIELDS_DEFERRED_TO_E`). Every roast-target
+    field is always ``"origin_estimated"``. The optional free-text fields
+    (``country``, ``farm``,
     ``bean_varietal``, ``description``) are normalized via
     :func:`_normalize_optional_text` BEFORE both the provenance loop and
     the draft construction (#587 P2) — see that function's docstring for
@@ -3126,9 +3127,8 @@ def _draft_from_identity(
     at all (:func:`draft_bean_profile_from_url` rejects those outright,
     before any fetch). The vendor page itself is still fetched with the
     REAL, un-redacted URL — only what is returned/persisted is redacted.
-    Of ``identity``'s four ``*_evidence`` quotes (#590 D2a), only
-    ``altitude_m_evidence`` affects provenance; the other three stay
-    captured-but-unconsumed pending slice E.
+    None of ``identity``'s four ``*_evidence`` quotes (#590 D2a) affect
+    provenance while the gate is dormant.
 
     Args:
         identity: The provider's page-only extraction, including its four
@@ -3219,10 +3219,8 @@ def _draft_from_identity(
             field_sources[field_name] = "origin_estimated"
             continue
         if field_name == "altitude_m":
-            # ENABLED (_ALTITUDE_CITATION_GATE_ENABLED, #590 D2c) — the
-            # flag stays checked here (rather than inlined) so a future
-            # kill-switch can disable the gate without touching this call
-            # site.
+            # DORMANT (_ALTITUDE_CITATION_GATE_ENABLED) — ``and`` short-
+            # circuits before the check ever runs, until D2d flips it.
             gate_verdict = _ALTITUDE_CITATION_GATE_ENABLED and _quote_supports_altitude(
                 identity.altitude_m, identity.altitude_m_evidence, corpus
             )
