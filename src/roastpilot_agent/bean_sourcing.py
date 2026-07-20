@@ -187,7 +187,7 @@ import socket
 import zlib
 from dataclasses import dataclass
 from html import unescape
-from typing import Any, cast
+from typing import Any, Final, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import extruct  # type: ignore[import-untyped]
@@ -2001,16 +2001,10 @@ class _ExtractedBeanIdentity(BaseModel):
     percent or a drop temperature.
 
     The four ``*_evidence`` fields (#590 slice D2a) are a PARALLEL, optional
-    verbatim quote alongside each of the four TYPED fields
-    (:data:`_FIELDS_DEFERRED_TO_D2` plus ``is_blend``) — the ones D1's
-    whole-phrase containment gate cannot soundly verify (see that constant's
-    docstring). This slice only CAPTURES the quote; it is not yet consulted
-    anywhere — :func:`_draft_from_identity` still demotes all four typed
-    fields unconditionally, byte-identical to D1. D2b wires an
-    ``evidence_quote in corpus`` + value-derivation check that flips them to
-    ``"on_page"`` when the citation actually supports the value; until then
-    a captured-but-unverified quote is simply inert data (also useful, on
-    its own, as the #588 eval harness's extraction-quality signal).
+    verbatim quote alongside each TYPED field (``altitude_m``,
+    ``processing``, ``bean_species``, ``is_blend``). All four stay
+    CAPTURED-BUT-UNCONSUMED at runtime — ``altitude_m_evidence`` feeds a
+    DORMANT gate, :data:`_ALTITUDE_CITATION_GATE_ENABLED`, pending D2c.
     """
 
     name: str | None = None
@@ -2019,14 +2013,14 @@ class _ExtractedBeanIdentity(BaseModel):
     farm: str | None = None
     bean_varietal: str | None = None
     processing: ProcessingMethod | None = None
-    processing_evidence: str | None = None
-    """A verbatim span of page text supporting ``processing``, or ``None``
-    when ``processing`` is itself ``None`` (#590 D2a). Captured, not yet
-    verified — see the class docstring."""
+    processing_evidence: str | None = Field(default=None, max_length=500)
+    """A verbatim span supporting ``processing`` (#590 D2a). Captured but
+    UNCONSUMED — deferred to slice E. Bounded to
+    :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's LOW."""
     bean_species: BeanSpecies | None = None
-    bean_species_evidence: str | None = None
-    """A verbatim span of page text supporting ``bean_species`` (#590 D2a).
-    Captured, not yet verified — see the class docstring."""
+    bean_species_evidence: str | None = Field(default=None, max_length=500)
+    """A verbatim span of page text supporting ``bean_species`` (#590
+    D2a). Captured but UNCONSUMED — see ``processing_evidence``."""
     altitude_m: int | None = Field(default=None, ge=0, le=4000)
     """A single STATED altitude — never a computed midpoint of a page-given
     RANGE (#587 P2, round 6: the extraction used to average a range down to
@@ -2037,9 +2031,10 @@ class _ExtractedBeanIdentity(BaseModel):
     itself (``altitude_min_m``/``altitude_max_m``) and estimating a midpoint
     with its own ``"origin_estimated"`` provenance is a richer follow-up,
     deferred to #590 — no new schema fields here."""
-    altitude_m_evidence: str | None = None
-    """A verbatim span of page text supporting ``altitude_m`` (#590 D2a).
-    Captured, not yet verified — see the class docstring."""
+    altitude_m_evidence: str | None = Field(default=None, max_length=500)
+    """A verbatim span supporting ``altitude_m`` (#590 D2a). Checked by
+    :func:`_quote_supports_altitude`, DORMANT pending D2c. Bounded to
+    :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's LOW."""
     description: str | None = None
     is_blend: bool | None = None
     """Tri-state, not a plain ``bool`` with a False default (#587 P2): the
@@ -2049,9 +2044,10 @@ class _ExtractedBeanIdentity(BaseModel):
     make an unstated page silently look like an on-page "not a blend"
     claim. See :data:`_EXTRACTION_INSTRUCTIONS` and
     :func:`_draft_from_identity`'s provenance handling."""
-    is_blend_evidence: str | None = None
-    """A verbatim span of page text supporting ``is_blend`` (either polarity
-    — #590 D2a). Captured, not yet verified — see the class docstring."""
+    is_blend_evidence: str | None = Field(default=None, max_length=500)
+    """A verbatim span supporting ``is_blend`` (#590 D2a). Still UNCONSUMED
+    — polarity verification is deferred to slice E. Bounded for
+    consistency with the other three fields even though not yet read."""
 
 
 _EXTRACTION_INSTRUCTIONS = """
@@ -2427,20 +2423,30 @@ _IDENTITY_FIELDS: tuple[str, ...] = (
     "description",
 )
 
-#: Fields DEMOTED UNCONDITIONALLY in D1 — never routed through
-#: :func:`_value_is_contained` (#590 D1 scoping, round-2 review: pure
-#: string containment can't safely verify a TYPED value against arbitrary
-#: page-numeral/vocabulary noise — e.g. a "honey" PROCESS collides with a
-#: "honey" tasting note, an altitude digit run collides with a price/SKU).
-#: ``altitude_m``/``processing``/``bean_species`` are verified in **D2**
-#: (an evidence-quote citation; F adds constrained enums). ``is_blend`` is
-#: handled separately in :func:`_draft_from_identity` (excluded from
-#: :data:`_IDENTITY_FIELDS` for its tri-state ``None``) and deferred to
-#: **D2/E** — polarity verification needs LOCALITY (a single-origin
-#: product page can still contain the word "blend" via an unrelated
-#: "shop our house blend" cross-sell link), which token presence alone
-#: cannot provide.
-_FIELDS_DEFERRED_TO_D2: frozenset[str] = frozenset({"altitude_m", "processing", "bean_species"})
+#: TYPED enum fields DEFERRED to slice E (#590 D2b — sound verification
+#: needs LOCALITY + conflicting-method handling flat matching can't
+#: provide safely). These two, like ``is_blend``, demote until E lands.
+_ENUM_FIELDS_DEFERRED_TO_E: frozenset[str] = frozenset({"processing", "bean_species"})
+
+#: Ships DORMANT (#590 D2b) — :func:`_quote_supports_altitude` is
+#: complete and unit-tested, but round-3 review found more cue-value/unit
+#: hardening it needs first. Tracked as #615/D2c, which flips this.
+_ALTITUDE_CITATION_GATE_ENABLED: Final = False
+
+#: Elevation cues an ``altitude_m`` evidence quote must carry, PROXIMATE to
+#: the value's digit-run token (#590 D2b). NOT bare ``"m"``; NOT
+#: standalone ``"above"``/``"sea"``/``"level"`` (a bare "level" used to
+#: verify a confabulated altitude) — "above sea level" is a COMPLETE
+#: phrase instead, see :func:`_altitude_evidence_supports_value`. Matched
+#: as a WHOLE alpha run (:func:`_token_carries_altitude_cue`) — a
+#: substring like ``"meter"`` inside ``"parameter"`` does not count.
+_ALTITUDE_CUES: frozenset[str] = frozenset(
+    {"masl", "meters", "metres", "meter", "metre", "altitude", "elevation", "asl", "msnm"}
+)
+
+#: How many word positions may separate a value-matching digit token from
+#: an elevation-cue token and still count as PROXIMATE (#590 D2b).
+_ALTITUDE_CUE_PROXIMITY_WINDOW: int = 4
 
 #: Roast-target fields a vendor page never states — always
 #: ``"origin_estimated"`` in the drafted :attr:`BeanProfileDraft.field_sources`.
@@ -2531,9 +2537,10 @@ def _contains_whole_phrase(phrase: str, corpus_normalized: str) -> bool:
 
 def _value_is_contained(value: object, corpus_normalized: str) -> bool:
     """Test whether ``value`` is verifiably present in the page corpus as a
-    whole word/phrase (#590 D1 — scoped to FREE-TEXT identity fields only,
-    round-2 review: typed fields are deferred to D2/E instead, see
-    :data:`_FIELDS_DEFERRED_TO_D2`).
+    whole word/phrase (#590 D1 — scoped to FREE-TEXT identity fields only;
+    ``altitude_m`` goes through the citation gate instead, see
+    :func:`_quote_supports_altitude`; ``processing``/``bean_species``/
+    ``is_blend`` demote unconditionally, deferred to slice E).
 
     Gates the ``"on_page"`` provenance tag: a field earns ``"on_page"`` only
     when its extracted value is actually present in the SAME page text the
@@ -2571,6 +2578,265 @@ def _value_is_contained(value: object, corpus_normalized: str) -> bool:
         normalized_value = _normalize_for_containment(text)
         return _contains_whole_phrase(normalized_value, corpus_normalized)
     except Exception:  # pragma: no cover - defensive: containment must fail soft, never raise
+        return False
+
+
+def _elides_as_thousands_separator(text: str, i: int) -> bool:
+    """Whether ``text[i]`` is a VALID thousands separator — exactly 3
+    digits follow (#590 D2b fold 1; ``"18,00"`` must NOT collapse).
+
+    Args:
+        text: The raw text being scanned.
+        i: The candidate separator index.
+
+    Returns:
+        ``True`` if exactly 3 digits immediately follow ``i``.
+    """
+    length = len(text)
+    if i + 3 >= length:
+        return False
+    if not (text[i + 1].isdigit() and text[i + 2].isdigit() and text[i + 3].isdigit()):
+        return False
+    return not (i + 4 < length and text[i + 4].isdigit())
+
+
+def _numeric_tokens(text: str) -> frozenset[str]:
+    """Extract every contiguous digit run in ``text`` as a token (#590
+    D2b) — a comma/period is elided only when a VALID thousands
+    separator (:func:`_elides_as_thousands_separator`). No regex.
+
+    Args:
+        text: The raw (not pre-normalized) evidence-quote text.
+
+    Returns:
+        The set of digit-run tokens found, e.g. ``{"1800"}``.
+    """
+    tokens: set[str] = set()
+    current: list[str] = []
+    for i, char in enumerate(text):
+        if char.isdigit():
+            current.append(char)
+        elif char in ",." and current and _elides_as_thousands_separator(text, i):
+            continue
+        elif current:
+            tokens.add("".join(current))
+            current = []
+    if current:
+        tokens.add("".join(current))
+    return frozenset(tokens)
+
+
+def _alpha_runs(token: str) -> list[str]:
+    """Split ``token`` into maximal alphabetic runs, casefolded, dropping
+    digit runs (#590 D2b). No regex.
+
+    Args:
+        token: One :func:`_proximity_tokens` token (already alphanumeric).
+
+    Returns:
+        The casefolded alphabetic runs, in order.
+    """
+    runs: list[str] = []
+    current: list[str] = []
+    for char in token:
+        if char.isalpha():
+            current.append(char.casefold())
+        elif current:
+            runs.append("".join(current))
+            current = []
+    if current:
+        runs.append("".join(current))
+    return runs
+
+
+def _token_carries_altitude_cue(token: str) -> bool:
+    """Whether ``token`` carries an elevation cue as a WHOLE alphabetic
+    run, not a substring (#590 D2b — ``"meter"`` used to match inside
+    ``"parameter"``/``"diameter"``). ``"1800masl"`` still counts.
+
+    Args:
+        token: One :func:`_proximity_tokens` token.
+
+    Returns:
+        ``True`` if any alpha run EQUALS an :data:`_ALTITUDE_CUES` member.
+    """
+    return any(run in _ALTITUDE_CUES for run in _alpha_runs(token))
+
+
+def _proximity_tokens(text: str) -> list[str]:
+    """Tokenize ``text`` on punctuation AND whitespace — split on
+    non-alphanumeric runs — for altitude cue-proximity measurement (#590
+    D2b fix 2: whitespace-only split let a punctuation-joined chain
+    collapse into ONE token). A VALID thousands separator
+    (:func:`_elides_as_thousands_separator`) is preserved. No regex.
+
+    Args:
+        text: The raw (not pre-normalized) evidence-quote text.
+
+    Returns:
+        The alphanumeric-run tokens, boundary characters dropped.
+    """
+    tokens: list[str] = []
+    current: list[str] = []
+    for i, char in enumerate(text):
+        if char.isalnum():
+            current.append(char)
+        elif (
+            char in ",."
+            and current
+            and current[-1].isdigit()
+            and _elides_as_thousands_separator(text, i)
+        ):
+            continue
+        elif current:
+            tokens.append("".join(current))
+            current = []
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _above_sea_level_cue_indices(tokens: list[str]) -> list[int]:
+    """Index positions of the contiguous 3-token phrase "above sea level"
+    within ``tokens`` (#590 D2b fix 1) — checked as a COMPLETE phrase,
+    never as 3 independent single-word cues.
+
+    Args:
+        tokens: The proximity token list (:func:`_proximity_tokens`).
+
+    Returns:
+        The middle ("sea") token index of every match, used as that
+        match's proximity anchor.
+    """
+    return [
+        i + 1
+        for i in range(len(tokens) - 2)
+        if tokens[i].casefold() == "above"
+        and tokens[i + 1].casefold() == "sea"
+        and tokens[i + 2].casefold() == "level"
+    ]
+
+
+def _altitude_evidence_supports_value(value: int, raw_quote: str) -> bool:
+    """Whether ``raw_quote`` supports ``value`` for ``altitude_m`` via a
+    PROXIMATE digit-run + elevation cue (#590 D2b): a cue token
+    (:func:`_token_carries_altitude_cue`,
+    :func:`_above_sea_level_cue_indices`, or a bare "m" GLUED onto the
+    matching digits themselves, fold 2) within
+    :data:`_ALTITUDE_CUE_PROXIMITY_WINDOW` positions of a
+    :func:`_proximity_tokens` token whose digit run equals ``value``.
+
+    Args:
+        value: The claimed altitude in metres.
+        raw_quote: The evidence quote, NOT pre-normalized.
+
+    Returns:
+        ``True`` if a value-matching digit token has a cue within the
+        proximity window, ``False`` otherwise.
+    """
+    target = str(value)
+    tokens = _proximity_tokens(raw_quote)
+    digit_indices = [i for i, token in enumerate(tokens) if target in _numeric_tokens(token)]
+    if not digit_indices:
+        return False
+    cue_indices = [i for i, token in enumerate(tokens) if _token_carries_altitude_cue(token)]
+    cue_indices += _above_sea_level_cue_indices(tokens)
+    # A bare "m" glued directly onto the value-matching digits (e.g.
+    # "1,850m") is unambiguous — standalone "m" elsewhere is not a cue.
+    cue_indices += [i for i in digit_indices if _alpha_runs(tokens[i]) == ["m"]]
+    if not cue_indices:
+        return False
+    return any(
+        abs(d - c) <= _ALTITUDE_CUE_PROXIMITY_WINDOW for d in digit_indices for c in cue_indices
+    )
+
+
+#: Hard sentence/line boundaries a corpus is segmented on for authenticity
+#: checking (#590 D2b fix 3) — a NEW, stricter check used only for the
+#: D2b altitude quote; D1's free-text checks are untouched.
+_CORPUS_SEGMENT_BOUNDARIES: frozenset[str] = frozenset({".", "\n", ";", "!", "?"})
+
+
+def _split_corpus_segments(corpus: str) -> list[str]:
+    """Split ``corpus`` into single-sentence/line segments on
+    :data:`_CORPUS_SEGMENT_BOUNDARIES` (#590 D2b fix 3). No regex.
+
+    Args:
+        corpus: The raw (not pre-normalized) page corpus.
+
+    Returns:
+        The non-empty segments.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    for char in corpus:
+        if char in _CORPUS_SEGMENT_BOUNDARIES:
+            if current:
+                segments.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    if current:
+        segments.append("".join(current))
+    return segments
+
+
+def _is_authentic_span(quote: str, corpus: str) -> bool:
+    """Whether ``quote`` is a whole-phrase match WITHIN A SINGLE
+    sentence/line segment of ``corpus`` (#590 D2b fix 3) — plain
+    whole-corpus containment lets a fabricated quote splice words from
+    DIFFERENT sentences into a span never actually written contiguously.
+    Splits ``corpus`` on hard boundaries (:func:`_split_corpus_segments`)
+    and requires a whole-phrase match within ONE segment. Only for the
+    D2b altitude quote — D1's free-text fields keep the whole-corpus check.
+
+    Args:
+        quote: The raw evidence quote (not pre-normalized).
+        corpus: The raw page corpus (not pre-normalized).
+
+    Returns:
+        ``True`` if the quote is a whole-phrase match within a single
+        corpus segment, ``False`` otherwise.
+    """
+    normalized_quote = _normalize_for_containment(quote)
+    if not normalized_quote:
+        return False
+    return any(
+        _contains_whole_phrase(normalized_quote, _normalize_for_containment(segment))
+        for segment in _split_corpus_segments(corpus)
+    )
+
+
+def _quote_supports_altitude(value: int | None, quote: str | None, corpus: str) -> bool:
+    """Whether ``quote`` genuinely supports ``value`` for ``altitude_m``
+    (#590 D2b — see :data:`_ENUM_FIELDS_DEFERRED_TO_E`). Two conditions:
+    (1) an AUTHENTIC single-segment page span (:func:`_is_authentic_span`)
+    and (2) a PROXIMATE elevation cue
+    (:func:`_altitude_evidence_supports_value`). Fails SOFT on any
+    defect — never raises out of a draft.
+
+    Args:
+        value: The extracted ``altitude_m`` value. ``None`` never supports.
+        quote: The model's verbatim ``altitude_m_evidence`` span, or
+            ``None``.
+        corpus: The page's RAW verification corpus (not pre-normalized —
+            :func:`_is_authentic_span` needs the original sentence
+            boundaries).
+
+    Returns:
+        ``True`` only when the quote is an authentic single-segment span
+        AND independently supports ``value``; ``False`` otherwise.
+    """
+    if value is None or not quote:
+        return False
+    try:
+        raw_quote = quote.strip()
+        if not raw_quote:
+            return False
+        if not _is_authentic_span(raw_quote, corpus):
+            return False  # not a genuine single-segment page quote
+        return _altitude_evidence_supports_value(value, raw_quote)
+    except Exception:  # pragma: no cover - defensive: citation gate must fail soft, never raise
         return False
 
 
@@ -2621,13 +2887,13 @@ def _draft_from_identity(
     ``description`` is EXEMPT from the containment gate — it is long prose
     the model may legitimately summarise/paraphrase rather than quote
     verbatim, it is lower-stakes (the roast advisor never reads it), and
-    it keeps the original presence-only tagging. :data:`_FIELDS_DEFERRED_TO_D2`
-    (``altitude_m``, ``processing``, ``bean_species``) and ``is_blend`` are
-    TYPED fields, never run through the containment matcher at all — see
-    that constant's docstring for why pure string containment can't safely
-    verify them; both demote unconditionally in D1. Every roast-target
-    field is always ``"origin_estimated"`` (the page never
-    states a roast target). The optional free-text fields (``country``, ``farm``,
+    it keeps the original presence-only tagging. ``altitude_m`` never runs
+    through the containment matcher — its citation gate ships DORMANT
+    (:data:`_ALTITUDE_CITATION_GATE_ENABLED`), so it demotes
+    unconditionally today like ``processing``/``bean_species``/
+    ``is_blend`` (:data:`_ENUM_FIELDS_DEFERRED_TO_E`). Every roast-target
+    field is always ``"origin_estimated"``. The optional free-text fields
+    (``country``, ``farm``,
     ``bean_varietal``, ``description``) are normalized via
     :func:`_normalize_optional_text` BEFORE both the provenance loop and
     the draft construction (#587 P2) — see that function's docstring for
@@ -2640,17 +2906,12 @@ def _draft_from_identity(
     at all (:func:`draft_bean_profile_from_url` rejects those outright,
     before any fetch). The vendor page itself is still fetched with the
     REAL, un-redacted URL — only what is returned/persisted is redacted.
-    ``identity``'s four ``*_evidence`` quotes (#590 D2a) are available on
-    ``identity`` itself (no separate parameter needed — this function
-    already receives the whole object) but are **not consumed here**: this
-    slice only captures the quotes, it does not verify them, so every
-    deferred typed field still demotes exactly as it did before D2a — D2b
-    is where a verified quote starts flipping a field to ``"on_page"``.
+    None of ``identity``'s four ``*_evidence`` quotes (#590 D2a) affect
+    provenance while the gate is dormant.
 
     Args:
-        identity: The provider's page-only extraction (including its four
-            ``*_evidence`` quote fields, captured but unconsumed by this
-            function — see above).
+        identity: The provider's page-only extraction, including its four
+            ``*_evidence`` quote fields (see above).
         url: The source URL (carried onto ``source_url`` in redacted form).
         corpus: The SAME page text the model saw when producing ``identity``
             (:func:`draft_bean_profile_from_url` threads its already-fetched
@@ -2732,11 +2993,17 @@ def _draft_from_identity(
             # see the function docstring for why.
             field_sources[field_name] = "on_page"
             continue
-        if field_name in _FIELDS_DEFERRED_TO_D2:
-            # altitude_m/processing/bean_species are TYPED fields, demoted
-            # UNCONDITIONALLY in D1, never routed through the containment
-            # matcher — see _FIELDS_DEFERRED_TO_D2's docstring for why.
+        if field_name in _ENUM_FIELDS_DEFERRED_TO_E:
+            # Demoted unconditionally — see _ENUM_FIELDS_DEFERRED_TO_E.
             field_sources[field_name] = "origin_estimated"
+            continue
+        if field_name == "altitude_m":
+            # DORMANT (_ALTITUDE_CITATION_GATE_ENABLED) — ``and`` short-
+            # circuits before the check ever runs, until D2c flips it.
+            gate_verdict = _ALTITUDE_CITATION_GATE_ENABLED and _quote_supports_altitude(
+                identity.altitude_m, identity.altitude_m_evidence, corpus
+            )
+            field_sources[field_name] = "on_page" if gate_verdict else "origin_estimated"
             continue
         field_sources[field_name] = (
             "on_page" if _value_is_contained(raw_value, corpus_normalized) else "origin_estimated"
@@ -2755,8 +3022,8 @@ def _draft_from_identity(
         # "not in (None, '')" test above would work for None but a bare
         # ``False`` used to be indistinguishable from "unstated" before
         # #587 P2 made this field tri-state. An explicit True or False is
-        # DEFERRED to D2/E (#590 D1 scoping, see _FIELDS_DEFERRED_TO_D2's
-        # docstring) — always demoted, never routed through any matcher.
+        # DEFERRED to slice E (locality) — always demotes, never routed
+        # through any matcher.
         # No field_sources entry at all when the page said nothing
         # (identity.is_blend is None) — "absent from field_sources" stays
         # meaningful as "unset".
@@ -2771,8 +3038,10 @@ def _draft_from_identity(
         f"{identity.processing or 'unstated'} processing method, so a wrong guess "
         "cannot burn the batch. Taste and step the development target up on the "
         "next bag if it reads underdeveloped. Every field marked "
-        '"origin_estimated" in field_sources was NOT confirmed present on the '
-        "vendor page (either absent, or a typed field not yet verified) — "
+        '"origin_estimated" in field_sources is NOT verified against the vendor '
+        "page — either the field was absent, its on-page citation check failed "
+        "(no supporting quote, or the quote did not genuinely support the "
+        "value), or verification for that field is not yet available — "
         "review it before roasting."
     )
 
