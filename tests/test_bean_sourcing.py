@@ -4010,6 +4010,138 @@ def test_draft_from_identity_is_blend_false_is_always_demoted_in_d1() -> None:
     assert draft.field_sources["is_blend"] == "origin_estimated"
 
 
+# --- #590 slice E1: fail-closed main-product-region locality (machinery
+# only, capture-only posture — no field's provenance consumes this yet;
+# a future slice wires is_blend through it) ---
+
+
+def _framed(title: str, body: str) -> str:
+    """Build a body_text carrying the exact trafilatura-frontmatter shape
+    _main_product_region expects (a leading title-only frontmatter block,
+    mirroring _sanitize_trafilatura_frontmatter's emitted shape)."""
+    return f"---\ntitle: {title}\n---\n{body}"
+
+
+def test_main_product_region_a1_only_lead_region_no_json_ld() -> None:
+    region = bean_sourcing._main_product_region(  # pyright: ignore[reportPrivateUsage]
+        _framed("Kenya Kiambu AA", "Great coffee here.\n"), ""
+    )
+    assert region == "Great coffee here."
+
+
+def test_main_product_region_a2_only_no_title_no_heading() -> None:
+    """No frontmatter at all (the linear-strip shape) and no heading to
+    anchor against — the region collapses to the JSON-LD value alone,
+    never the lead text (no A1, no lead region)."""
+    region = bean_sourcing._main_product_region(  # pyright: ignore[reportPrivateUsage]
+        "Some plain linear-strip text with no frontmatter at all.",
+        "Kenya Kiambu AA",
+    )
+    assert region == "Kenya Kiambu AA"
+
+
+def test_main_product_region_neither_anchor_collapses_to_empty() -> None:
+    """The fail-closed law, directly on the pure function: with NEITHER
+    anchor, the region is "" — never the whole corpus."""
+    region = bean_sourcing._main_product_region(  # pyright: ignore[reportPrivateUsage]
+        "Some plain linear-strip text with nothing else on the page.", ""
+    )
+    assert region == ""
+
+
+def test_main_product_region_both_anchors_headings_multiple_levels() -> None:
+    body = _framed(
+        "Kenya Kiambu AA",
+        "Intro line before any heading.\n"
+        "# Kenya Kiambu AA\n"
+        "Top-level anchored content.\n"
+        "## Kenya Kiambu AA Details\n"
+        "Nested anchored content too.\n"
+        "### Unrelated Subsection\n"
+        "Excluded content under an unmatched sub-heading.\n",
+    )
+    region = bean_sourcing._main_product_region(body, "Kenya Kiambu AA")  # pyright: ignore[reportPrivateUsage]
+    assert "Intro line before any heading." in region
+    assert "Top-level anchored content." in region
+    assert "Nested anchored content too." in region
+    assert "Excluded content under an unmatched sub-heading." not in region
+    assert region.endswith("Kenya Kiambu AA")  # the JSON-LD value appended last
+
+
+def test_main_product_region_sentinel_paragraph_truncates_lead_region() -> None:
+    """A sentinel need not be a heading — a plain cross-sell PARAGRAPH
+    truncates the lead region just the same."""
+    body = _framed(
+        "Kenya Kiambu AA",
+        "This is a single origin lot from Kiambu.\n"
+        "\n"
+        "You may also like our house blend for an everyday cup.\n",
+    )
+    region = bean_sourcing._main_product_region(body, "")  # pyright: ignore[reportPrivateUsage]
+    assert "single origin" in region
+    assert "house blend" not in region.lower()
+
+
+def test_main_product_region_anchored_heading_closes_at_next_heading() -> None:
+    body = _framed(
+        "Kenya Kiambu AA",
+        "## Kenya Kiambu AA\n"
+        "This is our house blend of three lots.\n"
+        "## Shipping Information\n"
+        "This shop also offers a house blend gift box.\n",
+    )
+    region = bean_sourcing._main_product_region(body, "")  # pyright: ignore[reportPrivateUsage]
+    assert "house blend of three lots" in region
+    assert "gift box" not in region
+
+
+def test_main_product_region_two_consecutive_anchored_headings_yield_no_empty_region() -> None:
+    """Two anchor-matching headings back-to-back, with no content line
+    between them, must not append an empty region (the ``region_lines``
+    guard) — the second heading still opens its OWN region normally."""
+    body = _framed(
+        "Kenya Kiambu AA",
+        "## Kenya Kiambu AA\n## Kenya Kiambu AA\nReal content under the second heading.\n",
+    )
+    region = bean_sourcing._main_product_region(body, "")  # pyright: ignore[reportPrivateUsage]
+    assert region == "Real content under the second heading."
+
+
+def test_frontmatter_title_and_body_untitled_block_returns_none() -> None:
+    """A hand-built, untitled frontmatter block — production code never
+    emits this shape (_sanitize_trafilatura_frontmatter drops an untitled
+    block entirely rather than leaving it in place), but the pure
+    function is exercised against it directly."""
+    title, rest = bean_sourcing._frontmatter_title_and_body(  # pyright: ignore[reportPrivateUsage]
+        "---\nauthor: Someone\n---\nBody text here."
+    )
+    assert title is None
+    assert rest == "Body text here."
+
+
+def test_heading_matches_anchor_empty_heading_text_never_matches() -> None:
+    """A bare ``"#"`` heading (no text after the hashes) normalizes to
+    ``""`` and can never match any anchor."""
+    matches = bean_sourcing._heading_matches_anchor(  # pyright: ignore[reportPrivateUsage]
+        "", ["kenya kiambu aa"]
+    )
+    assert matches is False
+
+
+def test_fetched_page_verification_corpus_matches_pre_split_formula() -> None:
+    """#590 slice E1: ``verification_corpus`` stays a derived,
+    byte-identical accessor after the ``extracted_text``/``json_ld_values``
+    split — both the blank and the non-blank ``json_ld_values`` cases."""
+    blank = bean_sourcing._FetchedPage(  # pyright: ignore[reportPrivateUsage]
+        prompt_text="prompt", extracted_text="body only", json_ld_values=""
+    )
+    assert blank.verification_corpus == "body only"
+    with_facts = bean_sourcing._FetchedPage(  # pyright: ignore[reportPrivateUsage]
+        prompt_text="prompt", extracted_text="body text", json_ld_values="Kenya Kiambu AA"
+    )
+    assert with_facts.verification_corpus == "body text\nKenya Kiambu AA"
+
+
 def test_draft_from_identity_marks_every_roast_target_origin_estimated() -> None:
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args()
