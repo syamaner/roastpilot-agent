@@ -3143,10 +3143,15 @@ def test_draft_from_identity_processing_and_species_always_demote_in_d2b() -> No
     assert draft.field_sources["bean_species"] == "origin_estimated"
 
 
-def test_draft_from_identity_is_blend_still_demotes_with_a_genuine_evidence_quote() -> None:
-    """``is_blend`` stays demoted unconditionally through D2b regardless of
-    how genuine its (unconsumed) evidence quote is — polarity verification
-    is deferred to slice E, not this citation gate."""
+def test_draft_from_identity_is_blend_demotes_with_no_anchor_even_with_a_genuine_quote() -> None:
+    """#590 slice E1b (executable spec): a genuinely on-page, genuinely
+    authentic evidence quote still demotes when the page carries NEITHER
+    anchor (no frontmatter ``title:`` — this ``corpus`` has no leading
+    ``---`` block — and no JSON-LD product name). With no anchor,
+    :func:`bean_sourcing._main_product_region` collapses to ``""`` —
+    there is no whole-corpus fallback (that would be fail-OPEN) — so the
+    quote has nowhere to authenticate against and the claim demotes
+    regardless of how genuine it is."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(is_blend=True, is_blend_evidence="a blend of three origins")
     )
@@ -3975,14 +3980,15 @@ def test_draft_from_identity_is_blend_silent_page_leaves_unset() -> None:
     assert "is_blend" not in draft.field_sources
 
 
-def test_draft_from_identity_is_blend_true_is_always_demoted() -> None:
-    """``is_blend`` is DEFERRED to slice E (post-D2b, still unconditional —
-    see :func:`bean_sourcing._draft_from_identity`'s ``is_blend``
-    handling) — token presence alone is unsafe positional evidence (a
-    single-origin product page can still contain the word "blend" via an
-    unrelated "shop our house blend" cross-sell link; true verification
-    needs LOCALITY). An explicit ``True`` the model returned always
-    demotes, even when the page genuinely says "blend"."""
+def test_draft_from_identity_is_blend_true_with_no_evidence_quote_demotes() -> None:
+    """#590 slice E1b: ``is_blend=True`` with NO evidence quote
+    (``is_blend_evidence`` left unset) always demotes —
+    :func:`bean_sourcing._quote_supports_is_blend` requires a quote to
+    even begin authenticating, so token presence elsewhere on the page is
+    never enough on its own (a single-origin product page can still
+    contain the word "blend" via an unrelated "shop our house blend"
+    cross-sell link; the quote+locality gate is what makes verification
+    sound, not bare presence)."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(is_blend=True)
     )
@@ -3995,9 +4001,9 @@ def test_draft_from_identity_is_blend_true_is_always_demoted() -> None:
     assert draft.field_sources["is_blend"] == "origin_estimated"
 
 
-def test_draft_from_identity_is_blend_false_is_always_demoted_in_d1() -> None:
-    """The mirror case: an explicit ``False`` always demotes too, even
-    when the page genuinely says "single origin"."""
+def test_draft_from_identity_is_blend_false_with_no_evidence_quote_demotes() -> None:
+    """The mirror case: ``is_blend=False`` with no evidence quote demotes
+    too, even when the page genuinely says "single origin"."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(is_blend=False)
     )
@@ -4270,6 +4276,254 @@ def test_fetched_page_verification_corpus_matches_pre_split_formula() -> None:
         prompt_text="prompt", extracted_text="body text", json_ld_values="Kenya Kiambu AA"
     )
     assert with_facts.verification_corpus == "body text\nKenya Kiambu AA"
+
+
+# --- #590 slice E1b: is_blend citation + locality gate ---
+
+
+def test_quote_supports_is_blend_false_claim_without_false_polarity_phrase_demotes() -> None:
+    """An authentic main-region quote that claims ``False`` but never
+    actually states a single-origin-family phrase demotes (the quote's
+    OWN polarity check, distinct from the region-wide opposite-polarity
+    veto)."""
+    region = "This coffee has notes of stone fruit and honey."
+    assert (
+        bean_sourcing._quote_supports_is_blend(  # pyright: ignore[reportPrivateUsage]
+            False,
+            "This coffee has notes of stone fruit and honey.",
+            region,
+            anchor_names_blend=False,
+        )
+        is False
+    )
+
+
+def test_draft_from_identity_is_blend_marquee_decoy_demotes_true_claim() -> None:
+    """The marquee decoy: a single-origin page whose cross-sell block says
+    "Shop our House Blend" under an unmatched "You May Also Like" heading.
+    Citing that line as ``is_blend=True`` evidence demotes — the quote
+    fails to authenticate against the MAIN region, since the cross-sell
+    block sits behind a heading that never matched the page's own
+    anchor."""
+    body = _framed(
+        "Ethiopia Yirgacheffe Single Origin",
+        "This lot is a single origin coffee from Yirgacheffe.\n"
+        "\n"
+        "## You May Also Like\n"
+        "Shop our House Blend for an everyday cup.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=True, is_blend_evidence="Shop our House Blend")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/yirgacheffe", corpus=body
+    )
+    assert draft.field_sources["is_blend"] == "origin_estimated"
+
+
+def test_draft_from_identity_is_blend_marquee_decoy_verifies_symmetric_false_claim() -> None:
+    """Symmetric proof: the SAME page, claiming ``False`` and citing the
+    authentic main-region "single origin" sentence, VERIFIES — proving
+    the polarity veto (and the region computation) is main-region-scoped,
+    not a whole-page string search the cross-sell chrome could poison."""
+    body = _framed(
+        "Ethiopia Yirgacheffe Single Origin",
+        "This lot is a single origin coffee from Yirgacheffe.\n"
+        "\n"
+        "## You May Also Like\n"
+        "Shop our House Blend for an everyday cup.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            is_blend=False,
+            is_blend_evidence="This lot is a single origin coffee from Yirgacheffe.",
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/yirgacheffe", corpus=body
+    )
+    assert draft.field_sources["is_blend"] == "on_page"
+
+
+def test_draft_from_identity_is_blend_both_polarities_in_region_demotes_true_claim() -> None:
+    """Both polarities present in the SAME main region — an ambiguous page
+    — demotes a ``True`` claim even though the quote itself carries a
+    valid Tier-2 compound phrase."""
+    body = _framed(
+        "Kenya Kiambu",
+        "This lot is a single origin coffee, though our house blend uses similar beans.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=True, is_blend_evidence="our house blend uses similar beans")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kiambu", corpus=body
+    )
+    assert draft.field_sources["is_blend"] == "origin_estimated"
+
+
+def test_draft_from_identity_is_blend_both_polarities_in_region_demotes_false_claim() -> None:
+    """The mirror case: a valid single-origin quote still demotes when the
+    SAME region also carries a Tier-2 blend compound."""
+    body = _framed(
+        "Kenya Kiambu",
+        "This lot is a single origin coffee, though our house blend uses similar beans.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=False, is_blend_evidence="a single origin coffee")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kiambu", corpus=body
+    )
+    assert draft.field_sources["is_blend"] == "origin_estimated"
+
+
+def test_draft_from_identity_is_blend_tasting_metaphor_bare_word_demotes() -> None:
+    """A tasting-note metaphor ("a blend of chocolate and cherry notes")
+    never verifies ``True`` — bare "blend", no compound phrase, and a
+    non-blend-named anchor."""
+    body = _framed(
+        "Kenya Kiambu AA",
+        "In the cup: a blend of chocolate and cherry notes lingers into the finish.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            is_blend=True,
+            is_blend_evidence="a blend of chocolate and cherry notes lingers into the finish",
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kiambu", corpus=body
+    )
+    assert draft.field_sources["is_blend"] == "origin_estimated"
+
+
+def test_draft_from_identity_is_blend_anchor_named_blend_tier1_verifies() -> None:
+    """Tier 1: the product's own title names it a blend AND the quote
+    carries a bare "blend" — verifies even without a Tier-2 compound."""
+    body = _framed(
+        "Autumn Blend",
+        "Our Autumn Blend brings together three origins. This is a blend crafted for balance.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=True, is_blend_evidence="This is a blend crafted for balance.")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/autumn", corpus=body
+    )
+    assert draft.field_sources["is_blend"] == "on_page"
+
+
+def test_draft_from_identity_is_blend_compound_phrase_tier2_verifies() -> None:
+    """Tier 2: a fixed compound phrase verifies regardless of the
+    anchor's own name."""
+    body = _framed(
+        "Kenya Kiambu AA",
+        "This is our house blend crafted from three regions for balance.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            is_blend=True,
+            is_blend_evidence="This is our house blend crafted from three regions for balance.",
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kiambu", corpus=body
+    )
+    assert draft.field_sources["is_blend"] == "on_page"
+
+
+def test_draft_from_identity_is_blend_documented_over_demote_genuine_blend_prose() -> None:
+    """Executable spec for a DOCUMENTED over-demote: genuine "blend" prose
+    ("This is a blend of two Colombian lots") on a non-blend-named
+    product demotes, because it satisfies neither tier — a future
+    evidence-gated widening of the compound-phrase set may flip this
+    specific shape; over-demotes never block convergence in the
+    meantime."""
+    body = _framed(
+        "Kenya Kiambu AA",
+        "This is a blend of two Colombian lots sourced for this harvest.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            is_blend=True,
+            is_blend_evidence="This is a blend of two Colombian lots sourced for this harvest.",
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kiambu", corpus=body
+    )
+    assert draft.field_sources["is_blend"] == "origin_estimated"
+
+
+def test_draft_from_identity_is_blend_no_anchor_single_origin_demotes() -> None:
+    """Executable spec: even a perfect on-page "single origin" quote
+    demotes when the page carries no anchor at all (no frontmatter title,
+    no JSON-LD product name) — the main region collapses to "" and there
+    is no whole-corpus fallback."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=False, is_blend_evidence="This is a single origin coffee.")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/no-anchor",
+        corpus="This is a single origin coffee, hand-picked at peak ripeness.",
+    )
+    assert draft.field_sources["is_blend"] == "origin_estimated"
+
+
+def test_draft_from_identity_is_blend_sentinel_paragraph_blend_never_verifies() -> None:
+    body = _framed(
+        "Kenya Kiambu AA",
+        "This is a single origin lot from Kiambu.\n"
+        "\n"
+        "You may also like our house blend for an everyday cup.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=True, is_blend_evidence="our house blend for an everyday cup")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kiambu", corpus=body
+    )
+    assert draft.field_sources["is_blend"] == "origin_estimated"
+
+
+def test_draft_from_identity_is_blend_verifies_under_anchored_heading() -> None:
+    body = _framed(
+        "Kenya Kiambu AA",
+        "## Kenya Kiambu AA\n"
+        "This is our house blend of three lots.\n"
+        "## Shipping Information\n"
+        "This shop also offers a house blend gift box.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(is_blend=True, is_blend_evidence="This is our house blend of three lots.")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kiambu", corpus=body
+    )
+    assert draft.field_sources["is_blend"] == "on_page"
+
+
+def test_draft_from_identity_is_blend_demotes_after_the_next_heading() -> None:
+    """The mirror of the previous test: the SAME page's evidence, cited
+    from the section AFTER the anchored heading closes, demotes."""
+    body = _framed(
+        "Kenya Kiambu AA",
+        "## Kenya Kiambu AA\n"
+        "This is our house blend of three lots.\n"
+        "## Shipping Information\n"
+        "This shop also offers a house blend gift box.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            is_blend=True, is_blend_evidence="This shop also offers a house blend gift box."
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kiambu", corpus=body
+    )
+    assert draft.field_sources["is_blend"] == "origin_estimated"
 
 
 def test_draft_from_identity_marks_every_roast_target_origin_estimated() -> None:
