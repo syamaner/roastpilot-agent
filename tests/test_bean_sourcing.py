@@ -7488,6 +7488,134 @@ async def test_extract_page_markdown_bounded_replaces_poisoned_executor_and_canc
 
 
 @pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_collateral_cancellation_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#607 fold 3 (claude-review on PR #629's rebased head): a submission
+    failure's ``cancel_futures=True`` replacement can collaterally cancel
+    a DIFFERENT, concurrent call's still-queued item on the SAME executor.
+    That call's own task was never told to cancel — it must fall back
+    like any other parse failure, not let ``CancelledError`` escape.
+
+    Call A is admitted and submitted (queued) on a fresh executor whose
+    ``_adjust_thread_count`` is a no-op, so its item genuinely never gets
+    picked up by a worker (deterministic "still queued", no timing race).
+    Call B's submission is then made to raise, triggering
+    ``_replace_poisoned_parse_executor`` — which ``shutdown``s the SAME
+    executor with ``cancel_futures=True``, collaterally cancelling A's
+    queued item."""
+    _reset_parse_pool_state()
+    monkeypatch.setattr(bean_sourcing, "_parse_executor", None)
+    executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+
+    def _never_starts_a_thread() -> None:
+        # A no-op _adjust_thread_count: submitted items sit on the queue
+        # forever, with no worker ever spawned to pick them up.
+        pass
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", _never_starts_a_thread)
+
+    task_a = asyncio.create_task(
+        bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+            "<html>A</html>", timeout_seconds=10.0
+        )
+    )
+    # Let call A run up to its own await point — its item is now queued
+    # (admitted, submitted, never picked up thanks to the no-op above).
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert bean_sourcing._inflight_parse_count == 1  # pyright: ignore[reportPrivateUsage]
+
+    def _raising_adjust_thread_count() -> None:
+        raise OSError("can't start new thread (simulated, #607 fold 3 test)")
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", _raising_adjust_thread_count)
+    result_b = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        "<html>B</html>", timeout_seconds=5.0
+    )
+    assert result_b is None  # B's own submission failure falls back too
+
+    # A's collaterally-cancelled item must ALSO fall back — never raise —
+    # and release its slot.
+    result_a = await task_a
+    assert result_a is None
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_genuine_task_cancellation_propagates() -> None:
+    """#607 fold 3: cancelling the TASK awaiting the parse (e.g. a client
+    disconnect) must propagate ``CancelledError`` — never be swallowed as
+    if it were a collateral cancellation — and the slot is still released
+    via the done-callback once the (already-running) worker actually
+    finishes."""
+    _reset_parse_pool_state()
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocks_until_released(html: str) -> str | None:
+        started.set()
+        release.wait(timeout=5.0)
+        return "should not be observed by the cancelled caller"
+
+    with unittest.mock.patch.object(
+        bean_sourcing, "_extract_page_markdown", _blocks_until_released
+    ):
+        task = asyncio.create_task(
+            bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                "<html></html>", timeout_seconds=10.0
+            )
+        )
+        await _await_condition(started.is_set)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The worker was ALREADY RUNNING when cancelled (concurrent.futures
+        # cannot cancel a running item), so it keeps going in the
+        # background — release it and confirm the slot still comes back.
+        release.set()
+        await _await_condition(
+            lambda: bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_genuine_cancellation_of_a_queued_item_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#607 fold 3 regression guard: a genuine task cancellation of an item
+    that has NOT started running yet also cancels ``concurrent_future``
+    (asyncio's own future-chaining propagates the Task's cancel down to
+    it) — so ``concurrent_future.cancelled()`` alone cannot distinguish
+    this from a collateral cancellation; only ``Task.cancelling() > 0``
+    can. Without that check, this exact case would be misclassified as
+    collateral and silently swallowed instead of propagating."""
+    _reset_parse_pool_state()
+    monkeypatch.setattr(bean_sourcing, "_parse_executor", None)
+    executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+
+    def _never_starts_a_thread() -> None:
+        pass
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", _never_starts_a_thread)
+
+    task = asyncio.create_task(
+        bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+            "<html></html>", timeout_seconds=10.0
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert bean_sourcing._inflight_parse_count == 1  # pyright: ignore[reportPrivateUsage]
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_fetch_page_text_prepends_json_ld_ahead_of_trafilatura_markdown() -> None:
     """The slice-B JSON-LD prepend still lands ahead of the (now
     trafilatura-produced) page-body text (#590 slice C)."""

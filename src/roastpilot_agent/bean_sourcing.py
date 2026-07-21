@@ -923,7 +923,11 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
     ``OSError``) discards/replaces the executor
     (:func:`_replace_poisoned_parse_executor`, since a released slot alone
     would leave a hidden queued parse behind) before releasing the slot
-    and falling back — same as every other extraction failure mode.
+    and falling back — same as every other extraction failure mode. A
+    collaterally-cancelled item (a DIFFERENT call's replacement cancelling
+    OUR still-queued item) falls back the same way; a genuine cancellation
+    of THIS call's own task (``Task.cancelling() > 0``) always propagates
+    (#607 fold 3).
 
     Either branch returns exactly like the pre-#607 call site: ``None``
     tells the caller to fall back to the linear-strip pass
@@ -984,6 +988,24 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
             "deadline; falling back to linear-strip (the worker keeps running in "
             "the dedicated pool — contained to that pool alone, #607)",
             timeout_seconds,
+        )
+        return None
+    except asyncio.CancelledError:
+        # Disambiguation (#607 fold 3): Task.cancelling() > 0 means OUR
+        # task was truly told to cancel (e.g. a client disconnect) —
+        # always re-raise. Otherwise this can only be concurrent_future
+        # itself getting collaterally cancelled by a DIFFERENT call's
+        # executor-replacement (cancel_futures=True) — fall back like any
+        # parse failure. (concurrent_future.cancelled() alone is NOT
+        # reliable here: a genuine cancellation of a not-yet-started item
+        # cancels the future too, via asyncio's own future-chaining.)
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling() > 0:
+            raise
+        _log.debug(
+            "bean_sourcing: dedicated parse pool item cancelled by a "
+            "concurrent submission-failure replacement (#607 fold 3); "
+            "falling back to linear-strip"
         )
         return None
 
