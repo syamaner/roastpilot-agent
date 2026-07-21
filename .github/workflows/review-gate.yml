@@ -76,20 +76,40 @@ name: Review gate
 # `ready_for_review` event to fire a clean, uncancelled run.
 #
 # THE FIX automates exactly that manual retry, scoped tightly so it can never
-# rubber-stamp an unreviewed diff: when `flip-on-review` sees a
-# `cancelled`/`skipped` conclusion (never `failure` — a real crash still
-# requires operator attention, unchanged), it checks (a) whether the PR's
-# CURRENT head SHA still matches the cancelled run's SHA (if a newer push
-# already superseded it, there is nothing to retry — a fresh run for the new
-# SHA is already the stamp-on-pr path's job) and (b) whether any OTHER run of
-# `Claude Code Review` for that same SHA is queued, in progress, or already
-# succeeded (if so, defer to it — it will fire its own `workflow_run` event
-# and re-enter this same logic). Only when the cancelled run was the sole,
-# now-dead attempt for the CURRENT head does it call the Actions API to
-# re-run that exact workflow run. The re-run's own completion re-enters this
+# rubber-stamp an unreviewed diff and can never fight a class it doesn't own:
+#
+#   1. Never clobber a gate that already reads `success` — a stamped
+#      exemption (Dependabot / workflow-editing PR, from stamp-on-pr) or a
+#      prior successful flip already owns this sha; a completion arriving
+#      after that is a no-op, whatever it concluded.
+#   2. Self-heal ONLY on a genuinely `cancelled` conclusion. `skipped` is
+#      NOT a race artifact — every Dependabot PR's claude-review job
+#      completes `skipped`, every single time, by its own job-level
+#      `if: actor != dependabot[bot]` — that's covered by rule 1 above
+#      (stamp-on-pr already stamped it success), not by retrying a job that
+#      structurally can never run. `failure` stays fail-closed exactly as
+#      originally designed — a real crash needs an operator, not a retry.
+#   3. Before retrying: is the PR's CURRENT head SHA still this cancelled
+#      run's SHA? If a newer push already superseded it, there is nothing to
+#      retry — a fresh run for the new SHA is already stamp-on-pr's job.
+#   4. Is there a terminal or in-flight successor for the same SHA — another
+#      run that's queued/in-progress, or already completed `success` OR
+#      `failure`? Defer to it (a `failure` successor is itself a fail-closed
+#      terminal state needing an operator, not grounds to retry a DIFFERENT,
+#      already-cancelled run).
+#   5. Bounded to ONE automatic retry ever, per run: only self-heal when
+#      this is the run's first attempt (`run_attempt == 1`). A re-run reuses
+#      the SAME run id, so if that retry is itself cancelled again, the
+#      successor check in step 4 can never see it as a "different" run —
+#      without this bound it would retry the identical run id forever.
+#      Attempt ≥2 completing `cancelled` stays pending for the operator.
+#
+# Only after all five checks does it call the Actions API to re-run that
+# exact workflow run. The re-run's own completion re-enters this exact
 # script; the gate still only ever flips to `success` on an actual
-# `success` conclusion — never on the cancellation itself. See `flip-on-
-# review`'s script for the concrete logic.
+# `success` conclusion (or on already being `success` per rule 1) — never on
+# the cancellation itself. See `flip-on-review`'s script for the concrete
+# logic.
 
 on:
   # Stamp the gate on every PR head as soon as it appears / updates.
@@ -101,13 +121,16 @@ on:
     workflows: ["Claude Code Review"]
     types: [completed]
 
-# statuses: write posts the commit status. pull-requests: read looks up the
-# PR's current head SHA (self-heal staleness check, #605). actions: write is
-# `flip-on-review`'s #605 self-heal only — re-running a cancelled/skipped
-# `Claude Code Review` run via the Actions API when nothing else will retry
-# it (read access to list runs is included in `write`). No code is checked
-# out or executed from the PR, so this stays safe even on the pull_request
-# trigger (which, for same-repo PRs, runs with the repo token).
+# statuses: write posts AND reads the commit status (`getCombinedStatusForRef`
+# — the #605 fold-2 exemption no-op check — is covered by `statuses: write`,
+# no separate `read` permission exists for statuses). pull-requests: read
+# looks up the PR's current head SHA (self-heal staleness check, #605).
+# actions: write is `flip-on-review`'s #605 self-heal only — listing +
+# re-running a cancelled `Claude Code Review` run via the Actions API when
+# nothing else will retry it (read access to list runs is included in
+# `write`). No code is checked out or executed from the PR, so this stays
+# safe even on the pull_request trigger (which, for same-repo PRs, runs with
+# the repo token).
 permissions:
   contents: read
   statuses: write
@@ -216,15 +239,31 @@ jobs:
               return;
             }
 
-            // #605 self-heal: a `cancelled`/`skipped` conclusion is usually
-            // the #579 concurrency group correctly superseding a stale run —
-            // but sometimes the run for the PR's CURRENT head sha is itself
-            // the one that gets cancelled, with nothing left to retry it
-            // (the draft->ready toggle race). Handle only those two
-            // conclusions here; a genuine `failure` stays fail-closed
-            // exactly as before (a crashed review still needs an operator
-            // to look at it, not an automatic retry loop).
-            if (run.conclusion !== 'cancelled' && run.conclusion !== 'skipped') {
+            // #605 fold 2: never clobber a gate that already reads
+            // `success`. A stamped exemption (Dependabot / workflow-editing
+            // PR, from stamp-on-pr) or a prior successful flip already owns
+            // this sha — a later completion of any kind (including this
+            // PR's own claude-review, which fails-by-design on
+            // workflow-editing PRs like this one) must be a no-op, not a
+            // `pending` re-stamp. This structurally covers fold 1 below too.
+            const combined = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha });
+            const currentGate = combined.data.statuses.find((s) => s.context === 'review-gate');
+            if (currentGate && currentGate.state === 'success') {
+              core.info(
+                `review-gate: ${run.conclusion} run ${run.id} on ${sha} — gate already reads success (exemption stamp or a prior flip); no-op.`,
+              );
+              return;
+            }
+
+            // #605 fold 1: self-heal ONLY on a genuinely `cancelled`
+            // conclusion. `skipped` is NOT a race artifact to retry — every
+            // Dependabot PR's claude-review job completes `skipped`, every
+            // time, by its own job-level `if: actor != dependabot[bot]`; that
+            // class is (also) handled by the exemption no-op above, not by
+            // resurrecting a job that structurally can never run. `failure`
+            // stays fail-closed exactly as originally designed — a real
+            // crash needs an operator, not an automatic retry loop.
+            if (run.conclusion !== 'cancelled') {
               core.info(
                 `review-gate NOT flipping on ${sha}: review run ${run.id} conclusion=${run.conclusion}, staying pending (fail-closed).`,
               );
@@ -233,7 +272,10 @@ jobs:
 
             // Find the PR this run reviewed (same-repo PRs populate
             // `pull_requests` directly; fall back to the commit-associated-PRs
-            // API for the rare case it doesn't).
+            // API for the rare case it doesn't — #605 fold 5: an OPEN PR
+            // whose head sha still matches this run's sha in THIS repo, not
+            // just the first commit-associated PR returned, which can be a
+            // closed/merged or unrelated PR that happens to share history).
             let prNumber = run.pull_requests && run.pull_requests[0]
               ? run.pull_requests[0].number
               : undefined;
@@ -243,11 +285,19 @@ jobs:
                 repo,
                 commit_sha: sha,
               });
-              prNumber = assoc.data[0] && assoc.data[0].number;
+              const match = assoc.data.find(
+                (p) =>
+                  p.state === 'open' &&
+                  p.head &&
+                  p.head.sha === sha &&
+                  p.head.repo &&
+                  p.head.repo.full_name === `${owner}/${repo}`,
+              );
+              prNumber = match && match.number;
             }
             if (!prNumber) {
               core.info(
-                `review-gate: cancelled/skipped run ${run.id} on ${sha} has no associated PR; nothing to self-heal, staying pending.`,
+                `review-gate: cancelled run ${run.id} on ${sha} has no associated OPEN PR with a matching head sha; nothing to self-heal, staying pending.`,
               );
               return;
             }
@@ -260,15 +310,19 @@ jobs:
             const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
             if (pr.data.head.sha !== sha) {
               core.info(
-                `review-gate: cancelled/skipped run ${run.id} targeted stale sha ${sha}; PR #${prNumber} head is now ${pr.data.head.sha} — already superseded, staying pending on the new sha until its own review completes.`,
+                `review-gate: cancelled run ${run.id} targeted stale sha ${sha}; PR #${prNumber} head is now ${pr.data.head.sha} — already superseded, staying pending on the new sha until its own review completes.`,
               );
               return;
             }
 
             // Successor check: if another run of this same workflow for this
-            // exact sha is queued/in-progress, or already succeeded, defer to
-            // it — it will fire its own `workflow_run` completed event and
-            // re-enter this exact script.
+            // exact sha is queued/in-progress, or has already reached a
+            // TERMINAL conclusion of its own (`success` — defer, it will
+            // flip; or `failure` — #605 fold 4: also a terminal, fail-closed
+            // state that needs an operator, not grounds to retry a
+            // different, already-cancelled run), defer to it. It will fire
+            // its own `workflow_run` completed event and re-enter this exact
+            // script.
             const runsForSha = await github.rest.actions.listWorkflowRuns({
               owner,
               repo,
@@ -276,16 +330,33 @@ jobs:
               head_sha: sha,
             });
             const successor = runsForSha.data.workflow_runs.find(
-              (r) => r.id !== run.id && (r.status !== 'completed' || r.conclusion === 'success'),
+              (r) =>
+                r.id !== run.id &&
+                (r.status !== 'completed' || r.conclusion === 'success' || r.conclusion === 'failure'),
             );
             if (successor) {
               core.info(
-                `review-gate: cancelled/skipped run ${run.id} on ${sha} has a successor (run ${successor.id}, status=${successor.status}, conclusion=${successor.conclusion}) — deferring to it, staying pending.`,
+                `review-gate: cancelled run ${run.id} on ${sha} has a successor (run ${successor.id}, status=${successor.status}, conclusion=${successor.conclusion}) — deferring to it, staying pending.`,
               );
               return;
             }
 
-            // This cancelled/skipped run was the only attempt for the
+            // #605 fold 3: bound self-heal to exactly ONE automatic retry.
+            // `reRunWorkflow` reuses the SAME run id, only bumping
+            // `run_attempt` — so if that retry is itself cancelled again
+            // (an operator deliberately cancelling it, or the same toggle
+            // race repeating), the successor check above can never see it as
+            // a *different* run, and without this bound we would rerun the
+            // identical run id forever. Self-heal only ever fires on this
+            // run's first completion.
+            if (run.run_attempt && run.run_attempt >= 2) {
+              core.notice(
+                `review-gate: cancelled run ${run.id} on ${sha} is already retry attempt ${run.run_attempt}; #605 self-heal retries automatically only once. Staying pending — needs operator attention (manual \`gh pr ready --undo && gh pr ready\` still works).`,
+              );
+              return;
+            }
+
+            // This cancelled run was the only (first-attempt) run for the
             // CURRENT head sha and nothing else will retry it automatically.
             // Self-heal: re-run this exact workflow run (the API re-runs it
             // against the same commit/ref it originally targeted). This is
@@ -301,10 +372,10 @@ jobs:
                 sha,
                 context: 'review-gate',
                 state: 'pending',
-                description: '#605 self-heal: re-running a cancelled/skipped review with no successor.'.slice(0, 140),
+                description: '#605 self-heal: re-running a cancelled review with no successor (1 of 1 auto-retries).'.slice(0, 140),
               });
               core.info(
-                `review-gate: #605 self-heal — re-ran ${run.conclusion} run ${run.id} on ${sha} (no successor found); staying pending until it completes.`,
+                `review-gate: #605 self-heal — re-ran cancelled run ${run.id} on ${sha} (attempt 1, no successor found); staying pending until it completes.`,
               );
             } catch (err) {
               // Fail-closed, not fail-loud: leave the stamp-time `pending`
