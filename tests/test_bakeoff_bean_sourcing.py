@@ -1704,6 +1704,26 @@ def test_environment_fingerprint_is_stable_across_calls() -> None:
     assert first  # this env has installed distributions
 
 
+def test_environment_fingerprint_changes_with_interpreter_and_platform_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The distribution set alone misses the RUNTIME itself: identical packages under
+    Python 3.12 vs 3.11 (or a different interpreter/OS) must NOT fingerprint the same, or
+    a checkpoint could resume across interpreters (#602 fold round 7)."""
+    baseline = bo._environment_fingerprint()  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(bo.platform, "python_version", lambda: "9.9.9")
+    assert bo._environment_fingerprint() != baseline  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.undo()
+
+    monkeypatch.setattr(bo.platform, "platform", lambda: "Some-Other-Platform-x86")
+    assert bo._environment_fingerprint() != baseline  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.undo()
+
+    monkeypatch.setattr(bo.sys.implementation, "name", "fake-impl")
+    assert bo._environment_fingerprint() != baseline  # pyright: ignore[reportPrivateUsage]
+
+
 def test_pipeline_fingerprint_changes_when_the_environment_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

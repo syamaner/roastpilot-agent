@@ -117,6 +117,7 @@ import inspect
 import itertools
 import json
 import os
+import platform
 import random
 import re
 import sys
@@ -1848,11 +1849,7 @@ def wilson_interval(successes: int, trials: int, *, z: float = 1.959963984540054
 
 
 def binary_cor_counts(run: ModelRun) -> tuple[int, int]:
-    """``(COR, trials)`` for the strictly-binary COR-vs-not Wilson view.
-
-    PAR is EXCLUDED from ``trials`` (#602 fold round 5): a partial match is neither a
-    success nor a countable trial in this binary COR-vs-{INC,MIS} decomposition.
-    """
+    """``(COR, trials)``, strictly-binary COR-vs-{INC,MIS} (PAR excluded, #602)."""
     counts = tally(all_outcomes(run))
     trials = counts.cor + counts.inc + counts.mis
     return counts.cor, trials
@@ -2256,18 +2253,23 @@ def sidecar_path(out: Path) -> Path:
 
 
 def _environment_fingerprint() -> str:
-    """A stable fingerprint of the ENTIRE installed distribution set.
+    """A stable fingerprint of the WHOLE environment: interpreter, platform, distributions.
 
-    Categorical replacement for a hand-picked dependency list (#602 fold round 6, FOLD 2): a
+    Categorical replacement for a hand-picked dependency list (#602 fold round 6): a
     TRANSITIVE dependency moving (e.g. jusText/courlan under ``trafilatura``) invalidates
-    resume too, with no enumeration arms race. Deliberately conservative: ANY environment
-    change invalidates resume (a fresh venv just re-runs everything), never silently wrong.
+    resume too, with no enumeration arms race. The distribution set alone missed the RUNTIME
+    itself (#602 fold round 7: same packages under Python 3.12 vs 3.11 would otherwise
+    fingerprint identically) -- also hashes ``sys.implementation.name``, the full
+    ``platform.python_version()`` (micro included), and ``platform.platform()`` (OS/arch).
+    Deliberately conservative: ANY environment change invalidates resume, never silently wrong.
 
     Returns:
-        A stable string built from every installed distribution's sorted ``(name, version)``.
+        A stable string built from the interpreter/platform identity plus every installed
+        distribution's sorted ``(name, version)``.
     """
     pairs = sorted((dist.name, dist.version) for dist in importlib.metadata.distributions())
-    return "|".join(f"{name}=={version}" for name, version in pairs)
+    identity = f"{sys.implementation.name}|{platform.python_version()}|{platform.platform()}"
+    return identity + "|" + "|".join(f"{name}=={version}" for name, version in pairs)
 
 
 def _pipeline_fingerprint() -> str:
@@ -2353,16 +2355,13 @@ def _load_checkpoint_lines(path: Path) -> list[dict[str, Any]]:
     A kill mid-``write`` can leave the LAST line an incomplete, newline-LESS JSON object (one
     ``write()`` call cut off before the trailing ``\\n``) -- unrepaired, the next invocation
     raises and loses every earlier, already-paid-for record too (#600). A malformed line
-    elsewhere, OR a malformed FINAL line that DOES end with a newline (#602 fold round 4: that
-    write completed, so it's genuine corruption, not an interrupted append), still raises for
-    manual recovery -- only a newline-less tail is auto-repaired, ATOMICALLY (see
-    :func:`_atomic_write_text`): a non-atomic rewrite would itself risk destroying recovered
-    records on a second crash mid-repair.
-
-    A kill can ALSO land right after the complete JSON payload but before its trailing
-    ``\\n`` -- that line parses FINE here, so the repair above never fires, yet the next
-    :meth:`Checkpoint.append` would concatenate directly onto it (#602 fold round 6, FOLD 3).
-    So after every line parses, a still-missing final newline is normalised in atomically.
+    elsewhere, OR a malformed FINAL line that DOES end with a newline (#602 round 4: that write
+    completed, so it's genuine corruption, not an interrupted append), still raises for manual
+    recovery -- only a newline-less tail is auto-repaired, ATOMICALLY (see
+    :func:`_atomic_write_text`). A kill can ALSO land right after the complete JSON payload but
+    before its trailing ``\\n`` -- that line parses FINE, so the repair above never fires, yet
+    the next :meth:`Checkpoint.append` would concatenate onto it (#602 round 6): a still-missing
+    final newline is normalised in atomically after every line parses.
 
     Args:
         path: The sidecar JSONL path.
@@ -2568,10 +2567,9 @@ def _has_any_success(run: ModelRun) -> bool:
 class FailedRun:
     """A wholly-failed run this invocation -- NEVER checkpointed (#602 fold round 5).
 
-    Rounds 3-4 eagerly checkpointed a "provable" MODEL-SPECIFIC failure -- backwards AND
-    unfixable, since no invocation-local signal can tell a transient outage apart from a
-    model-specific fault. Failed attempts are CHEAP to retry; a mis-scored failure is
-    EXPENSIVE to fix -- so every wholly-failed run is excluded and NEVER checkpointed.
+    Rounds 3-4 eagerly checkpointed a "provable" MODEL-SPECIFIC failure -- unfixable, since
+    no invocation-local signal can tell a transient outage apart from a model-specific fault.
+    Failed attempts are CHEAP to retry; a mis-scored failure is EXPENSIVE to fix.
 
     Attributes:
         model_slug: The failed model.
