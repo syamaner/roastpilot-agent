@@ -2740,10 +2740,23 @@ def _bean_sourcing_agent(
 
 @dataclass
 class BeanSourcingDiagnostics:
-    """Opt-in mutable accumulator: ``schema_retries`` counts ``RetryPromptPart``
-    occurrences a success recovered from (#601 F2 -- otherwise invisible)."""
+    """Opt-in mutable accumulator, populated only when passed in (#601).
+
+    Attributes:
+        schema_retries: ``RetryPromptPart`` occurrences a success recovered from
+            (F2 -- otherwise invisible).
+        request_tokens: Input/prompt tokens for the extraction call, from
+            ``AgentRunResult.usage.input_tokens`` -- PydanticAI already SUMS this
+            across every request in the run (retries included), so this is the
+            run TOTAL, not just the final request.
+        response_tokens: Output/completion tokens, same run-total semantics
+            (``AgentRunResult.usage.output_tokens``). Tokens only -- pricing is
+            harness policy, not a runtime concern.
+    """
 
     schema_retries: int = 0
+    request_tokens: int = 0
+    response_tokens: int = 0
 
 
 async def _extract_bean_identity(
@@ -2838,6 +2851,8 @@ async def _extract_bean_identity(
             if isinstance(msg, ModelRequest)
             for part in msg.parts
         )
+        diagnostics.request_tokens += result.usage.input_tokens
+        diagnostics.response_tokens += result.usage.output_tokens
     return result.output
 
 

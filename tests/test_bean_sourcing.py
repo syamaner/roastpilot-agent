@@ -2297,6 +2297,67 @@ async def test_extract_bean_identity_counts_a_recovered_validation_retry() -> No
 
 
 @pytest.mark.asyncio
+async def test_extract_bean_identity_captures_token_usage() -> None:
+    """A successful extraction call's actual token usage lands in the accumulator
+    (#601 usage-capture slice) -- populated ONLY when diagnostics is passed in."""
+    model = _function_model_returning(_identity_args())
+    diagnostics = bean_sourcing.BeanSourcingDiagnostics()
+    identity = await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text", advisor_config=_ADVISOR_CONFIG, model=model, diagnostics=diagnostics
+    )
+    assert identity.name == "Kenya Kiambu AA (Washed)"
+    assert diagnostics.request_tokens > 0
+    assert diagnostics.response_tokens > 0
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_token_usage_includes_the_retry_round_trip() -> None:
+    """PydanticAI's own ``RunUsage`` already SUMS every request in the run, so a
+    retry-recovered extraction's captured tokens include the retry round trip, not
+    just the final successful request -- verified empirically against installed
+    pydantic-ai-slim 1.107.1 (``RunUsage`` docstring: "Pydantic AI simply sums the
+    usage information across requests"; a 2-request run reports strictly more
+    tokens than a 1-request run over the same messages)."""
+    baseline_diagnostics = bean_sourcing.BeanSourcingDiagnostics()
+    await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_function_model_returning(_identity_args()),
+        diagnostics=baseline_diagnostics,
+    )
+
+    calls = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ModelResponse(parts=[TextPart("not yet structured")])
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, _identity_args())])
+
+    retry_diagnostics = bean_sourcing.BeanSourcingDiagnostics()
+    await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text",
+        advisor_config=_ADVISOR_CONFIG,
+        model=FunctionModel(respond),
+        diagnostics=retry_diagnostics,
+    )
+    assert retry_diagnostics.request_tokens > baseline_diagnostics.request_tokens
+    assert retry_diagnostics.response_tokens > baseline_diagnostics.response_tokens
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_omitted_diagnostics_captures_no_usage() -> None:
+    """Omitting ``diagnostics`` (every pre-existing caller) is a behaviour-preserving
+    no-op -- no token capture attempted, no crash (#601 usage-capture slice)."""
+    identity = await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text",
+        advisor_config=_ADVISOR_CONFIG,
+        model=_function_model_returning(_identity_args()),
+    )
+    assert identity.name == "Kenya Kiambu AA (Washed)"
+
+
+@pytest.mark.asyncio
 async def test_extract_bean_identity_maps_provider_error() -> None:
     """#613: a provider/transport error is DEPENDENCY-origin."""
     model = _function_model_raising(
