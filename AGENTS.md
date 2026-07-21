@@ -243,11 +243,17 @@ checklist before you open.
   from the branch's MERGE BASE (not the advancing `origin/main` tip):
   `git diff --stat $(git merge-base origin/main HEAD)` (equivalently
   `git diff --stat origin/main...HEAD`), minus data/fixtures/generated/doc files (those
-  are exempt and go in their own PR per the rule above). If the logic diff exceeds **400**,
-  the PR plan was too coarse — split to the planned slice boundary before opening. Enough
-  slices that every one is under the cap: the ~2,000-line #600 harness was ~5–6 reviewable
-  logic slices (scoring / stats / runner / report), not 4. The number is exact (400), the
-  slicing is what flexes.
+  are exempt and go in their own PR per the rule above). **Test files are also exempt
+  from the 400 count** (operator ruling, 21 Jul — #621): the cap bounds the reviewable
+  LOGIC change, and much test bulk is spec-corpus material (parametrised repro tables —
+  data in test form). The quality valve replacing the count: **any PR whose test-file
+  diff exceeds **600** lines (exact threshold) triggers a mandatory `qa` reviewer pass
+  pre-open** — test
+  quality is policed by the qa lens, not by rationing test lines. If the logic diff
+  exceeds **400**, the PR plan was too coarse — split to the planned slice boundary
+  before opening. Enough slices that every one is under the cap: the ~2,000-line #600
+  harness was ~5–6 reviewable logic slices (scoring / stats / runner / report), not 4.
+  The number is exact (400), the slicing is what flexes.
 - **Shift review LEFT — mandatory, not optional.** Before opening: run all gates +
   an adversarial self-critique, AND run the domain reviewer on the BRANCH
   (`safety-reviewer` for safety/controller/enum/recovery, `qa` for tests) and
