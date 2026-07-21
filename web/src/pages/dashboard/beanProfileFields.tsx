@@ -30,6 +30,19 @@ import {
 } from "./beanProfileDraft";
 
 /**
+ * Joins space-separated `aria-describedby` ids, skipping any that are
+ * `undefined` — used to append the provenance badge / evidence quote ids to
+ * a control's existing hint/error id without clobbering it (#627
+ * accessibility fold). Returns `undefined` (not `""`) when every id is
+ * absent, so the attribute is omitted exactly as it is without provenance —
+ * "renders exactly as today" holds at the attribute level too.
+ */
+function joinDescribedBy(...ids: (string | undefined)[]): string | undefined {
+  const present = ids.filter((value): value is string => value !== undefined);
+  return present.length > 0 ? present.join(" ") : undefined;
+}
+
+/**
  * Per-field provenance badge (#627): "on page" when the server read the
  * value straight off the vendor page; "review" when it was imputed and
  * never code-confirmed — every typed-field citation gate is permanently
@@ -37,12 +50,21 @@ import {
  * below it, when one was captured) before trusting it. Same visual language
  * as the shared `VerdictBadge` / `OutcomeBadge` (roast-nominal/caution
  * tokens), kept page-local since it renders a bean-metadata Literal, not a
- * safety verdict.
+ * safety verdict. Takes an `id` so the owning control's `aria-describedby`
+ * can reference it (#627 accessibility fold) — otherwise a screen reader in
+ * forms mode announces only the label/hint and skips this cue entirely.
  */
-function ProvenanceBadge({ source }: { source: FieldSourceValue }): React.JSX.Element {
+function ProvenanceBadge({
+  id,
+  source,
+}: {
+  id: string;
+  source: FieldSourceValue;
+}): React.JSX.Element {
   const onPage = source === "on_page";
   return (
     <span
+      id={id}
       data-testid="field-provenance-badge"
       data-provenance={source}
       title={
@@ -71,17 +93,24 @@ function ProvenanceBadge({ source }: { source: FieldSourceValue }): React.JSX.El
  * with an expand toggle for the rare long quote (server-bounded to 500
  * chars) — mirrors the `DecisionTraceTable` rationale clamp pattern; the
  * full quote is always present in the DOM/accessibility tree, clamp is
- * visual only. The quote span is bidi-isolated (`dir="ltr"` +
+ * visual only — and only applied when the quote is actually `truncatable`
+ * (the same threshold that renders the expand toggle): a short quote that
+ * merely wraps onto a couple of lines has no way to un-clamp itself, so it
+ * is left unclamped rather than silently hiding text with no escape hatch
+ * (#627 fold). The quote span is bidi-isolated (`dir="ltr"` +
  * `unicode-bidi: isolate`) so a U+202E (or other bidi-override) character in
  * the vendor text cannot visually invert this quoted-authority framing, and
  * carries `break-words` so a long unbroken token never paints outside the
- * flex box once expanded (security review, #627).
+ * flex box once expanded (security review, #627). Takes an `id` so the
+ * owning control's `aria-describedby` can reference it (#627 accessibility
+ * fold).
  */
-function EvidenceQuote({ quote, testId }: { quote: string; testId: string }): React.JSX.Element {
+function EvidenceQuote({ id, quote, testId }: { id: string; quote: string; testId: string }): React.JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const truncatable = quote.length > 160;
   return (
     <blockquote
+      id={id}
       data-testid={testId}
       className="flex items-start gap-2 border-l-2 border-muted-foreground/30 pl-2 text-xs text-muted-foreground"
     >
@@ -92,7 +121,7 @@ function EvidenceQuote({ quote, testId }: { quote: string; testId: string }): Re
           data-testid={`${testId}-text`}
           className={cn(
             "italic break-words [unicode-bidi:isolate]",
-            !expanded && "line-clamp-2",
+            truncatable && !expanded && "line-clamp-2",
           )}
         >
           &ldquo;{quote}&rdquo;
@@ -157,10 +186,13 @@ export function Field({
 }: FieldProps): React.JSX.Element {
   const errorId = `${testIdPrefix}-${id}-error`;
   const hintId = `${testIdPrefix}-${id}-hint`;
-  const describedBy = error !== undefined ? errorId : hint !== undefined ? hintId : undefined;
+  const provenanceId = provenance !== undefined ? `${testIdPrefix}-${id}-provenance` : undefined;
+  const evidenceId = evidenceQuote !== undefined ? `${testIdPrefix}-${id}-evidence` : undefined;
+  const baseDescribedBy = error !== undefined ? errorId : hint !== undefined ? hintId : undefined;
+  const describedBy = joinDescribedBy(baseDescribedBy, provenanceId, evidenceId);
   return (
     <div className={cn("flex flex-col gap-1", wide && "sm:col-span-2")}>
-      {provenance === undefined ? (
+      {provenance === undefined || provenanceId === undefined ? (
         <label
           htmlFor={`${testIdPrefix}-${id}`}
           className="text-xs font-semibold uppercase tracking-wide text-muted-foreground"
@@ -175,7 +207,7 @@ export function Field({
           >
             {label}
           </label>
-          <ProvenanceBadge source={provenance} />
+          <ProvenanceBadge id={provenanceId} source={provenance} />
         </div>
       )}
       <input
@@ -212,8 +244,8 @@ export function Field({
           </span>
         )
       )}
-      {evidenceQuote !== undefined && (
-        <EvidenceQuote quote={evidenceQuote} testId={`${testIdPrefix}-${id}-evidence`} />
+      {evidenceQuote !== undefined && evidenceId !== undefined && (
+        <EvidenceQuote id={evidenceId} quote={evidenceQuote} testId={evidenceId} />
       )}
     </div>
   );
@@ -248,9 +280,12 @@ function Select({
   evidenceQuote,
 }: SelectProps): React.JSX.Element {
   const hintId = `${testIdPrefix}-${id}-hint`;
+  const provenanceId = provenance !== undefined ? `${testIdPrefix}-${id}-provenance` : undefined;
+  const evidenceId = evidenceQuote !== undefined ? `${testIdPrefix}-${id}-evidence` : undefined;
+  const describedBy = joinDescribedBy(hintId, provenanceId, evidenceId);
   return (
     <div className="flex flex-col gap-1">
-      {provenance === undefined ? (
+      {provenance === undefined || provenanceId === undefined ? (
         <label
           htmlFor={`${testIdPrefix}-${id}`}
           className="text-xs font-semibold uppercase tracking-wide text-muted-foreground"
@@ -265,7 +300,7 @@ function Select({
           >
             {label}
           </label>
-          <ProvenanceBadge source={provenance} />
+          <ProvenanceBadge id={provenanceId} source={provenance} />
         </div>
       )}
       <select
@@ -273,7 +308,7 @@ function Select({
         name={id}
         value={value}
         onChange={onChange}
-        aria-describedby={hintId}
+        aria-describedby={describedBy}
         data-testid={`${testIdPrefix}-${id}`}
         className="rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus:ring-1 focus:ring-ring"
       >
@@ -286,8 +321,8 @@ function Select({
       <span id={hintId} className="text-xs text-muted-foreground">
         {hint}
       </span>
-      {evidenceQuote !== undefined && (
-        <EvidenceQuote quote={evidenceQuote} testId={`${testIdPrefix}-${id}-evidence`} />
+      {evidenceQuote !== undefined && evidenceId !== undefined && (
+        <EvidenceQuote id={evidenceId} quote={evidenceQuote} testId={evidenceId} />
       )}
     </div>
   );
@@ -565,9 +600,13 @@ function BlendToggle({
   provenance,
   evidenceQuote,
 }: BlendToggleProps): React.JSX.Element {
+  const provenanceId =
+    provenance !== undefined ? `${testIdPrefix}-is_blend-provenance` : undefined;
+  const evidenceId = evidenceQuote !== undefined ? `${testIdPrefix}-is_blend-evidence` : undefined;
+  const describedBy = joinDescribedBy(provenanceId, evidenceId);
   return (
     <div className="flex flex-col gap-1 sm:col-span-2">
-      {provenance === undefined ? (
+      {provenance === undefined || provenanceId === undefined ? (
         <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
           Blend
         </span>
@@ -576,7 +615,7 @@ function BlendToggle({
           <span className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
             Blend
           </span>
-          <ProvenanceBadge source={provenance} />
+          <ProvenanceBadge id={provenanceId} source={provenance} />
         </div>
       )}
       <label htmlFor={`${testIdPrefix}-is_blend`} className="flex items-center gap-2 text-sm">
@@ -586,6 +625,7 @@ function BlendToggle({
           type="checkbox"
           checked={checked}
           onChange={onChange}
+          aria-describedby={describedBy}
           data-testid={`${testIdPrefix}-is_blend`}
           className="h-4 w-4 rounded border-input bg-background accent-roast-coffee"
         />
@@ -596,8 +636,8 @@ function BlendToggle({
           ? "Put the secondary beans / components in the description below."
           : "Single origin — leave off, or turn on for a blend."}
       </span>
-      {evidenceQuote !== undefined && (
-        <EvidenceQuote quote={evidenceQuote} testId={`${testIdPrefix}-is_blend-evidence`} />
+      {evidenceQuote !== undefined && evidenceId !== undefined && (
+        <EvidenceQuote id={evidenceId} quote={evidenceQuote} testId={evidenceId} />
       )}
     </div>
   );

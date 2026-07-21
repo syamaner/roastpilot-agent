@@ -148,6 +148,11 @@ describe("BeanProfileFields draft-review provenance + evidence (#627b)", () => {
     const toggle = screen.getByTestId(`${PREFIX}-processing-evidence-toggle`);
     expect(toggle).toHaveAttribute("aria-expanded", "false");
     expect(toggle).toHaveTextContent(/more/i);
+    // The clamp class is applied while collapsed — the whole point of the
+    // toggle (#627 fold 1).
+    expect(screen.getByTestId(`${PREFIX}-processing-evidence-text`)).toHaveClass(
+      "line-clamp-2",
+    );
 
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-expanded", "true");
@@ -157,11 +162,106 @@ describe("BeanProfileFields draft-review provenance + evidence (#627b)", () => {
     expect(screen.getByTestId(`${PREFIX}-processing-evidence`)).toHaveTextContent(longQuote);
   });
 
-  it("does not show an expand toggle for a short quote", () => {
+  it("does not clamp or show an expand toggle for a short quote (#627 fold 1)", () => {
+    // Below the truncatable threshold (160 chars) but long enough to wrap
+    // onto a couple of lines on a narrow (mobile single-column) layout — it
+    // must render unclamped, since there is no toggle to un-clamp it with.
+    const shortButWrapping =
+      "Grown on a small family farm at moderate altitude, hand-picked and sun-dried on raised beds.";
     renderFields({
       ...DEFAULT_BEAN_PROFILE_DRAFT,
-      field_evidence: { processing: "Washed" },
+      field_evidence: { processing: shortButWrapping },
     });
     expect(screen.queryByTestId(`${PREFIX}-processing-evidence-toggle`)).toBeNull();
+    expect(screen.getByTestId(`${PREFIX}-processing-evidence-text`)).not.toHaveClass(
+      "line-clamp-2",
+    );
+  });
+});
+
+describe("BeanProfileFields draft-review aria-describedby association (#627b fold 2)", () => {
+  it("input: aria-describedby is unchanged (hint only) when provenance/evidence are absent", () => {
+    renderFields(DEFAULT_BEAN_PROFILE_DRAFT);
+    const input = screen.getByTestId(`${PREFIX}-altitude_m`);
+    expect(input).toHaveAttribute("aria-describedby", `${PREFIX}-altitude_m-hint`);
+  });
+
+  it("input: aria-describedby includes the provenance badge id, and the badge carries that id", () => {
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_sources: { altitude_m: "origin_estimated" },
+    });
+    const input = screen.getByTestId(`${PREFIX}-altitude_m`);
+    const badge = screen.getByTestId("field-provenance-badge");
+    expect(badge).toHaveAttribute("id", `${PREFIX}-altitude_m-provenance`);
+    expect(input.getAttribute("aria-describedby")?.split(" ")).toContain(
+      `${PREFIX}-altitude_m-provenance`,
+    );
+  });
+
+  it("input: aria-describedby includes the evidence quote id, and the quote carries that id", () => {
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_evidence: { altitude_m: "Grown at 1900m" },
+    });
+    const input = screen.getByTestId(`${PREFIX}-altitude_m`);
+    const quote = screen.getByTestId(`${PREFIX}-altitude_m-evidence`);
+    expect(quote).toHaveAttribute("id", `${PREFIX}-altitude_m-evidence`);
+    expect(input.getAttribute("aria-describedby")?.split(" ")).toContain(
+      `${PREFIX}-altitude_m-evidence`,
+    );
+  });
+
+  it("input: aria-describedby carries the hint, provenance, and evidence ids together, without clobbering the hint", () => {
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_sources: { altitude_m: "origin_estimated" },
+      field_evidence: { altitude_m: "Grown at 1900m" },
+    });
+    const input = screen.getByTestId(`${PREFIX}-altitude_m`);
+    const describedBy = input.getAttribute("aria-describedby")?.split(" ") ?? [];
+    expect(describedBy).toEqual(
+      expect.arrayContaining([
+        `${PREFIX}-altitude_m-hint`,
+        `${PREFIX}-altitude_m-provenance`,
+        `${PREFIX}-altitude_m-evidence`,
+      ]),
+    );
+  });
+
+  it("select: aria-describedby carries the hint, provenance, and evidence ids together", () => {
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_sources: { processing: "on_page" },
+      field_evidence: { processing: "Washed" },
+    });
+    const select = screen.getByTestId(`${PREFIX}-processing`);
+    const describedBy = select.getAttribute("aria-describedby")?.split(" ") ?? [];
+    expect(describedBy).toEqual(
+      expect.arrayContaining([
+        `${PREFIX}-processing-hint`,
+        `${PREFIX}-processing-provenance`,
+        `${PREFIX}-processing-evidence`,
+      ]),
+    );
+  });
+
+  it("checkbox: has no aria-describedby when provenance/evidence are absent (unchanged from today)", () => {
+    renderFields(DEFAULT_BEAN_PROFILE_DRAFT);
+    const checkbox = screen.getByTestId(`${PREFIX}-is_blend`);
+    expect(checkbox).not.toHaveAttribute("aria-describedby");
+  });
+
+  it("checkbox: aria-describedby references the provenance badge + evidence quote when present", () => {
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_sources: { is_blend: "origin_estimated" },
+      field_evidence: { is_blend: "A single-origin lot" },
+    });
+    const checkbox = screen.getByTestId(`${PREFIX}-is_blend`);
+    const describedBy = checkbox.getAttribute("aria-describedby")?.split(" ") ?? [];
+    expect(describedBy).toEqual(
+      expect.arrayContaining([`${PREFIX}-is_blend-provenance`, `${PREFIX}-is_blend-evidence`]),
+    );
   });
 });
