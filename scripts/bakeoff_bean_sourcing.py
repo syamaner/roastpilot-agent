@@ -56,12 +56,12 @@ model can only ever land ``MIS`` (a correct abstention) or ``INC`` (a leaked
 scalar, always tagged ``on_page``) -- never ``COR`` -- uniformly deflating
 recall/macro-F1 on the two RANGE-altitude corpus pages
 (``cbc-costa-rica-laminita-tarrazu``, ``counterculture-concepcion-huista``)
-regardless of model quality. This does not change the bake-off's *relative*
-ranking (the gap is systematic across every model), but it does deflate the
-absolute recall/macro-F1 numbers; see the report's committed
-:data:`CAVEAT_TEXT` and the results doc's Honest caveats section, which both
-disclose it. Aligning the harness's RANGE contract with a real midpoint/
-``origin_estimated`` extractor feature is deferred to #590.
+regardless of model quality. **This does NOT guarantee an unchanged relative ranking** (#602
+correction -- prior wording overclaimed this): ``MIS`` (weight 0) and ``INC`` (weight -0.5) are
+different penalties, so one model abstaining while another leaks a scalar here CAN shift
+``CombinedScore``/macro-F1 ordering. The committed 19 Jul run saw uniform abstention on both
+cells -- a property of THAT run, not a guarantee; see :data:`CAVEAT_TEXT` and the results doc.
+Aligning the RANGE contract with a real midpoint/``origin_estimated`` feature is deferred to #590.
 
 **Evidence-quote capture (#612).** Every ``pages[*].extracted`` record already
 carries the drafted :attr:`~roastpilot_agent.models.BeanProfileDraft.field_sources`
@@ -112,10 +112,12 @@ import argparse
 import asyncio
 import dataclasses
 import hashlib
+import importlib.metadata
 import inspect
 import itertools
 import json
 import os
+import platform
 import random
 import re
 import sys
@@ -124,8 +126,9 @@ import unicodedata
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from math import comb, sqrt
+from math import comb, isfinite, sqrt
 from pathlib import Path
+from types import ModuleType
 from typing import Any, cast
 
 import httpx
@@ -134,7 +137,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))  # editable
 
 from pydantic_ai.models import Model  # noqa: E402
 
+import roastpilot_agent.advisor as _advisor_module  # noqa: E402
 import roastpilot_agent.bean_sourcing as _bean_sourcing_module  # noqa: E402
+import roastpilot_agent.config as _config_module  # noqa: E402
+import roastpilot_agent.models as _models_module  # noqa: E402
 from roastpilot_agent.bean_sourcing import (  # noqa: E402
     BeanSourcingError,
     draft_bean_profile_from_url,
@@ -145,6 +151,22 @@ from roastpilot_agent.config import (  # noqa: E402
     BeanSourcingConfig,
 )
 from roastpilot_agent.models import BeanProfileDraft  # noqa: E402
+
+#: The first-party ``roastpilot_agent`` modules transitively imported by the
+#: evaluated extraction call path (``draft_bean_profile_from_url``) that can
+#: change a drafted RESULT: preprocessing/extraction (``bean_sourcing``),
+#: provider/model construction (``advisor.build_model``), config defaults
+#: (``AdvisorConfig``/``BeanSourcingConfig``), and schema/validation
+#: (``BeanProfileDraft``). INCLUSION RULE (#602): hash every first-party
+#: module on that call path whose source can change a result. Third-party
+#: dependencies are hashed CATEGORICALLY instead of a hand-picked list --
+#: see :func:`_environment_fingerprint` (#602 fold round 6, FOLD 2).
+_FINGERPRINTED_MODULES: tuple[ModuleType, ...] = (
+    _bean_sourcing_module,
+    _advisor_module,
+    _config_module,
+    _models_module,
+)
 
 # --- Constants ---------------------------------------------------------------
 
@@ -490,6 +512,35 @@ def _validate_gold_value_type(slug: str, spec: FieldSpec, value: Any) -> None:
         raise AssertionError(f"unhandled FieldSpec.kind {spec.kind!r} for {spec.name!r}")
 
 
+def _validate_accept_any_of(slug: str, spec: FieldSpec, value: Any) -> None:
+    """Validate an optional gold-ABSENT ``accept_any_of`` tolerance list.
+
+    Runs at corpus-LOAD time, same as :func:`_validate_gold_value_type`, so a malformed list
+    (e.g. a non-string entry) fails fast BEFORE any paid call (#602 fold 3). Every entry must
+    also yield >=1 token under the SAME :func:`words` normalisation scoring uses (#602 fold
+    round 8): a stopword/punctuation-only entry (``"the"``, ``"---"``) strips to zero tokens,
+    so it can never match -- an advertised tolerance silently dead until a paid run reveals it.
+
+    Args:
+        slug: The fixture stem (for the error message).
+        spec: The field spec (for the error message).
+        value: The candidate ``accept_any_of`` payload.
+
+    Raises:
+        ValueError: If ``value`` isn't a list of non-empty strings, or any entry has no
+            matchable token after :func:`words` normalisation.
+    """
+    label = f"{slug}.gold.json: field {spec.name!r} 'accept_any_of'"
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a non-empty list of non-empty strings, got {value!r}")
+    items = cast("list[Any]", value)
+    if not items or not all(isinstance(v, str) and v.strip() for v in items):
+        raise ValueError(f"{label} must be a non-empty list of non-empty strings, got {value!r}")
+    for item in cast("list[str]", items):
+        if not words(item):
+            raise ValueError(f"{label} entry {item!r} has no matchable token (never matches)")
+
+
 def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> None:
     """Validate every scored field has exactly one of ``{"value": ...}`` / ``{"absent": true}``.
 
@@ -499,7 +550,9 @@ def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> N
     and only then crashing in :func:`render_report`'s unconditional per-field
     indexing (#600 finding) -- extended in round 2 to also validate the
     ``value`` payload's TYPE (see :func:`_validate_gold_value_type`), not
-    just that the ``"value"`` key exists.
+    just that the ``"value"`` key exists, and in #602 (fold 3) to also
+    validate an optional ``accept_any_of`` tolerance list on an ABSENT field
+    (see :func:`_validate_accept_any_of`).
 
     Args:
         slug: The fixture stem (for the error message).
@@ -507,8 +560,12 @@ def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> N
 
     Raises:
         ValueError: If a required field is missing, has neither/both of
-            ``"value"``/``"absent": true``, or a present ``"value"`` has the
-            wrong type/shape for its field kind.
+            ``"value"``/``"absent": true``, a present ``"value"`` has the wrong
+            type/shape, ``"value"`` and ``accept_any_of`` are BOTH present (the
+            latter is absent-only), ``accept_any_of`` is on a field whose
+            classifier never consults it (see
+            :data:`_ACCEPT_ANY_OF_ELIGIBLE_FIELDS`), or it is not a non-empty
+            string list.
     """
     for spec in FIELD_SPECS:
         field = gold_fields.get(spec.name)
@@ -525,7 +582,21 @@ def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> N
                 "{'value': ...} or {'absent': true}, got " + repr(field)
             )
         if has_value:
+            if "accept_any_of" in field:
+                raise ValueError(
+                    f"{slug}.gold.json: field {spec.name!r} has BOTH 'value' and "
+                    "'accept_any_of' -- 'accept_any_of' is an ABSENT-only tolerance list, "
+                    "not valid alongside a 'value' (#602 fold round 4)"
+                )
             _validate_gold_value_type(slug, spec, field["value"])
+        elif "accept_any_of" in field:
+            if spec.name not in _ACCEPT_ANY_OF_ELIGIBLE_FIELDS:
+                raise ValueError(
+                    f"{slug}.gold.json: field {spec.name!r} (kind={spec.kind!r}) carries "
+                    "'accept_any_of', but its classifier never consults it on an absent "
+                    f"field -- only {sorted(_ACCEPT_ANY_OF_ELIGIBLE_FIELDS)} do"
+                )
+            _validate_accept_any_of(slug, spec, field["accept_any_of"])
 
 
 def load_corpus(fixtures_dir: Path) -> list[CorpusPage]:
@@ -800,6 +871,15 @@ FIELD_SPECS: tuple[FieldSpec, ...] = (
     FieldSpec("is_blend", "bool", lambda d: d.is_blend),
 )
 
+#: FieldSpec kinds whose ``extract`` returns ``str | None`` -- the ONLY kinds
+#: ``_classify_absent_field``'s ``isinstance(str)`` gate lets reach the tolerance check.
+_STRING_PRODUCING_FIELD_KINDS: frozenset[str] = frozenset({"text", "enum", "variety"})
+
+#: Field names eligible for ``accept_any_of``; rejected elsewhere at load time.
+_ACCEPT_ANY_OF_ELIGIBLE_FIELDS: frozenset[str] = frozenset(
+    spec.name for spec in FIELD_SPECS if spec.kind in _STRING_PRODUCING_FIELD_KINDS
+)
+
 
 def _is_empty(value: object | None) -> bool:
     """Whether a model value counts as an abstention (``None`` or blank text)."""
@@ -965,13 +1045,67 @@ _COMPARATORS: dict[str, Callable[[Any, Any], Outcome]] = {
 }
 
 
+def _tolerates_absent_value(tolerated: Sequence[str], model_value: str) -> bool:
+    """Whether ``model_value`` matches ANY tolerated phrase on recall AND
+    EXACT precision -- unlike :func:`_compare_text`'s fuzzy 0.75 gate (fit
+    for free-text comparison), ``accept_any_of`` is a WHITELIST, so ANY
+    unsupported token must reject the match: a fuzzy threshold admitted
+    "blend of multiple origins Ethiopia" (precision exactly 0.75) as if it
+    were a correct non-answer (#602 fold round 2). Precision must be
+    ``1.0`` -- zero padding tolerated.
+
+    Args:
+        tolerated: The gold-JSON ``accept_any_of`` phrase list.
+        model_value: The model's extracted (non-empty) text value.
+
+    Returns:
+        Whether any phrase matches on both axes.
+    """
+    for phrase in tolerated:
+        recall = word_bag_recall([phrase], model_value)
+        precision_ = word_bag_precision([phrase], model_value)
+        if recall >= _WORDBAG_COR_RECALL and precision_ >= 1.0:
+            return True
+    return False
+
+
+def _classify_absent_field(gold_field: dict[str, Any], model_value: object | None) -> Outcome:
+    """Score a gold-ABSENT field, honouring an optional ``accept_any_of`` tolerance.
+
+    A field is gold-ABSENT either because the page says nothing, or because it is
+    absent-because-UNKNOWABLE -- e.g. a blend's ``origin`` has no single country, so a model
+    answering "a blend of multiple origins" has not hallucinated a wrong one (#602 gold-label
+    nuance). ``accept_any_of`` (an optional gold-JSON phrase list) marks those cases: a value
+    matching ANY tolerated phrase on BOTH recall AND precision (:func:`_tolerates_absent_value`)
+    scores ``ABS_COR`` -- same as a plain abstention. Anything else, including a padded
+    tolerated phrase, still scores ``SPU``. Absent/empty ``accept_any_of`` is a no-op.
+
+    Args:
+        gold_field: The field's gold state (``{"absent": true, ...}``).
+        model_value: The model's extracted value (``None``/blank counts as
+            an abstention).
+
+    Returns:
+        ``ABS_COR`` (a correct abstention or a tolerated non-answer) or
+        ``SPU`` (a genuinely spurious value).
+    """
+    if _is_empty(model_value):
+        return Outcome.ABS_COR
+    if isinstance(model_value, str):
+        tolerated = cast("list[str]", gold_field.get("accept_any_of", []))
+        if _tolerates_absent_value(tolerated, model_value):
+            return Outcome.ABS_COR
+    return Outcome.SPU
+
+
 def classify_field(spec: FieldSpec, gold_field: dict[str, Any], draft: BeanProfileDraft) -> Outcome:
     """Classify one ``(field)`` of a successfully-drafted page (section 5.1).
 
     Args:
         spec: The field spec.
         gold_field: The field's gold state (``{"value": ...}`` /
-            ``{"absent": true}``).
+            ``{"absent": true}``, the latter optionally carrying
+            ``accept_any_of`` -- see :func:`_classify_absent_field`).
         draft: The drafted profile.
 
     Returns:
@@ -983,7 +1117,7 @@ def classify_field(spec: FieldSpec, gold_field: dict[str, Any], draft: BeanProfi
         return _classify_tasting(gold_field, draft)
     model_value = spec.extract(draft)
     if gold_field.get("absent") is True:
-        return Outcome.ABS_COR if _is_empty(model_value) else Outcome.SPU
+        return _classify_absent_field(gold_field, model_value)
     if _is_empty(model_value):
         return Outcome.MIS
     return _COMPARATORS[spec.kind](gold_field["value"], model_value)
@@ -1442,15 +1576,18 @@ class BootstrapCI:
     """A paired-bootstrap point estimate + percentile interval.
 
     Attributes:
-        estimate: The observed A-minus-B gap on the full sample.
-        low: The lower percentile bound (default 2.5%).
-        high: The upper percentile bound (default 97.5%).
-        resamples: How many bootstrap resamples were drawn.
+        estimate: The observed A-minus-B gap, or ``None`` when the metric is
+            undefined for A or B (an empty denominator) -- rendered
+            ``n/a``, never coerced to a fabricated ``0.0`` (#602 finding).
+        low: The lower percentile bound (2.5%), or ``None`` under the same
+            condition as ``estimate``.
+        high: The upper percentile bound (97.5%); ``None`` likewise.
+        resamples: How many bootstrap resamples had both sides defined.
     """
 
-    estimate: float
-    low: float
-    high: float
+    estimate: float | None
+    low: float | None
+    high: float | None
     resamples: int
 
 
@@ -1529,7 +1666,7 @@ def paired_bootstrap_combined(
 
     full_a = _flattened(shared, outcomes_a)
     full_b = _flattened(shared, outcomes_b)
-    estimate = 0.0 if full_a is None or full_b is None else full_a - full_b
+    estimate = None if full_a is None or full_b is None else full_a - full_b
     rng = random.Random(seed)
     n = len(shared)
     gaps: list[float] = []
@@ -1542,8 +1679,8 @@ def paired_bootstrap_combined(
     gaps.sort()
     return BootstrapCI(
         estimate=estimate,
-        low=_percentile(gaps, ci[0]) if gaps else 0.0,
-        high=_percentile(gaps, ci[1]) if gaps else 0.0,
+        low=_percentile(gaps, ci[0]) if gaps else None,
+        high=_percentile(gaps, ci[1]) if gaps else None,
         resamples=len(gaps),
     )
 
@@ -1586,7 +1723,7 @@ def paired_bootstrap_metric(
         raise ValueError("runs share no page for a paired bootstrap")
     full_a = metric_fn(_sum_counts(counts_a[s] for s in shared))
     full_b = metric_fn(_sum_counts(counts_b[s] for s in shared))
-    estimate = 0.0 if full_a is None or full_b is None else full_a - full_b
+    estimate = None if full_a is None or full_b is None else full_a - full_b
     rng = random.Random(seed)
     n = len(shared)
     gaps: list[float] = []
@@ -1599,8 +1736,8 @@ def paired_bootstrap_metric(
     gaps.sort()
     return BootstrapCI(
         estimate=estimate,
-        low=_percentile(gaps, ci[0]) if gaps else 0.0,
-        high=_percentile(gaps, ci[1]) if gaps else 0.0,
+        low=_percentile(gaps, ci[0]) if gaps else None,
+        high=_percentile(gaps, ci[1]) if gaps else None,
         resamples=len(gaps),
     )
 
@@ -1669,16 +1806,18 @@ class WilsonInterval:
     """A Wilson score interval on a strictly-binary proportion.
 
     Attributes:
-        successes: COR count (PAR excluded).
-        trials: Present-field decisions (COR+PAR+INC+MIS).
-        proportion: ``successes / trials``.
-        low: Lower Wilson bound.
-        high: Upper Wilson bound.
+        successes: COR count.
+        trials: STRICTLY binary COR-vs-not (COR+INC+MIS; PAR excluded from both --
+            #602 fold round 5, matching the research note's documented decomposition).
+        proportion: ``successes / trials``, or ``None`` when 0 (rendered ``n/a``,
+            never a fabricated ``0.000``, #602 fold round 4).
+        low: Lower Wilson bound (degenerate ``0.0`` when ``trials`` is 0).
+        high: Upper Wilson bound (degenerate ``1.0`` when ``trials`` is 0).
     """
 
     successes: int
     trials: int
-    proportion: float
+    proportion: float | None
     low: float
     high: float
 
@@ -1696,11 +1835,11 @@ def wilson_interval(successes: int, trials: int, *, z: float = 1.959963984540054
         z: The standard-normal quantile (default 95%).
 
     Returns:
-        The :class:`WilsonInterval` (a degenerate ``0..1`` interval when
-        ``trials == 0``).
+        The :class:`WilsonInterval` (``proportion=None`` and a degenerate
+        ``[0, 1]`` bound when ``trials == 0``).
     """
     if trials == 0:
-        return WilsonInterval(0, 0, 0.0, 0.0, 1.0)
+        return WilsonInterval(0, 0, None, 0.0, 1.0)
     phat = successes / trials
     denom = 1.0 + z * z / trials
     centre = (phat + z * z / (2 * trials)) / denom
@@ -1715,9 +1854,9 @@ def wilson_interval(successes: int, trials: int, *, z: float = 1.959963984540054
 
 
 def binary_cor_counts(run: ModelRun) -> tuple[int, int]:
-    """``(COR, present-field decisions)`` for a strictly-binary Wilson view."""
+    """``(COR, trials)``, strictly-binary COR-vs-{INC,MIS} (PAR excluded, #602)."""
     counts = tally(all_outcomes(run))
-    trials = counts.cor + counts.par + counts.inc + counts.mis
+    trials = counts.cor + counts.inc + counts.mis
     return counts.cor, trials
 
 
@@ -1829,9 +1968,11 @@ CAVEAT_TEXT = (
     "is currently UNREACHABLE against the real, unmodified extractor (it never "
     "computes a range midpoint or tags altitude 'origin_estimated'), so the two "
     "RANGE-altitude pages (cbc-costa-rica-laminita-tarrazu, "
-    "counterculture-concepcion-huista) cap altitude at MIS/INC regardless of "
-    "model quality -- a systematic, not model-specific, deflation (see the "
-    "module docstring)."
+    "counterculture-concepcion-huista) cap altitude at MIS (a compliant abstention, "
+    "weight 0) or INC (a leaked scalar, weight -0.5) regardless of model quality -- "
+    "an asymmetric penalty whose effect on CombinedScore/macro-F1 ordering is NOT "
+    "guaranteed uniform across the roster (a run where one model abstains and another "
+    "leaks a scalar on these cells CAN shift the ranking; see the module docstring)."
 )
 
 
@@ -1842,13 +1983,21 @@ def _fmt(value: float | None, digits: int = 3) -> str:
     return "n/a" if value is None else f"{value:.{digits}f}"
 
 
+def _fmt_gap(ci: BootstrapCI) -> str:
+    """Render a paired-bootstrap gap, preserving ``n/a`` for an undefined
+    comparison (#602 finding) instead of the pre-fix fabricated ``0.000``."""
+    if ci.estimate is None:
+        return "n/a (undefined -- no comparable cells)"
+    return f"{ci.estimate:+.3f} [{_fmt(ci.low)}, {_fmt(ci.high)}]"
+
+
 def render_report(
     runs: Sequence[ModelRun],
     cost_estimates: Sequence[ModelCostEstimate],
     *,
     stopped_early: bool = False,
     unevaluated_slugs: Sequence[str] = (),
-    failed_slugs: Sequence[str] = (),
+    failed_slugs: Sequence[FailedRun] = (),
     executed_slugs: Sequence[str] = (),
 ) -> str:
     """Render the markdown scorecard for one or more model runs.
@@ -1863,17 +2012,15 @@ def render_report(
             finding).
         unevaluated_slugs: The requested models never run, when
             ``stopped_early`` is ``True``.
-        failed_slugs: Models excluded because every page errored (a
-            transient outage, not a quality result) -- rendered as a
-            separate banner; never counted in the leaderboard/stats below
-            since they are already excluded from ``runs`` (#600 round-2
-            finding).
-        executed_slugs: Models a REAL call was made for THIS invocation (see
-            :attr:`BakeoffResult.executed_slugs`) -- distinguishes ACTUAL
-            spend from a pre-run planning estimate in the cost section
-            (#600 round-2 finding). Empty (the default) renders the cost
-            section as a pure pre-run estimate, matching a direct
-            :func:`render_report` call outside :func:`run_bakeoff`.
+        failed_slugs: Every wholly-failed run this invocation, with its DISPLAY-ONLY
+            heuristic label (:class:`FailedRun`) -- rendered as a separate banner; NEVER
+            checkpointed, never counted in the leaderboard/stats below (#600 round-2;
+            never-checkpoint simplification #602 fold round 5).
+        executed_slugs: Models a REAL call was made for THIS invocation --
+            distinguishes spend already INCURRED (still this harness's cost
+            ESTIMATE, never verified OpenRouter billing -- #602) from a
+            pre-run planning estimate (#600 round-2). Empty (the default)
+            renders the cost section as a pure pre-run estimate.
 
     Returns:
         The markdown report text.
@@ -1890,12 +2037,15 @@ def render_report(
         )
         lines.append("")
     if failed_slugs:
+        failed_desc = ", ".join(
+            f"`{f.model_slug}` ({f.heuristic_label}, heuristic)" for f in failed_slugs
+        )
         lines.append(
-            "> **EXCLUDED -- transient failure.** Every page errored (a bad key / provider "
-            f"outage, not a quality result) for {len(failed_slugs)} model(s): "
-            f"{', '.join(f'`{s}`' for s in failed_slugs)}. Excluded from the leaderboard "
-            "and every statistic below (never a scored 0.000 row) and NOT checkpointed --"
-            " re-run to retry them."
+            f"> **EXCLUDED -- failed this invocation.** Every page errored for "
+            f"{len(failed_slugs)} model(s): {failed_desc}. The heuristic label is DISPLAY-ONLY "
+            "best-effort context (no invocation-local signal can truly tell a transient "
+            "outage apart from a model-specific fault) -- NEVER checkpointed regardless of "
+            "it, so a re-run ALWAYS retries them; excluded from every statistic below."
         )
         lines.append("")
     lines.append(f"- models scored: {len(runs)}")
@@ -1924,6 +2074,22 @@ def render_report(
             f"{c.spu} | {c.err} | {_fmt(m.recall)} | {_fmt(m.precision)} | "
             f"{_fmt(m.abstention)} | {_fmt(m.micro_f1)} | {_fmt(m.macro_f1)} | "
             f"{_fmt(m.combined_score)} | {latency} |"
+        )
+    lines.append("")
+
+    lines.append(
+        "## Wilson intervals (indicative only, section 5.2 -- ignores within-page "
+        "clustering, so it OVERSTATES certainty like McNemar; the bootstrap above is primary)"
+    )
+    lines.append("")
+    lines.append("| Model | COR / trials | proportion | 95% Wilson CI |")
+    lines.append("|---|--:|--:|--:|")
+    for run in runs:
+        cor, trials = binary_cor_counts(run)
+        wi = wilson_interval(cor, trials)
+        lines.append(
+            f"| `{run.model_slug}` | {cor}/{trials} | {_fmt(wi.proportion)} | "
+            f"[{_fmt(wi.low)}, {_fmt(wi.high)}] |"
         )
     lines.append("")
 
@@ -1974,12 +2140,10 @@ def render_report(
             mc = mcnemar_exact(base, other)
             lines.append(
                 f"- `{base.model_slug}` vs `{other.model_slug}`: CombinedScore gap "
-                f"{boot.estimate:+.3f} (95% CI [{boot.low:+.3f}, {boot.high:+.3f}], "
-                f"page-clustered bootstrap -- PRIMARY); recall gap {rec.estimate:+.3f} "
-                f"([{rec.low:+.3f}, {rec.high:+.3f}]); faithfulness (precision) gap "
-                f"{prec.estimate:+.3f} ([{prec.low:+.3f}, {prec.high:+.3f}]); abstention "
-                f"gap {absn.estimate:+.3f} ([{absn.low:+.3f}, {absn.high:+.3f}]); McNemar "
-                f"exact p={mc.exact_p_two_sided:.4f} (secondary, indicative)."
+                f"{_fmt_gap(boot)} (page-clustered bootstrap -- PRIMARY); recall gap "
+                f"{_fmt_gap(rec)}; faithfulness (precision) gap {_fmt_gap(prec)}; "
+                f"abstention gap {_fmt_gap(absn)}; McNemar exact "
+                f"p={mc.exact_p_two_sided:.4f} (secondary, indicative)."
             )
         lines.append("")
 
@@ -1988,13 +2152,15 @@ def render_report(
     scored_slugs = {r.model_slug for r in runs}
     resumed_set = scored_slugs - executed_set
     if executed_slugs:
-        actually_spent = sum(cost_by_slug.get(s, 0.0) for s in executed_slugs)
-        lines.append("## Cost")
+        incurred_estimate = sum(cost_by_slug.get(s, 0.0) for s in executed_slugs)
+        lines.append("## Cost (estimated spend incurred this invocation)")
         lines.append("")
         lines.append(
-            f"**${actually_spent:.4f} ACTUALLY SPENT** this invocation, on "
+            f"**~${incurred_estimate:.4f} ESTIMATED SPEND INCURRED** this invocation, on "
             f"{len(executed_slugs)} newly-called model(s): "
-            f"{', '.join(f'`{s}`' for s in executed_slugs)}."
+            f"{', '.join(f'`{s}`' for s in executed_slugs)}. A real (paid) call WAS made for "
+            "each -- but see the note below: this is still this harness's cost ESTIMATE, "
+            "never a verified OpenRouter billing amount."
         )
     else:
         lines.append("## Cost (pre-run estimate -- NOT yet spent)")
@@ -2010,7 +2176,7 @@ def render_report(
     for est in cost_estimates:
         total += est.usd
         if est.slug in executed_set:
-            status = "spent this run"
+            status = "spend incurred (est.)"
         elif est.slug in resumed_set:
             status = "resumed (no new spend)"
         else:
@@ -2026,9 +2192,11 @@ def render_report(
     lines.append(
         "Token counts use a chars/4 heuristic over the extractor's ACTUAL post-strip "
         "prompt text; prompt caching on the stable schema/instructions makes the real "
-        "cost lower. This harness has no live token-usage readback, so a model marked "
-        "'spent this run' used exactly this estimate as its actual charge. A "
-        "self-consistency vote (sample 3-5x) or a two-pass entailment judge would "
+        "cost lower. This harness has NO live token-usage/billing readback, so EVERY USD "
+        "figure above -- including a model marked 'spend incurred (est.)' -- is still this "
+        "harness's pre-call ESTIMATE, never a verified OpenRouter billing amount: actual "
+        "output/reasoning tokens, retries, and prompt caching can all make the real charge "
+        "differ. A self-consistency vote (sample 3-5x) or a two-pass entailment judge would "
         "multiply these figures accordingly."
     )
     lines.append("")
@@ -2089,37 +2257,47 @@ def sidecar_path(out: Path) -> Path:
     return out.with_name(out.name + ".cells.jsonl")
 
 
+def _environment_fingerprint() -> str:
+    """A stable fingerprint of the WHOLE environment: interpreter, platform, distributions.
+
+    Categorical (#602 round 6): a TRANSITIVE dependency moving invalidates resume too, no
+    enumeration arms race. Also hashes ``sys.implementation.name``, ``platform.python_version()``,
+    and ``platform.platform()`` (#602 round 7 -- the distribution set alone missed the runtime).
+    Deliberately conservative: ANY change invalidates resume, never silently wrong.
+
+    Returns:
+        A stable string: interpreter/platform identity + every distribution's ``(name, version)``.
+    """
+    pairs = sorted((dist.name, dist.version) for dist in importlib.metadata.distributions())
+    identity = f"{sys.implementation.name}|{platform.python_version()}|{platform.platform()}"
+    return identity + "|" + "|".join(f"{name}=={version}" for name, version in pairs)
+
+
 def _pipeline_fingerprint() -> str:
     """A fingerprint of the EVALUATED PIPELINE (not the corpus).
 
-    Hashes ``roastpilot_agent/bean_sourcing.py`` (the extraction/preprocessing
-    pipeline this harness runs unchanged) together with this harness's OWN
-    source (its scoring logic -- ``FIELD_SPECS``, comparators, thresholds) and
-    the extraction timeout. Any code change to either invalidates a stale
-    checkpoint automatically, with nothing to remember to bump.
-
-    This closes the exact gap the fixture-only fingerprint left open (#600
-    round-2 finding): #590 (preprocessing) changes ``bean_sourcing.py``
-    WITHOUT touching any committed HTML/gold fixture, so a corpus-only
-    fingerprint would silently resume the pre-#590 checkpoint as if it were
-    the post-#590 result.
+    Hashes every module in :data:`_FINGERPRINTED_MODULES` (first-party source that can change
+    a drafted result) plus this harness's OWN source, the extraction timeout, and the WHOLE
+    installed environment (see :func:`_environment_fingerprint`, #602 fold round 6). Any
+    change invalidates a stale checkpoint automatically (closes the #600 round-2 gap:
+    #590-style preprocessing changes without touching any fixture).
 
     Returns:
-        A short, stable hex digest of the extractor + harness source bytes
-        plus the extraction timeout. ``""`` (fingerprinting disabled) if the
-        extractor's source file cannot be located (e.g. a frozen/zipped
-        install) -- degrading to the pre-existing corpus-only guard rather
-        than crashing a real run over an unreachable introspection failure.
+        A short, stable hex digest of every fingerprinted module + the environment; ``""``
+        (fingerprinting disabled) if ANY source file cannot be located -- degrading to the
+        pre-existing corpus-only guard rather than crashing.
     """
     try:
-        extractor_source = inspect.getsourcefile(_bean_sourcing_module)
         harness_source = inspect.getsourcefile(sys.modules[__name__])
-        if extractor_source is None or harness_source is None:
+        module_sources = [inspect.getsourcefile(m) for m in _FINGERPRINTED_MODULES]
+        if harness_source is None or any(src is None for src in module_sources):
             return ""
         digest = hashlib.sha256()
-        digest.update(Path(extractor_source).read_bytes())
+        for src in module_sources:
+            digest.update(Path(cast("str", src)).read_bytes())
         digest.update(Path(harness_source).read_bytes())
         digest.update(str(BAKEOFF_EXTRACTION_TIMEOUT_S).encode())
+        digest.update(_environment_fingerprint().encode())
         return digest.hexdigest()[:16]
     except OSError:  # pragma: no cover - only when source is unavailable
         return ""
@@ -2152,16 +2330,39 @@ def compute_fingerprint(pages: Sequence[CorpusPage]) -> str:
     return digest.hexdigest()[:16]
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    """Replace ``path``'s content atomically via a same-directory temp file.
+
+    A plain ``path.write_text(content)`` truncates THEN writes -- a crash in between leaves a
+    partial/zero-byte file, destroying already-complete records a repair means to preserve
+    (#602 fold 4). Write a sibling temp file, ``fsync`` it, then ``os.replace`` over ``path``:
+    atomic, so the destination is always either the full OLD or full NEW content.
+
+    Args:
+        path: The destination file.
+        content: The full text to write.
+    """
+    tmp_path = path.with_name(f"{path.name}.repair-{os.getpid()}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, path)
+
+
 def _load_checkpoint_lines(path: Path) -> list[dict[str, Any]]:
     """Parse the checkpoint sidecar, recovering from a truncated final line.
 
-    A kill mid-``write`` can leave the LAST appended line an incomplete JSON
-    object (the multi-kilobyte per-model record does not fit in one atomic
-    filesystem write). Without this, the very next invocation raises on that
-    truncated tail and loses every EARLIER, complete, already-paid-for model
-    record too (#600 finding). A malformed line anywhere else in the file
-    still raises -- that is real corruption, not an interrupted in-flight
-    append, and should not be silently swallowed.
+    A kill mid-``write`` can leave the LAST line an incomplete, newline-LESS JSON object (one
+    ``write()`` call cut off before the trailing ``\\n``) -- unrepaired, the next invocation
+    raises and loses every earlier, already-paid-for record too (#600). A malformed line
+    elsewhere, OR a malformed FINAL line that DOES end with a newline (#602 round 4: that write
+    completed, so it's genuine corruption, not an interrupted append), still raises for manual
+    recovery -- only a newline-less tail is auto-repaired, ATOMICALLY (see
+    :func:`_atomic_write_text`). A kill can ALSO land right after the complete JSON payload but
+    before its trailing ``\\n`` -- that line parses FINE, so the repair above never fires, yet
+    the next :meth:`Checkpoint.append` would concatenate onto it (#602 round 6): a still-missing
+    final newline is normalised in atomically after every line parses.
 
     Args:
         path: The sidecar JSONL path.
@@ -2170,22 +2371,34 @@ def _load_checkpoint_lines(path: Path) -> list[dict[str, Any]]:
         Every successfully-parsed record, in file order.
 
     Raises:
-        json.JSONDecodeError: If a non-final line is malformed.
+        json.JSONDecodeError: If a non-final line is malformed, or the final line is malformed
+            but newline-terminated.
     """
-    lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+    raw_text = path.read_text()
+    lines = [ln for ln in raw_text.splitlines() if ln.strip()]
     records: list[dict[str, Any]] = []
+    truncated_at: int | None = None
     for i, line in enumerate(lines):
         try:
             records.append(cast("dict[str, Any]", json.loads(line)))
         except json.JSONDecodeError:
-            if i == len(lines) - 1:
+            if i == len(lines) - 1 and not raw_text.endswith("\n"):
+                truncated_at = i
                 print(
                     f"[resume] ignoring a truncated final line in {path.name} "
                     f"(interrupted write) -- recovered {len(records)} earlier record(s)",
                     flush=True,
                 )
                 break
-            raise
+            raise  # non-final OR newline-terminated final line: real corruption, not repaired
+    if truncated_at is not None:
+        clean_lines = lines[:truncated_at]
+        _atomic_write_text(path, "".join(f"{ln}\n" for ln in clean_lines))
+    elif lines and not raw_text.endswith("\n"):
+        # Every line parsed, but the file itself is missing its final newline: a
+        # valid tail with no separator for the next append (#602 fold round 6,
+        # FOLD 3). Normalise it now, atomically, before any further append.
+        _atomic_write_text(path, "".join(f"{ln}\n" for ln in lines))
     return records
 
 
@@ -2346,6 +2559,30 @@ def _run_wholly_failed(run: ModelRun) -> bool:
     return bool(run.pages) and all(page.error is not None for page in run.pages)
 
 
+def _has_any_success(run: ModelRun) -> bool:
+    """Whether at least one page of ``run`` succeeded (extraction did not error)."""
+    return any(page.error is None for page in run.pages)
+
+
+@dataclass(frozen=True)
+class FailedRun:
+    """A wholly-failed run this invocation -- NEVER checkpointed (#602 fold round 5).
+
+    Rounds 3-4 eagerly checkpointed a "provable" MODEL-SPECIFIC failure -- unfixable, since
+    no invocation-local signal can tell a transient outage apart from a model-specific fault.
+    Failed attempts are CHEAP to retry; a mis-scored failure is EXPENSIVE to fix.
+
+    Attributes:
+        model_slug: The failed model.
+        heuristic_label: ``"MODEL-SPECIFIC"`` if a FRESHLY-EXECUTED peer had already succeeded
+            this invocation, else ``"INFRA-WIDE"``. DISPLAY-ONLY best-effort context -- NOT
+            authoritative, NEVER affects checkpointing or scoring.
+    """
+
+    model_slug: str
+    heuristic_label: str
+
+
 @dataclass(frozen=True)
 class BakeoffResult:
     """The outcome of :func:`run_bakeoff`.
@@ -2358,23 +2595,24 @@ class BakeoffResult:
             comparison (#600 finding).
         unevaluated_slugs: The requested model slugs never run at all because
             of the budget stop (empty when ``stopped_early`` is ``False``).
-        failed_slugs: Model slugs whose run was a total outage (every page
-            errored -- a bad key / provider fault, not a quality result).
-            EXCLUDED from ``runs`` and therefore from every metric, the
-            leaderboard, and pairwise statistics -- a transient failure must
-            not masquerade as a scored 0.000 row (#600 round-2 finding). Not
-            checkpointed either, so a re-run retries these models.
+        failed_slugs: Every wholly-failed run this invocation, as a
+            :class:`FailedRun` (model slug + DISPLAY-ONLY heuristic label). NEVER
+            checkpointed (#602 fold round 5 -- see :class:`FailedRun`'s docstring
+            for the trade), excluded from ``runs`` and every metric/leaderboard/
+            pairwise statistic -- never a scored 0.000 row (#600 round-2) -- and a
+            re-run always retries them.
         executed_slugs: Model slugs a REAL (paid) call was made for THIS
-            invocation -- includes ``failed_slugs`` (a paid attempt was still
-            made) but excludes anything resumed from an existing checkpoint.
-            Distinguishes actual spend from a pre-run estimate in the report
-            (#600 round-2 finding): a resumed model made no new call.
+            invocation -- includes every :attr:`failed_slugs` entry (a paid
+            attempt was still made) but excludes anything resumed from an
+            existing checkpoint. Distinguishes spend already INCURRED (still
+            this harness's cost ESTIMATE, never verified billing -- #602) from
+            a pre-run planning estimate (#600 round-2).
     """
 
     runs: list[ModelRun]
     stopped_early: bool
     unevaluated_slugs: list[str]
-    failed_slugs: list[str]
+    failed_slugs: list[FailedRun]
     executed_slugs: list[str]
 
 
@@ -2390,17 +2628,14 @@ async def run_bakeoff(
 ) -> BakeoffResult:
     """Run + checkpoint every model over the corpus, under a spend guard.
 
-    Read-only: never touches any store/DB, never saves a profile. Stops
-    gracefully BEFORE a model whose estimated cost would breach ``max_spend``
-    (see :attr:`BakeoffResult.stopped_early`). A run where EVERY page errored
-    (a transient provider outage / bad key / timeout, not a real quality
-    result) is NOT checkpointed, so a plain retry actually retries it instead
-    of resuming and permanently reporting the outage as the model's score
-    (#600 finding) -- AND is excluded from ``runs`` entirely (round-2
-    hardening), so it cannot appear as a scored 0.000 row polluting the
-    leaderboard or the pairwise/bootstrap statistics; it is reported
-    separately via :attr:`BakeoffResult.failed_slugs`. It IS still counted
-    against the spend guard (a paid attempt was made).
+    Read-only: never touches any store/DB, never saves a profile. Stops gracefully BEFORE a
+    model whose estimated cost would breach ``max_spend`` (see :attr:`BakeoffResult.stopped_early`).
+    A run where EVERY page errored is NEVER checkpointed (#602 fold round 5 -- see
+    :class:`FailedRun`'s docstring for the trade this simplification resolves): it is reported
+    as a :class:`FailedRun` with a DISPLAY-ONLY ``heuristic_label`` (``"MODEL-SPECIFIC"`` if a
+    FRESHLY-EXECUTED peer had already succeeded this invocation, else ``"INFRA-WIDE"``) and a
+    re-run ALWAYS retries it. Either way a wholly-failed run IS still counted against the spend
+    guard (a paid attempt was made).
 
     Args:
         pages: The corpus.
@@ -2420,8 +2655,9 @@ async def run_bakeoff(
     fingerprint = compute_fingerprint(pages)
     checkpoint = Checkpoint(sidecar_path(out), resume=resume, fingerprint=fingerprint)
     runs: list[ModelRun] = []
-    failed_slugs: list[str] = []
+    failed_runs: list[FailedRun] = []
     executed_slugs: list[str] = []
+    has_fresh_success = False
     spent = 0.0
     for index, slug in enumerate(model_slugs):
         if checkpoint.has(slug):
@@ -2439,7 +2675,7 @@ async def run_bakeoff(
                 runs=runs,
                 stopped_early=True,
                 unevaluated_slugs=list(model_slugs[index:]),
-                failed_slugs=failed_slugs,
+                failed_slugs=failed_runs,
                 executed_slugs=executed_slugs,
             )
         run = await run_model_over_corpus(
@@ -2452,14 +2688,15 @@ async def run_bakeoff(
         spent += upcoming
         executed_slugs.append(slug)  # a real call was attempted, win or lose
         if _run_wholly_failed(run):
+            label = "MODEL-SPECIFIC" if has_fresh_success else "INFRA-WIDE"
             print(
-                f"[run] {slug}: ALL {len(run.pages)} page(s) errored -- transient failure, "
-                "EXCLUDED from the leaderboard/statistics, NOT checkpointed (a re-run will "
-                "retry this model)",
+                f"[run] {slug}: ALL {len(run.pages)} page(s) errored -- {label} (heuristic, "
+                "display-only) -- NEVER checkpointed, a re-run always retries it",
                 flush=True,
             )
-            failed_slugs.append(slug)
+            failed_runs.append(FailedRun(model_slug=slug, heuristic_label=label))
             continue
+        has_fresh_success = has_fresh_success or _has_any_success(run)
         checkpoint.append(run_to_json(run))
         m = model_metrics(run)
         print(
@@ -2472,7 +2709,7 @@ async def run_bakeoff(
         runs=runs,
         stopped_early=False,
         unevaluated_slugs=[],
-        failed_slugs=failed_slugs,
+        failed_slugs=failed_runs,
         executed_slugs=executed_slugs,
     )
 
@@ -2499,6 +2736,35 @@ def _run_from_checkpoint(record: dict[str, Any]) -> ModelRun:
     return ModelRun(model_slug=str(record["model_slug"]), pages=pages)
 
 
+def _finite_nonnegative_spend(raw: str) -> float:
+    """``argparse`` ``type=`` for ``--max-spend``: a finite, non-negative USD figure.
+
+    Plain ``type=float`` parses ``"inf"``/``"nan"``, and every
+    ``spent + upcoming > max_spend`` guard in :func:`run_bakeoff` is FALSE
+    against either -- silently bypassing the spend guard (#602). A negative
+    limit is equally meaningless.
+
+    Args:
+        raw: The raw CLI argument string.
+
+    Returns:
+        The parsed, validated float.
+
+    Raises:
+        argparse.ArgumentTypeError: If ``raw`` does not parse as a finite,
+            non-negative number.
+    """
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"--max-spend must be a number, got {raw!r}") from exc
+    if not isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(
+            f"--max-spend must be a finite, non-negative USD amount, got {raw!r}"
+        )
+    return value
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -2514,10 +2780,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-spend",
-        type=float,
+        type=_finite_nonnegative_spend,
         default=None,
         help="REQUIRED USD budget for a real run; the run stops before a model whose "
-        "estimated cost would breach it. No default -- an unbounded paid run is refused.",
+        "estimated cost would breach it. No default -- an unbounded paid run is refused. "
+        "Must be finite and non-negative (inf/nan/negative are rejected).",
     )
     parser.add_argument("--out", type=Path, default=Path("/tmp/bakeoff-bean-sourcing.json"))
     parser.add_argument("--report-md", type=Path, default=None)
@@ -2599,7 +2866,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 "runs": [run_to_json(r) for r in result.runs],
                 "stopped_early": result.stopped_early,
                 "unevaluated_slugs": result.unevaluated_slugs,
-                "failed_slugs": result.failed_slugs,
+                "failed_slugs": [dataclasses.asdict(f) for f in result.failed_slugs],
                 "executed_slugs": result.executed_slugs,
             },
             indent=2,

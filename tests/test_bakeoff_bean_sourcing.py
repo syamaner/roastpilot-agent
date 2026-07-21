@@ -14,6 +14,7 @@ new scoring logic.
 
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import sys
 from pathlib import Path
@@ -131,6 +132,138 @@ def test_load_corpus_rejects_ambiguous_gold_shape(tmp_path: Path) -> None:
         bo.load_corpus(tmp_path)
 
 
+def test_load_corpus_rejects_malformed_accept_any_of(tmp_path: Path) -> None:
+    """A malformed ``accept_any_of`` tolerance list (a non-string entry) must
+    fail at LOAD time -- before any paid call -- naming the fixture, not
+    crash mid-scoring inside ``_tolerates_absent_value`` after money has
+    already been spent (#602 fold 3)."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_absent = {f.name: {"absent": True} for f in bo.FIELD_SPECS if f.name != "name"}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                "fields": {**all_absent, "origin": {"absent": True, "accept_any_of": ["ok", 5]}},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="bad.gold.json.*accept_any_of"):
+        bo.load_corpus(tmp_path)
+
+
+def test_load_corpus_rejects_a_zero_token_accept_any_of_entry(tmp_path: Path) -> None:
+    """A stopword-only ``accept_any_of`` entry ("the") strips to zero tokens
+    at scoring time, so it can never match -- must fail at LOAD time, not
+    silently pass a paid experiment that then never fires (#602 fold round
+    8)."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_absent = {f.name: {"absent": True} for f in bo.FIELD_SPECS if f.name != "name"}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                "fields": {**all_absent, "origin": {"absent": True, "accept_any_of": ["the"]}},
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="bad.gold.json.*accept_any_of"):
+        bo.load_corpus(tmp_path)
+
+
+def test_load_corpus_rejects_accept_any_of_on_a_gold_present_field(tmp_path: Path) -> None:
+    """``accept_any_of`` is an ABSENT-only construct -- a field carrying
+    BOTH a ``value`` and ``accept_any_of`` must fail at LOAD time, naming
+    the field and the reason (#602 fold round 4, FOLD 3)."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_absent = {f.name: {"absent": True} for f in bo.FIELD_SPECS if f.name != "name"}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                "fields": {
+                    **all_absent,
+                    "origin": {"value": "Ecuador", "accept_any_of": ["a blend"]},
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="origin.*accept_any_of"):
+        bo.load_corpus(tmp_path)
+
+
+def test_accept_any_of_eligible_fields_excludes_altitude_and_tasting() -> None:
+    """``altitude``/``tasting`` kinds have their OWN bespoke absent-handling
+    (``_classify_altitude``/``_classify_tasting``) that never consults
+    ``accept_any_of`` -- they must be excluded from the eligible set (#602
+    fold round 5, FOLD 4)."""
+    eligible = bo._ACCEPT_ANY_OF_ELIGIBLE_FIELDS  # pyright: ignore[reportPrivateUsage]
+    assert "altitude" not in eligible
+    assert "tasting_notes" not in eligible
+    assert "origin" in eligible  # a "text"-kind field IS eligible
+
+
+def test_accept_any_of_eligible_fields_excludes_bool_kind() -> None:
+    """``is_blend`` (kind ``bool``) reaches the GENERIC ``classify_field``
+    absent branch, but its extracted value is a ``bool``/``None``, never a
+    ``str`` -- ``_classify_absent_field``'s ``isinstance(model_value, str)``
+    gate means ``accept_any_of`` is NEVER consulted for it. Round 5's
+    exclude-altitude-and-tasting derivation let it slip in; the POSITIVE,
+    string-producing-kinds derivation must exclude it (#602 fold round 6,
+    FOLD 1)."""
+    eligible = bo._ACCEPT_ANY_OF_ELIGIBLE_FIELDS  # pyright: ignore[reportPrivateUsage]
+    assert "is_blend" not in eligible
+
+
+def test_load_corpus_rejects_accept_any_of_on_a_field_its_classifier_ignores(
+    tmp_path: Path,
+) -> None:
+    """``tasting_notes`` (kind ``tasting``) has its OWN bespoke absent-handling
+    that never consults ``accept_any_of`` -- setting it there would be
+    silently ignored, so it must be rejected at LOAD time instead, naming
+    the field and the reason (#602 fold round 5, FOLD 4)."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_absent = {f.name: {"absent": True} for f in bo.FIELD_SPECS if f.name != "name"}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                "fields": {
+                    **all_absent,
+                    "tasting_notes": {"absent": True, "accept_any_of": ["sweet"]},
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="tasting_notes.*accept_any_of"):
+        bo.load_corpus(tmp_path)
+
+
+def test_load_corpus_rejects_accept_any_of_on_is_blend(tmp_path: Path) -> None:
+    """``is_blend`` (kind ``bool``) extracts a ``bool``/``None``, never a ``str`` --
+    ``accept_any_of`` can never be consulted for it, so it must be rejected at
+    LOAD time too, naming the field and the reason (#602 fold round 6, FOLD 1)."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_absent = {f.name: {"absent": True} for f in bo.FIELD_SPECS if f.name != "name"}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                "fields": {
+                    **all_absent,
+                    "is_blend": {"absent": True, "accept_any_of": ["yes"]},
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="is_blend.*accept_any_of"):
+        bo.load_corpus(tmp_path)
+
+
 def test_load_corpus_rejects_a_gold_json_with_no_top_level_name(tmp_path: Path) -> None:
     """A custom gold record missing the top-level ``name`` key entirely (the
     ``if name_field is not None`` branch's False path) must fail the same
@@ -224,6 +357,47 @@ def test_validate_gold_value_type_altitude_accepts_scalar_and_range() -> None:
     bo._validate_gold_value_type(  # pyright: ignore[reportPrivateUsage]
         "slug", _altitude_spec, {"min_m": 1000, "max_m": 2000}
     )
+
+
+# --- accept_any_of validation (#602 fold 3) -----------------------------------
+
+
+def test_validate_accept_any_of_accepts_a_nonempty_string_list() -> None:
+    bo._validate_accept_any_of(  # pyright: ignore[reportPrivateUsage]
+        "slug", _text_spec, ["blend of multiple origins", "multiple origins"]
+    )
+
+
+def test_validate_accept_any_of_rejects_a_non_list() -> None:
+    with pytest.raises(ValueError, match="accept_any_of"):
+        bo._validate_accept_any_of("slug", _text_spec, "blend of multiple origins")  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validate_accept_any_of_rejects_an_empty_list() -> None:
+    with pytest.raises(ValueError, match="accept_any_of"):
+        bo._validate_accept_any_of("slug", _text_spec, [])  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validate_accept_any_of_rejects_a_non_string_element() -> None:
+    with pytest.raises(ValueError, match="accept_any_of"):
+        bo._validate_accept_any_of("slug", _text_spec, ["ok", 5])  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("zero_token_entry", ["the", "---"])
+def test_validate_accept_any_of_rejects_a_zero_token_entry(zero_token_entry: str) -> None:
+    """A stopword-only or punctuation-only entry strips to zero tokens under
+    ``words()`` normalisation, so it has zero recall against every
+    response and can never match at scoring time -- an advertised
+    tolerance that silently never fires, only discoverable after a paid
+    run (#602 fold round 8)."""
+    with pytest.raises(ValueError, match="accept_any_of"):
+        bo._validate_accept_any_of("slug", _text_spec, [zero_token_entry])  # pyright: ignore[reportPrivateUsage]
+
+
+def test_validate_accept_any_of_accepts_an_entry_with_one_substantive_token() -> None:
+    """An entry need not be multi-word -- one substantive (non-stopword)
+    token is enough to be matchable (#602 fold round 8)."""
+    bo._validate_accept_any_of("slug", _text_spec, ["blend"])  # pyright: ignore[reportPrivateUsage]
 
 
 def test_load_corpus_rejects_null_value_before_paid_calls(tmp_path: Path) -> None:
@@ -344,6 +518,91 @@ async def test_invent_on_absent_scores_spu(corpus: list[bo.CorpusPage]) -> None:
     )
     outcomes = await _score(page, model)
     assert outcomes["species"] is bo.Outcome.SPU
+
+
+# --- Origin-absent-blend gold nuance (#602) -----------------------------------
+
+
+def test_classify_absent_field_tolerates_an_accepted_phrase() -> None:
+    gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
+    assert (
+        bo._classify_absent_field(gold, "a blend of multiple origins")  # pyright: ignore[reportPrivateUsage]
+        is bo.Outcome.ABS_COR
+    )
+
+
+def test_classify_absent_field_still_penalises_a_real_invented_value() -> None:
+    """``accept_any_of`` must not become a blanket amnesty -- a model naming
+    an actual (wrong) single country on the same field still scores SPU."""
+    gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
+    assert bo._classify_absent_field(gold, "Ethiopia") is bo.Outcome.SPU  # pyright: ignore[reportPrivateUsage]
+
+
+def test_classify_absent_field_rejects_a_tolerated_phrase_padded_with_a_country() -> None:
+    """Recall alone would let 'a blend of multiple origins, primarily
+    Ethiopia' match the tolerated phrase on recall (every phrase word is
+    present) while smuggling in an invented country -- the precision gate
+    must catch the padding and still score SPU (#602 fold 2)."""
+    gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
+    padded = "a blend of multiple origins, primarily Ethiopia"
+    assert bo._classify_absent_field(gold, padded) is bo.Outcome.SPU  # pyright: ignore[reportPrivateUsage]
+
+
+def test_classify_absent_field_rejects_exact_boundary_precision_padding() -> None:
+    """A single padded content token lands EXACTLY on the old 0.75 fuzzy
+    threshold (3 of 4 content tokens = precision 0.75) -- the fuzzy bar fit
+    for free-text comparison wrongly admitted this and scored an invented
+    country ABS_COR; a whitelist tolerance must reject ANY unsupported
+    token, so only an EXACT (1.0) precision may pass (#602 fold 2, round
+    2)."""
+    gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
+    boundary = "blend of multiple origins Ethiopia"
+    assert bo._classify_absent_field(gold, boundary) is bo.Outcome.SPU  # pyright: ignore[reportPrivateUsage]
+
+
+def test_classify_absent_field_clean_tolerated_phrase_still_scores_abs_cor() -> None:
+    """A clean (unpadded) tolerated phrase must still pass the joint
+    recall+precision gate -- the precision requirement must not become so
+    strict it defeats the tolerance itself (#602 fold 2)."""
+    gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
+    assert (
+        bo._classify_absent_field(gold, "a blend of multiple origins")  # pyright: ignore[reportPrivateUsage]
+        is bo.Outcome.ABS_COR
+    )
+
+
+def test_classify_absent_field_without_accept_any_of_is_unchanged() -> None:
+    """No ``accept_any_of`` key is a no-op -- identical pre-#602 behaviour."""
+    gold = {"absent": True}
+    assert bo._classify_absent_field(gold, None) is bo.Outcome.ABS_COR  # pyright: ignore[reportPrivateUsage]
+    assert bo._classify_absent_field(gold, "anything") is bo.Outcome.SPU  # pyright: ignore[reportPrivateUsage]
+
+
+def test_classify_absent_field_non_string_value_scores_spu() -> None:
+    """A non-empty, non-string value (e.g. a stray ``bool`` reaching the
+    generic absent-field path for the ``is_blend`` kind) skips the
+    ``accept_any_of`` word-bag check entirely -- SPU, same as before."""
+    gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
+    assert bo._classify_absent_field(gold, True) is bo.Outcome.SPU  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_origin_absent_blend_tolerates_the_gold_accept_any_of_phrase(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """The real ``klatch-blue-thunder-blend`` fixture: a model that faithfully
+    answers 'a blend of multiple origins' must not be penalised as SPU, but a
+    model that invents an actual single country still is (#602)."""
+    page = _page(corpus, "klatch-blue-thunder-blend")
+    tolerant_model = _model_returning(
+        {"name": "Blue Thunder Blend", "country": "a blend of multiple origins"}
+    )
+    outcomes = await _score(page, tolerant_model)
+    assert outcomes["origin"] is bo.Outcome.ABS_COR
+
+    inventive_model = _model_returning({"name": "Blue Thunder Blend", "country": "Ethiopia"})
+    outcomes = await _score(page, inventive_model)
+    assert outcomes["origin"] is bo.Outcome.SPU
 
 
 @pytest.mark.asyncio
@@ -684,7 +943,39 @@ def test_wilson_interval_known() -> None:
     assert interval.proportion == pytest.approx(0.8)
     assert interval.low == pytest.approx(0.4902, abs=1e-3)
     assert interval.high == pytest.approx(0.9432, abs=1e-3)
-    assert bo.wilson_interval(0, 0).high == 1.0
+
+
+def test_wilson_interval_zero_trials_is_undefined_proportion() -> None:
+    """Zero trials must leave ``proportion`` undefined (``None``, rendered
+    ``n/a``), never a fabricated ``0.0`` -- consistent with every other
+    undefined metric in this harness; the degenerate ``[0, 1]`` bounds are
+    kept (#602 fold round 4, FOLD 5)."""
+    degenerate = bo.wilson_interval(0, 0)
+    assert degenerate.proportion is None
+    assert degenerate.low == 0.0
+    assert degenerate.high == 1.0
+
+
+def test_binary_cor_counts_excludes_par() -> None:
+    """PAR is EXCLUDED from both COR and trials (#602 fold round 5, FOLD 3):
+    the research note's COR-vs-not decomposition here is binary -- COR vs
+    {INC, MIS} -- so a partial match is neither a success nor a countable
+    trial. A prior round's ``+ par`` in the denominator contradicted the
+    documented decomposition and diluted the estimate."""
+    run = _run(
+        "m",
+        {
+            "p1": {"a": bo.Outcome.COR},
+            "p2": {"a": bo.Outcome.PAR},
+            "p3": {"a": bo.Outcome.INC},
+            "p4": {"a": bo.Outcome.MIS},
+            "p5": {"a": bo.Outcome.ABS_COR},
+            "p6": {"a": bo.Outcome.SPU},
+        },
+    )
+    cor, trials = bo.binary_cor_counts(run)
+    assert cor == 1  # only the COR cell
+    assert trials == 3  # COR + INC + MIS -- PAR, ABS_COR, SPU all excluded
 
 
 def test_mcnemar_exact_known() -> None:
@@ -745,12 +1036,27 @@ def test_paired_bootstrap_combined_flattens_cell_weighted_not_page_averaged() ->
 def test_paired_bootstrap_combined_handles_all_err_pages() -> None:
     """When every shared page's cells are all ``ERR``, the flattened
     CombinedScore is undefined for every resample -- must degrade gracefully
-    (a zero-width, zero-resample interval), not crash."""
+    and PRESERVE the undefined state as ``None`` (rendered ``n/a``), never
+    fabricate a ``0.0`` gap that reads as "no difference" (#602 finding)."""
     run_a = _run("a", {"p": {"x": bo.Outcome.ERR}})
     run_b = _run("b", {"p": {"x": bo.Outcome.ERR}})
     ci = bo.paired_bootstrap_combined(run_a, run_b, resamples=50, seed=1)
-    assert ci.estimate == 0.0
+    assert ci.estimate is None
+    assert ci.low is None
+    assert ci.high is None
     assert ci.resamples == 0
+
+
+def test_paired_bootstrap_metric_undefined_denominator_is_none_not_zero() -> None:
+    """A model with no gold-present cell for a metric (e.g. every field
+    abstained on) has an undefined precision -- the gap must stay ``None``,
+    not be fabricated as an exact tie (#602 finding)."""
+    run_a = _run("a", {"p": {"x": bo.Outcome.ABS_COR}})
+    run_b = _run("b", {"p": {"x": bo.Outcome.ABS_COR}})
+    ci = bo.paired_bootstrap_metric(run_a, run_b, bo.precision, resamples=50, seed=1)
+    assert ci.estimate is None
+    assert ci.low is None
+    assert ci.high is None
 
 
 def test_paired_bootstrap_metric_recall_gap() -> None:
@@ -812,6 +1118,31 @@ async def test_main_estimate_only_is_zero_spend(capsys: pytest.CaptureFixture[st
     assert "roster total" in out
 
 
+# --- --max-spend argparse validation (#602 finding) --------------------------
+
+
+@pytest.mark.parametrize("raw", ["inf", "-inf", "nan", "-1"])
+def test_parse_args_rejects_non_finite_or_negative_max_spend(raw: str) -> None:
+    """``float()`` happily parses ``inf``/``nan``, and every
+    ``spent + upcoming > max_spend`` guard comparison in :func:`run_bakeoff`
+    is FALSE against either -- silently bypassing the explicit spend guard
+    (#602 finding)."""
+    with pytest.raises(SystemExit):
+        bo._parse_args(["--max-spend", raw])  # pyright: ignore[reportPrivateUsage]
+
+
+def test_parse_args_rejects_a_non_numeric_max_spend() -> None:
+    with pytest.raises(SystemExit):
+        bo._parse_args(["--max-spend", "not-a-number"])  # pyright: ignore[reportPrivateUsage]
+
+
+def test_parse_args_accepts_a_finite_nonnegative_max_spend() -> None:
+    args = bo._parse_args(["--max-spend", "3.5"])  # pyright: ignore[reportPrivateUsage]
+    assert args.max_spend == pytest.approx(3.5)
+    zero_args = bo._parse_args(["--max-spend", "0"])  # pyright: ignore[reportPrivateUsage]
+    assert zero_args.max_spend == 0.0
+
+
 # --- Report + serialization + checkpoint/budget (all network-free) ----------
 
 
@@ -832,7 +1163,7 @@ def test_render_report_has_headline_pairwise_cost_and_caveat(
     assert "SCREENING harness, not certification" in report
     assert "RANGE-altitude COR" in report  # the range-altitude caveat (#600)
     assert "PARTIAL RUN" not in report
-    assert "EXCLUDED -- transient failure" not in report
+    assert "EXCLUDED -- failed this invocation" not in report
 
 
 def test_render_report_pairwise_reports_every_promised_axis(
@@ -845,6 +1176,37 @@ def test_render_report_pairwise_reports_every_promised_axis(
     report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:2]))
     assert "faithfulness (precision) gap" in report
     assert "abstention gap" in report
+
+
+def test_render_report_pairwise_shows_na_not_zero_for_undefined_metric(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """Two models that only ever abstain (ABS_COR) have an undefined
+    faithfulness/abstention denominator -- the gap must render ``n/a``, never
+    a fabricated ``+0.000`` that reads as a confirmed tie (#602 finding)."""
+    runs = [_full_run("model-a", bo.Outcome.ABS_COR), _full_run("model-b", bo.Outcome.ABS_COR)]
+    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:2]))
+    assert "faithfulness (precision) gap n/a" in report
+
+
+def test_render_report_emits_wilson_intervals(corpus: list[bo.CorpusPage]) -> None:
+    """The report promises Wilson intervals (module docstring + CAVEAT_TEXT)
+    -- they must actually be rendered, not just computed and dropped (#602
+    finding)."""
+    runs = [_full_run("model-a", bo.Outcome.COR)]
+    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    assert "## Wilson intervals" in report
+    assert "`model-a`" in report
+    assert "95% Wilson CI" in report
+
+
+def test_render_report_wilson_zero_trials_renders_na(corpus: list[bo.CorpusPage]) -> None:
+    """A model with zero present-field decisions (every field ABS_COR) has
+    an undefined Wilson proportion -- rendered 'n/a', never a fabricated
+    '0.000' (#602 fold round 4, FOLD 5)."""
+    runs = [_full_run("model-a", bo.Outcome.ABS_COR)]
+    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    assert "| `model-a` | 0/0 | n/a | [0.000, 1.000] |" in report
 
 
 def test_render_report_marks_budget_stopped_runs_partial(
@@ -865,15 +1227,16 @@ def test_render_report_marks_budget_stopped_runs_partial(
 def test_render_report_marks_failed_models_excluded(corpus: list[bo.CorpusPage]) -> None:
     """A wholly-failed model must appear ONLY in the exclusion banner, never
     in the leaderboard/per-page/pairwise sections below it (#600 round-2
-    finding)."""
+    finding) -- and the banner shows its DISPLAY-ONLY heuristic label,
+    never checkpointed regardless of it (#602 fold round 5)."""
     runs = [_full_run("model-a", bo.Outcome.COR)]
     report = bo.render_report(
         runs,
         bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
-        failed_slugs=["model-failed"],
+        failed_slugs=[bo.FailedRun(model_slug="model-failed", heuristic_label="MODEL-SPECIFIC")],
     )
-    assert "EXCLUDED -- transient failure" in report
-    assert "model-failed" in report
+    assert "EXCLUDED -- failed this invocation" in report
+    assert "`model-failed` (MODEL-SPECIFIC, heuristic)" in report
     assert "- models scored: 1" in report  # the failed model is NOT counted
 
 
@@ -895,17 +1258,21 @@ def test_render_report_pairwise_covers_all_pairs_not_just_first(
 
 
 def test_render_report_labels_actual_spend_vs_resumed(corpus: list[bo.CorpusPage]) -> None:
-    """A newly-called model's cost must be labelled ACTUAL spend, not the
-    generic pre-run 'NOT yet spent' estimate framing (#600 round-2 finding)."""
+    """A newly-called model's cost must be labelled as spend INCURRED, not
+    the generic pre-run 'NOT yet spent' estimate framing (#600 round-2
+    finding) -- and never claimed as verified ACTUAL billing, since this
+    harness has no live token-usage/billing readback (#602 finding: the
+    round-2 'ACTUALLY SPENT' wording overclaimed this)."""
     runs = [_full_run("model-a", bo.Outcome.COR), _full_run("model-b", bo.Outcome.COR)]
     cost_estimates = [
         bo.ModelCostEstimate(slug="model-a", input_tokens=100, output_tokens=50, usd=0.01),
         bo.ModelCostEstimate(slug="model-b", input_tokens=100, output_tokens=50, usd=0.02),
     ]
     report = bo.render_report(runs, cost_estimates, executed_slugs=["model-a"])
-    assert "ACTUALLY SPENT" in report
-    assert "$0.0100" in report  # only model-a's cost counted as spent
-    assert "spent this run" in report
+    assert "ESTIMATED SPEND INCURRED" in report
+    assert "ACTUALLY SPENT" not in report
+    assert "$0.0100" in report  # only model-a's cost counted as incurred
+    assert "spend incurred (est.)" in report
     assert "resumed (no new spend)" in report
 
 
@@ -913,6 +1280,7 @@ def test_render_report_no_executed_slugs_is_pure_estimate(corpus: list[bo.Corpus
     runs = [_full_run("model-a", bo.Outcome.COR)]
     report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
     assert "NOT yet spent" in report
+    assert "ESTIMATED SPEND INCURRED" not in report
     assert "ACTUALLY SPENT" not in report
 
 
@@ -1136,6 +1504,56 @@ def test_checkpoint_recovers_earlier_records_after_truncated_final_line(
     assert reopened.has("m1")
     assert reopened.has("m2")
     assert not reopened.has("m3")
+    # The truncated tail must be REMOVED from disk, not merely skipped in
+    # memory -- otherwise the next append concatenates a new record directly
+    # onto it (no trailing newline) and a later resume raises (#602 finding).
+    assert "truncated" not in path.read_text()
+    reopened.append(bo.run_to_json(_run("m4", {"p": {"origin": bo.Outcome.COR}})))
+    resumed_again = bo.Checkpoint(path, resume=True)
+    assert resumed_again.has("m1")
+    assert resumed_again.has("m2")
+    assert resumed_again.has("m4")
+    assert not resumed_again.has("m3")
+
+
+def test_atomic_write_text_replaces_content_and_leaves_no_temp_file(tmp_path: Path) -> None:
+    """``_atomic_write_text`` fully replaces the destination's content via a
+    same-directory temp file + ``os.replace`` -- never a bare truncate-then-
+    write in place (#602 fold 4)."""
+    path = tmp_path / "cells.jsonl"
+    path.write_text("old content\n")
+    bo._atomic_write_text(path, "new content\n")  # pyright: ignore[reportPrivateUsage]
+    assert path.read_text() == "new content\n"
+    assert list(tmp_path.glob("*.tmp")) == []  # the temp file is renamed away, not left behind
+
+
+def test_checkpoint_tail_repair_goes_through_atomic_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The truncated-tail repair goes through ``_atomic_write_text`` (#602
+    fold 4), not a direct ``path.write_text`` -- a non-atomic truncate-then-
+    write would risk destroying the just-recovered records on a SECOND crash
+    mid-repair, exactly the failure class this repair exists to prevent."""
+    path = tmp_path / "cells.jsonl"
+    checkpoint = bo.Checkpoint(path, resume=False)
+    checkpoint.append(bo.run_to_json(_run("m1", {"p": {"origin": bo.Outcome.COR}})))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"model_slug": "m2", "pages": [truncated')  # no trailing newline
+
+    calls: list[tuple[Path, str]] = []
+    original = bo._atomic_write_text  # pyright: ignore[reportPrivateUsage]
+
+    def spy(target: Path, content: str) -> None:
+        calls.append((target, content))
+        original(target, content)
+
+    monkeypatch.setattr(bo, "_atomic_write_text", spy)
+    reopened = bo.Checkpoint(path, resume=True)
+    assert reopened.has("m1")
+    assert len(calls) == 1
+    repaired_path, repaired_content = calls[0]
+    assert repaired_path == path
+    assert repaired_content == path.read_text()  # exactly what's on disk now
 
 
 def test_checkpoint_raises_on_malformed_interior_line(tmp_path: Path) -> None:
@@ -1150,6 +1568,56 @@ def test_checkpoint_raises_on_malformed_interior_line(tmp_path: Path) -> None:
         handle.write(m2_record + "\n")
     with pytest.raises(json.JSONDecodeError):
         bo.Checkpoint(path, resume=True)
+
+
+def test_checkpoint_raises_on_a_newline_terminated_malformed_final_line(
+    tmp_path: Path,
+) -> None:
+    """A malformed FINAL line that DOES end with a newline cannot be an
+    interrupted in-flight append -- that write completed, so the broken
+    JSON is real corruption (a manual edit / a bug), not a mid-write kill.
+    It must raise for manual recovery, NOT be silently auto-repaired away
+    (#602 fold round 4, FOLD 4)."""
+    path = tmp_path / "cells.jsonl"
+    checkpoint = bo.Checkpoint(path, resume=False)
+    checkpoint.append(bo.run_to_json(_run("m1", {"p": {"origin": bo.Outcome.COR}})))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write('{"model_slug": "m2", "pages": [corrupted}\n')  # WITH a trailing newline
+    with pytest.raises(json.JSONDecodeError):
+        bo.Checkpoint(path, resume=True)
+    # Not auto-repaired: the corrupted bytes must still be on disk, untouched,
+    # for manual recovery.
+    assert "corrupted" in path.read_text()
+
+
+def test_checkpoint_normalises_a_valid_newline_less_tail(tmp_path: Path) -> None:
+    """A COMPLETE, valid JSON final line missing only its trailing newline parses fine, so
+    the truncated-tail repair never fires -- yet the next append would concatenate directly
+    onto it with no separator, corrupting the JSONL. The loader must normalise this
+    newline-less-but-valid tail atomically before any further append (#602 fold round 6,
+    FOLD 3)."""
+    path = tmp_path / "cells.jsonl"
+    checkpoint = bo.Checkpoint(path, resume=False)
+    checkpoint.append(bo.run_to_json(_run("m1", {"p": {"origin": bo.Outcome.COR}})))
+    checkpoint.append(bo.run_to_json(_run("m2", {"p": {"origin": bo.Outcome.COR}})))
+    # Simulate a kill that wrote the complete final JSON payload but not its
+    # trailing newline.
+    raw = path.read_bytes()
+    assert raw.endswith(b"\n")
+    path.write_bytes(raw[:-1])
+
+    reopened = bo.Checkpoint(path, resume=True)
+    assert reopened.has("m1")
+    assert reopened.has("m2")
+    assert path.read_text().endswith("\n")  # normalised BEFORE any further append
+
+    reopened.append(bo.run_to_json(_run("m3", {"p": {"origin": bo.Outcome.COR}})))
+    # The new record must be on its OWN line, not concatenated -- a resume
+    # must read all three records as valid JSONL.
+    resumed_again = bo.Checkpoint(path, resume=True)
+    assert resumed_again.has("m1")
+    assert resumed_again.has("m2")
+    assert resumed_again.has("m3")
 
 
 def test_checkpoint_ignores_stale_fingerprinted_records(tmp_path: Path) -> None:
@@ -1222,6 +1690,102 @@ def test_pipeline_fingerprint_is_deterministic_and_nonempty() -> None:
     second = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
     assert first == second
     assert first  # this env can locate the extractor/harness source files
+
+
+def test_fingerprinted_modules_cover_the_whole_extraction_call_path() -> None:
+    """Round-2 hashed only ``bean_sourcing.py`` + the harness; the evaluated
+    call path also calls ``advisor.build_model`` and constructs
+    ``BeanProfileDraft``/config objects through ``config.py``/``models.py`` --
+    a change to any of those could alter a fresh result while an old
+    checkpoint is still (wrongly) accepted (#602 finding)."""
+    module_names = {m.__name__ for m in bo._FINGERPRINTED_MODULES}  # pyright: ignore[reportPrivateUsage]
+    assert module_names == {
+        "roastpilot_agent.bean_sourcing",
+        "roastpilot_agent.advisor",
+        "roastpilot_agent.config",
+        "roastpilot_agent.models",
+    }
+
+
+def test_pipeline_fingerprint_changes_when_a_widened_module_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``advisor.py`` (not just ``bean_sourcing.py`` + the harness) must be
+    hashed too -- a provider-construction change must invalidate a stale
+    checkpoint (#602 finding)."""
+    import inspect as inspect_module
+
+    original_getsourcefile = inspect_module.getsourcefile
+    baseline = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
+
+    fake_advisor_source = tmp_path / "advisor_fake.py"
+    fake_advisor_source.write_text("# changed content for a fingerprint-sensitivity test\n")
+
+    def _patched(module: object) -> str | None:
+        if module is bo._advisor_module:  # pyright: ignore[reportPrivateUsage]
+            return str(fake_advisor_source)
+        return original_getsourcefile(module)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(bo.inspect, "getsourcefile", _patched)
+    changed = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    assert changed != baseline
+    assert changed  # still resolvable, not degraded to ""
+
+
+def test_environment_fingerprint_is_stable_across_calls() -> None:
+    """The same installed environment must fingerprint identically across
+    calls (#602 fold round 6, FOLD 2)."""
+    first = bo._environment_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    second = bo._environment_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    assert first == second
+    assert first  # this env has installed distributions
+
+
+def test_environment_fingerprint_changes_with_interpreter_and_platform_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The distribution set alone misses the RUNTIME itself: identical packages under
+    Python 3.12 vs 3.11 (or a different interpreter/OS) must NOT fingerprint the same, or
+    a checkpoint could resume across interpreters (#602 fold round 7)."""
+    baseline = bo._environment_fingerprint()  # pyright: ignore[reportPrivateUsage]
+
+    monkeypatch.setattr(bo.platform, "python_version", lambda: "9.9.9")
+    assert bo._environment_fingerprint() != baseline  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.undo()
+
+    monkeypatch.setattr(bo.platform, "platform", lambda: "Some-Other-Platform-x86")
+    assert bo._environment_fingerprint() != baseline  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.undo()
+
+    monkeypatch.setattr(bo.sys.implementation, "name", "fake-impl")
+    assert bo._environment_fingerprint() != baseline  # pyright: ignore[reportPrivateUsage]
+
+
+def test_pipeline_fingerprint_changes_when_the_environment_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A CATEGORICAL distribution-set fingerprint means ANY installed
+    package's version change invalidates resume -- including a TRANSITIVE
+    dependency a hand-picked list would miss entirely (#602 fold round 6,
+    FOLD 2 -- replaces the round-4/5 hand-list)."""
+    baseline = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    real_distributions = list(importlib.metadata.distributions())
+
+    class _FakeDist:
+        def __init__(self, name: str, version: str) -> None:
+            self.name = name
+            self.version = version
+
+    def _patched() -> list[_FakeDist]:
+        fakes = [_FakeDist(d.name, d.version) for d in real_distributions]
+        if fakes:
+            fakes[0].version = "999.999.999"  # simulate ANY package moving, even transitive
+        return fakes
+
+    monkeypatch.setattr(bo.importlib.metadata, "distributions", _patched)
+    changed = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    assert changed != baseline
+    assert changed
 
 
 def test_compute_fingerprint_changes_with_pipeline_fingerprint(
@@ -1313,11 +1877,12 @@ async def test_run_bakeoff_stale_fingerprint_is_not_resumed(
 async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
-    """Every page erroring (a transient outage) must not be cached as 'done'
-    -- a re-run should retry, not resume the outage forever (#600 finding) --
-    AND must not appear in ``runs`` as a scored 0.000 row polluting the
-    leaderboard/statistics (#600 round-2 finding): it is reported separately
-    via ``failed_slugs`` instead."""
+    """Every page erroring, with NO peer having succeeded this invocation, is
+    labelled INFRA-WIDE (heuristic, display-only, #602 fold round 5): must
+    not be cached as 'done' -- a re-run should retry, not resume the outage
+    forever (#600 finding) -- AND must not appear in ``runs`` as a scored
+    0.000 row polluting the leaderboard/statistics (#600 round-2 finding):
+    it is reported separately via ``failed_slugs`` instead."""
     out = tmp_path / "o.json"
     result = await bo.run_bakeoff(
         corpus,
@@ -1329,11 +1894,112 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
         model=_model_text_only(),
     )
     assert result.runs == []
-    assert result.failed_slugs == ["m1"]
+    assert result.failed_slugs == [bo.FailedRun(model_slug="m1", heuristic_label="INFRA-WIDE")]
     assert result.executed_slugs == ["m1"]  # a paid attempt WAS made
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
     assert not checkpoint.has("m1")
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_resumed_success_does_not_flip_the_heuristic_label(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """A RESUMED peer's PAST success does not count as ``has_fresh_success``
+    for the DISPLAY-ONLY heuristic label (#602 fold round 1, preserved
+    through the round-5 simplification): with only a resumed peer and every
+    FRESH model failing, the fresh failure is labelled INFRA-WIDE -- never
+    checkpointed either way (the label no longer affects persistence at
+    all, #602 fold round 5)."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    # Seed a checkpoint with a peer that succeeded in a PRIOR invocation --
+    # resuming it (no new call) means it is NOT freshly executed this run.
+    seed = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    seed.append(bo.run_to_json(_full_run("good", bo.Outcome.COR)))
+
+    result = await bo.run_bakeoff(
+        corpus,
+        ["good", "bad"],
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(
+            corpus, [bo.RosterModel("good", 0.1, 0.1, "x"), bo.RosterModel("bad", 0.1, 0.1, "x")]
+        ),
+        model=_model_text_only(),  # only applies to "bad" -- "good" resumes
+    )
+    assert {r.model_slug for r in result.runs} == {"good"}  # "bad" NOT scored
+    assert result.failed_slugs == [bo.FailedRun(model_slug="bad", heuristic_label="INFRA-WIDE")]
+    assert result.executed_slugs == ["bad"]
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert not checkpoint.has("bad")  # NEVER checkpointed, regardless of the heuristic label
+
+
+def _model_switch_after(n: int, *, fail_first: bool) -> FunctionModel:
+    """A double that flips outcome after the ``n``th call, letting one
+    shared ``model`` drive TWO sequential models in one ``run_bakeoff``
+    invocation to different outcomes. ``fail_first`` fails the first ``n``
+    calls then succeeds; otherwise it succeeds the first ``n`` then fails.
+    A successful page costs 1 call; a wholly-failing page retries once, so
+    2 calls -- callers compute ``n`` accordingly."""
+    calls = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        succeeding = calls["n"] > n if fail_first else calls["n"] <= n
+        if succeeding:
+            return ModelResponse(
+                parts=[ToolCallPart(info.output_tools[0].name, {"name": "X", "country": "Ecuador"})]
+            )
+        return ModelResponse(parts=[TextPart("no structured output")])
+
+    return FunctionModel(respond)
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_never_checkpoints_a_wholly_failed_run_even_with_a_fresh_peer(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """#602 fold round 5 SIMPLIFICATION: rounds 3-4 eagerly checkpointed a
+    wholly-failed run once a fresh peer's success made it "provable"
+    MODEL-SPECIFIC -- but no invocation-local signal can truly tell a
+    transient outage occurring inside ONE model's turn apart from a
+    model-specific fault, so that eager persistence could permanently
+    corrupt the leaderboard on exactly this ambiguous case. Failed attempts
+    are cheap to retry; a mis-scored failure is expensive to fix -- so a
+    wholly-failed run is NEVER checkpointed, even when "a" succeeds first
+    and "b" then wholly fails (the heuristic label is display-only)."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    roster = [bo.RosterModel("a", 0.1, 0.1, "x"), bo.RosterModel("b", 0.1, 0.1, "x")]
+    estimates = bo.estimate_cost(corpus, roster)
+    result = await bo.run_bakeoff(
+        corpus,
+        ["a", "b"],
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=estimates,
+        model=_model_switch_after(len(corpus), fail_first=False),  # "a" succeeds, "b" fails
+    )
+    assert {r.model_slug for r in result.runs} == {"a"}  # the success IS scored, unaffected
+    assert result.failed_slugs == [bo.FailedRun(model_slug="b", heuristic_label="MODEL-SPECIFIC")]
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert checkpoint.has("a")
+    assert not checkpoint.has("b")  # NEVER checkpointed, regardless of the heuristic label
+
+    # A resume must ALWAYS retry "b" -- a paid attempt is made again.
+    resumed = await bo.run_bakeoff(
+        corpus,
+        ["a", "b"],
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=estimates,
+        model=_model_text_only(),
+    )
+    assert resumed.executed_slugs == ["b"]  # "a" resumed (no new call), "b" retried
 
 
 def test_run_wholly_failed_detects_all_errored_pages() -> None:
@@ -1392,7 +2058,7 @@ async def test_main_full_run_writes_artifact_and_partial_report(
         runs=[_full_run(bo.MODEL_ROSTER[0].slug, bo.Outcome.COR)],
         stopped_early=True,
         unevaluated_slugs=[bo.MODEL_ROSTER[1].slug],
-        failed_slugs=["some/failed-slug"],
+        failed_slugs=[bo.FailedRun(model_slug="some/failed-slug", heuristic_label="INFRA-WIDE")],
         executed_slugs=[bo.MODEL_ROSTER[0].slug, "some/failed-slug"],
     )
 
@@ -1422,10 +2088,12 @@ async def test_main_full_run_writes_artifact_and_partial_report(
     artifact = json.loads(out.read_text())
     assert artifact["stopped_early"] is True
     assert artifact["unevaluated_slugs"] == [bo.MODEL_ROSTER[1].slug]
-    assert artifact["failed_slugs"] == ["some/failed-slug"]
+    assert artifact["failed_slugs"] == [
+        {"model_slug": "some/failed-slug", "heuristic_label": "INFRA-WIDE"}
+    ]
     assert artifact["executed_slugs"] == [bo.MODEL_ROSTER[0].slug, "some/failed-slug"]
     report_text = report_md.read_text()
     assert "PARTIAL RUN" in report_text
-    assert "EXCLUDED -- transient failure" in report_text
+    assert "EXCLUDED -- failed this invocation" in report_text
     assert "some/failed-slug" in report_text
-    assert "ACTUALLY SPENT" in report_text
+    assert "ESTIMATED SPEND INCURRED" in report_text
