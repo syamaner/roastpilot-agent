@@ -48,6 +48,48 @@ name: Review gate
 # Branch protection (marking review-gate required) is the operator's governance
 # call (main has enforce_admins on) and is NOT changed here — this PR ships only
 # the mechanism.
+#
+# #605 — THE DRAFT->READY DEADLOCK (found 19 Jul on #604, repeated on every
+# ready-toggle that week: #608/#610/#611/#614/#616/#618-#620/#622/#624/#626).
+#
+# claude-code-review.yml runs on `opened` (drafts included — AGENTS.md notes
+# this is intentional; #599's attempt to skip it on drafts was rejected as
+# unsafe, see that issue) AND on `ready_for_review`, in a concurrency group
+# keyed ONLY by PR number (`claude-review-<PR#>`, `cancel-in-progress: true`).
+# That grouping is deliberate (#579): a later run for the SAME PR — whatever
+# triggered it — must cancel an still-running earlier one, or a stale review
+# can post inline threads against a diff a later push already replaced.
+#
+# The failure mode: a run gets cancelled by this concurrency group (e.g. the
+# draft-time `opened` run is still executing when `ready_for_review` fires a
+# fresh one on the SAME head SHA — no new commit, so nothing about the diff is
+# actually stale). `flip-on-review` correctly does NOT flip on a non-success
+# conclusion (fail-closed, by design — see that job's comment). The design
+# assumed a later, uncancelled run always eventually lands `success` and
+# flips the gate. In practice, GitHub's concurrency cancellation raced
+# strangely enough across the observed sequences (draft opened -> ready;
+# ready -> push -> toggle; rebase force-push while ready) that a run for the
+# PR's CURRENT head SHA was sometimes the *last* run ever created for that
+# SHA, and it was the one cancelled — so nothing further was ever going to
+# retry it, and `review-gate` sat PENDING forever. The only fix in practice
+# was the manual `gh pr ready --undo && gh pr ready`, which forces one more
+# `ready_for_review` event to fire a clean, uncancelled run.
+#
+# THE FIX automates exactly that manual retry, scoped tightly so it can never
+# rubber-stamp an unreviewed diff: when `flip-on-review` sees a
+# `cancelled`/`skipped` conclusion (never `failure` — a real crash still
+# requires operator attention, unchanged), it checks (a) whether the PR's
+# CURRENT head SHA still matches the cancelled run's SHA (if a newer push
+# already superseded it, there is nothing to retry — a fresh run for the new
+# SHA is already the stamp-on-pr path's job) and (b) whether any OTHER run of
+# `Claude Code Review` for that same SHA is queued, in progress, or already
+# succeeded (if so, defer to it — it will fire its own `workflow_run` event
+# and re-enter this same logic). Only when the cancelled run was the sole,
+# now-dead attempt for the CURRENT head does it call the Actions API to
+# re-run that exact workflow run. The re-run's own completion re-enters this
+# script; the gate still only ever flips to `success` on an actual
+# `success` conclusion — never on the cancellation itself. See `flip-on-
+# review`'s script for the concrete logic.
 
 on:
   # Stamp the gate on every PR head as soon as it appears / updates.
@@ -59,13 +101,18 @@ on:
     workflows: ["Claude Code Review"]
     types: [completed]
 
-# statuses: write is the only privilege needed — we POST a commit status. No
-# code is checked out or executed from the PR, so this stays safe even on the
-# pull_request trigger (which, for same-repo PRs, runs with the repo token).
+# statuses: write posts the commit status. pull-requests: read looks up the
+# PR's current head SHA (self-heal staleness check, #605). actions: write is
+# `flip-on-review`'s #605 self-heal only — re-running a cancelled/skipped
+# `Claude Code Review` run via the Actions API when nothing else will retry
+# it (read access to list runs is included in `write`). No code is checked
+# out or executed from the PR, so this stays safe even on the pull_request
+# trigger (which, for same-repo PRs, runs with the repo token).
 permissions:
   contents: read
   statuses: write
   pull-requests: read
+  actions: write
 
 jobs:
   # ---- PR opened / synchronized: stamp PENDING, or auto-pass the exempt classes.
@@ -151,23 +198,121 @@ jobs:
             // `success` at STAMP time by stamp-on-pr, so the flip is moot for
             // them — the unblock comes from the stamp-time auto-pass, never from
             // this conclusion-gated flip.
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
             const run = context.payload.workflow_run;
             const sha = run.head_sha;
 
-            if (run.conclusion !== 'success') {
+            if (run.conclusion === 'success') {
+              await github.rest.repos.createCommitStatus({
+                owner,
+                repo,
+                sha,
+                context: 'review-gate',
+                state: 'success',
+                description: 'Claude Code Review completed; findings gated by conversation resolution.'.slice(0, 140),
+              });
+              core.info(`review-gate=success on ${sha} (review run ${run.id}, conclusion=success).`);
+              return;
+            }
+
+            // #605 self-heal: a `cancelled`/`skipped` conclusion is usually
+            // the #579 concurrency group correctly superseding a stale run —
+            // but sometimes the run for the PR's CURRENT head sha is itself
+            // the one that gets cancelled, with nothing left to retry it
+            // (the draft->ready toggle race). Handle only those two
+            // conclusions here; a genuine `failure` stays fail-closed
+            // exactly as before (a crashed review still needs an operator
+            // to look at it, not an automatic retry loop).
+            if (run.conclusion !== 'cancelled' && run.conclusion !== 'skipped') {
               core.info(
                 `review-gate NOT flipping on ${sha}: review run ${run.id} conclusion=${run.conclusion}, staying pending (fail-closed).`,
               );
               return;
             }
 
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha,
-              context: 'review-gate',
-              state: 'success',
-              description: 'Claude Code Review completed; findings gated by conversation resolution.'.slice(0, 140),
-            });
+            // Find the PR this run reviewed (same-repo PRs populate
+            // `pull_requests` directly; fall back to the commit-associated-PRs
+            // API for the rare case it doesn't).
+            let prNumber = run.pull_requests && run.pull_requests[0]
+              ? run.pull_requests[0].number
+              : undefined;
+            if (!prNumber) {
+              const assoc = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner,
+                repo,
+                commit_sha: sha,
+              });
+              prNumber = assoc.data[0] && assoc.data[0].number;
+            }
+            if (!prNumber) {
+              core.info(
+                `review-gate: cancelled/skipped run ${run.id} on ${sha} has no associated PR; nothing to self-heal, staying pending.`,
+              );
+              return;
+            }
 
-            core.info(`review-gate=success on ${sha} (review run ${run.id}, conclusion=success).`);
+            // Stale check: if the PR has since moved to a newer commit, this
+            // cancelled run's sha is no longer the head. The push that
+            // superseded it already re-stamped `pending` for the new sha via
+            // stamp-on-pr, and a fresh claude-review run for THAT sha is
+            // already the mechanism that will flip it — nothing to retry here.
+            const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            if (pr.data.head.sha !== sha) {
+              core.info(
+                `review-gate: cancelled/skipped run ${run.id} targeted stale sha ${sha}; PR #${prNumber} head is now ${pr.data.head.sha} — already superseded, staying pending on the new sha until its own review completes.`,
+              );
+              return;
+            }
+
+            // Successor check: if another run of this same workflow for this
+            // exact sha is queued/in-progress, or already succeeded, defer to
+            // it — it will fire its own `workflow_run` completed event and
+            // re-enter this exact script.
+            const runsForSha = await github.rest.actions.listWorkflowRuns({
+              owner,
+              repo,
+              workflow_id: run.workflow_id,
+              head_sha: sha,
+            });
+            const successor = runsForSha.data.workflow_runs.find(
+              (r) => r.id !== run.id && (r.status !== 'completed' || r.conclusion === 'success'),
+            );
+            if (successor) {
+              core.info(
+                `review-gate: cancelled/skipped run ${run.id} on ${sha} has a successor (run ${successor.id}, status=${successor.status}, conclusion=${successor.conclusion}) — deferring to it, staying pending.`,
+              );
+              return;
+            }
+
+            // This cancelled/skipped run was the only attempt for the
+            // CURRENT head sha and nothing else will retry it automatically.
+            // Self-heal: re-run this exact workflow run (the API re-runs it
+            // against the same commit/ref it originally targeted). This is
+            // exactly what the manual `gh pr ready --undo && gh pr ready`
+            // workaround forced — one more clean attempt. The gate itself
+            // still does not flip here; the re-run's own completion re-enters
+            // this script and only flips on an actual `success` conclusion.
+            try {
+              await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
+              await github.rest.repos.createCommitStatus({
+                owner,
+                repo,
+                sha,
+                context: 'review-gate',
+                state: 'pending',
+                description: '#605 self-heal: re-running a cancelled/skipped review with no successor.'.slice(0, 140),
+              });
+              core.info(
+                `review-gate: #605 self-heal — re-ran ${run.conclusion} run ${run.id} on ${sha} (no successor found); staying pending until it completes.`,
+              );
+            } catch (err) {
+              // Fail-closed, not fail-loud: leave the stamp-time `pending`
+              // exactly where it was (never flip on a re-run request we
+              // couldn't even confirm was accepted) and surface the API
+              // error in the log for the operator, who still has the manual
+              // `gh pr ready --undo && gh pr ready` workaround available.
+              core.warning(
+                `review-gate: #605 self-heal re-run of ${run.id} on ${sha} failed: ${err}. Staying pending — manual re-trigger still works.`,
+              );
+            }
