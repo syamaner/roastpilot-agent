@@ -4905,6 +4905,65 @@ def test_quote_supports_processing_none_value_demotes() -> None:
     )
 
 
+# --- #590 slice E2: independent adversarial security-reviewer BLOCK on
+# ``processing`` — two SEMANTIC certify-bypass classes on ORDINARY vendor
+# copy, motivating the permanent dormancy above (same disposition as
+# E1b's ``is_blend``). These three tests are EXECUTABLE SPECS for the
+# reviewer's exact findings: they assert the helper's ACTUAL
+# (documented-bypass) behaviour, not the desired one — proof the park is
+# warranted, not a claim the gate is correct.
+
+
+def test_quote_supports_processing_negation_with_adjacent_cue_bypass_certifies_wrongly() -> None:
+    """Reviewer repro 1: negation, with the process-word cue immediately
+    adjacent and the TRUE method never named anywhere in the sentence —
+    "never a washed process — we let the fruit dry on the bean" certifies
+    ``washed`` even though the sentence explicitly DENIES it. The
+    conflict exclusion cannot fire here: no OTHER method's display
+    spelling is present to contradict the claim, so the whitelist has no
+    signal at all that "washed" is being negated rather than asserted."""
+    sentence = "never a washed process — we let the fruit dry on the bean"
+    result = bean_sourcing._quote_supports_processing(  # pyright: ignore[reportPrivateUsage]
+        "washed", sentence, sentence
+    )
+    assert result is True  # documented negation bypass — NOT the desired outcome
+
+
+def test_quote_supports_processing_non_coffee_cue_collision_bypass_certifies_wrongly() -> None:
+    """Reviewer repro 2: a non-coffee use of "process"/"method" collides
+    with the context cue — "Our roasting process: natural gas burners
+    power the drum." is describing EQUIPMENT FUEL, not a coffee
+    processing method, yet ``natural`` certifies because the cue words
+    are not coffee-processing-specific and "natural" sits right after the
+    colon (which normalizes away)."""
+    sentence = "Our roasting process: natural gas burners power the drum."
+    result = bean_sourcing._quote_supports_processing(  # pyright: ignore[reportPrivateUsage]
+        "natural", sentence, sentence
+    )
+    assert result is True  # documented cue-collision bypass — NOT the desired outcome
+
+
+def test_quote_supports_processing_sibling_product_locality_bypass_certifies_wrongly() -> None:
+    """MEDIUM finding: an anchored sibling-product heading ("## Kenya AA
+    & Friends" matching the page's own "Kenya AA" anchor) admits a
+    DIFFERENT product's processing sentence ("our sister lot, the
+    Ethiopia Yirgacheffe, which uses a honey process") into the main
+    region — the heading-match whitelist has no way to know the sentence
+    describes another SKU entirely, so the wrong-entity citation
+    certifies ``honey`` for the Kenya AA page."""
+    body = _framed(
+        "Kenya AA",
+        "## Kenya AA & Friends\n"
+        "Our sister lot, the Ethiopia Yirgacheffe, which uses a honey "
+        "process, is also available.\n",
+    )
+    region = bean_sourcing._main_product_region(body, "", "")  # pyright: ignore[reportPrivateUsage]
+    result = bean_sourcing._quote_supports_processing(  # pyright: ignore[reportPrivateUsage]
+        "honey", "which uses a honey process", region
+    )
+    assert result is True  # documented wrong-entity bypass — NOT the desired outcome
+
+
 def test_quote_supports_bean_species_percent_prefix_verifies_without_a_cue() -> None:
     """ "100% arabica" verifies with NO process-word-style cue required —
     species tokens are self-disambiguating."""
@@ -5042,10 +5101,16 @@ def test_segment_has_conflicting_enum_value_no_conflict_returns_false() -> None:
 # --- #590 slice E2: full-pipeline (_draft_from_identity) integration ---
 
 
-def test_draft_from_identity_processing_verifies_under_matched_heading() -> None:
-    """Headline positive path: an anchored heading region genuinely
-    stating "Process: Natural", with a matching evidence quote, flips
-    ``processing`` to ``"on_page"``."""
+def test_draft_from_identity_processing_under_matched_heading_stays_dormant() -> None:
+    """DORMANT-gate form (#590 slice E2 — ``processing`` shipped ENABLED
+    at birth, then PARKED PERMANENTLY by an independent adversarial
+    review BLOCK before this slice opened, see
+    :data:`bean_sourcing._PROCESSING_CITATION_GATE_ENABLED`), mirroring
+    E1b's ``is_blend`` dormancy proof: an anchored heading region
+    genuinely stating "Process: Natural", with a matching evidence quote,
+    demotes at RUNTIME regardless — the helper itself still recognizes
+    the citation (see the direct-call assertion below), proving the
+    machinery works and only its consumption is gated off."""
     body = _framed(
         "Ethiopia Yirgacheffe",
         "## Ethiopia Yirgacheffe\nProcess: Natural\nGrown at high altitude.\n",
@@ -5056,7 +5121,14 @@ def test_draft_from_identity_processing_verifies_under_matched_heading() -> None
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
         identity, url="https://vendor.example/products/yirgacheffe", corpus=body
     )
-    assert draft.field_sources["processing"] == "on_page"
+    assert draft.field_sources["processing"] == "origin_estimated"
+    main_region = bean_sourcing._main_product_region(body, "", "")  # pyright: ignore[reportPrivateUsage]
+    assert (
+        bean_sourcing._quote_supports_processing(  # pyright: ignore[reportPrivateUsage]
+            "natural", "Process: Natural", main_region
+        )
+        is True
+    )
 
 
 def test_draft_from_identity_bean_species_under_matched_heading_stays_dormant() -> None:
@@ -5109,12 +5181,15 @@ def test_draft_from_identity_processing_cross_sell_decoy_demotes() -> None:
     assert draft.field_sources["processing"] == "origin_estimated"
 
 
-def test_draft_from_identity_processing_gate_ships_enabled() -> None:
-    """#590 slice E2: ``processing`` ships ENABLED at birth (unlike the
-    altitude retrofit) — its cue+conflict structure has no demonstrated
-    bypass, so it earns its adversarial review shot live."""
+def test_draft_from_identity_processing_gate_ships_dormant() -> None:
+    """#590 slice E2: ``processing`` shipped ENABLED at birth, then was
+    PARKED PERMANENTLY by an independent adversarial review BLOCK before
+    this slice opened — two demonstrated semantic bypasses on ordinary
+    vendor copy (see the negation-probe and cue-collision tests below),
+    the same disposition as ``bean_species``/``is_blend``."""
     assert (
-        bean_sourcing._PROCESSING_CITATION_GATE_ENABLED is True  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._PROCESSING_CITATION_GATE_ENABLED  # pyright: ignore[reportPrivateUsage]
+        is False
     )
 
 
