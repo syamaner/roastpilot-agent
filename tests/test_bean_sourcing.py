@@ -2885,16 +2885,19 @@ def test_draft_from_identity_is_blend_demotes_with_no_anchor_even_with_a_genuine
     assert draft.field_sources["is_blend"] == "origin_estimated"
 
 
-def test_draft_from_identity_altitude_gate_enabled_certifies_on_page() -> None:
-    """#617 D2d-b: the citation gate ships ENABLED
-    (:data:`bean_sourcing._ALTITUDE_CITATION_GATE_ENABLED` is ``True``) —
-    a genuine, region-authenticated citation now flips
-    ``field_sources["altitude_m"]`` to ``"on_page"`` at the
-    :func:`_draft_from_identity` level, not just via a direct call to the
-    gate function. The page carries a real frontmatter ``title:`` anchor
-    (:func:`bean_sourcing._main_product_region`'s A1), so the evidence
-    quote authenticates against the MAIN REGION exactly as a real fetched
-    page would."""
+def test_draft_from_identity_altitude_ships_dormant() -> None:
+    """#617 terminal probe: the citation gate ships DORMANT PERMANENTLY
+    (:data:`bean_sourcing._ALTITUDE_CITATION_GATE_ENABLED` is ``False``)
+    — even a PERFECT citation (genuine, region-authenticated, no
+    conjunction/comma-compound heading, no clause-bridging quote gap, a
+    real context-cued unit) must still demote at runtime, because
+    :func:`_draft_from_identity` gates the flip on the flag. The
+    underlying gate function itself (the whitelist grammar stays built
+    and unit-tested, just permanently unconsumed) would return ``True``
+    for this exact quote — the two-round enable arc closed five, then
+    three, real leaks in this exact mechanism before the terminal probe
+    found two more, so it never got to run this correctly in
+    production."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(altitude_m=1800, altitude_m_evidence="grown at 1,800 masl")
     )
@@ -2907,7 +2910,110 @@ def test_draft_from_identity_altitude_gate_enabled_certifies_on_page() -> None:
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
         identity, url="https://vendor.example/products/kenya", corpus=corpus
     )
-    assert draft.field_sources["altitude_m"] == "on_page"
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+    main_region = bean_sourcing._main_product_region(corpus, "", "")  # pyright: ignore[reportPrivateUsage]
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "grown at 1,800 masl", main_region
+        )
+        is True
+    )
+
+
+# --- #617 terminal probe: the two plausible certify-leaks that PARKED
+# altitude certification permanently (see
+# :data:`bean_sourcing._ALTITUDE_CITATION_GATE_ENABLED`'s docstring). The
+# whitelist grammar stays built and unit-tested (all the other fold tests
+# in this file still pass), but these two repros are the MOTIVATING
+# EVIDENCE for the park: each asserts the CURRENT actual (leaking)
+# outcome, not the desired one — do NOT "fix" these assertions without
+# also revisiting the park decision itself. ---
+
+
+@pytest.mark.parametrize("separator", ["; ", "/ ", "| "])
+def test_heading_matches_anchor_separator_sweep_incompleteness_is_a_leak(
+    separator: str,
+) -> None:
+    """Terminal-probe repro (leak 1): the comma/conjunction sweep (#617
+    fold 4, fold 4-FIX-1) covered only the ONE separator character
+    actually repro'd at each round, not the general class — ";"/"/"/"|"
+    still anchor a compound heading exactly like the comma and "&"/"and"
+    did before their own fixes. This is the CURRENT LEAKING behavior
+    (``True``), asserted as the park's motivating evidence — it is NOT
+    the desired outcome."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor(f"Kenya AA{separator}Sumatra", ["kenya aa"]) is True
+
+
+def test_quote_supports_altitude_slash_heading_cross_bean_misattribution_is_a_leak() -> None:
+    """Terminal-probe repro (leak 1, end-to-end): a page anchored on
+    "Kenya AA" has a "## Kenya AA / Sumatra Mandailing" section stating a
+    SIBLING lot's altitude ("1,800 metres") — the slash-joined heading
+    still anchors (leak 1), so the sibling's reading sits INSIDE the main
+    region and cross-bean-certifies. Asserted as the park's motivating
+    evidence — it is NOT the desired outcome."""
+    body = _framed(
+        "Kenya AA",
+        "## Kenya AA / Sumatra Mandailing\n"
+        "Our Sumatra Mandailing lot is grown at 1,800 metres in the highlands.\n",
+    )
+    region = bean_sourcing._main_product_region(body, "", "")  # pyright: ignore[reportPrivateUsage]
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "is grown at 1,800 metres", region
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_paren_bridged_quote_gap_is_a_leak() -> None:
+    """Terminal-probe repro (leak 2): the clause-break character set
+    (#617 fold 4-FIX-2) was a hand-picked subset of the module's own
+    boundary-punctuation set — it never included the paren/bracket/pipe
+    family, so a 2-char gap through ")" still bridges an unrelated
+    clause: "This farm has (with a lovely tasting room) 1800masl of
+    shelving space nearby" certifies off a quote naming only the
+    parenthetical, which never mentions the number at all. Asserted as
+    the park's motivating evidence — it is NOT the desired outcome."""
+    corpus = "This farm has (with a lovely tasting room) 1800masl of shelving space nearby."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "with a lovely tasting room", corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_pipe_bridged_quote_gap_is_a_leak() -> None:
+    """Terminal-probe repro (leak 2, pipe variant): "Farm Notes| 1800masl
+    of shelving space in the warehouse" certifies off a quote naming only
+    "Farm Notes", which never mentions the number either — the same
+    clause-break gap, through "|" instead of ")". Asserted as the park's
+    motivating evidence — it is NOT the desired outcome."""
+    corpus = "Farm Notes| 1800masl of shelving space in the warehouse."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "Farm Notes", corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_context_word_referent_mismatch_is_a_leak() -> None:
+    """Terminal-probe repro (leak 3, the context-word medium): "This
+    locally grown coffee sits beside 1,800 metres of shelving" certifies
+    — "grown" is genuinely within the context-word window, but it
+    describes the COFFEE, not the shelving measurement; a proximity
+    check has no way to verify the word's actual REFERENT, only its
+    distance. Asserted as the park's motivating evidence — it is NOT the
+    desired outcome."""
+    corpus = "This locally grown coffee sits beside 1,800 metres of shelving"
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, corpus, corpus
+        )
+        is True
+    )
 
 
 def test_draft_from_identity_altitude_no_anchor_page_demotes_despite_a_perfect_quote() -> None:
@@ -3770,6 +3876,20 @@ def test_quote_supports_altitude_returns_false_for_none_value() -> None:
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
             None, "grown at 1800 masl", "grown at 1800 masl"
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_fabricated_quote_demotes() -> None:
+    """A quote that genuinely WOULD support the value if it were real page
+    text, but is never actually on the page (a fabricated citation), must
+    still demote — the authentic-single-segment-span check is the first
+    gate, exercised here with a region that never mentions 1800/masl at
+    all."""
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "grown at 1,800 masl", _IDENTITY_PAGE_TEXT
         )
         is False
     )

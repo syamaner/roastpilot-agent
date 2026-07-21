@@ -2022,16 +2022,18 @@ class _ExtractedBeanIdentity(BaseModel):
 
     The four ``*_evidence`` fields (#590 slice D2a) are a PARALLEL, optional
     verbatim quote alongside each TYPED field (``altitude_m``,
-    ``processing``, ``bean_species``, ``is_blend``). THREE
-    (``processing``, ``bean_species``, ``is_blend``) stay
-    CAPTURED-BUT-UNCONSUMED at runtime (#590 slice E2 concludes lexical
-    typed-field certification exhausted for those three);
-    ``altitude_m_evidence`` IS consumed, gating ``altitude_m``'s
-    provenance through the fail-closed whitelist grammar (#617 D2d,
-    :func:`_altitude_whitelist_match`) — see :func:`_draft_from_identity`'s
-    docstring for each field's own gate and evidence. The live
-    verification surface is D1's free-text containment, the
-    ``description`` exemption, and the D2d altitude whitelist.
+    ``processing``, ``bean_species``, ``is_blend``). ALL FOUR are now
+    CAPTURED-BUT-UNCONSUMED at runtime — PARKED PERMANENTLY (#590 slice
+    E2 concludes lexical certification exhausted for
+    ``processing``/``bean_species``/``is_blend``; #617's terminal probe
+    concludes the same for ``altitude_m``, whose fail-closed whitelist
+    grammar (:func:`_altitude_whitelist_match`) built and stayed
+    unit-tested but never reached a leak-free state across two post-
+    enable review rounds) — see :func:`_draft_from_identity`'s docstring
+    for each field's own gate and evidence. The live verification surface
+    is D1's free-text containment plus the ``description`` exemption;
+    every typed field's evidence quote is surfaced to the operator for
+    human judgement instead.
     """
 
     name: str | None = None
@@ -2064,10 +2066,13 @@ class _ExtractedBeanIdentity(BaseModel):
     with its own ``"origin_estimated"`` provenance is a richer follow-up,
     deferred to #590 — no new schema fields here."""
     altitude_m_evidence: str | None = Field(default=None, max_length=500)
-    """A verbatim span supporting ``altitude_m`` (#590 D2a). Checked by
-    :func:`_quote_supports_altitude`, ENABLED (#617 D2d) via the
-    fail-closed whitelist grammar (:func:`_altitude_whitelist_match`).
-    Bounded to :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's
+    """A verbatim span supporting ``altitude_m`` (#590 D2a). Feeds
+    :func:`_quote_supports_altitude`'s fail-closed whitelist grammar
+    (:func:`_altitude_whitelist_match`), but that gate ships DORMANT
+    (:data:`_ALTITUDE_CITATION_GATE_ENABLED`) — captured but UNCONSUMED
+    at runtime, PARKED PERMANENTLY on the #617 terminal probe's two
+    plausible certify-leaks; see that constant's docstring. Bounded to
+    :data:`_MAX_JSON_LD_FIELD_CHARS`-sized (500 chars), D2a's
     LOW."""
     description: str | None = None
     is_blend: bool | None = None
@@ -2530,25 +2535,42 @@ _BEAN_SPECIES_DISPLAY_SPELLINGS: dict[str, str] = {
     "excelsa": "excelsa",
 }
 
-#: Ships ENABLED (#617 D2d-b) — replaces the RETIRED guard-stack matcher
-#: (#590 D2b/D2c, #617 D2d-a), which FAILED OPEN twice. D2d-b inverts the
-#: polarity: :func:`_altitude_whitelist_match` certifies ONLY on POSITIVE
-#: recognition of a strict ``NUMBER UNIT`` grammar; everything else
-#: demotes by construction. STOPPING RULE (#617): a review-round
-#: certify-bypass of THIS whitelist parks certification permanently, flag
-#: back to ``False`` — over-demotes never count against that rule. Two
-#: post-enable review rounds have already folded five, then three more,
-#: parameter-level leaks (conjunction/comma-compound headings, the
-#: quote-span margin, the generic-unit context-word set — see each
-#: mechanism's own docstring for the specific repro each fold closed).
-#: TERMINAL CONDITION (second round, pre-declared): this is the LAST
-#: parameter-tuning round for these three mechanisms — a follow-up
-#: scoped probe runs after this fold lands; if ANY certify-leak remains
-#: in the quote-anchoring, generic-unit-context, or heading-anchor
-#: mechanisms, this flag flips back to ``False`` and altitude
-#: certification parks PERMANENTLY under the stopping rule above — no
-#: further tuning rounds on these mechanisms after that.
-_ALTITUDE_CITATION_GATE_ENABLED: Final = True
+#: PARKED PERMANENTLY (#617, terminal probe) — ``altitude_m`` joins the
+#: other three typed fields (``processing``, ``bean_species``,
+#: ``is_blend``) as a fourth permanently-parked lexical citation gate.
+#: The guard-stack matcher (#590 D2b/D2c) FAILED OPEN twice (#615/#616);
+#: its fail-CLOSED whitelist replacement (#617 D2d-b,
+#: :func:`_altitude_whitelist_match`) then FAILED OPEN across TWO more
+#: post-enable review rounds — five shape-grammar leaks folded, then
+#: three parameter-level leaks folded (conjunction/comma-compound
+#: headings, the quote-span margin, the generic-unit context-word set) —
+#: and the pre-declared TERMINAL probe still found two MORE plausible
+#: leaks in the just-tightened mechanisms: compound headings joined by
+#: ``;``/``/``/``|`` still anchor (the comma sweep covered only the one
+#: character actually repro'd, not the class), and the quote-span
+#: margin still bridges through ``)``/``]``/``|`` (the clause-break set
+#: was a hand-picked subset of the module's own boundary-punctuation
+#: set, :data:`_CONTAINMENT_PUNCTUATION_TRANSLATION`, not that full
+#: set). This demonstrates the SAME structural problem the #617 D2d
+#: redesign was meant to solve for the guard-stack: an enumerative
+#: denylist of "characters/words that break a clause" cannot be
+#: completed with confidence — every round finds one more separator
+#: class. Per the pre-declared stopping rule, this is now PERMANENT: no
+#: further tightening rounds inside this arc. The whole grammar
+#: (:func:`_altitude_whitelist_match` and everything it calls) stays
+#: built and unit-tested — a strictly-better-though-dormant matcher than
+#: the retired guard-stack — with the terminal probe's own repros now
+#: captured as executable-spec tests documenting the two leaks (see the
+#: "#617 terminal probe" test section). ``altitude_m_evidence`` is
+#: captured (#590 D2a) and surfaced to the operator for human judgement,
+#: same disposition as the other three fields; ``altitude_m`` itself
+#: always demotes to ``"origin_estimated"``. A future revisit starts
+#: from EITHER the probe's own class-sweep design (use
+#: :data:`_CONTAINMENT_PUNCTUATION_TRANSLATION`'s full punctuation set,
+#: not a hand-picked subset, as the phrase/clause-boundary definition)
+#: OR a non-lexical mechanism (e.g. an entailment judge) — never by
+#: growing this whitelist further.
+_ALTITUDE_CITATION_GATE_ENABLED: Final = False
 
 #: SELF-SUFFICIENT trailing units (#617 fold 2, post-review) — these are
 #: altitude-specific abbreviations with no other common reading, so a
@@ -4168,17 +4190,24 @@ def _draft_from_identity(
     ``description`` is EXEMPT from the containment gate — it is long prose
     the model may legitimately summarise/paraphrase rather than quote
     verbatim, it is lower-stakes (the roast advisor never reads it), and
-    it keeps the original presence-only tagging. THREE of the four typed
-    fields (``processing``, ``bean_species``, ``is_blend``) demote
-    unconditionally — #590 slice E2 concludes lexical certification of
-    those three EXHAUSTED, each gated off by its own parked constant, see
-    each constant's docstring; no lexical denylist hardening will be
-    attempted, revisit only with a non-lexical mechanism. ``altitude_m``
-    is the exception: #617 D2d's fail-CLOSED whitelist
-    (:func:`_altitude_whitelist_match`) ships ENABLED, tagging
-    ``"on_page"`` only on POSITIVE recognition of a strict ``NUMBER
-    UNIT`` shape, authenticated against the main product region and the
-    evidence quote's own span.
+    it keeps the original presence-only tagging. ALL FOUR typed fields
+    (``altitude_m``, ``processing``, ``bean_species``, ``is_blend``) now
+    demote unconditionally — lexical certification is EXHAUSTED for all
+    four, each gated off by its own parked constant, see each constant's
+    docstring: ``processing``/``bean_species``/``is_blend`` concluded
+    #590 slice E2; ``altitude_m`` concluded #617's terminal probe — its
+    fail-CLOSED whitelist (:func:`_altitude_whitelist_match`) built,
+    stayed unit-tested, and ran ENABLED for two review rounds, but a
+    THIRD (terminal) round still found plausible certify-leaks in the
+    just-tightened mechanisms, demonstrating the same enumerative-
+    denylist problem the whole redesign existed to avoid. No lexical
+    denylist hardening will be attempted on any of the four; revisit
+    only with a non-lexical mechanism (e.g. an entailment judge). THE
+    LIVE VERIFICATION SURFACE, final for this architecture, is D1's
+    free-text containment below plus the ``description`` exemption
+    above — every typed field's evidence quote is captured and surfaced
+    to the operator for human judgement instead of automated
+    certification.
     Every roast-target field is always
     ``"origin_estimated"``. The optional free-text fields (``country``, ``farm``,
     ``bean_varietal``, ``description``) are normalized via
@@ -4193,9 +4222,9 @@ def _draft_from_identity(
     at all (:func:`draft_bean_profile_from_url` rejects those outright,
     before any fetch). The vendor page itself is still fetched with the
     REAL, un-redacted URL — only what is returned/persisted is redacted.
-    THREE of ``identity``'s four ``*_evidence`` quotes never affect
-    provenance (those gates are parked, see above); ``altitude_m_evidence``
-    DOES, via #617 D2d.
+    NONE of ``identity``'s four ``*_evidence`` quotes affect provenance at
+    runtime — every typed-field gate is now permanently parked, see
+    above.
 
     Args:
         identity: The provider's page-only extraction, including its four
@@ -4328,9 +4357,12 @@ def _draft_from_identity(
             field_sources[field_name] = "on_page" if gate_verdict else "origin_estimated"
             continue
         if field_name == "altitude_m":
-            # ENABLED (#617 D2d-b) — authenticates against the MAIN
-            # REGION (not merged_corpus/the whole page), same as the
-            # E-gated fields, closing the wrong-entity class for altitude.
+            # PARKED PERMANENTLY (_ALTITUDE_CITATION_GATE_ENABLED, see its
+            # docstring — the #617 terminal probe) — ``and`` short-circuits
+            # before the helper ever runs, so this demotes unconditionally,
+            # same as processing/bean_species/is_blend. main_region (not
+            # merged_corpus/the whole page) is still the intended
+            # authentication scope should this ever revisit.
             gate_verdict = _ALTITUDE_CITATION_GATE_ENABLED and _quote_supports_altitude(
                 identity.altitude_m, identity.altitude_m_evidence, main_region
             )
