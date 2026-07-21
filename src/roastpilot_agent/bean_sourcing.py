@@ -2524,9 +2524,89 @@ _BEAN_SPECIES_DISPLAY_SPELLINGS: dict[str, str] = {
     "excelsa": "excelsa",
 }
 
-#: DORMANT — guard-stack RETIRED (#617 D2d-a, failed open, #615/#616);
-#: D2d-b lands the whitelist replacement and the enable flip.
-_ALTITUDE_CITATION_GATE_ENABLED: Final = False
+#: Ships ENABLED (#617 D2d-b) — replaces the RETIRED guard-stack matcher
+#: (#590 D2b/D2c, #617 D2d-a), which FAILED OPEN twice. D2d-b inverts the
+#: polarity: :func:`_altitude_whitelist_match` certifies ONLY on POSITIVE
+#: recognition of a strict ``NUMBER UNIT`` grammar; everything else
+#: demotes by construction. STOPPING RULE (#617): a review-round
+#: certify-bypass of THIS whitelist parks certification permanently, flag
+#: back to ``False`` — over-demotes never count against that rule.
+_ALTITUDE_CITATION_GATE_ENABLED: Final = True
+
+#: Trailing units :func:`_match_altitude_unit` accepts glued
+#: (``"1850m"``) or one space away (``"1800 metres"``) — #617 D2d-b. Bare
+#: ``"m"`` counts ONLY in this attached position, never as a free-standing
+#: cue. "above sea level" (:data:`_ABOVE_SEA_LEVEL_WORDS`) is a separate
+#: accepted trailing form, not a member of this set.
+_ALTITUDE_UNIT_TOKENS: frozenset[str] = frozenset(
+    {"masl", "asl", "msnm", "m", "metres", "meters", "metre", "meter"}
+)
+
+#: The complete 3-word trailing phrase :func:`_match_above_sea_level`
+#: accepts in place of a unit token (#617 D2d-b) — the words alone never
+#: count.
+_ABOVE_SEA_LEVEL_WORDS: tuple[str, str, str] = ("above", "sea", "level")
+
+#: Non-metre length units that REJECT an altitude reading when adjacent to
+#: a matched shape (#617 D2d-b context guard) — "1800 ft" already fails to
+#: match any shape ("ft" isn't a metre unit); this set additionally
+#: rejects a CLEAN metres shape sitting beside a competing non-metre
+#: reading. Single-word only; "sq ft" is a forward-looking gap (LOW).
+_NON_METRE_UNIT_TOKENS: frozenset[str] = frozenset(
+    {
+        "ft",
+        "feet",
+        "foot",
+        "yd",
+        "yard",
+        "yards",
+        "km",
+        "kms",
+        "kilometre",
+        "kilometres",
+        "kilometer",
+        "kilometers",
+        "mi",
+        "mile",
+        "miles",
+    }
+)
+
+#: PRE-qualifiers — words stating a bound when they sit BEFORE a matched
+#: shape (#617 D2d-b context guard), within 2 raw words before only: "up
+#: to 1,800 masl", "grown above 1,800 masl", "at least 1,800 masl"
+#: ("least" alone suffices; bare "at" is EXCLUDED — "grown at 1,800 masl"
+#: is ordinary phrasing). BEFORE-only avoids false-firing on trailing
+#: prose like "...above the valley floor"; the accepted trailing phrase
+#: "above sea level" is a different code path
+#: (:func:`_match_above_sea_level`) that never reaches the context guard.
+_ALTITUDE_PRE_BOUND_QUALIFIER_WORDS: frozenset[str] = frozenset(
+    {"above", "below", "over", "under", "up", "least"}
+)
+
+#: POST-qualifiers — words stating a bound AFTER a matched shape (#617
+#: D2d-b context guard), within 2 raw words after only: "1,800 masl max"
+#: / "1,800 masl or more".
+_ALTITUDE_POST_BOUND_QUALIFIER_WORDS: frozenset[str] = frozenset(
+    {"max", "maximum", "min", "minimum", "plus", "more"}
+)
+
+#: Words that join two digit runs into a RANGE (#617 D2d-b context
+#: guard) — "1,600 masl to 1,800 masl".
+_ALTITUDE_RANGE_JOINER_WORDS: frozenset[str] = frozenset({"to", "and"})
+
+#: Characters that join two digit runs into a RANGE as their OWN
+#: whitespace-delimited word (#617 D2d-b), e.g. "1,600 masl - 1,800 masl".
+#: A joiner GLUED with no surrounding whitespace ("1,600–1,800") never
+#: reaches this check — :func:`_breaks_altitude_word_boundary` already
+#: treats these chars as boundary-breaking, so a number glued to one can
+#: never start a NUMBER match (same rule that kills "SKU-1800").
+_ALTITUDE_RANGE_JOINER_CHARS: frozenset[str] = frozenset({"-", "–", "/"})
+
+#: How many raw words outward the context guard inspects (#617 D2d-b) —
+#: enough for a bound qualifier at distance <= 2, or a range joiner
+#: followed by a unit word then the far digit run.
+_ALTITUDE_CONTEXT_WINDOW_WORDS: Final[int] = 4
 
 #: Roast-target fields a vendor page never states — always
 #: ``"origin_estimated"`` in the drafted :attr:`BeanProfileDraft.field_sources`.
@@ -2763,10 +2843,309 @@ def _find_authentic_segment(quote: str, corpus: str) -> str | None:
     return None
 
 
-def _quote_supports_altitude(value: int | None, quote: str | None, corpus: str) -> bool:
-    """Retired guard-stack stub (#617 D2d-a), always ``False``;
-    D2d-b replaces it with the whitelist grammar."""
+def _breaks_altitude_word_boundary(char: str) -> bool:
+    """Whether ``char`` glues onto an identifier: a letter, digit,
+    underscore, or range-joiner char (:data:`_ALTITUDE_RANGE_JOINER_CHARS`,
+    #617 D2d-b). Applied symmetrically on the leading side of a NUMBER
+    (:func:`_altitude_number_at`) and the trailing side of a UNIT
+    (:func:`_match_altitude_unit`) — kills "SKU-1800", "1800m2", and a
+    glued range ("1,600–1,800 masl") with one rule.
+
+    Args:
+        char: A single character adjacent to the candidate shape.
+
+    Returns:
+        ``True`` if ``char`` breaks the word-boundary requirement.
+    """
+    return char.isalpha() or char.isdigit() or char == "_" or char in _ALTITUDE_RANGE_JOINER_CHARS
+
+
+def _altitude_number_at(segment: str, start: int) -> tuple[int, str] | None:
+    """Parse a NUMBER run beginning EXACTLY at ``start`` (#617 D2d-b) —
+    digits with optional valid thousands grouping
+    (:func:`_elides_as_thousands_separator`). Precondition:
+    ``segment[start]`` is a digit. Returns ``None`` unless ``start`` is at
+    a clean word boundary (:func:`_breaks_altitude_word_boundary`) — kills
+    "SKU-1800"/"v1.800"/"M1800" at the source.
+
+    Args:
+        segment: The raw authentic segment being scanned.
+        start: The candidate NUMBER's first character index (a digit).
+
+    Returns:
+        ``(end, digits)`` — ``end`` one past the last digit consumed,
+        ``digits`` with every valid separator elided — or ``None``.
+    """
+    if start > 0 and _breaks_altitude_word_boundary(segment[start - 1]):
+        return None
+    length = len(segment)
+    digits = [segment[start]]
+    i = start + 1
+    while i < length and segment[i].isdigit():
+        digits.append(segment[i])
+        i += 1
+    while i < length and segment[i] in ",." and _elides_as_thousands_separator(segment, i):
+        i += 1
+        digits.extend(segment[i : i + 3])
+        i += 3
+    return i, "".join(digits)
+
+
+def _read_alpha_run(segment: str, start: int) -> str:
+    """The maximal casefolded alphabetic run beginning at ``start`` (#617
+    D2d-b) — used only to read a candidate UNIT, never the digit side.
+
+    Args:
+        segment: The raw authentic segment being scanned.
+        start: The candidate run's first character index.
+
+    Returns:
+        The casefolded run of consecutive alphabetic characters, empty if
+        ``segment[start]`` is out of range or not alphabetic.
+    """
+    length = len(segment)
+    end = start
+    while end < length and segment[end].isalpha():
+        end += 1
+    return segment[start:end].casefold()
+
+
+def _match_above_sea_level(segment: str, start: int) -> int | None:
+    """Match the exact 3-word phrase "above sea level" beginning at
+    ``start`` (#617 D2d-b), single-space-separated, case-insensitive,
+    ending at a clean word boundary.
+
+    Args:
+        segment: The raw authentic segment being scanned.
+        start: The candidate phrase's first character index.
+
+    Returns:
+        The index one past "level", or ``None`` if it does not match.
+    """
+    index = start
+    length = len(segment)
+    for position, word in enumerate(_ABOVE_SEA_LEVEL_WORDS):
+        run = _read_alpha_run(segment, index)
+        if run != word:
+            return None
+        index += len(run)
+        if position < len(_ABOVE_SEA_LEVEL_WORDS) - 1:
+            if index >= length or segment[index] != " ":
+                return None
+            index += 1
+    if index < length and _breaks_altitude_word_boundary(segment[index]):
+        return None
+    return index
+
+
+def _match_altitude_unit(segment: str, number_end: int) -> int | None:
+    """Match a trailing UNIT immediately after a parsed NUMBER (#617
+    D2d-b) — glued (``"1850m"``), one space away (``"1800 metres"``), or
+    the complete "above sea level" phrase one space away
+    (:func:`_match_above_sea_level`). Either form must end at a clean word
+    boundary — kills "1800m2" and "1800masl-x".
+
+    Args:
+        segment: The raw authentic segment being scanned.
+        number_end: The index one past the parsed NUMBER's last digit.
+
+    Returns:
+        The index one past the matched UNIT (or phrase), or ``None``.
+    """
+    length = len(segment)
+    glued_run = _read_alpha_run(segment, number_end)
+    if glued_run and glued_run in _ALTITUDE_UNIT_TOKENS:
+        end = number_end + len(glued_run)
+        if end >= length or not _breaks_altitude_word_boundary(segment[end]):
+            return end
+    if number_end < length and segment[number_end] == " ":
+        after_space = number_end + 1
+        word_run = _read_alpha_run(segment, after_space)
+        if word_run and word_run in _ALTITUDE_UNIT_TOKENS:
+            end = after_space + len(word_run)
+            if end >= length or not _breaks_altitude_word_boundary(segment[end]):
+                return end
+        phrase_end = _match_above_sea_level(segment, after_space)
+        if phrase_end is not None:
+            return phrase_end
+    return None
+
+
+def _iter_altitude_shapes(segment: str, target_digits: str) -> list[tuple[int, int]]:
+    """Every accepted ``NUMBER UNIT`` shape in ``segment`` whose digits
+    equal ``target_digits`` (#617 D2d-b step 2), left-to-right. Returns
+    EVERY occurrence, not just the first, so
+    :func:`_altitude_whitelist_match` can keep looking past an earlier
+    context-guard-rejected one.
+
+    Args:
+        segment: The raw authentic segment being scanned.
+        target_digits: The claimed altitude value, as a digit string.
+
+    Returns:
+        ``(start, end)`` spans of every matched shape, in order.
+    """
+    length = len(segment)
+    shapes: list[tuple[int, int]] = []
+    index = 0
+    while index < length:
+        if not segment[index].isdigit():
+            index += 1
+            continue
+        parsed = _altitude_number_at(segment, index)
+        if parsed is None:
+            index += 1
+            continue
+        number_end, digits = parsed
+        if digits == target_digits:
+            unit_end = _match_altitude_unit(segment, number_end)
+            if unit_end is not None:
+                shapes.append((index, unit_end))
+        index = number_end if number_end > index else index + 1
+    return shapes
+
+
+def _raw_words_around(segment: str, start: int, end: int) -> tuple[list[str], list[str]]:
+    """The raw whitespace-delimited words immediately outside the matched
+    shape ``segment[start:end]`` (#617 D2d-b step 3), outward order
+    (index 0 = closest).
+
+    Args:
+        segment: The raw authentic segment the shape was matched in.
+        start: The matched shape's start index.
+        end: The matched shape's end index (one past its last character).
+
+    Returns:
+        ``(before, after)`` word lists, each ordered closest-first.
+    """
+    before = segment[:start].split()
+    before.reverse()
+    after = segment[end:].split()
+    return before, after
+
+
+def _altitude_word_is_range_joiner(word: str) -> bool:
+    """Whether ``word`` joins two digit runs into a RANGE (#617 D2d-b
+    step 3): a joiner char standing alone
+    (:data:`_ALTITUDE_RANGE_JOINER_CHARS`) or a joiner word
+    (:data:`_ALTITUDE_RANGE_JOINER_WORDS`).
+
+    Args:
+        word: One raw word from :func:`_raw_words_around`.
+
+    Returns:
+        ``True`` if ``word`` is a range joiner.
+    """
+    return word in _ALTITUDE_RANGE_JOINER_CHARS or word.casefold() in _ALTITUDE_RANGE_JOINER_WORDS
+
+
+def _altitude_context_guard_rejects(segment: str, start: int, end: int) -> bool:
+    """The small, finite context guard around an already-matched shape
+    (#617 D2d-b step 3), checked on the RAW segment (never a cropped
+    quote). Rejects when, within :data:`_ALTITUDE_CONTEXT_WINDOW_WORDS`
+    raw words either side:
+
+    - a range joiner (:func:`_altitude_word_is_range_joiner`) is followed
+      later in the same outward window by a word starting with a digit
+      (catches a unit-mediated range like "1,600 masl to 1,800 masl");
+    - a PRE-qualifier (:data:`_ALTITUDE_PRE_BOUND_QUALIFIER_WORDS`) sits
+      within 2 words BEFORE the shape, or a POST-qualifier
+      (:data:`_ALTITUDE_POST_BOUND_QUALIFIER_WORDS`) within 2 words
+      AFTER — direction-scoped so ordinary trailing prose ("...above the
+      valley floor") never false-fires;
+    - a non-metre unit (:data:`_NON_METRE_UNIT_TOKENS`) sits in the
+      immediately adjacent word, either direction.
+
+    Args:
+        segment: The raw authentic segment the shape was matched in.
+        start: The matched shape's start index.
+        end: The matched shape's end index (one past its last character).
+
+    Returns:
+        ``True`` if the shape is rejected (a bound, range, or non-metre
+        unit collision); ``False`` if it is clean.
+    """
+    before, after = _raw_words_around(segment, start, end)
+    for words, qualifiers in (
+        (before, _ALTITUDE_PRE_BOUND_QUALIFIER_WORDS),
+        (after, _ALTITUDE_POST_BOUND_QUALIFIER_WORDS),
+    ):
+        window = words[:_ALTITUDE_CONTEXT_WINDOW_WORDS]
+        for position, word in enumerate(window):
+            if position < 2 and word.casefold() in qualifiers:
+                return True
+            if position < 1 and word.casefold() in _NON_METRE_UNIT_TOKENS:
+                return True
+            if _altitude_word_is_range_joiner(word):
+                remainder = window[position + 1 :]
+                if any(bool(w) and w[0].isdigit() for w in remainder):
+                    return True
     return False
+
+
+def _altitude_whitelist_match(value: int, quote: str, main_region_text: str) -> bool:
+    """Whether ``main_region_text`` contains a POSITIVELY RECOGNIZED
+    altitude reading of ``value`` metres, authenticated against ``quote``
+    (#617 D2d-b). Certify ONLY on a shape the grammar recognizes;
+    everything else demotes by construction. Fails SOFT, never raises.
+
+    1. ``quote`` authenticates within a single segment of
+       ``main_region_text`` (:func:`_find_authentic_segment`).
+    2. The raw segment is scanned (:func:`_iter_altitude_shapes`) for
+       every accepted shape naming ``value``'s digits — this alone closes
+       every SKU/version/decimal/price-cents bypass in the accumulated
+       spec, since none can ever produce a recognized shape.
+    3. At least one matched shape survives the context guard
+       (:func:`_altitude_context_guard_rejects`) — an earlier rejected
+       occurrence does not stop a later, clean one from certifying.
+
+    Deliberately accepted OVER-DEMOTES (never a certify-bypass per the
+    #617 stopping rule): cue-first unit-less forms ("Altitude: 1,800").
+
+    Args:
+        value: The claimed ``altitude_m`` value, in metres.
+        quote: The model's verbatim evidence span (non-blank).
+        main_region_text: :func:`_main_product_region`'s output — never
+            the whole page corpus.
+
+    Returns:
+        ``True`` only when all three conditions hold.
+    """
+    try:
+        segment = _find_authentic_segment(quote, main_region_text)
+        if segment is None:
+            return False
+        target_digits = str(value)
+        for start, end in _iter_altitude_shapes(segment, target_digits):
+            if not _altitude_context_guard_rejects(segment, start, end):
+                return True
+        return False
+    except Exception:  # pragma: no cover - defensive: gate must fail soft, never raise
+        return False
+
+
+def _quote_supports_altitude(value: int | None, quote: str | None, main_region_text: str) -> bool:
+    """Whether ``quote`` genuinely supports ``value`` for ``altitude_m``
+    (#617 D2d-b) — the ``None``/blank guard around
+    :func:`_altitude_whitelist_match`.
+
+    Args:
+        value: The extracted ``altitude_m`` value. ``None`` never
+            supports.
+        quote: The model's verbatim ``altitude_m_evidence`` span, or
+            ``None``.
+        main_region_text: :func:`_main_product_region`'s output — NOT the
+            whole page corpus.
+
+    Returns:
+        ``True`` only when :func:`_altitude_whitelist_match` certifies.
+    """
+    if value is None or not quote:
+        return False
+    raw_quote = quote.strip()
+    if not raw_quote:
+        return False
+    return _altitude_whitelist_match(value, raw_quote, main_region_text)
 
 
 def _normalize_optional_text(value: str | None) -> str | None:
@@ -3602,10 +3981,11 @@ def _draft_from_identity(
             field_sources[field_name] = "on_page" if gate_verdict else "origin_estimated"
             continue
         if field_name == "altitude_m":
-            # DORMANT (_ALTITUDE_CITATION_GATE_ENABLED) — ``and`` short-
-            # circuits before the check ever runs, until D2d flips it.
+            # ENABLED (#617 D2d-b) — authenticates against the MAIN
+            # REGION (not merged_corpus/the whole page), same as the
+            # E-gated fields, closing the wrong-entity class for altitude.
             gate_verdict = _ALTITUDE_CITATION_GATE_ENABLED and _quote_supports_altitude(
-                identity.altitude_m, identity.altitude_m_evidence, merged_corpus
+                identity.altitude_m, identity.altitude_m_evidence, main_region
             )
             field_sources[field_name] = "on_page" if gate_verdict else "origin_estimated"
             continue

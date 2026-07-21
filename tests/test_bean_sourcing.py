@@ -2885,46 +2885,346 @@ def test_draft_from_identity_is_blend_demotes_with_no_anchor_even_with_a_genuine
     assert draft.field_sources["is_blend"] == "origin_estimated"
 
 
-def test_quote_supports_altitude_ships_dormant() -> None:
-    """#617 D2d-a: the citation gate ships DORMANT
-    (:data:`bean_sourcing._ALTITUDE_CITATION_GATE_ENABLED` is ``False``)
-    AND its underlying matcher is now a RETIRED STUB
-    (:func:`bean_sourcing._quote_supports_altitude`) — a genuine, well-formed
-    citation demotes both at the :func:`_draft_from_identity` level (the
-    flag) and via a direct call to the gate function itself (the stub
-    always returns ``False``, unlike the pre-retirement guard-stack, which
-    would have returned ``True`` for this exact quote). #617 D2d-b
-    replaces the stub with the whitelist grammar and flips the flag."""
+def test_draft_from_identity_altitude_gate_enabled_certifies_on_page() -> None:
+    """#617 D2d-b: the citation gate ships ENABLED
+    (:data:`bean_sourcing._ALTITUDE_CITATION_GATE_ENABLED` is ``True``) —
+    a genuine, region-authenticated citation now flips
+    ``field_sources["altitude_m"]`` to ``"on_page"`` at the
+    :func:`_draft_from_identity` level, not just via a direct call to the
+    gate function. The page carries a real frontmatter ``title:`` anchor
+    (:func:`bean_sourcing._main_product_region`'s A1), so the evidence
+    quote authenticates against the MAIN REGION exactly as a real fetched
+    page would."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800, altitude_m_evidence="grown at 1,800 masl")
+    )
+    corpus = _framed(
+        "Kenya Kiambu AA (Washed)",
+        "Kenya Kiambu AA (Washed) is a washed coffee from Kenya, grown at 1,800 masl on the "
+        "Gakuyuini Factory farm. Variety: SL28, SL34. Tasting notes: blackcurrant, tomato, "
+        "bright acidity.\n",
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya", corpus=corpus
+    )
+    assert draft.field_sources["altitude_m"] == "on_page"
+
+
+def test_draft_from_identity_altitude_no_anchor_page_demotes_despite_a_perfect_quote() -> None:
+    """The fail-CLOSED law at the :func:`_draft_from_identity` level: a
+    page with NEITHER a frontmatter title nor a matched JSON-LD name has
+    an EMPTY main region (:func:`bean_sourcing._main_product_region`'s
+    documented fail-closed collapse) — even a perfect, genuine,
+    grammar-matching citation demotes, because there is nowhere authentic
+    for it to land. The underlying gate function (tested directly
+    elsewhere) returns ``True`` for this exact quote against a region
+    that actually contained it."""
     identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
         _identity_args(altitude_m=1800, altitude_m_evidence="grown at 1,800 masl")
     )
     draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
         identity,
         url="https://vendor.example/products/kenya",
-        corpus=f"{_IDENTITY_PAGE_TEXT} This lot is grown at 1,800 masl.",
+        corpus="This lot is grown at 1,800 masl, no frontmatter or heading anchor anywhere.",
     )
     assert draft.field_sources["altitude_m"] == "origin_estimated"
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1800, "grown at 1,800 masl", f"{_IDENTITY_PAGE_TEXT} This lot is grown at 1,800 masl."
+            1800,
+            "grown at 1,800 masl",
+            "This lot is grown at 1,800 masl, no frontmatter or heading anchor anywhere.",
+        )
+        is True
+    )
+
+
+def test_draft_from_identity_altitude_wrong_entity_sibling_product_demotes() -> None:
+    """The wrong-entity class the E-gated fields close, now closed for
+    altitude too (#617 D2d-b): a single-origin page's own anchored region
+    never mentions an altitude at all; a SIBLING product's "1,900 masl"
+    sits under an unmatched "## You May Also Like" heading, outside the
+    main region entirely. Citing that line demotes even though it is a
+    genuine, grammar-matching page span — it simply belongs to the wrong
+    product."""
+    corpus = _framed(
+        "Ethiopia Yirgacheffe Single Origin",
+        "This lot is a single origin coffee from Yirgacheffe.\n"
+        "\n"
+        "## You May Also Like\n"
+        "Our Kenya AA grows at 1,900 masl on the Gakuyuini Factory farm.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1900, altitude_m_evidence="Our Kenya AA grows at 1,900 masl")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/yirgacheffe", corpus=corpus
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+
+
+# --- #617 D2d-b: the positive matrix (direct-call, region text == the
+# raw text under test, bypassing _main_product_region) ---
+
+
+@pytest.mark.parametrize(
+    "evidence_quote",
+    [
+        "grown at 1,800 masl",
+        "1,800 masl",
+        "1800masl",
+        "elevation of 1800 metres",
+        "1800 metres elevation",
+        "at 1800 above sea level",
+        "1800 above sea level",
+    ],
+)
+def test_quote_supports_altitude_genuinely_verified_flips_on_page(evidence_quote: str) -> None:
+    """A quote that both (a) is an authentic single-segment page span and
+    (b) genuinely matches the #617 D2d-b whitelist grammar (a ``NUMBER
+    UNIT`` shape — comma-grouped digits, a glued unit, a unit before or
+    after the value, or the complete "above sea level" phrase) — the
+    ENABLED gate returns ``True``."""
+    corpus = f"{_IDENTITY_PAGE_TEXT} This lot is {evidence_quote}."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, evidence_quote, corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_cue_first_unitless_form_now_demotes() -> None:
+    """#617 D2d-b's accepted OVER-DEMOTE: "Elevation: 1,800" has no
+    recognized unit adjacent to the digits (a bare colon is not a unit),
+    so the whitelist grammar does not certify it — the whole cue-adjacency
+    surface the retired guard-stack matcher used is gone entirely. #617's
+    stopping rule explicitly accepts this direction of change (over-
+    demotes never count as a certify-bypass)."""
+    evidence_quote = "Elevation: 1,800"
+    corpus = f"{_IDENTITY_PAGE_TEXT} This lot is {evidence_quote}."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, evidence_quote, corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_thousands_period_glued_metre_verifies() -> None:
+    """A European-style thousands-period number glued to a bare "m" unit
+    ("1.850m") must verify — the segmenter
+    (:func:`bean_sourcing._split_corpus_segments`) must not treat that
+    period as a sentence boundary, or the authentic-span check could
+    never see the quote as a single segment."""
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1850, "grown at 1.850m", "This farm is grown at 1.850m above the valley floor."
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_shape_stands_alone_irrelevant_surrounding_copy() -> None:
+    """The grammar needs no elevation cue at all — the shape itself is
+    sufficient evidence, regardless of what the rest of the page says."""
+    corpus = "Tasting notes: blackcurrant and stone fruit. Beans from 1,750 masl. Roasted fresh."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1750, "Beans from 1,750 masl", corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_real_single_sentence_quote_verifies() -> None:
+    """A genuine sentence among many others still verifies — a quote that
+    genuinely sits within ONE sentence, surrounded by other sentences on
+    both sides (a page with many segments, not just the target one)."""
+    corpus = "Random intro text. This farm sits at 1800 masl elevation. More text follows after."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "1800 masl elevation", corpus
+        )
+        is True
+    )
+
+
+# --- #617 D2d-b: additional grammar-branch coverage (direct-call, region
+# text == the raw text under test, bypassing _main_product_region so the
+# shape/context-guard machinery is what's actually exercised rather than
+# short-circuiting on an empty region) ---
+
+
+def test_quote_supports_altitude_plain_multidigit_glued_unit_verifies() -> None:
+    """A plain multi-digit NUMBER with no thousands separator at all
+    (exercising :func:`bean_sourcing._altitude_number_at`'s digit-run loop
+    beyond the first character) glued to a unit still certifies."""
+    text = "This farm is grown at 1850m above the valley floor."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1850, text, text
+        )
+        is True
+    )
+
+
+def test_altitude_whitelist_match_glued_unit_boundary_break_falls_through_to_space_check() -> None:
+    """A glued unit match that fails ITS OWN trailing-boundary check must
+    fall through to the space-separated form, not return early — "1800m2"
+    (a digit glued right after "m") never certifies either way, since
+    there is no space-separated unit here either."""
+    text = "This building has a 1800m2 apartment for sale nearby."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, text, text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_glued_unit_hyphen_suffix_falls_through() -> None:
+    """The hyphen-glued-suffix mirror of the "1800m2" case: "1800masl-x" —
+    the glued "masl" match fails its trailing-boundary check (a hyphen
+    right after), and no space-separated unit follows either."""
+    text = "This lot is coded 1800masl-x in our internal system."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, text, text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_space_unit_boundary_break_falls_through_to_phrase_check() -> None:
+    """A space-separated unit match that fails its trailing-boundary check
+    must fall through to the "above sea level" phrase check, not return
+    early — "1800 masl2" (a digit glued right after "masl") never
+    certifies, and the phrase check correctly also fails ("masl2" is not
+    "above")."""
+    text = "This sign reads 1800 masl2 at the trailhead."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, text, text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_above_sea_level_missing_space_demotes() -> None:
+    """The "above sea level" phrase match requires an ACTUAL single space
+    between each word — "above-sea level" (a hyphen instead of a space
+    after "above") does not match the phrase, and there is no other unit
+    adjacent either."""
+    text = "This farm sits at 1800 above-sea level on the ridge."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, text, text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_above_sea_levels_word_mismatch_demotes() -> None:
+    """The phrase match's word-equality check: "above sea levels" reads a
+    FULL alphabetic run ("levels", not "level") for the third word, which
+    does not equal "level" at all — a plain mismatch, not a boundary
+    break."""
+    text = "This farm sits at 1800 above sea levels on the ridge."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, text, text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_above_sea_level_glued_digit_suffix_demotes() -> None:
+    """The phrase match's OWN trailing-boundary check
+    (:func:`bean_sourcing._match_above_sea_level`): "above sea level2" —
+    the alpha run for the third word reads exactly "level" (stopping at
+    the digit), satisfying the word-equality check, but the digit
+    immediately glued after it breaks the trailing word boundary, so the
+    phrase still does not match."""
+    text = "This farm sits at 1800 above sea level2 on the ridge."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, text, text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_non_metre_unit_adjacent_to_a_clean_shape_demotes() -> None:
+    """#617 D2d-b context guard: a non-metre unit sitting in the word
+    IMMEDIATELY before an otherwise clean, structurally-complete
+    ``NUMBER UNIT`` shape must still reject it — a mixed-unit page stating
+    a feet reading directly beside the metres one must not let the metres
+    reading certify uncontested."""
+    text = "This farm reads 5,905 ft 1,800 masl at the gate."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "1,800 masl", text
+        )
+        is False
+    )
+
+
+def test_altitude_whitelist_match_range_joiner_word_with_no_far_digit_is_unaffected() -> None:
+    """The safe-direction mirror of the unit-mediated-range guard: a range
+    joiner word ("to") sitting near the shape but NOT followed by another
+    digit run within the window must not false-fire — "grown at 1,800
+    masl to great acclaim" is an ordinary sentence, not a range."""
+    text = "This farm is grown at 1,800 masl to great acclaim."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "1,800 masl", text
+        )
+        is True
+    )
+
+
+def test_altitude_whitelist_match_skips_a_rejected_occurrence_for_a_later_clean_one() -> None:
+    """#617 D2d-b step 3's stated behavior: an earlier occurrence failing
+    the context guard does not stop
+    :func:`bean_sourcing._altitude_whitelist_match` from certifying a
+    LATER, genuinely clean occurrence of the same value in the same
+    segment — "up to 1,800 masl" (bound, rejected) followed by "sits at
+    1,800 masl exactly" (clean) within one sentence."""
+    text = "This farm ranges up to 1,800 masl and a neighbouring plot sits at 1,800 masl exactly"
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "sits at 1,800 masl exactly", text
+        )
+        is True
+    )
+
+
+def test_altitude_whitelist_match_all_occurrences_bounded_demotes() -> None:
+    """The negative control for the multi-occurrence loop: when EVERY
+    occurrence in the segment is context-guard-rejected, the whole match
+    demotes — it does not just stop at the first rejection and skip
+    forward past a clean one that doesn't exist."""
+    text = "This region grows coffee up to 1,800 masl and never above 1,800 masl either."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "up to 1,800 masl", text
         )
         is False
     )
 
 
 # --- #616 Codex round-1: known guard-stack bypasses. The guard-stack is
-# RETIRED (#617 D2d-a) — a stub can no longer BE bypassed, so every one of
-# these now correctly demotes; #617 D2d-b's whitelist grammar re-proves
-# each shape closed STRUCTURALLY (positive recognition), not just as an
-# artifact of the stub. ---
+# RETIRED (#617 D2d-a) and REPLACED (#617 D2d-b) — the fail-closed
+# whitelist grammar closes every one of these STRUCTURALLY (positive
+# recognition of a shape, never enumeration of a bad one). ---
 
 
 def test_quote_supports_altitude_delimiter_blind_adjacency_is_a_known_bypass() -> None:
     """#616 Codex repro: "Altitude | 1,800 reviews" — the retired
     guard-stack's cue-adjacency check was blind to a field-delimiter ("|")
     sitting between a cue and an unrelated number and WRONGLY certified
-    it. Closed by retirement (#617 D2d-a); D2d-b's whitelist grammar
-    re-proves this structurally (no unit adjacent to the digits)."""
+    it. Closed STRUCTURALLY by #617 D2d-b: "reviews" is not an accepted
+    unit, so no ``NUMBER UNIT`` shape ever matches "1800" here."""
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
             1800, "Altitude | 1,800 reviews", "This lot is Altitude | 1,800 reviews."
@@ -2942,8 +3242,10 @@ def test_quote_supports_altitude_above_below_at_least_bounds_are_a_known_bypass(
 ) -> None:
     """#616 Codex repro: bound phrasing ("above"/"at least") the retired
     guard-stack's fold-5 qualifier set didn't cover, so it WRONGLY
-    certified a bound as a scalar. Closed by retirement (#617 D2d-a);
-    D2d-b's whitelist grammar re-proves this structurally."""
+    certified a bound as a scalar. Closed STRUCTURALLY by #617 D2d-b's
+    PRE-qualifier context guard
+    (:data:`bean_sourcing._ALTITUDE_PRE_BOUND_QUALIFIER_WORDS`), which
+    covers both "above" and "least" (for "at least")."""
     corpus = f"This lot is {evidence_quote}."
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
@@ -2958,8 +3260,10 @@ def test_quote_supports_altitude_un_isolated_plain_digit_is_a_known_bypass() -> 
     guard-stack's isolation guard only ran on the glued-m shortcut path, so
     a plain digit token hyphen-glued to an identifier, immediately
     adjacent to a genuine "masl" cue, was never isolation-checked and
-    WRONGLY certified. Closed by retirement (#617 D2d-a); D2d-b's
-    whitelist grammar re-proves this structurally."""
+    WRONGLY certified. Closed STRUCTURALLY by #617 D2d-b: the leading
+    word-boundary check applies to EVERY NUMBER match unconditionally
+    (:func:`bean_sourcing._altitude_number_at`) — the digits are preceded
+    by a hyphen, so no NUMBER match can even start there."""
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
             1800, "product SKU-1800 masl", "This lot is product SKU-1800 masl."
@@ -2973,8 +3277,10 @@ def test_quote_supports_altitude_quote_scoped_unit_check_is_a_known_bypass() -> 
     "Elevation: 1,800" — the retired guard-stack's non-metre-unit check ran
     on the QUOTE, not the authenticated segment, so cropping the unit out
     of the quote defeated it even though the full segment states feet, and
-    it WRONGLY certified. Closed by retirement (#617 D2d-a); D2d-b's
-    whitelist grammar re-proves this structurally."""
+    it WRONGLY certified. Closed STRUCTURALLY by #617 D2d-b: the grammar
+    scans the RAW AUTHENTIC SEGMENT (never the cropped quote) for a
+    shape, and "ft" is not an accepted unit, so no shape matches "1800"
+    here at all."""
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
             1800, "Elevation: 1,800", "Elevation: 1,800 ft"
@@ -2987,8 +3293,11 @@ def test_quote_supports_altitude_unit_mediated_range_is_a_known_bypass() -> None
     """#616 Codex repro: "1,600 masl to 1,800 masl" — each endpoint has its
     OWN unit token between it and "to", so the retired guard-stack's
     adjacent-to-"to" range check never fired and it WRONGLY certified the
-    upper bound as a scalar. Closed by retirement (#617 D2d-a); D2d-b's
-    whitelist grammar re-proves this structurally."""
+    upper bound as a scalar. Closed STRUCTURALLY by #617 D2d-b: the
+    context guard scans OUTWARD past the unit word for a range joiner
+    followed by a far digit run
+    (:func:`bean_sourcing._altitude_context_guard_rejects`), which is
+    exactly this unit-mediated shape."""
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
             1800, "1,600 masl to 1,800 masl", "This lot is 1,600 masl to 1,800 masl."
@@ -3002,8 +3311,11 @@ def test_quote_supports_altitude_decimal_split_segment_is_a_known_bypass() -> No
     "Elevation: 1,800" — the retired guard-stack's segmenter treated the
     non-thousands decimal point as a sentence boundary, splitting the unit
     into a DIFFERENT segment than the one the quote authenticated against,
-    and it WRONGLY certified. Closed by retirement (#617 D2d-a); D2d-b's
-    whitelist grammar re-proves this structurally."""
+    and it WRONGLY certified. Closed STRUCTURALLY by #617 D2d-b: the
+    grammar requires a UNIT immediately after the parsed NUMBER (glued or
+    one space away); here the NUMBER "1800" is followed by "." with no
+    unit at all, so no shape matches — the decimal-split segmentation
+    quirk no longer matters."""
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
             1800, "Elevation: 1,800", "Elevation: 1,800.5 ft"
