@@ -221,9 +221,33 @@ class BeanFetchError(BeanSourcingError):
 
 
 class BeanExtractionError(BeanSourcingError):
-    """The page could not be mapped to a usable bean identity: the LLM
-    provider/transport failed, its output was malformed, or the page stated
-    neither a usable name nor a usable origin to draft from."""
+    """The page could not be mapped to a usable bean identity.
+
+    Raised directly for the genuinely **client-actionable** case: the page
+    stated neither a usable name nor a usable origin to draft from, or the
+    assembled draft failed its own field validation. See
+    :class:`BeanExtractionUnavailableError` for the dependency-origin
+    subclass (#613) — a provider/transport failure is never raised as this
+    base class directly.
+    """
+
+
+class BeanExtractionUnavailableError(BeanExtractionError):
+    """A DEPENDENCY-origin extraction failure — the vendor page itself may
+    have been perfectly fine (#613).
+
+    Covers a provider/transport timeout, a provider API error
+    (:class:`~pydantic_ai.exceptions.ModelAPIError`), a failure to build the
+    extraction model (:class:`~roastpilot_agent.advisor.AdvisorDependencyError`
+    / :class:`~roastpilot_agent.advisor.AdvisorError`), and validation-retry
+    exhaustion (:class:`~pydantic_ai.exceptions.UnexpectedModelBehavior`) —
+    the model failed to produce the required structured shape after its
+    retries, which is a provider/model-quality failure, not evidence the
+    caller's URL was bad. A subclass of :class:`BeanExtractionError` so any
+    existing ``except BeanExtractionError`` still catches it; callers that
+    need to distinguish origin (e.g. the API's 422-vs-503 mapping, #613)
+    catch this subclass FIRST.
+    """
 
 
 def _redact_query(query: str) -> str:
@@ -2391,13 +2415,14 @@ async def _extract_bean_identity(
         The provider's honest, page-only bean identity.
 
     Raises:
-        BeanExtractionError: On any provider/transport failure, a malformed
-            structured-output shape, a failure to construct the extraction
-            agent itself (a missing optional provider dependency, or an
-            unsupported provider — see :func:`build_model`), or exceeding
-            ``sourcing_config.extraction_timeout_seconds`` (#587 fix 3, #590
-            slice A — an unbounded LLM call must not be able to hang the
-            drafting request forever).
+        BeanExtractionUnavailableError: On any provider/transport failure, a
+            malformed structured-output shape, a failure to construct the
+            extraction agent itself (a missing optional provider dependency,
+            or an unsupported provider — see :func:`build_model`), or
+            exceeding ``sourcing_config.extraction_timeout_seconds`` (#587
+            fix 3, #590 slice A — an unbounded LLM call must not be able to
+            hang the drafting request forever). All of these are
+            DEPENDENCY-origin, not the caller's fault (#613).
     """
     extraction_timeout_seconds = (
         sourcing_config.extraction_timeout_seconds
@@ -2414,17 +2439,22 @@ async def _extract_bean_identity(
         async with asyncio.timeout(extraction_timeout_seconds):
             result = await agent.run(page_text)
     except TimeoutError as exc:
-        raise BeanExtractionError(
+        raise BeanExtractionUnavailableError(
             f"bean identity extraction exceeded the {extraction_timeout_seconds:g}s deadline"
         ) from exc
     except UnexpectedModelBehavior as exc:
-        raise BeanExtractionError(
+        # Validation-retry exhaustion (#590 slice D2b makes this a realistic
+        # path via the evidence-quote length cap) is a model-QUALITY failure,
+        # not evidence the caller's URL/page was bad — #613.
+        raise BeanExtractionUnavailableError(
             f"bean identity extraction returned a malformed shape: {exc}"
         ) from exc
     except ModelAPIError as exc:
-        raise BeanExtractionError(f"bean identity extraction provider error: {exc}") from exc
+        raise BeanExtractionUnavailableError(
+            f"bean identity extraction provider error: {exc}"
+        ) from exc
     except (AdvisorDependencyError, AdvisorError) as exc:
-        raise BeanExtractionError(
+        raise BeanExtractionUnavailableError(
             f"bean identity extraction could not build its model: {exc}"
         ) from exc
     return result.output
@@ -4599,8 +4629,14 @@ async def draft_bean_profile_from_url(
             a fragment (``#...``, #587 P1/P2 — both checked FIRST, before
             any logging or outbound request), or the vendor page could not
             be fetched.
-        BeanExtractionError: The LLM call failed, or the page yielded too
-            little identity to draft a profile from.
+        BeanExtractionUnavailableError: The LLM call failed (provider/
+            transport error, timeout, or a malformed structured-output
+            shape) — a dependency-origin failure, not the caller's fault
+            (#613; a subclass of ``BeanExtractionError``, raised by
+            :func:`_extract_bean_identity`).
+        BeanExtractionError: The page yielded too little identity (no usable
+            name/origin) to draft a profile from, or the assembled draft
+            failed its own field validation — both client-actionable.
     """
     # Credential-leak guard (#587 P1): checked before ANYTHING else — no
     # logging, no fetch, no billable LLM call — so a URL with embedded

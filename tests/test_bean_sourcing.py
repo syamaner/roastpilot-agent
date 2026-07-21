@@ -41,6 +41,7 @@ from roastpilot_agent import bean_sourcing
 from roastpilot_agent.advisor import AdvisorDependencyError
 from roastpilot_agent.bean_sourcing import (
     BeanExtractionError,
+    BeanExtractionUnavailableError,
     BeanFetchError,
     draft_bean_profile_from_url,
 )
@@ -2228,8 +2229,11 @@ async def test_extract_bean_identity_returns_provider_output() -> None:
 
 @pytest.mark.asyncio
 async def test_extract_bean_identity_maps_malformed_output() -> None:
+    """#613: validation-retry exhaustion is DEPENDENCY-origin (model-quality
+    failure, not a bad caller URL) — raised as the ``BeanExtractionError``
+    SUBCLASS, ``BeanExtractionUnavailableError``, not the base class."""
     model = _function_model_text("here is some prose, not the tool call")
-    with pytest.raises(BeanExtractionError, match="malformed"):
+    with pytest.raises(BeanExtractionUnavailableError, match="malformed"):
         await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
             "page text", advisor_config=_ADVISOR_CONFIG, model=model
         )
@@ -2237,10 +2241,11 @@ async def test_extract_bean_identity_maps_malformed_output() -> None:
 
 @pytest.mark.asyncio
 async def test_extract_bean_identity_maps_provider_error() -> None:
+    """#613: a provider/transport error is DEPENDENCY-origin."""
     model = _function_model_raising(
         ModelHTTPError(status_code=503, model_name="x", body="upstream down")
     )
-    with pytest.raises(BeanExtractionError, match="provider error"):
+    with pytest.raises(BeanExtractionUnavailableError, match="provider error"):
         await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
             "page text", advisor_config=_ADVISOR_CONFIG, model=model
         )
@@ -2255,11 +2260,12 @@ async def test_extract_bean_identity_timeout_uses_sourcing_config_not_advisor_co
     short one, so this only passes if the short, sourcing-owned deadline is
     the one actually enforced (the old coupling would let this hang for the
     full 10s test-suite-unfriendly duration, or simply never time out at
-    all with a 100s advisor budget)."""
+    all with a 100s advisor budget). Also #613: a provider timeout is
+    DEPENDENCY-origin."""
     model = _function_model_hanging()
     advisor_config = AdvisorConfig(timeout_seconds=100.0)
     sourcing_config = BeanSourcingConfig(extraction_timeout_seconds=0.05)
-    with pytest.raises(BeanExtractionError, match="deadline"):
+    with pytest.raises(BeanExtractionUnavailableError, match="deadline"):
         await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
             "page text",
             advisor_config=advisor_config,
@@ -2306,7 +2312,9 @@ async def test_extract_bean_identity_maps_build_model_dependency_error(
     """#587 fix 2: ``_bean_sourcing_agent`` (which calls ``build_model`` when
     ``model`` is omitted) used to run BEFORE the try block, so an
     ``AdvisorDependencyError`` from a missing optional provider dependency
-    escaped uncaught instead of failing soft as ``BeanExtractionError``."""
+    escaped uncaught instead of failing soft as ``BeanExtractionError``.
+    #613: this is DEPENDENCY-origin, so it is the ``BeanExtractionUnavailableError``
+    subclass, not the base class."""
 
     def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
         raise AdvisorDependencyError(
@@ -2315,7 +2323,7 @@ async def test_extract_bean_identity_maps_build_model_dependency_error(
         )
 
     monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
-    with pytest.raises(BeanExtractionError, match="could not build its model"):
+    with pytest.raises(BeanExtractionUnavailableError, match="could not build its model"):
         await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
             "page text", advisor_config=_ADVISOR_CONFIG
         )
@@ -7060,9 +7068,10 @@ async def test_draft_bean_profile_from_url_threads_extraction_timeout_from_sourc
     """#590 slice A, full pipeline: a short
     ``sourcing_config.extraction_timeout_seconds`` reaches the extraction
     call even though ``advisor_config.timeout_seconds`` is long — proves
-    the decoupling holds end-to-end, not just at the unit level."""
+    the decoupling holds end-to-end, not just at the unit level. Also #613,
+    full pipeline: a timeout is DEPENDENCY-origin."""
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as http_client:
-        with pytest.raises(BeanExtractionError, match="deadline"):
+        with pytest.raises(BeanExtractionUnavailableError, match="deadline"):
             await draft_bean_profile_from_url(
                 "https://vendor.example/products/kenya-kiambu",
                 advisor_config=AdvisorConfig(timeout_seconds=100.0),
@@ -7162,8 +7171,9 @@ async def test_draft_bean_profile_from_url_propagates_fetch_error() -> None:
 
 @pytest.mark.asyncio
 async def test_draft_bean_profile_from_url_propagates_extraction_error() -> None:
+    """#613: a malformed structured-output shape is DEPENDENCY-origin."""
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as http_client:
-        with pytest.raises(BeanExtractionError):
+        with pytest.raises(BeanExtractionUnavailableError):
             await draft_bean_profile_from_url(
                 "https://vendor.example/products/kenya-kiambu",
                 advisor_config=_ADVISOR_CONFIG,
@@ -7195,7 +7205,8 @@ async def test_draft_bean_profile_from_url_maps_build_model_dependency_error(
     """#587 fix 2, full pipeline: a missing optional provider dependency
     surfaced by ``build_model`` (via ``_bean_sourcing_agent``) must reach the
     caller as ``BeanExtractionError``, not the raw ``AdvisorDependencyError``.
-    ``model`` is deliberately omitted so the ``build_model`` path is hit."""
+    ``model`` is deliberately omitted so the ``build_model`` path is hit.
+    #613: this is DEPENDENCY-origin, so the subclass, ``BeanExtractionUnavailableError``."""
 
     def fake_build_model(config: AdvisorConfig, *, model_slug: str | None = None) -> Model:
         raise AdvisorDependencyError(
@@ -7205,7 +7216,7 @@ async def test_draft_bean_profile_from_url_maps_build_model_dependency_error(
 
     monkeypatch.setattr(bean_sourcing, "build_model", fake_build_model)
     async with _mock_client(_html_response(200, _SAMPLE_HTML)) as http_client:
-        with pytest.raises(BeanExtractionError, match="could not build its model"):
+        with pytest.raises(BeanExtractionUnavailableError, match="could not build its model"):
             await draft_bean_profile_from_url(
                 "https://vendor.example/products/kenya-kiambu",
                 advisor_config=_ADVISOR_CONFIG,

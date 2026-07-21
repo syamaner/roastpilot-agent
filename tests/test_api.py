@@ -39,7 +39,11 @@ from roastpilot_agent.api import (
     create_app,
     stream_events,
 )
-from roastpilot_agent.bean_sourcing import BeanExtractionError, BeanFetchError
+from roastpilot_agent.bean_sourcing import (
+    BeanExtractionError,
+    BeanExtractionUnavailableError,
+    BeanFetchError,
+)
 from roastpilot_agent.config import AppConfig, ControllerConfig, ReferenceCurve
 from roastpilot_agent.mcp_client import (
     AmbientStatus,
@@ -4425,6 +4429,49 @@ async def test_draft_bean_from_url_extraction_error_is_422(
     )
     assert response.status_code == 422
     assert "could not determine" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param("bean identity extraction exceeded the 45s deadline", id="provider_timeout"),
+        pytest.param(
+            "bean identity extraction provider error: upstream down", id="model_api_error"
+        ),
+        pytest.param(
+            "bean identity extraction could not build its model: missing optional dependency",
+            id="advisor_dependency_error",
+        ),
+        pytest.param(
+            "bean identity extraction returned a malformed shape: exceeded max retries",
+            id="unexpected_model_behavior",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_dependency_origin_extraction_error_is_503(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch, message: str
+) -> None:
+    """#613: every DEPENDENCY-origin cause ``_extract_bean_identity`` maps to
+    ``BeanExtractionUnavailableError`` (provider timeout, ``ModelAPIError``,
+    ``AdvisorDependencyError``/``AdvisorError``, and validation-retry
+    exhaustion via ``UnexpectedModelBehavior`` — see
+    ``test_bean_sourcing.py`` for the FunctionModel-driven proof that each
+    real cause actually raises this subclass) surfaces as **503**, never the
+    uniform 422 a bare ``BeanExtractionError`` used to get — the vendor page
+    may have been fine; the failure is operational, not the caller's input."""
+
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        raise BeanExtractionUnavailableError(message)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    response = await client.post(
+        "/api/beans/draft-from-url", json={"url": "https://vendor.example/products/outage"}
+    )
+    assert response.status_code == 503
+    detail = response.json()["detail"]
+    assert "temporarily unavailable" in detail
+    assert message in detail
 
 
 @pytest.mark.asyncio
