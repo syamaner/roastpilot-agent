@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "@/lib/api";
 import type { BeanProfile, BeanProfileInput } from "@/lib/types";
 import { BeanProfileModal } from "./BeanProfileModal";
+import * as beanProfileDraft from "./beanProfileDraft";
 import { FIXTURE_KOKE } from "./beanProfileFixture";
 
 afterEach(cleanup);
@@ -164,5 +165,40 @@ describe("BeanProfileModal edit mode (#303)", () => {
     fireEvent.click(screen.getByTestId("bean-profile-cancel"));
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(onSave).not.toHaveBeenCalled();
+  });
+});
+
+describe("BeanProfileModal — clears provenance on edit (#627 Codex round-2)", () => {
+  // Same constraint as StartRoastForm: the draft-from-URL flow isn't wired
+  // into the FE yet, so neither "add" (DEFAULT_BEAN_PROFILE_DRAFT) nor "edit"
+  // (draftFromBeanProfile, which never copies field_sources/field_evidence
+  // off a saved BeanProfile) can seed the draft with provenance via this
+  // modal's props — spy on the shared `withFieldEdited` helper (its clearing
+  // behaviour is exhaustively unit-tested in beanProfileDraft.test.ts) to
+  // prove the REAL onChange/onBlendChange closures delegate to it.
+  it("delegates a text/select field edit to withFieldEdited with the field name + new value", () => {
+    const spy = vi.spyOn(beanProfileDraft, "withFieldEdited");
+    render(
+      <BeanProfileModal mode="add" onSave={vi.fn()} onSaved={vi.fn()} onClose={vi.fn()} />,
+    );
+    fireEvent.change(screen.getByTestId("bean-profile-processing"), {
+      target: { value: "washed" },
+    });
+    expect(spy).toHaveBeenCalledWith(expect.anything(), "processing", "washed");
+  });
+
+  it("delegates the blend-toggle edit to withFieldEdited with is_blend + the new boolean", () => {
+    const spy = vi.spyOn(beanProfileDraft, "withFieldEdited");
+    render(
+      <BeanProfileModal
+        mode="edit"
+        profile={FIXTURE_KOKE}
+        onSave={vi.fn()}
+        onSaved={vi.fn()}
+        onClose={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByTestId("bean-profile-is_blend"));
+    expect(spy).toHaveBeenCalledWith(expect.anything(), "is_blend", !FIXTURE_KOKE.is_blend);
   });
 });

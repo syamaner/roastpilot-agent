@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ApiError } from "@/lib/api";
 import type { BeanProfile, BeanProfileInput, RoastProfile } from "@/lib/types";
+import * as beanProfileDraft from "./beanProfileDraft";
 import { FIXTURE_BEAN_PROFILES, FIXTURE_KOKE } from "./beanProfileFixture";
 import { StartRoastForm } from "./StartRoastForm";
 
@@ -535,5 +536,33 @@ describe("StartRoastForm — bean-profile library (#303)", () => {
     // The add modal never renders the archive affordance (onArchive is undefined
     // for mode==="add" even though onArchiveProfile is wired).
     expect(screen.queryByTestId("bean-profile-archive")).toBeNull();
+  });
+});
+
+describe("StartRoastForm — clears provenance on edit (#627 Codex round-2)", () => {
+  // The draft-from-URL flow isn't wired into the FE yet (#627b): there is no
+  // way to seed the draft with field_sources/field_evidence via this form's
+  // props (a saved BeanProfile/RoastProfile never carries them —
+  // draftFromBeanProfile deliberately never copies them across), so a
+  // visible "badge disappears on edit" assertion isn't reachable through
+  // this component today. Instead, spy on the shared `withFieldEdited`
+  // helper (its clearing behaviour is exhaustively unit-tested in
+  // beanProfileDraft.test.ts) to prove the REAL onChange/onBlendChange
+  // closures delegate to it for every field — spyOn wraps without
+  // stubbing, so the real clearing logic still runs.
+  it("delegates a text/select field edit to withFieldEdited with the field name + new value", () => {
+    const spy = vi.spyOn(beanProfileDraft, "withFieldEdited");
+    render(<StartRoastForm onStart={vi.fn()} />);
+    fireEvent.change(screen.getByTestId("start-roast-processing"), {
+      target: { value: "washed" },
+    });
+    expect(spy).toHaveBeenCalledWith(expect.anything(), "processing", "washed");
+  });
+
+  it("delegates the blend-toggle edit to withFieldEdited with is_blend + the new boolean", () => {
+    const spy = vi.spyOn(beanProfileDraft, "withFieldEdited");
+    render(<StartRoastForm onStart={vi.fn()} />);
+    fireEvent.click(screen.getByTestId("start-roast-is_blend"));
+    expect(spy).toHaveBeenCalledWith(expect.anything(), "is_blend", true);
   });
 });

@@ -51,12 +51,111 @@ export interface BeanProfileDraft {
    * (`altitude_m`, `processing`, `bean_species`, `is_blend`), keyed the
    * same way as the server's `field_sources` map (#627) — mirrors
    * `models.BeanProfileDraft.field_evidence`. Untrusted vendor page text;
-   * present only when a quote was captured. Optional/read-only: nothing
-   * in this file parses, edits, or renders it yet (that's #627b) — it
-   * exists here purely so the draft-from-URL response shape round-trips
-   * without loss once a caller starts threading it through.
+   * present only when a quote was captured. Read only via `fieldEvidenceFor`
+   * below, which whitelists the key — never index this map directly with an
+   * unvalidated key (#627b).
    */
   field_evidence?: Record<string, string>;
+  /**
+   * Per-field provenance, mirroring `models.BeanProfileDraft.field_sources`
+   * (`BeanFieldSource`): `"on_page"` when the server read the value from the
+   * vendor page text, `"origin_estimated"` when it was imputed (a
+   * conservative first-roast target, or a value the page never stated). The
+   * draft-review UI (#627b) surfaces this only for the four typed fields the
+   * evidence quotes cover — read via `fieldSourceFor`, never indexed
+   * directly with an unvalidated key.
+   */
+  field_sources?: Record<string, string>;
+}
+
+/** The four typed fields whose provenance + captured evidence quote the
+ *  draft-review UI surfaces (#627) — every automated citation gate for these
+ *  fields is permanently parked, so the operator judges from the quote
+ *  instead. The ONLY keys ever read from `field_sources`/`field_evidence`:
+ *  both maps are server-controlled but conceptually untrusted (vendor-page
+ *  derived), so a key outside this whitelist is ignored rather than
+ *  rendered. */
+export const PROVENANCE_TRACKED_FIELDS = [
+  "altitude_m",
+  "processing",
+  "bean_species",
+  "is_blend",
+] as const;
+
+export type ProvenanceTrackedField = (typeof PROVENANCE_TRACKED_FIELDS)[number];
+
+function isProvenanceTrackedField(field: string): field is ProvenanceTrackedField {
+  return (PROVENANCE_TRACKED_FIELDS as readonly string[]).includes(field);
+}
+
+/** The two `field_sources` values the server ever emits (`BeanFieldSource`,
+ *  models.py) — mirrors the Literal, not an enum (bean metadata, not a
+ *  safety verdict). */
+export type FieldSourceValue = "on_page" | "origin_estimated";
+
+/**
+ * The `field_sources` provenance for one of the four typed fields, or
+ * `undefined` when the field isn't tracked, has no entry (unset/absent — the
+ * same "absent means unset" convention as the server), or holds a value this
+ * UI doesn't recognise. Whitelists both the KEY (only a tracked typed field)
+ * and the VALUE (only the two known literals) — defense-in-depth against a
+ * future/unexpected server value rendering as something it isn't.
+ */
+export function fieldSourceFor(
+  draft: BeanProfileDraft,
+  field: ProvenanceTrackedField,
+): FieldSourceValue | undefined {
+  if (!isProvenanceTrackedField(field)) return undefined;
+  const value = draft.field_sources?.[field];
+  return value === "on_page" || value === "origin_estimated" ? value : undefined;
+}
+
+/**
+ * The captured vendor-page quote for one of the four typed fields, or
+ * `undefined` when absent or the field isn't tracked. Whitelists the KEY —
+ * the value is UNTRUSTED vendor page text; callers must render it through
+ * React's default escaping only (never `dangerouslySetInnerHTML`, never
+ * built into an HTML string, never linkified).
+ */
+export function fieldEvidenceFor(
+  draft: BeanProfileDraft,
+  field: ProvenanceTrackedField,
+): string | undefined {
+  if (!isProvenanceTrackedField(field)) return undefined;
+  return draft.field_evidence?.[field];
+}
+
+/**
+ * Applies an operator edit to `field` on the draft, immutably — AND drops
+ * that field's `field_sources`/`field_evidence` entries, if any (#627
+ * Codex round-2): provenance describes the value the server EXTRACTED from
+ * the vendor page; once the operator edits the field, carrying the old
+ * badge/quote forward would falsely attribute the operator's new value to
+ * the vendor page. Applies to every keyed field, not just the four typed
+ * ones — a `field_sources`-tracked free-text field (e.g. `bean_varietal`)
+ * is subject to the same false-attribution risk.
+ *
+ * Only rebuilds a map when it actually carries an entry for this field, so
+ * editing an untracked field (the common case — no draft-from-URL flow is
+ * wired up yet) leaves `field_sources`/`field_evidence` at the SAME
+ * reference as before: no spurious object churn for anything memoised on
+ * them.
+ */
+export function withFieldEdited<K extends keyof BeanProfileDraft>(
+  draft: BeanProfileDraft,
+  field: K,
+  value: BeanProfileDraft[K],
+): BeanProfileDraft {
+  const next: BeanProfileDraft = { ...draft, [field]: value };
+  if (draft.field_sources !== undefined && field in draft.field_sources) {
+    const { [field as string]: _removed, ...rest } = draft.field_sources;
+    next.field_sources = rest;
+  }
+  if (draft.field_evidence !== undefined && field in draft.field_evidence) {
+    const { [field as string]: _removed, ...rest } = draft.field_evidence;
+    next.field_evidence = rest;
+  }
+  return next;
 }
 
 /** Field-level validation errors, keyed by draft field. */

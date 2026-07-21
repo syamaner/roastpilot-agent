@@ -22,6 +22,7 @@ import {
   DEFAULT_BEAN_PROFILE_DRAFT,
   draftFromBeanProfile,
   validateBeanProfile,
+  withFieldEdited,
   type BeanProfileDraft,
   type BeanProfileErrors,
 } from "./beanProfileDraft";
@@ -61,10 +62,14 @@ export function BeanProfileModal({
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
 
+  // Editing a field orphans any provenance/evidence it carried (#627): those
+  // describe the value the SERVER extracted, not whatever the operator just
+  // typed — `withFieldEdited` drops the stale entry so it is never re-attributed
+  // to the new value.
   const onChange = (field: keyof BeanProfileDraft, value: string) =>
-    setDraft((d) => ({ ...d, [field]: value }));
+    setDraft((d) => withFieldEdited(d, field, value));
   const onBlendChange = (checked: boolean) =>
-    setDraft((d) => ({ ...d, is_blend: checked }));
+    setDraft((d) => withFieldEdited(d, "is_blend", checked));
 
   const title = mode === "add" ? "Add Bean Profile" : "Edit Bean Profile";
 
