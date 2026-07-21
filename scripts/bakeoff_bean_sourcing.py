@@ -3125,9 +3125,15 @@ async def main(argv: Sequence[str] | None = None) -> int:
         m.slug: m.reasoning for m in roster_for_cost
     }
     arms = expand_arms(model_slugs, reasoning_arg, capability=capability)
-    if reasoning_arg == "light" and not arms:
+    if not arms:
+        # Categorical (#601 fold round 4): ANY --reasoning value can skip every
+        # requested model (e.g. "off" against an all-none/mandatory roster) -- not
+        # just "light" -- so this guard is mode-agnostic, not a "light"-only special
+        # case, and fires before any cost estimate or spend.
         print(
-            "REFUSED: --reasoning light -- no requested model supports reasoning (#601).",
+            f"REFUSED: --reasoning {reasoning_arg} -- every requested model "
+            f"({', '.join(model_slugs)}) was skipped as reasoning-incapable for this "
+            "mode; nothing to run (#601).",
             file=sys.stderr,
         )
         return 2

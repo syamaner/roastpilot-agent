@@ -1328,10 +1328,48 @@ async def test_main_refuses_reasoning_light_with_no_capable_model(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """``--reasoning light`` against a roster with ZERO reasoning-capable models must
-    refuse before any spend (#601 fold round 2, F3) -- gpt-4o is non-reasoning."""
+    refuse before any spend (#601 fold round 2, F3; the categorical empty-expansion
+    guard, fold round 4) -- gpt-4o is non-reasoning."""
     code = await bo.main(["--models", "openai/gpt-4o", "--reasoning", "light", "--max-spend", "5"])
     assert code == 2
-    assert "no requested model supports reasoning" in capsys.readouterr().err
+    assert "nothing to run" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_main_refuses_reasoning_off_with_no_off_capable_model(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--reasoning off`` must refuse pre-spend, not just ``light`` -- gpt-4o is
+    "none" (off skipped) and gpt-5-mini is "mandatory" (off skipped), so EVERY
+    requested model is skipped and the arm list is empty (#601 fold round 4)."""
+    code = await bo.main(
+        [
+            "--models",
+            "openai/gpt-4o",
+            "openai/gpt-5-mini",
+            "--reasoning",
+            "off",
+            "--max-spend",
+            "5",
+        ]
+    )
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "REFUSED: --reasoning off" in err
+    assert "nothing to run" in err
+
+
+@pytest.mark.asyncio
+async def test_main_refuses_reasoning_off_with_no_off_capable_model_estimate_only(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The categorical empty-expansion guard fires even under ``--estimate-only`` --
+    it must not exit 0 with a zero-arm estimate (#601 fold round 4)."""
+    code = await bo.main(
+        ["--models", "openai/gpt-4o", "openai/gpt-5-mini", "--reasoning", "off", "--estimate-only"]
+    )
+    assert code == 2
+    assert "nothing to run" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio
