@@ -810,6 +810,16 @@ def _sanitize_trafilatura_frontmatter(markdown: str) -> str:
 # anyway. :func:`_replace_poisoned_parse_executor` discards the whole
 # executor instead (``shutdown(cancel_futures=True)``, the supported
 # drain-and-cancel mechanism) and resets the singleton to rebuild fresh.
+#
+# #607 fold 4: an EXISTING idle worker can dequeue and START that hidden
+# item before the fold-2 drain reaches it — a started item can never be
+# cancelled, and (pre-fold-4) never got a done-callback either, since
+# ``submit()`` raised before ``add_done_callback`` could run; releasing
+# the slot anyway silently grew the worker bound. Fixed by submitting a
+# WRAPPER, not the bare parse (:class:`_ParseSlotToken` +
+# :func:`_release_parse_slot_once`): the slot belongs to the work item
+# once submitted, and the failure path may reclaim it only after proving
+# (post-replacement) the item never started.
 
 #: Worker count for the dedicated parse pool. Two, matching the existing
 #: concurrency-1 draft semaphore (``api._draft_bean_from_url_semaphore``)
@@ -837,7 +847,7 @@ _parse_slot_lock = threading.Lock()
 #: Tracks workers ACTUALLY OCCUPIED, not calls merely awaited: a timed-out
 #: *await* does not decrement it, since the worker thread keeps running
 #: regardless — only its own eventual completion does, via
-#: :func:`_release_parse_slot`.
+#: :func:`_release_parse_slot_once`.
 _inflight_parse_count: int = 0
 
 
@@ -889,21 +899,36 @@ def _replace_poisoned_parse_executor(poisoned: concurrent.futures.ThreadPoolExec
             _parse_executor = None
 
 
-def _release_parse_slot(_future: concurrent.futures.Future[str | None]) -> None:
-    """Decrement :data:`_inflight_parse_count` by one, under
-    :data:`_parse_slot_lock`.
+class _ParseSlotToken:
+    """Owns exactly one release of an admitted parse slot (#607 fold 4).
 
-    Registered as the dedicated pool's worker-thread completion callback —
-    ``concurrent.futures`` invokes it synchronously on whichever thread
-    completed the future, so this runs DIRECTLY on the worker thread with
-    no event-loop hop and no dependency on any loop still existing (a
-    worker completing after its submitting loop has closed still releases
-    correctly). Clamped at zero as a defensive floor.
-
-    Args:
-        _future: The completed future (unused; required by the
-            ``add_done_callback`` signature).
+    Built alongside the wrapper submitted in its place of the bare parse
+    call (see :func:`_extract_page_markdown_bounded`) — never attached
+    after the fact — so the submission-failure handler can tell "this
+    item can never run" (safe to release now) apart from "an existing
+    worker already grabbed it" (its own wrapper owns the release) by
+    checking :attr:`started`, itself only ever set from inside the
+    wrapper on whichever thread runs it.
     """
+
+    __slots__ = ("lock", "started", "released")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.started = False
+        self.released = False
+
+
+def _release_parse_slot_once(token: _ParseSlotToken) -> None:
+    """Idempotently release the slot ``token`` reserves: the FIRST caller
+    decrements :data:`_inflight_parse_count`, every later caller is a
+    no-op. The slot belongs to the work item once submitted; a caller may
+    reclaim it only after proving the item can never run.
+    """
+    with token.lock:
+        if token.released:
+            return
+        token.released = True
     global _inflight_parse_count
     with _parse_slot_lock:
         _inflight_parse_count = max(0, _inflight_parse_count - 1)
@@ -919,15 +944,17 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
     :data:`_MAX_CONCURRENT_PARSES` slots. Admission control: when
     :data:`_inflight_parse_count` already reports every worker busy, a new
     call skips the markdown attempt immediately rather than queuing behind
-    the saturated pool. Submission failure (e.g. a thread-limit
-    ``OSError``) discards/replaces the executor
-    (:func:`_replace_poisoned_parse_executor`, since a released slot alone
-    would leave a hidden queued parse behind) before releasing the slot
-    and falling back — same as every other extraction failure mode. A
-    collaterally-cancelled item (a DIFFERENT call's replacement cancelling
-    OUR still-queued item) falls back the same way; a genuine cancellation
-    of THIS call's own task (``Task.cancelling() > 0``) always propagates
-    (#607 fold 3).
+    the saturated pool. The parse is submitted wrapped in a
+    :class:`_ParseSlotToken`-owned closure, not the bare
+    :func:`_extract_page_markdown` call, so the slot's release rides WITH
+    the work item (the wrapper's own ``finally``) — an EXISTING idle
+    worker starting the item before a submission failure's replacement can
+    reach it keeps its slot correctly reserved instead of the accounting
+    silently over-freeing it (#607 fold 4). Submission failure
+    (:func:`_replace_poisoned_parse_executor` FIRST, then release ONLY if
+    the token proves the item never started) and cancellation (collateral
+    falls back, ``Task.cancelling() > 0`` always propagates, #607 fold 3)
+    are the other two fail-soft branches.
 
     Either branch returns exactly like the pre-#607 call site: ``None``
     tells the caller to fall back to the linear-strip pass
@@ -960,20 +987,42 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
             return None
         _inflight_parse_count += 1
 
+    token = _ParseSlotToken()
+
+    def _run_and_release() -> str | None:
+        # Runs on the worker thread once (and only if) it is ACTUALLY
+        # dequeued and started — marking that fact is what lets the
+        # submission-failure path (below) tell an item that will truly
+        # never run apart from one an existing worker already grabbed.
+        with token.lock:
+            token.started = True
+        try:
+            return _extract_page_markdown(html)
+        finally:
+            _release_parse_slot_once(token)
+
     executor = _get_parse_executor()
     try:
-        concurrent_future = executor.submit(_extract_page_markdown, html)
-        concurrent_future.add_done_callback(_release_parse_slot)
+        concurrent_future = executor.submit(_run_and_release)
     except Exception:
         # Submission failed — the executor may hold a hidden queued item
-        # (see the module-level #607 fold 2 comment), so replace it FIRST,
-        # then release the slot (order closes the racing-admission window).
+        # (see the module-level #607 fold 2 comment). Replace it FIRST:
+        # after that returns, the item is either cancelled-forever (an
+        # existing worker never got to it) or already started (its own
+        # wrapper now owns the eventual release) — #607 fold 4.
         _replace_poisoned_parse_executor(executor)
-        with _parse_slot_lock:
-            _inflight_parse_count = max(0, _inflight_parse_count - 1)
+        with token.lock:
+            already_started = token.started
+        if not already_started:
+            _release_parse_slot_once(token)
         _log.warning(
-            "bean_sourcing: dedicated parse pool submission failed; replacing the "
-            "poisoned executor and falling back to linear-strip",
+            "bean_sourcing: dedicated parse pool submission failed; replaced the "
+            "poisoned executor%s; falling back to linear-strip",
+            ""
+            if not already_started
+            else " (an existing worker already started "
+            "the hidden item, #607 fold 4 — its slot stays reserved until that "
+            "parse completes)",
             exc_info=True,
         )
         return None
@@ -999,6 +1048,11 @@ async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -
         # parse failure. (concurrent_future.cancelled() alone is NOT
         # reliable here: a genuine cancellation of a not-yet-started item
         # cancels the future too, via asyncio's own future-chaining.)
+        if concurrent_future.cancelled():
+            # The item was cancelled before it ever ran (never will) —
+            # the wrapper's own ``finally`` will never execute, so WE own
+            # releasing its slot (#607 fold 4).
+            _release_parse_slot_once(token)
         current_task = asyncio.current_task()
         if current_task is not None and current_task.cancelling() > 0:
             raise
