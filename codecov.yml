@@ -2,6 +2,14 @@ coverage:
   status:
     patch:
       default:
+        # Best-effort guard for the #624/#625 trap: codecov silently posts
+        # NO patch status when a diff has zero coverable lines (pure
+        # deletions), deadlocking the app-pinned required check.
+        # if_not_found is documented for project status; accepted here as
+        # best-effort — empirically verifiable only on the next
+        # pure-deletion PR. The standing workaround (AGENTS.md): fold a
+        # pure-deletion retirement with the logic that replaces it.
+        if_not_found: success
         # The auto target equals current project coverage (~96%); allow a
         # small margin so genuinely environment-dependent slivers (real-IO
         # shims, filesystem-failure paths) don't red-flag otherwise
@@ -11,3 +19,4 @@ coverage:
     project:
       default:
         threshold: 1%
+        if_not_found: success
