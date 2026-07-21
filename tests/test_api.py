@@ -4376,10 +4376,56 @@ async def test_draft_bean_from_url_happy_path(
     assert body["name"] == "Kenya Kiambu AA (Washed)"
     assert body["source_url"] == "https://vendor.example/products/kenya-kiambu"
     assert body["field_sources"]["target_development_percent"] == "origin_estimated"
+    # #627: the empty form — a draft with no captured evidence quotes still
+    # carries the key, as an empty object, not an omission.
+    assert body["field_evidence"] == {}
     assert "id" not in body  # never persisted / never mints a library id
     # It reused the service's configured advisor + bean_sourcing config (BYOK).
     assert len(calls) == 1
     assert calls[0][0] == "https://vendor.example/products/kenya-kiambu"
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_from_url_response_carries_field_evidence(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#627: the endpoint returns ``field_evidence`` as-is — the populated
+    form — verifying nothing on the response path (route/service/pydantic
+    serialization) drops or filters it."""
+
+    def _draft_with_evidence(url: str) -> BeanProfileDraft:
+        return BeanProfileDraft(
+            name="Kenya Kiambu AA (Washed)",
+            bean_origin="Kenya",
+            processing="washed",
+            source_url=url,
+            initial_heat_percent=100,
+            initial_fan_percent=30,
+            target_drop_temp_c=195.0,
+            target_development_percent=15.0,
+            default_bean_weight_grams=250.0,
+            field_sources={"processing": "origin_estimated"},
+            field_evidence={
+                "processing": "Fully washed and dried on raised beds.",
+                "altitude_m": "Grown at 1,900 masl.",
+            },
+            scouting_note="Scouting run — de-risked first-roast targets.",
+        )
+
+    async def fake_draft(url: str, *, advisor_config: object, sourcing_config: object) -> object:
+        return _draft_with_evidence(url)
+
+    monkeypatch.setattr("roastpilot_agent.api.draft_bean_profile_from_url", fake_draft)
+    response = await client.post(
+        "/api/beans/draft-from-url",
+        json={"url": "https://vendor.example/products/kenya-kiambu"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["field_evidence"] == {
+        "processing": "Fully washed and dried on raised beds.",
+        "altitude_m": "Grown at 1,900 masl.",
+    }
 
 
 @pytest.mark.asyncio

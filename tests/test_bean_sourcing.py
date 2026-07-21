@@ -2493,6 +2493,140 @@ def test_draft_from_identity_evidence_quotes_do_not_change_free_text_provenance(
     assert draft_without_evidence.field_sources["processing"] == "origin_estimated"
     assert "bean_species" not in draft_with_evidence.field_sources
     assert "is_blend" not in draft_with_evidence.field_sources
+    # #627: field_evidence is INDEPENDENT of field_sources/the gate verdicts
+    # above — a captured quote surfaces for operator judgement regardless
+    # of whether its field demoted to "origin_estimated".
+    assert draft_with_evidence.field_evidence["altitude_m"] == "Altitude: 1775m."
+    assert draft_with_evidence.field_evidence["processing"] == "washed coffee"
+    assert "bean_species" not in draft_with_evidence.field_evidence
+    assert "is_blend" not in draft_with_evidence.field_evidence
+    assert draft_without_evidence.field_evidence == {}
+
+
+#: A page corpus carrying a genuine, corpus-backed quote for each of the
+#: four typed fields (#633) — each on its OWN sentence/segment, so every
+#: quote below is a whole-phrase match within a single
+#: :func:`bean_sourcing._split_corpus_segments` segment.
+_FOUR_FIELD_EVIDENCE_PAGE_TEXT = (
+    "Kenya Kiambu AA is a washed coffee, dried on raised beds. "
+    "This lot is 100% Arabica. "
+    "Altitude: 1775m. "
+    "This is a blend of two lots."
+)
+
+
+def test_draft_from_identity_field_evidence_captures_all_four_typed_fields() -> None:
+    """#627/#633: every one of the four typed fields' captured quote is
+    threaded onto the draft's ``field_evidence``, keyed the same way as
+    ``field_sources`` — provided each quote AUTHENTICATES against the page
+    (#633): appears verbatim, whole-phrase, within one corpus segment."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            processing_evidence="washed coffee, dried on raised beds",
+            bean_species_evidence="100% Arabica",
+            altitude_m_evidence="Altitude: 1775m.",
+            is_blend=True,
+            is_blend_evidence="This is a blend of two lots.",
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=_FOUR_FIELD_EVIDENCE_PAGE_TEXT,
+    )
+    assert draft.field_evidence == {
+        "processing": "washed coffee, dried on raised beds",
+        "bean_species": "100% Arabica",
+        "altitude_m": "Altitude: 1775m.",
+        "is_blend": "This is a blend of two lots.",
+    }
+
+
+def test_draft_from_identity_field_evidence_drops_a_fabricated_quote() -> None:
+    """#633 (Codex P2): a quote the model returns but which never actually
+    appears on the page must be DROPPED from ``field_evidence`` — the
+    operator must never see a possibly-fabricated string presented as
+    verbatim vendor-page text. The other three genuine, corpus-backed
+    quotes stay included — only the fabricated one is excluded."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            processing_evidence="washed coffee, dried on raised beds",
+            # Fabricated: this sentence never appears anywhere on the page.
+            bean_species_evidence="Certified 100% organic since 1995.",
+            altitude_m_evidence="Altitude: 1775m.",
+            is_blend=True,
+            is_blend_evidence="This is a blend of two lots.",
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=_FOUR_FIELD_EVIDENCE_PAGE_TEXT,
+    )
+    assert "bean_species" not in draft.field_evidence
+    assert draft.field_evidence == {
+        "processing": "washed coffee, dried on raised beds",
+        "altitude_m": "Altitude: 1775m.",
+        "is_blend": "This is a blend of two lots.",
+    }
+
+
+def test_draft_from_identity_field_evidence_drops_a_cross_segment_splice() -> None:
+    """#633: whole-corpus normalized containment alone would let a
+    sentence-ending period turn "...at 1800." + "Masl is..." into the
+    contiguous phrase "1800 masl" once normalized — a splice across TWO
+    separate sentences, never actually written together (same repro
+    shape as :func:`test_quote_supports_altitude_cross_sentence_splice_demotes`).
+    :func:`bean_sourcing._find_authentic_segment` requires a whole-phrase
+    match WITHIN one segment, so this must be dropped from
+    ``field_evidence`` too — not just kept out of ``field_sources``."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1800, altitude_m_evidence="1800 masl")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus="This farm sits at 1800. Masl is the unit used here.",
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+    assert "altitude_m" not in draft.field_evidence
+
+
+@pytest.mark.parametrize("blank_quote", ["", "   ", None])
+def test_draft_from_identity_field_evidence_omits_blank_or_absent_quotes(
+    blank_quote: str | None,
+) -> None:
+    """#627: a blank/whitespace-only/``None`` evidence quote leaves the
+    field simply ABSENT from ``field_evidence`` — never an empty-string
+    entry — the same "absent means unset" convention as ``field_sources``."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            processing_evidence=blank_quote,
+            bean_species_evidence=blank_quote,
+            altitude_m_evidence=blank_quote,
+            is_blend_evidence=blank_quote,
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=_IDENTITY_PAGE_TEXT,
+    )
+    assert draft.field_evidence == {}
+
+
+def test_draft_from_identity_field_evidence_strips_surrounding_whitespace() -> None:
+    """#627: a quote is stripped like every other optional identity text
+    field (:func:`bean_sourcing._normalize_optional_text`)."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(processing_evidence="  washed coffee  ")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=_IDENTITY_PAGE_TEXT,
+    )
+    assert draft.field_evidence["processing"] == "washed coffee"
 
 
 def test_draft_from_identity_at_limit_name_still_verifies_on_page() -> None:
@@ -4056,6 +4190,17 @@ def test_draft_from_identity_absent_altitude_with_stray_evidence_quote_has_no_en
     )
     assert draft.altitude_m is None
     assert "altitude_m" not in draft.field_sources
+    # #627/#633: field_evidence is built from the raw ``*_evidence`` values
+    # alone (skip None/blank; strip; then authenticity-check against the
+    # page, #633) — independent of whether the corresponding typed VALUE
+    # is present. A deliberate divergence from field_sources' "raw_value in
+    # (None, '')" skip: a stray-but-GENUINE quote the model captured still
+    # surfaces for operator review even against an otherwise-absent field,
+    # since the point is showing the operator what the model actually cited
+    # from the page, not re-deriving provenance. It authenticates here
+    # because the corpus above deliberately carries "grown at 1800 masl"
+    # verbatim, on its own segment.
+    assert draft.field_evidence["altitude_m"] == "grown at 1800 masl"
 
 
 @pytest.mark.parametrize("evidence_quote", ["", "   ", None])
