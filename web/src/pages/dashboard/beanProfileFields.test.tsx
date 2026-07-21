@@ -265,3 +265,76 @@ describe("BeanProfileFields draft-review aria-describedby association (#627b fol
     );
   });
 });
+
+describe("BeanProfileFields draft-review sr-only warning + contextual toggle names (#627b Codex round-3)", () => {
+  it("the 'review' badge carries a full sr-only warning, referenced via aria-describedby, distinct from the short visible text", () => {
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_sources: { altitude_m: "origin_estimated" },
+    });
+    const badge = screen.getByTestId("field-provenance-badge");
+    // The referenced badge element (via aria-describedby on the input) is the
+    // one carrying the full warning — assert it lives WITHIN that element.
+    const srOnly = badge.querySelector(".sr-only");
+    expect(srOnly).not.toBeNull();
+    expect(srOnly).toHaveTextContent(/not confirmed on the vendor page.*review before use/i);
+    // The short visible fragment is hidden from the accessibility tree so the
+    // description isn't announced twice (fragment + full sentence).
+    const visible = badge.querySelector('[aria-hidden="true"]');
+    expect(visible).toHaveTextContent(/review/i);
+  });
+
+  it("the 'on page' badge also carries a full sr-only description", () => {
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_sources: { bean_species: "on_page" },
+    });
+    const badge = screen.getByTestId("field-provenance-badge");
+    const srOnly = badge.querySelector(".sr-only");
+    expect(srOnly).not.toBeNull();
+    expect(srOnly).toHaveTextContent(/confirmed on the vendor page/i);
+  });
+
+  it("gives two rendered quotes' expand toggles distinct, field-naming accessible names", () => {
+    const longAltitude = "Grown at high altitude in volcanic soil. ".repeat(6).trim();
+    const longProcessing = "Fully washed then dried slowly on raised African beds. ".repeat(4).trim();
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_evidence: { altitude_m: longAltitude, processing: longProcessing },
+    });
+    const altitudeToggle = screen.getByTestId(`${PREFIX}-altitude_m-evidence-toggle`);
+    const processingToggle = screen.getByTestId(`${PREFIX}-processing-evidence-toggle`);
+    const altitudeName = altitudeToggle.getAttribute("aria-label");
+    const processingName = processingToggle.getAttribute("aria-label");
+    expect(altitudeName).toEqual(expect.stringContaining("Altitude"));
+    expect(processingName).toEqual(expect.stringContaining("Processing"));
+    expect(altitudeName).not.toEqual(processingName);
+  });
+
+  it("the toggle's aria-controls points at the quote block's id, and aria-expanded still toggles", () => {
+    const longQuote = "Grown at high altitude in volcanic soil. ".repeat(6).trim();
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_evidence: { processing: longQuote },
+    });
+    const toggle = screen.getByTestId(`${PREFIX}-processing-evidence-toggle`);
+    const quote = screen.getByTestId(`${PREFIX}-processing-evidence`);
+    expect(toggle).toHaveAttribute("aria-controls", quote.id);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle).toHaveAttribute("aria-label", expect.stringMatching(/^Show/));
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    expect(toggle).toHaveAttribute("aria-label", expect.stringMatching(/^Hide/));
+  });
+
+  it("names the blend toggle's quote expand button 'Blend'", () => {
+    const longQuote = "This lot is single-origin, not a blend of multiple farms or lots. ".repeat(3).trim();
+    renderFields({
+      ...DEFAULT_BEAN_PROFILE_DRAFT,
+      field_evidence: { is_blend: longQuote },
+    });
+    const toggle = screen.getByTestId(`${PREFIX}-is_blend-evidence-toggle`);
+    expect(toggle.getAttribute("aria-label")).toEqual(expect.stringContaining("Blend"));
+  });
+});

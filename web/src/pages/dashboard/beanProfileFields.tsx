@@ -53,6 +53,13 @@ function joinDescribedBy(...ids: (string | undefined)[]): string | undefined {
  * safety verdict. Takes an `id` so the owning control's `aria-describedby`
  * can reference it (#627 accessibility fold) — otherwise a screen reader in
  * forms mode announces only the label/hint and skips this cue entirely.
+ *
+ * The visible "On page"/"Review" text is short by design (it fits inline
+ * next to the label); the FULL warning — the same wording as the `title`,
+ * for a sighted mouse-hover user — is carried by a `sr-only` span instead
+ * (repo convention, see `HistoryFilter`), and the short visible text is
+ * `aria-hidden` so `aria-describedby` announces the one full sentence, not
+ * both a fragment and the full text back to back (#627 a11y fold).
  */
 function ProvenanceBadge({
   id,
@@ -62,6 +69,9 @@ function ProvenanceBadge({
   source: FieldSourceValue;
 }): React.JSX.Element {
   const onPage = source === "on_page";
+  const fullText = onPage
+    ? "Confirmed on the vendor page."
+    : "Not confirmed on the vendor page — review before use.";
   return (
     <span
       id={id}
@@ -79,7 +89,8 @@ function ProvenanceBadge({
           : "border-roast-caution/40 bg-roast-caution/15 text-roast-caution",
       )}
     >
-      {onPage ? "On page" : "Review"}
+      <span aria-hidden="true">{onPage ? "On page" : "Review"}</span>
+      <span className="sr-only">{fullText}</span>
     </span>
   );
 }
@@ -103,9 +114,23 @@ function ProvenanceBadge({
  * carries `break-words` so a long unbroken token never paints outside the
  * flex box once expanded (security review, #627). Takes an `id` so the
  * owning control's `aria-describedby` can reference it (#627 accessibility
- * fold).
+ * fold). The expand toggle carries a contextual `aria-label` naming
+ * `fieldLabel` — with several quotes on one page, a bare "more"/"less"
+ * button gives every one the SAME accessible name, so a screen-reader user
+ * tabbing through them can't tell them apart — and `aria-controls={id}`
+ * pointing at this quote block (#627 a11y fold).
  */
-function EvidenceQuote({ id, quote, testId }: { id: string; quote: string; testId: string }): React.JSX.Element {
+function EvidenceQuote({
+  id,
+  quote,
+  testId,
+  fieldLabel,
+}: {
+  id: string;
+  quote: string;
+  testId: string;
+  fieldLabel: string;
+}): React.JSX.Element {
   const [expanded, setExpanded] = useState(false);
   const truncatable = quote.length > 160;
   return (
@@ -132,6 +157,8 @@ function EvidenceQuote({ id, quote, testId }: { id: string; quote: string; testI
           type="button"
           data-testid={`${testId}-toggle`}
           aria-expanded={expanded}
+          aria-controls={id}
+          aria-label={`${expanded ? "Hide" : "Show"} full page quote for ${fieldLabel}`}
           onClick={() => setExpanded((v) => !v)}
           className="shrink-0 text-xs text-muted-foreground underline-offset-2 hover:underline"
         >
@@ -245,7 +272,7 @@ export function Field({
         )
       )}
       {evidenceQuote !== undefined && evidenceId !== undefined && (
-        <EvidenceQuote id={evidenceId} quote={evidenceQuote} testId={evidenceId} />
+        <EvidenceQuote id={evidenceId} quote={evidenceQuote} testId={evidenceId} fieldLabel={label} />
       )}
     </div>
   );
@@ -322,7 +349,7 @@ function Select({
         {hint}
       </span>
       {evidenceQuote !== undefined && evidenceId !== undefined && (
-        <EvidenceQuote id={evidenceId} quote={evidenceQuote} testId={evidenceId} />
+        <EvidenceQuote id={evidenceId} quote={evidenceQuote} testId={evidenceId} fieldLabel={label} />
       )}
     </div>
   );
@@ -637,7 +664,7 @@ function BlendToggle({
           : "Single origin — leave off, or turn on for a blend."}
       </span>
       {evidenceQuote !== undefined && evidenceId !== undefined && (
-        <EvidenceQuote id={evidenceId} quote={evidenceQuote} testId={evidenceId} />
+        <EvidenceQuote id={evidenceId} quote={evidenceQuote} testId={evidenceId} fieldLabel="Blend" />
       )}
     </div>
   );
