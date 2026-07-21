@@ -418,6 +418,18 @@ def test_classify_absent_field_rejects_a_tolerated_phrase_padded_with_a_country(
     assert bo._classify_absent_field(gold, padded) is bo.Outcome.SPU  # pyright: ignore[reportPrivateUsage]
 
 
+def test_classify_absent_field_rejects_exact_boundary_precision_padding() -> None:
+    """A single padded content token lands EXACTLY on the old 0.75 fuzzy
+    threshold (3 of 4 content tokens = precision 0.75) -- the fuzzy bar fit
+    for free-text comparison wrongly admitted this and scored an invented
+    country ABS_COR; a whitelist tolerance must reject ANY unsupported
+    token, so only an EXACT (1.0) precision may pass (#602 fold 2, round
+    2)."""
+    gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
+    boundary = "blend of multiple origins Ethiopia"
+    assert bo._classify_absent_field(gold, boundary) is bo.Outcome.SPU  # pyright: ignore[reportPrivateUsage]
+
+
 def test_classify_absent_field_clean_tolerated_phrase_still_scores_abs_cor() -> None:
     """A clean (unpadded) tolerated phrase must still pass the joint
     recall+precision gate -- the precision requirement must not become so

@@ -1023,13 +1023,15 @@ _COMPARATORS: dict[str, Callable[[Any, Any], Outcome]] = {
 
 
 def _tolerates_absent_value(tolerated: Sequence[str], model_value: str) -> bool:
-    """Whether ``model_value`` matches ANY tolerated phrase on BOTH recall
-    AND precision -- the SAME bidirectional gate :func:`_compare_text` uses
-    (#600) so a padded answer cannot earn credit for an unsupported extra
-    token. Recall alone would let "a blend of multiple origins, primarily
-    Ethiopia" match "blend of multiple origins" (every phrase word present)
-    while smuggling in an invented country (#602 fold 2); precision catches
-    the padding and fails the match.
+    """Whether ``model_value`` matches ANY tolerated phrase on recall AND
+    EXACT precision -- unlike :func:`_compare_text`'s fuzzy 0.75 gate (fit
+    for comparing two free-text descriptions), ``accept_any_of`` is a
+    WHITELIST of acceptable non-answers, so ANY unsupported token must
+    reject the match: the fuzzy threshold would admit "blend of multiple
+    origins Ethiopia" (3/4 tokens = precision exactly 0.75) and score an
+    invented country ABS_COR (#602 fold 2 round 2). Precision must be
+    ``1.0`` -- every content token of ``model_value`` in the phrase's own
+    token bag, zero padding tolerated.
 
     Args:
         tolerated: The gold-JSON ``accept_any_of`` phrase list.
@@ -1041,7 +1043,7 @@ def _tolerates_absent_value(tolerated: Sequence[str], model_value: str) -> bool:
     for phrase in tolerated:
         recall = word_bag_recall([phrase], model_value)
         precision_ = word_bag_precision([phrase], model_value)
-        if recall >= _WORDBAG_COR_RECALL and precision_ >= _WORDBAG_COR_PRECISION:
+        if recall >= _WORDBAG_COR_RECALL and precision_ >= 1.0:
             return True
     return False
 
