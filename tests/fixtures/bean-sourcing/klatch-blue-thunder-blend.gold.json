@@ -7,7 +7,7 @@
   },
   "name": {"value": "Blue Thunder Blend"},
   "fields": {
-    "origin": {"absent": true},
+    "origin": {"absent": true, "accept_any_of": ["blend of multiple origins", "multiple origins", "global blend"]},
     "region": {"absent": true},
     "farm": {"absent": true},
     "variety": {"absent": true},
@@ -21,6 +21,7 @@
   "labeling_flags": [
     "is_blend=true: explicitly a 'blend' combining a French Roast of Central/South American beans and a Sumatra wet-hulled coffee.",
     "origin=absent and region=absent: the page's Region spec is 'Global' (a non-geographic placeholder for a multi-origin blend), so no single origin country/region is stated. SPOT-CHECK.",
+    "origin.accept_any_of (#602): a model that faithfully answers 'a blend of multiple origins' (rather than a plain abstention OR a specific invented country) scores the SAME as a correct abstention (ABS_COR) -- neither rewarded nor penalised for recognising the blend. A model naming any actual single country (e.g. 'Ethiopia') still scores SPU, unchanged. Single-cell nuance; does not change the accepted tie-level bake-off result.",
     "process=washed: the page's Process spec states 'Washed', though the prose says the blend includes a Sumatra WET-HULLED component (a contradiction handled by taking the structured spec value)."
   ]
 }
