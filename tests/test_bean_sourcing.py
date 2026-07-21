@@ -35,6 +35,7 @@ from typing import Literal
 import extruct  # type: ignore[import-untyped]
 import httpx
 import pytest
+from pydantic import ValidationError
 from pydantic_ai import ModelHTTPError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models import Model
@@ -2332,6 +2333,71 @@ async def test_extract_bean_identity_maps_build_model_dependency_error(
         )
 
 
+# --- #609: max_length parity for the model-returned free-text fields ---
+#
+# ``_ExtractedBeanIdentity``'s five short free-text fields (``name``,
+# ``country``, ``bean_origin``, ``farm``, ``bean_varietal``) previously had
+# NO length bound at all, unlike the deterministic JSON-LD path
+# (``_MAX_JSON_LD_FIELD_CHARS`` = 500) and the four ``*_evidence`` fields
+# (#590 D2a, also capped at 500). ``description`` gets its own, wider cap
+# (``_MAX_DESCRIPTION_FIELD_CHARS`` = 2000) since it is intentionally
+# multi-sentence prose, not a short name/label.
+
+_MAX_LENGTH_FIELD_CAPS = {
+    "name": bean_sourcing._MAX_JSON_LD_FIELD_CHARS,  # pyright: ignore[reportPrivateUsage]
+    "country": bean_sourcing._MAX_JSON_LD_FIELD_CHARS,  # pyright: ignore[reportPrivateUsage]
+    "bean_origin": bean_sourcing._MAX_JSON_LD_FIELD_CHARS,  # pyright: ignore[reportPrivateUsage]
+    "farm": bean_sourcing._MAX_JSON_LD_FIELD_CHARS,  # pyright: ignore[reportPrivateUsage]
+    "bean_varietal": bean_sourcing._MAX_JSON_LD_FIELD_CHARS,  # pyright: ignore[reportPrivateUsage]
+    "description": bean_sourcing._MAX_DESCRIPTION_FIELD_CHARS,  # pyright: ignore[reportPrivateUsage]
+}
+
+
+@pytest.mark.parametrize("field_name,cap", sorted(_MAX_LENGTH_FIELD_CAPS.items()))
+def test_extracted_bean_identity_rejects_over_limit_free_text_field(
+    field_name: str, cap: int
+) -> None:
+    """#609: a value one character over the cap fails ``model_validate`` —
+    schema-level proof of the new ``Field(max_length=...)`` bound, direct
+    construction (never a hand-rolled length check elsewhere)."""
+    with pytest.raises(ValidationError, match=field_name):
+        bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+            _identity_args(**{field_name: "a" * (cap + 1)})
+        )
+
+
+@pytest.mark.parametrize("field_name,cap", sorted(_MAX_LENGTH_FIELD_CAPS.items()))
+def test_extracted_bean_identity_accepts_at_limit_free_text_field(
+    field_name: str, cap: int
+) -> None:
+    """The boundary value itself (exactly ``cap`` chars) is still valid —
+    only strictly OVER the cap is rejected."""
+    value = "a" * cap
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(**{field_name: value})
+    )
+    assert getattr(identity, field_name) == value
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_maps_over_long_name_to_unavailable() -> None:
+    """#609 end-to-end mechanism, confirmed rather than assumed: an
+    over-long ``name`` fails the new ``max_length`` bound on every retry
+    attempt (the ``FunctionModel`` double always returns the same args), so
+    pydantic-ai exhausts its output-validation retries and raises
+    ``UnexpectedModelBehavior`` — which ``_extract_bean_identity`` maps to
+    ``BeanExtractionUnavailableError`` (#613: DEPENDENCY-origin, so HTTP 503
+    at the endpoint via ``test_api.py``'s existing generic parametrized
+    503 test — never a 422 as if the vendor page itself were bad). See
+    ``test_draft_bean_profile_from_url_propagates_over_long_field_error``
+    below for the same proof through the FULL fetch+extract pipeline."""
+    model = _function_model_returning(_identity_args(name="x" * 501))
+    with pytest.raises(BeanExtractionUnavailableError, match="malformed shape"):
+        await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+            "page text", advisor_config=_ADVISOR_CONFIG, model=model
+        )
+
+
 # --- #590 D2a: evidence-quote schema + prompt (capture only, no provenance change) ---
 
 
@@ -2427,6 +2493,23 @@ def test_draft_from_identity_evidence_quotes_do_not_change_free_text_provenance(
     assert draft_without_evidence.field_sources["processing"] == "origin_estimated"
     assert "bean_species" not in draft_with_evidence.field_sources
     assert "is_blend" not in draft_with_evidence.field_sources
+
+
+def test_draft_from_identity_at_limit_name_still_verifies_on_page() -> None:
+    """#609 regression: D1's free-text containment gate (#590 D1) is
+    unaffected by the new ``max_length`` bound — a ``name`` value exactly AT
+    the 500-char cap still verifies ``"on_page"`` when it is genuinely
+    present in the corpus, the same as any shorter value would."""
+    at_limit_name = "a" * bean_sourcing._MAX_JSON_LD_FIELD_CHARS  # pyright: ignore[reportPrivateUsage]
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(name=at_limit_name)
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=f"Product: {at_limit_name}. {_IDENTITY_PAGE_TEXT}",
+    )
+    assert draft.field_sources["name"] == "on_page"
 
 
 def test_draft_from_identity_abstained_processing_has_no_spurious_provenance() -> None:
@@ -8126,6 +8209,25 @@ async def test_draft_bean_profile_from_url_propagates_extraction_error() -> None
                 advisor_config=_ADVISOR_CONFIG,
                 http_client=http_client,
                 model=_function_model_text("no structured output here"),
+            )
+
+
+@pytest.mark.asyncio
+async def test_draft_bean_profile_from_url_propagates_over_long_field_error() -> None:
+    """#609, FULL pipeline (fetch + extract): an over-long ``name`` in the
+    model's structured output exhausts pydantic-ai's validation retries the
+    same way a malformed shape does — surfacing through
+    ``draft_bean_profile_from_url`` (and therefore ``POST
+    /api/beans/draft-from-url``, ``test_api.py``'s existing generic 503
+    test) as ``BeanExtractionUnavailableError``, never a 422 as if the
+    vendor page itself were bad (#613)."""
+    async with _mock_client(_html_response(200, _SAMPLE_HTML)) as http_client:
+        with pytest.raises(BeanExtractionUnavailableError, match="malformed shape"):
+            await draft_bean_profile_from_url(
+                "https://vendor.example/products/kenya-kiambu",
+                advisor_config=_ADVISOR_CONFIG,
+                http_client=http_client,
+                model=_function_model_returning(_identity_args(name="x" * 501)),
             )
 
 
