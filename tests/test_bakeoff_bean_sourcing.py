@@ -1670,42 +1670,147 @@ def _failed_run(slug: str, n_pages: int = 2) -> bo.ModelRun:
     )
 
 
-def test_classify_wholly_failed_runs_model_specific_when_a_fresh_peer_succeeded(
-    tmp_path: Path,
-) -> None:
-    """A FRESHLY-EXECUTED peer's success (a real call was made THIS
-    invocation, not merely resumed) DOES count as evidence the
-    corpus/pipeline is healthy right now -- MODEL-SPECIFIC: scored and
-    checkpointed like any other result (#602 design point, fold 1)."""
+def test_checkpoint_model_specific_scores_and_persists_eagerly(tmp_path: Path) -> None:
     checkpoint = bo.Checkpoint(tmp_path / "cells.jsonl", resume=False)
-    runs = [_full_run("good", bo.Outcome.COR)]
-    candidates = [_failed_run("bad")]
-    failed_slugs = bo._classify_wholly_failed_runs(  # pyright: ignore[reportPrivateUsage]
-        runs, candidates, checkpoint, ["good", "bad"]
-    )
-    assert failed_slugs == []
-    assert {r.model_slug for r in runs} == {"good", "bad"}
+    runs: list[bo.ModelRun] = []
+    failed = _failed_run("bad")
+    bo._checkpoint_model_specific(failed, runs, checkpoint)  # pyright: ignore[reportPrivateUsage]
+    assert runs == [failed]
     assert checkpoint.has("bad")
 
 
-def test_classify_wholly_failed_runs_infra_wide_when_only_a_resumed_peer_succeeded(
-    tmp_path: Path,
-) -> None:
-    """A RESUMED (not freshly-executed) peer's success must NOT count --
-    with no fresh success at all, the candidate stays INFRA-WIDE (#602
-    fold 1)."""
-    checkpoint = bo.Checkpoint(tmp_path / "cells.jsonl", resume=False)
-    runs = [_full_run("good", bo.Outcome.COR)]  # resumed -- NOT in executed_slugs
-    candidates = [_failed_run("bad")]
-    failed_slugs = bo._classify_wholly_failed_runs(  # pyright: ignore[reportPrivateUsage]
-        runs,
-        candidates,
-        checkpoint,
-        ["bad"],  # only "bad" was freshly executed
+def test_exclude_infra_wide_lists_every_pending_slug_uncheckpointed() -> None:
+    failed_slugs = bo._exclude_infra_wide(  # pyright: ignore[reportPrivateUsage]
+        [_failed_run("bad"), _failed_run("worse")]
     )
-    assert failed_slugs == ["bad"]
-    assert {r.model_slug for r in runs} == {"good"}  # "bad" NOT appended
-    assert not checkpoint.has("bad")
+    assert failed_slugs == ["bad", "worse"]
+
+
+def _model_switch_after(n: int, *, fail_first: bool) -> FunctionModel:
+    """A double that flips outcome after the ``n``th call, letting one
+    shared ``model`` drive TWO sequential models in one ``run_bakeoff``
+    invocation to different (fresh) outcomes. ``fail_first`` fails the
+    first ``n`` calls then succeeds; otherwise it succeeds the first ``n``
+    then fails. A successful page costs 1 call; a wholly-failing page
+    retries once, so 2 calls -- callers compute ``n`` accordingly."""
+    calls = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        succeeding = calls["n"] > n if fail_first else calls["n"] <= n
+        if succeeding:
+            return ModelResponse(
+                parts=[ToolCallPart(info.output_tools[0].name, {"name": "X", "country": "Ecuador"})]
+            )
+        return ModelResponse(parts=[TextPart("no structured output")])
+
+    return FunctionModel(respond)
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_eagerly_checkpoints_a_provable_model_specific_failure(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """A paid failed attempt is checkpointed at the EARLIEST provable moment,
+    not deferred to loop-end/budget-stop: "a" succeeds, "b" wholly fails
+    right after (already provable MODEL-SPECIFIC), then an "interruption"
+    (a budget stop) hits before "c" -- "b" must ALREADY be on disk, and a
+    later resume must NOT re-run (re-pay for) it (#602 fold, round 3)."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    roster = [
+        bo.RosterModel("a", 0.1, 0.1, "x"),
+        bo.RosterModel("b", 0.1, 0.1, "x"),
+        bo.RosterModel("c", 0.1, 0.1, "x"),
+    ]
+    estimates = bo.estimate_cost(corpus, roster)
+    cost_ab = sum(e.usd for e in estimates if e.slug in ("a", "b"))
+    result = await bo.run_bakeoff(
+        corpus,
+        ["a", "b", "c"],
+        out=out,
+        resume=True,
+        max_spend=cost_ab,  # enough for a+b -- "interrupts" (stops) before c
+        cost_estimates=estimates,
+        model=_model_switch_after(len(corpus), fail_first=False),  # a succeeds, b fails
+    )
+    assert result.stopped_early is True
+    assert result.unevaluated_slugs == ["c"]
+    assert {r.model_slug for r in result.runs} == {"a", "b"}
+    assert result.failed_slugs == []  # "b" was already MODEL-SPECIFIC, not INFRA-WIDE
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert checkpoint.has("b")  # already on disk BEFORE "c" was even attempted
+
+    resumed = await bo.run_bakeoff(
+        corpus,
+        ["a", "b", "c"],
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=estimates,
+        model=_model_text_only(),
+    )
+    assert "b" not in resumed.executed_slugs  # resumed, NOT re-run (no re-pay)
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_flushes_a_pending_failure_at_the_first_fresh_success(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """A wholly-failed model that ran BEFORE any fresh success is held
+    PENDING until the FIRST fresh success arrives -- then it is classified +
+    checkpointed AT THAT MOMENT: an "interruption" (a budget stop) right
+    after that first success must already see it checkpointed, never
+    wrongly excluded as INFRA-WIDE (#602 fold, round 3)."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    roster = [
+        bo.RosterModel("b", 0.1, 0.1, "x"),
+        bo.RosterModel("a", 0.1, 0.1, "x"),
+        bo.RosterModel("c", 0.1, 0.1, "x"),
+    ]
+    estimates = bo.estimate_cost(corpus, roster)
+    cost_ba = sum(e.usd for e in estimates if e.slug in ("b", "a"))
+    result = await bo.run_bakeoff(
+        corpus,
+        ["b", "a", "c"],  # "b" fails FIRST (pending), "a" succeeds SECOND (first success)
+        out=out,
+        resume=True,
+        max_spend=cost_ba,  # "interrupts" (stops) before c
+        cost_estimates=estimates,
+        # b fails for the first 2*len(corpus) calls (1 retry per failing page), then a succeeds.
+        model=_model_switch_after(2 * len(corpus), fail_first=True),
+    )
+    assert result.stopped_early is True
+    assert result.unevaluated_slugs == ["c"]
+    assert {r.model_slug for r in result.runs} == {"a", "b"}
+    assert result.failed_slugs == []  # flushed MODEL-SPECIFIC at "a"'s success, not INFRA-WIDE
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert checkpoint.has("b")
+    assert checkpoint.has("a")
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_a_second_fresh_success_does_not_reflush(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """Once ``has_fresh_success`` flips True, a SECOND fresh success must
+    not re-enter the (now-empty) pending-flush branch -- it is just scored
+    normally, like any other successful run."""
+    out = tmp_path / "o.json"
+    result = await bo.run_bakeoff(
+        corpus,
+        ["a", "b"],
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(
+            corpus, [bo.RosterModel("a", 0.1, 0.1, "x"), bo.RosterModel("b", 0.1, 0.1, "x")]
+        ),
+        model=_model_returning({"name": "X", "country": "Ecuador"}),  # both "a" and "b" succeed
+    )
+    assert {r.model_slug for r in result.runs} == {"a", "b"}
+    assert result.failed_slugs == []
 
 
 def test_run_wholly_failed_detects_all_errored_pages() -> None:

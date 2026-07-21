@@ -2551,66 +2551,54 @@ def _has_any_success(run: ModelRun) -> bool:
     return any(page.error is None for page in run.pages)
 
 
-def _classify_wholly_failed_runs(
-    runs: list[ModelRun],
-    candidates: list[ModelRun],
-    checkpoint: Checkpoint,
-    executed_slugs: Sequence[str],
-) -> list[str]:
-    """Classify each wholly-failed candidate as MODEL-SPECIFIC or INFRA-WIDE.
+def _checkpoint_model_specific(run: ModelRun, runs: list[ModelRun], checkpoint: Checkpoint) -> None:
+    """Score + checkpoint a wholly-failed run as MODEL-SPECIFIC, EAGERLY.
 
-    Detection rule (#602 design point): a candidate whose every page errored
-    may be a genuine (poor) reliability result for THAT model (bad schema,
-    persistent timeout, unsupported slug), not evidence the whole invocation
-    is broken. If ANY OTHER model FRESHLY EXECUTED this invocation (a real
-    call was made, NOT resumed from a prior checkpoint) succeeded on at
-    least one page, the corpus/pipeline is provably extractable right now --
-    MODEL-SPECIFIC, scored + checkpointed. A resumed run's PAST success
-    proves nothing about THIS invocation's key/provider health, so it does
-    NOT count (#602 fold 1 -- round 1 wrongly counted it too, letting a
-    stale checkpoint mask a real session-wide outage). With no fresh success
-    at all, a candidate is INFRA-WIDE: excluded, uncheckpointed, so a retry
-    actually retries it (#600). The caller batches every candidate and
-    classifies once every requested model has had its turn (once at the
-    end, again at an early budget-stop return), so an earlier candidate
-    benefits from a later fresh peer's success too -- order-independent
-    within one invocation's freshly-executed models (a budget-stopped
-    invocation only sees peers that ran before the stop).
+    A paid attempt is checkpointed at the EARLIEST moment its
+    classification is provable (#602 fold, round 3) -- the instant a fresh
+    peer succeeds this invocation -- not deferred to loop-end/budget-stop:
+    an interruption while a LATER roster model is still running must not
+    lose an EARLIER already-provable failure and force resume to re-pay
+    for it.
 
     Args:
-        runs: Already-scored (non-wholly-failed) runs this invocation
-            (resumed + freshly run); mutated in place with any
-            MODEL-SPECIFIC candidate appended.
-        candidates: Wholly-failed runs pending classification.
-        checkpoint: The sidecar to persist MODEL-SPECIFIC failures into.
-        executed_slugs: Model slugs a REAL call was made for THIS
-            invocation -- the only ones whose success counts as evidence.
+        run: The wholly-failed candidate.
+        runs: The scored-runs list; mutated in place (``run`` appended).
+        checkpoint: The sidecar to persist ``run`` into.
+    """
+    checkpoint.append(run_to_json(run))
+    runs.append(run)
+    print(
+        f"[run] {run.model_slug}: ALL {len(run.pages)} page(s) errored -- MODEL-SPECIFIC "
+        "failure (a FRESHLY-EXECUTED peer succeeded this invocation), SCORED + checkpointed "
+        "as a real (poor) result",
+        flush=True,
+    )
+
+
+def _exclude_infra_wide(pending: list[ModelRun]) -> list[str]:
+    """Every STILL-pending wholly-failed candidate: INFRA-WIDE, excluded.
+
+    Reached only when NO fresh success ever occurred this invocation (see
+    :func:`run_bakeoff`) -- the harness cannot tell a real per-model failure
+    apart from a session-wide outage (bad key, provider down), so each stays
+    excluded and NOT checkpointed, so a retry actually retries it (#600).
+
+    Args:
+        pending: Wholly-failed runs never reclassified MODEL-SPECIFIC.
 
     Returns:
-        The slugs classified INFRA-WIDE (excluded from ``runs``).
+        Every pending run's model slug.
     """
-    executed_set = set(executed_slugs)
-    has_fresh_success = any(r.model_slug in executed_set and _has_any_success(r) for r in runs)
     failed_slugs: list[str] = []
-    for run in candidates:
-        if has_fresh_success:
-            checkpoint.append(run_to_json(run))
-            runs.append(run)
-            print(
-                f"[run] {run.model_slug}: ALL {len(run.pages)} page(s) errored -- "
-                "MODEL-SPECIFIC failure (a FRESHLY-EXECUTED peer succeeded on this corpus "
-                "this invocation), SCORED + checkpointed as a real (poor) result",
-                flush=True,
-            )
-        else:
-            failed_slugs.append(run.model_slug)
-            print(
-                f"[run] {run.model_slug}: ALL {len(run.pages)} page(s) errored -- INFRA-WIDE "
-                "candidate (no FRESHLY-EXECUTED model has succeeded on any page this "
-                "invocation -- a resumed checkpoint does not count), EXCLUDED from the "
-                "leaderboard/statistics, NOT checkpointed (a re-run will retry it)",
-                flush=True,
-            )
+    for run in pending:
+        failed_slugs.append(run.model_slug)
+        print(
+            f"[run] {run.model_slug}: ALL {len(run.pages)} page(s) errored -- INFRA-WIDE "
+            "candidate (no FRESHLY-EXECUTED model ever succeeded this invocation), EXCLUDED "
+            "from the leaderboard/statistics, NOT checkpointed (a re-run will retry it)",
+            flush=True,
+        )
     return failed_slugs
 
 
@@ -2627,17 +2615,18 @@ class BakeoffResult:
         unevaluated_slugs: The requested model slugs never run at all because
             of the budget stop (empty when ``stopped_early`` is ``False``).
         failed_slugs: Model slugs whose run was a total outage every page
-            errored, AND classified INFRA-WIDE (#602): no other model
-            succeeded on any page this invocation, so the harness cannot
+            errored, AND classified INFRA-WIDE (#602): no FRESHLY-EXECUTED
+            model ever succeeded this invocation, so the harness cannot
             tell this apart from a session-wide provider/key fault (see
-            :func:`_classify_wholly_failed_runs`). EXCLUDED from ``runs`` and
+            :func:`_exclude_infra_wide`). EXCLUDED from ``runs`` and
             therefore from every metric, the leaderboard, and pairwise
             statistics -- a transient failure must not masquerade as a
             scored 0.000 row (#600 round-2 finding). Not checkpointed
             either, so a re-run retries these models. A wholly-failed run
-            classified MODEL-SPECIFIC instead (a peer succeeded this
-            invocation) is scored and checkpointed like any other result,
-            NOT listed here.
+            classified MODEL-SPECIFIC instead (a fresh peer succeeded) is
+            scored and checkpointed EAGERLY, at the moment its
+            classification became provable (see :func:`run_bakeoff`), NOT
+            listed here.
         executed_slugs: Model slugs a REAL (paid) call was made for THIS
             invocation -- includes ``failed_slugs`` (a paid attempt was still
             made) but excludes anything resumed from an existing checkpoint.
@@ -2669,15 +2658,19 @@ async def run_bakeoff(
     Read-only: never touches any store/DB, never saves a profile. Stops
     gracefully BEFORE a model whose estimated cost would breach ``max_spend``
     (see :attr:`BakeoffResult.stopped_early`). A run where EVERY page errored
-    is held back as a CANDIDATE and classified only once every requested
-    model this invocation has had its turn (or the budget guard stops the
-    run) -- see :func:`_classify_wholly_failed_runs`: MODEL-SPECIFIC (a peer
-    already succeeded this invocation) is scored + checkpointed as a real
-    result, INFRA-WIDE (nothing has succeeded yet) is excluded and NOT
-    checkpointed, so a plain retry actually retries it instead of resuming
-    and permanently reporting the outage as the model's score (#600 finding;
-    the model-specific/infra-wide split is #602). Either way a wholly-failed
-    run IS still counted against the spend guard (a paid attempt was made).
+    is classified EAGERLY, the instant it becomes provable (#602 fold, round
+    3 -- a money guarantee: a paid attempt is checkpointed at the earliest
+    moment its classification is provable, so an interruption while a LATER
+    roster model is still running cannot lose an already-provable EARLIER
+    failure and force resume to re-pay for it): MODEL-SPECIFIC the moment a
+    fresh peer has already succeeded (scored + checkpointed right there), or
+    held ``pending`` until the FIRST fresh success arrives, which flushes
+    every pending candidate immediately. Only candidates STILL pending when
+    every requested model has had its turn (or the budget guard stops the
+    run) are INFRA-WIDE -- excluded and NOT checkpointed, so a retry
+    actually retries them (#600; see :func:`_exclude_infra_wide`). Either
+    way a wholly-failed run IS still counted against the spend guard (a
+    paid attempt was made).
 
     Args:
         pages: The corpus.
@@ -2697,8 +2690,9 @@ async def run_bakeoff(
     fingerprint = compute_fingerprint(pages)
     checkpoint = Checkpoint(sidecar_path(out), resume=resume, fingerprint=fingerprint)
     runs: list[ModelRun] = []
-    candidates: list[ModelRun] = []  # wholly-failed, pending classification (#602)
+    pending: list[ModelRun] = []  # wholly-failed, unclassifiable until a fresh success (#602)
     executed_slugs: list[str] = []
+    has_fresh_success = False
     spent = 0.0
     for index, slug in enumerate(model_slugs):
         if checkpoint.has(slug):
@@ -2712,14 +2706,11 @@ async def run_bakeoff(
                 f"--max-spend ${max_spend:.2f} (spent est. ${spent:.4f})",
                 flush=True,
             )
-            failed_slugs = _classify_wholly_failed_runs(
-                runs, candidates, checkpoint, executed_slugs
-            )
             return BakeoffResult(
                 runs=runs,
                 stopped_early=True,
                 unevaluated_slugs=list(model_slugs[index:]),
-                failed_slugs=failed_slugs,
+                failed_slugs=_exclude_infra_wide(pending),
                 executed_slugs=executed_slugs,
             )
         run = await run_model_over_corpus(
@@ -2732,7 +2723,10 @@ async def run_bakeoff(
         spent += upcoming
         executed_slugs.append(slug)  # a real call was attempted, win or lose
         if _run_wholly_failed(run):
-            candidates.append(run)
+            if has_fresh_success:
+                _checkpoint_model_specific(run, runs, checkpoint)
+            else:
+                pending.append(run)
             continue
         checkpoint.append(run_to_json(run))
         m = model_metrics(run)
@@ -2742,12 +2736,16 @@ async def run_bakeoff(
             flush=True,
         )
         runs.append(run)
-    failed_slugs = _classify_wholly_failed_runs(runs, candidates, checkpoint, executed_slugs)
+        if not has_fresh_success and _has_any_success(run):
+            has_fresh_success = True
+            for candidate in pending:  # flush every pending failure NOW (#602)
+                _checkpoint_model_specific(candidate, runs, checkpoint)
+            pending = []
     return BakeoffResult(
         runs=runs,
         stopped_early=False,
         unevaluated_slugs=[],
-        failed_slugs=failed_slugs,
+        failed_slugs=_exclude_infra_wide(pending),
         executed_slugs=executed_slugs,
     )
 
