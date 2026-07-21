@@ -46,6 +46,17 @@ export interface BeanProfileDraft {
   target_drop_temp_c: string;
   target_development_percent: string;
   default_bean_weight_grams: string;
+  /**
+   * Model-cited verbatim vendor-page quotes for the four typed fields
+   * (`altitude_m`, `processing`, `bean_species`, `is_blend`), keyed the
+   * same way as the server's `field_sources` map (#627) — mirrors
+   * `models.BeanProfileDraft.field_evidence`. Untrusted vendor page text;
+   * present only when a quote was captured. Optional/read-only: nothing
+   * in this file parses, edits, or renders it yet (that's #627b) — it
+   * exists here purely so the draft-from-URL response shape round-trips
+   * without loss once a caller starts threading it through.
+   */
+  field_evidence?: Record<string, string>;
 }
 
 /** Field-level validation errors, keyed by draft field. */

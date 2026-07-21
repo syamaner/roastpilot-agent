@@ -845,6 +845,9 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
       weight) is always ``"origin_estimated"`` — a vendor page never states a
       development-percent target or a drop temperature, so these are never
       presented as scraped fact.
+    - :attr:`field_evidence` — the model-cited verbatim quote backing each
+      typed field's value (#627), for operator judgement now that the
+      typed-field citation gates are permanently parked.
     - :attr:`scouting_note` — the conservative "scouting run" framing the
       operator sees alongside the drafted targets: a wrong target on an
       unfamiliar bean must not burn a batch.
@@ -874,6 +877,24 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
     ``"target_development_percent"``) — see :data:`BeanFieldSource`. A field
     absent from this map means it was left ``None``/unset (never found on the
     page and not imputed), not "on the label"."""
+
+    field_evidence: dict[str, str] = Field(default_factory=dict)
+    """Model-cited verbatim vendor-page quotes for the four TYPED fields only
+    (``altitude_m``, ``processing``, ``bean_species``, ``is_blend``), keyed
+    the same way as :attr:`field_sources` (#627). Every automated lexical
+    citation gate for these four fields is now permanently parked (see
+    :func:`~roastpilot_agent.bean_sourcing._draft_from_identity`'s
+    docstring) — none of them promotes a field to ``"on_page"`` any more —
+    so this map exists to surface the quote the model actually cited for
+    OPERATOR judgement instead (#590's ledger), not to certify anything
+    automatically. An entry is present only when a quote was captured for
+    that field; a field with no captured quote (or whose value was ``None``)
+    is simply absent, the same "absent means unset" convention as
+    ``field_sources``. Values are UNTRUSTED vendor page text passed straight
+    through from the extraction — never render them unescaped — and are
+    already bounded to 500 characters each at the extraction schema
+    (``_ExtractedBeanIdentity``'s ``*_evidence`` fields); not re-validated
+    here."""
 
     scouting_note: str = Field(min_length=1)
     """Operator-facing conservative-target framing text (#573): explains why

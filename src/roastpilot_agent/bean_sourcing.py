@@ -2367,10 +2367,11 @@ class _ExtractedBeanIdentity(BaseModel):
     enable review rounds) — see :func:`_draft_from_identity`'s docstring
     for each field's own gate and evidence. The live verification surface
     is D1's free-text containment plus the ``description`` exemption;
-    every typed field's evidence quote is captured on this extraction
-    schema for operator surfacing (a follow-up UI/API slice, #627) and
-    eval capture (#612) instead — ``BeanProfileDraft`` itself carries no
-    evidence fields today, so the API does not yet return them.
+    every typed field's evidence quote captured on this extraction schema
+    is threaded onto the returned
+    :class:`~roastpilot_agent.models.BeanProfileDraft`'s
+    ``field_evidence`` (#627) for operator surfacing, and feeds eval
+    capture (#612) too.
     """
 
     name: str | None = Field(default=None, max_length=_MAX_JSON_LD_FIELD_CHARS)
@@ -2930,11 +2931,9 @@ _BEAN_SPECIES_DISPLAY_SPELLINGS: dict[str, str] = {
 #: the retired guard-stack — with the terminal probe's own repros now
 #: captured as executable-spec tests documenting the two leaks (see the
 #: "#617 terminal probe" test section). ``altitude_m_evidence`` is
-#: captured (#590 D2a) on this extraction schema for operator surfacing
-#: (a follow-up UI/API slice, #627) and eval capture (#612) — same
-#: disposition as the other three fields; ``BeanProfileDraft`` itself
-#: carries no evidence fields today, so the operator does not yet see
-#: any of them. ``altitude_m`` itself always demotes to
+#: captured (#590 D2a) and threaded onto ``BeanProfileDraft.field_evidence``
+#: (#627) for operator surfacing, and feeds eval capture (#612) too — same
+#: disposition as the other three fields. ``altitude_m`` itself always demotes to
 #: ``"origin_estimated"``. A future revisit starts
 #: from EITHER the probe's own class-sweep design (use
 #: :data:`_CONTAINMENT_PUNCTUATION_TRANSLATION`'s full punctuation set,
@@ -4669,12 +4668,13 @@ def _draft_from_identity(
     only with a non-lexical mechanism (e.g. an entailment judge). THE
     LIVE VERIFICATION SURFACE, final for this architecture, is D1's
     free-text containment below plus the ``description`` exemption
-    above. Every typed field's evidence quote IS captured on
-    ``identity`` (#590 D2a) — but ``BeanProfileDraft`` itself carries no
-    evidence fields, so it is not yet returned by the API; surfacing it
-    to the operator for human judgement, instead of automated
-    certification, is the deliberate contract-crossing follow-up slice
-    (#627), alongside eval capture (#612).
+    above. Every typed field's evidence quote captured on ``identity``
+    (#590 D2a) is now ALSO threaded onto the returned draft's
+    :attr:`~roastpilot_agent.models.BeanProfileDraft.field_evidence`
+    (#627), independent of the gate verdicts above — a quote is included
+    whenever the model returned one, regardless of whether its field
+    demoted to ``"origin_estimated"``, so the operator sees what the
+    model cited even though it is not automatically certified.
     Every roast-target field is always
     ``"origin_estimated"``. The optional free-text fields (``country``, ``farm``,
     ``bean_varietal``, ``description``) are normalized via
@@ -4872,6 +4872,27 @@ def _draft_from_identity(
     for field_name in _TARGET_FIELDS:
         field_sources[field_name] = "origin_estimated"
 
+    # field_evidence (#627): the model-cited verbatim quotes for the four
+    # TYPED fields, surfaced for operator judgement now that every
+    # automated citation gate for these four is permanently parked (see
+    # this function's docstring). Independent of field_sources/the gates
+    # above — a quote is captured whenever the model returned one,
+    # regardless of gate verdict. Blank/whitespace-only quotes normalize
+    # away via _normalize_optional_text, same convention as the optional
+    # identity text fields; an omitted/None quote leaves the field simply
+    # absent from the map (meaning "no quote captured"), not an empty
+    # string entry.
+    field_evidence: dict[str, str] = {}
+    for field_name, raw_evidence in (
+        ("processing", identity.processing_evidence),
+        ("bean_species", identity.bean_species_evidence),
+        ("altitude_m", identity.altitude_m_evidence),
+        ("is_blend", identity.is_blend_evidence),
+    ):
+        quote = _normalize_optional_text(raw_evidence)
+        if quote is not None:
+            field_evidence[field_name] = quote
+
     scouting_note = (
         "Scouting run — this is the FIRST roast on this bean. Targets are a "
         f"conservative, de-risked starting point ({dev_percent:g} % development, "
@@ -4907,6 +4928,7 @@ def _draft_from_identity(
             target_development_percent=dev_percent,
             default_bean_weight_grams=_DEFAULT_BEAN_WEIGHT_GRAMS,
             field_sources=field_sources,
+            field_evidence=field_evidence,
             scouting_note=scouting_note,
         )
     except ValidationError as exc:

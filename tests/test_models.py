@@ -893,7 +893,7 @@ def test_bean_profile_draft_shares_bean_profile_input_fields() -> None:
     input_fields = set(BeanProfileInput.model_fields)
     draft_fields = set(BeanProfileDraft.model_fields)
     assert input_fields <= draft_fields
-    assert draft_fields - input_fields == {"field_sources", "scouting_note"}
+    assert draft_fields - input_fields == {"field_sources", "field_evidence", "scouting_note"}
 
 
 def test_bean_profile_draft_validates_and_strips_like_bean_profile() -> None:
@@ -947,6 +947,34 @@ def test_bean_profile_draft_field_sources_rejects_unknown_source() -> None:
         BeanProfileDraft.model_validate(
             _bean_draft(field_sources={"name": "guessed_by_the_operator"})
         )
+
+
+def test_bean_profile_draft_field_evidence_defaults_empty() -> None:
+    """#627: a draft built without field_evidence (every pre-#627 caller)
+    defaults to an empty map, not a required field — back-compat."""
+    draft = BeanProfileDraft.model_validate(_bean_draft())
+    assert draft.field_evidence == {}
+
+
+def test_bean_profile_draft_field_evidence_round_trip() -> None:
+    """#627: the per-field cited-quote map survives a JSON round trip
+    untouched, same convention as field_sources."""
+    draft = BeanProfileDraft.model_validate(
+        _bean_draft(
+            field_evidence={
+                "processing": "Fully washed and dried on raised beds.",
+                "altitude_m": "Grown at 1,900 masl.",
+            }
+        )
+    )
+    restored = BeanProfileDraft.model_validate_json(draft.model_dump_json())
+    assert restored == draft
+    assert restored.field_evidence["processing"] == "Fully washed and dried on raised beds."
+    assert restored.field_evidence["altitude_m"] == "Grown at 1,900 masl."
+    # Absent from field_evidence stays absent — no synthesized entry for a
+    # field with no captured quote.
+    assert "bean_species" not in restored.field_evidence
+    assert "is_blend" not in restored.field_evidence
 
 
 @pytest.mark.parametrize(

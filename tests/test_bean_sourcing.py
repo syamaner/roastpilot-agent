@@ -2493,6 +2493,77 @@ def test_draft_from_identity_evidence_quotes_do_not_change_free_text_provenance(
     assert draft_without_evidence.field_sources["processing"] == "origin_estimated"
     assert "bean_species" not in draft_with_evidence.field_sources
     assert "is_blend" not in draft_with_evidence.field_sources
+    # #627: field_evidence is INDEPENDENT of field_sources/the gate verdicts
+    # above — a captured quote surfaces for operator judgement regardless
+    # of whether its field demoted to "origin_estimated".
+    assert draft_with_evidence.field_evidence["altitude_m"] == "Altitude: 1775m."
+    assert draft_with_evidence.field_evidence["processing"] == "washed coffee"
+    assert "bean_species" not in draft_with_evidence.field_evidence
+    assert "is_blend" not in draft_with_evidence.field_evidence
+    assert draft_without_evidence.field_evidence == {}
+
+
+def test_draft_from_identity_field_evidence_captures_all_four_typed_fields() -> None:
+    """#627: every one of the four typed fields' captured quote is threaded
+    onto the draft's ``field_evidence``, keyed the same way as
+    ``field_sources``."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            processing_evidence="A washed process, dried on raised beds.",
+            bean_species_evidence="100% Arabica.",
+            altitude_m_evidence="Altitude: 1775m.",
+            is_blend=True,
+            is_blend_evidence="This is a blend of two lots.",
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=_IDENTITY_PAGE_TEXT,
+    )
+    assert draft.field_evidence == {
+        "processing": "A washed process, dried on raised beds.",
+        "bean_species": "100% Arabica.",
+        "altitude_m": "Altitude: 1775m.",
+        "is_blend": "This is a blend of two lots.",
+    }
+
+
+@pytest.mark.parametrize("blank_quote", ["", "   ", None])
+def test_draft_from_identity_field_evidence_omits_blank_or_absent_quotes(
+    blank_quote: str | None,
+) -> None:
+    """#627: a blank/whitespace-only/``None`` evidence quote leaves the
+    field simply ABSENT from ``field_evidence`` — never an empty-string
+    entry — the same "absent means unset" convention as ``field_sources``."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            processing_evidence=blank_quote,
+            bean_species_evidence=blank_quote,
+            altitude_m_evidence=blank_quote,
+            is_blend_evidence=blank_quote,
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=_IDENTITY_PAGE_TEXT,
+    )
+    assert draft.field_evidence == {}
+
+
+def test_draft_from_identity_field_evidence_strips_surrounding_whitespace() -> None:
+    """#627: a quote is stripped like every other optional identity text
+    field (:func:`bean_sourcing._normalize_optional_text`)."""
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(processing_evidence="  washed coffee  ")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=_IDENTITY_PAGE_TEXT,
+    )
+    assert draft.field_evidence["processing"] == "washed coffee"
 
 
 def test_draft_from_identity_at_limit_name_still_verifies_on_page() -> None:
@@ -4056,6 +4127,14 @@ def test_draft_from_identity_absent_altitude_with_stray_evidence_quote_has_no_en
     )
     assert draft.altitude_m is None
     assert "altitude_m" not in draft.field_sources
+    # #627: field_evidence is built from the raw ``*_evidence`` values alone
+    # (skip None/blank; strip) — independent of whether the corresponding
+    # typed VALUE is present. A deliberate divergence from field_sources'
+    # "raw_value in (None, '')" skip: a stray quote the model captured
+    # still surfaces for operator review even against an otherwise-absent
+    # field, since the point is showing the operator what the model cited,
+    # not re-deriving provenance.
+    assert draft.field_evidence["altitude_m"] == "grown at 1800 masl"
 
 
 @pytest.mark.parametrize("evidence_quote", ["", "   ", None])
