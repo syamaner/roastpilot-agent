@@ -3026,11 +3026,14 @@ def test_quote_supports_altitude_thousands_period_glued_metre_verifies() -> None
 
 def test_quote_supports_altitude_shape_stands_alone_irrelevant_surrounding_copy() -> None:
     """The grammar needs no elevation cue at all — the shape itself is
-    sufficient evidence, regardless of what the rest of the page says."""
-    corpus = "Tasting notes: blackcurrant and stone fruit. Beans from 1,750 masl. Roasted fresh."
+    sufficient evidence, regardless of what the rest of the page says.
+    (NOT phrased as "Beans FROM 1,750 masl" — #617 fold 3 makes "from" a
+    PRE-bound qualifier, see
+    ``test_quote_supports_altitude_from_qualifier_bound_demotes``.)"""
+    corpus = "Tasting notes: blackcurrant and stone fruit. Farm data: 1,750 masl. Roasted fresh."
     assert (
         bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
-            1750, "Beans from 1,750 masl", corpus
+            1750, "Farm data: 1,750 masl", corpus
         )
         is True
     )
@@ -3211,6 +3214,275 @@ def test_altitude_whitelist_match_all_occurrences_bounded_demotes() -> None:
         )
         is False
     )
+
+
+# --- #617 fold 1 (BLOCKER, adversarial review post-D2d-b): the shape scan
+# must be anchored to the QUOTE's own raw span, not just anywhere in the
+# authentic segment — else a model can cite ANY authentic clause of a
+# sentence while the number it names sits elsewhere in that same segment. ---
+
+
+def test_quote_supports_altitude_unrelated_clause_in_same_segment_demotes() -> None:
+    """Reviewer repro: the quote cites a genuinely authentic clause of the
+    sentence ("which also produces excellent honey-processed lots") that
+    never mentions 1,900 at all — the claimed altitude sits in a
+    DIFFERENT clause of the SAME segment. Without a quote-anchored shape
+    scan this used to certify (any authentic segment text, wherever the
+    shape happened to be); #617 fold 1 requires the matched shape to
+    overlap the quote's own span, so this now demotes."""
+    corpus = (
+        "This coffee, which also produces excellent honey-processed lots, "
+        "grows at 1,900 masl in a nearby valley."
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(
+            altitude_m=1900,
+            altitude_m_evidence="which also produces excellent honey-processed lots",
+        )
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity,
+        url="https://vendor.example/products/kenya",
+        corpus=_framed("Kenya Example", corpus),
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1900, "which also produces excellent honey-processed lots", corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_quote_actually_containing_the_number_verifies() -> None:
+    """The positive control for fold 1: the SAME sentence, but the model's
+    quote genuinely contains "1,900 masl" this time — the matched shape
+    sits inside the quote's own span, so it certifies."""
+    corpus = (
+        "This coffee, which also produces excellent honey-processed lots, "
+        "grows at 1,900 masl in a nearby valley."
+    )
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1900, "grows at 1,900 masl in a nearby valley", corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_shape_just_outside_the_quote_span_margin_demotes() -> None:
+    """The margin (:data:`bean_sourcing._ALTITUDE_QUOTE_SPAN_MARGIN_CHARS`)
+    is a SMALL punctuation-trim allowance, not a licence to reach a
+    distant clause — a shape well beyond the margin outside the quote's
+    own span still demotes even though it is in the SAME authentic
+    segment."""
+    corpus = (
+        "This coffee, grown with meticulous care across several small family "
+        "plots nestled in the highlands, reaches 1,950 masl at its peak."
+    )
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1950,
+            "grown with meticulous care across several small family plots",
+            corpus,
+        )
+        is False
+    )
+
+
+def test_locate_quote_span_returns_none_for_a_blank_after_normalization_quote() -> None:
+    """Direct unit coverage: a quote that normalizes to zero words (pure
+    punctuation) has no span to locate."""
+    locate = bean_sourcing._locate_quote_span  # pyright: ignore[reportPrivateUsage]
+    assert locate("...", "This farm sits at 1,800 masl.") is None
+
+
+def test_locate_quote_span_returns_none_when_word_sequence_is_absent() -> None:
+    """Direct unit coverage: a quote whose word sequence never appears in
+    the segment (even though both are non-blank) cannot be located."""
+    locate = bean_sourcing._locate_quote_span  # pyright: ignore[reportPrivateUsage]
+    assert locate("completely unrelated words", "This farm sits at 1,800 masl.") is None
+
+
+# --- #617 fold 2 (BLOCKER, adversarial review post-D2d-b): a GENERIC
+# metre unit ("m"/"metre(s)"/"meter(s)") is an ordinary length unit with
+# countless non-altitude readings, so it additionally needs an
+# altitude-context word nearby; self-sufficient units (masl/asl/msnm, or
+# "above sea level") still need none. ---
+
+
+@pytest.mark.parametrize(
+    "corpus",
+    [
+        "This building is 1,800 metres of shelving in total.",
+        "The gauge shows a 1800 meter reading today.",
+        "The warehouse stocks 1800 meters of copper for the project.",
+        "This lot fetched £1,800m revenue at auction last year.",
+    ],
+)
+def test_quote_supports_altitude_generic_unit_without_context_word_demotes(corpus: str) -> None:
+    """Reviewer repros: a generic metre unit with NO altitude-context word
+    within the window must demote, even though the shape itself is
+    structurally complete."""
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, corpus, corpus
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "corpus"),
+    [
+        (1850, "This farm is grown at 1,850 metres in the highlands."),
+        (1850, "The elevation of 1.850m is typical for this region."),
+    ],
+)
+def test_quote_supports_altitude_generic_unit_with_context_word_verifies(
+    value: int, corpus: str
+) -> None:
+    """Reviewer repros: a generic metre unit WITH an altitude-context word
+    ("grown"/"elevation") within the window certifies."""
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            value, corpus, corpus
+        )
+        is True
+    )
+
+
+def test_quote_supports_altitude_bare_generic_unit_is_a_documented_over_demote() -> None:
+    """#617 fold 2's accepted OVER-DEMOTE: a bare generic-unit reading with
+    NO context word anywhere nearby ("1850m" entirely standing alone, no
+    "grown"/"elevation"/etc.) now demotes — the safe direction; a
+    self-sufficient unit (masl/asl/msnm) needs no such cue, see
+    ``test_quote_supports_altitude_shape_stands_alone_irrelevant_surrounding_copy``."""
+    corpus = "Product code: 1850m. Ships in 3-5 business days."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1850, "Product code: 1850m", corpus
+        )
+        is False
+    )
+
+
+# --- #617 fold 3 (MEDIUM, adversarial review post-D2d-b): context-guard
+# set extensions — comma-glued digit runs, the "or" joiner, the "from"
+# pre-qualifier, and the "higher"/"lower" post-qualifiers. ---
+
+
+def test_quote_supports_altitude_comma_glued_digit_run_range_demotes() -> None:
+    """Reviewer repro: "1,600, 1,800 masl" — the comma glued directly onto
+    the first number is BOTH the far digit run and its own joiner, a
+    shape the word/char joiner scan alone would miss (neither "1,600,"
+    nor a bare comma is a recognized joiner WORD)."""
+    corpus = "This farm sits at 1,600, 1,800 masl on the slope."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "1,800 masl", corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_or_joiner_range_demotes() -> None:
+    """Reviewer repro: "1,600 or 1,800 masl" is the same disjunctive-range
+    shape as "to"/"and", now closed for "or" too."""
+    corpus = "This farm sits at 1,600 or 1,800 masl on the slope."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, "1,800 masl", corpus
+        )
+        is False
+    )
+
+
+def test_quote_supports_altitude_from_qualifier_bound_demotes() -> None:
+    """Reviewer repro: "Grown from 1,200 masl" states a floor, not a
+    scalar reading — "from" now sits in the PRE-bound qualifier set."""
+    corpus = "Grown from 1,200 masl in select highland plots."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1200, corpus, corpus
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize("qualifier", ["higher", "lower"])
+def test_quote_supports_altitude_higher_lower_post_qualifier_bound_demotes(
+    qualifier: str,
+) -> None:
+    """Reviewer repro: "1,800 masl and higher/lower" states an open-ended
+    bound — "and" ALONE does not fire here (nothing after it starts with
+    a digit), so "higher"/"lower" must independently be recognized as a
+    post-qualifier."""
+    corpus = f"This region grows coffee at 1,800 masl and {qualifier} in some plots."
+    assert (
+        bean_sourcing._quote_supports_altitude(  # pyright: ignore[reportPrivateUsage]
+            1800, corpus, corpus
+        )
+        is False
+    )
+
+
+# --- #617 fold 4 (MEDIUM, E1-inherited, now live): a conjunction heading
+# ("## Kenya AA & Friends") must NOT anchor for a bare product name —
+# doing so admits a sibling product's data into the wrong region. ---
+
+
+def test_heading_matches_anchor_conjunction_symbol_no_longer_anchors() -> None:
+    """Direct unit coverage: "## Kenya AA & Friends" no longer anchors for
+    "Kenya AA" — the remainder "& Friends" names a compound section."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("Kenya AA & Friends", ["kenya aa"]) is False
+
+
+@pytest.mark.parametrize("conjunction", ["and", "with", "plus"])
+def test_heading_matches_anchor_conjunction_word_no_longer_anchors(conjunction: str) -> None:
+    """Direct unit coverage: the standalone conjunction WORDS "and"/
+    "with"/"plus" in the remainder are treated the same as "&"/"+"."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor(f"Kenya AA {conjunction} Friends", ["kenya aa"]) is False
+
+
+def test_heading_matches_anchor_still_anchors_with_no_conjunction_in_remainder() -> None:
+    """The E1b regression this fold must NOT break: "## Kenya Kiambu —
+    Single Origin" still anchors for "Kenya Kiambu" — its remainder
+    ("single origin", the em dash already punctuation-translated to a
+    space before tokenizing) carries no conjunction at all."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("Kenya Kiambu — Single Origin", ["kenya kiambu"]) is True
+
+
+def test_heading_matches_anchor_skips_a_blank_anchor_in_the_list() -> None:
+    """Direct unit coverage: an empty-string anchor in ``anchors_normalized``
+    (never produced by :func:`bean_sourcing._main_product_region`'s own
+    filtered construction, but defended against here) is skipped rather
+    than raising or matching everything."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    assert matches_anchor("Kenya AA & Friends", ["", "kenya aa"]) is False
+
+
+def test_draft_from_identity_altitude_conjunction_heading_sibling_demotes() -> None:
+    """End-to-end repro (#617 fold 4): a page anchored on "Kenya AA" has a
+    "## Kenya AA & Friends" section describing a SIBLING lot's altitude
+    ("1,900 masl") — the conjunction heading no longer anchors at all, so
+    that section falls OUTSIDE the main region and the citation demotes."""
+    corpus = _framed(
+        "Kenya AA",
+        "## Kenya AA & Friends\n"
+        "Our sister lot, the Ethiopia Yirgacheffe, grows at 1,900 masl "
+        "and is also available.\n",
+    )
+    identity = bean_sourcing._ExtractedBeanIdentity.model_validate(  # pyright: ignore[reportPrivateUsage]
+        _identity_args(altitude_m=1900, altitude_m_evidence="grows at 1,900 masl")
+    )
+    draft = bean_sourcing._draft_from_identity(  # pyright: ignore[reportPrivateUsage]
+        identity, url="https://vendor.example/products/kenya-aa", corpus=corpus
+    )
+    assert draft.field_sources["altitude_m"] == "origin_estimated"
 
 
 # --- #616 Codex round-1: known guard-stack bypasses. The guard-stack is
@@ -4845,14 +5117,20 @@ def test_quote_supports_processing_non_coffee_cue_collision_bypass_certifies_wro
     assert result is True  # documented cue-collision bypass — NOT the desired outcome
 
 
-def test_quote_supports_processing_sibling_product_locality_bypass_certifies_wrongly() -> None:
-    """MEDIUM finding: an anchored sibling-product heading ("## Kenya AA
-    & Friends" matching the page's own "Kenya AA" anchor) admits a
-    DIFFERENT product's processing sentence ("our sister lot, the
-    Ethiopia Yirgacheffe, which uses a honey process") into the main
-    region — the heading-match whitelist has no way to know the sentence
-    describes another SKU entirely, so the wrong-entity citation
-    certifies ``honey`` for the Kenya AA page."""
+def test_quote_supports_processing_sibling_product_locality_bypass_now_closed() -> None:
+    """MEDIUM finding, CLOSED by #617 fold 4: an anchored sibling-product
+    heading ("## Kenya AA & Friends" matching the page's own "Kenya AA"
+    anchor) used to admit a DIFFERENT product's processing sentence ("our
+    sister lot, the Ethiopia Yirgacheffe, which uses a honey process")
+    into the main region — the heading-match whitelist had no way to know
+    the sentence described another SKU entirely, so the wrong-entity
+    citation certified ``honey`` for the Kenya AA page. Fixed at the
+    SHARED root (:func:`bean_sourcing._heading_matches_anchor`'s
+    conjunction-remainder check, #617 fold 4, driven by the altitude
+    whitelist's own sibling-product finding) — a heading whose remainder
+    names a conjunction no longer anchors at all, for ANY citation gate
+    built on :func:`bean_sourcing._main_product_region`, not just
+    altitude's."""
     body = _framed(
         "Kenya AA",
         "## Kenya AA & Friends\n"
@@ -4863,7 +5141,7 @@ def test_quote_supports_processing_sibling_product_locality_bypass_certifies_wro
     result = bean_sourcing._quote_supports_processing(  # pyright: ignore[reportPrivateUsage]
         "honey", "which uses a honey process", region
     )
-    assert result is True  # documented wrong-entity bypass — NOT the desired outcome
+    assert result is False
 
 
 def test_quote_supports_bean_species_percent_prefix_verifies_without_a_cue() -> None:
