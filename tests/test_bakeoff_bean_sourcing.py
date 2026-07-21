@@ -346,6 +346,58 @@ async def test_invent_on_absent_scores_spu(corpus: list[bo.CorpusPage]) -> None:
     assert outcomes["species"] is bo.Outcome.SPU
 
 
+# --- Origin-absent-blend gold nuance (#602) -----------------------------------
+
+
+def test_classify_absent_field_tolerates_an_accepted_phrase() -> None:
+    gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
+    assert (
+        bo._classify_absent_field(gold, "a blend of multiple origins")  # pyright: ignore[reportPrivateUsage]
+        is bo.Outcome.ABS_COR
+    )
+
+
+def test_classify_absent_field_still_penalises_a_real_invented_value() -> None:
+    """``accept_any_of`` must not become a blanket amnesty -- a model naming
+    an actual (wrong) single country on the same field still scores SPU."""
+    gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
+    assert bo._classify_absent_field(gold, "Ethiopia") is bo.Outcome.SPU  # pyright: ignore[reportPrivateUsage]
+
+
+def test_classify_absent_field_without_accept_any_of_is_unchanged() -> None:
+    """No ``accept_any_of`` key is a no-op -- identical pre-#602 behaviour."""
+    gold = {"absent": True}
+    assert bo._classify_absent_field(gold, None) is bo.Outcome.ABS_COR  # pyright: ignore[reportPrivateUsage]
+    assert bo._classify_absent_field(gold, "anything") is bo.Outcome.SPU  # pyright: ignore[reportPrivateUsage]
+
+
+def test_classify_absent_field_non_string_value_scores_spu() -> None:
+    """A non-empty, non-string value (e.g. a stray ``bool`` reaching the
+    generic absent-field path for the ``is_blend`` kind) skips the
+    ``accept_any_of`` word-bag check entirely -- SPU, same as before."""
+    gold = {"absent": True, "accept_any_of": ["blend of multiple origins"]}
+    assert bo._classify_absent_field(gold, True) is bo.Outcome.SPU  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_origin_absent_blend_tolerates_the_gold_accept_any_of_phrase(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """The real ``klatch-blue-thunder-blend`` fixture: a model that faithfully
+    answers 'a blend of multiple origins' must not be penalised as SPU, but a
+    model that invents an actual single country still is (#602)."""
+    page = _page(corpus, "klatch-blue-thunder-blend")
+    tolerant_model = _model_returning(
+        {"name": "Blue Thunder Blend", "country": "a blend of multiple origins"}
+    )
+    outcomes = await _score(page, tolerant_model)
+    assert outcomes["origin"] is bo.Outcome.ABS_COR
+
+    inventive_model = _model_returning({"name": "Blue Thunder Blend", "country": "Ethiopia"})
+    outcomes = await _score(page, inventive_model)
+    assert outcomes["origin"] is bo.Outcome.SPU
+
+
 @pytest.mark.asyncio
 async def test_variety_partial_scores_par(corpus: list[bo.CorpusPage]) -> None:
     page = _page(corpus, "onyx-ecuador")  # gold variety = ["Typica Mejorado"]
@@ -745,12 +797,27 @@ def test_paired_bootstrap_combined_flattens_cell_weighted_not_page_averaged() ->
 def test_paired_bootstrap_combined_handles_all_err_pages() -> None:
     """When every shared page's cells are all ``ERR``, the flattened
     CombinedScore is undefined for every resample -- must degrade gracefully
-    (a zero-width, zero-resample interval), not crash."""
+    and PRESERVE the undefined state as ``None`` (rendered ``n/a``), never
+    fabricate a ``0.0`` gap that reads as "no difference" (#602 finding)."""
     run_a = _run("a", {"p": {"x": bo.Outcome.ERR}})
     run_b = _run("b", {"p": {"x": bo.Outcome.ERR}})
     ci = bo.paired_bootstrap_combined(run_a, run_b, resamples=50, seed=1)
-    assert ci.estimate == 0.0
+    assert ci.estimate is None
+    assert ci.low is None
+    assert ci.high is None
     assert ci.resamples == 0
+
+
+def test_paired_bootstrap_metric_undefined_denominator_is_none_not_zero() -> None:
+    """A model with no gold-present cell for a metric (e.g. every field
+    abstained on) has an undefined precision -- the gap must stay ``None``,
+    not be fabricated as an exact tie (#602 finding)."""
+    run_a = _run("a", {"p": {"x": bo.Outcome.ABS_COR}})
+    run_b = _run("b", {"p": {"x": bo.Outcome.ABS_COR}})
+    ci = bo.paired_bootstrap_metric(run_a, run_b, bo.precision, resamples=50, seed=1)
+    assert ci.estimate is None
+    assert ci.low is None
+    assert ci.high is None
 
 
 def test_paired_bootstrap_metric_recall_gap() -> None:
@@ -812,6 +879,31 @@ async def test_main_estimate_only_is_zero_spend(capsys: pytest.CaptureFixture[st
     assert "roster total" in out
 
 
+# --- --max-spend argparse validation (#602 finding) --------------------------
+
+
+@pytest.mark.parametrize("raw", ["inf", "-inf", "nan", "-1"])
+def test_parse_args_rejects_non_finite_or_negative_max_spend(raw: str) -> None:
+    """``float()`` happily parses ``inf``/``nan``, and every
+    ``spent + upcoming > max_spend`` guard comparison in :func:`run_bakeoff`
+    is FALSE against either -- silently bypassing the explicit spend guard
+    (#602 finding)."""
+    with pytest.raises(SystemExit):
+        bo._parse_args(["--max-spend", raw])  # pyright: ignore[reportPrivateUsage]
+
+
+def test_parse_args_rejects_a_non_numeric_max_spend() -> None:
+    with pytest.raises(SystemExit):
+        bo._parse_args(["--max-spend", "not-a-number"])  # pyright: ignore[reportPrivateUsage]
+
+
+def test_parse_args_accepts_a_finite_nonnegative_max_spend() -> None:
+    args = bo._parse_args(["--max-spend", "3.5"])  # pyright: ignore[reportPrivateUsage]
+    assert args.max_spend == pytest.approx(3.5)
+    zero_args = bo._parse_args(["--max-spend", "0"])  # pyright: ignore[reportPrivateUsage]
+    assert zero_args.max_spend == 0.0
+
+
 # --- Report + serialization + checkpoint/budget (all network-free) ----------
 
 
@@ -845,6 +937,28 @@ def test_render_report_pairwise_reports_every_promised_axis(
     report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:2]))
     assert "faithfulness (precision) gap" in report
     assert "abstention gap" in report
+
+
+def test_render_report_pairwise_shows_na_not_zero_for_undefined_metric(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """Two models that only ever abstain (ABS_COR) have an undefined
+    faithfulness/abstention denominator -- the gap must render ``n/a``, never
+    a fabricated ``+0.000`` that reads as a confirmed tie (#602 finding)."""
+    runs = [_full_run("model-a", bo.Outcome.ABS_COR), _full_run("model-b", bo.Outcome.ABS_COR)]
+    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:2]))
+    assert "faithfulness (precision) gap n/a" in report
+
+
+def test_render_report_emits_wilson_intervals(corpus: list[bo.CorpusPage]) -> None:
+    """The report promises Wilson intervals (module docstring + CAVEAT_TEXT)
+    -- they must actually be rendered, not just computed and dropped (#602
+    finding)."""
+    runs = [_full_run("model-a", bo.Outcome.COR)]
+    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    assert "## Wilson intervals" in report
+    assert "`model-a`" in report
+    assert "95% Wilson CI" in report
 
 
 def test_render_report_marks_budget_stopped_runs_partial(
@@ -895,17 +1009,21 @@ def test_render_report_pairwise_covers_all_pairs_not_just_first(
 
 
 def test_render_report_labels_actual_spend_vs_resumed(corpus: list[bo.CorpusPage]) -> None:
-    """A newly-called model's cost must be labelled ACTUAL spend, not the
-    generic pre-run 'NOT yet spent' estimate framing (#600 round-2 finding)."""
+    """A newly-called model's cost must be labelled as spend INCURRED, not
+    the generic pre-run 'NOT yet spent' estimate framing (#600 round-2
+    finding) -- and never claimed as verified ACTUAL billing, since this
+    harness has no live token-usage/billing readback (#602 finding: the
+    round-2 'ACTUALLY SPENT' wording overclaimed this)."""
     runs = [_full_run("model-a", bo.Outcome.COR), _full_run("model-b", bo.Outcome.COR)]
     cost_estimates = [
         bo.ModelCostEstimate(slug="model-a", input_tokens=100, output_tokens=50, usd=0.01),
         bo.ModelCostEstimate(slug="model-b", input_tokens=100, output_tokens=50, usd=0.02),
     ]
     report = bo.render_report(runs, cost_estimates, executed_slugs=["model-a"])
-    assert "ACTUALLY SPENT" in report
-    assert "$0.0100" in report  # only model-a's cost counted as spent
-    assert "spent this run" in report
+    assert "ESTIMATED SPEND INCURRED" in report
+    assert "ACTUALLY SPENT" not in report
+    assert "$0.0100" in report  # only model-a's cost counted as incurred
+    assert "spend incurred (est.)" in report
     assert "resumed (no new spend)" in report
 
 
@@ -913,6 +1031,7 @@ def test_render_report_no_executed_slugs_is_pure_estimate(corpus: list[bo.Corpus
     runs = [_full_run("model-a", bo.Outcome.COR)]
     report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
     assert "NOT yet spent" in report
+    assert "ESTIMATED SPEND INCURRED" not in report
     assert "ACTUALLY SPENT" not in report
 
 
@@ -1136,6 +1255,16 @@ def test_checkpoint_recovers_earlier_records_after_truncated_final_line(
     assert reopened.has("m1")
     assert reopened.has("m2")
     assert not reopened.has("m3")
+    # The truncated tail must be REMOVED from disk, not merely skipped in
+    # memory -- otherwise the next append concatenates a new record directly
+    # onto it (no trailing newline) and a later resume raises (#602 finding).
+    assert "truncated" not in path.read_text()
+    reopened.append(bo.run_to_json(_run("m4", {"p": {"origin": bo.Outcome.COR}})))
+    resumed_again = bo.Checkpoint(path, resume=True)
+    assert resumed_again.has("m1")
+    assert resumed_again.has("m2")
+    assert resumed_again.has("m4")
+    assert not resumed_again.has("m3")
 
 
 def test_checkpoint_raises_on_malformed_interior_line(tmp_path: Path) -> None:
@@ -1222,6 +1351,46 @@ def test_pipeline_fingerprint_is_deterministic_and_nonempty() -> None:
     second = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
     assert first == second
     assert first  # this env can locate the extractor/harness source files
+
+
+def test_fingerprinted_modules_cover_the_whole_extraction_call_path() -> None:
+    """Round-2 hashed only ``bean_sourcing.py`` + the harness; the evaluated
+    call path also calls ``advisor.build_model`` and constructs
+    ``BeanProfileDraft``/config objects through ``config.py``/``models.py`` --
+    a change to any of those could alter a fresh result while an old
+    checkpoint is still (wrongly) accepted (#602 finding)."""
+    module_names = {m.__name__ for m in bo._FINGERPRINTED_MODULES}  # pyright: ignore[reportPrivateUsage]
+    assert module_names == {
+        "roastpilot_agent.bean_sourcing",
+        "roastpilot_agent.advisor",
+        "roastpilot_agent.config",
+        "roastpilot_agent.models",
+    }
+
+
+def test_pipeline_fingerprint_changes_when_a_widened_module_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``advisor.py`` (not just ``bean_sourcing.py`` + the harness) must be
+    hashed too -- a provider-construction change must invalidate a stale
+    checkpoint (#602 finding)."""
+    import inspect as inspect_module
+
+    original_getsourcefile = inspect_module.getsourcefile
+    baseline = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
+
+    fake_advisor_source = tmp_path / "advisor_fake.py"
+    fake_advisor_source.write_text("# changed content for a fingerprint-sensitivity test\n")
+
+    def _patched(module: object) -> str | None:
+        if module is bo._advisor_module:  # pyright: ignore[reportPrivateUsage]
+            return str(fake_advisor_source)
+        return original_getsourcefile(module)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(bo.inspect, "getsourcefile", _patched)
+    changed = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    assert changed != baseline
+    assert changed  # still resolvable, not degraded to ""
 
 
 def test_compute_fingerprint_changes_with_pipeline_fingerprint(
@@ -1313,9 +1482,10 @@ async def test_run_bakeoff_stale_fingerprint_is_not_resumed(
 async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
-    """Every page erroring (a transient outage) must not be cached as 'done'
-    -- a re-run should retry, not resume the outage forever (#600 finding) --
-    AND must not appear in ``runs`` as a scored 0.000 row polluting the
+    """Every page erroring, with NO peer having succeeded this invocation, is
+    classified INFRA-WIDE (#602): must not be cached as 'done' -- a re-run
+    should retry, not resume the outage forever (#600 finding) -- AND must
+    not appear in ``runs`` as a scored 0.000 row polluting the
     leaderboard/statistics (#600 round-2 finding): it is reported separately
     via ``failed_slugs`` instead."""
     out = tmp_path / "o.json"
@@ -1334,6 +1504,42 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
     assert not checkpoint.has("m1")
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_model_specific_failure_is_scored_when_a_peer_succeeded(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """Every page erroring is NOT automatically excluded: if a PEER already
+    succeeded on this corpus this invocation, the corpus/pipeline is provably
+    extractable, so this model's total failure is its OWN reliability issue
+    (a bad schema, a persistent timeout, an unsupported slug) -- MODEL-
+    SPECIFIC, scored and checkpointed like any other result, not silently
+    dropped (#602 design point)."""
+    out = tmp_path / "o.json"
+    fingerprint = bo.compute_fingerprint(corpus)
+    # Seed a checkpoint with a peer that already succeeded on this corpus --
+    # resuming it (no new call) is how the injected FunctionModel below can
+    # apply ONLY to the newly-executed "bad" slug.
+    seed = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    seed.append(bo.run_to_json(_full_run("good", bo.Outcome.COR)))
+
+    result = await bo.run_bakeoff(
+        corpus,
+        ["good", "bad"],
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(
+            corpus, [bo.RosterModel("good", 0.1, 0.1, "x"), bo.RosterModel("bad", 0.1, 0.1, "x")]
+        ),
+        model=_model_text_only(),  # only applies to "bad" -- "good" resumes
+    )
+    assert {r.model_slug for r in result.runs} == {"good", "bad"}
+    assert result.failed_slugs == []
+    assert result.executed_slugs == ["bad"]
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert checkpoint.has("bad")  # a model-specific failure IS checkpointed
 
 
 def test_run_wholly_failed_detects_all_errored_pages() -> None:
@@ -1428,4 +1634,4 @@ async def test_main_full_run_writes_artifact_and_partial_report(
     assert "PARTIAL RUN" in report_text
     assert "EXCLUDED -- transient failure" in report_text
     assert "some/failed-slug" in report_text
-    assert "ACTUALLY SPENT" in report_text
+    assert "ESTIMATED SPEND INCURRED" in report_text
