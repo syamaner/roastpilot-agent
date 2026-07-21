@@ -185,6 +185,18 @@ def test_accept_any_of_eligible_fields_excludes_altitude_and_tasting() -> None:
     assert "origin" in eligible  # a "text"-kind field IS eligible
 
 
+def test_accept_any_of_eligible_fields_excludes_bool_kind() -> None:
+    """``is_blend`` (kind ``bool``) reaches the GENERIC ``classify_field``
+    absent branch, but its extracted value is a ``bool``/``None``, never a
+    ``str`` -- ``_classify_absent_field``'s ``isinstance(model_value, str)``
+    gate means ``accept_any_of`` is NEVER consulted for it. Round 5's
+    exclude-altitude-and-tasting derivation let it slip in; the POSITIVE,
+    string-producing-kinds derivation must exclude it (#602 fold round 6,
+    FOLD 1)."""
+    eligible = bo._ACCEPT_ANY_OF_ELIGIBLE_FIELDS  # pyright: ignore[reportPrivateUsage]
+    assert "is_blend" not in eligible
+
+
 def test_load_corpus_rejects_accept_any_of_on_a_field_its_classifier_ignores(
     tmp_path: Path,
 ) -> None:
@@ -207,6 +219,28 @@ def test_load_corpus_rejects_accept_any_of_on_a_field_its_classifier_ignores(
         )
     )
     with pytest.raises(ValueError, match="tasting_notes.*accept_any_of"):
+        bo.load_corpus(tmp_path)
+
+
+def test_load_corpus_rejects_accept_any_of_on_is_blend(tmp_path: Path) -> None:
+    """``is_blend`` (kind ``bool``) extracts a ``bool``/``None``, never a ``str`` --
+    ``accept_any_of`` can never be consulted for it, so it must be rejected at
+    LOAD time too, naming the field and the reason (#602 fold round 6, FOLD 1)."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_absent = {f.name: {"absent": True} for f in bo.FIELD_SPECS if f.name != "name"}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                "fields": {
+                    **all_absent,
+                    "is_blend": {"absent": True, "accept_any_of": ["yes"]},
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="is_blend.*accept_any_of"):
         bo.load_corpus(tmp_path)
 
 
@@ -1519,6 +1553,36 @@ def test_checkpoint_raises_on_a_newline_terminated_malformed_final_line(
     assert "corrupted" in path.read_text()
 
 
+def test_checkpoint_normalises_a_valid_newline_less_tail(tmp_path: Path) -> None:
+    """A COMPLETE, valid JSON final line missing only its trailing newline parses fine, so
+    the truncated-tail repair never fires -- yet the next append would concatenate directly
+    onto it with no separator, corrupting the JSONL. The loader must normalise this
+    newline-less-but-valid tail atomically before any further append (#602 fold round 6,
+    FOLD 3)."""
+    path = tmp_path / "cells.jsonl"
+    checkpoint = bo.Checkpoint(path, resume=False)
+    checkpoint.append(bo.run_to_json(_run("m1", {"p": {"origin": bo.Outcome.COR}})))
+    checkpoint.append(bo.run_to_json(_run("m2", {"p": {"origin": bo.Outcome.COR}})))
+    # Simulate a kill that wrote the complete final JSON payload but not its
+    # trailing newline.
+    raw = path.read_bytes()
+    assert raw.endswith(b"\n")
+    path.write_bytes(raw[:-1])
+
+    reopened = bo.Checkpoint(path, resume=True)
+    assert reopened.has("m1")
+    assert reopened.has("m2")
+    assert path.read_text().endswith("\n")  # normalised BEFORE any further append
+
+    reopened.append(bo.run_to_json(_run("m3", {"p": {"origin": bo.Outcome.COR}})))
+    # The new record must be on its OWN line, not concatenated -- a resume
+    # must read all three records as valid JSONL.
+    resumed_again = bo.Checkpoint(path, resume=True)
+    assert resumed_again.has("m1")
+    assert resumed_again.has("m2")
+    assert resumed_again.has("m3")
+
+
 def test_checkpoint_ignores_stale_fingerprinted_records(tmp_path: Path) -> None:
     path = tmp_path / "cells.jsonl"
     written = bo.Checkpoint(path, resume=False, fingerprint="fp-a")
@@ -1631,54 +1695,40 @@ def test_pipeline_fingerprint_changes_when_a_widened_module_changes(
     assert changed  # still resolvable, not degraded to ""
 
 
-def test_fingerprinted_dependencies_cover_bean_sourcing_third_party_imports() -> None:
-    """No lockfile + broad pyproject ranges mean a compatible upgrade of any
-    of these changes extraction behaviour without touching first-party
-    source (#602 fold round 4, FOLD 2; ``openai`` added round 5, FOLD 2)."""
-    assert set(bo._FINGERPRINTED_DEPENDENCIES) == {  # pyright: ignore[reportPrivateUsage]
-        "httpx",
-        "pydantic",
-        "pydantic-ai-slim",
-        "openai",
-        "extruct",
-        "trafilatura",
-        "lxml",
-    }
+def test_environment_fingerprint_is_stable_across_calls() -> None:
+    """The same installed environment must fingerprint identically across
+    calls (#602 fold round 6, FOLD 2)."""
+    first = bo._environment_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    second = bo._environment_fingerprint()  # pyright: ignore[reportPrivateUsage]
+    assert first == second
+    assert first  # this env has installed distributions
 
 
-def test_pipeline_fingerprint_changes_when_a_dependency_version_changes(
+def test_pipeline_fingerprint_changes_when_the_environment_changes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A compatible third-party upgrade (no lockfile, broad pyproject
-    ranges) must invalidate a stale checkpoint too, not just a first-party
-    source change (#602 fold round 4, FOLD 2)."""
+    """A CATEGORICAL distribution-set fingerprint means ANY installed
+    package's version change invalidates resume -- including a TRANSITIVE
+    dependency a hand-picked list would miss entirely (#602 fold round 6,
+    FOLD 2 -- replaces the round-4/5 hand-list)."""
     baseline = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
-    original_version = importlib.metadata.version
+    real_distributions = list(importlib.metadata.distributions())
 
-    def _patched(name: str) -> str:
-        if name == "httpx":
-            return "999.999.999"
-        return original_version(name)
+    class _FakeDist:
+        def __init__(self, name: str, version: str) -> None:
+            self.name = name
+            self.version = version
 
-    monkeypatch.setattr(bo.importlib.metadata, "version", _patched)
+    def _patched() -> list[_FakeDist]:
+        fakes = [_FakeDist(d.name, d.version) for d in real_distributions]
+        if fakes:
+            fakes[0].version = "999.999.999"  # simulate ANY package moving, even transitive
+        return fakes
+
+    monkeypatch.setattr(bo.importlib.metadata, "distributions", _patched)
     changed = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
     assert changed != baseline
     assert changed
-
-
-def test_pipeline_fingerprint_degrades_gracefully_on_missing_dependency_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An unresolvable dependency version must not crash a real run -- same
-    degrade-gracefully posture as a missing source file (#602 fold round
-    4, FOLD 2)."""
-
-    def _raise(name: str) -> str:
-        raise importlib.metadata.PackageNotFoundError(name)
-
-    monkeypatch.setattr(bo.importlib.metadata, "version", _raise)
-    fingerprint = bo._pipeline_fingerprint()  # pyright: ignore[reportPrivateUsage]
-    assert fingerprint  # still resolvable (source hashes still succeed)
 
 
 def test_compute_fingerprint_changes_with_pipeline_fingerprint(

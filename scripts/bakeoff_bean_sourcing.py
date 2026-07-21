@@ -158,32 +158,13 @@ from roastpilot_agent.models import BeanProfileDraft  # noqa: E402
 #: (``AdvisorConfig``/``BeanSourcingConfig``), and schema/validation
 #: (``BeanProfileDraft``). INCLUSION RULE (#602): hash every first-party
 #: module on that call path whose source can change a result. Third-party
-#: dependencies are hashed SEPARATELY, by installed VERSION (see
-#: :data:`_FINGERPRINTED_DEPENDENCIES`), not source -- their code is not
-#: committed to this repo.
+#: dependencies are hashed CATEGORICALLY instead of a hand-picked list --
+#: see :func:`_environment_fingerprint` (#602 fold round 6, FOLD 2).
 _FINGERPRINTED_MODULES: tuple[ModuleType, ...] = (
     _bean_sourcing_module,
     _advisor_module,
     _config_module,
     _models_module,
-)
-
-#: Third-party distribution names whose INSTALLED VERSION can change
-#: extraction behaviour with no first-party source change (#602 fold round
-#: 4): no lockfile, and pyproject's ranges (e.g. ``httpx>=0.28,<1``) admit a
-#: compatible upgrade between invocations. Same INCLUSION RULE as
-#: :data:`_FINGERPRINTED_MODULES`, applied to ``bean_sourcing.py``'s own
-#: third-party imports instead of first-party source -- ``openai`` (fold
-#: round 5) is the SDK behind ``pydantic-ai-slim[openai]``'s
-#: ``OpenAIProvider``, one more hop down the same call path.
-_FINGERPRINTED_DEPENDENCIES: tuple[str, ...] = (
-    "httpx",
-    "pydantic",
-    "pydantic-ai-slim",
-    "openai",
-    "extruct",
-    "trafilatura",
-    "lxml",
 )
 
 # --- Constants ---------------------------------------------------------------
@@ -883,12 +864,14 @@ FIELD_SPECS: tuple[FieldSpec, ...] = (
     FieldSpec("is_blend", "bool", lambda d: d.is_blend),
 )
 
-#: Field names whose :func:`classify_field` routing reaches
-#: :func:`_classify_absent_field` on a gold-ABSENT state (#602 fold round 5, FOLD 4) --
-#: ``altitude``/``tasting`` have their OWN bespoke absent-handling that never looks at
-#: ``accept_any_of``; :func:`_validate_gold_shape` rejects it there at load time.
+#: FieldSpec kinds whose ``extract`` returns ``str | None`` -- the ONLY kinds
+#: ``_classify_absent_field``'s ``isinstance(str)`` gate lets reach the tolerance check
+#: (#602 fold round 6: POSITIVE derivation -- round 5's exclusion list let ``is_blend`` in).
+_STRING_PRODUCING_FIELD_KINDS: frozenset[str] = frozenset({"text", "enum", "variety"})
+
+#: Field names eligible for ``accept_any_of``; rejected elsewhere at load time.
 _ACCEPT_ANY_OF_ELIGIBLE_FIELDS: frozenset[str] = frozenset(
-    spec.name for spec in FIELD_SPECS if spec.kind not in ("altitude", "tasting")
+    spec.name for spec in FIELD_SPECS if spec.kind in _STRING_PRODUCING_FIELD_KINDS
 )
 
 
@@ -2272,19 +2255,32 @@ def sidecar_path(out: Path) -> Path:
     return out.with_name(out.name + ".cells.jsonl")
 
 
+def _environment_fingerprint() -> str:
+    """A stable fingerprint of the ENTIRE installed distribution set.
+
+    Categorical replacement for a hand-picked dependency list (#602 fold round 6, FOLD 2): a
+    TRANSITIVE dependency moving (e.g. jusText/courlan under ``trafilatura``) invalidates
+    resume too, with no enumeration arms race. Deliberately conservative: ANY environment
+    change invalidates resume (a fresh venv just re-runs everything), never silently wrong.
+
+    Returns:
+        A stable string built from every installed distribution's sorted ``(name, version)``.
+    """
+    pairs = sorted((dist.name, dist.version) for dist in importlib.metadata.distributions())
+    return "|".join(f"{name}=={version}" for name, version in pairs)
+
+
 def _pipeline_fingerprint() -> str:
     """A fingerprint of the EVALUATED PIPELINE (not the corpus).
 
     Hashes every module in :data:`_FINGERPRINTED_MODULES` (first-party source that can change
-    a drafted result) plus this harness's OWN source, the extraction timeout, and every
-    :data:`_FINGERPRINTED_DEPENDENCIES` entry's INSTALLED VERSION (#602 fold round 4 -- no
-    lockfile, so a compatible third-party upgrade between invocations would otherwise change
-    behaviour under an unchanged fingerprint and mix old/new records). Any change invalidates a
-    stale checkpoint automatically (closes the #600 round-2 gap: #590-style preprocessing
-    changes without touching any fixture).
+    a drafted result) plus this harness's OWN source, the extraction timeout, and the WHOLE
+    installed environment (see :func:`_environment_fingerprint`, #602 fold round 6). Any
+    change invalidates a stale checkpoint automatically (closes the #600 round-2 gap:
+    #590-style preprocessing changes without touching any fixture).
 
     Returns:
-        A short, stable hex digest of every fingerprinted module/dependency; ``""``
+        A short, stable hex digest of every fingerprinted module + the environment; ``""``
         (fingerprinting disabled) if ANY source file cannot be located -- degrading to the
         pre-existing corpus-only guard rather than crashing.
     """
@@ -2298,12 +2294,7 @@ def _pipeline_fingerprint() -> str:
             digest.update(Path(cast("str", src)).read_bytes())
         digest.update(Path(harness_source).read_bytes())
         digest.update(str(BAKEOFF_EXTRACTION_TIMEOUT_S).encode())
-        for name in _FINGERPRINTED_DEPENDENCIES:
-            try:
-                installed_version = importlib.metadata.version(name)
-            except importlib.metadata.PackageNotFoundError:
-                installed_version = ""
-            digest.update(f"{name}=={installed_version}".encode())
+        digest.update(_environment_fingerprint().encode())
         return digest.hexdigest()[:16]
     except OSError:  # pragma: no cover - only when source is unavailable
         return ""
@@ -2368,6 +2359,11 @@ def _load_checkpoint_lines(path: Path) -> list[dict[str, Any]]:
     :func:`_atomic_write_text`): a non-atomic rewrite would itself risk destroying recovered
     records on a second crash mid-repair.
 
+    A kill can ALSO land right after the complete JSON payload but before its trailing
+    ``\\n`` -- that line parses FINE here, so the repair above never fires, yet the next
+    :meth:`Checkpoint.append` would concatenate directly onto it (#602 fold round 6, FOLD 3).
+    So after every line parses, a still-missing final newline is normalised in atomically.
+
     Args:
         path: The sidecar JSONL path.
 
@@ -2398,6 +2394,11 @@ def _load_checkpoint_lines(path: Path) -> list[dict[str, Any]]:
     if truncated_at is not None:
         clean_lines = lines[:truncated_at]
         _atomic_write_text(path, "".join(f"{ln}\n" for ln in clean_lines))
+    elif lines and not raw_text.endswith("\n"):
+        # Every line parsed, but the file itself is missing its final newline: a
+        # valid tail with no separator for the next append (#602 fold round 6,
+        # FOLD 3). Normalise it now, atomically, before any further append.
+        _atomic_write_text(path, "".join(f"{ln}\n" for ln in lines))
     return records
 
 
