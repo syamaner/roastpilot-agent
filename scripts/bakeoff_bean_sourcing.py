@@ -173,11 +173,14 @@ _FINGERPRINTED_MODULES: tuple[ModuleType, ...] = (
 #: 4): no lockfile, and pyproject's ranges (e.g. ``httpx>=0.28,<1``) admit a
 #: compatible upgrade between invocations. Same INCLUSION RULE as
 #: :data:`_FINGERPRINTED_MODULES`, applied to ``bean_sourcing.py``'s own
-#: third-party imports instead of first-party source.
+#: third-party imports instead of first-party source -- ``openai`` (fold
+#: round 5) is the SDK behind ``pydantic-ai-slim[openai]``'s
+#: ``OpenAIProvider``, one more hop down the same call path.
 _FINGERPRINTED_DEPENDENCIES: tuple[str, ...] = (
     "httpx",
     "pydantic",
     "pydantic-ai-slim",
+    "openai",
     "extruct",
     "trafilatura",
     "lxml",
@@ -569,10 +572,12 @@ def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> N
 
     Raises:
         ValueError: If a required field is missing, has neither/both of
-            ``"value"``/``"absent": true``, a present ``"value"`` has the
-            wrong type/shape, ``"value"`` and ``accept_any_of`` are BOTH
-            present (the latter is absent-only, #602 fold round 4), or a
-            present ``accept_any_of`` is not a non-empty string list.
+            ``"value"``/``"absent": true``, a present ``"value"`` has the wrong
+            type/shape, ``"value"`` and ``accept_any_of`` are BOTH present (the
+            latter is absent-only), ``accept_any_of`` is on a field whose
+            classifier never consults it (see
+            :data:`_ACCEPT_ANY_OF_ELIGIBLE_FIELDS`), or it is not a non-empty
+            string list.
     """
     for spec in FIELD_SPECS:
         field = gold_fields.get(spec.name)
@@ -597,6 +602,12 @@ def _validate_gold_shape(slug: str, gold_fields: dict[str, dict[str, Any]]) -> N
                 )
             _validate_gold_value_type(slug, spec, field["value"])
         elif "accept_any_of" in field:
+            if spec.name not in _ACCEPT_ANY_OF_ELIGIBLE_FIELDS:
+                raise ValueError(
+                    f"{slug}.gold.json: field {spec.name!r} (kind={spec.kind!r}) carries "
+                    "'accept_any_of', but its classifier never consults it on an absent "
+                    f"field -- only {sorted(_ACCEPT_ANY_OF_ELIGIBLE_FIELDS)} do"
+                )
             _validate_accept_any_of(slug, spec, field["accept_any_of"])
 
 
@@ -870,6 +881,14 @@ FIELD_SPECS: tuple[FieldSpec, ...] = (
     FieldSpec("altitude", "altitude", lambda d: d.altitude_m),
     FieldSpec("tasting_notes", "tasting", _extract_text("description")),
     FieldSpec("is_blend", "bool", lambda d: d.is_blend),
+)
+
+#: Field names whose :func:`classify_field` routing reaches
+#: :func:`_classify_absent_field` on a gold-ABSENT state (#602 fold round 5, FOLD 4) --
+#: ``altitude``/``tasting`` have their OWN bespoke absent-handling that never looks at
+#: ``accept_any_of``; :func:`_validate_gold_shape` rejects it there at load time.
+_ACCEPT_ANY_OF_ELIGIBLE_FIELDS: frozenset[str] = frozenset(
+    spec.name for spec in FIELD_SPECS if spec.kind not in ("altitude", "tasting")
 )
 
 
@@ -1798,11 +1817,11 @@ class WilsonInterval:
     """A Wilson score interval on a strictly-binary proportion.
 
     Attributes:
-        successes: COR count (PAR excluded).
-        trials: Present-field decisions (COR+PAR+INC+MIS).
-        proportion: ``successes / trials``, or ``None`` when ``trials`` is 0
-            (undefined -- rendered ``n/a``, never a fabricated ``0.000``,
-            #602 fold round 4).
+        successes: COR count.
+        trials: STRICTLY binary COR-vs-not (COR+INC+MIS; PAR excluded from both --
+            #602 fold round 5, matching the research note's documented decomposition).
+        proportion: ``successes / trials``, or ``None`` when 0 (rendered ``n/a``,
+            never a fabricated ``0.000``, #602 fold round 4).
         low: Lower Wilson bound (degenerate ``0.0`` when ``trials`` is 0).
         high: Upper Wilson bound (degenerate ``1.0`` when ``trials`` is 0).
     """
@@ -1846,9 +1865,13 @@ def wilson_interval(successes: int, trials: int, *, z: float = 1.959963984540054
 
 
 def binary_cor_counts(run: ModelRun) -> tuple[int, int]:
-    """``(COR, present-field decisions)`` for a strictly-binary Wilson view."""
+    """``(COR, trials)`` for the strictly-binary COR-vs-not Wilson view.
+
+    PAR is EXCLUDED from ``trials`` (#602 fold round 5): a partial match is neither a
+    success nor a countable trial in this binary COR-vs-{INC,MIS} decomposition.
+    """
     counts = tally(all_outcomes(run))
-    trials = counts.cor + counts.par + counts.inc + counts.mis
+    trials = counts.cor + counts.inc + counts.mis
     return counts.cor, trials
 
 
@@ -1989,7 +2012,7 @@ def render_report(
     *,
     stopped_early: bool = False,
     unevaluated_slugs: Sequence[str] = (),
-    failed_slugs: Sequence[str] = (),
+    failed_slugs: Sequence[FailedRun] = (),
     executed_slugs: Sequence[str] = (),
 ) -> str:
     """Render the markdown scorecard for one or more model runs.
@@ -2004,11 +2027,10 @@ def render_report(
             finding).
         unevaluated_slugs: The requested models never run, when
             ``stopped_early`` is ``True``.
-        failed_slugs: Models excluded because every page errored (a
-            transient outage, not a quality result) -- rendered as a
-            separate banner; never counted in the leaderboard/stats below
-            since they are already excluded from ``runs`` (#600 round-2
-            finding).
+        failed_slugs: Every wholly-failed run this invocation, with its DISPLAY-ONLY
+            heuristic label (:class:`FailedRun`) -- rendered as a separate banner; NEVER
+            checkpointed, never counted in the leaderboard/stats below (#600 round-2;
+            never-checkpoint simplification #602 fold round 5).
         executed_slugs: Models a REAL call was made for THIS invocation --
             distinguishes spend already INCURRED (still this harness's cost
             ESTIMATE, never verified OpenRouter billing -- #602) from a
@@ -2030,12 +2052,15 @@ def render_report(
         )
         lines.append("")
     if failed_slugs:
+        failed_desc = ", ".join(
+            f"`{f.model_slug}` ({f.heuristic_label}, heuristic)" for f in failed_slugs
+        )
         lines.append(
-            "> **EXCLUDED -- transient failure.** Every page errored (a bad key / provider "
-            f"outage, not a quality result) for {len(failed_slugs)} model(s): "
-            f"{', '.join(f'`{s}`' for s in failed_slugs)}. Excluded from the leaderboard "
-            "and every statistic below (never a scored 0.000 row) and NOT checkpointed --"
-            " re-run to retry them."
+            f"> **EXCLUDED -- failed this invocation.** Every page errored for "
+            f"{len(failed_slugs)} model(s): {failed_desc}. The heuristic label is DISPLAY-ONLY "
+            "best-effort context (no invocation-local signal can truly tell a transient "
+            "outage apart from a model-specific fault) -- NEVER checkpointed regardless of "
+            "it, so a re-run ALWAYS retries them; excluded from every statistic below."
         )
         lines.append("")
     lines.append(f"- models scored: {len(runs)}")
@@ -2259,10 +2284,9 @@ def _pipeline_fingerprint() -> str:
     changes without touching any fixture).
 
     Returns:
-        A short, stable hex digest of every fingerprinted module's + the harness's source
-        bytes, the extraction timeout, and every dependency's installed version (``""`` for an
-        unresolvable one). ``""`` overall (fingerprinting disabled) if ANY source file cannot
-        be located -- degrading to the pre-existing corpus-only guard rather than crashing.
+        A short, stable hex digest of every fingerprinted module/dependency; ``""``
+        (fingerprinting disabled) if ANY source file cannot be located -- degrading to the
+        pre-existing corpus-only guard rather than crashing.
     """
     try:
         harness_source = inspect.getsourcefile(sys.modules[__name__])
@@ -2539,49 +2563,24 @@ def _has_any_success(run: ModelRun) -> bool:
     return any(page.error is None for page in run.pages)
 
 
-def _checkpoint_model_specific(run: ModelRun, runs: list[ModelRun], checkpoint: Checkpoint) -> None:
-    """Score + checkpoint a wholly-failed run as MODEL-SPECIFIC, EAGERLY.
+@dataclass(frozen=True)
+class FailedRun:
+    """A wholly-failed run this invocation -- NEVER checkpointed (#602 fold round 5).
 
-    Checkpointed the instant classification is provable (see
-    :func:`run_bakeoff`), not deferred -- an interruption later must not
-    lose an already-provable failure and force a resume to re-pay for it.
+    Rounds 3-4 eagerly checkpointed a "provable" MODEL-SPECIFIC failure -- backwards AND
+    unfixable, since no invocation-local signal can tell a transient outage apart from a
+    model-specific fault. Failed attempts are CHEAP to retry; a mis-scored failure is
+    EXPENSIVE to fix -- so every wholly-failed run is excluded and NEVER checkpointed.
 
-    Args:
-        run: The wholly-failed candidate.
-        runs: The scored-runs list; mutated in place (``run`` appended).
-        checkpoint: The sidecar to persist ``run`` into.
+    Attributes:
+        model_slug: The failed model.
+        heuristic_label: ``"MODEL-SPECIFIC"`` if a FRESHLY-EXECUTED peer had already succeeded
+            this invocation, else ``"INFRA-WIDE"``. DISPLAY-ONLY best-effort context -- NOT
+            authoritative, NEVER affects checkpointing or scoring.
     """
-    checkpoint.append(run_to_json(run))
-    runs.append(run)
-    print(
-        f"[run] {run.model_slug}: ALL {len(run.pages)} page(s) errored -- MODEL-SPECIFIC, "
-        "checkpointed as a real (poor) result",
-        flush=True,
-    )
 
-
-def _exclude_infra_wide(pending: list[ModelRun]) -> list[str]:
-    """Every STILL-pending wholly-failed candidate: INFRA-WIDE, excluded.
-
-    Reached only when no fresh success ever occurred this invocation --
-    indistinguishable from a session-wide outage, so excluded and NOT
-    checkpointed, so a retry actually retries it (#600).
-
-    Args:
-        pending: Wholly-failed runs never reclassified MODEL-SPECIFIC.
-
-    Returns:
-        Every pending run's model slug.
-    """
-    failed_slugs: list[str] = []
-    for run in pending:
-        failed_slugs.append(run.model_slug)
-        print(
-            f"[run] {run.model_slug}: ALL {len(run.pages)} page(s) errored -- INFRA-WIDE, "
-            "excluded, not checkpointed (a re-run will retry it)",
-            flush=True,
-        )
-    return failed_slugs
+    model_slug: str
+    heuristic_label: str
 
 
 @dataclass(frozen=True)
@@ -2596,27 +2595,24 @@ class BakeoffResult:
             comparison (#600 finding).
         unevaluated_slugs: The requested model slugs never run at all because
             of the budget stop (empty when ``stopped_early`` is ``False``).
-        failed_slugs: Model slugs classified INFRA-WIDE (see
-            :func:`_exclude_infra_wide`): every page errored and no
-            FRESHLY-EXECUTED model ever succeeded this invocation. EXCLUDED
-            from ``runs`` and every metric/leaderboard/pairwise statistic --
-            never a scored 0.000 row (#600 round-2) -- and NOT checkpointed,
-            so a re-run retries them. A wholly-failed run classified
-            MODEL-SPECIFIC instead (a fresh peer succeeded) is scored and
-            checkpointed EAGERLY (see :func:`run_bakeoff`), NOT listed here.
+        failed_slugs: Every wholly-failed run this invocation, as a
+            :class:`FailedRun` (model slug + DISPLAY-ONLY heuristic label). NEVER
+            checkpointed (#602 fold round 5 -- see :class:`FailedRun`'s docstring
+            for the trade), excluded from ``runs`` and every metric/leaderboard/
+            pairwise statistic -- never a scored 0.000 row (#600 round-2) -- and a
+            re-run always retries them.
         executed_slugs: Model slugs a REAL (paid) call was made for THIS
-            invocation -- includes ``failed_slugs`` (a paid attempt was still
-            made) but excludes anything resumed from an existing checkpoint.
-            Distinguishes spend already INCURRED (still this harness's cost
-            ESTIMATE, never verified billing -- #602 finding) from a pre-run
-            estimate in the report (#600 round-2 finding): a resumed model
-            made no new call.
+            invocation -- includes every :attr:`failed_slugs` entry (a paid
+            attempt was still made) but excludes anything resumed from an
+            existing checkpoint. Distinguishes spend already INCURRED (still
+            this harness's cost ESTIMATE, never verified billing -- #602) from
+            a pre-run planning estimate (#600 round-2).
     """
 
     runs: list[ModelRun]
     stopped_early: bool
     unevaluated_slugs: list[str]
-    failed_slugs: list[str]
+    failed_slugs: list[FailedRun]
     executed_slugs: list[str]
 
 
@@ -2634,16 +2630,12 @@ async def run_bakeoff(
 
     Read-only: never touches any store/DB, never saves a profile. Stops gracefully BEFORE a
     model whose estimated cost would breach ``max_spend`` (see :attr:`BakeoffResult.stopped_early`).
-    A run where EVERY page errored is classified EAGERLY: a paid attempt is checkpointed at the
-    earliest moment its classification is provable, so an interruption while a LATER roster
-    model is still running cannot lose an already-provable EARLIER failure and force resume to
-    re-pay for it (#602 fold rounds 3-4). MODEL-SPECIFIC the moment a fresh peer has already
-    succeeded (checkpointed right there), or held ``pending`` until the FIRST fresh success
-    arrives -- which flushes every pending candidate BEFORE that success's own checkpoint/report
-    (fold round 4: an interruption during the success's own reporting must not lose the flush).
-    Only candidates STILL pending at the end (or an early budget stop) are INFRA-WIDE -- excluded
-    and NOT checkpointed, so a retry actually retries them (#600; see :func:`_exclude_infra_wide`).
-    Either way a wholly-failed run IS still counted against the spend guard.
+    A run where EVERY page errored is NEVER checkpointed (#602 fold round 5 -- see
+    :class:`FailedRun`'s docstring for the trade this simplification resolves): it is reported
+    as a :class:`FailedRun` with a DISPLAY-ONLY ``heuristic_label`` (``"MODEL-SPECIFIC"`` if a
+    FRESHLY-EXECUTED peer had already succeeded this invocation, else ``"INFRA-WIDE"``) and a
+    re-run ALWAYS retries it. Either way a wholly-failed run IS still counted against the spend
+    guard (a paid attempt was made).
 
     Args:
         pages: The corpus.
@@ -2663,7 +2655,7 @@ async def run_bakeoff(
     fingerprint = compute_fingerprint(pages)
     checkpoint = Checkpoint(sidecar_path(out), resume=resume, fingerprint=fingerprint)
     runs: list[ModelRun] = []
-    pending: list[ModelRun] = []  # wholly-failed, unclassifiable until a fresh success (#602)
+    failed_runs: list[FailedRun] = []
     executed_slugs: list[str] = []
     has_fresh_success = False
     spent = 0.0
@@ -2683,7 +2675,7 @@ async def run_bakeoff(
                 runs=runs,
                 stopped_early=True,
                 unevaluated_slugs=list(model_slugs[index:]),
-                failed_slugs=_exclude_infra_wide(pending),
+                failed_slugs=failed_runs,
                 executed_slugs=executed_slugs,
             )
         run = await run_model_over_corpus(
@@ -2696,19 +2688,15 @@ async def run_bakeoff(
         spent += upcoming
         executed_slugs.append(slug)  # a real call was attempted, win or lose
         if _run_wholly_failed(run):
-            if has_fresh_success:
-                _checkpoint_model_specific(run, runs, checkpoint)
-            else:
-                pending.append(run)
+            label = "MODEL-SPECIFIC" if has_fresh_success else "INFRA-WIDE"
+            print(
+                f"[run] {slug}: ALL {len(run.pages)} page(s) errored -- {label} (heuristic, "
+                "display-only) -- NEVER checkpointed, a re-run always retries it",
+                flush=True,
+            )
+            failed_runs.append(FailedRun(model_slug=slug, heuristic_label=label))
             continue
-        if not has_fresh_success and _has_any_success(run):
-            has_fresh_success = True
-            # Flush BEFORE this success's own checkpoint/report (#602 fold
-            # round 4, FOLD 1): an interruption during THIS success's own
-            # reporting must never lose an already-provable pending failure.
-            for candidate in pending:
-                _checkpoint_model_specific(candidate, runs, checkpoint)
-            pending = []
+        has_fresh_success = has_fresh_success or _has_any_success(run)
         checkpoint.append(run_to_json(run))
         m = model_metrics(run)
         print(
@@ -2721,7 +2709,7 @@ async def run_bakeoff(
         runs=runs,
         stopped_early=False,
         unevaluated_slugs=[],
-        failed_slugs=_exclude_infra_wide(pending),
+        failed_slugs=failed_runs,
         executed_slugs=executed_slugs,
     )
 
@@ -2878,7 +2866,7 @@ async def main(argv: Sequence[str] | None = None) -> int:
                 "runs": [run_to_json(r) for r in result.runs],
                 "stopped_early": result.stopped_early,
                 "unevaluated_slugs": result.unevaluated_slugs,
-                "failed_slugs": result.failed_slugs,
+                "failed_slugs": [dataclasses.asdict(f) for f in result.failed_slugs],
                 "executed_slugs": result.executed_slugs,
             },
             indent=2,

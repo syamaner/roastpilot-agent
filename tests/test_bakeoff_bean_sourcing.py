@@ -174,6 +174,42 @@ def test_load_corpus_rejects_accept_any_of_on_a_gold_present_field(tmp_path: Pat
         bo.load_corpus(tmp_path)
 
 
+def test_accept_any_of_eligible_fields_excludes_altitude_and_tasting() -> None:
+    """``altitude``/``tasting`` kinds have their OWN bespoke absent-handling
+    (``_classify_altitude``/``_classify_tasting``) that never consults
+    ``accept_any_of`` -- they must be excluded from the eligible set (#602
+    fold round 5, FOLD 4)."""
+    eligible = bo._ACCEPT_ANY_OF_ELIGIBLE_FIELDS  # pyright: ignore[reportPrivateUsage]
+    assert "altitude" not in eligible
+    assert "tasting_notes" not in eligible
+    assert "origin" in eligible  # a "text"-kind field IS eligible
+
+
+def test_load_corpus_rejects_accept_any_of_on_a_field_its_classifier_ignores(
+    tmp_path: Path,
+) -> None:
+    """``tasting_notes`` (kind ``tasting``) has its OWN bespoke absent-handling
+    that never consults ``accept_any_of`` -- setting it there would be
+    silently ignored, so it must be rejected at LOAD time instead, naming
+    the field and the reason (#602 fold round 5, FOLD 4)."""
+    (tmp_path / "bad.html").write_text("<html>hi</html>")
+    all_absent = {f.name: {"absent": True} for f in bo.FIELD_SPECS if f.name != "name"}
+    (tmp_path / "bad.gold.json").write_text(
+        json.dumps(
+            {
+                "provenance": {"url": "https://example.com/bad", "vendor": "x"},
+                "name": {"value": "X"},
+                "fields": {
+                    **all_absent,
+                    "tasting_notes": {"absent": True, "accept_any_of": ["sweet"]},
+                },
+            }
+        )
+    )
+    with pytest.raises(ValueError, match="tasting_notes.*accept_any_of"):
+        bo.load_corpus(tmp_path)
+
+
 def test_load_corpus_rejects_a_gold_json_with_no_top_level_name(tmp_path: Path) -> None:
     """A custom gold record missing the top-level ``name`` key entirely (the
     ``if name_field is not None`` branch's False path) must fail the same
@@ -849,6 +885,28 @@ def test_wilson_interval_zero_trials_is_undefined_proportion() -> None:
     assert degenerate.high == 1.0
 
 
+def test_binary_cor_counts_excludes_par() -> None:
+    """PAR is EXCLUDED from both COR and trials (#602 fold round 5, FOLD 3):
+    the research note's COR-vs-not decomposition here is binary -- COR vs
+    {INC, MIS} -- so a partial match is neither a success nor a countable
+    trial. A prior round's ``+ par`` in the denominator contradicted the
+    documented decomposition and diluted the estimate."""
+    run = _run(
+        "m",
+        {
+            "p1": {"a": bo.Outcome.COR},
+            "p2": {"a": bo.Outcome.PAR},
+            "p3": {"a": bo.Outcome.INC},
+            "p4": {"a": bo.Outcome.MIS},
+            "p5": {"a": bo.Outcome.ABS_COR},
+            "p6": {"a": bo.Outcome.SPU},
+        },
+    )
+    cor, trials = bo.binary_cor_counts(run)
+    assert cor == 1  # only the COR cell
+    assert trials == 3  # COR + INC + MIS -- PAR, ABS_COR, SPU all excluded
+
+
 def test_mcnemar_exact_known() -> None:
     fields_a = {f"f{i}": bo.Outcome.COR for i in range(5)}
     fields_b = {f"f{i}": bo.Outcome.INC for i in range(5)}
@@ -1034,7 +1092,7 @@ def test_render_report_has_headline_pairwise_cost_and_caveat(
     assert "SCREENING harness, not certification" in report
     assert "RANGE-altitude COR" in report  # the range-altitude caveat (#600)
     assert "PARTIAL RUN" not in report
-    assert "EXCLUDED -- transient failure" not in report
+    assert "EXCLUDED -- failed this invocation" not in report
 
 
 def test_render_report_pairwise_reports_every_promised_axis(
@@ -1098,15 +1156,16 @@ def test_render_report_marks_budget_stopped_runs_partial(
 def test_render_report_marks_failed_models_excluded(corpus: list[bo.CorpusPage]) -> None:
     """A wholly-failed model must appear ONLY in the exclusion banner, never
     in the leaderboard/per-page/pairwise sections below it (#600 round-2
-    finding)."""
+    finding) -- and the banner shows its DISPLAY-ONLY heuristic label,
+    never checkpointed regardless of it (#602 fold round 5)."""
     runs = [_full_run("model-a", bo.Outcome.COR)]
     report = bo.render_report(
         runs,
         bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]),
-        failed_slugs=["model-failed"],
+        failed_slugs=[bo.FailedRun(model_slug="model-failed", heuristic_label="MODEL-SPECIFIC")],
     )
-    assert "EXCLUDED -- transient failure" in report
-    assert "model-failed" in report
+    assert "EXCLUDED -- failed this invocation" in report
+    assert "`model-failed` (MODEL-SPECIFIC, heuristic)" in report
     assert "- models scored: 1" in report  # the failed model is NOT counted
 
 
@@ -1575,11 +1634,12 @@ def test_pipeline_fingerprint_changes_when_a_widened_module_changes(
 def test_fingerprinted_dependencies_cover_bean_sourcing_third_party_imports() -> None:
     """No lockfile + broad pyproject ranges mean a compatible upgrade of any
     of these changes extraction behaviour without touching first-party
-    source (#602 fold round 4, FOLD 2)."""
+    source (#602 fold round 4, FOLD 2; ``openai`` added round 5, FOLD 2)."""
     assert set(bo._FINGERPRINTED_DEPENDENCIES) == {  # pyright: ignore[reportPrivateUsage]
         "httpx",
         "pydantic",
         "pydantic-ai-slim",
+        "openai",
         "extruct",
         "trafilatura",
         "lxml",
@@ -1711,11 +1771,11 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
     """Every page erroring, with NO peer having succeeded this invocation, is
-    classified INFRA-WIDE (#602): must not be cached as 'done' -- a re-run
-    should retry, not resume the outage forever (#600 finding) -- AND must
-    not appear in ``runs`` as a scored 0.000 row polluting the
-    leaderboard/statistics (#600 round-2 finding): it is reported separately
-    via ``failed_slugs`` instead."""
+    labelled INFRA-WIDE (heuristic, display-only, #602 fold round 5): must
+    not be cached as 'done' -- a re-run should retry, not resume the outage
+    forever (#600 finding) -- AND must not appear in ``runs`` as a scored
+    0.000 row polluting the leaderboard/statistics (#600 round-2 finding):
+    it is reported separately via ``failed_slugs`` instead."""
     out = tmp_path / "o.json"
     result = await bo.run_bakeoff(
         corpus,
@@ -1727,7 +1787,7 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
         model=_model_text_only(),
     )
     assert result.runs == []
-    assert result.failed_slugs == ["m1"]
+    assert result.failed_slugs == [bo.FailedRun(model_slug="m1", heuristic_label="INFRA-WIDE")]
     assert result.executed_slugs == ["m1"]  # a paid attempt WAS made
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
@@ -1735,17 +1795,15 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
 
 
 @pytest.mark.asyncio
-async def test_run_bakeoff_resumed_success_does_not_excuse_a_fresh_failure(
+async def test_run_bakeoff_resumed_success_does_not_flip_the_heuristic_label(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
-    """A RESUMED peer's PAST success must NOT count as evidence this
-    invocation's key/provider/network is healthy right now -- otherwise a
-    stale checkpoint would turn a genuine session-wide outage into
-    permanently-checkpointed MODEL-SPECIFIC scores for every freshly-
-    attempted model (#602 fold 1: round 1 of this fix wrongly counted a
-    resumed success too). With ONLY a resumed peer and every FRESH model
-    failing, the fresh failure stays INFRA-WIDE -- excluded, not scored,
-    not checkpointed."""
+    """A RESUMED peer's PAST success does not count as ``has_fresh_success``
+    for the DISPLAY-ONLY heuristic label (#602 fold round 1, preserved
+    through the round-5 simplification): with only a resumed peer and every
+    FRESH model failing, the fresh failure is labelled INFRA-WIDE -- never
+    checkpointed either way (the label no longer affects persistence at
+    all, #602 fold round 5)."""
     out = tmp_path / "o.json"
     fingerprint = bo.compute_fingerprint(corpus)
     # Seed a checkpoint with a peer that succeeded in a PRIOR invocation --
@@ -1765,45 +1823,19 @@ async def test_run_bakeoff_resumed_success_does_not_excuse_a_fresh_failure(
         model=_model_text_only(),  # only applies to "bad" -- "good" resumes
     )
     assert {r.model_slug for r in result.runs} == {"good"}  # "bad" NOT scored
-    assert result.failed_slugs == ["bad"]
+    assert result.failed_slugs == [bo.FailedRun(model_slug="bad", heuristic_label="INFRA-WIDE")]
     assert result.executed_slugs == ["bad"]
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
-    assert not checkpoint.has("bad")  # INFRA-WIDE is never checkpointed
-
-
-def _failed_run(slug: str, n_pages: int = 2) -> bo.ModelRun:
-    return bo.ModelRun(
-        model_slug=slug,
-        pages=[
-            bo.PageResult(slug=f"p{i}", outcomes={}, error="boom", on_page_fields=0)
-            for i in range(n_pages)
-        ],
-    )
-
-
-def test_checkpoint_model_specific_scores_and_persists_eagerly(tmp_path: Path) -> None:
-    checkpoint = bo.Checkpoint(tmp_path / "cells.jsonl", resume=False)
-    runs: list[bo.ModelRun] = []
-    failed = _failed_run("bad")
-    bo._checkpoint_model_specific(failed, runs, checkpoint)  # pyright: ignore[reportPrivateUsage]
-    assert runs == [failed]
-    assert checkpoint.has("bad")
-
-
-def test_exclude_infra_wide_lists_every_pending_slug_uncheckpointed() -> None:
-    failed_slugs = bo._exclude_infra_wide(  # pyright: ignore[reportPrivateUsage]
-        [_failed_run("bad"), _failed_run("worse")]
-    )
-    assert failed_slugs == ["bad", "worse"]
+    assert not checkpoint.has("bad")  # NEVER checkpointed, regardless of the heuristic label
 
 
 def _model_switch_after(n: int, *, fail_first: bool) -> FunctionModel:
     """A double that flips outcome after the ``n``th call, letting one
     shared ``model`` drive TWO sequential models in one ``run_bakeoff``
-    invocation to different (fresh) outcomes. ``fail_first`` fails the
-    first ``n`` calls then succeeds; otherwise it succeeds the first ``n``
-    then fails. A successful page costs 1 call; a wholly-failing page
-    retries once, so 2 calls -- callers compute ``n`` accordingly."""
+    invocation to different outcomes. ``fail_first`` fails the first ``n``
+    calls then succeeds; otherwise it succeeds the first ``n`` then fails.
+    A successful page costs 1 call; a wholly-failing page retries once, so
+    2 calls -- callers compute ``n`` accordingly."""
     calls = {"n": 0}
 
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -1819,149 +1851,48 @@ def _model_switch_after(n: int, *, fail_first: bool) -> FunctionModel:
 
 
 @pytest.mark.asyncio
-async def test_run_bakeoff_eagerly_checkpoints_a_provable_model_specific_failure(
+async def test_run_bakeoff_never_checkpoints_a_wholly_failed_run_even_with_a_fresh_peer(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
-    """A paid failed attempt is checkpointed at the EARLIEST provable moment,
-    not deferred to loop-end/budget-stop: "a" succeeds, "b" wholly fails
-    right after (already provable MODEL-SPECIFIC), then an "interruption"
-    (a budget stop) hits before "c" -- "b" must ALREADY be on disk, and a
-    later resume must NOT re-run (re-pay for) it (#602 fold, round 3)."""
+    """#602 fold round 5 SIMPLIFICATION: rounds 3-4 eagerly checkpointed a
+    wholly-failed run once a fresh peer's success made it "provable"
+    MODEL-SPECIFIC -- but no invocation-local signal can truly tell a
+    transient outage occurring inside ONE model's turn apart from a
+    model-specific fault, so that eager persistence could permanently
+    corrupt the leaderboard on exactly this ambiguous case. Failed attempts
+    are cheap to retry; a mis-scored failure is expensive to fix -- so a
+    wholly-failed run is NEVER checkpointed, even when "a" succeeds first
+    and "b" then wholly fails (the heuristic label is display-only)."""
     out = tmp_path / "o.json"
     fingerprint = bo.compute_fingerprint(corpus)
-    roster = [
-        bo.RosterModel("a", 0.1, 0.1, "x"),
-        bo.RosterModel("b", 0.1, 0.1, "x"),
-        bo.RosterModel("c", 0.1, 0.1, "x"),
-    ]
+    roster = [bo.RosterModel("a", 0.1, 0.1, "x"), bo.RosterModel("b", 0.1, 0.1, "x")]
     estimates = bo.estimate_cost(corpus, roster)
-    cost_ab = sum(e.usd for e in estimates if e.slug in ("a", "b"))
-    result = await bo.run_bakeoff(
-        corpus,
-        ["a", "b", "c"],
-        out=out,
-        resume=True,
-        max_spend=cost_ab,  # enough for a+b -- "interrupts" (stops) before c
-        cost_estimates=estimates,
-        model=_model_switch_after(len(corpus), fail_first=False),  # a succeeds, b fails
-    )
-    assert result.stopped_early is True
-    assert result.unevaluated_slugs == ["c"]
-    assert {r.model_slug for r in result.runs} == {"a", "b"}
-    assert result.failed_slugs == []  # "b" was already MODEL-SPECIFIC, not INFRA-WIDE
-    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
-    assert checkpoint.has("b")  # already on disk BEFORE "c" was even attempted
-
-    resumed = await bo.run_bakeoff(
-        corpus,
-        ["a", "b", "c"],
-        out=out,
-        resume=True,
-        max_spend=1000.0,
-        cost_estimates=estimates,
-        model=_model_text_only(),
-    )
-    assert "b" not in resumed.executed_slugs  # resumed, NOT re-run (no re-pay)
-
-
-@pytest.mark.asyncio
-async def test_run_bakeoff_flushes_pending_before_the_triggering_success_reports(
-    corpus: list[bo.CorpusPage], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The pending flush must complete BEFORE the triggering success's OWN
-    checkpoint/report step -- if THAT step raises (simulating an
-    interruption in exactly that window, before "a" itself is ever
-    recorded), every already-provable pending failure must already be
-    durable on disk (#602 fold round 4, FOLD 1)."""
-    out = tmp_path / "o.json"
-    fingerprint = bo.compute_fingerprint(corpus)
-    original_model_metrics = bo.model_metrics
-
-    def _raise_for_a(run: bo.ModelRun) -> bo.ModelMetrics:
-        if run.model_slug == "a":
-            raise RuntimeError("simulated interruption during success reporting")
-        return original_model_metrics(run)
-
-    monkeypatch.setattr(bo, "model_metrics", _raise_for_a)
-    roster = [bo.RosterModel("b", 0.1, 0.1, "x"), bo.RosterModel("a", 0.1, 0.1, "x")]
-    estimates = bo.estimate_cost(corpus, roster)
-
-    with pytest.raises(RuntimeError, match="simulated interruption"):
-        await bo.run_bakeoff(
-            corpus,
-            ["b", "a"],  # "b" fails first (pending), "a" succeeds second (triggers the flush)
-            out=out,
-            resume=True,
-            max_spend=1000.0,
-            cost_estimates=estimates,
-            model=_model_switch_after(2 * len(corpus), fail_first=True),
-        )
-    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
-    # "b" is durable even though "a" itself never got recorded at all (its
-    # OWN serialisation raised) -- proving the flush fully completed BEFORE
-    # any of "a"'s own checkpoint/report code ran.
-    assert checkpoint.has("b")
-    assert not checkpoint.has("a")
-
-
-@pytest.mark.asyncio
-async def test_run_bakeoff_flushes_a_pending_failure_at_the_first_fresh_success(
-    corpus: list[bo.CorpusPage], tmp_path: Path
-) -> None:
-    """A wholly-failed model that ran BEFORE any fresh success is held
-    PENDING until the FIRST fresh success arrives -- then it is classified +
-    checkpointed AT THAT MOMENT: an "interruption" (a budget stop) right
-    after that first success must already see it checkpointed, never
-    wrongly excluded as INFRA-WIDE (#602 fold, round 3)."""
-    out = tmp_path / "o.json"
-    fingerprint = bo.compute_fingerprint(corpus)
-    roster = [
-        bo.RosterModel("b", 0.1, 0.1, "x"),
-        bo.RosterModel("a", 0.1, 0.1, "x"),
-        bo.RosterModel("c", 0.1, 0.1, "x"),
-    ]
-    estimates = bo.estimate_cost(corpus, roster)
-    cost_ba = sum(e.usd for e in estimates if e.slug in ("b", "a"))
-    result = await bo.run_bakeoff(
-        corpus,
-        ["b", "a", "c"],  # "b" fails FIRST (pending), "a" succeeds SECOND (first success)
-        out=out,
-        resume=True,
-        max_spend=cost_ba,  # "interrupts" (stops) before c
-        cost_estimates=estimates,
-        # b fails for the first 2*len(corpus) calls (1 retry per failing page), then a succeeds.
-        model=_model_switch_after(2 * len(corpus), fail_first=True),
-    )
-    assert result.stopped_early is True
-    assert result.unevaluated_slugs == ["c"]
-    assert {r.model_slug for r in result.runs} == {"a", "b"}
-    assert result.failed_slugs == []  # flushed MODEL-SPECIFIC at "a"'s success, not INFRA-WIDE
-    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
-    assert checkpoint.has("b")
-    assert checkpoint.has("a")
-
-
-@pytest.mark.asyncio
-async def test_run_bakeoff_a_second_fresh_success_does_not_reflush(
-    corpus: list[bo.CorpusPage], tmp_path: Path
-) -> None:
-    """Once ``has_fresh_success`` flips True, a SECOND fresh success must
-    not re-enter the (now-empty) pending-flush branch -- it is just scored
-    normally, like any other successful run."""
-    out = tmp_path / "o.json"
     result = await bo.run_bakeoff(
         corpus,
         ["a", "b"],
         out=out,
         resume=True,
         max_spend=1000.0,
-        cost_estimates=bo.estimate_cost(
-            corpus, [bo.RosterModel("a", 0.1, 0.1, "x"), bo.RosterModel("b", 0.1, 0.1, "x")]
-        ),
-        model=_model_returning({"name": "X", "country": "Ecuador"}),  # both "a" and "b" succeed
+        cost_estimates=estimates,
+        model=_model_switch_after(len(corpus), fail_first=False),  # "a" succeeds, "b" fails
     )
-    assert {r.model_slug for r in result.runs} == {"a", "b"}
-    assert result.failed_slugs == []
+    assert {r.model_slug for r in result.runs} == {"a"}  # the success IS scored, unaffected
+    assert result.failed_slugs == [bo.FailedRun(model_slug="b", heuristic_label="MODEL-SPECIFIC")]
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert checkpoint.has("a")
+    assert not checkpoint.has("b")  # NEVER checkpointed, regardless of the heuristic label
+
+    # A resume must ALWAYS retry "b" -- a paid attempt is made again.
+    resumed = await bo.run_bakeoff(
+        corpus,
+        ["a", "b"],
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=estimates,
+        model=_model_text_only(),
+    )
+    assert resumed.executed_slugs == ["b"]  # "a" resumed (no new call), "b" retried
 
 
 def test_run_wholly_failed_detects_all_errored_pages() -> None:
@@ -2020,7 +1951,7 @@ async def test_main_full_run_writes_artifact_and_partial_report(
         runs=[_full_run(bo.MODEL_ROSTER[0].slug, bo.Outcome.COR)],
         stopped_early=True,
         unevaluated_slugs=[bo.MODEL_ROSTER[1].slug],
-        failed_slugs=["some/failed-slug"],
+        failed_slugs=[bo.FailedRun(model_slug="some/failed-slug", heuristic_label="INFRA-WIDE")],
         executed_slugs=[bo.MODEL_ROSTER[0].slug, "some/failed-slug"],
     )
 
@@ -2050,10 +1981,12 @@ async def test_main_full_run_writes_artifact_and_partial_report(
     artifact = json.loads(out.read_text())
     assert artifact["stopped_early"] is True
     assert artifact["unevaluated_slugs"] == [bo.MODEL_ROSTER[1].slug]
-    assert artifact["failed_slugs"] == ["some/failed-slug"]
+    assert artifact["failed_slugs"] == [
+        {"model_slug": "some/failed-slug", "heuristic_label": "INFRA-WIDE"}
+    ]
     assert artifact["executed_slugs"] == [bo.MODEL_ROSTER[0].slug, "some/failed-slug"]
     report_text = report_md.read_text()
     assert "PARTIAL RUN" in report_text
-    assert "EXCLUDED -- transient failure" in report_text
+    assert "EXCLUDED -- failed this invocation" in report_text
     assert "some/failed-slug" in report_text
     assert "ESTIMATED SPEND INCURRED" in report_text
