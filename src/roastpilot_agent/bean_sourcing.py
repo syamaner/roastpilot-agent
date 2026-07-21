@@ -4671,10 +4671,16 @@ def _draft_from_identity(
     above. Every typed field's evidence quote captured on ``identity``
     (#590 D2a) is now ALSO threaded onto the returned draft's
     :attr:`~roastpilot_agent.models.BeanProfileDraft.field_evidence`
-    (#627), independent of the gate verdicts above — a quote is included
-    whenever the model returned one, regardless of whether its field
-    demoted to ``"origin_estimated"``, so the operator sees what the
-    model cited even though it is not automatically certified.
+    (#627), independent of the VALUE gate verdicts above — an authenticated
+    quote is included regardless of whether its field demoted to
+    ``"origin_estimated"``, so the operator sees what the model cited even
+    though it is not automatically certified as SUPPORTING the value.
+    Inclusion is still authenticity-gated on the quote's own existence
+    (#633, hardening the #627 crossing): :func:`_find_authentic_segment`
+    must find ``quote`` as a genuine whole-phrase, single-segment span in
+    ``merged_corpus`` (page-wide, not the narrower main-region locality)
+    or the quote is dropped — a fabricated or cross-segment-spliced quote
+    must never be presented to the operator as verbatim page text.
     Every roast-target field is always
     ``"origin_estimated"``. The optional free-text fields (``country``, ``farm``,
     ``bean_varietal``, ``description``) are normalized via
@@ -4872,14 +4878,30 @@ def _draft_from_identity(
     for field_name in _TARGET_FIELDS:
         field_sources[field_name] = "origin_estimated"
 
-    # field_evidence (#627): the model-cited verbatim quotes for the four
-    # TYPED fields, surfaced for operator judgement now that every
-    # automated citation gate for these four is permanently parked (see
-    # this function's docstring). Independent of field_sources/the gates
-    # above — a quote is captured whenever the model returned one,
-    # regardless of gate verdict. Blank/whitespace-only quotes normalize
-    # away via _normalize_optional_text, same convention as the optional
-    # identity text fields; an omitted/None quote leaves the field simply
+    # field_evidence (#627, hardened #633): the model-cited verbatim quotes
+    # for the four TYPED fields, surfaced for operator judgement now that
+    # every automated citation gate for these four is permanently parked
+    # (see this function's docstring). Independent of field_sources/the
+    # VALUE gates above — a quote's inclusion never depends on whether its
+    # field's value demoted to "origin_estimated". It IS, however,
+    # authenticity-checked against the page: entries are verified to
+    # appear verbatim (normalized, whole-phrase, within a single
+    # CONTIGUOUS corpus segment — :func:`_find_authentic_segment`, reused
+    # from the #590 D2b/D2c machinery) in ``merged_corpus`` — the whole
+    # merged vendor-data-only corpus (page body + JSON-LD facts), not the
+    # narrower main-region locality the parked gates use, because the
+    # claim being made to the operator is "this text appears on the page"
+    # (page-wide), not "this text supports the value in its own
+    # neighbourhood" (which is what locality is for). This authenticates
+    # only the QUOTE'S EXISTENCE on the page — it does NOT certify that
+    # the quote actually supports the field's value (that remains the
+    # permanently-parked certification gates' concern, #590). A quote that
+    # fails authentication (fabricated, or spliced across segments) is
+    # DROPPED — the operator sees no quote rather than a possible
+    # fabrication attributed to the vendor page. Blank/whitespace-only
+    # quotes normalize away via _normalize_optional_text first, same
+    # convention as the optional identity text fields; an omitted/None
+    # quote, or one that fails authentication, leaves the field simply
     # absent from the map (meaning "no quote captured"), not an empty
     # string entry.
     field_evidence: dict[str, str] = {}
@@ -4890,7 +4912,7 @@ def _draft_from_identity(
         ("is_blend", identity.is_blend_evidence),
     ):
         quote = _normalize_optional_text(raw_evidence)
-        if quote is not None:
+        if quote is not None and _find_authentic_segment(quote, merged_corpus) is not None:
             field_evidence[field_name] = quote
 
     scouting_note = (

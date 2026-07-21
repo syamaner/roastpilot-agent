@@ -887,9 +887,16 @@ class BeanProfileDraft(_BeanProfileFieldsBase):
     docstring) — none of them promotes a field to ``"on_page"`` any more —
     so this map exists to surface the quote the model actually cited for
     OPERATOR judgement instead (#590's ledger), not to certify anything
-    automatically. An entry is present only when a quote was captured for
-    that field; a field with no captured quote (or whose value was ``None``)
-    is simply absent, the same "absent means unset" convention as
+    automatically. Entries are authenticity-checked (#633): the quote text
+    is verified to appear verbatim (normalized, whole-phrase, within a
+    single contiguous segment) on the fetched page before it is included —
+    this authenticates the QUOTE'S EXISTENCE only, not the value-claim
+    (certification gates parked per #590); a quote that fails this check
+    (fabricated, or spliced across separate parts of the page) is dropped
+    entirely rather than surfaced as a possible fabrication. An entry is
+    present only when a quote was both captured AND authenticated for that
+    field; a field with no captured/authenticated quote (or whose value was
+    ``None``) is simply absent, the same "absent means unset" convention as
     ``field_sources``. Values are UNTRUSTED vendor page text passed straight
     through from the extraction — never render them unescaped — and are
     already bounded to 500 characters each at the extraction schema
