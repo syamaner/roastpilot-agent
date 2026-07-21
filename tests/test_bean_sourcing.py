@@ -4098,16 +4098,20 @@ def test_main_product_region_anchored_heading_closes_at_next_heading() -> None:
     assert "gift box" not in region
 
 
-def test_main_product_region_two_consecutive_anchored_headings_yield_no_empty_region() -> None:
+def test_main_product_region_two_consecutive_anchored_headings_each_get_own_region() -> None:
     """Two anchor-matching headings back-to-back, with no content line
-    between them, must not append an empty region (the ``region_lines``
-    guard) — the second heading still opens its OWN region normally."""
+    between them: each still opens its OWN region, seeded with its own
+    heading text (#590 Codex round-2 fold, Sa4cg — the heading IS
+    positive recognition, so the first heading's region is no longer
+    empty; it is the heading text alone). The second heading's region
+    correctly picks up the content that follows it."""
     body = _framed(
         "Kenya Kiambu AA",
         "## Kenya Kiambu AA\n## Kenya Kiambu AA\nReal content under the second heading.\n",
     )
     region = bean_sourcing._main_product_region(body, "", "")  # pyright: ignore[reportPrivateUsage]
-    assert region == "Kenya Kiambu AA\nReal content under the second heading."
+    assert "Real content under the second heading." in region
+    assert region.count("Kenya Kiambu AA") >= 2  # title prepend + at least one heading echo
 
 
 def test_main_product_region_json_ld_name_absent_brand_heading_opens_nothing() -> None:
@@ -4161,6 +4165,73 @@ def test_main_product_region_includes_title_text_for_authentication() -> None:
     assert (
         bean_sourcing._find_authentic_segment(  # pyright: ignore[reportPrivateUsage]
             "Morning House Blend", region
+        )
+        is not None
+    )
+
+
+# --- #590 slice E1a, Codex round 2: one-directional anchor match (Sa4cf)
+# + matched heading text belongs to its region (Sa4cg) ---
+
+
+def test_heading_matches_anchor_reverse_direction_no_longer_matches() -> None:
+    """Sa4cf: the reverse direction (a longer anchor merely CONTAINING
+    the heading) is DROPPED — a generic "Coffee" heading must not match
+    just because it's a substring of the longer anchor "Kenya Coffee"
+    (that direction would let an unrelated "## Coffee" related-products
+    heading open a region on any page whose own name contains "coffee")."""
+    matches = bean_sourcing._heading_matches_anchor(  # pyright: ignore[reportPrivateUsage]
+        "Coffee", ["kenya coffee"]
+    )
+    assert matches is False
+
+
+def test_heading_matches_anchor_forward_direction_still_matches() -> None:
+    """The forward direction (the heading CONTAINS the anchor) still
+    matches — a heading that extends the anchor with extra qualifying
+    text."""
+    matches = bean_sourcing._heading_matches_anchor(  # pyright: ignore[reportPrivateUsage]
+        "Kenya Kiambu — Single Origin", ["kenya kiambu"]
+    )
+    assert matches is True
+
+
+def test_heading_matches_anchor_abbreviation_is_a_documented_over_demote() -> None:
+    """Documented over-demote (AC E-2, same pattern as the altitude
+    whitelist): a heading that ABBREVIATES a suffix-laden anchor ("Kenya
+    Kiambu AA" vs the fuller "Kenya Kiambu AA 250g Whole Bean") no longer
+    matches now that the reverse direction is gone — the safe direction
+    only; widening is evidence-gated, never assumed."""
+    matches = bean_sourcing._heading_matches_anchor(  # pyright: ignore[reportPrivateUsage]
+        "Kenya Kiambu AA", ["kenya kiambu aa 250g whole bean"]
+    )
+    assert matches is False
+
+
+def test_main_product_region_reverse_match_heading_opens_nothing() -> None:
+    """Integration proof for Sa4cf: a generic "## Coffee" heading, with
+    JSON-LD name "Kenya Coffee", must not open a region — related-products
+    "Coffee" chrome must not become main region just because the page's
+    own name happens to contain that word."""
+    region = bean_sourcing._main_product_region(  # pyright: ignore[reportPrivateUsage]
+        "## Coffee\nShop our full range of house blends.\n", "Kenya Coffee", "Kenya Coffee"
+    )
+    assert region == "Kenya Coffee"
+    assert "Shop our full range" not in region
+
+
+def test_main_product_region_matched_heading_text_authenticates() -> None:
+    """Sa4cg: the matched heading's OWN text belongs to its region — a
+    polarity statement written only in the heading itself (never repeated
+    in the body) can still authenticate."""
+    body = _framed(
+        "Kenya Kiambu",
+        "## Kenya Kiambu — Single Origin\nNotes of stone fruit and honey.\n",
+    )
+    region = bean_sourcing._main_product_region(body, "", "")  # pyright: ignore[reportPrivateUsage]
+    assert (
+        bean_sourcing._find_authentic_segment(  # pyright: ignore[reportPrivateUsage]
+            "Kenya Kiambu — Single Origin", region
         )
         is not None
     )

@@ -3208,18 +3208,23 @@ def _line_is_sentinel(line: str) -> bool:
 
 
 def _heading_matches_anchor(heading_text: str, anchors_normalized: list[str]) -> bool:
-    """Whether ``heading_text`` (raw) whole-phrase-contains, or is
-    contained by, any of ``anchors_normalized`` (#590 slice E1) — a short
-    anchor inside a longer heading, or a longer anchor whose heading is
-    an abbreviation, both count."""
+    """Whether ``heading_text`` (raw) whole-phrase-CONTAINS any of
+    ``anchors_normalized`` (#590 slice E1) — ONE-DIRECTIONAL ONLY (Codex
+    round-2, Sa4cf): a short anchor inside a longer heading counts (e.g.
+    heading "Kenya Kiambu — Single Origin" for anchor "Kenya Kiambu"),
+    but the reverse — a longer anchor merely CONTAINING the heading —
+    does NOT, because that direction lets a generic heading reverse-match
+    a suffix-laden anchor (JSON-LD name "Kenya Coffee" would otherwise
+    let an unrelated "## Coffee" related-products heading open a region;
+    a fail-open crack in the whitelist). Documented over-demote (AC
+    E-2, same pattern as the altitude whitelist): a heading that
+    ABBREVIATES a suffix-laden anchor (e.g. "## Kenya Kiambu AA" vs
+    anchor "Kenya Kiambu AA 250g Whole Bean") no longer matches — the
+    safe direction only; widening is evidence-gated, not assumed."""
     normalized_heading = _normalize_for_containment(heading_text)
     if not normalized_heading:
         return False
-    return any(
-        _contains_whole_phrase(anchor, normalized_heading)
-        or _contains_whole_phrase(normalized_heading, anchor)
-        for anchor in anchors_normalized
-    )
+    return any(_contains_whole_phrase(anchor, normalized_heading) for anchor in anchors_normalized)
 
 
 def _main_product_region(body_text: str, json_ld_values: str, json_ld_name: str) -> str:
@@ -3257,8 +3262,14 @@ def _main_product_region(body_text: str, json_ld_values: str, json_ld_name: str)
       BEFORE the anchor match, so a heading that is both — e.g. "## More
       from Acme" when "Acme" is the anchor — never opens a region; a
       sentinel heading only ever closes/truncates, like every other
-      sentinel line), extended up to the next heading of ANY level or a
-      sentinel line; and
+      sentinel line). The MATCHED HEADING'S OWN TEXT (sans the ``#``
+      marks) is itself the first line of that region (Codex round-2,
+      Sa4cg — the heading IS the positive recognition, same rationale as
+      the A1 title prepend: a polarity statement written only in the
+      heading, e.g. "## Kenya Kiambu — Single Origin", must still be
+      able to authenticate even when the body below is only tasting
+      notes). The region then extends up to the next heading of ANY
+      level or a sentinel line; and
     - ``json_ld_values`` itself, appended unconditionally when non-blank
       (already identity-matched to the URL upstream, so it is
       main-region by construction, never scanned for headings/sentinels).
@@ -3315,7 +3326,12 @@ def _main_product_region(body_text: str, json_ld_values: str, json_ld_name: str)
             and _heading_matches_anchor(heading, anchors_normalized)
         ):
             index += 1
-            region_lines: list[str] = []
+            # The matched heading's own text seeds the region (#590 Codex
+            # round-2, Sa4cg) — always non-blank here (an empty/whitespace
+            # heading normalizes to "" in _heading_matches_anchor and so
+            # never reaches this branch), so this list is never empty and
+            # the join below always has content to append.
+            region_lines: list[str] = [heading]
             while (
                 index < total
                 and _heading_text(lines[index]) is None
@@ -3323,8 +3339,7 @@ def _main_product_region(body_text: str, json_ld_values: str, json_ld_name: str)
             ):
                 region_lines.append(lines[index])
                 index += 1
-            if region_lines:
-                regions.append("\n".join(region_lines))
+            regions.append("\n".join(region_lines))
         else:
             index += 1
 
