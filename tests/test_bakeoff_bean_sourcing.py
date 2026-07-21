@@ -14,6 +14,7 @@ new scoring logic.
 
 from __future__ import annotations
 
+import dataclasses
 import importlib.metadata
 import json
 import sys
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic_ai import ModelAPIError
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -48,10 +50,22 @@ def _model_returning(args: dict[str, Any]) -> FunctionModel:
 
 def _model_text_only() -> FunctionModel:
     """A double that only ever returns prose — never the output tool, so the
-    structured extraction exhausts retries and the page fails to draft."""
+    structured extraction exhausts retries and the page fails to draft.
+
+    A malformed-shape failure -- a SCHEMA failure (#601 F1), never wholly-failed."""
 
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
         return ModelResponse(parts=[TextPart("no structured output")])
+
+    return FunctionModel(respond)
+
+
+def _model_provider_error() -> FunctionModel:
+    """A double that always raises a genuine provider error -- an INFRA-class
+    failure (#601 F1), unlike :func:`_model_text_only`'s schema failure."""
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        raise ModelAPIError("test-model", "simulated provider outage")
 
     return FunctionModel(respond)
 
@@ -868,6 +882,65 @@ def test_macro_f1_excludes_a_field_never_gold_present() -> None:
     assert bo.macro_f1(run) == pytest.approx(1.0)
 
 
+# --- Schema failures vs other errors (#601 fold round 1, P2) -----------------
+#
+# model_metrics() used to count EVERY page.error identically in page_errors,
+# so a provider outage or a reasoning-induced timeout could masquerade as bad
+# schema adherence. schema_failures narrows to the one BeanExtractionUnavailableError
+# cause that IS a genuine malformed-structured-output failure; everything else
+# (timeout, provider/transport error, model-construction failure, fetch failure)
+# is other_errors instead.
+
+
+def test_is_schema_failure_matches_only_the_malformed_shape_message() -> None:
+    assert bo._is_schema_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanExtractionUnavailableError: bean identity extraction returned a malformed "
+        "shape: some pydantic-ai detail"
+    )
+    assert not bo._is_schema_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanExtractionUnavailableError: bean identity extraction exceeded the 45s deadline"
+    )
+    assert not bo._is_schema_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanExtractionUnavailableError: bean identity extraction provider error: boom"
+    )
+    assert not bo._is_schema_failure(  # pyright: ignore[reportPrivateUsage]
+        "BeanFetchError: vendor page fetch failed: boom"
+    )
+    assert not bo._is_schema_failure(None)  # pyright: ignore[reportPrivateUsage]
+
+
+def test_model_metrics_separates_schema_failures_from_other_errors() -> None:
+    fields = {spec.name: bo.Outcome.ERR for spec in bo.FIELD_SPECS}
+    pages = [
+        bo.PageResult(
+            slug="p1",
+            outcomes=dict(fields),
+            error="BeanExtractionUnavailableError: bean identity extraction returned a "
+            "malformed shape: x",
+            on_page_fields=0,
+        ),
+        bo.PageResult(
+            slug="p2",
+            outcomes=dict(fields),
+            error="BeanExtractionUnavailableError: bean identity extraction exceeded the "
+            "45s deadline",
+            on_page_fields=0,
+        ),
+        bo.PageResult(
+            slug="p3",
+            outcomes=dict(fields),
+            error="BeanExtractionUnavailableError: bean identity extraction provider error: boom",
+            on_page_fields=0,
+        ),
+        bo.PageResult(slug="p4", outcomes=dict(fields), error=None, on_page_fields=len(fields)),
+    ]
+    run = bo.ModelRun(model_slug="m", pages=pages)
+    m = bo.model_metrics(run)
+    assert m.schema_failures == 1  # only the malformed-shape page
+    assert m.other_errors == 2  # timeout + provider error
+    assert m.page_errors == 3  # schema_failures + other_errors, preserved for compat
+
+
 # --- Latency capture (#600 round-2 finding) -------------------------------
 #
 # The evaluation plan tie-breaks a statistical tie on cost PLUS latency, but
@@ -1078,6 +1151,117 @@ def test_estimate_cost_positive_and_price_ordered(corpus: list[bo.CorpusPage]) -
     assert by_slug["openai/gpt-5-nano"] < by_slug["openai/gpt-4o"]
 
 
+# --- Reasoning-effort arms (#601) ---------------------------------------------
+
+
+def test_expand_arms_default_off_and_light_are_one_arm_per_model() -> None:
+    slugs = ["m1", "m2"]
+    default_arms = bo.expand_arms(slugs, "default")
+    assert [(a.model_slug, a.reasoning, a.label) for a in default_arms] == [
+        ("m1", "default", "m1"),
+        ("m2", "default", "m2"),
+    ]
+    off_arms = bo.expand_arms(slugs, "off")
+    assert [(a.model_slug, a.reasoning, a.label) for a in off_arms] == [
+        ("m1", "off", "m1+reasoning-off"),
+        ("m2", "off", "m2+reasoning-off"),
+    ]
+    light_arms = bo.expand_arms(slugs, "light")
+    assert [(a.model_slug, a.reasoning, a.label) for a in light_arms] == [
+        ("m1", "light", "m1+reasoning-light"),
+        ("m2", "light", "m2+reasoning-light"),
+    ]
+
+
+def test_expand_arms_both_pairs_off_and_light_never_default() -> None:
+    """``both`` must expand to the "off" AND "light" arms -- the research's actual
+    no-reasoning-vs-light-reasoning question -- NEVER the "default" (provider-default,
+    possibly-high-reasoning) arm (#601 fold round 1)."""
+    both = bo.expand_arms(["m1", "m2"], "both")
+    assert len(both) == 4
+    # grouped per model (off then light), not all-off-then-all-light -- a per-model
+    # comparison reads naturally in run/report order.
+    assert [(a.model_slug, a.reasoning) for a in both] == [
+        ("m1", "off"),
+        ("m1", "light"),
+        ("m2", "off"),
+        ("m2", "light"),
+    ]
+    assert "default" not in {a.reasoning for a in both}
+    # every arm's label is distinct (#601 record-key distinctness).
+    assert len({a.label for a in both}) == 4
+
+
+def test_expand_arms_both_skips_light_for_an_incapable_model(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """ "both" on a mixed roster must emit "light" ONLY for a capable model -- an
+    incapable model gets its "off" arm plus a PRINTED skip note, never a fabricated
+    "light" arm (#601 fold round 2, F3)."""
+    both = bo.expand_arms(
+        ["capable", "incapable"], "both", supports_reasoning={"capable": True, "incapable": False}
+    )
+    assert [(a.model_slug, a.reasoning) for a in both] == [
+        ("capable", "off"),
+        ("capable", "light"),
+        ("incapable", "off"),
+    ]
+    assert "skipping light arm for 'incapable'" in capsys.readouterr().out
+
+
+def test_reasoning_effort_by_arm_maps_default_off_and_light_correctly() -> None:
+    """ "default" omits the setting (provider default, NOT no-reasoning), "off" is the
+    TRUE explicit no-reasoning request, "light" is the provider's low-effort tier
+    (#601 fold round 1)."""
+    assert bo._REASONING_EFFORT_BY_ARM == {  # pyright: ignore[reportPrivateUsage]
+        "default": None,
+        "off": "off",
+        "light": "low",
+    }
+
+
+def test_estimate_cost_for_arms_default_arm_matches_estimate_cost_exactly(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """The ``--reasoning default`` CLI default must reproduce :func:`bo.estimate_cost`'s
+    per-model figures byte-for-byte (behavioural no-op, #601 scope item 6)."""
+    roster = list(bo.MODEL_ROSTER[:2])
+    arms = bo.expand_arms([m.slug for m in roster], "default")
+    plain = bo.estimate_cost(corpus, roster)
+    for_arms = bo.estimate_cost_for_arms(corpus, arms, roster)
+    assert [dataclasses.asdict(e) for e in for_arms] == [dataclasses.asdict(e) for e in plain]
+
+
+def test_estimate_cost_for_arms_off_arm_costs_the_same_as_default(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """An "off" arm is priced identically to "default" (#601 fold round 1): explicit
+    no-reasoning costs no more than the omitted setting, only its label differs."""
+    roster = [bo.RosterModel("m1", 1.0, 1.0, "x")]
+    default_est = bo.estimate_cost_for_arms(corpus, bo.expand_arms(["m1"], "default"), roster)[0]
+    off_est = bo.estimate_cost_for_arms(corpus, bo.expand_arms(["m1"], "off"), roster)[0]
+    assert off_est.slug == "m1+reasoning-off"
+    assert off_est.input_tokens == default_est.input_tokens
+    assert off_est.output_tokens == default_est.output_tokens
+    assert off_est.usd == default_est.usd
+
+
+def test_estimate_cost_for_arms_light_multiplies_output_tokens(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """A "light" arm's cost must reflect :data:`bo.LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER`
+    on output tokens, and be MORE expensive than the same model's "off" arm."""
+    roster = [bo.RosterModel("m1", 1.0, 1.0, "x")]
+    arms = bo.expand_arms(["m1"], "both")
+    off_est, light_est = bo.estimate_cost_for_arms(corpus, arms, roster)
+    assert light_est.slug == "m1+reasoning-light"
+    assert light_est.output_tokens == round(
+        off_est.output_tokens * bo.LIGHT_REASONING_OUTPUT_TOKEN_MULTIPLIER
+    )
+    assert light_est.input_tokens == off_est.input_tokens
+    assert light_est.usd > off_est.usd
+
+
 def test_load_dotenv_key(tmp_path: Path) -> None:
     (tmp_path / ".env").write_text('OPENROUTER_API_KEY="sk-or-secret"\nOTHER=1\n')
     assert bo.load_dotenv_key(tmp_path) == "sk-or-secret"
@@ -1112,10 +1296,21 @@ async def test_main_refuses_unpriced_custom_model(capsys: pytest.CaptureFixture[
 
 
 @pytest.mark.asyncio
+async def test_main_refuses_reasoning_light_with_no_capable_model(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--reasoning light`` against a roster with ZERO reasoning-capable models must
+    refuse before any spend (#601 fold round 2, F3) -- gpt-4o is non-reasoning."""
+    code = await bo.main(["--models", "openai/gpt-4o", "--reasoning", "light", "--max-spend", "5"])
+    assert code == 2
+    assert "no requested model supports reasoning" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
 async def test_main_estimate_only_is_zero_spend(capsys: pytest.CaptureFixture[str]) -> None:
     assert await bo.main(["--estimate-only"]) == 0
     out = capsys.readouterr().out
-    assert "roster total" in out
+    assert "arm total" in out  # #601: "roster total" renamed once arms can outnumber models
 
 
 # --- --max-spend argparse validation (#602 finding) --------------------------
@@ -1282,6 +1477,72 @@ def test_render_report_no_executed_slugs_is_pure_estimate(corpus: list[bo.Corpus
     assert "NOT yet spent" in report
     assert "ESTIMATED SPEND INCURRED" not in report
     assert "ACTUALLY SPENT" not in report
+
+
+def test_render_report_reasoning_arm_comparison_groups_by_model(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """When both the "off" and "light" arms of a model were scored, the report groups
+    them into a per-model comparison section (#601 scope item 5, fold round 1: off vs
+    light, never default vs light)."""
+    runs = [
+        _full_run("model-a+reasoning-off", bo.Outcome.COR),
+        _full_run("model-a+reasoning-light", bo.Outcome.PAR),
+        _full_run("model-b", bo.Outcome.INC),  # a lone "default" arm -- must not appear below
+    ]
+    roster = [bo.RosterModel("model-a", 0.1, 0.1, "x"), bo.RosterModel("model-b", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["model-a"], "both") + bo.expand_arms(["model-b"], "default")
+    report = bo.render_report(runs, bo.estimate_cost_for_arms(corpus, arms, roster))
+    assert "Reasoning-arm comparison (off vs light" in report
+    after_heading = report.split("Reasoning-arm comparison", 1)[1]
+    section = after_heading.split("\n## ", 1)[0]  # up to the NEXT top-level heading only
+    assert "`model-a`" in section
+    assert "`model-b`" not in section  # only a paired model is compared
+
+
+def test_render_report_reasoning_arm_comparison_absent_for_default_only_runs(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """The ``--reasoning default`` CLI default (no off/light sibling ever scored) must
+    not add the comparison section at all -- report shape stays exactly the pre-#601
+    shape."""
+    runs = [_full_run("model-a", bo.Outcome.COR), _full_run("model-b", bo.Outcome.INC)]
+    report = bo.render_report(runs, bo.estimate_cost(corpus, bo.MODEL_ROSTER[:2]))
+    assert "Reasoning-arm comparison" not in report
+
+
+def test_render_report_reasoning_arm_comparison_separates_schema_and_other_errors(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """The off-vs-light comparison must show 'schema failures' and 'other errors' as
+    separate columns, never one merged 'page errors' count (#601 fold round 1, P2)."""
+
+    def _run_with_errors(slug: str, errors: list[str | None]) -> bo.ModelRun:
+        # Every field is populated (mirroring how score_page fills a whole-page
+        # failure) so render_report's per-page outcomes table can index every
+        # FIELD_SPECS cell without a KeyError.
+        fields = {spec.name: bo.Outcome.ERR for spec in bo.FIELD_SPECS}
+        pages = [
+            bo.PageResult(slug=f"p{i}", outcomes=dict(fields), error=err, on_page_fields=0)
+            for i, err in enumerate(errors)
+        ]
+        return bo.ModelRun(model_slug=slug, pages=pages)
+
+    off_run = _run_with_errors(
+        "model-a+reasoning-off",
+        ["BeanExtractionUnavailableError: bean identity extraction returned a malformed shape: x"],
+    )
+    light_run = _run_with_errors(
+        "model-a+reasoning-light",
+        ["BeanExtractionUnavailableError: bean identity extraction exceeded the 45s deadline"],
+    )
+    roster = [bo.RosterModel("model-a", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["model-a"], "both")
+    report = bo.render_report([off_run, light_run], bo.estimate_cost_for_arms(corpus, arms, roster))
+    assert "schema F/recovered R (off -> light)" in report
+    assert "other errors (off -> light)" in report
+    assert "1/0 -> 0/0" in report  # off's schema failure (0 recovered) -> light has none
+    assert "0 -> 1" in report  # light's timeout (other error) -> off has none
 
 
 def test_run_json_roundtrips_outcomes() -> None:
@@ -1642,7 +1903,7 @@ async def test_run_bakeoff_budget_stop_makes_no_calls(
     estimates = bo.estimate_cost(corpus, roster)
     result = await bo.run_bakeoff(
         corpus,
-        ["m1"],
+        bo.expand_arms(["m1"], "default"),
         out=tmp_path / "o.json",
         resume=False,
         max_spend=0.0,  # first model's estimate > 0 -> stop before any (paid) call
@@ -1665,7 +1926,7 @@ async def test_run_bakeoff_resumes_without_calls(
     checkpoint.append(bo.run_to_json(_full_run("m1", bo.Outcome.COR)))
     result = await bo.run_bakeoff(
         corpus,
-        ["m1"],
+        bo.expand_arms(["m1"], "default"),
         out=out,
         resume=True,
         max_spend=1000.0,
@@ -1676,6 +1937,60 @@ async def test_run_bakeoff_resumes_without_calls(
     assert result.unevaluated_slugs == []
     assert result.executed_slugs == []  # resumed, not newly called
     assert result.failed_slugs == []
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_both_arms_checkpoint_under_distinct_labels(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """``--reasoning both`` must checkpoint/score the "off" and "light" arms of ONE
+    model as two DISTINCT records (#601 scope item 3: the per-run record key
+    includes the reasoning arm; fold round 1: "both" is off+light, never default)."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "both")
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost_for_arms(corpus, arms, roster),
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert {r.model_slug for r in result.runs} == {"m1+reasoning-off", "m1+reasoning-light"}
+    assert result.executed_slugs == ["m1+reasoning-off", "m1+reasoning-light"]
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert checkpoint.has("m1+reasoning-off")
+    assert checkpoint.has("m1+reasoning-light")
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_resume_distinguishes_arms(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """A checkpointed "off" arm must NOT be mistaken for its "light" sibling on
+    resume -- only the arm actually on disk is skipped, the other still runs."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    fingerprint = bo.compute_fingerprint(corpus)
+    seed = bo.Checkpoint(bo.sidecar_path(out), resume=False, fingerprint=fingerprint)
+    # only the "off" arm resumed
+    seed.append(bo.run_to_json(_full_run("m1+reasoning-off", bo.Outcome.COR)))
+
+    arms = bo.expand_arms(["m1"], "both")
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost_for_arms(corpus, arms, roster),
+        model=_model_returning({"name": "X", "country": "Ecuador"}),
+    )
+    assert {r.model_slug for r in result.runs} == {"m1+reasoning-off", "m1+reasoning-light"}
+    assert result.executed_slugs == ["m1+reasoning-light"]  # "off" resumed, no new call
 
 
 # --- Pipeline fingerprint (#600 round-2 finding) --------------------------
@@ -1825,7 +2140,7 @@ async def test_run_bakeoff_pipeline_change_invalidates_resume(
     monkeypatch.setattr(bo, "_pipeline_fingerprint", lambda: "pipeline-v1")
     first = await bo.run_bakeoff(
         corpus,
-        ["m1"],
+        bo.expand_arms(["m1"], "default"),
         out=out,
         resume=True,
         max_spend=1000.0,
@@ -1839,7 +2154,7 @@ async def test_run_bakeoff_pipeline_change_invalidates_resume(
     monkeypatch.setattr(bo, "_pipeline_fingerprint", lambda: "pipeline-v2")
     second = await bo.run_bakeoff(
         corpus,
-        ["m1"],
+        bo.expand_arms(["m1"], "default"),
         out=out,
         resume=True,
         max_spend=1000.0,
@@ -1863,7 +2178,7 @@ async def test_run_bakeoff_stale_fingerprint_is_not_resumed(
     # on disk and hit the (real) budget-stop path.
     result = await bo.run_bakeoff(
         corpus,
-        ["m1"],
+        bo.expand_arms(["m1"], "default"),
         out=out,
         resume=True,
         max_spend=0.0,
@@ -1877,21 +2192,23 @@ async def test_run_bakeoff_stale_fingerprint_is_not_resumed(
 async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
     corpus: list[bo.CorpusPage], tmp_path: Path
 ) -> None:
-    """Every page erroring, with NO peer having succeeded this invocation, is
-    labelled INFRA-WIDE (heuristic, display-only, #602 fold round 5): must
-    not be cached as 'done' -- a re-run should retry, not resume the outage
-    forever (#600 finding) -- AND must not appear in ``runs`` as a scored
-    0.000 row polluting the leaderboard/statistics (#600 round-2 finding):
-    it is reported separately via ``failed_slugs`` instead."""
+    """Every page erroring on a genuine INFRA-class failure, with NO peer having
+    succeeded this invocation, is labelled INFRA-WIDE (heuristic, display-only, #602
+    fold round 5): must not be cached as 'done' -- a re-run should retry, not resume
+    the outage forever (#600 finding) -- AND must not appear in ``runs`` as a scored
+    0.000 row polluting the leaderboard/statistics (#600 round-2 finding): it is
+    reported separately via ``failed_slugs`` instead. Uses a genuine provider error
+    (NOT a schema failure -- #601 F1 gives that case different treatment, see
+    :func:`test_run_bakeoff_all_schema_failure_run_is_checkpointed_and_scored`)."""
     out = tmp_path / "o.json"
     result = await bo.run_bakeoff(
         corpus,
-        ["m1"],
+        bo.expand_arms(["m1"], "default"),
         out=out,
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost(corpus, [bo.RosterModel("m1", 0.1, 0.1, "x")]),
-        model=_model_text_only(),
+        model=_model_provider_error(),
     )
     assert result.runs == []
     assert result.failed_slugs == [bo.FailedRun(model_slug="m1", heuristic_label="INFRA-WIDE")]
@@ -1899,6 +2216,59 @@ async def test_run_bakeoff_does_not_checkpoint_a_wholly_failed_run(
     fingerprint = bo.compute_fingerprint(corpus)
     checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
     assert not checkpoint.has("m1")
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_all_schema_failure_run_is_checkpointed_and_scored(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """An ALL-SCHEMA-failure run (every page a malformed-structured-output failure) is
+    the strongest possible non-adherence signal, not an outage: it must be checkpointed,
+    scored, and appear in the off-vs-light comparison, not dropped as INFRA-WIDE
+    (#601 fold round 2, F1)."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    result = await bo.run_bakeoff(
+        corpus,
+        bo.expand_arms(["m1"], "default"),
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost(corpus, roster),
+        model=_model_text_only(),
+    )
+    assert result.failed_slugs == []
+    assert [r.model_slug for r in result.runs] == ["m1"]
+    m = bo.model_metrics(result.runs[0])
+    assert m.schema_failures == len(corpus)
+    assert m.other_errors == 0
+    fingerprint = bo.compute_fingerprint(corpus)
+    checkpoint = bo.Checkpoint(bo.sidecar_path(out), resume=True, fingerprint=fingerprint)
+    assert checkpoint.has("m1")
+
+
+@pytest.mark.asyncio
+async def test_run_bakeoff_all_schema_failure_arm_appears_in_reasoning_comparison(
+    corpus: list[bo.CorpusPage], tmp_path: Path
+) -> None:
+    """An all-schema-failure "off" arm must reach the off-vs-light report section --
+    the strongest adherence signal, not dropped (#601 F1)."""
+    out = tmp_path / "o.json"
+    roster = [bo.RosterModel("m1", 0.1, 0.1, "x")]
+    arms = bo.expand_arms(["m1"], "both")
+    result = await bo.run_bakeoff(
+        corpus,
+        arms,
+        out=out,
+        resume=True,
+        max_spend=1000.0,
+        cost_estimates=bo.estimate_cost_for_arms(corpus, arms, roster),
+        model=_model_text_only(),  # both arms all-schema-failure
+    )
+    assert {r.model_slug for r in result.runs} == {"m1+reasoning-off", "m1+reasoning-light"}
+    report = bo.render_report(result.runs, bo.estimate_cost_for_arms(corpus, arms, roster))
+    assert "Reasoning-arm comparison (off vs light" in report
+    assert f"{len(corpus)}/0 -> {len(corpus)}/0" in report  # both arms' schema failures
 
 
 @pytest.mark.asyncio
@@ -1920,14 +2290,14 @@ async def test_run_bakeoff_resumed_success_does_not_flip_the_heuristic_label(
 
     result = await bo.run_bakeoff(
         corpus,
-        ["good", "bad"],
+        bo.expand_arms(["good", "bad"], "default"),
         out=out,
         resume=True,
         max_spend=1000.0,
         cost_estimates=bo.estimate_cost(
             corpus, [bo.RosterModel("good", 0.1, 0.1, "x"), bo.RosterModel("bad", 0.1, 0.1, "x")]
         ),
-        model=_model_text_only(),  # only applies to "bad" -- "good" resumes
+        model=_model_provider_error(),  # only applies to "bad" -- "good" resumes
     )
     assert {r.model_slug for r in result.runs} == {"good"}  # "bad" NOT scored
     assert result.failed_slugs == [bo.FailedRun(model_slug="bad", heuristic_label="INFRA-WIDE")]
@@ -1941,8 +2311,8 @@ def _model_switch_after(n: int, *, fail_first: bool) -> FunctionModel:
     shared ``model`` drive TWO sequential models in one ``run_bakeoff``
     invocation to different outcomes. ``fail_first`` fails the first ``n``
     calls then succeeds; otherwise it succeeds the first ``n`` then fails.
-    A successful page costs 1 call; a wholly-failing page retries once, so
-    2 calls -- callers compute ``n`` accordingly."""
+    The failing side raises a genuine (INFRA-class, #601 F1) provider error,
+    NOT a schema failure -- 1 call per page either way."""
     calls = {"n": 0}
 
     def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
@@ -1952,7 +2322,7 @@ def _model_switch_after(n: int, *, fail_first: bool) -> FunctionModel:
             return ModelResponse(
                 parts=[ToolCallPart(info.output_tools[0].name, {"name": "X", "country": "Ecuador"})]
             )
-        return ModelResponse(parts=[TextPart("no structured output")])
+        raise ModelAPIError("test-model", "simulated provider outage")
 
     return FunctionModel(respond)
 
@@ -1976,7 +2346,7 @@ async def test_run_bakeoff_never_checkpoints_a_wholly_failed_run_even_with_a_fre
     estimates = bo.estimate_cost(corpus, roster)
     result = await bo.run_bakeoff(
         corpus,
-        ["a", "b"],
+        bo.expand_arms(["a", "b"], "default"),
         out=out,
         resume=True,
         max_spend=1000.0,
@@ -1992,7 +2362,7 @@ async def test_run_bakeoff_never_checkpoints_a_wholly_failed_run_even_with_a_fre
     # A resume must ALWAYS retry "b" -- a paid attempt is made again.
     resumed = await bo.run_bakeoff(
         corpus,
-        ["a", "b"],
+        bo.expand_arms(["a", "b"], "default"),
         out=out,
         resume=True,
         max_spend=1000.0,
@@ -2032,7 +2402,7 @@ async def test_run_bakeoff_checkpoints_a_successful_run(
     out = tmp_path / "o.json"
     result = await bo.run_bakeoff(
         corpus,
-        ["m1"],
+        bo.expand_arms(["m1"], "default"),
         out=out,
         resume=True,
         max_spend=1000.0,
