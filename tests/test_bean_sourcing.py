@@ -7745,6 +7745,133 @@ async def test_extract_page_markdown_bounded_hidden_item_started_by_existing_wor
 
 
 @pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_reclaim_prevents_worker_from_ever_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#607 fold 5 (Codex round 4, SjHAl): a worker can dequeue the hidden
+    item and mark its future RUNNING, then be DESCHEDULED before the
+    wrapper ever reaches ``token.lock``. Deterministically reproduces
+    that exact window via :func:`bean_sourcing._parse_wrapper_entry_seam`
+    (a no-op-in-production test seam): the seam pauses the worker thread
+    INSIDE the wrapper, before it ever touches the lock, while the
+    submission-failure path reclaims the slot on the main coroutine.
+    Asserts the parse body NEVER executes once reclaimed (not merely that
+    the slot is released) and the count stays exact throughout — no leak,
+    no over-free."""
+    _reset_parse_pool_state()
+    monkeypatch.setattr(bean_sourcing, "_parse_executor", None)
+    executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+
+    warmup_gate = threading.Event()
+
+    def _warmup() -> str:
+        warmup_gate.wait(timeout=5.0)
+        return "warmup done"
+
+    executor.submit(_warmup)  # worker-1, busy on the gate
+
+    parse_executed = threading.Event()
+
+    def _sentinel_parse(html: str) -> str | None:
+        parse_executed.set()
+        return "should never run"  # pragma: no cover
+
+    monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _sentinel_parse)
+
+    seam_entered = threading.Event()
+    seam_release = threading.Event()
+
+    def _seam() -> None:
+        # Simulates the worker being descheduled right after dequeuing
+        # the item (future already RUNNING) but before it ever reaches
+        # the wrapper's own token.lock acquisition.
+        seam_entered.set()
+        seam_release.wait(timeout=5.0)
+
+    monkeypatch.setattr(bean_sourcing, "_parse_wrapper_entry_seam", _seam)
+
+    def _raising_adjust_thread_count() -> None:
+        raise OSError("can't start new thread (simulated, #607 fold 5 test)")
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", _raising_adjust_thread_count)
+
+    real_replace = bean_sourcing._replace_poisoned_parse_executor  # pyright: ignore[reportPrivateUsage]
+
+    def _replace_after_worker_enters_seam(
+        poisoned: concurrent.futures.ThreadPoolExecutor,
+    ) -> None:
+        # Release worker-1 so it dequeues the hidden item and enters the
+        # wrapper's seam — confirmed via seam_entered — BEFORE the real
+        # replace/reclaim logic below runs.
+        warmup_gate.set()
+        assert seam_entered.wait(timeout=2.0), "worker never reached the wrapper's seam in time"
+        real_replace(poisoned)
+
+    monkeypatch.setattr(
+        bean_sourcing, "_replace_poisoned_parse_executor", _replace_after_worker_enters_seam
+    )
+
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        "<html>hidden</html>", timeout_seconds=5.0
+    )
+    assert result is None
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+    # Let the worker resume past the seam — it must observe reclaimed and
+    # bail out WITHOUT ever calling the parse.
+    seam_release.set()
+    await asyncio.sleep(0.2)  # settle window
+    assert not parse_executed.is_set(), (
+        "the reclaimed item executed its parse body despite the handshake"
+    )
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_timeout_while_queued_releases_no_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#607 fold 5 (Codex round 4, SjHAo): ``asyncio.timeout`` cancelling
+    the wrapped future while the underlying ``concurrent.futures.Future``
+    is still PENDING (never started, still queued) means
+    ``_run_and_release``'s own ``finally`` NEVER runs — the old
+    done-callback covered this, the wrapper-finally alone does not.
+    Without the fold-5 fix, EACH timeout-while-queued event leaks one
+    slot; two leaks alone would permanently saturate the 2-worker pool.
+    Repeats the scenario 3x to prove there is no cumulative leak."""
+    _reset_parse_pool_state()
+    monkeypatch.setattr(bean_sourcing, "_parse_executor", None)
+    executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+    real_adjust_thread_count = executor._adjust_thread_count  # pyright: ignore[reportPrivateUsage]
+
+    def _never_starts_a_thread() -> None:
+        # No worker is EVER spawned to dequeue the item — it sits on the
+        # queue, genuinely PENDING, until our own asyncio.timeout cancels
+        # it (never via a race with a worker actually picking it up).
+        pass
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", _never_starts_a_thread)
+
+    for attempt in range(3):
+        result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+            f"<html>attempt-{attempt}</html>", timeout_seconds=0.05
+        )
+        assert result is None, f"attempt {attempt} did not fall back"
+        assert (
+            bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+        ), f"attempt {attempt} leaked a slot"
+
+    # A follow-up admission on a HEALTHY (real thread-creation restored)
+    # executor still succeeds at full capacity — not silently shrunk by
+    # the three repeated timeouts above.
+    monkeypatch.setattr(executor, "_adjust_thread_count", real_adjust_thread_count)
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        _SAMPLE_HTML, timeout_seconds=5.0
+    )
+    assert result == bean_sourcing._extract_page_markdown(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_fetch_page_text_prepends_json_ld_ahead_of_trafilatura_markdown() -> None:
     """The slice-B JSON-LD prepend still lands ahead of the (now
     trafilatura-produced) page-body text (#590 slice C)."""
