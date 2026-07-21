@@ -247,7 +247,8 @@ checklist before you open.
   from the 400 count** (operator ruling, 21 Jul — #621): the cap bounds the reviewable
   LOGIC change, and much test bulk is spec-corpus material (parametrised repro tables —
   data in test form). The quality valve replacing the count: **any PR whose test-file
-  diff exceeds ~600 lines triggers a mandatory `qa` reviewer pass pre-open** — test
+  diff exceeds **600** lines (exact threshold) triggers a mandatory `qa` reviewer pass
+  pre-open** — test
   quality is policed by the qa lens, not by rationing test lines. If the logic diff
   exceeds **400**, the PR plan was too coarse — split to the planned slice boundary
   before opening. Enough slices that every one is under the cap: the ~2,000-line #600

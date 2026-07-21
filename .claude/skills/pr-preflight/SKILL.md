@@ -62,8 +62,14 @@ If a gate fails, fix it and re-run before continuing.
 - **The 400-line logic cap is a HARD STOP — the number is exact, not "~400".** Measure
   **logic** lines from the branch's MERGE BASE (so an advancing `origin/main` doesn't
   inflate the count): `git diff --stat $(git merge-base origin/main HEAD)` (equivalently
-  `git diff --stat origin/main...HEAD`), minus data/fixtures/generated/doc files. If that
-  exceeds **400**, STOP — do not open. The story should already have a **PR plan from
+  `git diff --stat origin/main...HEAD`), minus data/fixtures/generated/doc files **and
+  minus test files** (operator ruling, 21 Jul — #621: the cap bounds reviewable LOGIC;
+  test bulk is largely spec-corpus data in test form). If that
+  exceeds **400**, STOP — do not open.
+- **Large test diffs get a qa pass instead of a count.** If the test-file diff exceeds
+  **600** lines (exact threshold), run the `qa` reviewer on the branch pre-open and fold
+  its findings — test quality (vacuous assertions, wrong expectations) is policed by the
+  qa lens, not by rationing test lines. The story should already have a **PR plan from
   kickoff** (AGENTS.md PR-Hygiene: the ordered list of thin PRs decided *before* writing
   code); over the cap means the plan was too coarse or you merged two planned slices —
   split it back to the planned boundary and open the current slice only. Reactively
