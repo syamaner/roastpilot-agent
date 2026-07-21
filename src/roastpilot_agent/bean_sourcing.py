@@ -3578,23 +3578,48 @@ _HEADING_CONJUNCTION_WORDS: frozenset[str] = frozenset({"and", "with", "plus"})
 _HEADING_CONJUNCTION_SYMBOLS: frozenset[str] = frozenset({"&", "+"})
 
 
-def _heading_remainder_has_conjunction(remainder_tokens: list[str]) -> bool:
-    """Whether a heading's remainder tokens (#617 fold 4) — the heading's
-    own normalized words with the matched anchor span removed — name a
-    SECOND entity via a conjunction (:data:`_HEADING_CONJUNCTION_WORDS`,
-    :data:`_HEADING_CONJUNCTION_SYMBOLS`).
+def _heading_compound_marker_prefix_counts(
+    heading_text: str, heading_word_spans: list[tuple[str, int, int]]
+) -> list[int]:
+    """Precompute, ONCE per heading, a prefix-count array over the RAW
+    heading text recording how many "compound marker" positions (#617
+    perf fold, Codex PR #626) sit strictly before each raw index — a
+    comma (checked on the raw, untranslated text: normalization erases
+    it before tokenizing), or a conjunction word/symbol token
+    (:data:`_HEADING_CONJUNCTION_WORDS`, :data:`_HEADING_CONJUNCTION_SYMBOLS`,
+    marked at that token's own raw start position).
+
+    Building this array ONCE, rather than materializing a fresh
+    remainder slice (list or string) per anchor OCCURRENCE, is what
+    makes :func:`_heading_matches_anchor` linear: a crafted heading like
+    ``"a,a,a,..."`` with a 1-character anchor produces O(n) occurrences,
+    and the old per-occurrence slice-and-scan did O(n) work for each —
+    O(n²) total, an event-loop stall synchronously held behind
+    ``draft_bean_from_url``'s start-lock. Every occurrence now costs O(1)
+    array lookups instead (:func:`_heading_matches_anchor`).
 
     Args:
-        remainder_tokens: The heading's normalized, split tokens, minus
-            the matched anchor phrase's own span.
+        heading_text: The raw heading line's text.
+        heading_word_spans: :func:`_raw_word_spans` applied to
+            ``heading_text`` — computed once by the caller and reused
+            here, never re-tokenized.
 
     Returns:
-        ``True`` if the remainder contains a conjunction word or symbol.
+        ``bad_before``, length ``len(heading_text) + 1`` — ``bad_before[i]``
+        is the count of marker positions strictly less than ``i``.
     """
-    return any(
-        token in _HEADING_CONJUNCTION_WORDS or token in _HEADING_CONJUNCTION_SYMBOLS
-        for token in remainder_tokens
-    )
+    length = len(heading_text)
+    marker_at = [False] * length
+    for word, raw_start, _ in heading_word_spans:
+        if word in _HEADING_CONJUNCTION_WORDS or word in _HEADING_CONJUNCTION_SYMBOLS:
+            marker_at[raw_start] = True
+    for i, char in enumerate(heading_text):
+        if char == ",":
+            marker_at[i] = True
+    bad_before = [0] * (length + 1)
+    for i in range(length):
+        bad_before[i + 1] = bad_before[i] + (1 if marker_at[i] else 0)
+    return bad_before
 
 
 def _heading_matches_anchor(heading_text: str, anchors_normalized: list[str]) -> bool:
@@ -3614,23 +3639,28 @@ def _heading_matches_anchor(heading_text: str, anchors_normalized: list[str]) ->
 
     #617 fold 4 (post-review): a match is accepted only when the
     heading's REMAINDER — its own text minus the matched anchor span —
-    carries no conjunction (:func:`_heading_remainder_has_conjunction`).
-    "## Kenya AA & Friends" no longer anchors for "Kenya AA" (the
-    remainder "& Friends" names a compound section); "## Kenya Kiambu —
-    Single Origin" is UNCHANGED (its remainder "single origin" carries no
-    conjunction) — the em dash is already punctuation-translated to a
-    space by :func:`_normalize_for_containment` before tokenizing, so it
-    never reaches this check at all.
+    carries no conjunction word/symbol
+    (:data:`_HEADING_CONJUNCTION_WORDS`, :data:`_HEADING_CONJUNCTION_SYMBOLS`)
+    or comma. "## Kenya AA & Friends" no longer anchors for "Kenya AA"
+    (the remainder "& Friends" names a compound section); "## Kenya AA,
+    Sumatra Mandailing" no longer anchors either (#617 fold 4-FIX-1 — a
+    comma normalizes to a space before tokenizing, erasing the signal
+    unless checked on the RAW text); "## Kenya Kiambu — Single Origin" is
+    UNCHANGED (its remainder "single origin" carries neither — the em
+    dash is a DIFFERENT character, already punctuation-translated to a
+    space before tokenizing, and is never treated as a marker).
 
-    #617 fold 4-FIX-1 (second review round): a comma in the RAW remainder
-    is ALSO treated as compound — "## Kenya AA, Sumatra Mandailing" must
-    not anchor for "Kenya AA" either, but a comma normalizes to a space
-    by :func:`_normalize_for_containment` before the word-based
-    conjunction check ever runs, erasing the signal. Checked on the RAW
-    heading text (:func:`_raw_word_spans`, never the normalized/tokenized
-    form) so the comma survives long enough to be seen — the em dash in
-    "Kenya Kiambu — Single Origin" is a DIFFERENT character and is
-    unaffected by this check.
+    #617 perf fold (Codex PR #626): rather than materializing a fresh
+    remainder (list slice + string slice) and re-scanning it for EVERY
+    anchor occurrence — O(n) work per occurrence, O(n²) total on a
+    crafted heading with O(n) occurrences — every marker position
+    (conjunction word/symbol token, or raw comma) is precomputed ONCE
+    into a prefix-count array (:func:`_heading_compound_marker_prefix_counts`),
+    then each occurrence is checked with two O(1) array lookups: a
+    marker exists in the remainder iff one sits strictly before the
+    matched span's raw start, or at/after its raw end — exactly the
+    same "outside the matched anchor span" test the old remainder slice
+    computed, just without ever materializing it.
 
     Args:
         heading_text: The raw heading line's text (``#`` markers and
@@ -3640,26 +3670,24 @@ def _heading_matches_anchor(heading_text: str, anchors_normalized: list[str]) ->
 
     Returns:
         ``True`` if some anchor matches within the heading AND the
-        remainder around that match carries no conjunction AND no comma
-        (checked on the raw text).
+        remainder around that match carries no conjunction word/symbol
+        and no comma.
     """
     normalized_heading = _normalize_for_containment(heading_text)
     if not normalized_heading:
         return False
     heading_word_spans = _raw_word_spans(heading_text)
     heading_tokens = [word for word, _, _ in heading_word_spans]
+    bad_before = _heading_compound_marker_prefix_counts(heading_text, heading_word_spans)
+    length = len(heading_text)
     for anchor in anchors_normalized:
         anchor_tokens = tuple(anchor.split())
         if not anchor_tokens:
             continue
         for start, end in _phrase_token_spans(anchor_tokens, heading_tokens):
-            remainder_tokens = heading_tokens[:start] + heading_tokens[end + 1 :]
-            if _heading_remainder_has_conjunction(remainder_tokens):
-                continue
             raw_start = heading_word_spans[start][1]
             raw_end = heading_word_spans[end][2]
-            raw_remainder = heading_text[:raw_start] + heading_text[raw_end:]
-            if "," in raw_remainder:
+            if bad_before[raw_start] > 0 or bad_before[length] > bad_before[raw_end]:
                 continue
             return True
     return False

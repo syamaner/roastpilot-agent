@@ -3615,6 +3615,26 @@ def test_heading_matches_anchor_still_anchors_with_no_comma_in_remainder() -> No
     assert matches_anchor("Kenya Kiambu — Single Origin", ["kenya kiambu"]) is True
 
 
+def test_heading_matches_anchor_is_linear_not_quadratic_on_a_crafted_heading() -> None:
+    """Perf regression (Codex PR #626): the OLD implementation
+    materialized a fresh remainder (list slice + string slice) and
+    re-scanned it for EVERY anchor occurrence — O(n) work per
+    occurrence, O(n²) total on a heading engineered to produce O(n)
+    occurrences, a synchronous event-loop stall held behind
+    ``draft_bean_from_url``'s start-lock. A ~19,900-char heading of
+    repeated "a," (each "a" its own occurrence of the 1-character
+    anchor "a") must complete in comfortably sub-second time — the
+    bound is loose (well under the O(n²) case's expected multi-second
+    blowup) to absorb CI jitter, not to pin an exact budget."""
+    matches_anchor = bean_sourcing._heading_matches_anchor  # pyright: ignore[reportPrivateUsage]
+    heading = "a," * 9_950  # ~19,900 chars
+    start = time.monotonic()
+    result = matches_anchor(heading, ["a"])
+    elapsed = time.monotonic() - start
+    assert result is False  # every "a" is comma-adjacent — a compound heading throughout
+    assert elapsed < 1.0
+
+
 def test_draft_from_identity_altitude_comma_compound_heading_sibling_demotes() -> None:
     """End-to-end repro (#617 fold 4-FIX-1): a page anchored on "Kenya AA"
     has a "## Kenya AA, Sumatra Mandailing" section naming a SIBLING lot's
