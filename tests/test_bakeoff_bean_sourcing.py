@@ -981,6 +981,29 @@ async def test_run_model_over_corpus_captures_elapsed_time(corpus: list[bo.Corpu
     assert run.pages[0].elapsed_s >= 0.0
 
 
+@pytest.mark.asyncio
+async def test_run_model_over_corpus_zeroes_recovered_violations_on_a_failed_page(
+    corpus: list[bo.CorpusPage],
+) -> None:
+    """A retry-RECOVERED extraction whose identity is later REJECTED downstream (no
+    usable name/origin) must still report ``recovered_violations == 0`` on that page
+    -- ``PageResult``'s own "0 on a failed page" contract (#601 fold round 3, FB)."""
+    calls = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ModelResponse(parts=[TextPart("not yet structured")])
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, {})])
+
+    run = await bo.run_model_over_corpus(
+        [corpus[0]], model_slug="m", advisor_config=_ADVISOR_CONFIG, model=FunctionModel(respond)
+    )
+    page = run.pages[0]
+    assert page.error is not None  # no usable name/origin -> the page DID fail
+    assert page.recovered_violations == 0
+
+
 def test_run_json_roundtrips_elapsed_s() -> None:
     page = bo.PageResult(
         slug="p", outcomes={"origin": bo.Outcome.COR}, error=None, on_page_fields=1, elapsed_s=4.2
@@ -1192,21 +1215,26 @@ def test_expand_arms_both_pairs_off_and_light_never_default() -> None:
     assert len({a.label for a in both}) == 4
 
 
-def test_expand_arms_both_skips_light_for_an_incapable_model(
+def test_expand_arms_both_gates_arms_by_three_way_capability(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """ "both" on a mixed roster must emit "light" ONLY for a capable model -- an
-    incapable model gets its "off" arm plus a PRINTED skip note, never a fabricated
-    "light" arm (#601 fold round 2, F3)."""
+    """ "both" on a mixed roster must gate BOTH off and light per capability (#601
+    fold round 3, FA): "none" gets neither (both skipped), "mandatory" gets light
+    only (off skipped -- disabling would 400), "optional" gets both, unchanged."""
     both = bo.expand_arms(
-        ["capable", "incapable"], "both", supports_reasoning={"capable": True, "incapable": False}
+        ["nope", "must", "opt"],
+        "both",
+        capability={"nope": "none", "must": "mandatory", "opt": "optional"},
     )
     assert [(a.model_slug, a.reasoning) for a in both] == [
-        ("capable", "off"),
-        ("capable", "light"),
-        ("incapable", "off"),
+        ("must", "light"),
+        ("opt", "off"),
+        ("opt", "light"),
     ]
-    assert "skipping light arm for 'incapable'" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "skipping off arm for 'nope': reasoning is 'none'" in out
+    assert "skipping light arm for 'nope'" in out
+    assert "skipping off arm for 'must': reasoning is 'mandatory'" in out
 
 
 def test_reasoning_effort_by_arm_maps_default_off_and_light_correctly() -> None:
@@ -1304,6 +1332,28 @@ async def test_main_refuses_reasoning_light_with_no_capable_model(
     code = await bo.main(["--models", "openai/gpt-4o", "--reasoning", "light", "--max-spend", "5"])
     assert code == 2
     assert "no requested model supports reasoning" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_main_refuses_reasoning_both_with_no_comparable_model(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``--reasoning both`` must refuse pre-spend when NO requested model has both an
+    off and a light arm -- gpt-4o is "none", gpt-5-mini is "mandatory" (off-incapable),
+    so nothing is comparable (#601 fold round 3, FA)."""
+    code = await bo.main(
+        [
+            "--models",
+            "openai/gpt-4o",
+            "openai/gpt-5-mini",
+            "--reasoning",
+            "both",
+            "--max-spend",
+            "5",
+        ]
+    )
+    assert code == 2
+    assert "no requested model has BOTH off and light arms" in capsys.readouterr().err
 
 
 @pytest.mark.asyncio

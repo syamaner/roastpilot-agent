@@ -89,9 +89,9 @@ DISTINCT arms (:data:`ReasoningArm`) -- "default" (provider's own, possibly-high
 effort) is NOT "off" (true no-reasoning), so ``"both"`` expands to "off"+"light" only,
 never "default". Each arm is checkpointed/reported under its own :attr:`Arm.label`
 (:func:`expand_arms`); :func:`render_report` adds a per-model off-vs-light section
-(schema failures/recovered vs other errors, F1/F2) when both arms were scored. "light"
-is skipped, with a printed note, for a model whose roster entry is not
-``supports_reasoning`` (F3).
+(schema failures/recovered vs other errors, F1/F2) when both arms were scored. "off"/
+"light" are skipped, with a printed note, per a roster entry's
+:data:`RosterReasoningCapability` (FA).
 
 **Ops gotcha -- a stale ``OPENROUTER_API_KEY`` shadows ``.env`` -> 401.** The
 advisor reads ``OPENROUTER_API_KEY`` from ``os.environ`` (via
@@ -198,6 +198,16 @@ DEFAULT_FIXTURES_DIR = _REPO_ROOT / "tests" / "fixtures" / "bean-sourcing"
 OPENROUTER_KEY_ENV = "OPENROUTER_API_KEY"
 
 
+#: A model's reasoning-capability class (#601 fold round 3, FA): "none" never reasons
+#: (an "off" request is at best a no-op, so it and "light" are both skipped -- only
+#: "default" runs); "optional" honours BOTH an explicit off and a light request; a
+#: "mandatory"-reasoning endpoint REJECTS disabling reasoning (HTTP 400 "reasoning is
+#: mandatory for this endpoint", docs/advisor-bakeoff-2026-06-08.md:279-291) -- so its
+#: "off" arm is skipped (only "light" runs); ambiguous (no evidence either way) defaults
+#: to "mandatory", the SAFE choice (it only withholds an arm, never risks a paid 400).
+RosterReasoningCapability = Literal["none", "optional", "mandatory"]
+
+
 @dataclass(frozen=True)
 class RosterModel:
     """One candidate model + its list price (research note section 4).
@@ -207,17 +217,15 @@ class RosterModel:
         price_in_per_mtok: List input price, USD per 1M tokens.
         price_out_per_mtok: List output price, USD per 1M tokens.
         note: The shortlist rationale (report only).
-        supports_reasoning: Whether the model exposes a reasoning-effort parameter
-            (#601 F3) -- ``False`` for gpt-4o/gpt-4.1-mini (classic non-reasoning; the
-            19 Jul bake-off's timeout finding confirms gpt-5-nano/gpt-5-mini ARE).
-            Gates the "light" arm (:func:`expand_arms`).
+        reasoning: The model's :data:`RosterReasoningCapability`, gating
+            :func:`expand_arms`'s off/light arms.
     """
 
     slug: str
     price_in_per_mtok: float
     price_out_per_mtok: float
     note: str
-    supports_reasoning: bool = True
+    reasoning: RosterReasoningCapability = "optional"
 
 
 #: The section-4 cost/quality-frontier shortlist for the (later, gated) paid
@@ -229,27 +237,25 @@ class RosterModel:
 #: (the extraction-owning config, #590 slice A) and make_advisor_config.
 BAKEOFF_EXTRACTION_TIMEOUT_S: float = 45.0
 
+#: Reasoning classification evidence (#601 FA): gpt-5-nano/gpt-5-mini timed out as
+#: "reasoning models" in the 19 Jul bean-sourcing bake-off, and gpt-5-mini/
+#: gemini-3.5-flash are confirmed HTTP-400-on-disable ("mandatory") in
+#: docs/advisor-bakeoff-2026-06-08.md -- gemini-3.1-flash-lite (same flash family,
+#: "enable light thinking" per the research note) and gpt-5-nano (same -nano/-mini
+#: reasoning-model family) follow suit; grok-4.3 is ambiguous -> mandatory (safe
+#: default). That same doc reports Anthropic models "don't reason by default"
+#: (reasoning-off is a no-op) -- so claude-haiku-4.5 is "none", not "optional".
+#: gpt-4o/gpt-4.1-mini are the classic non-reasoning generation ("none"). gpt-5.6-luna
+#: follows gpt-5.5's (no "-mini"/"-nano" suffix) confirmed "optional" pattern.
 MODEL_ROSTER: tuple[RosterModel, ...] = (
-    RosterModel("openai/gpt-5-nano", 0.05, 0.40, "cheapest frontier; the one to beat on price"),
-    RosterModel("x-ai/grok-4.3", 0.20, 0.50, "grok-4-fast deprecated (404); 4.3 is the live slug"),
-    RosterModel("google/gemini-3.1-flash-lite", 0.25, 1.00, "beats gpt-5-mini on 6/8 benches"),
-    RosterModel("openai/gpt-5-mini", 0.25, 2.00, "ParseBench small-model reference; safe default"),
-    RosterModel(
-        "openai/gpt-4.1-mini",
-        0.40,
-        1.60,
-        "battle-tested strict-SO workhorse",
-        supports_reasoning=False,
-    ),
-    RosterModel("anthropic/claude-haiku-4.5", 1.00, 5.00, "best at deciding not to emit"),
+    RosterModel("openai/gpt-5-nano", 0.05, 0.40, "cheapest; beat this on price", "mandatory"),
+    RosterModel("x-ai/grok-4.3", 0.20, 0.50, "grok-4-fast dead (404); 4.3 live", "mandatory"),
+    RosterModel("google/gemini-3.1-flash-lite", 0.25, 1.00, "beats gpt-5-mini 6/8", "mandatory"),
+    RosterModel("openai/gpt-5-mini", 0.25, 2.00, "ParseBench small-model reference", "mandatory"),
+    RosterModel("openai/gpt-4.1-mini", 0.40, 1.60, "battle-tested strict-SO workhorse", "none"),
+    RosterModel("anthropic/claude-haiku-4.5", 1.00, 5.00, "best at deciding not to emit", "none"),
     RosterModel("openai/gpt-5.6-luna", 1.00, 6.00, "strong text/table extraction (ParseBench)"),
-    RosterModel(
-        "openai/gpt-4o",
-        2.50,
-        10.00,
-        "ceiling only -- no extraction edge at 50x price",
-        supports_reasoning=False,
-    ),
+    RosterModel("openai/gpt-4o", 2.50, 10.00, "ceiling only, no extraction edge", "none"),
 )
 
 
@@ -294,7 +300,7 @@ def expand_arms(
     model_slugs: Sequence[str],
     reasoning: Literal["default", "off", "light", "both"],
     *,
-    supports_reasoning: Mapping[str, bool] | None = None,
+    capability: Mapping[str, RosterReasoningCapability] | None = None,
 ) -> list[Arm]:
     """Expand requested model slugs into study arms per ``--reasoning`` (#601).
 
@@ -306,27 +312,34 @@ def expand_arms(
             "off" arm with "light", never the provider-default arm), grouped per model
             (off then light) so a per-model comparison reads naturally in run/report
             order.
-        supports_reasoning: Optional ``{model_slug: capable}`` map (#601 F3) -- a
-            model mapped ``False`` is skipped (printed note) instead of getting a
-            "light" arm. ``None`` (default) treats every model as capable.
+        capability: Optional ``{model_slug: RosterReasoningCapability}`` map (#601 FA)
+            -- ``"none"`` skips BOTH off and light (printed note); ``"mandatory"``
+            skips off only (printed note, light still runs); ``"optional"`` (or a slug
+            absent from the map) gets both, unchanged. "default" is always emitted.
 
     Returns:
         The expanded arm list.
     """
-    capable = supports_reasoning or {}
+    cap = capability or {}
     arms: list[Arm] = []
     for slug in model_slugs:
+        model_cap = cap.get(slug, "optional")
         if reasoning == "default":
             arms.append(Arm(model_slug=slug, reasoning="default", label=slug))
         if reasoning in ("off", "both"):
-            arms.append(Arm(model_slug=slug, reasoning="off", label=slug + _OFF_ARM_LABEL_SUFFIX))
+            if model_cap in ("none", "mandatory"):
+                print(f"[reasoning] skipping off arm for {slug!r}: reasoning is {model_cap!r}")
+            else:
+                arms.append(
+                    Arm(model_slug=slug, reasoning="off", label=slug + _OFF_ARM_LABEL_SUFFIX)
+                )
         if reasoning in ("light", "both"):
-            if not capable.get(slug, True):
+            if model_cap == "none":
                 print(f"[reasoning] skipping light arm for {slug!r}: not reasoning-capable")
-                continue
-            arms.append(
-                Arm(model_slug=slug, reasoning="light", label=slug + _LIGHT_ARM_LABEL_SUFFIX)
-            )
+            else:
+                arms.append(
+                    Arm(model_slug=slug, reasoning="light", label=slug + _LIGHT_ARM_LABEL_SUFFIX)
+                )
     return arms
 
 
@@ -1406,7 +1419,11 @@ async def run_model_over_corpus(
                 on_page_fields=on_page,
                 extracted=None if draft is None else draft.model_dump(mode="json"),
                 elapsed_s=elapsed_s,
-                recovered_violations=diagnostics.schema_retries,
+                # 0 on any failed page (#601 FB) -- a retry-recovered identity extraction
+                # followed by a LATER _draft_from_identity rejection still leaves
+                # diagnostics.schema_retries > 0; PageResult's own contract is "0 on a
+                # failed page", so zero it here rather than leaking a positive count.
+                recovered_violations=0 if draft is None else diagnostics.schema_retries,
             )
         )
     return ModelRun(model_slug=model_slug, pages=results)
@@ -3104,14 +3121,20 @@ async def main(argv: Sequence[str] | None = None) -> int:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
     reasoning_arg = cast("Literal['default', 'off', 'light', 'both']", args.reasoning)
-    arms = expand_arms(
-        model_slugs,
-        reasoning_arg,
-        supports_reasoning={m.slug: m.supports_reasoning for m in roster_for_cost},
-    )
+    capability: dict[str, RosterReasoningCapability] = {
+        m.slug: m.reasoning for m in roster_for_cost
+    }
+    arms = expand_arms(model_slugs, reasoning_arg, capability=capability)
     if reasoning_arg == "light" and not arms:
         print(
             "REFUSED: --reasoning light -- no requested model supports reasoning (#601).",
+            file=sys.stderr,
+        )
+        return 2
+    if reasoning_arg == "both" and not any(c == "optional" for c in capability.values()):
+        print(
+            "REFUSED: --reasoning both -- no requested model has BOTH off and light arms "
+            "(#601 FA); nothing comparable to run.",
             file=sys.stderr,
         )
         return 2
