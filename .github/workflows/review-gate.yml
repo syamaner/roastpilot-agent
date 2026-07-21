@@ -48,6 +48,132 @@ name: Review gate
 # Branch protection (marking review-gate required) is the operator's governance
 # call (main has enforce_admins on) and is NOT changed here — this PR ships only
 # the mechanism.
+#
+# #605 — THE DRAFT->READY DEADLOCK (found 19 Jul on #604, repeated on every
+# ready-toggle that week: #608/#610/#611/#614/#616/#618-#620/#622/#624/#626).
+#
+# claude-code-review.yml runs on `opened` (drafts included — AGENTS.md notes
+# this is intentional; #599's attempt to skip it on drafts was rejected as
+# unsafe, see that issue) AND on `ready_for_review`, in a concurrency group
+# keyed ONLY by PR number (`claude-review-<PR#>`, `cancel-in-progress: true`).
+# That grouping is deliberate (#579): a later run for the SAME PR — whatever
+# triggered it — must cancel an still-running earlier one, or a stale review
+# can post inline threads against a diff a later push already replaced.
+#
+# The failure mode: a run gets cancelled by this concurrency group (e.g. the
+# draft-time `opened` run is still executing when `ready_for_review` fires a
+# fresh one on the SAME head SHA — no new commit, so nothing about the diff is
+# actually stale). `flip-on-review` correctly does NOT flip on a non-success
+# conclusion (fail-closed, by design — see that job's comment). The design
+# assumed a later, uncancelled run always eventually lands `success` and
+# flips the gate. In practice, GitHub's concurrency cancellation raced
+# strangely enough across the observed sequences (draft opened -> ready;
+# ready -> push -> toggle; rebase force-push while ready) that a run for the
+# PR's CURRENT head SHA was sometimes the *last* run ever created for that
+# SHA, and it was the one cancelled — so nothing further was ever going to
+# retry it, and `review-gate` sat PENDING forever. The only fix in practice
+# was the manual `gh pr ready --undo && gh pr ready`, which forces one more
+# `ready_for_review` event to fire a clean, uncancelled run.
+#
+# THE FIX automates exactly that manual retry, scoped tightly so it can never
+# rubber-stamp an unreviewed diff and can never fight a class it doesn't own.
+#
+# ROUND 2 (Codex on #628, 21 Jul): the first cut of this fix used a separate
+# "successor" query with its own predicate to decide whether ANOTHER run
+# should be deferred to — which (a) could pick an OLDER run as the
+# "successor" ahead of the true newest one (an ordering bug: a stale
+# success/failure completion could out-race a newer cancelled run for who
+# gets to decide), (b) re-stamped `pending` on every self-heal, racing
+# `stamp-on-pr`'s exemption stamp (a TOCTOU — the exemption write and the
+# self-heal's `pending` write could land in either order), and (c) enumerated
+# only `success`/`failure` as "terminal", missing `timed_out`,
+# `startup_failure`, `action_required`, `stale`, and any other conclusion
+# GitHub might ever add. A single ownership rule subsumes all three:
+#
+#   **NEWEST-RUN-WINS.** A `flip-on-review` invocation acts on the gate ONLY
+#   if its own run is the newest `Claude Code Review` run for this exact head
+#   SHA (compare `run_number`, GitHub's monotonically increasing per-workflow
+#   counter; tiebreak on `created_at` for the vanishingly unlikely case of a
+#   tie). Every other invocation — regardless of ITS OWN conclusion, even
+#   `success` — defers unconditionally: the newest run's own completion event
+#   is the one authorized to decide, whenever it lands. This is provably
+#   race-order-independent (it doesn't matter which of several completion
+#   events for the same sha is processed first or last — only the newest
+#   run's own event ever acts) and needs no enumeration of terminal
+#   conclusions: `success` flips, `cancelled` (attempt 1 only) self-heals,
+#   and literally anything else (`failure`, `timed_out`, `startup_failure`,
+#   `action_required`, `stale`, future conclusions GitHub adds) falls through
+#   to the same fail-closed "stay pending, log it" branch, because none of
+#   them is `success` or `cancelled`.
+#
+# Within the newest run's own decision:
+#
+#   1. Never clobber a gate that already reads `success` — a stamped
+#      exemption (Dependabot / workflow-editing PR, from stamp-on-pr) or a
+#      prior successful flip already owns this sha; read it fresh
+#      immediately before acting and no-op if so. `skipped` (Dependabot's
+#      structural, permanent conclusion — its claude-review job always skips
+#      via `if: actor != dependabot[bot]`, never a race artifact) is covered
+#      here, not by retrying a job that can never run.
+#   2. Self-heal ONLY on `cancelled`. `failure` and everything else stays
+#      fail-closed exactly as originally designed — a real crash or
+#      infra-level non-success needs an operator, not a retry.
+#   3. Before retrying: is the PR's CURRENT head SHA still this cancelled
+#      run's SHA? If a newer push already superseded it, there is nothing to
+#      retry — a fresh run for the new SHA is already stamp-on-pr's job (and
+#      that new sha has its own, separate "newest run" ownership above it).
+#   4. Bounded to ONE automatic retry ever, per run: only self-heal when this
+#      is the run's first attempt (`run_attempt == 1`). A re-run reuses the
+#      SAME run id (and sha, and run_number) — so a retry that's itself
+#      cancelled again is STILL the newest run for that sha (nothing new was
+#      created), and without this bound it would rerun the identical run id
+#      forever. Attempt ≥2 completing `cancelled` stays pending, logged for
+#      the operator.
+#   5. The self-heal call re-runs the exact workflow run via the Actions API
+#      and does NOT re-write the commit status. The gate is already
+#      `pending` at this point (check 1 just confirmed it isn't `success`),
+#      so a redundant `pending` write adds no information — only a race
+#      window against `stamp-on-pr`'s exemption stamp landing at the same
+#      time (round 2's TOCTOU fold). The re-run's own completion re-enters
+#      this exact script and is, again, the newest run for the sha, so it
+#      alone decides the outcome next.
+#
+# The gate still only ever flips to `success` on an actual `success`
+# conclusion from the sha's newest run (or on already being `success`, check
+# 1) — never on a cancellation, and never from a non-newest run's completion.
+#
+# ROUND 3 (Codex on #628, 21 Jul): round 2's check-1 no-op'd on ANY existing
+# `success`, regardless of what put it there. That's wrong for a genuine
+# stale flip: draft-time claude-review completes `success` and flips the
+# gate; the operator marks the PR ready, which both (a) fires a fresh
+# `ready_for_review` claude-review run and (b) re-stamps the gate `pending`
+# via stamp-on-pr — but if the fresh run gets cancelled and its
+# `flip-on-review` invocation reads the gate BEFORE the ready-toggle's
+# `pending` re-stamp lands, it sees the draft's stale `success`, wrongly
+# no-ops, and the cancelled ready-run never heals. Deadlock reappears via a
+# path check 1 was supposed to prevent.
+#
+# THE FIX correlates the success with its ORIGIN instead of trusting any
+# `success` blindly: `stamp-on-pr`'s two EXEMPTION stamps (Dependabot;
+# workflow-editing PR — the only writers of a `success` state that must
+# never be second-guessed, because `Claude Code Review` legitimately cannot
+# run for them at all) prefix their status `description` with the
+# machine-readable marker `[exempt] `. The ordinary `pending` stamp and
+# `flip-on-review`'s own success-flip description both deliberately do NOT
+# carry it. Check 1 narrows to: no-op ONLY when the latest status is
+# `success` AND its description starts with `[exempt] `. A non-exempt
+# `success` (a real flip — possibly the stale one above) no longer no-ops;
+# the handler proceeds through the normal ownership checks, where
+# newest-run-wins (round 2) makes every remaining ordering safe on its own:
+# a genuinely CURRENT success belongs to the newest run, so a stale OLDER
+# run's cancelled completion still defers to it via the newest-run check
+# above (unchanged); only the sha's actual NEWEST run, if IT is the one
+# that's cancelled, reaches this far and self-heals — and that heal is
+# idempotent-harmless even if the existing non-exempt `success` was in fact
+# still current (the re-run's own eventual `success` just re-lands the same
+# state; see `flip-on-review`'s script for where the marker is checked and
+# `stamp-on-pr`'s script for where it's written — the exact string `[exempt]
+# ` is load-bearing and must stay identical in both places).
 
 on:
   # Stamp the gate on every PR head as soon as it appears / updates.
@@ -59,13 +185,21 @@ on:
     workflows: ["Claude Code Review"]
     types: [completed]
 
-# statuses: write is the only privilege needed — we POST a commit status. No
-# code is checked out or executed from the PR, so this stays safe even on the
-# pull_request trigger (which, for same-repo PRs, runs with the repo token).
+# statuses: write posts AND reads the commit status (`getCombinedStatusForRef`
+# — the #605 fold-2 exemption no-op check — is covered by `statuses: write`,
+# no separate `read` permission exists for statuses). pull-requests: read
+# looks up the PR's current head SHA (self-heal staleness check, #605).
+# actions: write is `flip-on-review`'s #605 self-heal only — listing +
+# re-running a cancelled `Claude Code Review` run via the Actions API when
+# nothing else will retry it (read access to list runs is included in
+# `write`). No code is checked out or executed from the PR, so this stays
+# safe even on the pull_request trigger (which, for same-repo PRs, runs with
+# the repo token).
 permissions:
   contents: read
   statuses: write
   pull-requests: read
+  actions: write
 
 jobs:
   # ---- PR opened / synchronized: stamp PENDING, or auto-pass the exempt classes.
@@ -102,11 +236,21 @@ jobs:
               f.filename.startsWith('.github/workflows/'),
             );
 
+            // #605 round 3, LOAD-BEARING: `[exempt] ` marks a status this
+            // job posted BECAUSE claude-review structurally cannot run for
+            // this PR (Dependabot / workflow-editing), never because a
+            // review actually completed. flip-on-review's check 1 reads this
+            // exact prefix to tell a genuine, permanent exemption apart from
+            // a possibly-stale prior flip `success` — keep it identical in
+            // both places, and never add it to the ordinary `pending` stamp
+            // below (the `else` branch) or to flip-on-review's own
+            // success-flip description.
+            const EXEMPT_MARKER = '[exempt] ';
             const exempt = isDependabot || editsWorkflow;
             const reason = isDependabot
-              ? 'Dependabot PR — Claude Code Review does not run (no secret); auto-pass.'
+              ? `${EXEMPT_MARKER}Dependabot PR — Claude Code Review does not run (no secret); auto-pass.`
               : editsWorkflow
-                ? 'PR edits .github/workflows/** — Claude Code Review cannot run (workflow-validation guard); auto-pass.'
+                ? `${EXEMPT_MARKER}PR edits .github/workflows/** — Claude Code Review cannot run (workflow-validation guard); auto-pass.`
                 : 'Awaiting Claude Code Review to post its findings.';
 
             await github.rest.repos.createCommitStatus({
@@ -151,23 +295,183 @@ jobs:
             // `success` at STAMP time by stamp-on-pr, so the flip is moot for
             // them — the unblock comes from the stamp-time auto-pass, never from
             // this conclusion-gated flip.
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
             const run = context.payload.workflow_run;
             const sha = run.head_sha;
 
-            if (run.conclusion !== 'success') {
+            // #605 round 2 — NEWEST-RUN-WINS ownership. This invocation may
+            // act on the gate ONLY if its own run is the newest `Claude Code
+            // Review` run for this exact sha (compare `run_number`, GitHub's
+            // monotonically increasing per-workflow counter; tiebreak
+            // `created_at`). Every other invocation defers unconditionally —
+            // regardless of its OWN conclusion, even `success` — because the
+            // newest run's own completion event is the one authorized to
+            // decide. This replaces the old separate successor query/
+            // predicate entirely and is race-order-independent: it doesn't
+            // matter which of several completions for the same sha is
+            // delivered first, only the newest run's own event ever acts.
+            const runsForSha = (
+              await github.rest.actions.listWorkflowRuns({
+                owner,
+                repo,
+                workflow_id: run.workflow_id,
+                head_sha: sha,
+              })
+            ).data.workflow_runs;
+            const newest = runsForSha.reduce((a, b) => {
+              if (a.run_number !== b.run_number) return a.run_number > b.run_number ? a : b;
+              return new Date(a.created_at) >= new Date(b.created_at) ? a : b;
+            });
+            if (newest.id !== run.id) {
               core.info(
-                `review-gate NOT flipping on ${sha}: review run ${run.id} conclusion=${run.conclusion}, staying pending (fail-closed).`,
+                `review-gate: run ${run.id} (run_number ${run.run_number}) on ${sha} is not the newest Claude Code Review run for this sha (newest is run ${newest.id}, run_number ${newest.run_number}) — deferring; its own completion event owns the gate.`,
               );
               return;
             }
 
-            await github.rest.repos.createCommitStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              sha,
-              context: 'review-gate',
-              state: 'success',
-              description: 'Claude Code Review completed; findings gated by conversation resolution.'.slice(0, 140),
-            });
+            if (run.conclusion === 'success') {
+              await github.rest.repos.createCommitStatus({
+                owner,
+                repo,
+                sha,
+                context: 'review-gate',
+                state: 'success',
+                description: 'Claude Code Review completed; findings gated by conversation resolution.'.slice(0, 140),
+              });
+              core.info(`review-gate=success on ${sha} (review run ${run.id}, conclusion=success, newest run for this sha).`);
+              return;
+            }
 
-            core.info(`review-gate=success on ${sha} (review run ${run.id}, conclusion=success).`);
+            // #605 fold 2 / round 3, LOAD-BEARING: never clobber a gate that
+            // already reads a genuinely EXEMPT `success` — but do NOT
+            // blindly trust every `success` (round 3's fix). stamp-on-pr
+            // prefixes its two exemption stamps (Dependabot / workflow-
+            // editing PR — the only classes where claude-review structurally
+            // cannot run) with the exact marker `[exempt] ` in the status
+            // description; that's the only `success` this check no-ops on.
+            // A NON-exempt `success` is a real flip (possibly a STALE one —
+            // e.g. a draft-time success sitting in front of a ready-toggle's
+            // `pending` re-stamp that hasn't landed yet) and must NOT
+            // suppress a self-heal: it falls through to the normal ownership
+            // checks below, where newest-run-wins (round 2) makes every
+            // remaining ordering safe on its own.
+            const EXEMPT_MARKER = '[exempt] ';
+            const combined = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha });
+            const currentGate = combined.data.statuses.find((s) => s.context === 'review-gate');
+            if (
+              currentGate &&
+              currentGate.state === 'success' &&
+              typeof currentGate.description === 'string' &&
+              currentGate.description.startsWith(EXEMPT_MARKER)
+            ) {
+              core.info(
+                `review-gate: ${run.conclusion} run ${run.id} on ${sha} — gate already reads success via a stamped EXEMPTION ("${currentGate.description}"); no-op.`,
+              );
+              return;
+            }
+
+            // #605 fold 1: self-heal ONLY on a genuinely `cancelled`
+            // conclusion. Everything else — `failure`, `timed_out`,
+            // `startup_failure`, `action_required`, `stale`, or any future
+            // conclusion GitHub adds — stays fail-closed exactly as
+            // originally designed: a real crash or infra-level non-success
+            // needs an operator, not an automatic retry loop. No enumeration
+            // needed; this is the single fallthrough for "not success, not
+            // cancelled".
+            if (run.conclusion !== 'cancelled') {
+              core.info(
+                `review-gate NOT flipping on ${sha}: review run ${run.id} conclusion=${run.conclusion} (newest run for this sha), staying pending (fail-closed).`,
+              );
+              return;
+            }
+
+            // Find the PR this run reviewed (same-repo PRs populate
+            // `pull_requests` directly; fall back to the commit-associated-PRs
+            // API for the rare case it doesn't — #605 fold 5: an OPEN PR
+            // whose head sha still matches this run's sha in THIS repo, not
+            // just the first commit-associated PR returned, which can be a
+            // closed/merged or unrelated PR that happens to share history).
+            let prNumber = run.pull_requests && run.pull_requests[0]
+              ? run.pull_requests[0].number
+              : undefined;
+            if (!prNumber) {
+              const assoc = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner,
+                repo,
+                commit_sha: sha,
+              });
+              const match = assoc.data.find(
+                (p) =>
+                  p.state === 'open' &&
+                  p.head &&
+                  p.head.sha === sha &&
+                  p.head.repo &&
+                  p.head.repo.full_name === `${owner}/${repo}`,
+              );
+              prNumber = match && match.number;
+            }
+            if (!prNumber) {
+              core.info(
+                `review-gate: cancelled run ${run.id} on ${sha} has no associated OPEN PR with a matching head sha; nothing to self-heal, staying pending.`,
+              );
+              return;
+            }
+
+            // Stale check: this run's sha may no longer be the PR's CURRENT
+            // head (the `runsForSha` query above is itself scoped to this
+            // possibly-stale sha, so "newest run for this sha" alone doesn't
+            // prove the sha is still current). If the PR has since moved to
+            // a newer commit, a fresh claude-review run for THAT sha already
+            // owns its own, separate newest-run decision — nothing to retry
+            // for this stale one.
+            const pr = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            if (pr.data.head.sha !== sha) {
+              core.info(
+                `review-gate: cancelled run ${run.id} targeted stale sha ${sha}; PR #${prNumber} head is now ${pr.data.head.sha} — already superseded, staying pending on the new sha until its own review completes.`,
+              );
+              return;
+            }
+
+            // #605 fold 3: bound self-heal to exactly ONE automatic retry.
+            // `reRunWorkflow` reuses the SAME run id (and sha, and
+            // run_number) — so a retry that's itself cancelled again is
+            // STILL the newest run for this sha (nothing new was created),
+            // and without this bound we would rerun the identical run id
+            // forever. Self-heal only ever fires on this run's first
+            // completion.
+            if (run.run_attempt && run.run_attempt >= 2) {
+              core.notice(
+                `review-gate: cancelled run ${run.id} on ${sha} is already retry attempt ${run.run_attempt}; #605 self-heal retries automatically only once. Staying pending — needs operator attention (manual \`gh pr ready --undo && gh pr ready\` still works).`,
+              );
+              return;
+            }
+
+            // This cancelled run is the newest, first-attempt run for the
+            // CURRENT head sha and nothing else will retry it automatically.
+            // Self-heal: re-run this exact workflow run (the API re-runs it
+            // against the same commit/ref it originally targeted). This is
+            // exactly what the manual `gh pr ready --undo && gh pr ready`
+            // workaround forced — one more clean attempt. Deliberately do
+            // NOT re-write the commit status here (#605 round 2 TOCTOU
+            // fold): the gate is already `pending` (the fold-2 check above
+            // just confirmed it isn't `success`), so a redundant `pending`
+            // write adds no information, only a race window against
+            // `stamp-on-pr`'s exemption stamp landing at the same time. The
+            // re-run's own completion re-enters this exact script and is,
+            // again, the newest run for this sha — it alone decides next.
+            try {
+              await github.rest.actions.reRunWorkflow({ owner, repo, run_id: run.id });
+              core.info(
+                `review-gate: #605 self-heal — re-ran cancelled run ${run.id} on ${sha} (newest run, attempt 1); staying pending (no redundant status write) until it completes.`,
+              );
+            } catch (err) {
+              // Fail-closed, not fail-loud: leave the stamp-time `pending`
+              // exactly where it was (never flip on a re-run request we
+              // couldn't even confirm was accepted) and surface the API
+              // error in the log for the operator, who still has the manual
+              // `gh pr ready --undo && gh pr ready` workaround available.
+              core.warning(
+                `review-gate: #605 self-heal re-run of ${run.id} on ${sha} failed: ${err}. Staying pending — manual re-trigger still works.`,
+              );
+            }
