@@ -149,10 +149,10 @@ text (no new network access, no new byte budget); its own HTML parser is
 verified XXE-safe the same way slice B's ``extruct`` parser is (HTML mode
 never expands DTD entities; ``no_network`` defaults ``True`` and is never
 overridden) — see :func:`_extract_page_markdown`. Dispatched off the event
-loop via ``asyncio.to_thread`` in :func:`_fetch_page_text` (checklist class
-6), BOUNDED by that same call's ``config.fetch_timeout_seconds`` deadline
-(#590 slice C P1 fix — this call runs under
-:meth:`~roastpilot_agent.api.RoastService.draft_bean_from_url`'s
+loop via :func:`_extract_page_markdown_bounded` in :func:`_fetch_page_text`
+(checklist class 6), BOUNDED by that same call's
+``config.fetch_timeout_seconds`` deadline (#590 slice C P1 fix — this call
+runs under :meth:`~roastpilot_agent.api.RoastService.draft_bean_from_url`'s
 ``_start_lock``, shared with ``start_roast``, so an unbounded call here
 would hang every roast start, not just this draft). On that timeout the
 draft FALLS BACK to the linear-strip pass rather than failing (#590 slice C
@@ -175,15 +175,33 @@ page's OWN, attacker-influenceable ``<link rel="canonical">``/``og:url``
 tags regardless of whether a ``url=`` argument is passed to
 ``trafilatura.extract``) must never reach the LLM prompt looking like
 code-verified provenance.
+
+**Bounded, dedicated executor for the markdown parse (#607):**
+``asyncio.timeout`` cancels the *await*, never the underlying OS thread, so
+a genuinely infinite-loop-class parse plus repeated retries would each leak
+a permanently-hung worker. :func:`_extract_page_markdown_bounded` dispatches
+onto a dedicated, module-owned :class:`~concurrent.futures.ThreadPoolExecutor`
+(:func:`_get_parse_executor`, two workers) rather than the shared default
+executor ``api.py``'s own ``asyncio.to_thread`` calls use, so a leak can only
+exhaust this pool, never theirs. An in-flight-worker counter
+(:data:`_inflight_parse_count`, guarded by :data:`_parse_slot_lock`) skips a
+new call straight to the linear-strip fallback once both workers are busy,
+rather than queuing behind a saturated pool. A submission failure (e.g. a
+thread-limit ``OSError``) discards and replaces the executor
+(:func:`_replace_poisoned_parse_executor`) and releases the reserved slot
+before falling back the same way — never escaping this function's fail-soft
+contract.
 """
 
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import ipaddress
 import logging
 import re
 import socket
+import threading
 import zlib
 from dataclasses import dataclass
 from html import unescape
@@ -765,6 +783,294 @@ def _sanitize_trafilatura_frontmatter(markdown: str) -> str:
     if not kept:
         return body
     return "---\n" + "\n".join(kept) + "\n---\n" + body
+
+
+# --- #607: dedicated, bounded executor + admission control for the
+# untrusted trafilatura markdown parse ---
+#
+# ``asyncio.timeout`` cancels the *await*, never the underlying OS thread,
+# so a genuinely infinite-loop-class parse plus repeated retries would
+# each leak a permanently-hung worker into the SHARED default executor
+# ``api.py``'s config-load/device-enumeration calls use (bare
+# ``asyncio.to_thread``, the pre-#607 approach). Fix: a dedicated pool a
+# leak can only exhaust on its own, plus admission control on actual
+# worker occupancy instead of queuing behind a full pool.
+#
+# #607 fold 1: the first admission counter released via
+# ``call_soon_threadsafe`` onto the submitting event loop, silently
+# swallowing the ``RuntimeError`` when that loop was already closed —
+# permanently skipping the decrement. Now LOOP-INDEPENDENT: a plain
+# ``int`` guarded by :data:`_parse_slot_lock`, mutated directly from
+# whichever thread touches it.
+#
+# #607 fold 2: a failed ``submit()`` still leaves a work item on the
+# executor's queue (CPython enqueues before the call that can raise) —
+# freeing only the slot left it hidden for a later thread start to run
+# anyway. :func:`_replace_poisoned_parse_executor` discards the whole
+# executor (``shutdown(cancel_futures=True)``) and resets the singleton.
+#
+# #607 fold 4: an EXISTING idle worker can dequeue and START that hidden
+# item before the fold-2 drain reaches it — a started item can never be
+# cancelled or, pre-fold-4, get a done-callback (``submit()`` raised
+# before ``add_done_callback`` could run). Fixed by submitting a
+# WRAPPER, not the bare parse (:class:`_ParseSlotToken` +
+# :func:`_release_parse_slot_once`): the slot rides with the work item,
+# reclaimed by the failure path only after proving it never started.
+#
+# #607 fold 5, two gaps in that handshake: (a) a worker can dequeue an
+# item and be descheduled BETWEEN the future going RUNNING and the
+# wrapper's first line — ``started``/``reclaimed`` are now a true
+# handshake under the SAME lock, so a reclaimed item can never reach the
+# parse at all; (b) a still-PENDING item OUR OWN ``asyncio.timeout``
+# cancels never runs the wrapper's ``finally`` — the ``TimeoutError``
+# handler now releases when ``concurrent_future.cancelled()``, mirroring
+# the collateral-cancellation branch.
+
+#: Worker count for the dedicated parse pool. Two, matching the existing
+#: concurrency-1 draft semaphore (``api._draft_bean_from_url_semaphore``)
+#: with one spare slot: a single worker still hung from a PRIOR draft
+#: attempt must not, on its own, leave the very next draft's markdown
+#: attempt with zero capacity.
+_MAX_CONCURRENT_PARSES: Final[int] = 2
+
+_parse_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+#: Guards read/create/replace of the :data:`_parse_executor` singleton —
+#: distinct from :data:`_parse_slot_lock` (the in-flight COUNT). Held only
+#: for the brief singleton swap, never across ``submit()``/the parse.
+_parse_executor_lock = threading.Lock()
+
+#: Guards read-modify-write of :data:`_inflight_parse_count`, held only for
+#: that mutation, never across ``submit()``/the parse — check-and-increment
+#: is one lock acquisition (no window to push past the cap), and the
+#: worker-thread release takes the same lock for its decrement.
+_parse_slot_lock = threading.Lock()
+
+#: In-flight-worker admission counter, guarded by :data:`_parse_slot_lock`.
+#: Tracks workers ACTUALLY OCCUPIED: a timed-out *await* does not
+#: decrement it (the worker keeps running) — only its own eventual
+#: completion does, via :func:`_release_parse_slot_once`.
+_inflight_parse_count: int = 0
+
+
+def _get_parse_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Return the module-owned, lazily-created dedicated parse executor —
+    or recreate it after :func:`_replace_poisoned_parse_executor` resets
+    the singleton to ``None``. Guarded by :data:`_parse_executor_lock`,
+    shared with that reset so both writers serialize on one lock.
+
+    Returns:
+        The process-wide dedicated executor for trafilatura markdown
+        parses, distinct from the default executor other
+        ``asyncio.to_thread``/``loop.run_in_executor(None, ...)`` callers
+        (``api.py``'s config load/persistence, device enumeration) share.
+    """
+    global _parse_executor
+    with _parse_executor_lock:
+        if _parse_executor is None:
+            _parse_executor = concurrent.futures.ThreadPoolExecutor(
+                max_workers=_MAX_CONCURRENT_PARSES,
+                thread_name_prefix="bean-sourcing-parse",
+            )
+        return _parse_executor
+
+
+def _replace_poisoned_parse_executor(poisoned: concurrent.futures.ThreadPoolExecutor) -> None:
+    """Discard ``poisoned`` and reset the singleton to ``None`` so the
+    NEXT :func:`_get_parse_executor` call lazily builds a fresh one.
+
+    Called BEFORE the caller releases its slot, closing the window where a
+    racing admission could grab the poisoned executor in between.
+    Replacement, not queue-surgery: a failed ``submit()`` gives no
+    reference to the work item it already enqueued, so
+    ``shutdown(cancel_futures=True)`` (3.9+) discards the whole instance.
+    ``wait=False`` returns immediately; an already-running worker keeps
+    running and releases its slot normally, since that accounting lives in
+    the process-wide counter, not this executor object.
+
+    Args:
+        poisoned: The executor instance whose ``submit()`` just raised.
+    """
+    global _parse_executor
+    with _parse_executor_lock:
+        poisoned.shutdown(wait=False, cancel_futures=True)
+        if _parse_executor is poisoned:
+            _parse_executor = None
+
+
+class _ParseSlotToken:
+    """Owns exactly one release of an admitted parse slot, and arbitrates
+    one winner between "started running" and "reclaimed by the
+    submission-failure path" (#607 folds 4–5).
+
+    Built alongside the wrapper submitted in place of the bare parse call
+    (see :func:`_extract_page_markdown_bounded`), never attached after the
+    fact. :attr:`started`/:attr:`reclaimed` are a HANDSHAKE under the SAME
+    :attr:`lock` (wrapper checks ``reclaimed`` before setting ``started``;
+    the failure path checks ``started`` before setting ``reclaimed``):
+    whichever side observes the lock first wins, so a reclaimed item is
+    GUARANTEED to never run its parse, even if a worker dequeued it and
+    was descheduled before ever reaching the wrapper's first line.
+    """
+
+    __slots__ = ("lock", "started", "released", "reclaimed")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.started = False
+        self.released = False
+        self.reclaimed = False
+
+
+def _release_parse_slot_once(token: _ParseSlotToken) -> None:
+    """Idempotently release the slot ``token`` reserves: the FIRST caller
+    decrements :data:`_inflight_parse_count`, every later caller is a
+    no-op. The slot belongs to the work item once submitted; a caller may
+    reclaim it only after proving the item can never run.
+    """
+    with token.lock:
+        if token.released:
+            return
+        token.released = True
+    global _inflight_parse_count
+    with _parse_slot_lock:
+        _inflight_parse_count = max(0, _inflight_parse_count - 1)
+
+
+def _parse_wrapper_entry_seam() -> None:
+    """No-op in production; a test seam called as the wrapper's very
+    first action (before it ever touches :attr:`_ParseSlotToken.lock`,
+    #607 fold 5) so a test can deterministically pause a worker between
+    "dequeued, future RUNNING" and "reached the handshake"."""
+
+
+async def _extract_page_markdown_bounded(html: str, *, timeout_seconds: float) -> str | None:
+    """Run :func:`_extract_page_markdown` on the dedicated, bounded parse
+    pool, admission-controlled by actual worker availability (#607).
+
+    Isolation: the parse runs via ``_get_parse_executor().submit(...)`` —
+    a separately-owned pool, so an orphaned hung worker can only exhaust
+    THIS pool's :data:`_MAX_CONCURRENT_PARSES` slots. Admission control:
+    when :data:`_inflight_parse_count` already reports every worker busy,
+    a new call skips the markdown attempt immediately. The parse is
+    submitted wrapped in a :class:`_ParseSlotToken`-owned closure, not the
+    bare :func:`_extract_page_markdown` call, so the slot rides WITH the
+    work item. Submission failure replaces the executor
+    (:func:`_replace_poisoned_parse_executor`) then reclaims the slot only
+    if the ``started``/``reclaimed`` handshake proves the item never ran
+    (#607 folds 4–5); cancellation falls back if collateral, always
+    propagates if genuine (``Task.cancelling() > 0``, #607 fold 3).
+
+    **Release enumeration (#607 fold 5).** Exactly one path ever calls
+    :func:`_release_parse_slot_once` per token: the wrapper's own
+    ``finally`` (ran); the failure path's reclaim (handshake proves it
+    never ran, and PREVENTS it from running); or the
+    timeout/``CancelledError`` handlers, only when
+    ``concurrent_future.cancelled()`` (still PENDING when cancelled) — a
+    still-RUNNING item's own ``finally`` releases it instead.
+
+    Either branch returns exactly like the pre-#607 call site: ``None``
+    tells the caller to fall back to the linear-strip pass
+    (:func:`_extract_page_text`) — this module's never-worse-than-before,
+    never-an-unhandled-exception fail-soft contract is unchanged.
+
+    Args:
+        html: The raw, already-fetched, already-capped page HTML.
+        timeout_seconds: The bound on this call's OWN wait (reuses
+            ``config.fetch_timeout_seconds`` — see
+            :func:`_fetch_and_extract`'s comment on the resulting
+            lock-hold bound, unchanged by this fix).
+
+    Returns:
+        The extracted markdown, or ``None`` on a timeout, a saturated
+        pool, a submission failure, or whatever
+        :func:`_extract_page_markdown` itself already returns
+        ``None``/raises for.
+    """
+    global _inflight_parse_count
+    with _parse_slot_lock:
+        if _inflight_parse_count >= _MAX_CONCURRENT_PARSES:
+            _log.warning(
+                "bean_sourcing: dedicated parse pool saturated (%d/%d workers busy "
+                "— likely orphaned by prior timed-out parses, #607); skipping "
+                "markdown extraction, falling back to linear-strip",
+                _inflight_parse_count,
+                _MAX_CONCURRENT_PARSES,
+            )
+            return None
+        _inflight_parse_count += 1
+
+    token = _ParseSlotToken()
+
+    def _run_and_release() -> str | None:
+        # Runs once (and only if) actually dequeued and started; the
+        # reclaimed check-then-set is the wrapper's half of the
+        # handshake with the submission-failure path below (#607 fold 5).
+        _parse_wrapper_entry_seam()
+        with token.lock:
+            if token.reclaimed:
+                return None
+            token.started = True
+        try:
+            return _extract_page_markdown(html)
+        finally:
+            _release_parse_slot_once(token)
+
+    executor = _get_parse_executor()
+    try:
+        concurrent_future = executor.submit(_run_and_release)
+    except Exception:
+        # Submission failed — replace the (possibly hidden-queue-holding,
+        # #607 fold 2) executor FIRST. The started/reclaimed check-and-set
+        # below is the other half of the wrapper's handshake (#607 fold
+        # 5): whichever side observes token.lock first wins, so a
+        # "not started" reading here provably stays that way.
+        _replace_poisoned_parse_executor(executor)
+        with token.lock:
+            already_started = token.started
+            if not already_started:
+                token.reclaimed = True
+        if not already_started:
+            _release_parse_slot_once(token)
+        _log.warning(
+            "bean_sourcing: dedicated parse pool submission failed; replaced the "
+            "poisoned executor; falling back to linear-strip (slot already_started=%s)",
+            already_started,
+            exc_info=True,
+        )
+        return None
+
+    loop = asyncio.get_running_loop()
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            return await asyncio.wrap_future(concurrent_future, loop=loop)
+    except TimeoutError:
+        _log.debug(
+            "bean_sourcing: trafilatura markdown extraction exceeded the %.3gs "
+            "deadline; falling back to linear-strip (the worker keeps running in "
+            "the dedicated pool — contained to that pool alone, #607)",
+            timeout_seconds,
+        )
+        if concurrent_future.cancelled():
+            # Our OWN timeout cancelled a still-PENDING item too — the
+            # wrapper's ``finally`` will never run (#607 fold 5).
+            _release_parse_slot_once(token)
+        return None
+    except asyncio.CancelledError:
+        # Task.cancelling() > 0: OUR task was truly told to cancel —
+        # always re-raise. Else: collateral, a DIFFERENT call's
+        # replacement cancelled us (#607 fold 3).
+        if concurrent_future.cancelled():
+            _release_parse_slot_once(token)
+        current_task = asyncio.current_task()
+        if current_task is not None and current_task.cancelling() > 0:
+            raise
+        _log.debug(
+            "bean_sourcing: dedicated parse pool item cancelled by a "
+            "concurrent submission-failure replacement (#607 fold 3); "
+            "falling back to linear-strip"
+        )
+        return None
 
 
 #: Redirect hops the internally-constructed client will follow manually
@@ -1902,17 +2208,13 @@ async def _fetch_and_extract(
             await client.aclose()
     # #590 slice C: trafilatura's boilerplate-stripped markdown is the
     # PRIMARY page-body text; the linear-strip pass is only the fail-soft
-    # fallback when trafilatura finds nothing usable or raises. Dispatched
-    # to a thread (checklist class 6 — CPU-heavy synchronous parsing is
-    # contention too, not just provider calls): measured up to ~2.5s of
-    # CPU-bound tree-walking on a page at the ``max_response_bytes`` cap,
-    # which would otherwise block the single event loop (other requests —
-    # SSE heartbeats, health checks — for that whole window) for a call
-    # this module's own concurrency-1 semaphore
-    # (``api._draft_bean_from_url_semaphore``) already keeps to at most one
-    # in flight. Matches the existing ``asyncio.to_thread`` convention for
-    # blocking work elsewhere in this codebase (e.g. ``api.py``'s config
-    # load/serial-enumeration calls).
+    # fallback when trafilatura finds nothing usable or raises. Measured up
+    # to ~2.5s of CPU-bound tree-walking on a page at the
+    # ``max_response_bytes`` cap, which would otherwise block the single
+    # event loop (other requests — SSE heartbeats, health checks — for
+    # that whole window) for a call this module's own concurrency-1
+    # semaphore (``api._draft_bean_from_url_semaphore``) already keeps to
+    # at most one in flight — hence dispatched off the loop.
     #
     # BOUNDED by its own ``config.fetch_timeout_seconds`` deadline (#590
     # slice C P1 fix): this call sits AFTER the fetch's own
@@ -1928,40 +2230,40 @@ async def _fetch_and_extract(
     # already closed — so the fetch term counts TWICE in the worst case,
     # not once. ``RoastService.draft_bean_from_url``'s docstring (api.py)
     # states the corrected bound: at most
-    # ``2 * fetch_timeout_seconds + extraction_timeout_seconds``. Note also
-    # that ``asyncio.timeout`` cancels the *await*, not the underlying OS
-    # thread (no safe way to kill a running thread in Python) — the
-    # trade-off ``asyncio.to_thread`` always has; what matters for the
-    # ``_start_lock`` interaction is that THIS coroutine stops waiting and
-    # releases the lock promptly, which this achieves. The hung worker
-    # thread itself keeps running in the background regardless (tracked as
-    # #607, orthogonal to this fix).
+    # ``2 * fetch_timeout_seconds + extraction_timeout_seconds``.
     #
-    # ON TIMEOUT: FALL BACK to the linear-strip pass, same as the
-    # None/exception cases below — do NOT fail the draft (#590 slice C
-    # Codex fold, #608). Before this slice EVERY page used the fast,
-    # synchronous linear-strip path; a slow-to-parse page timing out here
-    # must not regress that page from "draft succeeds via linear-strip" to
-    # a 422 that didn't exist before this slice. The ``2 * fetch_timeout +
-    # extraction_timeout`` lock-hold bound above still holds: the
-    # markdown-extraction stage still counts once (it still ran for up to
-    # ``fetch_timeout_seconds`` before giving up), the linear-strip
-    # fallback that follows is fast/synchronous/bounded by the same
-    # byte cap the markdown path already respects (negligible next to
-    # either timeout), and the draft then proceeds into
-    # ``_extract_bean_identity``'s OWN, separate ``extraction_timeout`` —
-    # no new unbounded stage is introduced.
-    try:
-        async with asyncio.timeout(config.fetch_timeout_seconds):
-            markdown = await asyncio.to_thread(_extract_page_markdown, html)
-    except TimeoutError:
-        _log.debug(
-            "bean_sourcing: trafilatura markdown extraction exceeded the "
-            "%.3gs deadline for %r; falling back to linear-strip",
-            config.fetch_timeout_seconds,
-            url,
-        )
-        markdown = None
+    # DISPATCHED via :func:`_extract_page_markdown_bounded` (#607), not
+    # bare ``asyncio.timeout(...)`` + ``asyncio.to_thread(...)`` as
+    # before: ``asyncio.timeout`` only ever cancels the *await*, never the
+    # underlying OS thread, so a genuinely infinite-loop-class parse plus
+    # repeated operator retries would each leak one permanently-hung
+    # worker into whatever executor the call targets. The bare
+    # ``asyncio.to_thread`` version put that leak in the process's SHARED
+    # default executor — the same pool ``api.py``'s
+    # ``asyncio.to_thread(load_app_config)``/device-enumeration calls use
+    # — so enough leaked workers would eventually hang THOSE unrelated
+    # calls too. :func:`_extract_page_markdown_bounded` isolates the leak
+    # to its OWN dedicated pool and adds admission control so a saturated
+    # pool is detected and skipped immediately rather than queued behind
+    # — see that function's own docstring for the full design.
+    #
+    # ON TIMEOUT (or a saturated pool): FALL BACK to the linear-strip
+    # pass, same as the ``None``/exception cases below — do NOT fail the
+    # draft (#590 slice C Codex fold, #608). Before slice C EVERY page
+    # used the fast, synchronous linear-strip path; a slow-to-parse (or
+    # pool-saturated) page must not regress that page from "draft
+    # succeeds via linear-strip" to a 422 that didn't exist before it. The
+    # ``2 * fetch_timeout + extraction_timeout`` lock-hold bound above
+    # still holds either way: the markdown-extraction stage still counts
+    # once (it ran for up to ``fetch_timeout_seconds`` before giving up,
+    # or returned near-instantly on a saturated pool), the linear-strip
+    # fallback that follows is fast/synchronous/bounded by the same byte
+    # cap the markdown path already respects, and the draft then proceeds
+    # into ``_extract_bean_identity``'s OWN, separate
+    # ``extraction_timeout`` — no new unbounded stage is introduced.
+    markdown = await _extract_page_markdown_bounded(
+        html, timeout_seconds=config.fetch_timeout_seconds
+    )
     extracted_text = markdown or _extract_page_text(html)
     # final_url, not url (#590 P1 fix) — a redirect commonly canonicalises
     # the URL, and the fetched HTML's own JSON-LD reflects the FINAL one.

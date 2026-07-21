@@ -18,13 +18,16 @@ transitive import graph checked in a fresh subprocess).
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gzip
 import ipaddress
 import logging
 import socket
 import subprocess
 import sys
+import threading
 import time
+import unittest.mock
 import zlib
 from collections.abc import AsyncGenerator, Callable
 from typing import Literal
@@ -6986,15 +6989,35 @@ async def test_fetch_page_text_bounds_a_hanging_markdown_extraction_with_a_timeo
     slow-to-parse page timing out here must not regress that page from
     "draft succeeds via linear-strip" to a 422 that didn't exist before
     this slice. The lock-hold bound still holds (the wait is capped, only
-    the OUTCOME changed from fail to fall back)."""
+    the OUTCOME changed from fail to fall back).
+
+    #607: the hung worker now runs on the DEDICATED
+    ``bean-sourcing-parse`` pool, not the process's shared default
+    executor — see the ``test_extract_page_markdown_bounded_*`` tests
+    below for that pool's own admission-control/isolation/recovery
+    coverage. This test stays a pure integration check: the
+    ``_fetch_page_text`` caller must still fall back promptly regardless
+    of which pool the hang happens on.
+
+    Drains the dedicated pool's admission counter back to zero (via
+    :func:`_await_condition`) before returning: this test's own hung
+    worker keeps running for up to a real ~1s AFTER the assertions below
+    (the timeout only bounds the await, not the thread) — draining here,
+    the same way the ``test_extract_page_markdown_bounded_*`` tests
+    below drain their own occupying tasks, prevents that lingering
+    worker's EVENTUAL release from firing during whichever test runs
+    next and mutating ITS view of the shared counter."""
+
+    _reset_parse_pool_state()
 
     def _hangs(html: str) -> str | None:
-        # A REAL (synchronous) sleep — this runs on the asyncio.to_thread
-        # worker thread, mirroring a genuinely pathological/slow parse;
-        # asyncio.timeout can only stop the AWAIT, not this thread, so it
-        # keeps running in the background after the test's own timeout
-        # fires (tracked separately as #607) — kept short so that residual
-        # cost stays negligible.
+        # A REAL (synchronous) sleep — this runs on the dedicated
+        # bean-sourcing-parse pool (#607), mirroring a genuinely
+        # pathological/slow parse; asyncio.timeout can only stop the
+        # AWAIT, not this thread, so it keeps running in the background
+        # after the test's own timeout fires — kept short so that
+        # residual cost stays negligible, and contained to the dedicated
+        # pool alone rather than the shared default executor.
         time.sleep(1.0)
         return "should never be observed"  # pragma: no cover
 
@@ -7014,6 +7037,930 @@ async def test_fetch_page_text_bounds_a_hanging_markdown_extraction_with_a_timeo
     # use — the draft proceeds, it does not fail.
     assert text == bean_sourcing._extract_page_text(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
     assert "Kenya Kiambu AA" in text
+    # Drain: let the still-running hung worker actually finish and release
+    # its slot before this test returns (see the docstring above).
+    await _await_condition(
+        lambda: bean_sourcing._inflight_parse_count == 0,  # pyright: ignore[reportPrivateUsage]
+        timeout=2.0,
+    )
+
+
+# --- #607: dedicated, bounded executor + admission control for the
+# untrusted trafilatura markdown parse ---
+#
+# Every test below drives a REAL (synchronous, cross-thread) hang via
+# ``threading.Event`` — never a fake/mocked future — so the admission
+# counter and the dedicated pool's actual worker occupancy are exercised
+# for real, not simulated. Every blocking fake bounds its own wait
+# (``event.wait(timeout=...)``) as a safety ceiling: even if a test's own
+# ``finally``/cleanup failed to signal release, the underlying thread
+# still returns on its own well within the test suite's timeout, so a
+# broken test cannot leave a genuinely un-joinable non-daemon thread
+# blocking process exit. Ad-hoc raw/warmup executors and futures created
+# directly in a test (bypassing the module's own admission wrapper) are
+# never explicitly ``.shutdown()``/torn down either — cleanup relies on
+# GC finalizers and eventual process exit, matching the module's own
+# process-lifetime singleton rather than adding per-test teardown.
+
+
+def _reset_parse_pool_state() -> None:
+    """Reset the module-level admission counter to zero.
+
+    Defensive: guards each test below against a prior failure elsewhere
+    in the suite having left :data:`bean_sourcing._inflight_parse_count`
+    non-zero. The dedicated executor singleton itself is intentionally
+    NOT torn down/recreated — matching production, where it lives for
+    the whole process — only the counter is reset.
+    """
+    bean_sourcing._inflight_parse_count = 0  # pyright: ignore[reportPrivateUsage]
+
+
+async def _await_condition(predicate: Callable[[], bool], *, timeout: float = 2.0) -> None:
+    """Poll ``predicate`` on a short ``asyncio.sleep`` cadence until it is
+    ``True`` or ``timeout`` elapses, without ever blocking the event loop
+    (a plain busy-``while`` would starve the worker threads' own
+    ``call_soon_threadsafe`` callbacks of a chance to run)."""
+    started = time.monotonic()
+    while not predicate():
+        if time.monotonic() - started > timeout:
+            raise AssertionError(f"condition not met within {timeout}s")
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_skips_immediately_when_pool_saturated() -> None:
+    """The cap works: with both dedicated-pool workers genuinely still
+    busy (simulating orphaned hung parses from prior timeouts), the NEXT
+    call must not queue behind them and wait out its own timeout — it
+    should skip the markdown attempt and return ``None`` almost
+    immediately (#607)."""
+    _reset_parse_pool_state()
+    release = threading.Event()
+    entered = threading.Event()
+    entered_count = 0
+    count_lock = threading.Lock()
+
+    def _hangs_until_released(html: str) -> str | None:
+        nonlocal entered_count
+        with count_lock:
+            entered_count += 1
+            if entered_count >= bean_sourcing._MAX_CONCURRENT_PARSES:  # pyright: ignore[reportPrivateUsage]
+                entered.set()
+        release.wait(timeout=5.0)  # safety ceiling — always released below
+        return None
+
+    with unittest.mock.patch.object(bean_sourcing, "_extract_page_markdown", _hangs_until_released):
+        occupying = [
+            asyncio.create_task(
+                bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                    "<html></html>", timeout_seconds=10.0
+                )
+            )
+            for _ in range(bean_sourcing._MAX_CONCURRENT_PARSES)  # pyright: ignore[reportPrivateUsage]
+        ]
+        try:
+            # Wait until BOTH workers have genuinely started (are
+            # occupying a real dedicated-pool thread), not merely
+            # "submitted" — otherwise the assertion below could race
+            # ahead of the pool actually filling up.
+            await _await_condition(entered.is_set)
+            assert (
+                bean_sourcing._inflight_parse_count  # pyright: ignore[reportPrivateUsage]
+                == bean_sourcing._MAX_CONCURRENT_PARSES  # pyright: ignore[reportPrivateUsage]
+            )
+
+            started_at = time.monotonic()
+            result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                "<html></html>", timeout_seconds=10.0
+            )
+            elapsed = time.monotonic() - started_at
+            assert result is None
+            assert elapsed < 1.0, f"admission control did not skip immediately: {elapsed:.2f}s"
+            # The skip path never touches the counter — still exactly the
+            # cap, not cap+1.
+            assert (
+                bean_sourcing._inflight_parse_count  # pyright: ignore[reportPrivateUsage]
+                == bean_sourcing._MAX_CONCURRENT_PARSES  # pyright: ignore[reportPrivateUsage]
+            )
+        finally:
+            release.set()
+            await asyncio.gather(*occupying)
+
+
+@pytest.mark.asyncio
+async def test_unrelated_to_thread_work_unaffected_by_saturated_parse_pool() -> None:
+    """Orphan containment: unrelated ``asyncio.to_thread`` work (the
+    process's SHARED default executor — what ``api.py``'s config
+    load/persistence and device-enumeration calls use) must still
+    complete promptly while the DEDICATED parse pool is fully saturated
+    (#607) — proving a leak is contained to the dedicated pool alone."""
+    _reset_parse_pool_state()
+    release = threading.Event()
+    entered = threading.Event()
+    entered_count = 0
+    count_lock = threading.Lock()
+
+    def _hangs_until_released(html: str) -> str | None:
+        nonlocal entered_count
+        with count_lock:
+            entered_count += 1
+            if entered_count >= bean_sourcing._MAX_CONCURRENT_PARSES:  # pyright: ignore[reportPrivateUsage]
+                entered.set()
+        release.wait(timeout=5.0)
+        return None
+
+    with unittest.mock.patch.object(bean_sourcing, "_extract_page_markdown", _hangs_until_released):
+        occupying = [
+            asyncio.create_task(
+                bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                    "<html></html>", timeout_seconds=10.0
+                )
+            )
+            for _ in range(bean_sourcing._MAX_CONCURRENT_PARSES)  # pyright: ignore[reportPrivateUsage]
+        ]
+        try:
+            await _await_condition(entered.is_set)
+            assert (
+                bean_sourcing._inflight_parse_count  # pyright: ignore[reportPrivateUsage]
+                == bean_sourcing._MAX_CONCURRENT_PARSES  # pyright: ignore[reportPrivateUsage]
+            )
+
+            started_at = time.monotonic()
+            result = await asyncio.to_thread(lambda: 21 + 21)
+            elapsed = time.monotonic() - started_at
+            assert result == 42
+            assert elapsed < 1.0, (
+                f"unrelated default-executor work was delayed by the saturated "
+                f"dedicated pool: {elapsed:.2f}s"
+            )
+        finally:
+            release.set()
+            await asyncio.gather(*occupying)
+
+
+@pytest.mark.asyncio
+async def test_parse_pool_recovers_once_hung_workers_complete() -> None:
+    """Recovery: once the previously-hung workers actually complete and
+    release their slots, markdown extraction works again (#607) — the
+    admission counter is not a permanent trip, only a reflection of
+    current worker occupancy."""
+    _reset_parse_pool_state()
+    release = threading.Event()
+    entered = threading.Event()
+    entered_count = 0
+    count_lock = threading.Lock()
+
+    def _hangs_until_released(html: str) -> str | None:
+        nonlocal entered_count
+        with count_lock:
+            entered_count += 1
+            if entered_count >= bean_sourcing._MAX_CONCURRENT_PARSES:  # pyright: ignore[reportPrivateUsage]
+                entered.set()
+        release.wait(timeout=5.0)
+        return None
+
+    with unittest.mock.patch.object(bean_sourcing, "_extract_page_markdown", _hangs_until_released):
+        occupying = [
+            asyncio.create_task(
+                bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                    "<html></html>", timeout_seconds=10.0
+                )
+            )
+            for _ in range(bean_sourcing._MAX_CONCURRENT_PARSES)  # pyright: ignore[reportPrivateUsage]
+        ]
+        await _await_condition(entered.is_set)
+        release.set()
+        await asyncio.gather(*occupying)
+
+    # The completion callbacks hop back onto the loop via
+    # call_soon_threadsafe — give them a turn to actually run.
+    await _await_condition(
+        lambda: bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+    )
+
+    def _recovered(html: str) -> str | None:
+        return "recovered markdown"
+
+    with unittest.mock.patch.object(bean_sourcing, "_extract_page_markdown", _recovered):
+        result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+            "<html></html>", timeout_seconds=5.0
+        )
+    assert result == "recovered markdown"
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_normal_path_returns_markdown() -> None:
+    """Regression: the ordinary (non-hung, non-saturated) draft path is
+    unchanged — a normal, fast parse still returns its markdown through
+    the new dedicated-pool dispatch (#607)."""
+    _reset_parse_pool_state()
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        _SAMPLE_HTML, timeout_seconds=5.0
+    )
+    assert result == bean_sourcing._extract_page_markdown(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_saturation_log_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The saturated-pool skip path logs a warning naming the occupied/
+    capacity counts (#607) — observability for an operator diagnosing a
+    stuck draft."""
+    _reset_parse_pool_state()
+    bean_sourcing._inflight_parse_count = (  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._MAX_CONCURRENT_PARSES  # pyright: ignore[reportPrivateUsage]
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="roastpilot_agent.bean_sourcing"):
+            result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                "<html></html>", timeout_seconds=5.0
+            )
+        assert result is None
+        assert any("saturated" in record.message for record in caplog.records)
+    finally:
+        _reset_parse_pool_state()
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_timeout_falls_back_and_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A genuine (bounded, not pool-saturation) timeout still falls back
+    to ``None`` and logs at debug — the pre-#607 timeout behavior,
+    unchanged by the dedicated-pool dispatch."""
+    _reset_parse_pool_state()
+    release = threading.Event()
+
+    def _hangs(html: str) -> str | None:
+        release.wait(timeout=5.0)
+        return None
+
+    with unittest.mock.patch.object(bean_sourcing, "_extract_page_markdown", _hangs):
+        try:
+            with caplog.at_level(logging.DEBUG, logger="roastpilot_agent.bean_sourcing"):
+                result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                    "<html></html>", timeout_seconds=0.1
+                )
+            assert result is None
+            assert any("deadline" in record.message for record in caplog.records)
+        finally:
+            release.set()
+            await _await_condition(
+                lambda: bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+            )
+
+
+def test_get_parse_executor_returns_the_same_singleton_across_calls() -> None:
+    """:func:`_get_parse_executor`'s lazy singleton is created once and
+    reused — a fresh executor per call would defeat the whole point of a
+    bounded pool (#607)."""
+    first = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+    second = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+    assert first is second
+
+
+def test_parse_wrapper_entry_seam_is_a_noop() -> None:
+    """#607 fold 5: unpatched, :func:`bean_sourcing._parse_wrapper_entry_seam`
+    is a genuine no-op — production behavior is unaffected by its
+    presence; only a test that deliberately monkeypatches it (see the
+    reclaim-handshake test) changes anything."""
+    assert bean_sourcing._parse_wrapper_entry_seam() is None  # pyright: ignore[reportPrivateUsage]
+
+
+def test_release_parse_slot_once_clamps_at_zero() -> None:
+    """Defensive floor: :func:`_release_parse_slot_once` never drives the
+    counter negative, even if called with the counter already at zero
+    (#607 fold 4 — should not happen in practice, since every increment
+    has exactly one matching token release, but the floor is cheap
+    insurance)."""
+    _reset_parse_pool_state()
+    token = bean_sourcing._ParseSlotToken()  # pyright: ignore[reportPrivateUsage]
+    try:
+        bean_sourcing._release_parse_slot_once(token)  # pyright: ignore[reportPrivateUsage]
+        assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _reset_parse_pool_state()
+
+
+def test_release_parse_slot_once_is_idempotent() -> None:
+    """#607 fold 4: a SECOND call for the same token (e.g. the
+    submission-failure path racing the wrapper's own ``finally``) must
+    decrement at most once — the token's own ``released`` flag, not the
+    counter's floor-at-zero clamp, is what enforces this (the counter
+    could otherwise be legitimately non-zero from an unrelated call and a
+    double-decrement would silently steal that call's slot)."""
+    _reset_parse_pool_state()
+    bean_sourcing._inflight_parse_count = 2  # pyright: ignore[reportPrivateUsage]
+    token = bean_sourcing._ParseSlotToken()  # pyright: ignore[reportPrivateUsage]
+    try:
+        bean_sourcing._release_parse_slot_once(token)  # pyright: ignore[reportPrivateUsage]
+        bean_sourcing._release_parse_slot_once(token)  # pyright: ignore[reportPrivateUsage]
+        assert bean_sourcing._inflight_parse_count == 1  # pyright: ignore[reportPrivateUsage]
+    finally:
+        _reset_parse_pool_state()
+
+
+def test_release_parse_slot_once_runs_correctly_from_a_foreign_thread() -> None:
+    """#607 fold 4: the token-guarded release has no event-loop
+    dependency at all — running it directly from a plain background
+    thread (simulating the wrapper's own ``finally``, which always runs
+    on a worker thread) still releases the slot correctly."""
+    _reset_parse_pool_state()
+    bean_sourcing._inflight_parse_count = 1  # pyright: ignore[reportPrivateUsage]
+    token = bean_sourcing._ParseSlotToken()  # pyright: ignore[reportPrivateUsage]
+    errors: list[BaseException] = []
+
+    def _run_release_with_no_event_loop() -> None:
+        # A plain background thread — deliberately never creates or sets
+        # an asyncio event loop of its own.
+        try:
+            bean_sourcing._release_parse_slot_once(token)  # pyright: ignore[reportPrivateUsage]
+        except BaseException as exc:  # pragma: no cover - regression guard only
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run_release_with_no_event_loop)
+    thread.start()
+    thread.join(timeout=5.0)
+    assert not errors
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+class _SubmitRaisingExecutor:
+    """A test double whose ``submit`` raises immediately — simulating a
+    thread-limit ``OSError`` (or any other submission-time failure) on a
+    resource-constrained host (#607 fold 1). ``shutdown`` is a no-op: this
+    fake never creates real threads/a real queue for
+    :func:`_replace_poisoned_parse_executor` to drain."""
+
+    def submit(
+        self, func: Callable[[str], str | None], html: str
+    ) -> concurrent.futures.Future[str | None]:
+        raise OSError("can't start new thread (simulated, #607 fold 1 test)")
+
+    def shutdown(self, wait: bool = True, *, cancel_futures: bool = False) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_submission_failure_falls_back_and_frees_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P2 + claude low fold: a submission failure must (a) fall back
+    to linear-strip rather than raise past this function's fail-soft
+    contract, and (b) release the slot it had just reserved — capacity
+    for the VERY NEXT call must stay intact, not silently shrink by one
+    forever (#607 fold 1). See
+    ``test_extract_page_markdown_bounded_replaces_poisoned_executor_and_cancels_hidden_queue``
+    below for fold 2's executor-replacement/hidden-queue coverage, which
+    needs a REAL ``ThreadPoolExecutor`` rather than this simple fake."""
+    _reset_parse_pool_state()
+    monkeypatch.setattr(bean_sourcing, "_get_parse_executor", lambda: _SubmitRaisingExecutor())
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        "<html></html>", timeout_seconds=5.0
+    )
+    assert result is None
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+    # Capacity intact: restore the REAL executor and confirm a normal
+    # parse still succeeds right afterwards — the failed submission above
+    # must not have permanently eaten a slot.
+    monkeypatch.undo()
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        _SAMPLE_HTML, timeout_seconds=5.0
+    )
+    assert result == bean_sourcing._extract_page_markdown(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_replaces_poisoned_executor_and_cancels_hidden_queue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#607 fold 2 (Codex round 2), hardened by the qa pass on PR #629:
+    the ORIGINAL version of this test patched ``_adjust_thread_count`` to
+    raise on the ONLY submission the executor ever saw — no worker thread
+    was ever created, so its "settle window gives a live worker every
+    chance" claim was FALSE (the assertion passed vacuously; there was
+    nothing that could ever have popped the item). This version submits a
+    gated warmup FIRST (fold-4's pattern) so worker-1 is a genuinely LIVE,
+    alive thread throughout the whole failure/replace/drain sequence —
+    proving ``cancel_futures=True`` actually drains the hidden item out
+    from under a pool that HAS a real thread, not an empty one.
+
+    ``ThreadPoolExecutor.submit()`` puts its work item on the internal
+    queue BEFORE calling ``_adjust_thread_count()`` — the call that can
+    raise — so a submission failure leaves a HIDDEN, queued work item
+    behind on a release-only handler's executor. Asserts the sentinel
+    NEVER executes (checked again after worker-1 is released and given a
+    settle window, with nothing left on the drained queue for it to pick
+    up), the singleton executor was REPLACED (new object identity), and
+    the very next call parses normally on the fresh executor with full
+    capacity."""
+    _reset_parse_pool_state()
+    # Force a fresh, otherwise-untouched singleton so this test owns the
+    # executor end-to-end and isn't sharing prior submissions with
+    # whichever executor an earlier test happened to create.
+    monkeypatch.setattr(bean_sourcing, "_parse_executor", None)
+    original_executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+
+    warmup_gate = threading.Event()
+
+    def _warmup() -> str:
+        warmup_gate.wait(timeout=5.0)
+        return "warmup done"
+
+    # Creates worker-1 as a REAL, alive thread — busy on the gate for the
+    # whole failure/replace/drain sequence below, so it cannot race to
+    # dequeue the hidden item itself (ad-hoc, GC-finalized — see the
+    # section note above).
+    original_executor.submit(_warmup)
+
+    executed = threading.Event()
+
+    def _sentinel_parse(html: str) -> str | None:
+        # Must NEVER run — if the hidden queued item survives
+        # cancel_futures=True, it would eventually be picked up here.
+        executed.set()
+        return "should never be observed"  # pragma: no cover
+
+    def _raising_adjust_thread_count() -> None:
+        # Reproduces the exact CPython failure shape: submit() has
+        # ALREADY called self._work_queue.put(w) by the time this raises
+        # (verified directly against ThreadPoolExecutor.submit's source),
+        # so the sentinel's work item is genuinely enqueued first.
+        raise OSError("can't start new thread (simulated, #607 fold 2 test)")
+
+    real_extract_page_markdown = bean_sourcing._extract_page_markdown  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(original_executor, "_adjust_thread_count", _raising_adjust_thread_count)
+    monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _sentinel_parse)
+
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        "<html></html>", timeout_seconds=5.0
+    )
+    assert result is None
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+    # The singleton was REPLACED, not merely reused: a fresh executor
+    # object, distinct from the poisoned one.
+    replaced_executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+    assert replaced_executor is not original_executor
+
+    # Release worker-1 NOW — after the cancel-and-replace above has
+    # already run — and give it (a genuinely live thread) every remaining
+    # chance to touch the (already-drained) queue.
+    warmup_gate.set()
+    await asyncio.sleep(0.2)
+    assert not executed.is_set(), (
+        "the hidden queued parse executed despite cancel_futures=True — "
+        "the poisoned executor was not properly drained"
+    )
+
+    # Recovery: the NEXT call, on the SAME fresh (replaced) executor,
+    # parses normally with full capacity. Restore ONLY the real
+    # _extract_page_markdown here (rather than a blanket monkeypatch.undo()
+    # — that would also revert bean_sourcing._parse_executor back to its
+    # PRE-test value, discarding the very replacement this assertion means
+    # to exercise).
+    monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", real_extract_page_markdown)
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        _SAMPLE_HTML, timeout_seconds=5.0
+    )
+    assert result == real_extract_page_markdown(_SAMPLE_HTML)
+    assert bean_sourcing._get_parse_executor() is replaced_executor  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_collateral_cancellation_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#607 fold 3 (claude-review on PR #629's rebased head): a submission
+    failure's ``cancel_futures=True`` replacement can collaterally cancel
+    a DIFFERENT, concurrent call's still-queued item on the SAME executor.
+    That call's own task was never told to cancel — it must fall back
+    like any other parse failure, not let ``CancelledError`` escape.
+
+    Call A is admitted and submitted (queued) on a fresh executor whose
+    ``_adjust_thread_count`` is a no-op, so its item genuinely never gets
+    picked up by a worker (deterministic "still queued", no timing race).
+    Call B's submission is then made to raise, triggering
+    ``_replace_poisoned_parse_executor`` — which ``shutdown``s the SAME
+    executor with ``cancel_futures=True``, collaterally cancelling A's
+    queued item."""
+    _reset_parse_pool_state()
+    monkeypatch.setattr(bean_sourcing, "_parse_executor", None)
+    executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+
+    def _never_starts_a_thread() -> None:
+        # A no-op _adjust_thread_count: submitted items sit on the queue
+        # forever, with no worker ever spawned to pick them up.
+        pass
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", _never_starts_a_thread)
+
+    task_a = asyncio.create_task(
+        bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+            "<html>A</html>", timeout_seconds=10.0
+        )
+    )
+    # Let call A run up to its own await point — its item is now queued
+    # (admitted, submitted, never picked up thanks to the no-op above).
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert bean_sourcing._inflight_parse_count == 1  # pyright: ignore[reportPrivateUsage]
+
+    def _raising_adjust_thread_count() -> None:
+        raise OSError("can't start new thread (simulated, #607 fold 3 test)")
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", _raising_adjust_thread_count)
+    result_b = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        "<html>B</html>", timeout_seconds=5.0
+    )
+    assert result_b is None  # B's own submission failure falls back too
+
+    # A's collaterally-cancelled item must ALSO fall back — never raise —
+    # and release its slot.
+    result_a = await task_a
+    assert result_a is None
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_genuine_task_cancellation_propagates() -> None:
+    """#607 fold 3: cancelling the TASK awaiting the parse (e.g. a client
+    disconnect) must propagate ``CancelledError`` — never be swallowed as
+    if it were a collateral cancellation — and the slot is still released
+    via the done-callback once the (already-running) worker actually
+    finishes."""
+    _reset_parse_pool_state()
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocks_until_released(html: str) -> str | None:
+        started.set()
+        release.wait(timeout=5.0)
+        return "should not be observed by the cancelled caller"
+
+    with unittest.mock.patch.object(
+        bean_sourcing, "_extract_page_markdown", _blocks_until_released
+    ):
+        task = asyncio.create_task(
+            bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                "<html></html>", timeout_seconds=10.0
+            )
+        )
+        await _await_condition(started.is_set)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The worker was ALREADY RUNNING when cancelled (concurrent.futures
+        # cannot cancel a running item), so it keeps going in the
+        # background — release it and confirm the slot still comes back.
+        release.set()
+        await _await_condition(
+            lambda: bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+        )
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_genuine_cancellation_of_a_queued_item_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#607 fold 3 regression guard: a genuine task cancellation of an item
+    that has NOT started running yet also cancels ``concurrent_future``
+    (asyncio's own future-chaining propagates the Task's cancel down to
+    it) — so ``concurrent_future.cancelled()`` alone cannot distinguish
+    this from a collateral cancellation; only ``Task.cancelling() > 0``
+    can. Without that check, this exact case would be misclassified as
+    collateral and silently swallowed instead of propagating."""
+    _reset_parse_pool_state()
+    monkeypatch.setattr(bean_sourcing, "_parse_executor", None)
+    executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+
+    def _never_starts_a_thread() -> None:
+        pass
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", _never_starts_a_thread)
+
+    task = asyncio.create_task(
+        bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+            "<html></html>", timeout_seconds=10.0
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert bean_sourcing._inflight_parse_count == 1  # pyright: ignore[reportPrivateUsage]
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_hidden_item_started_by_existing_worker_keeps_its_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#607 fold 4 (Codex round 3): an EXISTING idle worker can dequeue
+    and START a hidden queued item (left behind by a failed ``submit()``)
+    BEFORE ``_replace_poisoned_parse_executor``'s ``cancel_futures=True``
+    drain reaches it. A started item can never be cancelled and (pre-fold
+    4) never had a done-callback attached either (``submit()`` raised
+    before ``add_done_callback`` could even run) — an unconditional
+    release would silently grow the 2-worker bound to 3 with an
+    untracked, unaccounted-for hung parse.
+
+    Deterministically reproduces the race (no reliance on OS scheduling
+    luck): worker-1 is warmed up and kept BUSY on a gate so the hidden
+    item sits on the queue; ``_replace_poisoned_parse_executor`` is
+    wrapped to release that gate and WAIT for the hidden item to signal
+    it has actually started running, before letting the real
+    shutdown/cancel_futures call proceed — proving the shutdown reaches a
+    queue the item has ALREADY been dequeued from."""
+    _reset_parse_pool_state()
+    monkeypatch.setattr(bean_sourcing, "_parse_executor", None)
+    executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+
+    warmup_gate = threading.Event()
+
+    def _warmup() -> str:
+        warmup_gate.wait(timeout=5.0)
+        return "warmup done"
+
+    # Creates worker-1 as a real thread, BUSY (blocked on the gate) —
+    # not yet idle, so the hidden item below sits on the queue rather
+    # than being dequeued immediately.
+    executor.submit(_warmup)
+
+    hidden_started = threading.Event()
+    hidden_release = threading.Event()
+
+    def _hidden_parse(html: str) -> str | None:
+        hidden_started.set()
+        hidden_release.wait(timeout=5.0)
+        return "hidden parse result"
+
+    monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _hidden_parse)
+
+    real_adjust_thread_count = executor._adjust_thread_count  # pyright: ignore[reportPrivateUsage]
+
+    def _raising_adjust_thread_count() -> None:
+        raise OSError("can't start new thread (simulated, #607 fold 4 test)")
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", _raising_adjust_thread_count)
+
+    real_replace = bean_sourcing._replace_poisoned_parse_executor  # pyright: ignore[reportPrivateUsage]
+
+    def _replace_after_worker_grabs_item(
+        poisoned: concurrent.futures.ThreadPoolExecutor,
+    ) -> None:
+        # Release worker-1's warmup gate so it returns to the idle loop
+        # and dequeues the hidden item BEFORE the drain-and-cancel below
+        # can reach it — deterministic, not a hope-for-the-best race.
+        warmup_gate.set()
+        assert hidden_started.wait(timeout=2.0), (
+            "worker-1 never dequeued and started the hidden item in time"
+        )
+        real_replace(poisoned)
+
+    monkeypatch.setattr(
+        bean_sourcing, "_replace_poisoned_parse_executor", _replace_after_worker_grabs_item
+    )
+
+    result_hidden = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        "<html>hidden</html>", timeout_seconds=5.0
+    )
+    assert result_hidden is None  # falls back to linear-strip like any failure
+
+    # NOT over-freed: the hidden parse is genuinely running (worker-1),
+    # so the counter still correctly reports it occupied.
+    assert bean_sourcing._inflight_parse_count == 1  # pyright: ignore[reportPrivateUsage]
+
+    # A legitimate second admission (worker-2, spawned normally — restore
+    # REAL thread-creation on the SAME executor first; a blanket
+    # monkeypatch.undo() here would also revert bean_sourcing._parse_executor
+    # to its pre-test value, losing track of the very executor the hidden
+    # parse is still running on) must still be admitted...
+    monkeypatch.setattr(executor, "_adjust_thread_count", real_adjust_thread_count)
+    legit_started = threading.Event()
+    legit_release = threading.Event()
+
+    def _legit_parse(html: str) -> str | None:
+        legit_started.set()
+        legit_release.wait(timeout=5.0)
+        return "legit parse result"
+
+    monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _legit_parse)
+    legit_task = asyncio.create_task(
+        bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+            "<html>legit</html>", timeout_seconds=5.0
+        )
+    )
+    await _await_condition(legit_started.is_set)
+    assert bean_sourcing._inflight_parse_count == 2  # pyright: ignore[reportPrivateUsage]
+
+    # ...but a THIRD admission must be refused: the bound stays at 2,
+    # never silently growing to 3 with the hidden parse untracked.
+    result_third = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        "<html>third</html>", timeout_seconds=5.0
+    )
+    assert result_third is None
+
+    # Release both — the slot returns once each parse actually completes.
+    hidden_release.set()
+    legit_release.set()
+    legit_result = await legit_task
+    assert legit_result == "legit parse result"
+    await _await_condition(
+        lambda: bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+    )
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_reclaim_prevents_worker_from_ever_parsing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#607 fold 5 (Codex round 4, SjHAl): a worker can dequeue the hidden
+    item and mark its future RUNNING, then be DESCHEDULED before the
+    wrapper ever reaches ``token.lock``. Deterministically reproduces
+    that exact window via :func:`bean_sourcing._parse_wrapper_entry_seam`
+    (a no-op-in-production test seam): the seam pauses the worker thread
+    INSIDE the wrapper, before it ever touches the lock, while the
+    submission-failure path reclaims the slot on the main coroutine.
+    Asserts the parse body NEVER executes once reclaimed (not merely that
+    the slot is released) and the count stays exact throughout — no leak,
+    no over-free."""
+    _reset_parse_pool_state()
+    monkeypatch.setattr(bean_sourcing, "_parse_executor", None)
+    executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+
+    warmup_gate = threading.Event()
+
+    def _warmup() -> str:
+        warmup_gate.wait(timeout=5.0)
+        return "warmup done"
+
+    executor.submit(_warmup)  # worker-1, busy on the gate
+
+    parse_executed = threading.Event()
+
+    def _sentinel_parse(html: str) -> str | None:
+        parse_executed.set()
+        return "should never run"  # pragma: no cover
+
+    monkeypatch.setattr(bean_sourcing, "_extract_page_markdown", _sentinel_parse)
+
+    seam_entered = threading.Event()
+    seam_release = threading.Event()
+    seam_resumed = threading.Event()
+
+    def _seam() -> None:
+        # Simulates the worker being descheduled right after dequeuing
+        # the item (future already RUNNING) but before it ever reaches
+        # the wrapper's own token.lock acquisition. seam_resumed is set
+        # AFTER the wait returns — i.e. once the worker thread has
+        # genuinely resumed executing, just before the seam itself
+        # returns control to the wrapper's own handshake check.
+        seam_entered.set()
+        seam_release.wait(timeout=5.0)
+        seam_resumed.set()
+
+    monkeypatch.setattr(bean_sourcing, "_parse_wrapper_entry_seam", _seam)
+
+    def _raising_adjust_thread_count() -> None:
+        raise OSError("can't start new thread (simulated, #607 fold 5 test)")
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", _raising_adjust_thread_count)
+
+    real_replace = bean_sourcing._replace_poisoned_parse_executor  # pyright: ignore[reportPrivateUsage]
+
+    def _replace_after_worker_enters_seam(
+        poisoned: concurrent.futures.ThreadPoolExecutor,
+    ) -> None:
+        # Release worker-1 so it dequeues the hidden item and enters the
+        # wrapper's seam — confirmed via seam_entered — BEFORE the real
+        # replace/reclaim logic below runs.
+        warmup_gate.set()
+        assert seam_entered.wait(timeout=2.0), "worker never reached the wrapper's seam in time"
+        real_replace(poisoned)
+
+    monkeypatch.setattr(
+        bean_sourcing, "_replace_poisoned_parse_executor", _replace_after_worker_enters_seam
+    )
+
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        "<html>hidden</html>", timeout_seconds=5.0
+    )
+    assert result is None
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+    # Let the worker resume past the seam — it must observe reclaimed and
+    # bail out WITHOUT ever calling the parse. Assert on the explicit
+    # "resumed" signal, not a blind sleep: by the time seam_resumed
+    # fires, the worker has already made (or is making) its handshake
+    # decision, so checking immediately after is deterministic.
+    seam_release.set()
+    assert seam_resumed.wait(timeout=2.0), "worker never resumed past the seam in time"
+    assert not parse_executed.is_set(), (
+        "the reclaimed item executed its parse body despite the handshake"
+    )
+    assert bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_timeout_while_queued_releases_no_leak(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#607 fold 5 (Codex round 4, SjHAo): ``asyncio.timeout`` cancelling
+    the wrapped future while the underlying ``concurrent.futures.Future``
+    is still PENDING (never started, still queued) means
+    ``_run_and_release``'s own ``finally`` NEVER runs — the old
+    done-callback covered this, the wrapper-finally alone does not.
+    Without the fold-5 fix, EACH timeout-while-queued event leaks one
+    slot; two leaks alone would permanently saturate the 2-worker pool.
+    Repeats the scenario 3x to prove there is no cumulative leak."""
+    _reset_parse_pool_state()
+    monkeypatch.setattr(bean_sourcing, "_parse_executor", None)
+    executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+    real_adjust_thread_count = executor._adjust_thread_count  # pyright: ignore[reportPrivateUsage]
+
+    def _never_starts_a_thread() -> None:
+        # No worker is EVER spawned to dequeue the item — it sits on the
+        # queue, genuinely PENDING, until our own asyncio.timeout cancels
+        # it (never via a race with a worker actually picking it up).
+        pass
+
+    monkeypatch.setattr(executor, "_adjust_thread_count", _never_starts_a_thread)
+
+    for attempt in range(3):
+        result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+            f"<html>attempt-{attempt}</html>", timeout_seconds=0.05
+        )
+        assert result is None, f"attempt {attempt} did not fall back"
+        assert (
+            bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+        ), f"attempt {attempt} leaked a slot"
+
+    # A follow-up admission on a HEALTHY (real thread-creation restored)
+    # executor still succeeds at full capacity — not silently shrunk by
+    # the three repeated timeouts above.
+    monkeypatch.setattr(executor, "_adjust_thread_count", real_adjust_thread_count)
+    result = await bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+        _SAMPLE_HTML, timeout_seconds=5.0
+    )
+    assert result == bean_sourcing._extract_page_markdown(_SAMPLE_HTML)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_extract_page_markdown_bounded_timeout_while_running_keeps_slot() -> None:
+    """#607 (qa pass on PR #629): the one release-enumeration branch that
+    had no dedicated test of its own — a still-RUNNING item's own wrapper
+    releases the slot, never the ``TimeoutError`` handler.
+
+    Warms the executor with a throwaway submission first so an ALREADY
+    IDLE real worker thread picks up the call below in low-single-digit
+    milliseconds (not a freshly-spawned OS thread's own startup latency),
+    keeping the "genuinely running before the deadline" race practically
+    zero without needing a long timeout. A ``started`` event confirms the
+    real worker actually entered the parse callable before asserting
+    anything about the timeout. Once ``timeout_seconds`` elapses while the
+    parse is still blocked, asserts the call falls back (``None``) and —
+    because ``concurrent.futures.Future.cancel()`` cannot succeed on an
+    already-RUNNING item — the counter stays occupied immediately after
+    the timeout fires (the bound is enforced against the hung-but-running
+    parse, not silently freed). Only once the gate is released does the
+    wrapper's own ``finally`` return the counter to 0."""
+    _reset_parse_pool_state()
+    warmup_executor = bean_sourcing._get_parse_executor()  # pyright: ignore[reportPrivateUsage]
+    warmup_executor.submit(lambda: None).result(timeout=5.0)
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def _blocks_once_started(html: str) -> str | None:
+        started.set()
+        release.wait(timeout=5.0)
+        return "should not be observed"  # pragma: no cover
+
+    with unittest.mock.patch.object(bean_sourcing, "_extract_page_markdown", _blocks_once_started):
+        task = asyncio.create_task(
+            bean_sourcing._extract_page_markdown_bounded(  # pyright: ignore[reportPrivateUsage]
+                "<html></html>", timeout_seconds=0.2
+            )
+        )
+        await _await_condition(started.is_set)
+
+        result = await task
+        assert result is None
+        # RUNNING (not PENDING) when the timeout fired: cancel() cannot
+        # have succeeded, so the slot correctly stays reserved here — not
+        # released by the TimeoutError handler.
+        assert bean_sourcing._inflight_parse_count == 1  # pyright: ignore[reportPrivateUsage]
+
+        release.set()
+        await _await_condition(
+            lambda: bean_sourcing._inflight_parse_count == 0  # pyright: ignore[reportPrivateUsage]
+        )
 
 
 @pytest.mark.asyncio
