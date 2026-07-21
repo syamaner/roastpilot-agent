@@ -63,6 +63,19 @@ absolute recall/macro-F1 numbers; see the report's committed
 disclose it. Aligning the harness's RANGE contract with a real midpoint/
 ``origin_estimated`` extractor feature is deferred to #590.
 
+**Evidence-quote capture (#612).** Every ``pages[*].extracted`` record already
+carries the drafted :attr:`~roastpilot_agent.models.BeanProfileDraft.field_sources`
+and :attr:`~roastpilot_agent.models.BeanProfileDraft.field_evidence` maps
+verbatim (the harness serialises the whole draft via ``model_dump(mode="json")``
+-- see :func:`run_model_over_corpus`), so nothing new needs projecting through.
+:func:`evidence_summary` computes a compact per-run rollup of that data --
+per-typed-field {evidence captured, no evidence} counts plus an overall
+``on_page`` rate -- surfaced in :func:`render_report` and persisted in
+:func:`run_to_json`'s ``evidence_summary`` key. **This is a quote
+capture/authenticity-rate summary, NOT a certification signal**: the typed-field
+citation VALUE gates stay permanently parked (#590), so it describes what the
+extractor captured/tagged, never whether the value itself is correct.
+
 **Model roster (section 4).** :data:`MODEL_ROSTER` pins the shortlist for the
 eventual paid run. **This module is read-only and never runs a paid model on
 import or under the self-test**; a real bake-off spends OpenRouter credits and
@@ -1296,6 +1309,114 @@ def model_metrics(run: ModelRun) -> ModelMetrics:
     )
 
 
+# --- Evidence-quote capture summary (#612) -----------------------------------
+#
+# `BeanProfileDraft.field_evidence`/`field_sources` already ride along in
+# every `PageResult.extracted` dump (`draft.model_dump(mode="json")` in
+# `run_model_over_corpus`, and the checkpoint/artifact round trip via
+# `run_to_json`/`_run_from_checkpoint` -- both persist the WHOLE draft, so no
+# projection is needed). This section only adds a compact, honest SUMMARY of
+# what was captured, for the extraction-quality/#612 review; it computes no
+# new Outcome and changes no scoring.
+
+#: The four TYPED fields `BeanProfileDraft.field_evidence` tracks quotes for
+#: (#627/#633) -- these are the `field_evidence`/`field_sources` dict KEYS
+#: (the draft's own attribute names), which for `processing`/`bean_species`/
+#: `altitude_m` differ from the report-facing `FIELD_SPECS` names
+#: (`process`/`species`/`altitude`); `is_blend` matches both.
+TYPED_EVIDENCE_FIELDS: tuple[str, ...] = ("processing", "bean_species", "altitude_m", "is_blend")
+
+
+@dataclass(frozen=True)
+class TypedFieldEvidenceCounts:
+    """Evidence-quote capture counts for one typed field, over a run's scored pages.
+
+    Attributes:
+        field_name: The ``field_evidence``/``field_sources`` key (see
+            :data:`TYPED_EVIDENCE_FIELDS`).
+        captured: Pages (with a draft) where an authenticated evidence quote
+            was present in ``field_evidence`` for this field.
+        no_evidence: Pages (with a draft) where no quote is present -- either
+            the model gave none, or a quote was given but failed the
+            authenticity check (#633) and was dropped; this count cannot
+            distinguish the two.
+    """
+
+    field_name: str
+    captured: int
+    no_evidence: int
+
+
+@dataclass(frozen=True)
+class EvidenceSummary:
+    """A run's quote-capture / authenticity-rate summary.
+
+    **Quote capture/authenticity rates, NOT certification.** These counts
+    describe how often the extractor captured or tagged something, not
+    whether the underlying VALUE is correct -- the scored :class:`Outcome`
+    tallies elsewhere are the correctness signal. Every automated citation
+    VALUE gate for the four typed fields is permanently parked (#590), so
+    ``field_evidence``/``field_sources`` exist for OPERATOR judgement, not
+    automated certification; do not read this summary as a quality score.
+
+    Attributes:
+        model_slug: The model this summary is for.
+        pages_scored: Pages with a persisted draft this summary is computed
+            over (a whole-page extraction error has no draft to inspect and
+            contributes nothing).
+        typed_fields: Per-:data:`TYPED_EVIDENCE_FIELDS` evidence-capture
+            counts.
+        on_page_rate: Fraction of every ``field_sources`` entry (across every
+            drafted bean-identity/target field, not just the typed four)
+            tagged ``"on_page"`` over ``pages_scored`` -- ``None`` if no
+            scored page had any ``field_sources`` entry at all.
+    """
+
+    model_slug: str
+    pages_scored: int
+    typed_fields: tuple[TypedFieldEvidenceCounts, ...]
+    on_page_rate: float | None
+
+
+def evidence_summary(run: ModelRun) -> EvidenceSummary:
+    """Compute a run's #612 quote-capture / provenance summary.
+
+    Args:
+        run: The scored model run -- reads each page's persisted
+            :attr:`PageResult.extracted` draft dump; a page with no draft
+            (a whole-page extraction error) is skipped.
+
+    Returns:
+        The :class:`EvidenceSummary`.
+    """
+    scored_pages = [p.extracted for p in run.pages if p.extracted is not None]
+    captured: dict[str, int] = dict.fromkeys(TYPED_EVIDENCE_FIELDS, 0)
+    on_page = 0
+    total_sources = 0
+    for extracted in scored_pages:
+        field_evidence = cast("dict[str, str]", extracted.get("field_evidence") or {})
+        field_sources = cast("dict[str, str]", extracted.get("field_sources") or {})
+        for field_name in TYPED_EVIDENCE_FIELDS:
+            if field_name in field_evidence:
+                captured[field_name] += 1
+        total_sources += len(field_sources)
+        on_page += sum(1 for v in field_sources.values() if v == "on_page")
+    typed_fields = tuple(
+        TypedFieldEvidenceCounts(
+            field_name=field_name,
+            captured=captured[field_name],
+            no_evidence=len(scored_pages) - captured[field_name],
+        )
+        for field_name in TYPED_EVIDENCE_FIELDS
+    )
+    return EvidenceSummary(
+        model_slug=run.model_slug,
+        pages_scored=len(scored_pages),
+        typed_fields=typed_fields,
+        on_page_rate=(on_page / total_sources) if total_sources else None,
+    )
+
+
 # --- Statistics (section 5.2) ------------------------------------------------
 
 
@@ -1817,6 +1938,28 @@ def render_report(
             lines.append(f"| {page.slug} | {cells} | {'yes' if page.error else ''} |")
         lines.append("")
 
+    lines.append(
+        "## Evidence-quote capture (#612) -- quote capture/authenticity rates, "
+        "NOT certification: every typed-field citation VALUE gate stays permanently "
+        "parked (#590); these counts describe what the extractor captured/tagged, not "
+        "whether the value is correct"
+    )
+    lines.append("")
+    lines.append("| Model | pages scored | field | captured | no evidence | on_page rate |")
+    lines.append("|---|--:|---|--:|--:|--:|")
+    for run in runs:
+        summary = evidence_summary(run)
+        on_page_rate = _fmt(summary.on_page_rate, digits=3)
+        for i, field_counts in enumerate(summary.typed_fields):
+            model_cell = f"`{summary.model_slug}`" if i == 0 else ""
+            pages_cell = str(summary.pages_scored) if i == 0 else ""
+            rate_cell = on_page_rate if i == 0 else ""
+            lines.append(
+                f"| {model_cell} | {pages_cell} | {field_counts.field_name} | "
+                f"{field_counts.captured} | {field_counts.no_evidence} | {rate_cell} |"
+            )
+    lines.append("")
+
     if len(runs) >= 2:
         lines.append(
             "## Pairwise significance (ALL pairs, section 5.2) -- every comparison the "
@@ -1896,8 +2039,17 @@ def render_report(
 
 
 def run_to_json(run: ModelRun) -> dict[str, Any]:
-    """Serialise a model run + its metrics for the ``--out`` artifact."""
+    """Serialise a model run + its metrics for the ``--out`` artifact.
+
+    Includes ``evidence_summary`` (#612) -- the quote-capture/authenticity
+    counts, NOT a certification signal (see :class:`EvidenceSummary`) --
+    alongside the existing faithfulness/recall/abstention metrics. Every
+    ``pages[*].extracted`` entry already carries the drafted
+    ``field_sources``/``field_evidence`` maps verbatim (the full
+    ``BeanProfileDraft`` dump), so no separate per-page projection is added.
+    """
     m = model_metrics(run)
+    summary = evidence_summary(run)
     return {
         "model_slug": run.model_slug,
         "metrics": {
@@ -1912,6 +2064,7 @@ def run_to_json(run: ModelRun) -> dict[str, Any]:
             "median_latency_s": m.median_latency_s,
             "p95_latency_s": m.p95_latency_s,
         },
+        "evidence_summary": dataclasses.asdict(summary),
         "pages": [
             {
                 "slug": page.slug,

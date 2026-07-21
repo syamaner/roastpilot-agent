@@ -954,11 +954,160 @@ async def test_run_model_over_corpus_persists_extracted_draft(
     extracted = run.pages[0].extracted
     assert extracted is not None
     assert extracted["name"] == "Costa Rica La Minita"
+    # #612: the full draft dump rides along, so field_sources/field_evidence
+    # need no separate harness-side projection -- both keys are present
+    # (empty here since the double supplied no *_evidence args).
+    assert "field_sources" in extracted
+    assert "field_evidence" in extracted
     # a failed page persists no extracted draft.
     failed = await bo.run_model_over_corpus(
         [page], model_slug="m", advisor_config=_ADVISOR_CONFIG, model=_model_text_only()
     )
     assert failed.pages[0].extracted is None
+
+
+# --- Evidence-quote capture summary (#612) -----------------------------------
+
+
+def test_draft_model_dump_carries_field_sources_and_evidence_verbatim() -> None:
+    """``BeanProfileDraft.model_dump`` already carries ``field_sources``/
+    ``field_evidence`` (#627/#633) -- the harness's ``PageResult.extracted``
+    is the whole draft dump, so #612 needs no separate projection."""
+    draft = BeanProfileDraft(
+        name="X",
+        bean_origin="Y",
+        initial_heat_percent=100,
+        initial_fan_percent=30,
+        target_drop_temp_c=194.0,
+        target_development_percent=14.0,
+        default_bean_weight_grams=250.0,
+        scouting_note="scouting",
+        altitude_m=1400,
+        field_sources={"altitude_m": "on_page", "processing": "origin_estimated"},
+        field_evidence={"altitude_m": "grown at 1,400 metres"},
+    )
+    dumped = draft.model_dump(mode="json")
+    assert dumped["field_sources"] == {"altitude_m": "on_page", "processing": "origin_estimated"}
+    assert dumped["field_evidence"] == {"altitude_m": "grown at 1,400 metres"}
+
+
+def _evidence_page(
+    slug: str,
+    *,
+    field_sources: dict[str, str] | None = None,
+    field_evidence: dict[str, str] | None = None,
+    has_draft: bool = True,
+) -> bo.PageResult:
+    extracted = (
+        None
+        if not has_draft
+        else {"field_sources": field_sources or {}, "field_evidence": field_evidence or {}}
+    )
+    return bo.PageResult(
+        slug=slug,
+        outcomes={},
+        error=None if has_draft else "boom",
+        on_page_fields=0,
+        extracted=extracted,
+    )
+
+
+def test_evidence_summary_counts_captured_and_missing_per_typed_field() -> None:
+    run = bo.ModelRun(
+        model_slug="m",
+        pages=[
+            _evidence_page(
+                "a",
+                field_sources={
+                    "altitude_m": "on_page",
+                    "name": "on_page",
+                    "processing": "origin_estimated",
+                },
+                field_evidence={"altitude_m": "grown at 1400m"},
+            ),
+            _evidence_page(
+                "b", field_sources={"altitude_m": "origin_estimated"}, field_evidence={}
+            ),
+        ],
+    )
+    summary = bo.evidence_summary(run)
+    assert summary.model_slug == "m"
+    assert summary.pages_scored == 2
+    by_field = {f.field_name: f for f in summary.typed_fields}
+    assert by_field["altitude_m"].captured == 1
+    assert by_field["altitude_m"].no_evidence == 1
+    assert by_field["processing"].captured == 0
+    assert by_field["processing"].no_evidence == 2
+    assert by_field["bean_species"].captured == 0
+    assert by_field["bean_species"].no_evidence == 2
+    assert by_field["is_blend"].captured == 0
+    assert by_field["is_blend"].no_evidence == 2
+    # 2 "on_page" of 4 total field_sources entries across both pages (page a:
+    # 2 on_page of 3 entries; page b: 0 on_page of 1 entry) -> 2/4 = 0.5.
+    assert summary.on_page_rate == pytest.approx(0.5)
+
+
+def test_evidence_summary_empty_maps_yield_none_on_page_rate() -> None:
+    run = bo.ModelRun(
+        model_slug="m", pages=[_evidence_page("a", field_sources={}, field_evidence={})]
+    )
+    summary = bo.evidence_summary(run)
+    assert summary.pages_scored == 1
+    assert all(f.captured == 0 and f.no_evidence == 1 for f in summary.typed_fields)
+    assert summary.on_page_rate is None
+
+
+def test_evidence_summary_skips_pages_with_no_draft() -> None:
+    run = bo.ModelRun(
+        model_slug="m",
+        pages=[
+            _evidence_page("a", has_draft=False),
+            _evidence_page(
+                "b", field_sources={"altitude_m": "on_page"}, field_evidence={"altitude_m": "q"}
+            ),
+        ],
+    )
+    summary = bo.evidence_summary(run)
+    assert summary.pages_scored == 1
+    by_field = {f.field_name: f for f in summary.typed_fields}
+    assert by_field["altitude_m"].captured == 1
+    assert by_field["altitude_m"].no_evidence == 0
+
+
+def test_render_report_includes_evidence_capture_section(corpus: list[bo.CorpusPage]) -> None:
+    fields = {spec.name: bo.Outcome.COR for spec in bo.FIELD_SPECS}
+    page = bo.PageResult(
+        slug="page-a",
+        outcomes=fields,
+        error=None,
+        on_page_fields=1,
+        extracted={
+            "field_sources": {"altitude_m": "on_page"},
+            "field_evidence": {"altitude_m": "grown at 1400m"},
+        },
+    )
+    run = bo.ModelRun(model_slug="model-a", pages=[page])
+    report = bo.render_report([run], bo.estimate_cost(corpus, bo.MODEL_ROSTER[:1]))
+    assert "Evidence-quote capture" in report
+    assert "NOT certification" in report
+    assert "altitude_m" in report
+
+
+def test_run_to_json_includes_evidence_summary() -> None:
+    run = bo.ModelRun(
+        model_slug="m",
+        pages=[
+            _evidence_page(
+                "a", field_sources={"altitude_m": "on_page"}, field_evidence={"altitude_m": "q"}
+            )
+        ],
+    )
+    payload = bo.run_to_json(run)
+    assert payload["evidence_summary"]["model_slug"] == "m"
+    assert payload["evidence_summary"]["pages_scored"] == 1
+    typed = {f["field_name"]: f for f in payload["evidence_summary"]["typed_fields"]}
+    assert typed["altitude_m"]["captured"] == 1
+    assert typed["altitude_m"]["no_evidence"] == 0
 
 
 def test_checkpoint_appends_and_resumes(tmp_path: Path) -> None:
