@@ -1991,6 +1991,31 @@ def test_bean_sourcing_agent_builds_model_from_sourcing_config_default_when_none
     assert agent is not None
 
 
+def test_bean_sourcing_agent_sets_reasoning_extra_body_when_given() -> None:
+    """An explicit ``reasoning_effort`` threads into the OpenRouter ``extra_body``
+    via ``advisor.reasoning_extra_body`` (#601)."""
+    agent = bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
+        _ADVISOR_CONFIG,
+        model=_function_model_returning(_identity_args()),
+        reasoning_effort="low",
+    )
+    settings = agent.model_settings
+    assert isinstance(settings, dict)
+    assert "extra_body" in settings
+    assert settings["extra_body"] == {"reasoning": {"effort": "low"}}
+
+
+def test_bean_sourcing_agent_omits_extra_body_by_default() -> None:
+    """``reasoning_effort=None`` (the default) omits ``extra_body`` entirely --
+    behaviour-preserving, since extraction never set reasoning before #601."""
+    agent = bean_sourcing._bean_sourcing_agent(  # pyright: ignore[reportPrivateUsage]
+        _ADVISOR_CONFIG, model=_function_model_returning(_identity_args())
+    )
+    settings = agent.model_settings
+    assert isinstance(settings, dict)
+    assert "extra_body" not in settings
+
+
 # --- _resolve_extraction_model_slug (#590 P1 + P2 fix: provider-aware default) ---
 #
 # Codex caught a P1 on the PR that introduced BeanSourcingConfig.model_slug:
@@ -2241,6 +2266,34 @@ async def test_extract_bean_identity_maps_malformed_output() -> None:
         await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
             "page text", advisor_config=_ADVISOR_CONFIG, model=model
         )
+
+
+@pytest.mark.asyncio
+async def test_extract_bean_identity_counts_a_recovered_validation_retry() -> None:
+    """A first-attempt schema violation that succeeds on retry reports zero page
+    errors (PydanticAI's own retry recovery) -- ``diagnostics.schema_retries`` must
+    still count it; the default (omitted) path stays an unaffected no-op (#601 F2)."""
+    calls = {"n": 0}
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return ModelResponse(parts=[TextPart("not yet structured")])
+        return ModelResponse(parts=[ToolCallPart(info.output_tools[0].name, _identity_args())])
+
+    model = FunctionModel(respond)
+    diagnostics = bean_sourcing.BeanSourcingDiagnostics()
+    identity = await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text", advisor_config=_ADVISOR_CONFIG, model=model, diagnostics=diagnostics
+    )
+    assert identity.name == "Kenya Kiambu AA (Washed)"
+    assert diagnostics.schema_retries == 1
+
+    calls["n"] = 0  # default path (diagnostics omitted) is unaffected
+    identity_again = await bean_sourcing._extract_bean_identity(  # pyright: ignore[reportPrivateUsage]
+        "page text", advisor_config=_ADVISOR_CONFIG, model=model
+    )
+    assert identity_again.name == "Kenya Kiambu AA (Washed)"
 
 
 @pytest.mark.asyncio

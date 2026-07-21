@@ -205,7 +205,7 @@ import threading
 import zlib
 from dataclasses import dataclass
 from html import unescape
-from typing import Any, Final, cast
+from typing import Any, Final, Literal, cast
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import extruct  # type: ignore[import-untyped]
@@ -215,9 +215,15 @@ import lxml.html  # type: ignore[import-untyped]
 import trafilatura
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai import Agent, ModelAPIError, ModelSettings, UnexpectedModelBehavior
+from pydantic_ai.messages import ModelRequest, RetryPromptPart
 from pydantic_ai.models import Model
 
-from roastpilot_agent.advisor import AdvisorDependencyError, AdvisorError, build_model
+from roastpilot_agent.advisor import (
+    AdvisorDependencyError,
+    AdvisorError,
+    build_model,
+    reasoning_extra_body,
+)
 from roastpilot_agent.config import OPENROUTER_BASE_URL, AdvisorConfig, BeanSourcingConfig
 from roastpilot_agent.models import (
     BeanFieldSource,
@@ -2677,6 +2683,7 @@ def _bean_sourcing_agent(
     *,
     sourcing_config: BeanSourcingConfig | None = None,
     model: Model | None = None,
+    reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
 ) -> Agent[None, _ExtractedBeanIdentity]:
     """Build the bean-identity extraction agent.
 
@@ -2701,6 +2708,14 @@ def _bean_sourcing_agent(
         model: An injected ``Model`` (the extraction test seam) — always
             wins over the resolved model slug when given, matching
             :func:`build_model`'s own injection-seam precedence.
+        reasoning_effort: An optional provider reasoning-effort override,
+            reusing :func:`roastpilot_agent.advisor.reasoning_extra_body`
+            (#601 — the bean-sourcing bake-off's reasoning-arm dimension).
+            ``None`` (the default) omits the setting entirely — this
+            extraction call has never set reasoning before #601, so leaving
+            it unset is the behaviour-preserving no-op; an explicit level
+            sets the OpenRouter ``reasoning`` request body the same way the
+            roast advisor does.
 
     Returns:
         The extraction agent, temperature 0 for deterministic, literal
@@ -2711,12 +2726,24 @@ def _bean_sourcing_agent(
     else:
         model_slug = _resolve_extraction_model_slug(advisor_config, sourcing_config)
         resolved_model = build_model(advisor_config, model_slug=model_slug)
+    settings = ModelSettings(temperature=0.0)
+    extra_body = reasoning_extra_body(reasoning_effort)
+    if extra_body is not None:
+        settings["extra_body"] = extra_body
     return Agent(
         resolved_model,
         output_type=_ExtractedBeanIdentity,
         instructions=_EXTRACTION_INSTRUCTIONS,
-        model_settings=ModelSettings(temperature=0.0),
+        model_settings=settings,
     )
+
+
+@dataclass
+class BeanSourcingDiagnostics:
+    """Opt-in mutable accumulator: ``schema_retries`` counts ``RetryPromptPart``
+    occurrences a success recovered from (#601 F2 -- otherwise invisible)."""
+
+    schema_retries: int = 0
 
 
 async def _extract_bean_identity(
@@ -2725,6 +2752,8 @@ async def _extract_bean_identity(
     advisor_config: AdvisorConfig,
     sourcing_config: BeanSourcingConfig | None = None,
     model: Model | None = None,
+    reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
+    diagnostics: BeanSourcingDiagnostics | None = None,
 ) -> _ExtractedBeanIdentity:
     """Run the structured bean-identity extraction call over ``page_text``.
 
@@ -2734,6 +2763,9 @@ async def _extract_bean_identity(
             reused for the PROVIDER/key, and (for a native provider, or when
             ``sourcing_config.model_slug`` is unset) also for the MODEL; see
             :func:`_resolve_extraction_model_slug`.
+        reasoning_effort: An optional provider reasoning-effort override,
+            passed straight through to :func:`_bean_sourcing_agent` (#601).
+        diagnostics: Optional accumulator (#601 F2), incremented on success.
         sourcing_config: The extraction model/timeout config
             (:attr:`~roastpilot_agent.config.BeanSourcingConfig.model_slug`,
             :attr:`~roastpilot_agent.config.BeanSourcingConfig.extraction_timeout_seconds`
@@ -2772,7 +2804,12 @@ async def _extract_bean_identity(
         # / ``AdvisorError`` on a misconfigured or under-installed provider,
         # and that must fail soft as ``BeanExtractionError`` too, not escape
         # as an unhandled exception (#587).
-        agent = _bean_sourcing_agent(advisor_config, sourcing_config=sourcing_config, model=model)
+        agent = _bean_sourcing_agent(
+            advisor_config,
+            sourcing_config=sourcing_config,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
         async with asyncio.timeout(extraction_timeout_seconds):
             result = await agent.run(page_text)
     except TimeoutError as exc:
@@ -2794,6 +2831,13 @@ async def _extract_bean_identity(
         raise BeanExtractionUnavailableError(
             f"bean identity extraction could not build its model: {exc}"
         ) from exc
+    if diagnostics is not None:
+        diagnostics.schema_retries += sum(
+            isinstance(part, RetryPromptPart)
+            for msg in result.all_messages()
+            if isinstance(msg, ModelRequest)
+            for part in msg.parts
+        )
     return result.output
 
 
@@ -4971,6 +5015,8 @@ async def draft_bean_profile_from_url(
     sourcing_config: BeanSourcingConfig | None = None,
     http_client: httpx.AsyncClient | None = None,
     model: Model | None = None,
+    reasoning_effort: Literal["off", "minimal", "low", "medium", "high"] | None = None,
+    diagnostics: BeanSourcingDiagnostics | None = None,
 ) -> BeanProfileDraft:
     """Draft a bean profile from a vendor product URL (#573 phase 1).
 
@@ -5000,6 +5046,13 @@ async def draft_bean_profile_from_url(
         model: An injectable PydanticAI ``Model`` (the extraction test seam)
             — always wins over the resolved extraction model slug when
             given.
+        reasoning_effort: An optional provider reasoning-effort override for
+            the extraction call only (#601 — the bean-sourcing bake-off's
+            reasoning-arm dimension; unrelated to the roast advisor's own
+            ``AdvisorConfig.reasoning_effort``). ``None`` (the default) omits
+            the setting — behaviour-preserving, since extraction has never
+            set reasoning before #601.
+        diagnostics: Optional accumulator (#601 F2).
 
     Returns:
         The drafted :class:`~roastpilot_agent.models.BeanProfileDraft`.
@@ -5070,7 +5123,12 @@ async def draft_bean_profile_from_url(
     # consistent with the fetch's, rather than re-deriving its own None
     # fallback here (#590 slice A).
     identity = await _extract_bean_identity(
-        page.prompt_text, advisor_config=advisor_config, sourcing_config=config, model=model
+        page.prompt_text,
+        advisor_config=advisor_config,
+        sourcing_config=config,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        diagnostics=diagnostics,
     )
     # page.extracted_text/page.json_ld_values, NOT page.prompt_text (#590
     # D1 fold 1; split #590 slice E1) — the prompt text carries OUR OWN
