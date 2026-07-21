@@ -158,6 +158,34 @@ export function withFieldEdited<K extends keyof BeanProfileDraft>(
   return next;
 }
 
+/**
+ * Unicode bidi formatting control characters, as explicit `\u` escapes
+ * (never the literal control characters themselves — embedding a real bidi
+ * override in this source file would be its own Trojan-Source-style
+ * footgun): ALM (U+061C), LRM/RLM (U+200E–U+200F), LRE/RLE/PDF/LRO/RLO
+ * (U+202A–U+202E), and LRI/RLI/FSI/PDI (U+2066–U+2069). A fixed
+ * character-class regex on exact codepoints, not user-influenced — no ReDoS
+ * surface.
+ */
+const BIDI_CONTROL_CHARS = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
+
+/**
+ * Strips Unicode bidi formatting controls from `text` before display (#627
+ * retro finding on #634): `dir="ltr"` + `unicode-bidi: isolate` on the
+ * quote's container only shields the SURROUNDING layout — a U+202E (or any
+ * other override/embedding/isolate control) INSIDE the quote still reorders
+ * the quote's own rendered characters, so a malicious vendor page could make
+ * a "page says" quoted-authority display visually claim something the
+ * underlying text doesn't. Bidi controls carry no legitimate content in a
+ * quoted-authority display; stripping is fail-closed (retro finding on
+ * #634). Applied to quote TEXT only, never to labels/hints/other UI copy —
+ * the `dir`/isolate attributes stay as defence-in-depth for anything this
+ * misses.
+ */
+export function stripBidiControls(text: string): string {
+  return text.replace(BIDI_CONTROL_CHARS, "");
+}
+
 /** Field-level validation errors, keyed by draft field. */
 export type BeanProfileErrors = Partial<Record<keyof BeanProfileDraft, string>>;
 

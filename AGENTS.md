@@ -253,7 +253,10 @@ checklist before you open.
   exceeds **400**, the PR plan was too coarse — split to the planned slice boundary
   before opening. Enough slices that every one is under the cap: the ~2,000-line #600
   harness was ~5–6 reviewable logic slices (scoring / stats / runner / report), not 4.
-  The number is exact (400), the slicing is what flexes. **Pure-deletion PRs
+  The number is exact (400), the slicing is what flexes. **Pure-deletion accounting (operator ruling, 21 Jul — #623):** deletions of an
+  atomically-retired unit are EXEMPT from the summed count (insertions still
+  capped at 400) — a retired unit larger than the cap cannot be split without
+  dead-code scaffolding that worsens review. **Pure-deletion PRs
   deadlock on the app-pinned `codecov/patch`** (zero coverable lines → codecov
   posts no status; a hand-posted status is rejected at merge — #624/#625): fold
   an atomic retirement WITH the logic that replaces it rather than opening a

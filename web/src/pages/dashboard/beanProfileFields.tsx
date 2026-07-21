@@ -22,6 +22,7 @@ import {
   fieldSourceFor,
   PROCESSING_OPTIONS,
   SPECIES_OPTIONS,
+  stripBidiControls,
   TEMP_MAX_C,
   TEMP_MIN_C,
   type BeanProfileDraft,
@@ -119,6 +120,17 @@ function ProvenanceBadge({
  * button gives every one the SAME accessible name, so a screen-reader user
  * tabbing through them can't tell them apart — and `aria-controls={id}`
  * pointing at this quote block (#627 a11y fold).
+ *
+ * `dir="ltr"` + `unicode-bidi: isolate` on the quote span only shield the
+ * SURROUNDING layout from a bidi character in `quote` — they do NOT stop a
+ * bidi control INSIDE the quote from reordering the quote's own rendered
+ * characters, so a malicious vendor page could still make this
+ * quoted-authority display visually claim something the underlying text
+ * doesn't (retro finding on #634). Bidi controls carry no legitimate
+ * content in a quoted-authority display; stripping is fail-closed —
+ * `stripBidiControls` runs on the quote TEXT ONLY (never on `fieldLabel` or
+ * any other UI copy) before it's measured/rendered; the `dir`/isolate
+ * attributes stay as defence-in-depth for anything this misses.
  */
 function EvidenceQuote({
   id,
@@ -132,7 +144,8 @@ function EvidenceQuote({
   fieldLabel: string;
 }): React.JSX.Element {
   const [expanded, setExpanded] = useState(false);
-  const truncatable = quote.length > 160;
+  const displayQuote = stripBidiControls(quote);
+  const truncatable = displayQuote.length > 160;
   return (
     <blockquote
       id={id}
@@ -149,7 +162,7 @@ function EvidenceQuote({
             truncatable && !expanded && "line-clamp-2",
           )}
         >
-          &ldquo;{quote}&rdquo;
+          &ldquo;{displayQuote}&rdquo;
         </span>
       </span>
       {truncatable && (
